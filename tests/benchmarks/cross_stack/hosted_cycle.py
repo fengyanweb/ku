@@ -21,6 +21,8 @@ PG_MEMORY_C = {
     'A':'830536089f72ce56118e4e6a1556bbe007f816cc16a3c2f96c0dcff010d14e77',
     'B':'e2f32de65729b0c2f8241fec2238cc3c59cd955ccb3857e0d8be191dc0c1d5a2',
 }
+HTTP_STATUS_GOALS=('http-status-screen','http-status-confirm')
+HTTP_STATUS_C=dict(PG_MEMORY_C,B='2bfb5abc1c6ec68a3529d21b264cc4ead70eb93ebb564bedeba3a317d94d7b78')
 V4_GOALS=('v4-memory-screen','v4-memory-confirm')
 V4_MEMORY_C=dict(PG_MEMORY_C,B='6c8158cc3952b73015d28f2f18846f32aca5e65640efbd0f554db1beb34a7827')
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
@@ -43,12 +45,12 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def http_short_prepatch(goal):
-    if goal not in ('cpu','memory','pg-memory',*V4_GOALS):raise ValueError('unregistered HTTP short goal')
-    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in V4_GOALS else HTTP_SHORT_PREPATCH
+    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS):raise ValueError('unregistered HTTP short goal')
+    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS) else HTTP_SHORT_PREPATCH
 
 
 def verify_pg_memory_builds(identities,goal='pg-memory'):
-    for name,expected in (V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
+    for name,expected in (HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
         if identities.get(name,{}).get('files',{}).get('generated C',{}).get('sha256')!=expected:
             raise ValueError('PG memory screen requires the exact preregistered complete C: '+name)
 
@@ -286,6 +288,7 @@ def normal_self_plan(versions):
 
 
 def http_short_plan(versions,goal='cpu'):
+    if goal in HTTP_STATUS_GOALS:return http_status_plan(versions,goal)
     if goal in V4_GOALS:return v4_short_plan(versions,goal)
     prepatch=http_short_prepatch(goal)
     controls=[dict(name='A',phase='environment-control',workload='json_object',contract='dom',group=g,
@@ -322,6 +325,7 @@ def http_short_plan(versions,goal='cpu'):
 
 
 def http_short_comparison(rows,complete,environment=None,goal='cpu'):
+    if goal in HTTP_STATUS_GOALS:return http_status_comparison(rows,complete,environment,goal)
     if goal in V4_GOALS:return v4_short_comparison(rows,complete,environment,goal)
     http_short_prepatch(goal)
     result=dict(complete=complete,eligible_for_root_review=False,candidate_accepted=False,comparisons={},
@@ -438,6 +442,57 @@ def v4_short_comparison(rows,complete,environment,goal):
     cpu={r['name']:r for r in rows if r['phase']=='compute-guard'}
     ratio=cpu['B']['full_cpu_us']/cpu['A']['full_cpu_us']
     result['compute_guard']=dict(B_over_A=ratio,pairs=1,confidence_interval=None,scope='coarse guard only')
+    if ratio>1.03:result['reasons'].append('coarse compute guard failed')
+    result['eligible_for_root_review' if confirm else 'eligible_for_confirmation']=not result['reasons']
+    return result
+
+
+
+def http_status_plan(versions,goal):
+    if goal not in HTTP_STATUS_GOALS:raise ValueError('unregistered statusline stage')
+    confirm=goal==HTTP_STATUS_GOALS[1]
+    plan=v4_short_plan(versions,V4_GOALS[1] if confirm else V4_GOALS[0])
+    plan.update(http_short_goal=goal,
+        purpose='One fixed statusline-only CPU candidate on original16B token hash and original blocking slots; ordinary helpers/C11O2. Same23window screen and one independent77window confirmation, no old rows pooled.',
+        adoption_thresholds=dict(primary_workload='ok',CPU_ratio_maximum=.99,CPU_upper95_strictly_below=1,
+            related_CPU_lower95_maximum=1,related_CPU_upper95_maximum=1.03,
+            unexpected_memory_lower95_maximum=1,compute_ratio_maximum=1.03,
+            rationale='Small source-identified formatting component:1% minimum frozen before its measurements; original16targets unchanged. No storage/allocation/capacity/lifetime change; memory intervals retained and significant growth blocks, not claimed equivalent.',
+            CPU_metric='full_cpu_us: after startup/warmup before score driver through recorded termination',
+            memory_metric='original chronological middle60% cgroup memory.current median'),
+        evidence_basis=dict(normal_SELF_samples=549,statusline_context_samples=5,normal_ELF='234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b',
+            complete_C=HTTP_STATUS_C,source_only_statusline=True,other_v4_candidates_excluded=True,
+            mechanism='Already validated3digit status plus unchanged static reason bypasses general varargs formatter; not a majorPGcost or promised speedup.'))
+    return plan
+
+
+def http_status_comparison(rows,complete,environment,goal):
+    plan=http_status_plan({},goal);confirm=goal==HTTP_STATUS_GOALS[1];groups=range(1,plan['paired_windows_per_business']+1)
+    result=dict(complete=complete,http_short_goal=goal,eligible_for_confirmation=False,eligible_for_root_review=False,
+        candidate_accepted=False,formal_qualified=False,normal_score_eligible=False,reasons=[],comparisons={},memory_intervals={},
+        independent_stage=True,pooling_previous_windows=False,thresholds=plan['adoption_thresholds'])
+    if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification failed or unknown')
+    if not complete:
+        result['reasons'].append('incomplete observations or cleanup; no metric scoring');return result
+    business=[r for r in rows if r['phase']=='normal']
+    if len(business)!=6*len(groups) or any(r.get('environment_quality')!='pass' for r in business):
+        result['reasons'].append('business row count or environment differs');return result
+    for workload in ('json_object','ok','db'):
+        selected=[r for r in business if r['workload']==workload]
+        pairs=[{r['name']:r for r in selected if r['group']==g} for g in groups]
+        if any(set(p)!=set(('A','B')) for p in pairs):raise ValueError('statusline incomplete pair identity')
+        cpu=fc.paired_interval([p['B']['full_cpu_us'] for p in pairs],[p['A']['full_cpu_us'] for p in pairs],minimum=3)
+        memory=fc.paired_interval([fc.metric(p['B'],'memory.steady_median_bytes') for p in pairs],
+            [fc.metric(p['A'],'memory.steady_median_bytes') for p in pairs],minimum=3)
+        result['comparisons'][workload]=cpu;result['memory_intervals'][workload]=memory
+        if cpu.get('status')!='estimated' or cpu['lower95']>1 or cpu['upper95']>1.03:
+            result['reasons'].append(workload+' CPU guard unresolved/failed')
+        if workload=='ok' and (cpu.get('status')!='estimated' or cpu['estimate']>.99 or cpu['upper95']>=1):
+            result['reasons'].append('ordinaryHTTP CPU benefit criterion not demonstrated')
+        if memory.get('status')!='estimated' or memory['lower95']>1:
+            result['reasons'].append(workload+' significant memory increase or missing measurement')
+    cpu={r['name']:r for r in rows if r['phase']=='compute-guard'}
+    ratio=cpu['B']['full_cpu_us']/cpu['A']['full_cpu_us'];result['compute_guard']=dict(B_over_A=ratio,pairs=1,confidence_interval=None,scope='coarse guard only')
     if ratio>1.03:result['reasons'].append('coarse compute guard failed')
     result['eligible_for_root_review' if confirm else 'eligible_for_confirmation']=not result['reasons']
     return result
@@ -761,7 +816,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
-    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS):
+    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS):
         verify_pg_memory_builds(identities,getattr(a,'http_short_goal','cpu'))
     if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
@@ -2525,7 +2580,7 @@ def main(argv=None):
     p.add_argument('--fixed-goals-only',action='store_true',help='Explicit full-build/run stop after controls, admission and original80 windows/16 goals; capacity/stability and whole acceptance remain incomplete')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')

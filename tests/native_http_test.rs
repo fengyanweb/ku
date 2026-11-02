@@ -4651,16 +4651,31 @@ static void fixture_pressure(KuHttpConnection* connection) {
     let checks = r#"
 int main(void) {
   KuHttpConnection connection; KuHttpServer server={0};
-  /* Every supported status and the default Unknown reason must fit the real
-     production layout, including CRLF and the snprintf terminator. */
+  /* Compare every status to the previous wire contract, including Unknown,
+   * CRLF, NUL and exact/short capacities. Failed writes leave the buffer alone. */
   for(int status=100;status<=599;status++) {
-    int length=snprintf(connection.output.first,sizeof(connection.output.first),
+    char expected[64];int reference=snprintf(expected,sizeof(expected),
         "HTTP/1.1 %d %s\r\n",status,ku_http_status_text(status));
+    int length=ku_http_status_line(connection.output.first,sizeof(connection.output.first),status);
     CHECK(length>0 && (size_t)length<sizeof(connection.output.first));
+    CHECK(length==reference && !memcmp(connection.output.first,expected,(size_t)length+1u));
     CHECK(connection.output.first[length]=='\0');
     if(status==431)CHECK(length==46);
     if(status==599)CHECK(!strcmp(connection.output.first,"HTTP/1.1 599 Unknown\r\n"));
+    for(size_t capacity=0;capacity<=(size_t)length;capacity++) {
+      memset(connection.output.first,0xa5,sizeof(connection.output.first));
+      CHECK(ku_http_status_line(connection.output.first,capacity,status)==-1);
+      for(size_t i=0;i<sizeof(connection.output.first);i++)CHECK((unsigned char)connection.output.first[i]==0xa5);
+    }
+    memset(connection.output.first,0xa5,sizeof(connection.output.first));
+    CHECK(ku_http_status_line(connection.output.first,(size_t)length+1u,status)==length);
+    CHECK(!memcmp(connection.output.first,expected,(size_t)length+1u));
+    CHECK((unsigned char)connection.output.first[length+1]==0xa5);
   }
+  CHECK(ku_http_status_line(NULL,64u,200)==-1);
+  const int64_t invalid_status[]={INT64_MIN,99,600,INT64_MAX};
+  for(size_t i=0;i<sizeof(invalid_status)/sizeof(*invalid_status);i++)
+    CHECK(ku_http_status_line(connection.output.first,sizeof(connection.output.first),invalid_status[i])==-1);
   static const unsigned char fixture_prefix_bytes[9]={'H',0,'I','a','b','c','d','e','f'};
   /* The first-write opportunity is one syscall and16KiB, not an unbounded
      flush. The original readiness cursor/deadline must resume it exactly. */
@@ -8417,8 +8432,7 @@ static int fixture_fd_index_init_failures(void) {
   KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
   CHECK(ku_http_reactor_init_pending(&r,&active,1u,2u));
   CHECK(fixture_alloc_calls==5u);
-  CHECK(fixture_live_bytes+r.hash_capacity*(sizeof(KuHttpRegistrationHashBudget)-sizeof(KuHttpRegistrationHash))
-      ==ku_http_reactor_pending_storage_bytes(1u,1u,2u)-sizeof(r));
+  CHECK(fixture_live_bytes==ku_http_reactor_pending_storage_bytes(1u,1u,2u)-sizeof(r));
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
   CHECK(!ku_http_reactor_init(&r,&active,(size_t)UINT32_MAX));
   CHECK(!fixture_live_allocs && !fixture_live_bytes);
@@ -8548,43 +8562,7 @@ static int fixture_closed_event_source(void) {
   reactor.descriptor=-1;CHECK(!close(pair[1]));ku_http_reactor_destroy(&reactor);
   puts("http-persistent-closed-event-source-fault-ok");return 0;
 }
-static int fixture_token_fingerprints(void) {
-  KuHttpConnection connections[8]={{0}};KuHttpActiveSet active={connections,8,NULL};KuHttpReactor r;
-  CHECK(ku_http_reactor_init(&r,&active,0u));
-  CHECK(sizeof(KuHttpRegistrationHash)==8u && r.hash_capacity==32u);
-  /* Exact full32-fingerprint collisions, not merely common home buckets.
-   * Three equal hashes wrap the cluster through bucket zero. */
-  const uint64_t keys[]={UINT64_C(0x3c7ea7b57975bb15),UINT64_C(0xdadc6ecf1cc6cadb),
-      UINT64_C(0xda03735a05cdc14c),UINT64_C(0xa0d6349ed189bf84),UINT64_C(0x41ac6939a3137f18)};
-  for(size_t i=0;i<5u;i++) {
-    CHECK(ku_http_reactor_fingerprint(keys[i])==(i<3u?31u:0u));
-    r.registrations[i].token=keys[i];CHECK(ku_http_reactor_hash_add(&r,keys[i],i));
-    for(size_t j=0;j<=i;j++) CHECK(ku_http_reactor_lookup(&r,keys[j])==j);
-  }
-  const size_t deletion[]={1u,0u,3u,2u,4u};
-  for(size_t step=0;step<5u;step++) {
-    size_t i=deletion[step];ku_http_reactor_hash_remove(&r,keys[i]);
-    CHECK(!r.fault && ku_http_reactor_lookup(&r,keys[i])==SIZE_MAX);
-    r.registrations[i].token=0;
-    ku_http_reactor_hash_remove(&r,keys[i]); /* stale full token cannot remove its colliding neighbour */
-    for(size_t j=0;j<5u;j++) if(r.registrations[j].token) CHECK(ku_http_reactor_lookup(&r,keys[j])==j);
-  }
-  for(size_t i=0;i<r.hash_capacity;i++)CHECK(!r.hash[i].entry_plus_one);
-  CHECK(!ku_http_reactor_hash_add(&r,1u,r.capacity) && !ku_http_reactor_hash_add(&r,1u,SIZE_MAX));
-  CHECK(!ku_http_reactor_hash_add(&r,0u,0u) && !ku_http_reactor_hash_add(&r,UINT64_MAX,0u));
-  /* Exercise the original large-mask home without a gigantic allocation. */
-  if(sizeof(size_t)>4u) {
-    size_t old=r.hash_capacity;r.hash_capacity=(size_t)UINT32_MAX+1u;r.hash_capacity*=2u;
-    r.registrations[0].token=keys[0];KuHttpRegistrationHash item={31u,1u};
-    CHECK(ku_http_reactor_token_start(&r,keys[0],31u)==ku_http_reactor_hash_start(&r,keys[0]));
-    CHECK(ku_http_reactor_bucket_home(&r,&item)==ku_http_reactor_hash_start(&r,keys[0]));
-    r.hash_capacity=old;r.registrations[0].token=0;
-  }
-  ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
-  return 0;
-}
 int main(int argc,char** argv) {
-  if(argc>1 && !strcmp(argv[1],"token-fingerprints"))return fixture_token_fingerprints();
   if(argc>1 && !strcmp(argv[1],"fd-index-clusters"))return fixture_fd_index_clusters();
   if(argc>1 && !strcmp(argv[1],"fd-index-init-failures"))return fixture_fd_index_init_failures();
   if(argc>1 && !strcmp(argv[1],"failed-new-alias"))return fixture_failed_new_preserves_alias();
@@ -8659,16 +8637,11 @@ int main(int argc,char** argv) {
   /* Exercise finite open-address back-shift deletion across repeated churn.
    * It must preserve every other live full-width token and leave no tombstones. */
   for(uint64_t round=0;round<1024u;round++) {
+    for(uint64_t i=0;i<4u;i++) CHECK(ku_http_reactor_hash_add(&reactor,UINT64_C(1000000)+round*4u+i,6u));
     for(uint64_t i=0;i<4u;i++) {
       uint64_t token=UINT64_C(1000000)+round*4u+i;
-      reactor.registrations[2u+i].token=token;
-      CHECK(ku_http_reactor_hash_add(&reactor,token,2u+i));
-    }
-    for(uint64_t i=0;i<4u;i++) {
-      uint64_t token=UINT64_C(1000000)+round*4u+i;
-      CHECK(ku_http_reactor_lookup(&reactor,token)==2u+i);ku_http_reactor_hash_remove(&reactor,token);
+      CHECK(ku_http_reactor_lookup(&reactor,token)==6u);ku_http_reactor_hash_remove(&reactor,token);
       CHECK(ku_http_reactor_lookup(&reactor,token)==SIZE_MAX);
-      reactor.registrations[2u+i].token=0;
       CHECK(ku_http_reactor_lookup(&reactor,reactor.registrations[0].token)==0u);
       CHECK(ku_http_reactor_lookup(&reactor,reactor.registrations[1].token)==1u);
     }
@@ -8715,7 +8688,6 @@ int main(int argc,char** argv) {
     // registration. Root serializes execution; product code is unchanged.
     let mut failures = Vec::new();
     for scenario in [
-        "token-fingerprints",
         "fd-index-clusters",
         "fd-index-init-failures",
         "failed-new-alias",

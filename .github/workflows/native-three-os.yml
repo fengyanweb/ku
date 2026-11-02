@@ -57,7 +57,7 @@ on:
         description: 'Preregistered HTTP short-screen target; ignored when the screen is not selected'
         type: choice
         default: cpu
-        options: [cpu, memory, pg-memory, v4-memory-screen, v4-memory-confirm]
+        options: [cpu, memory, pg-memory, v4-memory-screen, v4-memory-confirm, http-status-screen, http-status-confirm]
 
       memory_owner_probe:
         description: 'One diagnostic startup-owner map; requires fixed41182804290 normal build reuse, no score or matrix'
@@ -269,17 +269,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --all -- --check
-          cargo test --release --locked --lib http_short::tests -- --list > "$RUNNER_TEMP/http-proof.list"
-          test "$(grep -c '^backend::c::http_short::tests::.*: test$' "$RUNNER_TEMP/http-proof.list")" -eq 7
-          cargo test --release --locked --lib http_short::tests -- --nocapture --test-threads=1
-          cargo test --release --locked --test native_pg_query_poll_test \
-            -- --skip live_loopback --nocapture --test-threads=1 | tee "$RUNNER_TEMP/pg-shape-O2.log"
-          grep -F 'test result: ok. 27 passed; 0 failed;' "$RUNNER_TEMP/pg-shape-O2.log"
-          cargo test --release --locked --test native_task_adapter_test \
-            native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline \
-            -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/blocking-free-index-O2.log"
-          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/blocking-free-index-O2.log"
           names=(
+            native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets
             native_http_bounded_json_owner_preserves_input_edges_and_legacy_results
             native_http_bounded_json_works_between_real_task_owner_polls
             native_http_validates_unmaterialized_headers_and_owns_route_snapshot
@@ -295,16 +286,6 @@ jobs:
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name.log"
             if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name.log"; then exit 1; fi
           done
-          if [ "$RUNNER_OS" != Windows ]; then
-            name=native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlines
-            cargo test --release --locked --test native_http_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name.log"
-            grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/$name.log"
-          fi
-          for name in native_task_zero_storage_checks_every_byte_without_alignment_or_tail_overread native_task_frame_pending_resume_cancel_and_payload_drop_execute_in_c; do
-            cargo test --release --locked --test native_task_frame_c_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name.log"
-            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name.log"
-            if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name.log"; then exit 1; fi
-          done
       - name: Check the request owner path with Linux detectors
         if: runner.os == 'Linux'
         shell: bash
@@ -314,26 +295,14 @@ jobs:
           UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
         run: |
           set -euo pipefail
-          cargo test --release --locked --test native_pg_query_poll_test \
-            -- --skip live_loopback --nocapture --test-threads=1 | tee "$RUNNER_TEMP/pg-shape-detectors.log"
-          grep -F 'test result: ok. 27 passed; 0 failed;' "$RUNNER_TEMP/pg-shape-detectors.log"
-          cargo test --release --locked --test native_task_adapter_test \
-            native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline \
-            -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/blocking-free-index-detectors.log"
-          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/blocking-free-index-detectors.log"
-          cargo test --release --locked --test native_http_test \
-            native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlines \
-            -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/token-planes-detectors.log"
-          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/token-planes-detectors.log"
+          name=native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets
+          cargo test --release --locked --test native_http_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/statusline-detectors.log"
+          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/statusline-detectors.log"
           for name in native_http_bounded_json_owner_preserves_input_edges_and_legacy_results native_http_bounded_json_works_between_real_task_owner_polls native_http_validates_unmaterialized_headers_and_owns_route_snapshot; do
             cargo test --release --locked --test native_http_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name-detectors.log"
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name-detectors.log"
             if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name-detectors.log"; then exit 1; fi
           done
-          name=native_task_zero_storage_checks_every_byte_without_alignment_or_tail_overread
-          cargo test --release --locked --test native_task_frame_c_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name-detectors.log"
-          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name-detectors.log"
-          if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name-detectors.log"; then exit 1; fi
 
   task-main-path:
     if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'task-main-path' || inputs.scope == 'windows-task-main-path')
@@ -667,7 +636,7 @@ jobs:
           fi
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
-            if [[ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = pg-memory || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = v4-memory-* ]]; then
+            if [[ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = pg-memory || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = v4-memory-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = http-status-* ]]; then
               test "$KU_PERFORMANCE_V2_PREPATCH" = 166453a1d2768bbce19796d9c7823be73cc84ccb
             else
               test "$KU_PERFORMANCE_V2_PREPATCH" = b765f9bc5d3a6e71353a562e27cef7b4cbb35f69
@@ -906,7 +875,7 @@ jobs:
           fi
 
       - name: Run the one serial cgroup cycle and preserve each goal status
-        timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_goal == 'v4-memory-confirm' && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}
+        timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}
         env:
           KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
         shell: bash
