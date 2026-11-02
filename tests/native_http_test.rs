@@ -8529,13 +8529,18 @@ static int fixture_failed_new_preserves_alias(void) {
   puts("http-persistent-failed-new-keeps-old-alias-ok");return 0;
 }
 static int fixture_external_net_close(int reuse,int both_filters) {
-  KuHttpConnection connections[1]={{0}};
-  KuHttpActiveSet active={connections,1,NULL};KuHttpReactor reactor;
+  KuHttpConnection connections[32]={{0}};
+  KuHttpActiveSet active={connections,32,NULL};KuHttpReactor reactor;
   CHECK(ku_http_reactor_init(&reactor,&active,1u));
+  int extra[31][2];size_t extra_count=reuse?31u:0u;
+  for(size_t i=0;i<extra_count;i++) {
+    CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,extra[i]));
+    ku_http_reactor_interest(&reactor,i+1u,extra[i][0],KU_HTTP_POLL_READ,i+1u,-1);CHECK(!reactor.fault);
+  }
   int retired[2],replacement[2];
   CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,retired));
   CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,replacement));
-  int fd=retired[0];size_t old_net=4u;
+  int fd=retired[0];size_t old_net=35u;
   ku_http_reactor_interest(&reactor,old_net,fd,(short)(KU_HTTP_POLL_READ|(both_filters?KU_HTTP_POLL_WRITE:0)),UINT64_MAX-300u,-1);
   CHECK(!reactor.fault && reactor.registrations[old_net].registered);
   /* The net owner closes during pump/interests before HTTP reconciles the
@@ -8548,6 +8553,7 @@ static int fixture_external_net_close(int reuse,int both_filters) {
     CHECK(dup2(replacement[0],fd)==fd);CHECK(!close(replacement[0]));
     ku_http_reactor_interest(&reactor,0u,fd,KU_HTTP_POLL_READ,UINT64_MAX-200u,-1);
     CHECK(!reactor.fault && reactor.registrations[0].registered);
+    CHECK(reactor.fd_count==32u && ku_http_reactor_token_capacity(&reactor)==reactor.hash_capacity);
     uint64_t current_token=reactor.registrations[0].token;
     /* A new HTTP slot (or new net resource) can register the reused numeric
      * fd before the retired net entry is reconciled. DEL is by numeric fd:
@@ -8573,6 +8579,12 @@ static int fixture_external_net_close(int reuse,int both_filters) {
   }
   CHECK(!close(retired[1]));
   if(!reuse) CHECK(!close(replacement[0]));
+  for(size_t i=0;i<extra_count;i++) {
+    CHECK(ku_http_reactor_lookup(&reactor,reactor.registrations[i+1u].token)==i+1u);
+    ku_http_reactor_delete(&reactor,i+1u);CHECK(!reactor.fault);
+    CHECK(!close(extra[i][0]) && !close(extra[i][1]));
+  }
+  CHECK(!reactor.fd_count);
   CHECK(!close(replacement[1]));ku_http_reactor_destroy(&reactor);
   puts(reuse?"http-external-net-reuse-preserves-current-registration-ok":"http-external-net-close-retirement-ok");
   return 0;
