@@ -181,9 +181,8 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
     KuPgAsyncOp* operation=job->pg_operation;
     done=ku_pg_async_step(operation,events,ku_pg_now_ms(),cancelled);
     queue_connect=operation->phase==KU_PG_ASYNC_CONNECT && !operation->connect_ready;
-    if(done && ku_pg_async_can_dispose(operation)) {
-      job->pg_result=ku_pg_async_take(operation);
-      ku_pg_async_dispose(operation,1);job->pg_operation=NULL;
+    if(done && ku_pg_async_take_and_dispose(operation,&job->pg_result)) {
+      job->pg_operation=NULL;
     } else if(done) {
       /* A pinned pool notification is still using this stable job. Recheck
        * within one millisecond, bounded by the original request deadline. */

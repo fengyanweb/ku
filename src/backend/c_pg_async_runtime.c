@@ -778,8 +778,11 @@ static KuResult_pg_result ku_pg_async_take(KuPgAsyncOp* op) {
   if(op->taken || !ku_pg_async_can_dispose(op))return (KuResult_pg_result){false,NULL,ku_pg_query_connection_error()};
   op->taken=1;KuResult_pg_result result=op->output;op->output=(KuResult_pg_result){0};return result;
 }
-static void ku_pg_async_dispose(KuPgAsyncOp* op,int transfer_result) {
-  if(!op || !ku_pg_async_can_dispose(op))return;
+/* Private to the single operation executor after can_dispose has unlinked
+ * this waiter and observed zero notification pins under the pool mutex.
+ * No new pin can be published for an unlinked waiter. async_operations keeps
+ * the pool alive through physical frees and budget refunds below. */
+static void ku_pg_async_dispose_ready(KuPgAsyncOp* op,int transfer_result) {
   KuPgClient* p=op->pool;KuPgAsyncBudget budget=op->budget;
   if(transfer_result && op->taken) { /* The bridge reconciles the transferred table in its frame receipt. */ }
   else if(op->output.ok)ku_pg_async_drop_table(op,&op->output.value);
@@ -790,6 +793,22 @@ static void ku_pg_async_dispose(KuPgAsyncOp* op,int transfer_result) {
   free(op);budget.refund(budget.context,charge);ku_database_operation_end(operation_charge);
   ku_pg_mutex_lock(&p->lock);p->async_operations--;int dispose=ku_pg_client_take_dispose_locked(p);ku_pg_mutex_unlock(&p->lock);
   if(dispose)ku_pg_client_dispose(p);
+}
+static void ku_pg_async_dispose(KuPgAsyncOp* op,int transfer_result) {
+  if(!op || !ku_pg_async_can_dispose(op))return;
+  ku_pg_async_dispose_ready(op,transfer_result);
+}
+/* Complete the owner's terminal take/dispose as one transaction. A pending
+ * callback prevents destruction and leaves the caller output untouched; the
+ * existing pin check may unlink the waiter before reporting not yet ready.
+ * Once ready the exclusive executor can move the output and free without
+ * repeating that same pool lock in take and dispose. Keep their independent
+ * entry points checked for callers that do not perform this combined action. */
+static int ku_pg_async_take_and_dispose(KuPgAsyncOp* op,KuResult_pg_result* output) {
+  if(!op || !output || !ku_pg_async_can_dispose(op))return 0;
+  if(op->taken)*output=(KuResult_pg_result){false,NULL,ku_pg_query_connection_error()};
+  else {op->taken=1;*output=op->output;op->output=(KuResult_pg_result){0};}
+  ku_pg_async_dispose_ready(op,1);return 1;
 }
 
 /* The synchronous typed API uses the same binary decoder and strict reset FSM.

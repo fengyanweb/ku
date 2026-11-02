@@ -3064,10 +3064,10 @@ static int async_finish(KuPgAsyncOp* op,int cancel) {
   return 0;
 }
 static void async_drop_output(KuPgAsyncOp* op,AsyncBudget* b,int expected_ok) {
-  if(!ku_pg_async_can_dispose(op))abort();
-  KuResult_pg_result result=ku_pg_async_take(op);if(result.ok!=expected_ok)abort();
+  KuResult_pg_result result={0};
+  if(!ku_pg_async_take_and_dispose(op,&result) || result.ok!=expected_ok)abort();
   size_t bytes=0;if(result.ok){if(!ku_pg_result_owned_bytes(result.value,&bytes))abort();ku_drop_pg_result(&result.value);}else ku_error_drop(&result.error);
-  ku_pg_async_dispose(op,1);if(bytes)async_refund(b,bytes);if(b->bytes)abort();
+  if(bytes)async_refund(b,bytes);if(b->bytes)abort();
 }
 int main(void) {
   clock_ms=1000;clock_step=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
@@ -3633,13 +3633,25 @@ int main(void) {
   KuPgAsyncOp* held=async_create(p,&held_budget);CHECK(!ku_pg_async_step(held,0,clock_ms,0));
   KuPgAsyncOp* waiting=async_create(p,&wait_budget);waiting->waiter.wake=pinned_wake;
   CHECK(!ku_pg_async_step(waiting,0,clock_ms,0));CHECK(waiting->waiting);
+  KuResult_pg_result detached={true,NULL,ku_pg_static_error("sentinel",8u,"unchanged",9u)};
+  size_t charge=wait_budget.bytes;
+  CHECK(!ku_pg_async_take_and_dispose(NULL,&detached));
+  CHECK(!ku_pg_async_take_and_dispose(waiting,NULL));
+  CHECK(!ku_pg_async_take_and_dispose(waiting,&detached));
+  CHECK(detached.ok && !detached.value && equals(detached.error.code,"sentinel")
+      && wait_budget.bytes==charge && p->async_operations==2);
   KuTestThread thread;CHECK(ku_test_thread_start(&thread,close_for_pin,p));
   CHECK(ku_test_event_wait(&pin_entered,5000));
   CHECK(ku_pg_async_step(waiting,0,clock_ms,1));
   CHECK(!ku_pg_async_can_dispose(waiting));
+  CHECK(!ku_pg_async_take_and_dispose(waiting,&detached));
+  CHECK(detached.ok && !detached.value && equals(detached.error.code,"sentinel")
+      && wait_budget.bytes==charge);
   ku_pg_mutex_lock(&p->lock);CHECK(!waiting->waiter.linked && waiting->waiter.in_flight==1 && p->async_operations==2);ku_pg_mutex_unlock(&p->lock);
   CHECK(ku_test_event_set(&pin_release));CHECK(ku_test_thread_join(&thread,5000));
-  CHECK(ku_pg_async_can_dispose(waiting));async_drop_output(waiting,&wait_budget,0);
+  CHECK(ku_pg_async_take_and_dispose(waiting,&detached));
+  CHECK(!detached.ok && equals(detached.error.code,"cancelled") && !wait_budget.bytes && p->async_operations==1);
+  ku_error_drop(&detached.error);
   CHECK(async_finish(held,1));async_drop_output(held,&held_budget,0);
   CHECK(ku_test_event_destroy(&pin_entered) && ku_test_event_destroy(&pin_release));
   CHECK(live_connections==0 && live_results==0);
@@ -3670,7 +3682,12 @@ int main(void) {
   CHECK(!ku_pg_result_is_inline(detached.value,detached.value->cells)
       && ku_pg_result_is_inline(detached.value,detached.value->bytes));
   CHECK(budget.bytes==op->input_charge+charge);
-  ku_pg_async_dispose(op,1);CHECK(budget.bytes==charge);
+  /* Match the old owner's take-then-dispose outcome even if an independent
+   * take already transferred the result: report the same error and retire. */
+  KuResult_pg_result already_taken={0};
+  CHECK(ku_pg_async_take_and_dispose(op,&already_taken));
+  CHECK(!already_taken.ok && equals(already_taken.error.code,"query_error"));
+  ku_error_drop(&already_taken.error);CHECK(budget.bytes==charge);
   ku_pg_client_close_owned(opened.value);
   CHECK(!live_connections && !live_results && runtime_bytes==charge && live_runtime_allocations==2);
   /* Values must outlive PQclear, strict reset, operation disposal and pool close. */
@@ -4051,9 +4068,11 @@ int main(void) {
   typed_source_text[0]='z';CHECK((uint8_t)op->values[3][0]==0xe4u);typed_source_text[0]=(char)0xe4;
   CHECK(async_finish(op,0) && op->output.ok && op->output.value->rows==1u && op->output.value->cols==10u
       && op->output.value->cell_capacity==10u && ku_pg_result_is_typed(op->output.value));
-  KuResult_pg_result detached=ku_pg_async_take(op);size_t physical=0;
+  KuResult_pg_result detached={0};
+  CHECK(ku_pg_async_take_and_dispose(op,&detached) && detached.ok);
+  size_t physical=0;
   CHECK(ku_pg_result_owned_bytes(detached.value,&physical) && physical==sizeof(KuPgResult)+120u+40u);
-  ku_pg_async_dispose(op,1);ku_pg_client_close_owned(pool);
+  ku_pg_client_close_owned(pool);
   CHECK(!live_connections && !live_results && budget.bytes==physical && runtime_bytes==physical && live_runtime_allocations==1);
   CHECK(!typed_values(detached.value));ku_drop_pg_result(&detached.value);async_refund(&budget,physical);
   CHECK(!budget.bytes && !runtime_bytes && !live_runtime_allocations);
