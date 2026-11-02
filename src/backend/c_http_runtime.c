@@ -2021,6 +2021,32 @@ typedef struct {
   int count; int part;
   size_t offset;
 } KuHttpOutput;
+/* Called once, after the tail and before the body are appended. Prefix parts
+   borrow first[], literals or the response owner, never last[]. Keep long
+   headers as vectors; small headers can use the already resident tail buffer
+   without enlarging the connection or copying the response body. */
+static void ku_http_output_pack_header(KuHttpOutput* output) {
+  int tail_part=output->count-1;
+  if(tail_part<=0)return;
+  size_t tail_length=output->parts[tail_part].length;
+  size_t total=tail_length;
+  if(total>sizeof(output->last))return;
+  for(int part=0;part<tail_part;part++) {
+    size_t length=output->parts[part].length;
+    if(length>sizeof(output->last)-total)return;
+    total+=length;
+  }
+  size_t prefix=total-tail_length;
+  memmove(output->last+prefix,output->last,tail_length);
+  size_t offset=0;
+  for(int part=0;part<tail_part;part++) {
+    size_t length=output->parts[part].length;
+    memcpy(output->last+offset,output->parts[part].bytes,length);
+    offset+=length;
+  }
+  output->parts[0]=(KuHttpPart){output->last,total};
+  output->count=1;
+}
 /* One bounded syscall publishes adjacent status/header/body slices together.
    Sending the short status line separately can stall subsequent bytes until
    a delayed ACK on a persistent TCP connection. These vectors borrow the
@@ -2326,6 +2352,7 @@ static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServ
     ku_http_connection_close(connection); return;
   }
   ku_http_output_part(output, output->last, (size_t)last_length);
+  ku_http_output_pack_header(output);
   ku_http_output_part(output, (const char*)response.body.ptr, body_length);
   connection->phase = KU_HTTP_IO_WRITE;
   connection->deadline = ku_http_deadline_ms((uint32_t)(server->write_timeout_ms > 0 ? server->write_timeout_ms : 10000));
@@ -3640,14 +3667,8 @@ typedef struct {
   KuHttpSocket fd;
   short events;
 } KuHttpReadyEvent;
-#if SIZE_MAX == UINT64_MAX && INT_MAX == 2147483647
-#define KU_HTTP_SMALL_TOKEN_MAP 1
-#endif
 typedef struct KuHttpReactor {
   int descriptor,fault,slots,work_count,idle_count,idle_initial_count,draining;
-#if defined(KU_HTTP_SMALL_TOKEN_MAP)
-  uint32_t small_token_map; /* Uses the original LP64 prefix padding. */
-#endif
   size_t capacity,hash_capacity,fd_capacity,fd_count,old_net_count,ready_count,pending_base;
   uint64_t next_token;
   KuHttpActiveSet* active;
@@ -3664,11 +3685,6 @@ typedef struct KuHttpReactor {
   struct kevent events[KU_HTTP_READY_BATCH];
 #endif
 } KuHttpReactor;
-#if defined(KU_HTTP_SMALL_TOKEN_MAP)
-typedef struct { int original_fields[7];size_t capacity; } KuHttpReactorOriginalPrefix;
-_Static_assert(offsetof(KuHttpReactor,capacity)==offsetof(KuHttpReactorOriginalPrefix,capacity),
-    "small token flag must fit original reactor padding");
-#endif
 #if defined(__APPLE__)
 typedef char KuHttpReactorTokenWidth[(sizeof(uintptr_t)>=sizeof(uint64_t))?1:-1];
 #endif
@@ -3694,92 +3710,41 @@ static size_t ku_http_reactor_hash_start(const KuHttpReactor* r,uint64_t token) 
   token^=token>>27; token*=UINT64_C(0x94d049bb133111eb); token^=token>>31;
   return (size_t)token&(r->hash_capacity-1u);
 }
-static size_t ku_http_reactor_token_capacity(const KuHttpReactor* r) {
-#if defined(KU_HTTP_SMALL_TOKEN_MAP)
-  if(r->small_token_map && r->hash_capacity>64u)return 64u;
-#endif
-  return r->hash_capacity;
-}
-/* capacity is the already selected logical token-table size. Only the active
- * 64-bucket prefix is smaller than the original backing. Its owner-generated
- * tokens can use their low bits directly; equality still compares all 64 bits
- * and every collision probe remains bounded. A native H==64 table and the
- * promoted full table retain the original hash, as does the separate fd map. */
-static size_t ku_http_reactor_token_start(const KuHttpReactor* r,uint64_t token,size_t capacity) {
-  return capacity<r->hash_capacity ? (size_t)token&(capacity-1u):ku_http_reactor_hash_start(r,token);
-}
 static size_t ku_http_reactor_lookup(const KuHttpReactor* r,uint64_t token) {
   if(!token || token==UINT64_MAX) return SIZE_MAX;
-  size_t capacity=ku_http_reactor_token_capacity(r),mask=capacity-1u;
-  size_t start=ku_http_reactor_token_start(r,token,capacity);
-  for(size_t i=0;i<capacity;i++) {
-    const KuHttpRegistrationHash* item=&r->hash[(start+i)&mask];
+  size_t start=ku_http_reactor_hash_start(r,token);
+  for(size_t i=0;i<r->hash_capacity;i++) {
+    const KuHttpRegistrationHash* item=&r->hash[(start+i)&(r->hash_capacity-1u)];
     if(!item->token) break;
     if(item->token==token) return item->entry;
   }
   return SIZE_MAX;
 }
 static int ku_http_reactor_hash_add(KuHttpReactor* r,uint64_t token,size_t entry) {
-  size_t capacity=ku_http_reactor_token_capacity(r),mask=capacity-1u;
-  size_t start=ku_http_reactor_token_start(r,token,capacity);
-  for(size_t i=0;i<capacity;i++) {
-    size_t at=(start+i)&mask;
+  size_t start=ku_http_reactor_hash_start(r,token);
+  for(size_t i=0;i<r->hash_capacity;i++) {
+    size_t at=(start+i)&(r->hash_capacity-1u);
     if(!r->hash[at].token) {r->hash[at]=(KuHttpRegistrationHash){token,entry};return 1;}
   }
   return 0;
 }
 static void ku_http_reactor_hash_remove(KuHttpReactor* r,uint64_t token) {
-  size_t capacity=ku_http_reactor_token_capacity(r),mask=capacity-1u;
-  size_t start=ku_http_reactor_token_start(r,token,capacity);
-  for(size_t i=0;i<capacity;i++) {
-    KuHttpRegistrationHash* item=&r->hash[(start+i)&mask];
+  size_t start=ku_http_reactor_hash_start(r,token);
+  for(size_t i=0;i<r->hash_capacity;i++) {
+    KuHttpRegistrationHash* item=&r->hash[(start+i)&(r->hash_capacity-1u)];
     if(!item->token) return;
     if(item->token==token) {
       /* Back-shift the finite probe cluster. Repeated request turnover must
        * not fill the table with tombstones and turn stale lookup into O(cap). */
-      size_t hole=(start+i)&mask,at=(hole+1u)&mask;
-      for(size_t moved=0;moved<capacity && r->hash[at].token;moved++,at=(at+1u)&mask) {
-        size_t home=ku_http_reactor_token_start(r,r->hash[at].token,capacity);
+      size_t mask=r->hash_capacity-1u,hole=(start+i)&mask,at=(hole+1u)&mask;
+      for(size_t moved=0;moved<r->hash_capacity && r->hash[at].token;moved++,at=(at+1u)&mask) {
+        size_t home=ku_http_reactor_hash_start(r,r->hash[at].token);
         if(((at-home)&mask)>=((hole-home)&mask)) {r->hash[hole]=r->hash[at];hole=at;}
       }
       r->hash[hole]=(KuHttpRegistrationHash){0,0};return;
     }
   }
   r->fault=1;
-}
-#if defined(KU_HTTP_SMALL_TOKEN_MAP)
-/* One transition per owner, before any provisional token/kernel publication.
- * Only 32 live full-key buckets can be present. The remaining original calloc
- * backing is still zero: no full-capacity scan, allocation or clearing is due.
- * Keep its 512B scratch frame off the ordinary interest path. */
-static __attribute__((noinline)) int ku_http_reactor_token_promote(KuHttpReactor* r) {
-  KuHttpRegistrationHash saved[32];size_t count=0;
-  if(r->fault || !r->small_token_map || r->hash_capacity<=64u || r->fd_count!=32u)goto invalid;
-  for(size_t i=0;i<64u;i++) {
-    KuHttpRegistrationHash item=r->hash[i];
-    if(!item.token)continue;
-    if(count>=32u || item.token==UINT64_MAX || item.entry>=r->capacity
-        || !r->registrations[item.entry].registered
-        || r->registrations[item.entry].token!=item.token)goto invalid;
-    for(size_t j=0;j<count;j++)
-      if(saved[j].token==item.token || saved[j].entry==item.entry)goto invalid;
-    saved[count++]=item;
-  }
-  if(count!=r->fd_count)goto invalid;
-  memset(r->hash,0,64u*sizeof(*r->hash));r->small_token_map=0;
-  for(size_t i=0;i<count;i++)
-    if(!ku_http_reactor_hash_add(r,saved[i].token,saved[i].entry))goto invalid;
-  return 1;
-invalid:
-  r->fault=1;return 0;
-}
-#endif
-static int ku_http_reactor_token_prepare(KuHttpReactor* r) {
-  if(r->fault)return 0;
-#if defined(KU_HTTP_SMALL_TOKEN_MAP)
-  if(r->small_token_map && r->fd_count>=32u)return ku_http_reactor_token_promote(r);
-#endif
-  return 1;
 }
 /* Owner-local fd index. At most one logical registration owns a numeric fd:
  * a successful NEW replaces a retired external resource before old events are
@@ -3933,7 +3898,6 @@ static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
   }
   ku_http_reactor_delete(r,index);
   if(r->next_token>=UINT64_MAX-1u) {r->fault=1;return;}
-  if(!ku_http_reactor_token_prepare(r))return;
   uint64_t token=++r->next_token;
   if(!ku_http_reactor_hash_add(r,token,index)) {r->fault=1;return;}
   /* Preflight before changing the kernel. This owner cannot concurrently
@@ -4110,9 +4074,6 @@ static int ku_http_reactor_init_pending(KuHttpReactor* r,KuHttpActiveSet* active
       || pending>UINT32_MAX-3u-(size_t)r->slots-net)return 0;
   r->pending_base=(size_t)r->slots+3u+net;
   r->capacity=r->pending_base+pending;r->hash_capacity=ku_http_reactor_hash_capacity(r->capacity);
-#if defined(KU_HTTP_SMALL_TOKEN_MAP)
-  r->small_token_map=r->hash_capacity>64u;
-#endif
   r->fd_capacity=r->hash_capacity<32u?r->hash_capacity:32u;
   r->registrations=(KuHttpRegistration*)calloc(r->capacity,sizeof(*r->registrations));
   r->hash=(KuHttpRegistrationHash*)calloc(r->hash_capacity,sizeof(*r->hash));

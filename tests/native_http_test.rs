@@ -4547,6 +4547,30 @@ static int ku_http_free_slot(const int* value) {(void)value;return -1;}
 static size_t fixture_calls, fixture_emitted, fixture_expected_length, fixture_max_bytes, fixture_max_vectors;
 static unsigned long long fixture_now;
 static unsigned char fixture_wire[300032], fixture_expected[300032], fixture_body[300000];
+static unsigned char* fixture_header_begin;
+static void* fixture_header_copy(void*,const void*,size_t);
+static void* fixture_header_move(void*,const void*,size_t);
+#define memcpy fixture_header_copy
+#define memmove fixture_header_move
+"#;
+    let checked_header_copies = r#"
+#undef memcpy
+#undef memmove
+/* A write just past last[] can be masked by the subsequent parts[0] assignment;
+   validate each real production helper copy before it touches the subobject. */
+static void fixture_header_copy_bound(void* destination,size_t length) {
+  if(!fixture_header_begin)return;
+  uintptr_t begin=(uintptr_t)fixture_header_begin, to=(uintptr_t)destination;
+  if(to<begin || to-begin>128u || length>128u-(to-begin))abort();
+}
+static void* fixture_header_copy(void* destination,const void* source,size_t length) {
+  fixture_header_copy_bound(destination,length);
+  return memcpy(destination,source,length);
+}
+static void* fixture_header_move(void* destination,const void* source,size_t length) {
+  fixture_header_copy_bound(destination,length);
+  return memmove(destination,source,length);
+}
 "#;
     let edges = r#"
 typedef struct {
@@ -4662,6 +4686,55 @@ int main(void) {
     if(status==599)CHECK(!strcmp(connection.output.first,"HTTP/1.1 599 Unknown\r\n"));
   }
   static const unsigned char fixture_prefix_bytes[9]={'H',0,'I','a','b','c','d','e','f'};
+  /* Pack the actual header parts before appending an owned/borrowed body.
+     Exact128B needs no terminator; longer headers retain every old vector.
+     Exercise both header fields, an embedded-NUL body and partial writes. */
+  unsigned char field[4096];
+  memset(field,'x',sizeof(field));
+  static const size_t field_lengths[]={1,32,60,61,62,63,64,65,128,4096};
+  for(size_t i=0;i<sizeof(field_lengths)/sizeof(field_lengths[0]);i++) {
+    for(int body=0;body<2;body++) {
+      fixture_reset(&connection,1);
+      memcpy(connection.output.first,"HTTP/1.1 200 OK\r\n",17);
+      memcpy(connection.output.last,"content-length: 9\r\n\r\n",21);
+      fixture_part(&connection,connection.output.first,17);
+      fixture_part(&connection,"content-type: ",14);
+      fixture_part(&connection,field,field_lengths[i]);
+      fixture_part(&connection,"\r\nlocation: /\r\n",15);
+      fixture_part(&connection,connection.output.last,21);
+      size_t header_length=fixture_expected_length;
+      int old_count=connection.output.count;
+      fixture_header_begin=(unsigned char*)connection.output.last;
+      ku_http_output_pack_header(&connection.output);
+      fixture_header_begin=NULL;
+      if(header_length<=sizeof(connection.output.last)) {
+        CHECK(connection.output.count==1);
+        CHECK(connection.output.parts[0].bytes==connection.output.last);
+        CHECK(connection.output.parts[0].length==header_length);
+        CHECK(!memcmp(connection.output.last,fixture_expected,header_length));
+      } else CHECK(connection.output.count==old_count);
+      if(body)fixture_part(&connection,fixture_prefix_bytes,sizeof(fixture_prefix_bytes));
+      const char* body_pointer=body ? connection.output.parts[connection.output.count-1].bytes : NULL;
+      CHECK(!body || body_pointer==(const char*)fixture_prefix_bytes);
+      for(int turn=0;turn<8 && !fixture_completed && !fixture_closed;turn++)
+        ku_http_connection_write(&connection,&server);
+      CHECK(fixture_completed==1 && !fixture_closed);
+      CHECK(fixture_emitted==fixture_expected_length && connection.deadline==1000);
+      CHECK(!memcmp(fixture_wire,fixture_expected,fixture_expected_length));
+      CHECK(fixture_max_vectors==(size_t)(header_length<=sizeof(connection.output.last) ? 1+body : old_count+body));
+    }
+  }
+  /* Bound arithmetic before any copy, and leave the fallback unmodified. */
+  fixture_reset(&connection,0);
+  memset(connection.output.last,'t',sizeof(connection.output.last));
+  connection.output.count=2;
+  connection.output.parts[0]=(KuHttpPart){"x",SIZE_MAX};
+  connection.output.parts[1]=(KuHttpPart){connection.output.last,1};
+  fixture_header_begin=(unsigned char*)connection.output.last;
+  ku_http_output_pack_header(&connection.output);
+  fixture_header_begin=NULL;
+  CHECK(connection.output.count==2 && connection.output.parts[0].length==SIZE_MAX);
+  for(size_t i=0;i<sizeof(connection.output.last);i++)CHECK(connection.output.last[i]=='t');
   /* The first-write opportunity is one syscall and16KiB, not an unbounded
      flush. The original readiness cursor/deadline must resume it exactly. */
   for(size_t i=0;i<sizeof(fixture_body);i++) fixture_body[i]=(unsigned char)(i%251u);
@@ -4773,7 +4846,7 @@ int main(void) {
     let path = directory.path().join("gather.c");
     fs::write(
         &path,
-        format!("{header}{status_text}{output}{phases}{edges}{write}{pressure_edges}{pressure}{pressure_end}{checks}"),
+        format!("{header}{status_text}{output}{checked_header_copies}{phases}{edges}{write}{pressure_edges}{pressure}{pressure_end}{checks}"),
     )
     .unwrap();
     let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "gather")
@@ -8287,7 +8360,6 @@ fn native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlin
     let header = r#"
 #include <stdint.h>
 #include <stddef.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8351,94 +8423,6 @@ static void fixture_free(void* value) {
 "#;
     let checks = r#"
 #define CHECK(c) do {if(!(c)){fprintf(stderr,"persistent owner line %d: %s\n",__LINE__,#c);return 1;}}while(0)
-static int fixture_token_prefix(void) {
-  const size_t cases[][3]={{1,0,0},{5,0,0},{28,0,0},{29,0,0},{30,0,0},{32,0,0},{64,0,0},{2048,2048,64},{32768,16384,8192}};
-  for(size_t test=0;test<sizeof(cases)/sizeof(cases[0]);test++) {
-    KuHttpActiveSet active={NULL,(int)cases[test][0],NULL};KuHttpReactor r;
-    CHECK(ku_http_reactor_init_pending(&r,&active,cases[test][1],cases[test][2]));
-    size_t full=r.hash_capacity,bytes=fixture_live_bytes;
-    CHECK(bytes==ku_http_reactor_pending_storage_bytes(cases[test][0],cases[test][1],cases[test][2])-sizeof(r));
-    uint64_t* keys=(uint64_t*)calloc(r.capacity,sizeof(*keys));CHECK(keys);
-    size_t calls=fixture_alloc_calls;uint64_t next=UINT64_C(0x1000000000000001);
-    for(uint64_t key=1u;key<=128u;key++) {
-      CHECK(ku_http_reactor_fd_start(&r,(KuHttpSocket)key)==
-          (ku_http_reactor_hash_start(&r,key)&(r.fd_capacity-1u)));
-      if(full<=64u)CHECK(ku_http_reactor_token_start(&r,key,full)==ku_http_reactor_hash_start(&r,key));
-    }
-    if(full>64u) {
-      /* Same low six bits, distinct upper 16 bits: compact collisions must
-       * compare full tokens and back-shift correctly across the 63->0 wrap. */
-      const size_t deletion[4]={1u,0u,3u,2u};
-      for(uint64_t round=0;round<64u;round++) {
-        for(size_t i=0;i<4u;i++) {
-          keys[i]=((UINT64_C(0x1000)+round*4u+i)<<48u)|63u;
-          CHECK(ku_http_reactor_token_start(&r,keys[i],64u)==63u);
-          CHECK(ku_http_reactor_hash_add(&r,keys[i],i));
-          r.registrations[i]=(KuHttpRegistration){(int)i,keys[i],1u,0,1,-1,0};r.fd_count++;
-        }
-        CHECK(ku_http_reactor_lookup(&r,keys[0]+(UINT64_C(1)<<40u))==SIZE_MAX);
-        for(size_t step=0;step<4u;step++) {
-          size_t i=deletion[step];ku_http_reactor_hash_remove(&r,keys[i]);
-          r.registrations[i]=(KuHttpRegistration){0};r.fd_count--;
-          CHECK(ku_http_reactor_lookup(&r,keys[i])==SIZE_MAX);
-          for(size_t other=0;other<4u;other++)if(r.registrations[other].registered)
-            CHECK(ku_http_reactor_lookup(&r,keys[other])==other);
-        }
-        CHECK(!r.fault && !r.fd_count && ku_http_reactor_token_capacity(&r)==64u);
-        for(size_t i=0;i<64u;i++)CHECK(!r.hash[i].token);
-      }
-    }
-    for(size_t i=0;i<r.capacity;i++) {
-      keys[i]=i<32u && full>64u ? ((UINT64_C(0x2000)+i)<<48u)|63u:next++;
-      if(i==32u && full>64u) {
-        CHECK(ku_http_reactor_token_capacity(&r)==64u);
-        for(size_t j=64u;j<full;j++)CHECK(!r.hash[j].token);
-      }
-      CHECK(ku_http_reactor_token_prepare(&r));
-      CHECK(ku_http_reactor_token_capacity(&r)==(full>64u && i<32u?64u:full));
-      CHECK(ku_http_reactor_hash_add(&r,keys[i],i));
-      r.registrations[i]=(KuHttpRegistration){(int)i,keys[i],1u,0,1,-1,0};r.fd_count++;
-      if(i<33u)for(size_t j=0;j<=i;j++)CHECK(ku_http_reactor_lookup(&r,keys[j])==j);
-    }
-    CHECK(!r.fault && fixture_alloc_calls==calls && r.hash_capacity==full);
-    for(size_t i=0;i<r.capacity;i++)CHECK(ku_http_reactor_lookup(&r,keys[i])==i);
-    if(full>64u && r.capacity>32u)for(size_t i=0;i<32u;i++)
-      CHECK(ku_http_reactor_token_start(&r,keys[i],full)==ku_http_reactor_hash_start(&r,keys[i]));
-    for(size_t i=1;i<r.capacity;i+=2u) {
-      ku_http_reactor_hash_remove(&r,keys[i]);r.registrations[i]=(KuHttpRegistration){0};r.fd_count--;
-    }
-    for(size_t i=0;i<r.capacity;i++)CHECK(ku_http_reactor_lookup(&r,keys[i])==(i%2u?SIZE_MAX:i));
-    for(size_t i=0;i<r.capacity;i+=2u) {ku_http_reactor_hash_remove(&r,keys[i]);r.fd_count--;}
-    CHECK(!r.fault && !r.fd_count);
-    for(size_t i=0;i<full;i++)CHECK(!r.hash[i].token);
-    if(r.capacity>32u)CHECK(ku_http_reactor_token_capacity(&r)==full); /* Never shrink on rollback/idle. */
-    free(keys);ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
-  }
-#if defined(KU_HTTP_SMALL_TOKEN_MAP)
-  for(int bad=0;bad<6;bad++) {
-    KuHttpActiveSet active={NULL,64,NULL};KuHttpReactor r;CHECK(ku_http_reactor_init(&r,&active,0u));
-    for(size_t i=0;i<32u;i++) {
-      uint64_t token=UINT64_C(0x2000000000000001)+i;
-      CHECK(ku_http_reactor_hash_add(&r,token,i));
-      r.registrations[i]=(KuHttpRegistration){(int)i,token,1u,0,1,-1,0};r.fd_count++;
-    }
-    size_t first=0,second=0,empty=0;
-    while(!r.hash[first].token)first++;second=first+1u;while(!r.hash[second].token)second++;
-    while(r.hash[empty].token)empty++;
-    if(bad==0)r.hash[first].entry=r.capacity;
-    if(bad==1)r.hash[second]=r.hash[first];
-    if(bad==2)r.hash[empty]=r.hash[first];
-    if(bad==3)r.registrations[r.hash[first].entry].token++;
-    if(bad==4)r.fd_count++;
-    if(bad==5)r.fault=1;
-    KuHttpRegistrationHash before[64];memcpy(before,r.hash,sizeof(before));size_t calls=fixture_alloc_calls;
-    CHECK(!ku_http_reactor_token_prepare(&r) && r.fault);
-    CHECK(r.small_token_map && !memcmp(before,r.hash,sizeof(before)) && fixture_alloc_calls==calls);
-    ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
-  }
-#endif
-  puts("http-token-prefix-fullcapacity-promotion-rollback-budget-ok");return 0;
-}
 static int fixture_fd_index_clusters(void) {
   KuHttpConnection connections[8]={{0}};KuHttpActiveSet active={connections,8,NULL};KuHttpReactor r;
   CHECK(ku_http_reactor_init(&r,&active,0u));
@@ -8513,24 +8497,17 @@ static int fixture_fd_index_init_failures(void) {
   puts("http-persistent-fd-index-init-budget-cleanup-ok");return 0;
 }
 static int fixture_failed_new_preserves_alias(void) {
-  KuHttpConnection connections[32]={{0}};KuHttpActiveSet active={connections,32,NULL};KuHttpReactor r;
+  KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
   CHECK(ku_http_reactor_init(&r,&active,1u));
-  int extra[31][2];
-  for(size_t i=0;i<31u;i++) {
-    CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,extra[i]));
-    ku_http_reactor_interest(&r,i+1u,extra[i][0],KU_HTTP_POLL_READ,i+1u,-1);CHECK(!r.fault);
-  }
   int pair[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
-  size_t old=35u;KuHttpSocket fd=pair[0];
+  size_t old=4u;KuHttpSocket fd=pair[0];
   ku_http_reactor_interest(&r,old,fd,KU_HTTP_POLL_READ,UINT64_MAX-99u,0);
-  uint64_t token=r.registrations[old].token;CHECK(!r.fault && r.fd_count==32u);
-  CHECK(ku_http_reactor_token_capacity(&r)==64u);
+  uint64_t token=r.registrations[old].token;CHECK(!r.fault);
 #if defined(__linux__)
   /* ADD on the still-live old fd fails with EEXIST. Keep both the logical
    * index and old kernel interest; unlike kqueue this does not replace it. */
   ku_http_reactor_interest(&r,0u,fd,KU_HTTP_POLL_READ,UINT64_MAX-98u,-1);
   CHECK(r.fault && !r.registrations[0].registered && r.registrations[old].registered);
-  CHECK(ku_http_reactor_token_capacity(&r)==r.hash_capacity);
   CHECK(ku_http_reactor_lookup(&r,token)==old);r.fault=0;
   KuHttpPollFd poll_items[8]={{0}};
   CHECK(write(pair[1],"f",1)==1 && ku_http_reactor_wait(&r,poll_items,1000)>0);
@@ -8547,29 +8524,18 @@ static int fixture_failed_new_preserves_alias(void) {
   r.fault=0;ku_http_reactor_delete(&r,old);
   CHECK(!r.fault && !r.registrations[old].registered);
   bucket=ku_http_reactor_fd_bucket(&r,fd);CHECK(bucket!=SIZE_MAX && !r.fd_entries[bucket]);
-  for(size_t i=0;i<31u;i++) {
-    CHECK(ku_http_reactor_lookup(&r,r.registrations[i+1u].token)==i+1u);
-    ku_http_reactor_delete(&r,i+1u);CHECK(!r.fault);
-    CHECK(!close(extra[i][0]) && !close(extra[i][1]));
-  }
-  CHECK(!r.fd_count && ku_http_reactor_token_capacity(&r)==r.hash_capacity);
   CHECK(!close(pair[1]));ku_http_reactor_destroy(&r);
   CHECK(!fixture_live_allocs && !fixture_live_bytes);
   puts("http-persistent-failed-new-keeps-old-alias-ok");return 0;
 }
 static int fixture_external_net_close(int reuse,int both_filters) {
-  KuHttpConnection connections[32]={{0}};
-  KuHttpActiveSet active={connections,32,NULL};KuHttpReactor reactor;
+  KuHttpConnection connections[1]={{0}};
+  KuHttpActiveSet active={connections,1,NULL};KuHttpReactor reactor;
   CHECK(ku_http_reactor_init(&reactor,&active,1u));
-  int extra[31][2];size_t extra_count=reuse?31u:0u;
-  for(size_t i=0;i<extra_count;i++) {
-    CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,extra[i]));
-    ku_http_reactor_interest(&reactor,i+1u,extra[i][0],KU_HTTP_POLL_READ,i+1u,-1);CHECK(!reactor.fault);
-  }
   int retired[2],replacement[2];
   CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,retired));
   CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,replacement));
-  int fd=retired[0];size_t old_net=35u;
+  int fd=retired[0];size_t old_net=4u;
   ku_http_reactor_interest(&reactor,old_net,fd,(short)(KU_HTTP_POLL_READ|(both_filters?KU_HTTP_POLL_WRITE:0)),UINT64_MAX-300u,-1);
   CHECK(!reactor.fault && reactor.registrations[old_net].registered);
   /* The net owner closes during pump/interests before HTTP reconciles the
@@ -8582,7 +8548,6 @@ static int fixture_external_net_close(int reuse,int both_filters) {
     CHECK(dup2(replacement[0],fd)==fd);CHECK(!close(replacement[0]));
     ku_http_reactor_interest(&reactor,0u,fd,KU_HTTP_POLL_READ,UINT64_MAX-200u,-1);
     CHECK(!reactor.fault && reactor.registrations[0].registered);
-    CHECK(reactor.fd_count==32u && ku_http_reactor_token_capacity(&reactor)==reactor.hash_capacity);
     uint64_t current_token=reactor.registrations[0].token;
     /* A new HTTP slot (or new net resource) can register the reused numeric
      * fd before the retired net entry is reconciled. DEL is by numeric fd:
@@ -8608,12 +8573,6 @@ static int fixture_external_net_close(int reuse,int both_filters) {
   }
   CHECK(!close(retired[1]));
   if(!reuse) CHECK(!close(replacement[0]));
-  for(size_t i=0;i<extra_count;i++) {
-    CHECK(ku_http_reactor_lookup(&reactor,reactor.registrations[i+1u].token)==i+1u);
-    ku_http_reactor_delete(&reactor,i+1u);CHECK(!reactor.fault);
-    CHECK(!close(extra[i][0]) && !close(extra[i][1]));
-  }
-  CHECK(!reactor.fd_count);
   CHECK(!close(replacement[1]));ku_http_reactor_destroy(&reactor);
   puts(reuse?"http-external-net-reuse-preserves-current-registration-ok":"http-external-net-close-retirement-ok");
   return 0;
@@ -8662,7 +8621,6 @@ static int fixture_closed_event_source(void) {
   puts("http-persistent-closed-event-source-fault-ok");return 0;
 }
 int main(int argc,char** argv) {
-  if(argc>1 && !strcmp(argv[1],"token-prefix"))return fixture_token_prefix();
   if(argc>1 && !strcmp(argv[1],"fd-index-clusters"))return fixture_fd_index_clusters();
   if(argc>1 && !strcmp(argv[1],"fd-index-init-failures"))return fixture_fd_index_init_failures();
   if(argc>1 && !strcmp(argv[1],"failed-new-alias"))return fixture_failed_new_preserves_alias();
@@ -8788,7 +8746,6 @@ int main(int argc,char** argv) {
     // registration. Root serializes execution; product code is unchanged.
     let mut failures = Vec::new();
     for scenario in [
-        "token-prefix",
         "fd-index-clusters",
         "fd-index-init-failures",
         "failed-new-alias",

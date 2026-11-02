@@ -29,6 +29,8 @@ OWNER_JOB_GOALS=('owner-job-screen','owner-job-confirm')
 OWNER_JOB_C=dict(PG_MEMORY_C,B='8010370bbc8867e7f39267f722250db493b20ce70c0d73b5a238a575e939fad4')
 HTTP_STATUS_GOALS=('http-status-screen','http-status-confirm')
 HTTP_STATUS_C=dict(PG_MEMORY_C,B='2bfb5abc1c6ec68a3529d21b264cc4ead70eb93ebb564bedeba3a317d94d7b78')
+HEADER_PACK_GOALS=('header-pack-screen','header-pack-confirm')
+HEADER_PACK_C=dict(PG_MEMORY_C,B='6894f08dbc09d158586999fa0a18c8e48f36544f927b3b5ae5d48a6399420994')
 V4_GOALS=('v4-memory-screen','v4-memory-confirm')
 V4_MEMORY_C=dict(PG_MEMORY_C,B='6c8158cc3952b73015d28f2f18846f32aca5e65640efbd0f554db1beb34a7827')
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
@@ -51,16 +53,18 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def http_short_prepatch(goal):
-    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS):raise ValueError('unregistered HTTP short goal')
-    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS) else HTTP_SHORT_PREPATCH
+    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS):raise ValueError('unregistered HTTP short goal')
+    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS) else HTTP_SHORT_PREPATCH
 
 
 def verify_pg_memory_builds(identities,goal='pg-memory'):
+    if goal in HEADER_PACK_GOALS and not re.fullmatch('[0-9a-f]{64}',HEADER_PACK_C['B']):
+        raise ValueError('header-pack complete generated C identity is not frozen')
     if goal in TOKEN_PREFIX_GOALS and not re.fullmatch('[0-9a-f]{64}',TOKEN_PREFIX_C['B']):
         raise ValueError('token-prefix complete generated C identity is not frozen')
     if goal in OWNER_JOB_GOALS and not re.fullmatch('[0-9a-f]{64}',OWNER_JOB_C['B']):
         raise ValueError('owner Job complete generated C identity is not frozen')
-    for name,expected in (TOKEN_PREFIX_C if goal in TOKEN_PREFIX_GOALS else OWNER_JOB_C if goal in OWNER_JOB_GOALS else FULL_KEY_C if goal in FULL_KEY_GOALS else HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
+    for name,expected in (HEADER_PACK_C if goal in HEADER_PACK_GOALS else TOKEN_PREFIX_C if goal in TOKEN_PREFIX_GOALS else OWNER_JOB_C if goal in OWNER_JOB_GOALS else FULL_KEY_C if goal in FULL_KEY_GOALS else HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
         if identities.get(name,{}).get('files',{}).get('generated C',{}).get('sha256')!=expected:
             raise ValueError('PG memory screen requires the exact preregistered complete C: '+name)
 
@@ -298,6 +302,7 @@ def normal_self_plan(versions):
 
 
 def http_short_plan(versions,goal='cpu'):
+    if goal in HEADER_PACK_GOALS:return header_pack_plan(versions,goal)
     if goal in TOKEN_PREFIX_GOALS:return token_prefix_plan(versions,goal)
     if goal in OWNER_JOB_GOALS:return owner_job_plan(versions,goal)
     if goal in FULL_KEY_GOALS:return full_key_plan(versions,goal)
@@ -338,6 +343,7 @@ def http_short_plan(versions,goal='cpu'):
 
 
 def http_short_comparison(rows,complete,environment=None,goal='cpu'):
+    if goal in HEADER_PACK_GOALS:return http_status_comparison(rows,complete,environment,goal)
     if goal in TOKEN_PREFIX_GOALS:return v4_short_comparison(rows,complete,environment,goal)
     if goal in OWNER_JOB_GOALS:return owner_job_comparison(rows,complete,environment,goal)
     if goal in FULL_KEY_GOALS:return v4_short_comparison(rows,complete,environment,goal)
@@ -610,14 +616,38 @@ def http_status_plan(versions,goal):
     return plan
 
 
+def header_pack_plan(versions,goal):
+    if goal not in HEADER_PACK_GOALS:raise ValueError('unregistered header-pack stage')
+    confirm=goal==HEADER_PACK_GOALS[1]
+    plan=http_status_plan(versions,HTTP_STATUS_GOALS[1] if confirm else HTTP_STATUS_GOALS[0])
+    paired=full_key_plan(versions,FULL_KEY_GOALS[1] if confirm else FULL_KEY_GOALS[0])
+    for key in ('windows','maximum_windows','paired_windows_per_business','observation_alarm_seconds','workflow_limit_seconds','stage'):
+        plan[key]=paired[key]
+    plan.update(http_short_goal=goal,maximum_confirmations=1,confirmation_requires_screen_eligible=True,
+        purpose='One bounded small-header packing candidate on unchanged status formatter, response owner, fullH token storage and ordinary helpers/C11O2.6pairs screen, at most one separate12pair confirmation; no old rows pooled or threshold changes.',
+        evidence_basis=dict(complete_C=HEADER_PACK_C,source_product_commit='2738576fb5ca54d9e87130651d4ecfb8ad8108e7',other_v4_candidates_excluded=True,
+            normal_SELF_samples=715,sendmsg_ancestry_kernel_samples=178,
+            normal_ELF='234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b',
+            mechanism='Merge complete headers <=128B into existing last buffer before appending unchanged zero-copy body; longer headers retain original vectors. No allocation, struct-size, capacity, ownership or formatter change.',
+            performance_effect='unknown; sendmsg ancestry is path scope, not iovec-import CPU attribution. Packing adds bounded header copying.'))
+    plan['adoption_thresholds']['rationale']='Same1percent minimum HTTPCPU benefit, upper95<1 and relatedCPU upper95<=1.03/lower95<=1; significant memory increase blocks. No storage/allocation/lifetime change; crossing memory1 is not equivalence. Original16targets unchanged.'
+    return plan
+
+
 def http_status_comparison(rows,complete,environment,goal):
-    plan=http_status_plan({},goal);confirm=goal==HTTP_STATUS_GOALS[1];groups=range(1,plan['paired_windows_per_business']+1)
+    plan=header_pack_plan({},goal) if goal in HEADER_PACK_GOALS else http_status_plan({},goal)
+    confirm=goal in (HTTP_STATUS_GOALS[1],HEADER_PACK_GOALS[1]);groups=range(1,plan['paired_windows_per_business']+1)
     result=dict(complete=complete,http_short_goal=goal,eligible_for_confirmation=False,eligible_for_root_review=False,
         candidate_accepted=False,formal_qualified=False,normal_score_eligible=False,reasons=[],comparisons={},memory_intervals={},
         independent_stage=True,pooling_previous_windows=False,thresholds=plan['adoption_thresholds'])
+    if goal in HEADER_PACK_GOALS:result.update(maximum_confirmations=1,confirmation_requires_screen_eligible=True)
     if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification failed or unknown')
     if not complete:
         result['reasons'].append('incomplete observations or cleanup; no metric scoring');return result
+    if goal in HEADER_PACK_GOALS:
+        if result['reasons']:return result
+        invalid=token_prefix_row_error(rows,plan)
+        if invalid:result['reasons'].append(invalid);return result
     business=[r for r in rows if r['phase']=='normal']
     if len(business)!=6*len(groups) or any(r.get('environment_quality')!='pass' for r in business):
         result['reasons'].append('business row count or environment differs');return result
@@ -960,7 +990,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
-    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS):
+    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS):
         verify_pg_memory_builds(identities,getattr(a,'http_short_goal','cpu'))
     if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
@@ -2724,7 +2754,7 @@ def main(argv=None):
     p.add_argument('--fixed-goals-only',action='store_true',help='Explicit full-build/run stop after controls, admission and original80 windows/16 goals; capacity/stability and whole acceptance remain incomplete')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit frozen control+normal A/B candidate diagnostic; goal selects exact windows/prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
