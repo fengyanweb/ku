@@ -4547,6 +4547,30 @@ static int ku_http_free_slot(const int* value) {(void)value;return -1;}
 static size_t fixture_calls, fixture_emitted, fixture_expected_length, fixture_max_bytes, fixture_max_vectors;
 static unsigned long long fixture_now;
 static unsigned char fixture_wire[300032], fixture_expected[300032], fixture_body[300000];
+static unsigned char* fixture_header_begin;
+static void* fixture_header_copy(void*,const void*,size_t);
+static void* fixture_header_move(void*,const void*,size_t);
+#define memcpy fixture_header_copy
+#define memmove fixture_header_move
+"#;
+    let checked_header_copies = r#"
+#undef memcpy
+#undef memmove
+/* A write just past last[] can be masked by the subsequent parts[0] assignment;
+   validate each real production helper copy before it touches the subobject. */
+static void fixture_header_copy_bound(void* destination,size_t length) {
+  if(!fixture_header_begin)return;
+  uintptr_t begin=(uintptr_t)fixture_header_begin, to=(uintptr_t)destination;
+  if(to<begin || to-begin>128u || length>128u-(to-begin))abort();
+}
+static void* fixture_header_copy(void* destination,const void* source,size_t length) {
+  fixture_header_copy_bound(destination,length);
+  return memcpy(destination,source,length);
+}
+static void* fixture_header_move(void* destination,const void* source,size_t length) {
+  fixture_header_copy_bound(destination,length);
+  return memmove(destination,source,length);
+}
 "#;
     let edges = r#"
 typedef struct {
@@ -4662,6 +4686,55 @@ int main(void) {
     if(status==599)CHECK(!strcmp(connection.output.first,"HTTP/1.1 599 Unknown\r\n"));
   }
   static const unsigned char fixture_prefix_bytes[9]={'H',0,'I','a','b','c','d','e','f'};
+  /* Pack the actual header parts before appending an owned/borrowed body.
+     Exact128B needs no terminator; longer headers retain every old vector.
+     Exercise both header fields, an embedded-NUL body and partial writes. */
+  unsigned char field[4096];
+  memset(field,'x',sizeof(field));
+  static const size_t field_lengths[]={1,32,60,61,62,63,64,65,128,4096};
+  for(size_t i=0;i<sizeof(field_lengths)/sizeof(field_lengths[0]);i++) {
+    for(int body=0;body<2;body++) {
+      fixture_reset(&connection,1);
+      memcpy(connection.output.first,"HTTP/1.1 200 OK\r\n",17);
+      memcpy(connection.output.last,"content-length: 9\r\n\r\n",21);
+      fixture_part(&connection,connection.output.first,17);
+      fixture_part(&connection,"content-type: ",14);
+      fixture_part(&connection,field,field_lengths[i]);
+      fixture_part(&connection,"\r\nlocation: /\r\n",15);
+      fixture_part(&connection,connection.output.last,21);
+      size_t header_length=fixture_expected_length;
+      int old_count=connection.output.count;
+      fixture_header_begin=(unsigned char*)connection.output.last;
+      ku_http_output_pack_header(&connection.output);
+      fixture_header_begin=NULL;
+      if(header_length<=sizeof(connection.output.last)) {
+        CHECK(connection.output.count==1);
+        CHECK(connection.output.parts[0].bytes==connection.output.last);
+        CHECK(connection.output.parts[0].length==header_length);
+        CHECK(!memcmp(connection.output.last,fixture_expected,header_length));
+      } else CHECK(connection.output.count==old_count);
+      if(body)fixture_part(&connection,fixture_prefix_bytes,sizeof(fixture_prefix_bytes));
+      const char* body_pointer=body ? connection.output.parts[connection.output.count-1].bytes : NULL;
+      CHECK(!body || body_pointer==(const char*)fixture_prefix_bytes);
+      for(int turn=0;turn<8 && !fixture_completed && !fixture_closed;turn++)
+        ku_http_connection_write(&connection,&server);
+      CHECK(fixture_completed==1 && !fixture_closed);
+      CHECK(fixture_emitted==fixture_expected_length && connection.deadline==1000);
+      CHECK(!memcmp(fixture_wire,fixture_expected,fixture_expected_length));
+      CHECK(fixture_max_vectors==(size_t)(header_length<=sizeof(connection.output.last) ? 1+body : old_count+body));
+    }
+  }
+  /* Bound arithmetic before any copy, and leave the fallback unmodified. */
+  fixture_reset(&connection,0);
+  memset(connection.output.last,'t',sizeof(connection.output.last));
+  connection.output.count=2;
+  connection.output.parts[0]=(KuHttpPart){"x",SIZE_MAX};
+  connection.output.parts[1]=(KuHttpPart){connection.output.last,1};
+  fixture_header_begin=(unsigned char*)connection.output.last;
+  ku_http_output_pack_header(&connection.output);
+  fixture_header_begin=NULL;
+  CHECK(connection.output.count==2 && connection.output.parts[0].length==SIZE_MAX);
+  for(size_t i=0;i<sizeof(connection.output.last);i++)CHECK(connection.output.last[i]=='t');
   /* The first-write opportunity is one syscall and16KiB, not an unbounded
      flush. The original readiness cursor/deadline must resume it exactly. */
   for(size_t i=0;i<sizeof(fixture_body);i++) fixture_body[i]=(unsigned char)(i%251u);
@@ -4773,7 +4846,7 @@ int main(void) {
     let path = directory.path().join("gather.c");
     fs::write(
         &path,
-        format!("{header}{status_text}{output}{phases}{edges}{write}{pressure_edges}{pressure}{pressure_end}{checks}"),
+        format!("{header}{status_text}{output}{checked_header_copies}{phases}{edges}{write}{pressure_edges}{pressure}{pressure_end}{checks}"),
     )
     .unwrap();
     let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "gather")

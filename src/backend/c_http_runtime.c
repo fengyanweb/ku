@@ -2021,6 +2021,32 @@ typedef struct {
   int count; int part;
   size_t offset;
 } KuHttpOutput;
+/* Called once, after the tail and before the body are appended. Prefix parts
+   borrow first[], literals or the response owner, never last[]. Keep long
+   headers as vectors; small headers can use the already resident tail buffer
+   without enlarging the connection or copying the response body. */
+static void ku_http_output_pack_header(KuHttpOutput* output) {
+  int tail_part=output->count-1;
+  if(tail_part<=0)return;
+  size_t tail_length=output->parts[tail_part].length;
+  size_t total=tail_length;
+  if(total>sizeof(output->last))return;
+  for(int part=0;part<tail_part;part++) {
+    size_t length=output->parts[part].length;
+    if(length>sizeof(output->last)-total)return;
+    total+=length;
+  }
+  size_t prefix=total-tail_length;
+  memmove(output->last+prefix,output->last,tail_length);
+  size_t offset=0;
+  for(int part=0;part<tail_part;part++) {
+    size_t length=output->parts[part].length;
+    memcpy(output->last+offset,output->parts[part].bytes,length);
+    offset+=length;
+  }
+  output->parts[0]=(KuHttpPart){output->last,total};
+  output->count=1;
+}
 /* One bounded syscall publishes adjacent status/header/body slices together.
    Sending the short status line separately can stall subsequent bytes until
    a delayed ACK on a persistent TCP connection. These vectors borrow the
@@ -2326,6 +2352,7 @@ static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServ
     ku_http_connection_close(connection); return;
   }
   ku_http_output_part(output, output->last, (size_t)last_length);
+  ku_http_output_pack_header(output);
   ku_http_output_part(output, (const char*)response.body.ptr, body_length);
   connection->phase = KU_HTTP_IO_WRITE;
   connection->deadline = ku_http_deadline_ms((uint32_t)(server->write_timeout_ms > 0 ? server->write_timeout_ms : 10000));
