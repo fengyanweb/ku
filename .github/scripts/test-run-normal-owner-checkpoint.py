@@ -5,6 +5,7 @@ import importlib.util
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -12,6 +13,35 @@ from unittest.mock import Mock, patch
 spec=importlib.util.spec_from_file_location('owner_run',Path(__file__).with_name('run-normal-owner-checkpoint.py'))
 r=importlib.util.module_from_spec(spec);spec.loader.exec_module(r)
 
+
+class CaptureEvent:
+    def __init__(self):self.flag=False;self.wait_seconds=None
+    def set(self):self.flag=True
+    def is_set(self):return self.flag
+    def wait(self,seconds):self.wait_seconds=seconds;return self.flag
+
+class CaptureProcess:
+    latest=None
+    def __init__(self,target,name):
+        self.target=target;self.name=name;self.pid=9876;self.alive=False;self.exitcode=None;self.joined=[];self.closed=False
+        CaptureProcess.latest=self
+    def start(self):self.alive=True
+    def fire(self):
+        with patch.object(r.os,'setsid'),patch.object(r.os,'getppid',return_value=r.os.getpid()):self.target()
+        self.alive=False;self.exitcode=0
+    def join(self,timeout):
+        self.joined.append(timeout)
+        if self.alive:self.fire()
+    def is_alive(self):return self.alive
+    def terminate(self):self.alive=False;self.exitcode=-15
+    def kill(self):self.alive=False;self.exitcode=-9
+    def close(self):self.closed=True
+
+class CaptureContext:
+    def __init__(self):self.events=[]
+    def Event(self):
+        event=CaptureEvent();self.events.append(event);return event
+    Process=CaptureProcess
 
 class CheckpointRunnerTests(unittest.TestCase):
     def test_all_action_refs_are40_hex_and_new_upload_matches_existing_pin(self):
@@ -54,6 +84,20 @@ class CheckpointRunnerTests(unittest.TestCase):
             self.assertFalse(old.exists());self.assertEqual(json.loads((root/'evidence/failure.json').read_text())['status'],'unknown')
             self.assertIn('layout compiler mismatch',(root/'evidence/failure.json').read_text());run.assert_called_once()
             self.assertTrue((root/'evidence/manifest.json').exists())
+    def test_lifecycle_cli_unknown_observation_is_not_a_success_exit(self):
+        for status in ('observed','unknown'):
+            with self.subTest(status=status),tempfile.TemporaryDirectory() as temp,ExitStack() as stack:
+                root=Path(temp)/'run';old=Path(temp)/'old.zip';old.write_bytes(b'fixture')
+                for attr,value in (('system','Linux'),('machine','aarch64')):stack.enter_context(patch.object(r.platform,attr,return_value=value))
+                stack.enter_context(patch.object(r.os,'geteuid',return_value=0));stack.enter_context(patch.dict(r.os.environ,{},clear=True))
+                stack.enter_context(patch.object(r.signal,'signal'));stack.enter_context(patch.object(r.signal,'alarm'))
+                stack.enter_context(patch.object(r.restorer,'restore_old',return_value={'run':41280471018}))
+                real_digest=r.checkpoint.digest
+                stack.enter_context(patch.object(r.checkpoint,'digest',side_effect=lambda p:r.D_SHA if str(p)=='/usr/lib/aarch64-linux-gnu/libpq.so.5' else real_digest(p)))
+                run=stack.enter_context(patch.object(r,'run_restored',return_value=dict(status=status,natural_cleanup=True,capture_attempts=3)))
+                self.assertEqual(r.main(['--old-zip',str(old),'--root',str(root),'--lifecycle']),0 if status=='observed' else 1)
+                run.assert_called_once_with(root.resolve(),lifecycle=True)
+
     def test_actual_default_mapping_requires_one_exact_D_hash(self):
         raw=b'1000-2000 r--p 00000000 00:01 9 /lib/libpq.so.5.18\n'
         with patch.object(r.checkpoint,'digest',return_value=r.D_SHA):
@@ -81,6 +125,121 @@ class CheckpointRunnerTests(unittest.TestCase):
         cleanup=dict(forced=False,cgroup_removed=True,after={'process_count':0},exit_code=1)
         self.assertFalse(r.natural(cleanup,service=True));self.assertTrue(r.natural(cleanup))
 
+    def test_PG_lifecycle_uses_one_service_serial_windows_and_no_STOP(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as stack:
+            service=Mock(address='127.0.0.1:1234');harness=Mock();result={'capture_attempts':0}
+            response=json.dumps(dict(id=1,label='item-1-中文🙂',score=17,rid='lifecycle-ready')).encode()
+            stack.enter_context(patch.object(r.lh,'request',return_value=(200,response)))
+            identity={'pid':1234,'start_ticks':'77'};stages=[]
+            def capture(s,d,phase,expected=None,supervisor_pid=None):
+                self.assertIs(s,service);self.assertIn(expected,(None,identity));stages.append(phase)
+                snapshot=dict(phase=phase,status='observed',identity=identity,monotonic_ns=8_000_000_000,ended_monotonic_ns=8_100_000_000)
+                r.save(d/(phase+'.json'),snapshot);return snapshot
+            snapshot=stack.enter_context(patch.object(r,'lifecycle_stage',side_effect=capture))
+            forbidden=stack.enter_context(patch.object(r.checkpoint,'capture_owned'))
+            context=CaptureContext();stack.enter_context(patch.object(r.multiprocessing,'get_context',return_value=context))
+            def client(s,workload,rate,duration,output,**kw):
+                self.assertIs(s,service);self.assertEqual((workload,rate),('db',200));self.assertEqual(stages,['ready'] if duration==3 else ['ready','warm'])
+                self.assertFalse(kw['events']);self.assertFalse(kw['runtime_metrics'])
+                if duration==15:CaptureProcess.latest.fire()
+                n=rate*duration
+                return dict(valid_driver=True,ledger=dict.fromkeys(('planned','attempted','sent','terminal','correct_total'),n),service_cost={'driver_cgroup_removed':True},configuration={'origin_monotonic_ns':500_000_000,'origin_monotonic_status':'available','origin_monotonic_uncertainty_ns':1})
+            def complete(*args,**kw):
+                v=client(*args,**kw);v['ledger'].update(planned_reconciled=True,results={'correct':200*args[3]});return v
+            harness.client.side_effect=complete
+            r.pg_lifecycle(harness,service,Path(temp),result)
+            self.assertEqual([p['phase'] for p in result['lifecycle_phases']],['init','ready','warm','steady'])
+            self.assertEqual(result['lifecycle_phases'][0]['status'],'unknown');self.assertIsNone(result['lifecycle_phases'][0]['monotonic_ns'])
+            self.assertEqual([c.args[3] for c in harness.client.call_args_list],[3,15]);self.assertEqual(snapshot.call_count,3)
+            self.assertEqual(context.events[0].wait_seconds,7.5);self.assertTrue(context.events[0].is_set());self.assertTrue(CaptureProcess.latest.closed)
+            self.assertTrue(result['lifecycle_phases'][-1]['fully_within_arrival_window'])
+            forbidden.assert_not_called();service.freeze.assert_not_called();service.stop.assert_not_called()
+            for phase in ('warm','steady'):
+                report=json.loads((Path(temp)/phase/'client.json').read_text())
+                self.assertTrue(report['diagnostic_only']);self.assertFalse(report['normal_score_eligible'])
+    def test_failed_PG_window_retains_failure_and_never_starts_steady(self):
+        with tempfile.TemporaryDirectory() as temp,patch.object(r.lh,'request',return_value=(200,br'{"id":1,"label":"item-1-\u4e2d\u6587\ud83d\ude42","score":17,"rid":"lifecycle-ready"}')),patch.object(r,'lifecycle_stage',return_value={'phase':'ready','status':'observed','identity':{}}):
+            h=Mock();h.client.return_value={'ledger':{}}
+            with self.assertRaisesRegex(ValueError,'correctness/accounting/cleanup'):r.pg_lifecycle(h,Mock(),Path(temp),{'capture_attempts':0})
+            h.client.assert_called_once()
+    def test_steady_early_client_and_collector_failures_cancel_reap_before_return(self):
+        for failure in ('client','collector','missing'):
+            with self.subTest(failure=failure),tempfile.TemporaryDirectory() as temp,patch.object(r.multiprocessing,'get_context',return_value=CaptureContext()):
+                h=Mock();result={}
+                def client(*args,**kw):
+                    if failure!='missing':CaptureProcess.latest.fire()
+                    if failure=='client':raise RuntimeError('client failed early')
+                    return {}
+                h.client.side_effect=client
+                with patch.object(r,'lifecycle_stage',side_effect=PermissionError('collector failed')):
+                    with self.assertRaises(RuntimeError):r.steady_pg_window(h,Mock(),Path(temp),{'pid':1234},result)
+                self.assertTrue(CaptureProcess.latest.closed);self.assertEqual(CaptureProcess.latest.joined,[10])
+                self.assertTrue(result['steady_helper_cleanup']['process_reaped'])
+
+    def test_steady_timeout_terminates_owned_helper_group_and_reaps_before_error(self):
+        class DelayedProcess(CaptureProcess):
+            def join(self,timeout):
+                self.joined.append(timeout)
+                if timeout!=10:self.alive=False;self.exitcode=-15
+        context=CaptureContext();context.Process=DelayedProcess
+        original_event=context.Event
+        def event():
+            value=original_event()
+            if len(context.events)==2:value.set()
+            return value
+        context.Event=event;h=Mock();h.client.return_value={};result={}
+        with tempfile.TemporaryDirectory() as temp,patch.object(r.multiprocessing,'get_context',return_value=context),patch.object(r.os,'killpg') as kill:
+            with self.assertRaisesRegex(RuntimeError,'forced cleanup'):r.steady_pg_window(h,Mock(),Path(temp),{},result)
+            self.assertEqual(kill.call_args_list,[unittest.mock.call(9876,r.signal.SIGTERM),unittest.mock.call(9876,r.signal.SIGKILL)])
+            self.assertTrue(result['steady_helper_cleanup']['forced']);self.assertTrue(result['steady_helper_cleanup']['process_reaped'])
+            self.assertTrue(CaptureProcess.latest.closed)
+    def test_helper_rejects_a_different_supervisor_without_polling_nonchild_service(self):
+        with tempfile.TemporaryDirectory() as temp,patch.object(r.os,'getppid',return_value=5):
+            service=Mock()
+            with self.assertRaisesRegex(ValueError,'helper supervisor'):r.lifecycle_stage(service,Path(temp),'steady',supervisor_pid=4)
+            service.process.poll.assert_not_called()
+
+    def test_actual_post_drain_endpoint_never_fabricates_live_smaps(self):
+        with tempfile.TemporaryDirectory() as temp,patch.object(r.checkpoint,'check_identity') as read:
+            service=Mock();service.process.poll.return_value=0
+            cleanup=dict(forced=False,cgroup_removed=True,exit_code=0,drain={'status':200},after={'process_count':0,'threads':0})
+            stage=r.lifecycle_stage(service,Path(temp),'drain',{'pid':1234},cleanup)
+            self.assertEqual(stage['status'],'observed-termination');self.assertFalse(stage['smaps']['available'])
+            self.assertEqual(stage['cgroups']['service'],cleanup['after']);read.assert_not_called()
+
+    def test_live_stage_is_bounded_and_keeps_denied_smaps_unknown(self):
+        for denied in (False,True,'alarm'):
+            with self.subTest(denied=denied),tempfile.TemporaryDirectory() as temp,ExitStack() as stack:
+                service=Mock();service.process.pid=1234;service.process.poll.return_value=None
+                service.harness.db_domain=None;service.domain.path=Path(temp)/'owned-cgroup'
+                real_stat=Path.stat;real_iter=Path.iterdir;real_digest=r.checkpoint.digest
+                stack.enter_context(patch.object(r.Path,'stat',autospec=True,side_effect=lambda p,*a,**kw:SimpleNamespace(st_ino=7,st_dev=8) if str(p)=='/proc/1234/exe' else real_stat(p,*a,**kw)))
+                stack.enter_context(patch.object(r.Path,'iterdir',autospec=True,side_effect=lambda p:iter([p/'1234']) if str(p)=='/proc/1234/task' else real_iter(p)))
+                stack.enter_context(patch.object(r.checkpoint,'read_start',return_value='77'))
+                identity=stack.enter_context(patch.object(r.checkpoint,'check_identity'))
+                stack.enter_context(patch.object(r.checkpoint,'digest',side_effect=lambda p:r.ELF_SHA if str(p)=='/proc/1234/exe' else real_digest(p)))
+                def read(path,limit):
+                    if denied=='alarm' and path.name=='smaps':raise TimeoutError('global execution bound')
+                    if denied and path.name=='smaps':raise PermissionError('denied fixture')
+                    return 'bounded fixture'
+                def command(argv,**kw):
+                    self.assertLessEqual(kw['timeout'],2);return SimpleNamespace(stdout=read(Path(argv[-1]),int(argv[2])-1).encode())
+                reads=stack.enter_context(patch.object(r.subprocess,'run',side_effect=command))
+                if denied=='alarm':
+                    with self.assertRaisesRegex(TimeoutError,'global execution'):r.lifecycle_stage(service,Path(temp),'ready')
+                    continue
+                stage=r.lifecycle_stage(service,Path(temp),'ready')
+                self.assertEqual(stage['status'],'unknown' if denied else 'observed');self.assertEqual(len(stage['threads']),1)
+                self.assertEqual(identity.call_count,2);self.assertFalse(stage['STOP_or_freeze_sent'])
+                self.assertTrue(all(int(c.args[0][2])<=1+(2<<20) for c in reads.call_args_list))
+                with self.assertRaisesRegex(ValueError,'identity changed'):r.lifecycle_stage(service,Path(temp),'warm',{'pid':0})
+    def test_unreaped_helper_defers_all_owned_cleanup_and_records_unknown(self):
+        self.lifecycle('five-unreaped')
+
+    def test_lifecycle_mode_skips_idle_capture_and_failure_still_finalizes(self):
+        for mode in ('five-ok','five-failed'):
+            with self.subTest(mode=mode):self.lifecycle(mode)
+
     def lifecycle(self,mode):
         with tempfile.TemporaryDirectory() as temp,ExitStack() as stack:
             root=Path(temp).resolve();(root/'original/B').mkdir(parents=True);(root/'evidence').mkdir();(root/'layout').mkdir()
@@ -105,15 +264,15 @@ class CheckpointRunnerTests(unittest.TestCase):
                 fp=root/'fixture/manifest.json';v=json.loads(fp.read_text());v.update(db_url='postgresql://own-fixture',db_cgroup=str(cgroup/'db'));fp.write_text(json.dumps(v));fake_db.manifest_path=fp
                 return {'status':'running','pid':3210}
             fake_db.start.side_effect=start_db;fake_db.stop.return_value=dict(forced=False,cgroup_removed=True,after={'process_count':0})
-            service=Mock();service.process.pid=1234;service.metrics.return_value={'queued':0};service.stop.return_value=dict(forced=False,cgroup_removed=True,after={'process_count':0},exit_code=0)
-            harness=Mock();harness.start.return_value=service
+            service=Mock();service.process.pid=1234;service.domain.path=cgroup/'service';service.metrics.return_value={'queued':0};service.stop.return_value=dict(forced=False,cgroup_removed=True,after={'process_count':0},exit_code=0)
+            harness=Mock();harness.start.return_value=service;harness.close.return_value=[]
             connection=Mock()
             stack.enter_context(patch.object(r,'save',side_effect=save))
             stack.enter_context(patch.object(r.json,'loads',side_effect=loads))
             original_exists=Path.exists
             stack.enter_context(patch.object(r.Path,'exists',autospec=True,side_effect=lambda p:original_exists(cgroup) if str(p).startswith('/sys/fs/cgroup/ku-idle-owner-') else original_exists(p)))
             stack.enter_context(patch.object(r.checkpoint,'digest',side_effect=lambda p:r.C_SHA if str(p).endswith('ku-server.c') else r.ELF_SHA))
-            stack.enter_context(patch.object(r.checkpoint,'prepare',return_value={}))
+            prepare=stack.enter_context(patch.object(r.checkpoint,'prepare',return_value={}))
             stack.enter_context(patch.object(r.database,'Database',return_value=fake_db))
             stack.enter_context(patch.object(r.lh,'Harness',return_value=harness))
             stack.enter_context(patch.object(r,'check_default_maps',return_value={'sha256':r.D_SHA}))
@@ -136,12 +295,32 @@ class CheckpointRunnerTests(unittest.TestCase):
                 if str(path).startswith('/sys/fs/cgroup/ku-idle-owner-'):return cgroup.rmdir()
                 return original_rmdir(path)
             stack.enter_context(patch.object(r.Path,'rmdir',autospec=True,side_effect=remove))
-            result=r.run_restored(root)
+            five=mode.startswith('five-')
+            if five:
+                def lifecycle(h,s,e,result):
+                    self.assertIs(h,harness);self.assertIs(s,service)
+                    result.update(lifecycle_phases=[{'phase':'init','status':'unknown'}],status='observed')
+                    if mode=='five-failed':raise ValueError('driver fixture failed')
+                    if mode=='five-unreaped':
+                        result['steady_helper_cleanup']={'pid':9876,'process_group':9876,'process_reaped':False,'forced':True}
+                        raise RuntimeError('helper could not be reaped')
+                stack.enter_context(patch.object(r,'pg_lifecycle',side_effect=lifecycle))
+                stack.enter_context(patch.object(r,'lifecycle_stage',return_value={'phase':'drain','status':'observed-termination'}))
+            result=r.run_restored(root,lifecycle=five)
+            harness.start.assert_called_once()
+            if mode=='five-unreaped':
+                service.metrics.assert_not_called();service.stop.assert_not_called();harness.close.assert_not_called();fake_db.stop.assert_not_called();wait.assert_not_called()
+                self.assertFalse(result['natural_cleanup']);self.assertEqual(result['status'],'unknown');self.assertFalse(result['observer_reaped'])
+                self.assertEqual(result['owned_not_confirmed_reclaimed']['service'],{'pid':1234,'cgroup':str(cgroup/'service')})
+                self.assertEqual(result['owned_not_confirmed_reclaimed']['database']['pid'],3210);self.assertTrue(cgroup.exists())
+                self.assertIn('runner teardown',result['cleanup_reason']);return
+            harness.close.assert_called_once()
+            self.assertEqual(prepare.call_count,0 if five else 1)
             service.stop.assert_called_once();fake_db.stop.assert_called_once()
-            self.assertEqual(connection.close.call_count,0 if mode=='JSON-failed' else 1)
-            self.assertEqual(capture.call_count,0 if mode=='JSON-failed' else 1)
-            self.assertEqual(service.metrics.call_count,1 if mode=='JSON-failed' else 2)
-            self.assertEqual(result['status'],'captured' if mode in ('ok','already-reaped') else 'unknown')
+            self.assertEqual(connection.close.call_count,0 if five or mode=='JSON-failed' else 1)
+            self.assertEqual(capture.call_count,0 if five or mode=='JSON-failed' else 1)
+            self.assertEqual(service.metrics.call_count,1 if five or mode=='JSON-failed' else 2)
+            self.assertEqual(result['status'],'observed' if mode=='five-ok' else 'captured' if mode in ('ok','already-reaped') else 'unknown')
             self.assertEqual(result['natural_cleanup'],mode!='already-reaped-with-residue');self.assertFalse(cgroup.exists())
             if mode.startswith('already-reaped'):
                 self.assertIsNone(result['owned_database_child_reaped'])

@@ -2048,7 +2048,7 @@ jobs:
 
   normal-owner-checkpoint:
     if: github.event_name == 'workflow_dispatch' && inputs.scope == 'normal-owner-checkpoint'
-    name: Linux ARM64 ordinary owner idle checkpoint
+    name: Linux ARM64 ordinary owner lifecycle observation
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 8
     permissions:
@@ -2078,7 +2078,7 @@ jobs:
                   jobs=json.loads(subprocess.check_output(['gh','api',f"repos/{os.environ['REPOSITORY']}/actions/runs/{run['id']}/jobs?per_page=100"],timeout=15))
                   if jobs['total_count']>100:raise SystemExit('Active job inventory exceeds bound')
                   for job in jobs['jobs']:
-                      if job['status']!='completed' and any(x in job['name'].lower() for x in ('serial performance evidence','libpq loader preliminary memory9','libpq loader build','ordinary owner idle checkpoint')):
+                      if job['status']!='completed' and any(x in job['name'].lower() for x in ('serial performance evidence','libpq loader preliminary memory9','libpq loader build','ordinary owner')):
                           blocked.append({'run':run['id'],'job':job['name']})
           print(json.dumps({'blocked':blocked}))
           if blocked:raise SystemExit('Concurrent owned measurement scope; nothing started')
@@ -2123,12 +2123,13 @@ jobs:
           set -euo pipefail
           gh api repos/fengyanweb/ku/actions/artifacts/13073466540/zip > "$RUNNER_TEMP/normal-owner-old.zip"
           printf '%s  %s\n' ee3328487aca8bdb5c6bf855a5a8dbe3da47a101c3f13abf29ee1e3fd313e234 "$RUNNER_TEMP/normal-owner-old.zip" | sha256sum --check --strict
-      - name: One ordinary JSON response then one independent idle checkpoint
+      - name: One bounded normal PG lifecycle observation without STOP or formal scoring
         shell: bash
         run: |
           set -euo pipefail
-          timeout --signal=TERM --kill-after=5s 115s sudo -n -E python3 -B \
+          timeout --signal=TERM --kill-after=5s 155s sudo -n -E python3 -B \
             .github/scripts/run-normal-owner-checkpoint.py \
+            --lifecycle \
             --old-zip "$RUNNER_TEMP/normal-owner-old.zip" \
             --root "$RUNNER_TEMP/normal-owner-checkpoint"
       - name: Remove temporary restored tools without touching retained evidence
@@ -2143,7 +2144,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: normal-owner-idle-checkpoint
+          name: normal-owner-lifecycle
           path: ${{ runner.temp }}/normal-owner-checkpoint/evidence
           if-no-files-found: warn
           retention-days: 14
