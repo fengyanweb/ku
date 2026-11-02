@@ -2387,6 +2387,28 @@ static void blocking_capacity_storage_is_bounded_and_freed(void) {
   CHECK(pool.initialized==KU_TASK_DRIVER_STORAGE_REAPING && !pool.storage);
   CHECK(ku_task_blocking_finish(&pool,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
   CHECK(!pool.initialized && !pool.storage_bytes && !fixture_ledger().bytes);
+  /* Retirement while a virgin prefix remains must never expose the retired
+   * slot through an implicit zero, including after a recycled suffix. */
+  memset(&pool,0,sizeof(pool));
+  CHECK(ku_task_blocking_init(&pool,3u,1u,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
+  CHECK(!ku_task_blocking_lock(&pool));
+  size_t virgin=SIZE_MAX;
+  CHECK(ku_task_blocking_claim_locked(&pool,&virgin)==KU_TASK_DRIVER_OK&&virgin==0u);
+  pool.jobs[virgin].generation=UINT64_MAX;
+  CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[virgin],virgin)==KU_TASK_DRIVER_OK);
+  CHECK(pool.retired_slots==1u&&pool.free_count==2u&&ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_claim_locked(&pool,&virgin)==KU_TASK_DRIVER_OK&&virgin==1u);
+  CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[virgin],virgin)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_claim_locked(&pool,&virgin)==KU_TASK_DRIVER_OK&&virgin==1u);
+  size_t last=SIZE_MAX;
+  CHECK(ku_task_blocking_claim_locked(&pool,&last)==KU_TASK_DRIVER_OK&&last==2u);
+  CHECK(!pool.free_count&&pool.retired_slots==1u&&ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[last],last)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[virgin],virgin)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
+  ku_task_blocking_unlock(&pool);
+  CHECK(ku_task_blocking_finish(&pool,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
+  CHECK(!fixture_ledger().allocations&&!fixture_ledger().bytes);
   for(size_t cap=1;cap<=16384u;cap=cap==1u?16384u:16385u) {
     memset(&pool,0,sizeof(pool));
     CHECK(ku_task_blocking_init(&pool,cap,1u,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
@@ -2394,8 +2416,25 @@ static void blocking_capacity_storage_is_bounded_and_freed(void) {
     CHECK(pool.storage_bytes==bytes && pool.capacity==cap);
     CHECK((void*)pool.jobs==pool.storage && pool.inputs==(KuTaskBlockingInputsV1*)((uint8_t*)pool.storage+cap*sizeof(*pool.jobs)) && pool.ring==(size_t*)(pool.inputs+cap));
     CHECK(pool.free_indices==(uint32_t*)(pool.ring+cap)&&pool.free_count==cap&&!pool.retired_slots);
+    CHECK(ku_task_frame_zero_bytes(pool.free_indices,cap*sizeof(*pool.free_indices)));
     CHECK(pool.workers_created==1u && fixture_ledger().allocations==1u && fixture_ledger().bytes==bytes);
     CHECK(!ku_task_blocking_lock(&pool));
+    CHECK(ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
+    /* Recycled slots must coexist with the implicit, never-claimed prefix.
+     * Preserve LIFO reuse and the ascending order of first-time claims. */
+    size_t first=SIZE_MAX;
+    CHECK(ku_task_blocking_claim_locked(&pool,&first)==KU_TASK_DRIVER_OK&&first==0u);
+    CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[first],first)==KU_TASK_DRIVER_OK);
+    CHECK(ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
+    CHECK(ku_task_blocking_claim_locked(&pool,&first)==KU_TASK_DRIVER_OK&&first==0u);
+    if(cap>1u) {
+      size_t second=SIZE_MAX;
+      CHECK(ku_task_blocking_claim_locked(&pool,&second)==KU_TASK_DRIVER_OK&&second==1u);
+      CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[first],first)==KU_TASK_DRIVER_OK);
+      CHECK(ku_task_blocking_claim_locked(&pool,&first)==KU_TASK_DRIVER_OK&&first==0u);
+      CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[second],second)==KU_TASK_DRIVER_OK);
+    }
+    CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[first],first)==KU_TASK_DRIVER_OK);
     CHECK(ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
     for(size_t i=0;i<cap;i++) {
       size_t index=SIZE_MAX;CHECK(ku_task_blocking_claim_locked(&pool,&index)==KU_TASK_DRIVER_OK&&index==i);
@@ -2414,7 +2453,7 @@ static void blocking_capacity_storage_is_bounded_and_freed(void) {
     CHECK(pool.fault==KU_TASK_DRIVER_INTERNAL&&pool.free_count==cap&&!pool.resident);
     pool.fault=0; /* Only the isolated invalid-call fixture resets its fault. */
     CHECK(ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
-    size_t exhausted=pool.free_indices[pool.free_count-1u];pool.jobs[exhausted].generation=UINT64_MAX-1u;
+    size_t exhausted=ku_task_blocking_free_slot(&pool,pool.free_count-1u);pool.jobs[exhausted].generation=UINT64_MAX-1u;
     size_t index=SIZE_MAX;CHECK(ku_task_blocking_claim_locked(&pool,&index)==KU_TASK_DRIVER_OK&&index==exhausted);
     CHECK(pool.jobs[index].generation==UINT64_MAX);
     CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[index],index)==KU_TASK_DRIVER_OK);

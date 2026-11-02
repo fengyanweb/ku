@@ -275,6 +275,10 @@ jobs:
           cargo test --release --locked --test native_pg_query_poll_test \
             -- --skip live_loopback --nocapture --test-threads=1 | tee "$RUNNER_TEMP/pg-shape-O2.log"
           grep -F 'test result: ok. 27 passed; 0 failed;' "$RUNNER_TEMP/pg-shape-O2.log"
+          cargo test --release --locked --test native_task_adapter_test \
+            native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline \
+            -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/blocking-free-index-O2.log"
+          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/blocking-free-index-O2.log"
           names=(
             native_http_bounded_json_owner_preserves_input_edges_and_legacy_results
             native_http_bounded_json_works_between_real_task_owner_polls
@@ -313,6 +317,10 @@ jobs:
           cargo test --release --locked --test native_pg_query_poll_test \
             -- --skip live_loopback --nocapture --test-threads=1 | tee "$RUNNER_TEMP/pg-shape-detectors.log"
           grep -F 'test result: ok. 27 passed; 0 failed;' "$RUNNER_TEMP/pg-shape-detectors.log"
+          cargo test --release --locked --test native_task_adapter_test \
+            native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline \
+            -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/blocking-free-index-detectors.log"
+          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/blocking-free-index-detectors.log"
           cargo test --release --locked --test native_http_test \
             native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlines \
             -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/token-planes-detectors.log"
