@@ -3700,10 +3700,18 @@ static size_t ku_http_reactor_token_capacity(const KuHttpReactor* r) {
 #endif
   return r->hash_capacity;
 }
+/* capacity is the already selected logical token-table size. Only the active
+ * 64-bucket prefix is smaller than the original backing. Its owner-generated
+ * tokens can use their low bits directly; equality still compares all 64 bits
+ * and every collision probe remains bounded. A native H==64 table and the
+ * promoted full table retain the original hash, as does the separate fd map. */
+static size_t ku_http_reactor_token_start(const KuHttpReactor* r,uint64_t token,size_t capacity) {
+  return capacity<r->hash_capacity ? (size_t)token&(capacity-1u):ku_http_reactor_hash_start(r,token);
+}
 static size_t ku_http_reactor_lookup(const KuHttpReactor* r,uint64_t token) {
   if(!token || token==UINT64_MAX) return SIZE_MAX;
   size_t capacity=ku_http_reactor_token_capacity(r),mask=capacity-1u;
-  size_t start=ku_http_reactor_hash_start(r,token)&mask;
+  size_t start=ku_http_reactor_token_start(r,token,capacity);
   for(size_t i=0;i<capacity;i++) {
     const KuHttpRegistrationHash* item=&r->hash[(start+i)&mask];
     if(!item->token) break;
@@ -3713,7 +3721,7 @@ static size_t ku_http_reactor_lookup(const KuHttpReactor* r,uint64_t token) {
 }
 static int ku_http_reactor_hash_add(KuHttpReactor* r,uint64_t token,size_t entry) {
   size_t capacity=ku_http_reactor_token_capacity(r),mask=capacity-1u;
-  size_t start=ku_http_reactor_hash_start(r,token)&mask;
+  size_t start=ku_http_reactor_token_start(r,token,capacity);
   for(size_t i=0;i<capacity;i++) {
     size_t at=(start+i)&mask;
     if(!r->hash[at].token) {r->hash[at]=(KuHttpRegistrationHash){token,entry};return 1;}
@@ -3722,7 +3730,7 @@ static int ku_http_reactor_hash_add(KuHttpReactor* r,uint64_t token,size_t entry
 }
 static void ku_http_reactor_hash_remove(KuHttpReactor* r,uint64_t token) {
   size_t capacity=ku_http_reactor_token_capacity(r),mask=capacity-1u;
-  size_t start=ku_http_reactor_hash_start(r,token)&mask;
+  size_t start=ku_http_reactor_token_start(r,token,capacity);
   for(size_t i=0;i<capacity;i++) {
     KuHttpRegistrationHash* item=&r->hash[(start+i)&mask];
     if(!item->token) return;
@@ -3731,7 +3739,7 @@ static void ku_http_reactor_hash_remove(KuHttpReactor* r,uint64_t token) {
        * not fill the table with tombstones and turn stale lookup into O(cap). */
       size_t hole=(start+i)&mask,at=(hole+1u)&mask;
       for(size_t moved=0;moved<capacity && r->hash[at].token;moved++,at=(at+1u)&mask) {
-        size_t home=ku_http_reactor_hash_start(r,r->hash[at].token)&mask;
+        size_t home=ku_http_reactor_token_start(r,r->hash[at].token,capacity);
         if(((at-home)&mask)>=((hole-home)&mask)) {r->hash[hole]=r->hash[at];hole=at;}
       }
       r->hash[hole]=(KuHttpRegistrationHash){0,0};return;

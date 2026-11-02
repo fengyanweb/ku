@@ -37,7 +37,7 @@ class HostedCycleTests(unittest.TestCase):
             with patch.dict(h.TOKEN_PREFIX_C,B='b'*64):
                 identities={n:{'files':{'generated C':{'sha256':v}}} for n,v in h.TOKEN_PREFIX_C.items()}
                 h.verify_pg_memory_builds(identities,goal)
-                for old in (h.FULL_KEY_C,h.OWNER_JOB_C,h.HTTP_STATUS_C,h.V4_MEMORY_C,h.PG_MEMORY_C):
+                for old in (h.FULL_KEY_C,h.OWNER_JOB_C,h.HTTP_STATUS_C,h.V4_MEMORY_C,h.PG_MEMORY_C,dict(h.PG_MEMORY_C,B='66147a80c2df7e7dcc7ef5bc6d5a85a6babd2bd5f60437f142c98167b274d23a')):
                     with self.assertRaises(ValueError):h.verify_pg_memory_builds({n:{'files':{'generated C':{'sha256':v}}} for n,v in old.items()},goal)
             args=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_SHORT_PG_PREPATCH,screen_variants=[],
                 http_short_screen=True,http_short_goal=goal)

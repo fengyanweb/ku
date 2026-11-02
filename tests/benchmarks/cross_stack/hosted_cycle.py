@@ -24,7 +24,7 @@ PG_MEMORY_C = {
 FULL_KEY_GOALS=('full-key-screen','full-key-confirm')
 FULL_KEY_C=dict(PG_MEMORY_C,B='9ae5b00535c13b75925b78f0be594a3bde4fd0b6a2996ec0bfe1ac6a6d5bcf77')
 TOKEN_PREFIX_GOALS=('token-prefix-screen','token-prefix-confirm')
-TOKEN_PREFIX_C=dict(PG_MEMORY_C,B='66147a80c2df7e7dcc7ef5bc6d5a85a6babd2bd5f60437f142c98167b274d23a')
+TOKEN_PREFIX_C=dict(PG_MEMORY_C,B='50f90a53e5e58ac41ef0e3a74d39501330ae9b31b9710907ddc36dace3b0363f')
 OWNER_JOB_GOALS=('owner-job-screen','owner-job-confirm')
 OWNER_JOB_C=dict(PG_MEMORY_C,B='8010370bbc8867e7f39267f722250db493b20ce70c0d73b5a238a575e939fad4')
 HTTP_STATUS_GOALS=('http-status-screen','http-status-confirm')
@@ -495,9 +495,9 @@ def token_prefix_plan(versions,goal):
     if goal not in TOKEN_PREFIX_GOALS:raise ValueError('unregistered token-prefix stage')
     plan=full_key_plan(versions,FULL_KEY_GOALS[1] if goal==TOKEN_PREFIX_GOALS[1] else FULL_KEY_GOALS[0])
     plan.update(http_short_goal=goal,maximum_confirmations=1,confirmation_requires_screen_eligible=True,
-        purpose='One token logical-prefix candidate on the unchanged fullH16B backing/calloc/budget; original publiccapacity, FD index, metadata, blocking free-index and owner Job.6pairs screen then at most one independent12pair confirmation only after eligible screen. No old data pooled or historical verdict changed.',
-        evidence_basis=dict(complete_C=TOKEN_PREFIX_C,other_v4_candidates_excluded=True,
-            mechanism='LP64 initial min(H,64) token mask; before provisional insert at32live, snapshot32 full-key buckets and promote once to originalH. No bucket compression, extra allocation, registration scan, fullH clearing or later shrink.',
+        purpose='One revised compact-token hash candidate36f8003 on unchanged fullH16B backing/calloc/budget; compact buckets use low6bits with full64key equality, fullH and FD hash unchanged.6pairs screen then at most one independent12pair confirmation. Originalprefix661 confirmation41402600641 stays rejected; no pooling or threshold changes.',
+        evidence_basis=dict(complete_C=TOKEN_PREFIX_C,source_product_commit='36f8003665819c24e92ca0a12d1eeef747b64eb4',prior_prefix_rejected_confirmation=41402600641,other_v4_candidates_excluded=True,
+            mechanism='Prior prefix mechanism retained, but only compact homes skip general xor/shift/two-multiply avalanche; complete64-bit keys, bounded probes/backshift, exact32promotion, fullH/FD hashes, capacity/budget and exhaustion remain. No decoded or truncated generation handles.',
             performance_effect='unknown before paired measurements; less token write-touch range is not a whole-service memory saving or CPU attribution.'))
     plan['adoption_thresholds']['rationale']='Original5percent PG memory minimum and every full-key/v4 CPU/othermemory guard unchanged; a distinct logical-prefix implementation, not reinterpretation of rejected layouts. Original16targets unchanged.'
     return plan
