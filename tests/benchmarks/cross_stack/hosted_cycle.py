@@ -1594,7 +1594,7 @@ def memory_owner_plan(versions):
         maximum_windows=1,maximum_replacements=0,timeout_seconds=3)
 
 
-def prepare_memory_owner(a,state):
+def prepare_memory_owner(a,state,*,plan_builder=None):
     import http_cost_diagnostic as hcd
     from compile_variants import Commands, clean_environment
     directory=a.root/'M';directory.mkdir();m=copy.deepcopy(load(a.root/'B/manifest.json'))
@@ -1623,7 +1623,7 @@ def prepare_memory_owner(a,state):
     versions={name:dict(root=str(a.root/name),stack='ku',source_commit=a.candidate,
         binary_sha256=load(a.root/name/'manifest.json')['stacks']['ku']['build']['native']['server']['binary_sha256'],
         diagnostic_only=name=='M',normal_score_eligible=False) for name in ('B','M')}
-    plan=memory_owner_plan(versions);save(a.root/'frozen-plan.json',plan)
+    plan=(plan_builder or memory_owner_plan)(versions);save(a.root/'frozen-plan.json',plan)
     save(a.root/'build-identities.json',{name:fc.version_identity(plan,name) for name in versions})
     if sha(original['binary'])!=original['binary_sha256'] or sha(original['generated_c'])!=original['generated_c_sha256']:
         raise ValueError('normal B artifact changed while preparing owner probe')

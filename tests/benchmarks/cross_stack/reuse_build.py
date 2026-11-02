@@ -28,13 +28,13 @@ def translated(value, root):
     return value
 
 
-def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False,pg_self_observation=False,ok_pmu_observation=False):
+def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False,pg_self_observation=False,ok_pmu_observation=False,owner_lifecycle_observation=False):
     """Check all paths/map entries first; write only into a fresh owned tree."""
     checked(archive,expected_sha256)
     root=Path(root)
-    measured=pg_self_observation or ok_pmu_observation
-    if sum(bool(x) for x in (owner_observation,pg_self_observation,ok_pmu_observation))>1:raise ValueError('one explicit build-reuse mode required')
-    allowed={'tools','normal-perf-preflight'} if measured else {'tools'}
+    measured=pg_self_observation or ok_pmu_observation or owner_lifecycle_observation
+    if sum(bool(x) for x in (owner_observation,pg_self_observation,ok_pmu_observation,owner_lifecycle_observation))>1:raise ValueError('one explicit build-reuse mode required')
+    allowed={'tools','normal-perf-preflight'} if pg_self_observation or ok_pmu_observation else {'tools'}
     if root.exists() and (root.is_symlink() or any(p.name not in allowed for p in root.iterdir())):
         raise ValueError('reuse requires a fresh output (only prepared tools may exist)')
     with tarfile.open(archive,'r:gz') as tar:
@@ -67,14 +67,14 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
                 if entry.get('bytes')!=len(data) or hashlib.sha256(data).hexdigest()!=entry.get('archived_sha256'):
                     raise ValueError('portable archived bytes differ: '+member.name)
         old=json.load(tar.extractfile('hosted-state.json'))
-        pmu=(ok_pmu_observation and set(names)=={'B','Driver'} and expected_sha256==OK_PMU_ARCHIVE_SHA
+        pmu=((ok_pmu_observation or owner_lifecycle_observation) and set(names)=={'B','Driver'} and expected_sha256==OK_PMU_ARCHIVE_SHA
                 and set(old.get('steps',{}))=={'build','build-B','build-Driver','diagnostic'}
                 and all(v.get('state')=='completed' for v in old['steps'].values())
                 and old.get('identity',{}).get('candidate')==h.NORMAL_OK_PRODUCT
                 and old['identity'].get('build_set')=='diagnostic'
                 and old['identity'].get('normal_self_probe') is True
                 and old['identity'].get('normal_self_workload')=='ok-gpr')
-        if ok_pmu_observation and not pmu:raise ValueError('fixed normal /ok build/diagnostic provenance differs')
+        if (ok_pmu_observation or owner_lifecycle_observation) and not pmu:raise ValueError('fixed normal /ok build/diagnostic provenance differs')
         if any(not name.startswith('build') for name in old.get('steps',{})):
             owner=(owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
                     and set(old.get('steps',{}))=={'build','build-B','build-R','diagnostic'}

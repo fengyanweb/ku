@@ -9,7 +9,7 @@ on:
         description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, owner-lifecycle]
       prepatch:
         description: 'Full prepatch commit for explicit paired screens; wake/PG probes require their frozen baseline'
         type: string
@@ -96,6 +96,67 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  owner-lifecycle:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'owner-lifecycle'
+    name: One same-PID PG allocation residency observation (not a score)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    env:
+      KU_OWNER_ROOT: ${{ runner.temp }}/ku-owner-lifecycle
+    steps:
+      - name: Check out the isolated observation tools
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download only the exact existing build archive
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: ku-performance-v2-evidence
+          path: ${{ runner.temp }}/ku-owner-reused
+          run-id: 41423107606
+          github-token: ${{ github.token }}
+      - name: Prepare tool paths without compiling CLI or driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$KU_OWNER_ROOT/tools"
+          ln -s "${CARGO_HOME:-$HOME/.cargo}" "$KU_OWNER_ROOT/tools/cargo"
+          ln -s "${RUSTUP_HOME:-$HOME/.rustup}" "$KU_OWNER_ROOT/tools/rustup"
+          ln -s "$(go env GOROOT)" "$KU_OWNER_ROOT/tools/go"
+          python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_owner_lifecycle.py -q
+      - name: Verify normal inputs and build only the diagnostic C derivative
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B tests/benchmarks/cross_stack/owner_lifecycle.py prepare \
+            --archive "$RUNNER_TEMP/ku-owner-reused/ku-performance-v2-evidence.tar.gz" \
+            --root "$KU_OWNER_ROOT" --tools "$KU_OWNER_ROOT/tools"
+      - name: Observe the three stages once with bounded cleanup
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B tests/benchmarks/cross_stack/owner_lifecycle.py run \
+            --root "$KU_OWNER_ROOT" > "$KU_OWNER_ROOT/run.log"
+      - name: Archive only selected raw records and normal or derived C identities
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B tests/benchmarks/cross_stack/owner_lifecycle.py archive --root "$KU_OWNER_ROOT"
+      - name: Retain the diagnostic record without a performance claim
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ku-owner-lifecycle-evidence
+          path: |
+            ${{ runner.temp }}/ku-owner-lifecycle/ku-performance-v2-evidence.tar.gz
+            ${{ runner.temp }}/ku-owner-lifecycle/archive.json
+          retention-days: 3
+          if-no-files-found: error
   quality:
     if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
     name: Rust format, check and clippy
@@ -1063,7 +1124,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'owner-lifecycle')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
