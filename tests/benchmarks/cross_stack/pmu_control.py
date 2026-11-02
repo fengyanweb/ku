@@ -21,6 +21,27 @@ def thread_ids(pid):
     return values
 
 
+def thread_state(pid,tid,proc=Path('/proc')):
+    """Bounded stable identity and actual scheduler CPU runtime, not ticks."""
+    base=proc/str(pid)/'task'/str(tid)
+    def read(name,limit):
+        with (base/name).open('rb') as stream:data=stream.read(limit+1)
+        if len(data)>limit:raise ValueError('thread '+name+' byte bound')
+        return data
+    def identity(raw):
+        end=raw.rfind(b')');begin=raw.find(b'(')
+        if not 0<begin<end or raw[:begin].strip()!=str(tid).encode():raise ValueError('thread stat identity differs')
+        fields=raw[end+1:].split()
+        if len(fields)<20 or not re.fullmatch(rb'[0-9]{1,20}',fields[19]):raise ValueError('thread stat start_ticks absent')
+        value=int(fields[19])
+        if not 0<value<1<<64:raise ValueError('thread start_ticks bound')
+        return value
+    before=identity(read('stat',4096));sched=read('schedstat',256).split();after=identity(read('stat',4096))
+    if before!=after or len(sched)!=3 or any(not re.fullmatch(rb'[0-9]{1,20}',x) or int(x)>=1<<64 for x in sched):
+        raise ValueError('stable available thread scheduler CPU evidence required')
+    return dict(start_ticks=before,cpu_runtime_ns=int(sched[0]),schedstat=[int(x) for x in sched])
+
+
 def cycle_identities(root=Path('/sys/bus/event_source/devices')):
     """Generic hardware cycles, plus the actual ARM64 PMU's sysfs alias."""
     rows=[dict(type=0,config=0,source='PERF_TYPE_HARDWARE/PERF_COUNT_HW_CPU_CYCLES')]
@@ -105,7 +126,7 @@ def raw_cpu_threads(path,start_ns,end_ns,pid,identities):
         scope='Only actual running cycles samples and captured task sideband in original client interval; not wall-time/core residency or offCPU duration. Period units are cycles, not nanoseconds.')
 
 
-def parse_stat(path,expected_tids):
+def parse_stat(path,expected_tids,*,no_cpu_evidence=None):
     """Read unscaled, per-thread CSV; never turn unavailable rows into zero."""
     with Path(path).open('rb') as stream:raw=stream.read((1<<20)+1)
     if len(raw)>1<<20:raise ValueError('PMU stat CSV exceeds1MiB')
@@ -130,16 +151,26 @@ def parse_stat(path,expected_tids):
     if set(rows)!=expected:raise ValueError('stat target TIDs/events differ from captured initial set')
     for tid in expected_tids:
         hardware=[rows[tid,event] for event in EVENTS[:2]];clock=rows[tid,'task-clock']
-        inactive=(clock['value']==0 and clock['runtime_ns']==0 and all(r['runtime_ns']==0 and r['value'] in (None,0) and r['raw_value']!='<not supported>' for r in hardware))
+        proof=(no_cpu_evidence or {}).get(tid,{})
+        first=proof.get('before',{});last=proof.get('after',{})
+        known=lambda value:isinstance(value,int) and not isinstance(value,bool) and 0<=value<1<<64
+        brackets=[proof.get(k) for k in ('before_end_ns','enable_begin_ns','disable_ack_ns','after_begin_ns')]
+        proven=(known(first.get('start_ticks')) and known(last.get('start_ticks')) and first['start_ticks']>0 and first.get('start_ticks')==last.get('start_ticks')
+            and known(first.get('cpu_runtime_ns')) and known(last.get('cpu_runtime_ns')) and first.get('cpu_runtime_ns')==last.get('cpu_runtime_ns')
+            and all(known(x) for x in brackets) and brackets==sorted(brackets))
+        inactive=(proven and all(r['runtime_ns']==0 and r['value'] in (None,0)
+            and (r['value'] is not None or r['raw_value']=='<not counted>') for r in [*hardware,clock]))
         if inactive:dormant.append(tid);continue
         if any(r['value'] is None or r['value']<=0 or r['runtime_ns']<=0 or r['percent_running']!=100 for r in [*hardware,clock]):
             raise ValueError('active target event unsupported/not counted/multiplexed')
         if hardware[0]['runtime_ns']!=hardware[1]['runtime_ns']:raise ValueError('grouped hardware event runtimes differ')
         if clock['unit'].lower() not in ('msec','nsec'):raise ValueError('unknown task-clock unit')
-    totals={event:sum(rows[tid,event]['value'] or 0 for tid in expected_tids) for event in EVENTS}
-    clock_ns=sum((rows[tid,'task-clock']['value'] or 0)*(1e6 if rows[tid,'task-clock']['unit'].lower()=='msec' else 1) for tid in expected_tids)
+    active=[tid for tid in expected_tids if tid not in dormant]
+    totals={event:sum(rows[tid,event]['value'] for tid in active) for event in EVENTS}
+    clock_ns=sum(rows[tid,'task-clock']['value']*(1e6 if rows[tid,'task-clock']['unit'].lower()=='msec' else 1) for tid in active)
     if min(totals.values())<=0:raise ValueError('positive target counts required')
     return dict(rows=list(rows.values()),initial_target_tids=list(expected_tids),dormant_zero_CPU_tids=dormant,
+        dormant_no_CPU_evidence={tid:no_cpu_evidence[tid] for tid in dormant},
         totals=totals,task_clock_ns=clock_ns,cycles_per_instruction=totals['cycles']/totals['instructions'],
         cycles_per_task_clock_ns=totals['cycles']/clock_ns,scaled=False,
         scope='Only initial attached TIDs. Boundary lists do not prove absence of transient new threads.',
@@ -156,7 +187,8 @@ def controlled_stat(client,pid,output,perf,record,*,deadline=None):
         return value
     def snapshot(label):
         began=time.monotonic_ns();tids=thread_ids(pid)
-        record.setdefault('thread_boundaries',[]).append(dict(label=label,tids=tids,
+        states={tid:thread_state(pid,tid) for tid in tids}
+        record.setdefault('thread_boundaries',[]).append(dict(label=label,tids=tids,states=states,
             started_monotonic_ns=began,ended_monotonic_ns=time.monotonic_ns()))
         return tids
     try:
@@ -203,7 +235,11 @@ def controlled_stat(client,pid,output,perf,record,*,deadline=None):
             # perf-stat's sig_atexit re-raises the deliberate SIGINT after
             # printing. A direct Popen therefore normally returns -SIGINT.
             record['flush_exit_expected']=process.returncode in (0,-signal.SIGINT)
-        record['counts']=parse_stat(csv,initial)
+        first,last=record['thread_boundaries'][0],record['thread_boundaries'][-1]
+        evidence={tid:dict(before=first['states'][tid],after=last['states'].get(tid,{}),
+            before_end_ns=first['ended_monotonic_ns'],enable_begin_ns=record['control'][0]['started_monotonic_ns'],
+            disable_ack_ns=record['control'][1]['ack_monotonic_ns'],after_begin_ns=last['started_monotonic_ns']) for tid in initial}
+        record['counts']=parse_stat(csv,initial,no_cpu_evidence=evidence)
         sets=[set(r['tids']) for r in record['thread_boundaries']]
         record['created_at_boundaries']=sorted(set.union(*sets)-sets[0]);record['exited_at_boundaries']=sorted(sets[0]-sets[-1])
         record['stable_boundary_TIDs']=all(s==sets[0] for s in sets)

@@ -1140,7 +1140,8 @@ def pg_failure_export(a,directory,*,output_name='pg-failure-observation',schema=
     output=a.root/output_name;output.mkdir(exist_ok=False);output.chmod(0o755)
     entries=[];skipped=[];total=0;paths=[];metadata_reserve=128<<10
     for path in directory.rglob('*') if selected is None else selected:
-        if not path.is_file() or path.is_symlink() or path.suffix not in ('.json','.log'):continue
+        pmu_csv=(schema=='ku-normal-self-small-artifact-v1' and path.name=='stat.csv' and path.parent.name=='pmu-stat')
+        if not path.is_file() or path.is_symlink() or (path.suffix not in ('.json','.log') and not pmu_csv):continue
         if len(paths)>=64:
             skipped.append(dict(path='*',reason='small artifact64-file limit; other raw receipts retained'));break
         paths.append(path)
