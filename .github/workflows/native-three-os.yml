@@ -118,9 +118,16 @@ jobs:
           run-id: 41423107606
           github-token: ${{ github.token }}
       - name: Prepare tool paths without compiling CLI or driver
+        timeout-minutes: 3
         shell: bash
         run: |
           set -euo pipefail
+          if ! test -x /usr/bin/clang-18 || ! test -x /usr/lib/postgresql/16/bin/initdb || \
+              ! test -f /usr/lib/aarch64-linux-gnu/libpq.so.5 || \
+              [ "$(sha256sum /usr/lib/aarch64-linux-gnu/libpq.so.5 2>/dev/null | cut -d' ' -f1)" != b59de287c314a78cb70e7e0bb31fb2be34b961ccc90beff405d8c48412ace2df ]; then
+            sudo -n apt-get update
+            sudo -n apt-get install -y --no-install-recommends clang-18 libpq-dev postgresql-16
+          fi
           mkdir -p "$KU_OWNER_ROOT/tools"
           ln -s "${CARGO_HOME:-$HOME/.cargo}" "$KU_OWNER_ROOT/tools/cargo"
           ln -s "${RUSTUP_HOME:-$HOME/.rustup}" "$KU_OWNER_ROOT/tools/rustup"
