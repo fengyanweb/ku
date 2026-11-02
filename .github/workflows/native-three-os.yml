@@ -101,9 +101,10 @@ jobs:
     name: One same-PID PG allocation residency observation (not a score)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
-    env:
-      KU_OWNER_ROOT: ${{ runner.temp }}/ku-owner-lifecycle
     steps:
+      - name: Set the owned root from the step runtime
+        shell: bash
+        run: printf 'KU_OWNER_ROOT=%s\n' "$RUNNER_TEMP/ku-owner-lifecycle" >> "$GITHUB_ENV"
       - name: Check out the isolated observation tools
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
