@@ -22,7 +22,7 @@ PG_MEMORY_C = {
     'B':'e2f32de65729b0c2f8241fec2238cc3c59cd955ccb3857e0d8be191dc0c1d5a2',
 }
 V4_GOALS=('v4-memory-screen','v4-memory-confirm')
-V4_MEMORY_C=dict(PG_MEMORY_C,B='19f5406c142cb93807d25dd114d1aee858c5498ffdfd228503f8879ca8146765')
+V4_MEMORY_C=dict(PG_MEMORY_C,B='1d686faf46db51ea98f6811bd653980cf0a6bb095cb6d393b2abbc15fc75c17a')
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
 RESOURCES = {'service_cores': 2, 'service_memory_bytes': GIB,
              'driver_cores': 1, 'driver_cpuset': '2', 'driver_memory_bytes': GIB}
@@ -388,10 +388,10 @@ def v4_short_plan(versions,goal):
     plan.update(http_short_goal=goal,windows=controls+windows,maximum_windows=len(controls+windows),
         observation_alarm_seconds=2130 if confirm else 690,workflow_limit_seconds=2160 if confirm else 720,
         paired_windows_per_business=pairs,stage='independent-confirmation' if confirm else 'screen',
-        purpose='V4 single SoA/full-token + same-result PG shape + query-capacity candidate; ordinary A/B helpers O2, unchanged business/SQL/deadlines/capacity. '
+        purpose='V4 cached32 fingerprint/slot8B + same-result PG shape + query-capacity candidate; ordinary A/B helpers O2, unchanged business/SQL/deadlines/capacity. '
             'Screen3pairs and one separate fixed12pair confirmation, each with3controls and one coarse compute pair. No optional stopping, replacements, pooled stages, Rust ranking, capacity or30min acceptance.',
-        adoption_thresholds=dict(pg_memory_geometric_ratio_maximum=.97,
-            rationale='New10/12B aligned full-key layout has smaller requested saving than rejected4B variant;3% minimum is frozen before this new candidate, not a changed historical5% gate or original16target.',
+        adoption_thresholds=dict(pg_memory_geometric_ratio_maximum=.95,
+            rationale='New8B cached hash+slot halves normal token backing;5% minimum is frozen for this new implementation, historical4B and SoA verdicts and original16targets stay unchanged.',
             screen_memory_upper95_maximum=1.03,screen_cpu_point_maximum=1.03,screen_cpu_lower95_maximum=1.03,
             confirmation_memory_upper95_strictly_below=1,confirmation_cpu_lower95_maximum=1,
             confirmation_cpu_upper95_maximum=1.03,confirmation_other_memory_lower95_maximum=1,
@@ -400,7 +400,7 @@ def v4_short_plan(versions,goal):
             final_decision='Screen can only enable the one fixed confirmation. Confirmation never automatically adopts or passes original16goals.'),
         evidence_basis=dict(old_candidate_run=41312215552,old_not_adopted=True,
             old_complete_C=PG_MEMORY_C['B'],new_complete_C=V4_MEMORY_C['B'],
-            mechanism='Aligned full64token plane plus16/32bit slot plane; no registration-dependent key probe or deletion home lookup. Same allocation count, capacity, namespace and conservative16B budget.',
+            mechanism='One8B cached mixed_hash32/slot32 bucket: full64token checked in registration only on fingerprint match, cached home for bounded backshift. Full-width home fallback for internal large masks. Same allocation count, capacity, namespace and conservative16B budget.',
             CPU_cause_of_old_point_estimate='unknown; added indirect loads are source facts, not established CPU cause',
             generic_Value_AST_changed=False))
     return plan
@@ -429,7 +429,7 @@ def v4_short_comparison(rows,complete,environment,goal):
             result['reasons'].append(workload+' CPU '+('confirmation guard unresolved/failed' if confirm else 'screen failed'))
         if workload=='db':
             result['pg_memory']=memory
-            if memory.get('status')!='estimated' or memory['estimate']>.97 or (memory['upper95']>=1 if confirm else memory['upper95']>1.03):
+            if memory.get('status')!='estimated' or memory['estimate']>plan['adoption_thresholds']['pg_memory_geometric_ratio_maximum'] or (memory['upper95']>=1 if confirm else memory['upper95']>1.03):
                 result['reasons'].append('PG memory '+('confirmation criterion unresolved/failed' if confirm else 'screen failed'))
         else:
             result['other_memory_guards'][workload]=memory
