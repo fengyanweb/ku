@@ -8383,11 +8383,12 @@ static int fixture_fd_index_clusters(void) {
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
   /* Low activity touches only the charged table prefix. Growth is a bounded
      in-place rebuild, without extra malloc or a lower maximum registration cap. */
-  KuHttpConnection larger[64]={{0}};KuHttpActiveSet more={larger,64,NULL};
+  /* Only registration metadata is used by this independent FD-index model. */
+  KuHttpActiveSet more={NULL,4160,NULL};
   CHECK(ku_http_reactor_init(&r,&more,0u));
   size_t calls=fixture_alloc_calls,full=r.hash_capacity;
   CHECK(r.fd_capacity==32u && full>32u && !r.fd_count);
-  for(size_t i=0;i<67u;i++) {
+  for(size_t i=0;i<4163u;i++) {
     CHECK(ku_http_reactor_fd_prepare(&r));
     r.registrations[i]=(KuHttpRegistration){(int)(10000u+i),i+1u,i,0,1,-1,0};
     size_t at=ku_http_reactor_fd_bucket(&r,r.registrations[i].fd);
@@ -8398,9 +8399,10 @@ static int fixture_fd_index_clusters(void) {
     }
     for(size_t j=r.fd_capacity;j<full;j++)CHECK(!r.fd_entries[j]);
   }
-  CHECK(r.fd_capacity==256u && fixture_alloc_calls==calls && r.fd_count==67u);
-  for(size_t i=0;i<67u;i++) {ku_http_reactor_fd_remove(&r,i);r.registrations[i]=(KuHttpRegistration){0};}
-  CHECK(!r.fault && !r.fd_count && r.fd_capacity==256u && r.hash_capacity==full);
+  CHECK(r.fd_capacity==16384u && fixture_alloc_calls==calls && r.fd_count==4163u
+      && ku_http_reactor_token_capacity(&r)==8192u);
+  for(size_t i=0;i<4163u;i++) {ku_http_reactor_fd_remove(&r,i);r.registrations[i]=(KuHttpRegistration){0};}
+  CHECK(!r.fault && !r.fd_count && r.fd_capacity==16384u && r.hash_capacity==full);
   for(size_t i=0;i<full;i++)CHECK(!r.fd_entries[i]);
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
   puts("http-persistent-fd-index-collision-backshift-ok");return 0;
@@ -8548,7 +8550,7 @@ static int fixture_closed_event_source(void) {
   puts("http-persistent-closed-event-source-fault-ok");return 0;
 }
 static int fixture_full_key_capacity(void) {
-  const size_t cases[]={3u,4u,5u,6u,7u,8u,9u,12u,13u,16u,17u,24u,25u,32u,33u,64u,65u,2048u,4096u,4163u,8192u,16384u,57347u};
+  const size_t cases[]={3u,4u,5u,6u,7u,8u,9u,12u,13u,16u,17u,24u,25u,32u,33u,64u,65u,2048u,4096u,4097u,4163u,6144u,6145u,8192u,8193u,12288u,12289u,16384u,57347u};
   for(size_t c=0;c<sizeof(cases)/sizeof(*cases);c++) {
     size_t cap=cases[c];KuHttpActiveSet active={NULL,0,NULL};KuHttpReactor r;
     CHECK(ku_http_reactor_init_pending(&r,&active,0u,cap-3u));
@@ -8557,7 +8559,9 @@ static int fixture_full_key_capacity(void) {
     CHECK(r.hash_capacity>=cap*2u && r.fd_capacity==(r.hash_capacity<32u?r.hash_capacity:32u));
     CHECK(fixture_live_bytes+(r.hash_capacity-buckets)*sizeof(*r.hash)
         ==ku_http_reactor_pending_storage_bytes(0u,0u,cap-3u)-sizeof(r));
-    if(cap==4163u)CHECK(buckets==8192u && r.hash_capacity==16384u);
+    if(r.hash_capacity<16384u)CHECK(buckets==r.hash_capacity);
+    if(cap==4163u || cap==6144u)CHECK(buckets==8192u && r.hash_capacity==16384u);
+    if(cap==6145u)CHECK(buckets==16384u && r.hash_capacity==16384u);
     for(size_t i=0;i<cap;i++) CHECK(ku_http_reactor_hash_add(&r,UINT64_MAX-1u-i,i));
     for(size_t i=0;i<cap;i++) CHECK(ku_http_reactor_lookup(&r,UINT64_MAX-1u-i)==i);
     /* Delete across every probe cluster, then verify every survivor and stale

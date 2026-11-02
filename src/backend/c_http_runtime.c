@@ -3689,7 +3689,9 @@ static size_t ku_http_reactor_hash_start(const KuHttpReactor* r,uint64_t token) 
  * No extra field or deferred allocation is needed for the smaller token map. */
 static size_t ku_http_reactor_token_capacity(const KuHttpReactor* r) {
   size_t full=r->hash_capacity;
-  return full>=16u && r->capacity<=(full/8u)*3u ? full/2u:full;
+  /* Keep smaller unmeasured allocation classes unchanged. The witnessed
+   * default has H=16384 and a 256KiB token backing; its half stays large. */
+  return full>=16384u && r->capacity<=(full/8u)*3u ? full/2u:full;
 }
 static size_t ku_http_reactor_lookup(const KuHttpReactor* r,uint64_t token) {
   if(!token || token==UINT64_MAX) return SIZE_MAX;
