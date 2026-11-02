@@ -14,6 +14,42 @@ import http_cost_diagnostic as hcd
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_fullkey_stages_are_balanced_and_keep_prior_guards(self):
+        for goal,count,pairs in zip(h.FULL_KEY_GOALS,(41,77),(6,12)):
+            p=h.http_short_plan({},goal)
+            self.assertEqual((p['maximum_windows'],p['paired_windows_per_business']),(count,pairs))
+            self.assertEqual(p['maximum_replacements'],0)
+            self.assertEqual(p['adoption_thresholds']['pg_memory_geometric_ratio_maximum'],.95)
+            self.assertEqual(p['adoption_thresholds']['confirmation_cpu_upper95_maximum'],1.03)
+            self.assertEqual(h.http_short_prepatch(goal),h.HTTP_SHORT_PG_PREPATCH)
+            for workload in ('json_object','ok','db'):
+                rows=[r for r in p['windows'] if r['phase']=='normal' and r['workload']==workload]
+                self.assertEqual(len(rows),2*pairs)
+                self.assertEqual(sum(rows[i]['name']=='A' for i in range(0,2*pairs,2)),pairs//2)
+            h.verify_pg_memory_builds({n:{'files':{'generated C':{'sha256':v}}} for n,v in h.FULL_KEY_C.items()},goal)
+            with self.assertRaises(ValueError):
+                h.verify_pg_memory_builds({n:{'files':{'generated C':{'sha256':v}}} for n,v in h.V4_MEMORY_C.items()},goal)
+
+    def test_fullkey_decision_preserves_CPU_and_memory_guards(self):
+        for goal in h.FULL_KEY_GOALS:
+            for issue in ('none','cpu','no-memory-benefit','other-memory','compute','unknown','incomplete'):
+                with self.subTest(goal=goal,issue=issue):
+                    rows=[]
+                    for config in h.http_short_plan({},goal)['windows']:
+                        r=dict(config,environment_quality='pass',full_cpu_us=100,memory={'steady_median_bytes':1000000})
+                        if r['name']=='B':
+                            r['full_cpu_us']*=.99
+                            if r['workload']=='db':r['memory']['steady_median_bytes']=940000
+                            if issue=='cpu' and r['workload']=='db':r['full_cpu_us']=104
+                            if issue=='no-memory-benefit' and r['workload']=='db':r['memory']['steady_median_bytes']=990000
+                            if issue=='other-memory' and r['workload']=='ok':r['memory']['steady_median_bytes']=1040000
+                            if issue=='compute' and r['workload']=='cpu':r['full_cpu_us']=104
+                        if issue=='unknown':r['environment_quality']='unknown'
+                        rows.append(r)
+                    result=h.http_short_comparison(rows,issue!='incomplete',{'quality':'pass'},goal)
+                    self.assertEqual(result['eligible_for_confirmation'] or result['eligible_for_root_review'],issue=='none')
+                    self.assertFalse(result['candidate_accepted']);self.assertFalse(result['pooling_previous_windows'])
+
     def test_statusline_stages_are_separate_and_cannot_score_other_layouts(self):
         for goal,count in zip(h.HTTP_STATUS_GOALS,(23,77)):
             p=h.http_short_plan({},goal)
@@ -1621,7 +1657,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",workflow)
+        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_goal == 'full-key-screen' && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 
