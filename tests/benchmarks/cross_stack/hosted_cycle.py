@@ -31,6 +31,8 @@ HTTP_STATUS_GOALS=('http-status-screen','http-status-confirm')
 HTTP_STATUS_C=dict(PG_MEMORY_C,B='2bfb5abc1c6ec68a3529d21b264cc4ead70eb93ebb564bedeba3a317d94d7b78')
 HEADER_PACK_GOALS=('header-pack-screen','header-pack-confirm')
 HEADER_PACK_C=dict(PG_MEMORY_C,B='6894f08dbc09d158586999fa0a18c8e48f36544f927b3b5ae5d48a6399420994')
+COMPACT_RETIRE_GOALS=('compact-retire-screen','compact-retire-confirm')
+COMPACT_RETIRE_C=dict(PG_MEMORY_C,B='e2ea29630a53b437fb8c3389dcb2e29a723920361f024c19e9691e7dcd0161f2')
 V4_GOALS=('v4-memory-screen','v4-memory-confirm')
 V4_MEMORY_C=dict(PG_MEMORY_C,B='6c8158cc3952b73015d28f2f18846f32aca5e65640efbd0f554db1beb34a7827')
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
@@ -53,18 +55,20 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def http_short_prepatch(goal):
-    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS):raise ValueError('unregistered HTTP short goal')
-    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS) else HTTP_SHORT_PREPATCH
+    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS,*COMPACT_RETIRE_GOALS):raise ValueError('unregistered HTTP short goal')
+    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS,*COMPACT_RETIRE_GOALS) else HTTP_SHORT_PREPATCH
 
 
 def verify_pg_memory_builds(identities,goal='pg-memory'):
+    if goal in COMPACT_RETIRE_GOALS and not re.fullmatch('[0-9a-f]{64}',COMPACT_RETIRE_C['B']):
+        raise ValueError('compact-retire complete generated C identity is not frozen')
     if goal in HEADER_PACK_GOALS and not re.fullmatch('[0-9a-f]{64}',HEADER_PACK_C['B']):
         raise ValueError('header-pack complete generated C identity is not frozen')
     if goal in TOKEN_PREFIX_GOALS and not re.fullmatch('[0-9a-f]{64}',TOKEN_PREFIX_C['B']):
         raise ValueError('token-prefix complete generated C identity is not frozen')
     if goal in OWNER_JOB_GOALS and not re.fullmatch('[0-9a-f]{64}',OWNER_JOB_C['B']):
         raise ValueError('owner Job complete generated C identity is not frozen')
-    for name,expected in (HEADER_PACK_C if goal in HEADER_PACK_GOALS else TOKEN_PREFIX_C if goal in TOKEN_PREFIX_GOALS else OWNER_JOB_C if goal in OWNER_JOB_GOALS else FULL_KEY_C if goal in FULL_KEY_GOALS else HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
+    for name,expected in (COMPACT_RETIRE_C if goal in COMPACT_RETIRE_GOALS else HEADER_PACK_C if goal in HEADER_PACK_GOALS else TOKEN_PREFIX_C if goal in TOKEN_PREFIX_GOALS else OWNER_JOB_C if goal in OWNER_JOB_GOALS else FULL_KEY_C if goal in FULL_KEY_GOALS else HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
         if identities.get(name,{}).get('files',{}).get('generated C',{}).get('sha256')!=expected:
             raise ValueError('PG memory screen requires the exact preregistered complete C: '+name)
 
@@ -302,6 +306,7 @@ def normal_self_plan(versions):
 
 
 def http_short_plan(versions,goal='cpu'):
+    if goal in COMPACT_RETIRE_GOALS:return compact_retire_plan(versions,goal)
     if goal in HEADER_PACK_GOALS:return header_pack_plan(versions,goal)
     if goal in TOKEN_PREFIX_GOALS:return token_prefix_plan(versions,goal)
     if goal in OWNER_JOB_GOALS:return owner_job_plan(versions,goal)
@@ -343,6 +348,7 @@ def http_short_plan(versions,goal='cpu'):
 
 
 def http_short_comparison(rows,complete,environment=None,goal='cpu'):
+    if goal in COMPACT_RETIRE_GOALS:return v4_short_comparison(rows,complete,environment,goal)
     if goal in HEADER_PACK_GOALS:return http_status_comparison(rows,complete,environment,goal)
     if goal in TOKEN_PREFIX_GOALS:return v4_short_comparison(rows,complete,environment,goal)
     if goal in OWNER_JOB_GOALS:return owner_job_comparison(rows,complete,environment,goal)
@@ -433,16 +439,17 @@ def v4_short_plan(versions,goal):
 
 
 def v4_short_comparison(rows,complete,environment,goal):
-    plan=token_prefix_plan({},goal) if goal in TOKEN_PREFIX_GOALS else full_key_plan({},goal) if goal in FULL_KEY_GOALS else v4_short_plan({},goal)
-    confirm=goal in (V4_GOALS[1],FULL_KEY_GOALS[1],TOKEN_PREFIX_GOALS[1]);groups=range(1,plan['paired_windows_per_business']+1)
+    plan=compact_retire_plan({},goal) if goal in COMPACT_RETIRE_GOALS else token_prefix_plan({},goal) if goal in TOKEN_PREFIX_GOALS else full_key_plan({},goal) if goal in FULL_KEY_GOALS else v4_short_plan({},goal)
+    confirm=goal in (V4_GOALS[1],FULL_KEY_GOALS[1],TOKEN_PREFIX_GOALS[1],COMPACT_RETIRE_GOALS[1]);groups=range(1,plan['paired_windows_per_business']+1)
+    strict=confirm or goal in COMPACT_RETIRE_GOALS
     result=dict(complete=complete,http_short_goal=goal,eligible_for_confirmation=False,eligible_for_root_review=False,
         candidate_accepted=False,formal_qualified=False,normal_score_eligible=False,reasons=[],comparisons={},other_memory_guards={},
         independent_stage=True,pooling_previous_windows=False,thresholds=plan['adoption_thresholds'])
-    if goal in TOKEN_PREFIX_GOALS:result.update(maximum_confirmations=1,confirmation_requires_screen_eligible=True)
+    if goal in (*TOKEN_PREFIX_GOALS,*COMPACT_RETIRE_GOALS):result.update(maximum_confirmations=1,confirmation_requires_screen_eligible=True)
     if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification failed or unknown')
     if not complete:
         result['reasons'].append('incomplete observations or cleanup; no metric scoring');return result
-    if goal in TOKEN_PREFIX_GOALS:
+    if goal in (*TOKEN_PREFIX_GOALS,*COMPACT_RETIRE_GOALS):
         if result['reasons']:return result
         invalid=token_prefix_row_error(rows,plan)
         if invalid:result['reasons'].append(invalid);return result
@@ -457,15 +464,15 @@ def v4_short_comparison(rows,complete,environment,goal):
         memory=fc.paired_interval([fc.metric(p['B'],'memory.steady_median_bytes') for p in pairs],
             [fc.metric(p['A'],'memory.steady_median_bytes') for p in pairs],minimum=3)
         result['comparisons'][workload]=cpu
-        if cpu.get('status')!='estimated' or (cpu['lower95']>1 or cpu['upper95']>1.03 if confirm else cpu['estimate']>1.03 or cpu['lower95']>1.03):
-            result['reasons'].append(workload+' CPU '+('confirmation guard unresolved/failed' if confirm else 'screen failed'))
+        if cpu.get('status')!='estimated' or (cpu['lower95']>1 or cpu['upper95']>1.03 if strict else cpu['estimate']>1.03 or cpu['lower95']>1.03):
+            result['reasons'].append(workload+' CPU '+('strict stage guard unresolved/failed' if goal in COMPACT_RETIRE_GOALS else 'confirmation guard unresolved/failed' if confirm else 'screen failed'))
         if workload=='db':
             result['pg_memory']=memory
-            if memory.get('status')!='estimated' or memory['estimate']>plan['adoption_thresholds']['pg_memory_geometric_ratio_maximum'] or (memory['upper95']>=1 if confirm else memory['upper95']>1.03):
-                result['reasons'].append('PG memory '+('confirmation criterion unresolved/failed' if confirm else 'screen failed'))
+            if memory.get('status')!='estimated' or memory['estimate']>plan['adoption_thresholds']['pg_memory_geometric_ratio_maximum'] or (memory['upper95']>=1 if strict else memory['upper95']>1.03):
+                result['reasons'].append('PG memory '+('strict stage criterion unresolved/failed' if goal in COMPACT_RETIRE_GOALS else 'confirmation criterion unresolved/failed' if confirm else 'screen failed'))
         else:
             result['other_memory_guards'][workload]=memory
-            if memory.get('status')!='estimated' or (memory['lower95']>1 or memory['upper95']>1.03 if confirm else memory['lower95']>1.03):
+            if memory.get('status')!='estimated' or (memory['lower95']>1 or memory['upper95']>1.03 if strict else memory['lower95']>1.03):
                 result['reasons'].append(workload+' memory guard unresolved/failed')
     cpu={r['name']:r for r in rows if r['phase']=='compute-guard'}
     ratio=cpu['B']['full_cpu_us']/cpu['A']['full_cpu_us']
@@ -506,6 +513,28 @@ def token_prefix_plan(versions,goal):
             mechanism='Prior prefix mechanism retained, but only compact homes skip general xor/shift/two-multiply avalanche; complete64-bit keys, bounded probes/backshift, exact32promotion, fullH/FD hashes, capacity/budget and exhaustion remain. No decoded or truncated generation handles.',
             performance_effect='unknown before paired measurements; less token write-touch range is not a whole-service memory saving or CPU attribution.'))
     plan['adoption_thresholds']['rationale']='Original5percent PG memory minimum and every full-key/v4 CPU/othermemory guard unchanged; a distinct logical-prefix implementation, not reinterpretation of rejected layouts. Original16targets unchanged.'
+    return plan
+
+
+def compact_retire_plan(versions,goal):
+    if goal not in COMPACT_RETIRE_GOALS:raise ValueError('unregistered compact-retire stage')
+    confirm=goal==COMPACT_RETIRE_GOALS[1]
+    plan=full_key_plan(versions,FULL_KEY_GOALS[1] if confirm else FULL_KEY_GOALS[0])
+    plan.update(http_short_goal=goal,maximum_confirmations=1,confirmation_requires_screen_eligible=True,
+        purpose='One actual combined compact-token and PG terminal-retire candidate; unchanged helpers/C11O2, fullH budgets/capacity, reset and ordinary interfaces.6pairs screen, at most one independent12pair confirmation; strict guards in both stages. No old ratios multiplied or windows pooled.',
+        adoption_thresholds=dict(pg_memory_geometric_ratio_maximum=.95,
+            pg_memory_upper95_strictly_below=1,CPU_lower95_maximum=1,CPU_upper95_maximum=1.03,
+            related_memory_lower95_maximum=1,related_memory_upper95_maximum=1.03,compute_ratio_maximum=1.03,
+            strict_screen_and_confirmation=True,
+            rationale='Original5percent PGmemory minimum and final CPU/relatedmemory guards apply to both new stages. Earlier compact confirmation remains rejected and standalone terminal CPU remains unknown; original16goals unchanged.',
+            CPU_metric='full_cpu_us: after startup/warmup before score-driver launch through recorded termination; no cold-start/warmup CPU',
+            memory_metric='original chronological middle60percent service-cgroup memory.current median'),
+        evidence_basis=dict(complete_C=COMPACT_RETIRE_C,source_product_commit='612048a5a7b13f602362ee88c3829581c0df90da',
+            component_commits=['36f8003665819c24e92ca0a12d1eeef747b64eb4','14dc8ccd1f91c5a67c6a03906e1392bc30615a2e'],
+            prior_compact_rejected_confirmation=41413665472,standalone_terminal_B_windows=0,
+            other_v4_candidates_excluded=True,header_pack_excluded=True,
+            mechanism='Combine complete64-bit compact homes and original bounded promotion with one-check PG terminal retirement, preserving standalone take/dispose and cleanup/refund order. Measure one actual emitted binary; no synthetic combination of old ratios.',
+            performance_effect='unknown before actual paired measurements; old component observations are not combined gains.'))
     return plan
 
 
@@ -990,7 +1019,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
-    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS):
+    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS,*COMPACT_RETIRE_GOALS):
         verify_pg_memory_builds(identities,getattr(a,'http_short_goal','cpu'))
     if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
@@ -2754,7 +2783,7 @@ def main(argv=None):
     p.add_argument('--fixed-goals-only',action='store_true',help='Explicit full-build/run stop after controls, admission and original80 windows/16 goals; capacity/stability and whole acceptance remain incomplete')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS,*COMPACT_RETIRE_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit frozen control+normal A/B candidate diagnostic; goal selects exact windows/prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')

@@ -14,6 +14,83 @@ import http_cost_diagnostic as hcd
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_compact_retire_stages_have_strict_guards_and_reject_component_C_identities(self):
+        for goal,count,pairs in zip(h.COMPACT_RETIRE_GOALS,(41,77),(6,12)):
+            plan=h.http_short_plan({},goal)
+            prior=h.full_key_plan({},h.FULL_KEY_GOALS[1] if pairs==12 else h.FULL_KEY_GOALS[0])
+            self.assertEqual(plan['windows'],prior['windows'])
+            self.assertEqual((plan['maximum_windows'],plan['paired_windows_per_business']),(count,pairs))
+            self.assertEqual((plan['maximum_replacements'],plan['maximum_confirmations']),(0,1))
+            self.assertTrue(plan['confirmation_requires_screen_eligible'])
+            self.assertTrue(plan['evidence_basis']['header_pack_excluded'])
+            limits=plan['adoption_thresholds']
+            self.assertTrue(limits['strict_screen_and_confirmation'])
+            self.assertEqual((limits['pg_memory_geometric_ratio_maximum'],limits['pg_memory_upper95_strictly_below']),(.95,1))
+            self.assertEqual((limits['CPU_lower95_maximum'],limits['CPU_upper95_maximum']),(1,1.03))
+            self.assertEqual((limits['related_memory_lower95_maximum'],limits['related_memory_upper95_maximum']),(1,1.03))
+            self.assertEqual(h.http_short_prepatch(goal),h.HTTP_SHORT_PG_PREPATCH)
+            h.verify_pg_memory_builds({n:{'files':{'generated C':{'sha256':v}}} for n,v in h.COMPACT_RETIRE_C.items()},goal)
+            with patch.dict(h.COMPACT_RETIRE_C,B='PENDING_COMPACT_RETIRE_C'),self.assertRaisesRegex(ValueError,'not frozen'):
+                h.verify_pg_memory_builds({},goal)
+            for old_C in (h.TOKEN_PREFIX_C,h.HEADER_PACK_C,h.FULL_KEY_C,h.HTTP_STATUS_C,h.OWNER_JOB_C,h.V4_MEMORY_C,h.PG_MEMORY_C,
+                    dict(h.PG_MEMORY_C,B='d05ed9e80423ade5a30adf9d0dccfab92ed8f18007dfbd44972411b257500785')):
+                with self.assertRaises(ValueError):
+                    h.verify_pg_memory_builds({n:{'files':{'generated C':{'sha256':v}}} for n,v in old_C.items()},goal)
+            args=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_SHORT_PG_PREPATCH,screen_variants=[],
+                http_short_screen=True,http_short_goal=goal)
+            self.assertEqual(h.hosted_identity(types.SimpleNamespace(**args),'diagnostic')['http_short_goal'],goal)
+            with self.assertRaises(ValueError):h.hosted_identity(types.SimpleNamespace(**dict(args,prepatch=h.HTTP_SHORT_PREPATCH)),'diagnostic')
+
+    def test_compact_retire_rejects_incomplete_invalid_or_pooled_stage_before_scoring(self):
+        for goal in h.COMPACT_RETIRE_GOALS:
+            for issue in ('missing','duplicate','pooled','functional_valid','accounting_valid','all_correct',
+                    'natural_reclamation','measurement_invalid','nonfinite','missing-memory','unknown','unknown-aggregate','incomplete'):
+                with self.subTest(goal=goal,issue=issue):
+                    rows=self.token_prefix_rows(goal);environment={'quality':'pass'}
+                    if issue=='missing':rows.pop()
+                    elif issue=='duplicate':rows[-1]=dict(rows[-2])
+                    elif issue=='pooled':rows.extend(self.token_prefix_rows(h.COMPACT_RETIRE_GOALS[0]))
+                    elif issue=='nonfinite':rows[3]['full_cpu_us']=float('nan')
+                    elif issue=='missing-memory':rows[3]['memory']={}
+                    elif issue=='unknown':rows[3]['environment_quality']='unknown'
+                    elif issue=='unknown-aggregate':environment['quality']='unknown'
+                    elif issue!='incomplete':rows[3].pop(issue)
+                    with patch.object(fc,'paired_interval',side_effect=AssertionError('invalid stage cannot score')):
+                        result=h.http_short_comparison(rows,issue!='incomplete',environment,goal)
+                    self.assertFalse(result['eligible_for_confirmation'] or result['eligible_for_root_review'])
+                    self.assertEqual(result['comparisons'],{})
+                    self.assertEqual(result['other_memory_guards'],{})
+
+    def test_compact_retire_strict_CPU_and_memory_boundary_decisions_match_both_stages(self):
+        def interval(point=1,lower=1,upper=1):return dict(status='estimated',estimate=point,lower95=lower,upper95=upper)
+        for goal in h.COMPACT_RETIRE_GOALS:
+            for issue in ('none','PG-point-boundary','PG-point-fail','PG-upper-fail','CPU-lower-boundary','CPU-lower-fail',
+                    'CPU-upper-boundary','CPU-upper-fail','memory-lower-boundary','memory-lower-fail',
+                    'memory-upper-boundary','memory-upper-fail','compute'):
+                with self.subTest(goal=goal,issue=issue):
+                    rows=self.token_prefix_rows(goal)
+                    values=[interval(),interval(),interval(),interval(),interval(),interval(.94,.9,.98)]
+                    if issue=='PG-point-boundary':values[5]=interval(.95,.9,.99)
+                    if issue=='PG-point-fail':values[5]=interval(.950001,.9,.99)
+                    if issue=='PG-upper-fail':values[5]=interval(.94,.9,1)
+                    if issue=='CPU-lower-boundary':values[4]=interval(1.01,1,1.02)
+                    if issue=='CPU-lower-fail':values[4]=interval(1.01,1.000001,1.02)
+                    if issue=='CPU-upper-boundary':values[4]=interval(1,1,1.03)
+                    if issue=='CPU-upper-fail':values[4]=interval(1,1,1.030001)
+                    if issue=='memory-lower-boundary':values[1]=interval(1.01,1,1.02)
+                    if issue=='memory-lower-fail':values[1]=interval(1.01,1.000001,1.02)
+                    if issue=='memory-upper-boundary':values[1]=interval(1,1,1.03)
+                    if issue=='memory-upper-fail':values[1]=interval(1,1,1.030001)
+                    if issue=='compute':rows[-1]['full_cpu_us']=104
+                    with patch.object(fc,'paired_interval',side_effect=values):
+                        result=h.http_short_comparison(rows,True,{'quality':'pass'},goal)
+                    eligible=issue in ('none','PG-point-boundary','CPU-lower-boundary','CPU-upper-boundary','memory-lower-boundary','memory-upper-boundary')
+                    self.assertEqual(result['eligible_for_confirmation'],eligible and goal==h.COMPACT_RETIRE_GOALS[0])
+                    self.assertEqual(result['eligible_for_root_review'],eligible and goal==h.COMPACT_RETIRE_GOALS[1])
+                    for flag in ('candidate_accepted','formal_qualified','normal_score_eligible','pooling_previous_windows'):
+                        self.assertFalse(result[flag])
+                    self.assertEqual(result['maximum_confirmations'],1)
+
     def test_header_pack_has_its_own_fixed_stages_and_exact_C_binding(self):
         for goal,count,pairs in zip(h.HEADER_PACK_GOALS,(41,77),(6,12)):
             plan=h.http_short_plan({},goal)
@@ -1933,7 +2010,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen' || inputs.http_short_goal == 'header-pack-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm' || inputs.http_short_goal == 'header-pack-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",workflow)
+        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen' || inputs.http_short_goal == 'header-pack-screen' || inputs.http_short_goal == 'compact-retire-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm' || inputs.http_short_goal == 'header-pack-confirm' || inputs.http_short_goal == 'compact-retire-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 

@@ -57,7 +57,7 @@ on:
         description: 'Preregistered HTTP short-screen target; ignored when the screen is not selected'
         type: choice
         default: cpu
-        options: [cpu, memory, pg-memory, v4-memory-screen, v4-memory-confirm, http-status-screen, http-status-confirm, full-key-screen, full-key-confirm, owner-job-screen, owner-job-confirm, token-prefix-screen, token-prefix-confirm, header-pack-screen, header-pack-confirm]
+        options: [cpu, memory, pg-memory, v4-memory-screen, v4-memory-confirm, http-status-screen, http-status-confirm, full-key-screen, full-key-confirm, owner-job-screen, owner-job-confirm, token-prefix-screen, token-prefix-confirm, header-pack-screen, header-pack-confirm, compact-retire-screen, compact-retire-confirm]
 
       memory_owner_probe:
         description: 'One diagnostic startup-owner map; requires fixed41182804290 normal build reuse, no score or matrix'
@@ -308,6 +308,34 @@ jobs:
           grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/full-key-detectors.log"
           for name in native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets native_http_bounded_json_owner_preserves_input_edges_and_legacy_results native_http_bounded_json_works_between_real_task_owner_polls native_http_validates_unmaterialized_headers_and_owns_route_snapshot; do
             cargo test --release --locked --test native_http_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name-detectors.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name-detectors.log"
+            if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name-detectors.log"; then exit 1; fi
+          done
+
+      - name: Run combined candidate PG ownership and terminal contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          pg_log="$RUNNER_TEMP/compact-retire-native-pg.log"
+          cargo test --release --locked --test native_pg_query_poll_test -- --nocapture --test-threads=1 | tee "$pg_log"
+          grep -F 'test result: ok. 27 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out;' "$pg_log"
+          # These existing live-database cases are ignored, never counted as passes.
+          for name in native_pg_query_poller_live_loopback_roundtrip native_pg_finite_pipeline_live_loopback_preserves_conditional_reset_boundary; do
+            grep -F "$name ... ignored," "$pg_log"
+          done
+          if grep -Ei 'skip(ped)?:' "$pg_log"; then exit 1; fi
+
+      - name: Check combined candidate PG ownership with Linux detectors
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          KU_CC: "clang -O2 -fsanitize=address,undefined -fno-omit-frame-pointer -g -DKU_BORROW_REQUIRE_ASAN"
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+        run: |
+          set -euo pipefail
+          for name in native_pg_async_notification_pins_survive_close_and_owner_cancellation native_pg_compact_result_growth_oom_and_detached_lifetime_keep_physical_budget native_pg_typed_single_row_binary_values_validate_types_and_survive_reset; do
+            cargo test --release --locked --test native_pg_query_poll_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name-detectors.log"
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name-detectors.log"
             if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name-detectors.log"; then exit 1; fi
           done
@@ -644,7 +672,7 @@ jobs:
           fi
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
-            if [[ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = pg-memory || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = v4-memory-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = http-status-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = full-key-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = owner-job-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = token-prefix-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = header-pack-* ]]; then
+            if [[ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = pg-memory || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = v4-memory-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = http-status-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = full-key-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = owner-job-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = token-prefix-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = header-pack-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = compact-retire-* ]]; then
               test "$KU_PERFORMANCE_V2_PREPATCH" = 166453a1d2768bbce19796d9c7823be73cc84ccb
             else
               test "$KU_PERFORMANCE_V2_PREPATCH" = b765f9bc5d3a6e71353a562e27cef7b4cbb35f69
@@ -883,7 +911,7 @@ jobs:
           fi
 
       - name: Run the one serial cgroup cycle and preserve each goal status
-        timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen' || inputs.http_short_goal == 'header-pack-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm' || inputs.http_short_goal == 'header-pack-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}
+        timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen' || inputs.http_short_goal == 'header-pack-screen' || inputs.http_short_goal == 'compact-retire-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm' || inputs.http_short_goal == 'header-pack-confirm' || inputs.http_short_goal == 'compact-retire-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}
         env:
           KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
         shell: bash
