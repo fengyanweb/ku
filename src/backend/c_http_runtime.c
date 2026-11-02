@@ -1341,8 +1341,8 @@ static size_t ku_http_projection_bytes(KuHttpInput* input,size_t parameters,size
 }
 static int ku_http_job_projection(KuHttpJob*,size_t);
 static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms);
-/* Only a handler worker calls this function. All synchronous exit/deadline TLS
-   remains on that same execution thread; socket ownership never enters it. */
+/* A worker or a compiler-proven bounded owner call executes synchronously.
+   Exit/deadline TLS remains on that execution thread; Job never escapes it. */
 static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server, KuHttpInput* input, KuHttpJob* job) {
   const char* method = input->method;
   const char* target = input->target;
@@ -2071,7 +2071,8 @@ enum {
   KU_HTTP_IO_JOB = 3, KU_HTTP_IO_WRITE = 4, KU_HTTP_IO_CLOSED_JOB = 5,
   KU_HTTP_IO_REJECT = 6, KU_HTTP_IO_REUSE_WAIT = 7,
   KU_HTTP_IO_ASYNC = 8, KU_HTTP_IO_CLOSED_ASYNC = 9,
-  KU_HTTP_IO_REQUEST_WAIT = 10
+  KU_HTTP_IO_REQUEST_WAIT = 10,
+  KU_HTTP_IO_OWNER_READY = 11, KU_HTTP_IO_OWNER_CANCELLED = 12
 };
 typedef struct KuHttpActiveSet {
   struct KuHttpConnection* connections;
@@ -2393,6 +2394,26 @@ static void ku_http_count_admitted(void);
 static int ku_http_async_submit(KuHttpConnection*, KuHttpServer*);
 static int ku_http_async_observe(KuHttpConnection*, KuHttpServer*);
 static int ku_http_reused_request_admit(void);
+/* No worker can observe this private Job. Keep the shared execution contract,
+ * including its mutex, TLS, cancellation and both allocation ledgers. Only the
+ * owned response survives in the connection until the original maintenance
+ * publication point; no automatic-storage pointer enters connection/queue. */
+static int ku_http_connection_run_owner(KuHttpConnection* connection,KuHttpServer* server,KuHttpQueue* queue) {
+  KuHttpJob job={0};
+  if(!ku_http_mutex_init(&job.lock))return 0;
+  ku_http_count_admitted();
+  job.queue=queue;job.budget=connection->input.budget;
+  job.input=connection->input;connection->input=(KuHttpInput){0};
+  job.request_deadline=connection->request_deadline;
+  ku_http_job_run_owner(server,&job);
+  connection->failure=job.failure;
+  connection->output.response=job.response;job.response=(KuStruct___ku_http_response){0};
+  connection->output.charge=job.response_charge;job.response_charge=0;
+  connection->phase=job.cancelled?KU_HTTP_IO_OWNER_CANCELLED:KU_HTTP_IO_OWNER_READY;
+  connection->deadline=0;
+  ku_http_mutex_destroy(&job.lock);
+  return 1;
+}
 static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {
   if (ku_http_control_request(connection, server)) return;
   if (connection->management) { ku_http_connection_status(connection,server,404); return; }
@@ -2415,17 +2436,11 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
     ku_http_connection_status(connection, server, 400); return;
   }
   if (ku_http_async_submit(connection, server)) return;
-  KuHttpJob* job = ku_http_job_new(queue, &connection->input);
-  if (!job) { connection->failure.reason=KU_HTTP_ERROR_ALLOCATION; ku_http_connection_status(connection, server, 500); return; }
-  job->request_deadline = connection->request_deadline;
-  connection->job = job;
-  connection->phase = KU_HTTP_IO_JOB;
-  connection->deadline = 0;
   int local=ku_http_queue_is_current_owner(queue) && queue->owner_inline_remaining
-      && job->input.route && job->input.route->status==200u;
-  int short_handler=local && ku_http_handler_is_short(job->input.route->invoke);
+      && connection->input.route && connection->input.route->status==200u;
+  int short_handler=local && ku_http_handler_is_short(connection->input.route->invoke);
   const KuHttpJsonWork* json_work=local && queue->owner_inline_remaining==32u && !short_handler
-      ? ku_http_handler_json_work(job->input.route->invoke):NULL;
+      ? ku_http_handler_json_work(connection->input.route->invoke):NULL;
   int bounded_json=0;
   if(json_work) {
     /* Rejection scans <=2B+3T<=6144 bytes and <=4N+192 bounded
@@ -2436,15 +2451,24 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
         ku_http_task_execution_inactive() &&
 #endif
-        ku_http_json_input_bounded(&job->input,json_work);
+        ku_http_json_input_bounded(&connection->input,json_work);
   }
   if(short_handler || bounded_json) {
     /* A single bounded JSON call owes the reactor a complete I/O turn. Keep
      * the literal proof's original32 credits and all existing checkpoints. */
     queue->owner_inline_remaining=bounded_json?0u:queue->owner_inline_remaining-1u;
-    ku_http_count_admitted();
-    ku_http_job_run_owner(server,job);return;
+    if(!ku_http_connection_run_owner(connection,server,queue)) {
+      connection->failure.reason=KU_HTTP_ERROR_ALLOCATION;
+      ku_http_connection_status(connection,server,500);
+    }
+    return;
   }
+  KuHttpJob* job = ku_http_job_new(queue, &connection->input);
+  if (!job) { connection->failure.reason=KU_HTTP_ERROR_ALLOCATION; ku_http_connection_status(connection, server, 500); return; }
+  job->request_deadline = connection->request_deadline;
+  connection->job = job;
+  connection->phase = KU_HTTP_IO_JOB;
+  connection->deadline = 0;
   if (!workers || !ku_http_queue_push(queue, job)) {
     if(workers && queue->workers && queue->workers->creation_failed) {
       /* No queue retain/publication occurred. Retire the sole job/input owner
@@ -2611,6 +2635,15 @@ static void ku_http_connection_write(KuHttpConnection* connection, KuHttpServer*
 }
 static void ku_http_connection_observe_job(KuHttpConnection* connection, KuHttpServer* server) {
   if (ku_http_async_observe(connection, server)) return;
+  if(connection->phase==KU_HTTP_IO_OWNER_CANCELLED) {ku_http_connection_close(connection);return;}
+  if(connection->phase==KU_HTTP_IO_OWNER_READY) {
+    /* response() clears the prior output. Detach the owned staging fields
+     * before publishing, otherwise it would drop/refund the same result. */
+    KuStruct___ku_http_response response=connection->output.response;
+    size_t charge=connection->output.charge;
+    connection->output.response=(KuStruct___ku_http_response){0};connection->output.charge=0;
+    ku_http_connection_response(connection,server,response,charge,1);return;
+  }
   if (connection->phase == KU_HTTP_IO_REUSE_WAIT) {
     ku_http_connection_next_request(connection, server); return;
   }
@@ -3902,7 +3935,8 @@ static int ku_http_reactor_idle(const KuHttpConnection* c) {
 static short ku_http_reactor_connection_events(const KuHttpConnection* c) {
   if(c->phase==KU_HTTP_IO_HEADER || c->phase==KU_HTTP_IO_BODY) return KU_HTTP_POLL_READ;
   if(c->phase==KU_HTTP_IO_WRITE) return KU_HTTP_POLL_WRITE;
-  if((c->phase==KU_HTTP_IO_ASYNC || c->phase==KU_HTTP_IO_JOB) && !c->peer_read_paused)
+  if((c->phase==KU_HTTP_IO_ASYNC || c->phase==KU_HTTP_IO_JOB
+      || c->phase==KU_HTTP_IO_OWNER_READY || c->phase==KU_HTTP_IO_OWNER_CANCELLED) && !c->peer_read_paused)
     return KU_HTTP_POLL_READ;
   return 0;
 }
@@ -3988,6 +4022,7 @@ static void ku_http_reactor_refresh(KuHttpConnection* c) {
     ku_http_reactor_idle_remove(r,c);ku_http_reactor_work_add(r,c);
   }
   int watch=c->phase==KU_HTTP_IO_ASYNC || c->phase==KU_HTTP_IO_JOB
+      || c->phase==KU_HTTP_IO_OWNER_READY || c->phase==KU_HTTP_IO_OWNER_CANCELLED
       || (c->phase==KU_HTTP_IO_REQUEST_WAIT && !c->request_wait_probe_deadline);
   ku_http_reactor_interest(r,(size_t)(c-r->active->connections),
       (watch || ku_http_reactor_connection_events(c))?c->socket_value:KU_HTTP_INVALID_SOCKET,
@@ -4296,7 +4331,8 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       int response_became_ready=before_observe_phase!=KU_HTTP_IO_WRITE
           && connection->phase==KU_HTTP_IO_WRITE;
 #if defined(__APPLE__)
-      if ((connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB)
+      if ((connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB
+          || connection->phase==KU_HTTP_IO_OWNER_READY || connection->phase==KU_HTTP_IO_OWNER_CANCELLED)
           && connection->peer_read_paused && connection->peer_error_probe_deadline
           && now>=connection->peer_error_probe_deadline)
         ku_http_connection_observe_peer(connection,0,1);
@@ -4421,6 +4457,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       connection->poll_index = -1;
       short events = 0;
       int watch_peer=connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB
+          || connection->phase==KU_HTTP_IO_OWNER_READY || connection->phase==KU_HTTP_IO_OWNER_CANCELLED
           || (connection->phase==KU_HTTP_IO_REQUEST_WAIT && !connection->request_wait_probe_deadline);
       if (connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) events = KU_HTTP_POLL_READ;
       else if (connection->phase == KU_HTTP_IO_WRITE) events = KU_HTTP_POLL_WRITE;
@@ -4437,6 +4474,8 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #endif
       if (connection->phase == KU_HTTP_IO_JOB && connection->job && connection->job->request_deadline < nearest)
         nearest = connection->job->request_deadline;
+      if ((connection->phase==KU_HTTP_IO_OWNER_READY || connection->phase==KU_HTTP_IO_OWNER_CANCELLED)
+          && connection->request_deadline<nearest) nearest=connection->request_deadline;
       if (connection->async_task && !connection->async_cancelled && connection->async_deadline < nearest)
         nearest = connection->async_deadline;
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
@@ -4694,7 +4733,8 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         ku_http_connection_read_body(connection, server, &queue, nworkers);
       else if (connection->phase == KU_HTTP_IO_WRITE && (events & (KU_HTTP_POLL_WRITE | POLLERR | POLLHUP)))
         ku_http_connection_write(connection, server);
-      else if ((connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB)
+      else if ((connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB
+          || connection->phase==KU_HTTP_IO_OWNER_READY || connection->phase==KU_HTTP_IO_OWNER_CANCELLED)
           && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP))) ku_http_connection_observe_peer(connection,events,0);
       else if(connection->phase==KU_HTTP_IO_REQUEST_WAIT && (events&(POLLERR|POLLHUP))) {
         ku_http_connection_observe_peer(connection,events,0);
