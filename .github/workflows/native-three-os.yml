@@ -57,7 +57,7 @@ on:
         description: 'Preregistered HTTP short-screen target; ignored when the screen is not selected'
         type: choice
         default: cpu
-        options: [cpu, memory, pg-memory, v4-memory-screen, v4-memory-confirm, http-status-screen, http-status-confirm, full-key-screen, full-key-confirm, owner-job-screen, owner-job-confirm]
+        options: [cpu, memory, pg-memory, v4-memory-screen, v4-memory-confirm, http-status-screen, http-status-confirm, full-key-screen, full-key-confirm, owner-job-screen, owner-job-confirm, token-prefix-screen, token-prefix-confirm]
 
       memory_owner_probe:
         description: 'One diagnostic startup-owner map; requires fixed41182804290 normal build reuse, no score or matrix'
@@ -640,7 +640,7 @@ jobs:
           fi
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
-            if [[ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = pg-memory || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = v4-memory-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = http-status-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = full-key-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = owner-job-* ]]; then
+            if [[ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = pg-memory || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = v4-memory-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = http-status-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = full-key-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = owner-job-* || "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = token-prefix-* ]]; then
               test "$KU_PERFORMANCE_V2_PREPATCH" = 166453a1d2768bbce19796d9c7823be73cc84ccb
             else
               test "$KU_PERFORMANCE_V2_PREPATCH" = b765f9bc5d3a6e71353a562e27cef7b4cbb35f69
@@ -879,7 +879,7 @@ jobs:
           fi
 
       - name: Run the one serial cgroup cycle and preserve each goal status
-        timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}
+        timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}
         env:
           KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
         shell: bash

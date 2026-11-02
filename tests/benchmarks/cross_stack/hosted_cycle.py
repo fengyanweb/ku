@@ -23,6 +23,8 @@ PG_MEMORY_C = {
 }
 FULL_KEY_GOALS=('full-key-screen','full-key-confirm')
 FULL_KEY_C=dict(PG_MEMORY_C,B='9ae5b00535c13b75925b78f0be594a3bde4fd0b6a2996ec0bfe1ac6a6d5bcf77')
+TOKEN_PREFIX_GOALS=('token-prefix-screen','token-prefix-confirm')
+TOKEN_PREFIX_C=dict(PG_MEMORY_C,B='66147a80c2df7e7dcc7ef5bc6d5a85a6babd2bd5f60437f142c98167b274d23a')
 OWNER_JOB_GOALS=('owner-job-screen','owner-job-confirm')
 OWNER_JOB_C=dict(PG_MEMORY_C,B='8010370bbc8867e7f39267f722250db493b20ce70c0d73b5a238a575e939fad4')
 HTTP_STATUS_GOALS=('http-status-screen','http-status-confirm')
@@ -49,14 +51,16 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def http_short_prepatch(goal):
-    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS):raise ValueError('unregistered HTTP short goal')
-    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS) else HTTP_SHORT_PREPATCH
+    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS):raise ValueError('unregistered HTTP short goal')
+    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS) else HTTP_SHORT_PREPATCH
 
 
 def verify_pg_memory_builds(identities,goal='pg-memory'):
+    if goal in TOKEN_PREFIX_GOALS and not re.fullmatch('[0-9a-f]{64}',TOKEN_PREFIX_C['B']):
+        raise ValueError('token-prefix complete generated C identity is not frozen')
     if goal in OWNER_JOB_GOALS and not re.fullmatch('[0-9a-f]{64}',OWNER_JOB_C['B']):
         raise ValueError('owner Job complete generated C identity is not frozen')
-    for name,expected in (OWNER_JOB_C if goal in OWNER_JOB_GOALS else FULL_KEY_C if goal in FULL_KEY_GOALS else HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
+    for name,expected in (TOKEN_PREFIX_C if goal in TOKEN_PREFIX_GOALS else OWNER_JOB_C if goal in OWNER_JOB_GOALS else FULL_KEY_C if goal in FULL_KEY_GOALS else HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
         if identities.get(name,{}).get('files',{}).get('generated C',{}).get('sha256')!=expected:
             raise ValueError('PG memory screen requires the exact preregistered complete C: '+name)
 
@@ -294,6 +298,7 @@ def normal_self_plan(versions):
 
 
 def http_short_plan(versions,goal='cpu'):
+    if goal in TOKEN_PREFIX_GOALS:return token_prefix_plan(versions,goal)
     if goal in OWNER_JOB_GOALS:return owner_job_plan(versions,goal)
     if goal in FULL_KEY_GOALS:return full_key_plan(versions,goal)
     if goal in HTTP_STATUS_GOALS:return http_status_plan(versions,goal)
@@ -333,6 +338,7 @@ def http_short_plan(versions,goal='cpu'):
 
 
 def http_short_comparison(rows,complete,environment=None,goal='cpu'):
+    if goal in TOKEN_PREFIX_GOALS:return v4_short_comparison(rows,complete,environment,goal)
     if goal in OWNER_JOB_GOALS:return owner_job_comparison(rows,complete,environment,goal)
     if goal in FULL_KEY_GOALS:return v4_short_comparison(rows,complete,environment,goal)
     if goal in HTTP_STATUS_GOALS:return http_status_comparison(rows,complete,environment,goal)
@@ -421,14 +427,19 @@ def v4_short_plan(versions,goal):
 
 
 def v4_short_comparison(rows,complete,environment,goal):
-    plan=full_key_plan({},goal) if goal in FULL_KEY_GOALS else v4_short_plan({},goal)
-    confirm=goal in (V4_GOALS[1],FULL_KEY_GOALS[1]);groups=range(1,plan['paired_windows_per_business']+1)
+    plan=token_prefix_plan({},goal) if goal in TOKEN_PREFIX_GOALS else full_key_plan({},goal) if goal in FULL_KEY_GOALS else v4_short_plan({},goal)
+    confirm=goal in (V4_GOALS[1],FULL_KEY_GOALS[1],TOKEN_PREFIX_GOALS[1]);groups=range(1,plan['paired_windows_per_business']+1)
     result=dict(complete=complete,http_short_goal=goal,eligible_for_confirmation=False,eligible_for_root_review=False,
         candidate_accepted=False,formal_qualified=False,normal_score_eligible=False,reasons=[],comparisons={},other_memory_guards={},
         independent_stage=True,pooling_previous_windows=False,thresholds=plan['adoption_thresholds'])
+    if goal in TOKEN_PREFIX_GOALS:result.update(maximum_confirmations=1,confirmation_requires_screen_eligible=True)
     if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification failed or unknown')
     if not complete:
         result['reasons'].append('incomplete observations or cleanup; no metric scoring');return result
+    if goal in TOKEN_PREFIX_GOALS:
+        if result['reasons']:return result
+        invalid=token_prefix_row_error(rows,plan)
+        if invalid:result['reasons'].append(invalid);return result
     business=[r for r in rows if r['phase']=='normal']
     if len(business)!=6*len(groups) or any(r.get('environment_quality')!='pass' for r in business):
         result['reasons'].append('business row count or environment differs');return result
@@ -478,6 +489,36 @@ def full_key_plan(versions,goal):
             sample_planning='Historical log(memoryB/A) SD.11766:6screen/12confirmation fixed before this implementation measured; rough uncertainty not guaranteed power; CPUvariability can still prevent qualification.'))
     plan['adoption_thresholds']['rationale']='Same5percent memory minimum and1.03CPUguards; newfull-key implementation, not reinterpretation or rerun of rejected8B. Original16targets unchanged.'
     return plan
+
+
+def token_prefix_plan(versions,goal):
+    if goal not in TOKEN_PREFIX_GOALS:raise ValueError('unregistered token-prefix stage')
+    plan=full_key_plan(versions,FULL_KEY_GOALS[1] if goal==TOKEN_PREFIX_GOALS[1] else FULL_KEY_GOALS[0])
+    plan.update(http_short_goal=goal,maximum_confirmations=1,confirmation_requires_screen_eligible=True,
+        purpose='One token logical-prefix candidate on the unchanged fullH16B backing/calloc/budget; original publiccapacity, FD index, metadata, blocking free-index and owner Job.6pairs screen then at most one independent12pair confirmation only after eligible screen. No old data pooled or historical verdict changed.',
+        evidence_basis=dict(complete_C=TOKEN_PREFIX_C,other_v4_candidates_excluded=True,
+            mechanism='LP64 initial min(H,64) token mask; before provisional insert at32live, snapshot32 full-key buckets and promote once to originalH. No bucket compression, extra allocation, registration scan, fullH clearing or later shrink.',
+            performance_effect='unknown before paired measurements; less token write-touch range is not a whole-service memory saving or CPU attribution.'))
+    plan['adoption_thresholds']['rationale']='Original5percent PG memory minimum and every full-key/v4 CPU/othermemory guard unchanged; a distinct logical-prefix implementation, not reinterpretation of rejected layouts. Original16targets unchanged.'
+    return plan
+
+
+def token_prefix_row_error(rows,plan):
+    key=lambda r:(r.get('phase'),r.get('workload'),r.get('group'),r.get('name'))
+    actual=[key(r) for r in rows];expected=[key(r) for r in plan['windows']]
+    if len(actual)!=len(expected) or len(set(actual))!=len(actual) or set(actual)!=set(expected):
+        return 'fixed stage window identities missing, duplicated or mixed'
+    # Original control rows remain unknown until the separate aggregate passes.
+    # Business/compute rows require their own pass; never rewrite a control.
+    if any((r.get('environment_quality') not in ('pass','unknown') if r['phase']=='environment-control'
+            else r.get('environment_quality')!='pass') or any(r.get(k) is not True for k in
+            ('functional_valid','accounting_valid','all_correct','natural_reclamation'))
+            or r.get('measurement_invalid') is not False or r.get('independent_collector_fault') is True for r in rows):
+        return 'window quality or cleanup failed/unknown; no exclusion or replacement'
+    positive=lambda value:isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and value>0
+    if any(not positive(r.get('full_cpu_us')) for r in rows) or any(not positive(fc.metric(r,'memory.steady_median_bytes')) for r in rows if r['phase']=='normal'):
+        return 'missing or non-finite paired CPU/memory measurement; no exclusion'
+    return None
 
 
 def owner_job_plan(versions,goal):
@@ -919,7 +960,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
-    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS):
+    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS):
         verify_pg_memory_builds(identities,getattr(a,'http_short_goal','cpu'))
     if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
@@ -2683,7 +2724,7 @@ def main(argv=None):
     p.add_argument('--fixed-goals-only',action='store_true',help='Explicit full-build/run stop after controls, admission and original80 windows/16 goals; capacity/stability and whole acceptance remain incomplete')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit frozen control+normal A/B candidate diagnostic; goal selects exact windows/prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')

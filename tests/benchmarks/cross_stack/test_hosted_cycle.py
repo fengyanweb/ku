@@ -14,6 +14,105 @@ import http_cost_diagnostic as hcd
 
 
 class HostedCycleTests(unittest.TestCase):
+    def token_prefix_rows(self,goal):
+        rows=self.owner_job_rows(goal)
+        for row in rows:
+            if row['phase']=='normal' and row['name']=='B' and row['workload']=='db':row['memory']['steady_median_bytes']=940000
+        return rows
+
+    def test_token_prefix_has_separate_frozen_stages_and_rejects_unfrozen_identity(self):
+        for goal,count,pairs in zip(h.TOKEN_PREFIX_GOALS,(41,77),(6,12)):
+            plan=h.http_short_plan({},goal);prior=h.full_key_plan({},h.FULL_KEY_GOALS[1] if pairs==12 else h.FULL_KEY_GOALS[0])
+            self.assertEqual(plan['windows'],prior['windows']);self.assertEqual(plan['resources'],prior['resources'])
+            self.assertEqual(plan['quality_policy'],prior['quality_policy'])
+            self.assertEqual((plan['maximum_windows'],plan['paired_windows_per_business']),(count,pairs))
+            self.assertEqual((plan['maximum_replacements'],plan['maximum_confirmations']),(0,1))
+            self.assertEqual(plan['confirmation_requires_screen_eligible'],True)
+            self.assertEqual(h.http_short_prepatch(goal),h.HTTP_SHORT_PG_PREPATCH)
+            self.assertEqual((plan['observation_alarm_seconds'],plan['workflow_limit_seconds']),(1230,1260) if pairs==6 else (2130,2160))
+            self.assertEqual({k:v for k,v in plan['adoption_thresholds'].items() if k!='rationale'},
+                {k:v for k,v in prior['adoption_thresholds'].items() if k!='rationale'})
+            with patch.dict(h.TOKEN_PREFIX_C,B='PENDING_TOKEN_PREFIX_COMPLETE_C_SHA256'),self.assertRaisesRegex(ValueError,'not frozen'):
+                h.verify_pg_memory_builds({n:{'files':{'generated C':{'sha256':v}}} for n,v in h.TOKEN_PREFIX_C.items()},goal)
+            with patch.dict(h.TOKEN_PREFIX_C,B='b'*64):
+                identities={n:{'files':{'generated C':{'sha256':v}}} for n,v in h.TOKEN_PREFIX_C.items()}
+                h.verify_pg_memory_builds(identities,goal)
+                for old in (h.FULL_KEY_C,h.OWNER_JOB_C,h.HTTP_STATUS_C,h.V4_MEMORY_C,h.PG_MEMORY_C):
+                    with self.assertRaises(ValueError):h.verify_pg_memory_builds({n:{'files':{'generated C':{'sha256':v}}} for n,v in old.items()},goal)
+            args=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_SHORT_PG_PREPATCH,screen_variants=[],
+                http_short_screen=True,http_short_goal=goal)
+            self.assertEqual(h.hosted_identity(types.SimpleNamespace(**args),'diagnostic')['http_short_goal'],goal)
+            with self.assertRaises(ValueError):h.hosted_identity(types.SimpleNamespace(**dict(args,prepatch=h.HTTP_SHORT_PREPATCH)),'diagnostic')
+        import io
+        output=io.StringIO()
+        with patch('sys.stdout',output),self.assertRaises(SystemExit):h.main(['--help'])
+        for goal in h.TOKEN_PREFIX_GOALS:self.assertIn(goal,output.getvalue())
+
+    def test_token_prefix_uses_existing_memory_and_CPU_decision_without_pooling(self):
+        for goal in h.TOKEN_PREFIX_GOALS:
+            for issue in ('none','no-pg-benefit','cpu','other-memory','compute','incomplete','missing','duplicate','pooled'):
+                with self.subTest(goal=goal,issue=issue):
+                    rows=self.token_prefix_rows(goal)
+                    for row in rows:
+                        if row['name']=='B':
+                            if issue=='no-pg-benefit' and row['workload']=='db':row['memory']['steady_median_bytes']=960000
+                            if issue=='cpu' and row['workload']=='db':row['full_cpu_us']=104
+                            if issue=='other-memory' and row['workload']=='ok':row['memory']['steady_median_bytes']=1040000
+                            if issue=='compute' and row['phase']=='compute-guard':row['full_cpu_us']=104
+                    if issue=='missing':rows.pop()
+                    if issue=='duplicate':rows[-1]=dict(rows[-2])
+                    if issue=='pooled':rows.extend(self.token_prefix_rows(h.TOKEN_PREFIX_GOALS[0]))
+                    result=h.http_short_comparison(rows,issue!='incomplete',{'quality':'pass'},goal)
+                    self.assertEqual(result['eligible_for_confirmation'],issue=='none' and goal==h.TOKEN_PREFIX_GOALS[0])
+                    self.assertEqual(result['eligible_for_root_review'],issue=='none' and goal==h.TOKEN_PREFIX_GOALS[1])
+                    for flag in ('candidate_accepted','formal_qualified','normal_score_eligible','pooling_previous_windows'):self.assertFalse(result[flag])
+                    self.assertEqual(result['maximum_confirmations'],1)
+
+    def test_token_prefix_keeps_control_unknown_and_rejects_missing_quality_or_measurements(self):
+        for goal in h.TOKEN_PREFIX_GOALS:
+            self.assertEqual([r['environment_quality'] for r in self.token_prefix_rows(goal)[:3]],['unknown']*3)
+            for issue in ('aggregate-unknown','aggregate-fail','control-fail','business-unknown','compute-unknown',
+                    'functional_valid','accounting_valid','all_correct','natural_reclamation','measurement_invalid',
+                    'nan-cpu','inf-memory','zero-memory','missing-memory','collector'):
+                with self.subTest(goal=goal,issue=issue):
+                    rows=self.token_prefix_rows(goal);environment={'quality':'pass'}
+                    if issue.startswith('aggregate-'):environment['quality']=issue.split('-',1)[1]
+                    elif issue=='control-fail':rows[0]['environment_quality']='fail'
+                    elif issue=='business-unknown':rows[3]['environment_quality']='unknown'
+                    elif issue=='compute-unknown':rows[-1]['environment_quality']='unknown'
+                    elif issue=='nan-cpu':rows[3]['full_cpu_us']=float('nan')
+                    elif issue=='inf-memory':rows[3]['memory']['steady_median_bytes']=float('inf')
+                    elif issue=='zero-memory':rows[3]['memory']['steady_median_bytes']=0
+                    elif issue=='missing-memory':rows[3]['memory']={'virtual_bytes':1}
+                    elif issue=='collector':rows[3]['independent_collector_fault']=True
+                    else:rows[3].pop(issue)
+                    with patch.object(fc,'paired_interval',side_effect=AssertionError('invalid stage must not score')):
+                        result=h.http_short_comparison(rows,True,environment,goal)
+                    self.assertFalse(result['eligible_for_confirmation'] or result['eligible_for_root_review'])
+                    self.assertEqual(result['comparisons'],{});self.assertEqual(result['other_memory_guards'],{})
+
+    def test_token_prefix_interval_boundaries_match_prior_fullkey_guards(self):
+        def interval(point=1,lower=1,upper=1):return dict(status='estimated',estimate=point,lower95=lower,upper95=upper)
+        for goal,old in zip(h.TOKEN_PREFIX_GOALS,h.FULL_KEY_GOALS):
+            for issue in ('none','PG-point-boundary','PG-too-small','PG-crosses-one','CPU-screen-upper',
+                    'CPU-lower-confirm','CPU-upper-confirm','memory-screen-point','memory-upper-confirm'):
+                with self.subTest(goal=goal,issue=issue):
+                    values=[interval(),interval(),interval(),interval(),interval(),interval(.94,.9,.98)]
+                    if issue=='PG-point-boundary':values[5]=interval(.95,.9,.98)
+                    if issue=='PG-too-small':values[5]=interval(.950001,.9,.98)
+                    if issue=='PG-crosses-one':values[5]=interval(.94,.9,1)
+                    if issue=='CPU-screen-upper':values[4]=interval(1.02,1,1.1)
+                    if issue=='CPU-lower-confirm':values[4]=interval(1.01,1.000001,1.02)
+                    if issue=='CPU-upper-confirm':values[4]=interval(1,1,1.030001)
+                    if issue=='memory-screen-point':values[1]=interval(1.05,1.02,1.1)
+                    if issue=='memory-upper-confirm':values[1]=interval(1,1,1.030001)
+                    with patch.object(fc,'paired_interval',side_effect=values):
+                        result=h.http_short_comparison(self.token_prefix_rows(goal),True,{'quality':'pass'},goal)
+                    with patch.object(fc,'paired_interval',side_effect=values):
+                        previous=h.http_short_comparison(self.token_prefix_rows(old),True,{'quality':'pass'},old)
+                    for field in ('eligible_for_confirmation','eligible_for_root_review','comparisons','pg_memory','other_memory_guards','compute_guard','reasons'):
+                        self.assertEqual(result[field],previous[field])
+
     def owner_job_rows(self,goal):
         return [dict(config,environment_quality='unknown' if config['phase']=='environment-control' else 'pass',
             functional_valid=True,accounting_valid=True,all_correct=True,
@@ -1758,7 +1857,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",workflow)
+        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 
