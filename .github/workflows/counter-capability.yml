@@ -1,0 +1,126 @@
+name: ARM counter capability (no business load)
+"on":
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  capability:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - name: Record counter availability, not performance acceptance
+        shell: bash
+        env:
+          CAPABILITY_DIR: ${{ runner.temp }}/ku-counter-capability
+        run: |
+          python3 -B - <<'PY'
+          import glob, hashlib, json, os, pathlib, re, selectors, shutil, signal, struct, subprocess, sys, time
+          root = pathlib.Path(os.environ['CAPABILITY_DIR']); root.mkdir(parents=True, exist_ok=True)
+          result = {'scope': 'capability facts only; not performance acceptance', 'business_requests': 0, 'commands': [], 'probes': []}
+          limit = 32768
+          def run(argv):
+              record = {'command': argv, 'timeout_seconds': 20, 'output_limit_bytes': limit}; data = bytearray(); stop = None
+              result['commands'].append(record); started = time.monotonic()
+              try:
+                  child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+              except OSError as exc:
+                  record.update(returncode=None, error=str(exc), classification='tool_missing'); return record
+              selector = selectors.DefaultSelector(); selector.register(child.stdout, selectors.EVENT_READ)
+              try:
+                  while selector.get_map() and not stop:
+                      remaining = 20 - (time.monotonic() - started)
+                      if remaining <= 0: stop = 'timeout'; break
+                      for key, _ in selector.select(min(remaining, .2)):
+                          chunk = os.read(key.fd, 4096)
+                          if not chunk: selector.unregister(key.fileobj)
+                          else: data.extend(chunk)
+                          if len(data) > limit: stop = 'output_limit'; break
+              finally:
+                  selector.close(); child.stdout.close()
+                  if not stop:
+                      try: child.wait(timeout=max(.01, 20-(time.monotonic()-started)))
+                      except subprocess.TimeoutExpired: stop = 'timeout'
+                  if stop:
+                      try: os.killpg(child.pid, signal.SIGTERM)
+                      except ProcessLookupError: pass
+                  try: child.wait(timeout=2)
+                  except subprocess.TimeoutExpired:
+                      try: os.killpg(child.pid, signal.SIGKILL)
+                      except ProcessLookupError: pass
+                      child.wait(timeout=2)
+              record.update(returncode=child.returncode, stop=stop, elapsed_seconds=time.monotonic()-started, output=data[:limit].decode(errors='replace'))
+              return record
+          def read(path, size=4096):
+              try:
+                  with pathlib.Path(path).open('rb') as stream: return stream.read(size)
+              except OSError as exc: return ('unavailable: '+str(exc)).encode()
+          def discover():
+              paths = sorted(glob.glob('/usr/lib/linux-tools/*/perf'))[:8] + [shutil.which('perf')]
+              for path in dict.fromkeys(p for p in paths if p):
+                  check = run([path, '--version'])
+                  if check['returncode'] == 0 and re.search(r'\bperf version\b', check.get('output', '')):
+                      result['perf_executable'] = {'path': path, 'realpath': os.path.realpath(path), 'ELF': read(path, 4) == b'\x7fELF'}; return path
+                  check['classification'] = 'tool_missing' if 'perf not found' in check.get('output', '').lower() else 'unusable'
+              return None
+          try:
+              os.environ['LC_ALL'] = 'C'; result['uname'] = run(['uname', '-a']); kernel = os.uname().release
+              result['perf_event_paranoid'] = read('/proc/sys/kernel/perf_event_paranoid').decode(errors='replace').strip()
+              devices = pathlib.Path('/sys/bus/event_source/devices'); result['event_sources'] = []
+              try: device_paths = sorted(devices.iterdir())[:32]
+              except OSError as exc: result['event_sources_error'] = str(exc); device_paths = []
+              for device in device_paths:
+                  events = device/'events'
+                  result['event_sources'].append({'name': device.name[:256], 'type': read(device/'type').decode(errors='replace').strip(), 'events': sorted(p.name[:256] for p in events.iterdir())[:64] if events.is_dir() else []})
+              notes = read('/sys/kernel/notes', 1048576); ids = []; offset = 0; endian = '<' if sys.byteorder == 'little' else '>'
+              while offset + 12 <= len(notes):
+                  names, desc, kind = struct.unpack_from(endian+'III', notes, offset); offset += 12
+                  if names > len(notes)-offset: break
+                  name = notes[offset:offset+names].rstrip(b'\0'); offset += (names+3)&~3
+                  if desc > len(notes)-offset: break
+                  if name == b'GNU' and kind == 3: ids.append(notes[offset:offset+desc].hex())
+                  offset += (desc+3)&~3
+              result['kernel_notes'] = {'bounded_prefix_bytes': len(notes), 'sha256': hashlib.sha256(notes).hexdigest(), 'GNU_build_ids': ids, 'error': notes.decode(errors='replace') if notes.startswith(b'unavailable:') else None}
+              perf = discover()
+              if not perf:
+                  package = None
+                  for candidate in ['linux-tools-'+kernel, 'linux-tools-generic']:
+                      policy = run(['apt-cache', 'policy', candidate])
+                      if re.search(r'Candidate:\s+(?!\(none\))\S+', policy.get('output', '')): package = candidate; break
+                  if package:
+                      result['dependency_install'] = run(['sudo', '-n', 'apt-get', '-q', '-y', '--no-install-recommends', 'install', package]); perf = discover()
+                  else: result['dependency_install'] = {'attempted': False, 'reason': 'no candidate package'}
+              payload = 's=0\nfor i in range(200000): s=(s+i*17+3)&0xffffffff\nprint(s)'
+              for event in ['task-clock', 'cycles', 'instructions']:
+                  probe = {'event': event, 'payload_iterations': 200000, 'payload_target_wall_seconds': .5}
+                  if not perf: probe.update(classification='tool_missing', reason='no executable perf found')
+                  else:
+                      record = run(['sudo', '-n', perf, 'stat', '--no-big-num', '-x,', '-e', event, '--', sys.executable, '-B', '-c', payload]); probe['execution'] = record
+                      text = record.get('output', ''); rows = [line.split(',') for line in text.splitlines() if len(line.split(',')) >= 3 and line.split(',')[2].strip().split(':')[0] == event]
+                      probe['event_rows'] = rows; low = text.lower()
+                      if record.get('stop'): status = 'unknown'; probe['reason'] = record['stop']
+                      elif record.get('classification') == 'tool_missing': status = 'tool_missing'
+                      elif any(word in low for word in ['permission', 'not permitted', 'password is required']): status = 'permission'
+                      elif any(word in low for word in ['not supported', 'unsupported', 'cannot find pmu', 'event syntax error']): status = 'unsupported'
+                      elif rows and record['returncode'] == 0 and re.fullmatch(r'[0-9]+(?:\.[0-9]+)?', rows[0][0].strip()) and float(rows[0][0]) > 0: status = 'available'
+                      elif '<not counted>' in low: status = 'unknown'; probe['reason'] = 'event not counted'
+                      else: status = 'unknown'
+                      probe['classification'] = status
+                  result['probes'].append(probe)
+              result['hardware_events'] = {p['event']: p['classification'] for p in result['probes'] if p['event'] != 'task-clock'}
+          except Exception as exc: result['collection_error'] = type(exc).__name__+': '+str(exc)
+          finally:
+              encoded = json.dumps(result, indent=2).encode()
+              if len(encoded) > 4*1024*1024:
+                  for command in result['commands']: command['output'] = command.get('output', '')[:1024]
+                  result['artifact_output_truncated'] = True; encoded = json.dumps(result, indent=2).encode()
+              if len(encoded) > 4*1024*1024: encoded = json.dumps({'scope': result['scope'], 'collection_error': 'artifact exceeded 4MiB cap'}).encode()
+              (root/'capability.json').write_bytes(encoded)
+          PY
+      - name: Retain bounded capability facts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arm-counter-capability-${{ github.run_id }}
+          path: ${{ runner.temp }}/ku-counter-capability
+          if-no-files-found: error
+          retention-days: 3
