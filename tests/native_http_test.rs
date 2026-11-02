@@ -8387,7 +8387,7 @@ static int fixture_fd_index_clusters(void) {
   CHECK(ku_http_reactor_init(&r,&more,0u));
   size_t calls=fixture_alloc_calls,full=r.hash_capacity;
   CHECK(r.fd_capacity==32u && full>32u && !r.fd_count);
-  for(size_t i=0;i<40u;i++) {
+  for(size_t i=0;i<67u;i++) {
     CHECK(ku_http_reactor_fd_prepare(&r));
     r.registrations[i]=(KuHttpRegistration){(int)(10000u+i),i+1u,i,0,1,-1,0};
     size_t at=ku_http_reactor_fd_bucket(&r,r.registrations[i].fd);
@@ -8398,9 +8398,9 @@ static int fixture_fd_index_clusters(void) {
     }
     for(size_t j=r.fd_capacity;j<full;j++)CHECK(!r.fd_entries[j]);
   }
-  CHECK(r.fd_capacity==128u && fixture_alloc_calls==calls && r.fd_count==40u);
-  for(size_t i=0;i<40u;i++) {ku_http_reactor_fd_remove(&r,i);r.registrations[i]=(KuHttpRegistration){0};}
-  CHECK(!r.fault && !r.fd_count && r.fd_capacity==128u && r.hash_capacity==full);
+  CHECK(r.fd_capacity==256u && fixture_alloc_calls==calls && r.fd_count==67u);
+  for(size_t i=0;i<67u;i++) {ku_http_reactor_fd_remove(&r,i);r.registrations[i]=(KuHttpRegistration){0};}
+  CHECK(!r.fault && !r.fd_count && r.fd_capacity==256u && r.hash_capacity==full);
   for(size_t i=0;i<full;i++)CHECK(!r.fd_entries[i]);
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
   puts("http-persistent-fd-index-collision-backshift-ok");return 0;
@@ -8547,7 +8547,32 @@ static int fixture_closed_event_source(void) {
   reactor.descriptor=-1;CHECK(!close(pair[1]));ku_http_reactor_destroy(&reactor);
   puts("http-persistent-closed-event-source-fault-ok");return 0;
 }
+static int fixture_full_key_capacity(void) {
+  const size_t cases[]={3u,4u,5u,6u,7u,8u,9u,12u,13u,16u,17u,24u,25u,32u,33u,64u,65u,2048u,4096u,4163u,8192u,16384u,57347u};
+  for(size_t c=0;c<sizeof(cases)/sizeof(*cases);c++) {
+    size_t cap=cases[c];KuHttpActiveSet active={NULL,0,NULL};KuHttpReactor r;
+    CHECK(ku_http_reactor_init_pending(&r,&active,0u,cap-3u));
+    size_t buckets=ku_http_reactor_token_capacity(&r);
+    CHECK(r.capacity==cap && buckets>=8u && cap*4u<=buckets*3u);
+    CHECK(r.hash_capacity>=cap*2u && r.fd_capacity==(r.hash_capacity<32u?r.hash_capacity:32u));
+    CHECK(fixture_live_bytes+(r.hash_capacity-buckets)*sizeof(*r.hash)
+        ==ku_http_reactor_pending_storage_bytes(0u,0u,cap-3u)-sizeof(r));
+    if(cap==4163u)CHECK(buckets==8192u && r.hash_capacity==16384u);
+    for(size_t i=0;i<cap;i++) CHECK(ku_http_reactor_hash_add(&r,UINT64_MAX-1u-i,i));
+    for(size_t i=0;i<cap;i++) CHECK(ku_http_reactor_lookup(&r,UINT64_MAX-1u-i)==i);
+    /* Delete across every probe cluster, then verify every survivor and stale
+     * full-width key before draining. No tombstone or narrowed identity. */
+    for(size_t i=1u;i<cap;i+=2u)ku_http_reactor_hash_remove(&r,UINT64_MAX-1u-i);
+    for(size_t i=0;i<cap;i++) CHECK(ku_http_reactor_lookup(&r,UINT64_MAX-1u-i)==(i%2u?SIZE_MAX:i));
+    for(size_t i=0;i<cap;i+=2u)ku_http_reactor_hash_remove(&r,UINT64_MAX-1u-i);
+    CHECK(!r.fault);
+    for(size_t i=0;i<buckets;i++)CHECK(!r.hash[i].token);
+    ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  }
+  return 0;
+}
 int main(int argc,char** argv) {
+  if(argc>1 && !strcmp(argv[1],"full-key-capacity"))return fixture_full_key_capacity();
   if(argc>1 && !strcmp(argv[1],"fd-index-clusters"))return fixture_fd_index_clusters();
   if(argc>1 && !strcmp(argv[1],"fd-index-init-failures"))return fixture_fd_index_init_failures();
   if(argc>1 && !strcmp(argv[1],"failed-new-alias"))return fixture_failed_new_preserves_alias();
@@ -8673,6 +8698,7 @@ int main(int argc,char** argv) {
     // registration. Root serializes execution; product code is unchanged.
     let mut failures = Vec::new();
     for scenario in [
+        "full-key-capacity",
         "fd-index-clusters",
         "fd-index-init-failures",
         "failed-new-alias",
