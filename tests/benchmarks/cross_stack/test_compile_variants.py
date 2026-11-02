@@ -176,16 +176,16 @@ class HostedWorkflowContracts(unittest.TestCase):
 
     def test_only_explicit_performance_dispatch_selects_one_arm_job(self):
         text,job=self.workflow()
-        self.assertIn("task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]",text)
+        self.assertIn("task-main-path, windows-task-main-path, http-short-proof, pg-terminal-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]",text)
         self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)",job)
         self.assertIn('runs-on: ubuntu-24.04-arm',job)
-        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",job)
+        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'pg-terminal-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'pg-terminal-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",job)
         self.assertIn('permissions:\n      contents: read',job)
         job_env=job.split('\n    env:\n',1)[1].split('\n    steps:',1)[0]
         self.assertNotIn('runner.',job_env, 'GitHub does not allow runner context in jobs.<job>.env')
         self.assertIn("printf 'KU_PERFORMANCE_V2_ROOT=%s\\n' \"$RUNNER_TEMP/ku-performance-v2\" >> \"$GITHUB_ENV\"",job)
         self.assertNotIn('strategy:',job)
-        self.assertIn("(inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')",text)
+        self.assertIn("(inputs.scope != 'http-short-proof' && inputs.scope != 'pg-terminal-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')",text)
         self.assertIn("&& format('-{0}', inputs.scope) || ''",text)
 
     def test_fixed_toolchains_and_nonroot_build_precede_root_execution(self):
@@ -212,7 +212,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertIn('set -euo pipefail',run)
         self.assertIn('KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}',run)
         self.assertIn('Dispatch these scopes serially',run)
-        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",run)
+        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'pg-terminal-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'pg-terminal-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",run)
         for sdk in ('setup-node','setup-java','setup-dotnet','docker','gh release','git push'):
             self.assertNotIn(sdk,job)
 
@@ -251,7 +251,7 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test -z "$KU_PERFORMANCE_V2_REUSE_RUN"','test -z "$KU_PERFORMANCE_V2_VARIANTS"'):
             self.assertIn(check,verify)
         self.assertEqual(job.count('performance_task_json_args+=(--pg-failure-probe)'),2)
-        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",job)
+        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'pg-terminal-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'pg-terminal-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",job)
         small=job.split('- name: Retain the small redacted PG failure observation',1)[1]
         self.assertIn('if: always() && inputs.pg_failure_probe',small)
         self.assertIn('name: ku-pg-failure-observation',small)
@@ -271,7 +271,7 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test -z "$KU_PERFORMANCE_V2_REUSE_RUN"','test -z "$KU_PERFORMANCE_V2_VARIANTS"'):
             self.assertIn(check,verify)
         self.assertEqual(job.count('performance_task_json_args+=(--normal-self-probe)'),2)
-        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",job)
+        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'pg-terminal-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'pg-terminal-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",job)
         small=job.split('- name: Retain the small redacted normal SELF observation',1)[1]
         self.assertIn('if: always() && inputs.normal_self_probe',small)
         self.assertIn('name: ku-normal-self-observation',small)
@@ -309,7 +309,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertNotIn('http_wake_screen:',text)
         self.assertNotIn('--http-wake-screen',text)
         self.assertIn('http_short_goal:\n',text)
-        self.assertIn('default: cpu\n        options: [cpu, memory, pg-memory, v4-memory-screen, v4-memory-confirm, http-status-screen, http-status-confirm, full-key-screen, full-key-confirm, owner-job-screen, owner-job-confirm, token-prefix-screen, token-prefix-confirm]',text)
+        self.assertIn('default: cpu\n        options: [cpu, memory, pg-memory, v4-memory-screen, v4-memory-confirm, http-status-screen, http-status-confirm, full-key-screen, full-key-confirm, owner-job-screen, owner-job-confirm, token-prefix-screen, token-prefix-confirm, pg-terminal-screen, pg-terminal-confirm]',text)
         self.assertIn("KU_PERFORMANCE_V2_HTTP_SHORT_GOAL: ${{ inputs.http_short_goal || 'cpu' }}",job)
         archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
         self.assertIn('--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" --build-set diagnostic --prepatch "$KU_PERFORMANCE_V2_PREPATCH"',archive)
@@ -317,7 +317,7 @@ class HostedWorkflowContracts(unittest.TestCase):
 
     def test_owner_job_workflow_preserves_prepatch_timeout_and_functional_gates(self):
         text,job=self.workflow()
-        self.assertIn('full-key-screen, full-key-confirm, owner-job-screen, owner-job-confirm, token-prefix-screen, token-prefix-confirm]',text)
+        self.assertIn('full-key-screen, full-key-confirm, owner-job-screen, owner-job-confirm, token-prefix-screen, token-prefix-confirm, pg-terminal-screen, pg-terminal-confirm]',text)
         self.assertIn('"$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = owner-job-*',job)
         self.assertIn("inputs.http_short_goal == 'owner-job-screen') && 21",job)
         self.assertIn("inputs.http_short_goal == 'owner-job-confirm') && 36",job)
@@ -335,7 +335,7 @@ class HostedWorkflowContracts(unittest.TestCase):
 
     def test_token_prefix_workflow_selects_frozen_prepatch_and_existing_bounded_windows(self):
         text,job=self.workflow()
-        self.assertIn('owner-job-screen, owner-job-confirm, token-prefix-screen, token-prefix-confirm]',text)
+        self.assertIn('owner-job-screen, owner-job-confirm, token-prefix-screen, token-prefix-confirm, pg-terminal-screen, pg-terminal-confirm]',text)
         self.assertIn('"$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = token-prefix-*',job)
         self.assertIn("inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21",job)
         self.assertIn("inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36",job)
@@ -343,6 +343,52 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertIn('test "$KU_PERFORMANCE_V2_PREPATCH" = 166453a1d2768bbce19796d9c7823be73cc84ccb',mode)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',mode)
         self.assertEqual(job.count('performance_task_json_args+=(--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL")'),2)
+
+    def test_pg_terminal_workflow_uses_frozen_identity_and_bounded_stage_limits(self):
+        text,job=self.workflow()
+        self.assertIn('token-prefix-screen, token-prefix-confirm, pg-terminal-screen, pg-terminal-confirm]',text)
+        self.assertIn('"$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = pg-terminal-*',job)
+        self.assertIn("inputs.http_short_goal == 'pg-terminal-screen' || inputs.http_short_goal == 'token-prefix-screen'",job)
+        self.assertIn("inputs.http_short_goal == 'pg-terminal-confirm' || inputs.http_short_goal == 'token-prefix-confirm'",job)
+        mode=job.split('if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then',1)[1].split('\n          if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE"',1)[0]
+        self.assertIn('test "$KU_PERFORMANCE_V2_PREPATCH" = 166453a1d2768bbce19796d9c7823be73cc84ccb',mode)
+        self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',mode)
+
+    def test_pg_terminal_proof_reuses_three_OS_job_without_running_legacy_proofs(self):
+        text,_=self.workflow()
+        self.assertIn('http-short-proof, pg-terminal-proof, performance-v2',text)
+        bounded=text.split('\n  http-short-proof:\n',1)[1].split('\n  task-main-path:\n',1)[0]
+        self.assertIn("(inputs.scope == 'http-short-proof' || inputs.scope == 'pg-terminal-proof')",bounded)
+        self.assertIn('os: [ubuntu-24.04, windows-2025, macos-15]',bounded)
+        self.assertIn('KU_CC: "clang -O2"',bounded)
+        old_http=bounded.split('- name: Run bounded proof and affected HTTP contracts',1)[1].split('\n      - name:',1)[0]
+        old_detectors=bounded.split('- name: Check the request owner path with Linux detectors',1)[1].split('\n      - name:',1)[0]
+        self.assertIn("if: inputs.scope == 'http-short-proof'",old_http)
+        self.assertIn("if: runner.os == 'Linux' && inputs.scope == 'http-short-proof'",old_detectors)
+        pg=bounded.split('- name: Run PG terminal and shared owner contracts',1)[1].split('\n      - name:',1)[0]
+        self.assertIn("if: inputs.scope == 'pg-terminal-proof'",pg)
+        self.assertIn('cargo fmt --all -- --check',pg)
+        self.assertIn('--test native_pg_query_poll_test -- --nocapture --test-threads=1',pg)
+        self.assertIn('27 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out;',pg)
+        for name in ('native_pg_query_poller_live_loopback_roundtrip','native_pg_finite_pipeline_live_loopback_preserves_conditional_reset_boundary'):
+            self.assertIn(name,pg)
+        self.assertIn('grep -F "$name ... ignored," "$pg_log"',pg)
+        self.assertIn('native_task_frame_c_test:native_task_frame_pending_resume_cancel_and_payload_drop_execute_in_c',pg)
+        self.assertIn('native_http_test:native_http_async_tcp_waits_share_owner_loops_without_occupying_blocking_worker',pg)
+        detector=bounded.split('- name: Check PG terminal ownership with Linux detectors',1)[1]
+        self.assertIn("if: runner.os == 'Linux' && inputs.scope == 'pg-terminal-proof'",detector)
+        self.assertIn('clang -O2 -fsanitize=address,undefined',detector)
+        self.assertIn('ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"',detector)
+        self.assertIn('UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"',detector)
+        for name in ('native_pg_async_notification_pins_survive_close_and_owner_cancellation',
+                'native_pg_compact_result_growth_oom_and_detached_lifetime_keep_physical_budget',
+                'native_pg_typed_single_row_binary_values_validate_types_and_survive_reset'):
+            self.assertIn(name,detector)
+        self.assertIn('-- --exact --nocapture --test-threads=1',detector)
+        self.assertIn('1 passed; 0 failed; 0 ignored;',detector)
+        self.assertNotIn('native_http_bounded_json',pg+detector)
+        self.assertNotIn('native_http_persistent_owner',pg+detector)
+        self.assertIn("inputs.scope != 'http-short-proof' && inputs.scope != 'pg-terminal-proof'",text)
 
     def test_pg_driver_screen_is_fresh_exclusive_and_never_a_capacity_ranking(self):
         text,job=self.workflow()
@@ -372,7 +418,7 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = false','test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',
                 'test -z "$KU_PERFORMANCE_V2_VARIANTS"'):self.assertIn(check,verify)
         self.assertEqual(job.count('performance_task_json_args+=(--pg-queue-screen)'),2)
-        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",job)
+        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'pg-terminal-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'pg-terminal-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",job)
         self.assertIn('if: always() && inputs.pg_queue_screen',job)
         self.assertIn('name: ku-pg-queue-observation',job)
         self.assertIn('path: ${{ runner.temp }}/ku-performance-v2/pg-queue-observation',job)

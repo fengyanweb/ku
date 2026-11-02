@@ -27,6 +27,8 @@ TOKEN_PREFIX_GOALS=('token-prefix-screen','token-prefix-confirm')
 TOKEN_PREFIX_C=dict(PG_MEMORY_C,B='66147a80c2df7e7dcc7ef5bc6d5a85a6babd2bd5f60437f142c98167b274d23a')
 OWNER_JOB_GOALS=('owner-job-screen','owner-job-confirm')
 OWNER_JOB_C=dict(PG_MEMORY_C,B='8010370bbc8867e7f39267f722250db493b20ce70c0d73b5a238a575e939fad4')
+PG_TERMINAL_GOALS=('pg-terminal-screen','pg-terminal-confirm')
+PG_TERMINAL_C=dict(PG_MEMORY_C,B='d05ed9e80423ade5a30adf9d0dccfab92ed8f18007dfbd44972411b257500785')
 HTTP_STATUS_GOALS=('http-status-screen','http-status-confirm')
 HTTP_STATUS_C=dict(PG_MEMORY_C,B='2bfb5abc1c6ec68a3529d21b264cc4ead70eb93ebb564bedeba3a317d94d7b78')
 V4_GOALS=('v4-memory-screen','v4-memory-confirm')
@@ -51,16 +53,18 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def http_short_prepatch(goal):
-    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS):raise ValueError('unregistered HTTP short goal')
-    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS) else HTTP_SHORT_PREPATCH
+    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*PG_TERMINAL_GOALS):raise ValueError('unregistered HTTP short goal')
+    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*PG_TERMINAL_GOALS) else HTTP_SHORT_PREPATCH
 
 
 def verify_pg_memory_builds(identities,goal='pg-memory'):
+    if goal in PG_TERMINAL_GOALS and not re.fullmatch('[0-9a-f]{64}',PG_TERMINAL_C['B']):
+        raise ValueError('PG terminal complete generated C identity is not frozen')
     if goal in TOKEN_PREFIX_GOALS and not re.fullmatch('[0-9a-f]{64}',TOKEN_PREFIX_C['B']):
         raise ValueError('token-prefix complete generated C identity is not frozen')
     if goal in OWNER_JOB_GOALS and not re.fullmatch('[0-9a-f]{64}',OWNER_JOB_C['B']):
         raise ValueError('owner Job complete generated C identity is not frozen')
-    for name,expected in (TOKEN_PREFIX_C if goal in TOKEN_PREFIX_GOALS else OWNER_JOB_C if goal in OWNER_JOB_GOALS else FULL_KEY_C if goal in FULL_KEY_GOALS else HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
+    for name,expected in (PG_TERMINAL_C if goal in PG_TERMINAL_GOALS else TOKEN_PREFIX_C if goal in TOKEN_PREFIX_GOALS else OWNER_JOB_C if goal in OWNER_JOB_GOALS else FULL_KEY_C if goal in FULL_KEY_GOALS else HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
         if identities.get(name,{}).get('files',{}).get('generated C',{}).get('sha256')!=expected:
             raise ValueError('PG memory screen requires the exact preregistered complete C: '+name)
 
@@ -298,6 +302,7 @@ def normal_self_plan(versions):
 
 
 def http_short_plan(versions,goal='cpu'):
+    if goal in PG_TERMINAL_GOALS:return pg_terminal_plan(versions,goal)
     if goal in TOKEN_PREFIX_GOALS:return token_prefix_plan(versions,goal)
     if goal in OWNER_JOB_GOALS:return owner_job_plan(versions,goal)
     if goal in FULL_KEY_GOALS:return full_key_plan(versions,goal)
@@ -338,6 +343,7 @@ def http_short_plan(versions,goal='cpu'):
 
 
 def http_short_comparison(rows,complete,environment=None,goal='cpu'):
+    if goal in PG_TERMINAL_GOALS:return owner_job_comparison(rows,complete,environment,goal)
     if goal in TOKEN_PREFIX_GOALS:return v4_short_comparison(rows,complete,environment,goal)
     if goal in OWNER_JOB_GOALS:return owner_job_comparison(rows,complete,environment,goal)
     if goal in FULL_KEY_GOALS:return v4_short_comparison(rows,complete,environment,goal)
@@ -542,8 +548,22 @@ def owner_job_plan(versions,goal):
     return plan
 
 
+def pg_terminal_plan(versions,goal):
+    if goal not in PG_TERMINAL_GOALS:raise ValueError('unregistered PG terminal stage')
+    plan=owner_job_plan(versions,OWNER_JOB_GOALS[1] if goal==PG_TERMINAL_GOALS[1] else OWNER_JOB_GOALS[0])
+    plan.update(http_short_goal=goal,
+        purpose='One PG terminal-retire candidate on original166453 helpers/O2 and unchanged HTTP/token/owner Job paths.6pairs screen then at most one independent12pair confirmation after eligible screen, no pooled stages, replacements or original16goal completion.',
+        evidence_basis=dict(complete_C=PG_TERMINAL_C,source_product_commit='14dc8ccd1f91c5a67c6a03906e1392bc30615a2e',other_v4_candidates_excluded=True,
+            mechanism='Pinned owner terminal completion retires with one pin check, removing two redundant terminal pool-lock validations. SQL/reset/readiness and cleanup contracts unchanged; not the earlier readiness candidate.',
+            performance_effect='unknown before paired normal full-call measurements; removed validations do not establish a CPU share or promised benefit.'))
+    plan['adoption_thresholds']['primary_workload']='db'
+    return plan
+
+
 def owner_job_comparison(rows,complete,environment,goal):
-    plan=owner_job_plan({},goal);confirm=goal==OWNER_JOB_GOALS[1]
+    terminal=goal in PG_TERMINAL_GOALS
+    plan=pg_terminal_plan({},goal) if terminal else owner_job_plan({},goal)
+    confirm=goal in (OWNER_JOB_GOALS[1],PG_TERMINAL_GOALS[1])
     groups=range(1,plan['paired_windows_per_business']+1);limits=plan['adoption_thresholds']
     result=dict(complete=complete,http_short_goal=goal,eligible_for_confirmation=False,eligible_for_root_review=False,
         candidate_accepted=False,formal_qualified=False,normal_score_eligible=False,reasons=[],comparisons={},memory_intervals={},
@@ -552,6 +572,7 @@ def owner_job_comparison(rows,complete,environment,goal):
     if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification failed or unknown')
     if not complete:
         result['reasons'].append('incomplete observations or cleanup; no metric scoring');return result
+    if terminal and result['reasons']:return result
     key=lambda r:(r.get('phase'),r.get('workload'),r.get('group'),r.get('name'))
     actual=[key(r) for r in rows];expected=[key(r) for r in plan['windows']]
     if len(actual)!=len(expected) or len(set(actual))!=len(actual) or set(actual)!=set(expected):
@@ -578,9 +599,9 @@ def owner_job_comparison(rows,complete,environment,goal):
         if cpu.get('status')!='estimated' or (cpu['lower95']>limits['confirmation_CPU_lower95_maximum'] or cpu['upper95']>limits['confirmation_CPU_upper95_maximum'] if confirm
                 else cpu['estimate']>limits['screen_related_CPU_point_maximum'] or cpu['lower95']>limits['screen_related_CPU_lower95_maximum']):
             result['reasons'].append(workload+' CPU '+('confirmation guard unresolved/failed' if confirm else 'screen failed'))
-        if workload=='ok' and (cpu.get('status')!='estimated' or cpu['estimate']>limits['CPU_ratio_maximum'] or
+        if workload==limits['primary_workload'] and (cpu.get('status')!='estimated' or cpu['estimate']>limits['CPU_ratio_maximum'] or
                 (cpu['upper95']>=limits['confirmation_primary_CPU_upper95_strictly_below'] if confirm else cpu['upper95']>limits['screen_primary_CPU_upper95_maximum'])):
-            result['reasons'].append('ordinaryHTTP CPU benefit criterion not demonstrated')
+            result['reasons'].append(('PG terminal' if terminal else 'ordinaryHTTP')+' CPU benefit criterion not demonstrated')
         if memory.get('status')!='estimated' or (memory['lower95']>limits['confirmation_memory_lower95_maximum'] or memory['upper95']>limits['confirmation_memory_upper95_maximum'] if confirm
                 else memory['estimate']>limits['screen_memory_point_maximum'] or memory['lower95']>limits['screen_memory_lower95_maximum']):
             result['reasons'].append(workload+' memory '+('confirmation guard unresolved/failed' if confirm else 'screen failed'))
@@ -960,7 +981,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
-    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS):
+    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*PG_TERMINAL_GOALS):
         verify_pg_memory_builds(identities,getattr(a,'http_short_goal','cpu'))
     if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
@@ -2724,7 +2745,7 @@ def main(argv=None):
     p.add_argument('--fixed-goals-only',action='store_true',help='Explicit full-build/run stop after controls, admission and original80 windows/16 goals; capacity/stability and whole acceptance remain incomplete')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*PG_TERMINAL_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit frozen control+normal A/B candidate diagnostic; goal selects exact windows/prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')

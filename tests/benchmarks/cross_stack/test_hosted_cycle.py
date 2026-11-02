@@ -14,6 +14,104 @@ import http_cost_diagnostic as hcd
 
 
 class HostedCycleTests(unittest.TestCase):
+    def pg_terminal_rows(self,goal):
+        rows=self.owner_job_rows(goal)
+        for row in rows:
+            if row['name']=='B':row['full_cpu_us']=98 if row['workload']=='db' else 100
+        return rows
+
+    def test_pg_terminal_stages_bind_only_the_fixed_complete_C(self):
+        for goal,count,pairs in zip(h.PG_TERMINAL_GOALS,(41,77),(6,12)):
+            plan=h.http_short_plan({},goal);reference=h.full_key_plan({},h.FULL_KEY_GOALS[1] if pairs==12 else h.FULL_KEY_GOALS[0])
+            self.assertEqual(plan['windows'],reference['windows']);self.assertEqual(plan['resources'],reference['resources'])
+            self.assertEqual(plan['quality_policy'],reference['quality_policy'])
+            self.assertEqual((plan['maximum_windows'],plan['paired_windows_per_business']),(count,pairs))
+            self.assertEqual((plan['maximum_replacements'],plan['maximum_confirmations']),(0,1))
+            self.assertTrue(plan['confirmation_requires_screen_eligible'])
+            self.assertEqual((plan['observation_alarm_seconds'],plan['workflow_limit_seconds']),(1230,1260) if pairs==6 else (2130,2160))
+            self.assertEqual(h.http_short_prepatch(goal),h.HTTP_SHORT_PG_PREPATCH)
+            self.assertEqual(plan['adoption_thresholds']['primary_workload'],'db')
+            self.assertEqual(plan['adoption_thresholds']['CPU_ratio_maximum'],.99)
+            self.assertEqual(plan['adoption_thresholds']['screen_primary_CPU_upper95_maximum'],1.03)
+            self.assertEqual(plan['evidence_basis']['source_product_commit'],'14dc8ccd1f91c5a67c6a03906e1392bc30615a2e')
+            identities={n:{'files':{'generated C':{'sha256':v}}} for n,v in h.PG_TERMINAL_C.items()}
+            h.verify_pg_memory_builds(identities,goal)
+            for old in (h.TOKEN_PREFIX_C,h.OWNER_JOB_C,h.FULL_KEY_C,h.HTTP_STATUS_C,h.V4_MEMORY_C,h.PG_MEMORY_C):
+                with self.assertRaises(ValueError):h.verify_pg_memory_builds({n:{'files':{'generated C':{'sha256':v}}} for n,v in old.items()},goal)
+            for name in ('A','B'):
+                changed=json.loads(json.dumps(identities));changed[name]['files']['generated C']['sha256']='0'*64
+                with self.assertRaises(ValueError):h.verify_pg_memory_builds(changed,goal)
+            args=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_SHORT_PG_PREPATCH,screen_variants=[],http_short_screen=True,http_short_goal=goal)
+            self.assertEqual(h.hosted_identity(types.SimpleNamespace(**args),'diagnostic')['http_short_goal'],goal)
+            with self.assertRaises(ValueError):h.hosted_identity(types.SimpleNamespace(**dict(args,prepatch=h.HTTP_SHORT_PREPATCH)),'diagnostic')
+        import io
+        output=io.StringIO()
+        with patch('sys.stdout',output),self.assertRaises(SystemExit):h.main(['--help'])
+        for goal in h.PG_TERMINAL_GOALS:self.assertIn(goal,output.getvalue())
+
+    def test_pg_terminal_requires_PG_benefit_and_all_related_guards(self):
+        for goal in h.PG_TERMINAL_GOALS:
+            for issue in ('none','small-PG-benefit','HTTP-only-benefit','other-CPU','memory','compute','incomplete','missing','duplicate','pooled'):
+                with self.subTest(goal=goal,issue=issue):
+                    rows=self.pg_terminal_rows(goal)
+                    for row in rows:
+                        if row['name']=='B':
+                            if issue=='small-PG-benefit' and row['workload']=='db':row['full_cpu_us']=99.5
+                            if issue=='HTTP-only-benefit':row['full_cpu_us']=100 if row['workload']=='db' else 98
+                            if issue=='other-CPU' and row['workload']=='ok':row['full_cpu_us']=104
+                            if issue=='memory' and row['workload']=='json_object':row['memory']['steady_median_bytes']=1040000
+                            if issue=='compute' and row['phase']=='compute-guard':row['full_cpu_us']=104
+                    if issue=='missing':rows.pop()
+                    if issue=='duplicate':rows[-1]=dict(rows[-2])
+                    if issue=='pooled':rows.extend(self.pg_terminal_rows(h.PG_TERMINAL_GOALS[0]))
+                    result=h.http_short_comparison(rows,issue!='incomplete',{'quality':'pass'},goal)
+                    self.assertEqual(result['eligible_for_confirmation'],issue=='none' and goal==h.PG_TERMINAL_GOALS[0])
+                    self.assertEqual(result['eligible_for_root_review'],issue=='none' and goal==h.PG_TERMINAL_GOALS[1])
+                    for flag in ('candidate_accepted','formal_qualified','normal_score_eligible','pooling_previous_windows'):self.assertFalse(result[flag])
+                    self.assertEqual(result['maximum_confirmations'],1)
+
+    def test_pg_terminal_interval_boundaries_are_frozen_before_measurement(self):
+        def interval(point=1,lower=1,upper=1):return dict(status='estimated',estimate=point,lower95=lower,upper95=upper)
+        for goal in h.PG_TERMINAL_GOALS:
+            confirm=goal==h.PG_TERMINAL_GOALS[1]
+            for issue in ('none','primary-screen-boundary','primary-small-benefit','primary-crosses-one','primary-upper-too-wide',
+                    'other-CPU-wide','other-CPU-lower','other-memory-wide','other-memory-lower','confirm-upper'):
+                with self.subTest(goal=goal,issue=issue):
+                    values=[interval(),interval(),interval(),interval(),interval(.98,.97,.99),interval()]
+                    if issue=='primary-screen-boundary':values[4]=interval(.99,.95,1.03)
+                    if issue=='primary-small-benefit':values[4]=interval(.990001,.98,.999)
+                    if issue=='primary-crosses-one':values[4]=interval(.98,.95,1)
+                    if issue=='primary-upper-too-wide':values[4]=interval(.98,.94,1.030001)
+                    if issue=='other-CPU-wide':values[0]=interval(1.02,1,1.1)
+                    if issue=='other-CPU-lower':values[0]=interval(1.01,1.000001,1.02)
+                    if issue=='other-memory-wide':values[1]=interval(1.02,1,1.1)
+                    if issue=='other-memory-lower':values[1]=interval(1.01,1.000001,1.02)
+                    if issue=='confirm-upper':values[1]=interval(1,1,1.030001)
+                    with patch.object(fc,'paired_interval',side_effect=values):
+                        result=h.http_short_comparison(self.pg_terminal_rows(goal),True,{'quality':'pass'},goal)
+                    passed=issue=='none' or not confirm and issue not in ('primary-small-benefit','primary-upper-too-wide')
+                    self.assertEqual(result['eligible_for_root_review'] if confirm else result['eligible_for_confirmation'],passed)
+
+    def test_pg_terminal_rejects_missing_quality_and_preserves_original_control_shape(self):
+        for goal in h.PG_TERMINAL_GOALS:
+            rows=self.pg_terminal_rows(goal);self.assertEqual([r['environment_quality'] for r in rows[:3]],['unknown']*3)
+            for issue in ('aggregate-unknown','aggregate-fail','control-fail','business-unknown','compute-unknown',
+                    'functional_valid','accounting_valid','all_correct','natural_reclamation','measurement_invalid','nan-CPU','missing-memory','collector'):
+                with self.subTest(goal=goal,issue=issue):
+                    rows=self.pg_terminal_rows(goal);environment={'quality':'pass'}
+                    if issue.startswith('aggregate-'):environment['quality']=issue.split('-',1)[1]
+                    elif issue=='control-fail':rows[0]['environment_quality']='fail'
+                    elif issue=='business-unknown':rows[3]['environment_quality']='unknown'
+                    elif issue=='compute-unknown':rows[-1]['environment_quality']='unknown'
+                    elif issue=='nan-CPU':rows[3]['full_cpu_us']=float('nan')
+                    elif issue=='missing-memory':rows[3]['memory']={'virtual_bytes':1}
+                    elif issue=='collector':rows[3]['independent_collector_fault']=True
+                    else:rows[3].pop(issue)
+                    with patch.object(fc,'paired_interval',side_effect=AssertionError('invalid stage cannot score')):
+                        result=h.http_short_comparison(rows,True,environment,goal)
+                    self.assertFalse(result['eligible_for_confirmation'] or result['eligible_for_root_review'])
+                    self.assertEqual(result['comparisons'],{});self.assertEqual(result['memory_intervals'],{})
+
     def token_prefix_rows(self,goal):
         rows=self.owner_job_rows(goal)
         for row in rows:
@@ -1857,7 +1955,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",workflow)
+        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'pg-terminal-screen' || inputs.http_short_goal == 'token-prefix-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'pg-terminal-confirm' || inputs.http_short_goal == 'token-prefix-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 
