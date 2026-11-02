@@ -750,6 +750,20 @@ static const char* ku_http_status_text(int64_t status) {
     default: return "Unknown";
   }
 }
+static int ku_http_status_line(char* buffer,size_t capacity,int64_t status) {
+  if(!buffer || status<100 || status>599) return -1;
+  const char* reason=ku_http_status_text(status);size_t length=0;
+  while(length<64u && reason[length]) length++;
+  if(length==64u || capacity<16u+length) return -1;
+  unsigned int code=(unsigned int)status;
+  memcpy(buffer,"HTTP/1.1 ",9u);
+  buffer[9]=(char)('0'+code/100u);
+  buffer[10]=(char)('0'+(code/10u)%10u);
+  buffer[11]=(char)('0'+code%10u);buffer[12]=' ';
+  memcpy(buffer+13u,reason,length);
+  buffer[13u+length]='\r';buffer[14u+length]='\n';buffer[15u+length]=0;
+  return (int)(15u+length);
+}
 static KuString ku_http_string_copy(const char* ptr, size_t len) {
   if (len == 0) return (KuString){0};
   uint8_t* data = (uint8_t*)malloc(len);
@@ -2304,7 +2318,7 @@ static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServ
   if(response.status>=500) ku_http_record_failure(connection,(int)response.status);
   size_t body_length = ((response.status >= 100 && response.status < 200) || response.status == 204 || response.status == 304)
     ? 0 : response.body.len;
-  int first_length = snprintf(output->first, sizeof(output->first), "HTTP/1.1 %lld %s\r\n", (long long)response.status, ku_http_status_text(response.status));
+  int first_length = ku_http_status_line(output->first, sizeof(output->first), response.status);
   if (first_length < 0 || (size_t)first_length >= sizeof(output->first)) {
     ku_http_connection_close(connection); return;
   }

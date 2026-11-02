@@ -4651,16 +4651,31 @@ static void fixture_pressure(KuHttpConnection* connection) {
     let checks = r#"
 int main(void) {
   KuHttpConnection connection; KuHttpServer server={0};
-  /* Every supported status and the default Unknown reason must fit the real
-     production layout, including CRLF and the snprintf terminator. */
+  /* Compare every status to the previous wire contract, including Unknown,
+   * CRLF, NUL and exact/short capacities. Failed writes leave the buffer alone. */
   for(int status=100;status<=599;status++) {
-    int length=snprintf(connection.output.first,sizeof(connection.output.first),
+    char expected[64];int reference=snprintf(expected,sizeof(expected),
         "HTTP/1.1 %d %s\r\n",status,ku_http_status_text(status));
+    int length=ku_http_status_line(connection.output.first,sizeof(connection.output.first),status);
     CHECK(length>0 && (size_t)length<sizeof(connection.output.first));
+    CHECK(length==reference && !memcmp(connection.output.first,expected,(size_t)length+1u));
     CHECK(connection.output.first[length]=='\0');
     if(status==431)CHECK(length==46);
     if(status==599)CHECK(!strcmp(connection.output.first,"HTTP/1.1 599 Unknown\r\n"));
+    for(size_t capacity=0;capacity<=(size_t)length;capacity++) {
+      memset(connection.output.first,0xa5,sizeof(connection.output.first));
+      CHECK(ku_http_status_line(connection.output.first,capacity,status)==-1);
+      for(size_t i=0;i<sizeof(connection.output.first);i++)CHECK((unsigned char)connection.output.first[i]==0xa5);
+    }
+    memset(connection.output.first,0xa5,sizeof(connection.output.first));
+    CHECK(ku_http_status_line(connection.output.first,(size_t)length+1u,status)==length);
+    CHECK(!memcmp(connection.output.first,expected,(size_t)length+1u));
+    CHECK((unsigned char)connection.output.first[length+1]==0xa5);
   }
+  CHECK(ku_http_status_line(NULL,64u,200)==-1);
+  const int64_t invalid_status[]={INT64_MIN,99,600,INT64_MAX};
+  for(size_t i=0;i<sizeof(invalid_status)/sizeof(*invalid_status);i++)
+    CHECK(ku_http_status_line(connection.output.first,sizeof(connection.output.first),invalid_status[i])==-1);
   static const unsigned char fixture_prefix_bytes[9]={'H',0,'I','a','b','c','d','e','f'};
   /* The first-write opportunity is one syscall and16KiB, not an unbounded
      flush. The original readiness cursor/deadline must resume it exactly. */
