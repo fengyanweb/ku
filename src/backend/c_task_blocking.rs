@@ -258,10 +258,16 @@ invalid:
 }
 /* One pop per ordinary claim. Exhausted generations are never returned, so
  * even the all-retired case does not rescan cold job storage. */
+static size_t ku_task_blocking_free_slot(const KuTaskBlockingPoolV1* pool,size_t position) {
+  uint32_t encoded=pool->free_indices[position];
+  /* The untouched calloc prefix encodes the original ascending first claims.
+   * Returned slots form a nonzero LIFO suffix and never overwrite that prefix. */
+  return encoded ? (size_t)encoded-1u:pool->capacity-1u-position;
+}
 static uint32_t ku_task_blocking_claim_locked(KuTaskBlockingPoolV1* pool,size_t* index) {
   if(!pool->free_count)return KU_TASK_DRIVER_LIMIT;
   if(pool->free_count>pool->capacity || pool->resident>=pool->capacity)goto invalid;
-  size_t slot=pool->free_indices[pool->free_count-1u];
+  size_t slot=ku_task_blocking_free_slot(pool,pool->free_count-1u);
   if(slot>=pool->capacity)goto invalid;
   KuTaskBlockingJobV1* job=&pool->jobs[slot];
   if(job->state!=KU_TASK_BLOCKING_FREE || job->generation==UINT64_MAX)goto invalid;
@@ -290,7 +296,7 @@ static uint32_t ku_task_blocking_return_locked(KuTaskBlockingPoolV1* pool,KuTask
   if(job->kind<=5u)memset(job->inputs,0,sizeof(*job->inputs));
   memset(job,0,sizeof(*job));job->generation=generation;pool->resident--;
   if(generation==UINT64_MAX)pool->retired_slots++;
-  else pool->free_indices[pool->free_count++]=(uint32_t)index;
+  else pool->free_indices[pool->free_count++]=(uint32_t)(index+1u);
   return KU_TASK_DRIVER_OK;
 invalid:
   pool->fault=KU_TASK_DRIVER_INTERNAL;return KU_TASK_DRIVER_INTERNAL;
@@ -778,7 +784,6 @@ static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacit
   pool->inputs=(KuTaskBlockingInputsV1*)((uint8_t*)pool->storage+capacity*sizeof(*pool->jobs));
   pool->ring=(size_t*)(pool->inputs+capacity);
   pool->free_indices=(uint32_t*)(pool->ring+capacity);pool->free_count=capacity;
-  for(size_t i=0;i<capacity;i++)pool->free_indices[i]=(uint32_t)(capacity-1u-i);
 #if defined(_WIN32)
   InitializeSRWLock(&pool->mutex); pool->resources|=KU_TASK_DRIVER_SYNC_MUTEX;
   InitializeConditionVariable(&pool->condition); pool->resources|=KU_TASK_DRIVER_SYNC_STATE;
@@ -931,7 +936,7 @@ static uint32_t ku_task_blocking_oracle_locked(KuTaskBlockingPoolV1* pool) {
   if(!pool || pool->capacity>KU_TASK_DRIVER_MAX_SLOTS || pool->free_count>pool->capacity)goto invalid;
   uint8_t seen[KU_TASK_DRIVER_MAX_SLOTS]={0};
   for(size_t i=0;i<pool->free_count;i++) {
-    size_t index=pool->free_indices[i];
+    size_t index=ku_task_blocking_free_slot(pool,i);
     if(index>=pool->capacity || seen[index] || pool->jobs[index].state!=KU_TASK_BLOCKING_FREE
         || pool->jobs[index].generation==UINT64_MAX)goto invalid;
     seen[index]=1u;
