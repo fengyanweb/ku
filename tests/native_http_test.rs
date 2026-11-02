@@ -3895,9 +3895,9 @@ static void* fixture_header_grow(void* previous,size_t bytes) {
         &format!("{receive_hooks}\n{receive_anchor}"),
         1,
     );
-    let receive_edge = "} else received = ku_http_socket_recv(connection->socket_value, incoming, sizeof(incoming));";
+    let receive_edge = "} else if (!received) received = ku_http_socket_recv(connection->socket_value, incoming, sizeof(incoming));";
     assert_eq!(generated.matches(receive_edge).count(), 1);
-    generated = generated.replacen(receive_edge,"} else received = fixture_header_receive(connection->socket_value,incoming,sizeof(incoming));",1);
+    generated = generated.replacen(receive_edge,"} else if (!received) received = fixture_header_receive(connection->socket_value,incoming,sizeof(incoming));",1);
     let grow_edge = "char* grown = (char*)realloc(connection->header, capacity);";
     assert_eq!(generated.matches(grow_edge).count(), 1);
     generated = generated.replacen(
@@ -4800,6 +4800,296 @@ int main(void) {
 }
 
 #[test]
+fn native_http_admitted_header_read_reuses_received_bytes_and_preserves_pending_contract() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let runtime = include_str!("../src/backend/c_http_runtime.c").replace("\r\n", "\n");
+    let region = |start: &str, end: &str| {
+        format!(
+            "{start}{}",
+            runtime
+                .split_once(start)
+                .expect("production admitted-read region starts")
+                .1
+                .split_once(end)
+                .expect("production admitted-read region ends")
+                .0
+        )
+    };
+    let leases = region(
+        "static int ku_http_request_lease_take(",
+        "#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)",
+    );
+    let observe = region(
+        "static int ku_http_request_observe_received(",
+        "static void ku_http_pending_raw_close(",
+    );
+    // Stop immediately before parsing. The entire admission/read prefix is
+    // production C; only its delivered bytes and lifecycle edges are observed.
+    let read = region(
+        "static void ku_http_connection_read_header(",
+        "  size_t scan_from = connection->buffered;",
+    );
+    let header = r#"
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define KU_HTTP_READ_CHUNK 32u
+#define MSG_PEEK 2
+#define KU_HTTP_IO_FREE 0
+#define KU_HTTP_IO_HEADER 1
+#define KU_HTTP_IO_WRITE 2
+#define KU_HTTP_IO_REQUEST_WAIT 10
+#define KU_HTTP_ERROR_PARSER_INVARIANT 20
+#define KU_HTTP_ERROR_QUEUE 21
+#define CHECK(c) do {if(!(c)){fprintf(stderr,"admitted header read line %d: %s\n",__LINE__,#c);return 1;}}while(0)
+enum { FIXTURE_AGAIN=11, FIXTURE_INTERRUPTED=4, FIXTURE_FATAL=77 };
+typedef int KuHttpSocket;
+typedef struct { int unused; } KuHttpBufferBudget;
+typedef struct { int unused; } KuHttpQueue;
+typedef struct { int count,cap; } KuHttpPending;
+typedef struct { KuHttpPending* pending; int request_active,request_limit,request_peak; } KuHttpActiveSet;
+typedef struct { unsigned int request_timeout_ms; int read_header_timeout_ms; } KuHttpServer;
+typedef struct KuHttpConnection {
+  KuHttpSocket socket_value;
+  KuHttpBufferBudget* budget;
+  KuHttpActiveSet* active_set;
+  int phase,management,request_lease,request_queued,pending_index,header_started,reused;
+  unsigned long long request_deadline,deadline;
+  size_t buffered,carry_length;
+  char* carry;
+  struct { int reason; } failure;
+} KuHttpConnection;
+static KuHttpConnection connection;
+static KuHttpPending pending;
+static KuHttpActiveSet active;
+static KuHttpServer server;
+static KuHttpBufferBudget buffer_budget;
+static const char fixture_bytes[]={'G','E','T',' ','/','\0','z'};
+static int fixture_reads,fixture_peeks,fixture_read_result,fixture_peek_result;
+static int fixture_error,fixture_io_error,fixture_closed,fixture_status,fixture_pushes;
+static int fixture_admit,fixture_admit_calls,fixture_queue_ok,fixture_break_lease;
+static int fixture_deliveries,fixture_deadline_calls;
+static size_t fixture_read_capacity,fixture_delivered,fixture_refunded;
+static char fixture_delivery_bytes[KU_HTTP_READ_CHUNK];
+static unsigned long long fixture_now,fixture_advance_read,fixture_queued_deadline;
+static unsigned long long ku_http_now_ms(void) { return fixture_now; }
+static unsigned long long ku_http_deadline_ms(unsigned int delta) {
+  fixture_deadline_calls++;return fixture_now+delta;
+}
+static int ku_http_socket_last_error(void) { return fixture_error; }
+static int ku_http_socket_would_block(int error) { return error==FIXTURE_AGAIN; }
+static int ku_http_socket_error_interrupted(int error) { return error==FIXTURE_INTERRUPTED; }
+static int ku_http_reused_request_admit(void) {fixture_admit_calls++;return fixture_admit;}
+static int fixture_recv(KuHttpSocket fd,void* bytes,size_t capacity,int flags);
+#define recv fixture_recv
+static int ku_http_socket_recv(KuHttpSocket fd,void* bytes,size_t capacity);
+static void ku_http_connection_status(KuHttpConnection*,KuHttpServer*,int);
+static void ku_http_connection_close(KuHttpConnection*);
+static int ku_http_pending_push_request(KuHttpPending*,KuHttpConnection*);
+static void ku_http_buffer_refund(KuHttpBufferBudget* budget,size_t bytes) {
+  (void)budget;fixture_refunded+=bytes;
+}
+static void fixture_deliver(const char* incoming,size_t received) {
+  if(received>sizeof(fixture_delivery_bytes))abort();
+  fixture_deliveries++;fixture_delivered=received;
+  memcpy(fixture_delivery_bytes,incoming,received);
+}
+"#;
+    let stubs = r#"
+static int fixture_recv(KuHttpSocket fd,void* bytes,size_t capacity,int flags) {
+  (void)fd;
+  if(flags!=MSG_PEEK || capacity!=1u)abort();
+  fixture_peeks++;fixture_error=fixture_io_error;
+  if(fixture_peek_result>0) *(char*)bytes=fixture_bytes[0];
+  return fixture_peek_result;
+}
+static int ku_http_socket_recv(KuHttpSocket fd,void* bytes,size_t capacity) {
+  (void)fd;fixture_reads++;fixture_read_capacity=capacity;
+  fixture_now+=fixture_advance_read;fixture_error=fixture_io_error;
+  if(fixture_read_result>0) {
+    if((size_t)fixture_read_result>capacity || (size_t)fixture_read_result>sizeof(fixture_bytes))abort();
+    memcpy(bytes,fixture_bytes,(size_t)fixture_read_result);
+    /* Fault injection after consumption: production owns this state on one
+       thread, but a broken invariant must not enqueue an empty successor. */
+    if(fixture_break_lease) active.request_active=active.request_limit;
+  }
+  return fixture_read_result;
+}
+static void ku_http_connection_status(KuHttpConnection* c,KuHttpServer* s,int status) {
+  (void)s;fixture_status=status;c->phase=KU_HTTP_IO_WRITE;
+}
+static void ku_http_connection_close(KuHttpConnection* c) {
+  fixture_closed++;ku_http_request_lease_release(c);c->phase=KU_HTTP_IO_FREE;
+}
+static int ku_http_pending_push_request(KuHttpPending* p,KuHttpConnection* c) {
+  fixture_pushes++;
+  if(!fixture_queue_ok || p->count>=p->cap)return 0;
+  if(c->request_queued)return 1;
+  fixture_queued_deadline=c->request_deadline<c->deadline?c->request_deadline:c->deadline;
+  p->count++;c->request_queued=1;c->phase=KU_HTTP_IO_REQUEST_WAIT;return 1;
+}
+"#;
+    let checks = r#"
+static void fixture_reset(void) {
+  ku_http_request_lease_release(&connection);
+  free(connection.carry);
+  memset(&connection,0,sizeof(connection));memset(&active,0,sizeof(active));
+  pending=(KuHttpPending){.cap=4};active.pending=&pending;active.request_limit=1;
+  server=(KuHttpServer){.request_timeout_ms=500,.read_header_timeout_ms=200};
+  connection.active_set=&active;connection.budget=&buffer_budget;
+  connection.phase=KU_HTTP_IO_HEADER;connection.deadline=1000;connection.pending_index=-1;
+  fixture_reads=fixture_peeks=fixture_closed=fixture_status=fixture_pushes=0;
+  fixture_admit_calls=fixture_deliveries=fixture_deadline_calls=0;
+  fixture_admit=fixture_queue_ok=1;fixture_break_lease=0;
+  fixture_read_result=(int)sizeof(fixture_bytes);fixture_peek_result=1;
+  fixture_error=fixture_io_error=0;fixture_now=100;fixture_advance_read=0;
+  fixture_read_capacity=fixture_delivered=fixture_refunded=0;fixture_queued_deadline=0;
+  memset(fixture_delivery_bytes,0,sizeof(fixture_delivery_bytes));
+}
+static void fixture_read(void) {ku_http_connection_read_header(&connection,&server,NULL,0);}
+int main(void) {
+  fixture_reset();fixture_read();
+  CHECK(fixture_reads==1 && !fixture_peeks && fixture_read_capacity==KU_HTTP_READ_CHUNK);
+  CHECK(fixture_deliveries==1 && fixture_delivered==sizeof(fixture_bytes));
+  CHECK(!memcmp(fixture_delivery_bytes,fixture_bytes,sizeof(fixture_bytes)));
+  CHECK(connection.request_lease && active.request_active==1 && active.request_peak==1);
+  CHECK(connection.header_started && connection.request_deadline==600 && connection.deadline==300);
+  CHECK(!fixture_pushes && !pending.count && !fixture_closed && !fixture_status);
+  ku_http_request_lease_release(&connection);ku_http_request_lease_release(&connection);
+  CHECK(!active.request_active && !connection.request_lease);
+
+  /* Busy A and a nonempty shared FIFO retain the nonconsuming old path. */
+  fixture_reset();active.request_active=1;fixture_read();
+  CHECK(!fixture_reads && fixture_peeks==1 && fixture_pushes==1 && pending.count==1);
+  CHECK(!connection.request_lease && connection.request_queued && active.request_active==1);
+  CHECK(connection.phase==KU_HTTP_IO_REQUEST_WAIT && fixture_queued_deadline==300);
+  fixture_now=150;fixture_read();
+  CHECK(!fixture_reads && fixture_peeks==1 && fixture_pushes==1 && !fixture_deliveries);
+  CHECK(connection.request_deadline==600 && connection.deadline==300);
+  fixture_reset();pending.count=1;fixture_read();
+  CHECK(!fixture_reads && fixture_peeks==1 && fixture_pushes==1 && pending.count==2);
+  CHECK(!connection.request_lease && !active.request_active && connection.request_queued);
+  fixture_reset();pending.count=1;fixture_queue_ok=0;fixture_read();
+  CHECK(!fixture_reads && fixture_peeks==1 && fixture_status==503 && !connection.request_lease);
+  CHECK(connection.failure.reason==KU_HTTP_ERROR_QUEUE && !connection.request_queued);
+
+  /* Carry bytes never incur socket I/O or get replaced by another read. */
+  fixture_reset();connection.carry=malloc(sizeof(fixture_bytes));CHECK(connection.carry);
+  memcpy(connection.carry,fixture_bytes,sizeof(fixture_bytes));connection.carry_length=sizeof(fixture_bytes);
+  fixture_read();
+  CHECK(!fixture_reads && !fixture_peeks && fixture_deliveries==1);
+  CHECK(!connection.carry && !connection.carry_length && fixture_refunded==sizeof(fixture_bytes));
+  CHECK(fixture_delivered==sizeof(fixture_bytes) && !memcmp(fixture_delivery_bytes,fixture_bytes,sizeof(fixture_bytes)));
+  CHECK(connection.request_lease && active.request_active==1);
+  fixture_reset();active.request_active=1;connection.carry=malloc(sizeof(fixture_bytes));CHECK(connection.carry);
+  memcpy(connection.carry,fixture_bytes,sizeof(fixture_bytes));connection.carry_length=sizeof(fixture_bytes);
+  fixture_read();
+  CHECK(!fixture_reads && !fixture_peeks && !fixture_deliveries && fixture_pushes==1);
+  CHECK(connection.carry && connection.carry_length==sizeof(fixture_bytes) && !fixture_refunded);
+
+  /* Existing leases, management, and non-owner callers use their old read. */
+  fixture_reset();CHECK(ku_http_request_lease_take(&connection));fixture_read();
+  CHECK(fixture_reads==1 && !fixture_peeks && fixture_deliveries==1 && active.request_active==1);
+  CHECK(!connection.header_started && !connection.request_deadline && connection.deadline==1000);
+  fixture_reset();connection.management=1;fixture_read();
+  CHECK(fixture_reads==1 && !fixture_peeks && fixture_deliveries==1 && !connection.request_lease);
+  CHECK(!connection.header_started && !fixture_deadline_calls && !active.request_active);
+  fixture_reset();connection.active_set=NULL;fixture_read();
+  CHECK(fixture_reads==1 && !fixture_peeks && fixture_deliveries==1 && !connection.request_lease);
+
+  /* Drain rejection happens before reading even the first persistent byte. */
+  fixture_reset();connection.reused=1;fixture_admit=0;fixture_read();
+  CHECK(!fixture_reads && !fixture_peeks && fixture_closed==1 && fixture_admit_calls==1);
+  CHECK(!connection.header_started && !connection.request_deadline && !active.request_active);
+  fixture_reset();fixture_read_result=0;fixture_read();
+  CHECK(fixture_reads==1 && !fixture_peeks && fixture_status==400 && !fixture_closed);
+  CHECK(!fixture_deliveries && !connection.request_lease && !fixture_deadline_calls);
+  fixture_reset();connection.reused=1;fixture_read_result=0;fixture_read();
+  CHECK(fixture_reads==1 && !fixture_peeks && fixture_closed==1 && !fixture_status);
+  CHECK(!fixture_deliveries && !connection.request_lease && !fixture_deadline_calls);
+
+  /* A failed observation cannot acquire A or start/refresh either clock. */
+  const int retry_errors[]={FIXTURE_AGAIN,FIXTURE_INTERRUPTED};
+  for(size_t index=0;index<sizeof(retry_errors)/sizeof(retry_errors[0]);index++) {
+    fixture_reset();connection.request_deadline=333;
+    fixture_read_result=-1;fixture_io_error=retry_errors[index];fixture_read();
+    CHECK(fixture_reads==1 && !fixture_peeks && !fixture_deliveries && !fixture_closed && !fixture_status);
+    CHECK(!connection.request_lease && !active.request_active && !connection.header_started);
+    CHECK(connection.request_deadline==333 && connection.deadline==1000 && !fixture_deadline_calls);
+    fixture_reset();active.request_active=1;fixture_peek_result=-1;fixture_io_error=retry_errors[index];fixture_read();
+    CHECK(!fixture_reads && fixture_peeks==1 && !fixture_pushes && !fixture_closed && !fixture_status);
+    CHECK(!connection.request_lease && !connection.header_started && connection.deadline==1000);
+  }
+  fixture_reset();fixture_read_result=-1;fixture_io_error=FIXTURE_FATAL;fixture_read();
+  CHECK(fixture_reads==1 && !fixture_peeks && fixture_closed==1 && !fixture_status);
+  CHECK(!connection.request_lease && !active.request_active && !fixture_deadline_calls);
+
+  /* The first successful socket observation starts D; an old D clips it. */
+  fixture_reset();fixture_advance_read=50;fixture_read();
+  CHECK(connection.request_deadline==650 && connection.deadline==350 && fixture_deadline_calls==2);
+  fixture_reset();connection.request_deadline=180;fixture_advance_read=50;fixture_read();
+  CHECK(connection.header_started && connection.request_deadline==180 && connection.deadline==180);
+  CHECK(fixture_deadline_calls==1 && fixture_deliveries==1);
+  fixture_now=170;fixture_advance_read=0;fixture_read();
+  CHECK(fixture_reads==2 && !fixture_peeks && fixture_deliveries==2);
+  CHECK(connection.request_deadline==180 && connection.deadline==180 && fixture_deadline_calls==1);
+  fixture_reset();connection.header_started=1;connection.request_deadline=180;connection.deadline=170;
+  fixture_read();
+  CHECK(connection.request_deadline==180 && connection.deadline==170 && !fixture_deadline_calls);
+  fixture_reset();connection.deadline=fixture_now;fixture_read();
+  CHECK(fixture_status==408 && !fixture_reads && !fixture_peeks && !fixture_pushes && !fixture_deliveries);
+  CHECK(!connection.request_lease && !connection.header_started && !fixture_deadline_calls);
+
+  /* Consumed bytes cannot fall back to an unconsumed FIFO node on a broken
+     owner invariant. Report the failure instead of silently losing the read. */
+  fixture_reset();fixture_break_lease=1;fixture_read();
+  CHECK(fixture_reads==1 && !fixture_peeks && fixture_status==500);
+  CHECK(connection.failure.reason==KU_HTTP_ERROR_PARSER_INVARIANT);
+  CHECK(!fixture_pushes && !pending.count && !connection.request_queued && !fixture_deliveries);
+  CHECK(!connection.request_lease && connection.header_started);
+  fixture_reset();puts("http-admitted-header-read-contract-ok");return 0;
+}
+"#;
+    let directory = native_c_harness::TempDir::new("http-admitted-header-read");
+    let path = directory.path().join("read.c");
+    fs::write(
+        &path,
+        format!(
+            "{header}{leases}{stubs}{observe}{read}  fixture_deliver(incoming,(size_t)received);\n  (void)queue;(void)workers;\n}}\n{checks}"
+        ),
+    )
+    .unwrap();
+    let Some(executable) =
+        native_c_harness::compile_harness(directory.path(), &path, "admitted-read")
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires native admitted-header read regression"
+        );
+        return;
+    };
+    let output = run_bounded(
+        &mut Command::new(executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .expect("bounded native admitted-header read regression");
+    assert!(
+        output.status.success(),
+        "native admitted-header read regression failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "http-admitted-header-read-contract-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_http_request_leases_and_shared_pending_fifo_preserve_full_identity() {
     let runtime = include_str!("../src/backend/c_http_runtime.c");
     let leases = runtime
@@ -4813,7 +5103,7 @@ fn native_http_request_leases_and_shared_pending_fifo_preserve_full_identity() {
         .split_once("enum { KU_HTTP_PENDING_FREE=0")
         .unwrap()
         .1
-        .split_once("/* A single nonconsuming observation")
+        .split_once("/* Either a nonconsuming observation")
         .unwrap()
         .0;
     let header = r#"
