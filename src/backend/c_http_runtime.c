@@ -2021,32 +2021,6 @@ typedef struct {
   int count; int part;
   size_t offset;
 } KuHttpOutput;
-/* Called once, after the tail and before the body are appended. Prefix parts
-   borrow first[], literals or the response owner, never last[]. Keep long
-   headers as vectors; small headers can use the already resident tail buffer
-   without enlarging the connection or copying the response body. */
-static void ku_http_output_pack_header(KuHttpOutput* output) {
-  int tail_part=output->count-1;
-  if(tail_part<=0)return;
-  size_t tail_length=output->parts[tail_part].length;
-  size_t total=tail_length;
-  if(total>sizeof(output->last))return;
-  for(int part=0;part<tail_part;part++) {
-    size_t length=output->parts[part].length;
-    if(length>sizeof(output->last)-total)return;
-    total+=length;
-  }
-  size_t prefix=total-tail_length;
-  memmove(output->last+prefix,output->last,tail_length);
-  size_t offset=0;
-  for(int part=0;part<tail_part;part++) {
-    size_t length=output->parts[part].length;
-    memcpy(output->last+offset,output->parts[part].bytes,length);
-    offset+=length;
-  }
-  output->parts[0]=(KuHttpPart){output->last,total};
-  output->count=1;
-}
 /* One bounded syscall publishes adjacent status/header/body slices together.
    Sending the short status line separately can stall subsequent bytes until
    a delayed ACK on a persistent TCP connection. These vectors borrow the
@@ -2142,7 +2116,7 @@ typedef struct KuHttpConnection {
   size_t rejected_bytes; size_t rejected_seen; unsigned char rejected_window[4];
 } KuHttpConnection;
 typedef struct { int slot; uint64_t generation; } KuHttpPollConnection;
-static int ku_http_request_prepare(KuHttpConnection*,KuHttpServer*);
+static int ku_http_request_prepare(KuHttpConnection*,KuHttpServer*,char*,size_t,int*);
 static void ku_http_request_cancel_pending(KuHttpConnection*);
 static int ku_http_request_lease_take(KuHttpConnection* connection) {
   KuHttpActiveSet* active=connection->active_set;
@@ -2352,7 +2326,6 @@ static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServ
     ku_http_connection_close(connection); return;
   }
   ku_http_output_part(output, output->last, (size_t)last_length);
-  ku_http_output_pack_header(output);
   ku_http_output_part(output, (const char*)response.body.ptr, body_length);
   connection->phase = KU_HTTP_IO_WRITE;
   connection->deadline = ku_http_deadline_ms((uint32_t)(server->write_timeout_ms > 0 ? server->write_timeout_ms : 10000));
@@ -2488,16 +2461,16 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
 }
 static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {
   if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_status(connection, server, 408); return; }
-  if (!ku_http_request_prepare(connection,server)) return;
   char incoming[KU_HTTP_READ_CHUNK];
-  int received;
-  if (connection->carry_length) {
+  int received=0;
+  if (!ku_http_request_prepare(connection,server,incoming,sizeof(incoming),&received)) return;
+  if (!received && connection->carry_length) {
     if (connection->carry_length > sizeof(incoming)) { connection->failure.reason=KU_HTTP_ERROR_PARSER_INVARIANT; ku_http_connection_status(connection, server, 500); return; }
     received = (int)connection->carry_length;
     memcpy(incoming, connection->carry, connection->carry_length);
     free(connection->carry); connection->carry = NULL;
   ku_http_buffer_refund(connection->budget, connection->carry_length); connection->carry_length = 0;
-  } else received = ku_http_socket_recv(connection->socket_value, incoming, sizeof(incoming));
+  } else if (!received) received = ku_http_socket_recv(connection->socket_value, incoming, sizeof(incoming));
   if (received < 0) {
     int error = ku_http_socket_last_error();
     if (ku_http_socket_would_block(error) || ku_http_socket_error_interrupted(error)) return;
@@ -2799,22 +2772,19 @@ static int ku_http_pending_push_raw(KuHttpPending* pending,KuHttpSocket fd,unsig
 #endif
   return 1;
 }
-/* A single nonconsuming observation establishes the first-byte deadline.
- * Queuing and later A transfer never refresh either original absolute D. */
-static int ku_http_request_observe_start(KuHttpConnection* connection,KuHttpServer* server) {
-  int available=connection->carry_length!=0;
-  if(!available) {
-    char byte;int count=recv(connection->socket_value,&byte,1,MSG_PEEK);
-    if(count<0) {
-      int error=ku_http_socket_last_error();
-      if(ku_http_socket_would_block(error) || ku_http_socket_error_interrupted(error)) return 0;
-      ku_http_connection_close(connection);return 0;
-    }
-    if(!count) {
-      if(connection->reused) ku_http_connection_close(connection);
-      else ku_http_connection_status(connection,server,400);
-      return 0;
-    }
+/* Either a nonconsuming observation or the immediately admitted bounded read
+ * establishes the first-byte deadline. Queuing and later A transfer never
+ * refresh either original absolute D. */
+static int ku_http_request_observe_received(KuHttpConnection* connection,KuHttpServer* server,int count) {
+  if(count<0) {
+    int error=ku_http_socket_last_error();
+    if(ku_http_socket_would_block(error) || ku_http_socket_error_interrupted(error)) return 0;
+    ku_http_connection_close(connection);return 0;
+  }
+  if(!count) {
+    if(connection->reused) ku_http_connection_close(connection);
+    else ku_http_connection_status(connection,server,400);
+    return 0;
   }
   if(!connection->header_started) {
     connection->header_started=1;
@@ -2824,12 +2794,32 @@ static int ku_http_request_observe_start(KuHttpConnection* connection,KuHttpServ
   }
   return 1;
 }
-static int ku_http_request_prepare(KuHttpConnection* connection,KuHttpServer* server) {
+static int ku_http_request_observe_start(KuHttpConnection* connection,KuHttpServer* server) {
+  char byte;
+  int count=connection->carry_length?1:recv(connection->socket_value,&byte,1,MSG_PEEK);
+  return ku_http_request_observe_received(connection,server,count);
+}
+static int ku_http_request_prepare(KuHttpConnection* connection,KuHttpServer* server,
+    char* incoming,size_t capacity,int* received) {
   if(connection->management || !connection->active_set || connection->request_lease) return 1;
   if(connection->request_queued) return 0;
   if(connection->reused && !ku_http_reused_request_admit()) {ku_http_connection_close(connection);return 0;}
-  if(!ku_http_request_observe_start(connection,server)) return 0;
   KuHttpPending* pending=connection->active_set->pending;
+  if(!connection->carry_length && !pending->count
+      && connection->active_set->request_active<connection->active_set->request_limit) {
+    /* The owner exclusively mutates this FIFO and lease count. No callback or
+       suspension occurs between this availability check and taking the lease.
+       Receive once into read_header's existing stack buffer; queued callers
+       retain the nonconsuming observation and exact old admission order. */
+    int count=ku_http_socket_recv(connection->socket_value,incoming,capacity);
+    if(!ku_http_request_observe_received(connection,server,count))return 0;
+    if(!ku_http_request_lease_take(connection)) {
+      connection->failure.reason=KU_HTTP_ERROR_PARSER_INVARIANT;
+      ku_http_connection_status(connection,server,500);return 0;
+    }
+    *received=count;return 1;
+  }
+  if(!ku_http_request_observe_start(connection,server)) return 0;
   if(!pending->count && ku_http_request_lease_take(connection)) return 1;
   if(!ku_http_pending_push_request(pending,connection)) {
     connection->failure.reason=KU_HTTP_ERROR_QUEUE;ku_http_connection_status(connection,server,503);

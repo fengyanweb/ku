@@ -31,6 +31,8 @@ HTTP_STATUS_GOALS=('http-status-screen','http-status-confirm')
 HTTP_STATUS_C=dict(PG_MEMORY_C,B='2bfb5abc1c6ec68a3529d21b264cc4ead70eb93ebb564bedeba3a317d94d7b78')
 HEADER_PACK_GOALS=('header-pack-screen','header-pack-confirm')
 HEADER_PACK_C=dict(PG_MEMORY_C,B='6894f08dbc09d158586999fa0a18c8e48f36544f927b3b5ae5d48a6399420994')
+READ_FUSION_GOALS=('read-fusion-screen','read-fusion-confirm')
+READ_FUSION_C=dict(PG_MEMORY_C,B='46ec2e0f355f121161a4987f635956cdfb301ebf240ed688ce66d8b054593570')
 V4_GOALS=('v4-memory-screen','v4-memory-confirm')
 V4_MEMORY_C=dict(PG_MEMORY_C,B='6c8158cc3952b73015d28f2f18846f32aca5e65640efbd0f554db1beb34a7827')
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
@@ -53,18 +55,20 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def http_short_prepatch(goal):
-    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS):raise ValueError('unregistered HTTP short goal')
-    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS) else HTTP_SHORT_PREPATCH
+    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS,*READ_FUSION_GOALS):raise ValueError('unregistered HTTP short goal')
+    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS,*READ_FUSION_GOALS) else HTTP_SHORT_PREPATCH
 
 
 def verify_pg_memory_builds(identities,goal='pg-memory'):
+    if goal in READ_FUSION_GOALS and not re.fullmatch('[0-9a-f]{64}',READ_FUSION_C['B']):
+        raise ValueError('read-fusion complete generated C identity is not frozen')
     if goal in HEADER_PACK_GOALS and not re.fullmatch('[0-9a-f]{64}',HEADER_PACK_C['B']):
         raise ValueError('header-pack complete generated C identity is not frozen')
     if goal in TOKEN_PREFIX_GOALS and not re.fullmatch('[0-9a-f]{64}',TOKEN_PREFIX_C['B']):
         raise ValueError('token-prefix complete generated C identity is not frozen')
     if goal in OWNER_JOB_GOALS and not re.fullmatch('[0-9a-f]{64}',OWNER_JOB_C['B']):
         raise ValueError('owner Job complete generated C identity is not frozen')
-    for name,expected in (HEADER_PACK_C if goal in HEADER_PACK_GOALS else TOKEN_PREFIX_C if goal in TOKEN_PREFIX_GOALS else OWNER_JOB_C if goal in OWNER_JOB_GOALS else FULL_KEY_C if goal in FULL_KEY_GOALS else HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
+    for name,expected in (READ_FUSION_C if goal in READ_FUSION_GOALS else HEADER_PACK_C if goal in HEADER_PACK_GOALS else TOKEN_PREFIX_C if goal in TOKEN_PREFIX_GOALS else OWNER_JOB_C if goal in OWNER_JOB_GOALS else FULL_KEY_C if goal in FULL_KEY_GOALS else HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
         if identities.get(name,{}).get('files',{}).get('generated C',{}).get('sha256')!=expected:
             raise ValueError('PG memory screen requires the exact preregistered complete C: '+name)
 
@@ -302,6 +306,7 @@ def normal_self_plan(versions):
 
 
 def http_short_plan(versions,goal='cpu'):
+    if goal in READ_FUSION_GOALS:return read_fusion_plan(versions,goal)
     if goal in HEADER_PACK_GOALS:return header_pack_plan(versions,goal)
     if goal in TOKEN_PREFIX_GOALS:return token_prefix_plan(versions,goal)
     if goal in OWNER_JOB_GOALS:return owner_job_plan(versions,goal)
@@ -343,6 +348,7 @@ def http_short_plan(versions,goal='cpu'):
 
 
 def http_short_comparison(rows,complete,environment=None,goal='cpu'):
+    if goal in READ_FUSION_GOALS:return http_status_comparison(rows,complete,environment,goal)
     if goal in HEADER_PACK_GOALS:return http_status_comparison(rows,complete,environment,goal)
     if goal in TOKEN_PREFIX_GOALS:return v4_short_comparison(rows,complete,environment,goal)
     if goal in OWNER_JOB_GOALS:return owner_job_comparison(rows,complete,environment,goal)
@@ -634,17 +640,32 @@ def header_pack_plan(versions,goal):
     return plan
 
 
+def read_fusion_plan(versions,goal):
+    if goal not in READ_FUSION_GOALS:raise ValueError('unregistered read-fusion stage')
+    confirm=goal==READ_FUSION_GOALS[1]
+    plan=header_pack_plan(versions,HEADER_PACK_GOALS[1] if confirm else HEADER_PACK_GOALS[0])
+    plan.update(http_short_goal=goal,
+        purpose='One available-owner request-prepare/read fusion candidate; ordinary helpers/C11O2, unchanged parser/input buffer, first-byte deadline origin, FIFO, leases and response path.6pairs screen, at most one independent12pair confirmation; no pooled windows or thresholds changed.',
+        evidence_basis=dict(complete_C=READ_FUSION_C,source_product_commit='8692506769d7aa87e5fc9b5d49393ce95356eb8f',
+            other_v4_candidates_excluded=True,header_pack_excluded=True,
+            normal_SELF_samples=715,request_observe_peek_kernel_samples=19,read_header_recv_kernel_samples=20,
+            normal_ELF='234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b',
+            mechanism='When owner-local FIFO is empty and immediate lease capacity is guaranteed, receive once into the existing bounded incoming buffer and use those bytes for both first observation and original header parsing. Other admission/read paths unchanged.',
+            performance_effect='unknown;39recv ancestry samples are path scope, not syscall CPU fraction or promised saving. No output packing, smaller buffers or altered deadline/cancellation checks.'))
+    return plan
+
+
 def http_status_comparison(rows,complete,environment,goal):
-    plan=header_pack_plan({},goal) if goal in HEADER_PACK_GOALS else http_status_plan({},goal)
-    confirm=goal in (HTTP_STATUS_GOALS[1],HEADER_PACK_GOALS[1]);groups=range(1,plan['paired_windows_per_business']+1)
+    plan=read_fusion_plan({},goal) if goal in READ_FUSION_GOALS else header_pack_plan({},goal) if goal in HEADER_PACK_GOALS else http_status_plan({},goal)
+    confirm=goal in (HTTP_STATUS_GOALS[1],HEADER_PACK_GOALS[1],READ_FUSION_GOALS[1]);groups=range(1,plan['paired_windows_per_business']+1)
     result=dict(complete=complete,http_short_goal=goal,eligible_for_confirmation=False,eligible_for_root_review=False,
         candidate_accepted=False,formal_qualified=False,normal_score_eligible=False,reasons=[],comparisons={},memory_intervals={},
         independent_stage=True,pooling_previous_windows=False,thresholds=plan['adoption_thresholds'])
-    if goal in HEADER_PACK_GOALS:result.update(maximum_confirmations=1,confirmation_requires_screen_eligible=True)
+    if goal in (*HEADER_PACK_GOALS,*READ_FUSION_GOALS):result.update(maximum_confirmations=1,confirmation_requires_screen_eligible=True)
     if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification failed or unknown')
     if not complete:
         result['reasons'].append('incomplete observations or cleanup; no metric scoring');return result
-    if goal in HEADER_PACK_GOALS:
+    if goal in (*HEADER_PACK_GOALS,*READ_FUSION_GOALS):
         if result['reasons']:return result
         invalid=token_prefix_row_error(rows,plan)
         if invalid:result['reasons'].append(invalid);return result
@@ -990,7 +1011,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
-    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS):
+    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS,*READ_FUSION_GOALS):
         verify_pg_memory_builds(identities,getattr(a,'http_short_goal','cpu'))
     if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
@@ -2754,7 +2775,7 @@ def main(argv=None):
     p.add_argument('--fixed-goals-only',action='store_true',help='Explicit full-build/run stop after controls, admission and original80 windows/16 goals; capacity/stability and whole acceptance remain incomplete')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS,*TOKEN_PREFIX_GOALS,*HEADER_PACK_GOALS,*READ_FUSION_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit frozen control+normal A/B candidate diagnostic; goal selects exact windows/prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
