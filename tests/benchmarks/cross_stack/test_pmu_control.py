@@ -18,8 +18,8 @@ def csv(tid=101):
         for event,value,unit in [('cycles',3000000,''),('instructions',6000000,''),('task-clock',1,'msec')])
 
 
-def idle_proof(cpu=0,start=1):
-    return dict(before=dict(start_ticks=start,cpu_runtime_ns=cpu),after=dict(start_ticks=start,cpu_runtime_ns=cpu),
+def idle_proof(cpu=1,start=1):
+    return dict(before=dict(start_ticks=start,cpu_runtime_ns=cpu,schedstat=[cpu,0,1]),after=dict(start_ticks=start,cpu_runtime_ns=cpu,schedstat=[cpu,0,1]),
         before_end_ns=1,enable_begin_ns=2,disable_ack_ns=3,after_begin_ns=4)
 
 
@@ -31,13 +31,17 @@ class PmuTests(unittest.TestCase):
         evidence={3135:idle_proof(55488,140480),3137:idle_proof(21224,140481)}
         with tempfile.TemporaryDirectory() as tmp:
             file=Path(tmp)/'stat.csv'
-            for issue in ('none','no-proof','activity','identity','unavailable','outside','unsupported','runtime'):
+            for issue in ('none','no-proof','activity','identity','unavailable','outside','unsupported','runtime','zero-schedstat','zero-brackets'):
                 proof=copy.deepcopy(evidence);data=raw
                 if issue=='no-proof':proof={}
                 if issue=='activity':proof[3135]['after']['cpu_runtime_ns']+=1
                 if issue=='identity':proof[3135]['after']['start_ticks']+=1
                 if issue=='unavailable':proof[3135]['after']['cpu_runtime_ns']=None
                 if issue=='outside':proof[3135]['before_end_ns']=3
+                if issue=='zero-schedstat':
+                    for point in ('before','after'):proof[3135][point].update(cpu_runtime_ns=0,schedstat=[0,0,0])
+                if issue=='zero-brackets':
+                    for key in ('before_end_ns','enable_begin_ns','disable_ack_ns','after_begin_ns'):proof[3135][key]=0
                 if issue=='unsupported':data=data.replace('<not counted>','<not supported>',1)
                 if issue=='runtime':data=data.replace('<not counted>;;cycles;0;','<not counted>;;cycles;1;',1)
                 file.write_text(data)

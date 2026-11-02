@@ -155,9 +155,11 @@ def parse_stat(path,expected_tids,*,no_cpu_evidence=None):
         first=proof.get('before',{});last=proof.get('after',{})
         known=lambda value:isinstance(value,int) and not isinstance(value,bool) and 0<=value<1<<64
         brackets=[proof.get(k) for k in ('before_end_ns','enable_begin_ns','disable_ack_ns','after_begin_ns')]
+        sched=first.get('schedstat',[])
         proven=(known(first.get('start_ticks')) and known(last.get('start_ticks')) and first['start_ticks']>0 and first.get('start_ticks')==last.get('start_ticks')
-            and known(first.get('cpu_runtime_ns')) and known(last.get('cpu_runtime_ns')) and first.get('cpu_runtime_ns')==last.get('cpu_runtime_ns')
-            and all(known(x) for x in brackets) and brackets==sorted(brackets))
+            and known(first.get('cpu_runtime_ns')) and first['cpu_runtime_ns']>0 and known(last.get('cpu_runtime_ns')) and first.get('cpu_runtime_ns')==last.get('cpu_runtime_ns')
+            and len(sched)==3 and all(known(x) for x in sched) and sched==last.get('schedstat') and sched[0]==first['cpu_runtime_ns'] and sched[2]>0
+            and all(known(x) for x in brackets) and 0<brackets[0]<=brackets[1]<brackets[2]<=brackets[3])
         inactive=(proven and all(r['runtime_ns']==0 and r['value'] in (None,0)
             and (r['value'] is not None or r['raw_value']=='<not counted>') for r in [*hardware,clock]))
         if inactive:dormant.append(tid);continue
