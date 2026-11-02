@@ -164,10 +164,15 @@ export default defineConfig({
       },
     }),
     starlight({
-      title: 'Ku',
+      title: Object.fromEntries(
+        Object.entries(languages).map(([locale, language]) => [
+          language.lang,
+          locale === 'zh-cn' ? 'Ku 编程语言' : 'Ku Programming Language',
+        ]),
+      ),
       disable404Route: true,
       description:
-        'Ku programming language — documentation and language guide.',
+        'Ku Programming Language — documentation and language guide.',
       defaultLocale: 'zh-cn',
       locales: languages,
       plugins: [

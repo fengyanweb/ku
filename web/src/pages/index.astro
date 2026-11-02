@@ -1,6 +1,8 @@
 ---
 // The request entry handles / before this static fallback is served. A purely
 // static host has no trusted country metadata; its fallback is English.
+import { locales, localeDefinitions } from '../i18n/locales';
+import { project } from '../data/site';
 ---
 
 <!doctype html>
@@ -8,11 +10,12 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width" />
-    <meta name="robots" content="noindex, nofollow" />
-    <title>Ku</title>
-    <noscript>
-      <meta http-equiv="refresh" content="0;url=/en/" />
-    </noscript>
+    <meta name="robots" content="noindex, follow" />
+    <meta
+      name="description"
+      content="Ku Programming Language / Ku 编程语言 — an experimental language with an interpreter, static checking, native C compilation, a standard library, and VS Code tools."
+    />
+    <title>{project.name} / {project.nameZh}</title>
     <script>
       import { readPreferenceCookie } from '../entry/language.mjs';
       let locale = 'en';
@@ -25,8 +28,40 @@
     </script>
   </head>
   <body data-pagefind-ignore="all">
-    <noscript>
-      <a href="/en/">Ku — English</a>
-    </noscript>
+    <main>
+      <h1>
+        {project.name} / <span lang="zh-CN">{project.nameZh}</span>
+      </h1>
+      <p>
+        Ku is an experimental programming language with an interpreter, static
+        checking, native C compilation, a standard library, and VS Code tools.
+      </p>
+      <p lang="zh-CN">
+        Ku 是一门实验性编程语言，提供解释执行、静态检查、原生 C 编译、标准库和
+        VS Code 工具。
+      </p>
+      <nav aria-label="Languages / 语言">
+        <ul>
+          {locales.map((locale) => (
+            <li>
+              <a href={`/${locale}/`} lang={localeDefinitions[locale].lang}>
+                {localeDefinitions[locale].label}
+              </a>
+            </li>
+          ))}
+        </ul>
+      </nav>
+      <p>
+        <a href="/zh-cn/docs/getting-started/" lang="zh-CN">
+          中文文档
+        </a>{' '}
+        ·<a href="/en/docs/getting-started/">English documentation</a> ·
+        <a href="/zh-cn/docs/install/" lang="zh-CN">
+          安装 Ku
+        </a>{' '}
+        ·<a href="/en/docs/install/">Install Ku</a> ·
+        <a href={project.repository}>GitHub</a>
+      </p>
+    </main>
   </body>
 </html>

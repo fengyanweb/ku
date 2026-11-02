@@ -1,7 +1,9 @@
 {
   "name": "ku-language",
-  "displayName": "Ku Language",
-  "description": "Syntax highlighting, snippets, and editor intelligence for Ku",
+  "displayName": "Ku Programming Language",
+  "description": "Syntax highlighting, snippets, CLI diagnostics, formatting, and editor commands for Ku Programming Language",
+  "homepage": "https://ku-lang.com/",
+  "keywords": ["ku", "ku-lang", "programming-language", "syntax-highlighting", "snippets"],
   "version": "0.0.19",
   "publisher": "ku-lang",
   "license": "Apache-2.0",

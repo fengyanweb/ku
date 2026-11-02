@@ -1,6 +1,6 @@
-# Ku Language for VS Code
+# Ku Programming Language for VS Code
 
-[完整中文说明](README.zh-CN.md) · [English](README.md#english)
+[完整中文说明](README.zh-CN.md) · [English](README.md#english) · [Website](https://ku-lang.com/) · [English documentation](https://ku-lang.com/en/docs/getting-started/) · [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=ku-lang.ku-language)
 
 ## 中文
 

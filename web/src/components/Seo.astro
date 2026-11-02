@@ -1,6 +1,7 @@
 ---
 import { locales, localeDefinitions, type Locale } from '../i18n/locales';
 import { translationsForPath } from '../i18n/routes';
+import { project } from '../data/site';
 interface Props {
   title: string;
   description: string;
@@ -53,11 +54,12 @@ const indexable =
     set:html={JSON.stringify({
       '@context': 'https://schema.org',
       '@type': 'WebSite',
-      name: 'Ku',
+      name: project.name,
+      alternateName: project.nameZh,
       description,
       url: new URL(path, Astro.site).href,
       inLanguage: localeDefinitions[locale].lang,
-      sameAs: 'https://github.com/fengyanweb/ku',
+      sameAs: project.repository,
     }).replace(/</g, '\\u003c')}
   />
 )}

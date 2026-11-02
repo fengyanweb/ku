@@ -1,6 +1,8 @@
 import { versions } from './versions';
 export const project = {
-  name: 'Ku',
+  name: 'Ku Programming Language',
+  nameZh: 'Ku 编程语言',
+  website: 'https://ku-lang.com/',
   repository: 'https://github.com/fengyanweb/ku',
   release: versions.releaseUrl,
   version: versions.languageVersion,

@@ -17,6 +17,8 @@ Ku 插件为 VS Code 1.85 及以上版本提供语法高亮、代码片段、补
 
 ## 安装插件
 
+现在可以直接在 VS Code 扩展视图中搜索 **ku-lang.ku-language** 安装，也可以打开 [Visual Studio Marketplace 页面](https://marketplace.visualstudio.com/items?itemName=ku-lang.ku-language)。扩展 ID 为 `ku-lang.ku-language`。
+
 从 [0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) 下载对应系统的压缩包并解压。每个平台包都包含 `ku-language-0.0.19.vsix` 和 CLI。VSIX 位于压缩包内，没有单独的 Release 下载文件。
 
 在 VS Code 中打开**扩展 → … → 从 VSIX 安装…**，选择该文件，然后执行 **Developer: Reload Window**。也可以在解压目录执行：

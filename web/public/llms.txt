@@ -1,0 +1,31 @@
+# Ku Programming Language / Ku 编程语言
+
+> Ku is an experimental programming language with an interpreter, static checking, native C compilation, a standard library, and VS Code tools. It is not yet recommended for production use; execution-path coverage and known limits are documented below.
+
+## Official entry points
+
+- [English website](https://ku-lang.com/en/)
+- [中文官网](https://ku-lang.com/zh-cn/)
+- [GitHub repository](https://github.com/fengyanweb/ku)
+- [Releases](https://github.com/fengyanweb/ku/releases)
+- [VS Code Marketplace: ku-lang.ku-language](https://marketplace.visualstudio.com/items?itemName=ku-lang.ku-language)
+
+## English documentation
+
+- [Install Ku](https://ku-lang.com/en/docs/install/)
+- [Quick start](https://ku-lang.com/en/docs/getting-started/)
+- [Language guide](https://ku-lang.com/en/docs/guide/language/)
+- [Standard library](https://ku-lang.com/en/docs/stdlib/)
+- [CLI reference](https://ku-lang.com/en/docs/tools/cli/)
+- [Supported execution paths and limitations](https://ku-lang.com/en/docs/support/)
+- [VS Code extension](https://ku-lang.com/en/docs/tools/vscode/)
+
+## 中文文档
+
+- [安装 Ku](https://ku-lang.com/zh-cn/docs/install/)
+- [快速入门](https://ku-lang.com/zh-cn/docs/getting-started/)
+- [语言指南](https://ku-lang.com/zh-cn/docs/guide/language/)
+- [标准库](https://ku-lang.com/zh-cn/docs/stdlib/)
+- [命令行工具](https://ku-lang.com/zh-cn/docs/tools/cli/)
+- [执行路径支持范围与限制](https://ku-lang.com/zh-cn/docs/support/)
+- [VS Code 插件](https://ku-lang.com/zh-cn/docs/tools/vscode/)

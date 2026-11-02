@@ -17,6 +17,8 @@ The Ku extension provides syntax highlighting, snippets, completion, formatting 
 
 ## Install
 
+Search for **ku-lang.ku-language** in the VS Code Extensions view to install it, or open its [Visual Studio Marketplace page](https://marketplace.visualstudio.com/items?itemName=ku-lang.ku-language). The extension ID is `ku-lang.ku-language`.
+
 Download your platform archive from the [0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19), then extract it. Each archive contains `ku-language-0.0.19.vsix` alongside the CLI. The VSIX is inside the archive, rather than a separate Release asset.
 
 In VS Code, open **Extensions → … → Install from VSIX…**, select that file, then run **Developer: Reload Window**. You can also install from the extracted directory:

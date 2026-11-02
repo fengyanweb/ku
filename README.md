@@ -1,6 +1,8 @@
-# Ku
+# Ku 编程语言
 
-[English](README.en.md) · [中文文档源码](web/src/content/docs/zh-cn/docs) · [English documentation source](web/src/content/docs/en/docs)
+[English](README.en.md) · [官网](https://ku-lang.com/) · [中文文档](https://ku-lang.com/zh-cn/docs/getting-started/) · [English Docs](https://ku-lang.com/en/docs/getting-started/) · [安装 Ku](https://ku-lang.com/zh-cn/docs/install/)
+
+[中文文档源码](web/src/content/docs/zh-cn/docs) · [English documentation source](web/src/content/docs/en/docs)
 
 Ku 是一门开发中的编程语言，提供解释执行、静态检查、native C 编译、标准库和 VS Code 扩展。当前源码版本为 **0.0.19**，采用 [Apache-2.0](LICENSE) 许可证，归属声明见 [NOTICE](NOTICE)。
 

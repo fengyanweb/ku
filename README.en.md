@@ -1,6 +1,8 @@
-# Ku
+# Ku Programming Language
 
-[简体中文](README.md) · [Documentation source](web/src/content/docs/en/docs)
+[简体中文](README.md) · [Website](https://ku-lang.com/) · [English Docs](https://ku-lang.com/en/docs/getting-started/) · [中文文档](https://ku-lang.com/zh-cn/docs/getting-started/) · [Install Ku](https://ku-lang.com/en/docs/install/)
+
+[Documentation source](web/src/content/docs/en/docs)
 
 Ku is an experimental programming language with an interpreter, static checking, native C compilation, a standard library, and a VS Code extension. The current source version is **0.0.19**, licensed under [Apache-2.0](LICENSE); see [NOTICE](NOTICE) for attribution.
 

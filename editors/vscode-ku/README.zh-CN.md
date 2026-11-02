@@ -1,6 +1,6 @@
-# Ku Language for VS Code
+# Ku 编程语言 VS Code 插件
 
-[简体中文](README.zh-CN.md) · [English](README.md#english)
+[简体中文](README.zh-CN.md) · [English](README.md#english) · [官网](https://ku-lang.com/) · [中文文档](https://ku-lang.com/zh-cn/docs/getting-started/) · [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=ku-lang.ku-language)
 
 本插件为 `.ku` 文件提供语法高亮、代码片段、编译器诊断、运行命令和编辑辅助功能。插件版本为 **0.0.19**，需要另行安装匹配的 Ku CLI。
 
