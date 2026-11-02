@@ -87,6 +87,7 @@ def check_report(report,wanted):
     if (report.get('valid_driver') is not True or ledger.get('results')!={'correct':wanted}
             or any(ledger.get(k)!=wanted for k in ('planned','attempted','sent','terminal','correct_total'))
             or ledger.get('planned_reconciled') is not True
+            or report.get('assessment',{}).get('arrival_schedule_quality')!='pass'
             or report.get('service_cost',{}).get('driver_cgroup_removed') is not True):
         raise ValueError('PG diagnostic correctness/accounting/driver cleanup failed')
 

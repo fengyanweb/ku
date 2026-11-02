@@ -7,12 +7,16 @@ import reuse_build as reuse
 
 class OwnerLifecycleTests(unittest.TestCase):
     def test_correct_requests_do_not_hide_failed_driver_cleanup(self):
-        report=dict(valid_driver=True,ledger=dict(results={'correct':3},planned=3,attempted=3,sent=3,terminal=3,correct_total=3,planned_reconciled=True),service_cost=dict(driver_cgroup_removed=True))
+        report=dict(valid_driver=True,ledger=dict(results={'correct':3},planned=3,attempted=3,sent=3,terminal=3,correct_total=3,planned_reconciled=True),service_cost=dict(driver_cgroup_removed=True),assessment=dict(arrival_schedule_quality='pass'))
         owner.check_report(report,3)
         for value in (False,None,1):
             with self.subTest(cleanup=value):
                 report['service_cost']['driver_cgroup_removed']=value
                 with self.assertRaisesRegex(ValueError,'driver cleanup'):owner.check_report(report,3)
+        report['service_cost']['driver_cgroup_removed']=True
+        for value in ('fail','unknown',None):
+            report['assessment']['arrival_schedule_quality']=value
+            with self.assertRaises(ValueError):owner.check_report(report,3)
 
     def test_archive_only_keeps_fixed_artifacts_and_redacted_diagnostic_records(self):
         with tempfile.TemporaryDirectory() as temp:
