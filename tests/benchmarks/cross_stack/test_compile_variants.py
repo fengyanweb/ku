@@ -278,6 +278,21 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertIn('path: ${{ runner.temp }}/ku-performance-v2/normal-self-observation',small)
         self.assertNotIn('*.csv',small);self.assertNotIn('bin/',small)
 
+    def test_ok_pmu_is_explicit_and_reuses_only_the_exact_normal_F_builds(self):
+        text,job=self.workflow()
+        self.assertIn('options: [json_object, db, db-gpr, ok-gpr, ok-pmu]',text)
+        for identity in ('41423107606','516f0422cbb3bab02c561d5410d0d452b51fe0a637a2930487488a4a5f8b27bc',
+                '166453a1d2768bbce19796d9c7823be73cc84ccb'):
+            self.assertIn(identity,job)
+        verify=job.split('- name: Verify runner entry',1)[1].split('- name: Install only',1)[0]
+        self.assertIn('if [ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = ok-pmu ]; then',verify)
+        self.assertIn('test "$KU_PERFORMANCE_V2_REUSE_RUN" = 41423107606',verify)
+        preflight=job.split('- name: Verify acknowledged perf control before any normal SELF build',1)[1].split('\n      - name:',1)[0]
+        self.assertIn('performance_self_args+=(--normal-self-workload ok-pmu)',preflight)
+        self.assertLess(job.index('Verify acknowledged perf control'),job.index('Build frozen sources and plans'))
+        self.assertEqual(job.count('performance_task_json_args+=(--normal-self-workload "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD")'),2)
+        self.assertNotIn('continue-on-error',preflight)
+
     def test_normal_perf_preflight_blocks_build_before_any_six_window_capture(self):
         _,job=self.workflow()
         preflight=job.split('- name: Verify acknowledged perf control before any normal SELF build',1)[1].split('\n      - name:',1)[0]

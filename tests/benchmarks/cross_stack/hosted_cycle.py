@@ -25,6 +25,7 @@ NORMAL_OK_INPUT_SHA = '59ede7cdba403d4d038c3720ab65f1cd940efd1038d07df782743a35e
 NORMAL_PG_PERF_FLAGS = ['--call-graph','dwarf,4096']
 NORMAL_PG_GPR_FLAGS = ['--call-graph','dwarf,16384',
     '--user-regs='+','.join([*('x%d'%n for n in range(30)),'lr','sp','pc'])]
+NORMAL_OK_PMU_FLAGS = [*NORMAL_PG_GPR_FLAGS,'--sample-cpu']
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
 RESOURCES = {'service_cores': 2, 'service_memory_bytes': GIB,
              'driver_cores': 1, 'driver_cpuset': '2', 'driver_memory_bytes': GIB}
@@ -47,8 +48,8 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 def validate_screen_selection(a,build_set):
     if getattr(a,'normal_self_workload','json_object')!='json_object':
         workload=getattr(a,'normal_self_workload',None)
-        product=NORMAL_OK_PRODUCT if workload=='ok-gpr' else NORMAL_PG_PRODUCT
-        if (workload not in ('db','db-gpr','ok-gpr') or not getattr(a,'normal_self_probe',False)
+        product=NORMAL_OK_PRODUCT if workload in ('ok-gpr','ok-pmu') else NORMAL_PG_PRODUCT
+        if (workload not in ('db','db-gpr','ok-gpr','ok-pmu') or not getattr(a,'normal_self_probe',False)
                 or a.candidate!=product):
             raise ValueError('normal SELF explicit workload requires normal-self-probe and its frozen ordinary F product')
     if getattr(a,'http_short_screen',False):
@@ -91,7 +92,7 @@ def hosted_identity(a,build_set):
         task_json_screen=getattr(a,'task_json_screen',False),common_http_screen=getattr(a,'common_http_screen',False),final_task_json=getattr(a,'final_task_json',False),pg_failure_probe=getattr(a,'pg_failure_probe',False))
     if getattr(a,'normal_self_probe',False):
         identity['normal_self_probe']=True
-        if getattr(a,'normal_self_workload','json_object') in ('db','db-gpr','ok-gpr'):identity['normal_self_workload']=a.normal_self_workload
+        if getattr(a,'normal_self_workload','json_object') in ('db','db-gpr','ok-gpr','ok-pmu'):identity['normal_self_workload']=a.normal_self_workload
     if getattr(a,'pg_queue_screen',False):identity['pg_queue_screen']=True
     if getattr(a,'pg_driver_screen',False):identity['pg_driver_screen']=True
     if getattr(a,'http_short_screen',False):
@@ -263,7 +264,18 @@ def pg_failure_plan(versions):
 
 def normal_self_plan(versions,workload='json_object'):
     """Normal Release SELF, bounded by two unsampled controls per stack."""
-    if workload=='ok-gpr':
+    if workload=='ok-pmu':
+        plan=normal_self_plan(versions,'ok-gpr')
+        plan.pop('source_archive_unavailable',None)
+        plan.update(schema='ku-hosted-normal-ok-pmu-probe-v1',event='cycles',perf_flags=list(NORMAL_OK_PMU_FLAGS),
+            count_events=['{cycles,instructions}','task-clock'],count_each_window=True,count_scope='initial attached TIDs; per-thread raw CSV, explicit ACK and original-client boundaries; no future-thread coverage assumed',
+            thread_evidence='TID sets before attach/enable/client-start/client-end/disable; middle raw FORK/EXIT and CPU/TID samples. Equal endpoint sets do not prove absence of transient threads.',
+            hardware_count_quality='Unscaled per-thread counts; active rows require100percent running and equal grouped hardware runtimes. Unavailable, missing or changed target threads remain unknown; no replacement.',
+            expected_cpu_samples=None,sample_estimate_basis='Hardware cycles observation; no minimum/extension or claimed sample count from old software CPUclock.',
+            build_contract='Exact verified B+Driver from41423107606/archive516f0422cbb3bab02c561d5410d0d452b51fe0a637a2930487488a4a5f8b27bc, no imported measurements; otherwise fresh normal F166 source, no PATH Ku/cache substitution.',
+            purpose='Distinguish same-/ok CPU-order changes in instructions/correct versus cycles/instruction and cycles/task-clock; check whether software IRQ-restore SELF clustering persists in hardware cycles. Three before/sample/after windows only; no product optimization, scoring or automatic adoption.')
+        return plan
+    if workload in ('ok-gpr','ok-pmu'):
         plan=normal_self_plan(versions)
         plan.update(schema='ku-hosted-normal-ok-self-probe-v1',workload='ok',contract='ordinary-async-http',rate=2000,
             order=[['B',turn] for turn in ('before','sample','after')],maximum_windows=3,
@@ -633,7 +645,7 @@ def build(a,state):
         ('BJ',a.candidate,{'ku_json':'typed'}),('BP',a.candidate,{'ku_pg_read':'typed'}),('BD',a.candidate,{'ku_format':'direct'})]
     if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):builds=[('A',prepatch,None),('B',a.candidate,None),('Driver',a.candidate,None)]
     if getattr(a,'pg_driver_screen',False):builds=[('B',a.candidate,None),('Driver',a.candidate,None)]
-    if getattr(a,'normal_self_workload','json_object') in ('db','db-gpr','ok-gpr'):builds=[('B',a.candidate,None),('Driver',a.candidate,None)]
+    if getattr(a,'normal_self_workload','json_object') in ('db','db-gpr','ok-gpr','ok-pmu'):builds=[('B',a.candidate,None),('Driver',a.candidate,None)]
     for name,commit,mode in builds:
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
     # Inspect the frozen product snapshot, never the current tools checkout.
@@ -650,7 +662,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     final_task_json=getattr(a,'final_task_json',False)
     validate_screen_selection(a,build_set)
     diagnostic=build_set in ('diagnostic','followup-screen')
-    rm=load(a.root/('Driver' if getattr(a,'pg_queue_screen',False) or getattr(a,'pg_driver_screen',False) or getattr(a,'http_short_screen',False) or getattr(a,'normal_self_workload','json_object') in ('db','db-gpr','ok-gpr') else 'R')/'manifest.json');client=copy.deepcopy(rm['client']);protocol=Path(rm['protocol']);versions={}
+    rm=load(a.root/('Driver' if getattr(a,'pg_queue_screen',False) or getattr(a,'pg_driver_screen',False) or getattr(a,'http_short_screen',False) or getattr(a,'normal_self_workload','json_object') in ('db','db-gpr','ok-gpr','ok-pmu') else 'R')/'manifest.json');client=copy.deepcopy(rm['client']);protocol=Path(rm['protocol']);versions={}
     if getattr(a,'pg_driver_screen',False):client['command'].append('--diagnostic-arrival-ledger')
     b_normal=load(a.root/'B/manifest.json')['stacks']['ku']['build']['native']['server']
     fixed_control=build_set=='followup-screen' and 'KU_HTTP_WORKER_POLICY' in Path(b_normal['generated_c']).read_text()
@@ -658,7 +670,7 @@ def complete_build(a,state,build_set,prepatch,variants):
         +['B',*(['BF'] if fixed_control else []),'R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS'])
     if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):names=['A','B']
     if getattr(a,'pg_driver_screen',False):names=['B']
-    if getattr(a,'normal_self_workload','json_object') in ('db','db-gpr','ok-gpr'):names=['B']
+    if getattr(a,'normal_self_workload','json_object') in ('db','db-gpr','ok-gpr','ok-pmu'):names=['B']
     if task_json_screen or final_task_json:
         require_task_json_support(a.root)
         if not (a.root/'BT/manifest.json').is_file():raise ValueError('explicit Task JSON mode requires the completed BT build')
@@ -701,7 +713,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions}
-    if getattr(a,'normal_self_workload','json_object')=='ok-gpr':check_normal_ok_binding(identities['B'])
+    if getattr(a,'normal_self_workload','json_object') in ('ok-gpr','ok-pmu'):check_normal_ok_binding(identities['B'])
     save(a.root/'build-identities.json',identities)
     if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
@@ -1242,8 +1254,9 @@ def pg_failure_probe(a,state):
     return result
 
 
-def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20,perf_flags=(),perf_frequency=499):
+def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20,perf_flags=(),perf_frequency=499,perf_event='cpu-clock'):
     """Readiness is an acknowledged enable, completion an acknowledged stop+exit0."""
+    if perf_event not in ('cpu-clock','cycles'):raise ValueError('explicit supported sampling event required')
     output=Path(output);raw=output/'perf.data';fds=[];process=watch=None;stop=threading.Event()
     def remaining(seconds):
         value=min(seconds,deadline-time.monotonic()) if deadline is not None else seconds
@@ -1252,7 +1265,7 @@ def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20,p
     try:
         read_ctl,write_ctl=os.pipe();fds.extend((read_ctl,write_ctl));read_ack,write_ack=os.pipe();fds.extend((read_ack,write_ack))
         os.set_blocking(write_ctl,False);os.set_blocking(read_ack,False)
-        command=[perf,'record','--clockid','mono','-e','cpu-clock','-F',str(perf_frequency),'--delay=-1',*perf_flags,
+        command=[perf,'record','--clockid','mono','-e',perf_event,'-F',str(perf_frequency),'--delay=-1',*perf_flags,
             f'--control=fd:{read_ctl},{write_ack}','-p',str(pid),'-o',str(raw)]
         record.update(command=command,raw_limit_bytes=limit,control=[],started_monotonic_ns=time.monotonic_ns(),
             control_ack_framing='Linux perf ACK_TAG sizeof includes trailing NUL: fixed5 bytes ack\\n\\0; consume full frame before next command')
@@ -1360,13 +1373,18 @@ def normal_perf_preflight(a,*,output=None,perf_flags=None):
                 if not chunk or len(data)>16:raise ValueError('owned busy child EOF/16-byte bound')
             if data!=b'done\n':raise ValueError('owned busy child completion mismatch')
         workload=getattr(a,'normal_self_workload','json_object')
-        flags=(NORMAL_PG_GPR_FLAGS if workload in ('db-gpr','ok-gpr') else NORMAL_PG_PERF_FLAGS if workload=='db' else []) if perf_flags is None else perf_flags
+        flags=(NORMAL_OK_PMU_FLAGS if workload=='ok-pmu' else NORMAL_PG_GPR_FLAGS if workload in ('db-gpr','ok-gpr','ok-pmu') else NORMAL_PG_PERF_FLAGS if workload=='db' else []) if perf_flags is None else perf_flags
         if flags:record['perf_flags']=list(flags)
-        raw_limit=96<<20 if workload in ('db-gpr','ok-gpr') else 4<<20 if '--call-graph' in flags else 1<<20
-        if workload in ('db-gpr','ok-gpr') or perf_flags is not None:
+        raw_limit=96<<20 if workload in ('db-gpr','ok-gpr','ok-pmu') else 4<<20 if '--call-graph' in flags else 1<<20
+        if workload in ('db-gpr','ok-gpr','ok-pmu') or perf_flags is not None:
             record.update(kernel=platform.release(),machine=platform.machine(),target_pid=child.pid,
                 target_scope='Only this owned busy child via -p; no product, database, driver or system-wide collection')
-        controlled_perf(busy,child.pid,output,perf,record,deadline=deadline,limit=raw_limit,**({'perf_flags':flags,**({'perf_frequency':999} if workload in ('db-gpr','ok-gpr') else {})} if flags else {}))
+        observed_busy=busy
+        if workload=='ok-pmu':
+            import pmu_control as pmu
+            record['sampling_event']='cycles';record['pmu_identities']=pmu.cycle_identities();record['pmu_stat']={};record['pmu_control_sha256']=sha(pmu.__file__)
+            observed_busy=lambda:pmu.controlled_stat(busy,child.pid,output/'pmu-stat',perf,record['pmu_stat'],deadline=deadline)
+        controlled_perf(observed_busy,child.pid,output,perf,record,deadline=deadline,limit=raw_limit,**({'perf_event':'cycles'} if workload=='ok-pmu' else {}),**({'perf_flags':flags,**({'perf_frequency':999} if workload in ('db-gpr','ok-gpr','ok-pmu') else {})} if flags else {}))
         os.write(child.stdin.fileno(),b'x');child.stdin.close();child.wait(timeout=1);record['child_reaped']=child.returncode==0
         size_on_disk=(output/'perf.data').stat().st_size
         with (output/'perf.data').open('rb') as stream:header=stream.read(56)
@@ -1383,13 +1401,19 @@ def normal_perf_preflight(a,*,output=None,perf_flags=None):
             perf_version_source='record header VERSION feature from the required perf report --header')
         record['perf_version_valid']=len(versions)==1 and bool(version) and version.isprintable() and len(version.encode('utf-8'))<=128
         if not record['perf_version_valid']:record['version_identity_error']='expected exactly one nonempty printable record-header version, at most128 UTF-8 bytes'
-        text=(output/'perf-script.log').read_text();record['sample_count']=sum(int(m[1],16)!=0 for m in re.finditer(r'cpu-clock:\s+(?:0x)?([0-9a-fA-F]+)\b',text))
+        text=(output/'perf-script.log').read_text();record['sample_count']=sum(int(m[1],16)!=0 for m in re.finditer(('cycles' if workload=='ok-pmu' else 'cpu-clock')+r':\s+(?:0x)?([0-9a-fA-F]+)\b',text))
         record['complete']=(record.get('record_complete') is True and record['child_reaped'] and record['header_bounds_valid']
             and record['sample_count']>0 and record['perf_version_valid'] and all(x['complete'] for x in record['exports']) and time.monotonic()<=deadline)
-        if workload in ('db-gpr','ok-gpr'):
+        if workload in ('db-gpr','ok-gpr','ok-pmu'):
             record['event_attributes']=normal_perf_event_attributes(output/'perf.data')
             record['raw_path']=str(output/'perf.data');record['raw_sha256']=sha(output/'perf.data')
-            record['actual_mask_valid']=normal_perf_gpr_attributes_valid(record['event_attributes'])
+            record['actual_mask_valid']=(pmu.cycles_attributes_valid(record['event_attributes'],record['pmu_identities']) if workload=='ok-pmu' else normal_perf_gpr_attributes_valid(record['event_attributes']))
+            if workload=='ok-pmu':
+                stat=record['pmu_stat'];record['raw_CPU_thread_evidence']=pmu.raw_cpu_threads(output/'perf.data',stat['client_started_monotonic_ns'],stat['client_finished_monotonic_ns'],child.pid,record['pmu_identities'])
+                record['sample_count']=record['raw_CPU_thread_evidence']['sample_count']
+                record['complete']=(record.get('record_complete') is True and record['child_reaped'] and record['header_bounds_valid']
+                    and record['sample_count']>0 and record['perf_version_valid'] and all(x['complete'] for x in record['exports'])
+                    and time.monotonic()<=deadline and stat.get('complete') is True)
             record['complete']=record['complete'] and record['actual_mask_valid']
     except BaseException as error:
         record.update(error=repr(error),complete=False)
@@ -1417,7 +1441,7 @@ def normal_perf_capability(a):
         candidate=a.candidate,entry_sha256=sha(__file__),execution_complete=False,complete=False,
         purpose='Plain CPU SELF control and explicit33-GPR DWARF once each; old default-DWARF failure retained. '
             'Only a successful DWARF GPR arm may permit the frozen F three-window PG probe. No automatic retry.')
-    if getattr(a,'normal_self_workload','json_object')=='ok-gpr':
+    if getattr(a,'normal_self_workload','json_object') in ('ok-gpr','ok-pmu'):
         result['purpose']='Plain CPU SELF and explicit33-GPR DWARF once each, owned child only. A successful GPR arm permits exactly three fresh normal /ok windows; no product operation or automatic retry.'
     try:
         for name,workload,flags in [('plain','json_object',[]),('dwarf-gpr','db-gpr',NORMAL_PG_GPR_FLAGS)]:
@@ -1457,6 +1481,17 @@ def require_normal_perf_preflight(a):
                 and record.get('event_attributes')==normal_perf_event_attributes(record['raw_path'])
                 and record.get('command',[])[-4:-2]==['-p',str(record.get('target_pid'))]))):
         raise ValueError('matching successful controlled-perf preflight required before build/normal six-window capture')
+    if getattr(a,'normal_self_workload','json_object')=='ok-pmu':
+        import pmu_control as pmu
+        if not(record.get('sampling_event')=='cycles' and record.get('perf_flags')==NORMAL_OK_PMU_FLAGS
+                and record.get('pmu_stat',{}).get('complete') is True and record.get('raw_path')
+                and record.get('raw_sha256')==sha(record['raw_path'])
+                and record.get('pmu_identities')==pmu.cycle_identities() and record.get('pmu_control_sha256')==sha(pmu.__file__)
+                and record.get('command',[])[-4:-2]==['-p',str(record.get('target_pid'))]
+                and record.get('command',[])[record.get('command',[]).index('-e')+1]=='cycles'
+                and record.get('event_attributes')==normal_perf_event_attributes(record['raw_path'])
+                and pmu.cycles_attributes_valid(normal_perf_event_attributes(record['raw_path']),record['pmu_identities'])):
+            raise ValueError('matching current controlled PMU/GPR/CPU/stat preflight required')
 
 
 def normal_pg_runtime(service,output):
@@ -1475,7 +1510,7 @@ def normal_pg_runtime(service,output):
     (output/'runtime-default-libpq.maps').write_bytes(raw)
 
 
-def normal_self_client(client,service,output,duration,perf,*,sample,perf_flags=(),perf_frequency=499,raw_limit=16<<20,expected_elf_sha=None):
+def normal_self_client(client,service,output,duration,perf,*,sample,perf_flags=(),perf_frequency=499,raw_limit=16<<20,expected_elf_sha=None,perf_event='cpu-clock',pmu_stat=False):
     """Observe the existing scored client; never change its requests or deadlines."""
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     record=dict(sampled=sample,callchains='unavailable: minimal SELF has no CALLCHAIN field',
@@ -1507,6 +1542,11 @@ def normal_self_client(client,service,output,duration,perf,*,sample,perf_flags=(
             scope='Sequential endpoint reads, not a simultaneous snapshot or thread/core residency histogram.')
         return value
     record['before']=endpoint('before')
+    observed_client=client
+    if pmu_stat:
+        import pmu_control as pmu
+        record['sampling_event']='cycles';record['pmu_identities']=pmu.cycle_identities();record['pmu_stat']={};record['pmu_control_sha256']=sha(pmu.__file__)
+        observed_client=lambda:pmu.controlled_stat(client,service.process.pid,output/'pmu-stat',perf,record['pmu_stat'])
     try:
         if sample:
             if not perf:raise ValueError('perf unavailable; preflight required')
@@ -1519,19 +1559,28 @@ def normal_self_client(client,service,output,duration,perf,*,sample,perf_flags=(
                 record['actual_ELF_disassembly']=diagnostic_command(['objdump','-d','-l',executable],
                     output/'normal-ELF-disassembly.log',timeout=20,limit=16<<20)
                 if not record['actual_ELF_disassembly']['complete']:raise ValueError('actual PG ELF disassembly incomplete')
-            return controlled_perf(client,service.process.pid,output,perf,record,**({'perf_flags':perf_flags,**({'perf_frequency':perf_frequency,'limit':raw_limit} if perf_frequency!=499 else {})} if perf_flags else {}))
+            return controlled_perf(observed_client,service.process.pid,output,perf,record,**({'perf_event':perf_event} if perf_event!='cpu-clock' else {}),**({'perf_flags':perf_flags,**({'perf_frequency':perf_frequency,'limit':raw_limit} if perf_frequency!=499 else {})} if perf_flags else {}))
         record['client_started_monotonic_ns']=time.monotonic_ns()
-        try:return client()
+        try:return observed_client()
         finally:record['client_finished_monotonic_ns']=time.monotonic_ns()
     finally:
         if sample and perf_frequency==999 and record.get('record_complete') is True:
             try:
                 record['event_attributes']=normal_perf_event_attributes(output/'perf.data')
-                record['actual_mask_frequency_stack_valid']=normal_perf_gpr_attributes_valid(record['event_attributes'])
+                record['actual_mask_frequency_stack_valid']=(pmu.cycles_attributes_valid(record['event_attributes'],record['pmu_identities']) if pmu_stat else normal_perf_gpr_attributes_valid(record['event_attributes']))
                 record['record_complete']=record['actual_mask_frequency_stack_valid']
             except (OSError,ValueError) as error:
                 record.update(record_complete=False,event_attributes_error=repr(error))
         record['after']=endpoint('after');record.setdefault('record_complete',not sample)
+        if pmu_stat:
+            stat=record['pmu_stat'];record['record_complete']=record['record_complete'] and stat.get('complete') is True
+            if sample and record['record_complete']:
+                try:
+                    record['raw_CPU_thread_evidence']=pmu.raw_cpu_threads(output/'perf.data',stat['client_started_monotonic_ns'],stat['client_finished_monotonic_ns'],service.process.pid,record['pmu_identities'])
+                    captured=record['raw_CPU_thread_evidence'];unknown=set(captured['sampled_tids']+captured['created_tids'])-set(stat['initial_tids'])
+                    record['stat_future_thread_coverage_unknown']=sorted(unknown)
+                    if unknown:record['record_complete']=False
+                except (OSError,ValueError) as error:record.update(record_complete=False,raw_CPU_thread_error=repr(error))
         save(output/'normal-self-observations.json',record)
 
 
@@ -1905,14 +1954,14 @@ def normal_self_probe(a,state):
     plan=load(a.root/'frozen-plan.json')
     workload=getattr(a,'normal_self_workload','json_object');pg=workload in ('db','db-gpr')
     if plan!=normal_self_plan(plan.get('versions',{}),workload):raise ValueError('matching frozen normal SELF plan required')
-    bindings={name:fc.version_identity(plan,name) for name in (('B',) if pg or workload=='ok-gpr' else ('B','R'))}
+    bindings={name:fc.version_identity(plan,name) for name in (('B',) if pg or workload in ('ok-gpr','ok-pmu') else ('B','R'))}
     mode=bindings['B']['build_mode']
     expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
         pg_execution_mode='async',pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
-    if (bindings['B']['stack']!='ku' or mode!=expected or (not pg and workload!='ok-gpr' and bindings['R']['stack']!='rust')
+    if (bindings['B']['stack']!='ku' or mode!=expected or (not pg and workload not in ('ok-gpr','ok-pmu') and bindings['R']['stack']!='rust')
             or (pg and (bindings['B'].get('source_commit')!=NORMAL_PG_PRODUCT or set(plan['versions'])!={'B'}))):
         raise ValueError('identified normal B/R binaries required; no D instrumentation')
-    if workload=='ok-gpr':
+    if workload in ('ok-gpr','ok-pmu'):
         if set(plan['versions'])!={'B'}:raise ValueError('normal /ok SELF permits only one fresh B')
         check_normal_ok_binding(bindings['B'])
     directory=a.root/'normal-self-probe';directory.mkdir(exist_ok=False)
@@ -1928,11 +1977,12 @@ def normal_self_probe(a,state):
             self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
         def client(self,service,request_workload,rate,duration,output,**kwargs):
             parent=super().client
-            if pg or workload=='ok-gpr':normal_pg_runtime(service,output)
+            if pg or workload in ('ok-gpr','ok-pmu'):normal_pg_runtime(service,output)
             if Path(output).name!='score':return parent(service,request_workload,rate,duration,output,**kwargs)
             return normal_self_client(lambda:parent(service,request_workload,rate,duration,output,**kwargs),
-                service,output,duration,perf,sample=active['sample'],**({'perf_flags':plan['perf_flags'],**({'perf_frequency':plan['perf_frequency'],'raw_limit':plan['raw_limit_bytes']} if workload in ('db-gpr','ok-gpr') else {})} if pg or workload=='ok-gpr' else {}),
-                **({'expected_elf_sha':bindings['B']['files']['ELF']['sha256']} if workload=='ok-gpr' else {}))
+                service,output,duration,perf,sample=active['sample'],**({'perf_flags':plan['perf_flags'],**({'perf_frequency':plan['perf_frequency'],'raw_limit':plan['raw_limit_bytes']} if workload in ('db-gpr','ok-gpr','ok-pmu') else {})} if pg or workload in ('ok-gpr','ok-pmu') else {}),
+                **({'expected_elf_sha':bindings['B']['files']['ELF']['sha256']} if workload in ('ok-gpr','ok-pmu') else {}),
+                **({'perf_event':'cycles','pmu_stat':True} if workload=='ok-pmu' else {}))
     began=time.monotonic()
     try:
         fixture.start();private=load(fixture.manifest_path);fc.Harness=SelfHarness
@@ -1956,7 +2006,8 @@ def normal_self_probe(a,state):
             row['observation_complete']=observation.get('record_complete') is True
             exports=[]
             if active['sample'] and row['observation_complete']:
-                start=observation.get('client_started_monotonic_ns');end=observation.get('client_finished_monotonic_ns')
+                selected_observation=observation.get('pmu_stat',{}) if workload=='ok-pmu' else observation
+                start=selected_observation.get('client_started_monotonic_ns');end=selected_observation.get('client_finished_monotonic_ns')
                 if type(start) is not int or type(end) is not int or not 0<start<end:
                     row['observation_complete']=False;row['perf_export_error']='client monotonic sampling range unavailable'
             if active['sample'] and row['observation_complete']:
@@ -1967,12 +2018,17 @@ def normal_self_probe(a,state):
                 exports.append(diagnostic_command([perf,'report','-i',str(raw),'--symfs',str(symfs),'--time',sample_time,'--stdio','--no-children',
                     '--show-nr-samples','--sort','symbol,dso,comm','--percent-limit','0'],output/'score/perf-self.log',timeout=20,limit=4<<20))
                 exports.append(diagnostic_command([perf,'script','-i',str(raw),'--symfs',str(symfs),'--time',sample_time,'--ns',
-                    '--show-lost-events','--show-task-events','-F','+pid,+tid,+time,+ip,+sym,+dso,+symoff,+srcline,+misc'],
+                    '--show-lost-events','--show-task-events','-F','+pid,+tid,+time,+ip,+sym,+dso,+symoff,+srcline,+misc'+(',+cpu' if workload=='ok-pmu' else '')],
                     output/'score/perf-pcs.log',timeout=20,limit=8<<20))
                 row['exports_complete']=all(x['complete'] for x in exports)
             quality,signature=normal_diagnostic_quality(row)
             valid=(quality and row['observation_complete']
                 and (not active['sample'] or row.get('exports_complete') is True))
+            if workload=='ok-pmu' and observation.get('pmu_stat',{}).get('complete') is True and type(row.get('correct')) is int and row['correct']>0:
+                counts=observation['pmu_stat']['counts'];row['PMU']=dict(counts,correct_requests=row['correct'],
+                    instructions_per_correct=counts['totals']['instructions']/row['correct'],cycles_per_correct=counts['totals']['cycles']/row['correct'],
+                    task_clock_ns_per_correct=counts['task_clock_ns']/row['correct'],
+                    CPU_scope='Attached initial TIDs only; original-client bracket includes driver startup/drain, not assumed equal to planned arrivals or existing CPU snapshots')
             row['diagnostic_qualified']=valid;result['rows'].append(row)
             save(directory/'results.json',dict(rows=result['rows'],stopped=result['stopped']))
             if not valid:
@@ -1994,9 +2050,9 @@ def normal_self_probe(a,state):
                     full_cpu_contract='full_cpu_us: complete service lifecycle including post-client perf finalization/cleanup; descriptive separately',
                     scope='Single before/sample/after sequence, no CI or automatic adoption. Full CPU includes post-client perf finalization; '
                         'client CPU uses existing h.client lifetime. Neither ratio alone proves observer overhead.')
-                if workload=='ok-gpr':
+                if workload in ('ok-gpr','ok-pmu'):
                     result['controls'][name]['full_cpu_contract']='full_cpu_us: existing after-warmup/pre-score-driver CPU snapshot to recorded drain/termination accounting; excludes cold startup and warmup, reported separately from scored-client CPU'
-                if pg or workload=='ok-gpr':
+                if pg or workload in ('ok-gpr','ok-pmu'):
                     envelope=plan['maximum_sample_cpu_ratio']
                     result['controls'][name]['sample_within_registered_cpu_envelope']=(client_ratio is not None and 1/envelope<=client_ratio<=envelope)
                     if not result['controls'][name]['sample_within_registered_cpu_envelope']:
@@ -2024,8 +2080,9 @@ def normal_self_probe(a,state):
             'score/normal-self-observations.json','score/perf-self.log','score/perf-pcs.log',
             'score/symbol-identities.json','score/maps.log','score/perf-record.log','score/normal-ELF-disassembly.log',
             'score/runtime-default-libpq.json','score/runtime-default-libpq.maps'))
-        if pg or workload=='ok-gpr':selected.extend(directory/name/turn/'warmup'/relative for name,turn in plan['order']
+        if pg or workload in ('ok-gpr','ok-pmu'):selected.extend(directory/name/turn/'warmup'/relative for name,turn in plan['order']
             for relative in ('client.json','driver-cleanup.json','runtime-default-libpq.json','runtime-default-libpq.maps'))
+        if workload=='ok-pmu':selected.extend(directory/name/turn/'score/pmu-stat'/relative for name,turn in plan['order'] for relative in ('stat.csv','stat.log'))
         result['small_artifact']=pg_failure_export(a,directory,output_name='normal-self-observation',schema='ku-normal-self-small-artifact-v1',selected=selected)
         save(a.root/'hosted-state.json',state)
     return result
@@ -2581,7 +2638,7 @@ def main(argv=None):
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--normal-self-workload',choices=['json_object','db','db-gpr','ok-gpr'],default='json_object',help='db retains the original probe; db-gpr gates the same three F PG windows; ok-gpr captures only three fresh F /ok2000/s windows, both after the existing explicit33-GPR capability control')
+    p.add_argument('--normal-self-workload',choices=['json_object','db','db-gpr','ok-gpr','ok-pmu'],default='json_object',help='db retains the original probe; db-gpr gates the same three F PG windows; ok-gpr captures only three fresh F /ok2000/s windows, both after the existing explicit33-GPR capability control')
     p.add_argument('--http-short-goal',choices=['cpu','memory'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
@@ -2615,9 +2672,9 @@ def main(argv=None):
     if a.phase=='perf-preflight':
         def preflight_stop(*unused):raise KeyboardInterrupt('perf preflight wall bound')
         signal.signal(signal.SIGALRM,preflight_stop)
-        gpr=a.normal_self_workload in ('db-gpr','ok-gpr')
+        gpr=a.normal_self_workload in ('db-gpr','ok-gpr','ok-pmu')
         signal.alarm(49 if gpr else 19)
-        try:result=normal_perf_capability(a) if gpr else normal_perf_preflight(a)
+        try:result=normal_perf_preflight(a) if a.normal_self_workload=='ok-pmu' else normal_perf_capability(a) if gpr else normal_perf_preflight(a)
         finally:signal.alarm(0)
         print(json.dumps(result));return 0 if result.get('complete') is True else 2
     identity=hosted_identity(a,a.build_set)

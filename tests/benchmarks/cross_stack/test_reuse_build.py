@@ -32,6 +32,112 @@ def archive(path, changes=None, old_run=False):
 
 class ReuseBuildTests(unittest.TestCase):
 
+    def test_ok_pmu_reuse_requires_frozen_archive_source_and_explicit_mode(self):
+        base=dict(normal_self_probe=True,normal_self_workload='ok-pmu',source_run=r.OK_PMU_RUN,
+            archive_sha256=r.OK_PMU_ARCHIVE_SHA,candidate=r.h.NORMAL_OK_PRODUCT,screen_variants=[])
+        for changes in ({'source_run':'123'},{'archive_sha256':'0'*64},{'candidate':'b'*40},
+                {'normal_self_probe':False},{'normal_self_workload':'ok-gpr'},{'screen_variants':['b'*40]}):
+            with self.subTest(changes=changes),patch.object(r,'extract_builds') as extract:
+                with self.assertRaises(ValueError):r.prepare_ok_pmu(types.SimpleNamespace(**dict(base,**changes)))
+                extract.assert_not_called()
+
+    def test_ok_pmu_measured_source_imports_only_verified_builds_and_preserves_current_preflight(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            def make(path,issue='none'):
+                state=dict(identity=dict(candidate=r.h.NORMAL_OK_PRODUCT,build_set='diagnostic',normal_self_probe=True,
+                    normal_self_workload='db-gpr' if issue=='wrong-profile' else 'ok-gpr'),
+                    steps={name:{'state':'completed'} for name in ('build','build-B','build-Driver','diagnostic')},
+                    database_cleanup={'old':'runtime'},boot_sha256='old boot')
+                if issue=='missing-diagnostic':state['steps'].pop('diagnostic')
+                if issue=='incomplete-build':state['steps']['build-B']['state']='started'
+                files={'B/build/bin/ku-server':b'normal immutable server','Driver/build/bin/client':b'normal immutable driver',
+                    'normal-self-probe/results.json':b'old measured result','normal-perf-preflight/preflight.json':b'old boot receipt',
+                    'hosted-state.json':json.dumps(state).encode()}
+                index=dict(path_root=r.TOKEN,raw_and_redacted_hashes_distinct=True,files=[
+                    dict(path=name,bytes=len(data),archived_sha256=hashlib.sha256(data).hexdigest()) for name,data in files.items()])
+                if issue=='missing-map':index['files'].pop()
+                if issue=='unselected-tamper':files['normal-self-probe/results.json']=b'modified old result'
+                files['portable-file-map.json']=json.dumps(index).encode()
+                with tarfile.open(path,'w:gz') as tar:
+                    for name,data in files.items():
+                        info=tarfile.TarInfo(name);info.size=len(data);tar.addfile(info,io.BytesIO(data))
+                return r.h.sha(path),len(index['files'])
+            for issue in ('none','wrong-profile','missing-diagnostic','incomplete-build','missing-map','unselected-tamper'):
+                path=root/(issue+'.tgz');fresh=root/issue;digest,count=make(path,issue)
+                (fresh/'tools').mkdir(parents=True);current=fresh/'normal-perf-preflight/preflight.json'
+                current.parent.mkdir();current.write_text('current boot PMU preflight')
+                with patch.object(r,'OK_PMU_ARCHIVE_SHA',digest):
+                    if issue!='none':
+                        with self.assertRaises(ValueError):r.extract_builds(path,fresh,digest,{'B','Driver'},ok_pmu_observation=True)
+                    else:r.extract_builds(path,fresh,digest,{'B','Driver'},ok_pmu_observation=True)
+                self.assertEqual(current.read_text(),'current boot PMU preflight')
+                self.assertFalse((fresh/'normal-self-probe').exists());self.assertFalse((fresh/'hosted-state.json').exists())
+                if issue!='none':self.assertFalse((fresh/'B').exists())
+                else:
+                    self.assertEqual((fresh/'B/build/bin/ku-server').read_bytes(),b'normal immutable server')
+                    self.assertEqual((fresh/'Driver/build/bin/client').read_bytes(),b'normal immutable driver')
+                    provenance=r.h.load(fresh/'reuse-original-state.json')
+                    self.assertEqual(set(provenance['steps']),{'build','build-B','build-Driver'})
+                    self.assertNotIn('boot_sha256',provenance);self.assertNotIn('database_cleanup',provenance)
+                    self.assertFalse(provenance['measurement_results_imported'])
+                    self.assertEqual(r.h.load(fresh/'reuse-byte-verification.json')['all_map_files_verified'],count)
+
+    def test_ok_pmu_preparation_keeps_actual_driver_and_revalidates_default_inputs_without_building(self):
+        for issue in ('none','driver-hash','driver-source','driver-commit','driver-command','protocol','ELF','C','input','libpq','override'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);fresh=root/'fresh';(fresh/'tools').mkdir(parents=True)
+                current=fresh/'normal-perf-preflight/preflight.json';current.parent.mkdir();current.write_text('current boot')
+                args=types.SimpleNamespace(root=fresh,source=root/'source',tools=fresh/'tools',archive=root/'source.tgz',
+                    source_run=r.OK_PMU_RUN,archive_sha256=r.OK_PMU_ARCHIVE_SHA,candidate=r.h.NORMAL_OK_PRODUCT,
+                    normal_self_probe=True,normal_self_workload='ok-pmu',baseline=r.h.BASELINE,prepatch=r.h.BASELINE,screen_variants=[])
+                calls=[];client={};protocol_digest=[]
+                def extract(archive,output,digest,commits,**kwargs):
+                    calls.append('extract');self.assertEqual(calls,['preflight','extract'])
+                    self.assertEqual(commits,{'B':args.candidate,'Driver':args.candidate});self.assertEqual(kwargs,{'ok_pmu_observation':True})
+                    source=output/'Driver/src/tests/benchmarks/cross_stack/client/main.go';source.parent.mkdir(parents=True);source.write_text('package main\n')
+                    binary=output/'Driver/build/bin/client';binary.parent.mkdir(parents=True);header=bytearray(20);header[:6]=b'\x7fELF\x02\x01';header[18:20]=(183).to_bytes(2,'little');binary.write_bytes(header)
+                    protocol=source.parent.parent/'protocol.json';protocol.write_text('{"schema":1}\n');protocol_digest.append(r.h.sha(protocol))
+                    client.update(command=[str(binary)],sha256=r.h.sha(binary),source_sha256=r.h.sha(source))
+                    patches.enter_context(patch.object(r,'OK_PMU_DRIVER_SHA',r.h.sha(binary)))
+                    receipt=output/'Driver/build/build.json';r.h.save(receipt,dict(candidate_base=args.candidate,failure=None,
+                        commands=[{'exit_code':1 if issue=='driver-command' else 0}]))
+                    r.h.save(output/'Driver/manifest.json',dict(candidate_base='b'*40 if issue=='driver-commit' else args.candidate,
+                        protocol=str(protocol),client=client,build_receipt=str(receipt)))
+                    return {}
+                patches.enter_context(patch.object(r.os,'geteuid',return_value=1));patches.enter_context(patch.object(r.platform,'system',return_value='Linux'))
+                patches.enter_context(patch.object(r.platform,'machine',return_value='aarch64'))
+                patches.enter_context(patch.object(r.h,'validate_screen_selection'))
+                patches.enter_context(patch.object(r.h,'require_normal_perf_preflight',side_effect=lambda a:calls.append('preflight')))
+                patches.enter_context(patch.object(r,'extract_builds',side_effect=extract));patches.enter_context(patch.object(r,'restore_json_inputs'))
+                patches.enter_context(patch.object(r,'validate_protocol_inputs',side_effect=lambda p,n,m:
+                    {'protocol_sha256':'0'*64 if issue=='protocol' and n=='B' else protocol_digest[0]}))
+                def verify(*unused,**kwargs):
+                    self.assertEqual(kwargs,{'client_source':fresh/'Driver/src/tests/benchmarks/cross_stack/client/main.go'})
+                    common=dict(client)
+                    if issue=='driver-hash':common['sha256']='0'*64
+                    if issue=='driver-source':common['source_sha256']='0'*64
+                    return dict(client=common,stacks={'ku':dict(env={'LD_LIBRARY_PATH':'override'} if issue=='override' else {},
+                        build=dict(libpq_source='libpq',native={'server':dict(binary='ELF',generated_c='C',source='input')}))})
+                patches.enter_context(patch.object(r,'verify_manifest',side_effect=verify));original_checked=r.checked
+                def checked(path,wanted):
+                    if isinstance(path,str) and path in ('ELF','C','input','libpq'):
+                        if issue==path:raise ValueError('wrong default '+path)
+                    else:original_checked(path,wanted)
+                patches.enter_context(patch.object(r,'checked',side_effect=checked))
+                fresh_driver=patches.enter_context(patch.object(r,'new_driver'))
+                complete=patches.enter_context(patch.object(r.h,'complete_build',return_value={'execution_complete':True}))
+                if issue!='none':
+                    with self.assertRaises(ValueError):r.prepare_ok_pmu(args)
+                    complete.assert_not_called();self.assertFalse((fresh/'hosted-state.json').exists())
+                else:
+                    self.assertTrue(r.prepare_ok_pmu(args)['execution_complete']);complete.assert_called_once()
+                    state=r.h.load(fresh/'hosted-state.json');self.assertEqual(set(state['steps']),{'build'})
+                    self.assertEqual(state['reused_build']['normal_versions'],{'B':args.candidate,'Driver':args.candidate})
+                    self.assertEqual(state['reused_build']['imported_measurement_windows'],0)
+                    self.assertFalse(state['reused_build']['old_boot_or_runtime_state_imported'])
+                fresh_driver.assert_not_called();self.assertEqual(current.read_text(),'current boot')
+
     def test_pg_self_reuse_requires_the_fixed_archive_and_explicit_profile_before_extraction(self):
         base=dict(normal_self_probe=True,normal_self_workload='db-gpr',source_run=r.PG_SELF_RUN,
             archive_sha256=r.PG_SELF_ARCHIVE_SHA,candidate=r.h.NORMAL_PG_PRODUCT,screen_variants=[])

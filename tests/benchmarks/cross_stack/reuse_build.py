@@ -11,6 +11,9 @@ MAX_FILES=20000
 MAX_FILE=128<<20
 MAX_TOTAL=768<<20
 TOKEN='${EVIDENCE_ROOT}'
+OK_PMU_RUN='41423107606'
+OK_PMU_ARCHIVE_SHA='516f0422cbb3bab02c561d5410d0d452b51fe0a637a2930487488a4a5f8b27bc'
+OK_PMU_DRIVER_SHA='08f1f4cf722c2c9939dd2b2df3c19951895cddac8dbabd395053a7af1534efbd'
 
 
 def checked(path, expected):
@@ -25,11 +28,13 @@ def translated(value, root):
     return value
 
 
-def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False,pg_self_observation=False):
+def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False,pg_self_observation=False,ok_pmu_observation=False):
     """Check all paths/map entries first; write only into a fresh owned tree."""
     checked(archive,expected_sha256)
     root=Path(root)
-    allowed={'tools','normal-perf-preflight'} if pg_self_observation else {'tools'}
+    measured=pg_self_observation or ok_pmu_observation
+    if sum(bool(x) for x in (owner_observation,pg_self_observation,ok_pmu_observation))>1:raise ValueError('one explicit build-reuse mode required')
+    allowed={'tools','normal-perf-preflight'} if measured else {'tools'}
     if root.exists() and (root.is_symlink() or any(p.name not in allowed for p in root.iterdir())):
         raise ValueError('reuse requires a fresh output (only prepared tools may exist)')
     with tarfile.open(archive,'r:gz') as tar:
@@ -51,9 +56,9 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
         if len(entries)>MAX_FILES:raise ValueError('portable map entry limit')
         mapping={entry['path']:entry for entry in entries}
         if len(mapping)!=len(entries):raise ValueError('duplicate portable map entry')
-        if pg_self_observation:
+        if measured:
             if set(mapping)!={m.name for m in members if m.name!='portable-file-map.json'}:
-                raise ValueError('PG SELF archive/map closure differs')
+                raise ValueError('normal SELF archive/map closure differs')
             # Check every original archived byte, including retained failed
             # observations, while importing only the immutable build prefixes.
             for member in members:
@@ -62,6 +67,14 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
                 if entry.get('bytes')!=len(data) or hashlib.sha256(data).hexdigest()!=entry.get('archived_sha256'):
                     raise ValueError('portable archived bytes differ: '+member.name)
         old=json.load(tar.extractfile('hosted-state.json'))
+        pmu=(ok_pmu_observation and set(names)=={'B','Driver'} and expected_sha256==OK_PMU_ARCHIVE_SHA
+                and set(old.get('steps',{}))=={'build','build-B','build-Driver','diagnostic'}
+                and all(v.get('state')=='completed' for v in old['steps'].values())
+                and old.get('identity',{}).get('candidate')==h.NORMAL_OK_PRODUCT
+                and old['identity'].get('build_set')=='diagnostic'
+                and old['identity'].get('normal_self_probe') is True
+                and old['identity'].get('normal_self_workload')=='ok-gpr')
+        if ok_pmu_observation and not pmu:raise ValueError('fixed normal /ok build/diagnostic provenance differs')
         if any(not name.startswith('build') for name in old.get('steps',{})):
             owner=(owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
                     and set(old.get('steps',{}))=={'build','build-B','build-R','diagnostic'}
@@ -71,7 +84,7 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
                 and all(v.get('state')=='completed' for v in old['steps'].values())
                 and old.get('identity',{}).get('candidate')==h.NORMAL_PG_PRODUCT
                 and old['identity'].get('http_short_screen') is True and old['identity'].get('http_short_goal')=='pg-zero-cpu')
-            if not (owner or pg):
+            if not (owner or pg or pmu):
                 raise ValueError('this reuse path accepts build-only source runs except the fixed owner archive')
         if any(old.get('steps',{}).get('build-'+name,{}).get('state')!='completed' for name in names):
             raise ValueError('requested normal build was not completed')
@@ -86,9 +99,9 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
             with destination.open('xb') as stream:stream.write(data)
             destination.chmod(member.mode&0o777)
         h.save(root/'reuse-portable-file-map.json',index)
-        if pg_self_observation:h.save(root/'reuse-byte-verification.json',dict(archive_sha256=expected_sha256,
+        if measured:h.save(root/'reuse-byte-verification.json',dict(archive_sha256=expected_sha256,
             all_map_files_verified=len(mapping),imported_build_prefixes=sorted(names),imported_measurement_windows=0))
-        provenance=old if not (owner_observation or pg_self_observation) else dict(identity=old.get('identity'),
+        provenance=old if not (owner_observation or measured) else dict(identity=old.get('identity'),
             steps={k:v for k,v in old.get('steps',{}).items() if k.startswith('build')},measurement_results_imported=False)
         h.save(root/'reuse-original-state.json',provenance)
         return mapping
@@ -317,6 +330,45 @@ def prepare_pg_self(a):
     return result
 
 
+def prepare_ok_pmu(a):
+    h.validate_screen_selection(a,'diagnostic')
+    if ((a.source_run,a.archive_sha256,a.candidate)!=(OK_PMU_RUN,OK_PMU_ARCHIVE_SHA,h.NORMAL_OK_PRODUCT)
+            or getattr(a,'normal_self_workload',None)!='ok-pmu' or a.screen_variants):
+        raise ValueError('PMU reuse requires fixed41423107606 F166 B/Driver builds and explicit ok-pmu profile')
+    if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
+        raise ValueError('ordinary benchmark user on Linux ARM64 required')
+    h.require_normal_perf_preflight(a)
+    commits={'B':a.candidate,'Driver':a.candidate}
+    mapping=extract_builds(a.archive,a.root,a.archive_sha256,commits,ok_pmu_observation=True)
+    restore_json_inputs(a.source,a.root,commits,mapping)
+    inputs={name:validate_protocol_inputs(a.root,name,mapping) for name in commits}
+    if len({v['protocol_sha256'] for v in inputs.values()})!=1:raise ValueError('PMU protocol inputs differ')
+    source=a.root/'Driver/src/tests/benchmarks/cross_stack/client/main.go'
+    normal=verify_manifest(a.root,'B',a.candidate,mapping,client_source=source)
+    build=normal['stacks']['ku']['build'];native=build['native']['server']
+    checked(native['binary'],h.NORMAL_PG_ELF_SHA);checked(native['generated_c'],h.NORMAL_PG_C_SHA)
+    checked(native['source'],h.NORMAL_OK_INPUT_SHA);checked(build['libpq_source'],h.NORMAL_PG_D_SHA)
+    if normal['stacks']['ku'].get('env'):raise ValueError('PMU normal service cannot have a runtime library override')
+    original=h.load(a.root/'Driver/manifest.json');driver=translated(original,a.root);receipt=h.load(driver['build_receipt'])
+    if (driver.get('candidate_base')!=a.candidate or receipt.get('candidate_base')!=a.candidate
+            or receipt.get('failure') is not None or not receipt.get('commands')
+            or any(row.get('exit_code')!=0 for row in receipt['commands'])):
+        raise ValueError('PMU driver build identity/completion differs')
+    client=driver['client'];require_elf(client['command'][0]);checked(client['command'][0],OK_PMU_DRIVER_SHA)
+    checked(client['command'][0],client['sha256']);checked(source,client['source_sha256'])
+    checked(driver['protocol'],inputs['Driver']['protocol_sha256'])
+    if any(client[k]!=normal['client'][k] for k in ('sha256','source_sha256')):raise ValueError('PMU B/Driver client bytes differ')
+    h.save(a.root/'reuse-provenance/Driver-manifest.json',original)
+    driver['uid'],driver['gid']=os.getuid(),os.getgid();h.save(a.root/'Driver/manifest.json',driver)
+    state=dict(identity=h.hosted_identity(a,'diagnostic'),steps={},uid=os.getuid(),gid=os.getgid(),goal_status='unknown',
+        reused_build=dict(source_run=a.source_run,archive_sha256=a.archive_sha256,product_commit=a.candidate,
+            normal_versions=commits,imported_measurement_windows=0,old_boot_or_runtime_state_imported=False))
+    h.save(a.root/'hosted-state.json',state)
+    result=h.step(state,a.root,'build',lambda:h.complete_build(a,state,'diagnostic',a.prepatch,[]))
+    h.save(a.root/'reuse-build.json',dict(**state['reused_build'],complete=result['execution_complete']))
+    return result
+
+
 def prepare_owner(a):
     h.validate_screen_selection(a,'diagnostic')
     if (a.source_run,a.archive_sha256,a.candidate)!=(OWNER_RUN,OWNER_ARCHIVE_SHA,OWNER_PRODUCT):
@@ -339,7 +391,7 @@ def prepare_owner(a):
 
 
 def prepare(a):
-    if getattr(a,'normal_self_probe',False):return prepare_pg_self(a)
+    if getattr(a,'normal_self_probe',False):return prepare_ok_pmu(a) if getattr(a,'normal_self_workload',None)=='ok-pmu' else prepare_pg_self(a)
     if getattr(a,'memory_owner_probe',False):return prepare_owner(a)
     h.validate_screen_selection(a,'followup-screen')
     if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
@@ -375,7 +427,7 @@ def main(argv=None):
     parser.add_argument('--baseline',default=h.BASELINE);parser.add_argument('--screen-variants',default='')
     parser.add_argument('--memory-owner-probe',action='store_true',help='Reuse only the fixed verified normal B/R archive for one instrumented allocation-owner observation')
     parser.add_argument('--normal-self-probe',action='store_true',help='Only the fixed F B/Driver archive; fresh GPR capability gate required')
-    parser.add_argument('--normal-self-workload',choices=['json_object','db','db-gpr'],default='json_object')
+    parser.add_argument('--normal-self-workload',choices=['json_object','db','db-gpr','ok-pmu'],default='json_object')
     parser.add_argument('--task-json-screen',action='store_true',help='Require a completed, verified BT build in the source archive; never infer the screen from product capability')
     parser.add_argument('--final-task-json',action='store_true',help='Rejected: final/full requires a fresh full build, not followup archive reuse')
     parser.add_argument('--common-http-screen',action='store_true',help='Explicit shared HTTP screen; requires --task-json-screen and preserves its distinct cache identity')
