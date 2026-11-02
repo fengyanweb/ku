@@ -20,6 +20,8 @@ NORMAL_PG_PRODUCT = '5b6b41138cce4086c19cc7daa24e820c9b6513d8'
 NORMAL_PG_ELF_SHA = '234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b'
 NORMAL_PG_C_SHA = '830536089f72ce56118e4e6a1556bbe007f816cc16a3c2f96c0dcff010d14e77'
 NORMAL_PG_D_SHA = 'b59de287c314a78cb70e7e0bb31fb2be34b961ccc90beff405d8c48412ace2df'
+NORMAL_OK_PRODUCT = '166453a1d2768bbce19796d9c7823be73cc84ccb'
+NORMAL_OK_INPUT_SHA = '59ede7cdba403d4d038c3720ab65f1cd940efd1038d07df782743a35eb9887ae'
 NORMAL_PG_PERF_FLAGS = ['--call-graph','dwarf,4096']
 NORMAL_PG_GPR_FLAGS = ['--call-graph','dwarf,16384',
     '--user-regs='+','.join([*('x%d'%n for n in range(30)),'lr','sp','pc'])]
@@ -44,9 +46,11 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 def validate_screen_selection(a,build_set):
     if getattr(a,'normal_self_workload','json_object')!='json_object':
-        if (getattr(a,'normal_self_workload',None) not in ('db','db-gpr') or not getattr(a,'normal_self_probe',False)
-                or a.candidate!=NORMAL_PG_PRODUCT):
-            raise ValueError('normal SELF db requires explicit normal-self-probe and frozen ordinary F product')
+        workload=getattr(a,'normal_self_workload',None)
+        product=NORMAL_OK_PRODUCT if workload=='ok-gpr' else NORMAL_PG_PRODUCT
+        if (workload not in ('db','db-gpr','ok-gpr') or not getattr(a,'normal_self_probe',False)
+                or a.candidate!=product):
+            raise ValueError('normal SELF explicit workload requires normal-self-probe and its frozen ordinary F product')
     if getattr(a,'http_short_screen',False):
         if getattr(a,'http_short_goal','cpu') not in ('cpu','memory'):
             raise ValueError('--http-short-goal must be cpu or memory')
@@ -87,7 +91,7 @@ def hosted_identity(a,build_set):
         task_json_screen=getattr(a,'task_json_screen',False),common_http_screen=getattr(a,'common_http_screen',False),final_task_json=getattr(a,'final_task_json',False),pg_failure_probe=getattr(a,'pg_failure_probe',False))
     if getattr(a,'normal_self_probe',False):
         identity['normal_self_probe']=True
-        if getattr(a,'normal_self_workload','json_object') in ('db','db-gpr'):identity['normal_self_workload']=a.normal_self_workload
+        if getattr(a,'normal_self_workload','json_object') in ('db','db-gpr','ok-gpr'):identity['normal_self_workload']=a.normal_self_workload
     if getattr(a,'pg_queue_screen',False):identity['pg_queue_screen']=True
     if getattr(a,'pg_driver_screen',False):identity['pg_driver_screen']=True
     if getattr(a,'http_short_screen',False):
@@ -259,6 +263,21 @@ def pg_failure_plan(versions):
 
 def normal_self_plan(versions,workload='json_object'):
     """Normal Release SELF, bounded by two unsampled controls per stack."""
+    if workload=='ok-gpr':
+        plan=normal_self_plan(versions)
+        plan.update(schema='ku-hosted-normal-ok-self-probe-v1',workload='ok',contract='ordinary-async-http',rate=2000,
+            order=[['B',turn] for turn in ('before','sample','after')],maximum_windows=3,
+            product_commit=NORMAL_OK_PRODUCT,generated_C_sha256=NORMAL_PG_C_SHA,expanded_source_sha256=NORMAL_OK_INPUT_SHA,
+            perf_flags=list(NORMAL_PG_GPR_FLAGS),perf_frequency=999,raw_limit_bytes=96<<20,
+            log_limit_bytes=1<<20,maximum_sample_cpu_ratio=1.10,expected_cpu_samples=749,
+            sample_estimate_basis='2000 requests/s *15s *25us service CPU/request *999Hz; planning estimate only, no minimum or extension',
+            user_regs_mask='0x1ffffffff',register_scope='All33 ARM64 GPRs; VG excluded. Unresolved/inline callers remain unknown.',
+            caller_PC_contract='SELF is the sampled instruction; retain raw ancestor PCs and resolve actual aligned call sites from this fresh ELF. Inclusive chains overlap and cannot be summed.',
+            build_contract='One fresh normal B plus common Driver from frozen F source; no R, derived binary, old archive upload or imported measurements. ELF identity is recorded, not assumed equal to old234.',
+            source_archive_unavailable=dict(run='41280471018',observation='GitHub artifacts lookup completed successfully with zero entries; fresh build required, not a product performance failure'),
+            purpose='Locate ordinary async /ok2000/s CPU in one before/sample/after sequence. Distinguish initial/completed Task work and actual HTTP system calls without presuming a cause. '
+                'No product patch, Rust ranking, performance acceptance, repeats or later sample extension. Preserve unidentified CPU and sampling perturbation.')
+        return plan
     if workload in ('db','db-gpr'):
         plan=normal_self_plan(versions)
         plan.update(schema='ku-hosted-normal-pg-self-probe-v1',workload='db',contract='pg-default',rate=200,
@@ -614,7 +633,7 @@ def build(a,state):
         ('BJ',a.candidate,{'ku_json':'typed'}),('BP',a.candidate,{'ku_pg_read':'typed'}),('BD',a.candidate,{'ku_format':'direct'})]
     if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):builds=[('A',prepatch,None),('B',a.candidate,None),('Driver',a.candidate,None)]
     if getattr(a,'pg_driver_screen',False):builds=[('B',a.candidate,None),('Driver',a.candidate,None)]
-    if getattr(a,'normal_self_workload','json_object') in ('db','db-gpr'):builds=[('B',a.candidate,None),('Driver',a.candidate,None)]
+    if getattr(a,'normal_self_workload','json_object') in ('db','db-gpr','ok-gpr'):builds=[('B',a.candidate,None),('Driver',a.candidate,None)]
     for name,commit,mode in builds:
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
     # Inspect the frozen product snapshot, never the current tools checkout.
@@ -631,7 +650,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     final_task_json=getattr(a,'final_task_json',False)
     validate_screen_selection(a,build_set)
     diagnostic=build_set in ('diagnostic','followup-screen')
-    rm=load(a.root/('Driver' if getattr(a,'pg_queue_screen',False) or getattr(a,'pg_driver_screen',False) or getattr(a,'http_short_screen',False) or getattr(a,'normal_self_workload','json_object') in ('db','db-gpr') else 'R')/'manifest.json');client=copy.deepcopy(rm['client']);protocol=Path(rm['protocol']);versions={}
+    rm=load(a.root/('Driver' if getattr(a,'pg_queue_screen',False) or getattr(a,'pg_driver_screen',False) or getattr(a,'http_short_screen',False) or getattr(a,'normal_self_workload','json_object') in ('db','db-gpr','ok-gpr') else 'R')/'manifest.json');client=copy.deepcopy(rm['client']);protocol=Path(rm['protocol']);versions={}
     if getattr(a,'pg_driver_screen',False):client['command'].append('--diagnostic-arrival-ledger')
     b_normal=load(a.root/'B/manifest.json')['stacks']['ku']['build']['native']['server']
     fixed_control=build_set=='followup-screen' and 'KU_HTTP_WORKER_POLICY' in Path(b_normal['generated_c']).read_text()
@@ -639,7 +658,7 @@ def complete_build(a,state,build_set,prepatch,variants):
         +['B',*(['BF'] if fixed_control else []),'R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS'])
     if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):names=['A','B']
     if getattr(a,'pg_driver_screen',False):names=['B']
-    if getattr(a,'normal_self_workload','json_object') in ('db','db-gpr'):names=['B']
+    if getattr(a,'normal_self_workload','json_object') in ('db','db-gpr','ok-gpr'):names=['B']
     if task_json_screen or final_task_json:
         require_task_json_support(a.root)
         if not (a.root/'BT/manifest.json').is_file():raise ValueError('explicit Task JSON mode requires the completed BT build')
@@ -681,7 +700,9 @@ def complete_build(a,state,build_set,prepatch,variants):
     else:plan=frozen_plan(versions,final_task_json=final_task_json)
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
-    identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
+    identities={n:fc.version_identity(plan,n) for n in versions}
+    if getattr(a,'normal_self_workload','json_object')=='ok-gpr':check_normal_ok_binding(identities['B'])
+    save(a.root/'build-identities.json',identities)
     if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
     if build_set=='followup-screen':
@@ -1339,13 +1360,13 @@ def normal_perf_preflight(a,*,output=None,perf_flags=None):
                 if not chunk or len(data)>16:raise ValueError('owned busy child EOF/16-byte bound')
             if data!=b'done\n':raise ValueError('owned busy child completion mismatch')
         workload=getattr(a,'normal_self_workload','json_object')
-        flags=(NORMAL_PG_GPR_FLAGS if workload=='db-gpr' else NORMAL_PG_PERF_FLAGS if workload=='db' else []) if perf_flags is None else perf_flags
+        flags=(NORMAL_PG_GPR_FLAGS if workload in ('db-gpr','ok-gpr') else NORMAL_PG_PERF_FLAGS if workload=='db' else []) if perf_flags is None else perf_flags
         if flags:record['perf_flags']=list(flags)
-        raw_limit=96<<20 if workload=='db-gpr' else 4<<20 if '--call-graph' in flags else 1<<20
-        if workload=='db-gpr' or perf_flags is not None:
+        raw_limit=96<<20 if workload in ('db-gpr','ok-gpr') else 4<<20 if '--call-graph' in flags else 1<<20
+        if workload in ('db-gpr','ok-gpr') or perf_flags is not None:
             record.update(kernel=platform.release(),machine=platform.machine(),target_pid=child.pid,
                 target_scope='Only this owned busy child via -p; no product, database, driver or system-wide collection')
-        controlled_perf(busy,child.pid,output,perf,record,deadline=deadline,limit=raw_limit,**({'perf_flags':flags,**({'perf_frequency':999} if workload=='db-gpr' else {})} if flags else {}))
+        controlled_perf(busy,child.pid,output,perf,record,deadline=deadline,limit=raw_limit,**({'perf_flags':flags,**({'perf_frequency':999} if workload in ('db-gpr','ok-gpr') else {})} if flags else {}))
         os.write(child.stdin.fileno(),b'x');child.stdin.close();child.wait(timeout=1);record['child_reaped']=child.returncode==0
         size_on_disk=(output/'perf.data').stat().st_size
         with (output/'perf.data').open('rb') as stream:header=stream.read(56)
@@ -1365,7 +1386,7 @@ def normal_perf_preflight(a,*,output=None,perf_flags=None):
         text=(output/'perf-script.log').read_text();record['sample_count']=sum(int(m[1],16)!=0 for m in re.finditer(r'cpu-clock:\s+(?:0x)?([0-9a-fA-F]+)\b',text))
         record['complete']=(record.get('record_complete') is True and record['child_reaped'] and record['header_bounds_valid']
             and record['sample_count']>0 and record['perf_version_valid'] and all(x['complete'] for x in record['exports']) and time.monotonic()<=deadline)
-        if workload=='db-gpr':
+        if workload in ('db-gpr','ok-gpr'):
             record['event_attributes']=normal_perf_event_attributes(output/'perf.data')
             record['raw_path']=str(output/'perf.data');record['raw_sha256']=sha(output/'perf.data')
             record['actual_mask_valid']=normal_perf_gpr_attributes_valid(record['event_attributes'])
@@ -1396,6 +1417,8 @@ def normal_perf_capability(a):
         candidate=a.candidate,entry_sha256=sha(__file__),execution_complete=False,complete=False,
         purpose='Plain CPU SELF control and explicit33-GPR DWARF once each; old default-DWARF failure retained. '
             'Only a successful DWARF GPR arm may permit the frozen F three-window PG probe. No automatic retry.')
+    if getattr(a,'normal_self_workload','json_object')=='ok-gpr':
+        result['purpose']='Plain CPU SELF and explicit33-GPR DWARF once each, owned child only. A successful GPR arm permits exactly three fresh normal /ok windows; no product operation or automatic retry.'
     try:
         for name,workload,flags in [('plain','json_object',[]),('dwarf-gpr','db-gpr',NORMAL_PG_GPR_FLAGS)]:
             arm=copy.copy(a);arm.normal_self_workload=workload
@@ -1427,7 +1450,7 @@ def require_normal_perf_preflight(a):
             and record.get('boot_sha256')==sha('/proc/sys/kernel/random/boot_id') and record.get('perf_path')
             and record.get('perf_sha256')==sha(record['perf_path'])
             and (getattr(a,'normal_self_workload','json_object')!='db' or record.get('perf_flags')==NORMAL_PG_PERF_FLAGS)
-            and (getattr(a,'normal_self_workload','json_object')!='db-gpr' or (
+            and (getattr(a,'normal_self_workload','json_object') not in ('db-gpr','ok-gpr') or (
                 record.get('perf_flags')==NORMAL_PG_GPR_FLAGS and record.get('actual_mask_valid') is True
                 and normal_perf_gpr_attributes_valid(record.get('event_attributes',[]))
                 and record.get('raw_path') and record.get('raw_sha256')==sha(record['raw_path'])
@@ -1452,7 +1475,7 @@ def normal_pg_runtime(service,output):
     (output/'runtime-default-libpq.maps').write_bytes(raw)
 
 
-def normal_self_client(client,service,output,duration,perf,*,sample,perf_flags=(),perf_frequency=499,raw_limit=16<<20):
+def normal_self_client(client,service,output,duration,perf,*,sample,perf_flags=(),perf_frequency=499,raw_limit=16<<20,expected_elf_sha=None):
     """Observe the existing scored client; never change its requests or deadlines."""
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     record=dict(sampled=sample,callchains='unavailable: minimal SELF has no CALLCHAIN field',
@@ -1490,7 +1513,7 @@ def normal_self_client(client,service,output,duration,perf,*,sample,perf_flags=(
             record['symbols']=diagnostic_symbols(service,output)
             if perf_frequency==999:
                 if (record['symbols'].get('complete') is not True
-                        or not any(row.get('sha256')==NORMAL_PG_ELF_SHA for row in record['symbols'].get('files',[]))):
+                        or not any(row.get('sha256')==(expected_elf_sha or NORMAL_PG_ELF_SHA) for row in record['symbols'].get('files',[]))):
                     raise ValueError('complete mapped-symbol snapshot of actual normal PG ELF required')
                 executable=str(Path('/proc')/str(service.process.pid)/'exe')
                 record['actual_ELF_disassembly']=diagnostic_command(['objdump','-d','-l',executable],
@@ -1864,6 +1887,17 @@ def pg_driver_screen(a,state):
     return result
 
 
+def check_normal_ok_binding(binding):
+    expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
+        pg_execution_mode='async',pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+    files=binding.get('files',{})
+    if (binding.get('stack')!='ku' or binding.get('source_commit')!=NORMAL_OK_PRODUCT or binding.get('build_mode')!=expected
+            or files.get('generated C',{}).get('sha256')!=NORMAL_PG_C_SHA
+            or files.get('expanded source',{}).get('sha256')!=NORMAL_OK_INPUT_SHA
+            or not re.fullmatch('[0-9a-f]{64}',files.get('ELF',{}).get('sha256',''))):
+        raise ValueError('identified fresh normal /ok F source/C/input/ELF required')
+
+
 def normal_self_probe(a,state):
     """Exact normal binaries: six JSON or three explicit PG diagnostic windows."""
     if os.geteuid()!=0:raise ValueError('normal SELF probe requires root cgroup control')
@@ -1871,13 +1905,16 @@ def normal_self_probe(a,state):
     plan=load(a.root/'frozen-plan.json')
     workload=getattr(a,'normal_self_workload','json_object');pg=workload in ('db','db-gpr')
     if plan!=normal_self_plan(plan.get('versions',{}),workload):raise ValueError('matching frozen normal SELF plan required')
-    bindings={name:fc.version_identity(plan,name) for name in (('B',) if pg else ('B','R'))}
+    bindings={name:fc.version_identity(plan,name) for name in (('B',) if pg or workload=='ok-gpr' else ('B','R'))}
     mode=bindings['B']['build_mode']
     expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
         pg_execution_mode='async',pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
-    if (bindings['B']['stack']!='ku' or mode!=expected or (not pg and bindings['R']['stack']!='rust')
+    if (bindings['B']['stack']!='ku' or mode!=expected or (not pg and workload!='ok-gpr' and bindings['R']['stack']!='rust')
             or (pg and (bindings['B'].get('source_commit')!=NORMAL_PG_PRODUCT or set(plan['versions'])!={'B'}))):
         raise ValueError('identified normal B/R binaries required; no D instrumentation')
+    if workload=='ok-gpr':
+        if set(plan['versions'])!={'B'}:raise ValueError('normal /ok SELF permits only one fresh B')
+        check_normal_ok_binding(bindings['B'])
     directory=a.root/'normal-self-probe';directory.mkdir(exist_ok=False)
     fixture=db.Database(a.root/'fixture',state['uid'],state['gid']);original=fc.Harness;private=None
     perf=shutil.which('perf',path=str(a.tools/'bin')+os.pathsep+os.environ.get('PATH',''))
@@ -1891,10 +1928,11 @@ def normal_self_probe(a,state):
             self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
         def client(self,service,request_workload,rate,duration,output,**kwargs):
             parent=super().client
-            if pg:normal_pg_runtime(service,output)
+            if pg or workload=='ok-gpr':normal_pg_runtime(service,output)
             if Path(output).name!='score':return parent(service,request_workload,rate,duration,output,**kwargs)
             return normal_self_client(lambda:parent(service,request_workload,rate,duration,output,**kwargs),
-                service,output,duration,perf,sample=active['sample'],**({'perf_flags':plan['perf_flags'],**({'perf_frequency':plan['perf_frequency'],'raw_limit':plan['raw_limit_bytes']} if workload=='db-gpr' else {})} if pg else {}))
+                service,output,duration,perf,sample=active['sample'],**({'perf_flags':plan['perf_flags'],**({'perf_frequency':plan['perf_frequency'],'raw_limit':plan['raw_limit_bytes']} if workload in ('db-gpr','ok-gpr') else {})} if pg or workload=='ok-gpr' else {}),
+                **({'expected_elf_sha':bindings['B']['files']['ELF']['sha256']} if workload=='ok-gpr' else {}))
     began=time.monotonic()
     try:
         fixture.start();private=load(fixture.manifest_path);fc.Harness=SelfHarness
@@ -1956,7 +1994,9 @@ def normal_self_probe(a,state):
                     full_cpu_contract='full_cpu_us: complete service lifecycle including post-client perf finalization/cleanup; descriptive separately',
                     scope='Single before/sample/after sequence, no CI or automatic adoption. Full CPU includes post-client perf finalization; '
                         'client CPU uses existing h.client lifetime. Neither ratio alone proves observer overhead.')
-                if pg:
+                if workload=='ok-gpr':
+                    result['controls'][name]['full_cpu_contract']='full_cpu_us: existing after-warmup/pre-score-driver CPU snapshot to recorded drain/termination accounting; excludes cold startup and warmup, reported separately from scored-client CPU'
+                if pg or workload=='ok-gpr':
                     envelope=plan['maximum_sample_cpu_ratio']
                     result['controls'][name]['sample_within_registered_cpu_envelope']=(client_ratio is not None and 1/envelope<=client_ratio<=envelope)
                     if not result['controls'][name]['sample_within_registered_cpu_envelope']:
@@ -1984,7 +2024,7 @@ def normal_self_probe(a,state):
             'score/normal-self-observations.json','score/perf-self.log','score/perf-pcs.log',
             'score/symbol-identities.json','score/maps.log','score/perf-record.log','score/normal-ELF-disassembly.log',
             'score/runtime-default-libpq.json','score/runtime-default-libpq.maps'))
-        if pg:selected.extend(directory/name/turn/'warmup'/relative for name,turn in plan['order']
+        if pg or workload=='ok-gpr':selected.extend(directory/name/turn/'warmup'/relative for name,turn in plan['order']
             for relative in ('client.json','driver-cleanup.json','runtime-default-libpq.json','runtime-default-libpq.maps'))
         result['small_artifact']=pg_failure_export(a,directory,output_name='normal-self-observation',schema='ku-normal-self-small-artifact-v1',selected=selected)
         save(a.root/'hosted-state.json',state)
@@ -2541,7 +2581,7 @@ def main(argv=None):
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--normal-self-workload',choices=['json_object','db','db-gpr'],default='json_object',help='db retains the original probe; db-gpr gates the same three F PG windows on one plain and one explicit33-GPR DWARF owned-child capability capture')
+    p.add_argument('--normal-self-workload',choices=['json_object','db','db-gpr','ok-gpr'],default='json_object',help='db retains the original probe; db-gpr gates the same three F PG windows; ok-gpr captures only three fresh F /ok2000/s windows, both after the existing explicit33-GPR capability control')
     p.add_argument('--http-short-goal',choices=['cpu','memory'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
@@ -2575,7 +2615,7 @@ def main(argv=None):
     if a.phase=='perf-preflight':
         def preflight_stop(*unused):raise KeyboardInterrupt('perf preflight wall bound')
         signal.signal(signal.SIGALRM,preflight_stop)
-        gpr=a.normal_self_workload=='db-gpr'
+        gpr=a.normal_self_workload in ('db-gpr','ok-gpr')
         signal.alarm(49 if gpr else 19)
         try:result=normal_perf_capability(a) if gpr else normal_perf_preflight(a)
         finally:signal.alarm(0)

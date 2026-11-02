@@ -18,6 +18,721 @@ const MAX_STRING: usize = 256;
 const MAX_BYTE_WORK: usize = 4096;
 const MAX_CALLS: usize = 8;
 
+// The JSON proof has its own certificate. Runtime counters are:
+// 1, body bytes, target bytes, body key bytes, body container slots,
+// body lexical nodes, body fields, query key bytes, query slots, query fields,
+// extra encoded bytes from legacy short \b/\f escapes (four per occurrence).
+// Byte work counts bounded scans/copies/comparisons. Visits count fixed-size
+// node/bucket operations (the runtime also checks the ABI element-size bound).
+// A JSON call requires all32 untouched credits and consumes that complete turn.
+// Bounds cover normal execution and returning errors. Existing fatal allocation
+// failure still reports to stderr and terminates the process, as on the worker
+// and on the original owner's string allocation paths; it is not a resumable
+// Result or a promise of continued scheduling after process termination begins.
+const JSON_INPUT_BYTES: usize = 2048;
+const JSON_MAX_BYTE_WORK: usize = 32 * 4096;
+const JSON_MAX_VISITS: usize = 32 * 192;
+const JSON_MAX_VALUE_BYTES: usize = 16384;
+const JSON_MAX_VALUE_NODES: usize = 256;
+const JSON_MAX_DEPTH: usize = 24;
+const JSON_METRICS: usize = 11;
+
+#[derive(Clone, Default)]
+struct JsonCost([usize; JSON_METRICS]);
+impl JsonCost {
+    fn constant(value: usize) -> Self {
+        let mut out = Self::default();
+        out.0[0] = value;
+        out
+    }
+    fn metric(index: usize) -> Self {
+        let mut out = Self::default();
+        out.0[index] = 1;
+        out
+    }
+    fn add(&self, other: &Self) -> Option<Self> {
+        let mut out = Self::default();
+        for (index, value) in out.0.iter_mut().enumerate() {
+            *value = self.0[index].checked_add(other.0[index])?;
+            // Avoid enormous generated certificates even when runtime input is0.
+            if *value > 1 << 20 {
+                return None;
+            }
+        }
+        Some(out)
+    }
+    fn times(&self, factor: usize) -> Option<Self> {
+        let mut out = Self::default();
+        for (index, value) in out.0.iter_mut().enumerate() {
+            *value = self.0[index].checked_mul(factor)?;
+            if *value > 1 << 20 {
+                return None;
+            }
+        }
+        Some(out)
+    }
+    fn cover(&mut self, other: &Self) {
+        for (value, next) in self.0.iter_mut().zip(&other.0) {
+            *value = (*value).max(*next);
+        }
+    }
+    fn c(&self) -> String {
+        self.0
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+#[derive(Clone)]
+struct JsonBound {
+    ty: IrType,
+    bytes: JsonCost,
+    encoded: JsonCost,
+    keys: JsonCost,
+    slots: JsonCost,
+    nodes: JsonCost,
+    fields: JsonCost,
+    depth: usize,
+    body_text: bool,
+    // Only set by a complete, type-checked literal of a known user layout.
+    // A Named type alone must never qualify resources or arbitrary structs.
+    pure_struct: Option<String>,
+}
+impl JsonBound {
+    fn scalar(ty: &IrType, bytes: usize) -> Self {
+        Self {
+            ty: ty.clone(),
+            bytes: JsonCost::constant(bytes),
+            encoded: JsonCost::constant(bytes),
+            keys: JsonCost::default(),
+            slots: JsonCost::default(),
+            nodes: JsonCost::constant(1),
+            fields: JsonCost::default(),
+            depth: 0,
+            body_text: false,
+            pure_struct: None,
+        }
+    }
+    fn string(ty: &IrType, bytes: JsonCost) -> Option<Self> {
+        let mut out = Self::scalar(ty, 0);
+        out.encoded = bytes.times(6)?.add(&JsonCost::constant(2))?;
+        out.bytes = bytes;
+        Some(out)
+    }
+    fn retag(mut self, ty: &IrType) -> Option<Self> {
+        match ty {
+            IrType::Int | IrType::Bool | IrType::Null | IrType::Void => {
+                return Some(Self::scalar(ty, if *ty == IrType::Int { 20 } else { 5 }))
+            }
+            IrType::Float
+            | IrType::Array(_)
+            | IrType::Unknown
+            | IrType::Function
+            | IrType::Closure { .. }
+            | IrType::Cell(_) => return None,
+            _ => {}
+        }
+        self.ty = ty.clone();
+        self.checked()
+    }
+    fn checked(self) -> Option<Self> {
+        let supported = match &self.ty {
+            IrType::Int | IrType::Bool | IrType::Null | IrType::Str | IrType::Void => true,
+            IrType::Named(name) => {
+                matches!(
+                    name.as_str(),
+                    "__ku_value" | "__ku_object" | "__ku_error_type" | "__ku_http_response"
+                ) || self.pure_struct.as_ref() == Some(name)
+            }
+            IrType::Result(inner) => {
+                matches!(
+                    inner.as_ref(),
+                    IrType::Int | IrType::Bool | IrType::Null | IrType::Str
+                ) || matches!(inner.as_ref(),IrType::Named(name) if matches!(name.as_str(),"__ku_value"|"__ku_object"|"__ku_error_type"|"__ku_http_response"))
+            }
+            _ => false,
+        };
+        (supported && self.depth <= JSON_MAX_DEPTH).then_some(self)
+    }
+    fn merge(mut self, other: &Self) -> Option<Self> {
+        if self.ty != other.ty {
+            return None;
+        }
+        self.bytes.cover(&other.bytes);
+        self.encoded.cover(&other.encoded);
+        self.keys.cover(&other.keys);
+        self.slots.cover(&other.slots);
+        self.nodes.cover(&other.nodes);
+        self.fields.cover(&other.fields);
+        self.depth = self.depth.max(other.depth);
+        self.body_text &= other.body_text;
+        self.checked()
+    }
+    fn combine(mut self, other: &Self) -> Option<Self> {
+        self.bytes = self.bytes.add(&other.bytes)?;
+        self.keys = self.keys.add(&other.keys)?;
+        self.slots = self.slots.add(&other.slots)?;
+        self.nodes = self.nodes.add(&other.nodes)?;
+        self.fields = self.fields.add(&other.fields)?;
+        self.depth = self.depth.max(other.depth);
+        self.body_text = false;
+        Some(self)
+    }
+}
+#[derive(Default)]
+struct JsonProof {
+    instructions: usize,
+    byte_work: JsonCost,
+    visits: JsonCost,
+    max_bytes: JsonCost,
+    max_nodes: JsonCost,
+    json: bool,
+    struct_fields: HashMap<String, Vec<(String, IrType)>>,
+}
+fn json_forward_cfg(function: &IrFunction) -> bool {
+    function.blocks.iter().enumerate().all(|(position, block)| {
+        let edges = match &block.terminator {
+            IrTerminator::Next => function
+                .blocks
+                .get(position + 1)
+                .map(|block| vec![block.id])
+                .unwrap_or_default(),
+            IrTerminator::Jump(target) => vec![*target],
+            IrTerminator::Branch {
+                then_block,
+                else_block,
+                ..
+            } => vec![*then_block, *else_block],
+            IrTerminator::ResultBranch {
+                ok_block,
+                err_block,
+                ..
+            } => vec![*ok_block, *err_block],
+            IrTerminator::JumpErr { target, .. } => vec![*target],
+            IrTerminator::Safepoint {
+                continue_block,
+                timeout_block,
+            } => vec![*continue_block, *timeout_block],
+            IrTerminator::SyncGuard {
+                continue_block,
+                cleanup_block,
+            } => vec![*continue_block, *cleanup_block],
+            IrTerminator::Return(_) | IrTerminator::PropagateErr(_) | IrTerminator::Unreachable => {
+                vec![]
+            }
+            _ => return false,
+        };
+        edges.iter().all(|target| {
+            function
+                .blocks
+                .iter()
+                .position(|block| block.id == *target)
+                .is_some_and(|next| next > position)
+        })
+    })
+}
+impl JsonProof {
+    fn work(&mut self, bytes: JsonCost, visits: JsonCost) -> Option<()> {
+        self.byte_work = self.byte_work.add(&bytes)?;
+        self.visits = self.visits.add(&visits)?;
+        Some(())
+    }
+    fn observe(&mut self, value: &JsonBound) -> Option<()> {
+        self.max_bytes.cover(&value.bytes);
+        self.max_bytes.cover(&value.encoded);
+        self.max_nodes.cover(&value.nodes);
+        Some(())
+    }
+    fn retire(&mut self, value: &JsonBound) -> Option<()> {
+        // One bucket scan plus recursive leaves. Also charge the inactive legacy
+        // Result error alternative, so all OOM/error-prefix cleanup is covered.
+        let error = usize::from(matches!(value.ty, IrType::Result(_)));
+        self.work(
+            JsonCost::constant(error * 256),
+            value
+                .slots
+                .add(&value.nodes.times(2)?)?
+                .add(&JsonCost::constant(1 + error * 6))?,
+        )
+    }
+    fn clone_tree(&mut self, value: &JsonBound) -> Option<()> {
+        // <=16 probes for each inserted key, one hash and full leaf copies.
+        // Three slot passes cover initialization, input traversal and a failed
+        // clone's partial cleanup. No generic clone/drop implementation changes.
+        self.work(
+            value.bytes.add(&value.keys.times(17)?)?,
+            value
+                .slots
+                .times(3)?
+                .add(&value.fields.times(32)?)?
+                .add(&value.nodes.times(4)?)?,
+        )
+    }
+    fn expression(
+        &mut self,
+        expr: &IrExpr,
+        parameter: &str,
+        locals: &HashMap<String, JsonBound>,
+        temps: &HashMap<TempId, JsonBound>,
+    ) -> Option<JsonBound> {
+        self.instructions = self.instructions.checked_add(1)?;
+        if self.instructions > 512 {
+            return None;
+        }
+        self.work(JsonCost::default(), JsonCost::constant(1))?;
+        let value = match &expr.kind {
+            IrExprKind::Literal(value) => {
+                if expr.ty == IrType::Str {
+                    let length = crate::backend::llvm::decode_string_literal(value)
+                        .ok()?
+                        .len();
+                    if length > 256 {
+                        return None;
+                    }
+                    JsonBound::string(&expr.ty, JsonCost::constant(length))?
+                } else {
+                    JsonBound::scalar(&expr.ty, if expr.ty == IrType::Int { 20 } else { 5 })
+                }
+            }
+            IrExprKind::Local(name) | IrExprKind::BorrowedParam(name) => locals.get(name)?.clone(),
+            IrExprKind::Temp(id) | IrExprKind::BorrowedTemp(id) => temps.get(id)?.clone(),
+            IrExprKind::Borrow(value) => self.expression(value, parameter, locals, temps)?,
+            IrExprKind::StructLiteral { name, fields } => {
+                // Typed JSON writers have no user callbacks: they write these
+                // exact fields in static key order and borrow their values.
+                // Require every layout field exactly once; unknown/defaulted
+                // fields, resources and unbounded element types stay workers.
+                let layout = self.struct_fields.get(name)?.clone();
+                if name.starts_with("__ku_")
+                    || expr.ty != IrType::Named(name.clone())
+                    || layout.len() != fields.len()
+                    || fields.len() > 8
+                {
+                    return None;
+                }
+                let mut seen = HashSet::new();
+                let mut object = JsonBound::scalar(&expr.ty, 0);
+                object.pure_struct = Some(name.clone());
+                object.encoded = JsonCost::constant(2);
+                object.depth = 1;
+                for (key, field) in fields {
+                    let declared = layout.iter().find(|(name, _)| name == key)?;
+                    if key.len() > 64 || !seen.insert(key) || field.ty != declared.1 {
+                        return None;
+                    }
+                    let value = self.expression(field, parameter, locals, temps)?;
+                    if !matches!(
+                        &value.ty,
+                        IrType::Int | IrType::Bool | IrType::Null | IrType::Str
+                    ) && !matches!(&value.ty,IrType::Named(name) if name=="__ku_object"||name=="__ku_value"||value.pure_struct.as_ref()==Some(name))
+                    {
+                        return None;
+                    }
+                    // Six per key byte is conservative for the static writer's
+                    // escaping; +4 covers quotes, colon and comma. Values use
+                    // the same bounded legacy JSON writer as dynamic objects.
+                    object.encoded =
+                        object
+                            .encoded
+                            .add(&value.encoded)?
+                            .add(&JsonCost::constant(
+                                key.len().checked_mul(6)?.checked_add(4)?,
+                            ))?;
+                    object.keys = object.keys.add(&JsonCost::constant(key.len()))?;
+                    object = object.combine(&value)?;
+                }
+                object.depth = object.depth.checked_add(1)?;
+                object.fields = object.fields.add(&JsonCost::constant(fields.len()))?;
+                // Struct construction moves each field, without heap keys,
+                // table insertion or an output DOM. Deep cleanup/clone work is
+                // charged by retire/clone_tree, including embedded KuValues.
+                self.work(
+                    JsonCost::default(),
+                    JsonCost::constant(1 + fields.len() * 4),
+                )?;
+                object
+            }
+            IrExprKind::Field { target, name } if matches!(&target.kind,IrExprKind::Local(local)|IrExprKind::BorrowedParam(local) if local==parameter) => {
+                match name.as_str() {
+                    "body" => {
+                        let mut value = JsonBound::string(&expr.ty, JsonCost::metric(1))?;
+                        value.body_text = true;
+                        value
+                    }
+                    "query" => {
+                        let mut value = JsonBound::scalar(&expr.ty, 0);
+                        value.bytes = JsonCost::metric(2);
+                        value.encoded = value.bytes.times(6)?.add(&JsonCost::constant(50))?;
+                        value.keys = JsonCost::metric(7);
+                        value.slots = JsonCost::metric(8);
+                        value.nodes = JsonCost::metric(9).add(&JsonCost::constant(1))?;
+                        value.fields = JsonCost::metric(9);
+                        value.depth = 1;
+                        value
+                    }
+                    _ => return None,
+                }
+            }
+            IrExprKind::Unary { expr: value, .. } => {
+                let value = self.expression(value, parameter, locals, temps)?;
+                if !matches!(value.ty, IrType::Int | IrType::Bool) {
+                    return None;
+                }
+                JsonBound::scalar(&expr.ty, 20)
+            }
+            IrExprKind::Binary { left, op, right } => {
+                let left = self.expression(left, parameter, locals, temps)?;
+                let right = self.expression(right, parameter, locals, temps)?;
+                if left.ty == IrType::Str && right.ty == IrType::Str {
+                    let bytes = left.bytes.add(&right.bytes)?;
+                    self.work(bytes.clone(), JsonCost::constant(1))?;
+                    if *op == crate::ast::BinaryOp::Add {
+                        JsonBound::string(&expr.ty, bytes)?
+                    } else {
+                        JsonBound::scalar(&expr.ty, 0)
+                    }
+                } else if matches!(left.ty, IrType::Int | IrType::Bool | IrType::Null)
+                    && matches!(right.ty, IrType::Int | IrType::Bool | IrType::Null)
+                {
+                    JsonBound::scalar(&expr.ty, 20)
+                } else {
+                    return None;
+                }
+            }
+            IrExprKind::Call {
+                args,
+                kind: IrCallKind::Intrinsic(name),
+                ..
+            } => {
+                let values = args
+                    .iter()
+                    .map(|arg| self.expression(arg, parameter, locals, temps))
+                    .collect::<Option<Vec<_>>>()?;
+                match (name.as_str(), values.as_slice()) {
+                    ("json.decode" | "json.parse" | "json.try_parse", [text])
+                        if text.ty == IrType::Str && text.body_text =>
+                    {
+                        self.json = true;
+                        // <=18 total hashes/comparison byte-passes over raw key
+                        // bytes. <=46 field probe/rehash visits, four capacity/
+                        // node passes include every partial-error cleanup.
+                        self.work(
+                            JsonCost::metric(1)
+                                .times(8)?
+                                .add(&JsonCost::metric(3).times(18)?)?,
+                            JsonCost::metric(4)
+                                .times(4)?
+                                .add(&JsonCost::metric(5).times(4)?)?
+                                .add(&JsonCost::metric(6).times(46)?)?,
+                        )?;
+                        let mut value = JsonBound::scalar(&expr.ty, 0);
+                        value.bytes = JsonCost::metric(1);
+                        // Legacy writer expands \b/\f to six-byte Unicode escapes.
+                        // All other integer-only decoded token encodings fit
+                        // their source span; E includes keys and values.
+                        value.encoded = value.bytes.add(&JsonCost::metric(10))?;
+                        value.keys = JsonCost::metric(3);
+                        value.slots = JsonCost::metric(4);
+                        value.nodes = JsonCost::metric(5);
+                        value.fields = JsonCost::metric(6);
+                        value.depth = 16;
+                        value
+                    }
+                    ("json.encode" | "json.stringify", [value]) => {
+                        self.json = true;
+                        // <=8 fields: insertion sort only. Each key appears in
+                        // <=14 comparator operands; no qsort or strtod here.
+                        self.work(
+                            value
+                                .encoded
+                                .times(8)?
+                                .add(&value.keys.times(14)?)?
+                                .add(&value.nodes.times(20)?)?,
+                            value
+                                .slots
+                                .add(&value.fields.times(7)?)?
+                                .add(&value.nodes.times(2)?)?,
+                        )?;
+                        JsonBound::string(&expr.ty, value.encoded.clone())?
+                    }
+                    ("__ku_object", _) if values.len() % 2 == 0 && values.len() <= 16 => {
+                        let mut object = JsonBound::scalar(&expr.ty, 0);
+                        object.slots = JsonCost::constant(if values.len() > 10 { 16 } else { 8 });
+                        object.encoded = JsonCost::constant(2);
+                        object.depth = 1;
+                        for (args, values) in args.chunks_exact(2).zip(values.chunks_exact(2)) {
+                            if !matches!(args[0].kind, IrExprKind::Literal(_))
+                                || values[0].ty != IrType::Str
+                                || values[0].bytes.0[0] > 64
+                                || values[0].bytes.0[1..].iter().any(|n| *n != 0)
+                            {
+                                return None;
+                            }
+                            if !matches!(
+                                &values[1].ty,
+                                IrType::Int | IrType::Bool | IrType::Null | IrType::Str
+                            ) && !matches!(&values[1].ty,IrType::Named(name) if name=="__ku_object"||name=="__ku_value")
+                            {
+                                return None;
+                            }
+                            object.encoded = object
+                                .encoded
+                                .add(&values[0].encoded)?
+                                .add(&values[1].encoded)?
+                                .add(&JsonCost::constant(2))?;
+                            object.keys = object.keys.add(&values[0].bytes)?;
+                            object = object.combine(&values[0])?.combine(&values[1])?;
+                        }
+                        object.depth = object.depth.checked_add(1)?;
+                        object.fields = object.fields.add(&JsonCost::constant(values.len() / 2))?;
+                        self.work(
+                            JsonCost::constant(
+                                values
+                                    .iter()
+                                    .step_by(2)
+                                    .map(|key| key.bytes.0[0] * 18)
+                                    .sum(),
+                            ),
+                            // Even an empty object initializes its eight buckets.
+                            // The per-field allowance covers this for nonempty
+                            // objects, but must not erase the empty-table cost.
+                            JsonCost::constant((values.len() * 32).max(8)),
+                        )?;
+                        object
+                    }
+                    ("__ku_http_map_get", [map, key])
+                        if key.ty == IrType::Str
+                            && key.bytes.0[0] <= 64
+                            && key.bytes.0[1..].iter().all(|n| *n == 0) =>
+                    {
+                        self.work(
+                            map.bytes.add(&key.bytes.times(16)?)?,
+                            JsonCost::constant(16),
+                        )?;
+                        JsonBound::string(&expr.ty, map.bytes.clone())?
+                    }
+                    ("__ku_value_get" | "kuvalue.take", [value, key])
+                        if key.ty == IrType::Str
+                            && key.bytes.0[0] <= 64
+                            && key.bytes.0[1..].iter().all(|n| *n == 0) =>
+                    {
+                        if name == "kuvalue.take" {
+                            self.retire(value)?;
+                        } else {
+                            self.clone_tree(value)?;
+                        }
+                        self.work(
+                            key.bytes.times(16)?.add(&JsonCost::constant(256))?,
+                            JsonCost::constant(16),
+                        )?;
+                        value.clone().retag(&expr.ty)?
+                    }
+                    ("kuvalue.as_int", [value]) => {
+                        self.retire(value)?;
+                        JsonBound::scalar(&IrType::Int, 20).retag(&expr.ty)?
+                    }
+                    ("kuvalue.as_str", [value]) => {
+                        self.retire(value)?;
+                        let mut out = JsonBound::string(&expr.ty, value.bytes.clone())?;
+                        out.encoded = value.encoded.clone();
+                        out
+                    }
+                    ("__ku_clone", [value]) => {
+                        self.clone_tree(value)?;
+                        value.clone()
+                    }
+                    ("__ku_drop_borrow_temp", [value]) => {
+                        self.retire(value)?;
+                        JsonBound::scalar(&expr.ty, 0)
+                    }
+                    ("ok" | "err" | "fail", [value]) => value.clone().retag(&expr.ty)?,
+                    ("http.text" | "http.html" | "http.redirect", [body])
+                        if body.ty == IrType::Str =>
+                    {
+                        body.clone().retag(&expr.ty)?
+                    }
+                    ("http.text" | "http.html" | "http.redirect", [status, body])
+                        if status.ty == IrType::Int && body.ty == IrType::Str =>
+                    {
+                        body.clone().retag(&expr.ty)?
+                    }
+                    ("http.empty", []) => JsonBound::scalar(&expr.ty, 0),
+                    ("http.empty", [status]) if status.ty == IrType::Int => {
+                        JsonBound::scalar(&expr.ty, 0)
+                    }
+                    ("str", [value])
+                        if matches!(value.ty, IrType::Int | IrType::Bool | IrType::Null) =>
+                    {
+                        JsonBound::string(&expr.ty, JsonCost::constant(32))?
+                    }
+                    ("str", [value]) if value.ty == IrType::Str => {
+                        self.work(value.bytes.clone(), JsonCost::constant(1))?;
+                        value.clone()
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        if value.ty != expr.ty {
+            return None;
+        }
+        let value = value.checked()?;
+        self.observe(&value)?;
+        Some(value)
+    }
+    fn function(&mut self, function: &IrFunction) -> Option<()> {
+        let [parameter] = function.params.as_slice() else {
+            return None;
+        };
+        if parameter.ty != IrType::Named("__ku_http_request".into())
+            || !function.captures.is_empty()
+            || !json_forward_cfg(function)
+            || function.blocks.len() > 128
+        {
+            return None;
+        }
+        let fields = request_fields(function)?;
+        if fields & !36u32 != 0 {
+            return None;
+        }
+        // Read-only gate, route-name projection (<=8192 bytes), request ABI and
+        // all query construction/drop work are outside the user IR but included.
+        self.work(
+            JsonCost::constant(8192)
+                .add(&JsonCost::metric(1).times(2)?)?
+                .add(&JsonCost::metric(2).times(3)?)?,
+            JsonCost::constant(192).add(&JsonCost::metric(5).times(4)?)?,
+        )?;
+        if fields & 4 != 0 {
+            self.work(
+                JsonCost::metric(2)
+                    .times(8)?
+                    .add(&JsonCost::metric(7).times(18)?)?,
+                JsonCost::metric(8)
+                    .times(3)?
+                    .add(&JsonCost::metric(9).times(50)?)?,
+            )?;
+        }
+        let mut locals = HashMap::new();
+        let mut temps = HashMap::new();
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                match instruction {
+                    IrInst::Temp { id, ty, value } => {
+                        let value = self.expression(value, &parameter.name, &locals, &temps)?;
+                        if value.ty != *ty {
+                            return None;
+                        }
+                        self.retire(&value)?;
+                        let value = if let Some(old) = temps.get(id) {
+                            value.merge(old)?
+                        } else {
+                            value
+                        };
+                        temps.insert(*id, value);
+                    }
+                    IrInst::Let { name, ty, value } => {
+                        let value = self.expression(value, &parameter.name, &locals, &temps)?;
+                        if value.ty != *ty {
+                            return None;
+                        }
+                        self.retire(&value)?;
+                        let value = if let Some(old) = locals.get(name) {
+                            value.merge(old)?
+                        } else {
+                            value
+                        };
+                        locals.insert(name.clone(), value);
+                    }
+                    IrInst::Store {
+                        target: IrLValue::Local(name),
+                        value,
+                    } => {
+                        let value = self
+                            .expression(value, &parameter.name, &locals, &temps)?
+                            .merge(locals.get(name)?)?;
+                        self.retire(&value)?;
+                        locals.insert(name.clone(), value);
+                    }
+                    IrInst::BindOk { id, ty, result } => {
+                        // Result_take only transfers and clears an addressable
+                        // source. Its producer already paid for payload/error
+                        // retirement, including any later overwrite or unwind.
+                        // Keep the fixed take/zero/old-destination operations;
+                        // charging the whole tree again would count one owned
+                        // resource once per move rather than once per lifetime.
+                        if !matches!(result.kind, IrExprKind::Local(_) | IrExprKind::Temp(_)) {
+                            return None;
+                        }
+                        let value = self
+                            .expression(result, &parameter.name, &locals, &temps)?
+                            .retag(ty)?;
+                        self.work(JsonCost::default(), JsonCost::constant(8))?;
+                        let value = if let Some(old) = temps.get(id) {
+                            value.merge(old)?
+                        } else {
+                            value
+                        };
+                        temps.insert(*id, value);
+                    }
+                    IrInst::Expr(value) => {
+                        let value = self.expression(value, &parameter.name, &locals, &temps)?;
+                        self.retire(&value)?;
+                    }
+                    _ => return None,
+                }
+            }
+            let value = match &block.terminator {
+                IrTerminator::Branch { condition, .. } => Some(condition),
+                IrTerminator::ResultBranch { result, .. }
+                | IrTerminator::JumpErr { result, .. }
+                | IrTerminator::PropagateErr(result) => Some(result),
+                IrTerminator::Return(value) => value.as_ref(),
+                IrTerminator::Next
+                | IrTerminator::Jump(_)
+                | IrTerminator::Safepoint { .. }
+                | IrTerminator::SyncGuard { .. }
+                | IrTerminator::Unreachable => None,
+                _ => return None,
+            };
+            if let Some(value) = value {
+                let value = self.expression(value, &parameter.name, &locals, &temps)?;
+                self.retire(&value)?;
+            }
+        }
+        self.json.then_some(())
+    }
+}
+fn bounded_json(program: &IrProgram, function: &IrFunction) -> Option<JsonProof> {
+    let response = matches!(&function.return_type,IrType::Named(name) if name=="__ku_http_response")
+        || matches!(&function.return_type,IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name=="__ku_http_response"));
+    if !response {
+        return None;
+    }
+    let mut proof = JsonProof {
+        struct_fields: program
+            .layouts
+            .structs
+            .iter()
+            .map(|layout| {
+                (
+                    layout.name.clone(),
+                    layout
+                        .fields
+                        .iter()
+                        .map(|field| (field.name.clone(), field.ty.clone()))
+                        .collect(),
+                )
+            })
+            .collect(),
+        ..JsonProof::default()
+    };
+    proof.function(function)?;
+    Some(proof)
+}
+
 #[derive(Clone)]
 struct Bound {
     ty: IrType,
@@ -588,6 +1303,36 @@ pub(super) fn emit(
         }
     }
     out.push_str("  return 0;\n}\n");
+    // Descriptor lookup has a fixed comparison bound as well. Larger programs
+    // retain their complete worker capability.
+    let json_candidates = program
+        .functions
+        .iter()
+        .filter(|function| {
+            (function.is_closure_body || targets.iter().any(|target| target.id == function.id))
+                && bounded_json(program, function).is_some()
+        })
+        .count();
+    out.push_str(&format!("/* JSON certificate caps: input {JSON_INPUT_BYTES}, bytes {JSON_MAX_BYTE_WORK}, visits {JSON_MAX_VISITS}, output {JSON_MAX_VALUE_BYTES}, nodes {JSON_MAX_VALUE_NODES}. */\n"));
+    out.push_str(
+        "typedef struct { size_t bytes[11],visits[11],output[11],nodes[11]; } KuHttpJsonWork;\n",
+    );
+    out.push_str("static const KuHttpJsonWork* ku_http_handler_json_work(void* invoke) {\n");
+    for function in &program.functions {
+        if !function.is_closure_body && !targets.iter().any(|target| target.id == function.id) {
+            continue;
+        }
+        if json_candidates > 64 {
+            continue;
+        }
+        if let (Some(proof), Some(symbol)) = (
+            bounded_json(program, function),
+            closure_invoke_symbol(function.id),
+        ) {
+            out.push_str(&format!("  if(invoke==(void*){symbol}) {{ static const KuHttpJsonWork work={{{{{}}},{{{}}},{{{}}},{{{}}}}}; return &work; }} /* bounded JSON owner handler {} */\n",proof.byte_work.c(),proof.visits.c(),proof.max_bytes.c(),proof.max_nodes.c(),function.id.0));
+        }
+    }
+    out.push_str("  return NULL;\n}\n");
     out.push_str("static unsigned int ku_http_handler_request_fields(void* invoke) {\n");
     for function in &program.functions {
         if async_names.contains(function.name.as_str())
@@ -727,6 +1472,212 @@ mod tests {
             },
         ];
         assert!(!proven(&program, &program.functions[index]));
+    }
+
+    #[test]
+    fn json_owner_empty_object_work_cannot_hide_below_the_turn_limit() {
+        let source = r#"import {http,json} from "std"
+            fn Reply(_req:HttpRequest):HttpResponse! {
+                return ok(http.text(json.encode(null)?))
+            } fn main() {}"#;
+        let ast = crate::parser::Parser::new(crate::lexer::Lexer::new(source).tokenize().unwrap())
+            .parse_program()
+            .unwrap();
+        let program = crate::ir::optimize_program(&crate::ir::lower_program(&ast).unwrap());
+        let mut function = program
+            .functions
+            .iter()
+            .find(|function| function.name == "Reply")
+            .unwrap()
+            .clone();
+        // Typed IR counterexample: 400 zero-field object temporaries already
+        // require 6,400 bucket initializations/retirement visits. The original
+        // certificate forgot initialization and incorrectly fitted this turn.
+        // Build IR after optimization so unrelated DCE cannot erase the witness.
+        let objects = (0..400).map(|index| IrInst::Temp {
+            id: TempId(100_000 + index),
+            ty: IrType::Named("__ku_object".into()),
+            value: IrExpr {
+                ty: IrType::Named("__ku_object".into()),
+                kind: IrExprKind::Call {
+                    callee: Box::new(IrExpr {
+                        ty: IrType::Function,
+                        kind: IrExprKind::Local("__ku_object".into()),
+                    }),
+                    args: vec![],
+                    kind: IrCallKind::Intrinsic("__ku_object".into()),
+                },
+            },
+        });
+        function.blocks[0].instructions.splice(0..0, objects);
+        let proof = bounded_json(&program, &function).expect("finite typed JSON IR");
+        assert!(proof.instructions <= 512);
+        assert!(
+            proof.visits.0[0] > JSON_MAX_VISITS,
+            "the runtime must keep this over-budget handler on its worker"
+        );
+    }
+    #[test]
+    fn json_owner_typed_structs_keep_layout_and_work_bounds() {
+        fn program(declarations: &str, body: &str) -> IrProgram {
+            let source = format!(
+                r#"import {{http,json}} from "std" {declarations}
+                fn Reply(req:HttpRequest):HttpResponse! {{ {body} }} fn main() {{}}"#
+            );
+            let ast =
+                crate::parser::Parser::new(crate::lexer::Lexer::new(&source).tokenize().unwrap())
+                    .parse_program()
+                    .unwrap();
+            crate::ir::optimize_program(&crate::ir::lower_program(&ast).unwrap())
+        }
+        fn proof(program: &IrProgram) -> Option<JsonProof> {
+            bounded_json(
+                program,
+                program
+                    .functions
+                    .iter()
+                    .find(|function| function.name == "Reply")
+                    .unwrap(),
+            )
+        }
+        let body = r#"decoded=json.decode(req.body)?
+            counter=decoded["counter"]?.as_int()?
+            data=decoded.take("data")?
+            envelope=Packet {id:req.query.rid,counter:counter+1,data:data}
+            return ok(http.text(json.encode(envelope)?))"#;
+        let mut typed = program("struct Packet {id:str counter:int data:KuValue}", body);
+        let certificate = proof(&typed).expect("known pure struct has a certificate");
+        let metrics = [1, 1048, 80, 64, 72, 56, 10, 5, 8, 1, 0];
+        let evaluate = |cost: &JsonCost| {
+            cost.0
+                .iter()
+                .zip(metrics)
+                .map(|(a, b)| a * b)
+                .sum::<usize>()
+        };
+        assert!(evaluate(&certificate.byte_work) <= JSON_MAX_BYTE_WORK);
+        assert!(evaluate(&certificate.visits) <= JSON_MAX_VISITS);
+        assert!(evaluate(&certificate.max_bytes) <= JSON_MAX_VALUE_BYTES);
+        assert!(evaluate(&certificate.max_nodes) <= JSON_MAX_VALUE_NODES);
+        // A Named type without its matching declaration is insufficient proof.
+        typed
+            .layouts
+            .structs
+            .retain(|layout| layout.name != "Packet");
+        assert!(proof(&typed).is_none());
+        for (declarations, expression) in [
+            (
+                "struct Wide {a:int b:int c:int d:int e:int f:int g:int h:int i:int}",
+                "Wide {a:1,b:2,c:3,d:4,e:5,f:6,g:7,h:8,i:9}",
+            ),
+            ("struct Decimal {value:float}", "Decimal {value:1.5}"),
+            ("struct Items {values:[int]}", "Items {values:[1,2]}"),
+        ] {
+            assert!(proof(&program(
+                declarations,
+                &format!("value={expression} return ok(http.text(json.encode(value)?))")
+            ))
+            .is_none());
+        }
+        let nested = program(
+            "struct Inner {value:KuValue} struct Outer {id:str content:Inner}",
+            r#"decoded=json.decode(req.body)?
+            inner=Inner {value:decoded}
+            outer=Outer {id:req.query.rid,content:inner}
+            copy=outer.clone()
+            return ok(http.text(json.encode(copy)?))"#,
+        );
+        assert!(
+            proof(&nested).is_some(),
+            "nested finite layouts retain clone/drop bounds"
+        );
+    }
+
+    #[test]
+    fn json_owner_certificate_keeps_pure_value_flow_and_rejects_escape() {
+        fn plan(body: &str) -> Option<JsonProof> {
+            let source = format!(
+                r#"import {{http,json}} from "std"
+                fn Reply(req:HttpRequest):HttpResponse! {{ {body} }} fn main() {{}}"#
+            );
+            let ast =
+                crate::parser::Parser::new(crate::lexer::Lexer::new(&source).tokenize().unwrap())
+                    .parse_program()
+                    .unwrap();
+            let program = crate::ir::optimize_program(&crate::ir::lower_program(&ast).unwrap());
+            bounded_json(
+                &program,
+                program
+                    .functions
+                    .iter()
+                    .find(|function| function.name == "Reply")
+                    .unwrap(),
+            )
+        }
+        let proof = plan(
+            r#"decoded=json.decode(req.body)?
+            count=decoded["count"]?.as_int()?
+            payload=decoded.take("payload")?
+            encoded=json.encode({trace:req.query.trace,total:count+1,payload:payload})?
+            return ok(http.text(encoded))"#,
+        )
+        .expect("bounded JSON value flow has an input certificate");
+        // A concrete small tree fits; wider trees may conservatively retain
+        // workers without changing any of their public JSON capabilities.
+        for metrics in [
+            [1, 120, 24, 24, 24, 16, 4, 5, 8, 1, 0],
+            [1, 1048, 80, 64, 72, 56, 10, 5, 8, 1, 0],
+        ] {
+            let evaluate = |cost: &JsonCost| {
+                cost.0
+                    .iter()
+                    .zip(metrics)
+                    .map(|(a, b)| a * b)
+                    .sum::<usize>()
+            };
+            assert!(evaluate(&proof.byte_work) <= JSON_MAX_BYTE_WORK);
+            assert!(evaluate(&proof.visits) <= JSON_MAX_VISITS);
+            assert!(evaluate(&proof.max_bytes) <= JSON_MAX_VALUE_BYTES);
+            assert!(evaluate(&proof.max_nodes) <= JSON_MAX_VALUE_NODES);
+        }
+        assert!(
+            proof.max_bytes.0[10] > 0,
+            "decoded escapes remain in the output certificate"
+        );
+        let escaped = plan(
+            r#"value=json.decode(req.body)?
+            text=value.as_str()?
+            first=json.encode(text)?
+            return ok(http.text(json.encode(first)?))"#,
+        )
+        .expect("bounded escape composition");
+        // body "\\b" has4 source bytes and E=4: first encoded string has8
+        // bytes, re-encoding that returned string must have its own escaping.
+        let metrics = [1, 4, 5, 0, 0, 1, 0, 0, 8, 0, 4];
+        let max_encoded = escaped
+            .max_bytes
+            .0
+            .iter()
+            .zip(metrics)
+            .map(|(a, b)| a * b)
+            .sum::<usize>();
+        assert!(
+            max_encoded >= 14,
+            "as_str + encode + encode cannot discard escape provenance"
+        );
+        assert!(escaped.max_bytes.0[10] >= 6);
+
+        for body in [
+            r#"x=req return ok(http.text(json.encode(x.body)?))"#,
+            r#"while(true) {} return ok(http.text(json.encode(req.body)?))"#,
+            r#"x=json.decode(req.query.value)? return ok(http.text(json.encode(x)?))"#,
+            r#"x=json.decode(req.body)? x["cycle"]=x return ok(http.text(json.encode(x)?))"#,
+            r#"return ok(http.text(json.encode({number:1.5})?))"#,
+            r#"x=json.decode(req.body)? println(x) return ok(http.text(json.encode(x)?))"#,
+            r#"return ok(http.text(json.encode({a:1,b:2,c:3,d:4,e:5,f:6,g:7,h:8,i:9})?))"#,
+        ] {
+            assert!(plan(body).is_none(), "worker fallback: {body}");
+        }
     }
     #[test]
     fn request_field_proof_rejects_whole_value_escape_and_keeps_direct_fields() {

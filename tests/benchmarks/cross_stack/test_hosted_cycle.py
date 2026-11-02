@@ -723,21 +723,23 @@ class HostedCycleTests(unittest.TestCase):
         class Parent:
             def __init__(self):self.manifest={}
             def client(self,*args,**kwargs):return args
-        for mode in ('db','db-gpr'):
+        for mode in ('db','db-gpr','ok-gpr'):
             for sample in (False,True):
                 with self.subTest(mode=mode,sample=sample):
                     plan=h.normal_self_plan({'B':{}},mode);calls=[]
                     def observer(client,*args,**kwargs):
                         calls.append(kwargs);return client()
                     scope=dict(vars(h),original=Parent,private={'db_url':'inert','db_cgroup':'/inert'},
-                        ExternalDomain=lambda p:None,pg=True,workload=mode,plan=plan,perf='/inert',
+                        ExternalDomain=lambda p:None,pg=mode!='ok-gpr',workload=mode,plan=plan,perf='/inert',
+                        bindings={'B':{'files':{'ELF':{'sha256':'e'*64}}}},
                         active={'sample':sample},normal_pg_runtime=lambda *args:None,normal_self_client=observer)
                     exec(compile(ast.Module(body=[adapter],type_ignores=[]),'<actual normal SelfHarness>','exec'),scope)
                     harness=scope['SelfHarness']();service=object()
                     result=harness.client(service,'db',200,60,Path('/inert/score'))
                     self.assertEqual(result,(service,'db',200,60,Path('/inert/score')))
                     expected={'sample':sample,'perf_flags':plan['perf_flags']}
-                    if mode=='db-gpr':expected.update(perf_frequency=999,raw_limit=96<<20)
+                    if mode in ('db-gpr','ok-gpr'):expected.update(perf_frequency=999,raw_limit=96<<20)
+                    if mode=='ok-gpr':expected['expected_elf_sha']='e'*64
                     self.assertEqual(calls,[expected])
                     harness.client(service,'db',200,10,Path('/inert/warmup'))
                     self.assertEqual(len(calls),1)
@@ -817,13 +819,13 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(measured.call_count,1 if sample else 0)
 
     def test_gpr16_sampler_binds_frequency_raw_bound_actual_attrs_and_actual_ELF(self):
-        for valid in (True,False):
-            with self.subTest(valid=valid),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+        for valid,elf in ((True,h.NORMAL_PG_ELF_SHA),(False,h.NORMAL_PG_ELF_SHA),(True,'e'*64),(False,'e'*64)):
+            with self.subTest(valid=valid,elf=elf),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
                 output=Path(temp);service=types.SimpleNamespace(process=types.SimpleNamespace(pid=99999999),
                     domain=types.SimpleNamespace(path='/service-only',snapshot=lambda:{}))
                 patches.enter_context(patch.object(h,'diagnostic_context',return_value={'task_count':3}))
                 patches.enter_context(patch.object(h,'diagnostic_memory',return_value={}))
-                patches.enter_context(patch.object(h,'diagnostic_symbols',return_value={'complete':True,'files':[{'sha256':h.NORMAL_PG_ELF_SHA}]}))
+                patches.enter_context(patch.object(h,'diagnostic_symbols',return_value={'complete':True,'files':[{'sha256':elf}]}))
                 assembly=patches.enter_context(patch.object(h,'diagnostic_command',return_value={'complete':True}))
                 def controlled(client,pid,out,perf,record,**kwargs):
                     self.assertEqual(kwargs,dict(perf_flags=h.NORMAL_PG_GPR_FLAGS,perf_frequency=999,limit=96<<20))
@@ -832,7 +834,7 @@ class HostedCycleTests(unittest.TestCase):
                 attrs=h.normal_perf_event_attributes
                 raw=output/'perf.data';raw.write_bytes(self.normal_perf_attr_fixture(stack=16384 if valid else 4096))
                 result=h.normal_self_client(lambda:{'same':'requests'},service,output,60,'/perf',sample=True,
-                    perf_flags=h.NORMAL_PG_GPR_FLAGS,perf_frequency=999,raw_limit=96<<20)
+                    perf_flags=h.NORMAL_PG_GPR_FLAGS,perf_frequency=999,raw_limit=96<<20,expected_elf_sha=elf)
                 self.assertEqual(result,{'same':'requests'})
                 record=h.load(output/'normal-self-observations.json')
                 self.assertEqual(record['record_complete'],valid)
@@ -2208,6 +2210,146 @@ class HostedCycleTests(unittest.TestCase):
         self.assertTrue(h.evidence_file(root/'compiler/RPGO/target/release/ku-cross-stack-rust',root))
         self.assertFalse(h.evidence_file(root/'compiler/RPGO/target/release/.fingerprint/dependency.json',root))
         self.assertTrue(h.evidence_file(root/'compiler/http-train-rust/merged.profdata',root))
+
+
+    def test_normal_ok_plan_and_binding_freeze_F_source_without_requiring_old_ELF(self):
+        import copy
+        plan=h.normal_self_plan({'B':{}},'ok-gpr')
+        self.assertEqual((plan['workload'],plan['rate'],plan['warmup_seconds'],plan['score_seconds']),('ok',2000,10,15))
+        self.assertEqual(plan['order'],[['B',turn] for turn in ('before','sample','after')])
+        self.assertEqual((plan['maximum_windows'],plan['maximum_replacements']),(3,0))
+        self.assertEqual((plan['perf_frequency'],plan['perf_flags'],plan['raw_limit_bytes']),(999,h.NORMAL_PG_GPR_FLAGS,96<<20))
+        self.assertFalse(plan['normal_score_eligible']);self.assertFalse(plan['formal_qualified'])
+        base=dict(baseline=h.BASELINE,candidate=h.NORMAL_OK_PRODUCT,prepatch=h.BASELINE,screen_variants=[],
+            normal_self_probe=True,normal_self_workload='ok-gpr')
+        self.assertEqual(h.hosted_identity(types.SimpleNamespace(**base),'diagnostic')['normal_self_workload'],'ok-gpr')
+        for change in ({'candidate':h.NORMAL_PG_PRODUCT},{'normal_self_probe':False}):
+            with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(**dict(base,**change)),'diagnostic')
+        binding=dict(stack='ku',source_commit=h.NORMAL_OK_PRODUCT,
+            build_mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',
+                pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']}),
+            files={'generated C':{'sha256':h.NORMAL_PG_C_SHA},'expanded source':{'sha256':h.NORMAL_OK_INPUT_SHA},'ELF':{'sha256':'e'*64}})
+        h.check_normal_ok_binding(binding)
+        for field in ('generated C','expanded source','ELF'):
+            bad=copy.deepcopy(binding);bad['files'][field]['sha256']='not-a-hash'
+            with self.assertRaises(ValueError):h.check_normal_ok_binding(bad)
+        for field,value in (('source_commit',h.NORMAL_PG_PRODUCT),('stack','rust')):
+            bad=copy.deepcopy(binding);bad[field]=value
+            with self.assertRaises(ValueError):h.check_normal_ok_binding(bad)
+        bad=copy.deepcopy(binding);bad['build_mode']['native_flags']['server'][1]='-O3'
+        with self.assertRaises(ValueError):h.check_normal_ok_binding(bad)
+
+    def test_normal_ok_self_builds_only_fresh_F_Ku_and_driver(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);calls=[]
+            class Builder:
+                def __init__(self,directory,source,**kwargs):self.name=directory.name
+                def ku(self):calls.append((self.name,'ku'))
+                def go_build(self,client=False):calls.append((self.name,'driver',client))
+                def rust(self):raise AssertionError('no Rust build in PG SELF mode')
+                def ku_native(self,*args):raise AssertionError('no derived diagnostic binary')
+                def finish(self,**kwargs):return {}
+            patches.enter_context(patch.object(h.bl,'Builder',Builder))
+            patches.enter_context(patch.object(h,'snapshot',side_effect=lambda s,c,d:d.mkdir(parents=True)))
+            patches.enter_context(patch.object(h.os,'geteuid',return_value=1));patches.enter_context(patch.object(h.os,'getegid',return_value=1))
+            preflight=patches.enter_context(patch.object(h,'require_normal_perf_preflight'))
+            complete=patches.enter_context(patch.object(h,'complete_build',return_value={'ready':True}))
+            a=types.SimpleNamespace(root=root,source=root/'source',tools=root/'tools',baseline=h.BASELINE,candidate=h.NORMAL_OK_PRODUCT,
+                prepatch=h.BASELINE,screen_variants=[],build_set='diagnostic',normal_self_probe=True,normal_self_workload='ok-gpr')
+            self.assertEqual(h.build(a,{'steps':{}}),{'ready':True});preflight.assert_called_once_with(a)
+            self.assertEqual(calls,[('B','ku'),('Driver','driver',True)]);complete.assert_called_once()
+
+    def test_normal_ok_self_three_windows_stop_without_replacement_on_failure_or_observer_drift(self):
+        cases=(('none',10,10,10,True),('upper-boundary',10,11,10,True),('lower-boundary',11,10,11,True),
+            ('sample-high',10,11.01,10,False),('sample-low',11.01,10,11.01,False),
+            ('drift',10,10.5,11.01,False),('functional',10,10,10,False),('observer',10,10,10,False),
+            ('product',10,10,10,False),('extra-reference',10,10,10,False))
+        for issue,before,sample,after,complete in cases:
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);plan=h.normal_self_plan({'B':dict(root=str(root/'B'),stack='ku',binary_sha256='f'*64)},'ok-gpr')
+                if issue=='extra-reference':plan['versions']['R']={'stack':'rust'}
+                h.save(root/'frozen-plan.json',plan);manifest=root/'fixture/manifest.json';dbstate=root/'fixture/state.json'
+                h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'});h.save(dbstate,{'limits':{}})
+                fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=dbstate,
+                    stop=lambda:dict(forced=False,cgroup_removed=True,after={'process_count':0}))
+                mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',
+                    pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0));patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
+                patches.enter_context(patch.object(h,'require_normal_perf_preflight'))
+                def binding(p,name):
+                    self.assertEqual(name,'B');return dict(stack='ku',build_mode=mode,
+                        source_commit='b'*40 if issue=='product' else h.NORMAL_OK_PRODUCT,
+                        files={'generated C':{'sha256':h.NORMAL_PG_C_SHA},'expanded source':{'sha256':h.NORMAL_OK_INPUT_SHA},'ELF':{'sha256':'e'*64}})
+                identities=patches.enter_context(patch.object(fc,'version_identity',side_effect=binding))
+                patches.enter_context(patch.object(h,'sha',return_value='f'*64));patches.enter_context(patch.object(h.shutil,'which',return_value='/perf'))
+                commands=patches.enter_context(patch.object(h,'diagnostic_command',return_value={'complete':True}))
+                measured=[]
+                def window(p,name,workload,rate,warmup,duration,output,**kwargs):
+                    turn=Path(output).name;measured.append((name,turn,duration))
+                    self.assertEqual((name,workload,rate,warmup),('B','ok',2000,10))
+                    self.assertEqual(kwargs['job'],dict(phase='diagnostic',contract='ordinary-async-http'))
+                    row=dict(status='observed',functional_valid=not(turn=='sample' and issue=='functional'),accounting_valid=True,
+                        all_correct=True,natural_reclamation=True,arrival_schedule_quality='pass',environment_quality='unknown',
+                        measurement_invalid=False,full_cpu_us=100,cpu_us={'before':before,'sample':sample,'after':after}[turn])
+                    report=Path(output)/'score/client.json';h.save(report,dict(service_cost=dict(before={'observed':True},after={'observed':True},
+                        driver_headroom={'fraction_of_quota':.3,'saturated':False})))
+                    row['score_report']=str(report)
+                    h.save(Path(output)/'score/normal-self-observations.json',dict(record_complete=not(turn=='sample' and issue=='observer'),
+                        client_started_monotonic_ns=10_000_000_001,client_finished_monotonic_ns=70_000_000_002))
+                    return row
+                patches.enter_context(patch.object(fc,'window',side_effect=window));original=fc.Harness
+                a=types.SimpleNamespace(root=root,tools=root/'tools',normal_self_workload='ok-gpr');state={'uid':1,'gid':1,'steps':{}}
+                if issue in ('product','extra-reference'):
+                    with self.assertRaises(ValueError):h.normal_self_probe(a,state)
+                    self.assertEqual(measured,[]);continue
+                result=h.normal_self_probe(a,state)
+                self.assertIs(fc.Harness,original);self.assertEqual(identities.call_count,1)
+                expected=[('B','before',15),('B','sample',15),('B','after',15)]
+                self.assertEqual(measured,expected[:2] if issue in ('functional','observer') else expected)
+                self.assertEqual(result['execution_complete'],complete);self.assertEqual(result['perf_attempts'],1)
+                self.assertFalse(result['candidate_accepted']);self.assertFalse(result['attribution_eligible'])
+                self.assertEqual(bool(result['stopped']),not complete)
+                if len(measured)==3:
+                    control=result['controls']['B']
+                    self.assertEqual(control['drift_valid'],issue!='drift')
+                    self.assertEqual(control['sample_within_registered_cpu_envelope'],issue not in ('sample-high','sample-low'))
+                for call in commands.call_args_list:
+                    if call.args[0][1] in ('report','script'):
+                        argv=call.args[0];self.assertEqual(argv[argv.index('--time')+1],'10.000000001,70.000000002')
+
+    def test_actual_normal_ok_workflow_requires_fresh_F_and_rejects_archive_reuse(self):
+        import os,subprocess,textwrap
+        import reuse_build
+        workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
+        body=workflow.split('      - name: Verify runner entry contracts without starting workloads',1)[1]
+        body=body.split('        run: |\n',1)[1].split('          python3 -B -m unittest',1)[0]
+        body=textwrap.dedent(body)
+        base={**os.environ,**{'KU_PERFORMANCE_V2_'+key:'false' for key in ('HTTP_SHORT_SCREEN','MEMORY_OWNER_PROBE',
+            'PG_DRIVER_SCREEN','PG_FAILURE_PROBE','PG_QUEUE_SCREEN','TASK_JSON_SCREEN','COMMON_HTTP_SCREEN','FINAL_TASK_JSON')}}
+        base.update(KU_PERFORMANCE_V2_NORMAL_SELF_PROBE='true',KU_PERFORMANCE_V2_SCOPE='performance-followup-diagnostic',
+            KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD='ok-gpr',KU_PERFORMANCE_V2_REUSE_RUN='',
+            KU_PERFORMANCE_V2_REUSE_SHA256='',KU_PERFORMANCE_V2_CANDIDATE=h.NORMAL_OK_PRODUCT,
+            KU_PERFORMANCE_V2_VARIANTS='')
+        for change in ({},{'KU_PERFORMANCE_V2_REUSE_RUN':'41271758889'},
+                {'KU_PERFORMANCE_V2_REUSE_SHA256':'0'*64},{'KU_PERFORMANCE_V2_CANDIDATE':'b'*40}):
+            with self.subTest(change=change):
+                result=subprocess.run(['bash','-euo','pipefail','-c',body],env=dict(base,**change),
+                    stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=2)
+                self.assertEqual(result.returncode==0,not change,result.stderr.decode())
+
+
+    def test_fresh_ok_sampler_rejects_mapped_old_ELF_before_collecting(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            output=Path(temp);service=types.SimpleNamespace(process=types.SimpleNamespace(pid=99999999),
+                domain=types.SimpleNamespace(path='/service-only',snapshot=lambda:{}))
+            patches.enter_context(patch.object(h,'diagnostic_context',return_value={}))
+            patches.enter_context(patch.object(h,'diagnostic_memory',return_value={}))
+            patches.enter_context(patch.object(h,'diagnostic_symbols',return_value={'complete':True,'files':[{'sha256':h.NORMAL_PG_ELF_SHA}]}))
+            controlled=patches.enter_context(patch.object(h,'controlled_perf'))
+            with self.assertRaisesRegex(ValueError,'mapped-symbol snapshot'):
+                h.normal_self_client(lambda:None,service,output,15,'/perf',sample=True,
+                    perf_flags=h.NORMAL_PG_GPR_FLAGS,perf_frequency=999,raw_limit=96<<20,expected_elf_sha='e'*64)
+            controlled.assert_not_called()
 
 
 if __name__=='__main__':unittest.main()
