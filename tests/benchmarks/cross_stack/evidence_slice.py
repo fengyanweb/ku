@@ -59,6 +59,7 @@ def selected(name, include_self):
     if path.parts[0] == 'http-short-screen' or (include_self and path.parts[0] == 'normal-self-probe'):
         return (path.name in OBSERVATIONS or re.fullmatch(r'resources(?:\.[a-z0-9_-]+)+', path.name)
                 or (include_self and path.parts[0] == 'normal-self-probe' and (path.name in SELF
+                    or (path.parent.name == 'pmu-stat' and path.name in ('stat.csv', 'stat.log'))
                     or ('symfs' in path.parts and re.fullmatch(
                         r'libpq\.so(?:\.[0-9.]+)?|lib[cm]\.so\.6|ld-linux-aarch64\.so\.1', path.name)))))
     if path.parts[0] in ('A', 'B'):

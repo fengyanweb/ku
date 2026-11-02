@@ -80,6 +80,9 @@ class EvidenceSliceTests(unittest.TestCase):
         for name in ('libpq.so.5.18', 'libc.so.6', 'ld-linux-aarch64.so.1', 'libm.so.6', 'other.so', 'ku'):
             self.files[base + 'symfs/usr/lib/' + name] = b'\x7fELFsymbol bytes'
         self.files[base + 'config.json'] = b'private'
+        self.files[base + 'pmu-stat/stat.csv'] = b'ku-server-1;1;;cycles;1;100.00\n'
+        self.files[base + 'pmu-stat/stat.log'] = b'Events disabled\n'
+        self.files[base + 'requests.csv'] = b'private request rows'
         self.pack()
         self.run_slice()
         with tarfile.open(self.output) as tar:
@@ -94,6 +97,9 @@ class EvidenceSliceTests(unittest.TestCase):
             for name in ('other.so', 'ku'):
                 self.assertNotIn(base + 'symfs/usr/lib/' + name, tar.getnames())
             self.assertNotIn(base + 'config.json', tar.getnames())
+            self.assertIn(base + 'pmu-stat/stat.csv', tar.getnames())
+            self.assertIn(base + 'pmu-stat/stat.log', tar.getnames())
+            self.assertNotIn(base + 'requests.csv', tar.getnames())
 
     def test_unselected_bytes_and_every_map_entry_are_verified(self):
         mutations = [lambda m: m['files'][-1].update(archived_sha256='0' * 64),
