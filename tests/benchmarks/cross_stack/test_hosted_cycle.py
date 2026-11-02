@@ -14,6 +14,107 @@ import http_cost_diagnostic as hcd
 
 
 class HostedCycleTests(unittest.TestCase):
+    def owner_job_rows(self,goal):
+        return [dict(config,environment_quality='unknown' if config['phase']=='environment-control' else 'pass',
+            functional_valid=True,accounting_valid=True,all_correct=True,
+            natural_reclamation=True,measurement_invalid=False,full_cpu_us=98 if config['name']=='B' and config['workload']=='ok' else 100,
+            memory={'steady_median_bytes':1000000}) for config in h.http_short_plan({},goal)['windows']]
+
+    def test_owner_job_stages_are_independent_exact_and_require_frozen_identity(self):
+        for goal,count,pairs,alarm,limit in zip(h.OWNER_JOB_GOALS,(41,77),(6,12),(1230,2130),(1260,2160)):
+            plan=h.http_short_plan({},goal);reference=h.full_key_plan({},h.FULL_KEY_GOALS[1] if pairs==12 else h.FULL_KEY_GOALS[0])
+            self.assertEqual(plan['windows'],reference['windows'])
+            self.assertEqual((plan['maximum_windows'],plan['paired_windows_per_business']),(count,pairs))
+            self.assertEqual((plan['observation_alarm_seconds'],plan['workflow_limit_seconds']),(alarm,limit))
+            self.assertEqual((plan['maximum_replacements'],plan['maximum_confirmations']),(0,1))
+            self.assertTrue(plan['confirmation_requires_screen_eligible']);self.assertTrue(plan['evidence_basis']['other_v4_candidates_excluded'])
+            self.assertEqual(h.http_short_prepatch(goal),h.HTTP_SHORT_PG_PREPATCH)
+            self.assertEqual(plan['adoption_thresholds']['CPU_ratio_maximum'],.99)
+            self.assertEqual(plan['adoption_thresholds']['confirmation_memory_upper95_maximum'],1.03)
+            identities={n:{'files':{'generated C':{'sha256':v}}} for n,v in h.OWNER_JOB_C.items()}
+            h.verify_pg_memory_builds(identities,goal)
+            for old in (h.FULL_KEY_C,h.HTTP_STATUS_C,h.V4_MEMORY_C,h.PG_MEMORY_C):
+                with self.assertRaises(ValueError):h.verify_pg_memory_builds({n:{'files':{'generated C':{'sha256':v}}} for n,v in old.items()},goal)
+            with patch.dict(h.OWNER_JOB_C,B='PENDING_OWNER_JOB_COMPLETE_C_SHA256'),self.assertRaisesRegex(ValueError,'not frozen'):
+                h.verify_pg_memory_builds(identities,goal)
+        import io
+        output=io.StringIO()
+        with patch('sys.stdout',output),self.assertRaises(SystemExit) as stopped:h.main(['--help'])
+        self.assertEqual(stopped.exception.code,0)
+        for goal in h.OWNER_JOB_GOALS:self.assertIn(goal,output.getvalue())
+
+    def test_owner_job_decisions_keep_failures_and_never_pool_or_adopt(self):
+        for goal in h.OWNER_JOB_GOALS:
+            for issue in ('none','small-benefit','other-cpu','memory','missing-memory','nonfinite-cpu','compute','unknown','incomplete','missing','duplicate','pooled','cleanup'):
+                with self.subTest(goal=goal,issue=issue):
+                    rows=self.owner_job_rows(goal)
+                    for row in rows:
+                        if row['phase']=='normal' and row['name']=='B':
+                            if issue=='small-benefit' and row['workload']=='ok':row['full_cpu_us']=99.5
+                            if issue=='other-cpu' and row['workload']=='db':row['full_cpu_us']=104
+                            if issue=='memory' and row['workload']=='json_object':row['memory']['steady_median_bytes']=1040000
+                            if issue=='missing-memory' and row['workload']=='db':row['memory']={'virtual_bytes':1}
+                            if issue=='nonfinite-cpu' and row['workload']=='ok':row['full_cpu_us']=float('nan')
+                        if issue=='compute' and row['phase']=='compute-guard' and row['name']=='B':row['full_cpu_us']=104
+                    if issue=='unknown':rows[3]['environment_quality']='unknown'
+                    if issue=='cleanup':rows[3]['natural_reclamation']=False
+                    if issue=='missing':rows.pop()
+                    if issue=='duplicate':rows[-1]=dict(rows[-2])
+                    if issue=='pooled':rows.extend(self.owner_job_rows(h.OWNER_JOB_GOALS[0]))
+                    result=h.http_short_comparison(rows,issue!='incomplete',{'quality':'pass'},goal)
+                    self.assertEqual(result['eligible_for_confirmation'],issue=='none' and goal==h.OWNER_JOB_GOALS[0])
+                    self.assertEqual(result['eligible_for_root_review'],issue=='none' and goal==h.OWNER_JOB_GOALS[1])
+                    for flag in ('candidate_accepted','formal_qualified','normal_score_eligible','pooling_previous_windows'):self.assertFalse(result[flag])
+                    self.assertEqual(result['maximum_confirmations'],1)
+                    self.assertTrue(result['confirmation_requires_screen_eligible'])
+
+    def test_owner_job_screen_and_confirmation_interval_boundaries_are_distinct(self):
+        def interval(point=1,lower=1,upper=1):return dict(status='estimated',estimate=point,lower95=lower,upper95=upper)
+        for goal in h.OWNER_JOB_GOALS:
+            confirm=goal==h.OWNER_JOB_GOALS[1]
+            for issue in ('none','primary-crosses-one','primary-upper-too-wide','other-cpu-crosses-one','memory-crosses-one','cpu-confirm-upper','memory-confirm-upper'):
+                with self.subTest(goal=goal,issue=issue):
+                    values=[interval(),interval(),interval(.98,.97,.99),interval(),interval(),interval()]
+                    if issue=='primary-crosses-one':values[2]=interval(.98,.95,1)
+                    if issue=='primary-upper-too-wide':values[2]=interval(.98,.94,1.030001)
+                    if issue=='other-cpu-crosses-one':values[4]=interval(1.02,1.01,1.1)
+                    if issue=='memory-crosses-one':values[1]=interval(1.02,1.01,1.1)
+                    if issue=='cpu-confirm-upper':values[4]=interval(1,1,1.030001)
+                    if issue=='memory-confirm-upper':values[1]=interval(1,1,1.030001)
+                    with patch.object(fc,'paired_interval',side_effect=values):
+                        result=h.http_short_comparison(self.owner_job_rows(goal),True,{'quality':'pass'},goal)
+                    passed=issue=='none' or not confirm and issue!='primary-upper-too-wide'
+                    self.assertEqual(result['eligible_for_root_review'] if confirm else result['eligible_for_confirmation'],passed)
+        with patch.object(fc,'paired_interval',side_effect=[interval(),interval(),interval(.99,.95,1.03),interval(),interval(),interval()]):
+            self.assertTrue(h.http_short_comparison(self.owner_job_rows(h.OWNER_JOB_GOALS[0]),True,{'quality':'pass'},h.OWNER_JOB_GOALS[0])['eligible_for_confirmation'])
+
+    def test_owner_job_missing_or_unknown_quality_flags_block_without_metric_scoring(self):
+        for goal in h.OWNER_JOB_GOALS:
+            for field in ('functional_valid','accounting_valid','all_correct','natural_reclamation','measurement_invalid'):
+                for missing in (True,False):
+                    with self.subTest(goal=goal,field=field,missing=missing):
+                        rows=self.owner_job_rows(goal)
+                        if missing:rows[3].pop(field)
+                        else:rows[3][field]=None
+                        with patch.object(fc,'paired_interval',side_effect=AssertionError('invalid quality must not reach metric scoring')):
+                            result=h.http_short_comparison(rows,True,{'quality':'pass'},goal)
+                        self.assertFalse(result['eligible_for_confirmation']);self.assertFalse(result['eligible_for_root_review'])
+                        self.assertEqual(result['comparisons'],{});self.assertEqual(result['memory_intervals'],{})
+
+    def test_owner_job_preserves_control_unknown_but_requires_aggregate_qualification(self):
+        for goal in h.OWNER_JOB_GOALS:
+            rows=self.owner_job_rows(goal)
+            self.assertEqual([r['environment_quality'] for r in rows[:3]],['unknown']*3)
+            accepted=h.http_short_comparison(rows,True,{'quality':'pass'},goal)
+            self.assertTrue(accepted['eligible_for_confirmation'] or accepted['eligible_for_root_review'])
+            for quality in ('unknown','fail'):
+                rejected=h.http_short_comparison(rows,True,{'quality':quality},goal)
+                self.assertFalse(rejected['eligible_for_confirmation'] or rejected['eligible_for_root_review'])
+            rows[0]['environment_quality']='fail'
+            with patch.object(fc,'paired_interval',side_effect=AssertionError('failed control cannot score')):
+                rejected=h.http_short_comparison(rows,True,{'quality':'pass'},goal)
+            self.assertEqual(rejected['comparisons'],{})
+
     def test_fullkey_stages_are_balanced_and_keep_prior_guards(self):
         for goal,count,pairs in zip(h.FULL_KEY_GOALS,(41,77),(6,12)):
             p=h.http_short_plan({},goal)
@@ -1657,7 +1758,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_goal == 'full-key-screen' && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",workflow)
+        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || (inputs.http_short_goal == 'full-key-screen' || inputs.http_short_goal == 'owner-job-screen') && 21 || (inputs.http_short_goal == 'v4-memory-confirm' || inputs.http_short_goal == 'http-status-confirm' || inputs.http_short_goal == 'full-key-confirm' || inputs.http_short_goal == 'owner-job-confirm') && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 

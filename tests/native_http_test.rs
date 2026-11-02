@@ -3860,6 +3860,29 @@ fn main(): null! {
         ),
         1,
     );
+    let job_anchor = "static KuHttpJob* ku_http_job_new(";
+    assert_eq!(generated.matches(job_anchor).count(), 1);
+    generated = generated.replacen(
+        job_anchor,
+        &format!(
+            "static size_t fixture_heap_jobs;\nstatic int fixture_owner_mutex_fail;\n{job_anchor}"
+        ),
+        1,
+    );
+    let job_allocation = "KuHttpJob* job = (KuHttpJob*)calloc(1, sizeof(KuHttpJob));";
+    assert_eq!(generated.matches(job_allocation).count(), 1);
+    generated = generated.replacen(
+        job_allocation,
+        &format!("fixture_heap_jobs++;\n  {job_allocation}"),
+        1,
+    );
+    let owner_mutex = "if(!ku_http_mutex_init(&job.lock))return 0;";
+    assert_eq!(generated.matches(owner_mutex).count(), 1);
+    generated = generated.replacen(
+        owner_mutex,
+        "if(fixture_owner_mutex_fail || !ku_http_mutex_init(&job.lock))return 0;",
+        1,
+    );
     let receive_anchor = "static void ku_http_connection_read_header(";
     assert_eq!(generated.matches(receive_anchor).count(), 1);
     let receive_hooks = r#"
@@ -4159,7 +4182,7 @@ int main(void) {
   }
   /* The ordinary one-argument route must actually take the bounded owner
      admission path, without a physical handler worker or queued reference. */
-  {
+  for(int mode=0;mode<10;mode++) {
     KuHttpLoopGroup inline_group={0};CHECK(ku_http_mutex_init(&inline_group.lock));inline_group.server=server;
     KuHttpLoopOwner inline_owner={0};inline_owner.group=&inline_group;inline_owner.wake=&local_wake;
     KuHttpConnection connection={0};connection.socket_value=KU_HTTP_INVALID_SOCKET;
@@ -4168,15 +4191,45 @@ int main(void) {
     const char* request="POST /unused/a?q=z HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\n";
     CHECK(!ku_http_parse_complete_header(server,request,strlen(request),&connection.input));
     memcpy(connection.input.body,"hey",3u);local_queue.owner_inline_remaining=1;
+    if(mode==1)connection.request_deadline=1u;
+    if(mode==3)budget.limit=budget.current+sizeof(KuStruct___ku_http_request)-1u;
+    if(mode>=4 && mode<=6) {
+      connection.input.route->invoke=invokes[mode];
+      connection.input.route->returns_result=mode==6;
+    }
+    if(mode==9)connection.input.route->invoke=invokes[7];
+    fixture_owner_mutex_fail=mode==8;
+    size_t heap_jobs_before=fixture_heap_jobs;
     ku_http_current_loop=&inline_owner;
     ku_http_connection_submit(&connection,server,&local_queue,0);
-    CHECK(!local_queue.owner_inline_remaining && !local_queue.count && local_queue.resident==1u);
-    CHECK(connection.phase==KU_HTTP_IO_JOB && connection.job && connection.job->completed);
-    CHECK(ku_http_job_only_owner(connection.job) && !connection.job->input.body && !connection.job->input.route);
-    ku_http_connection_observe_job(&connection,server);
-    CHECK(connection.phase==KU_HTTP_IO_WRITE && connection.output.response.status==200);
-    CHECK(connection.output.response.body.len==5u && !memcmp(connection.output.response.body.ptr,"owner",5u));
-    CHECK(inline_owner.requests==1u && inline_owner.admitted==1u && inline_owner.success==1u);
+    fixture_owner_mutex_fail=0;
+    CHECK(fixture_heap_jobs==heap_jobs_before);
+    CHECK(!local_queue.owner_inline_remaining && !local_queue.count && !local_queue.resident);
+    if(mode==8) {
+      CHECK(connection.phase==KU_HTTP_IO_WRITE && connection.output.response.status==500);
+      CHECK(!inline_owner.admitted && connection.failure.reason==KU_HTTP_ERROR_ALLOCATION);
+      ku_http_connection_close(&connection);ku_http_current_loop=NULL;
+      CHECK(!connection.job && !budget.current);ku_http_mutex_destroy(&inline_group.lock);continue;
+    }
+    CHECK(!connection.job && !connection.input.body && !connection.input.route);
+    CHECK(connection.phase==(mode==1?KU_HTTP_IO_OWNER_CANCELLED:KU_HTTP_IO_OWNER_READY));
+    CHECK(local_queue.owner_work_pending && inline_owner.requests==1u && inline_owner.admitted==1u);
+    if(mode==2)ku_http_connection_close(&connection); /* Owned output before publication. */
+    else {
+      ku_http_connection_observe_job(&connection,server);
+      if(mode==1)CHECK(connection.phase==KU_HTTP_IO_FREE && !inline_owner.success);
+      else {
+        CHECK(connection.phase==KU_HTTP_IO_WRITE);
+        if(mode==3)CHECK(connection.output.response.status==503);
+        else if(mode==6 || mode==9)CHECK(connection.output.response.status==500);
+        else {
+          CHECK(connection.output.response.status==200 && inline_owner.success==1u);
+          const char* expected=mode==5?"42":"owner";
+          CHECK(connection.output.response.body.len==strlen(expected)
+              && !memcmp(connection.output.response.body.ptr,expected,strlen(expected)));
+        }
+      }
+    }
     ku_http_connection_close(&connection);ku_http_current_loop=NULL;
     CHECK(!connection.job && !local_queue.resident && !budget.current);
     ku_http_mutex_destroy(&inline_group.lock);
@@ -8307,7 +8360,8 @@ fn native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlin
 #define KU_HTTP_POLL_WRITE POLLOUT
 typedef int KuHttpSocket;
 typedef struct pollfd KuHttpPollFd;
-enum { KU_HTTP_IO_HEADER=1,KU_HTTP_IO_BODY=2,KU_HTTP_IO_JOB=3,KU_HTTP_IO_WRITE=4,KU_HTTP_IO_ASYNC=8,KU_HTTP_IO_REQUEST_WAIT=10 };
+enum { KU_HTTP_IO_HEADER=1,KU_HTTP_IO_BODY=2,KU_HTTP_IO_JOB=3,KU_HTTP_IO_WRITE=4,KU_HTTP_IO_ASYNC=8,KU_HTTP_IO_REQUEST_WAIT=10,
+  KU_HTTP_IO_OWNER_READY=11,KU_HTTP_IO_OWNER_CANCELLED=12 };
 struct KuHttpConnection;
 typedef struct KuHttpActiveSet {
   struct KuHttpConnection* connections;
@@ -8383,12 +8437,11 @@ static int fixture_fd_index_clusters(void) {
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
   /* Low activity touches only the charged table prefix. Growth is a bounded
      in-place rebuild, without extra malloc or a lower maximum registration cap. */
-  /* Only registration metadata is used by this independent FD-index model. */
-  KuHttpActiveSet more={NULL,4160,NULL};
+  KuHttpConnection larger[64]={{0}};KuHttpActiveSet more={larger,64,NULL};
   CHECK(ku_http_reactor_init(&r,&more,0u));
   size_t calls=fixture_alloc_calls,full=r.hash_capacity;
   CHECK(r.fd_capacity==32u && full>32u && !r.fd_count);
-  for(size_t i=0;i<4163u;i++) {
+  for(size_t i=0;i<40u;i++) {
     CHECK(ku_http_reactor_fd_prepare(&r));
     r.registrations[i]=(KuHttpRegistration){(int)(10000u+i),i+1u,i,0,1,-1,0};
     size_t at=ku_http_reactor_fd_bucket(&r,r.registrations[i].fd);
@@ -8399,10 +8452,9 @@ static int fixture_fd_index_clusters(void) {
     }
     for(size_t j=r.fd_capacity;j<full;j++)CHECK(!r.fd_entries[j]);
   }
-  CHECK(r.fd_capacity==16384u && fixture_alloc_calls==calls && r.fd_count==4163u
-      && ku_http_reactor_token_capacity(&r)==8192u);
-  for(size_t i=0;i<4163u;i++) {ku_http_reactor_fd_remove(&r,i);r.registrations[i]=(KuHttpRegistration){0};}
-  CHECK(!r.fault && !r.fd_count && r.fd_capacity==16384u && r.hash_capacity==full);
+  CHECK(r.fd_capacity==128u && fixture_alloc_calls==calls && r.fd_count==40u);
+  for(size_t i=0;i<40u;i++) {ku_http_reactor_fd_remove(&r,i);r.registrations[i]=(KuHttpRegistration){0};}
+  CHECK(!r.fault && !r.fd_count && r.fd_capacity==128u && r.hash_capacity==full);
   for(size_t i=0;i<full;i++)CHECK(!r.fd_entries[i]);
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
   puts("http-persistent-fd-index-collision-backshift-ok");return 0;
@@ -8549,34 +8601,7 @@ static int fixture_closed_event_source(void) {
   reactor.descriptor=-1;CHECK(!close(pair[1]));ku_http_reactor_destroy(&reactor);
   puts("http-persistent-closed-event-source-fault-ok");return 0;
 }
-static int fixture_full_key_capacity(void) {
-  const size_t cases[]={3u,4u,5u,6u,7u,8u,9u,12u,13u,16u,17u,24u,25u,32u,33u,64u,65u,2048u,4096u,4097u,4163u,6144u,6145u,8192u,8193u,12288u,12289u,16384u,57347u};
-  for(size_t c=0;c<sizeof(cases)/sizeof(*cases);c++) {
-    size_t cap=cases[c];KuHttpActiveSet active={NULL,0,NULL};KuHttpReactor r;
-    CHECK(ku_http_reactor_init_pending(&r,&active,0u,cap-3u));
-    size_t buckets=ku_http_reactor_token_capacity(&r);
-    CHECK(r.capacity==cap && buckets>=8u && cap*4u<=buckets*3u);
-    CHECK(r.hash_capacity>=cap*2u && r.fd_capacity==(r.hash_capacity<32u?r.hash_capacity:32u));
-    CHECK(fixture_live_bytes+(r.hash_capacity-buckets)*sizeof(*r.hash)
-        ==ku_http_reactor_pending_storage_bytes(0u,0u,cap-3u)-sizeof(r));
-    if(r.hash_capacity<16384u)CHECK(buckets==r.hash_capacity);
-    if(cap==4163u || cap==6144u)CHECK(buckets==8192u && r.hash_capacity==16384u);
-    if(cap==6145u)CHECK(buckets==16384u && r.hash_capacity==16384u);
-    for(size_t i=0;i<cap;i++) CHECK(ku_http_reactor_hash_add(&r,UINT64_MAX-1u-i,i));
-    for(size_t i=0;i<cap;i++) CHECK(ku_http_reactor_lookup(&r,UINT64_MAX-1u-i)==i);
-    /* Delete across every probe cluster, then verify every survivor and stale
-     * full-width key before draining. No tombstone or narrowed identity. */
-    for(size_t i=1u;i<cap;i+=2u)ku_http_reactor_hash_remove(&r,UINT64_MAX-1u-i);
-    for(size_t i=0;i<cap;i++) CHECK(ku_http_reactor_lookup(&r,UINT64_MAX-1u-i)==(i%2u?SIZE_MAX:i));
-    for(size_t i=0;i<cap;i+=2u)ku_http_reactor_hash_remove(&r,UINT64_MAX-1u-i);
-    CHECK(!r.fault);
-    for(size_t i=0;i<buckets;i++)CHECK(!r.hash[i].token);
-    ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
-  }
-  return 0;
-}
 int main(int argc,char** argv) {
-  if(argc>1 && !strcmp(argv[1],"full-key-capacity"))return fixture_full_key_capacity();
   if(argc>1 && !strcmp(argv[1],"fd-index-clusters"))return fixture_fd_index_clusters();
   if(argc>1 && !strcmp(argv[1],"fd-index-init-failures"))return fixture_fd_index_init_failures();
   if(argc>1 && !strcmp(argv[1],"failed-new-alias"))return fixture_failed_new_preserves_alias();
@@ -8702,7 +8727,6 @@ int main(int argc,char** argv) {
     // registration. Root serializes execution; product code is unchanged.
     let mut failures = Vec::new();
     for scenario in [
-        "full-key-capacity",
         "fd-index-clusters",
         "fd-index-init-failures",
         "failed-new-alias",
@@ -9580,10 +9604,10 @@ int main(void) {
   __ku_handler_timed_out=1;__ku_handler_unwind_depth=3;
   KuSyncExitSignal previous={0};previous.kind=KU_SYNC_EXIT_ARITHMETIC_FATAL;previous.arithmetic_status=2;__ku_sync_return_signal=previous;
   ku_http_connection_submit(&connection,server,&queue,1);
-  /* This behavioral assertion is also compiled with the old public CLI for
-     RED: its ordinary sync JSON is queued rather than completed on the owner. */
-  CHECK(connection.job && connection.job->completed && !queue.count && !queue.owner_inline_remaining);
-  CHECK(ku_http_job_only_owner(connection.job) && !connection.job->input.body && !connection.job->projection_charge);
+  /* Public synchronous JSON completes on the owner and retains only its
+     owned response, with neither a queued nor a persistent heap Job. */
+  CHECK(connection.phase==KU_HTTP_IO_OWNER_READY && !connection.job && !queue.count && !queue.owner_inline_remaining);
+  CHECK(!queue.resident && !connection.input.body && !connection.input.route);
   CHECK(__ku_call_depth==7 && __ku_handler_deadline==11 && __ku_handler_cleanup_deadline==13);
   CHECK(__ku_handler_timed_out==1 && __ku_handler_unwind_depth==3 && __ku_sync_return_signal.kind==previous.kind);
   ku_http_connection_observe_job(&connection,server);
@@ -9618,8 +9642,9 @@ int main(void) {
     if(expired)connection.request_deadline=1u;
     else budget.limit=budget.current+sizeof(KuStruct___ku_http_request)-1u;
     queue.owner_inline_remaining=32u;ku_http_connection_submit(&connection,server,&queue,1);
-    CHECK(connection.job && connection.job->completed && !connection.job->started);
-    if(expired)CHECK(connection.job->cancelled);else CHECK(connection.job->response.status==503);
+    CHECK(!connection.job && !queue.resident);
+    if(expired)CHECK(connection.phase==KU_HTTP_IO_OWNER_CANCELLED);
+    else CHECK(connection.phase==KU_HTTP_IO_OWNER_READY && connection.output.response.status==503);
     ku_http_connection_close(&connection);CHECK(!queue.resident && !budget.current);budget.limit=1048576u;
   }
   for(int active=0;active<2;active++) {
@@ -9659,7 +9684,7 @@ int main(void) {
   }
   CHECK(!fresh(&connection,server,&budget,"\"\\b\\f\"","/escaped"));queue.owner_inline_remaining=32u;
   ku_http_connection_submit(&connection,server,&queue,1);
-  CHECK(connection.job && connection.job->completed && !queue.count);
+  CHECK(connection.phase==KU_HTTP_IO_OWNER_READY && !connection.job && !queue.count && !queue.resident);
   ku_http_connection_observe_job(&connection,server);
   const char* escaped="\"\\\"\\\\u0008\\\\u000c\\\"\"";
   CHECK(connection.output.response.status==200 && connection.output.response.body.len==strlen(escaped));

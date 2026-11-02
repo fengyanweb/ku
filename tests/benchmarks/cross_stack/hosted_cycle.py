@@ -3,7 +3,7 @@
 No product patch, remote dispatch, SDK matrix, installation or release operation.
 """
 from __future__ import annotations
-import argparse, copy, gzip, hashlib, io, json, os
+import argparse, copy, gzip, hashlib, io, json, math, os
 from pathlib import Path
 import platform, pwd, re, select, shutil, signal, struct, subprocess, sys, tarfile, threading, time
 import build_linux as bl
@@ -23,6 +23,8 @@ PG_MEMORY_C = {
 }
 FULL_KEY_GOALS=('full-key-screen','full-key-confirm')
 FULL_KEY_C=dict(PG_MEMORY_C,B='9ae5b00535c13b75925b78f0be594a3bde4fd0b6a2996ec0bfe1ac6a6d5bcf77')
+OWNER_JOB_GOALS=('owner-job-screen','owner-job-confirm')
+OWNER_JOB_C=dict(PG_MEMORY_C,B='8010370bbc8867e7f39267f722250db493b20ce70c0d73b5a238a575e939fad4')
 HTTP_STATUS_GOALS=('http-status-screen','http-status-confirm')
 HTTP_STATUS_C=dict(PG_MEMORY_C,B='2bfb5abc1c6ec68a3529d21b264cc4ead70eb93ebb564bedeba3a317d94d7b78')
 V4_GOALS=('v4-memory-screen','v4-memory-confirm')
@@ -47,12 +49,14 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def http_short_prepatch(goal):
-    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS):raise ValueError('unregistered HTTP short goal')
-    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS) else HTTP_SHORT_PREPATCH
+    if goal not in ('cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS):raise ValueError('unregistered HTTP short goal')
+    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in (*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS) else HTTP_SHORT_PREPATCH
 
 
 def verify_pg_memory_builds(identities,goal='pg-memory'):
-    for name,expected in (FULL_KEY_C if goal in FULL_KEY_GOALS else HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
+    if goal in OWNER_JOB_GOALS and not re.fullmatch('[0-9a-f]{64}',OWNER_JOB_C['B']):
+        raise ValueError('owner Job complete generated C identity is not frozen')
+    for name,expected in (OWNER_JOB_C if goal in OWNER_JOB_GOALS else FULL_KEY_C if goal in FULL_KEY_GOALS else HTTP_STATUS_C if goal in HTTP_STATUS_GOALS else V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
         if identities.get(name,{}).get('files',{}).get('generated C',{}).get('sha256')!=expected:
             raise ValueError('PG memory screen requires the exact preregistered complete C: '+name)
 
@@ -290,6 +294,7 @@ def normal_self_plan(versions):
 
 
 def http_short_plan(versions,goal='cpu'):
+    if goal in OWNER_JOB_GOALS:return owner_job_plan(versions,goal)
     if goal in FULL_KEY_GOALS:return full_key_plan(versions,goal)
     if goal in HTTP_STATUS_GOALS:return http_status_plan(versions,goal)
     if goal in V4_GOALS:return v4_short_plan(versions,goal)
@@ -328,6 +333,7 @@ def http_short_plan(versions,goal='cpu'):
 
 
 def http_short_comparison(rows,complete,environment=None,goal='cpu'):
+    if goal in OWNER_JOB_GOALS:return owner_job_comparison(rows,complete,environment,goal)
     if goal in FULL_KEY_GOALS:return v4_short_comparison(rows,complete,environment,goal)
     if goal in HTTP_STATUS_GOALS:return http_status_comparison(rows,complete,environment,goal)
     if goal in V4_GOALS:return v4_short_comparison(rows,complete,environment,goal)
@@ -472,6 +478,77 @@ def full_key_plan(versions,goal):
             sample_planning='Historical log(memoryB/A) SD.11766:6screen/12confirmation fixed before this implementation measured; rough uncertainty not guaranteed power; CPUvariability can still prevent qualification.'))
     plan['adoption_thresholds']['rationale']='Same5percent memory minimum and1.03CPUguards; newfull-key implementation, not reinterpretation or rerun of rejected8B. Original16targets unchanged.'
     return plan
+
+
+def owner_job_plan(versions,goal):
+    if goal not in OWNER_JOB_GOALS:raise ValueError('unregistered owner Job stage')
+    confirm=goal==OWNER_JOB_GOALS[1]
+    plan=full_key_plan(versions,FULL_KEY_GOALS[1] if confirm else FULL_KEY_GOALS[0])
+    plan.update(http_short_goal=goal,maximum_confirmations=1,confirmation_requires_screen_eligible=True,
+        purpose='One automatic-storage Job candidate for the existing compiler-proven bounded owner entry; ordinary helpers/C11O2, original16B hash and blocking slots.6pairs screen then at most one independent12pair confirmation only after eligible screen. No old rows pooled, historical verdict changed, capacity or30min acceptance.',
+        adoption_thresholds=dict(primary_workload='ok',CPU_ratio_maximum=.99,
+            screen_primary_CPU_upper95_maximum=1.03,screen_related_CPU_point_maximum=1.03,
+            screen_related_CPU_lower95_maximum=1.03,screen_memory_point_maximum=1.03,
+            screen_memory_lower95_maximum=1.03,confirmation_primary_CPU_upper95_strictly_below=1,
+            confirmation_CPU_lower95_maximum=1,confirmation_CPU_upper95_maximum=1.03,
+            confirmation_memory_lower95_maximum=1,confirmation_memory_upper95_maximum=1.03,
+            compute_ratio_maximum=1.03,CPU_metric='full_cpu_us: before score driver launch after warmup through recorded termination; no cold-start/warmup CPU',
+            memory_metric='original chronological middle60% cgroup memory.current median',
+            final_decision='Root may dispatch at most one independent confirmation after an eligible screen; no automatic dispatch/adoption or original16goal completion.'),
+        evidence_basis=dict(complete_C=OWNER_JOB_C,other_v4_candidates_excluded=True,
+            mechanism='Existing synchronous bounded owner entry uses a private automatic Job; unchanged execution mutex/TLS/deadline/budget checks. Only owned response/charge survives until original maintenance publication; fallback unchanged.',
+            performance_effect='unknown before paired measurements; fewer allocation/ownership operations are not dynamic CPU attribution.'))
+    return plan
+
+
+def owner_job_comparison(rows,complete,environment,goal):
+    plan=owner_job_plan({},goal);confirm=goal==OWNER_JOB_GOALS[1]
+    groups=range(1,plan['paired_windows_per_business']+1);limits=plan['adoption_thresholds']
+    result=dict(complete=complete,http_short_goal=goal,eligible_for_confirmation=False,eligible_for_root_review=False,
+        candidate_accepted=False,formal_qualified=False,normal_score_eligible=False,reasons=[],comparisons={},memory_intervals={},
+        independent_stage=True,pooling_previous_windows=False,thresholds=limits,maximum_confirmations=1,
+        confirmation_requires_screen_eligible=True)
+    if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification failed or unknown')
+    if not complete:
+        result['reasons'].append('incomplete observations or cleanup; no metric scoring');return result
+    key=lambda r:(r.get('phase'),r.get('workload'),r.get('group'),r.get('name'))
+    actual=[key(r) for r in rows];expected=[key(r) for r in plan['windows']]
+    if len(actual)!=len(expected) or len(set(actual))!=len(actual) or set(actual)!=set(expected):
+        result['reasons'].append('fixed stage window identities missing, duplicated or mixed');return result
+    # Control rows precede aggregate qualification and retain their original
+    # 'unknown' field. The separate three-control report above must pass; do
+    # not rewrite those rows or require a retroactive 'pass' on each control.
+    if any((r.get('environment_quality') not in ('pass','unknown') if r['phase']=='environment-control'
+            else r.get('environment_quality')!='pass') or any(r.get(k) is not True for k in
+            ('functional_valid','accounting_valid','all_correct','natural_reclamation'))
+            or r.get('measurement_invalid') is not False or r.get('independent_collector_fault') is True for r in rows):
+        result['reasons'].append('window quality or cleanup failed/unknown; no exclusion or replacement');return result
+    positive=lambda value:isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and value>0
+    if any(not positive(r.get('full_cpu_us')) for r in rows) or any(not positive(fc.metric(r,'memory.steady_median_bytes')) for r in rows if r['phase']=='normal'):
+        result['reasons'].append('missing or non-finite paired CPU/memory measurement; no exclusion');return result
+    business=[r for r in rows if r['phase']=='normal']
+    for workload in ('json_object','ok','db'):
+        selected=[r for r in business if r['workload']==workload]
+        pairs=[{r['name']:r for r in selected if r['group']==g} for g in groups]
+        cpu=fc.paired_interval([p['B']['full_cpu_us'] for p in pairs],[p['A']['full_cpu_us'] for p in pairs],minimum=3)
+        memory=fc.paired_interval([fc.metric(p['B'],'memory.steady_median_bytes') for p in pairs],
+            [fc.metric(p['A'],'memory.steady_median_bytes') for p in pairs],minimum=3)
+        result['comparisons'][workload]=cpu;result['memory_intervals'][workload]=memory
+        if cpu.get('status')!='estimated' or (cpu['lower95']>limits['confirmation_CPU_lower95_maximum'] or cpu['upper95']>limits['confirmation_CPU_upper95_maximum'] if confirm
+                else cpu['estimate']>limits['screen_related_CPU_point_maximum'] or cpu['lower95']>limits['screen_related_CPU_lower95_maximum']):
+            result['reasons'].append(workload+' CPU '+('confirmation guard unresolved/failed' if confirm else 'screen failed'))
+        if workload=='ok' and (cpu.get('status')!='estimated' or cpu['estimate']>limits['CPU_ratio_maximum'] or
+                (cpu['upper95']>=limits['confirmation_primary_CPU_upper95_strictly_below'] if confirm else cpu['upper95']>limits['screen_primary_CPU_upper95_maximum'])):
+            result['reasons'].append('ordinaryHTTP CPU benefit criterion not demonstrated')
+        if memory.get('status')!='estimated' or (memory['lower95']>limits['confirmation_memory_lower95_maximum'] or memory['upper95']>limits['confirmation_memory_upper95_maximum'] if confirm
+                else memory['estimate']>limits['screen_memory_point_maximum'] or memory['lower95']>limits['screen_memory_lower95_maximum']):
+            result['reasons'].append(workload+' memory '+('confirmation guard unresolved/failed' if confirm else 'screen failed'))
+    cpu={r['name']:r for r in rows if r['phase']=='compute-guard'}
+    ratio=cpu['B']['full_cpu_us']/cpu['A']['full_cpu_us']
+    result['compute_guard']=dict(B_over_A=ratio,pairs=1,confidence_interval=None,scope='coarse guard only')
+    if ratio>limits['compute_ratio_maximum']:result['reasons'].append('coarse compute guard failed')
+    result['eligible_for_root_review' if confirm else 'eligible_for_confirmation']=not result['reasons']
+    return result
 
 
 def http_status_plan(versions,goal):
@@ -842,7 +919,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
-    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS):
+    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS):
         verify_pg_memory_builds(identities,getattr(a,'http_short_goal','cpu'))
     if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
@@ -2606,8 +2683,8 @@ def main(argv=None):
     p.add_argument('--fixed-goals-only',action='store_true',help='Explicit full-build/run stop after controls, admission and original80 windows/16 goals; capacity/stability and whole acceptance remain incomplete')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
-    p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
+    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS,*HTTP_STATUS_GOALS,*FULL_KEY_GOALS,*OWNER_JOB_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-screen',action='store_true',help='Explicit frozen control+normal A/B candidate diagnostic; goal selects exact windows/prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
     p.add_argument('--pg-queue-screen',action='store_true',help='Eight normal A/B PG fix diagnostic windows; frozen f39c673 prepatch required, no matrix or formal capacity claim')
