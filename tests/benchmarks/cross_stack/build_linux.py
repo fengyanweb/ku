@@ -26,6 +26,38 @@ import tomllib
 from compile_variants import ku_cc_command
 
 CANDIDATE = "8210e5200c466d9041807d04a68c1844ba9cbd6f"
+RUST_TOOLCHAIN = "1.99.1"
+
+
+def require_rust_release_receipt(receipt, label):
+    """Reject historical compilers instead of relabelling their output."""
+    versions = receipt.get("exact_versions", {})
+    commands = receipt.get("commands", [])
+    if (receipt.get("rust_toolchain") != RUST_TOOLCHAIN or receipt.get("failure") is not None
+            or not commands or any(c.get("exit_code") != 0 for c in commands)
+            or any(not re.match(r"^" + tool + r" " + re.escape(RUST_TOOLCHAIN) + r"\b", versions.get(tool, ""))
+                   for tool in ("rustc", "cargo"))):
+        raise ValueError("successful Rust " + RUST_TOOLCHAIN + " build receipt required")
+    builds = [c.get("command", []) for c in commands if c.get("label") == label]
+    if len(builds) != 1 or not all(flag in builds[0] for flag in ("+" + RUST_TOOLCHAIN, "build", "--locked", "--release")):
+        raise ValueError("explicit Rust " + RUST_TOOLCHAIN + " locked Release command required")
+    return versions
+
+
+def require_rust_manifest(manifest):
+    """Check each Rust-built measured artifact before a new timed window."""
+    for name in ("ku", "rust"):
+        if name not in manifest.get("stacks", {}):
+            continue
+        build = manifest["stacks"][name]["build"]
+        if manifest.get("rust_toolchain") != RUST_TOOLCHAIN or build.get("rust_toolchain") != RUST_TOOLCHAIN:
+            raise ValueError("historical Rust build cannot enter a new " + RUST_TOOLCHAIN + " run")
+        receipt = Path(build["cli_build_receipt"] if name == "ku" else manifest["build_receipt"])
+        if name == "ku" and digest(receipt) != build.get("cli_build_receipt_sha256"):
+            raise ValueError("CLI build receipt identity changed")
+        versions = require_rust_release_receipt(json.loads(receipt.read_text()), "ku-cli" if name == "ku" else "rust-server")
+        if any(manifest.get("versions", {}).get(k) != versions[k] for k in ("rustc", "cargo")):
+            raise ValueError("manifest Rust compiler differs from its build receipt")
 
 
 def digest(path):
@@ -330,6 +362,8 @@ class Builder:
         previous = self.manifest.get("candidate_base")
         if previous not in (None, candidate):
             raise RuntimeError("existing manifest belongs to another candidate; use a new benchmark root")
+        if {"ku", "rust"}.intersection(self.manifest.get("stacks", {})):
+            require_rust_manifest(self.manifest)
         self.manifest.update(schema="ku-cross-stack-manifest-v1", candidate_base=candidate,
                              source_root=str(self.source), uid=uid, gid=gid,
                              protocol=str(self.benchmark / "protocol.json"), peer_port=peer_port,
@@ -382,11 +416,11 @@ class Builder:
         return value
 
     def ku(self):
-        self.version("rustc", [self.rustc, "+1.89.0", "-vV"], "rustc 1.89.0")
-        self.version("cargo", [self.cargo, "+1.89.0", "--version"], "cargo 1.89.0")
+        self.version("rustc", [self.rustc, "+" + RUST_TOOLCHAIN, "-vV"], "rustc " + RUST_TOOLCHAIN)
+        self.version("cargo", [self.cargo, "+" + RUST_TOOLCHAIN, "--version"], "cargo " + RUST_TOOLCHAIN)
         self.version("cc", ["clang-18", "--version"], "18.")
         target = self.build / "ku-cargo"
-        self.command("ku-cli", [self.cargo, "+1.89.0", "build", "--locked", "--release", "--bin", "ku",
+        self.command("ku-cli", [self.cargo, "+" + RUST_TOOLCHAIN, "build", "--locked", "--release", "--bin", "ku",
                                 "--jobs", "2", "--target-dir", target])
         ku = target / "release/ku"
         self.version("ku", [ku, "--version"], "ku " + self.package_version)
@@ -399,6 +433,19 @@ class Builder:
         benchmark program. Reusing the CLI does not claim it was rebuilt here.
         """
         ku = Path(ku).resolve(strict=True)
+        if any(c.get("label") == "ku-cli" for c in self.commands):
+            require_rust_release_receipt(dict(rust_toolchain=RUST_TOOLCHAIN, failure=None,
+                exact_versions=self.versions, commands=self.commands), "ku-cli")
+            cli_receipt = self.logs / "build.json"
+        else:
+            origin = json.loads((ku.parents[3] / "manifest.json").read_text())
+            require_rust_manifest(origin)
+            prior = origin["stacks"]["ku"]["build"]
+            if (origin.get("candidate_base") != self.candidate or Path(prior["cli"]).resolve() != ku
+                    or prior["cli_sha256"] != digest(ku)):
+                raise ValueError("native CLI differs from the current source/compiler receipt")
+            cli_receipt = Path(prior["cli_build_receipt"])
+            self.versions.update({k: origin["versions"][k] for k in ("rustc", "cargo")})
         self.version("ku", [ku, "--version"], "ku " + self.package_version)
         compiler = shutil.which("clang-18", path=self.environment["PATH"])
         if compiler is None:
@@ -458,6 +505,8 @@ class Builder:
                                                batch_command=[str(self.bin / "ku-batch")], cwd="{workdir}",
                                                runtime_layout=dict(binary_dir="bin", fs_base_dir="ku-native"),
                                                env={}, build=dict(cli=str(ku), cli_sha256=digest(ku),
+                                                                  rust_toolchain=RUST_TOOLCHAIN,
+                                                                  cli_build_receipt=str(cli_receipt),
                                                                   formatting_mode=self.ku_format,
                                                                   json_response_mode=self.ku_json,
                                                                   json_execution_mode=self.ku_json_execution,
@@ -505,15 +554,17 @@ class Builder:
             self.built.add("go")
 
     def rust(self):
-        self.version("rustc", [self.rustc, "+1.89.0", "-vV"], "rustc 1.89.0")
+        self.version("rustc", [self.rustc, "+" + RUST_TOOLCHAIN, "-vV"], "rustc " + RUST_TOOLCHAIN)
+        self.version("cargo", [self.cargo, "+" + RUST_TOOLCHAIN, "--version"], "cargo " + RUST_TOOLCHAIN)
         directory = self.benchmark / "rust"
         target = self.build / "rust-cargo"
-        self.command("rust-server", [self.cargo, "+1.89.0", "build", "--locked", "--release", "--jobs", "2",
+        self.command("rust-server", [self.cargo, "+" + RUST_TOOLCHAIN, "build", "--locked", "--release", "--jobs", "2",
                                      "--target-dir", target], cwd=directory)
         binary = target / "release/ku-cross-stack-rust"
         self.manifest["stacks"]["rust"] = dict(command=[str(binary)], batch_command=[str(binary), "--batch", "{batch_input}"],
                                                  cwd="{workdir}", env={}, build=dict(binary_sha256=digest(binary),
-                                                                                  flags="cargo +1.89.0 build --locked --release -j2",
+                                                                                  rust_toolchain=RUST_TOOLCHAIN,
+                                                                                  flags="cargo +" + RUST_TOOLCHAIN + " build --locked --release -j2",
                                                                                   source_files_sha256=benchmark_stack_sources(directory),
                                                                                   pg_modes=["normal", "reset-equivalent"]))
         self.built.add("rust")
@@ -622,14 +673,25 @@ class Builder:
                      self.benchmark / "client/go.mod", self.benchmark / "java/dependencies.lock.json",
                      self.benchmark / "dotnet/packages.lock.json", self.benchmark / "cpp/dependencies.lock.json"):
             lockfiles[str(path.relative_to(self.source))] = digest(path)
+        rust_toolchain = RUST_TOOLCHAIN if self.built & {"ku", "rust"} else None
         receipt = dict(schema="ku-cross-stack-build-v1", candidate_base=self.candidate,
+                       rust_toolchain=rust_toolchain,
                        package_version=self.package_version, source_files=self.initial_hashes, lockfiles=lockfiles,
                        source_inventory_sha256=hashlib.sha256(json.dumps(self.initial_hashes, sort_keys=True).encode()).hexdigest(),
                        exact_versions=self.versions, commands=self.commands, failure=failed,
                        compiled_jobs=2, uname=list(os.uname()), published=False)
+        if not failed:
+            for label in ("ku-cli", "rust-server"):
+                if any(c.get("label") == label for c in self.commands):
+                    require_rust_release_receipt(receipt, label)
         write_json(self.logs / "build.json", receipt)
         if failed:
             raise RuntimeError(f"build preparation failed: {failed}; receipt={self.logs/'build.json'}")
+        if "ku" in self.built:
+            build = self.manifest["stacks"]["ku"]["build"]
+            build["cli_build_receipt_sha256"] = digest(build["cli_build_receipt"])
+        if rust_toolchain is not None:
+            self.manifest["rust_toolchain"] = rust_toolchain
         # The root-only DB preparer may complete while compilation runs. Merge
         # the shared manifest under a lock instead of dropping its new domain.
         with (self.root / ".manifest.lock").open("a") as lock:

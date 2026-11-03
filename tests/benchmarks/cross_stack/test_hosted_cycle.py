@@ -14,6 +14,51 @@ import http_cost_diagnostic as hcd
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_shared_cli_builder_snapshots_each_current_toolchain_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);commands=[]
+            def base_command(builder,label,command,**kwargs):
+                commands.append(command);cache=Path(command[command.index('--target-dir')+1])/'release/ku'
+                cache.parent.mkdir(parents=True,exist_ok=True);cache.write_bytes(builder.root.name.encode());return 'built'
+            with patch.object(h.bl.Builder,'command',autospec=True,side_effect=base_command):
+                cls=h.shared_cli_builder(root)
+                for name in ('A','B'):
+                    b=cls.__new__(cls);b.root=root/name;b.build=b.root/'build'
+                    b.command('ku-cli',['cargo','+1.99.1','build','--target-dir',b.build/'ku-cargo'])
+            self.assertEqual(h.CLI_CACHE,'cli-cache-1.99.1')
+            self.assertEqual((root/'A/build/ku-cargo/release/ku').read_bytes(),b'A')
+            self.assertEqual((root/'B/build/ku-cargo/release/ku').read_bytes(),b'B')
+            self.assertTrue(all(c[c.index('--target-dir')+1]==root/h.CLI_CACHE for c in commands))
+            args=types.SimpleNamespace(baseline=h.BASELINE,candidate='b'*40,prepatch=h.BASELINE,screen_variants=[])
+            identity=h.hosted_identity(args,'diagnostic');self.assertEqual(identity['rust_toolchain'],'1.99.1')
+            self.assertNotEqual(identity,dict(identity,rust_toolchain='1.89.0'))
+
+    def test_fp_preflight_requires_the_actual_callchain_field(self):
+        for present in (True,False):
+            with self.subTest(present=present),tempfile.TemporaryDirectory() as temporary,ExitStack() as patches:
+                root=Path(temporary);a=types.SimpleNamespace(root=root,tools=root/'tools',candidate='b'*40,perf_callchains=True)
+                stream=types.SimpleNamespace(fileno=lambda:1234,close=lambda:None)
+                child=types.SimpleNamespace(pid=777,returncode=None,stdin=stream,stdout=stream)
+                child.poll=lambda:child.returncode
+                def wait(timeout):child.returncode=0;return 0
+                child.wait=wait;patches.enter_context(patch.object(h.subprocess,'Popen',return_value=child))
+                patches.enter_context(patch.object(h.shutil,'which',return_value='/perf'));patches.enter_context(patch.object(h,'sha',return_value='f'*64))
+                patches.enter_context(patch.object(h.os,'write',side_effect=lambda fd,data:len(data)))
+                kill=patches.enter_context(patch.object(h.os,'killpg'))
+                def controlled(client,pid,output,perf,record,**kwargs):
+                    self.assertTrue(kwargs['callchains']);raw=bytearray(200);raw[:8]=b'PERFILE2'
+                    h.struct.pack_into('<QQ',raw,24,112,72);h.struct.pack_into('<QQ',raw,40,184,16)
+                    h.struct.pack_into('<Q',raw,136,1<<5 if present else 0);(output/'perf.data').write_bytes(raw)
+                    record.update(record_complete=True,client_started_monotonic_ns=10_000_000_001,client_finished_monotonic_ns=11_000_000_002)
+                patches.enter_context(patch.object(h,'controlled_perf',side_effect=controlled))
+                def export(command,output,**kwargs):
+                    Path(output).write_text('# perf version : 7.0.14\n' if command[1]=='report' else '777 777 10.5: cpu-clock: abc\n')
+                    return {'complete':True}
+                patches.enter_context(patch.object(h,'diagnostic_command',side_effect=export))
+                result=h.normal_perf_preflight(a)
+                self.assertEqual(result['complete'],present);self.assertEqual(result['callchain_field_present'],present)
+                self.assertTrue(result['perf_callchains']);self.assertTrue(result['child_reaped']);kill.assert_not_called()
+
     def test_pg_input_guard_export_opt_in_preserves_all_windows_and_old_default_bound(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);directory=root/'raw';directory.mkdir();selected=[]
@@ -643,7 +688,7 @@ class HostedCycleTests(unittest.TestCase):
         self.assertEqual(invalid.exception.code,2)
 
     def test_controlled_perf_requires_enable_ack_stop_ack_and_exit_zero(self):
-        for issue in ('success','fragmented','exit-minus2','exit130','missing-ack','bad-ack','junk','oversize','eof','padding-eof','stop-ack','exit-timeout'):
+        for issue in ('success','fp','fragmented','exit-minus2','exit130','missing-ack','bad-ack','junk','oversize','eof','padding-eof','stop-ack','exit-timeout'):
             with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
                 output=Path(temp);record={};invoked=[];commands=[]
                 class Process:
@@ -674,16 +719,17 @@ class HostedCycleTests(unittest.TestCase):
                 if bad_ready or issue in ('stop-ack','exit-timeout'):
                     with self.assertRaises((TimeoutError,RuntimeError,h.subprocess.TimeoutExpired)):
                         h.controlled_perf(client,123,output,'/perf',record)
-                else:self.assertEqual(h.controlled_perf(client,123,output,'/perf',record),{'original':True})
-                self.assertEqual(record['record_complete'],issue in ('success','fragmented'))
+                else:self.assertEqual(h.controlled_perf(client,123,output,'/perf',record,**({'callchains':True} if issue=='fp' else {})),{'original':True})
+                self.assertEqual(record['record_complete'],issue in ('success','fp','fragmented'))
                 self.assertEqual(bool(invoked),not bad_ready)
                 argv,options=commands[0];self.assertIn('--delay=-1',argv);self.assertNotIn('--',argv)
                 self.assertIn('--control=fd:'+','.join(map(str,options['pass_fds'])),argv)
                 self.assertEqual(argv[argv.index('-p')+1],'123');self.assertEqual(len(options['pass_fds']),2)
+                self.assertEqual(argv[-2:],['--call-graph','fp'] if issue=='fp' else ['-o',str(output/'perf.data')])
                 for call in kill.call_args_list:self.assertEqual(call.args,(99999999,h.signal.SIGKILL))
                 for fd in options['pass_fds']:
                     with self.assertRaises(OSError):h.os.fstat(fd)
-                if issue in ('success','fragmented'):
+                if issue in ('success','fp','fragmented'):
                     self.assertEqual([x['command'] for x in record['control']],['enable','stop'])
                     self.assertTrue(all(x['ack_wire_bytes']==5 for x in record['control']))
                     self.assertEqual(len(set(x.args[0] for x in ack_reads.call_args_list)),1)
@@ -691,22 +737,23 @@ class HostedCycleTests(unittest.TestCase):
                     [b'enable\n'] if bad_ready else [b'enable\n',b'stop\n'])
 
     def test_normal_self_sampler_preserves_client_and_snapshot_scope(self):
-        for sample in (False,True):
-            with self.subTest(sample=sample),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+        for sample,callchains in ((False,False),(True,False),(True,True)):
+            with self.subTest(sample=sample,callchains=callchains),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
                 output=Path(temp);service=types.SimpleNamespace(process=types.SimpleNamespace(pid=99999999),
                     domain=types.SimpleNamespace(snapshot=lambda:{'memory_stat':{'anon':42}}))
                 patches.enter_context(patch.object(h,'diagnostic_context',return_value={'task_count':3}))
                 memory=patches.enter_context(patch.object(h,'diagnostic_memory',return_value={'categories':{}}))
                 symbols=patches.enter_context(patch.object(h,'diagnostic_symbols',return_value={'files':[]}))
-                def controlled(client,pid,out,perf,record):
+                def controlled(client,pid,out,perf,record,**kwargs):
                     self.assertEqual((pid,out,perf),(99999999,output,'/perf'))
+                    self.assertEqual(kwargs,{'callchains':True} if callchains else {})
                     record.update(client_started_monotonic_ns=1,client_finished_monotonic_ns=2,record_complete=True)
                     return client()
                 measured=patches.enter_context(patch.object(h,'controlled_perf',side_effect=controlled));invoked=[]
-                self.assertEqual(h.normal_self_client(lambda:invoked.append(True) or {'original':True},service,output,15,'/perf',sample=sample),{'original':True})
+                self.assertEqual(h.normal_self_client(lambda:invoked.append(True) or {'original':True},service,output,15,'/perf',sample=sample,**({'callchains':True} if callchains else {})),{'original':True})
                 self.assertEqual(invoked,[True]);record=h.load(output/'normal-self-observations.json')
                 self.assertTrue(record['record_complete']);self.assertIn('not a simultaneous',record['before']['scope'])
-                self.assertIn('unavailable',record['callchains']);self.assertIn('unknown',record['cpu_distribution'])
+                self.assertIn('kernel chains' if callchains else 'unavailable',record['callchains']);self.assertIn('unknown',record['cpu_distribution'])
                 self.assertEqual(memory.call_count,2 if sample else 0);self.assertEqual(symbols.call_count,1 if sample else 0)
                 self.assertEqual(measured.call_count,1 if sample else 0)
 
@@ -1756,7 +1803,7 @@ class HostedCycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)
             for name in ['B/build/ku-cargo/release/ku','R/build/rust-cargo/release/ku-cross-stack-rust','B/build/ku-native/normal.c',
-                         'B/src/tests/benchmarks/cross_stack/rust/src/main.rs','cli-cache/release/ku','B/src/src/runtime.rs',
+                         'B/src/tests/benchmarks/cross_stack/rust/src/main.rs','cli-cache/release/ku',h.CLI_CACHE+'/release/ku','B/src/src/runtime.rs',
                          'compiler/http-train-ku/http-profiles/train.profraw','compiler/KGenerate/build-time-profiles/build.profraw']:
                 path=root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'normal bytes')
             (root/'B/build/ku-cargo/release/ku').chmod(0o755)
@@ -1768,6 +1815,7 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertIn('R/build/rust-cargo/release/ku-cross-stack-rust',names)
                 self.assertIn('B/src/tests/benchmarks/cross_stack/rust/src/main.rs',names)
                 self.assertNotIn('cli-cache/release/ku',names);self.assertNotIn('B/src/src/runtime.rs',names)
+                self.assertNotIn(h.CLI_CACHE+'/release/ku',names)
                 profile='compiler/http-train-ku/http-profiles/train.profraw'
                 self.assertIn(profile,names);self.assertNotIn('compiler/KGenerate/build-time-profiles/build.profraw',names)
                 mapping={x['path']:x for x in json.load(tar.extractfile('portable-file-map.json'))['files']}

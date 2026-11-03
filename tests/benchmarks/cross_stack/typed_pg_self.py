@@ -11,32 +11,32 @@ INPUTS={'B':'59ede7cdba403d4d038c3720ab65f1cd940efd1038d07df782743a35eb9887ae',
         'BP':'d9b5ea46dd2b401ae368471a822efa8467efa64c50e4b5966681c0d2a21bc4a0'}
 
 
-def frozen_plan(versions):
+def frozen_plan(versions, *, callchains=False, current_product=None):
     return dict(schema='ku-typed-pg-minimal-SELF-v1',versions=versions,entry_sha256=h.sha(__file__),
         observer_helper_sha256=h.sha(h.__file__),resources=copy.deepcopy(h.RESOURCES),
         quality_policy=copy.deepcopy(h.POLICY),workload='db',contract='pg-strict',rate=800,
         warmup_seconds=3,score_seconds=15,order=[[n,t] for n in ('B','BP') for t in ('before','sample','after')],
-        event='cpu-clock',perf_frequency=499,maximum_windows=6,maximum_replacements=0,
+        event='cpu-clock',perf_frequency=499,callchains=callchains,current_product=current_product,maximum_windows=6,maximum_replacements=0,
         maximum_control_cpu_ratio=1.10,observation_alarm_seconds=330,diagnostic_only=True,
         formal_qualified=False,normal_score_eligible=False,
         purpose='Current ordinary versus typed public PG path, same fixed work and mandatory reset. '
             'Fixed800rps improves sample opportunity, not guaranteed density; typed regions may remain unknown. '
-            'Minimal running SELF/PC only; no source-call-count timing, PMU/cycles, full callchains, offCPU attribution, retries or score. '
+            'Running SELF/PC and optional fp chains; missing or incomplete user frames remain unknown. No source-call-count timing, PMU/cycles, offCPU attribution, retries or score. '
             'Historical200rps measurements are not a before/after gain comparison.')
 
 
-def identify(normal,typed):
+def identify(normal,typed, *, current_product=None, callchains=False):
     manifests={};versions={}
     for name,path in (('B',normal),('BP',typed)):
         if path.name!='manifest.json' or path.is_symlink():raise ValueError('plain manifest.json inputs required')
         m=h.load(path);manifests[name]=m;target=m['stacks']['ku'];build=target['build']
         declared=build['native']['server']['binary_sha256']
-        if m['candidate_base'] not in (FROZEN_BASE,FROZEN_DEFAULT) or not re.fullmatch('[0-9a-f]{64}',declared):raise ValueError('fixed archived source and declared ELF SHA required')
+        if m['candidate_base'] not in ((current_product,) if current_product else (FROZEN_BASE,FROZEN_DEFAULT)) or not re.fullmatch('[0-9a-f]{64}',declared):raise ValueError('fixed archived source and declared ELF SHA required')
         protocol=Path(m['protocol'])
         versions[name]=dict(root=str(path.parent),stack='ku',source_commit=m['candidate_base'],binary_sha256=declared,
             artifacts={'protocol':dict(path=str(protocol),sha256=h.sha(protocol))})
     if versions['B']['source_commit']!=versions['BP']['source_commit']:raise ValueError('both PG arms must use the same fixed source')
-    plan=frozen_plan(versions);bindings={n:fc.version_identity(plan,n) for n in versions}
+    plan=frozen_plan(versions,callchains=callchains,current_product=current_product);bindings={n:fc.version_identity(plan,n) for n in versions}
     expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
         pg_execution_mode='async',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
     for n,b in bindings.items():
@@ -44,8 +44,16 @@ def identify(normal,typed):
         if b['files']['expanded source']['sha256']!=INPUTS[n]:raise ValueError('frozen PG business input changed')
     for key in ('Ku CLI','driver ELF','libpq'):
         if bindings['B']['files'][key]['sha256']!=bindings['BP']['files'][key]['sha256']:raise ValueError('same frozen '+key+' required')
-    if versions['B']['binary_sha256']!='234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b':raise ValueError('frozen default ordinary ELF234 required')
-    if versions['BP']['binary_sha256']!='faf34cec074f10b225ad880f149fb60f2fda9068fd192872ee00222344bd5b93':raise ValueError('frozen typed ELFfaf required')
+    if not current_product and versions['B']['binary_sha256']!='234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b':raise ValueError('frozen default ordinary ELF234 required')
+    if not current_product and versions['BP']['binary_sha256']!='faf34cec074f10b225ad880f149fb60f2fda9068fd192872ee00222344bd5b93':raise ValueError('frozen typed ELFfaf required')
+    if current_product:
+        for name,manifest in manifests.items():
+            h.bl.require_rust_manifest(manifest)
+            receipt=h.load(manifest['build_receipt'])
+            cli_receipt=manifest['stacks']['ku']['build']['cli_build_receipt']
+            if manifest['stacks']['ku']['build'].get('rust_toolchain')!='1.99.1':
+                raise ValueError('new PG paths require actual Rust1.99.1 CLI provenance')
+            if receipt.get('failure') is not None or not cli_receipt:raise ValueError('incomplete current build provenance')
     if versions['B']['artifacts']['protocol']['sha256']!=versions['BP']['artifacts']['protocol']['sha256']:raise ValueError('actual protocol bytes differ')
     if manifests['B']['client']['command'][1:]!=manifests['BP']['client']['command'][1:]:raise ValueError('driver base arguments differ')
     for key in ('protocol_sha256','quality_policy','driver_cores','driver_cpuset','service_memory_bytes','service_env','uid','gid'):
@@ -63,11 +71,12 @@ def drift(rows):
         sample_ratio_is_observation_not_proven_overhead=True)
 
 
-def exports(perf,output,observation):
+def exports(perf,output,observation,kallsyms=None):
     start,end=(observation.get(k) for k in ('client_started_monotonic_ns','client_finished_monotonic_ns'))
     if type(start)is not int or type(end)is not int or not 0<start<end:return False
     selected=f'{start//10**9}.{start%10**9:09d},{end//10**9}.{end%10**9:09d}'
     base=[perf,'-i',str(output/'perf.data'),'--symfs',str(output/'symfs'),'--time',selected]
+    if kallsyms:base+=['--kallsyms',str(kallsyms)]
     report=h.diagnostic_command([base[0],'report',*base[1:],'--stdio','--no-children','--show-nr-samples',
         '--sort','symbol,dso,comm','--percent-limit','0'],output/'perf-self.log',timeout=20,limit=4<<20)
     pcs=h.diagnostic_command([base[0],'script',*base[1:],'--ns','--show-lost-events','--show-task-events',
@@ -92,12 +101,21 @@ def observe(a,plan,bindings,normal_manifest):
             parent=super().client
             if Path(output).name!='score':return parent(service,workload,rate,duration,output,**kwargs)
             return h.normal_self_client(lambda:parent(service,workload,rate,duration,output,**kwargs),
-                service,output,duration,perf,sample=active)
+                service,output,duration,perf,sample=active,callchains=plan.get('callchains',False))
+    kernel_symbols=None
+    if plan.get('callchains'):
+        with Path('/proc/kallsyms').open('rb') as stream:raw=stream.read((32<<20)+1)
+        if len(raw)>32<<20:raise ValueError('bounded kernel symbol snapshot exceeded32MiB')
+        kernel_symbols=a.root/'kernel.kallsyms';kernel_symbols.write_bytes(raw)
+        with Path('/sys/kernel/notes').open('rb') as stream:notes=stream.read((1<<20)+1)
+        if len(notes)>1<<20:raise ValueError('kernel notes exceed1MiB')
+        (a.root/'kernel.notes').write_bytes(notes)
+        h.save(a.root/'kernel-identity.json',dict(kernel=platform.release(),kallsyms_sha256=h.sha(kernel_symbols),notes_sha256=h.sha(a.root/'kernel.notes'),boot_sha256=h.sha('/proc/sys/kernel/random/boot_id'),boundary='Kernel fp chains use the active kernel unwinder. Missing, zero or truncated frames stay unknown; inclusive paths overlap and are not summed.'))
     try:
         fixture.start();private=h.load(fixture.manifest_path);fc.Harness=SelfHarness
         h.save(a.root/'identity.json',dict(bindings=bindings,private_database_limits=h.load(fixture.state_path)['limits'],
             kernel=platform.release(),machine=platform.machine(),boot_sha256=h.sha('/proc/sys/kernel/random/boot_id'),
-            event='software cpu-clock499Hz; no callchain/GPR/CPU field',source='verified fixed80 or F166 arms; default ELF234 and original typed ELFfaf, not746 candidate or daily1.99 SDK'))
+            event='software cpu-clock499Hz; optional fp chains, no GPR/CPU field',source='fresh Rust1.99.1 normal/typed builds' if plan.get('current_product') else 'archived fixed80/F166 arms; historical binaries only'))
         for name,turn in plan['order']:
             active=turn=='sample';output=directory/name/turn
             try:
@@ -106,7 +124,7 @@ def observe(a,plan,bindings,normal_manifest):
                 row=fc.window(plan,name,'db',800,3,15,output,binding=binding,job={'phase':'diagnostic','contract':'pg-strict'})
                 observation=h.load(output/'score/normal-self-observations.json')
                 row.update(name=name,turn=turn,observation_complete=observation.get('record_complete') is True)
-                if active:row['exports_complete']=observation.get('symbols',{}).get('complete') is True and exports(perf,output/'score',observation)
+                if active:row['exports_complete']=observation.get('symbols',{}).get('complete') is True and exports(perf,output/'score',observation,kernel_symbols)
                 report=h.load(output/'score/client.json');row['driver_send_delay']=report.get('ledger',{}).get('scheduled_to_attempt')
                 row['correct_response_denominator']=report.get('ledger',{}).get('correct_total')
                 quality,signature=h.normal_diagnostic_quality(row)
@@ -132,7 +150,7 @@ def observe(a,plan,bindings,normal_manifest):
         dbok=cleanup.get('forced') is False and cleanup.get('cgroup_removed') is True and cleanup.get('after',{}).get('process_count')==0
         result['execution_complete']=len(result['rows'])==6 and not result['stopped'] and dbok and 'observer_error' not in result
         result['attribution_controls_passed']=result['execution_complete']
-        result['boundary']='Running software SELF/PC exploration only; raw denominator/loss/sparsity/PC and sampling perturbation require review. No full callchains, waiting attribution, comparative score or automatic product change.'
+        result['boundary']='Running software SELF/PC exploration only; raw denominator/loss/sparsity/PC and sampling perturbation require review. Kernel fp callers may be available; incomplete user frames and waiting attribution remain unknown. No comparative score or automatic product change.'
         h.save(a.root/'summary.json',result)
         for name in ('B','BP'):
             raw=directory/name/'sample/score/perf.data'
@@ -140,13 +158,52 @@ def observe(a,plan,bindings,normal_manifest):
     return result
 
 
+def prepare_current(a):
+    """Use the shared versioned builder/normalizer once; never import old builds or scores."""
+    if os.geteuid()==0:raise ValueError('prepare fresh builds as the ordinary runner')
+    h.require_normal_perf_preflight(a)
+    Builder=h.shared_cli_builder(a.root)
+    for name,mode in (('B',{}),('Driver',{}),('BP',{'ku_pg_read':'typed'})):
+        directory=a.root/name;h.snapshot(a.source,a.current_product,directory/'src')
+        (directory/'tools').symlink_to(a.tools,target_is_directory=True)
+        builder=Builder(directory,directory/'src',uid=os.getuid(),gid=os.getgid(),candidate=a.current_product,**mode)
+        try:
+            if name=='B':builder.ku()
+            elif name=='Driver':builder.go_build(client=True)
+            else:builder.ku_native(Path(h.load(a.root/'B/manifest.json')['stacks']['ku']['build']['cli']))
+            builder.finish()
+        except BaseException as error:builder.finish(failed=repr(error));raise
+    driver=h.load(a.root/'Driver/manifest.json');protocol=Path(driver['protocol'])
+    for name in ('B','BP'):
+        manifest=h.normalize_manifest(h.load(a.root/name/'manifest.json'),protocol,driver['client'])
+        h.save(a.root/name/'manifest.json',manifest)
+    plan,bindings,_=identify(a.root/'B/manifest.json',a.root/'BP/manifest.json',current_product=a.current_product,callchains=a.callchains)
+    h.save(a.root/'prepared-current.json',dict(product=a.current_product,rust_toolchain='1.99.1',bindings=bindings,
+        helper_sha256={name:h.sha(path)for name,path in [('entry',__file__),('builder',h.bl.__file__),('harness',h.__file__)]},
+        new_builds=True,imported_measurement_windows=0,plan=plan))
+    return 0
+
+
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--root',required=True,type=Path)
-    p.add_argument('--normal-manifest',required=True,type=Path);p.add_argument('--typed-manifest',required=True,type=Path)
+    p.add_argument('--normal-manifest',type=Path);p.add_argument('--typed-manifest',type=Path)
+    p.add_argument('--current-product');p.add_argument('--source',type=Path);p.add_argument('--prepare',action='store_true')
+    p.add_argument('--preflight',action='store_true');p.add_argument('--preflight-root',type=Path);p.add_argument('--callchains',action='store_true')
     p.add_argument('--tools',type=Path);a=p.parse_args(argv)
+    a.root=a.root.resolve();a.tools=a.tools.resolve() if a.tools else None
+    if a.current_product and not re.fullmatch('[0-9a-f]{40}',a.current_product):p.error('explicit full product SHA required')
+    a.candidate=a.current_product;a.perf_callchains=a.callchains
+    if a.preflight:
+        if not a.current_product or not a.tools:p.error('preflight requires current product/tools')
+        a.root.mkdir(parents=True,exist_ok=True)
+        return 0 if h.normal_perf_preflight(a).get('complete') is True else 2
+    if a.prepare:
+        if not a.source or not a.current_product or not a.tools:p.error('prepare requires current product/source/tools')
+        return prepare_current(a)
+    if not a.normal_manifest or not a.typed_manifest:p.error('two identified manifests required')
     if os.geteuid()!=0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):p.error('owned Linux ARM64/cgroup root required')
     a.normal_manifest=a.normal_manifest.resolve(strict=True);a.typed_manifest=a.typed_manifest.resolve(strict=True)
-    plan,bindings,manifest=identify(a.normal_manifest,a.typed_manifest)
+    plan,bindings,manifest=identify(a.normal_manifest,a.typed_manifest,current_product=a.current_product,callchains=a.callchains)
     a.root=a.root.resolve()
     if any(root==a.root or root in a.root.parents or a.root in root.parents for root in (a.normal_manifest.parent,a.typed_manifest.parent)):p.error('fresh output must be independent of cached inputs')
     if any(os.environ.get(k) for k in ('LD_PRELOAD','LD_AUDIT','LD_LIBRARY_PATH')):p.error('library overrides are not normal default measurements')
@@ -164,7 +221,11 @@ def main(argv=None):
             if h.sha(source)!=h.sha(destination):raise ValueError('retained input copy differs')
             retained[name].append(dict(path=str(destination.relative_to(a.root)),source=str(source),bytes=destination.stat().st_size,sha256=h.sha(destination)))
     h.save(a.root/'retained-inputs.json',retained)
-    preflight=h.normal_perf_preflight(a)
+    if a.preflight_root:
+        shutil.copytree(a.preflight_root/'normal-perf-preflight',a.root/'normal-perf-preflight')
+        preflight=h.load(a.root/'normal-perf-preflight/preflight.json')
+        h.save(a.root/'preflight-reuse.json',dict(source_root=str(a.preflight_root),same_boot_and_mode_required=True,sha256=h.sha(a.root/'normal-perf-preflight/preflight.json')))
+    else:preflight=h.normal_perf_preflight(a)
     if preflight.get('complete') is not True:
         h.save(a.root/'summary.json',dict(execution_complete=False,diagnostic_only=True,formal_qualified=False,
             attribution_eligible=False,stopped=['preflight failed; no services or windows started'],preflight=preflight));return 2

@@ -12,6 +12,7 @@ import database as db
 from linux_harness import ExternalDomain, GIB
 
 ARCHIVE_LIMIT = 384<<20
+CLI_CACHE = 'cli-cache-' + bl.RUST_TOOLCHAIN
 BASELINE = '956727188a058119fdb3790959063f1496ccb4cc'
 FOLLOWUP_PREPATCH = BASELINE
 PG_INPUT_PREPATCH = '166453a1d2768bbce19796d9c7823be73cc84ccb'
@@ -81,7 +82,7 @@ def validate_screen_selection(a,build_set):
 
 def hosted_identity(a,build_set):
     validate_screen_selection(a,build_set)
-    identity=dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=build_set,
+    identity=dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=build_set,rust_toolchain=bl.RUST_TOOLCHAIN,
         prepatch=a.prepatch if build_set=='followup-screen' or getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False) or getattr(a,'pg_input_guard',False) else None,screen_variants=a.screen_variants,
         task_json_screen=getattr(a,'task_json_screen',False),common_http_screen=getattr(a,'common_http_screen',False),final_task_json=getattr(a,'final_task_json',False),pg_failure_probe=getattr(a,'pg_failure_probe',False))
     if getattr(a,'normal_self_probe',False):identity['normal_self_probe']=True
@@ -91,6 +92,7 @@ def hosted_identity(a,build_set):
         identity.update(http_short_screen=True,http_short_goal=getattr(a,'http_short_goal','cpu'))
     if getattr(a,'memory_owner_probe',False):identity['memory_owner_probe']=True
     if getattr(a,'pg_input_guard',False):identity['pg_input_guard']=True
+    if getattr(a,'perf_callchains',False):identity['perf_callchains']=True
     return identity
 
 
@@ -617,21 +619,27 @@ def build_json_layers(a):
         return dict(execution_complete=False,records=records,error=repr(error),diagnostic_only=True,goal_status='blocked')
 
 
+def shared_cli_builder(root):
+    root=Path(root)
+    class Builder(bl.Builder):
+        def command(self,label,command,**kwargs):
+            command=list(command)
+            if label=='ku-cli':command[command.index('--target-dir')+1]=root/CLI_CACHE
+            result=super().command(label,command,**kwargs)
+            if label=='ku-cli':
+                dest=self.build/'ku-cargo/release/ku';dest.parent.mkdir(parents=True,exist_ok=True)
+                shutil.copy2(root/CLI_CACHE/'release/ku',dest) # distinct snapshot BEFORE next CLI overwrites cache
+            return result
+    return Builder
+
+
 def build(a,state):
     if os.geteuid()==0: raise ValueError('build must run as the ordinary checkout user')
     validate_screen_selection(a,getattr(a,'build_set','full'))
     if getattr(a,'memory_owner_probe',False):raise ValueError('owner probe requires verified fixed archive reuse, not a fresh build')
     if getattr(a,'normal_self_probe',False):require_normal_perf_preflight(a)
     uid,gid=os.getuid(),os.getgid();state.update(uid=uid,gid=gid)
-    class Builder(bl.Builder):
-        def command(self,label,command,**kwargs):
-            command=list(command)
-            if label=='ku-cli':command[command.index('--target-dir')+1]=a.root/'cli-cache'
-            result=super().command(label,command,**kwargs)
-            if label=='ku-cli':
-                dest=self.build/'ku-cargo/release/ku';dest.parent.mkdir(parents=True,exist_ok=True)
-                shutil.copy2(a.root/'cli-cache/release/ku',dest) # distinct snapshot BEFORE next CLI overwrites cache
-            return result
+    Builder=shared_cli_builder(a.root)
     def one(name,commit,mode=None):
         d=a.root/name;snapshot(a.source,commit,d/'src');(d/'tools').symlink_to(a.tools,target_is_directory=True)
         b=Builder(d,d/'src',uid=uid,gid=gid,candidate=commit,**(mode or {}))
@@ -680,6 +688,7 @@ def complete_build(a,state,build_set,prepatch,variants):
         names.append('BT')
     for name in names:
         d=a.root/name;is_r=name.startswith('R');m=load(a.root/('R' if is_r else 'B' if name=='BF' else name)/'manifest.json')
+        bl.require_rust_manifest(m)
         m=normalize_manifest(m,protocol,client);stack='rust' if is_r else 'ku';m['stacks']={stack:m['stacks'][stack]}
         if not is_r and 'KU_HTTP_WORKER_POLICY' in Path(m['stacks']['ku']['build']['native']['server']['generated_c']).read_text():
             m['declared_worker_policy']='fixed' if name=='BF' else 'elastic'
@@ -692,7 +701,7 @@ def complete_build(a,state,build_set,prepatch,variants):
         if name=='BT':m.update(diagnostic_only=not final_task_json,normal_score_eligible=final_task_json,
             supplemental_only=final_task_json,diagnostic_role='native-task-json-local-values',original_worker_score_eligible=False)
         save(d/'manifest.json',m);binary=m['stacks'][stack]['command'][0]
-        versions[name]=dict(root=str(d),stack=stack,source_commit=m['candidate_base'],binary_sha256=sha(binary))
+        versions[name]=dict(root=str(d),stack=stack,source_commit=m['candidate_base'],binary_sha256=sha(binary),rust_toolchain=bl.RUST_TOOLCHAIN)
         if name=='BT':versions[name].update(diagnostic_only=not final_task_json,normal_score_eligible=final_task_json,
             supplemental_only=final_task_json,original_worker_score_eligible=False,json_execution_mode='task')
     fixture=normalize_manifest(copy.deepcopy(load(a.root/'B/manifest.json')),protocol,client)
@@ -1258,7 +1267,7 @@ def pg_failure_probe(a,state):
     return result
 
 
-def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20):
+def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20,callchains=False):
     """Readiness is an acknowledged enable, completion an acknowledged stop+exit0."""
     output=Path(output);raw=output/'perf.data';fds=[];process=watch=None;stop=threading.Event()
     def remaining(seconds):
@@ -1270,6 +1279,7 @@ def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20):
         os.set_blocking(write_ctl,False);os.set_blocking(read_ack,False)
         command=[perf,'record','--clockid','mono','-e','cpu-clock','-F','499','--delay=-1',
             f'--control=fd:{read_ctl},{write_ack}','-p',str(pid),'-o',str(raw)]
+        if callchains:command+=['--call-graph','fp']
         record.update(command=command,raw_limit_bytes=limit,control=[],started_monotonic_ns=time.monotonic_ns(),
             control_ack_framing='Linux perf ACK_TAG sizeof includes trailing NUL: fixed5 bytes ack\\n\\0; consume full frame before next command')
         with (output/'perf-record.log').open('xb') as log:
@@ -1326,7 +1336,7 @@ def normal_perf_preflight(a):
     """One short owned child, before any build or service; no hosted-state mutation."""
     output=a.root/'normal-perf-preflight';output.mkdir();deadline=time.monotonic()+18;child=None
     perf=shutil.which('perf',path=str(a.tools/'bin')+os.pathsep+os.environ.get('PATH',''))
-    record=dict(complete=False,maximum_wall_seconds=25,coordinator_alarm_seconds=19,entry_sha256=sha(__file__),candidate=a.candidate,
+    record=dict(complete=False,maximum_wall_seconds=25,coordinator_alarm_seconds=19,entry_sha256=sha(__file__),candidate=a.candidate,perf_callchains=getattr(a,'perf_callchains',False),
         boot_sha256=sha('/proc/sys/kernel/random/boot_id'),perf_path=perf,child_reaped=False)
     try:
         if not perf:raise ValueError('perf unavailable; preflight blocks build and six windows')
@@ -1342,12 +1352,18 @@ def normal_perf_preflight(a):
                 chunk=os.read(child.stdout.fileno(),17-len(data));data+=chunk
                 if not chunk or len(data)>16:raise ValueError('owned busy child EOF/16-byte bound')
             if data!=b'done\n':raise ValueError('owned busy child completion mismatch')
-        controlled_perf(busy,child.pid,output,perf,record,deadline=deadline,limit=1<<20)
+        controlled_perf(busy,child.pid,output,perf,record,deadline=deadline,limit=1<<20,**({'callchains':True} if record['perf_callchains'] else {}))
         os.write(child.stdin.fileno(),b'x');child.stdin.close();child.wait(timeout=1);record['child_reaped']=child.returncode==0
         size_on_disk=(output/'perf.data').stat().st_size
         with (output/'perf.data').open('rb') as stream:header=stream.read(56)
         offset,size=struct.unpack_from('<QQ',header,40)
         record['header_bounds_valid']=header[:8]==b'PERFILE2' and 0<offset<size_on_disk<=1<<20 and 0<size<=size_on_disk-offset
+        if record['perf_callchains']:
+            with (output/'perf.data').open('rb') as stream:
+                stream.seek(24);attr_offset,attr_bytes=struct.unpack('<QQ',stream.read(16))
+                if attr_bytes<32 or attr_offset+32>size_on_disk:raise ValueError('CALLCHAIN attribute unavailable')
+                stream.seek(attr_offset+24);record['callchain_field_present']=bool(struct.unpack('<Q',stream.read(8))[0] & (1<<5))
+            if record['callchain_field_present'] is not True:raise ValueError('required CALLCHAIN sample format absent')
         start=record['client_started_monotonic_ns'];end=record['client_finished_monotonic_ns']
         selected=f'{start//10**9}.{start%10**9:09d},{end//10**9}.{end%10**9:09d}'
         record['exports']=[diagnostic_command([perf,kind,'-i',str(output/'perf.data'),'--time',selected,*flags],
@@ -1384,11 +1400,13 @@ def require_normal_perf_preflight(a):
     path=a.root/'normal-perf-preflight/preflight.json';record=load(path) if path.is_file() else {}
     if not (record.get('complete') is True and record.get('candidate')==a.candidate and record.get('entry_sha256')==sha(__file__)
             and record.get('boot_sha256')==sha('/proc/sys/kernel/random/boot_id') and record.get('perf_path')
+            and record.get('perf_callchains',False)==getattr(a,'perf_callchains',False)
+            and (not getattr(a,'perf_callchains',False) or record.get('callchain_field_present') is True)
             and record.get('perf_sha256')==sha(record['perf_path'])):
         raise ValueError('matching successful controlled-perf preflight required before build/normal six-window capture')
 
 
-def normal_self_client(client,service,output,duration,perf,*,sample):
+def normal_self_client(client,service,output,duration,perf,*,sample,callchains=False):
     """Observe the existing scored client; never change its requests or deadlines."""
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     record=dict(sampled=sample,callchains='unavailable: minimal SELF has no CALLCHAIN field',
@@ -1396,6 +1414,7 @@ def normal_self_client(client,service,output,duration,perf,*,sample):
         sample_scope='Controlled perf enable is acknowledged before client launch; stop follows client return. Filter mono-clock raw events by client_started/finished_monotonic_ns; '
             'that interval includes client startup/drain, not only planned arrivals. Full lifecycle CPU includes post-client perf finalization; '
             'scored-client cpu_us retains the existing h.client accounting interval.')
+    if callchains:record['callchains']='fp CALLCHAIN requested: kernel chains when available; user FP unwinding may be incomplete; not blocked-time evidence'
     def endpoint(label):
         started=time.monotonic_ns()
         snapshot=diagnostic_observe(lambda:diagnostic_context(service))
@@ -1419,7 +1438,7 @@ def normal_self_client(client,service,output,duration,perf,*,sample):
         if sample:
             if not perf:raise ValueError('perf unavailable; preflight required')
             record['symbols']=diagnostic_symbols(service,output)
-            return controlled_perf(client,service.process.pid,output,perf,record)
+            return controlled_perf(client,service.process.pid,output,perf,record,**({'callchains':True} if callchains else {}))
         record['client_started_monotonic_ns']=time.monotonic_ns()
         try:return client()
         finally:record['client_finished_monotonic_ns']=time.monotonic_ns()
@@ -1813,7 +1832,7 @@ def normal_self_probe(a,state):
             parent=super().client
             if Path(output).name!='score':return parent(service,workload,rate,duration,output,**kwargs)
             return normal_self_client(lambda:parent(service,workload,rate,duration,output,**kwargs),
-                service,output,duration,perf,sample=active['sample'])
+                service,output,duration,perf,sample=active['sample'],**({'callchains':True} if getattr(a,'perf_callchains',False) else {}))
     began=time.monotonic()
     try:
         fixture.start();private=load(fixture.manifest_path);fc.Harness=SelfHarness
@@ -2376,7 +2395,7 @@ def evidence_file(path, root):
     if len(parts)>2 and parts[1]=='src' and parts[2:5]!=('tests','benchmarks','cross_stack'):return False
     if 'build-time-profiles' in parts:return False
     if 'dependencies' in parts:return True
-    if any(x in parts for x in ['tools','cli-cache','rust-cargo','ku-cargo','target','data','socket','.git','__pycache__']):
+    if any(x in parts for x in ['tools','cli-cache',CLI_CACHE,'rust-cargo','ku-cargo','target','data','socket','.git','__pycache__']):
         return path.name=='ku' and parts[-3:]==('ku-cargo','release','ku') or path.name=='ku-cross-stack-rust' and parts[-3:] in (('rust-cargo','release','ku-cross-stack-rust'),('target','release','ku-cross-stack-rust'))
     return path.name not in ('ku-performance-v2-evidence.tar.gz','archive.json') and not path.name.endswith('.writing') and (
         path.suffix in ('.json','.ku','.c','.md','.log','.sql','.gz','.csv','.py','.lock','.toml','.rs','.go','.mod','.sum','.profdata') or (path.suffix=='.profraw' and 'http-profiles' in parts) or
@@ -2451,6 +2470,7 @@ def main(argv=None):
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
+    p.add_argument('--perf-callchains',action='store_true',help='Optional fp CALLCHAIN format; requires a matching successful preflight, no DWARF or compiler flag changes')
     p.add_argument('--http-short-goal',choices=['cpu','memory'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
@@ -2459,6 +2479,7 @@ def main(argv=None):
     p.add_argument('--pg-queue-screen',action='store_true',help='Eight normal A/B PG fix diagnostic windows; frozen f39c673 prepatch required, no matrix or formal capacity claim')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv)
+    if a.perf_callchains and not a.normal_self_probe:p.error('--perf-callchains requires explicit normal-self-probe/preflight mode')
     if a.memory_owner_probe and a.phase not in ('diagnostic','archive'):p.error('--memory-owner-probe requires fixed archive reuse before diagnostic')
     if a.final_task_json and a.phase not in ('build','run','archive'):p.error('--final-task-json only supports build/run/archive in the complete performance-v2 flow')
     if a.pg_failure_probe and a.phase not in ('build','diagnostic','archive'):p.error('--pg-failure-probe only supports fresh build/diagnostic/archive')
@@ -2494,6 +2515,9 @@ def main(argv=None):
     identity=hosted_identity(a,a.build_set)
     state=load(a.root/'hosted-state.json') if (a.root/'hosted-state.json').exists() else {'identity':identity,'steps':{},'goal_status':'unknown'}
     if state['identity']!=identity and a.phase!='archive':p.error('identity changed; new root required')
+    if a.phase not in ('archive','build') and (a.root/'frozen-plan.json').is_file():
+        for spec in load(a.root/'frozen-plan.json').get('versions',{}).values():
+            if spec.get('stack','ku') in ('ku','rust'):bl.require_rust_manifest(load(Path(spec['root'])/'manifest.json'))
     if a.phase=='archive':result=archive(a,state)
     else:
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')

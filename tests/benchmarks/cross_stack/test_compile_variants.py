@@ -10,6 +10,8 @@ import tempfile
 import unittest
 import types
 from unittest.mock import patch
+from unittest.mock import Mock
+import build_linux as bl
 import batch
 import compile_variants
 import json_dense
@@ -19,6 +21,52 @@ from pg_variants import derive
 from profile_training import PLANS, expected, identity, plan, parse_output
 from build_linux import (expand_ku_server, file_identity, ku_json_execution_evidence, native_emission_source,
                          normal_compiler_receipt, normal_compiler_recorder)
+
+
+class RustToolchainIdentityTests(unittest.TestCase):
+    def receipt(self):
+        return dict(rust_toolchain=bl.RUST_TOOLCHAIN, failure=None,
+            exact_versions={'rustc':'rustc 1.99.1 (fixture)\nbinary: rustc', 'cargo':'cargo 1.99.1 (fixture)'},
+            commands=[dict(label='ku-cli',exit_code=0,command=['cargo','+1.99.1','build','--locked','--release','--bin','ku'])])
+
+    def test_pinned_release_receipt_rejects_old_versions_or_unverified_commands(self):
+        self.assertEqual(bl.RUST_TOOLCHAIN,'1.99.1')
+        self.assertEqual(bl.require_rust_release_receipt(self.receipt(),'ku-cli')['cargo'],'cargo 1.99.1 (fixture)')
+        for issue in ('old-marker','old-rustc','old-cargo','old-command','failed','no-release','missing'):
+            with self.subTest(issue=issue):
+                r=self.receipt()
+                if issue=='old-marker':r['rust_toolchain']='1.89.0'
+                elif issue in ('old-rustc','old-cargo'):r['exact_versions'][issue[4:]]=issue[4:]+' 1.89.0'
+                elif issue=='old-command':r['commands'][0]['command'][1]='+1.89.0'
+                elif issue=='failed':r['commands'][0]['exit_code']=1
+                elif issue=='no-release':r['commands'][0]['command'].remove('--release')
+                else:r['commands']=[]
+                with self.assertRaises(ValueError):bl.require_rust_release_receipt(r,'ku-cli')
+
+    def test_default_ku_uses_explicit_current_toolchain(self):
+        b=bl.Builder.__new__(bl.Builder);b.rustc=Path('/rustc');b.cargo=Path('/cargo');b.build=Path('/build');b.package_version='0.0.19'
+        b.version=Mock();b.command=Mock();b.ku_native=Mock();b.ku()
+        self.assertEqual(b.version.call_args_list[0].args,('rustc',[Path('/rustc'),'+1.99.1','-vV'],'rustc 1.99.1'))
+        self.assertEqual(b.version.call_args_list[1].args,('cargo',[Path('/cargo'),'+1.99.1','--version'],'cargo 1.99.1'))
+        self.assertEqual(b.command.call_args.args[1][:7],[Path('/cargo'),'+1.99.1','build','--locked','--release','--bin','ku'])
+        b.ku_native.assert_called_once_with(Path('/build/ku-cargo/release/ku'))
+
+    def test_typed_native_reuses_same_current_cli_provenance_not_an_old_cli(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);cli=root/'B/build/ku-cargo/release/ku';cli.parent.mkdir(parents=True);cli.write_bytes(b'identified CLI')
+            receipt=root/'B/build.json';bl.write_json(receipt,self.receipt())
+            manifest=dict(candidate_base='b'*40,rust_toolchain=bl.RUST_TOOLCHAIN,versions=self.receipt()['exact_versions'],
+                stacks={'ku':{'build':dict(rust_toolchain=bl.RUST_TOOLCHAIN,cli=str(cli),cli_sha256=bl.digest(cli),
+                    cli_build_receipt=str(receipt),cli_build_receipt_sha256=bl.digest(receipt))}})
+            bl.write_json(root/'B/manifest.json',manifest)
+            b=bl.Builder.__new__(bl.Builder);b.commands=[];b.versions={};b.candidate='b'*40;b.package_version='0.0.19'
+            b.version=Mock(side_effect=RuntimeError('past provenance; no native execution'))
+            with self.assertRaisesRegex(RuntimeError,'past provenance'):b.ku_native(cli)
+            self.assertEqual(b.versions,manifest['versions'])
+            b.version.reset_mock();old=self.receipt();old['exact_versions']['rustc']='rustc 1.89.0';bl.write_json(receipt,old)
+            manifest['stacks']['ku']['build']['cli_build_receipt_sha256']=bl.digest(receipt);bl.write_json(root/'B/manifest.json',manifest)
+            with self.assertRaises(ValueError):b.ku_native(cli)
+            b.version.assert_not_called()
 
 
 class KuCompilerCommandTests(unittest.TestCase):

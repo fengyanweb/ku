@@ -64,6 +64,35 @@ class TypedPgSelfTests(unittest.TestCase):
                 changed['candidate_base']='0'*40;paths[1].write_text(json.dumps(changed))
                 with self.assertRaisesRegex(ValueError,'fixed archived source'):t.identify(*paths)
 
+    def test_fresh_current_paths_require_actual_1991_receipt_and_keep_original_contract(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);product='d'*40;protocol=root/'protocol.json';protocol.write_text('{}')
+            receipt=root/'CLI-build.json'
+            versions={'rustc':'rustc 1.99.1 (fixed)','cargo':'cargo 1.99.1 (fixed)'}
+            record=dict(rust_toolchain='1.99.1',failure=None,exact_versions=versions,
+                commands=[dict(label='ku-cli',command=['cargo','+1.99.1','build','--locked','--release'],exit_code=0)])
+            receipt.write_text(json.dumps(record));bindings={};paths=[]
+            mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',
+                native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+            for name in ('B','BP'):
+                path=root/name/'manifest.json';path.parent.mkdir();paths.append(path)
+                path.write_text(json.dumps(dict(candidate_base=product,protocol=str(protocol),client={'command':['driver']},
+                    rust_toolchain='1.99.1',versions=versions,build_receipt=str(receipt),stacks={'ku':{'build':dict(
+                        rust_toolchain='1.99.1',cli_build_receipt=str(receipt),cli_build_receipt_sha256=t.h.sha(receipt),
+                        native={'server':{'binary_sha256':'f'*64}})}})))
+                bindings[name]=dict(build_mode={**mode,'pg_read_mode':'int' if name=='B' else 'typed'},
+                    files={k:{'sha256':'c'*64}for k in ('Ku CLI','driver ELF','libpq')})
+                bindings[name]['files']['expanded source']={'sha256':t.INPUTS[name]}
+            with patch.object(t.fc,'version_identity',side_effect=lambda p,n:bindings[n]):
+                plan,_,_=t.identify(*paths,current_product=product,callchains=True)
+                self.assertEqual(plan['current_product'],product);self.assertTrue(plan['callchains'])
+                self.assertFalse(plan['formal_qualified']);self.assertEqual(plan['rate'],800)
+                record['exact_versions']={'rustc':'rustc 1.89.0','cargo':'cargo 1.89.0'};receipt.write_text(json.dumps(record))
+                for path in paths:
+                    manifest=t.h.load(path);manifest['stacks']['ku']['build']['cli_build_receipt_sha256']=t.h.sha(receipt);path.write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError,'1.99.1'):
+                    t.identify(*paths,current_product=product,callchains=True)
+
     def test_failed_preflight_starts_no_windows(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);paths=[];bindings={};versions={}

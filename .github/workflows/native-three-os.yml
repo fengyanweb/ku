@@ -116,21 +116,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.89.0 --profile minimal --no-self-update
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
           if [ "$RUNNER_OS" = Linux ]; then
             sudo apt-get update -qq
             sudo apt-get install -y --no-install-recommends clang-18 libclang-rt-18-dev
           fi
           mkdir -p "$RUNNER_TEMP/poll-budget"
           git rev-parse HEAD > "$RUNNER_TEMP/poll-budget/product-commit.txt"
-          rustc +1.89.0 -vV > "$RUNNER_TEMP/poll-budget/rustc.txt"
+          rustc +1.99.1 -vV > "$RUNNER_TEMP/poll-budget/rustc.txt"
       - name: Check only startup accounting, backend snapshots and real loop shutdown
         shell: bash
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/poll-budget"
           run_exact() {
-            cargo +1.89.0 test --release --locked --test "$1" "$2" -- --exact --nocapture > "$out/$2.log" 2>&1
+            cargo +1.99.1 test --release --locked --test "$1" "$2" -- --exact --nocapture > "$out/$2.log" 2>&1
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$out/$2.log"
           }
           if [ "$RUNNER_OS" = Linux ]; then
@@ -144,7 +144,7 @@ jobs:
           run_exact native_http_test native_http_fixed_loops_share_limits_authenticate_control_and_drain
           if [ "$RUNNER_OS" = Linux ]; then
             KU_CC='clang-18 -O2 -fsanitize=address,undefined -fno-omit-frame-pointer' ASAN_OPTIONS='detect_leaks=1:halt_on_error=1' UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
-              cargo +1.89.0 test --release --locked --test native_http_startup_test native_http_owner_budget_counts_only_storage_used_by_its_poll_backend -- --exact --nocapture > "$out/budget-detectors.log" 2>&1
+              cargo +1.99.1 test --release --locked --test native_http_startup_test native_http_owner_budget_counts_only_storage_used_by_its_poll_backend -- --exact --nocapture > "$out/budget-detectors.log" 2>&1
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$out/budget-detectors.log"
           fi
       - if: always()
@@ -217,21 +217,31 @@ jobs:
 
   pg-typed-self:
     if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-typed-self'
-    name: Linux ARM64 reused ordinary and typed PG SELF
+    name: Linux ARM64 current Rust1.99.1 PG caller attribution
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 12
+    timeout-minutes: 22
     permissions:
       contents: read
       actions: read
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      KU_PG_PRODUCT: d05ca1551d4585011499d81d0ae828c4173306ff
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Prepare software sampling without rebuilding frozen products
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.2'
+          cache: false
+      - name: Reuse the existing compiler, paths and software sampler setup
         shell: bash
         run: |
           set -euo pipefail
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
+          rustup default 1.99.1
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang-18 llvm-18 libpq-dev postgresql-16 linux-tools-common
           for pg_perf_package in "linux-tools-$(uname -r)" linux-tools-generic; do
@@ -240,83 +250,111 @@ jobs:
               break
             fi
           done
-          mkdir -p "$RUNNER_TEMP/ku-pg-typed-tools/bin"
+          mkdir -p "$RUNNER_TEMP/ku-pg-current-tools/bin" "$RUNNER_TEMP/ku-pg-current-1.99.1"
           pg_perf_binary="$(readlink -e "/usr/lib/linux-tools/$(uname -r)/perf" || true)"
           if [ -z "$pg_perf_binary" ] || [ ! -x "$pg_perf_binary" ]; then
             pg_perf_binary="$(find -L /usr/lib/linux-tools* /usr/lib/linux-azure-tools* -maxdepth 2 -type f -name perf -print 2>/dev/null | sort -V | tail -n 1 || true)"
           fi
-          test -n "$pg_perf_binary"
-          test -x "$pg_perf_binary"
-          ln -s "$pg_perf_binary" "$RUNNER_TEMP/ku-pg-typed-tools/bin/perf"
-          ln -s "${CARGO_HOME:-$HOME/.cargo}" "$RUNNER_TEMP/ku-pg-typed-tools/cargo"
-          ln -s "${RUSTUP_HOME:-$HOME/.rustup}" "$RUNNER_TEMP/ku-pg-typed-tools/rustup"
-          printf 'KU_PG_TYPED_ROOT=%s\n' "$RUNNER_TEMP/ku-pg-typed-self" >> "$GITHUB_ENV"
-          printf 'KU_PG_TYPED_REUSE=%s\n' "$RUNNER_TEMP/ku-pg-typed-reuse" >> "$GITHUB_ENV"
-          printf '%s\n' "$RUNNER_TEMP/ku-pg-typed-tools/bin" >> "$GITHUB_PATH"
-      - name: Download the retained frozen default CLI and driver cache
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+          test -n "$pg_perf_binary"; test -x "$pg_perf_binary"
+          ln -s "$pg_perf_binary" "$RUNNER_TEMP/ku-pg-current-tools/bin/perf"
+          ln -s "${CARGO_HOME:-$HOME/.cargo}" "$RUNNER_TEMP/ku-pg-current-tools/cargo"
+          ln -s "${RUSTUP_HOME:-$HOME/.rustup}" "$RUNNER_TEMP/ku-pg-current-tools/rustup"
+          ln -s "$(dirname "$(dirname "$(command -v go)")")" "$RUNNER_TEMP/ku-pg-current-tools/go"
+          printf 'KU_PG_CURRENT_BUILD=%s\n' "$RUNNER_TEMP/ku-pg-current-1.99.1" >> "$GITHUB_ENV"
+          printf 'KU_PG_CURRENT_ROOT=%s\n' "$RUNNER_TEMP/ku-pg-current-observation" >> "$GITHUB_ENV"
+          printf '%s\n' "$RUNNER_TEMP/ku-pg-current-tools/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          name: ku-pg-input-guard-full
-          path: ${{ runner.temp }}/ku-pg-typed-download
-          run-id: 41582847043
-          github-token: ${{ github.token }}
-      - name: Restore the original A only and reproduce identical typed native C
-        timeout-minutes: 2
+          path: |
+            ${{ runner.temp }}/ku-pg-current-1.99.1/cli-cache-1.99.1
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ku-pg-current-rust1.99.1-linux-arm64-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ku-pg-current-rust1.99.1-linux-arm64-${{ hashFiles('Cargo.lock') }}-
+      - name: Validate the exact fp sampling format before a product build
+        timeout-minutes: 1
         shell: bash
-        env:
-          PYTHONPATH: tests/benchmarks/cross_stack
         run: |
           set -euo pipefail
-          python3 -B - <<'PY'
-          import os
-          from pathlib import Path
-          import reuse_build
-          manifests = reuse_build.prepare_typed_pg_from_input_guard(
-              Path(os.environ['RUNNER_TEMP'])/'ku-pg-typed-download/ku-performance-v2-evidence.tar.gz',
-              Path(os.environ['KU_PG_TYPED_REUSE']),Path(os.environ['GITHUB_WORKSPACE']),
-              Path(os.environ['RUNNER_TEMP'])/'ku-pg-typed-tools')
-          print(manifests)
-          PY
-      - name: Observe only the one typed materialization question
+          sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --preflight --callchains \
+            --root "$KU_PG_CURRENT_BUILD" --tools "$RUNNER_TEMP/ku-pg-current-tools" --current-product "$KU_PG_PRODUCT"
+      - name: Fresh current default and typed builds using the shared Rust1.99.1 CLI
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --prepare --callchains \
+            --root "$KU_PG_CURRENT_BUILD" --tools "$RUNNER_TEMP/ku-pg-current-tools" \
+            --source "$GITHUB_WORKSPACE" --current-product "$KU_PG_PRODUCT" > "$RUNNER_TEMP/ku-pg-current-build.log" 2>&1
+      - name: Observe only the shared PG and reactor caller question
         timeout-minutes: 6
         shell: bash
         run: |
           set -euo pipefail
-          sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py \
-            --root "$KU_PG_TYPED_ROOT" --tools "$RUNNER_TEMP/ku-pg-typed-tools" \
-            --normal-manifest "$KU_PG_TYPED_REUSE/A/manifest.json" \
-            --typed-manifest "$KU_PG_TYPED_REUSE/BP/manifest.json" \
-            > "$RUNNER_TEMP/ku-pg-typed-self.log" 2>&1
-      - name: Archive raw samples while excluding private database files
+          sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --callchains \
+            --root "$KU_PG_CURRENT_ROOT" --tools "$RUNNER_TEMP/ku-pg-current-tools" \
+            --normal-manifest "$KU_PG_CURRENT_BUILD/B/manifest.json" --typed-manifest "$KU_PG_CURRENT_BUILD/BP/manifest.json" \
+            --current-product "$KU_PG_PRODUCT" --preflight-root "$KU_PG_CURRENT_BUILD" > "$RUNNER_TEMP/ku-pg-current-observation.log" 2>&1
+      - name: Preserve the existing build and observation archive formats
         if: always()
-        timeout-minutes: 2
+        timeout-minutes: 3
         shell: bash
         run: |
           set -euo pipefail
-          pg_typed_archive_root="${KU_PG_TYPED_ROOT:-$RUNNER_TEMP/ku-pg-typed-self}"
-          if [ -d "$pg_typed_archive_root" ]; then
-            sudo -n python3 -B - "$GITHUB_WORKSPACE/tests/benchmarks/cross_stack" "$pg_typed_archive_root" "$(id -u)" "$(id -g)" <<'PY'
+          for pg_current_root in "$RUNNER_TEMP/ku-pg-current-1.99.1" "$RUNNER_TEMP/ku-pg-current-observation"; do
+            if [ -d "$pg_current_root" ]; then
+              sudo -n python3 -B - "$GITHUB_WORKSPACE/tests/benchmarks/cross_stack" "$pg_current_root" "$(id -u)" "$(id -g)" <<'PY'
           import sys
           from pathlib import Path
           from types import SimpleNamespace
           sys.path.insert(0,sys.argv[1])
           import hosted_cycle
-          print(hosted_cycle.archive(SimpleNamespace(root=Path(sys.argv[2])),
-              dict(uid=int(sys.argv[3]),gid=int(sys.argv[4]))))
+          print(hosted_cycle.archive(SimpleNamespace(root=Path(sys.argv[2])),dict(uid=int(sys.argv[3]),gid=int(sys.argv[4]))))
           PY
-          fi
+            fi
+          done
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ku-pg-current-build-rust1.99.1
+          path: |
+            ${{ runner.temp }}/ku-pg-current-1.99.1/ku-performance-v2-evidence.tar.gz
+            ${{ runner.temp }}/ku-pg-current-1.99.1/archive.json
+            ${{ runner.temp }}/ku-pg-current-build.log
+          retention-days: 14
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ku-pg-typed-self
           path: |
-            ${{ runner.temp }}/ku-pg-typed-self/ku-performance-v2-evidence.tar.gz
-            ${{ runner.temp }}/ku-pg-typed-self/archive.json
-            ${{ runner.temp }}/ku-pg-typed-self/summary.json
-            ${{ runner.temp }}/ku-pg-typed-self/frozen-plan.json
-            ${{ runner.temp }}/ku-pg-typed-self.log
-            ${{ runner.temp }}/ku-pg-typed-reuse/typed-pg-cache.json
-            ${{ runner.temp }}/ku-pg-typed-reuse/reuse-json-input-recovery.json
+            ${{ runner.temp }}/ku-pg-current-observation/ku-performance-v2-evidence.tar.gz
+            ${{ runner.temp }}/ku-pg-current-observation/archive.json
+            ${{ runner.temp }}/ku-pg-current-observation/kernel.*
+            ${{ runner.temp }}/ku-pg-current-observation.log
+          retention-days: 14
+          if-no-files-found: warn
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ku-pg-current-core
+          path: |
+            ${{ runner.temp }}/ku-pg-current-observation/summary.json
+            ${{ runner.temp }}/ku-pg-current-observation/results.json
+            ${{ runner.temp }}/ku-pg-current-observation/frozen-plan.json
+            ${{ runner.temp }}/ku-pg-current-observation/identity.json
+            ${{ runner.temp }}/ku-pg-current-observation/kernel.*
+            ${{ runner.temp }}/ku-pg-current-observation/kernel-identity.json
+            ${{ runner.temp }}/ku-pg-current-observation/normal-self-probe/**/window.json
+            ${{ runner.temp }}/ku-pg-current-observation/normal-self-probe/**/client.json
+            ${{ runner.temp }}/ku-pg-current-observation/normal-self-probe/**/perf-self.log
+            ${{ runner.temp }}/ku-pg-current-observation/normal-self-probe/**/perf-pcs.log
+            ${{ runner.temp }}/ku-pg-current-observation/normal-self-probe/**/export-receipt.json
+            ${{ runner.temp }}/ku-pg-current-observation/normal-self-probe/**/normal-self-observations.json
+            ${{ runner.temp }}/ku-pg-current-observation/inputs/**/*.c
+            ${{ runner.temp }}/ku-pg-current-observation/inputs/**/bin/ku-server
+            ${{ runner.temp }}/ku-pg-current-observation/normal-self-probe/**/maps.log
+            ${{ runner.temp }}/ku-pg-current-observation/normal-self-probe/**/symbol-identities.json
           retention-days: 14
           if-no-files-found: warn
 
@@ -342,8 +380,8 @@ jobs:
         run: |
           set -euo pipefail
           printf 'KU_PG_GUARD_ROOT=%s\n' "$RUNNER_TEMP/ku-pg-input-guard" >> "$GITHUB_ENV"
-          rustup toolchain install 1.89.0 --profile minimal --no-self-update
-          rustup default 1.89.0
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
+          rustup default 1.99.1
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18 libclang-rt-18-dev libpq-dev postgresql-16
       - name: Reuse the already verified A, candidate B and request driver
@@ -447,16 +485,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.89.0 --profile minimal --no-self-update
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
           clang --version
       - name: Run only input lifetime, typed ownership and notification pins
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/ku-pg-input-windows"
-          cargo +1.89.0 build --release --locked --bin ku > "$RUNNER_TEMP/ku-pg-input-windows/build.log" 2>&1
+          cargo +1.99.1 build --release --locked --bin ku > "$RUNNER_TEMP/ku-pg-input-windows/build.log" 2>&1
           for test in native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins native_pg_typed_single_row_binary_values_validate_types_and_survive_reset native_pg_async_notification_pins_survive_close_and_owner_cancellation; do
-            cargo +1.89.0 test --release --locked --test native_pg_query_poll_test "$test" -- --exact --nocapture > "$RUNNER_TEMP/ku-pg-input-windows/$test.log" 2>&1
+            cargo +1.99.1 test --release --locked --test native_pg_query_poll_test "$test" -- --exact --nocapture > "$RUNNER_TEMP/ku-pg-input-windows/$test.log" 2>&1
           done
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -484,7 +522,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.89.0 --profile minimal --no-self-update
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
           sudo apt-get update -qq
           sudo apt-get install -y postgresql-16 libpq-dev clang-18
           printf 'KU_PG_INPUT_ROOT=%s\n' "$RUNNER_TEMP/ku-pg-input-lifetime" >> "$GITHUB_ENV"
@@ -495,11 +533,11 @@ jobs:
           set -euo pipefail
           mkdir -p "$KU_PG_INPUT_ROOT/probe/evidence"
           git worktree add --detach "$KU_PG_INPUT_ROOT/base" 166453a1d2768bbce19796d9c7823be73cc84ccb
-          cargo +1.89.0 build --release --locked --bin ku --manifest-path "$KU_PG_INPUT_ROOT/base/Cargo.toml" > "$KU_PG_INPUT_ROOT/probe/evidence/A-build.log" 2>&1
+          cargo +1.99.1 build --release --locked --bin ku --manifest-path "$KU_PG_INPUT_ROOT/base/Cargo.toml" > "$KU_PG_INPUT_ROOT/probe/evidence/A-build.log" 2>&1
           cp "$CARGO_TARGET_DIR/release/ku" "$KU_PG_INPUT_ROOT/probe/A-ku"
-          cargo +1.89.0 build --release --locked --bin ku > "$KU_PG_INPUT_ROOT/probe/evidence/B-build.log" 2>&1
+          cargo +1.99.1 build --release --locked --bin ku > "$KU_PG_INPUT_ROOT/probe/evidence/B-build.log" 2>&1
           cp "$CARGO_TARGET_DIR/release/ku" "$KU_PG_INPUT_ROOT/probe/B-ku"
-          rustc +1.89.0 -Vv > "$KU_PG_INPUT_ROOT/probe/evidence/rustc.txt"
+          rustc +1.99.1 -Vv > "$KU_PG_INPUT_ROOT/probe/evidence/rustc.txt"
           clang-18 --version > "$KU_PG_INPUT_ROOT/probe/evidence/clang.txt"
           git rev-parse HEAD > "$KU_PG_INPUT_ROOT/probe/evidence/tools-head.txt"
       - name: Reuse unchanged PG contracts from41577864855
@@ -541,9 +579,9 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
-          rustup component add rustfmt clippy --toolchain 1.89.0
+          rustup toolchain install 1.99.1 --no-self-update
+          rustup default 1.99.1
+          rustup component add rustfmt clippy --toolchain 1.99.1
           rustc --version --verbose
 
       - name: Check Rust formatting
@@ -597,8 +635,8 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          rustup toolchain install 1.99.1 --no-self-update
+          rustup default 1.99.1
           clang --version
 
       - name: Verify borrowed lifetimes, checked Task and synchronous arithmetic, source-free cleanup
@@ -649,8 +687,8 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          rustup toolchain install 1.99.1 --no-self-update
+          rustup default 1.99.1
 
       - name: Require detector self-test and real Task paths
         shell: bash
@@ -686,9 +724,9 @@ jobs:
         run: |
           set -euo pipefail
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
-          rustup component add rustfmt --toolchain 1.89.0
+          rustup toolchain install 1.99.1 --no-self-update
+          rustup default 1.99.1
+          rustup component add rustfmt --toolchain 1.99.1
           command -v clang
           clang --version
       - name: Run bounded proof and affected HTTP contracts
@@ -764,10 +802,10 @@ jobs:
         run: |
           set -euo pipefail
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          rustup toolchain install 1.99.1 --no-self-update
+          rustup default 1.99.1
           if [ "$RUNNER_OS" = Linux ]; then
-            rustup component add rustfmt clippy --toolchain 1.89.0
+            rustup component add rustfmt clippy --toolchain 1.99.1
           fi
           rustc --version --verbose
           command -v clang
@@ -962,8 +1000,8 @@ jobs:
         run: |
           set -euo pipefail
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          rustup toolchain install 1.99.1 --no-self-update
+          rustup default 1.99.1
           rustc --version --verbose
           test "$(uname -m)" = aarch64
           command -v clang
@@ -1142,8 +1180,8 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = aarch64
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update --component llvm-tools-preview
-          rustup default 1.89.0
+          rustup toolchain install 1.99.1 --no-self-update --component llvm-tools-preview
+          rustup default 1.99.1
           rustc --version --verbose
 
       - name: Install the fixed Go compiler without dependency cache
@@ -1483,9 +1521,9 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup component add clippy rustfmt --toolchain 1.89.0
-          rustup default 1.89.0
+          rustup toolchain install 1.99.1 --no-self-update
+          rustup component add clippy rustfmt --toolchain 1.99.1
+          rustup default 1.99.1
           rustc --version --verbose
 
       - name: Prepare exact shared database client link inputs on Linux
@@ -1938,8 +1976,8 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          rustup toolchain install 1.99.1 --no-self-update
+          rustup default 1.99.1
           rustc --version --verbose
 
       - name: Install the release packaging Node runtime
@@ -2031,8 +2069,8 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          rustup toolchain install 1.99.1 --no-self-update
+          rustup default 1.99.1
           rustc --version --verbose
 
       - name: Build Ku CLI
