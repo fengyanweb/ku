@@ -32,6 +32,78 @@ def archive(path, changes=None, old_run=False):
 
 class ReuseBuildTests(unittest.TestCase):
 
+    def test_fixed_large_cache_extracts_three_builds_and_four_logs_without_score_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);path=root/'large.tgz'
+            files={name+'/build/bin/server':name.encode() for name in ('A','B','Driver')}
+            files.update({name:b'contract bytes' for name in r.PG_CONTRACT_LOGS})
+            files['pg-input-guard-observation/score.json']=b'not imported'
+            files['hosted-state.json']=json.dumps(dict(identity=dict(baseline=r.TYPED_GUARD_PRODUCT,
+                prepatch=r.TYPED_GUARD_PRODUCT,candidate=r.LARGE_PG_PRODUCT,pg_input_guard=True),
+                steps={**{k:{'state':'completed'} for k in ('build','build-A','build-B','build-Driver')},
+                    'diagnostic':{'state':'failed'}})).encode()
+            index=dict(path_root=r.TOKEN,raw_and_redacted_hashes_distinct=True,files=[dict(path=k,bytes=len(v),
+                original_sha256=hashlib.sha256(v).hexdigest(),archived_sha256=hashlib.sha256(v).hexdigest()) for k,v in files.items()])
+            files['portable-file-map.json']=json.dumps(index).encode()
+            with tarfile.open(path,'w:gz') as tar:
+                for name,data in files.items():
+                    info=tarfile.TarInfo(name);info.size=len(data);tar.addfile(info,io.BytesIO(data))
+            digest=r.h.sha(path)
+            with patch.object(r,'LARGE_PG_ARCHIVE_SHA',digest):
+                with self.assertRaisesRegex(ValueError,'fixed large-input'):
+                    r.extract_builds(path,root/'wrong',digest,{'A','Driver'},pg_large_input_cache=True)
+                r.extract_builds(path,root/'good',digest,{'A','B','Driver'},pg_large_input_cache=True)
+            self.assertTrue((root/'good/B/build/bin/server').is_file())
+            self.assertTrue(all((root/'good'/name).is_file() for name in r.PG_CONTRACT_LOGS))
+            self.assertFalse((root/'good/pg-input-guard-observation').exists())
+            self.assertFalse((root/'good/hosted-state.json').exists())
+            self.assertNotIn('diagnostic',r.h.load(root/'good/reuse-original-state.json')['steps'])
+
+    def test_large_contracts_require_four_exact_passes_and_bound_runtime_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);raws={name:('fixed '+name).encode() for name in r.LARGE_PG_SOURCES}
+            hashes={name:hashlib.sha256(raw).hexdigest() for name,raw in raws.items()};mapping={}
+            for name in r.PG_CONTRACT_LOGS:
+                test=Path(name).name.rsplit('-',1)[0];path=root/name;path.parent.mkdir(exist_ok=True)
+                path.write_text('test '+test+' ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n')
+                mapping[name]={'archived_sha256':r.h.sha(path),'original_sha256':r.h.sha(path)}
+            receipt=root/'build.json';r.h.save(receipt,{'source_files':hashes})
+            generated=root/'server.c';generated.write_bytes(raws['src/backend/c_pg_async_runtime.c'])
+            manifest={'build_receipt':str(receipt),'stacks':{'ku':{'build':{'native':{'server':{'generated_c':str(generated)}}}}}}
+            with patch.object(r,'LARGE_PG_SOURCES',hashes),patch.object(r.subprocess,'check_output',side_effect=lambda args,**kw:raws[args[-1].split(':',1)[1]]):
+                self.assertTrue(r.verify_large_pg_contracts(root,root,manifest,mapping)['all_four_contracts_passed'])
+                bad=root/r.PG_CONTRACT_LOGS[0];original=bad.read_text();bad.write_text(original.replace('0 ignored','1 ignored'))
+                mapping[r.PG_CONTRACT_LOGS[0]]['archived_sha256']=r.h.sha(bad)
+                with self.assertRaisesRegex(ValueError,'exactly one'):r.verify_large_pg_contracts(root,root,manifest,mapping)
+                bad.write_text(original);mapping[r.PG_CONTRACT_LOGS[0]]['archived_sha256']=r.h.sha(bad)
+                generated.write_bytes(b'wrong runtime')
+                with self.assertRaisesRegex(ValueError,'generated C'):r.verify_large_pg_contracts(root,root,manifest,mapping)
+
+    def test_large_guard_cache_seeds_B_without_importing_overall_build_or_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp)/'fresh';a=types.SimpleNamespace(root=root,source=Path(temp)/'source',baseline=r.TYPED_GUARD_PRODUCT,
+                prepatch=r.TYPED_GUARD_PRODUCT,candidate=r.LARGE_PG_PRODUCT,screen_variants=[],pg_input_guard=True)
+            client={'sha256':'driver','source_sha256':hashlib.sha256(b'go').hexdigest()}
+            manifests={n:{'client':client,'stacks':{'ku':{'command':[n+'-ELF']}}} for n in ('A','B')}
+            def extract(*args,**kwargs):
+                root.mkdir();r.h.save(root/'reuse-original-state.json',{'steps':{k:{'state':'completed'} for k in
+                    ('build-A','build-B','build-Driver','diagnostic')}});return {}
+            patches.enter_context(patch.object(r.os,'geteuid',return_value=1001))
+            patches.enter_context(patch.object(r,'extract_builds',side_effect=extract))
+            patches.enter_context(patch.object(r,'restore_json_inputs'));patches.enter_context(patch.object(r,'validate_protocol_inputs'))
+            patches.enter_context(patch.object(r,'verify_driver_cache',return_value={'client':client}))
+            patches.enter_context(patch.object(r,'verify_manifest',side_effect=lambda root,name,*args,**kw:manifests[name]))
+            check=patches.enter_context(patch.object(r,'checked'))
+            contracts=patches.enter_context(patch.object(r,'verify_large_pg_contracts'))
+            patches.enter_context(patch.object(r.subprocess,'run',return_value=types.SimpleNamespace(returncode=0)))
+            patches.enter_context(patch.object(r.subprocess,'check_output',return_value=b'go'))
+            state=r.prepare_pg_input_guard_cache(Path(temp)/'archive',a,source_run='41599087071')
+            self.assertEqual(set(state['steps']),{'build-A','build-B','build-Driver'})
+            self.assertEqual(state['identity'],r.h.hosted_identity(a,'diagnostic'));self.assertEqual(state['imported_measurement_windows'],0)
+            self.assertFalse(r.h.load(root/'verified-baseline-cache.json')['new_candidate_build_still_required'])
+            contracts.assert_called_once_with(root,a.source,manifests['B'],{})
+            check.assert_any_call('B-ELF',r.LARGE_PG_ELF)
+
     def test_guard_cache_seeds_only_verified_A_driver_not_candidate_or_measurements(self):
         for same_source in (True,False):
             with self.subTest(same_source=same_source),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:

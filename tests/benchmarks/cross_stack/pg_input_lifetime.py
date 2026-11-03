@@ -46,6 +46,17 @@ def tool(command, **kwargs):
         row.update(exit_code=0, output=output); return output
     except BaseException as error: row['error'] = repr(error); raise
     finally: row['ended'] = time.monotonic()
+def preserve_database_log(private):
+    source = private / 'database' / 'postgres.log'
+    if source.is_symlink(): raise RuntimeError('refuse linked PostgreSQL diagnostic log')
+    if not source.is_file(): return
+    limit = 256 * 1024
+    with source.open('rb') as stream:
+        stream.seek(0, 2); size = stream.tell(); stream.seek(max(0, size - limit))
+        tail = stream.read(limit)
+    (EVIDENCE / 'postgres.log').write_bytes(tail)
+    R['database_log'] = dict(original_bytes=size, retained_bytes=len(tail), tail_only=size > limit,
+                            sha256=hashlib.sha256(tail).hexdigest())
 def request(port, path, token=None):
     connection = fixture.DeadlineHTTPConnection('127.0.0.1', port, time.monotonic() + 4)
     try:
@@ -152,7 +163,11 @@ def main():
         linkdir = private / 'libpq-link'; linkdir.mkdir(mode=0o755); (linkdir / 'libpq.so').symlink_to(libpq.resolve()); environment['KU_PG_LIB'] = str(linkdir)
         R.update(libpq_sha256=sha(libpq), libpq_path=str(libpq.resolve()), cc=tool(['clang-18', '--version']), pg_config=tool(['pg_config', '--version']))
         lh.write_json(private / 'manifest.json', dict(uid=uid, gid=gid, stacks={}, protocol=str(Path(__file__).with_name('protocol.json')), cgroup_root=str(group), database_cpu_set=str(cpus[-1])))
-        database = db.Database(private, uid, gid); R['database_start'] = database.start(); spec = lh.read_json(database.manifest_path)
+        database = db.Database(private, uid, gid)
+        socket_path = str(database.socket / ('.s.PGSQL.' + str(db.PORT)))
+        R['database_socket_path_bytes'] = len(os.fsencode(socket_path))
+        if R['database_socket_path_bytes'] >= 108: raise RuntimeError('owned PostgreSQL socket path exceeds Linux sun_path; use a shorter observation root')
+        R['database_start'] = database.start(); spec = lh.read_json(database.manifest_path)
         harness = lh.Harness(private, EVIDENCE / 'harness'); domain, exists = database.validated_domain(database.state())
         if not exists: raise RuntimeError('owned database domain missing')
         def observer(statement, deadline):
@@ -170,6 +185,8 @@ def main():
             if database is not None: R['database_stop'] = database.stop()
             if database is not None and (R['database_stop'].get('forced') is not False or R['database_stop'].get('cgroup_removed') is not True or R['database_stop'].get('after', {}).get('process_count') != 0): raise RuntimeError('database cleanup was not natural and complete')
         except BaseException as error: R['cleanup_errors'].append(dict(stage='database', error=repr(error)))
+        try: preserve_database_log(private)
+        except BaseException as error: R['cleanup_errors'].append(dict(stage='database-log', error=repr(error)))
         try:
             if group.exists(): group.rmdir()
             shutil.rmtree(private); R['private_tree_removed'] = True

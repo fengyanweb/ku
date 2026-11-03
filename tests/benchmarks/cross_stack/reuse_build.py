@@ -19,6 +19,14 @@ TYPED_GUARD_REJECTED='746e913538a76f111e44d212b3dbbfb4ca5a06c1'
 PG_CACHE_ELFS={'normal':'234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b',
     'typed':'faf34cec074f10b225ad880f149fb60f2fda9068fd192872ee00222344bd5b93'}
 TYPED_PG_INPUT_SHA='d9b5ea46dd2b401ae368471a822efa8467efa64c50e4b5966681c0d2a21bc4a0'
+LARGE_PG_ARCHIVE_SHA='0e46b5fc4032cce8410d4c9fa8654f9e942af400bac5fd63e0783d328338b332'
+LARGE_PG_PRODUCT='5857373ef316c9b67789141038a93b46e62a2f20'
+LARGE_PG_ELF='2b884a0e6a4a44ee5aa603b74042504f4195cc62441cc4505259e259c98a39ae'
+LARGE_PG_SOURCES={'src/backend/c_pg_async_runtime.c':'a2f775f6586ac09d09cf20c107fc7bfca847e0d5cd3f40da9b8b080086fa99ae',
+    'tests/native_pg_query_poll_test.rs':'aa0c75aa408112877a57a26e55aa0509fadb68e8e6551e416045c5b3756f5179'}
+PG_CONTRACT_TESTS=('native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins',
+    'native_pg_typed_single_row_binary_values_validate_types_and_survive_reset')
+PG_CONTRACT_LOGS=tuple('contracts/'+test+'-'+mode+'.log' for test in PG_CONTRACT_TESTS for mode in ('O2','detectors'))
 
 
 def checked(path, expected):
@@ -33,7 +41,7 @@ def translated(value, root):
     return value
 
 
-def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False, typed_pg_observation=False, pg_input_cache=False):
+def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False, typed_pg_observation=False, pg_input_cache=False, pg_large_input_cache=False):
     """Check all paths/map entries first; write only into a fresh owned tree."""
     checked(archive,expected_sha256)
     root=Path(root)
@@ -69,14 +77,19 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
             and identity.get('candidate')==TYPED_GUARD_REJECTED and identity.get('pg_input_guard') is True
             and all(old.get('steps',{}).get(k,{}).get('state')=='completed' for k in ('build','build-A','build-B','build-Driver')))
         if pg_input_cache and not guard_cache:raise ValueError('fixed default A/Driver build cache required')
+        large_cache=(pg_large_input_cache and expected_sha256==LARGE_PG_ARCHIVE_SHA and set(names)=={'A','B','Driver'}
+            and identity.get('baseline')==identity.get('prepatch')==TYPED_GUARD_PRODUCT
+            and identity.get('candidate')==LARGE_PG_PRODUCT and identity.get('pg_input_guard') is True
+            and all(old.get('steps',{}).get(k,{}).get('state')=='completed' for k in ('build','build-A','build-B','build-Driver')))
+        if pg_large_input_cache and not large_cache:raise ValueError('fixed large-input A/B/Driver build cache required')
         if any(not name.startswith('build') for name in old.get('steps',{})):
-            if not (typed_cache or guard_cache) and not (owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
+            if not (typed_cache or guard_cache or large_cache) and not (owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
                     and set(old.get('steps',{}))=={'build','build-B','build-R','diagnostic'}
                     and all(v.get('state')=='completed' for v in old['steps'].values())):
                 raise ValueError('this reuse path accepts build-only source runs except the fixed owner archive')
-        if not (typed_cache or guard_cache) and any(old.get('steps',{}).get('build-'+name,{}).get('state')!='completed' for name in names):
+        if not (typed_cache or guard_cache or large_cache) and any(old.get('steps',{}).get('build-'+name,{}).get('state')!='completed' for name in names):
             raise ValueError('requested normal build was not completed')
-        selected=[m for m in members if PurePosixPath(m.name).parts[0] in names]
+        selected=[m for m in members if PurePosixPath(m.name).parts[0] in names or (large_cache and m.name in PG_CONTRACT_LOGS)]
         root.mkdir(parents=True,exist_ok=True)
         for member in selected:
             entry=mapping.get(member.name,{})
@@ -87,7 +100,7 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
             with destination.open('xb') as stream:stream.write(data)
             destination.chmod(member.mode&0o777)
         h.save(root/'reuse-portable-file-map.json',index)
-        provenance=old if not (owner_observation or typed_cache or guard_cache) else dict(identity=old.get('identity'),
+        provenance=old if not (owner_observation or typed_cache or guard_cache or large_cache) else dict(identity=old.get('identity'),
             steps={k:v for k,v in old.get('steps',{}).items() if k.startswith('build')},measurement_results_imported=False)
         h.save(root/'reuse-original-state.json',provenance)
         return mapping
@@ -297,14 +310,47 @@ def prepare_typed_pg_from_input_guard(archive,root,source,tools):
     return manifests
 
 
-def prepare_pg_input_guard_cache(archive,a):
+def verify_large_pg_contracts(root,source,manifest,mapping):
+    """Bind completed checks to the fixed artifact and the declared product Git objects."""
+    records=[]
+    for relative in PG_CONTRACT_LOGS:
+        path=root/relative;entry=mapping[relative];checked(path,entry['archived_sha256'])
+        text=path.read_text();test=path.name.rsplit('-',1)[0]
+        results=re.findall(r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;',text,re.M)
+        if (results!=[('ok','1','0','0')] or len(re.findall(r'^test '+re.escape(test)+r' \.\.\. ok$',text,re.M))!=1):
+            raise ValueError('fixed PG contract log is not exactly one passing test: '+relative)
+        records.append(dict(path=relative,archived_sha256=entry['archived_sha256'],
+            original_sha256=entry['original_sha256'],passed=1,failed=0,ignored=0))
+    sources={}
+    for relative,expected in LARGE_PG_SOURCES.items():
+        raw=subprocess.check_output(['git','-C',str(source),'show',LARGE_PG_PRODUCT+':'+relative],timeout=10)
+        if hashlib.sha256(raw).hexdigest()!=expected:raise ValueError('fixed product Git source differs: '+relative)
+        sources[relative]=raw
+    receipt=h.load(manifest['build_receipt']);runtime='src/backend/c_pg_async_runtime.c'
+    if receipt.get('source_files',{}).get(runtime)!=LARGE_PG_SOURCES[runtime]:
+        raise ValueError('cached product runtime source receipt differs')
+    generated=Path(manifest['stacks']['ku']['build']['native']['server']['generated_c']).read_bytes()
+    if sources[runtime] not in generated:raise ValueError('cached generated C does not contain the fixed runtime source')
+    result=dict(source_commit=LARGE_PG_PRODUCT,source_sha256=LARGE_PG_SOURCES,contracts=records,
+        source_scope='runtime bound by archived build receipt, actual generated C and fixed Git object; test source SHA is the fixed Git object, not an unarchived file read',
+        original_test_file_archived=False,all_four_contracts_passed=True,imported_measurement_windows=0)
+    h.save(root/'verified-pg-contract-cache.json',result);return result
+
+
+def prepare_pg_input_guard_cache(archive,a,*,source_run='41582847043'):
     """Seed verified completed build steps, never a timed result, into a fresh guard."""
     if os.geteuid()==0:raise ValueError('prepare cached builds as the ordinary benchmark user')
     h.validate_screen_selection(a,'diagnostic')
     root=Path(a.root);source=Path(a.source)
-    mapping=extract_builds(archive,root,TYPED_GUARD_ARCHIVE_SHA,{'A','Driver'},pg_input_cache=True)
-    restore_json_inputs(source,root,{'A':TYPED_GUARD_PRODUCT,'Driver':TYPED_GUARD_REJECTED},mapping)
-    for name in ('A','Driver'):validate_protocol_inputs(root,name,mapping)
+    if source_run not in ('41582847043','41599087071'):raise ValueError('explicit fixed PG cache run required')
+    large=source_run=='41599087071'
+    if large and a.candidate!=LARGE_PG_PRODUCT:raise ValueError('fixed large-input candidate required')
+    archive_sha=LARGE_PG_ARCHIVE_SHA if large else TYPED_GUARD_ARCHIVE_SHA
+    names={'A','B','Driver'} if large else {'A','Driver'}
+    mapping=extract_builds(archive,root,archive_sha,names,**({'pg_large_input_cache':True} if large else {'pg_input_cache':True}))
+    commits={'A':TYPED_GUARD_PRODUCT,'Driver':TYPED_GUARD_REJECTED,**({'B':LARGE_PG_PRODUCT} if large else {})}
+    restore_json_inputs(source,root,commits,mapping)
+    for name in commits:validate_protocol_inputs(root,name,mapping)
     driver=verify_driver_cache(root)
     normal=verify_manifest(root,'A',TYPED_GUARD_PRODUCT,mapping,client_source_name='Driver')
     checked(normal['stacks']['ku']['command'][0],PG_CACHE_ELFS['normal'])
@@ -316,17 +362,24 @@ def prepare_pg_input_guard_cache(archive,a):
     if hashlib.sha256(new_driver_source).hexdigest()!=driver['client']['source_sha256']:
         raise ValueError('cached driver source differs from the explicit new candidate')
     if normal['client']['sha256']!=driver['client']['sha256']:raise ValueError('cached A/Driver identity mismatch')
+    manifests={'A':normal,'Driver':driver}
+    if large:
+        candidate=verify_manifest(root,'B',LARGE_PG_PRODUCT,mapping,client_source_name='Driver')
+        checked(candidate['stacks']['ku']['command'][0],LARGE_PG_ELF)
+        if candidate['client']['sha256']!=driver['client']['sha256']:raise ValueError('cached B/Driver identity mismatch')
+        verify_large_pg_contracts(root,source,candidate,mapping);manifests['B']=candidate
     old=h.load(root/'reuse-original-state.json');state=dict(identity=h.hosted_identity(a,'diagnostic'),
         uid=os.getuid(),gid=os.getgid(),steps={},goal_status='unknown',imported_measurement_windows=0)
-    for name,manifest in (('A',normal),('Driver',driver)):
+    for name,manifest in manifests.items():
         step=copy.deepcopy(old['steps']['build-'+name]);step['result']=manifest
-        step.update(reused_from_run='41582847043',build_repeated=False)
+        step.update(reused_from_run=source_run,build_repeated=False)
         state['steps']['build-'+name]=step
     h.save(root/'hosted-state.json',state)
-    h.save(root/'verified-baseline-cache.json',dict(archive_sha256=TYPED_GUARD_ARCHIVE_SHA,
+    h.save(root/'verified-baseline-cache.json',dict(archive_sha256=archive_sha,
         original_A_source=TYPED_GUARD_PRODUCT,candidate_source=a.candidate,A_ELF=PG_CACHE_ELFS['normal'],
-        source_run='41582847043',driver_source_matches_candidate=True,benchmark_inputs_match_candidate=True,imported_measurement_windows=0,
-        reused_steps=['build-A','build-Driver'],new_candidate_build_still_required=True))
+        source_run=source_run,driver_source_matches_candidate=True,benchmark_inputs_match_candidate=True,imported_measurement_windows=0,
+        reused_steps=['build-'+name for name in manifests],new_candidate_build_still_required=not large,
+        **({'B_ELF':LARGE_PG_ELF,'four_contract_logs_verified':True} if large else {})))
     return state
 
 

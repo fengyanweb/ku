@@ -221,12 +221,12 @@ jobs:
           rustup default 1.89.0
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18 libclang-rt-18-dev libpq-dev postgresql-16
-      - name: Reuse the verified original A and request driver
+      - name: Reuse the already verified A, candidate B and request driver
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: ku-pg-input-guard-full
           path: ${{ runner.temp }}/ku-pg-guard-build-cache
-          run-id: 41582847043
+          run-id: 41599087071
           github-token: ${{ github.token }}
       - name: Verify cache and seed build steps without any old scores
         shell: bash
@@ -244,34 +244,26 @@ jobs:
               baseline='166453a1d2768bbce19796d9c7823be73cc84ccb',prepatch='166453a1d2768bbce19796d9c7823be73cc84ccb',
               candidate='5857373ef316c9b67789141038a93b46e62a2f20',screen_variants=[],pg_input_guard=True)
           reuse_build.prepare_pg_input_guard_cache(
-              Path(os.environ['RUNNER_TEMP'])/'ku-pg-guard-build-cache/ku-performance-v2-evidence.tar.gz',a)
+              Path(os.environ['RUNNER_TEMP'])/'ku-pg-guard-build-cache/ku-performance-v2-evidence.tar.gz',a,source_run='41599087071')
           PY
-      - name: Build only the new candidate with the frozen compiler
+      - name: Finalize the verified frozen build identities
         shell: bash
         run: |
           set -euo pipefail
           python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build --build-set diagnostic --pg-input-guard --root "$KU_PG_GUARD_ROOT" --source "$GITHUB_WORKSPACE" --tools "$KU_PG_GUARD_ROOT/tools" --baseline 166453a1d2768bbce19796d9c7823be73cc84ccb --candidate 5857373ef316c9b67789141038a93b46e62a2f20 --prepatch 166453a1d2768bbce19796d9c7823be73cc84ccb > "$KU_PG_GUARD_ROOT/build.log" 2>&1
-      - name: Check only the changed normal and typed input paths
-        timeout-minutes: 4
-        shell: bash
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/ku-pg-input-guard/cli-cache
-        run: |
-          set -euo pipefail
-          mkdir -p "$KU_PG_GUARD_ROOT/contracts"
-          for test in native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins native_pg_typed_single_row_binary_values_validate_types_and_survive_reset; do
-            KU_CC='clang-18 -O2' cargo +1.89.0 test --manifest-path "$KU_PG_GUARD_ROOT/B/src/Cargo.toml" --release --locked --test native_pg_query_poll_test "$test" -- --exact --nocapture > "$KU_PG_GUARD_ROOT/contracts/$test-O2.log" 2>&1
-            KU_CC='clang-18 -O2 -fsanitize=address,undefined -fno-omit-frame-pointer' ASAN_OPTIONS='detect_leaks=1:halt_on_error=1' UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' cargo +1.89.0 test --manifest-path "$KU_PG_GUARD_ROOT/B/src/Cargo.toml" --release --locked --test native_pg_query_poll_test "$test" -- --exact --nocapture > "$KU_PG_GUARD_ROOT/contracts/$test-detectors.log" 2>&1
-          done
       - name: Observe one large-input residence pair before the fixed guard
         timeout-minutes: 2
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$KU_PG_GUARD_ROOT/large-input-lifetime/evidence"
-          cp "$KU_PG_GUARD_ROOT/A/build/ku-cargo/release/ku" "$KU_PG_GUARD_ROOT/large-input-lifetime/A-ku"
-          cp "$KU_PG_GUARD_ROOT/B/build/ku-cargo/release/ku" "$KU_PG_GUARD_ROOT/large-input-lifetime/B-ku"
-          sudo -n python3 -B tests/benchmarks/cross_stack/pg_input_lifetime.py --root "$KU_PG_GUARD_ROOT/large-input-lifetime" --uid "$(id -u)" --gid "$(id -g)"
+          pg_observation_root="$RUNNER_TEMP/pgl"
+          mkdir -p "$pg_observation_root/evidence" "$KU_PG_GUARD_ROOT/large-input-lifetime/evidence"
+          cp "$KU_PG_GUARD_ROOT/A/build/ku-cargo/release/ku" "$pg_observation_root/A-ku"
+          cp "$KU_PG_GUARD_ROOT/B/build/ku-cargo/release/ku" "$pg_observation_root/B-ku"
+          pg_observation_rc=0
+          sudo -n python3 -B tests/benchmarks/cross_stack/pg_input_lifetime.py --root "$pg_observation_root" --uid "$(id -u)" --gid "$(id -g)" || pg_observation_rc=$?
+          cp -R "$pg_observation_root/evidence/." "$KU_PG_GUARD_ROOT/large-input-lifetime/evidence/"
+          exit "$pg_observation_rc"
       - name: Complete the one frozen27-window candidate guard
         timeout-minutes: 20
         shell: bash
@@ -300,6 +292,7 @@ jobs:
             ${{ runner.temp }}/ku-pg-input-guard/contracts
             ${{ runner.temp }}/ku-pg-input-guard/large-input-lifetime/evidence
             ${{ runner.temp }}/ku-pg-input-guard/verified-baseline-cache.json
+            ${{ runner.temp }}/ku-pg-input-guard/verified-pg-contract-cache.json
           retention-days: 14
           if-no-files-found: warn
       - if: always()
