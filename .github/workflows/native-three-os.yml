@@ -123,17 +123,19 @@ jobs:
           test -n "$pg_perf_binary"
           test -x "$pg_perf_binary"
           ln -s "$pg_perf_binary" "$RUNNER_TEMP/ku-pg-typed-tools/bin/perf"
+          ln -s "${CARGO_HOME:-$HOME/.cargo}" "$RUNNER_TEMP/ku-pg-typed-tools/cargo"
+          ln -s "${RUSTUP_HOME:-$HOME/.rustup}" "$RUNNER_TEMP/ku-pg-typed-tools/rustup"
           printf 'KU_PG_TYPED_ROOT=%s\n' "$RUNNER_TEMP/ku-pg-typed-self" >> "$GITHUB_ENV"
           printf 'KU_PG_TYPED_REUSE=%s\n' "$RUNNER_TEMP/ku-pg-typed-reuse" >> "$GITHUB_ENV"
           printf '%s\n' "$RUNNER_TEMP/ku-pg-typed-tools/bin" >> "$GITHUB_PATH"
-      - name: Download the exact original normal and typed builds
+      - name: Download the retained frozen default CLI and driver cache
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
-          name: ku-performance-v2-evidence
+          name: ku-pg-input-guard-full
           path: ${{ runner.temp }}/ku-pg-typed-download
-          run-id: 41304747275
+          run-id: 41582847043
           github-token: ${{ github.token }}
-      - name: Restore verified builds only with zero old windows
+      - name: Restore the original A only and reproduce identical typed native C
         timeout-minutes: 2
         shell: bash
         env:
@@ -144,9 +146,10 @@ jobs:
           import os
           from pathlib import Path
           import reuse_build
-          manifests = reuse_build.prepare_typed_pg_cache(
+          manifests = reuse_build.prepare_typed_pg_from_input_guard(
               Path(os.environ['RUNNER_TEMP'])/'ku-pg-typed-download/ku-performance-v2-evidence.tar.gz',
-              Path(os.environ['KU_PG_TYPED_REUSE']),Path(os.environ['GITHUB_WORKSPACE']))
+              Path(os.environ['KU_PG_TYPED_REUSE']),Path(os.environ['GITHUB_WORKSPACE']),
+              Path(os.environ['RUNNER_TEMP'])/'ku-pg-typed-tools')
           print(manifests)
           PY
       - name: Observe only the one typed materialization question
@@ -156,7 +159,7 @@ jobs:
           set -euo pipefail
           sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py \
             --root "$KU_PG_TYPED_ROOT" --tools "$RUNNER_TEMP/ku-pg-typed-tools" \
-            --normal-manifest "$KU_PG_TYPED_REUSE/B/manifest.json" \
+            --normal-manifest "$KU_PG_TYPED_REUSE/A/manifest.json" \
             --typed-manifest "$KU_PG_TYPED_REUSE/BP/manifest.json" \
             > "$RUNNER_TEMP/ku-pg-typed-self.log" 2>&1
       - name: Archive raw samples while excluding private database files

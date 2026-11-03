@@ -6,6 +6,7 @@ import hosted_cycle as h
 import focus_cycle as fc
 
 FROZEN_BASE='80aaf7bccd4a436ebdf83e2283a83fcc6deec4fd'
+FROZEN_DEFAULT='166453a1d2768bbce19796d9c7823be73cc84ccb'
 INPUTS={'B':'59ede7cdba403d4d038c3720ab65f1cd940efd1038d07df782743a35eb9887ae',
         'BP':'d9b5ea46dd2b401ae368471a822efa8467efa64c50e4b5966681c0d2a21bc4a0'}
 
@@ -30,10 +31,11 @@ def identify(normal,typed):
         if path.name!='manifest.json' or path.is_symlink():raise ValueError('plain manifest.json inputs required')
         m=h.load(path);manifests[name]=m;target=m['stacks']['ku'];build=target['build']
         declared=build['native']['server']['binary_sha256']
-        if m['candidate_base']!=FROZEN_BASE or not re.fullmatch('[0-9a-f]{64}',declared):raise ValueError('fixed archived source and declared ELF SHA required')
+        if m['candidate_base'] not in (FROZEN_BASE,FROZEN_DEFAULT) or not re.fullmatch('[0-9a-f]{64}',declared):raise ValueError('fixed archived source and declared ELF SHA required')
         protocol=Path(m['protocol'])
         versions[name]=dict(root=str(path.parent),stack='ku',source_commit=m['candidate_base'],binary_sha256=declared,
             artifacts={'protocol':dict(path=str(protocol),sha256=h.sha(protocol))})
+    if versions['B']['source_commit']!=versions['BP']['source_commit']:raise ValueError('both PG arms must use the same fixed source')
     plan=frozen_plan(versions);bindings={n:fc.version_identity(plan,n) for n in versions}
     expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
         pg_execution_mode='async',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
@@ -43,6 +45,7 @@ def identify(normal,typed):
     for key in ('Ku CLI','driver ELF','libpq'):
         if bindings['B']['files'][key]['sha256']!=bindings['BP']['files'][key]['sha256']:raise ValueError('same frozen '+key+' required')
     if versions['B']['binary_sha256']!='234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b':raise ValueError('frozen default ordinary ELF234 required')
+    if versions['BP']['binary_sha256']!='faf34cec074f10b225ad880f149fb60f2fda9068fd192872ee00222344bd5b93':raise ValueError('frozen typed ELFfaf required')
     if versions['B']['artifacts']['protocol']['sha256']!=versions['BP']['artifacts']['protocol']['sha256']:raise ValueError('actual protocol bytes differ')
     if manifests['B']['client']['command'][1:]!=manifests['BP']['client']['command'][1:]:raise ValueError('driver base arguments differ')
     for key in ('protocol_sha256','quality_policy','driver_cores','driver_cpuset','service_memory_bytes','service_env','uid','gid'):
@@ -94,7 +97,7 @@ def observe(a,plan,bindings,normal_manifest):
         fixture.start();private=h.load(fixture.manifest_path);fc.Harness=SelfHarness
         h.save(a.root/'identity.json',dict(bindings=bindings,private_database_limits=h.load(fixture.state_path)['limits'],
             kernel=platform.release(),machine=platform.machine(),boot_sha256=h.sha('/proc/sys/kernel/random/boot_id'),
-            event='software cpu-clock499Hz; no callchain/GPR/CPU field',source='verified cached original B/BP, not746 candidate or daily1.99 SDK'))
+            event='software cpu-clock499Hz; no callchain/GPR/CPU field',source='verified fixed80 or F166 arms; default ELF234 and original typed ELFfaf, not746 candidate or daily1.99 SDK'))
         for name,turn in plan['order']:
             active=turn=='sample';output=directory/name/turn
             try:

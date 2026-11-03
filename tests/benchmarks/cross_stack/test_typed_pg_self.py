@@ -39,7 +39,8 @@ class TypedPgSelfTests(unittest.TestCase):
                 p=root/name/'manifest.json';p.parent.mkdir();paths.append(p)
                 manifest=dict(candidate_base=t.FROZEN_BASE,protocol=str(protocol),client={'command':['driver']},
                     stacks={'ku':{'command':['server'],'build':{'native':{'server':{'binary_sha256':
-                        '234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b' if name=='B' else 'b'*64}}}}})
+                        '234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b' if name=='B' else
+                        'faf34cec074f10b225ad880f149fb60f2fda9068fd192872ee00222344bd5b93'}}}}})
                 p.write_text(json.dumps(manifest))
                 bindings[name]=dict(build_mode={**mode,'pg_read_mode':'int' if name=='B' else 'typed'},
                     files={k:{'sha256':'c'*64} for k in ('Ku CLI','driver ELF','libpq')})
@@ -53,6 +54,15 @@ class TypedPgSelfTests(unittest.TestCase):
                     if issue=='none':self.assertEqual(set(t.identify(*paths)[0]['versions']),{'B','BP'})
                     else:
                         with self.assertRaises(ValueError):t.identify(*paths)
+            with patch.object(t.fc,'version_identity',side_effect=lambda p,n:bindings[n]):
+                for base in (t.FROZEN_DEFAULT,t.FROZEN_BASE):
+                    for path in paths:
+                        manifest=t.h.load(path);manifest['candidate_base']=base;path.write_text(json.dumps(manifest))
+                    self.assertEqual(t.identify(*paths)[0]['versions']['BP']['source_commit'],base)
+                changed=t.h.load(paths[1]);changed['candidate_base']=t.FROZEN_DEFAULT;paths[1].write_text(json.dumps(changed))
+                with self.assertRaisesRegex(ValueError,'same fixed source'):t.identify(*paths)
+                changed['candidate_base']='0'*40;paths[1].write_text(json.dumps(changed))
+                with self.assertRaisesRegex(ValueError,'fixed archived source'):t.identify(*paths)
 
     def test_failed_preflight_starts_no_windows(self):
         with tempfile.TemporaryDirectory() as temp:

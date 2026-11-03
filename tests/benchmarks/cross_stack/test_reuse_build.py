@@ -32,6 +32,97 @@ def archive(path, changes=None, old_run=False):
 
 class ReuseBuildTests(unittest.TestCase):
 
+    def test_fixed_guard_cache_only_imports_default_A_and_Driver_builds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);path=root/'guard.tgz'
+            identity=dict(baseline=r.TYPED_GUARD_PRODUCT,prepatch=r.TYPED_GUARD_PRODUCT,
+                candidate=r.TYPED_GUARD_REJECTED,pg_input_guard=True)
+            steps={k:{'state':'completed'} for k in ('build','build-A','build-B','build-Driver')}
+            steps['diagnostic']={'state':'failed','result':{'memory_guard':False}}
+            files={n+'/build/bin/artifact':n.encode() for n in ('A','B','Driver')}
+            files['pg-input-guard-observation/old.json']=b'old score never imported'
+            files['hosted-state.json']=json.dumps(dict(identity=identity,steps=steps)).encode()
+            index=dict(path_root=r.TOKEN,raw_and_redacted_hashes_distinct=True,files=[dict(path=k,
+                bytes=len(v),archived_sha256=hashlib.sha256(v).hexdigest()) for k,v in files.items()])
+            files['portable-file-map.json']=json.dumps(index).encode()
+            with tarfile.open(path,'w:gz') as tar:
+                for name,data in files.items():
+                    info=tarfile.TarInfo(name);info.size=len(data);tar.addfile(info,io.BytesIO(data))
+            digest=r.h.sha(path)
+            with self.assertRaisesRegex(ValueError,'build-only'):
+                r.extract_builds(path,root/'ordinary',digest,{'A','Driver'})
+            with self.assertRaisesRegex(ValueError,'fixed default'):
+                r.extract_builds(path,root/'wrong-sha',digest,{'A','Driver'},pg_input_cache=True)
+            with patch.object(r,'TYPED_GUARD_ARCHIVE_SHA',digest):
+                with self.assertRaisesRegex(ValueError,'fixed default'):
+                    r.extract_builds(path,root/'rejected-B',digest,{'A','B','Driver'},pg_input_cache=True)
+                r.extract_builds(path,root/'good',digest,{'A','Driver'},pg_input_cache=True)
+            self.assertFalse((root/'good/B').exists());self.assertFalse((root/'good/pg-input-guard-observation').exists())
+            provenance=r.h.load(root/'good/reuse-original-state.json')
+            self.assertFalse(provenance['measurement_results_imported'])
+            self.assertEqual(set(provenance['steps']),{'build','build-A','build-B','build-Driver'})
+
+    def test_guard_cache_typed_preparation_uses_only_cached_cli_and_checks_exact_ELF(self):
+        for mismatch in (False,True):
+            with self.subTest(mismatch=mismatch),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp)/'fresh';root.mkdir();tools=Path(temp)/'tools';tools.mkdir()
+                protocol=root/'Driver/src/tests/benchmarks/cross_stack/protocol.json';protocol.parent.mkdir(parents=True);protocol.write_text('{}')
+                client=dict(command=['/cached-driver'],sha256='a'*64)
+                normal=dict(candidate_base=r.TYPED_GUARD_PRODUCT,protocol=str(protocol),client=client,
+                    stacks={'ku':dict(command=['/normal-ELF'],build=dict(cli='/cached-cli',cli_sha256='b'*64,
+                        native={'server':dict(source='/normal.ku')}))})
+                typed=dict(candidate_base=r.TYPED_GUARD_PRODUCT,stacks={'ku':dict(command=['/typed-ELF'],
+                    build=dict(native={'server':dict(binary='/typed-ELF',source='/typed.ku')}))})
+                def snapshot(source,commit,destination):
+                    self.assertEqual(commit,r.TYPED_GUARD_PRODUCT);destination.mkdir(parents=True)
+                def finish(**kwargs):
+                    r.h.save(root/'BP/manifest.json',typed)
+                builder=types.SimpleNamespace(commands=[{'label':'ku-native-server'}],finish=finish)
+                builder.ku_native=patches.enter_context(patch.object(types.SimpleNamespace(call=None),'call'))
+                patches.enter_context(patch.object(r.os,'geteuid',return_value=1))
+                patches.enter_context(patch.object(r.platform,'system',return_value='Linux'))
+                patches.enter_context(patch.object(r.platform,'machine',return_value='aarch64'))
+                patches.enter_context(patch.object(r,'extract_builds',return_value={}))
+                patches.enter_context(patch.object(r,'restore_json_inputs'))
+                patches.enter_context(patch.object(r,'validate_protocol_inputs'))
+                patches.enter_context(patch.object(r,'verify_driver_cache',return_value={'client':client}))
+                verify=patches.enter_context(patch.object(r,'verify_manifest',return_value=normal))
+                patches.enter_context(patch.object(r.h,'snapshot',side_effect=snapshot))
+                factory=patches.enter_context(patch.object(r.h.bl,'Builder',return_value=builder))
+                patches.enter_context(patch.object(r.h.fc,'version_identity',return_value={'identity':'fixture'}))
+                def checked(path,expected):
+                    if mismatch and path=='/typed-ELF':raise ValueError('reused file identity differs')
+                check=patches.enter_context(patch.object(r,'checked',side_effect=checked))
+                if mismatch:
+                    with self.assertRaisesRegex(ValueError,'identity differs'):
+                        r.prepare_typed_pg_from_input_guard(Path(temp)/'fixed.tgz',root,Path(temp)/'source',tools)
+                    self.assertFalse((root/'typed-pg-cache.json').exists())
+                else:
+                    result=r.prepare_typed_pg_from_input_guard(Path(temp)/'fixed.tgz',root,Path(temp)/'source',tools)
+                    self.assertEqual(result,{'B':str(root/'A/manifest.json'),'BP':str(root/'BP/manifest.json')})
+                    self.assertEqual(factory.call_args.kwargs['ku_pg_read'],'typed')
+                    verify.assert_called_once_with(root,'A',r.TYPED_GUARD_PRODUCT,{},client_source_name='Driver')
+                    receipt=r.h.load(root/'typed-pg-cache.json')
+                    self.assertFalse(receipt['Rust_rebuilt']);self.assertFalse(receipt['Go_rebuilt'])
+                    self.assertEqual(receipt['imported_measurement_windows'],0)
+                builder.ku_native.assert_called_once_with(Path('/cached-cli'))
+                check.assert_any_call('/typed-ELF',r.PG_CACHE_ELFS['typed'])
+
+    def test_guard_driver_verifies_existing_client_and_control_without_rebuilding(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);directory=root/'Driver';directory.mkdir();header=bytearray(20)
+            header[:6]=b'\x7fELF\x02\x01';header[18:20]=(183).to_bytes(2,'little')
+            client=directory/'client';control=directory/'control';client.write_bytes(header);control.write_bytes(header+b'control')
+            source=directory/'src/tests/benchmarks/cross_stack/client/main.go';source.parent.mkdir(parents=True);source.write_text('package main')
+            receipt=directory/'build.json';r.h.save(receipt,dict(candidate_base=r.TYPED_GUARD_REJECTED,
+                failure=None,commands=[{'label':'go-client','exit_code':0}]))
+            r.h.save(directory/'manifest.json',dict(candidate_base=r.TYPED_GUARD_REJECTED,build_receipt=str(receipt),
+                client=dict(command=[str(client)],sha256=r.h.sha(client),source_sha256=r.h.sha(source)),
+                stacks={'control':dict(command=[str(control)],build={'binary_sha256':r.h.sha(control)})}))
+            self.assertEqual(r.verify_driver_cache(root)['client']['sha256'],r.h.sha(client))
+            client.write_bytes(header+b'tampered')
+            with self.assertRaisesRegex(ValueError,'identity differs'):r.verify_driver_cache(root)
+
     def test_fixed_typed_pg_cache_reuses_only_build_trees_never_old_measurements(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);path=root/'typed.tgz'

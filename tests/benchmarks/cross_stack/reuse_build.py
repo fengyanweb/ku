@@ -13,6 +13,12 @@ MAX_TOTAL=768<<20
 TOKEN='${EVIDENCE_ROOT}'
 TYPED_PG_ARCHIVE_SHA='b6eaf2d1e1c3273017a63890d74ec42c366c0219056ea3ad64cb0d9bda885ea1'
 TYPED_PG_PRODUCT='80aaf7bccd4a436ebdf83e2283a83fcc6deec4fd'
+TYPED_GUARD_ARCHIVE_SHA='0e0b4c4fa47659d05222ae09e8e7d1147421189fa8c45437927f6ef95ca4af1b'
+TYPED_GUARD_PRODUCT='166453a1d2768bbce19796d9c7823be73cc84ccb'
+TYPED_GUARD_REJECTED='746e913538a76f111e44d212b3dbbfb4ca5a06c1'
+PG_CACHE_ELFS={'normal':'234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b',
+    'typed':'faf34cec074f10b225ad880f149fb60f2fda9068fd192872ee00222344bd5b93'}
+TYPED_PG_INPUT_SHA='d9b5ea46dd2b401ae368471a822efa8467efa64c50e4b5966681c0d2a21bc4a0'
 
 
 def checked(path, expected):
@@ -27,7 +33,7 @@ def translated(value, root):
     return value
 
 
-def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False, typed_pg_observation=False):
+def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False, typed_pg_observation=False, pg_input_cache=False):
     """Check all paths/map entries first; write only into a fresh owned tree."""
     checked(archive,expected_sha256)
     root=Path(root)
@@ -57,12 +63,18 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
             and set(names)=={'B','BP','R'} and old.get('identity',{}).get('candidate')==TYPED_PG_PRODUCT
             and all(old.get('steps',{}).get(k,{}).get('state')=='completed' for k in ('build','run')))
         if typed_pg_observation and not typed_cache:raise ValueError('fixed typed PG build cache required')
+        identity=old.get('identity',{})
+        guard_cache=(pg_input_cache and expected_sha256==TYPED_GUARD_ARCHIVE_SHA and set(names)=={'A','Driver'}
+            and identity.get('baseline')==identity.get('prepatch')==TYPED_GUARD_PRODUCT
+            and identity.get('candidate')==TYPED_GUARD_REJECTED and identity.get('pg_input_guard') is True
+            and all(old.get('steps',{}).get(k,{}).get('state')=='completed' for k in ('build','build-A','build-B','build-Driver')))
+        if pg_input_cache and not guard_cache:raise ValueError('fixed default A/Driver build cache required')
         if any(not name.startswith('build') for name in old.get('steps',{})):
-            if not typed_cache and not (owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
+            if not (typed_cache or guard_cache) and not (owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
                     and set(old.get('steps',{}))=={'build','build-B','build-R','diagnostic'}
                     and all(v.get('state')=='completed' for v in old['steps'].values())):
                 raise ValueError('this reuse path accepts build-only source runs except the fixed owner archive')
-        if not typed_cache and any(old.get('steps',{}).get('build-'+name,{}).get('state')!='completed' for name in names):
+        if not (typed_cache or guard_cache) and any(old.get('steps',{}).get('build-'+name,{}).get('state')!='completed' for name in names):
             raise ValueError('requested normal build was not completed')
         selected=[m for m in members if PurePosixPath(m.name).parts[0] in names]
         root.mkdir(parents=True,exist_ok=True)
@@ -75,7 +87,7 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
             with destination.open('xb') as stream:stream.write(data)
             destination.chmod(member.mode&0o777)
         h.save(root/'reuse-portable-file-map.json',index)
-        provenance=old if not (owner_observation or typed_cache) else dict(identity=old.get('identity'),
+        provenance=old if not (owner_observation or typed_cache or guard_cache) else dict(identity=old.get('identity'),
             steps={k:v for k,v in old.get('steps',{}).items() if k.startswith('build')},measurement_results_imported=False)
         h.save(root/'reuse-original-state.json',provenance)
         return mapping
@@ -131,7 +143,7 @@ def require_elf(path):
         raise ValueError('reused artifact is not ELF64 little-endian AArch64: '+str(path))
 
 
-def verify_manifest(root, name, commit, mapping, verify_system=True, *, expected_pg_read='int'):
+def verify_manifest(root, name, commit, mapping, verify_system=True, *, expected_pg_read='int', client_source_name='R'):
     path=root/name/'manifest.json';original=h.load(path);m=translated(original,root)
     receipt=h.load(m['build_receipt'])
     if (m.get('candidate_base')!=commit or receipt.get('candidate_base')!=commit
@@ -185,7 +197,8 @@ def verify_manifest(root, name, commit, mapping, verify_system=True, *, expected
             native['compiler_receipt_sha256']=entry['archived_sha256']
             native['compiler_receipt_scope']='archived redacted bytes; original declaration verified via portable file map'
     old_client=m['client'];checked(old_client['command'][0],old_client['sha256']);require_elf(old_client['command'][0])
-    checked(root/'R/src/tests/benchmarks/cross_stack/client/main.go',old_client['source_sha256'])
+    if client_source_name not in ('R','Driver'):raise ValueError('explicit R or Driver source required')
+    checked(root/client_source_name/'src/tests/benchmarks/cross_stack/client/main.go',old_client['source_sha256'])
     h.save(root/'reuse-provenance'/(name+'-manifest.json'),original)
     m['uid'],m['gid']=os.getuid(),os.getgid()
     m['source_inventory_scope']='original build inventory; portable tree is partial and documentation redactions are separately bound'
@@ -218,6 +231,69 @@ def prepare_typed_pg_cache(archive,root,source,*,verify_system=True):
     h.save(root/'typed-pg-cache.json',dict(manifests=manifests,source_run='41304747275',
         archive_sha256=TYPED_PG_ARCHIVE_SHA,source_commit=TYPED_PG_PRODUCT,system_verified=verify_system,
         imported_measurement_windows=0,product_rebuilt=False,normal_F166_ELF_identical=True))
+    return manifests
+
+
+def verify_driver_cache(root):
+    """Verify the fixed Go driver's completed build without invoking Go/Rust."""
+    path=root/'Driver/manifest.json';original=h.load(path);m=translated(original,root)
+    receipt=h.load(m['build_receipt']);client=m['client']
+    if (m.get('candidate_base')!=TYPED_GUARD_REJECTED or set(m.get('stacks',{}))!={'control'}
+            or receipt.get('candidate_base')!=TYPED_GUARD_REJECTED or receipt.get('failure') is not None
+            or not receipt.get('commands') or any(c.get('exit_code')!=0 for c in receipt['commands'])):
+        raise ValueError('fixed completed Driver build required')
+    checked(client['command'][0],client['sha256']);require_elf(client['command'][0])
+    control=m['stacks']['control'];checked(control['command'][0],control['build']['binary_sha256']);require_elf(control['command'][0])
+    checked(root/'Driver/src/tests/benchmarks/cross_stack/client/main.go',client['source_sha256'])
+    h.save(root/'reuse-provenance/Driver-manifest.json',original)
+    m['uid'],m['gid']=os.getuid(),os.getgid();h.save(path,m)
+    return m
+
+
+def prepare_typed_pg_from_input_guard(archive,root,source,tools):
+    """Reuse default A/Driver; regenerate typed C with its exact cached CLI only."""
+    if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
+        raise ValueError('native C preparation requires ordinary Linux ARM64 benchmark user')
+    root=Path(root);source=Path(source);tools=Path(tools).resolve(strict=True)
+    mapping=extract_builds(archive,root,TYPED_GUARD_ARCHIVE_SHA,{'A','Driver'},pg_input_cache=True)
+    restore_json_inputs(source,root,{'A':TYPED_GUARD_PRODUCT,'Driver':TYPED_GUARD_REJECTED},mapping)
+    for name in ('A','Driver'):validate_protocol_inputs(root,name,mapping)
+    driver=verify_driver_cache(root)
+    normal=verify_manifest(root,'A',TYPED_GUARD_PRODUCT,mapping,client_source_name='Driver')
+    checked(normal['stacks']['ku']['command'][0],PG_CACHE_ELFS['normal'])
+    checked(normal['stacks']['ku']['build']['native']['server']['source'],
+        '59ede7cdba403d4d038c3720ab65f1cd940efd1038d07df782743a35eb9887ae')
+    if (normal['client']['command'][0]!=driver['client']['command'][0]
+            or normal['client']['sha256']!=driver['client']['sha256']):
+        raise ValueError('ordinary manifest does not use the verified cached Driver')
+    protocol=root/'Driver/src/tests/benchmarks/cross_stack/protocol.json'
+    checked(normal['protocol'],h.sha(protocol))
+    normal=h.normalize_manifest(normal,protocol,normal['client']);h.save(root/'A/manifest.json',normal)
+    directory=root/'BP';h.snapshot(source,TYPED_GUARD_PRODUCT,directory/'src')
+    (directory/'tools').symlink_to(tools,target_is_directory=True)
+    builder=h.bl.Builder(directory,directory/'src',uid=os.getuid(),gid=os.getgid(),
+        candidate=TYPED_GUARD_PRODUCT,ku_pg_read='typed')
+    try:
+        builder.ku_native(Path(normal['stacks']['ku']['build']['cli']));builder.finish()
+    except BaseException as error:
+        builder.finish(failed=repr(error));raise
+    typed=h.load(directory/'manifest.json');native=typed['stacks']['ku']['build']['native']['server']
+    checked(native['binary'],PG_CACHE_ELFS['typed']);checked(native['source'],TYPED_PG_INPUT_SHA)
+    if any(c['label'] not in {'version-ku','version-cc',*[prefix+kind for prefix in
+            ('ku-native-','ku-elf-header-','ku-elf-dynamic-') for kind in ('server','batch')]} for c in builder.commands):
+        raise ValueError('typed preparation invoked a command outside native C generation/linking')
+    typed=h.normalize_manifest(typed,protocol,normal['client'])
+    typed['stacks']['ku']['build']['reused_cli']=dict(path=normal['stacks']['ku']['build']['cli'],
+        sha256=normal['stacks']['ku']['build']['cli_sha256'],Rust_rebuilt=False)
+    h.save(directory/'manifest.json',typed)
+    manifests={'B':str(root/'A/manifest.json'),'BP':str(directory/'manifest.json')}
+    versions={name:dict(root=str(root/name),stack='ku',source_commit=TYPED_GUARD_PRODUCT,
+        binary_sha256=PG_CACHE_ELFS[role]) for name,role in (('A','normal'),('BP','typed'))}
+    bindings={name:h.fc.version_identity({'versions':versions},name) for name in versions}
+    h.save(root/'typed-pg-cache.json',dict(manifests=manifests,bindings=bindings,source_run='41582847043',
+        archive_sha256=TYPED_GUARD_ARCHIVE_SHA,source_commit=TYPED_GUARD_PRODUCT,system_verified=True,
+        imported_measurement_windows=0,rejected_product_B_tree_imported=False,Rust_rebuilt=False,Go_rebuilt=False,
+        typed_native_C_rebuilt=True,normal_ELF_unchanged=True,typed_ELF_byte_identical_to_original80=True))
     return manifests
 
 
