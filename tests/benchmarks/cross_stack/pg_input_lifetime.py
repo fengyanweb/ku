@@ -148,7 +148,8 @@ def main():
     environment = os.environ | dict(KU_CC='clang-18', KU_EVENT_LOOPS='2', KU_BLOCKING_THREADS='2', KU_DB_MAX_CONNECTIONS='1', KU_DB_MAX_WAITERS='1', KU_DB_MAX_PENDING_BYTES=str(8 << 20), PGCLIENTENCODING='UTF8')
     R.update(status='running', source_sha256=hashlib.sha256(SOURCE.encode()).hexdigest(), input_bytes=2 << 20, input_sha256=hashlib.sha256(b'x' * (2 << 20)).hexdigest(), sql=SQL, uid=uid, gid=gid, service_cpus=cpus[:2], database_cpu=cpus[-1], cgroup_root=str(group))
     try:
-        libdir = tool(['pg_config', '--libdir']); environment['KU_PG_LIB'] = libdir; libpq = Path(libdir) / 'libpq.so'
+        libdir = tool(['pg_config', '--libdir']); libpq = Path(libdir) / 'libpq.so'
+        linkdir = private / 'libpq-link'; linkdir.mkdir(mode=0o755); (linkdir / 'libpq.so').symlink_to(libpq.resolve()); environment['KU_PG_LIB'] = str(linkdir)
         R.update(libpq_sha256=sha(libpq), libpq_path=str(libpq.resolve()), cc=tool(['clang-18', '--version']), pg_config=tool(['pg_config', '--version']))
         lh.write_json(private / 'manifest.json', dict(uid=uid, gid=gid, stacks={}, protocol=str(Path(__file__).with_name('protocol.json')), cgroup_root=str(group), database_cpu_set=str(cpus[-1])))
         database = db.Database(private, uid, gid); R['database_start'] = database.start(); spec = lh.read_json(database.manifest_path)

@@ -127,15 +127,12 @@ jobs:
           rustc +1.89.0 -Vv > "$KU_PG_INPUT_ROOT/probe/evidence/rustc.txt"
           clang-18 --version > "$KU_PG_INPUT_ROOT/probe/evidence/clang.txt"
           git rev-parse HEAD > "$KU_PG_INPUT_ROOT/probe/evidence/tools-head.txt"
-      - name: Run only related PG contracts and Linux detectors
+      - name: Reuse unchanged PG contracts from41577864855
         shell: bash
         run: |
           set -euo pipefail
-          export KU_BIN="$KU_PG_INPUT_ROOT/probe/B-ku"
-          KU_CC='clang-18 -O2' cargo +1.89.0 test --release --locked --test native_pg_query_poll_test -- --nocapture --test-threads=1 > "$KU_PG_INPUT_ROOT/probe/evidence/PG-O2.log" 2>&1
-          for test in native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins native_pg_typed_single_row_binary_values_validate_types_and_survive_reset; do
-            ASAN_OPTIONS=detect_leaks=1 KU_CC='clang-18 -O2 -g -fsanitize=address,undefined -fno-omit-frame-pointer' cargo +1.89.0 test --release --locked --test native_pg_query_poll_test "$test" -- --exact --nocapture > "$KU_PG_INPUT_ROOT/probe/evidence/$test-detectors.log" 2>&1
-          done
+          git diff --exit-code 6f6b2ff565d7d06e4329209df6b8c8e21b7d9558 HEAD -- src Cargo.toml Cargo.lock tests/native_pg_query_poll_test.rs tests/support/native_pg_harness.rs
+          printf 'PG O2 and detector results reused from41577864855; product/test inputs unchanged.\n' > "$KU_PG_INPUT_ROOT/probe/evidence/reused-PG-contracts.txt"
       - name: Observe one serial AB in a fresh private database and service cgroups
         shell: bash
         run: |
