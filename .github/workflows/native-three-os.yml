@@ -9,7 +9,7 @@ on:
         description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, pg-input-lifetime, pg-input-guard, pg-input-windows, pg-typed-self, arena-residency]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, pg-input-lifetime, pg-input-guard, pg-input-windows, pg-typed-self, arena-residency, poll-budget-contract]
       prepatch:
         description: 'Full prepatch commit for explicit paired screens; wake/PG probes require their frozen baseline'
         type: string
@@ -86,10 +86,74 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'pg-input-lifetime' || inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-input-windows' || inputs.scope == 'pg-typed-self' || inputs.scope == 'arena-residency') && format('-{0}', inputs.scope) || '' }}
+  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'pg-input-lifetime' || inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-input-windows' || inputs.scope == 'pg-typed-self' || inputs.scope == 'arena-residency' || inputs.scope == 'poll-budget-contract') && format('-{0}', inputs.scope) || '' }}
   cancel-in-progress: true
 
 jobs:
+  poll-budget-contract:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'poll-budget-contract'
+    name: ${{ matrix.os }} HTTP poll-budget contracts
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            cc: clang-18 -O2
+          - os: windows-2025
+            cc: clang -O2
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 18
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      KU_CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: d05ca1551d4585011499d81d0ae828c4173306ff
+          persist-credentials: false
+      - name: Install the fixed check compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.89.0 --profile minimal --no-self-update
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends clang-18 libclang-rt-18-dev
+          fi
+          mkdir -p "$RUNNER_TEMP/poll-budget"
+          git rev-parse HEAD > "$RUNNER_TEMP/poll-budget/product-commit.txt"
+          rustc +1.89.0 -vV > "$RUNNER_TEMP/poll-budget/rustc.txt"
+      - name: Check only startup accounting, backend snapshots and real loop shutdown
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/poll-budget"
+          run_exact() {
+            cargo +1.89.0 test --release --locked --test "$1" "$2" -- --exact --nocapture > "$out/$2.log" 2>&1
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$out/$2.log"
+          }
+          if [ "$RUNNER_OS" = Linux ]; then
+            run_exact native_http_startup_test native_http_owner_budget_counts_only_storage_used_by_its_poll_backend
+          fi
+          run_exact native_http_startup_test native_http_early_loop_startup_failures_retire_on_the_original_thread
+          run_exact native_http_test native_http_dense_slots_preserve_iteration_and_reject_stale_poll_snapshots
+          if [ "$RUNNER_OS" = Linux ]; then
+            run_exact native_http_test native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlines
+          fi
+          run_exact native_http_test native_http_fixed_loops_share_limits_authenticate_control_and_drain
+          if [ "$RUNNER_OS" = Linux ]; then
+            KU_CC='clang-18 -O2 -fsanitize=address,undefined -fno-omit-frame-pointer' ASAN_OPTIONS='detect_leaks=1:halt_on_error=1' UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+              cargo +1.89.0 test --release --locked --test native_http_startup_test native_http_owner_budget_counts_only_storage_used_by_its_poll_backend -- --exact --nocapture > "$out/budget-detectors.log" 2>&1
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$out/budget-detectors.log"
+          fi
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ku-poll-budget-${{ matrix.os }}
+          path: ${{ runner.temp }}/poll-budget
+          retention-days: 14
+
   arena-residency:
     if: github.event_name == 'workflow_dispatch' && inputs.scope == 'arena-residency'
     name: Linux ARM64 normal Release arena residency question
@@ -1396,7 +1460,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'pg-input-lifetime' && inputs.scope != 'pg-input-guard' && inputs.scope != 'pg-input-windows' && inputs.scope != 'pg-typed-self' && inputs.scope != 'arena-residency')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'pg-input-lifetime' && inputs.scope != 'pg-input-guard' && inputs.scope != 'pg-input-windows' && inputs.scope != 'pg-typed-self' && inputs.scope != 'arena-residency' && inputs.scope != 'poll-budget-contract')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
