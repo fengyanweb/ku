@@ -667,6 +667,9 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
           op->count?op->values:NULL,op->typed?ku_pg_typed_lengths(op->typed):NULL,
           op->typed?ku_pg_typed_formats(op->typed):NULL,op->typed?1:0)
           || !PQsetSingleRowMode(op->conn)) {ku_pg_async_failure(op);return 1;}
+      /* libpq has copied the message. Release only large parameter snapshots;
+       * SQL, metadata and both budget receipts keep their original lifetime. */
+      if(op->param_bytes>=65536u) {free(op->params);op->params=NULL;}
       ku_pg_async_set_phase(op,KU_PG_ASYNC_FLUSH);
     }
     if(op->phase==KU_PG_ASYNC_RESET_SEND) {
