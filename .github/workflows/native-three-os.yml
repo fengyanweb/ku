@@ -374,7 +374,7 @@ jobs:
 
   pg-input-guard:
     if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-input-guard'
-    name: Linux ARM64 ordinary PG net-registration relative guard
+    name: Linux ARM64 ordinary PG candidate relative guard
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     permissions:
@@ -469,7 +469,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ steps.pg_guard_cargo_restore.outputs.cache-primary-key }}
-      - name: Check the affected reactor and ordinary Task network contracts
+      - name: Check the shared PG and ordinary Task network contracts
         timeout-minutes: 5
         shell: bash
         env:
@@ -484,6 +484,16 @@ jobs:
             cargo +1.99.1 test --release --locked --test native_http_test "$test" -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/$test-O2.log" 2>&1
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/$test-O2.log"
             if grep -Ei 'skip(ped)?:' "$KU_PG_GUARD_ROOT/contracts/$test-O2.log"; then exit 1; fi
+          done
+          for test in native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins native_pg_async_rows_share_owner_turn_budgets_without_empty_growth_charges native_pg_typed_single_row_binary_values_validate_types_and_survive_reset; do
+            cargo +1.99.1 test --release --locked --test native_pg_query_poll_test "$test" -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/$test-O2.log" 2>&1
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/$test-O2.log"
+            if grep -Ei 'skip(ped)?:' "$KU_PG_GUARD_ROOT/contracts/$test-O2.log"; then exit 1; fi
+          done
+          for test in native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins native_pg_async_rows_share_owner_turn_budgets_without_empty_growth_charges; do
+            KU_CC='clang-18 -O2 -fsanitize=address,undefined -fno-omit-frame-pointer' ASAN_OPTIONS='detect_leaks=1:halt_on_error=1' UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+              cargo +1.99.1 test --release --locked --test native_pg_query_poll_test "$test" -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/$test-detectors.log" 2>&1
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/$test-detectors.log"
           done
           KU_CC='clang-18 -O2 -fsanitize=address,undefined -fno-omit-frame-pointer' ASAN_OPTIONS='detect_leaks=1:halt_on_error=1' UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
             cargo +1.99.1 test --release --locked --test native_http_test native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlines -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/reactor-detectors.log" 2>&1
