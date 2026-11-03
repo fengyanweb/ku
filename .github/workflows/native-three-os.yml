@@ -397,13 +397,27 @@ jobs:
           rustup default 1.99.1
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18 libclang-rt-18-dev libpq-dev postgresql-16
+      - name: Restore the exact baseline archive bytes
+        id: pg_guard_archive_restore
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/ku-pg-guard-build-cache
+          key: ku-pg-baseline-d05-rust1.99.1-2f1163c34bd45ad4172acf28f1a94f38f7b382a271ba99c6469592beb0744142
       - name: Reuse the verified Rust1.99.1 baseline and request driver
+        if: steps.pg_guard_archive_restore.outputs.cache-hit != 'true'
+        id: pg_guard_archive_download
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: ku-pg-current-build-rust1.99.1
           path: ${{ runner.temp }}/ku-pg-guard-build-cache
           run-id: 41630973206
           github-token: ${{ github.token }}
+      - name: Keep the downloaded archive for the next stage
+        if: ${{ always() && steps.pg_guard_archive_download.outcome == 'success' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/ku-pg-guard-build-cache
+          key: ${{ steps.pg_guard_archive_restore.outputs.cache-primary-key }}
       - name: Verify cache and seed build steps without any old scores
         shell: bash
         run: |
@@ -420,7 +434,7 @@ jobs:
               baseline=os.environ['KU_PG_BASELINE'],prepatch=os.environ['KU_PG_BASELINE'],
               candidate=os.environ['KU_PG_CANDIDATE'],screen_variants=[],pg_input_guard=True)
           reuse_build.prepare_pg_input_guard_cache(
-              Path(os.environ['RUNNER_TEMP'])/'ku-pg-guard-build-cache/ku-performance-v2-evidence.tar.gz',a,source_run='41630973206')
+              Path(os.environ['RUNNER_TEMP'])/'ku-pg-guard-build-cache/ku-pg-current-1.99.1/ku-performance-v2-evidence.tar.gz',a,source_run='41630973206')
           PY
       - name: Restore only Rust1.99.1 candidate Cargo state
         id: pg_guard_cargo_restore
