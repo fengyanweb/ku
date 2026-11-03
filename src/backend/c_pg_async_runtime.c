@@ -609,18 +609,6 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op,KuPgAsyncTurn* turn) {
   }
   op->query.value->rows=op->row_next_rows;return 1;
 }
-/* Successful PQsendQueryParams has copied SQL/parameter bytes into libpq's
- * output buffer (and owns its own command text). Later flushes/results/reset
- * never read these snapshots. Keep typed result metadata until disposal, and
- * keep both budget receipts until their original retirement boundary. This
- * releases only operation-owned buffers, never the caller's input values. */
-static void ku_pg_async_drop_sent_inputs(KuPgAsyncOp* op) {
-  if(!op->sql)return;
-  free(op->sql);op->sql=NULL;
-  free(op->params);op->params=NULL;
-  if(!op->typed)free(op->values);
-  op->values=NULL;
-}
 static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned long long now,int cancelled) {
   if(op->phase==KU_PG_ASYNC_DONE)return 1;
   op->observed_ms=now;if(op->diagnostic_steps!=UINT64_MAX)op->diagnostic_steps++;
@@ -639,7 +627,7 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
   }
   if(op->phase==KU_PG_ASYNC_ACQUIRE) {int acquired=ku_pg_async_acquire(op,now);if(acquired || op->phase==KU_PG_ASYNC_ACQUIRE)return op->phase==KU_PG_ASYNC_DONE;}
   KuPgAsyncTurn turn={0};
-/* A maximum of 32 protocol results per turn. Byte/row hard limits and the
+  /* A maximum of 32 protocol results per turn. Byte/row hard limits and the
    * original absolute deadline also apply in the shared detach implementation. */
   for(size_t work=0;work<32u;work++) {
     if(ku_pg_deadline_expired(op->deadline)) {
@@ -679,7 +667,9 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
           op->count?op->values:NULL,op->typed?ku_pg_typed_lengths(op->typed):NULL,
           op->typed?ku_pg_typed_formats(op->typed):NULL,op->typed?1:0)
           || !PQsetSingleRowMode(op->conn)) {ku_pg_async_failure(op);return 1;}
-      ku_pg_async_drop_sent_inputs(op);
+      /* libpq has copied the message. Release only large parameter snapshots;
+       * SQL, metadata and both budget receipts keep their original lifetime. */
+      if(op->param_bytes>=65536u) {free(op->params);op->params=NULL;}
       ku_pg_async_set_phase(op,KU_PG_ASYNC_FLUSH);
     }
     if(op->phase==KU_PG_ASYNC_RESET_SEND) {
@@ -798,8 +788,7 @@ static void ku_pg_async_dispose(KuPgAsyncOp* op,int transfer_result) {
   else if(op->output.ok)ku_pg_async_drop_table(op,&op->output.value);
   else ku_error_drop(&op->output.error);
   ku_pg_async_drop_query(op);
-  ku_pg_async_drop_sent_inputs(op);
-  if(op->typed)free(op->typed);
+  free(op->sql);free(op->typed?(void*)op->typed:(void*)op->values);free(op->params);
   size_t charge=op->input_charge,operation_charge=op->operation_charge;
   free(op);budget.refund(budget.context,charge);ku_database_operation_end(operation_charge);
   ku_pg_mutex_lock(&p->lock);p->async_operations--;int dispose=ku_pg_client_take_dispose_locked(p);ku_pg_mutex_unlock(&p->lock);

@@ -1952,6 +1952,7 @@ static int live_results = 0, live_connections = 0, shutdowns = 0, bad_calls = 0;
 static int both_waits = 0, read_waits = 0, get_gate = 0, restore_mode = T_RESTORE;
 static int mode_on_send = T_OK, fail_nonblocking = 0, parameter_checks = 0;
 static int reset_mode_on_send = T_RESTORE, reset_sends = 0, user_sends = 0;
+static size_t large_parameter_length = 0;
 static int next_user_transaction_status = KU_PQTRANS_IDLE;
 static int expire_encoding_observation = 0, connect_elapsed = 0;
 static int fail_connect_on_attempt = 0, bad_connect_on_attempt = 0;
@@ -2184,7 +2185,10 @@ int PQsendQueryParams(PGconn* conn, const char* sql, int count, const void* type
   int valid_two = count == 2 && values && strcmp(sql, "SELECT $1::text, $2::text") == 0
       && strcmp(values[0], "x'; SELECT pg_sleep(999); --") == 0 && strcmp(values[1], "UTF8") == 0
       && values[1] == values[0] + strlen(values[0]) + 1;
-  if (types || lengths || formats || format || (!valid_empty && !valid_two)) bad_calls++;
+  int valid_large = large_parameter_length && count == 1 && values && values[0]
+      && strcmp(sql, "SELECT $1::text") == 0 && strlen(values[0]) == large_parameter_length
+      && strspn(values[0], "p") == large_parameter_length;
+  if (types || lengths || formats || format || (!valid_empty && !valid_two && !valid_large)) bad_calls++;
   else parameter_checks++;
   return send_query(conn, sql);
 }
@@ -3069,40 +3073,43 @@ static void async_drop_output(KuPgAsyncOp* op,AsyncBudget* b,int expected_ok) {
   size_t bytes=0;if(result.ok){if(!ku_pg_result_owned_bytes(result.value,&bytes))abort();ku_drop_pg_result(&result.value);}else ku_error_drop(&result.error);
   ku_pg_async_dispose(op,1);if(bytes)async_refund(b,bytes);if(b->bytes)abort();
 }
-static int async_sent_inputs_lifetime(void) {
+static int async_large_parameter_lifetime(void) {
+  const size_t lengths[]={65534u,65535u,65536u,2u*1024u*1024u};
   const int modes[]={T_FLUSH_TIMEOUT,T_READ_TIMEOUT,T_SEND_FAIL,T_SINGLE_FAIL};
   track_runtime_allocations=1;
-  for(size_t test=0;test<sizeof(modes)/sizeof(modes[0]);test++) {
-    mode_on_send=modes[test];reset_mode_on_send=T_RESTORE;
+  for(size_t size=0;size<sizeof(lengths)/sizeof(lengths[0]);size++)for(size_t test=0;test<4u;test++) {
+    mode_on_send=modes[test];reset_mode_on_send=T_RESTORE;large_parameter_length=lengths[size];
     KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);
     CHECK(opened.ok);AsyncBudget budget={0};KuError error={0};
-    KuString inputs[]={text("x'; SELECT pg_sleep(999); --"),text("UTF8")};
-    KuPgAsyncOp* op=ku_pg_async_create(opened.value,text("SELECT $1::text, $2::text"),
-        (KuArray_str){2u,inputs},clock_ms+2000u,
+    KuString input=ku_string_alloc(large_parameter_length);memset(input.ptr,'p',input.len);KuString original=input;
+    KuPgAsyncOp* op=ku_pg_async_create(opened.value,text("SELECT $1::text"),(KuArray_str){1u,&input},clock_ms+2000u,
         (KuPgAsyncBudget){&budget,async_reserve,async_refund},async_wake,&budget,&error);
-    CHECK(op && op->sql && op->params && op->values && !op->typed);
-    size_t before=runtime_bytes,charge=budget.bytes;
-    size_t snapshots=op->sql_bytes+op->param_bytes+op->values_bytes;
-    int before_sends=user_sends,before_resets=reset_sends;
-    int done=ku_pg_async_step(op,0,clock_ms,0);
-    CHECK(user_sends==before_sends+1 && reset_sends==before_resets);
-    CHECK(budget.bytes==charge && !budget.refunds);
+    CHECK(op && op->sql && op->params && op->values && !op->typed && op->param_bytes==input.len+1u
+        && op->params!=(char*)input.ptr && !memcmp(op->params,input.ptr,input.len));
+    char* sql=op->sql;const char** values=op->values;
+    size_t before=runtime_bytes,charge=budget.bytes,pending=ku_database_budget_snapshot().pending_bytes;
+    int before_live=live_runtime_allocations,before_sends=user_sends,before_resets=reset_sends;
+    int done=ku_pg_async_step(op,0,clock_ms,0),released=test<2u && op->param_bytes>=65536u;
+    CHECK(user_sends==before_sends+1 && reset_sends==before_resets && budget.bytes==charge && !budget.refunds
+        && ku_database_budget_snapshot().pending_operations==1u && ku_database_budget_snapshot().pending_bytes==pending);
+    CHECK(op->sql==sql && op->values==values && !strcmp(op->sql,"SELECT $1::text")
+        && runtime_allocation_index(sql)>=0 && runtime_allocation_index((void*)values)>=0);
+    CHECK((op->params==NULL)==released && runtime_bytes+(released?op->param_bytes:0u)==before
+        && live_runtime_allocations==before_live-released);
     if(test<2u) {
-      CHECK(!done && !op->sql && !op->params && !op->values);
-      CHECK(runtime_bytes+snapshots==before);
-      CHECK(op->phase==(test?KU_PG_ASYNC_READ:KU_PG_ASYNC_FLUSH)
-          && op->interest==(test?1u:3u));
-      CHECK(async_finish(op,1) && error_is(op->output,"execution_unknown"));
-    } else {
-      /* A failed submission/setup retains the original disposal path. */
-      CHECK(done && op->sql && op->params && op->values && !op->output.ok);
-    }
-    CHECK(equals(inputs[0],"x'; SELECT pg_sleep(999); --") && equals(inputs[1],"UTF8"));
-    async_drop_output(op,&budget,0);ku_pg_client_close_owned(opened.value);
-    CHECK(!budget.bytes && !runtime_bytes && !live_runtime_allocations && !live_connections && !live_results);
-    CHECK(user_sends==before_sends+1 && reset_sends==before_resets);
+      CHECK(!done && op->phase==(test?KU_PG_ASYNC_READ:KU_PG_ASYNC_FLUSH) && op->interest==(test?1u:3u));
+      if(test) {op->conn->mode=T_OK;CHECK(async_finish(op,0) && op->output.ok);}
+      else CHECK(async_finish(op,1) && error_is(op->output,"execution_unknown"));
+    } else CHECK(done && !op->output.ok && op->params);
+    CHECK(input.ptr==original.ptr && input.len==original.len && input.capacity==original.capacity
+        && input.storage==original.storage && input.storage==KU_STRING_OWNED);
+    for(size_t byte=0;byte<input.len;byte++)CHECK(input.ptr[byte]=='p');
+    async_drop_output(op,&budget,test==1u);ku_pg_client_close_owned(opened.value);ku_string_drop(&input);
+    CHECK(!budget.bytes && !runtime_bytes && !live_runtime_allocations && !live_connections && !live_results
+        && !ku_database_budget_snapshot().pending_operations && !ku_database_budget_snapshot().pending_bytes);
+    CHECK(user_sends==before_sends+1 && reset_sends==before_resets+(test==1u));
   }
-  track_runtime_allocations=0;CHECK(!bad_calls);return 0;
+  large_parameter_length=0;track_runtime_allocations=0;CHECK(!bad_calls);return 0;
 }
 int main(void) {
   clock_ms=1000;clock_step=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
@@ -3143,7 +3150,7 @@ int main(void) {
   for(size_t i=0;i<128;i++){CHECK(budgets[i].wakes==1);CHECK(waiters[i]->waiter.in_flight==0);CHECK(async_finish(waiters[i],1));async_drop_output(waiters[i],&budgets[i],0);}
   CHECK(async_finish(held,1));async_drop_output(held,&b,0); /* Last op physically destroys closed p. */
   CHECK(live_results==0 && live_connections==0 && live_runtime_allocations==0);
-  CHECK(!async_sent_inputs_lifetime());
+  CHECK(!async_large_parameter_lifetime());
   puts("pg async pump closed loop");return 0;
 }
 "#;
@@ -4033,6 +4040,7 @@ int main(void) {
 
 const TYPED_STUB_GLOBALS: &str = r#"
 static int typed_rows=1,typed_errors,typed_large,typed_parameter_checks;
+static size_t typed_large_parameter_length;
 static char typed_large_bytes[131080];
 static char typed_source_text[]="\xe4\xb8\xad\xe6\x96\x87\xf0\x9f\x99\x82 ' \\";
 static const unsigned int typed_column_oids[10]={23u,20u,16u,25u,1043u,25u,23u,20u,16u,20u};
@@ -4042,6 +4050,12 @@ static int typed_accept_parameters(int,const void*,const char* const*,const int*
 
 const TYPED_QUERY_SUITE: &str = r#"
 static int typed_accept_parameters(int count,const void* raw,const char* const* values,const int* lengths,const int* formats) {
+  if(typed_large_parameter_length) {
+    int valid=count==1 && raw && values && values[0] && lengths && formats
+        && ((const uint32_t*)raw)[0]==25u && formats[0]==1 && lengths[0]==(int)typed_large_parameter_length;
+    for(size_t i=0;valid && i<typed_large_parameter_length;i++)valid=values[0][i]=='p';
+    if(!valid)bad_calls++;else typed_parameter_checks++;return valid;
+  }
   static const uint32_t expected[6]={23u,20u,16u,25u,25u,1043u};
   const uint32_t* types=(const uint32_t*)raw;int valid=count==6 && types && values && lengths && formats;
   for(int i=0;valid && i<6;i++)valid=types[i]==expected[i] && formats[i]==1;
@@ -4080,6 +4094,47 @@ static int typed_values(KuPgResult* result) {
   a=ku_pg_value_int(result,0,9);CHECK(!a.ok && equals(a.error.code,"null_value"));ku_error_drop(&a.error);
   return 0;
 }
+static int typed_large_parameter_lifetime(void) {
+  const size_t lengths[]={65534u,65535u,65536u,2u*1024u*1024u};
+  const int modes[]={T_FLUSH_TIMEOUT,T_READ_TIMEOUT,T_SEND_FAIL,T_SINGLE_FAIL};
+  KuString parameter=text("text");
+  KuString columns[]={text("int4"),text("int8"),text("bool"),text("text"),text("varchar"),text("text?"),text("int4"),text("int8"),text("bool"),text("int8?")};
+  for(size_t size=0;size<sizeof(lengths)/sizeof(lengths[0]);size++)for(size_t test=0;test<4u;test++) {
+    mode_on_send=modes[test];reset_mode_on_send=T_RESTORE;typed_large_parameter_length=lengths[size];
+    KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);
+    CHECK(opened.ok);AsyncBudget budget={0};KuError error={0};
+    KuString input=ku_string_alloc(typed_large_parameter_length);memset(input.ptr,'p',input.len);KuString original=input;
+    KuValue value=ku_v_str(input);
+    KuPgAsyncOp* op=ku_pg_async_create_one_typed(opened.value,
+        text("SELECT 0::int4,0::int8,true,$1::text,''::varchar,NULL::text,2147483647::int4,9223372036854775807::int8,false,NULL::int8"),
+        &value,1u,(KuArray_str){1u,&parameter},(KuArray_str){10u,columns},clock_ms+2000u,
+        (KuPgAsyncBudget){&budget,async_reserve,async_refund},async_wake,&budget,&error);
+    CHECK(op && op->params && op->param_bytes==input.len+1u && !memcmp(op->params,input.ptr,input.len));
+    KuPgTypedQuery* metadata=op->typed;char* sql=op->sql;const char** values=op->values;
+    size_t before=runtime_bytes,charge=budget.bytes,pending=ku_database_budget_snapshot().pending_bytes;
+    int before_live=live_runtime_allocations,before_sends=user_sends,before_resets=reset_sends;
+    int done=ku_pg_async_step(op,0,clock_ms,0),released=test<2u && op->param_bytes>=65536u;
+    CHECK(op->typed==metadata && op->sql==sql && op->values==values && metadata->parameters==1u && metadata->columns==10u
+        && !metadata->rows_seen && ku_pg_typed_lengths(metadata)[0]==(int)input.len
+        && ku_pg_typed_formats(metadata)[0]==1 && ku_pg_typed_parameter_oids(metadata)[0]==25u);
+    CHECK((op->params==NULL)==released && runtime_bytes+(released?op->param_bytes:0u)==before
+        && live_runtime_allocations==before_live-released && budget.bytes==charge && !budget.refunds
+        && ku_database_budget_snapshot().pending_operations==1u && ku_database_budget_snapshot().pending_bytes==pending);
+    if(test<2u) {
+      CHECK(!done && op->phase==(test?KU_PG_ASYNC_READ:KU_PG_ASYNC_FLUSH) && op->interest==(test?1u:3u));
+      if(test) {op->conn->mode=T_TYPED;CHECK(async_finish(op,0) && op->output.ok && metadata->rows_seen==1u);CHECK(!typed_values(op->output.value));}
+      else CHECK(async_finish(op,1) && error_is(op->output,"execution_unknown"));
+    } else CHECK(done && !op->output.ok && op->params);
+    CHECK(input.ptr==original.ptr && input.len==original.len && input.capacity==original.capacity && input.storage==original.storage
+        && value.tag==KU_STR && value.as.s.ptr==input.ptr && input.storage==KU_STRING_OWNED);
+    for(size_t byte=0;byte<input.len;byte++)CHECK(input.ptr[byte]=='p');
+    async_drop_output(op,&budget,test==1u);ku_pg_client_close_owned(opened.value);ku_string_drop(&input);
+    CHECK(!budget.bytes && !runtime_bytes && !live_runtime_allocations && !live_connections && !live_results
+        && !ku_database_budget_snapshot().pending_operations && !ku_database_budget_snapshot().pending_bytes);
+    CHECK(user_sends==before_sends+1 && reset_sends==before_resets+(test==1u));
+  }
+  typed_large_parameter_length=0;CHECK(!bad_calls);return 0;
+}
 int main(void) {
   clock_ms=1000;clock_step=0;track_runtime_allocations=1;mode_on_send=T_TYPED;reset_mode_on_send=T_RESTORE;
   KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);CHECK(opened.ok);
@@ -4087,8 +4142,6 @@ int main(void) {
   typed_source_text[0]='z';CHECK((uint8_t)op->values[3][0]==0xe4u);typed_source_text[0]=(char)0xe4;
   CHECK(async_finish(op,0) && op->output.ok && op->output.value->rows==1u && op->output.value->cols==10u
       && op->output.value->cell_capacity==10u && ku_pg_result_is_typed(op->output.value));
-  CHECK(!op->sql && !op->params && !op->values && op->typed
-      && op->typed->parameters==6u && op->typed->columns==10u && op->typed->rows_seen==1u);
   KuResult_pg_result detached=ku_pg_async_take(op);size_t physical=0;
   CHECK(ku_pg_result_owned_bytes(detached.value,&physical) && physical==sizeof(KuPgResult)+120u+40u);
   ku_pg_async_dispose(op,1);ku_pg_client_close_owned(pool);
@@ -4142,6 +4195,7 @@ int main(void) {
   CHECK(!typed_values(op->output.value));async_drop_output(op,&budget,1);
   ku_pg_client_close_owned(pool);
   CHECK(!budget.bytes && !live_connections && !live_results && !live_runtime_allocations && !runtime_bytes && !bad_calls && typed_parameter_checks>0);
+  CHECK(!typed_large_parameter_lifetime());
   puts("pg typed single-row binary values and strict lifetime closed loop");return 0;
 }
 "#;

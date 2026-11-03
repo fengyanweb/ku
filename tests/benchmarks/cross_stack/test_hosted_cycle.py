@@ -62,7 +62,7 @@ class HostedCycleTests(unittest.TestCase):
         for flag in ('pg_queue_screen','normal_self_probe','http_short_screen','pg_failure_probe','pg_driver_screen','task_json_screen','common_http_screen','final_task_json','memory_owner_probe'):
             with self.subTest(flag=flag),self.assertRaises(ValueError):
                 h.validate_screen_selection(types.SimpleNamespace(**base,**{flag:True}),'diagnostic')
-        for change in ({'baseline':h.BASELINE},{'prepatch':h.BASELINE},{'candidate':'b'*40}):
+        for change in ({'baseline':h.BASELINE},{'prepatch':h.BASELINE},{'candidate':'short'},{'candidate':h.PG_INPUT_PREPATCH}):
             with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(**dict(base,**change)),'diagnostic')
 
     def test_pg_input_guard_comparison_never_passes_unknown_or_partial(self):
@@ -151,7 +151,7 @@ class HostedCycleTests(unittest.TestCase):
                             driver_headroom={'fraction_of_quota':.3,'saturated':False})))
                         h.save(Path(output)/part/'driver-cleanup.json',dict(process_reaped=not(issue=='cleanup' and not control),cgroup_removed=True,after={'process_count':0}))
                     row['score_report']=str(Path(output)/'score/client.json');return row
-                patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,pg_input_guard=True)
+                patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,pg_input_guard=True,candidate=h.PG_INPUT_CANDIDATE)
                 if issue in ('flags','business'):
                     with self.assertRaises(ValueError):h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
                     self.assertEqual(measured,[]);database.assert_not_called();continue

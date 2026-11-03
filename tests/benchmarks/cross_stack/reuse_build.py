@@ -297,6 +297,39 @@ def prepare_typed_pg_from_input_guard(archive,root,source,tools):
     return manifests
 
 
+def prepare_pg_input_guard_cache(archive,a):
+    """Seed verified completed build steps, never a timed result, into a fresh guard."""
+    if os.geteuid()==0:raise ValueError('prepare cached builds as the ordinary benchmark user')
+    h.validate_screen_selection(a,'diagnostic')
+    root=Path(a.root);source=Path(a.source)
+    mapping=extract_builds(archive,root,TYPED_GUARD_ARCHIVE_SHA,{'A','Driver'},pg_input_cache=True)
+    restore_json_inputs(source,root,{'A':TYPED_GUARD_PRODUCT,'Driver':TYPED_GUARD_REJECTED},mapping)
+    for name in ('A','Driver'):validate_protocol_inputs(root,name,mapping)
+    driver=verify_driver_cache(root)
+    normal=verify_manifest(root,'A',TYPED_GUARD_PRODUCT,mapping,client_source_name='Driver')
+    checked(normal['stacks']['ku']['command'][0],PG_CACHE_ELFS['normal'])
+    unchanged=subprocess.run(['git','-C',str(source),'diff','--quiet',TYPED_GUARD_PRODUCT,
+        a.candidate,'--','tests/benchmarks/cross_stack'],timeout=10)
+    if unchanged.returncode!=0:raise ValueError('cached benchmark inputs differ from the explicit new candidate')
+    new_driver_source=subprocess.check_output(['git','-C',str(source),'show',
+        a.candidate+':tests/benchmarks/cross_stack/client/main.go'],timeout=10)
+    if hashlib.sha256(new_driver_source).hexdigest()!=driver['client']['source_sha256']:
+        raise ValueError('cached driver source differs from the explicit new candidate')
+    if normal['client']['sha256']!=driver['client']['sha256']:raise ValueError('cached A/Driver identity mismatch')
+    old=h.load(root/'reuse-original-state.json');state=dict(identity=h.hosted_identity(a,'diagnostic'),
+        uid=os.getuid(),gid=os.getgid(),steps={},goal_status='unknown',imported_measurement_windows=0)
+    for name,manifest in (('A',normal),('Driver',driver)):
+        step=copy.deepcopy(old['steps']['build-'+name]);step['result']=manifest
+        step.update(reused_from_run='41582847043',build_repeated=False)
+        state['steps']['build-'+name]=step
+    h.save(root/'hosted-state.json',state)
+    h.save(root/'verified-baseline-cache.json',dict(archive_sha256=TYPED_GUARD_ARCHIVE_SHA,
+        original_A_source=TYPED_GUARD_PRODUCT,candidate_source=a.candidate,A_ELF=PG_CACHE_ELFS['normal'],
+        source_run='41582847043',driver_source_matches_candidate=True,benchmark_inputs_match_candidate=True,imported_measurement_windows=0,
+        reused_steps=['build-A','build-Driver'],new_candidate_build_still_required=True))
+    return state
+
+
 def new_driver(a):
     directory=a.source/'tests/benchmarks/cross_stack/client';out=a.root/'fresh-driver';out.mkdir()
     def sources():return {p.relative_to(directory).as_posix():h.sha(p) for p in directory.rglob('*')

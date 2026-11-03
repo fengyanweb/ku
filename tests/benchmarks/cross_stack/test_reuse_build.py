@@ -32,6 +32,36 @@ def archive(path, changes=None, old_run=False):
 
 class ReuseBuildTests(unittest.TestCase):
 
+    def test_guard_cache_seeds_only_verified_A_driver_not_candidate_or_measurements(self):
+        for same_source in (True,False):
+            with self.subTest(same_source=same_source),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp)/'fresh';candidate='c'*40
+                a=types.SimpleNamespace(root=root,source=Path(temp)/'repo',baseline=r.TYPED_GUARD_PRODUCT,
+                    prepatch=r.TYPED_GUARD_PRODUCT,candidate=candidate,screen_variants=[],pg_input_guard=True)
+                client={'sha256':'driver','source_sha256':hashlib.sha256(b'go').hexdigest()}
+                normal={'client':client,'stacks':{'ku':{'command':['immutable-A']}}}
+                def extract(*args,**kwargs):
+                    root.mkdir();r.h.save(root/'reuse-original-state.json',{'steps':{k:{'state':'completed'}
+                        for k in ('build-A','build-Driver')}});return {}
+                patches.enter_context(patch.object(r.os,'geteuid',return_value=1001))
+                patches.enter_context(patch.object(r,'extract_builds',side_effect=extract))
+                patches.enter_context(patch.object(r,'restore_json_inputs'))
+                patches.enter_context(patch.object(r,'validate_protocol_inputs'))
+                patches.enter_context(patch.object(r,'verify_driver_cache',return_value={'client':client}))
+                patches.enter_context(patch.object(r,'verify_manifest',return_value=normal))
+                patches.enter_context(patch.object(r,'checked'))
+                patches.enter_context(patch.object(r.subprocess,'run',return_value=types.SimpleNamespace(returncode=0)))
+                patches.enter_context(patch.object(r.subprocess,'check_output',return_value=b'go' if same_source else b'changed'))
+                if not same_source:
+                    with self.assertRaisesRegex(ValueError,'cached driver source differs'):r.prepare_pg_input_guard_cache(Path(temp)/'archive',a)
+                    self.assertFalse((root/'hosted-state.json').exists());continue
+                state=r.prepare_pg_input_guard_cache(Path(temp)/'archive',a)
+                self.assertEqual(state['identity'],r.h.hosted_identity(a,'diagnostic'))
+                self.assertEqual(set(state['steps']),{'build-A','build-Driver'})
+                self.assertEqual(state['imported_measurement_windows'],0)
+                self.assertNotIn('build-B',state['steps']);self.assertNotIn('diagnostic',state['steps'])
+                self.assertTrue(r.h.load(root/'verified-baseline-cache.json')['new_candidate_build_still_required'])
+
     def test_fixed_guard_cache_only_imports_default_A_and_Driver_builds(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);path=root/'guard.tgz'
