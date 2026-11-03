@@ -692,6 +692,7 @@ fn native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_p
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).replace('\r', ""),
         "pg async pump closed loop\n"
@@ -1952,6 +1953,7 @@ static int live_results = 0, live_connections = 0, shutdowns = 0, bad_calls = 0;
 static int both_waits = 0, read_waits = 0, get_gate = 0, restore_mode = T_RESTORE;
 static int mode_on_send = T_OK, fail_nonblocking = 0, parameter_checks = 0;
 static int reset_mode_on_send = T_RESTORE, reset_sends = 0, user_sends = 0;
+static void (*async_before_send_observation)(const PGconn*,int);
 static int next_user_transaction_status = KU_PQTRANS_IDLE;
 static int expire_encoding_observation = 0, connect_elapsed = 0;
 static int fail_connect_on_attempt = 0, bad_connect_on_attempt = 0;
@@ -2106,6 +2108,7 @@ int PQtransactionStatus(const PGconn* conn) {
 }
 const char* PQparameterStatus(const PGconn* conn, const char* parameter) {
   (void)parameter;
+  if(async_before_send_observation)async_before_send_observation(conn,1);
   if (!conn->utf8 && expire_encoding_observation) { clock_ms = test_deadline; expire_encoding_observation = 0; }
   return conn->utf8 ? "UTF8" : "LATIN1";
 }
@@ -2200,7 +2203,7 @@ int PQconsumeInput(PGconn* conn) {
   if (!conn->nonblocking) bad_calls++;
   if (conn->shutdowns) { poisoned_consumes++; conn->status = KU_PG_CONNECTION_BAD; return 0; }
   if (conn->status != KU_PG_CONNECTION_OK) return 0;
-  if (!conn->active) return 1;
+  if (!conn->active) {if(async_before_send_observation)async_before_send_observation(conn,0);return 1;}
   /* All normal response packets are already buffered after the first row.
      Reading again before asking isBusy would model libpq input accumulation. */
   if (conn->index > 0 && conn->index < conn->total && conn->mode != T_PARTIAL_TIMEOUT) read_ahead_calls++;
@@ -3069,6 +3072,70 @@ static void async_drop_output(KuPgAsyncOp* op,AsyncBudget* b,int expected_ok) {
   size_t bytes=0;if(result.ok){if(!ku_pg_result_owned_bytes(result.value,&bytes))abort();ku_drop_pg_result(&result.value);}else ku_error_drop(&result.error);
   ku_pg_async_dispose(op,1);if(bytes)async_refund(b,bytes);if(b->bytes)abort();
 }
+typedef struct AsyncSendFenceObserver {
+  KuPgAsyncOp* op;int target,mode,cancel,hooks;size_t calls;KuPgResult* detached;
+} AsyncSendFenceObserver;
+static AsyncSendFenceObserver* async_send_fence_active;
+static int async_send_fence_observe(void* raw,uint64_t generation) {
+  AsyncSendFenceObserver* observer=(AsyncSendFenceObserver*)raw;
+  if(generation!=41u)abort();
+  if(observer->op->phase==observer->target) {
+    observer->calls++;
+    if(observer->mode==2)clock_ms=observer->op->deadline;
+    if(observer->target==KU_PG_ASYNC_RESET_SEND)observer->detached=observer->op->output.value;
+  }
+  return observer->cancel;
+}
+static void async_send_fence_hook(const PGconn* conn,int encoding) {
+  AsyncSendFenceObserver* observer=async_send_fence_active;
+  if(!observer || observer->op->conn!=conn
+      || observer->op->phase!=(encoding?KU_PG_ASYNC_RESET_SEND:KU_PG_ASYNC_PREPARE)
+      || observer->target!=(encoding?KU_PG_ASYNC_RESET_SEND:KU_PG_ASYNC_SEND))return;
+  async_before_send_observation=NULL;observer->hooks++;
+  if(encoding)observer->detached=observer->op->output.value;
+  if(observer->mode==0)clock_ms=observer->op->deadline;else observer->cancel=1;
+}
+static int async_send_fence_cases(void) {
+  int failures=0;
+  for(int reset=0;reset<2;reset++)for(int mode=0;mode<3;mode++) {
+    clock_ms=1000;clock_step=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
+    track_runtime_allocations=1;
+    KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);
+    CHECK(opened.ok);KuPgClient* pool=opened.value;AsyncBudget budget={0};
+    KuPgAsyncOp* op=async_create(pool,&budget);
+    AsyncSendFenceObserver observer={op,reset?KU_PG_ASYNC_RESET_SEND:KU_PG_ASYNC_SEND,mode,0,0,0,NULL};
+    op->waiter.diagnostic.job_generation=41u;op->fresh_cancel_context=&observer;
+    op->fresh_cancel=async_send_fence_observe;async_send_fence_active=&observer;
+    if(mode!=2)async_before_send_observation=async_send_fence_hook;
+    int before_user=user_sends,before_reset=reset_sends;
+    CHECK(async_finish(op,0) && ku_pg_async_can_dispose(op));
+    async_before_send_observation=NULL;async_send_fence_active=NULL;
+    int correct=user_sends-before_user==reset && reset_sends==before_reset
+        && op->sent==reset && !op->reset_sent && !pool->conns[0] && !pool->active
+        && (mode==2?observer.calls==1u:observer.hooks==1);
+    size_t owned=0;
+    if(op->output.ok)CHECK(ku_pg_result_owned_bytes(op->output.value,&owned));
+    if(reset) {
+      correct=correct && op->output.ok && op->output.value==observer.detached
+          && budget.bytes==op->input_charge+owned;
+      if(op->output.ok) {
+        KuResult_str value=ku_pg_value(op->output.value,0,0);
+        CHECK(value.ok && value.value.len);ku_test_pg_free(value.value.ptr);
+      }
+    } else correct=correct && !op->output.ok
+        && error_is(op->output,mode==1?"cancelled":"query_timeout") && budget.bytes==op->input_charge;
+    fprintf(stderr,"PG send fence %s/%s: user_sends=%d reset_sends=%d sent=%d reset_sent=%d hooks=%d observers=%zu output=%.*s evicted=%d charged=%zu owned=%zu valid=%d\n",
+        reset?"reset":"query",mode==0?"deadline":mode==1?"cancel":"observer-crosses-deadline",
+        user_sends-before_user,reset_sends-before_reset,op->sent,op->reset_sent,observer.hooks,observer.calls,
+        op->output.ok?2:(int)op->output.error.code.len,op->output.ok?"ok":(const char*)op->output.error.code.ptr,
+        !pool->conns[0],budget.bytes,owned,correct);
+    int actual_ok=op->output.ok;async_drop_output(op,&budget,actual_ok);ku_pg_client_close_owned(pool);
+    CHECK(!budget.bytes && !live_results && !live_connections && !live_runtime_allocations && !runtime_bytes
+        && !ku_database_budget_snapshot().pending_operations && !ku_database_budget_snapshot().pending_bytes);
+    if(!correct)failures++;
+  }
+  track_runtime_allocations=0;return failures;
+}
 int main(void) {
   clock_ms=1000;clock_step=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
   KuResult_pg_client captured=ku_pg_client_open(ku_string_static((const uint8_t*)"hostaddr=127.0.0.1",18),1,128,1000,1000,2000);
@@ -3108,6 +3175,7 @@ int main(void) {
   for(size_t i=0;i<128;i++){CHECK(budgets[i].wakes==1);CHECK(waiters[i]->waiter.in_flight==0);CHECK(async_finish(waiters[i],1));async_drop_output(waiters[i],&budgets[i],0);}
   CHECK(async_finish(held,1));async_drop_output(held,&b,0); /* Last op physically destroys closed p. */
   CHECK(live_results==0 && live_connections==0 && live_runtime_allocations==0);
+  CHECK(!async_send_fence_cases());
   puts("pg async pump closed loop");return 0;
 }
 "#;
@@ -3832,10 +3900,13 @@ int main(void) {
 const ASYNC_TURN_SUITE: &str = r#"
 /* A deterministic pinned-executor substitute. It observes the exact old growth
  * yield, after allocation but before any result byte/cell has been published. */
-typedef struct AsyncFreshObserver { KuPgAsyncOp* operation;uint64_t generation;size_t calls;int cancel,expire; } AsyncFreshObserver;
+typedef struct AsyncFreshObserver { KuPgAsyncOp* operation;uint64_t generation;size_t calls;int cancel,expire;size_t send_calls,reset_calls; } AsyncFreshObserver;
 static int async_fresh_observe(void* raw,uint64_t generation) {
   AsyncFreshObserver* observer=(AsyncFreshObserver*)raw;KuPgAsyncOp* op=observer->operation;
-  if(generation!=observer->generation || !op->query.value || op->row_phase!=3
+  if(generation!=observer->generation)abort();
+  if(op->phase==KU_PG_ASYNC_SEND) {observer->send_calls++;return 0;}
+  if(op->phase==KU_PG_ASYNC_RESET_SEND) {observer->reset_calls++;return 0;}
+  if(!op->query.value || op->row_phase!=3
       || op->query.value->rows || op->query.value->bytes_len)abort();
   observer->calls++;if(observer->expire)clock_ms=op->deadline;return observer->cancel;
 }
@@ -3887,6 +3958,7 @@ int main(void) {
   size_t standalone_steps=async_turn_steps;async_turn_steps=0;
   AsyncFreshObserver observer={0};op=async_create(pool,&budget);async_use_fresh_observer(op,&observer);
   CHECK(async_measured_finish(op) && op->output.ok && observer.calls==1u
+      && observer.send_calls==1u && observer.reset_calls==1u
       && async_turn_steps<=standalone_steps && op->output.value->rows==257
       && op->output.value->bytes_len==257u*3u*4u);
   size_t observed=observer.calls;async_drop_output(op,&budget,1);CHECK(observer.calls==observed && !budget.bytes);
@@ -3895,6 +3967,7 @@ int main(void) {
     op=async_create(pool,&budget);async_use_fresh_observer(op,&observer);
     sends_before=user_sends;resets_before=reset_sends;
     CHECK(async_measured_finish(op) && !op->output.ok && observer.calls==1u
+        && observer.send_calls==1u && !observer.reset_calls
         && error_is(op->output,"execution_unknown") && user_sends==sends_before+1
         && reset_sends==resets_before && !pool->conns[0] && !pool->active);
     observed=observer.calls;async_drop_output(op,&budget,0);
