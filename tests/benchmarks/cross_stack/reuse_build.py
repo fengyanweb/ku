@@ -11,6 +11,8 @@ MAX_FILES=20000
 MAX_FILE=128<<20
 MAX_TOTAL=768<<20
 TOKEN='${EVIDENCE_ROOT}'
+TYPED_PG_ARCHIVE_SHA='b6eaf2d1e1c3273017a63890d74ec42c366c0219056ea3ad64cb0d9bda885ea1'
+TYPED_PG_PRODUCT='80aaf7bccd4a436ebdf83e2283a83fcc6deec4fd'
 
 
 def checked(path, expected):
@@ -25,7 +27,7 @@ def translated(value, root):
     return value
 
 
-def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False):
+def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False, typed_pg_observation=False):
     """Check all paths/map entries first; write only into a fresh owned tree."""
     checked(archive,expected_sha256)
     root=Path(root)
@@ -51,12 +53,16 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
         mapping={entry['path']:entry for entry in entries}
         if len(mapping)!=len(entries):raise ValueError('duplicate portable map entry')
         old=json.load(tar.extractfile('hosted-state.json'))
+        typed_cache=(typed_pg_observation and expected_sha256==TYPED_PG_ARCHIVE_SHA
+            and set(names)=={'B','BP','R'} and old.get('identity',{}).get('candidate')==TYPED_PG_PRODUCT
+            and all(old.get('steps',{}).get(k,{}).get('state')=='completed' for k in ('build','run')))
+        if typed_pg_observation and not typed_cache:raise ValueError('fixed typed PG build cache required')
         if any(not name.startswith('build') for name in old.get('steps',{})):
-            if not (owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
+            if not typed_cache and not (owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
                     and set(old.get('steps',{}))=={'build','build-B','build-R','diagnostic'}
                     and all(v.get('state')=='completed' for v in old['steps'].values())):
                 raise ValueError('this reuse path accepts build-only source runs except the fixed owner archive')
-        if any(old.get('steps',{}).get('build-'+name,{}).get('state')!='completed' for name in names):
+        if not typed_cache and any(old.get('steps',{}).get('build-'+name,{}).get('state')!='completed' for name in names):
             raise ValueError('requested normal build was not completed')
         selected=[m for m in members if PurePosixPath(m.name).parts[0] in names]
         root.mkdir(parents=True,exist_ok=True)
@@ -69,7 +75,7 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
             with destination.open('xb') as stream:stream.write(data)
             destination.chmod(member.mode&0o777)
         h.save(root/'reuse-portable-file-map.json',index)
-        provenance=old if not owner_observation else dict(identity=old.get('identity'),
+        provenance=old if not (owner_observation or typed_cache) else dict(identity=old.get('identity'),
             steps={k:v for k,v in old.get('steps',{}).items() if k.startswith('build')},measurement_results_imported=False)
         h.save(root/'reuse-original-state.json',provenance)
         return mapping
@@ -125,7 +131,7 @@ def require_elf(path):
         raise ValueError('reused artifact is not ELF64 little-endian AArch64: '+str(path))
 
 
-def verify_manifest(root, name, commit, mapping, verify_system=True):
+def verify_manifest(root, name, commit, mapping, verify_system=True, *, expected_pg_read='int'):
     path=root/name/'manifest.json';original=h.load(path);m=translated(original,root)
     receipt=h.load(m['build_receipt'])
     if (m.get('candidate_base')!=commit or receipt.get('candidate_base')!=commit
@@ -149,7 +155,9 @@ def verify_manifest(root, name, commit, mapping, verify_system=True):
                 build['source_files_sha256'][relative]=entry['archived_sha256']
             else:checked(file,digest)
     else:
-        if any(build.get(k)!=v for k,v in [('formatting_mode','helpers'),('json_response_mode','text'),('pg_execution_mode','async'),('pg_read_mode','int')]):
+        if expected_pg_read not in ('int','typed') or (expected_pg_read=='typed' and name!='BP'):
+            raise ValueError('explicit typed BP or ordinary int mode required')
+        if any(build.get(k)!=v for k,v in [('formatting_mode','helpers'),('json_response_mode','text'),('pg_execution_mode','async'),('pg_read_mode',expected_pg_read)]):
             raise ValueError('reused build is not the normal helpers/text/async/int contract')
         if build.get('json_execution_mode','worker')!=('task' if name=='BT' else 'worker'):
             raise ValueError('reused JSON execution mode differs: '+name)
@@ -186,6 +194,31 @@ def verify_manifest(root, name, commit, mapping, verify_system=True):
         imported_measurement_windows=0,original_manifest=str(root/'reuse-provenance'/(name+'-manifest.json')))
     h.save(path,m)
     return m
+
+
+def prepare_typed_pg_cache(archive,root,source,*,verify_system=True):
+    """The exact completed80 archive supplies artifacts only, never its scores."""
+    root=Path(root);source=Path(source)
+    mapping=extract_builds(archive,root,TYPED_PG_ARCHIVE_SHA,{'B','BP','R'},typed_pg_observation=True)
+    commits={name:TYPED_PG_PRODUCT for name in ('B','BP','R')}
+    restore_json_inputs(source,root,commits,mapping)
+    manifests={}
+    expected={'B':'234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b',
+        'BP':'faf34cec074f10b225ad880f149fb60f2fda9068fd192872ee00222344bd5b93'}
+    for name,mode in (('B','int'),('BP','typed')):
+        validate_protocol_inputs(root,name,mapping)
+        manifest=verify_manifest(root,name,TYPED_PG_PRODUCT,mapping,verify_system,expected_pg_read=mode)
+        checked(manifest['stacks']['ku']['command'][0],expected[name])
+        if not verify_system:
+            # Offline provenance review only; actual Linux use still requires
+            # the exact selected system libpq and compiler below the loader.
+            manifest['stacks']['ku']['build']['libpq_source']=str(root/name/'build/libpq/libpq.so')
+            h.save(root/name/'manifest.json',manifest)
+        manifests[name]=str(root/name/'manifest.json')
+    h.save(root/'typed-pg-cache.json',dict(manifests=manifests,source_run='41304747275',
+        archive_sha256=TYPED_PG_ARCHIVE_SHA,source_commit=TYPED_PG_PRODUCT,system_verified=verify_system,
+        imported_measurement_windows=0,product_rebuilt=False,normal_F166_ELF_identical=True))
+    return manifests
 
 
 def new_driver(a):

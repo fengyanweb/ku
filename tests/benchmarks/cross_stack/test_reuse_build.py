@@ -32,6 +32,34 @@ def archive(path, changes=None, old_run=False):
 
 class ReuseBuildTests(unittest.TestCase):
 
+    def test_fixed_typed_pg_cache_reuses_only_build_trees_never_old_measurements(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);path=root/'typed.tgz'
+            files={name+'/build/bin/ku-server':name.encode() for name in ('B','BP','R')}
+            files['final/rows.json']=b'old measurement never imported'
+            files['hosted-state.json']=json.dumps({'identity':{'candidate':r.TYPED_PG_PRODUCT},
+                'steps':{k:{'state':'completed'} for k in ('build','run','final')}}).encode()
+            index={'path_root':r.TOKEN,'raw_and_redacted_hashes_distinct':True,'files':[
+                {'path':k,'bytes':len(v),'archived_sha256':hashlib.sha256(v).hexdigest()} for k,v in files.items()]}
+            files['portable-file-map.json']=json.dumps(index).encode()
+            with tarfile.open(path,'w:gz') as tar:
+                for name,data in files.items():
+                    info=tarfile.TarInfo(name);info.size=len(data);tar.addfile(info,io.BytesIO(data))
+            digest=r.h.sha(path)
+            with self.assertRaisesRegex(ValueError,'build-only'):
+                r.extract_builds(path,root/'default',digest,{'B','BP','R'})
+            with self.assertRaisesRegex(ValueError,'fixed typed'):
+                r.extract_builds(path,root/'wrong',digest,{'B','BP','R'},typed_pg_observation=True)
+            with patch.object(r,'TYPED_PG_ARCHIVE_SHA',digest):
+                with self.assertRaisesRegex(ValueError,'fixed typed'):
+                    r.extract_builds(path,root/'wrong-selection',digest,{'B','R'},typed_pg_observation=True)
+                r.extract_builds(path,root/'good',digest,{'B','BP','R'},typed_pg_observation=True)
+            self.assertFalse((root/'good/final').exists())
+            old=r.h.load(root/'good/reuse-original-state.json')
+            self.assertFalse(old['measurement_results_imported']);self.assertEqual(set(old['steps']),{'build'})
+            self.assertFalse((root/'good/hosted-state.json').exists())
+            self.assertEqual((root/'good/BP/build/bin/ku-server').read_bytes(),b'BP')
+
     def test_owner_reuse_requires_the_fixed_triple_before_touching_archive(self):
         args=types.SimpleNamespace(memory_owner_probe=True,source_run='bad',archive_sha256=r.OWNER_ARCHIVE_SHA,candidate=r.OWNER_PRODUCT)
         with patch.object(r,'extract_builds') as extract,self.assertRaisesRegex(ValueError,'fixed verified'):

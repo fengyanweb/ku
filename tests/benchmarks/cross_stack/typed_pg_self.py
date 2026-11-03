@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Six serial cached ordinary/typed PG software-SELF windows; never a score."""
+import argparse, copy, json, os, platform, re, shutil, signal
+from pathlib import Path
+import hosted_cycle as h
+import focus_cycle as fc
+
+FROZEN_BASE='80aaf7bccd4a436ebdf83e2283a83fcc6deec4fd'
+INPUTS={'B':'59ede7cdba403d4d038c3720ab65f1cd940efd1038d07df782743a35eb9887ae',
+        'BP':'d9b5ea46dd2b401ae368471a822efa8467efa64c50e4b5966681c0d2a21bc4a0'}
+
+
+def frozen_plan(versions):
+    return dict(schema='ku-typed-pg-minimal-SELF-v1',versions=versions,entry_sha256=h.sha(__file__),
+        observer_helper_sha256=h.sha(h.__file__),resources=copy.deepcopy(h.RESOURCES),
+        quality_policy=copy.deepcopy(h.POLICY),workload='db',contract='pg-strict',rate=800,
+        warmup_seconds=3,score_seconds=15,order=[[n,t] for n in ('B','BP') for t in ('before','sample','after')],
+        event='cpu-clock',perf_frequency=499,maximum_windows=6,maximum_replacements=0,
+        maximum_control_cpu_ratio=1.10,observation_alarm_seconds=330,diagnostic_only=True,
+        formal_qualified=False,normal_score_eligible=False,
+        purpose='Current ordinary versus typed public PG path, same fixed work and mandatory reset. '
+            'Fixed800rps improves sample opportunity, not guaranteed density; typed regions may remain unknown. '
+            'Minimal running SELF/PC only; no source-call-count timing, PMU/cycles, full callchains, offCPU attribution, retries or score. '
+            'Historical200rps measurements are not a before/after gain comparison.')
+
+
+def identify(normal,typed):
+    manifests={};versions={}
+    for name,path in (('B',normal),('BP',typed)):
+        if path.name!='manifest.json' or path.is_symlink():raise ValueError('plain manifest.json inputs required')
+        m=h.load(path);manifests[name]=m;target=m['stacks']['ku'];build=target['build']
+        declared=build['native']['server']['binary_sha256']
+        if m['candidate_base']!=FROZEN_BASE or not re.fullmatch('[0-9a-f]{64}',declared):raise ValueError('fixed archived source and declared ELF SHA required')
+        protocol=Path(m['protocol'])
+        versions[name]=dict(root=str(path.parent),stack='ku',source_commit=m['candidate_base'],binary_sha256=declared,
+            artifacts={'protocol':dict(path=str(protocol),sha256=h.sha(protocol))})
+    plan=frozen_plan(versions);bindings={n:fc.version_identity(plan,n) for n in versions}
+    expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
+        pg_execution_mode='async',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+    for n,b in bindings.items():
+        if b['build_mode']!={**expected,'pg_read_mode':'int' if n=='B' else 'typed'}:raise ValueError('normal O2/helpers/public async PG modes required')
+        if b['files']['expanded source']['sha256']!=INPUTS[n]:raise ValueError('frozen PG business input changed')
+    for key in ('Ku CLI','driver ELF','libpq'):
+        if bindings['B']['files'][key]['sha256']!=bindings['BP']['files'][key]['sha256']:raise ValueError('same frozen '+key+' required')
+    if versions['B']['binary_sha256']!='234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b':raise ValueError('frozen default ordinary ELF234 required')
+    if versions['B']['artifacts']['protocol']['sha256']!=versions['BP']['artifacts']['protocol']['sha256']:raise ValueError('actual protocol bytes differ')
+    if manifests['B']['client']['command'][1:]!=manifests['BP']['client']['command'][1:]:raise ValueError('driver base arguments differ')
+    for key in ('protocol_sha256','quality_policy','driver_cores','driver_cpuset','service_memory_bytes','service_env','uid','gid'):
+        if manifests['B'].get(key)!=manifests['BP'].get(key):raise ValueError('manifest protocol/resources differ: '+key)
+    return plan,bindings,manifests['B']
+
+
+def drift(rows):
+    costs={r['turn']:r.get('cpu_us') for r in rows};full={r['turn']:r.get('full_cpu_us') for r in rows}
+    good=set(costs)=={'before','sample','after'} and all(type(x) in (int,float) and x>0 for x in costs.values())
+    spread=max(costs['before'],costs['after'])/min(costs['before'],costs['after']) if good else None
+    return dict(unsampled_cpu_max_min=spread,drift_valid=spread is not None and spread<=1.10,
+        sampled_cpu_over_control_geomean=costs['sample']/(costs['before']*costs['after'])**.5 if good else None,
+        full_lifecycle_cpu_us=full,cpu_contract='cpu_us is the original scored-client service CPU/correct; full_cpu_us remains separate',
+        sample_ratio_is_observation_not_proven_overhead=True)
+
+
+def exports(perf,output,observation):
+    start,end=(observation.get(k) for k in ('client_started_monotonic_ns','client_finished_monotonic_ns'))
+    if type(start)is not int or type(end)is not int or not 0<start<end:return False
+    selected=f'{start//10**9}.{start%10**9:09d},{end//10**9}.{end%10**9:09d}'
+    base=[perf,'-i',str(output/'perf.data'),'--symfs',str(output/'symfs'),'--time',selected]
+    report=h.diagnostic_command([base[0],'report',*base[1:],'--stdio','--no-children','--show-nr-samples',
+        '--sort','symbol,dso,comm','--percent-limit','0'],output/'perf-self.log',timeout=20,limit=4<<20)
+    pcs=h.diagnostic_command([base[0],'script',*base[1:],'--ns','--show-lost-events','--show-task-events',
+        '-F','+pid,+tid,+time,+ip,+sym,+dso,+symoff,+srcline,+misc'],output/'perf-pcs.log',timeout=20,limit=8<<20)
+    h.save(output/'export-receipt.json',dict(client_time_range_ns=[start,end],exports=[report,pcs],
+        SELF_counted_once=True,inclusive_chains_unavailable=True,missing_source_lines_remain_unknown=True))
+    return all(x['complete'] for x in (report,pcs))
+
+
+def observe(a,plan,bindings,normal_manifest):
+    result=dict(schema=plan['schema'],diagnostic_only=True,formal_qualified=False,normal_score_eligible=False,
+        candidate_accepted=False,execution_complete=False,attribution_eligible=False,rows=[],controls={},stopped=[])
+    directory=a.root/'normal-self-probe';directory.mkdir()
+    fixture_root=a.root/'fixture';fixture_root.mkdir();manifest=copy.deepcopy(normal_manifest);manifest['stacks']={}
+    h.save(fixture_root/'manifest.json',manifest);fixture=h.db.Database(fixture_root,manifest['uid'],manifest['gid'])
+    original=fc.Harness;private=None;active=False;perf=shutil.which('perf',path=str(a.tools/'bin')+os.pathsep+os.environ.get('PATH',''))
+    class SelfHarness(original):
+        def __init__(self,*args,**kwargs):
+            super().__init__(*args,**kwargs);self.manifest=copy.deepcopy(self.manifest)
+            self.manifest['db_url']=private['db_url'];self.db_domain=h.ExternalDomain(private['db_cgroup'])
+        def client(self,service,workload,rate,duration,output,**kwargs):
+            parent=super().client
+            if Path(output).name!='score':return parent(service,workload,rate,duration,output,**kwargs)
+            return h.normal_self_client(lambda:parent(service,workload,rate,duration,output,**kwargs),
+                service,output,duration,perf,sample=active)
+    try:
+        fixture.start();private=h.load(fixture.manifest_path);fc.Harness=SelfHarness
+        h.save(a.root/'identity.json',dict(bindings=bindings,private_database_limits=h.load(fixture.state_path)['limits'],
+            kernel=platform.release(),machine=platform.machine(),boot_sha256=h.sha('/proc/sys/kernel/random/boot_id'),
+            event='software cpu-clock499Hz; no callchain/GPR/CPU field',source='verified cached original B/BP, not746 candidate or daily1.99 SDK'))
+        for name,turn in plan['order']:
+            active=turn=='sample';output=directory/name/turn
+            try:
+                binding=fc.version_identity(plan,name)
+                if binding!=bindings[name]:raise ValueError('cached identity changed during sequence')
+                row=fc.window(plan,name,'db',800,3,15,output,binding=binding,job={'phase':'diagnostic','contract':'pg-strict'})
+                observation=h.load(output/'score/normal-self-observations.json')
+                row.update(name=name,turn=turn,observation_complete=observation.get('record_complete') is True)
+                if active:row['exports_complete']=observation.get('symbols',{}).get('complete') is True and exports(perf,output/'score',observation)
+                report=h.load(output/'score/client.json');row['driver_send_delay']=report.get('ledger',{}).get('scheduled_to_attempt')
+                row['correct_response_denominator']=report.get('ledger',{}).get('correct_total')
+                quality,signature=h.normal_diagnostic_quality(row)
+                valid=quality and row['observation_complete'] and (not active or row.get('exports_complete') is True)
+            except Exception as error:
+                row=h.load(output/'window.json') if (output/'window.json').is_file() else {}
+                row.update(name=name,turn=turn,observer_error=repr(error));valid=False
+            row.update(diagnostic_only=True,formal_qualified=False,normal_score_eligible=False,diagnostic_qualified=valid)
+            result['rows'].append(row);h.save(a.root/'results.json',result)
+            if not valid:result['stopped'].append(dict(name=name,turn=turn,reason='quality/observer/correctness/cleanup failure; no retry'));break
+            if turn=='after':
+                result['controls'][name]=control=drift([r for r in result['rows'] if r['name']==name])
+                if not control['drift_valid']:
+                    result['stopped'].append(dict(name=name,turn=turn,reason='unsampled drift>1.10 or unknown; no replacement'));break
+    except BaseException as error:
+        result['observer_error']=repr(error)
+        if not isinstance(error,Exception):raise
+    finally:
+        fc.Harness=original
+        try:cleanup=fixture.stop()
+        except Exception as error:cleanup=dict(error=repr(error))
+        result['database_cleanup']=cleanup
+        dbok=cleanup.get('forced') is False and cleanup.get('cgroup_removed') is True and cleanup.get('after',{}).get('process_count')==0
+        result['execution_complete']=len(result['rows'])==6 and not result['stopped'] and dbok and 'observer_error' not in result
+        result['attribution_controls_passed']=result['execution_complete']
+        result['boundary']='Running software SELF/PC exploration only; raw denominator/loss/sparsity/PC and sampling perturbation require review. No full callchains, waiting attribution, comparative score or automatic product change.'
+        h.save(a.root/'summary.json',result)
+        for name in ('B','BP'):
+            raw=directory/name/'sample/score/perf.data'
+            if raw.is_file() and not raw.is_symlink():raw.chmod(0o644)
+    return result
+
+
+def main(argv=None):
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--root',required=True,type=Path)
+    p.add_argument('--normal-manifest',required=True,type=Path);p.add_argument('--typed-manifest',required=True,type=Path)
+    p.add_argument('--tools',type=Path);a=p.parse_args(argv)
+    if os.geteuid()!=0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):p.error('owned Linux ARM64/cgroup root required')
+    a.normal_manifest=a.normal_manifest.resolve(strict=True);a.typed_manifest=a.typed_manifest.resolve(strict=True)
+    plan,bindings,manifest=identify(a.normal_manifest,a.typed_manifest)
+    a.root=a.root.resolve()
+    if any(root==a.root or root in a.root.parents or a.root in root.parents for root in (a.normal_manifest.parent,a.typed_manifest.parent)):p.error('fresh output must be independent of cached inputs')
+    if any(os.environ.get(k) for k in ('LD_PRELOAD','LD_AUDIT','LD_LIBRARY_PATH')):p.error('library overrides are not normal default measurements')
+    a.root.mkdir(parents=True,exist_ok=False)
+    a.tools=(a.tools or a.normal_manifest.parent/'tools').resolve();a.candidate=bindings['B']['source_commit']
+    def stop(*unused):raise KeyboardInterrupt('typed PG SELF fixed coordinator bound')
+    signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop);signal.alarm(330)
+    h.save(a.root/'frozen-plan.json',plan)
+    retained={}
+    for name,binding in bindings.items():
+        directory=a.root/'inputs'/name;directory.mkdir(parents=True);retained[name]=[]
+        paths=[('manifest.json',Path(plan['versions'][name]['root'])/'manifest.json')]+[(label,binding['files'][key]['path']) for label,key in (('server.ku','expanded source'),('server.c','generated C'),('bin/ku-server','ELF'),('protocol.json','declared:protocol'))]
+        for label,source in paths:
+            source=Path(source);destination=directory/label;destination.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(source,destination)
+            if h.sha(source)!=h.sha(destination):raise ValueError('retained input copy differs')
+            retained[name].append(dict(path=str(destination.relative_to(a.root)),source=str(source),bytes=destination.stat().st_size,sha256=h.sha(destination)))
+    h.save(a.root/'retained-inputs.json',retained)
+    preflight=h.normal_perf_preflight(a)
+    if preflight.get('complete') is not True:
+        h.save(a.root/'summary.json',dict(execution_complete=False,diagnostic_only=True,formal_qualified=False,
+            attribution_eligible=False,stopped=['preflight failed; no services or windows started'],preflight=preflight));return 2
+    h.require_normal_perf_preflight(a)
+    result=observe(a,plan,bindings,manifest);print(json.dumps(result))
+    return 0 if result['execution_complete'] else 2
+
+
+if __name__=='__main__':raise SystemExit(main())

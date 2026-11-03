@@ -9,7 +9,7 @@ on:
         description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, pg-input-lifetime, pg-input-guard, pg-input-windows]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, pg-input-lifetime, pg-input-guard, pg-input-windows, pg-typed-self]
       prepatch:
         description: 'Full prepatch commit for explicit paired screens; wake/PG probes require their frozen baseline'
         type: string
@@ -86,10 +86,107 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'pg-input-lifetime' || inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-input-windows') && format('-{0}', inputs.scope) || '' }}
+  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'pg-input-lifetime' || inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-input-windows' || inputs.scope == 'pg-typed-self') && format('-{0}', inputs.scope) || '' }}
   cancel-in-progress: true
 
 jobs:
+  pg-typed-self:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-typed-self'
+    name: Linux ARM64 reused ordinary and typed PG SELF
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare software sampling without rebuilding frozen products
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 libpq-dev postgresql-16 linux-tools-common
+          for pg_perf_package in "linux-tools-$(uname -r)" linux-tools-generic; do
+            if apt-cache show "$pg_perf_package" >/dev/null 2>&1; then
+              sudo apt-get install -y --no-install-recommends "$pg_perf_package"
+              break
+            fi
+          done
+          mkdir -p "$RUNNER_TEMP/ku-pg-typed-tools/bin"
+          pg_perf_binary="$(find /usr/lib/linux-tools* -maxdepth 2 -type f -name perf -print 2>/dev/null | sort -V | tail -n 1 || true)"
+          test -n "$pg_perf_binary"
+          ln -s "$pg_perf_binary" "$RUNNER_TEMP/ku-pg-typed-tools/bin/perf"
+          printf 'KU_PG_TYPED_ROOT=%s\n' "$RUNNER_TEMP/ku-pg-typed-self" >> "$GITHUB_ENV"
+          printf 'KU_PG_TYPED_REUSE=%s\n' "$RUNNER_TEMP/ku-pg-typed-reuse" >> "$GITHUB_ENV"
+          printf '%s\n' "$RUNNER_TEMP/ku-pg-typed-tools/bin" >> "$GITHUB_PATH"
+      - name: Download the exact original normal and typed builds
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ku-performance-v2-evidence
+          path: ${{ runner.temp }}/ku-pg-typed-download
+          run-id: 41304747275
+          github-token: ${{ github.token }}
+      - name: Restore verified builds only with zero old windows
+        timeout-minutes: 2
+        shell: bash
+        env:
+          PYTHONPATH: tests/benchmarks/cross_stack
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import os
+          from pathlib import Path
+          import reuse_build
+          manifests = reuse_build.prepare_typed_pg_cache(
+              Path(os.environ['RUNNER_TEMP'])/'ku-pg-typed-download/ku-performance-v2-evidence.tar.gz',
+              Path(os.environ['KU_PG_TYPED_REUSE']),Path(os.environ['GITHUB_WORKSPACE']))
+          print(manifests)
+          PY
+      - name: Observe only the one typed materialization question
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py \
+            --root "$KU_PG_TYPED_ROOT" --tools "$RUNNER_TEMP/ku-pg-typed-tools" \
+            --normal-manifest "$KU_PG_TYPED_REUSE/B/manifest.json" \
+            --typed-manifest "$KU_PG_TYPED_REUSE/BP/manifest.json" \
+            > "$RUNNER_TEMP/ku-pg-typed-self.log" 2>&1
+      - name: Archive raw samples while excluding private database files
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d "$KU_PG_TYPED_ROOT" ]; then
+            sudo -n python3 -B - "$GITHUB_WORKSPACE/tests/benchmarks/cross_stack" "$KU_PG_TYPED_ROOT" "$(id -u)" "$(id -g)" <<'PY'
+          import sys
+          from pathlib import Path
+          from types import SimpleNamespace
+          sys.path.insert(0,sys.argv[1])
+          import hosted_cycle
+          print(hosted_cycle.archive(SimpleNamespace(root=Path(sys.argv[2])),
+              dict(uid=int(sys.argv[3]),gid=int(sys.argv[4]))))
+          PY
+          fi
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ku-pg-typed-self
+          path: |
+            ${{ runner.temp }}/ku-pg-typed-self/ku-performance-v2-evidence.tar.gz
+            ${{ runner.temp }}/ku-pg-typed-self/archive.json
+            ${{ runner.temp }}/ku-pg-typed-self/summary.json
+            ${{ runner.temp }}/ku-pg-typed-self/frozen-plan.json
+            ${{ runner.temp }}/ku-pg-typed-self.log
+            ${{ runner.temp }}/ku-pg-typed-reuse/typed-pg-cache.json
+            ${{ runner.temp }}/ku-pg-typed-reuse/reuse-json-input-recovery.json
+          retention-days: 14
+          if-no-files-found: warn
+
   pg-input-guard:
     if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-input-guard'
     name: Linux ARM64 PG input relative guard
@@ -1191,7 +1288,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'pg-input-lifetime' && inputs.scope != 'pg-input-guard' && inputs.scope != 'pg-input-windows')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'pg-input-lifetime' && inputs.scope != 'pg-input-guard' && inputs.scope != 'pg-input-windows' && inputs.scope != 'pg-typed-self')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
