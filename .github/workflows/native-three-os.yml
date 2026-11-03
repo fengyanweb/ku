@@ -217,7 +217,7 @@ jobs:
 
   pg-typed-self:
     if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-typed-self'
-    name: Linux ARM64 current Rust1.99.1 PG caller attribution
+    name: Linux ARM64 current Rust1.99.1 typed PG caller attribution
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 22
     permissions:
@@ -263,42 +263,41 @@ jobs:
           printf 'KU_PG_CURRENT_BUILD=%s\n' "$RUNNER_TEMP/ku-pg-current-1.99.1" >> "$GITHUB_ENV"
           printf 'KU_PG_CURRENT_ROOT=%s\n' "$RUNNER_TEMP/ku-pg-current-observation" >> "$GITHUB_ENV"
           printf '%s\n' "$RUNNER_TEMP/ku-pg-current-tools/bin" >> "$GITHUB_PATH"
-      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        id: pg_current_cargo_restore
+      - name: Restore the already cached Rust1.99.1 source build archive
+        id: pg_typed_archive_restore
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: |
-            ${{ runner.temp }}/ku-pg-current-1.99.1/cli-cache-1.99.1
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ku-pg-current-rust1.99.1-linux-arm64-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
-          restore-keys: |
-            ku-pg-current-rust1.99.1-linux-arm64-${{ hashFiles('Cargo.lock') }}-
-      - name: Validate the exact fp sampling format before a product build
+          path: ${{ runner.temp }}/ku-pg-guard-build-cache
+          key: ku-pg-baseline-d05-rust1.99.1-2f1163c34bd45ad4172acf28f1a94f38f7b382a271ba99c6469592beb0744142
+      - name: Download the identified build archive only if the cache is absent
+        if: steps.pg_typed_archive_restore.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ku-pg-current-build-rust1.99.1
+          path: ${{ runner.temp }}/ku-pg-guard-build-cache
+          run-id: 41630973206
+          github-token: ${{ github.token }}
+      - name: Verify original normal and typed builds without importing measurements
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tests/benchmarks/cross_stack python3 -B - <<'PYIN'
+          import os
+          from pathlib import Path
+          import reuse_build
+          paths=reuse_build.prepare_current_typed_pg_cache(
+              Path(os.environ['RUNNER_TEMP'])/'ku-pg-guard-build-cache/ku-pg-current-1.99.1/ku-performance-v2-evidence.tar.gz',
+              Path(os.environ['KU_PG_CURRENT_BUILD']),Path(os.environ['GITHUB_WORKSPACE']))
+          print({name:str(path) for name,path in paths.items()})
+          PYIN
+      - name: Validate the exact fp sampling format on this boot
         timeout-minutes: 1
         shell: bash
         run: |
           set -euo pipefail
           sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --preflight --callchains \
             --root "$KU_PG_CURRENT_BUILD" --tools "$RUNNER_TEMP/ku-pg-current-tools" --current-product "$KU_PG_PRODUCT"
-      - name: Fresh current default and typed builds using the shared Rust1.99.1 CLI
-        id: pg_current_prepare
-        timeout-minutes: 12
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --prepare --callchains \
-            --root "$KU_PG_CURRENT_BUILD" --tools "$RUNNER_TEMP/ku-pg-current-tools" \
-            --source "$GITHUB_WORKSPACE" --current-product "$KU_PG_PRODUCT" > "$RUNNER_TEMP/ku-pg-current-build.log" 2>&1
-      - name: Save the successful Cargo preparation before observation
-        if: ${{ always() && steps.pg_current_prepare.outcome == 'success' && steps.pg_current_cargo_restore.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ${{ runner.temp }}/ku-pg-current-1.99.1/cli-cache-1.99.1
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ steps.pg_current_cargo_restore.outputs.cache-primary-key }}
-      - name: Observe only the shared PG and reactor caller question
+      - name: Observe only the previously missing typed PG caller question
         timeout-minutes: 6
         shell: bash
         run: |
@@ -306,14 +305,14 @@ jobs:
           sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --callchains \
             --root "$KU_PG_CURRENT_ROOT" --tools "$RUNNER_TEMP/ku-pg-current-tools" \
             --normal-manifest "$KU_PG_CURRENT_BUILD/B/manifest.json" --typed-manifest "$KU_PG_CURRENT_BUILD/BP/manifest.json" \
-            --current-product "$KU_PG_PRODUCT" --preflight-root "$KU_PG_CURRENT_BUILD" > "$RUNNER_TEMP/ku-pg-current-observation.log" 2>&1
+            --current-product "$KU_PG_PRODUCT" --preflight-root "$KU_PG_CURRENT_BUILD" --only BP > "$RUNNER_TEMP/ku-pg-current-observation.log" 2>&1
       - name: Preserve the existing build and observation archive formats
         if: always()
         timeout-minutes: 3
         shell: bash
         run: |
           set -euo pipefail
-          for pg_current_root in "$RUNNER_TEMP/ku-pg-current-1.99.1" "$RUNNER_TEMP/ku-pg-current-observation"; do
+          for pg_current_root in "$RUNNER_TEMP/ku-pg-current-observation"; do
             if [ -d "$pg_current_root" ]; then
               sudo -n python3 -B - "$GITHUB_WORKSPACE/tests/benchmarks/cross_stack" "$pg_current_root" "$(id -u)" "$(id -g)" <<'PY'
           import sys
@@ -328,11 +327,11 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ku-pg-current-build-rust1.99.1
+          name: ku-pg-current-build-reuse
           path: |
-            ${{ runner.temp }}/ku-pg-current-1.99.1/ku-performance-v2-evidence.tar.gz
-            ${{ runner.temp }}/ku-pg-current-1.99.1/archive.json
-            ${{ runner.temp }}/ku-pg-current-build.log
+            ${{ runner.temp }}/ku-pg-current-1.99.1/verified-typed-pg-cache.json
+            ${{ runner.temp }}/ku-pg-current-1.99.1/prepared-current.json
+            ${{ runner.temp }}/ku-pg-current-1.99.1/reuse-provenance
           retention-days: 14
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
