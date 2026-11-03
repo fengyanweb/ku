@@ -58,6 +58,45 @@ class ReuseBuildTests(unittest.TestCase):
                 self.assertFalse((root/'out/hosted-state.json').exists())
                 provenance=r.h.load(root/'out/reuse-original-state.json')
                 self.assertFalse(provenance['measurement_results_imported']);self.assertFalse(provenance['hosted_state_imported'])
+                with patch.object(r,'CURRENT_PG_ARCHIVE_SHA',digest):
+                    r.extract_builds(path,root/'typed',digest,{'B','BP','Driver'},current_pg_cache=True)
+                self.assertTrue((root/'typed/BP/build/bin/server').is_file())
+                self.assertFalse((root/'typed/normal-self-probe').exists())
+
+    def test_current_typed_cache_verifies_BP_receipts_binding_and_never_rebuilds(self):
+        for bad_binding in (False,True):
+            with self.subTest(bad_binding=bad_binding),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp)/'fresh';source=Path(temp)/'source'
+                client={'sha256':r.CURRENT_PG_FILES['driver ELF']};bindings={};manifests={}
+                for name,expected in (('B',r.CURRENT_PG_FILES),('BP',r.CURRENT_TYPED_PG_FILES)):
+                    bindings[name]=dict(source_commit=r.h.PG_CURRENT_BASELINE,manifest_sha256=name+'-original',
+                        source_inventory_sha256='inventory',build_mode={'pg_read_mode':'int' if name=='B' else 'typed'},
+                        files={k:{'sha256':v} for k,v in expected.items()})
+                    manifests[name]=dict(client=client,protocol='/verified/protocol',
+                        stacks={'ku':{'build':{'native':{'server':{'generated_c':name+'-C'}}}}})
+                prepared=json.loads(json.dumps(bindings))
+                if bad_binding:prepared['BP']['files']['ELF']['sha256']='0'*64
+                def extract(*args,**kwargs):
+                    r.h.save(root/'prepared-current.json',{'bindings':prepared})
+                    return {name+'/manifest.json':{'original_sha256':name+'-original'} for name in bindings}
+                patches.enter_context(patch.object(r.os,'geteuid',return_value=1001))
+                imported=patches.enter_context(patch.object(r,'extract_builds',side_effect=extract))
+                patches.enter_context(patch.object(r,'restore_json_inputs'));patches.enter_context(patch.object(r,'validate_protocol_inputs'))
+                patches.enter_context(patch.object(r,'verify_driver_cache',return_value={'client':client}))
+                verify=patches.enter_context(patch.object(r,'verify_manifest',side_effect=lambda cache,name,*args,**kw:manifests[name]))
+                patches.enter_context(patch.object(r.h.fc,'version_identity',side_effect=lambda plan,name:bindings[name]))
+                patches.enter_context(patch.object(r,'checked'))
+                if bad_binding:
+                    with self.assertRaisesRegex(ValueError,'binding differs.*BP'):r.prepare_current_typed_pg_cache(Path(temp)/'archive',root,source)
+                    self.assertFalse((root/'verified-typed-pg-cache.json').exists());continue
+                result=r.prepare_current_typed_pg_cache(Path(temp)/'archive',root,source)
+                self.assertEqual(result,{name:str(root/name/'manifest.json') for name in ('B','BP')})
+                imported.assert_called_once_with(Path(temp)/'archive',root,r.CURRENT_PG_ARCHIVE_SHA,{'B','BP','Driver'},current_pg_cache=True)
+                self.assertEqual(verify.call_count,2)
+                self.assertEqual(verify.call_args.kwargs,dict(client_source_name='Driver',require_current_rust=True,expected_pg_read='typed'))
+                receipt=r.h.load(root/'verified-typed-pg-cache.json')
+                self.assertFalse(receipt['product_rebuilt']);self.assertEqual(receipt['imported_measurement_windows'],0)
+                self.assertEqual(receipt['source_run'],'41630973206')
 
     def test_current_guard_aliases_verified_B_as_A_and_requires_fresh_candidate(self):
         with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:

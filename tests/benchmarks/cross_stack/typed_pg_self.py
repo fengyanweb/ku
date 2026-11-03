@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Six serial cached ordinary/typed PG software-SELF windows; never a score."""
+"""Serial cached PG software-SELF windows (six by default, explicit BP-only three); never a score."""
 import argparse, copy, json, os, platform, re, shutil, signal
 from pathlib import Path
 import hosted_cycle as h
@@ -11,8 +11,9 @@ INPUTS={'B':'59ede7cdba403d4d038c3720ab65f1cd940efd1038d07df782743a35eb9887ae',
         'BP':'d9b5ea46dd2b401ae368471a822efa8467efa64c50e4b5966681c0d2a21bc4a0'}
 
 
-def frozen_plan(versions, *, callchains=False, current_product=None):
-    return dict(schema='ku-typed-pg-minimal-SELF-v1',versions=versions,entry_sha256=h.sha(__file__),
+def frozen_plan(versions, *, callchains=False, current_product=None, only=None):
+    if only not in (None,'BP'):raise ValueError('only the explicit BP-only three-window mode is supported')
+    plan=dict(schema='ku-typed-pg-minimal-SELF-v1',versions=versions,entry_sha256=h.sha(__file__),
         observer_helper_sha256=h.sha(h.__file__),resources=copy.deepcopy(h.RESOURCES),
         quality_policy=copy.deepcopy(h.POLICY),workload='db',contract='pg-strict',rate=800,
         warmup_seconds=3,score_seconds=15,order=[[n,t] for n in ('B','BP') for t in ('before','sample','after')],
@@ -23,9 +24,13 @@ def frozen_plan(versions, *, callchains=False, current_product=None):
             'Fixed800rps improves sample opportunity, not guaranteed density; typed regions may remain unknown. '
             'Running SELF/PC and optional fp chains; missing or incomplete user frames remain unknown. No source-call-count timing, PMU/cycles, offCPU attribution, retries or score. '
             'Historical200rps measurements are not a before/after gain comparison.')
+    if only:
+        plan.update(only=only,order=[[only,turn] for turn in ('before','sample','after')],maximum_windows=3,
+            purpose=plan['purpose']+' Explicit BP-only capture; ordinary B is identity-checked and retained, never measured or compared in this sequence.')
+    return plan
 
 
-def identify(normal,typed, *, current_product=None, callchains=False):
+def identify(normal,typed, *, current_product=None, callchains=False, only=None):
     manifests={};versions={}
     for name,path in (('B',normal),('BP',typed)):
         if path.name!='manifest.json' or path.is_symlink():raise ValueError('plain manifest.json inputs required')
@@ -36,7 +41,7 @@ def identify(normal,typed, *, current_product=None, callchains=False):
         versions[name]=dict(root=str(path.parent),stack='ku',source_commit=m['candidate_base'],binary_sha256=declared,
             artifacts={'protocol':dict(path=str(protocol),sha256=h.sha(protocol))})
     if versions['B']['source_commit']!=versions['BP']['source_commit']:raise ValueError('both PG arms must use the same fixed source')
-    plan=frozen_plan(versions,callchains=callchains,current_product=current_product);bindings={n:fc.version_identity(plan,n) for n in versions}
+    plan=frozen_plan(versions,callchains=callchains,current_product=current_product,only=only);bindings={n:fc.version_identity(plan,n) for n in versions}
     expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
         pg_execution_mode='async',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
     for n,b in bindings.items():
@@ -115,7 +120,7 @@ def observe(a,plan,bindings,normal_manifest):
         fixture.start();private=h.load(fixture.manifest_path);fc.Harness=SelfHarness
         h.save(a.root/'identity.json',dict(bindings=bindings,private_database_limits=h.load(fixture.state_path)['limits'],
             kernel=platform.release(),machine=platform.machine(),boot_sha256=h.sha('/proc/sys/kernel/random/boot_id'),
-            event='software cpu-clock499Hz; optional fp chains, no GPR/CPU field',source='fresh Rust1.99.1 normal/typed builds' if plan.get('current_product') else 'archived fixed80/F166 arms; historical binaries only'))
+            event='software cpu-clock499Hz; optional fp chains, no GPR/CPU field',source='Rust1.99.1 normal/typed build artifacts, verified before fresh observation' if plan.get('current_product') else 'archived fixed80/F166 arms; historical binaries only'))
         for name,turn in plan['order']:
             active=turn=='sample';output=directory/name/turn
             try:
@@ -148,7 +153,7 @@ def observe(a,plan,bindings,normal_manifest):
         except Exception as error:cleanup=dict(error=repr(error))
         result['database_cleanup']=cleanup
         dbok=cleanup.get('forced') is False and cleanup.get('cgroup_removed') is True and cleanup.get('after',{}).get('process_count')==0
-        result['execution_complete']=len(result['rows'])==6 and not result['stopped'] and dbok and 'observer_error' not in result
+        result['execution_complete']=len(result['rows'])==len(plan['order']) and not result['stopped'] and dbok and 'observer_error' not in result
         result['attribution_controls_passed']=result['execution_complete']
         result['boundary']='Running software SELF/PC exploration only; raw denominator/loss/sparsity/PC and sampling perturbation require review. Kernel fp callers may be available; incomplete user frames and waiting attribution remain unknown. No comparative score or automatic product change.'
         h.save(a.root/'summary.json',result)
@@ -189,6 +194,7 @@ def main(argv=None):
     p.add_argument('--normal-manifest',type=Path);p.add_argument('--typed-manifest',type=Path)
     p.add_argument('--current-product');p.add_argument('--source',type=Path);p.add_argument('--prepare',action='store_true')
     p.add_argument('--preflight',action='store_true');p.add_argument('--preflight-root',type=Path);p.add_argument('--callchains',action='store_true')
+    p.add_argument('--only',choices=['BP'],help='Only typed before/sample/after; normal B remains identity-checked and retained')
     p.add_argument('--tools',type=Path);a=p.parse_args(argv)
     a.root=a.root.resolve();a.tools=a.tools.resolve() if a.tools else None
     if a.current_product and not re.fullmatch('[0-9a-f]{40}',a.current_product):p.error('explicit full product SHA required')
@@ -203,7 +209,7 @@ def main(argv=None):
     if not a.normal_manifest or not a.typed_manifest:p.error('two identified manifests required')
     if os.geteuid()!=0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):p.error('owned Linux ARM64/cgroup root required')
     a.normal_manifest=a.normal_manifest.resolve(strict=True);a.typed_manifest=a.typed_manifest.resolve(strict=True)
-    plan,bindings,manifest=identify(a.normal_manifest,a.typed_manifest,current_product=a.current_product,callchains=a.callchains)
+    plan,bindings,manifest=identify(a.normal_manifest,a.typed_manifest,current_product=a.current_product,callchains=a.callchains,only=a.only)
     a.root=a.root.resolve()
     if any(root==a.root or root in a.root.parents or a.root in root.parents for root in (a.normal_manifest.parent,a.typed_manifest.parent)):p.error('fresh output must be independent of cached inputs')
     if any(os.environ.get(k) for k in ('LD_PRELOAD','LD_AUDIT','LD_LIBRARY_PATH')):p.error('library overrides are not normal default measurements')

@@ -36,6 +36,10 @@ CURRENT_PG_FILES={'ELF':CURRENT_PG_ELF,'generated C':CURRENT_PG_C,
     'driver ELF':'08f1f4cf722c2c9939dd2b2df3c19951895cddac8dbabd395053a7af1534efbd',
     'libpq':'b59de287c314a78cb70e7e0bb31fb2be34b961ccc90beff405d8c48412ace2df',
     'declared:protocol':'ac9438bbda3ed4298980dcca6c5f4a26536fc871fd24d4ec843c62c17b8a6cf7'}
+CURRENT_TYPED_PG_FILES={**CURRENT_PG_FILES,
+    'ELF':'b66d4a02726366410fd08c589ce20129401b1a6b878e9683e87b36a888a3fc31',
+    'generated C':'6a54f5e24fd5451659dbf0585c0849c5c2b0f699540398d5f79e2826c95305d3',
+    'expanded source':'d9b5ea46dd2b401ae368471a822efa8467efa64c50e4b5966681c0d2a21bc4a0'}
 
 
 def checked(path, expected):
@@ -76,7 +80,7 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
         mapping={entry['path']:entry for entry in entries}
         if len(mapping)!=len(entries):raise ValueError('duplicate portable map entry')
         prepared=json.load(tar.extractfile('prepared-current.json')) if current_pg_cache else None
-        current_cache=(current_pg_cache and expected_sha256==CURRENT_PG_ARCHIVE_SHA and set(names)=={'B','Driver'}
+        current_cache=(current_pg_cache and expected_sha256==CURRENT_PG_ARCHIVE_SHA and set(names) in ({'B','Driver'},{'B','BP','Driver'})
             and prepared.get('product')==h.PG_CURRENT_BASELINE and prepared.get('rust_toolchain')=='1.99.1'
             and prepared.get('new_builds') is True and prepared.get('imported_measurement_windows')==0
             and prepared.get('bindings',{}).get('B',{}).get('files',{}).get('ELF',{}).get('sha256')==CURRENT_PG_ELF)
@@ -362,6 +366,47 @@ def verify_large_pg_contracts(root,source,manifest,mapping):
     h.save(root/'verified-pg-contract-cache.json',result);return result
 
 
+def restore_current_pg_builds(archive,cache,source,*,typed=False):
+    """Common fixed current-build verifier; no original observations or builds."""
+    names={'B','Driver',*(['BP'] if typed else [])}
+    mapping=extract_builds(archive,cache,CURRENT_PG_ARCHIVE_SHA,names,current_pg_cache=True)
+    prepared=h.load(cache/'prepared-current.json');original={};actual={}
+    restore_json_inputs(source,cache,{name:h.PG_CURRENT_BASELINE for name in names},mapping)
+    for name in names:validate_protocol_inputs(cache,name,mapping)
+    driver=verify_driver_cache(cache,expected_commit=h.PG_CURRENT_BASELINE)
+    manifests={'Driver':driver}
+    for name in ('B',*(['BP'] if typed else [])):
+        binding=prepared['bindings'][name];expected=CURRENT_PG_FILES if name=='B' else CURRENT_TYPED_PG_FILES
+        if (binding.get('source_commit')!=h.PG_CURRENT_BASELINE
+                or mapping[name+'/manifest.json']['original_sha256']!=binding.get('manifest_sha256')
+                or {key:value.get('sha256') for key,value in binding.get('files',{}).items()}!=expected):
+            raise ValueError('original current build binding differs from frozen archive: '+name)
+        options={'expected_pg_read':'typed'} if name=='BP' else {}
+        manifest=verify_manifest(cache,name,h.PG_CURRENT_BASELINE,mapping,client_source_name='Driver',require_current_rust=True,**options)
+        plan={'versions':{name:dict(root=str(cache/name),stack='ku',source_commit=h.PG_CURRENT_BASELINE,
+            binary_sha256=expected['ELF'],artifacts={'protocol':dict(path=manifest['protocol'],sha256=expected['declared:protocol'])})}}
+        observed=h.fc.version_identity(plan,name)
+        if ({key:value['sha256'] for key,value in observed['files'].items()}!=expected
+                or observed['source_inventory_sha256']!=binding.get('source_inventory_sha256')
+                or observed['build_mode']!=binding.get('build_mode') or manifest['client']['sha256']!=driver['client']['sha256']):
+            raise ValueError('restored current normal/typed/Driver build identity differs: '+name)
+        checked(manifest['stacks']['ku']['build']['native']['server']['generated_c'],expected['generated C'])
+        manifests[name]=manifest;original[name]=binding;actual[name]=observed
+    return manifests,original,actual
+
+
+def prepare_current_typed_pg_cache(archive,root,source):
+    """Recover exact d05 ordinary/typed Rust1.99.1 builds for fresh SELF only."""
+    if os.geteuid()==0 or h.bl.RUST_TOOLCHAIN!='1.99.1':raise ValueError('ordinary user and current Rust1.99.1 required')
+    root=Path(root)
+    _,original,actual=restore_current_pg_builds(archive,root,Path(source),typed=True)
+    manifests={name:str(root/name/'manifest.json') for name in ('B','BP')}
+    h.save(root/'verified-typed-pg-cache.json',dict(manifests=manifests,source_run='41630973206',archive_sha256=CURRENT_PG_ARCHIVE_SHA,
+        source_commit=h.PG_CURRENT_BASELINE,rust_toolchain='1.99.1',original_bindings=original,restored_bindings=actual,
+        imported_measurement_windows=0,product_rebuilt=False,scope='build artifacts only; fresh same-boot preflight and windows required'))
+    return manifests
+
+
 def prepare_current_pg_guard_cache(archive,a):
     """Reuse only the exact Rust1.99.1 normal B as A; build candidate B afresh."""
     if a.baseline!=h.PG_CURRENT_BASELINE or a.prepatch!=h.PG_CURRENT_BASELINE or h.bl.RUST_TOOLCHAIN!='1.99.1':
@@ -370,25 +415,8 @@ def prepare_current_pg_guard_cache(archive,a):
     if root.exists() and (root.is_symlink() or any(p.name!='tools' for p in root.iterdir())):
         raise ValueError('current cache requires fresh guard root')
     cache=root/'verified-current-cache'
-    mapping=extract_builds(archive,cache,CURRENT_PG_ARCHIVE_SHA,{'B','Driver'},current_pg_cache=True)
-    prepared=h.load(cache/'prepared-current.json');binding=prepared['bindings']['B']
-    if (binding.get('source_commit')!=h.PG_CURRENT_BASELINE
-            or mapping['B/manifest.json']['original_sha256']!=binding.get('manifest_sha256')
-            or {key:value.get('sha256') for key,value in binding.get('files',{}).items()}!=CURRENT_PG_FILES):
-        raise ValueError('original current build binding differs from frozen archive')
-    restore_json_inputs(source,cache,{name:h.PG_CURRENT_BASELINE for name in ('B','Driver')},mapping)
-    for name in ('B','Driver'):validate_protocol_inputs(cache,name,mapping)
-    driver=verify_driver_cache(cache,expected_commit=h.PG_CURRENT_BASELINE)
-    normal=verify_manifest(cache,'B',h.PG_CURRENT_BASELINE,mapping,client_source_name='Driver',require_current_rust=True)
-    native=normal['stacks']['ku']['build']['native']['server']
-    plan={'versions':{'B':dict(root=str(cache/'B'),stack='ku',source_commit=h.PG_CURRENT_BASELINE,
-        binary_sha256=CURRENT_PG_ELF,artifacts={'protocol':dict(path=normal['protocol'],sha256=CURRENT_PG_FILES['declared:protocol'])})}}
-    actual=h.fc.version_identity(plan,'B')
-    if ({key:value['sha256'] for key,value in actual['files'].items()}!=CURRENT_PG_FILES
-            or actual['source_inventory_sha256']!=binding.get('source_inventory_sha256')
-            or actual['build_mode']!=binding.get('build_mode') or normal['client']['sha256']!=driver['client']['sha256']):
-        raise ValueError('restored current normal/Driver build identity differs')
-    checked(native['generated_c'],CURRENT_PG_C)
+    restored,bindings,observations=restore_current_pg_builds(archive,cache,source)
+    normal,driver=restored['B'],restored['Driver'];binding,actual=bindings['B'],observations['B']
     unchanged=subprocess.run(['git','-C',str(source),'diff','--quiet',h.PG_CURRENT_BASELINE,
         a.candidate,'--','tests/benchmarks/cross_stack'],timeout=10)
     if unchanged.returncode!=0:raise ValueError('cached benchmark inputs differ from the explicit new candidate')

@@ -12,6 +12,16 @@ class TypedPgSelfTests(unittest.TestCase):
         self.assertEqual((p['event'],p['perf_frequency']),('cpu-clock',499))
         self.assertFalse(p['formal_qualified']);self.assertFalse(p['normal_score_eligible'])
 
+    def test_explicit_only_BP_keeps_sampling_work_and_limits(self):
+        normal=t.frozen_plan({});only=t.frozen_plan({},only='BP')
+        self.assertEqual(only['order'],[['BP',turn] for turn in ('before','sample','after')])
+        self.assertEqual(only['maximum_windows'],3)
+        for key in ('rate','warmup_seconds','score_seconds','maximum_replacements','event','perf_frequency',
+                'maximum_control_cpu_ratio','observation_alarm_seconds','quality_policy','resources'):
+            self.assertEqual(only[key],normal[key])
+        self.assertNotIn('only',normal)
+        with self.assertRaises(ValueError):t.frozen_plan({},only='B')
+
     def test_drift_uses_same_cpu_field_and_unknown_never_passes(self):
         rows=[dict(turn=x,cpu_us=v,full_cpu_us=v+1) for x,v in [('before',100),('sample',120),('after',105)]]
         self.assertTrue(t.drift(rows)['drift_valid'])
@@ -118,5 +128,29 @@ class TypedPgSelfTests(unittest.TestCase):
             self.assertIs(t.fc.Harness,original);self.assertEqual(window.call_count,1)
             self.assertFalse(result['execution_complete']);self.assertFalse(result['attribution_eligible'])
             self.assertEqual(len(result['stopped']),1)
+
+    def test_only_BP_completes_three_windows_or_stops_at_original_drift_limit(self):
+        for after in (100,111):
+            with self.subTest(after=after),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);private=root/'private.json';state=root/'state.json'
+                private.write_text(json.dumps({'db_url':'x','db_cgroup':'x'}));state.write_text('{"limits":{}}')
+                fixture=types.SimpleNamespace(start=lambda:None,stop=lambda:{'forced':False,'cgroup_removed':True,'after':{'process_count':0}},manifest_path=private,state_path=state)
+                calls=[];original=t.fc.Harness
+                def window(plan,name,workload,rate,warm,score,output,**kwargs):
+                    calls.append((name,output.name,rate,warm,score))
+                    t.h.save(output/'score/normal-self-observations.json',{'record_complete':True,'symbols':{'complete':True}})
+                    t.h.save(output/'score/client.json',{'ledger':{'correct_total':12000,'scheduled_to_attempt':{}}})
+                    return dict(cpu_us=after if output.name=='after' else 100,full_cpu_us=102)
+                with patch.object(t.h.db,'Database',return_value=fixture),patch.object(t.h,'sha',return_value='a'*64),\
+                        patch.object(t.fc,'version_identity',return_value={}),patch.object(t.fc,'window',side_effect=window),\
+                        patch.object(t.h,'normal_diagnostic_quality',return_value=(True,{})),patch.object(t,'exports',return_value=True):
+                    result=t.observe(types.SimpleNamespace(root=root,tools=root),t.frozen_plan({},only='BP'),
+                        {'B':{},'BP':{}},{'uid':1,'gid':1})
+                self.assertEqual(calls,[('BP',turn,800,3,15) for turn in ('before','sample','after')])
+                self.assertEqual(result['execution_complete'],after==100)
+                self.assertEqual(result['attribution_controls_passed'],after==100)
+                self.assertFalse(result['attribution_eligible']);self.assertIs(t.fc.Harness,original)
+                self.assertFalse((root/'normal-self-probe/B').exists())
+                self.assertEqual(set(result['controls']),{'BP'})
 
 if __name__=='__main__':unittest.main()
