@@ -9,7 +9,7 @@ on:
         description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, pg-input-lifetime, pg-input-guard, pg-input-windows, pg-typed-self]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, pg-input-lifetime, pg-input-guard, pg-input-windows, pg-typed-self, arena-residency]
       prepatch:
         description: 'Full prepatch commit for explicit paired screens; wake/PG probes require their frozen baseline'
         type: string
@@ -86,10 +86,71 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'pg-input-lifetime' || inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-input-windows' || inputs.scope == 'pg-typed-self') && format('-{0}', inputs.scope) || '' }}
+  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'pg-input-lifetime' || inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-input-windows' || inputs.scope == 'pg-typed-self' || inputs.scope == 'arena-residency') && format('-{0}', inputs.scope) || '' }}
   cancel-in-progress: true
 
 jobs:
+  arena-residency:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'arena-residency'
+    name: Linux ARM64 normal Release arena residency question
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install only existing binary dependencies and bounded debugger
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-18 libpq-dev postgresql-16 gdb
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ku-pg-input-guard-full
+          path: ${{ runner.temp }}/arena-download
+          run-id: 41582847043
+          github-token: ${{ github.token }}
+      - name: Verify the unchanged default A and driver without building or importing scores
+        shell: bash
+        env:
+          PYTHONPATH: tests/benchmarks/cross_stack
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import os
+          from pathlib import Path
+          from types import SimpleNamespace
+          import reuse_build
+          a=SimpleNamespace(root=Path(os.environ['RUNNER_TEMP'])/'arena-cache',source=Path(os.environ['GITHUB_WORKSPACE']),
+              baseline='166453a1d2768bbce19796d9c7823be73cc84ccb',prepatch='166453a1d2768bbce19796d9c7823be73cc84ccb',
+              candidate='5857373ef316c9b67789141038a93b46e62a2f20',screen_variants=[],pg_input_guard=True)
+          reuse_build.prepare_pg_input_guard_cache(
+              Path(os.environ['RUNNER_TEMP'])/'arena-download/ku-performance-v2-evidence.tar.gz',a)
+          PY
+      - name: Answer only live versus retained allocator pages
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B tests/benchmarks/cross_stack/normal_arena_read.py \
+            --root "$RUNNER_TEMP/arena-read" --manifest "$RUNNER_TEMP/arena-cache/A/manifest.json" \
+            > "$RUNNER_TEMP/arena-read.log" 2>&1
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ku-normal-arena-residency
+          path: |
+            ${{ runner.temp }}/arena-read/evidence
+            ${{ runner.temp }}/arena-read.log
+            ${{ runner.temp }}/arena-cache/verified-baseline-cache.json
+          retention-days: 14
+          if-no-files-found: warn
+
   pg-typed-self:
     if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-typed-self'
     name: Linux ARM64 reused ordinary and typed PG SELF
@@ -1335,7 +1396,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'pg-input-lifetime' && inputs.scope != 'pg-input-guard' && inputs.scope != 'pg-input-windows' && inputs.scope != 'pg-typed-self')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'pg-input-lifetime' && inputs.scope != 'pg-input-guard' && inputs.scope != 'pg-input-windows' && inputs.scope != 'pg-typed-self' && inputs.scope != 'arena-residency')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
