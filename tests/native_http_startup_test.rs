@@ -333,6 +333,88 @@ int main(void) {
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn native_http_owner_budget_counts_only_storage_used_by_its_poll_backend() {
+    let original = startup_source();
+    let reserve = "if(ku_http_task_fixed_reserve(group->tasks,fixed_bytes)!=0u)";
+    let tight_budget = r#"
+extern void ku_fixture_limit_owner_bytes(void*,size_t);
+size_t required_owner_bytes=(size_t)slot_count*(sizeof(KuHttpConnection)+sizeof(int))
+    +(size_t)request_limit*sizeof(KuHttpJob*)+poll_capacity*sizeof(KuHttpPollFd)
+    +(size_t)max_pending*sizeof(KuHttpPendingItem)+net_bytes+(size_t)nworkers*sizeof(pthread_t);
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+required_owner_bytes+=ku_http_reactor_pending_storage_bytes((size_t)slot_count,net_capacity,(size_t)max_pending);
+#else
+required_owner_bytes+=(size_t)slot_count*sizeof(KuHttpPollConnection);
+#endif
+ku_fixture_limit_owner_bytes(group->tasks,required_owner_bytes);
+if(ku_http_task_fixed_reserve(group->tasks,fixed_bytes)!=0u)
+"#;
+    let observe = r#"
+static size_t ku_fixture_limit_calls;
+void ku_fixture_limit_owner_bytes(void* raw,size_t required) {
+  KuTaskDriverV1* driver=&((KuHttpTaskRuntime*)raw)->driver;
+  if(ku_task_driver_lock(driver))abort();
+  if(driver->fixed_bytes>SIZE_MAX-driver->reserved_bytes
+      || required>SIZE_MAX-driver->fixed_bytes-driver->reserved_bytes)abort();
+  driver->byte_limit=driver->fixed_bytes+driver->reserved_bytes+required;
+  ku_fixture_limit_calls++;
+  if(ku_task_driver_unlock(driver))abort();
+}
+int main(void) {
+  int input_flags=fcntl(0,F_GETFD,0);
+  int status=fixture_original_main();
+  if(ku_fixture_limit_calls!=1u || (input_flags>=0 && fcntl(0,F_GETFD,0)<0))return 94;
+  return status;
+}
+"#;
+    // Run fallback first so the old product proves its real snapshot allocation
+    // fits before the persistent backend exposes the phantom budget charge.
+    for (name, persistent) in [("fallback", false), ("persistent", true)] {
+        let generated = if persistent {
+            original.clone()
+        } else {
+            original.replace("#define KU_HTTP_PERSISTENT_EVENT_LOOP 1", "")
+        };
+        assert_eq!(generated.matches(reserve).count(), 1);
+        let generated = generated
+            .replacen(reserve, tight_budget, 1)
+            .replacen(
+                "if (!ku_http_wake_init(&wake)) {",
+                "if (owner->index == 0 || !ku_http_wake_init(&wake)) {",
+                1,
+            )
+            .replacen(
+                "int main(void) {",
+                "static int fixture_original_main(void) {",
+                1,
+            );
+        let directory = TempDir::new(&format!("http-owner-budget-{name}"));
+        let source = directory.path().join("startup.c");
+        fs::write(&source, generated + observe).unwrap();
+        let Some(executable) = compile_harness(directory.path(), &source, "startup") else {
+            return;
+        };
+        let mut command = Command::new(executable);
+        command
+            .current_dir(directory.path())
+            .env("KU_EVENT_LOOPS", "1")
+            .env("KU_BLOCKING_THREADS", "4")
+            .env("KU_THREAD_BUDGET", "12")
+            .env("KU_TASK_MAX_BYTES", "16777216")
+            .env("KU_HTTP_DRAIN_TIMEOUT_MS", "250");
+        let result = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS).unwrap();
+        assert_eq!(result.status.code(), Some(1), "{name}: {result:?}");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("reactor wake initialization failed"),
+            "{name}: actual necessary storage must fit before the injected wake failure: {stderr}"
+        );
+        eprintln!("{name}: original wake failure and startup cleanup reached");
+    }
+}
+
+#[test]
 fn native_http_root_admission_rejects_before_execution_and_reports_exact_limit() {
     let generated =
         startup_source().replacen("int main(void) {", "static int ku_unused_main(void) {", 1);
