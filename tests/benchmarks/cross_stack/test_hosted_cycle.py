@@ -14,6 +14,157 @@ import http_cost_diagnostic as hcd
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_pg_input_guard_export_opt_in_preserves_all_windows_and_old_default_bound(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);directory=root/'raw';directory.mkdir();selected=[]
+            for group in range(27):
+                for name in ('window.json','full-lifecycle.json','warmup/client.json','score/client.json',
+                    'warmup/runtime-after-failure.json','service/service.log','score/resources.json',
+                    'score/driver-cleanup.json','warmup/driver-cleanup.json'):
+                    path=directory/str(group)/name;path.parent.mkdir(parents=True,exist_ok=True)
+                    path.write_text('raw log' if path.suffix=='.log' else '{"raw_resource_endpoints":true}')
+                    selected.append(path)
+            default=h.pg_failure_export(types.SimpleNamespace(root=root),directory,selected=selected)
+            self.assertEqual(len(default['entries']),64);self.assertEqual(default['total_limit_bytes'],8<<20)
+            self.assertIn('64-file limit',default['skipped'][0]['reason'])
+            complete=h.pg_failure_export(types.SimpleNamespace(root=root),directory,selected=selected,
+                output_name='guard',max_files=256,total_limit=32<<20)
+            self.assertEqual(len(complete['entries']),243);self.assertEqual(complete['skipped'],[])
+            self.assertEqual(complete['total_limit_bytes'],32<<20)
+            for group in range(27):
+                for name in ('score/resources.json','score/driver-cleanup.json','warmup/driver-cleanup.json'):
+                    self.assertTrue((root/'guard'/str(group)/name).is_file())
+
+    def test_pg_input_guard_cli_returns_failure_for_unknown_or_failed_guard(self):
+        for passed in (True,False,None):
+            with self.subTest(passed=passed),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                base=Path(temp);source=base/'source';tools=base/'tools';source.mkdir();tools.mkdir()
+                patches.enter_context(patch.object(h.platform,'system',return_value='Linux'))
+                patches.enter_context(patch.object(h.platform,'machine',return_value='aarch64'))
+                patches.enter_context(patch.object(h.signal,'signal'));alarm=patches.enter_context(patch.object(h.signal,'alarm'))
+                patches.enter_context(patch.object(h,'diagnostic',return_value=dict(execution_complete=True,relative_guard_passed=passed)))
+                code=h.main(['--phase','diagnostic','--root',str(base/'output'),'--source',str(source),'--tools',str(tools),
+                    '--baseline',h.PG_INPUT_PREPATCH,'--candidate',h.PG_INPUT_CANDIDATE,'--prepatch',h.PG_INPUT_PREPATCH,'--build-set','diagnostic','--pg-input-guard'])
+                self.assertEqual(code,0 if passed is True else 2);alarm.assert_called_with(900)
+
+    def test_pg_input_guard_fixed_pair_plan_and_exclusive_identity(self):
+        plan=h.pg_input_guard_plan({'A':{},'B':{}})
+        self.assertEqual((len(plan['windows']),plan['maximum_windows'],plan['maximum_replacements']),(27,27,0))
+        self.assertEqual((plan['observation_alarm_seconds'],plan['workflow_limit_seconds']),(900,1200))
+        self.assertTrue(all((r['workload'],r['contract'],r['rate'],r['warmup_seconds'],r['score_seconds'])==
+            ('db','pg-strict',200,3,15) for r in plan['windows']))
+        self.assertEqual([(r['group'],r['name']) for r in plan['windows'][3:]],
+            [(g,n) for g in range(1,13) for n in (('A','B') if g%2 else ('B','A'))])
+        self.assertEqual([r['name'] for r in plan['windows'][:3]],['A']*3)
+        self.assertFalse(plan['formal_qualified']);self.assertFalse(plan['normal_score_eligible'])
+        base=dict(baseline=h.PG_INPUT_PREPATCH,candidate=h.PG_INPUT_CANDIDATE,prepatch=h.PG_INPUT_PREPATCH,screen_variants=[],pg_input_guard=True)
+        self.assertTrue(h.hosted_identity(types.SimpleNamespace(**base),'diagnostic')['pg_input_guard'])
+        for flag in ('pg_queue_screen','normal_self_probe','http_short_screen','pg_failure_probe','pg_driver_screen','task_json_screen','common_http_screen','final_task_json','memory_owner_probe'):
+            with self.subTest(flag=flag),self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(**base,**{flag:True}),'diagnostic')
+        for change in ({'baseline':h.BASELINE},{'prepatch':h.BASELINE},{'candidate':'b'*40}):
+            with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(**dict(base,**change)),'diagnostic')
+
+    def test_pg_input_guard_comparison_never_passes_unknown_or_partial(self):
+        rows=[dict(c,observation_complete=True,functional_valid=True,accounting_valid=True,all_correct=True,
+            natural_reclamation=True,arrival_schedule_quality='pass',environment_quality='pass',measurement_invalid=False,
+            observed_environment_faults=[],diagnostic_quality={'valid':True},comparison_contract='same',full_cpu_us=100,
+            memory={'steady_median_bytes':1000}) for c in h.pg_input_guard_plan({})['windows']]
+        with patch.object(fc,'paired_interval',wraps=fc.paired_interval) as interval:
+            result=h.pg_input_guard_comparison(rows,True,{'quality':'pass'})
+        self.assertTrue(result['eligible_for_root_review']);self.assertFalse(result['formal_qualified'])
+        self.assertEqual(interval.call_count,2)
+        self.assertTrue(all(c.kwargs==dict(minimum=12,resamples=20000,seed=20261023) for c in interval.call_args_list))
+        fake=dict(status='estimated',lower95=.99,upper95=1.02)
+        for issue in ('environment','window','memory','duplicate','partial','regression'):
+            with self.subTest(issue=issue),patch.object(fc,'paired_interval',return_value=(dict(fake,lower95=1.001) if issue=='regression' else fake)):
+                changed=json.loads(json.dumps(rows));environment={'quality':'unknown' if issue=='environment' else 'pass'}
+                if issue=='window':changed[3]['environment_quality']='unknown'
+                if issue=='memory':
+                    changed[3]['memory']={}
+                    # Missing metrics must use the real unavailable interval decision.
+                    with patch.object(fc,'paired_interval',wraps=__import__('linux_harness').paired_interval):
+                        self.assertFalse(h.pg_input_guard_comparison(changed,True,environment)['eligible_for_root_review'])
+                    continue
+                if issue=='duplicate':changed[4]['name']=changed[3]['name']
+                if issue=='partial':changed.pop()
+                self.assertFalse(h.pg_input_guard_comparison(changed,True,environment)['eligible_for_root_review'])
+
+    def test_pg_input_guard_keeps_old_plan_bytes(self):
+        import hashlib
+        expected={'frozen_plan':'4aec3b660440ecdbefc9857e258675843333feca223db3eb745c33e2e286754e',
+            'http_short_plan':'c0a86f180f87ee5b29db7f97935f61a2d4daa96b299cc3fd79da92e0f46576b5',
+            'normal_self_plan':'c8bda1efcc78364aea0060ad78df47d1e497c18604f997f951fa1552805a95ed',
+            'pg_queue_plan':'f11f1515259c7877e0f8f026c7c8df7f1bba7a7aa193c7748277f05eceac67af',
+            'pg_driver_plan':'e00a9f1e0c3fb9601b93ba869a14b26516ea14cb59e248972627378fa1484d17'}
+        for name,digest in expected.items():
+            args=({},h.PG_QUEUE_PREPATCH) if name=='pg_queue_plan' else ({},)
+            self.assertEqual(hashlib.sha256(h.encoded(getattr(h,name)(*args))).hexdigest(),digest)
+
+    def test_pg_input_guard_build_uses_only_A_B_and_driver(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);calls=[]
+            class Builder:
+                def __init__(self,directory,source,**kwargs):self.name=directory.name
+                def ku(self):calls.append((self.name,'ku'))
+                def go_build(self,client=False):calls.append((self.name,'driver',client))
+                def rust(self):raise AssertionError('no Rust guard build')
+                def ku_native(self,*args):raise AssertionError('normal CLI identity required')
+                def finish(self,**kwargs):return {}
+            patches.enter_context(patch.object(h.bl,'Builder',Builder))
+            patches.enter_context(patch.object(h,'snapshot',side_effect=lambda s,c,d:d.mkdir(parents=True)))
+            patches.enter_context(patch.object(h.os,'geteuid',return_value=1));patches.enter_context(patch.object(h.os,'getegid',return_value=1))
+            patches.enter_context(patch.object(h,'complete_build',return_value={'ready':True}))
+            a=types.SimpleNamespace(root=root,source=root/'source',tools=root/'tools',baseline=h.PG_INPUT_PREPATCH,
+                candidate=h.PG_INPUT_CANDIDATE,prepatch=h.PG_INPUT_PREPATCH,screen_variants=[],build_set='diagnostic',pg_input_guard=True)
+            self.assertEqual(h.build(a,{'steps':{}}),{'ready':True})
+            self.assertEqual(calls,[('A','ku'),('B','ku'),('Driver','driver',True)])
+
+    def test_pg_input_guard_runner_stops_controls_or_invalid_window_without_replacement(self):
+        for issue in ('none','control-quality','environment-unknown','environment-fail','arrival','cleanup','database','flags','business'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);plan=h.pg_input_guard_plan({n:dict(root=str(root/n),stack='ku') for n in ('A','B')})
+                h.save(root/'frozen-plan.json',plan);manifest=root/'fixture/manifest.json';state_path=root/'fixture/state.json'
+                h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'});h.save(state_path,{'limits':{}})
+                fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=state_path,
+                    stop=lambda:dict(forced=issue=='database',cgroup_removed=True,after={'process_count':0}))
+                mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',
+                    pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+                if issue=='flags':mode['native_flags']['server']=['-std=c11','-O3','-pthread']
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0));database=patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
+                patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:dict(stack='ku',build_mode=mode,
+                    source_commit=h.PG_INPUT_PREPATCH if n=='A' else h.PG_INPUT_CANDIDATE,
+                    files={'expanded source':{'sha256':'a'*64 if issue=='business' and n=='A' else 'b'*64}})))
+                patches.enter_context(patch.object(fc,'service_termination_succeeded',side_effect=lambda s,t:t.get('natural') is True))
+                patches.enter_context(patch.object(h,'sha',return_value='f'*64));measured=[]
+                env=patches.enter_context(patch.object(h,'environment_record',return_value={'evidence':str(root/'qualification.json'),'quality':
+                    'unknown' if issue=='environment-unknown' else 'fail' if issue=='environment-fail' else 'pass'}))
+                def window(p,name,workload,rate,warmup,duration,output,**kwargs):
+                    control='environment-controls' in Path(output).parts;measured.append((name,workload,control))
+                    row=dict(status='observed',score_started=True,functional_valid=not(issue=='control-quality' and control),accounting_valid=True,
+                        all_correct=True,natural_reclamation=True,arrival_schedule_quality='fail' if issue=='arrival' and not control else 'pass',
+                        environment_quality='unknown' if control else 'pass',measurement_invalid=False,
+                        full_cpu_us=97 if name=='B' else 100,memory={'steady_median_bytes':1000},comparison_contract='same-pg',cleanup=[{'natural':True}])
+                    self.assertEqual(kwargs['job']['contract'],'pg-strict')
+                    for part in ('warmup','score'):
+                        report=Path(output)/part/'client.json';h.save(report,dict(service_cost=dict(before={'observed':True},after={'observed':True},
+                            driver_headroom={'fraction_of_quota':.3,'saturated':False})))
+                        h.save(Path(output)/part/'driver-cleanup.json',dict(process_reaped=not(issue=='cleanup' and not control),cgroup_removed=True,after={'process_count':0}))
+                    row['score_report']=str(Path(output)/'score/client.json');return row
+                patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,pg_input_guard=True)
+                if issue in ('flags','business'):
+                    with self.assertRaises(ValueError):h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
+                    self.assertEqual(measured,[]);database.assert_not_called();continue
+                result=h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
+                self.assertEqual(len(measured),1 if issue=='control-quality' else 3 if issue.startswith('environment') else 4 if issue in ('arrival','cleanup') else 27)
+                self.assertEqual(result['execution_complete'],issue=='none');self.assertFalse(result['candidate_accepted'])
+                self.assertEqual(env.call_count,0 if issue=='control-quality' else 1)
+                if issue=='none':
+                    self.assertEqual([x[2] for x in measured[:3]],[True]*3)
+                    self.assertEqual(result['environment_qualification']['quality'],'pass')
+                    self.assertTrue(result['comparison']['eligible_for_root_review'])
+                else:self.assertFalse(result['comparison']['eligible_for_root_review'])
+
     def test_http_short_plan_is_three_original_controls_and_only_twenty_business_windows(self):
         plan=h.http_short_plan({'A':{},'B':{}})
         controls,business=plan['windows'][:3],plan['windows'][3:]

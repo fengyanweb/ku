@@ -14,6 +14,8 @@ from linux_harness import ExternalDomain, GIB
 ARCHIVE_LIMIT = 384<<20
 BASELINE = '956727188a058119fdb3790959063f1496ccb4cc'
 FOLLOWUP_PREPATCH = BASELINE
+PG_INPUT_PREPATCH = '166453a1d2768bbce19796d9c7823be73cc84ccb'
+PG_INPUT_CANDIDATE = '746e913538a76f111e44d212b3dbbfb4ca5a06c1'
 PG_QUEUE_PREPATCH = 'f39c673df0cd08232f184141a7e2aedef4f585c9'
 HTTP_SHORT_PREPATCH = 'b765f9bc5d3a6e71353a562e27cef7b4cbb35f69'
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
@@ -36,6 +38,13 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def validate_screen_selection(a,build_set):
+    if getattr(a,'pg_input_guard',False):
+        others=('task_json_screen','common_http_screen','final_task_json','pg_failure_probe',
+            'normal_self_probe','pg_queue_screen','pg_driver_screen','memory_owner_probe','http_short_screen')
+        if build_set!='diagnostic' or any(getattr(a,k,False) for k in others):
+            raise ValueError('--pg-input-guard requires diagnostic build-set and no other opt-in mode')
+        if a.baseline!=PG_INPUT_PREPATCH or getattr(a,'prepatch',None)!=PG_INPUT_PREPATCH or a.candidate!=PG_INPUT_CANDIDATE:
+            raise ValueError('--pg-input-guard requires exact F166/746e913 product identities')
     if getattr(a,'http_short_screen',False):
         if getattr(a,'http_short_goal','cpu') not in ('cpu','memory'):
             raise ValueError('--http-short-goal must be cpu or memory')
@@ -72,7 +81,7 @@ def validate_screen_selection(a,build_set):
 def hosted_identity(a,build_set):
     validate_screen_selection(a,build_set)
     identity=dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=build_set,
-        prepatch=a.prepatch if build_set=='followup-screen' or getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False) else None,screen_variants=a.screen_variants,
+        prepatch=a.prepatch if build_set=='followup-screen' or getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False) or getattr(a,'pg_input_guard',False) else None,screen_variants=a.screen_variants,
         task_json_screen=getattr(a,'task_json_screen',False),common_http_screen=getattr(a,'common_http_screen',False),final_task_json=getattr(a,'final_task_json',False),pg_failure_probe=getattr(a,'pg_failure_probe',False))
     if getattr(a,'normal_self_probe',False):identity['normal_self_probe']=True
     if getattr(a,'pg_queue_screen',False):identity['pg_queue_screen']=True
@@ -80,6 +89,7 @@ def hosted_identity(a,build_set):
     if getattr(a,'http_short_screen',False):
         identity.update(http_short_screen=True,http_short_goal=getattr(a,'http_short_goal','cpu'))
     if getattr(a,'memory_owner_probe',False):identity['memory_owner_probe']=True
+    if getattr(a,'pg_input_guard',False):identity['pg_input_guard']=True
     return identity
 
 
@@ -341,6 +351,63 @@ def pg_driver_plan(versions):
                 'observed, never accepted; no timeout renewal, SQL retry, product change, matrix or capacity ranking.')
 
 
+def pg_input_guard_plan(versions):
+    controls=[dict(name='A',phase='environment-control',workload='db',contract='pg-strict',
+        group=g,rate=200,warmup_seconds=3,score_seconds=15) for g in (1,2,3)]
+    windows=[dict(name=name,phase='normal',workload='db',contract='pg-strict',
+        group=group,rate=200,warmup_seconds=3,score_seconds=15)
+        for group in range(1,13) for name in (('A','B') if group%2 else ('B','A'))]
+    return dict(schema='ku-hosted-pg-input-guard-v1',versions=versions,prepatch=PG_INPUT_PREPATCH,
+        candidate=PG_INPUT_CANDIDATE,resources=copy.deepcopy(RESOURCES),quality_policy=copy.deepcopy(POLICY),
+        windows=controls+windows,maximum_windows=27,maximum_replacements=0,
+        observation_alarm_seconds=900,workflow_limit_seconds=1200,
+        bootstrap_resamples=20000,bootstrap_seed=20261023,minimum_pairs=12,
+        guard_thresholds=dict(lower95_maximum=1,upper95_maximum=1.03,
+            metrics=['full_cpu_us','memory.steady_median_bytes']),
+        diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
+        purpose='Three independent original-A PG controls, then exactly12 balanced serial A/B PG pairs. '
+            'Normal helpers/text/async/int, original SQL/data/driver/resources/deadlines and natural cleanup. '
+            'Candidate-relative CPU and steady cgroup memory guard only; no R, pressure, JSON, compute, '
+            'replacement, automatic adoption or original16-goal qualification. Unknown never passes.')
+
+
+def pg_input_guard_comparison(rows,complete,environment):
+    result=dict(complete=complete,eligible_for_root_review=False,candidate_accepted=False,
+        formal_qualified=False,normal_score_eligible=False,comparisons={},reasons=[],
+        environment_qualification=environment)
+    if not environment or environment.get('quality')!='pass':
+        result['reasons'].append('environment controls unresolved or failed')
+    controls=[r for r in rows if r.get('phase')=='environment-control']
+    normal=[r for r in rows if r.get('phase')=='normal']
+    if not complete or len(rows)!=27 or len(controls)!=3 or len(normal)!=24:
+        result['reasons'].append('exact27 complete windows required; no replacement');return result
+    pairs=[]
+    for group in range(1,13):
+        selected=[r for r in normal if r.get('group')==group]
+        if len(selected)!=2 or {r.get('name') for r in selected}!={'A','B'}:
+            result['reasons'].append('missing or duplicate A/B group');return result
+        pair={r['name']:r for r in selected};pairs.append(pair)
+        for r in selected:
+            if not (r.get('observation_complete') is True and r.get('functional_valid') is True
+                and r.get('accounting_valid') is True and r.get('all_correct') is True
+                and r.get('natural_reclamation') is True and r.get('arrival_schedule_quality')=='pass'
+                and r.get('environment_quality')=='pass' and r.get('measurement_invalid') is False
+                and r.get('observed_environment_faults')==[] and r.get('diagnostic_quality',{}).get('valid') is True):
+                result['reasons'].append('one or more PG windows invalid or unknown')
+        if not pair['A'].get('comparison_contract') or pair['A']['comparison_contract']!=pair['B'].get('comparison_contract'):
+            result['reasons'].append('A/B comparison contract missing or different')
+    for metric in ('full_cpu_us','memory.steady_median_bytes'):
+        interval=fc.paired_interval([fc.metric(p['B'],metric) for p in pairs],
+            [fc.metric(p['A'],metric) for p in pairs],minimum=12,resamples=20000,seed=20261023)
+        result['comparisons'][metric]=interval
+        if interval.get('status')!='estimated' or interval['lower95']>1 or interval['upper95']>1.03:
+            result['reasons'].append(metric+' guard requires lower95<=1 and upper95<=1.03')
+    result['eligible_for_root_review']=not result['reasons']
+    result['note']=('Candidate-relative guard only. Steady memory is middle60% cgroup memory.current; '
+        'no original16 acceptance, overall performance win or automatic adoption is inferred.')
+    return result
+
+
 def pg_queue_plan(versions,prepatch):
     return dict(schema='ku-hosted-pg-queue-screen-v1',versions=versions,prepatch=prepatch,
         resources=copy.deepcopy(RESOURCES),quality_policy=copy.deepcopy(POLICY),
@@ -578,7 +645,7 @@ def build(a,state):
     builds=([('A',prepatch,None),*[(f'C{i+1}',commit,None) for i,commit in enumerate(variants)]] if build_set=='followup-screen' else [])+[
         ('B',a.candidate,None),('R',a.candidate,None)] if diagnostic else [('A0',a.baseline,None),('B',a.candidate,None),('R',a.candidate,None),
         ('BJ',a.candidate,{'ku_json':'typed'}),('BP',a.candidate,{'ku_pg_read':'typed'}),('BD',a.candidate,{'ku_format':'direct'})]
-    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):builds=[('A',prepatch,None),('B',a.candidate,None),('Driver',a.candidate,None)]
+    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False) or getattr(a,'pg_input_guard',False):builds=[('A',prepatch,None),('B',a.candidate,None),('Driver',a.candidate,None)]
     if getattr(a,'pg_driver_screen',False):builds=[('B',a.candidate,None),('Driver',a.candidate,None)]
     for name,commit,mode in builds:
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
@@ -596,13 +663,13 @@ def complete_build(a,state,build_set,prepatch,variants):
     final_task_json=getattr(a,'final_task_json',False)
     validate_screen_selection(a,build_set)
     diagnostic=build_set in ('diagnostic','followup-screen')
-    rm=load(a.root/('Driver' if getattr(a,'pg_queue_screen',False) or getattr(a,'pg_driver_screen',False) or getattr(a,'http_short_screen',False) else 'R')/'manifest.json');client=copy.deepcopy(rm['client']);protocol=Path(rm['protocol']);versions={}
+    rm=load(a.root/('Driver' if getattr(a,'pg_queue_screen',False) or getattr(a,'pg_driver_screen',False) or getattr(a,'http_short_screen',False) or getattr(a,'pg_input_guard',False) else 'R')/'manifest.json');client=copy.deepcopy(rm['client']);protocol=Path(rm['protocol']);versions={}
     if getattr(a,'pg_driver_screen',False):client['command'].append('--diagnostic-arrival-ledger')
     b_normal=load(a.root/'B/manifest.json')['stacks']['ku']['build']['native']['server']
     fixed_control=build_set=='followup-screen' and 'KU_HTTP_WORKER_POLICY' in Path(b_normal['generated_c']).read_text()
     names=((['A',*[f'C{i+1}' for i in range(len(variants))]] if build_set=='followup-screen' else [])
         +['B',*(['BF'] if fixed_control else []),'R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS'])
-    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):names=['A','B']
+    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False) or getattr(a,'pg_input_guard',False):names=['A','B']
     if getattr(a,'pg_driver_screen',False):names=['B']
     if task_json_screen or final_task_json:
         require_task_json_support(a.root)
@@ -627,7 +694,7 @@ def complete_build(a,state,build_set,prepatch,variants):
             supplemental_only=final_task_json,original_worker_score_eligible=False,json_execution_mode='task')
     fixture=normalize_manifest(copy.deepcopy(load(a.root/'B/manifest.json')),protocol,client)
     fixture['stacks']={};save(a.root/'fixture/manifest.json',fixture)
-    if diagnostic and not any(getattr(a,k,False) for k in ('normal_self_probe','pg_queue_screen','pg_driver_screen','http_short_screen')):versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
+    if diagnostic and not any(getattr(a,k,False) for k in ('normal_self_probe','pg_queue_screen','pg_driver_screen','http_short_screen','pg_input_guard')):versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
     layers=None
     if build_set=='followup-screen':
         layers=step(state,a.root,'build-json-layers',lambda:build_json_layers(a))
@@ -635,7 +702,8 @@ def complete_build(a,state,build_set,prepatch,variants):
             m=load(a.root/'HC/manifest.json');versions['HC']=dict(root=str(a.root/'HC'),stack='ku',
                 source_commit=m['candidate_base'],binary_sha256=sha(m['stacks']['ku']['command'][0]),
                 diagnostic_only=True,normal_score_eligible=False)
-    if getattr(a,'http_short_screen',False):plan=http_short_plan(versions,getattr(a,'http_short_goal','cpu'))
+    if getattr(a,'pg_input_guard',False):plan=pg_input_guard_plan(versions)
+    elif getattr(a,'http_short_screen',False):plan=http_short_plan(versions,getattr(a,'http_short_goal','cpu'))
     elif getattr(a,'pg_driver_screen',False):plan=pg_driver_plan(versions)
     elif getattr(a,'pg_queue_screen',False):plan=pg_queue_plan(versions,prepatch)
     elif getattr(a,'normal_self_probe',False):plan=normal_self_plan(versions)
@@ -646,7 +714,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
-    if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
+    if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False) or getattr(a,'pg_input_guard',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
     if build_set=='followup-screen':
         for name in plan['candidate_versions']:
@@ -1066,14 +1134,16 @@ def task_json_screen(rows,case,slo):
               'not an original sixteen-goal result or proof from changing the fixture declaration alone')
 
 
-def pg_failure_export(a,directory,*,output_name='pg-failure-observation',schema='ku-pg-failure-small-artifact-v1',selected=None):
+def pg_failure_export(a,directory,*,output_name='pg-failure-observation',schema='ku-pg-failure-small-artifact-v1',selected=None,max_files=64,total_limit=8<<20):
     """Small redacted receipts only; raw originals remain in the full archive."""
+    if type(max_files)is not int or not 1<=max_files<=256 or type(total_limit)is not int or not (8<<20)<=total_limit<=(32<<20):
+        raise ValueError('bounded export limits required')
     output=a.root/output_name;output.mkdir(exist_ok=False);output.chmod(0o755)
     entries=[];skipped=[];total=0;paths=[];metadata_reserve=128<<10
     for path in directory.rglob('*') if selected is None else selected:
         if not path.is_file() or path.is_symlink() or path.suffix not in ('.json','.log'):continue
-        if len(paths)>=64:
-            skipped.append(dict(path='*',reason='small artifact64-file limit; other raw receipts retained'));break
+        if len(paths)>=max_files:
+            skipped.append(dict(path='*',reason=f'small artifact{max_files}-file limit; other raw receipts retained'));break
         paths.append(path)
     for path in sorted(paths):
         relative=path.relative_to(directory)
@@ -1085,8 +1155,8 @@ def pg_failure_export(a,directory,*,output_name='pg-failure-observation',schema=
         try:data=encoded(redact(json.loads(raw),a.root)) if path.suffix=='.json' else redact(raw.decode(),a.root).encode()
         except (ValueError,UnicodeError):
             skipped.append(dict(path=str(relative),reason='unreadable text receipt; raw not exported'));continue
-        if total+len(data)>(8<<20)-metadata_reserve:
-            skipped.append(dict(path=str(relative),reason='small artifact8MiB limit; retained in full archive'));continue
+        if total+len(data)>total_limit-metadata_reserve:
+            skipped.append(dict(path=str(relative),reason=f'small artifact{total_limit>>20}MiB limit; retained in full archive'));continue
         dest=output/relative;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(data);dest.chmod(0o644);total+=len(data)
         parent=dest.parent
         while parent!=output:
@@ -1094,7 +1164,7 @@ def pg_failure_export(a,directory,*,output_name='pg-failure-observation',schema=
         entries.append(dict(path=str(relative),original_sha256=hashlib.sha256(raw).hexdigest(),
             exported_sha256=hashlib.sha256(data).hexdigest(),bytes=len(data)))
     record=dict(schema=schema,entries=entries,skipped=skipped,bytes=total,
-        metadata_reservation_bytes=metadata_reserve,total_limit_bytes=8<<20,
+        metadata_reservation_bytes=metadata_reserve,total_limit_bytes=total_limit,
         raw_receipts_in_full_archive=True,redacted=True,normal_score_eligible=False)
     data=encoded(record)
     if len(data)>metadata_reserve:raise ValueError('small artifact metadata limit exceeded')
@@ -1486,20 +1556,21 @@ def normal_diagnostic_quality(row):
 
 def pg_queue_screen(a,state):
     if os.geteuid()!=0:raise ValueError('PG queue screen requires root cgroup control')
-    short=getattr(a,'http_short_screen',False);plan=load(a.root/'frozen-plan.json')
-    prepatch=HTTP_SHORT_PREPATCH if short else PG_QUEUE_PREPATCH
-    expected_plan=http_short_plan(plan.get('versions',{}),getattr(a,'http_short_goal','cpu')) if short else pg_queue_plan(plan.get('versions',{}),prepatch)
+    short=getattr(a,'http_short_screen',False);guard=getattr(a,'pg_input_guard',False);plan=load(a.root/'frozen-plan.json')
+    prepatch=PG_INPUT_PREPATCH if guard else HTTP_SHORT_PREPATCH if short else PG_QUEUE_PREPATCH
+    expected_plan=pg_input_guard_plan(plan.get('versions',{})) if guard else http_short_plan(plan.get('versions',{}),getattr(a,'http_short_goal','cpu')) if short else pg_queue_plan(plan.get('versions',{}),prepatch)
     if plan!=expected_plan:raise ValueError('matching frozen A/B diagnostic plan required')
     bindings={name:fc.version_identity(plan,name) for name in ('A','B')}
     expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
         pg_execution_mode='async',pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
     if any(x['stack']!='ku' or x['build_mode']!=expected for x in bindings.values()):raise ValueError('normal A/B Release modes required')
     if bindings['A']['source_commit']!=prepatch or bindings['B']['source_commit']==prepatch:raise ValueError('A/B source identities differ from the frozen pair')
-    if short and bindings['A']['files']['expanded source']['sha256']!=bindings['B']['files']['expanded source']['sha256']:
+    if (short or guard) and bindings['A']['files']['expanded source']['sha256']!=bindings['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
-    directory=a.root/('http-short-screen' if short else 'pg-queue-screen');directory.mkdir(exist_ok=False)
+    if guard and bindings['B']['source_commit']!=PG_INPUT_CANDIDATE:raise ValueError('exact PG input candidate required')
+    directory=a.root/('pg-input-guard' if guard else 'http-short-screen' if short else 'pg-queue-screen');directory.mkdir(exist_ok=False)
     fixture=db.Database(a.root/'fixture',state['uid'],state['gid']);original=fc.Harness;private=None;environment=None
-    result=dict(schema='ku-http-short-screen-v1' if short else 'ku-pg-queue-screen-v1',diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
+    result=dict(schema='ku-hosted-pg-input-guard-v1' if guard else 'ku-http-short-screen-v1' if short else 'ku-pg-queue-screen-v1',diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
         candidate_accepted=False,goal_status='unknown',execution_complete=False,rows=[],stopped=[],purpose=plan['purpose'])
     if short:result['http_short_goal']=plan['http_short_goal']
     began=time.monotonic()
@@ -1515,7 +1586,7 @@ def pg_queue_screen(a,state):
             **({'http_short_goal':plan['http_short_goal'],'adoption_thresholds':plan['adoption_thresholds']} if short else {})))
         for config in plan['windows']:
             name=config['name'];phase=config['phase'];workload=config.get('workload','db')
-            output=directory/(('environment-controls' if phase=='environment-control' else workload) if short else phase)/f"g{config['group']}-{name}"
+            output=directory/(('environment-controls' if phase=='environment-control' else workload) if short or guard else phase)/f"g{config['group']}-{name}"
             try:
                 row=fc.window(plan,name,workload,config['rate'],config['warmup_seconds'],config['score_seconds'],output,
                     binding=bindings[name],job={'phase':'diagnostic','contract':config.get('contract','pg-default')})
@@ -1533,9 +1604,9 @@ def pg_queue_screen(a,state):
                 bool(cleanup) and all(fc.service_termination_succeeded('ku',x) for x in cleanup))
             obtained=row.get('status') in ('warmup_failure','observed','functional_failure','accounting_failure') and 'observer_error' not in row
             observed=obtained and natural and all(c['report_present'] and c['cleanup_ok'] for c in clients)
-            if phase=='normal' or short:
+            if phase=='normal' or short or guard:
                 quality,_=normal_diagnostic_quality(row);observed=observed and quality
-                if short and environment:
+                if (short or guard) and environment:
                     row['diagnostic_quality'].update(registered_environment_evidence=environment['evidence'],
                         scope='Diagnostic A/B observation with separately registered original environment controls; '
                             'row quality is preserved. This is not formal ranking or automatic adoption.')
@@ -1547,14 +1618,14 @@ def pg_queue_screen(a,state):
             result['rows'].append(row);save(directory/'results.json',dict(rows=result['rows'],stopped=result['stopped']))
             if not observed:
                 result['stopped'].append(dict(name=name,phase=phase,group=config['group'],reason='normal quality or observation/physical cleanup failed; no retries'));break
-            if short and phase=='environment-control' and config['group']==3:
+            if (short or guard) and phase=='environment-control' and config['group']==3:
                 environment=environment_record(dict(rows=result['rows']),directory/'environment-qualification.json')
                 environment.update(control_version='A',scope='Three independent frozen prepatch A controls; original registered qualification checks.')
                 save(directory/'environment-qualification.json',environment);result['environment_qualification']=environment
                 if environment['quality']!='pass':
                     result['stopped'].append(dict(phase=phase,reason='environment qualification unresolved or failed; business windows not started'));break
         normal=[row for row in result['rows'] if row['phase']=='normal']
-        if not short and len(normal)==6 and all(r['observation_complete'] for r in normal):
+        if not short and not guard and len(normal)==6 and all(r['observation_complete'] for r in normal):
             pairs=[{r['name']:r for r in normal if r['group']==g} for g in (1,2,3)]
             result['normal_cpu_pairs']=[dict(group=g,A=p['A']['full_cpu_us'],B=p['B']['full_cpu_us']) for g,p in enumerate(pairs,1)]
             result['normal_cpu_B_over_A']=fc.paired_interval([p['B']['full_cpu_us'] for p in pairs],[p['A']['full_cpu_us'] for p in pairs],minimum=3)
@@ -1569,13 +1640,18 @@ def pg_queue_screen(a,state):
         dbok=cleanup.get('forced') is False and cleanup.get('cgroup_removed') is True and cleanup.get('after',{}).get('process_count')==0
         result.update(seconds=time.monotonic()-began,execution_complete=len(result['rows'])==plan['maximum_windows']
             and not result['stopped'] and dbok and 'observer_error' not in result)
-        if short:result['comparison']=http_short_comparison(result['rows'],result['execution_complete'],environment,plan['http_short_goal'])
+        if guard:
+            result['comparison']=pg_input_guard_comparison(result['rows'],result['execution_complete'],environment)
+            result['relative_guard_passed']=result['comparison']['eligible_for_root_review']
+        elif short:result['comparison']=http_short_comparison(result['rows'],result['execution_complete'],environment,plan['http_short_goal'])
         result['goal_status']='unknown' if result['execution_complete'] else 'blocked';save(directory/'summary.json',result)
         selected=[directory/name for name in ('summary.json','identity.json','results.json','environment-qualification.json')]
-        selected.extend(directory/(('environment-controls' if c['phase']=='environment-control' else c['workload']) if short else c['phase'])/f"g{c['group']}-{c['name']}"/relative for c in plan['windows'] for relative in (
-            'window.json','full-lifecycle.json','warmup/client.json','score/client.json','warmup/runtime-after-failure.json','service/service.log'))
-        result['small_artifact']=pg_failure_export(a,directory,output_name='http-short-observation' if short else 'pg-queue-observation',
-            schema='ku-http-short-small-artifact-v1' if short else 'ku-pg-queue-small-artifact-v1',selected=selected)
+        selected.extend(directory/(('environment-controls' if c['phase']=='environment-control' else c['workload']) if short or guard else c['phase'])/f"g{c['group']}-{c['name']}"/relative for c in plan['windows'] for relative in (
+            'window.json','full-lifecycle.json','warmup/client.json','score/client.json','warmup/runtime-after-failure.json','service/service.log',
+            *((('score/resources.json','score/driver-cleanup.json','warmup/driver-cleanup.json')) if guard else ())))
+        result['small_artifact']=pg_failure_export(a,directory,output_name='pg-input-guard-observation' if guard else 'http-short-observation' if short else 'pg-queue-observation',
+            schema='ku-pg-input-guard-small-artifact-v1' if guard else 'ku-http-short-small-artifact-v1' if short else 'ku-pg-queue-small-artifact-v1',selected=selected,
+            **({'max_files':256,'total_limit':32<<20} if guard else {}))
         save(a.root/'hosted-state.json',state)
     return result
 
@@ -1825,7 +1901,7 @@ def normal_self_probe(a,state):
 def diagnostic(a,state,followup=False):
     if getattr(a,'memory_owner_probe',False):return memory_owner_probe(a,state)
     if getattr(a,'pg_driver_screen',False):return pg_driver_screen(a,state)
-    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):return pg_queue_screen(a,state)
+    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False) or getattr(a,'pg_input_guard',False):return pg_queue_screen(a,state)
     if getattr(a,'normal_self_probe',False):return normal_self_probe(a,state)
     if getattr(a,'pg_failure_probe',False):return pg_failure_probe(a,state)
     import http_cost_diagnostic as hcd
@@ -2376,6 +2452,7 @@ def main(argv=None):
     p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
+    p.add_argument('--pg-input-guard',action='store_true',help='Fixed F166/746e913 PG-only3 controls+12 paired candidate-relative guards; no formal goal or retry')
     p.add_argument('--pg-queue-screen',action='store_true',help='Eight normal A/B PG fix diagnostic windows; frozen f39c673 prepatch required, no matrix or formal capacity claim')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv)
@@ -2386,6 +2463,7 @@ def main(argv=None):
     if a.phase=='perf-preflight' and not a.normal_self_probe:p.error('perf-preflight requires explicit normal-self mode')
     if a.http_short_screen and a.phase not in ('build','diagnostic','archive'):p.error('--http-short-screen only supports fresh build/diagnostic/archive')
     if a.pg_driver_screen and a.phase not in ('build','diagnostic','archive'):p.error('--pg-driver-screen only supports fresh build/diagnostic/archive')
+    if a.pg_input_guard and a.phase not in ('build','diagnostic','archive'):p.error('--pg-input-guard only supports build/diagnostic/archive')
     if a.pg_queue_screen and a.phase not in ('build','diagnostic','archive'):p.error('--pg-queue-screen only supports fresh build/diagnostic/archive')
     try:validate_screen_selection(a,a.build_set)
     except ValueError as error:p.error(str(error))
@@ -2393,7 +2471,8 @@ def main(argv=None):
     if a.phase!='archive' and (a.root==a.source or a.source in a.root.parents or a.root in a.source.parents):p.error('output must be independent of checkout')
     a.screen_variants=a.screen_variants.split(',') if a.screen_variants else []
     if len(a.screen_variants)>7 or len(set(a.screen_variants))!=len(a.screen_variants):p.error('at most seven distinct screen variants')
-    if any(not re.fullmatch('[0-9a-f]{40}',x) for x in [a.baseline,a.candidate,a.prepatch,*a.screen_variants]) or a.baseline!=BASELINE:p.error('frozen full commit identities required')
+    expected_baseline=PG_INPUT_PREPATCH if a.pg_input_guard else BASELINE
+    if any(not re.fullmatch('[0-9a-f]{40}',x) for x in [a.baseline,a.candidate,a.prepatch,*a.screen_variants]) or a.baseline!=expected_baseline:p.error('frozen full commit identities required')
     if a.build_set!='followup-screen' and a.screen_variants:p.error('screen variants require followup-screen build-set')
     if a.prepatch in a.screen_variants or a.candidate in a.screen_variants:p.error('screen variants must differ from prepatch and final candidate')
     if a.phase!='archive' and (platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64')):p.error('actual Linux ARM64 required')
@@ -2417,13 +2496,15 @@ def main(argv=None):
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
-        if a.phase=='diagnostic':signal.alarm(120 if a.memory_owner_probe else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
+        if a.phase=='diagnostic':signal.alarm(900 if a.pg_input_guard else 120 if a.memory_owner_probe else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
         if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,
             'followup-screen':lambda a,s:diagnostic(a,s,followup=True)}[a.phase]
         result=step(state,a.root,a.phase,lambda:operation(a,state),resume=a.phase in ('run','tail','lifecycle','compiler'))
     if a.phase!='archive':state['goal_status']=result.get('goal_status','unknown');save(a.root/'hosted-state.json',state)
-    print(json.dumps(result));return 2 if a.phase in ('run','tail','lifecycle','diagnostic','followup-screen') and result.get('execution_complete') is not True else 0
+    print(json.dumps(result))
+    if a.pg_input_guard and a.phase=='diagnostic' and result.get('relative_guard_passed') is not True:return 2
+    return 2 if a.phase in ('run','tail','lifecycle','diagnostic','followup-screen') and result.get('execution_complete') is not True else 0
 
 if __name__=='__main__':raise SystemExit(main())
