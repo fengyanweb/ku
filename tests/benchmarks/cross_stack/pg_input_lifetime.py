@@ -145,8 +145,8 @@ def main():
     cpus = sorted(os.sched_getaffinity(0))
     if len(cpus) < 3: raise RuntimeError('need two service CPUs and a separate DB CPU')
     private = Path(tempfile.mkdtemp(prefix='private-', dir=ROOT)); private.chmod(0o755); group = Path('/sys/fs/cgroup') / ('ku-pg-input-' + secrets.token_hex(8)); database = None
-    environment = os.environ | dict(KU_CC='clang-18', KU_EVENT_LOOPS='2', KU_BLOCKING_THREADS='2', KU_DB_MAX_CONNECTIONS='1', KU_DB_MAX_WAITERS='1', KU_DB_MAX_PENDING_BYTES=str(8 << 20), PGCLIENTENCODING='UTF8')
-    R.update(status='running', source_sha256=hashlib.sha256(SOURCE.encode()).hexdigest(), input_bytes=2 << 20, input_sha256=hashlib.sha256(b'x' * (2 << 20)).hexdigest(), sql=SQL, uid=uid, gid=gid, service_cpus=cpus[:2], database_cpu=cpus[-1], cgroup_root=str(group))
+    environment = os.environ | dict(KU_CC='clang-18', KU_EVENT_LOOPS='2', KU_BLOCKING_THREADS='3', KU_DB_MAX_CONNECTIONS='1', KU_DB_MAX_WAITERS='1', KU_DB_MAX_PENDING_BYTES=str(8 << 20), PGCLIENTENCODING='UTF8')
+    R.update(status='running', source_sha256=hashlib.sha256(SOURCE.encode()).hexdigest(), input_bytes=2 << 20, input_sha256=hashlib.sha256(b'x' * (2 << 20)).hexdigest(), sql=SQL, uid=uid, gid=gid, service_cpus=cpus[:2], database_cpu=cpus[-1], cgroup_root=str(group), thread_configuration=dict(event_loops=2,total_blocking=3,reserved_Task_blocking=1))
     try:
         libdir = tool(['pg_config', '--libdir']); libpq = Path(libdir) / 'libpq.so'
         linkdir = private / 'libpq-link'; linkdir.mkdir(mode=0o755); (linkdir / 'libpq.so').symlink_to(libpq.resolve()); environment['KU_PG_LIB'] = str(linkdir)
