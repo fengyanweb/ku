@@ -263,7 +263,8 @@ jobs:
           printf 'KU_PG_CURRENT_BUILD=%s\n' "$RUNNER_TEMP/ku-pg-current-1.99.1" >> "$GITHUB_ENV"
           printf 'KU_PG_CURRENT_ROOT=%s\n' "$RUNNER_TEMP/ku-pg-current-observation" >> "$GITHUB_ENV"
           printf '%s\n' "$RUNNER_TEMP/ku-pg-current-tools/bin" >> "$GITHUB_PATH"
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: pg_current_cargo_restore
         with:
           path: |
             ${{ runner.temp }}/ku-pg-current-1.99.1/cli-cache-1.99.1
@@ -280,6 +281,7 @@ jobs:
           sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --preflight --callchains \
             --root "$KU_PG_CURRENT_BUILD" --tools "$RUNNER_TEMP/ku-pg-current-tools" --current-product "$KU_PG_PRODUCT"
       - name: Fresh current default and typed builds using the shared Rust1.99.1 CLI
+        id: pg_current_prepare
         timeout-minutes: 12
         shell: bash
         run: |
@@ -287,6 +289,15 @@ jobs:
           python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --prepare --callchains \
             --root "$KU_PG_CURRENT_BUILD" --tools "$RUNNER_TEMP/ku-pg-current-tools" \
             --source "$GITHUB_WORKSPACE" --current-product "$KU_PG_PRODUCT" > "$RUNNER_TEMP/ku-pg-current-build.log" 2>&1
+      - name: Save the successful Cargo preparation before observation
+        if: ${{ always() && steps.pg_current_prepare.outcome == 'success' && steps.pg_current_cargo_restore.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ${{ runner.temp }}/ku-pg-current-1.99.1/cli-cache-1.99.1
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.pg_current_cargo_restore.outputs.cache-primary-key }}
       - name: Observe only the shared PG and reactor caller question
         timeout-minutes: 6
         shell: bash
