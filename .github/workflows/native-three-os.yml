@@ -116,8 +116,12 @@ jobs:
             fi
           done
           mkdir -p "$RUNNER_TEMP/ku-pg-typed-tools/bin"
-          pg_perf_binary="$(find /usr/lib/linux-tools* -maxdepth 2 -type f -name perf -print 2>/dev/null | sort -V | tail -n 1 || true)"
+          pg_perf_binary="$(readlink -e "/usr/lib/linux-tools/$(uname -r)/perf" || true)"
+          if [ -z "$pg_perf_binary" ] || [ ! -x "$pg_perf_binary" ]; then
+            pg_perf_binary="$(find -L /usr/lib/linux-tools* /usr/lib/linux-azure-tools* -maxdepth 2 -type f -name perf -print 2>/dev/null | sort -V | tail -n 1 || true)"
+          fi
           test -n "$pg_perf_binary"
+          test -x "$pg_perf_binary"
           ln -s "$pg_perf_binary" "$RUNNER_TEMP/ku-pg-typed-tools/bin/perf"
           printf 'KU_PG_TYPED_ROOT=%s\n' "$RUNNER_TEMP/ku-pg-typed-self" >> "$GITHUB_ENV"
           printf 'KU_PG_TYPED_REUSE=%s\n' "$RUNNER_TEMP/ku-pg-typed-reuse" >> "$GITHUB_ENV"
@@ -161,8 +165,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -d "$KU_PG_TYPED_ROOT" ]; then
-            sudo -n python3 -B - "$GITHUB_WORKSPACE/tests/benchmarks/cross_stack" "$KU_PG_TYPED_ROOT" "$(id -u)" "$(id -g)" <<'PY'
+          pg_typed_archive_root="${KU_PG_TYPED_ROOT:-$RUNNER_TEMP/ku-pg-typed-self}"
+          if [ -d "$pg_typed_archive_root" ]; then
+            sudo -n python3 -B - "$GITHUB_WORKSPACE/tests/benchmarks/cross_stack" "$pg_typed_archive_root" "$(id -u)" "$(id -g)" <<'PY'
           import sys
           from pathlib import Path
           from types import SimpleNamespace
