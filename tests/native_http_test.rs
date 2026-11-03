@@ -6476,7 +6476,12 @@ fn native_http_task_self_wake_keeps_late_work_and_cross_thread_retirement() {
     let late_end = runtime[late_start..].find("\n    }").unwrap() + late_start + 6;
     let late = &runtime[late_start..late_end];
     assert!(runtime.contains("owner_work|=owner->task_work_pending;"));
-    assert!(late_start > runtime.find("reactor.old_net_count=net_count;").unwrap());
+    assert!(
+        late_start
+            > runtime
+                .find("ku_http_reactor_sync_net(&reactor,net_interests,net_count,net_capacity,poll_items,net_base);")
+                .unwrap()
+    );
     assert!(late_end < runtime.find("int selected=ku_http_reactor_wait(").unwrap());
     let header = r#"
 #define _GNU_SOURCE
@@ -8281,6 +8286,49 @@ fn native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlin
         .find("/* End persistent owner reactor. */")
         .unwrap()
         + begin;
+    let rejection = runtime
+        .find("rejection.phase==KU_HTTP_IO_REJECT?KU_HTTP_POLL_READ:KU_HTTP_POLL_WRITE,0,rejection.poll_index);")
+        .unwrap();
+    let net_marker = "#if defined(KU_HTTP_HAS_TASK_NET)\n";
+    let net_begin = rejection + runtime[rejection..].find(net_marker).unwrap() + net_marker.len();
+    let net_end = net_begin + runtime[net_begin..].find("\n#endif").unwrap();
+    let net_sync = &runtime[net_begin..net_end];
+    let kernel_signature = "static int ku_http_reactor_kernel(";
+    assert_eq!(runtime[begin..end].matches(kernel_signature).count(), 1);
+    let reactor_source = runtime[begin..end]
+        .replacen(kernel_signature, "static int fixture_real_kernel(", 1)
+        .replacen(
+            "static void ku_http_reactor_delete(",
+            r#"static int ku_http_reactor_kernel(KuHttpReactor* r,KuHttpRegistration* entry,
+    KuHttpSocket fd,short events,uint64_t token,int remove) {
+  if(fd==fixture_net_tracked_fd) {
+    if(remove)fixture_net_deletes++;
+    else if(entry->registered)fixture_net_modifies++;
+    else fixture_net_adds++;
+  }
+  return fixture_real_kernel(r,entry,fd,events,token,remove);
+}
+static void ku_http_reactor_delete("#,
+            1,
+        );
+    let net_wrapper = format!(
+        r#"
+static void fixture_sync(KuHttpReactor* fixture_reactor,KuTaskNetPollV1* net_interests,
+    size_t net_count,KuHttpPollFd* poll_items,int net_base) {{
+  int slot_count=fixture_reactor->slots;
+  size_t net_capacity=fixture_reactor->pending_base-(size_t)slot_count-3u;
+  (void)net_capacity;
+  for(size_t i=0;i<net_count;i++) {{
+    poll_items[net_base+(int)i].fd=(KuHttpSocket)net_interests[i].socket_value;
+    poll_items[net_base+(int)i].events=(short)(((net_interests[i].events&KU_TASK_NET_READ)?KU_HTTP_POLL_READ:0)
+        |((net_interests[i].events&KU_TASK_NET_WRITE)?KU_HTTP_POLL_WRITE:0));
+  }}
+#define reactor (*fixture_reactor)
+{net_sync}
+#undef reactor
+}}
+"#
+    );
     // Compile actual production registry/heap/kernel helpers with a model of
     // only their borrowed connection fields. Real socketpair readiness and fd
     // recycling exercise the OS backend; no alternate event algorithm exists.
@@ -8291,6 +8339,7 @@ fn native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlin
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -8302,6 +8351,7 @@ fn native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlin
 #include <sys/event.h>
 #endif
 #define KU_HTTP_PERSISTENT_EVENT_LOOP 1
+#define KU_HTTP_HAS_TASK_NET 1
 #define KU_HTTP_INVALID_SOCKET (-1)
 #define KU_HTTP_POLL_READ POLLIN
 #define KU_HTTP_POLL_WRITE POLLOUT
@@ -8347,9 +8397,180 @@ static void fixture_free(void* value) {
 }
 #define calloc fixture_calloc
 #define free fixture_free
+static int fixture_net_tracked_fd=-1;
+static size_t fixture_net_adds,fixture_net_deletes,fixture_net_modifies;
 "#;
     let checks = r#"
 #define CHECK(c) do {if(!(c)){fprintf(stderr,"persistent owner line %d: %s\n",__LINE__,#c);return 1;}}while(0)
+static uint64_t fixture_net_token(KuHttpReactor* r,int fd) {
+  size_t bucket=ku_http_reactor_fd_bucket(r,fd);
+  if(bucket==SIZE_MAX || !r->fd_entries[bucket])return 0;
+  return r->registrations[r->fd_entries[bucket]-1u].token;
+}
+static int fixture_net_read(KuHttpReactor* r,int fd,int peer,int poll_index,uint64_t generation,KuHttpReadyEvent* captured) {
+  KuHttpPollFd items[16]={{0}};char byte;uint64_t token=fixture_net_token(r,fd);
+  CHECK(token && write(peer,"n",1)==1 && ku_http_reactor_wait(r,items,1000)>0);
+  CHECK(items[poll_index].revents&KU_HTTP_POLL_READ);
+#if defined(__linux__)
+  uint64_t observed=r->events[0].data.u64;
+#else
+  uint64_t observed=(uint64_t)(uintptr_t)r->events[0].udata;
+#endif
+  CHECK(observed==token);
+  size_t entry=ku_http_reactor_lookup(r,observed);
+  CHECK(entry<r->capacity && r->registrations[entry].fd==fd
+      && r->registrations[entry].generation==generation);
+  KuHttpReadyEvent saved={entry,observed,generation,fd,KU_HTTP_POLL_READ};
+  CHECK(ku_http_reactor_event_valid(r,&saved));
+  if(captured)*captured=saved;
+  CHECK(read(fd,&byte,1)==1 && byte=='n');return 0;
+}
+static int fixture_net_snapshot_compaction(int swap) {
+  KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
+  CHECK(ku_http_reactor_init(&r,&active,4u));
+  int a[2],b[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,a) && !socketpair(AF_UNIX,SOCK_STREAM,0,b));
+  KuHttpPollFd items[16]={{0}};
+  KuTaskNetPollV1 interests[4]={{(uintptr_t)a[0],0u,UINT64_MAX-30u,KU_TASK_NET_READ},
+      {(uintptr_t)b[0],3u,UINT64_MAX-20u,KU_TASK_NET_READ}};
+  fixture_sync(&r,interests,2u,items,3);CHECK(!r.fault && r.fd_count==2u);
+  uint64_t a_token=fixture_net_token(&r,a[0]),b_token=fixture_net_token(&r,b[0]);KuHttpReadyEvent saved;
+  CHECK(!fixture_net_read(&r,b[0],b[1],4,interests[1].generation,&saved));
+  fixture_net_tracked_fd=b[0];fixture_net_adds=fixture_net_deletes=fixture_net_modifies=0;
+  KuTaskNetPollV1 previous=interests[0];interests[0]=interests[1];interests[1]=previous;
+  fixture_sync(&r,interests,swap?2u:1u,items,3);
+  CHECK(!r.fault && r.fd_count==(swap?2u:1u));
+  CHECK(!fixture_net_read(&r,b[0],b[1],3,interests[0].generation,NULL));
+  if(!swap)CHECK(ku_http_reactor_lookup(&r,a_token)==SIZE_MAX && !fixture_net_token(&r,a[0]));
+  uint64_t after=fixture_net_token(&r,b[0]);int stale_valid=ku_http_reactor_event_valid(&r,&saved);
+  printf("net-snapshot-%s B adds=%zu deletes=%zu modifies=%zu token_before=%llu token_after=%llu readiness=1 old_event_valid=%d\n",
+      swap?"swap":"remove-A",fixture_net_adds,fixture_net_deletes,fixture_net_modifies,
+      (unsigned long long)b_token,(unsigned long long)after,stale_valid);fflush(stdout);
+  int stable=!fixture_net_adds && !fixture_net_deletes && !fixture_net_modifies && b_token==after && stale_valid;
+  fixture_sync(&r,NULL,0u,items,3);CHECK(!r.fault && !r.fd_count);
+  CHECK(!close(a[0]) && !close(a[1]) && !close(b[0]) && !close(b[1]));
+  ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  CHECK(stable);puts("http-net-snapshot-stable-registration-ok");return 0;
+}
+static int fixture_net_snapshot_lifecycle(void) {
+  KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
+  CHECK(ku_http_reactor_init(&r,&active,4u));
+  int a[2],b[2],replacement[2];
+  CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,a) && !socketpair(AF_UNIX,SOCK_STREAM,0,b)
+      && !socketpair(AF_UNIX,SOCK_STREAM,0,replacement));
+  KuHttpPollFd items[16]={{0}};
+  KuTaskNetPollV1 interests[4]={{(uintptr_t)a[0],0u,UINT64_MAX-100u,KU_TASK_NET_READ},
+      {(uintptr_t)b[0],3u,UINT64_MAX-90u,KU_TASK_NET_READ}};
+  fixture_sync(&r,interests,2u,items,3);CHECK(!r.fault);
+  KuHttpReadyEvent stale_a,stale_b;
+  CHECK(!fixture_net_read(&r,a[0],a[1],3,interests[0].generation,&stale_a));
+  CHECK(!fixture_net_read(&r,b[0],b[1],4,interests[1].generation,&stale_b));
+  fixture_net_tracked_fd=a[0];fixture_net_adds=fixture_net_deletes=fixture_net_modifies=0;
+  interests[0].generation++;
+  fixture_sync(&r,interests,2u,items,3);CHECK(!r.fault && fixture_net_adds==1u && fixture_net_deletes==1u);
+  CHECK(!ku_http_reactor_event_valid(&r,&stale_a) && ku_http_reactor_event_valid(&r,&stale_b));
+  CHECK(!fixture_net_read(&r,a[0],a[1],3,interests[0].generation,&stale_a));
+  /* Same compact positions, exchanged resource FDs: retire both before adding. */
+  interests[0].socket_value=(uintptr_t)b[0];interests[1].socket_value=(uintptr_t)a[0];
+  interests[0].generation++;interests[1].generation++;
+  fixture_sync(&r,interests,2u,items,3);CHECK(!r.fault && r.fd_count==2u);
+  CHECK(!ku_http_reactor_event_valid(&r,&stale_a) && !ku_http_reactor_event_valid(&r,&stale_b));
+  CHECK(!fixture_net_read(&r,b[0],b[1],3,interests[0].generation,NULL));
+  CHECK(!fixture_net_read(&r,a[0],a[1],4,interests[1].generation,&stale_a));
+  CHECK(!close(a[0]) && dup2(replacement[0],a[0])==a[0] && !close(replacement[0]));
+  interests[1].generation++;
+  fixture_sync(&r,interests,2u,items,3);CHECK(!r.fault && !ku_http_reactor_event_valid(&r,&stale_a));
+  CHECK(!fixture_net_read(&r,a[0],replacement[1],4,interests[1].generation,NULL));
+  fixture_sync(&r,NULL,0u,items,3);CHECK(!r.fault && !r.fd_count && !r.net_head_plus_one);
+  CHECK(!ku_http_reactor_event_valid(&r,&stale_a) && !ku_http_reactor_event_valid(&r,&stale_b));
+  CHECK(!close(a[0]) && !close(a[1]) && !close(b[0]) && !close(b[1]) && !close(replacement[1]));
+  ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  puts("http-net-snapshot-generation-swap-reuse-empty-ok");return 0;
+}
+static int fixture_net_snapshot_capacity(void) {
+  KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
+  KuHttpPollFd items[16]={{0}};KuTaskNetPollV1 interests[4];int pairs[4][2];
+  CHECK(ku_http_reactor_init(&r,&active,4u));fixture_sync(&r,NULL,0u,items,3);CHECK(!r.fault);
+  for(size_t i=0;i<4u;i++) {
+    CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pairs[i]));
+    interests[i]=(KuTaskNetPollV1){(uintptr_t)pairs[i][0],i,UINT64_MAX-200u+i,KU_TASK_NET_READ};
+  }
+  fixture_sync(&r,interests,4u,items,3);CHECK(!r.fault && r.fd_count==4u);
+  CHECK(!fixture_net_read(&r,pairs[3][0],pairs[3][1],6,interests[3].generation,NULL));
+  fixture_sync(&r,NULL,0u,items,3);CHECK(!r.fault && !r.fd_count);
+  for(size_t i=0;i<4u;i++)CHECK(!close(pairs[i][0]) && !close(pairs[i][1]));
+  ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  CHECK(ku_http_reactor_init(&r,&active,0u));fixture_sync(&r,NULL,0u,items,3);CHECK(!r.fault && !r.fd_count);
+  ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  puts("http-net-snapshot-capacity-last-slot-empty-ok");return 0;
+}
+static int fixture_net_snapshot_retired_middle(int alias) {
+  KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
+  KuHttpPollFd items[16]={{0}};KuTaskNetPollV1 interests[3];int pairs[3][2],replacement[2]={-1,-1};
+  CHECK(ku_http_reactor_init(&r,&active,4u));
+  for(size_t i=0;i<3u;i++) {
+    CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pairs[i]));
+    interests[i]=(KuTaskNetPollV1){(uintptr_t)pairs[i][0],i==2u?3u:i,100u+i,KU_TASK_NET_READ};
+  }
+  fixture_sync(&r,interests,3u,items,3);CHECK(!r.fault && r.fd_count==3u);
+  KuHttpReadyEvent saved_a,saved_b,saved_c;
+  CHECK(!fixture_net_read(&r,pairs[0][0],pairs[0][1],3,100u,&saved_a));
+  CHECK(!fixture_net_read(&r,pairs[1][0],pairs[1][1],4,101u,&saved_b));
+  CHECK(!fixture_net_read(&r,pairs[2][0],pairs[2][1],5,102u,&saved_c));
+  size_t middle=ku_http_reactor_lookup(&r,saved_b.token);
+  CHECK(middle<r.capacity && r.registrations[middle].net_next_plus_one==saved_a.entry+1u);
+  size_t next=r.registrations[middle].net_next_plus_one;
+  if(alias) {
+    CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,replacement));
+    CHECK(!close(pairs[1][0]) && dup2(replacement[0],pairs[1][0])==pairs[1][0] && !close(replacement[0]));
+    /* A non-net owner reuses B's numeric FD before the next net snapshot. */
+    ku_http_reactor_interest(&r,(size_t)r.slots,pairs[1][0],KU_HTTP_POLL_READ,500u,7);
+  } else ku_http_reactor_delete(&r,middle);
+  CHECK(!r.fault && !r.registrations[middle].registered
+      && r.registrations[middle].net_next_plus_one==next && !ku_http_reactor_event_valid(&r,&saved_b));
+  interests[1]=interests[0];interests[0]=interests[2];
+  fixture_sync(&r,interests,2u,items,3);CHECK(!r.fault && r.fd_count==(alias?3u:2u));
+  CHECK(ku_http_reactor_event_valid(&r,&saved_a) && ku_http_reactor_event_valid(&r,&saved_c));
+  CHECK(!fixture_net_read(&r,pairs[2][0],pairs[2][1],3,102u,NULL));
+  CHECK(!fixture_net_read(&r,pairs[0][0],pairs[0][1],4,100u,NULL));
+  fixture_sync(&r,NULL,0u,items,3);CHECK(!r.fault && !r.net_head_plus_one && r.fd_count==(alias?1u:0u));
+  CHECK(!ku_http_reactor_event_valid(&r,&saved_a) && !ku_http_reactor_event_valid(&r,&saved_c));
+  if(alias) {
+    CHECK(!fixture_net_read(&r,pairs[1][0],replacement[1],7,500u,NULL));
+    ku_http_reactor_delete(&r,(size_t)r.slots);CHECK(!r.fault && !r.fd_count);
+    CHECK(!close(replacement[1]));
+  }
+  for(size_t i=0;i<3u;i++)CHECK(!close(pairs[i][0]) && !close(pairs[i][1]));
+  ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  puts(alias?"http-net-snapshot-outside-alias-keeps-tail-ok":"http-net-snapshot-outside-delete-keeps-tail-ok");return 0;
+}
+static int fixture_net_snapshot_invalid(int mode) {
+  KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
+  KuHttpPollFd items[16]={{0}};KuTaskNetPollV1 interests[5];int pairs[2][2];
+  CHECK(ku_http_reactor_init(&r,&active,4u));
+  for(size_t i=0;i<2u;i++)CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pairs[i]));
+  for(size_t i=0;i<5u;i++)interests[i]=(KuTaskNetPollV1){(uintptr_t)pairs[i%2u][0],3u,100u+i,KU_TASK_NET_READ};
+  size_t count=2u,live=0;uint64_t before=0;
+  if(mode==0) {
+    interests[0].slot=interests[1].slot=1u;
+    fixture_sync(&r,interests,1u,items,3);CHECK(!r.fault);
+    live=1u;before=fixture_net_token(&r,pairs[0][0]);
+  } else if(mode==2) {interests[0].slot=4u;count=1u;}
+  else if(mode==3) count=5u;
+  else if(mode==4) {interests[0].generation=0;count=1u;}
+  else if(mode==5) {
+    interests[0].slot=0u;fixture_sync(&r,interests,2u,items,3);CHECK(!r.fault);
+    live=2u;before=fixture_net_token(&r,pairs[0][0]);
+    size_t head=r.net_head_plus_one;CHECK(head && head<=r.capacity);
+    r.registrations[head-1u].net_next_plus_one=head;count=0;
+  }
+  fixture_net_tracked_fd=pairs[1][0];fixture_net_adds=fixture_net_deletes=fixture_net_modifies=0;
+  fixture_sync(&r,interests,count,items,3);
+  CHECK(r.fault && r.fd_count==live && !fixture_net_adds && !fixture_net_deletes && !fixture_net_modifies);
+  if(before)CHECK(fixture_net_token(&r,pairs[0][0])==before);
+  for(size_t i=0;i<2u;i++)CHECK(!close(pairs[i][0]) && !close(pairs[i][1]));
+  ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  puts("http-net-snapshot-invalid-fails-closed-without-kernel-churn-ok");return 0;
+}
 static int fixture_fd_index_clusters(void) {
   KuHttpConnection connections[8]={{0}};KuHttpActiveSet active={connections,8,NULL};KuHttpReactor r;
   CHECK(ku_http_reactor_init(&r,&active,0u));
@@ -8548,6 +8769,18 @@ static int fixture_closed_event_source(void) {
   puts("http-persistent-closed-event-source-fault-ok");return 0;
 }
 int main(int argc,char** argv) {
+  if(argc>1 && !strcmp(argv[1],"net-snapshot-compact"))return fixture_net_snapshot_compaction(0);
+  if(argc>1 && !strcmp(argv[1],"net-snapshot-swap"))return fixture_net_snapshot_compaction(1);
+  if(argc>1 && !strcmp(argv[1],"net-snapshot-lifecycle"))return fixture_net_snapshot_lifecycle();
+  if(argc>1 && !strcmp(argv[1],"net-snapshot-capacity"))return fixture_net_snapshot_capacity();
+  if(argc>1 && !strcmp(argv[1],"net-snapshot-middle-alias"))return fixture_net_snapshot_retired_middle(1);
+  if(argc>1 && !strcmp(argv[1],"net-snapshot-middle-delete"))return fixture_net_snapshot_retired_middle(0);
+  if(argc>1 && !strcmp(argv[1],"net-snapshot-duplicate-live"))return fixture_net_snapshot_invalid(0);
+  if(argc>1 && !strcmp(argv[1],"net-snapshot-duplicate-new"))return fixture_net_snapshot_invalid(1);
+  if(argc>1 && !strcmp(argv[1],"net-snapshot-slot-range"))return fixture_net_snapshot_invalid(2);
+  if(argc>1 && !strcmp(argv[1],"net-snapshot-count-range"))return fixture_net_snapshot_invalid(3);
+  if(argc>1 && !strcmp(argv[1],"net-snapshot-generation-zero"))return fixture_net_snapshot_invalid(4);
+  if(argc>1 && !strcmp(argv[1],"net-snapshot-chain-cycle"))return fixture_net_snapshot_invalid(5);
   if(argc>1 && !strcmp(argv[1],"fd-index-clusters"))return fixture_fd_index_clusters();
   if(argc>1 && !strcmp(argv[1],"fd-index-init-failures"))return fixture_fd_index_init_failures();
   if(argc>1 && !strcmp(argv[1],"failed-new-alias"))return fixture_failed_new_preserves_alias();
@@ -8644,7 +8877,12 @@ int main(int argc,char** argv) {
 "#;
     let directory = native_c_harness::TempDir::new("http-persistent-owner");
     let path = directory.path().join("persistent.c");
-    fs::write(&path, format!("{header}{}{checks}", &runtime[begin..end])).unwrap();
+    let task_abi = include_str!("../src/backend/c_task_reactor.h");
+    fs::write(
+        &path,
+        format!("{header}{task_abi}{reactor_source}{net_wrapper}{checks}"),
+    )
+    .unwrap();
     let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "persistent")
     else {
         assert!(
@@ -8668,9 +8906,8 @@ int main(int argc,char** argv) {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"http-persistent-owner-generation-idle-ok\n");
-    // Run both independent external-close counterexamples even if the first
-    // fails, so retained output distinguishes stale-fd fault from a lost new
-    // registration. Root serializes execution; product code is unchanged.
+    // Run independent counterexamples even if one fails, preserving the
+    // distinction between a lost registration, identity churn and a bad chain.
     let mut failures = Vec::new();
     for scenario in [
         "fd-index-clusters",
@@ -8681,6 +8918,18 @@ int main(int argc,char** argv) {
         "external-net-reuse-both",
         "filter-masks",
         "closed-event-source",
+        "net-snapshot-compact",
+        "net-snapshot-swap",
+        "net-snapshot-lifecycle",
+        "net-snapshot-capacity",
+        "net-snapshot-middle-alias",
+        "net-snapshot-middle-delete",
+        "net-snapshot-duplicate-live",
+        "net-snapshot-duplicate-new",
+        "net-snapshot-slot-range",
+        "net-snapshot-count-range",
+        "net-snapshot-generation-zero",
+        "net-snapshot-chain-cycle",
     ] {
         let output = run_bounded(
             Command::new(&executable).arg(scenario),
@@ -8695,6 +8944,22 @@ int main(int argc,char** argv) {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ));
+        } else if scenario.starts_with("net-snapshot-") {
+            let expected = match scenario {
+                "net-snapshot-compact" | "net-snapshot-swap" => {
+                    "http-net-snapshot-stable-registration-ok"
+                }
+                "net-snapshot-lifecycle" => "http-net-snapshot-generation-swap-reuse-empty-ok",
+                "net-snapshot-capacity" => "http-net-snapshot-capacity-last-slot-empty-ok",
+                "net-snapshot-middle-alias" => "http-net-snapshot-outside-alias-keeps-tail-ok",
+                "net-snapshot-middle-delete" => "http-net-snapshot-outside-delete-keeps-tail-ok",
+                _ => "http-net-snapshot-invalid-fails-closed-without-kernel-churn-ok",
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.lines().filter(|line| *line == expected).count() != 1 {
+                failures.push(format!("{scenario}: missing scenario receipt: {stdout}"));
+            }
+            println!("{scenario}: {stdout}");
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

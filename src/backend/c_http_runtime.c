@@ -3631,7 +3631,7 @@ typedef struct {
   uint64_t token,generation;
   short events;
   int registered,poll_index;
-  size_t resource_slot;
+  size_t net_next_plus_one;
 } KuHttpRegistration;
 typedef struct { uint64_t token; size_t entry; } KuHttpRegistrationHash;
 typedef struct {
@@ -3642,7 +3642,7 @@ typedef struct {
 } KuHttpReadyEvent;
 typedef struct KuHttpReactor {
   int descriptor,fault,slots,work_count,idle_count,idle_initial_count,draining;
-  size_t capacity,hash_capacity,fd_capacity,fd_count,old_net_count,ready_count,pending_base;
+  size_t capacity,hash_capacity,fd_capacity,fd_count,net_head_plus_one,ready_count,pending_base;
   uint64_t next_token;
   KuHttpActiveSet* active;
   KuHttpRegistration* registrations;
@@ -3842,7 +3842,10 @@ static void ku_http_reactor_delete(KuHttpReactor* r,size_t index) {
 #if defined(KU_HTTP_REACTOR_FD_ORACLE)
   KuHttpSocket removed_fd=entry->fd;
 #endif
-  *entry=(KuHttpRegistration){0};
+  /* A different owner resource can reuse a closed Task FD before the next
+   * net snapshot. Retiring its identity must not unlink the old net tail. */
+  size_t net_next=entry->net_next_plus_one;
+  *entry=(KuHttpRegistration){0};entry->net_next_plus_one=net_next;
 #if defined(KU_HTTP_REACTOR_FD_ORACLE)
   if(!ku_http_reactor_fd_oracle(r,removed_fd,SIZE_MAX))r->fault=1;
 #endif
@@ -3857,7 +3860,8 @@ static void ku_http_reactor_retire_fd_aliases(KuHttpReactor* r,size_t current,Ku
       || r->registrations[i].fd!=fd) {r->fault=1;return;}
   KuHttpRegistration* old=&r->registrations[i];
   ku_http_reactor_hash_remove(r,old->token);
-  *old=(KuHttpRegistration){0};
+  size_t net_next=old->net_next_plus_one;
+  *old=(KuHttpRegistration){0};old->net_next_plus_one=net_next;
 
 }
 static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
@@ -3894,6 +3898,65 @@ static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
   if(!ku_http_reactor_fd_oracle(r,fd,index))r->fault=1;
 #endif
 }
+#if defined(KU_HTTP_HAS_TASK_NET)
+static void ku_http_reactor_sync_net(KuHttpReactor* r,const KuTaskNetPollV1* interests,
+    size_t count,size_t capacity,KuHttpPollFd* items,int net_base) {
+  const size_t first=(size_t)r->slots+3u;
+  if(r->fault)return;
+  if(first>r->pending_base || capacity!=r->pending_base-first || count>capacity
+      || net_base<0 || count>(size_t)(INT_MAX-net_base) || (count && (!interests || !items))) {
+    r->fault=1;return;
+  }
+  /* Only previously live net slots are visited, not the pool's capacity.
+   * Alias-retired nodes retain their next link but no registration identity. */
+  size_t node=r->net_head_plus_one,visited=0;
+  while(node) {
+    if(node<=first || node>r->pending_base || visited++>=capacity) {r->fault=1;return;}
+    KuHttpRegistration* entry=&r->registrations[node-1u];
+    entry->poll_index=-1;node=entry->net_next_plus_one;
+  }
+  for(size_t i=0;i<count;i++) {
+    if(interests[i].slot>=capacity || !interests[i].generation
+        || items[net_base+(int)i].fd==KU_HTTP_INVALID_SOCKET) {r->fault=1;return;}
+    KuHttpRegistration* entry=&r->registrations[first+interests[i].slot];
+    if((entry->registered && entry->poll_index>=0)
+        || (!entry->registered && entry->token==UINT64_MAX)) {r->fault=1;return;}
+    /* MAX is never a live token. It detects duplicate new slots without an
+     * extra capacity-sized array; any preflight failure terminates this owner. */
+    if(!entry->registered)entry->token=UINT64_MAX;
+    entry->poll_index=net_base+(int)i;
+  }
+  /* Remove every old conflicting identity before any ADD, including fd swaps. */
+  node=r->net_head_plus_one;visited=0;
+  while(node) {
+    if(node<=first || node>r->pending_base || visited++>=capacity) {r->fault=1;return;}
+    size_t index=node-1u;
+    KuHttpRegistration* entry=&r->registrations[index];
+    node=entry->net_next_plus_one;
+    if(entry->poll_index<0 || entry->fd!=items[entry->poll_index].fd
+        || entry->generation!=interests[(size_t)(entry->poll_index-net_base)].generation)
+      ku_http_reactor_delete(r,index);
+  }
+  if(r->fault)return;
+  r->net_head_plus_one=0;
+  for(size_t i=0;i<count;i++) {
+    size_t index=first+interests[i].slot;
+    ku_http_reactor_interest(r,index,items[net_base+(int)i].fd,
+        items[net_base+(int)i].events,interests[i].generation,net_base+(int)i);
+    if(r->fault)return;
+  }
+  /* interest may retire an alias at another slot. Publish links only after
+   * all interests, and only for identities that still belong to this snapshot. */
+  for(size_t i=0;i<count;i++) {
+    size_t index=first+interests[i].slot;
+    KuHttpRegistration* entry=&r->registrations[index];
+    if(!entry->registered || entry->fd!=items[net_base+(int)i].fd
+        || entry->generation!=interests[i].generation)continue;
+    entry->net_next_plus_one=r->net_head_plus_one;
+    r->net_head_plus_one=index+1u;
+  }
+}
+#endif
 static int ku_http_reactor_idle(const KuHttpConnection* c) {
   return c->phase==KU_HTTP_IO_HEADER && !c->request_lease && !c->request_queued && !c->buffered && !c->carry_length
       && !c->job && !c->async_task
@@ -4577,21 +4640,8 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         rejection.phase==KU_HTTP_IO_REJECT?KU_HTTP_POLL_READ:KU_HTTP_POLL_WRITE,0,rejection.poll_index);
 #if defined(KU_HTTP_HAS_TASK_NET)
     /* The driver's bounded snapshot is compact and may reorder live FDs.
-     * Detach every changed identity before adding any replacement, otherwise
-     * swapping two entries could delete a just-added generation or hit EEXIST. */
-    for(size_t i=0;i<reactor.old_net_count;i++) {
-      KuHttpRegistration* entry=&reactor.registrations[(size_t)slot_count+3u+i];
-      if(i>=net_count || entry->fd!=poll_items[net_base+(int)i].fd
-          || entry->generation!=net_interests[i].generation || entry->resource_slot!=net_interests[i].slot)
-        ku_http_reactor_delete(&reactor,(size_t)slot_count+3u+i);
-    }
-    for(size_t i=0;i<net_count;i++)
-    {
-      ku_http_reactor_interest(&reactor,(size_t)slot_count+3u+i,poll_items[net_base+(int)i].fd,
-          poll_items[net_base+(int)i].events,net_interests[i].generation,net_base+(int)i);
-      reactor.registrations[(size_t)slot_count+3u+i].resource_slot=net_interests[i].slot;
-    }
-    reactor.old_net_count=net_count;
+     * Register by stable Task slot; poll_index follows the compact snapshot. */
+    ku_http_reactor_sync_net(&reactor,net_interests,net_count,net_capacity,poll_items,net_base);
 #endif
     for(int node=pending.head;node>=0;node=pending.items[node].next) {
       KuHttpPendingItem* item=&pending.items[node];
