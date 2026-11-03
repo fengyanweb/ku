@@ -14,6 +14,10 @@ on:
         description: 'Full prepatch commit for explicit paired screens; wake/PG probes require their frozen baseline'
         type: string
         default: ''
+      product_commit:
+        description: 'Optional full 40-hex product commit for pg-input-windows and pg-input-guard only'
+        type: string
+        default: ''
       screen_variants:
         description: 'Up to seven full commit ablations, comma-separated, in one serial followup-screen; no extra formal matrix'
         type: string
@@ -381,7 +385,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       RUST_BACKTRACE: "1"
       KU_PG_BASELINE: d05ca1551d4585011499d81d0ae828c4173306ff
-      KU_PG_CANDIDATE: e9d619af2f1061d8ec826c736eecbddcfee6a05a
+      KU_PG_CANDIDATE: ${{ inputs.product_commit || 'e9d619af2f1061d8ec826c736eecbddcfee6a05a' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -391,6 +395,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ ! "$KU_PG_CANDIDATE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'product_commit must be a full 40-hex commit' >&2
+            exit 1
+          fi
           printf 'KU_PG_GUARD_ROOT=%s\n' "$RUNNER_TEMP/ku-pg-input-guard" >> "$GITHUB_ENV"
           rustup toolchain install 1.99.1 --profile minimal --no-self-update
           rustup default 1.99.1
@@ -529,14 +537,26 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       KU_CC: clang -O2
+      KU_PG_PRODUCT_COMMIT: ${{ inputs.product_commit }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ inputs.product_commit || github.ref }}
           persist-credentials: false
       - name: Install the pinned compiler
         shell: bash
         run: |
           set -euo pipefail
+          if [ -n "$KU_PG_PRODUCT_COMMIT" ]; then
+            if [[ ! "$KU_PG_PRODUCT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+              echo 'product_commit must be a full 40-hex commit' >&2
+              exit 1
+            fi
+            if [ "$(git rev-parse HEAD)" != "$KU_PG_PRODUCT_COMMIT" ]; then
+              echo 'checked out HEAD does not match product_commit' >&2
+              exit 1
+            fi
+          fi
           rustup toolchain install 1.99.1 --profile minimal --no-self-update
           clang --version
       - name: Run only input lifetime, typed ownership and notification pins
