@@ -32,6 +32,102 @@ def archive(path, changes=None, old_run=False):
 
 class ReuseBuildTests(unittest.TestCase):
 
+    def test_current_cache_without_hosted_state_imports_only_fixed_B_and_driver(self):
+        for rust in ('1.99.1','1.89.0'):
+            with self.subTest(rust=rust),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);path=root/'current.tgz'
+                prepared=dict(product=r.h.PG_CURRENT_BASELINE,rust_toolchain=rust,new_builds=True,
+                    imported_measurement_windows=0,bindings={'B':{'files':{'ELF':{'sha256':r.CURRENT_PG_ELF}}}})
+                files={'prepared-current.json':json.dumps(prepared).encode(),'B/build/bin/server':b'B',
+                    'Driver/build/bin/client':b'Driver','BP/build/bin/server':b'not imported',
+                    'normal-self-probe/B/sample/score/perf.data':b'not imported'}
+                files['portable-file-map.json']=json.dumps(dict(path_root=r.TOKEN,raw_and_redacted_hashes_distinct=True,
+                    files=[dict(path=k,bytes=len(v),original_sha256=hashlib.sha256(v).hexdigest(),
+                        archived_sha256=hashlib.sha256(v).hexdigest()) for k,v in files.items()])).encode()
+                with tarfile.open(path,'w:gz') as tar:
+                    for name,raw in files.items():
+                        info=tarfile.TarInfo(name);info.size=len(raw);tar.addfile(info,io.BytesIO(raw))
+                digest=r.h.sha(path)
+                with patch.object(r,'CURRENT_PG_ARCHIVE_SHA',digest):
+                    if rust!='1.99.1':
+                        with self.assertRaisesRegex(ValueError,'Rust1.99.1'):r.extract_builds(path,root/'out',digest,{'B','Driver'},current_pg_cache=True)
+                        continue
+                    r.extract_builds(path,root/'out',digest,{'B','Driver'},current_pg_cache=True)
+                self.assertTrue((root/'out/B/build/bin/server').is_file())
+                self.assertFalse((root/'out/BP').exists());self.assertFalse((root/'out/normal-self-probe').exists())
+                self.assertFalse((root/'out/hosted-state.json').exists())
+                provenance=r.h.load(root/'out/reuse-original-state.json')
+                self.assertFalse(provenance['measurement_results_imported']);self.assertFalse(provenance['hosted_state_imported'])
+
+    def test_current_guard_aliases_verified_B_as_A_and_requires_fresh_candidate(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp)/'fresh';cache=root/'verified-current-cache'
+            a=types.SimpleNamespace(root=root,source=Path(temp)/'source',baseline=r.h.PG_CURRENT_BASELINE,
+                prepatch=r.h.PG_CURRENT_BASELINE,candidate='c'*40,screen_variants=[],pg_input_guard=True)
+            binding=dict(source_commit=a.baseline,manifest_sha256='original',source_inventory_sha256='inventory',
+                build_mode={'formatting_mode':'helpers'},files={k:{'sha256':v} for k,v in r.CURRENT_PG_FILES.items()})
+            client=dict(sha256=r.CURRENT_PG_FILES['driver ELF'],source_sha256=hashlib.sha256(b'go').hexdigest())
+            normal=dict(client=client,protocol='/verified/protocol',stacks={'ku':{'build':{'native':{'server':{'generated_c':'verified-C'}}}}})
+            def extract(*args,**kwargs):
+                r.h.save(cache/'prepared-current.json',{'bindings':{'B':binding}})
+                return {'B/manifest.json':{'original_sha256':'original'}}
+            patches.enter_context(patch.object(r.os,'geteuid',return_value=1001))
+            imported=patches.enter_context(patch.object(r,'extract_builds',side_effect=extract))
+            patches.enter_context(patch.object(r,'restore_json_inputs'));patches.enter_context(patch.object(r,'validate_protocol_inputs'))
+            driver=patches.enter_context(patch.object(r,'verify_driver_cache',return_value={'client':client}))
+            verify=patches.enter_context(patch.object(r,'verify_manifest',return_value=normal))
+            patches.enter_context(patch.object(r.h.fc,'version_identity',return_value=binding))
+            patches.enter_context(patch.object(r,'checked'))
+            patches.enter_context(patch.object(r.subprocess,'run',return_value=types.SimpleNamespace(returncode=0)))
+            patches.enter_context(patch.object(r.subprocess,'check_output',return_value=b'go'))
+            state=r.prepare_pg_input_guard_cache(Path(temp)/'archive',a,source_run='41630973206')
+            self.assertEqual(set(state['steps']),{'build-A','build-Driver'})
+            self.assertEqual(state['identity'],r.h.hosted_identity(a,'diagnostic'))
+            self.assertEqual(state['imported_measurement_windows'],0)
+            self.assertFalse((root/'B').exists());self.assertTrue((root/'A/manifest.json').is_file())
+            self.assertEqual(state['steps']['build-A']['original_build_name'],'B')
+            self.assertTrue(r.h.load(root/'verified-baseline-cache.json')['new_candidate_build_still_required'])
+            imported.assert_called_once_with(Path(temp)/'archive',cache,r.CURRENT_PG_ARCHIVE_SHA,{'B','Driver'},current_pg_cache=True)
+            driver.assert_called_once_with(cache,expected_commit=a.baseline)
+            verify.assert_called_once_with(cache,'B',a.baseline,{'B/manifest.json':{'original_sha256':'original'}},
+                client_source_name='Driver',require_current_rust=True)
+            with self.assertRaisesRegex(ValueError,'fresh guard root'):r.prepare_current_pg_guard_cache(Path(temp)/'archive',a)
+
+    def test_current_manifest_binds_redacted_cli_receipt_and_rejects_historical_rust(self):
+        for rust in ('1.99.1','1.89.0'):
+            with self.subTest(rust=rust),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);b=root/'B';b.mkdir();mapping={}
+                header=bytearray(20);header[:6]=b'\x7fELF\x02\x01';header[18:20]=(183).to_bytes(2,'little')
+                binary=b/'server';binary.write_bytes(header)
+                source=b/'program';source.write_text('frozen program')
+                pq=b/'build/libpq/libpq.so';pq.parent.mkdir(parents=True);pq.write_bytes(b'pq')
+                go=root/'Driver/src/tests/benchmarks/cross_stack/client/main.go';go.parent.mkdir(parents=True);go.write_bytes(b'go')
+                build_receipt=b/'build.json';r.h.save(build_receipt,dict(candidate_base=r.h.PG_CURRENT_BASELINE,failure=None,commands=[{'exit_code':0}]))
+                native_receipt=b/'native.json';r.h.save(native_receipt,{'cwd':r.TOKEN+'/B'})
+                cli_receipt=b/'cli.json';versions={'rustc':'rustc '+rust,'cargo':'cargo '+rust}
+                r.h.save(cli_receipt,dict(rust_toolchain=rust,failure=None,exact_versions=versions,
+                    commands=[dict(label='ku-cli',command=['cargo','+'+rust,'build','--locked','--release'],exit_code=0)],cwd=r.TOKEN+'/B'))
+                for path,original in ((native_receipt,'a'*64),(cli_receipt,'b'*64)):
+                    mapping[path.relative_to(root).as_posix()]=dict(original_sha256=original,archived_sha256=r.h.sha(path))
+                native=dict(binary=str(binary),binary_sha256=r.h.sha(binary),source=str(source),source_sha256=r.h.sha(source),
+                    generated_c=str(source),generated_c_sha256=r.h.sha(source),compiler_receipt=str(native_receipt),
+                    compiler_receipt_sha256='a'*64,compiler_invocation={'flags':['-std=c11','-O2','-pthread'],'library_inputs':[]})
+                build=dict(formatting_mode='helpers',json_response_mode='text',pg_execution_mode='async',pg_read_mode='int',
+                    cli=str(binary),cli_sha256=r.h.sha(binary),libpq_sha256=r.h.sha(pq),native={'server':native},
+                    rust_toolchain=rust,cli_build_receipt=str(cli_receipt),cli_build_receipt_sha256='b'*64)
+                r.h.save(b/'manifest.json',dict(candidate_base=r.h.PG_CURRENT_BASELINE,build_receipt=str(build_receipt),
+                    rust_toolchain=rust,versions=versions,stacks={'ku':{'command':[str(binary)],'build':build}},
+                    client={'command':[str(binary)],'sha256':r.h.sha(binary),'source_sha256':r.h.sha(go)}))
+                if rust!='1.99.1':
+                    with self.assertRaisesRegex(ValueError,'historical Rust'):
+                        r.verify_manifest(root,'B',r.h.PG_CURRENT_BASELINE,mapping,False,client_source_name='Driver',require_current_rust=True)
+                else:
+                    m=r.verify_manifest(root,'B',r.h.PG_CURRENT_BASELINE,mapping,False,client_source_name='Driver',require_current_rust=True)
+                    receipt=m['stacks']['ku']['build']
+                    self.assertEqual(receipt['original_cli_build_receipt_sha256'],'b'*64)
+                    self.assertEqual(receipt['cli_build_receipt_sha256'],r.h.sha(cli_receipt))
+                    r.h.bl.require_rust_manifest(m)
+
     def test_fixed_large_cache_extracts_three_builds_and_four_logs_without_score_state(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);path=root/'large.tgz'

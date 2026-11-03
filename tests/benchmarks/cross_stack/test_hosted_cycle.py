@@ -109,6 +109,13 @@ class HostedCycleTests(unittest.TestCase):
                 h.validate_screen_selection(types.SimpleNamespace(**base,**{flag:True}),'diagnostic')
         for change in ({'baseline':h.BASELINE},{'prepatch':h.BASELINE},{'candidate':'short'},{'candidate':h.PG_INPUT_PREPATCH}):
             with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(**dict(base,**change)),'diagnostic')
+        current=dict(base,baseline=h.PG_CURRENT_BASELINE,prepatch=h.PG_CURRENT_BASELINE,candidate='c'*40)
+        h.validate_screen_selection(types.SimpleNamespace(**current),'diagnostic')
+        current_plan=h.pg_input_guard_plan({'A':{},'B':{}},current['candidate'],current['baseline'])
+        self.assertEqual(current_plan,dict(plan,prepatch=current['baseline'],candidate=current['candidate']))
+        for change in ({'prepatch':h.PG_INPUT_PREPATCH},{'candidate':h.PG_CURRENT_BASELINE}):
+            with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(**dict(current,**change)),'diagnostic')
+        with self.assertRaises(ValueError):h.pg_input_guard_plan({},'c'*40,h.BASELINE)
 
     def test_pg_input_guard_comparison_never_passes_unknown_or_partial(self):
         rows=[dict(c,observation_complete=True,functional_valid=True,accounting_valid=True,all_correct=True,

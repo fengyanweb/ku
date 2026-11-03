@@ -16,6 +16,7 @@ CLI_CACHE = 'cli-cache-' + bl.RUST_TOOLCHAIN
 BASELINE = '956727188a058119fdb3790959063f1496ccb4cc'
 FOLLOWUP_PREPATCH = BASELINE
 PG_INPUT_PREPATCH = '166453a1d2768bbce19796d9c7823be73cc84ccb'
+PG_CURRENT_BASELINE = 'd05ca1551d4585011499d81d0ae828c4173306ff'
 PG_INPUT_CANDIDATE = '746e913538a76f111e44d212b3dbbfb4ca5a06c1'
 PG_QUEUE_PREPATCH = 'f39c673df0cd08232f184141a7e2aedef4f585c9'
 HTTP_SHORT_PREPATCH = 'b765f9bc5d3a6e71353a562e27cef7b4cbb35f69'
@@ -44,9 +45,9 @@ def validate_screen_selection(a,build_set):
             'normal_self_probe','pg_queue_screen','pg_driver_screen','memory_owner_probe','http_short_screen')
         if build_set!='diagnostic' or any(getattr(a,k,False) for k in others):
             raise ValueError('--pg-input-guard requires diagnostic build-set and no other opt-in mode')
-        if (a.baseline!=PG_INPUT_PREPATCH or getattr(a,'prepatch',None)!=PG_INPUT_PREPATCH
-                or not re.fullmatch('[0-9a-f]{40}',a.candidate) or a.candidate==PG_INPUT_PREPATCH):
-            raise ValueError('--pg-input-guard requires frozen F166 baseline and an explicit full candidate commit')
+        if (a.baseline not in (PG_INPUT_PREPATCH,PG_CURRENT_BASELINE) or getattr(a,'prepatch',None)!=a.baseline
+                or not re.fullmatch('[0-9a-f]{40}',a.candidate) or a.candidate==a.baseline):
+            raise ValueError('--pg-input-guard requires explicit matching frozen F166/current d05 baseline and distinct full candidate')
     if getattr(a,'http_short_screen',False):
         if getattr(a,'http_short_goal','cpu') not in ('cpu','memory'):
             raise ValueError('--http-short-goal must be cpu or memory')
@@ -354,15 +355,15 @@ def pg_driver_plan(versions):
                 'observed, never accepted; no timeout renewal, SQL retry, product change, matrix or capacity ranking.')
 
 
-def pg_input_guard_plan(versions,candidate=PG_INPUT_CANDIDATE):
-    if not re.fullmatch('[0-9a-f]{40}',candidate) or candidate==PG_INPUT_PREPATCH:
+def pg_input_guard_plan(versions,candidate=PG_INPUT_CANDIDATE,baseline=PG_INPUT_PREPATCH):
+    if baseline not in (PG_INPUT_PREPATCH,PG_CURRENT_BASELINE) or not re.fullmatch('[0-9a-f]{40}',candidate) or candidate==baseline:
         raise ValueError('explicit full candidate commit different from the frozen baseline required')
     controls=[dict(name='A',phase='environment-control',workload='db',contract='pg-strict',
         group=g,rate=200,warmup_seconds=3,score_seconds=15) for g in (1,2,3)]
     windows=[dict(name=name,phase='normal',workload='db',contract='pg-strict',
         group=group,rate=200,warmup_seconds=3,score_seconds=15)
         for group in range(1,13) for name in (('A','B') if group%2 else ('B','A'))]
-    return dict(schema='ku-hosted-pg-input-guard-v1',versions=versions,prepatch=PG_INPUT_PREPATCH,
+    return dict(schema='ku-hosted-pg-input-guard-v1',versions=versions,prepatch=baseline,
         candidate=candidate,resources=copy.deepcopy(RESOURCES),quality_policy=copy.deepcopy(POLICY),
         windows=controls+windows,maximum_windows=27,maximum_replacements=0,
         observation_alarm_seconds=900,workflow_limit_seconds=1200,
@@ -714,7 +715,7 @@ def complete_build(a,state,build_set,prepatch,variants):
             m=load(a.root/'HC/manifest.json');versions['HC']=dict(root=str(a.root/'HC'),stack='ku',
                 source_commit=m['candidate_base'],binary_sha256=sha(m['stacks']['ku']['command'][0]),
                 diagnostic_only=True,normal_score_eligible=False)
-    if getattr(a,'pg_input_guard',False):plan=pg_input_guard_plan(versions,a.candidate)
+    if getattr(a,'pg_input_guard',False):plan=pg_input_guard_plan(versions,a.candidate,a.prepatch)
     elif getattr(a,'http_short_screen',False):plan=http_short_plan(versions,getattr(a,'http_short_goal','cpu'))
     elif getattr(a,'pg_driver_screen',False):plan=pg_driver_plan(versions)
     elif getattr(a,'pg_queue_screen',False):plan=pg_queue_plan(versions,prepatch)
@@ -1579,8 +1580,8 @@ def normal_diagnostic_quality(row):
 def pg_queue_screen(a,state):
     if os.geteuid()!=0:raise ValueError('PG queue screen requires root cgroup control')
     short=getattr(a,'http_short_screen',False);guard=getattr(a,'pg_input_guard',False);plan=load(a.root/'frozen-plan.json')
-    prepatch=PG_INPUT_PREPATCH if guard else HTTP_SHORT_PREPATCH if short else PG_QUEUE_PREPATCH
-    expected_plan=pg_input_guard_plan(plan.get('versions',{}),a.candidate) if guard else http_short_plan(plan.get('versions',{}),getattr(a,'http_short_goal','cpu')) if short else pg_queue_plan(plan.get('versions',{}),prepatch)
+    prepatch=getattr(a,'prepatch',PG_INPUT_PREPATCH) if guard else HTTP_SHORT_PREPATCH if short else PG_QUEUE_PREPATCH
+    expected_plan=pg_input_guard_plan(plan.get('versions',{}),a.candidate,prepatch) if guard else http_short_plan(plan.get('versions',{}),getattr(a,'http_short_goal','cpu')) if short else pg_queue_plan(plan.get('versions',{}),prepatch)
     if plan!=expected_plan:raise ValueError('matching frozen A/B diagnostic plan required')
     bindings={name:fc.version_identity(plan,name) for name in ('A','B')}
     expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
@@ -2475,7 +2476,7 @@ def main(argv=None):
     p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
-    p.add_argument('--pg-input-guard',action='store_true',help='Frozen F166 and explicit candidate: PG-only3 controls+12 paired guards; no formal goal or retry')
+    p.add_argument('--pg-input-guard',action='store_true',help='Explicit matching F166/current d05 baseline/prepatch and distinct candidate: PG-only3 controls+12 pairs, current Rust1.99.1 only')
     p.add_argument('--pg-queue-screen',action='store_true',help='Eight normal A/B PG fix diagnostic windows; frozen f39c673 prepatch required, no matrix or formal capacity claim')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv)
@@ -2495,7 +2496,7 @@ def main(argv=None):
     if a.phase!='archive' and (a.root==a.source or a.source in a.root.parents or a.root in a.source.parents):p.error('output must be independent of checkout')
     a.screen_variants=a.screen_variants.split(',') if a.screen_variants else []
     if len(a.screen_variants)>7 or len(set(a.screen_variants))!=len(a.screen_variants):p.error('at most seven distinct screen variants')
-    expected_baseline=PG_INPUT_PREPATCH if a.pg_input_guard else BASELINE
+    expected_baseline=a.prepatch if a.pg_input_guard else BASELINE
     if any(not re.fullmatch('[0-9a-f]{40}',x) for x in [a.baseline,a.candidate,a.prepatch,*a.screen_variants]) or a.baseline!=expected_baseline:p.error('frozen full commit identities required')
     if a.build_set!='followup-screen' and a.screen_variants:p.error('screen variants require followup-screen build-set')
     if a.prepatch in a.screen_variants or a.candidate in a.screen_variants:p.error('screen variants must differ from prepatch and final candidate')
