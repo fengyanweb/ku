@@ -9,7 +9,7 @@ on:
         description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, pg-input-lifetime]
       prepatch:
         description: 'Full prepatch commit for explicit paired screens; wake/PG probes require their frozen baseline'
         type: string
@@ -90,6 +90,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pg-input-lifetime:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-input-lifetime'
+    name: Linux ARM64 PG sent-input lifetime
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 18
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+      KU_CC: clang-18
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare only the pinned build and private PG tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.89.0 --profile minimal --no-self-update
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-16 libpq-dev clang-18
+          printf 'KU_PG_INPUT_ROOT=%s\n' "$RUNNER_TEMP/ku-pg-input-lifetime" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/ku-pg-input-cargo" >> "$GITHUB_ENV"
+      - name: Build both ordinary Release compilers without changing toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$KU_PG_INPUT_ROOT/probe/evidence"
+          git worktree add --detach "$KU_PG_INPUT_ROOT/base" 166453a1d2768bbce19796d9c7823be73cc84ccb
+          cargo +1.89.0 build --release --locked --bin ku --manifest-path "$KU_PG_INPUT_ROOT/base/Cargo.toml" > "$KU_PG_INPUT_ROOT/probe/evidence/A-build.log" 2>&1
+          cp "$CARGO_TARGET_DIR/release/ku" "$KU_PG_INPUT_ROOT/probe/A-ku"
+          cargo +1.89.0 build --release --locked --bin ku > "$KU_PG_INPUT_ROOT/probe/evidence/B-build.log" 2>&1
+          cp "$CARGO_TARGET_DIR/release/ku" "$KU_PG_INPUT_ROOT/probe/B-ku"
+          rustc +1.89.0 -Vv > "$KU_PG_INPUT_ROOT/probe/evidence/rustc.txt"
+          clang-18 --version > "$KU_PG_INPUT_ROOT/probe/evidence/clang.txt"
+          git rev-parse HEAD > "$KU_PG_INPUT_ROOT/probe/evidence/tools-head.txt"
+      - name: Run only related PG contracts and Linux detectors
+        shell: bash
+        run: |
+          set -euo pipefail
+          export KU_BIN="$KU_PG_INPUT_ROOT/probe/B-ku"
+          KU_CC='clang-18 -O2' cargo +1.89.0 test --release --locked --test native_pg_query_poll_test -- --nocapture --test-threads=1 > "$KU_PG_INPUT_ROOT/probe/evidence/PG-O2.log" 2>&1
+          for test in native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins native_pg_typed_single_row_binary_values_validate_types_and_survive_reset; do
+            ASAN_OPTIONS=detect_leaks=1 KU_CC='clang-18 -O2 -g -fsanitize=address,undefined -fno-omit-frame-pointer' cargo +1.89.0 test --release --locked --test native_pg_query_poll_test "$test" -- --exact --nocapture > "$KU_PG_INPUT_ROOT/probe/evidence/$test-detectors.log" 2>&1
+          done
+      - name: Observe one serial AB in a fresh private database and service cgroups
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n --preserve-env=KU_CC python3 -B tests/benchmarks/cross_stack/pg_input_lifetime.py --root "$KU_PG_INPUT_ROOT/probe" --uid "$(id -u)" --gid "$(id -g)"
+      - name: Upload only selected nonprivate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ku-pg-input-lifetime
+          path: ${{ runner.temp }}/ku-pg-input-lifetime/probe/evidence
+          if-no-files-found: warn
+          retention-days: 14
+
   quality:
     if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
     name: Rust format, check and clippy
@@ -1028,7 +1088,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'pg-input-lifetime')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
