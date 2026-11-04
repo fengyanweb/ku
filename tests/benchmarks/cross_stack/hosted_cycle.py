@@ -514,6 +514,128 @@ def diagnostic_turns(plan,case,followup):
     return turns
 
 
+def common_typed_guard_plan(versions,kind):
+    names,workload,rate,contract,slo=({'json':(('AJ','BJ'),'json_object',500,'typed',100),
+        'pg':(('AP','BP'),'db',200,'typed-pg-strict',250)}[kind])
+    if set(versions)!=set(names) or versions[names[0]]['source_commit']!=PG_CURRENT_BASELINE:
+        raise ValueError('typed public guard requires exactly d05 baseline and matching typed candidate roles')
+    candidate=versions[names[1]]['source_commit']
+    if not re.fullmatch('[0-9a-f]{40}',candidate) or candidate==PG_CURRENT_BASELINE:
+        raise ValueError('typed public guard requires a distinct full candidate')
+    return dict(schema='ku-common-typed-public-guard-v1',kind=kind,versions=versions,
+        resources=copy.deepcopy(RESOURCES),quality_policy=copy.deepcopy(POLICY),
+        schedule=[dict(phase='explore',workload=workload,rate=rate,contract=contract,warmup_seconds=3,score_seconds=15,
+            orders=[list(names if group%2==0 else names[::-1]) for group in range(6)])],targets=[],
+        resume={'maximum_replacements':0},maximum_windows=12,stop_after_consecutive_unusable_windows=2,
+        bootstrap_seed=20261023,bootstrap_resamples=20000,minimum_pairs=6,latency_slo_ms=slo,
+        root_review_bounds={'lower95_maximum':1,'upper95_maximum':1.03},
+        diagnostic_only=True,formal_qualified=False,normal_score_eligible=False,candidate_accepted=False,
+        scope='Separate six balanced typed public A/B pairs; normal helpers/worker/native C11O2; same private database and driver. '
+              'Original full_cpu_us/correct definition and middle60% service cgroup memory; no expanded cold-start claim, pooling with common55, original16 or automatic adoption.')
+
+
+def prepare_common_typed_guards(a,state,main_plan,main_bindings,client,protocol):
+    """Only native-generate typed arms using each parent's already verified CLI."""
+    root=a.root/'common-typed-guards';root.mkdir(exist_ok=True);Builder=shared_cli_builder(a.root)
+    bindings={};versions={}
+    for name,parent,mode in (('AJ','A',{'ku_json':'typed'}),('BJ','B',{'ku_json':'typed'}),
+            ('AP','A',{'ku_pg_read':'typed'}),('BP','B',{'ku_pg_read':'typed'})):
+        owner=load(a.root/parent/'manifest.json');bl.require_rust_manifest(owner)
+        commit=main_plan['versions'][parent]['source_commit']
+        if owner['candidate_base']!=commit:raise ValueError('typed parent source identity differs: '+parent)
+        def native(name=name,owner=owner,commit=commit,mode=mode):
+            d=a.root/name;d.mkdir(exist_ok=True)
+            if not (d/'tools').exists():(d/'tools').symlink_to(a.tools,target_is_directory=True)
+            if (d/'tools').resolve()!=a.tools.resolve():raise ValueError('typed native tools differ')
+            b=Builder(d,Path(owner['source_root']),uid=state['uid'],gid=state['gid'],candidate=commit,**mode)
+            try:b.ku_native(Path(owner['stacks']['ku']['build']['cli']));return b.finish()
+            except BaseException as error:b.finish(failed=repr(error));raise
+        step(state,a.root,'build-'+name,native)
+        m=load(a.root/name/'manifest.json');bl.require_rust_manifest(m)
+        if m['candidate_base']!=commit:raise ValueError('typed native source differs: '+name)
+        m=normalize_manifest(m,protocol,client);m['stacks']={'ku':m['stacks']['ku']}
+        m['declared_worker_policy']=owner.get('declared_worker_policy','legacy-fixed')
+        if 'KU_HTTP_WORKER_POLICY' in owner['service_env']:
+            m['service_env']={**m['service_env'],'KU_HTTP_WORKER_POLICY':owner['service_env']['KU_HTTP_WORKER_POLICY']}
+        save(a.root/name/'manifest.json',m)
+        binary=m['stacks']['ku']['command'][0]
+        versions[name]=dict(root=str(a.root/name),stack='ku',source_commit=commit,binary_sha256=sha(binary),rust_toolchain=bl.RUST_TOOLCHAIN)
+        bindings[name]=fc.version_identity({'versions':{name:versions[name]}},name)
+        expected=dict(formatting_mode='helpers',json_response_mode='typed' if name.endswith('J') else 'text',
+            json_execution_mode='worker',pg_execution_mode='async',pg_read_mode='int' if name.endswith('J') else 'typed',
+            native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+        if bindings[name]['build_mode']!=expected or bindings[name]['files']['Ku CLI']['sha256']!=main_bindings[parent]['files']['Ku CLI']['sha256']:
+            raise ValueError('typed arm is not the required same-parent CLI public mode: '+name)
+    plans={}
+    for kind,names in (('json',('AJ','BJ')),('pg',('AP','BP'))):
+        for field in ('expanded source','driver ELF','libpq'):
+            if bindings[names[0]]['files'][field]['sha256']!=bindings[names[1]]['files'][field]['sha256']:
+                raise ValueError('typed paired input/dependency differs: '+kind+'/'+field)
+        plan=common_typed_guard_plan({name:versions[name] for name in names},kind)
+        path=root/(kind+'-plan.json');save(path,plan);plans[kind]={'path':str(path),'sha256':sha(path)}
+    save(root/'identity.json',dict(main_plan_sha256=sha(a.root/'frozen-plan.json'),bindings=bindings,plans=plans,
+        source_commits={name:value['source_commit'] for name,value in versions.items()},CLI_rebuilt=False,
+        input_scope='Each typed arm derives from its own A/B snapshot and CLI; BT is not a typed JSON arm.'))
+    return bindings
+
+
+def common_typed_guard_comparison(plan,result):
+    rows=result.get('rows',[]);names={'json':('AJ','BJ'),'pg':('AP','BP')}[plan['kind']];pairs=[];reasons=[]
+    if result.get('execution_complete') is not True or len(rows)!=12:reasons.append('exact12 complete windows required')
+    for group,order in enumerate(plan['schedule'][0]['orders'],1):
+        selected=[r for r in rows if r.get('group')==group]
+        if len(selected)!=2 or [r.get('name') for r in selected]!=order:
+            reasons.append('missing/duplicate/out-of-order typed pair');continue
+        pair={r['name']:r for r in selected};pairs.append(pair)
+        for row in selected:
+            invalid,_=window_quality(row);p99=row.get('latency',{}).get('p99_ms')
+            if (invalid or row.get('status')!='observed' or row.get('functional_valid') is not True
+                    or row.get('accounting_valid') is not True or row.get('all_correct') is not True
+                    or row.get('natural_reclamation') is not True or row.get('environment_quality')!='pass'
+                    or row.get('observed_environment_faults') or type(p99) not in (int,float) or not 0<=p99<=plan['latency_slo_ms']):
+                reasons.append('invalid typed correctness/resources/arrival/latency/cleanup window')
+        if not pair[names[0]].get('comparison_contract') or pair[names[0]]['comparison_contract']!=pair[names[1]].get('comparison_contract'):
+            reasons.append('typed paired comparison contracts differ or are missing')
+    valid=not reasons and len(pairs)==6;metrics={}
+    for metric in ('full_cpu_us','memory.steady_median_bytes'):
+        interval=fc.paired_interval([fc.metric(p[names[1]],metric) for p in pairs] if valid else [],
+            [fc.metric(p[names[0]],metric) for p in pairs] if valid else [],minimum=6,
+            seed=plan['bootstrap_seed'],resamples=plan['bootstrap_resamples'])
+        metrics[metric]=dict(interval=interval,lower95_maximum=1,upper95_maximum=1.03,
+            status='unknown' if interval.get('status')!='estimated' else
+                'within_relative_bounds' if interval['lower95']<=1 and interval['upper95']<=1.03 else 'outside_relative_bounds')
+    return dict(execution_complete=valid,reasons=reasons,metrics=metrics,
+        all_metrics_within_bounds=valid and all(x['status']=='within_relative_bounds' for x in metrics.values()),
+        automatic_adoption=False,candidate_accepted=False,formal_qualified=False,original_goal_status='not_evaluated')
+
+
+def run_common_typed_guards(a,main_plan):
+    """Called only inside diagnostic's live private DB/Harness scope."""
+    root=a.root/'common-typed-guards';results={}
+    try:
+        identity=load(root/'identity.json')
+        if identity['main_plan_sha256']!=sha(a.root/'frozen-plan.json'):raise ValueError('typed guards belong to a different main plan')
+        for kind,names in (('json',('AJ','BJ')),('pg',('AP','BP'))):
+            path=root/(kind+'-plan.json');plan=load(path)
+            if (identity['plans'][kind]['sha256']!=sha(path) or plan!=common_typed_guard_plan(plan['versions'],kind)
+                    or any(plan['versions'][name]['source_commit']!=main_plan['versions'][parent]['source_commit'] for name,parent in zip(names,('A','B')))):
+                raise ValueError('typed guard plan changed: '+kind)
+            for name in names:
+                if fc.version_identity(plan,name)!=identity['bindings'][name]:raise ValueError('typed artifact identity changed: '+name)
+            observed=fc.execute(path,root/(kind+'-windows'),'explore',plan['schedule'][0]['workload'],names)
+            comparison=common_typed_guard_comparison(plan,observed)
+            results[kind]=dict(observation=observed,root_review=comparison)
+            save(root/(kind+'-comparison.json'),results[kind])
+            if not comparison['execution_complete']:break
+    except (OSError,ValueError,KeyError) as error:
+        results['error']=repr(error)
+    complete=set(results)=={'json','pg'} and all(results[k]['root_review']['execution_complete'] for k in ('json','pg'))
+    summary=dict(execution_complete=complete,results=results,maximum_windows=24,maximum_replacements=0,
+        all_metrics_within_bounds=complete and all(results[k]['root_review']['all_metrics_within_bounds'] for k in ('json','pg')),
+        candidate_accepted=False,formal_qualified=False,original_goal_status='not_evaluated',main_windows_not_pooled=True)
+    save(root/'summary.json',summary);return summary
+
+
 def diagnostic_axes(plan,rows,expected,stopped,control,growth,followup,admission=None):
     normal=len(rows)==expected and not stopped
     qualified=not followup or all((r.get('name')=='D' and r.get('diagnostic_only')) or
@@ -751,8 +873,11 @@ def complete_build(a,state,build_set,prepatch,variants):
                 raise ValueError('formal Task JSON must be an uninstrumented same-mode/same-CLI build')
         save(a.root/'task-json-source-identity.json',dict(**expected,source_commit=a.candidate,
             worker_binding=identities['B'],task_binding=identities['BT'],formal_qualified=False))
+    typed_bindings={}
+    if build_set=='followup-screen' and getattr(a,'common_http_screen',False) and prepatch==PG_CURRENT_BASELINE:
+        typed_bindings=prepare_common_typed_guards(a,state,plan,identities,client,protocol)
     dependencies={};abi={}
-    for binary in sorted({f['path'] for v in identities.values() for k,f in v['files'].items() if k in ('ELF','Ku CLI','driver ELF')}):
+    for binary in sorted({f['path'] for v in [*identities.values(),*typed_bindings.values()] for k,f in v['files'].items() if k in ('ELF','Ku CLI','driver ELF')}):
         linked=subprocess.run(['ldd',binary],capture_output=True,text=True,check=True,timeout=30).stdout
         abi[binary]={'sha256':sha(binary),'ELF_header':subprocess.run(['readelf','-h',binary],capture_output=True,text=True,check=True,timeout=30).stdout,
             'dynamic':subprocess.run(['readelf','-d',binary],capture_output=True,text=True,check=True,timeout=30).stdout,'linked_libraries':linked}
@@ -2176,7 +2301,29 @@ def diagnostic(a,state,followup=False):
             scope_window_count=len(rows)+len(control_rows)+(control_row is not None)+len(growth_rows),transport_control=control_row,
             worker_growth=growth_rows,
             json_layer_diagnosis=plan.get('json_layer_diagnosis'))
-        save(directory/'summary.json',result);return result
+        save(directory/'summary.json',result)
+        if followup and plan.get('common_http_screen') is True and plan.get('prepatch')==PG_CURRENT_BASELINE:
+            resource_guards={}
+            for case in plan['cases']:
+                try:review=load(directory/case['workload']/'comparison.json')['paired_screen']['relative_resource_guard_for_root_review']
+                except (OSError,ValueError,KeyError,TypeError):review={}
+                resource_guards[case['workload']]=review
+            resources_pass=(set(resource_guards)=={'ok','json_object','json_escape','db','cpu'} and
+                all(review.get('all_metrics_within_bounds') is True and
+                    set(review.get('metrics',{}))=={'full_cpu_us','memory.steady_median_bytes'} and
+                    all(m.get('status')=='within_relative_bounds' for m in review['metrics'].values())
+                    for review in resource_guards.values()))
+            ready=axes['execution_complete'] and environment and environment.get('quality')=='pass' and resources_pass
+            typed=(run_common_typed_guards(a,plan) if ready else dict(execution_complete=False,results={},
+                reason='main55 functional/quality or five-case CPU/memory relative guard failed or unknown; typed guards not started'))
+            combined=dict(result,main_execution_complete=result['execution_complete'],main_result_path=str(directory/'summary.json'),
+                main_relative_resource_guards=resource_guards,main_relative_resource_guards_passed=resources_pass,
+                typed_public_guards=typed,execution_complete=result['execution_complete'] and typed['execution_complete'],
+                additional_typed_window_count=sum(len(v.get('observation',{}).get('rows',[])) for v in typed['results'].values() if isinstance(v,dict)),
+                maximum_main_plus_typed_windows=79,typed_public_guards_within_bounds=typed.get('all_metrics_within_bounds',False))
+            if not combined['execution_complete']:combined['goal_status']='blocked'
+            save(directory/'common-public-guards-summary.json',combined);return combined
+        return result
     finally:
         fc.Harness=original
         state['database_cleanup']=fixture.stop();save(a.root/'hosted-state.json',state)
@@ -2544,7 +2691,7 @@ def main(argv=None):
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
         if a.phase=='diagnostic':signal.alarm(900 if a.pg_input_guard else 120 if a.memory_owner_probe else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
-        if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
+        if a.phase=='followup-screen':signal.alarm(((35 if a.common_http_screen and a.prepatch==PG_CURRENT_BASELINE else 25)+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,
             'followup-screen':lambda a,s:diagnostic(a,s,followup=True)}[a.phase]

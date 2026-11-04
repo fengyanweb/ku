@@ -1287,6 +1287,105 @@ class HostedCycleTests(unittest.TestCase):
             self.assertEqual(changed.exception.code,2);self.assertIn('identity changed',error.getvalue())
             build.assert_called_once()
 
+    def test_common_typed_plans_are_only_six_balanced_public_pairs(self):
+        for kind,names,workload,rate,contract in (('json',('AJ','BJ'),'json_object',500,'typed'),
+                ('pg',('AP','BP'),'db',200,'typed-pg-strict')):
+            versions={n:dict(source_commit=h.PG_CURRENT_BASELINE if i==0 else 'b'*40) for i,n in enumerate(names)}
+            plan=h.common_typed_guard_plan(versions,kind)
+            jobs=fc.jobs_for(plan,'explore',names=('unexpected',))
+            self.assertEqual(len(jobs),12)
+            self.assertEqual([j['name'] for j in jobs],list(names+names[::-1])*3)
+            self.assertEqual({j['group'] for j in jobs},set(range(1,7)))
+            self.assertTrue(all((j['workload'],j['rate'],j['warmup'],j['duration'],j['contract'])==(workload,rate,3,15,contract) for j in jobs))
+            self.assertEqual(plan['resume']['maximum_replacements'],0);self.assertEqual(plan['targets'],[])
+            self.assertNotIn('capacity',plan);self.assertNotIn('stability',plan)
+            self.assertFalse(plan['candidate_accepted']);self.assertFalse(plan['formal_qualified'])
+            with self.assertRaises(ValueError):h.common_typed_guard_plan({**versions,'BT':versions[names[1]]},kind)
+
+    def test_common_typed_preparation_uses_each_parent_cli_without_rebuilding_it(self):
+        for incorrect in (False,True):
+            with self.subTest(incorrect=incorrect),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);tools=root/'tools';tools.mkdir();calls=[]
+                main={'versions':{n:dict(source_commit=h.PG_CURRENT_BASELINE if n=='A' else 'b'*40) for n in ('A','B')}}
+                for n in ('A','B'):
+                    source=root/n/'src';source.mkdir(parents=True)
+                    h.save(root/n/'manifest.json',dict(candidate_base=main['versions'][n]['source_commit'],source_root=str(source),
+                        service_env={'KU_HTTP_WORKER_POLICY':'elastic'},declared_worker_policy='elastic',
+                        stacks={'ku':{'build':{'cli':str(root/n/'cli')}}}))
+                h.save(root/'frozen-plan.json',main);before=(root/'frozen-plan.json').read_bytes()
+                class Builder:
+                    def __init__(self,d,source,**kw):self.d=d;self.source=source;self.kw=kw
+                    def ku(self):raise AssertionError('typed supplements must never rebuild the CLI')
+                    def ku_native(self,cli):
+                        calls.append((self.d.name,self.source,cli,self.kw))
+                        binary=self.d/'ku-server';binary.write_bytes(b'pure artifact')
+                        h.save(self.d/'manifest.json',dict(candidate_base=self.kw['candidate'],source_root=str(self.source),
+                            stacks={'ku':{'command':[str(binary)],'build':{}}}))
+                    def finish(self,**kw):return {'manifest':str(self.d/'manifest.json')}
+                def identity(plan,n):
+                    parent=n[0];j=n.endswith('J')
+                    return dict(source_commit=main['versions'][parent]['source_commit'],
+                        build_mode=dict(formatting_mode='helpers',json_response_mode='typed' if j else 'text',
+                            json_execution_mode='task' if incorrect else 'worker',pg_execution_mode='async',pg_read_mode='int' if j else 'typed',
+                            native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']}),
+                        files={key:{'sha256':value} for key,value in (('Ku CLI',parent.lower()*64),
+                            ('expanded source','1'*64 if j else '2'*64),('driver ELF','d'*64),('libpq','e'*64))})
+                owner_bindings={n:{'files':{'Ku CLI':{'sha256':n.lower()*64}}} for n in ('A','B')}
+                with patch.object(h,'shared_cli_builder',return_value=Builder),patch.object(h.bl,'require_rust_manifest'),\
+                        patch.object(fc,'version_identity',side_effect=identity):
+                    if incorrect:
+                        with self.assertRaisesRegex(ValueError,'same-parent CLI public mode'):
+                            h.prepare_common_typed_guards(types.SimpleNamespace(root=root,tools=tools),{'uid':1,'gid':1,'steps':{}},main,owner_bindings,{},root/'protocol.json')
+                    else:
+                        bindings=h.prepare_common_typed_guards(types.SimpleNamespace(root=root,tools=tools),{'uid':1,'gid':1,'steps':{}},main,owner_bindings,{},root/'protocol.json')
+                        self.assertEqual(set(bindings),{'AJ','BJ','AP','BP'})
+                        self.assertEqual([x[0] for x in calls],['AJ','BJ','AP','BP'])
+                        for name,source,cli,kw in calls:
+                            self.assertEqual(source,root/name[0]/'src');self.assertEqual(cli,root/name[0]/'cli')
+                            self.assertEqual(kw.get('ku_json'), 'typed' if name.endswith('J') else None)
+                            self.assertEqual(kw.get('ku_pg_read'),None if name.endswith('J') else 'typed')
+                        self.assertFalse(h.load(root/'common-typed-guards/identity.json')['CLI_rebuilt'])
+                self.assertEqual((root/'frozen-plan.json').read_bytes(),before)
+
+    def test_common_typed_execution_rejects_missing_or_expanded_plans_and_checks_both_metrics(self):
+        def rows(plan):
+            return [dict(job,status='observed',functional_valid=True,accounting_valid=True,all_correct=True,
+                natural_reclamation=True,arrival_schedule_quality='pass',environment_quality='pass',measurement_invalid=False,
+                comparison_contract='same',full_cpu_us=10,memory={'steady_median_bytes':90 if job['name'].startswith('B') else 100},
+                latency={'p99_ms':1}) for job in fc.jobs_for(plan,'explore')]
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);guard=root/'common-typed-guards';guard.mkdir()
+            main={'versions':{n:dict(source_commit=h.PG_CURRENT_BASELINE if n=='A' else 'b'*40) for n in ('A','B')}}
+            h.save(root/'frozen-plan.json',main);a=types.SimpleNamespace(root=root)
+            with patch.object(fc,'execute') as execute:
+                self.assertFalse(h.run_common_typed_guards(a,main)['execution_complete']);execute.assert_not_called()
+            index={'main_plan_sha256':h.sha(root/'frozen-plan.json'),'bindings':{},'plans':{}}
+            for kind,names in (('json',('AJ','BJ')),('pg',('AP','BP'))):
+                plan=h.common_typed_guard_plan({n:dict(source_commit=main['versions'][n[0]]['source_commit']) for n in names},kind)
+                path=guard/(kind+'-plan.json');h.save(path,plan)
+                index['plans'][kind]={'path':str(path),'sha256':h.sha(path)}
+                index['bindings'].update({n:{'role':n} for n in names})
+            h.save(guard/'identity.json',index)
+            calls=[]
+            def execute(path,out,phase,workload,names):
+                calls.append((phase,workload,names));return dict(execution_complete=True,rows=rows(h.load(path)))
+            with patch.object(fc,'version_identity',side_effect=lambda p,n:index['bindings'][n]),patch.object(fc,'execute',side_effect=execute):
+                result=h.run_common_typed_guards(a,main)
+            self.assertTrue(result['execution_complete']);self.assertTrue(result['all_metrics_within_bounds'])
+            self.assertEqual(calls,[('explore','json_object',('AJ','BJ')),('explore','db',('AP','BP'))])
+            self.assertFalse(result['candidate_accepted']);self.assertEqual(result['original_goal_status'],'not_evaluated')
+            plan=h.load(guard/'json-plan.json');bad=rows(plan);bad.pop()
+            self.assertFalse(h.common_typed_guard_comparison(plan,dict(execution_complete=True,rows=bad))['execution_complete'])
+            missing=rows(plan);missing[0]['memory'].clear()
+            self.assertFalse(h.common_typed_guard_comparison(plan,dict(execution_complete=True,rows=missing))['all_metrics_within_bounds'])
+            for lower,upper,ok in ((1,1.03,True),(1.0001,1.03,False),(1,1.0301,False)):
+                with patch.object(fc,'paired_interval',return_value=dict(status='estimated',estimate=1,lower95=lower,upper95=upper)):
+                    self.assertEqual(h.common_typed_guard_comparison(plan,dict(execution_complete=True,rows=rows(plan)))['all_metrics_within_bounds'],ok)
+            plan['schedule'].append(dict(phase='final',workload='db',orders=[['AJ','BJ']]))
+            h.save(guard/'json-plan.json',plan);index['plans']['json']['sha256']=h.sha(guard/'json-plan.json');h.save(guard/'identity.json',index)
+            with patch.object(fc,'execute') as execute:
+                self.assertFalse(h.run_common_typed_guards(a,main)['execution_complete']);execute.assert_not_called()
+
     def test_task_json_screen_uses_current_worker_denominator_and_all_quality_checks(self):
         rows=[]
         for group in range(1,4):
@@ -1649,14 +1748,17 @@ class HostedCycleTests(unittest.TestCase):
 
     def test_diagnostic_and_screen_admission_are_required_but_not_timed_windows(self):
         from unittest.mock import Mock
-        for followup,gate_passed,task,common in ((False,True,False,False),(False,False,False,False),
+        cases=[(*case,False) for case in ((False,True,False,False),(False,False,False,False),
                 (True,True,False,False),(True,False,False,False),(True,True,True,False),(True,False,True,False),
-                (True,True,True,True),(True,False,True,True)):
-            with self.subTest(followup=followup,gate_passed=gate_passed,task=task,common=common),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
+                (True,True,True,True),(True,False,True,True))]+[(True,True,True,True,True),(True,False,True,True,True)]
+        cases=[(*case,True) for case in cases]+[(True,True,True,True,True,False),(True,True,True,True,True,None)]
+        for followup,gate_passed,task,common,typed,resource_ok in cases:
+            with self.subTest(followup=followup,gate_passed=gate_passed,task=task,common=common,typed=typed,resource_ok=resource_ok),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
                 root=Path(directory)
                 versions={name:{'root':str(root/name),'source_commit':'a'*40}
                     for name in ['A','B','R','RS','D','HC',*(['BT'] if task else [])]}
                 plan=h.followup_plan(versions,task_json_screen=task,common_http_screen=common) if followup else h.diagnostic_plan(versions)
+                if typed:plan['prepatch']=h.PG_CURRENT_BASELINE
                 plan['json_layer_diagnosis']={'execution_complete':True}
                 h.save(root/'frozen-plan.json',plan)
                 manifest=root/'fixture/manifest.json';dbstate=root/'fixture/state.json'
@@ -1664,6 +1766,13 @@ class HostedCycleTests(unittest.TestCase):
                 h.save(dbstate,{'limits':{'cpuset.cpus':'3'}})
                 cleanup=[];fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=dbstate,
                     stop=lambda:cleanup.append('database') or {'stopped':True})
+                initial_harness=fc.Harness
+                def typed_windows(*args):
+                    self.assertIsNot(fc.Harness,initial_harness);self.assertEqual(cleanup,[])
+                    self.assertTrue((root/'diagnostic/summary.json').is_file())
+                    return dict(execution_complete=True,all_metrics_within_bounds=True,
+                        results={kind:{'observation':{'rows':[{}]*12}} for kind in ('json','pg')})
+                supplements=patches.enter_context(patch.object(h,'run_common_typed_guards',side_effect=typed_windows))
                 state={'uid':os.getuid(),'gid':os.getgid(),'steps':{}}
                 gate=Mock(return_value={'passed':gate_passed,'execution_complete':True,'binding':{'source_commit':'a'*40}})
                 good=dict(status='observed',functional_valid=True,accounting_valid=True,all_correct=True,
@@ -1674,7 +1783,9 @@ class HostedCycleTests(unittest.TestCase):
                     if args[1]=='D':
                         score=Path(args[6])/'score';score.mkdir(parents=True,exist_ok=True)
                         (score/'perf.data').write_bytes(b'mocked recorded IP samples without CPU field')
-                    return dict(good)
+                    row=dict(good,full_cpu_us=11 if resource_ok is False and args[1]=='B' and args[2]=='ok' else 10)
+                    if resource_ok is None and args[1]=='B' and args[2]=='ok':row['memory']={}
+                    return row
                 window=Mock(side_effect=observed_window)
                 patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
                 patches.enter_context(patch.object(h.os,'sched_getaffinity',return_value={0,1,2,3},create=True))
@@ -1695,13 +1806,21 @@ class HostedCycleTests(unittest.TestCase):
                     self.assertTrue({'+pid','+tid','+time','+ip','+sym','+dso'}<=fields)
                     self.assertNotIn('+cpu',fields)
                 self.assertEqual(gate.call_count,2 if task and gate_passed else 1)
-                self.assertEqual(result['execution_complete'],gate_passed)
+                self.assertEqual(result['execution_complete'],bool(gate_passed and (not typed or resource_ok)))
                 controls=plan['environment_controls']['count'] if followup else 0
                 expected=plan['maximum_windows'] if followup else sum(len(h.diagnostic_turns(plan,c,False)) for c in plan['cases'])
                 # Supplementary gate failure must preserve already valid normal windows.
                 self.assertEqual(window.call_count,expected)
                 self.assertEqual(result['scope_window_count'],expected)
                 self.assertEqual(cleanup,['database']);self.assertEqual(result['admission']['passed'],gate_passed)
+                self.assertEqual(supplements.call_count,1 if typed and gate_passed and resource_ok else 0)
+                if typed:
+                    self.assertEqual(result['main_execution_complete'],gate_passed)
+                    self.assertEqual(result['additional_typed_window_count'],24 if gate_passed and resource_ok else 0)
+                    self.assertNotIn('typed_public_guards',h.load(root/'diagnostic/summary.json'))
+                    self.assertEqual(result['maximum_main_plus_typed_windows'],79)
+                    self.assertEqual(result['main_relative_resource_guards_passed'],bool(resource_ok))
+                    if not resource_ok:self.assertIn('failed or unknown',result['typed_public_guards']['reason'])
                 if not gate_passed:self.assertEqual(result['goal_status'],'blocked')
                 if task:
                     self.assertEqual(set(result['admission']['gates']),{'B','BT'})
