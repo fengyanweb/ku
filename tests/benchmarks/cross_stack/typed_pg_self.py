@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Cached PG software-SELF windows, or explicit current ordinary /ok three; never a score."""
-import argparse, copy, json, os, platform, re, shutil, signal
+import argparse, copy, importlib.util, json, os, platform, re, shutil, signal
 from pathlib import Path
 import hosted_cycle as h
 import focus_cycle as fc
@@ -9,6 +9,166 @@ FROZEN_BASE='80aaf7bccd4a436ebdf83e2283a83fcc6deec4fd'
 FROZEN_DEFAULT='166453a1d2768bbce19796d9c7823be73cc84ccb'
 INPUTS={'B':'59ede7cdba403d4d038c3720ab65f1cd940efd1038d07df782743a35eb9887ae',
         'BP':'d9b5ea46dd2b401ae368471a822efa8467efa64c50e4b5966681c0d2a21bc4a0'}
+
+
+def mechanism_plan(versions, original_bindings, recipe):
+    return dict(schema='ku-current-pg-mechanism-v1',versions=versions,
+        original_bindings=original_bindings,recipe=recipe,entry_sha256=h.sha(__file__),
+        resources=copy.deepcopy(h.RESOURCES),quality_policy=copy.deepcopy(h.POLICY),
+        current_product=h.PG_CURRENT_BASELINE,workload='db',contract='pg-strict',rate=200,
+        warmup_seconds=3,score_seconds=15,order=[['B','mechanism'],['BP','mechanism']],
+        maximum_windows=2,maximum_replacements=0,observation_alarm_seconds=420,
+        diagnostic_only=True,instrumented=True,formal_qualified=False,normal_score_eligible=False,
+        purpose='One ordinary and one typed serial instrumented PG mechanism window. '
+            'Original200rps/SQL/driver/resources/deadlines/mandatory reset and natural cleanup. '
+            'No perf, product Rust rebuild, replacement, CPU gain or performance acceptance. '
+            'Counters cover full service lifetime including startup/warmup/score/quiet/cleanup; '
+            'score and warmup request denominators remain separately retained.')
+
+
+def prepare_mechanism(a, source_plan, original_bindings):
+    """Compile only two private derived C programs from verified current cache."""
+    from compile_variants import Commands, clean_environment
+    import reuse_build
+    expected={'B':reuse_build.CURRENT_PG_FILES,'BP':reuse_build.CURRENT_TYPED_PG_FILES}
+    for name in ('B','BP'):
+        if {key:value['sha256'] for key,value in original_bindings[name]['files'].items()}!=expected[name]:
+            raise ValueError('mechanism requires exact cached d05 Rust1.99.1 inputs: '+name)
+    recipe=a.mechanism_recipe
+    if recipe.is_symlink() or not recipe.is_file() or recipe.stat().st_size>256<<10:
+        raise ValueError('bounded plain mechanism recipe required')
+    recipe_sha=h.sha(recipe)
+    spec=importlib.util.spec_from_file_location('ku_private_pg_mechanism',recipe)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    if not callable(getattr(module,'transform',None)):raise ValueError('mechanism recipe transform(source) required')
+    directory=a.root/'mechanism-derived';directory.mkdir()
+    versions={};receipts={}
+    for name in ('B','BP'):
+        old=original_bindings[name];source=Path(old['files']['generated C']['path'])
+        if h.sha(source)!=old['files']['generated C']['sha256']:raise ValueError('cached C changed before derivation')
+        derived=module.transform(source.read_text())
+        if not isinstance(derived,str) or not derived or len(derived.encode())>16<<20 or derived==source.read_text():
+            raise ValueError('bounded changed mechanism C required')
+        if h.sha(recipe)!=recipe_sha:raise ValueError('mechanism recipe changed while deriving C')
+        arm=directory/name;arm.mkdir();generated=arm/'mechanism.c';generated.write_text(derived)
+        manifest=copy.deepcopy(h.load(Path(source_plan['versions'][name]['root'])/'manifest.json'))
+        stack=manifest['stacks']['ku'];build=stack['build'];native=build['native']['server']
+        invocation=native['compiler_invocation'];libraries=invocation['library_inputs']
+        if len(libraries)!=1 or libraries[0]['role']!='libpq' or invocation['flags']!=['-std=c11','-O2','-pthread']:
+            raise ValueError('mechanism requires original normal C11O2 and one libpq input')
+        compiler=Path(invocation['compiler']['path']);library=Path(libraries[0]['selected_input']['real_path'])
+        if h.sha(compiler)!=invocation['compiler']['sha256'] or h.sha(library)!=old['files']['libpq']['sha256']:
+            raise ValueError('mechanism native compiler/library identity changed')
+        binary=arm/'bin/ku-mechanism';binary.parent.mkdir()
+        command=[str(compiler),str(generated),*invocation['flags'],str(library),'-o',str(binary)]
+        log=Commands(arm/'logs',clean_environment(a.tools));log.run('mechanism-link',command,arm,timeout=120)
+        with binary.open('rb') as stream:header=stream.read(20)
+        if len(header)!=20 or header[:6]!=b'\x7fELF\x02\x01' or int.from_bytes(header[18:20],'little')!=183:
+            raise ValueError('mechanism derived program must be ELF64 AArch64')
+        compiler_version=log.run('compiler-version',[str(compiler),'--version'],arm,timeout=10)
+        linked=log.run('linked-libraries',['ldd',str(binary)],arm,timeout=10)
+        if 'not found' in linked:raise ValueError('mechanism dynamic dependency unavailable')
+        dependencies={str(path.resolve()):h.sha(path) for text in re.findall(r'(/[^ ()\n]+)',linked)
+            if (path:=Path(text)).is_file()}
+        receipt=arm/'compile.json'
+        h.save(receipt,dict(command=command,commands=log.rows,original_binding=old,recipe_sha256=recipe_sha,
+            compiler=invocation['compiler'],library=libraries[0],flags=invocation['flags'],
+            compiler_version=compiler_version,dynamic_library_files_sha256=dependencies,
+            dependency_scope='ldd-resolved files before service startup; not live malloc binding or used-object proof',
+            source_sha256=h.sha(generated),binary_sha256=h.sha(binary),diagnostic_only=True,
+            normal_score_eligible=False,instrumented=True,product_Rust_rebuilt=False))
+        native.update(binary=str(binary),binary_sha256=h.sha(binary),generated_c=str(generated),
+            generated_c_sha256=h.sha(generated),compiler_receipt=str(receipt),compiler_receipt_sha256=h.sha(receipt),
+            compiler_invocation=dict(invocation,argv=command,output=str(binary),
+                source=dict(path=str(generated),sha256=h.sha(generated)),cwd=str(arm)))
+        stack['command']=[str(binary)];build.update(instrumented='pg-owner-mechanism-v1',normal_score_eligible=False)
+        manifest.update(diagnostic_only=True,normal_score_eligible=False)
+        h.save(arm/'manifest.json',manifest)
+        versions[name]=dict(root=str(arm),stack='ku',source_commit=h.PG_CURRENT_BASELINE,
+            binary_sha256=h.sha(binary),diagnostic_only=True,normal_score_eligible=False,
+            artifacts=copy.deepcopy(source_plan['versions'][name].get('artifacts',{})))
+        receipts[name]=dict(path=str(receipt),sha256=h.sha(receipt))
+        if fc.version_identity(source_plan,name)!=old:raise ValueError('cached source/ELF/CLI/driver changed during mechanism derivation')
+    plan=mechanism_plan(versions,original_bindings,dict(path=str(recipe),sha256=recipe_sha))
+    plan['original_versions']=copy.deepcopy(source_plan['versions'])
+    bindings={name:fc.version_identity(plan,name) for name in versions}
+    h.save(a.root/'mechanism-build.json',dict(original_bindings=original_bindings,bindings=bindings,
+        compile_receipts=receipts,recipe=plan['recipe'],product_Rust_rebuilt=False,
+        original_artifacts_unchanged=True,instrumented=True,normal_score_eligible=False))
+    h.save(a.root/'frozen-plan.json',plan)
+    return plan,bindings
+
+
+def mechanism_records(path):
+    if not path.is_file() or path.stat().st_size>1<<20:raise ValueError('bounded mechanism service log missing/oversized')
+    records=[]
+    for line in path.read_text().splitlines():
+        if not line.startswith('KU_MECHANISM '):continue
+        if len(line)>65536 or len(records)>=256:raise ValueError('mechanism record bound exceeded')
+        item=json.loads(line[len('KU_MECHANISM '):])
+        if not isinstance(item,dict):raise ValueError('mechanism JSON object required')
+        records.append(item)
+    if not records:raise ValueError('mechanism output absent after normal cleanup')
+    return dict(records=records,source_log_sha256=h.sha(path),source_log=str(path),
+        scope='Full service lifetime; includes startup/warmup/score/quiet/cleanup. Not score-only frequency or CPU attribution.',
+        diagnostic_only=True,normal_score_eligible=False)
+
+
+def observe_mechanism(a,plan,bindings,normal_manifest):
+    result=dict(schema=plan['schema'],diagnostic_only=True,instrumented=True,formal_qualified=False,
+        normal_score_eligible=False,candidate_accepted=False,cpu_gain_claimed=False,
+        execution_complete=False,rows=[],stopped=[])
+    directory=a.root/'mechanism-probe';directory.mkdir()
+    fixture_root=a.root/'fixture';fixture_root.mkdir();manifest=copy.deepcopy(normal_manifest);manifest['stacks']={}
+    h.save(fixture_root/'manifest.json',manifest);fixture=h.db.Database(fixture_root,manifest['uid'],manifest['gid'])
+    original=fc.Harness;private=None
+    class MechanismHarness(original):
+        def __init__(self,*args,**kwargs):
+            super().__init__(*args,**kwargs);self.manifest=copy.deepcopy(self.manifest)
+            self.manifest['db_url']=private['db_url'];self.db_domain=h.ExternalDomain(private['db_cgroup'])
+    try:
+        fixture.start();private=h.load(fixture.manifest_path);fc.Harness=MechanismHarness
+        h.save(a.root/'identity.json',dict(bindings=bindings,original_bindings=plan['original_bindings'],
+            private_database_limits=h.load(fixture.state_path)['limits'],kernel=platform.release(),machine=platform.machine(),
+            boot_sha256=h.sha('/proc/sys/kernel/random/boot_id'),recipe=plan['recipe'],
+            instrumented=True,perf_used=False,product_Rust_rebuilt=False,normal_score_eligible=False))
+        for name,turn in plan['order']:
+            output=directory/name/turn
+            try:
+                if any(fc.version_identity({'versions':plan['original_versions']},arm)!=plan['original_bindings'][arm]
+                        for arm in ('B','BP')):raise ValueError('original cached mechanism input changed')
+                binding=fc.version_identity(plan,name)
+                if binding!=bindings[name] or h.sha(a.mechanism_recipe)!=plan['recipe']['sha256']:
+                    raise ValueError('mechanism artifact/recipe identity changed')
+                row=fc.window(plan,name,'db',200,3,15,output,binding=binding,
+                    job={'phase':'diagnostic','contract':'pg-strict'})
+                records=mechanism_records(output/'service/service.log');h.save(output/'mechanism.json',records)
+                report=h.load(output/'score/client.json');row.update(mechanism_record_count=len(records['records']),
+                    correct_response_denominator=report.get('ledger',{}).get('correct_total'),
+                    driver_send_delay=report.get('ledger',{}).get('scheduled_to_attempt'))
+                valid,_=h.normal_diagnostic_quality(row)
+                if fc.version_identity(plan,name)!=binding:raise ValueError('mechanism artifact changed during window')
+            except Exception as error:
+                row=h.load(output/'window.json') if (output/'window.json').is_file() else {}
+                row.update(name=name,observer_error=repr(error));valid=False
+            row.update(name=name,turn=turn,instrumented=True,diagnostic_only=True,
+                formal_qualified=False,normal_score_eligible=False,mechanism_qualified=valid)
+            result['rows'].append(row);h.save(a.root/'results.json',result)
+            if not valid:
+                result['stopped'].append(dict(name=name,turn=turn,reason='quality/correctness/observer/cleanup failure; no retry'));break
+    except BaseException as error:
+        result['observer_error']=repr(error)
+        if not isinstance(error,Exception):raise
+    finally:
+        fc.Harness=original
+        try:cleanup=fixture.stop()
+        except Exception as error:cleanup=dict(error=repr(error))
+        result['database_cleanup']=cleanup
+        dbok=cleanup.get('forced') is False and cleanup.get('cgroup_removed') is True and cleanup.get('after',{}).get('process_count')==0
+        result['execution_complete']=len(result['rows'])==2 and not result['stopped'] and dbok and 'observer_error' not in result
+        result['boundary']='Mechanism confirmation only. Instrumented callbacks/counters may perturb execution; no CPU/memory benefit, formal guard or product adoption inferred.'
+        h.save(a.root/'summary.json',result)
+    return result
 
 
 def frozen_plan(versions, *, callchains=False, current_product=None, only=None, workload='db'):
@@ -212,11 +372,20 @@ def main(argv=None):
     p.add_argument('--normal-manifest',type=Path);p.add_argument('--typed-manifest',type=Path)
     p.add_argument('--current-product');p.add_argument('--source',type=Path);p.add_argument('--prepare',action='store_true')
     p.add_argument('--preflight',action='store_true');p.add_argument('--preflight-root',type=Path);p.add_argument('--callchains',action='store_true')
+    p.add_argument('--mechanism',action='store_true',help='Two instrumented current d05 PG windows; no perf or gain claim')
+    p.add_argument('--mechanism-recipe',type=Path,help='Explicit bounded private transform(source)->derived module')
     p.add_argument('--workload',choices=['db','ok'],default='db',help='PG by default; /ok requires exact current d05 B-only cached fp capture')
     p.add_argument('--only',choices=['B','BP'],help='BP-only PG, or B-only /ok; the other arm remains identity-checked and retained')
     p.add_argument('--tools',type=Path);a=p.parse_args(argv)
     a.root=a.root.resolve();a.tools=a.tools.resolve() if a.tools else None
     if a.current_product and not re.fullmatch('[0-9a-f]{40}',a.current_product):p.error('explicit full product SHA required')
+    if a.mechanism_recipe and not a.mechanism:p.error('--mechanism-recipe requires --mechanism')
+    if a.mechanism and (a.prepare or a.preflight or a.preflight_root or a.callchains or a.only
+            or a.workload!='db' or a.current_product!=h.PG_CURRENT_BASELINE or not a.mechanism_recipe):
+        p.error('--mechanism requires cached current d05 db, explicit recipe, no sampling/prepare/preflight/only')
+    if a.mechanism:
+        if a.mechanism_recipe.is_symlink():p.error('plain mechanism recipe required')
+        a.mechanism_recipe=a.mechanism_recipe.resolve(strict=True)
     if a.workload=='ok' and (a.prepare or a.preflight or a.current_product!=h.PG_CURRENT_BASELINE or a.only!='B' or not a.callchains):
         p.error('/ok requires cached current d05, --only B and --callchains; no prepare/preflight workload switch')
     if a.workload=='db' and a.only=='B':p.error('B-only is reserved for explicit /ok; PG default and BP-only stay unchanged')
@@ -237,6 +406,19 @@ def main(argv=None):
     if any(os.environ.get(k) for k in ('LD_PRELOAD','LD_AUDIT','LD_LIBRARY_PATH')):p.error('library overrides are not normal default measurements')
     a.root.mkdir(parents=True,exist_ok=False)
     a.tools=(a.tools or a.normal_manifest.parent/'tools').resolve();a.candidate=bindings['B']['source_commit']
+    if a.mechanism:
+        def mechanism_stop(*unused):raise KeyboardInterrupt('PG mechanism coordinator bound')
+        signal.signal(signal.SIGTERM,mechanism_stop);signal.signal(signal.SIGALRM,mechanism_stop);signal.alarm(420)
+        try:
+            plan,bindings=prepare_mechanism(a,plan,bindings)
+            result=observe_mechanism(a,plan,bindings,manifest)
+            print(json.dumps(result));return 0 if result['execution_complete'] else 2
+        except Exception as error:
+            h.save(a.root/'summary.json',dict(schema='ku-current-pg-mechanism-v1',execution_complete=False,
+                diagnostic_only=True,instrumented=True,formal_qualified=False,normal_score_eligible=False,
+                cpu_gain_claimed=False,observer_error=repr(error),stopped=['mechanism failed; no retry']))
+            return 2
+        finally:signal.alarm(0)
     def stop(*unused):raise KeyboardInterrupt('typed PG SELF fixed coordinator bound')
     signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop);signal.alarm(330)
     h.save(a.root/'frozen-plan.json',plan)

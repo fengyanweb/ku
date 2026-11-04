@@ -227,7 +227,7 @@ class TypedPgSelfTests(unittest.TestCase):
         import subprocess,textwrap
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
         choice=workflow.split('\n      self_workload:\n',1)[1].split('\n      screen_variants:',1)[0]
-        self.assertIn('default: db',choice);self.assertIn('options: [db, ok]',choice)
+        self.assertIn('default: db',choice);self.assertIn('options: [db, ok, db-typed, db-mechanism]',choice)
         prefix,job=workflow.split('\n  pg-typed-self:\n',1);job,suffix=job.split('\n  pg-input-guard:\n',1)
         self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-typed-self'",job)
         self.assertNotIn('KU_PG_SELF_WORKLOAD',prefix+suffix)
@@ -235,11 +235,112 @@ class TypedPgSelfTests(unittest.TestCase):
         setup=next(line.strip() for line in job.splitlines() if 'case "$KU_PG_SELF_WORKLOAD"' in line)
         observed=job.split('- name: Observe only the selected current caller question',1)[1].split('- name: Preserve',1)[0]
         args=textwrap.dedent(observed.split('run: |\n',1)[1].split('          sudo -n',1)[0])
-        for workload,expected in (('db',['--only','BP']),('ok',['--workload','ok','--only','B']),('other',None)):
+        for workload,expected in (('db',['--only','BP']),('ok',['--workload','ok','--only','B']),('db-mechanism',['--mechanism','--mechanism-recipe','/checkout/tests/benchmarks/cross_stack/pg_owner_mechanism.py']),('other',None)):
             with self.subTest(workload=workload):
                 checked=subprocess.run(['bash','-eu'],input=setup+'\n'+args+'\nprintf "%s\\n" "${pg_self_args[@]}"\n',
-                    text=True,capture_output=True,env={'KU_PG_SELF_WORKLOAD':workload},timeout=5)
+                    text=True,capture_output=True,env={'KU_PG_SELF_WORKLOAD':workload,'KU_PG_CURRENT_BUILD':'/cached','GITHUB_WORKSPACE':'/checkout'},timeout=5)
                 if expected is None:self.assertNotEqual(checked.returncode,0)
                 else:self.assertEqual(checked.returncode,0,checked.stderr);self.assertEqual(checked.stdout.splitlines(),expected)
+
+    def test_mechanism_fixed_two_original_rate_windows_without_perf_or_gain(self):
+        p=t.mechanism_plan({}, {'B':{'frozen':1},'BP':{'frozen':2}}, {'sha256':'a'*64})
+        self.assertEqual(p['order'],[['B','mechanism'],['BP','mechanism']])
+        self.assertEqual((p['rate'],p['warmup_seconds'],p['score_seconds'],p['maximum_windows'],p['maximum_replacements']),(200,3,15,2,0))
+        self.assertTrue(p['instrumented']);self.assertFalse(p['normal_score_eligible']);self.assertFalse(p['formal_qualified'])
+        self.assertNotIn('event',p);self.assertNotIn('perf_frequency',p)
+        self.assertEqual(p['original_bindings']['B'],{'frozen':1})
+
+    def test_mechanism_records_are_bounded_and_no_missing_output_passes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            p=Path(temp)/'service.log'
+            p.write_text('ordinary log\nKU_MECHANISM {"kind":"aggregate","first":3}\n')
+            result=t.mechanism_records(p)
+            self.assertEqual(result['records'],[{'kind':'aggregate','first':3}])
+            self.assertFalse(result['normal_score_eligible'])
+            p.write_text('no mechanism output\n')
+            with self.assertRaisesRegex(ValueError,'absent'):t.mechanism_records(p)
+            p.write_text('KU_MECHANISM []\n')
+            with self.assertRaisesRegex(ValueError,'object'):t.mechanism_records(p)
+            p.write_text('KU_MECHANISM {}\n'*257)
+            with self.assertRaisesRegex(ValueError,'bound'):t.mechanism_records(p)
+
+    def test_mechanism_serial_windows_and_cleanup_keep_warm_score_distinct(self):
+        for fail in (False,True):
+            with self.subTest(fail=fail),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);recipe=root/'recipe.py';recipe.write_text('def transform(source):return source')
+                private=root/'private.json';state=root/'state.json';private.write_text('{"db_url":"x","db_cgroup":"x"}');state.write_text('{"limits":{}}')
+                fixture=types.SimpleNamespace(start=lambda:None,stop=lambda:{'forced':False,'cgroup_removed':True,'after':{'process_count':0}},manifest_path=private,state_path=state)
+                original=t.fc.Harness;calls=[];old={'B':{'old':'B'},'BP':{'old':'BP'}};derived={'B':{'new':'B'},'BP':{'new':'BP'}}
+                plan=t.mechanism_plan({'B':{'root':'derivedB'},'BP':{'root':'derivedBP'}},old,{'sha256':'a'*64});plan['original_versions']={'B':{'root':'oldB'},'BP':{'root':'oldBP'}}
+                def identity(p,n):return old[n] if p['versions']==plan['original_versions'] else derived[n]
+                def window(p,n,w,rate,warm,score,out,**kw):
+                    calls.append((n,w,rate,warm,score,kw['job']['contract']))
+                    if fail:raise RuntimeError('retained original failure')
+                    (out/'service').mkdir(parents=True);(out/'service/service.log').write_text('KU_MECHANISM {"kind":"aggregate"}\n')
+                    t.h.save(out/'score/client.json',{'ledger':{'correct_total':3000,'scheduled_to_attempt':{}}})
+                    return {'all_correct':True,'functional_valid':True,'natural_reclamation':True}
+                with patch.object(t.h.db,'Database',return_value=fixture),patch.object(t.h,'sha',return_value='a'*64),patch.object(t.fc,'version_identity',side_effect=identity),patch.object(t.fc,'window',side_effect=window),patch.object(t.h,'normal_diagnostic_quality',return_value=(True,{})),patch.object(t.h,'normal_self_client') as perf:
+                    result=t.observe_mechanism(types.SimpleNamespace(root=root,mechanism_recipe=recipe),plan,derived,{'uid':1,'gid':1})
+                self.assertIs(t.fc.Harness,original);perf.assert_not_called()
+                self.assertEqual(calls,[('B','db',200,3,15,'pg-strict')]+([] if fail else [('BP','db',200,3,15,'pg-strict')]))
+                self.assertEqual(result['execution_complete'],not fail);self.assertFalse(result['cpu_gain_claimed'])
+                self.assertFalse(result['normal_score_eligible']);self.assertFalse(result['candidate_accepted'])
+                self.assertTrue(result['database_cleanup']['cgroup_removed'])
+                if not fail:self.assertEqual(result['rows'][1]['correct_response_denominator'],3000)
+
+    def test_mechanism_derivation_changes_only_private_native_artifacts(self):
+        import compile_variants as cv
+        import reuse_build as rb
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);output=root/'out';output.mkdir();recipe=root/'recipe.py'
+            recipe.write_text('def transform(source):return source+"\\n/*mechanism*/\\n"\n')
+            common={}
+            for name in ('compiler','libpq','cli','driver','protocol'):
+                f=root/name;f.write_text(name);common[name]=f
+            versions={};manifests={}
+            for name,mode in (('B','int'),('BP','typed')):
+                arm=root/name;arm.mkdir();source=arm/'server.ku';source.write_text('frozen business '+name)
+                generated=arm/'server.c';generated.write_text('int frozen_'+name+';')
+                binary=arm/'server';binary.write_bytes(b'original ELF '+name.encode())
+                invocation={'compiler':{'path':str(common['compiler']),'sha256':t.h.sha(common['compiler'])},
+                    'flags':['-std=c11','-O2','-pthread'],'library_inputs':[{'role':'libpq','selected_input':{'real_path':str(common['libpq'])}}]}
+                build={'cli':str(common['cli']),'cli_sha256':t.h.sha(common['cli']),
+                    'libpq_source':str(common['libpq']),'libpq_sha256':t.h.sha(common['libpq']),
+                    'formatting_mode':'helpers','pg_read_mode':mode,
+                    'native':{'server':{'binary_sha256':t.h.sha(binary),'generated_c':str(generated),'generated_c_sha256':t.h.sha(generated),
+                        'source':str(source),'source_sha256':t.h.sha(source),'compiler_invocation':invocation}}}
+                m={'candidate_base':t.h.PG_CURRENT_BASELINE,'stacks':{'ku':{'command':[str(binary)],'build':build}},
+                    'client':{'command':[str(common['driver'])],'sha256':t.h.sha(common['driver'])},'protocol':str(common['protocol'])}
+                t.h.save(arm/'manifest.json',m);manifests[name]=m
+                versions[name]={'root':str(arm),'source_commit':t.h.PG_CURRENT_BASELINE,'binary_sha256':t.h.sha(binary)}
+            plan={'versions':versions};bindings={n:t.fc.version_identity(plan,n)for n in versions}
+            expected={n:{key:value['sha256']for key,value in bindings[n]['files'].items()}for n in versions}
+            original={p:t.h.sha(p)for p in root.rglob('*')if p.is_file()};commands=[]
+            class FakeCommands:
+                def __init__(self,directory,environment):directory.mkdir();self.rows=[]
+                def run(self,label,command,cwd,timeout):
+                    commands.append(command);self.rows.append({'label':label,'exit_code':0})
+                    if label=='mechanism-link':Path(command[-1]).write_bytes(b'\x7fELF\x02\x01'+b'\0'*12+(183).to_bytes(2,'little'))
+                    return 'clang fake' if label=='compiler-version' else str(common['libpq']) if label=='linked-libraries' else ''
+            with patch.object(rb,'CURRENT_PG_FILES',expected['B']),patch.object(rb,'CURRENT_TYPED_PG_FILES',expected['BP']),patch.object(cv,'Commands',FakeCommands):
+                derived,new=t.prepare_mechanism(types.SimpleNamespace(root=output,tools=root,mechanism_recipe=recipe),plan,bindings)
+            self.assertEqual(len(commands),6);self.assertEqual(derived['rate'],200)
+            self.assertEqual({p:t.h.sha(p)for p in original},original)
+            for name in versions:
+                m=t.h.load(output/'mechanism-derived'/name/'manifest.json');build=m['stacks']['ku']['build']
+                self.assertEqual(build['cli_sha256'],bindings[name]['files']['Ku CLI']['sha256'])
+                self.assertEqual(build['native']['server']['source_sha256'],bindings[name]['files']['expanded source']['sha256'])
+                self.assertNotEqual(new[name]['files']['ELF']['sha256'],bindings[name]['files']['ELF']['sha256'])
+                self.assertTrue(build['instrumented']);self.assertFalse(m['normal_score_eligible'])
+
+    def test_mechanism_workflow_skips_unrelated_setup_and_large_archive(self):
+        workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
+        job=workflow.split('\n  pg-typed-self:\n',1)[1].split('\n  pg-input-guard:\n',1)[0]
+        self.assertIn("- if: inputs.self_workload != 'db-mechanism'\n        uses: actions/setup-go",job)
+        self.assertIn("if: inputs.self_workload != 'db-mechanism'\n        timeout-minutes: 1",job)
+        self.assertIn('pg_self_sampling=()',job)
+        self.assertIn("if: always() && inputs.self_workload != 'db-mechanism'",job)
+        self.assertIn('mechanism-probe/**/resources.json',job);self.assertIn('mechanism-derived/**/*.c',job)
+        self.assertNotIn('mechanism-derived/**/bin',job);self.assertNotIn('cargo +1.99.1 build',job)
 
 if __name__=='__main__':unittest.main()
