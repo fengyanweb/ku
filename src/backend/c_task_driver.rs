@@ -2083,15 +2083,27 @@ static int ku_task_driver_compute_end(const KuTaskDriverTicketV1* ticket,
   budget->active=0; budget->open=0;
   return !budget->invalid;
 }
-static uint32_t ku_task_driver_wrapper_begin(
-    const KuTaskDriverTicketV1* ticket, const KuTaskControlLeaseV1* lease) {
+static uint32_t ku_task_driver_wrapper_begin_mode(
+    const KuTaskDriverTicketV1* ticket, const KuTaskControlLeaseV1* lease, int ready_only) {
   uint32_t checked = ku_task_driver_check_ticket(ticket);
   if (checked != KU_TASK_DRIVER_OK) return checked;
-  checked = ku_task_control_check_lease(lease);
-  if (checked != KU_TASK_CONTROL_OK) return checked;
+  if (!ready_only) {
+    checked = ku_task_control_check_lease(lease);
+    if (checked != KU_TASK_CONTROL_OK) return checked;
+  }
   KuTaskDriverV1* driver = ticket->driver;
   if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
   KuTaskDriverSlotV1* slot = ku_task_driver_find(ticket);
+  if (ready_only) {
+    /* Match HTTP's former probe before wrapper validation. Pending never
+     * registers a wrapper or schedules payload/cleanup advancement. */
+    uint32_t ready = slot ? ku_task_driver_wait_ready_locked(slot) : KU_TASK_DRIVER_STALE;
+    if (ready != KU_TASK_DRIVER_WAIT_READY) {
+      ku_task_driver_unlock(driver); return ready;
+    }
+    checked = ku_task_control_check_lease(lease);
+    if (checked != KU_TASK_CONTROL_OK) {ku_task_driver_unlock(driver); return checked;}
+  }
   uint32_t result = !slot ? KU_TASK_DRIVER_STALE : slot->binding != lease->control
       ? KU_TASK_DRIVER_INVALID_ARGUMENT : slot->state == KU_TASK_DRIVER_BUILDING
       || slot->state == KU_TASK_DRIVER_RETIRING ? KU_TASK_DRIVER_INVALID_STATE
@@ -2102,6 +2114,10 @@ static uint32_t ku_task_driver_wrapper_begin(
   }
   ku_task_driver_unlock(driver);
   return result;
+}
+static uint32_t ku_task_driver_wrapper_begin(
+    const KuTaskDriverTicketV1* ticket, const KuTaskControlLeaseV1* lease) {
+  return ku_task_driver_wrapper_begin_mode(ticket, lease, 0);
 }
 static void ku_task_driver_wrapper_end(const KuTaskDriverTicketV1* ticket) {
   KuTaskDriverV1* driver = ticket->driver;
@@ -2144,6 +2160,18 @@ static uint32_t ku_task_driver_take_result(
   if (checked != KU_TASK_DRIVER_OK) return checked;
   uint32_t result = ku_task_control_take_result(lease, output);
   ku_task_driver_wrapper_end(ticket); /* AFTER final TAKEN/AVAILABLE publication. */
+  return result;
+}
+/* HTTP readiness and wrapper residency share one locked slot observation.
+ * Once registered, a control-level Pending still ends the wrapper exactly as
+ * the public take does; only an unready probe has no wrapper to end. */
+static uint32_t ku_task_driver_take_ready_result(
+    const KuTaskDriverTicketV1* ticket, const KuTaskControlLeaseV1* lease, void* output) {
+  uint32_t checked = ku_task_driver_wrapper_begin_mode(ticket, lease, 1);
+  if (checked == KU_TASK_DRIVER_PENDING) return KU_TASK_CONTROL_PENDING;
+  if (checked != KU_TASK_DRIVER_OK) return checked;
+  uint32_t result = ku_task_control_take_result(lease, output);
+  ku_task_driver_wrapper_end(ticket);
   return result;
 }
 /* Only the current generated callback may use this bound cancellation entry.
