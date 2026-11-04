@@ -594,6 +594,22 @@ jobs:
           KU_CC='clang-18 -O2 -fsanitize=address,undefined -fno-omit-frame-pointer' ASAN_OPTIONS='detect_leaks=1:halt_on_error=1' UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
             cargo +1.99.1 test --release --locked --test native_pg_query_poll_test native_pg_async_fresh_send_waits_without_empty_probes_or_lost_readiness -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/read-boundary-detectors.log" 2>&1
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/read-boundary-detectors.log"
+      - name: Prepare native candidate-only I/O observations without rebuilding Rust
+        if: inputs.scope == 'pg-read-screen'
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B tests/benchmarks/cross_stack/pg_read_candidate_mechanism.py --phase prepare \
+            --root "$KU_PG_GUARD_ROOT" --source "$GITHUB_WORKSPACE" --tools "$KU_PG_GUARD_ROOT/tools" > "$KU_PG_GUARD_ROOT/read-mechanism-prepare.log" 2>&1
+      - name: Confirm candidate I/O and event counts once per PG path
+        if: inputs.scope == 'pg-read-screen'
+        timeout-minutes: 7
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B tests/benchmarks/cross_stack/pg_read_candidate_mechanism.py --phase observe \
+            --root "$KU_PG_GUARD_ROOT" --source "$GITHUB_WORKSPACE" --tools "$KU_PG_GUARD_ROOT/tools" > "$KU_PG_GUARD_ROOT/read-mechanism.log" 2>&1
       - name: Run only the fixed twelve normal full-path screen windows
         if: inputs.scope == 'pg-read-screen'
         timeout-minutes: 9
@@ -621,6 +637,22 @@ jobs:
             ${{ runner.temp }}/ku-pg-input-guard/B/build/ku-native/.ku/build/release/c/*/ku-server.c
             ${{ runner.temp }}/ku-pg-input-guard/BP/build/ku-native/.ku/build/release/c/*/ku-server.c
             ${{ runner.temp }}/ku-pg-input-guard/pg-read-screen
+            ${{ runner.temp }}/ku-pg-input-guard/read-mechanism-prepare.log
+            ${{ runner.temp }}/ku-pg-input-guard/read-mechanism.log
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/parent.json
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/frozen-plan.json
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/identity.json
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/summary.json
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/results.json
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/mechanism-build.json
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/mechanism-derived/**/*.c
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/mechanism-derived/**/compile.json
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/mechanism-derived/**/logs/*
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/mechanism-probe/**/window.json
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/mechanism-probe/**/client.json
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/mechanism-probe/**/resources.json
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/mechanism-probe/**/mechanism.json
+            ${{ runner.temp }}/ku-pg-input-guard/read-candidate-mechanism/mechanism-probe/**/service.log
             ${{ runner.temp }}/ku-pg-input-guard/read-prepare.log
             ${{ runner.temp }}/ku-pg-input-guard/read-screen.log
             ${{ runner.temp }}/ku-pg-input-guard/pg-input-guard-observation
