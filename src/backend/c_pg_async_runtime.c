@@ -519,7 +519,8 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op,KuPgAsyncTurn* turn) {
   const size_t byte_quantum=65536u,cell_quantum=64u;
   if(turn->bytes>=byte_quantum || turn->cells>=cell_quantum)return 0;
   if(!op->row_phase) {
-    int rows=PQntuples(op->row),cols=PQnfields(op->row);
+    int rows=op->row_rows,cols=op->row_columns;
+    if(op->row_status==KU_PGRES_COMMAND_OK) {rows=PQntuples(op->row);cols=PQnfields(op->row);}
     size_t previous=op->query.value ? op->query.value->rows:0;
     if(rows<0 || rows>1 || cols<0 || (size_t)cols>KU_PG_MAX_RESULT_COLS
         || previous>KU_PG_MAX_RESULT_ROWS-(size_t)rows
@@ -721,6 +722,9 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
       if(rows!=(status==KU_PGRES_SINGLE_TUPLE?1:0) || columns<0 || (op->partial && op->columns!=columns)) {PQclear(next);ku_pg_async_failure(op);return 1;}
       if(!op->partial) {ku_pg_async_drop_query(op);op->columns=columns;}
       if(op->query.validation==1) {
+        /* The ordinary result materializer reuses this immutable shape after
+         * bounded yields. Typed results retain their independent shape reads. */
+        if(!op->typed) {op->row_rows=rows;op->row_columns=columns;}
         op->row=next;op->row_phase=0;op->row_status=status;continue;
       }
       if(status==KU_PGRES_SINGLE_TUPLE) {op->partial=1;PQclear(next);}
