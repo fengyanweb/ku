@@ -19,10 +19,10 @@ on:
         type: string
         default: ''
       self_workload:
-        description: 'pg-typed-self: PG or ordinary /ok SELF, db-mechanism joint confirmation; pg-input-guard: ordinary db/200rps, ok/2000rps or typed db-typed/200rps'
+        description: 'pg-typed-self: PG or ordinary /ok SELF; pg-input-guard: ordinary db/200rps, ok/2000rps or typed db-typed/200rps'
         type: choice
         default: db
-        options: [db, ok, db-typed, db-mechanism]
+        options: [db, ok, db-typed]
       screen_variants:
         description: 'Up to seven full commit ablations, comma-separated, in one serial followup-screen; no extra formal matrix'
         type: string
@@ -211,8 +211,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - if: inputs.self_workload != 'db-mechanism'
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: '1.27.2'
           cache: false
@@ -220,35 +219,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          case "$KU_PG_SELF_WORKLOAD" in db|ok|db-mechanism) ;; *) echo 'unsupported SELF workload' >&2; exit 1 ;; esac
+          case "$KU_PG_SELF_WORKLOAD" in db|ok) ;; *) echo 'unsupported SELF workload' >&2; exit 1 ;; esac
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
+          rustup default 1.99.1
           sudo apt-get update -qq
-          if [ "$KU_PG_SELF_WORKLOAD" = db-mechanism ]; then
-            sudo apt-get install -y --no-install-recommends clang-18 libpq-dev postgresql-16
-          else
-            rustup toolchain install 1.99.1 --profile minimal --no-self-update
-            rustup default 1.99.1
-            sudo apt-get install -y --no-install-recommends clang-18 llvm-18 libpq-dev postgresql-16 linux-tools-common
-            for pg_perf_package in "linux-tools-$(uname -r)" linux-tools-generic; do
-              if apt-cache show "$pg_perf_package" >/dev/null 2>&1; then
-                sudo apt-get install -y --no-install-recommends "$pg_perf_package"
-                break
-              fi
-            done
-          fi
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 libpq-dev postgresql-16 linux-tools-common
+          for pg_perf_package in "linux-tools-$(uname -r)" linux-tools-generic; do
+            if apt-cache show "$pg_perf_package" >/dev/null 2>&1; then
+              sudo apt-get install -y --no-install-recommends "$pg_perf_package"
+              break
+            fi
+          done
           mkdir -p "$RUNNER_TEMP/ku-pg-current-tools/bin" "$RUNNER_TEMP/ku-pg-current-1.99.1"
-          if [ "$KU_PG_SELF_WORKLOAD" != db-mechanism ]; then
           pg_perf_binary="$(readlink -e "/usr/lib/linux-tools/$(uname -r)/perf" || true)"
           if [ -z "$pg_perf_binary" ] || [ ! -x "$pg_perf_binary" ]; then
             pg_perf_binary="$(find -L /usr/lib/linux-tools* /usr/lib/linux-azure-tools* -maxdepth 2 -type f -name perf -print 2>/dev/null | sort -V | tail -n 1 || true)"
           fi
           test -n "$pg_perf_binary"; test -x "$pg_perf_binary"
           ln -s "$pg_perf_binary" "$RUNNER_TEMP/ku-pg-current-tools/bin/perf"
-          fi
           ln -s "${CARGO_HOME:-$HOME/.cargo}" "$RUNNER_TEMP/ku-pg-current-tools/cargo"
           ln -s "${RUSTUP_HOME:-$HOME/.rustup}" "$RUNNER_TEMP/ku-pg-current-tools/rustup"
-          if [ "$KU_PG_SELF_WORKLOAD" != db-mechanism ]; then
-            ln -s "$(dirname "$(dirname "$(command -v go)")")" "$RUNNER_TEMP/ku-pg-current-tools/go"
-          fi
+          ln -s "$(dirname "$(dirname "$(command -v go)")")" "$RUNNER_TEMP/ku-pg-current-tools/go"
           printf 'KU_PG_CURRENT_BUILD=%s\n' "$RUNNER_TEMP/ku-pg-current-1.99.1" >> "$GITHUB_ENV"
           printf 'KU_PG_CURRENT_ROOT=%s\n' "$RUNNER_TEMP/ku-pg-current-observation" >> "$GITHUB_ENV"
           printf '%s\n' "$RUNNER_TEMP/ku-pg-current-tools/bin" >> "$GITHUB_PATH"
@@ -280,7 +271,6 @@ jobs:
           print({name:str(path) for name,path in paths.items()})
           PYIN
       - name: Validate the exact fp sampling format on this boot
-        if: inputs.self_workload != 'db-mechanism'
         timeout-minutes: 1
         shell: bash
         run: |
@@ -288,24 +278,20 @@ jobs:
           sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --preflight --callchains \
             --root "$KU_PG_CURRENT_BUILD" --tools "$RUNNER_TEMP/ku-pg-current-tools" --current-product "$KU_PG_PRODUCT"
       - name: Observe only the selected current caller question
-        timeout-minutes: ${{ inputs.self_workload == 'db-mechanism' && 8 || 6 }}
+        timeout-minutes: 6
         shell: bash
         run: |
           set -euo pipefail
           pg_self_args=(--only BP)
-          pg_self_sampling=(--callchains --preflight-root "$KU_PG_CURRENT_BUILD")
           if [ "$KU_PG_SELF_WORKLOAD" = ok ]; then
             pg_self_args=(--workload ok --only B)
-          elif [ "$KU_PG_SELF_WORKLOAD" = db-mechanism ]; then
-            pg_self_args=(--mechanism --mechanism-recipe "$GITHUB_WORKSPACE/tests/benchmarks/cross_stack/pg_owner_mechanism.py")
-            pg_self_sampling=()
           fi
-          sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py \
+          sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --callchains \
             --root "$KU_PG_CURRENT_ROOT" --tools "$RUNNER_TEMP/ku-pg-current-tools" \
             --normal-manifest "$KU_PG_CURRENT_BUILD/B/manifest.json" --typed-manifest "$KU_PG_CURRENT_BUILD/BP/manifest.json" \
-            --current-product "$KU_PG_PRODUCT" "${pg_self_sampling[@]}" "${pg_self_args[@]}" > "$RUNNER_TEMP/ku-pg-current-observation.log" 2>&1
+            --current-product "$KU_PG_PRODUCT" --preflight-root "$KU_PG_CURRENT_BUILD" "${pg_self_args[@]}" > "$RUNNER_TEMP/ku-pg-current-observation.log" 2>&1
       - name: Preserve the existing build and observation archive formats
-        if: always() && inputs.self_workload != 'db-mechanism'
+        if: always()
         timeout-minutes: 3
         shell: bash
         run: |
@@ -322,7 +308,7 @@ jobs:
           PY
             fi
           done
-      - if: always() && inputs.self_workload != 'db-mechanism'
+      - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ku-pg-current-build-reuse
@@ -331,7 +317,7 @@ jobs:
             ${{ runner.temp }}/ku-pg-current-1.99.1/prepared-current.json
             ${{ runner.temp }}/ku-pg-current-1.99.1/reuse-provenance
           retention-days: 14
-      - if: always() && inputs.self_workload != 'db-mechanism'
+      - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ku-pg-typed-self
@@ -351,16 +337,6 @@ jobs:
             ${{ runner.temp }}/ku-pg-current-observation/results.json
             ${{ runner.temp }}/ku-pg-current-observation/frozen-plan.json
             ${{ runner.temp }}/ku-pg-current-observation/identity.json
-            ${{ runner.temp }}/ku-pg-current-observation/mechanism-build.json
-            ${{ runner.temp }}/ku-pg-current-observation/mechanism-derived/**/*.c
-            ${{ runner.temp }}/ku-pg-current-observation/mechanism-derived/**/compile.json
-            ${{ runner.temp }}/ku-pg-current-observation/mechanism-derived/**/logs/*.json
-            ${{ runner.temp }}/ku-pg-current-observation/mechanism-derived/**/logs/*.log
-            ${{ runner.temp }}/ku-pg-current-observation/mechanism-probe/**/window.json
-            ${{ runner.temp }}/ku-pg-current-observation/mechanism-probe/**/client.json
-            ${{ runner.temp }}/ku-pg-current-observation/mechanism-probe/**/resources.json
-            ${{ runner.temp }}/ku-pg-current-observation/mechanism-probe/**/mechanism.json
-            ${{ runner.temp }}/ku-pg-current-observation/mechanism-probe/**/service.log
             ${{ runner.temp }}/ku-pg-current-observation/kernel.*
             ${{ runner.temp }}/ku-pg-current-observation/kernel-identity.json
             ${{ runner.temp }}/ku-pg-current-observation/normal-self-probe/**/window.json
