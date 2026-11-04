@@ -698,6 +698,57 @@ fn native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_p
     );
 }
 
+#[test]
+fn native_pg_async_fresh_send_waits_without_empty_probes_or_lost_readiness() {
+    let directory = TempDir::new("pg-fresh-readiness");
+    let mut harness = query_stub_harness(&directory)
+        .replacen(
+            "int main(void) {",
+            "static int ku_legacy_query_tests(void) {",
+            1,
+        )
+        .replacen(
+            "enum {\n  T_OK",
+            &format!("{FRESH_READ_GLOBALS}\nenum {{\n  T_OK"),
+            1,
+        );
+    for (needle, replacement) in [
+        ("int PQflush(PGconn* conn) {", "int PQflush(PGconn* conn) { if(fr_enabled) { unsigned s=(unsigned)conn->is_reset;fr_flushes[s]++;if(fr_backpressure[s] && !conn->notice_consumed)return 1;if(fr_flush_buffers[s])conn->received_reads=fr_required[s]; }"),
+        ("int PQconsumeInput(PGconn* conn) {", "int PQconsumeInput(PGconn* conn) { if(fr_enabled) { if(!conn->active){fr_prepare++;if(fr_fail_prepare){conn->status=KU_PG_CONNECTION_BAD;return 0;}}else {unsigned s=(unsigned)conn->is_reset;fr_consumes[s]++;if(fr_fail_consume[s]){conn->status=KU_PG_CONNECTION_BAD;return 0;}if(!conn->pending_read)fr_empty[s]++;} }"),
+        ("int PQisBusy(PGconn* conn) {", "int PQisBusy(PGconn* conn) { if(fr_enabled && conn->active) {unsigned s=(unsigned)conn->is_reset;int busy=!fr_buffered[s] && conn->index<conn->total && (conn->received_reads<fr_required[s] || (fr_split_rows && !s && conn->received_reads<=conn->index));get_gate=!busy;return busy;}"),
+        ("int PQsendQueryParams(PGconn* conn, const char* sql, int count, const void* types, const char* const* values, const int* lengths, const int* formats, int format) {", "int PQsendQueryParams(PGconn* conn, const char* sql, int count, const void* types, const char* const* values, const int* lengths, const int* formats, int format) { if(fr_enabled && fr_typed && format==1){if(count || values)bad_calls++;param_sends++;return send_query(conn,sql);}"),
+        ("static int result_format(const PGresult* result, int column) {", "static int result_format(const PGresult* result, int column) { if(fr_enabled && fr_typed && result->mode==T_OK)return 1;"),
+        ("unsigned int PQftype(const PGresult* result,int column) {", "unsigned int PQftype(const PGresult* result,int column) { if(fr_enabled && fr_typed && result->mode==T_OK)return 23u;"),
+        ("char* PQgetvalue(const PGresult* result, int row, int column) {", "char* PQgetvalue(const PGresult* result, int row, int column) { if(fr_enabled && fr_typed && result->mode==T_OK)return \"\\0\\0\\0\\3\";"),
+    ] {
+        assert_eq!(harness.matches(needle).count(), 1, "fresh readiness seam: {needle}");
+        harness = harness.replacen(needle, replacement, 1);
+    }
+    harness.push_str(&ASYNC_QUERY_SUITE.replace(
+        "int main(void) {",
+        "static int ku_async_sequential_tests(void) {",
+    ));
+    harness.push_str(FRESH_READ_SUITE);
+    let path = directory.path().join("pg-fresh-readiness.c");
+    fs::write(&path, harness).expect("write fresh PG readiness fixture");
+    let Some(executable) = compile_harness(directory.path(), &path, "pg-fresh-readiness") else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .expect("fresh PG readiness fixture exceeded bounds");
+    assert!(
+        output.status.success(),
+        "fresh PG readiness fixture failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg fresh-send readiness and buffer contract closed loop\n"
+    );
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+}
+
 fn run_async_acquire_waiter_handoff(kind: u8) {
     let name = match kind {
         0 => "async-query-acquire-handoff-expired",
@@ -1487,11 +1538,15 @@ static int ku_test_value(KuPgResult* result, const char* value) {
   if (read.ok) ku_string_drop(&read.value); else ku_error_drop(&read.error); return equal;
 }
 #define LIVE_CHECK(value) do { if (!(value)) { fprintf(stderr, "live PG check failed at line %d\n", __LINE__); return 1; } } while (0)
+static int ku_test_live_tls(PGconn* conn) {
+  const char* required=getenv("KU_PG_TEST_REQUIRE_TLS");
+  return !required || strcmp(required,"1")!=0 || (conn && PQsslInUse(conn));
+}
 static int ku_test_typed_live_idle(KuPgClient* pool) {
   return pool && pool->conns[0] && !pool->in_use[0] && pool->active==0
       && PQstatus(pool->conns[0])==KU_PG_CONNECTION_OK
       && PQtransactionStatus(pool->conns[0])==KU_PQTRANS_IDLE
-      && ku_pg_connection_is_utf8(pool->conns[0]);
+      && ku_pg_connection_is_utf8(pool->conns[0]) && ku_test_live_tls(pool->conns[0]);
 }
 static int ku_test_typed_live_row(KuPgResult* row,const uint8_t* text,size_t length) {
   if(!row || ku_pg_rows(row)!=1 || ku_pg_cols(row)!=10)return 0;
@@ -1544,6 +1599,22 @@ static int ku_test_typed_live(KuPgClient** owned_pool) {
   memset(values,0,sizeof(values));
   KuString int4=ku_test_text("int4"),text=ku_test_text("text"),nullable=ku_test_text("text?");
   KuArray_str one_int={1u,&int4},one_text={1u,&text},one_nullable={1u,&nullable},none={0};
+  /* This public typed wrapper drives KuPgAsyncOp's step/interest loop. The
+   * field exceeds one TLS record and the 64KiB materialization quantum; a
+   * subsequent query verifies drain/reset before reusing the same lease. */
+  result=ku_pg_client_query_one_typed(pool,
+      ku_test_text("SELECT repeat('0123456789abcdef',4097)::text"),NULL,0,none,one_text);
+  LIVE_CHECK(result.ok && ku_test_typed_live_idle(pool));KuPgResult* large=result.value;
+  KuResult_str large_value=ku_pg_value(large,0,0);
+  LIVE_CHECK(large_value.ok && large_value.value.len==65552u);
+  for(size_t i=0;i<large_value.value.len;i++)LIVE_CHECK(large_value.value.ptr[i]==(uint8_t)"0123456789abcdef"[i%16u]);
+  ku_string_drop(&large_value.value);
+  result=ku_pg_client_query_one_typed(pool,ku_test_text("SELECT 9::int4"),NULL,0,none,one_int);
+  LIVE_CHECK(result.ok && ku_test_typed_live_idle(pool));
+  KuResult_int after_large=ku_pg_value_int(result.value,0,0);LIVE_CHECK(after_large.ok && after_large.value==9);
+  ku_drop_pg_result(&result.value);
+  large_value=ku_pg_value(large,0,0);LIVE_CHECK(large_value.ok && large_value.value.len==65552u);
+  ku_string_drop(&large_value.value);ku_drop_pg_result(&large);
   result=ku_pg_client_query_one_typed(pool,ku_test_text("SELECT 1::int4 WHERE false"),NULL,0,none,one_int);
   LIVE_CHECK(ku_test_code(result,"row_count_error") && ku_test_typed_live_idle(pool));ku_error_drop(&result.error);
   result=ku_pg_client_query_one_typed(pool,ku_test_text("SELECT i::int4 FROM generate_series(1,2) AS i"),NULL,0,none,one_int);
@@ -1600,6 +1671,7 @@ int main(void) {
   if (strlen(conninfo) != size || !ku_test_conninfo_is_loopback(conninfo)) return 77;
   KuPgConnectAttempt raw_opened = ku_pg_connect_until(conninfo, __ku_handler_now_ms() + 2000);
   LIVE_CHECK(raw_opened.conn); PGconn* conn = raw_opened.conn;
+  LIVE_CHECK(ku_test_live_tls(conn));
   KuString value = ku_test_text("x'; SELECT pg_sleep(999); --"); KuArray_str params = { 1, &value };
   KuResult_pg_result result = ku_pg_query_params(conn, ku_test_text("SELECT $1::text"), params);
   LIVE_CHECK(result.ok && ku_test_value(result.value, "x'; SELECT pg_sleep(999); --")); ku_drop_pg_result(&result.value);
@@ -3109,6 +3181,129 @@ int main(void) {
   CHECK(async_finish(held,1));async_drop_output(held,&b,0); /* Last op physically destroys closed p. */
   CHECK(live_results==0 && live_connections==0 && live_runtime_allocations==0);
   puts("pg async pump closed loop");return 0;
+}
+"#;
+
+const FRESH_READ_GLOBALS: &str = r#"
+/* Deterministic public-libpq model: command results arrive only after an
+ * explicit packet, or are already in libpq's input buffer. This is not a TLS
+ * implementation; real encrypted transport is covered by the opt-in harness. */
+static int fr_enabled,fr_typed,fr_prepare,fr_fail_prepare,fr_split_rows;
+static int fr_buffered[2],fr_flush_buffers[2],fr_backpressure[2],fr_required[2];
+static int fr_fail_consume[2],fr_consumes[2],fr_empty[2],fr_flushes[2];
+"#;
+
+const FRESH_READ_SUITE: &str = r#"
+static int fr_live_control(void* context,uint64_t generation) {
+  (void)context;(void)generation;return 0;
+}
+static void fr_configure(int typed) {
+  fr_enabled=1;fr_typed=typed;fr_prepare=fr_fail_prepare=fr_split_rows=0;
+  memset(fr_buffered,0,sizeof(fr_buffered));memset(fr_flush_buffers,0,sizeof(fr_flush_buffers));
+  memset(fr_backpressure,0,sizeof(fr_backpressure));memset(fr_fail_consume,0,sizeof(fr_fail_consume));
+  memset(fr_consumes,0,sizeof(fr_consumes));memset(fr_empty,0,sizeof(fr_empty));memset(fr_flushes,0,sizeof(fr_flushes));
+  fr_required[0]=fr_required[1]=1;
+  clock_ms=1000;clock_step=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
+}
+static KuPgAsyncOp* fr_create(KuPgClient* pool,AsyncBudget* budget) {
+  KuError error={0};KuPgAsyncOp* op;
+  if(fr_typed) {
+    KuString columns[]={text("int4")};
+    op=ku_pg_async_create_one_typed(pool,text("SELECT 3"),NULL,0u,
+        (KuArray_str){0},(KuArray_str){1u,columns},clock_ms+2000u,
+        (KuPgAsyncBudget){budget,async_reserve,async_refund},async_wake,budget,&error);
+  } else op=async_create(pool,budget);
+  if(!op)abort();
+  /* Match the existing small-result Task observer contract, so a query READ
+   * can complete and send reset within this same owner turn. */
+  op->fresh_cancel=fr_live_control;return op;
+}
+static int fr_finish_reset(KuPgAsyncOp* op) {
+  CHECK(op->phase==KU_PG_ASYNC_RESET_READ && op->interest==1u && op->output.ok);
+  op->conn->pending_read=1;
+  CHECK(ku_pg_async_step(op,1u,clock_ms,0));return 0;
+}
+static int fr_case(int typed,unsigned scenario) {
+  fr_configure(typed);track_runtime_allocations=1;
+  KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);
+  CHECK(opened.ok);KuPgClient* pool=opened.value;
+  /* Give the operation an existing, idle lease. Connection workers are not
+   * part of the fresh SQL/readiness observation being tested here. */
+  PGconn* warm=NULL;KuError error={0};int slot=ku_pg_client_acquire(pool,&warm,&error,clock_ms+2000u);
+  CHECK(slot>=0 && warm);ku_pg_client_release(pool,slot,0,clock_ms+2000u);
+  /* Warm release performs its own mandatory reset; exclude that completed
+   * setup operation from the query/reset probes below. */
+  fr_prepare=0;memset(fr_consumes,0,sizeof(fr_consumes));
+  memset(fr_empty,0,sizeof(fr_empty));memset(fr_flushes,0,sizeof(fr_flushes));
+  if(scenario==1u)fr_buffered[0]=fr_buffered[1]=1;
+  if(scenario==2u)fr_flush_buffers[0]=fr_flush_buffers[1]=1;
+  if(scenario==3u || scenario==4u)fr_fail_consume[0]=1;
+  if(scenario==5u || scenario==6u) {fr_buffered[0]=1;fr_fail_consume[1]=1;}
+  if(scenario==7u) {fr_backpressure[0]=1;fr_required[0]=2;}
+  if(scenario==8u)fr_split_rows=1;
+  if(scenario==11u)fr_fail_prepare=1;
+  AsyncBudget budget={0};KuPgAsyncOp* op=fr_create(pool,&budget);
+  int before_user=user_sends,before_reset=reset_sends;
+  unsigned flags=scenario==3u || scenario==5u?8u:scenario==4u || scenario==6u?4u:0u;
+  int done=ku_pg_async_step(op,flags,clock_ms,0);
+  if(scenario==1u || scenario==2u) {
+    CHECK(done && op->output.ok && fr_prepare==1 && !fr_consumes[0] && !fr_consumes[1]);
+    CHECK(user_sends==before_user+1 && reset_sends==before_reset+1);
+  } else if(scenario>=3u && scenario<=6u) {
+    CHECK(done && (int)op->output.ok==(scenario>=5u));
+    CHECK(fr_consumes[scenario>=5u?1:0]>=1 && !pool->conns[0]);
+    CHECK(user_sends==before_user+1 && reset_sends==before_reset+(scenario>=5u));
+  } else if(scenario==11u) {
+    CHECK(done && !op->output.ok && fr_prepare==1 && user_sends==before_user && reset_sends==before_reset);
+  } else {
+    CHECK(!done && op->sent && user_sends==before_user+1 && reset_sends==before_reset);
+    if(scenario==7u) {
+      CHECK(op->phase==KU_PG_ASYNC_FLUSH && op->interest==3u && !fr_consumes[0]);
+      op->conn->pending_read=1;CHECK(!ku_pg_async_step(op,1u,clock_ms,0));
+      CHECK(op->phase==KU_PG_ASYNC_FLUSH && op->interest==3u && fr_consumes[0]==1);
+      CHECK(!ku_pg_async_step(op,2u,clock_ms,0));
+      /* Old partial-FLUSH completion still performs its original probe. */
+      CHECK(op->phase==KU_PG_ASYNC_READ && op->interest==1u && fr_empty[0]==1);
+    } else {
+      fprintf(stderr,"fresh-read typed=%d scenario=%u query-consume=%d empty=%d prepare=%d\n",
+          typed,scenario,fr_consumes[0],fr_empty[0],fr_prepare);
+      CHECK(op->phase==KU_PG_ASYNC_READ && op->interest==1u && !fr_consumes[0] && !fr_empty[0] && fr_prepare==1);
+    }
+    if(scenario==9u) {
+      CHECK(ku_pg_async_step(op,0u,clock_ms,1) && error_is(op->output,"execution_unknown"));
+      CHECK(!pool->conns[0] && reset_sends==before_reset);
+    } else {
+      op->conn->pending_read=1;CHECK(!ku_pg_async_step(op,1u,clock_ms,0));
+      if(scenario==8u) {
+        /* An incomplete following packet still follows the original READ
+         * path: this optimization must not become general read suppression. */
+        CHECK(op->phase==KU_PG_ASYNC_READ && op->interest==1u && fr_empty[0]==1);
+        op->conn->pending_read=1;CHECK(!ku_pg_async_step(op,1u,clock_ms,0));
+      }
+      CHECK(op->phase==KU_PG_ASYNC_RESET_READ && op->interest==1u && op->output.ok);
+      /* The READ that completed query is stale after the new reset send. */
+      CHECK(reset_sends==before_reset+1 && !fr_consumes[1] && !fr_empty[1]);
+      if(scenario==10u) {
+        clock_ms=op->deadline;CHECK(ku_pg_async_step(op,0u,clock_ms,0));
+        CHECK(op->output.ok && !pool->conns[0]);
+      } else CHECK(!fr_finish_reset(op));
+    }
+  }
+  int expected=scenario!=3u && scenario!=4u && scenario!=9u && scenario!=11u;
+  CHECK(op->phase==KU_PG_ASYNC_DONE && (int)op->output.ok==expected);
+  if(expected) {
+    CHECK(op->output.value->rows==1u && op->output.value->cols==1u);
+    if(typed) {KuResult_int value=ku_pg_value_int(op->output.value,0,0);CHECK(value.ok && value.value==3);}
+    else {KuPgCell cell=op->output.value->cells[0];CHECK(cell.len==4u && !memcmp(op->output.value->bytes+cell.offset,"last",4u));}
+  }
+  async_drop_output(op,&budget,expected);ku_pg_client_close_owned(pool);
+  CHECK(!budget.bytes && !live_results && !live_connections && !runtime_bytes && !live_runtime_allocations && !bad_calls);
+  return 0;
+}
+int main(void) {
+  for(int typed=0;typed<2;typed++)for(unsigned scenario=0;scenario<12u;scenario++)
+    CHECK(!fr_case(typed,scenario));
+  puts("pg fresh-send readiness and buffer contract closed loop");return 0;
 }
 "#;
 

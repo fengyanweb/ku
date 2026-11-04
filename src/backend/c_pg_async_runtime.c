@@ -652,6 +652,7 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
       if(op->row_status==KU_PGRES_COMMAND_OK)op->partial=0;
       continue;
     }
+    int fresh_send=0;
     if(op->phase==KU_PG_ASYNC_PREPARE) {
       int tx=PQtransactionStatus(op->conn);
       if(PQstatus(op->conn)!=KU_PG_CONNECTION_OK || tx!=KU_PQTRANS_IDLE || PQsetnonblocking(op->conn,1)!=0
@@ -667,12 +668,12 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
           op->count?op->values:NULL,op->typed?ku_pg_typed_lengths(op->typed):NULL,
           op->typed?ku_pg_typed_formats(op->typed):NULL,op->typed?1:0)
           || !PQsetSingleRowMode(op->conn)) {ku_pg_async_failure(op);return 1;}
-      ku_pg_async_set_phase(op,KU_PG_ASYNC_FLUSH);
+      fresh_send=1;ku_pg_async_set_phase(op,KU_PG_ASYNC_FLUSH);
     }
     if(op->phase==KU_PG_ASYNC_RESET_SEND) {
       if(PQstatus(op->conn)!=KU_PG_CONNECTION_OK || PQtransactionStatus(op->conn)!=KU_PQTRANS_IDLE || !ku_pg_connection_is_utf8(op->conn)
           || !PQsendQueryParams(op->conn,"DISCARD ALL",0,NULL,NULL,NULL,NULL,0) || !PQsetSingleRowMode(op->conn))goto reset_failed;
-      op->reset_sent=1;ku_pg_async_set_phase(op,KU_PG_ASYNC_RESET_FLUSH);
+      op->reset_sent=1;fresh_send=1;ku_pg_async_set_phase(op,KU_PG_ASYNC_RESET_FLUSH);
     }
     int reset=op->phase>=KU_PG_ASYNC_RESET_FLUSH;
     if(op->phase==KU_PG_ASYNC_FLUSH || op->phase==KU_PG_ASYNC_RESET_FLUSH) {
@@ -685,6 +686,12 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
       ku_pg_async_set_phase(op,reset ? KU_PG_ASYNC_RESET_READ:KU_PG_ASYNC_READ);
     }
     if(PQisBusy(op->conn)) {
+      /* A just-sent command has no readiness notification for its own
+       * response yet: an entry READ belongs to the preceding command.
+       * Keep buffered results above, and
+       * preserve immediate ERROR/HUP (bits4/8) and unknown-event observation.
+       * This is only the successful fresh flush, not later READ/FLUSH work. */
+      if(fresh_send && !(events&~3u)) {op->interest=1u;return 0;}
       if(!PQconsumeInput(op->conn)) {if(reset)goto reset_failed;ku_pg_async_failure(op);return 1;}
       if(PQisBusy(op->conn)) {op->interest=1u;return 0;}
     }
