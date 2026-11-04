@@ -6,6 +6,7 @@ reclaim, freeze, product timeout/limit change, candidate score or replacement.
 """
 import argparse
 import decimal
+import errno
 import hashlib
 import json
 import os
@@ -134,6 +135,9 @@ class DirectStock:
 
     def _append_definition(self,text):
         # Never truncate kprobe_events or remove an event not created here.
+        payload=(text+'\n').encode('ascii')
+        if '\n' in text or '\r' in text or len(payload)>=4096:
+            raise ValueError('one definition line strictly below4096bytes required')
         def errors():
             result={}
             for root in (self.base,self.instance):
@@ -149,7 +153,21 @@ class DirectStock:
                  'before_ns':time.monotonic_ns(),'error_log_before':errors()}
         self.info['last_definition_attempt']=attempt
         try:
-            with interface.open('a') as stream:stream.write(text+'\n')
+            descriptor=None
+            try:
+                # FileIO append performs SEEK_END at open: tracefs can reject
+                # that with EINVAL before any definition reaches the kernel.
+                attempt.update(stage='os.open',bytes_expected=len(payload))
+                descriptor=os.open(interface,os.O_WRONLY|os.O_APPEND|getattr(os,'O_CLOEXEC',0))
+                attempt['stage']='os.write'
+                written=os.write(descriptor,payload);attempt['bytes_written']=written
+                if written!=len(payload):
+                    attempt['short_write']=True
+                    raise OSError(errno.EIO,'short tracefs definition write; stop without retrying the remainder')
+            finally:
+                if descriptor is not None:
+                    attempt['close_attempted']=True
+                    os.close(descriptor);attempt['descriptor_closed']=True
         except OSError as error:
             attempt.update(after_ns=time.monotonic_ns(),errno=error.errno,error=repr(error),
                            traceback=traceback.format_exc()[-16384:],error_log_after=errors())
@@ -212,14 +230,24 @@ class DirectStock:
                     returning=kind.startswith('r');kind='f64' if returning else 'f'
                     if returning:function+='%return'
                 definition=kind+':'+self.group+'/'+self.names[key]+' '+function+' '+fields
-                self._append_definition(definition);self.definitions.append(self.names[key])
                 directory=self.instance/'events'/self.group/self.names[key]
+                if directory.exists():raise RuntimeError('probe name already exists; no preexisting definition may be changed')
+                try:self._append_definition(definition)
+                except BaseException:
+                    # A short/error return must not leak a definition which
+                    # the kernel nevertheless created. Never retry its tail.
+                    if directory.is_dir():
+                        self.definitions.append(self.names[key]);self.paths[key]=directory
+                    raise
+                self.definitions.append(self.names[key])
                 fmt=(directory/'format').read_text()
                 required=('css','value') if key=='cr' else ('css',) if key=='ce' else ('stock','index','n0','n6','c0','c6') if key=='de' else ('stock','index','n0','n6') if key=='dr' else ('memcg','pages')
                 if not all(re.search(r'\b'+name+r'\b',fmt) for name in required):raise RuntimeError('probe fields missing: '+key)
                 self.paths[key]=directory;self.info['probe_definitions'][key]=definition;self.info['formats'][key]=fmt
         try:define('kprobe')
         except OSError as error:
+            if self.info.get('last_definition_attempt',{}).get('short_write'):
+                raise RuntimeError('partial definition write; stop and clean owned events without backend retry') from error
             self.info['kprobe_create_failed']=repr(error)
             self._clear_definitions()
             if not (self.base/'dynamic_events').is_file():raise RuntimeError('official fprobe dynamic_events unavailable') from error
