@@ -2116,6 +2116,7 @@ typedef struct KuHttpConnection {
   size_t rejected_bytes; size_t rejected_seen; unsigned char rejected_window[4];
 } KuHttpConnection;
 typedef struct { int slot; uint64_t generation; } KuHttpPollConnection;
+enum { KU_HTTP_PREPARE_WAIT=0, KU_HTTP_PREPARE_READY=1, KU_HTTP_PREPARE_FIRST_READ=2 };
 static int ku_http_request_prepare(KuHttpConnection*,KuHttpServer*);
 static void ku_http_request_cancel_pending(KuHttpConnection*);
 static int ku_http_request_lease_take(KuHttpConnection* connection) {
@@ -2461,7 +2462,17 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
 }
 static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {
   if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_status(connection, server, 408); return; }
-  if (!ku_http_request_prepare(connection,server)) return;
+  int prepared=ku_http_request_prepare(connection,server);
+  if (!prepared) return;
+  unsigned long long first_request_deadline=0,first_header_deadline=0;
+  if(prepared==KU_HTTP_PREPARE_FIRST_READ) {
+    /* Compute the old first-byte bounds before the consuming read, but publish
+       nothing for empty readiness. No allocation or callback can defer D. */
+    first_request_deadline=connection->request_deadline;
+    if(!first_request_deadline) first_request_deadline=ku_http_deadline_ms(server->request_timeout_ms);
+    first_header_deadline=ku_http_deadline_ms((uint32_t)(server->read_header_timeout_ms>0?server->read_header_timeout_ms:5000));
+    if(first_request_deadline<first_header_deadline) first_header_deadline=first_request_deadline;
+  }
   char incoming[KU_HTTP_READ_CHUNK];
   int received;
   if (connection->carry_length) {
@@ -2474,12 +2485,23 @@ static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpS
   if (received < 0) {
     int error = ku_http_socket_last_error();
     if (ku_http_socket_would_block(error) || ku_http_socket_error_interrupted(error)) return;
+    if(prepared==KU_HTTP_PREPARE_FIRST_READ) {ku_http_connection_close(connection);return;}
     ku_http_connection_status(connection, server, 408); return;
   }
   if (!received) {
     if (connection->reused && !connection->buffered) ku_http_connection_close(connection);
     else ku_http_connection_status(connection, server, 400);
     return;
+  }
+  if(prepared==KU_HTTP_PREPARE_FIRST_READ) {
+    connection->request_deadline=first_request_deadline;
+    connection->deadline=first_header_deadline;
+    connection->header_started=1;
+    /* A is owner-local. Between prepare and this commit there was only clock
+       sampling and one nonblocking recv, with no dispatch or application call. */
+    if(!ku_http_request_lease_take(connection)) {
+      fputs("http first-read admission invariant failed\n",stderr);exit(1);
+    }
   }
   /* Linearize the first bytes of a new persistent request against drain,
      including events returned by a poll that began before drain was set.
@@ -2801,8 +2823,15 @@ static int ku_http_request_prepare(KuHttpConnection* connection,KuHttpServer* se
   if(connection->management || !connection->active_set || connection->request_lease) return 1;
   if(connection->request_queued) return 0;
   if(connection->reused && !ku_http_reused_request_admit()) {ku_http_connection_close(connection);return 0;}
+  KuHttpActiveSet* active=connection->active_set;
+  KuHttpPending* pending=active->pending;
+  /* Only this owner changes A. An immediately available slot can be committed
+     after the first real bytes, without a speculative lease/peak or a peek.
+     Existing FIFO identities and retained bytes keep their original path. */
+  if(!connection->header_started && !connection->buffered && !connection->carry_length
+      && !pending->count && active->request_active<active->request_limit)
+    return KU_HTTP_PREPARE_FIRST_READ;
   if(!ku_http_request_observe_start(connection,server)) return 0;
-  KuHttpPending* pending=connection->active_set->pending;
   if(!pending->count && ku_http_request_lease_take(connection)) return 1;
   if(!ku_http_pending_push_request(pending,connection)) {
     connection->failure.reason=KU_HTTP_ERROR_QUEUE;ku_http_connection_status(connection,server,503);

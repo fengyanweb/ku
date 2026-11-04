@@ -3860,32 +3860,66 @@ fn main(): null! {
         ),
         1,
     );
+    let clock_anchor =
+        "static unsigned long long ku_http_now_ms(void) { return __ku_handler_now_ms(); }";
+    assert_eq!(generated.matches(clock_anchor).count(), 1);
+    generated = generated.replacen(
+        clock_anchor,
+        r#"static int fixture_header_clock_active;
+static unsigned long long fixture_header_now,fixture_header_recv_advance;
+static unsigned long long ku_http_now_ms(void) {
+  return fixture_header_clock_active?fixture_header_now:__ku_handler_now_ms();
+}"#,
+        1,
+    );
     let receive_anchor = "static void ku_http_connection_read_header(";
     assert_eq!(generated.matches(receive_anchor).count(), 1);
     let receive_hooks = r#"
 static const char* fixture_header_bytes;
-static size_t fixture_header_length,fixture_header_recv_calls,fixture_header_grow_calls;
+static size_t fixture_header_length,fixture_header_recv_calls,fixture_header_peek_calls,fixture_header_grow_calls;
 static size_t fixture_header_grow_bytes,fixture_header_reserved_at_grow;
 static int fixture_header_recv_mode,fixture_header_fail_grow,fixture_header_old_null;
 static KuHttpBufferBudget* fixture_header_budget;
+static KuHttpConnection* fixture_header_observed_connection;
+static int fixture_header_lease_at_grow,fixture_header_started_at_grow,fixture_header_peak_at_grow;
+static unsigned long long fixture_header_deadline_at_grow,fixture_header_request_at_grow;
+static void (*fixture_header_on_recv)(void);
+static int fixture_header_receive_error(void) {
+  if(fixture_header_recv_mode==1)return 0;
+#if defined(_WIN32)
+  WSASetLastError(fixture_header_recv_mode==2?WSAEWOULDBLOCK:
+      fixture_header_recv_mode==3?WSAEINTR:WSAECONNRESET);
+#else
+  errno=fixture_header_recv_mode==2?EAGAIN:fixture_header_recv_mode==3?EINTR:ECONNRESET;
+#endif
+  return -1;
+}
 static int fixture_header_receive(KuHttpSocket socket_value,char* bytes,size_t capacity) {
   (void)socket_value;fixture_header_recv_calls++;
-  if(fixture_header_recv_mode==1)return 0;
-  if(fixture_header_recv_mode==2 || fixture_header_recv_mode==3) {
-#if defined(_WIN32)
-    WSASetLastError(fixture_header_recv_mode==2?WSAEWOULDBLOCK:WSAEINTR);
-#else
-    errno=fixture_header_recv_mode==2?EAGAIN:EINTR;
-#endif
-    return -1;
-  }
+  if(fixture_header_recv_mode)return fixture_header_receive_error();
+  if(fixture_header_clock_active)fixture_header_now+=fixture_header_recv_advance;
+  if(fixture_header_on_recv)fixture_header_on_recv();
   size_t amount=fixture_header_length<capacity?fixture_header_length:capacity;
   memcpy(bytes,fixture_header_bytes,amount);return (int)amount;
+}
+static int fixture_header_peek(KuHttpSocket socket_value,char* byte) {
+  (void)socket_value;fixture_header_peek_calls++;
+  if(fixture_header_recv_mode)return fixture_header_receive_error();
+  if(!fixture_header_length)return 0;
+  *byte=fixture_header_bytes[0];return 1;
 }
 static void* fixture_header_grow(void* previous,size_t bytes) {
   fixture_header_grow_calls++;fixture_header_grow_bytes=bytes;
   fixture_header_old_null=previous==NULL;
   fixture_header_reserved_at_grow=fixture_header_budget->current;
+  if(fixture_header_observed_connection) {
+    KuHttpConnection* c=fixture_header_observed_connection;
+    fixture_header_lease_at_grow=c->request_lease;
+    fixture_header_started_at_grow=c->header_started;
+    fixture_header_deadline_at_grow=c->deadline;
+    fixture_header_request_at_grow=c->request_deadline;
+    fixture_header_peak_at_grow=c->active_set->request_peak;
+  }
   if(fixture_header_fail_grow) {fixture_header_fail_grow=0;return NULL;}
   return ku_perf_realloc(previous,bytes);
 }
@@ -3898,6 +3932,13 @@ static void* fixture_header_grow(void* previous,size_t bytes) {
     let receive_edge = "} else received = ku_http_socket_recv(connection->socket_value, incoming, sizeof(incoming));";
     assert_eq!(generated.matches(receive_edge).count(), 1);
     generated = generated.replacen(receive_edge,"} else received = fixture_header_receive(connection->socket_value,incoming,sizeof(incoming));",1);
+    let peek_edge = "char byte;int count=recv(connection->socket_value,&byte,1,MSG_PEEK);";
+    assert_eq!(generated.matches(peek_edge).count(), 1);
+    generated = generated.replacen(
+        peek_edge,
+        "char byte;int count=fixture_header_peek(connection->socket_value,&byte);",
+        1,
+    );
     let grow_edge = "char* grown = (char*)realloc(connection->header, capacity);";
     assert_eq!(generated.matches(grow_edge).count(), 1);
     generated = generated.replacen(
@@ -3932,9 +3973,10 @@ static void fixture_header_fresh(KuHttpConnection* connection,KuHttpBufferBudget
   memset(connection,0,sizeof(*connection));connection->socket_value=KU_HTTP_INVALID_SOCKET;
   connection->budget=budget;connection->phase=KU_HTTP_IO_HEADER;
   connection->deadline=ku_http_deadline_ms(3000u);connection->request_deadline=connection->deadline;
-  fixture_header_budget=budget;fixture_header_recv_calls=fixture_header_grow_calls=0;
+  fixture_header_budget=budget;fixture_header_recv_calls=fixture_header_peek_calls=fixture_header_grow_calls=0;
   fixture_header_grow_bytes=fixture_header_reserved_at_grow=0;
   fixture_header_recv_mode=fixture_header_fail_grow=fixture_header_old_null=0;
+  fixture_header_observed_connection=NULL;fixture_header_on_recv=NULL;fixture_header_recv_advance=0;
 }
 static int fixture_header_first_backing(KuHttpServer* server,KuHttpBufferBudget* budget,KuHttpQueue* queue) {
   char bytes[1325];memset(bytes,'a',sizeof(bytes));
@@ -3995,6 +4037,158 @@ static int fixture_header_first_backing(KuHttpServer* server,KuHttpBufferBudget*
   CHECK(!memcmp(connection.header,bytes,sizeof(bytes)));
   ku_http_connection_close(&connection);CHECK(!budget->current && ku_perf_live_bytes==baseline);
   puts("header-first-backing=1call/2048B split-peak=3072B oom/carry/EOF/EAGAIN/EINTR-clean");return 0;
+}
+static void fixture_header_owner_fresh(KuHttpConnection connections[2],KuHttpActiveSet* active,
+    KuHttpPending* pending,KuHttpPendingItem items[2],int indices[2],KuHttpBufferBudget* budget) {
+  fixture_header_now=1000u;
+  *active=(KuHttpActiveSet){.connections=connections,.indices=indices,.count=2,.capacity=2,
+      .high_water=2,.free_head=-1,.request_limit=1};
+  for(int i=0;i<2;i++) {
+    fixture_header_fresh(&connections[i],budget);connections[i].active_set=active;
+    connections[i].active_position=i;connections[i].connection_generation=1u;
+    connections[i].request_sequence=1u;connections[i].request_deadline=1300u;
+    connections[i].deadline=3000u;indices[i]=i;
+  }
+  memset(items,0,2u*sizeof(*items));*pending=(KuHttpPending){.items=items,.cap=2};
+  ku_http_pending_init(pending,active);fixture_header_observed_connection=&connections[0];
+}
+static int fixture_header_owner_finish(KuHttpConnection connections[2],KuHttpActiveSet* active,
+    KuHttpPending* pending,KuHttpBufferBudget* budget,size_t baseline) {
+  ku_http_connection_close(&connections[0]);ku_http_connection_close(&connections[1]);
+  while(pending->count)ku_http_pending_unlink(pending,pending->head);
+  CHECK(!active->count && !active->request_active && !pending->count && !pending->raw_count);
+  CHECK(!budget->current && ku_perf_live_bytes==baseline);return 0;
+}
+static void fixture_header_drain_on_recv(void) {ku_http_current_loop->group->draining=1;}
+static int fixture_header_owner_first_read(KuHttpServer* server,KuHttpBufferBudget* budget,KuHttpQueue* queue) {
+  KuHttpConnection connections[2];KuHttpActiveSet active;KuHttpPending pending;
+  KuHttpPendingItem items[2];int indices[2];size_t baseline=ku_perf_live_bytes;
+  KuHttpLoopGroup group={0};KuHttpLoopOwner owner={0};CHECK(ku_http_mutex_init(&group.lock));
+  owner.group=&group;ku_http_current_loop=&owner;
+  long long saved_header=server->read_header_timeout_ms;
+  uint32_t saved_request=server->request_timeout_ms;
+  server->read_header_timeout_ms=200;server->request_timeout_ms=1000u;fixture_header_clock_active=1;
+  fixture_header_bytes="G";fixture_header_length=1u;
+  /* These calls use the actual prepare -> consuming-header-read function with
+     an owner A/P set. Empty readiness must not publish a lease, peak or D. */
+  for(int reused=0;reused<2;reused++)for(int mode=1;mode<=4;mode++) {
+    fixture_header_owner_fresh(connections,&active,&pending,items,indices,budget);
+    KuHttpConnection* c=&connections[0];c->reused=reused;
+    if(reused)c->request_deadline=0;
+    unsigned long long request=c->request_deadline,deadline=c->deadline;
+    fixture_header_recv_mode=mode;ku_http_connection_read_header(c,server,queue,0);
+    CHECK(fixture_header_recv_calls==1u && !fixture_header_peek_calls && !fixture_header_grow_calls);
+    CHECK(!active.request_active && !active.request_peak && !pending.count && !budget->current);
+    if(mode==2 || mode==3) {
+      CHECK(c->phase==KU_HTTP_IO_HEADER && !c->request_lease && !c->header_started);
+      CHECK(c->request_deadline==request && c->deadline==deadline);
+    } else if(mode==1 && !reused)CHECK(c->phase==KU_HTTP_IO_WRITE && c->output.response.status==400);
+    else CHECK(c->phase==KU_HTTP_IO_FREE);
+    CHECK(!fixture_header_owner_finish(connections,&active,&pending,budget,baseline));
+  }
+  fixture_header_owner_fresh(connections,&active,&pending,items,indices,budget);
+  fixture_header_recv_advance=10u;
+  ku_http_connection_read_header(&connections[0],server,queue,0);
+  CHECK(fixture_header_recv_calls==1u && !fixture_header_peek_calls && active.request_active==1 && active.request_peak==1);
+  CHECK(connections[0].buffered==1u && connections[0].header_started && connections[0].request_lease);
+  CHECK(fixture_header_lease_at_grow && fixture_header_started_at_grow && fixture_header_peak_at_grow==1);
+  CHECK(fixture_header_deadline_at_grow==1200u && fixture_header_request_at_grow==1300u);
+  fixture_header_bytes="E";fixture_header_recv_advance=0;
+  ku_http_connection_read_header(&connections[0],server,queue,0);
+  CHECK(fixture_header_recv_calls==2u && !fixture_header_peek_calls && connections[0].buffered==2u);
+  CHECK(connections[0].deadline==1200u && connections[0].request_deadline==1300u && active.request_peak==1);
+  fixture_header_recv_mode=2;ku_http_connection_read_header(&connections[0],server,queue,0);
+  CHECK(active.request_active==1 && connections[0].deadline==1200u && connections[0].buffered==2u);
+  fixture_header_recv_mode=4;ku_http_connection_read_header(&connections[0],server,queue,0);
+  CHECK(connections[0].output.response.status==408 && active.request_active==1);
+  CHECK(!fixture_header_owner_finish(connections,&active,&pending,budget,baseline));
+  /* Existing accept/RAW D clips header D; reused D starts before recv, never
+     after its simulated delay or backing allocation. */
+  for(int existing=0;existing<2;existing++) {
+    fixture_header_owner_fresh(connections,&active,&pending,items,indices,budget);
+    connections[0].reused=!existing;connections[0].request_deadline=existing?1050u:0u;
+    fixture_header_bytes="G";fixture_header_recv_advance=10u;
+    ku_http_connection_read_header(&connections[0],server,queue,0);
+    CHECK(!fixture_header_peek_calls && fixture_header_now==1010u);
+    CHECK(fixture_header_request_at_grow==(existing?1050u:2000u));
+    CHECK(fixture_header_deadline_at_grow==(existing?1050u:1200u));
+    CHECK(!fixture_header_owner_finish(connections,&active,&pending,budget,baseline));
+  }
+  for(int failure=0;failure<2;failure++) {
+    fixture_header_owner_fresh(connections,&active,&pending,items,indices,budget);
+    if(failure)budget->limit=1023u;else fixture_header_fail_grow=1;
+    ku_http_connection_read_header(&connections[0],server,queue,0);
+    CHECK(connections[0].output.response.status==(failure?503:500));
+    CHECK(active.request_active==1 && active.request_peak==1 && !budget->current && !connections[0].header);
+    if(!failure)CHECK(fixture_header_lease_at_grow && fixture_header_started_at_grow
+        && fixture_header_deadline_at_grow==1200u && fixture_header_request_at_grow==1300u);
+    CHECK(!fixture_header_owner_finish(connections,&active,&pending,budget,baseline));budget->limit=1048576u;
+  }
+  /* A real FIFO predecessor forbids a consuming read even though A is free.
+     Removal/activation transfers the old first-byte identity without renewal. */
+  fixture_header_owner_fresh(connections,&active,&pending,items,indices,budget);
+  CHECK(ku_http_pending_push_raw(&pending,KU_HTTP_INVALID_SOCKET,1275u));int head=pending.head;
+  ku_http_connection_read_header(&connections[0],server,queue,0);
+  CHECK(fixture_header_peek_calls==1u && !fixture_header_recv_calls && pending.count==2);
+  CHECK(!active.request_active && !active.request_peak && connections[0].request_queued);
+  CHECK(pending.head==head && pending.items[head].next==connections[0].pending_index);
+  CHECK(connections[0].deadline==1200u && pending.items[connections[0].pending_index].deadline==1200u);
+  ku_http_pending_unlink(&pending,head);fixture_header_now=1100u;
+  ku_http_pending_activate(&pending,&active,server);
+  CHECK(connections[0].request_lease && !pending.count && connections[0].deadline==1200u);
+  ku_http_connection_read_header(&connections[0],server,queue,0);
+  CHECK(fixture_header_recv_calls==1u && fixture_header_peek_calls==1u && connections[0].deadline==1200u);
+  CHECK(!fixture_header_owner_finish(connections,&active,&pending,budget,baseline));
+  fixture_header_owner_fresh(connections,&active,&pending,items,indices,budget);
+  CHECK(ku_http_request_lease_take(&connections[1]));
+  ku_http_connection_read_header(&connections[0],server,queue,0);
+  CHECK(fixture_header_peek_calls==1u && !fixture_header_recv_calls && connections[0].request_queued);
+  CHECK(active.request_active==1 && active.request_peak==1 && !connections[0].request_lease);
+  ku_http_connection_close(&connections[1]);ku_http_pending_activate(&pending,&active,server);
+  CHECK(connections[0].request_lease && active.request_active==1 && active.request_peak==1);
+  CHECK(!fixture_header_owner_finish(connections,&active,&pending,budget,baseline));
+  fixture_header_owner_fresh(connections,&active,&pending,items,indices,budget);pending.cap=1;
+  CHECK(ku_http_pending_push_raw(&pending,KU_HTTP_INVALID_SOCKET,1275u));
+  ku_http_connection_read_header(&connections[0],server,queue,0);
+  CHECK(connections[0].output.response.status==503 && fixture_header_peek_calls==1u && !fixture_header_recv_calls);
+  CHECK(!active.request_active && !active.request_peak && pending.count==1);
+  CHECK(!fixture_header_owner_finish(connections,&active,&pending,budget,baseline));
+  fixture_header_owner_fresh(connections,&active,&pending,items,indices,budget);
+  connections[0].carry=(char*)malloc(1u);CHECK(connections[0].carry && ku_http_buffer_reserve(budget,1u));
+  connections[0].carry[0]='G';connections[0].carry_length=1u;fixture_header_recv_mode=2;
+  ku_http_connection_read_header(&connections[0],server,queue,0);
+  CHECK(!fixture_header_recv_calls && !fixture_header_peek_calls && !connections[0].carry);
+  CHECK(connections[0].buffered==1u && active.request_active==1 && active.request_peak==1);
+  CHECK(!fixture_header_owner_finish(connections,&active,&pending,budget,baseline));
+  /* Preserve the original reused-request drain check. Drain appearing only
+     during the read does not retroactively move that linearization point. */
+  for(int during=0;during<2;during++) {
+    fixture_header_owner_fresh(connections,&active,&pending,items,indices,budget);
+    connections[0].reused=1;connections[0].request_deadline=0;group.draining=!during;
+    if(during)fixture_header_on_recv=fixture_header_drain_on_recv;
+    ku_http_connection_read_header(&connections[0],server,queue,0);
+    CHECK(!fixture_header_peek_calls && group.draining);
+    if(during)CHECK(fixture_header_recv_calls==1u && connections[0].buffered==1u
+        && connections[0].request_lease && active.request_peak==1 && connections[0].request_deadline==2000u);
+    else CHECK(!fixture_header_recv_calls && connections[0].phase==KU_HTTP_IO_FREE && !active.request_peak);
+    group.draining=0;CHECK(!fixture_header_owner_finish(connections,&active,&pending,budget,baseline));
+  }
+  fixture_header_owner_fresh(connections,&active,&pending,items,indices,budget);
+  fixture_header_now=~0ULL-30u;connections[0].deadline=~0ULL;
+  connections[0].reused=1;connections[0].request_deadline=0;
+  ku_http_connection_read_header(&connections[0],server,queue,0);
+  CHECK(connections[0].request_deadline==~0ULL && connections[0].deadline==~0ULL && active.request_active==1);
+  CHECK(!fixture_header_owner_finish(connections,&active,&pending,budget,baseline));
+  fixture_header_owner_fresh(connections,&active,&pending,items,indices,budget);
+  fixture_header_bytes="GET /missing HTTP/1.1\r\nBad\r\n\r\n";fixture_header_length=strlen(fixture_header_bytes);
+  ku_http_connection_read_header(&connections[0],server,queue,0);
+  CHECK(connections[0].output.response.status==400 && active.request_active==1 && active.request_peak==1);
+  CHECK(fixture_header_recv_calls==1u && !fixture_header_peek_calls && !connections[0].header);
+  CHECK(!fixture_header_owner_finish(connections,&active,&pending,budget,baseline));
+  fixture_header_observed_connection=NULL;fixture_header_clock_active=0;fixture_header_on_recv=NULL;
+  server->read_header_timeout_ms=saved_header;server->request_timeout_ms=saved_request;
+  ku_http_current_loop=NULL;ku_http_mutex_destroy(&group.lock);
+  puts("http-owner-first-read-no-peek A/P/peak/FIFO/negative/D/OOM/carry/drain-clean");return 0;
 }
 static unsigned int fixture_async_fields;
 static const char* fixture_async_path;
@@ -4317,6 +4511,7 @@ int main(void) {
   __ku_call_depth=0;__ku_handler_deadline=0;__ku_handler_cleanup_deadline=0;
   __ku_handler_timed_out=0;__ku_handler_unwind_depth=0;__ku_sync_reset();
   CHECK(!fixture_header_first_backing(server,&budget,&local_queue));
+  CHECK(!fixture_header_owner_first_read(server,&budget,&local_queue));
   ku_http_queue_free(&local_queue);ku_http_wake_close(&local_wake);ku_http_net_cleanup();
   ku_http_mutex_destroy(&budget.lock);ku_http_server_free(server);
   CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
