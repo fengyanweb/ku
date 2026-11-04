@@ -224,7 +224,14 @@ class HostedWorkflowContracts(unittest.TestCase):
 
     def test_only_explicit_performance_dispatch_selects_one_arm_job(self):
         text,job=self.workflow()
-        self.assertIn("task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]",text)
+        expected_scopes=['full','windows-service','windows-pg-host','macos-service','service-recovery','windows-roll',
+            'task-main-path','windows-task-main-path','http-short-proof','performance-v2','performance-v2-builds',
+            'performance-v2-finish','performance-v2-validation','performance-followup-diagnostic','followup-screen',
+            'pg-input-lifetime','pg-input-guard','pg-input-windows','pg-typed-self','arena-residency','poll-budget-contract']
+        scope=text.split('\n      scope:\n',1)[1].split('\n      prepatch:',1)[0]
+        self.assertIn('type: choice',scope);self.assertIn('default: full',scope)
+        options=next(line.strip()[len('options: '):] for line in scope.splitlines() if line.strip().startswith('options: '))
+        self.assertEqual(options,'['+', '.join(expected_scopes)+']')
         self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)",job)
         self.assertIn('runs-on: ubuntu-24.04-arm',job)
         self.assertIn('timeout-minutes: 180',job)
@@ -233,14 +240,20 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertNotIn('runner.',job_env, 'GitHub does not allow runner context in jobs.<job>.env')
         self.assertIn("printf 'KU_PERFORMANCE_V2_ROOT=%s\\n' \"$RUNNER_TEMP/ku-performance-v2\" >> \"$GITHUB_ENV\"",job)
         self.assertNotIn('strategy:',job)
-        self.assertIn("(inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')",text)
+        isolated_scopes=['http-short-proof','task-main-path','windows-task-main-path',*expected_scopes[9:]]
+        full=text.split('\n  full-tests:\n',1)[1]
+        full_if=next(line.strip() for line in full.splitlines() if line.strip().startswith('if: '))
+        self.assertEqual(full_if,"if: github.event_name != 'workflow_dispatch' || ("+
+            ' && '.join("inputs.scope != '"+scope+"'" for scope in isolated_scopes)+')')
         self.assertIn("&& format('-{0}', inputs.scope) || ''",text)
 
     def test_fixed_toolchains_and_nonroot_build_precede_root_execution(self):
         _,job=self.workflow()
         self.assertIn('actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd',job)
         self.assertIn('fetch-depth: 0',job);self.assertIn('persist-credentials: false',job)
-        self.assertIn('1.89.0 --no-self-update --component llvm-tools-preview',job)
+        installs=[line.strip() for line in job.splitlines() if line.strip().startswith('rustup toolchain install ')]
+        self.assertEqual(installs,['rustup toolchain install 1.99.1 --no-self-update --component llvm-tools-preview'])
+        self.assertIn('rustup default 1.99.1',job)
         self.assertIn('actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16',job)
         self.assertIn("go-version: '1.27.2'",job);self.assertIn('cache: false',job)
         build=job.split('- name: Build frozen',1)[1].split('- name: Run the one',1)[0]
