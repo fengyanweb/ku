@@ -652,7 +652,7 @@ fn native_task_driver_admission_wake_retirement_and_shutdown_execute_in_c() {
             .expect("end of generated driver wait helper");
     let generated_wait = &generated[wait_start..wait_end];
     let instrumentation = format!(
-        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic int fixture_binding_force_collision;\n"
+        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic int fixture_binding_force_collision;\nstatic void fixture_ready_driver_call(unsigned);\n"
     );
     let mut source = generated
         .replacen(
@@ -702,6 +702,31 @@ fn native_task_driver_admission_wake_retirement_and_shutdown_execute_in_c() {
         &format!("#if !defined(_WIN32)\n#undef pthread_cond_init\n#endif\n{init_exit}"),
         1,
     );
+    for (entry, kind) in [
+        (
+            "static int ku_task_driver_lock(KuTaskDriverV1* driver) {",
+            0,
+        ),
+        (
+            "static int ku_task_driver_unlock(KuTaskDriverV1* driver) {",
+            1,
+        ),
+        (
+            "static void ku_task_driver_enqueue(KuTaskDriverV1* driver, size_t index) {",
+            2,
+        ),
+        (
+            "static void ku_task_driver_signal(KuTaskDriverV1* driver) {",
+            3,
+        ),
+    ] {
+        assert_eq!(source.matches(entry).count(), 1);
+        source = source.replacen(
+            entry,
+            &format!("{entry}\n  fixture_ready_driver_call({kind}u);"),
+            1,
+        );
+    }
     source.push_str(LINUX_DEADLINE_HEAD);
     source.push_str(generated_wait);
     source.push_str(LINUX_DEADLINE_TAIL);
@@ -731,7 +756,7 @@ fn native_task_driver_admission_wake_retirement_and_shutdown_execute_in_c() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().replace('\r', ""),
-        "task-driver-v1-ok\n"
+        "task-driver-ready-take-ok pending_locks=1 old_ready_locks=3 ready_locks=2\ntask-driver-v1-ok\n"
     );
     assert!(output.stderr.is_empty());
 }
@@ -908,6 +933,28 @@ const C_MAIN: &str = r#"
 #define DRIVER_ABI KU_TASK_DRIVER_ABI_VERSION
 #define FRAME_ABI KU_TASK_FRAME_ABI_VERSION
 #define CONTROL_ABI KU_TASK_CONTROL_ABI_VERSION
+#if defined(_MSC_VER)
+#define FIXTURE_READY_TLS __declspec(thread)
+#else
+#define FIXTURE_READY_TLS _Thread_local
+#endif
+static FIXTURE_READY_TLS int fixture_ready_counting;
+static FIXTURE_READY_TLS size_t fixture_ready_calls[4];
+static FIXTURE_READY_TLS const char* fixture_ready_scenario;
+static void fixture_ready_driver_call(unsigned kind) {
+  if(fixture_ready_counting) {CHECK(kind<4u);fixture_ready_calls[kind]++;}
+}
+static void fixture_ready_count_begin(const char* scenario) {fixture_ready_scenario=scenario;memset(fixture_ready_calls,0,sizeof(fixture_ready_calls));fixture_ready_counting=1;}
+static void fixture_ready_count_end(size_t locks,size_t enqueues,size_t signals) {
+  fixture_ready_counting=0;
+  if(fixture_ready_calls[0]!=locks || fixture_ready_calls[1]!=locks
+      || fixture_ready_calls[2]!=enqueues || fixture_ready_calls[3]!=signals)
+    fprintf(stderr,"ready-take scenario=%s expected(lock,unlock,enqueue,signal)=%zu,%zu,%zu,%zu actual=%zu,%zu,%zu,%zu\n",
+        fixture_ready_scenario?fixture_ready_scenario:"unset",locks,locks,enqueues,signals,
+        fixture_ready_calls[0],fixture_ready_calls[1],fixture_ready_calls[2],fixture_ready_calls[3]);
+  CHECK(fixture_ready_calls[0]==locks && fixture_ready_calls[1]==locks
+      && fixture_ready_calls[2]==enqueues && fixture_ready_calls[3]==signals);
+}
 typedef struct FixtureDriver {
   KuTaskDriverV1* driver;
   KuTaskDriverSlotV1* slots;
@@ -934,7 +981,9 @@ typedef struct FixtureTask {
   bool early_take_notify;
   bool block_cleanup;
   bool block_dispose;
+  bool verify_ready_take, take_pending_once;
 } FixtureTask;
+static void (*fixture_ready_verify_callback)(FixtureTask*);
 typedef struct FixtureInputs { KuResult_str result; KuString cleanup; } FixtureInputs;
 static uint64_t fixture_deadline(void) { return ku_task_driver_now_ms() + 2000; }
 static uint64_t fixture_driver_one_second(void) {
@@ -1140,6 +1189,8 @@ static uint32_t fixture_take_payload(void* raw, void* output) {
   if (!target || target->ok || target->value.ptr || target->error.message.ptr)
     return KU_TASK_CONTROL_INVALID_ARGUMENT;
   CHECK(task->payload_initialized);
+  if(task->verify_ready_take) {CHECK(fixture_ready_verify_callback);fixture_ready_verify_callback(task);}
+  if(task->take_pending_once) {task->take_pending_once=false;return KU_TASK_CONTROL_PENDING;}
   if (task->block_take) {
     if (task->early_take_notify)
       CHECK(ku_task_driver_wake(&task->ticket) == KU_TASK_DRIVER_OK);
@@ -1505,6 +1556,106 @@ static void fixture_deduplicated_wakes(bool running, bool retire_running) {
   }
   fixture_witness_finish(&witness); fixture_driver_finish(&runtime);
 }
+static void fixture_ready_callback_outside_lock(FixtureTask* task) {
+  /* Exclude this test-only verification lock from the measured call sequence.
+   * Reentering the actual mutex would hang if take_payload ran under it. */
+  int counting=fixture_ready_counting;fixture_ready_counting=0;
+  CHECK(!ku_task_driver_lock(task->ticket.driver));
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(&task->ticket);
+  CHECK(slot && slot->wrapper_active==1u);
+  CHECK(!ku_task_driver_unlock(task->ticket.driver));fixture_ready_counting=counting;
+}
+static void fixture_ready_reject(const char* scenario,const KuTaskDriverTicketV1* ticket,
+    const KuTaskControlLeaseV1* lease,uint32_t expected) {
+  KuResult_str untouched;unsigned char before[sizeof(untouched)];memset(&untouched,0x5a,sizeof(untouched));memcpy(before,&untouched,sizeof(before));
+  fixture_ready_count_begin(scenario);
+  CHECK(ku_task_driver_take_ready_result(ticket,lease,&untouched)==expected);
+  fixture_ready_count_end(1u,0u,0u);CHECK(!memcmp(before,&untouched,sizeof(before)));
+}
+static void fixture_ready_take_lifecycle(void) {
+  FixtureDriver runtime;fixture_driver_init(&runtime,2u,2u*fixture_task_bytes());
+  FixtureWitness witnesses[2];KuTaskControlOwnerV1 owners[2]={{0}};KuTaskDriverTicketV1 tickets[2]={{0}};
+  for(size_t i=0;i<2u;i++) {
+    fixture_witness_init(&witnesses[i]);FixtureInputs inputs=fixture_inputs();
+    CHECK(fixture_build(&runtime,&inputs,&witnesses[i],&owners[i],&tickets[i],
+        FIXTURE_NORMAL,true,false,false,false)==KU_TASK_DRIVER_OK);
+    fixture_idle(&runtime);
+  }
+  KuTaskControlV1* control=owners[0].lease.control;
+  const size_t phases[]={KU_TASK_CONTROL_LIVE,KU_TASK_CONTROL_REQUESTED_CANCEL,KU_TASK_CONTROL_REQUESTED_TIMEOUT,
+      KU_TASK_CONTROL_PUBLISHING_CANCEL,KU_TASK_CONTROL_PUBLISHING_TIMEOUT,KU_TASK_CONTROL_COMMITTING,KU_TASK_CONTROL_COMPLETED};
+  const char* scenarios[]={"live","requested-cancel","requested-timeout","publishing-cancel","publishing-timeout","committing","taking-snapshot"};
+  for(size_t i=0;i<sizeof(phases)/sizeof(phases[0]);i++) {
+    /* One real leased, parked Control supplies atomic observation snapshots.
+     * Restore LIVE/EMPTY before any wake; no synthetic terminal is executed. */
+    CHECK(!ku_task_driver_lock(runtime.driver));
+    CHECK(runtime.slots[tickets[0].slot].state==KU_TASK_DRIVER_PARKED);
+    uint32_t notified=runtime.slots[tickets[0].slot].notified;
+    ku_task_control_atomic_store(&control->phase,phases[i]);
+    ku_task_control_atomic_store(&control->payload,i==6u?KU_TASK_CONTROL_PAYLOAD_TAKING:KU_TASK_CONTROL_PAYLOAD_EMPTY);
+    CHECK(!ku_task_driver_unlock(runtime.driver));
+    fixture_ready_reject(scenarios[i],&tickets[0],&owners[0].lease,KU_TASK_CONTROL_PENDING);
+    CHECK(!ku_task_driver_lock(runtime.driver));
+    CHECK(!runtime.slots[tickets[0].slot].wrapper_active && runtime.slots[tickets[0].slot].notified==notified);
+    ku_task_control_atomic_store(&control->phase,KU_TASK_CONTROL_LIVE);
+    ku_task_control_atomic_store(&control->payload,KU_TASK_CONTROL_PAYLOAD_EMPTY);
+    CHECK(!ku_task_driver_unlock(runtime.driver));
+    CHECK(fixture_count(&witnesses[0].resumes)==1u && !fixture_count(&witnesses[0].takes));
+  }
+  /* Preserve HTTP's old Pending priority, before lease/binding validation. */
+  fixture_ready_reject("pending-binding-priority",&tickets[0],&owners[1].lease,KU_TASK_CONTROL_PENDING);
+  KuTaskDriverTicketV1 stale=tickets[0];stale.generation++;
+  fixture_ready_reject("stale",&stale,&owners[0].lease,KU_TASK_DRIVER_STALE);
+  /* Public take retains its original wrapper/end advancement on Pending. */
+  KuResult_str untouched;unsigned char before[sizeof(untouched)];memset(&untouched,0x5a,sizeof(untouched));memcpy(before,&untouched,sizeof(before));
+  fixture_ready_count_begin("public-pending");
+  CHECK(ku_task_driver_take_result(&tickets[0],&owners[0].lease,&untouched)==KU_TASK_CONTROL_PENDING);
+  fixture_ready_count_end(2u,1u,2u);CHECK(!memcmp(before,&untouched,sizeof(before)));fixture_idle(&runtime);
+  CHECK(ku_task_control_status(&owners[0].lease)==KU_TASK_CONTROL_COMPLETED);
+  fixture_ready_reject("ready-wrong-binding",&tickets[0],&owners[1].lease,KU_TASK_DRIVER_INVALID_ARGUMENT);
+  KuTaskControlLeaseV1 invalid={0};fixture_ready_reject("ready-invalid-lease",&tickets[0],&invalid,KU_TASK_CONTROL_INVALID_ARGUMENT);
+  CHECK(!ku_task_driver_lock(runtime.driver));runtime.slots[tickets[0].slot].cleanup_fault=KU_TASK_DRIVER_CLEANUP_TIMEOUT;
+  CHECK(!ku_task_driver_unlock(runtime.driver));
+  fixture_ready_reject("ready-cleanup-fault",&tickets[0],&owners[0].lease,KU_TASK_DRIVER_CLEANUP_TIMEOUT);
+  CHECK(!ku_task_driver_lock(runtime.driver));runtime.slots[tickets[0].slot].cleanup_fault=0;
+  runtime.slots[tickets[0].slot].wrapper_active=KU_TASK_CONTROL_MAX_REFERENCES;
+  CHECK(!ku_task_driver_unlock(runtime.driver));
+  fixture_ready_reject("ready-wrapper-limit",&tickets[0],&owners[0].lease,KU_TASK_DRIVER_LIMIT);
+  CHECK(!ku_task_driver_lock(runtime.driver));CHECK(runtime.slots[tickets[0].slot].wrapper_active==KU_TASK_CONTROL_MAX_REFERENCES);
+  runtime.slots[tickets[0].slot].wrapper_active=0;CHECK(!ku_task_driver_unlock(runtime.driver));
+  CHECK(ku_task_driver_wake(&tickets[1])==KU_TASK_DRIVER_OK);fixture_idle(&runtime);
+  FixtureTask* first=(FixtureTask*)owners[0].lease.control->context;
+  FixtureTask* second=(FixtureTask*)owners[1].lease.control->context;
+  first->verify_ready_take=second->verify_ready_take=true;fixture_ready_verify_callback=fixture_ready_callback_outside_lock;
+  KuResult_str outputs[2]={{0}};
+  fixture_ready_count_begin("old-http-probe-and-public-take");
+  CHECK(!ku_task_driver_lock(runtime.driver));
+  CHECK(ku_task_driver_wait_ready_locked(ku_task_driver_find(&tickets[0]))==KU_TASK_DRIVER_WAIT_READY);
+  CHECK(!ku_task_driver_unlock(runtime.driver));
+  CHECK(ku_task_driver_take_result(&tickets[0],&owners[0].lease,&outputs[0])==KU_TASK_CONTROL_OK);
+  fixture_ready_count_end(3u,1u,2u);fixture_idle(&runtime);
+  /* A callback's own Pending follows successful wrapper registration. It must
+   * restore AVAILABLE and run wrapper_end, unlike a pure readiness Pending. */
+  second->take_pending_once=true;fixture_ready_count_begin("ready-callback-pending");
+  CHECK(ku_task_driver_take_ready_result(&tickets[1],&owners[1].lease,&outputs[1])==KU_TASK_CONTROL_PENDING);
+  fixture_ready_count_end(2u,1u,2u);CHECK(!outputs[1].ok && !outputs[1].value.ptr);
+  CHECK(ku_task_control_atomic_load(&owners[1].lease.control->payload)==KU_TASK_CONTROL_PAYLOAD_AVAILABLE);
+  fixture_idle(&runtime);fixture_ready_count_begin("private-ready-take");
+  CHECK(ku_task_driver_take_ready_result(&tickets[1],&owners[1].lease,&outputs[1])==KU_TASK_CONTROL_OK);
+  fixture_ready_count_end(2u,1u,2u);fixture_idle(&runtime);
+  KuResult_str already_taken={0};fixture_ready_count_begin("private-result-already-taken");
+  CHECK(ku_task_driver_take_ready_result(&tickets[1],&owners[1].lease,&already_taken)==KU_TASK_CONTROL_RESULT_TAKEN);
+  fixture_ready_count_end(2u,1u,2u);CHECK(!already_taken.ok && !already_taken.value.ptr);fixture_idle(&runtime);
+  fixture_ready_verify_callback=NULL;
+  for(size_t i=0;i<2u;i++) {
+    CHECK(outputs[i].ok && outputs[i].value.len==7u && fixture_count(&witnesses[i].takes)==1u);
+    fixture_retire(&runtime,&tickets[i],&owners[i],&witnesses[i]);
+    CHECK(outputs[i].value.ptr[0]=='p' && !fixture_count(&witnesses[i].payload_drops));
+    ku_result_drop_str(&outputs[i]);fixture_witness_finish(&witnesses[i]);
+  }
+  CHECK(!fixture_snapshot(&runtime).reserved_bytes);fixture_driver_finish(&runtime);
+  puts("task-driver-ready-take-ok pending_locks=1 old_ready_locks=3 ready_locks=2");
+}
 typedef struct FixtureTakeWorker {
   KuTaskDriverTicketV1 ticket;
   KuTaskControlLeaseV1 lease;
@@ -1529,6 +1680,11 @@ static void fixture_take_publication_notifies_retirement(void) {
   KuTestThread thread;
   CHECK(ku_test_thread_start(&thread, fixture_take_worker, &worker));
   CHECK(ku_test_event_wait(&witness.entered, 2000));
+  /* The real concurrent callback owns TAKING and its one wrapper. This pure
+   * HTTP readiness probe must not end that wrapper or manufacture a wake. */
+  fixture_ready_reject("concurrent-real-taking",&ticket,&owner.lease,KU_TASK_CONTROL_PENDING);
+  CHECK(!ku_task_driver_lock(runtime.driver));CHECK(runtime.slots[ticket.slot].wrapper_active==1u);
+  CHECK(!ku_task_driver_unlock(runtime.driver));
   CHECK(ku_task_driver_owner_drop(&ticket, &owner, fixture_deadline()) == KU_TASK_DRIVER_OK);
   CHECK(!owner.lease.control);
   /* The callback already sent an intentionally EARLY wake while R2 was TAKING.
@@ -1922,6 +2078,7 @@ int main(void) {
   fixture_duplicate_control_commit_preserves_first_owner();
   fixture_retiring_binding_cleared_before_budget_return();
   fixture_error_result_and_caller_budget();
+  fixture_ready_take_lifecycle();
   fixture_building_blocks_shutdown(false);
   fixture_building_blocks_shutdown(true);
   fixture_shared_deadline_and_blocked_shutdown();

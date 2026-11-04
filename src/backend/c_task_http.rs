@@ -435,17 +435,10 @@ static uint32_t ku_http_task_poll(void* raw,void** task,int cancel,uint64_t dead
       uint32_t status;
       if(handle->value.tag==KU_TASK_VALUE_INLINE_FAILED) status=ku_task_value_take(&handle->value,NULL,&outcome);
       else {
-        /* A readiness probe must not call take_result's wrapper_end: that
-         * operation schedules actual payload progress. Repeating a Pending
-         * take on every HTTP turn would wake an idle timer forever. */
-        if(ku_task_driver_lock(&runtime->driver)) return KU_TASK_DRIVER_INTERNAL;
-        KuTaskDriverSlotV1* waiting=ku_task_driver_find(&handle->value.ticket);
-        uint32_t ready=waiting ? ku_task_driver_wait_ready_locked(waiting) : KU_TASK_DRIVER_STALE;
-        ku_task_driver_unlock(&runtime->driver);
-        if(ready==KU_TASK_DRIVER_PENDING) return KU_TASK_DRIVER_PENDING;
-        if(ready!=KU_TASK_DRIVER_WAIT_READY) return ready;
+        /* The private take registers no wrapper and schedules no work while
+         * unready; a ready payload enters its wrapper in the same mutex turn. */
         KuTaskAdapterTakeRequestV1 request={&outcome,NULL,0u,1u};
-        status=ku_task_driver_take_result(&handle->value.ticket,&handle->value.owner.lease,&request);
+        status=ku_task_driver_take_ready_result(&handle->value.ticket,&handle->value.owner.lease,&request);
         if(status==KU_TASK_CONTROL_OK) handle->retained_bytes=request.retained_bytes;
       }
       if(status==KU_TASK_CONTROL_PENDING)

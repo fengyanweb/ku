@@ -3632,8 +3632,8 @@ typedef struct {
   short events;
   int registered,poll_index;
   size_t resource_slot;
+  uint32_t tree_left,tree_right,tree_parent,tree_red;
 } KuHttpRegistration;
-typedef struct { uint64_t token; size_t entry; } KuHttpRegistrationHash;
 typedef struct {
   size_t entry;
   uint64_t token,generation;
@@ -3646,7 +3646,7 @@ typedef struct KuHttpReactor {
   uint64_t next_token;
   KuHttpActiveSet* active;
   KuHttpRegistration* registrations;
-  KuHttpRegistrationHash* hash;
+  size_t token_root; /* Registration slot+1; zero is the black nil leaf. */
   /* Slot+1, not a truncated fd/token. Zero is empty; keys live in registrations. */
   uint32_t* fd_entries;
   int* work;
@@ -3669,14 +3669,14 @@ static size_t ku_http_reactor_hash_capacity(size_t capacity) {
 static size_t ku_http_reactor_storage_bytes(size_t slots,size_t net) {
   size_t capacity=slots+3u+net;
   return sizeof(KuHttpReactor)+capacity*sizeof(KuHttpRegistration)
-      +ku_http_reactor_hash_capacity(capacity)*(sizeof(KuHttpRegistrationHash)+sizeof(uint32_t))
+      +ku_http_reactor_hash_capacity(capacity)*sizeof(uint32_t)
       +slots*2u*sizeof(int);
 }
 static size_t ku_http_reactor_pending_storage_bytes(size_t slots,size_t net,size_t pending) {
   size_t before=slots+3u+net,after=before+pending;
   return ku_http_reactor_storage_bytes(slots,net)
       +pending*sizeof(KuHttpRegistration)
-      +(ku_http_reactor_hash_capacity(after)-ku_http_reactor_hash_capacity(before))*(sizeof(KuHttpRegistrationHash)+sizeof(uint32_t));
+      +(ku_http_reactor_hash_capacity(after)-ku_http_reactor_hash_capacity(before))*sizeof(uint32_t);
 }
 static size_t ku_http_reactor_hash_start(const KuHttpReactor* r,uint64_t token) {
   token^=token>>30; token*=UINT64_C(0xbf58476d1ce4e5b9);
@@ -3685,39 +3685,174 @@ static size_t ku_http_reactor_hash_start(const KuHttpReactor* r,uint64_t token) 
 }
 static size_t ku_http_reactor_lookup(const KuHttpReactor* r,uint64_t token) {
   if(!token || token==UINT64_MAX) return SIZE_MAX;
-  size_t start=ku_http_reactor_hash_start(r,token);
-  for(size_t i=0;i<r->hash_capacity;i++) {
-    const KuHttpRegistrationHash* item=&r->hash[(start+i)&(r->hash_capacity-1u)];
-    if(!item->token) break;
-    if(item->token==token) return item->entry;
+  size_t node=r->token_root;
+  for(size_t steps=0;node && steps<r->capacity;steps++) {
+    if(node>r->capacity)return SIZE_MAX;
+    const KuHttpRegistration* item=&r->registrations[node-1u];
+    if(!item->token || item->token==UINT64_MAX)return SIZE_MAX;
+    if(item->token==token)return node-1u;
+    node=token<item->token?item->tree_left:item->tree_right;
   }
   return SIZE_MAX;
 }
+/* The full-token index is intrusive: only registration indices move, never a
+ * different registration's fd/token/generation. Pending NEW nodes participate
+ * before kernel publication, and every traversal has a finite capacity bound. */
+static KuHttpRegistration* ku_http_reactor_tree_node(KuHttpReactor* r,uint32_t node) {
+  if(!node || (size_t)node>r->capacity) {r->fault=1;return NULL;}
+  return &r->registrations[node-1u];
+}
+static int ku_http_reactor_tree_red(KuHttpReactor* r,uint32_t node) {
+  if(!node)return 0;
+  KuHttpRegistration* entry=ku_http_reactor_tree_node(r,node);
+  return entry && entry->tree_red!=0u;
+}
+static void ku_http_reactor_tree_black(KuHttpReactor* r,uint32_t node) {
+  if(node) {KuHttpRegistration* entry=ku_http_reactor_tree_node(r,node);if(entry)entry->tree_red=0;}
+}
+static int ku_http_reactor_tree_rotate(KuHttpReactor* r,uint32_t node,int right) {
+  KuHttpRegistration* entry=ku_http_reactor_tree_node(r,node);if(!entry)return 0;
+  uint32_t other=right?entry->tree_left:entry->tree_right;
+  KuHttpRegistration* pivot=ku_http_reactor_tree_node(r,other);if(!pivot)return 0;
+  uint32_t middle=right?pivot->tree_right:pivot->tree_left,parent=entry->tree_parent;
+  KuHttpRegistration* moved=middle?ku_http_reactor_tree_node(r,middle):NULL;
+  KuHttpRegistration* above=parent?ku_http_reactor_tree_node(r,parent):NULL;
+  if((middle && !moved) || (parent && !above))return 0;
+  if((above && above->tree_left!=node && above->tree_right!=node)
+      || (!parent && r->token_root!=node)) {r->fault=1;return 0;}
+  if(right)entry->tree_left=middle;else entry->tree_right=middle;
+  if(moved)moved->tree_parent=node;
+  pivot->tree_parent=parent;
+  if(!parent)r->token_root=other;
+  else if(above->tree_left==node)above->tree_left=other;else above->tree_right=other;
+  if(right)pivot->tree_right=node;else pivot->tree_left=node;
+  entry->tree_parent=other;return 1;
+}
 static int ku_http_reactor_hash_add(KuHttpReactor* r,uint64_t token,size_t entry) {
-  size_t start=ku_http_reactor_hash_start(r,token);
-  for(size_t i=0;i<r->hash_capacity;i++) {
-    size_t at=(start+i)&(r->hash_capacity-1u);
-    if(!r->hash[at].token) {r->hash[at]=(KuHttpRegistrationHash){token,entry};return 1;}
+  if(!token || token==UINT64_MAX || entry>=r->capacity || entry>=UINT32_MAX
+      || r->token_root>r->capacity)return 0;
+  KuHttpRegistration* added=&r->registrations[entry];
+  if(added->token || added->tree_left || added->tree_right || added->tree_parent || added->tree_red)return 0;
+  uint32_t parent=0,node=(uint32_t)r->token_root;
+  size_t steps=0;
+  for(;node && steps<r->capacity;steps++) {
+    KuHttpRegistration* item=ku_http_reactor_tree_node(r,node);if(!item)return 0;
+    if(!item->token || item->token==UINT64_MAX) {r->fault=1;return 0;}
+    if(item->token==token)return 0;
+    parent=node;node=token<item->token?item->tree_left:item->tree_right;
   }
-  return 0;
+  if(node) {r->fault=1;return 0;}
+  node=(uint32_t)(entry+1u);added->token=token;added->tree_parent=parent;added->tree_red=1u;
+  if(!parent)r->token_root=node;
+  else if(token<r->registrations[parent-1u].token)r->registrations[parent-1u].tree_left=node;
+  else r->registrations[parent-1u].tree_right=node;
+  for(steps=0;steps<r->capacity;steps++) {
+    KuHttpRegistration* current=ku_http_reactor_tree_node(r,node);if(!current)return 0;
+    parent=current->tree_parent;
+    if(!ku_http_reactor_tree_red(r,parent))break;
+    KuHttpRegistration* p=ku_http_reactor_tree_node(r,parent);if(!p)return 0;
+    uint32_t grand=p->tree_parent;
+    KuHttpRegistration* g=ku_http_reactor_tree_node(r,grand);if(!g)return 0;
+    int left=g->tree_left==parent;
+    if(!left && g->tree_right!=parent) {r->fault=1;return 0;}
+    uint32_t uncle=left?g->tree_right:g->tree_left;
+    if(ku_http_reactor_tree_red(r,uncle)) {
+      p->tree_red=0;ku_http_reactor_tree_black(r,uncle);g->tree_red=1u;node=grand;continue;
+    }
+    if(node==(left?p->tree_right:p->tree_left)) {
+      node=parent;if(!ku_http_reactor_tree_rotate(r,node,!left))return 0;
+      current=ku_http_reactor_tree_node(r,node);if(!current)return 0;
+      parent=current->tree_parent;p=ku_http_reactor_tree_node(r,parent);if(!p)return 0;
+      grand=p->tree_parent;g=ku_http_reactor_tree_node(r,grand);if(!g)return 0;
+    }
+    p->tree_red=0;g->tree_red=1u;
+    if(!ku_http_reactor_tree_rotate(r,grand,left))return 0;
+  }
+  if(steps==r->capacity) {r->fault=1;return 0;}
+  ku_http_reactor_tree_black(r,(uint32_t)r->token_root);return !r->fault;
+}
+static int ku_http_reactor_tree_transplant(KuHttpReactor* r,uint32_t old,uint32_t next) {
+  KuHttpRegistration* entry=ku_http_reactor_tree_node(r,old);if(!entry)return 0;
+  uint32_t parent=entry->tree_parent;
+  KuHttpRegistration* above=parent?ku_http_reactor_tree_node(r,parent):NULL;
+  KuHttpRegistration* replacement=next?ku_http_reactor_tree_node(r,next):NULL;
+  if((parent && !above) || (next && !replacement))return 0;
+  if(!parent) {
+    if(r->token_root!=old) {r->fault=1;return 0;}
+    r->token_root=next;
+  } else if(above->tree_left==old)above->tree_left=next;
+  else if(above->tree_right==old)above->tree_right=next;
+  else {r->fault=1;return 0;}
+  if(replacement)replacement->tree_parent=parent;
+  return 1;
 }
 static void ku_http_reactor_hash_remove(KuHttpReactor* r,uint64_t token) {
-  size_t start=ku_http_reactor_hash_start(r,token);
-  for(size_t i=0;i<r->hash_capacity;i++) {
-    KuHttpRegistrationHash* item=&r->hash[(start+i)&(r->hash_capacity-1u)];
-    if(!item->token) return;
-    if(item->token==token) {
-      /* Back-shift the finite probe cluster. Repeated request turnover must
-       * not fill the table with tombstones and turn stale lookup into O(cap). */
-      size_t mask=r->hash_capacity-1u,hole=(start+i)&mask,at=(hole+1u)&mask;
-      for(size_t moved=0;moved<r->hash_capacity && r->hash[at].token;moved++,at=(at+1u)&mask) {
-        size_t home=ku_http_reactor_hash_start(r,r->hash[at].token);
-        if(((at-home)&mask)>=((hole-home)&mask)) {r->hash[hole]=r->hash[at];hole=at;}
-      }
-      r->hash[hole]=(KuHttpRegistrationHash){0,0};return;
+  size_t index=ku_http_reactor_lookup(r,token);if(index==SIZE_MAX)return;
+  uint32_t removed=(uint32_t)(index+1u),successor=removed,node=0,parent=0;
+  KuHttpRegistration* entry=&r->registrations[index];
+  int red=entry->tree_red!=0u;
+  if(!entry->tree_left || !entry->tree_right) {
+    node=entry->tree_left?entry->tree_left:entry->tree_right;parent=entry->tree_parent;
+    if(!ku_http_reactor_tree_transplant(r,removed,node))return;
+  } else {
+    successor=entry->tree_right;size_t steps=0;
+    for(;steps<r->capacity;steps++) {
+      KuHttpRegistration* next=ku_http_reactor_tree_node(r,successor);if(!next)return;
+      if(!next->tree_left)break;
+      successor=next->tree_left;
     }
+    if(steps==r->capacity) {r->fault=1;return;}
+    KuHttpRegistration* moved=ku_http_reactor_tree_node(r,successor);if(!moved)return;
+    red=moved->tree_red!=0u;node=moved->tree_right;
+    if(moved->tree_parent==removed) {
+      parent=successor;
+      if(node) {KuHttpRegistration* child=ku_http_reactor_tree_node(r,node);if(!child)return;child->tree_parent=successor;}
+    } else {
+      parent=moved->tree_parent;
+      if(!ku_http_reactor_tree_transplant(r,successor,node))return;
+      moved->tree_right=entry->tree_right;
+      KuHttpRegistration* right=ku_http_reactor_tree_node(r,moved->tree_right);if(!right)return;
+      right->tree_parent=successor;
+    }
+    if(!ku_http_reactor_tree_transplant(r,removed,successor))return;
+    moved->tree_left=entry->tree_left;
+    KuHttpRegistration* left=ku_http_reactor_tree_node(r,moved->tree_left);if(!left)return;
+    left->tree_parent=successor;moved->tree_red=entry->tree_red;
   }
-  r->fault=1;
+  if(!red) {
+    size_t steps=0;
+    for(;node!=r->token_root && !ku_http_reactor_tree_red(r,node) && steps<r->capacity;steps++) {
+      KuHttpRegistration* above=ku_http_reactor_tree_node(r,parent);if(!above)return;
+      int left=above->tree_left==node;
+      if(!left && above->tree_right!=node) {r->fault=1;return;}
+      uint32_t sibling=left?above->tree_right:above->tree_left;
+      if(ku_http_reactor_tree_red(r,sibling)) {
+        KuHttpRegistration* other=ku_http_reactor_tree_node(r,sibling);if(!other)return;
+        other->tree_red=0;above->tree_red=1u;
+        if(!ku_http_reactor_tree_rotate(r,parent,!left))return;
+        sibling=left?above->tree_right:above->tree_left;
+      }
+      if(!sibling) {node=parent;parent=above->tree_parent;continue;}
+      KuHttpRegistration* other=ku_http_reactor_tree_node(r,sibling);if(!other)return;
+      uint32_t near=left?other->tree_left:other->tree_right,far=left?other->tree_right:other->tree_left;
+      if(!ku_http_reactor_tree_red(r,near) && !ku_http_reactor_tree_red(r,far)) {
+        other->tree_red=1u;node=parent;parent=above->tree_parent;continue;
+      }
+      if(!ku_http_reactor_tree_red(r,far)) {
+        ku_http_reactor_tree_black(r,near);other->tree_red=1u;
+        if(!ku_http_reactor_tree_rotate(r,sibling,left))return;
+        sibling=left?above->tree_right:above->tree_left;
+        other=ku_http_reactor_tree_node(r,sibling);if(!other)return;
+        far=left?other->tree_right:other->tree_left;
+      }
+      other->tree_red=above->tree_red;above->tree_red=0;ku_http_reactor_tree_black(r,far);
+      if(!ku_http_reactor_tree_rotate(r,parent,!left))return;
+      node=(uint32_t)r->token_root;parent=0;
+    }
+    if(steps==r->capacity) {r->fault=1;return;}
+    ku_http_reactor_tree_black(r,node);
+  }
+  entry->token=0;entry->tree_left=entry->tree_right=entry->tree_parent=entry->tree_red=0;
 }
 /* Owner-local fd index. At most one logical registration owns a numeric fd:
  * a successful NEW replaces a retired external resource before old events are
@@ -3887,7 +4022,10 @@ static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
   }
   int new_fd=!r->fd_entries[bucket];
   ku_http_reactor_retire_fd_aliases(r,index,fd,bucket);
-  *entry=(KuHttpRegistration){fd,token,generation,events,1,poll_index,0};
+  /* Alias retirement may transplant/rotate this pending node. Publish its
+   * resource identity without overwriting the now-current intrusive links. */
+  entry->fd=fd;entry->token=token;entry->generation=generation;entry->events=events;
+  entry->registered=1;entry->poll_index=poll_index;entry->resource_slot=0;
   r->fd_entries[bucket]=(uint32_t)(index+1u);
   if(new_fd)r->fd_count++;
 #if defined(KU_HTTP_REACTOR_FD_ORACLE)
@@ -4035,8 +4173,8 @@ static int ku_http_reactor_wait(KuHttpReactor* r,KuHttpPollFd* items,int timeout
 }
 static void ku_http_reactor_destroy(KuHttpReactor* r) {
   if(r->descriptor>=0) close(r->descriptor);
-  free(r->registrations);free(r->hash);free(r->fd_entries);free(r->work);free(r->idle_heap);
-  r->descriptor=-1;r->registrations=NULL;r->hash=NULL;r->fd_entries=NULL;r->work=NULL;r->idle_heap=NULL;
+  free(r->registrations);free(r->fd_entries);free(r->work);free(r->idle_heap);
+  r->descriptor=-1;r->registrations=NULL;r->token_root=0;r->fd_entries=NULL;r->work=NULL;r->idle_heap=NULL;
 }
 static int ku_http_reactor_init_pending(KuHttpReactor* r,KuHttpActiveSet* active,size_t net,size_t pending) {
   memset(r,0,sizeof(*r));r->descriptor=-1;r->slots=active->capacity;r->active=active;
@@ -4049,7 +4187,6 @@ static int ku_http_reactor_init_pending(KuHttpReactor* r,KuHttpActiveSet* active
   r->capacity=r->pending_base+pending;r->hash_capacity=ku_http_reactor_hash_capacity(r->capacity);
   r->fd_capacity=r->hash_capacity<32u?r->hash_capacity:32u;
   r->registrations=(KuHttpRegistration*)calloc(r->capacity,sizeof(*r->registrations));
-  r->hash=(KuHttpRegistrationHash*)calloc(r->hash_capacity,sizeof(*r->hash));
   r->fd_entries=(uint32_t*)calloc(r->hash_capacity,sizeof(*r->fd_entries));
   r->work=(int*)calloc((size_t)r->slots,sizeof(int));r->idle_heap=(int*)calloc((size_t)r->slots,sizeof(int));
 #if defined(__linux__)
@@ -4058,7 +4195,7 @@ static int ku_http_reactor_init_pending(KuHttpReactor* r,KuHttpActiveSet* active
   r->descriptor=kqueue();
   if(r->descriptor>=0 && fcntl(r->descriptor,F_SETFD,FD_CLOEXEC)<0) {close(r->descriptor);r->descriptor=-1;}
 #endif
-  if(r->descriptor<0 || !r->registrations || !r->hash || !r->fd_entries || (r->slots && (!r->work || !r->idle_heap))) {
+  if(r->descriptor<0 || !r->registrations || !r->fd_entries || (r->slots && (!r->work || !r->idle_heap))) {
     ku_http_reactor_destroy(r);return 0;
   }
   active->reactor=r;return 1;

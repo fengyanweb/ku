@@ -8350,6 +8350,127 @@ static void fixture_free(void* value) {
 "#;
     let checks = r#"
 #define CHECK(c) do {if(!(c)){fprintf(stderr,"persistent owner line %d: %s\n",__LINE__,#c);return 1;}}while(0)
+#define FIXTURE_TOKEN_SLOTS 4096u
+#define FIXTURE_TOKEN_CAPACITY (FIXTURE_TOKEN_SLOTS+3u)
+static size_t fixture_token_observed_height;
+static size_t fixture_token_reference_lookup(const uint64_t* reference,size_t capacity,uint64_t token) {
+  if(!token || token==UINT64_MAX)return SIZE_MAX;
+  for(size_t i=0;i<capacity;i++)if(reference[i]==token)return i;
+  return SIZE_MAX;
+}
+/* Validate public tree invariants and a separate slot->full-key reference.
+ * This oracle implements no insertion, deletion, balancing or rotations. */
+static int fixture_token_reference(KuHttpReactor* r,const uint64_t* reference) {
+  static uint32_t stack[FIXTURE_TOKEN_CAPACITY],depths[FIXTURE_TOKEN_CAPACITY],blacks[FIXTURE_TOKEN_CAPACITY];
+  static unsigned char seen[FIXTURE_TOKEN_CAPACITY];
+  CHECK(r->capacity<=FIXTURE_TOKEN_CAPACITY && r->token_root<=r->capacity && !r->fault);
+  memset(seen,0,r->capacity);size_t expected=0,top=0,count=0,height=0;uint32_t leaf_black=UINT32_MAX;
+  for(size_t i=0;i<r->capacity;i++)if(reference[i]) {
+    expected++;CHECK(ku_http_reactor_lookup(r,reference[i])==i);
+  }
+  CHECK(ku_http_reactor_lookup(r,0)==SIZE_MAX && ku_http_reactor_lookup(r,UINT64_MAX)==SIZE_MAX);
+  if(r->token_root) {
+    CHECK(!r->registrations[r->token_root-1u].tree_parent && !r->registrations[r->token_root-1u].tree_red);
+    stack[top]=(uint32_t)r->token_root;depths[top]=1u;blacks[top++]=0;
+  }
+  while(top) {
+    top--;uint32_t node=stack[top],depth=depths[top],black=blacks[top];
+    CHECK(node && node<=r->capacity && !seen[node-1u] && count++<r->capacity);
+    seen[node-1u]=1;KuHttpRegistration* entry=&r->registrations[node-1u];
+    CHECK(reference[node-1u] && entry->token==reference[node-1u] && entry->tree_red<=1u);
+    black+=!entry->tree_red;if(depth>height)height=depth;
+    const uint32_t children[2]={entry->tree_left,entry->tree_right};
+    for(size_t i=0;i<2u;i++) {
+      uint32_t child=children[i];CHECK(child<=r->capacity);
+      if(!child) {if(leaf_black==UINT32_MAX)leaf_black=black;else CHECK(leaf_black==black);continue;}
+      KuHttpRegistration* next=&r->registrations[child-1u];
+      CHECK(next->tree_parent==node && (!entry->tree_red || !next->tree_red) && top<r->capacity);
+      stack[top]=child;depths[top]=depth+1u;blacks[top++]=black;
+    }
+  }
+  CHECK(count==expected);
+  size_t logarithm=0,power=1u;while(power<expected+1u) {power*=2u;logarithm++;}
+  CHECK(height<=2u*logarithm);
+  if(height>fixture_token_observed_height)fixture_token_observed_height=height;
+  uint64_t previous=0;uint32_t node=(uint32_t)r->token_root;top=0;count=0;
+  while(node || top) {
+    while(node) {CHECK(top<r->capacity);stack[top++]=node;node=r->registrations[node-1u].tree_left;}
+    node=stack[--top];KuHttpRegistration* entry=&r->registrations[node-1u];
+    CHECK(entry->token>previous && count++<expected);previous=entry->token;node=entry->tree_right;
+  }
+  CHECK(count==expected);return 0;
+}
+static int fixture_token_tree_stress(void) {
+  static KuHttpConnection connections[FIXTURE_TOKEN_SLOTS];static uint64_t reference[FIXTURE_TOKEN_CAPACITY];
+  KuHttpActiveSet active={connections,(int)FIXTURE_TOKEN_SLOTS,NULL};KuHttpReactor r;
+  CHECK(ku_http_reactor_init(&r,&active,0u));size_t allocations=fixture_alloc_calls,bytes=fixture_live_bytes;
+  for(size_t i=0;i<FIXTURE_TOKEN_SLOTS;i++) {
+    /* Increasing keys with identical low32 bits catch truncation and skew. */
+    uint64_t token=((uint64_t)(i+1u)<<32u)|UINT64_C(0x80000001);
+    CHECK(ku_http_reactor_hash_add(&r,token,i));reference[i]=token;
+    CHECK(!r.registrations[i].registered && ku_http_reactor_lookup(&r,token)==i);
+    r.registrations[i].registered=1;r.registrations[i].generation=UINT64_MAX-i;
+    if(i%256u==255u)CHECK(!fixture_token_reference(&r,reference));
+  }
+  uint64_t random=UINT64_C(0x123456789abcdef);size_t mutations=FIXTURE_TOKEN_SLOTS;
+  for(size_t step=0;step<40000u;step++) {
+    random^=random<<13u;random^=random>>7u;random^=random<<17u;
+    size_t index=(size_t)random&(FIXTURE_TOKEN_SLOTS-1u);uint64_t old=reference[index];
+    CHECK(ku_http_reactor_lookup(&r,old)==fixture_token_reference_lookup(reference,r.capacity,old));
+    ku_http_reactor_hash_remove(&r,old);reference[index]=0;mutations++;
+    CHECK(!r.fault && ku_http_reactor_lookup(&r,old)==SIZE_MAX && !r.registrations[index].token
+        && !r.registrations[index].tree_left && !r.registrations[index].tree_right
+        && !r.registrations[index].tree_parent && !r.registrations[index].tree_red);
+    r.registrations[index]=(KuHttpRegistration){0};
+    uint64_t token=step%1024u?((uint64_t)(step+65536u)<<32u)|UINT64_C(0x80000001):UINT64_MAX-1u-step;
+    CHECK(ku_http_reactor_hash_add(&r,token,index));reference[index]=token;mutations++;
+    CHECK(ku_http_reactor_lookup(&r,token)==index && !r.registrations[index].registered);
+    r.registrations[index].registered=1;r.registrations[index].generation=UINT64_MAX-step;
+    CHECK(ku_http_reactor_lookup(&r,old)==fixture_token_reference_lookup(reference,r.capacity,old));
+    if(step%128u==127u)CHECK(!fixture_token_reference(&r,reference));
+  }
+  for(size_t i=0;i<FIXTURE_TOKEN_SLOTS;i++) {
+    size_t index=(i*2053u)&(FIXTURE_TOKEN_SLOTS-1u);uint64_t token=reference[index];
+    ku_http_reactor_hash_remove(&r,token);reference[index]=0;mutations++;
+    r.registrations[index]=(KuHttpRegistration){0};CHECK(ku_http_reactor_lookup(&r,token)==SIZE_MAX);
+    if(i%128u==127u)CHECK(!fixture_token_reference(&r,reference));
+  }
+  CHECK(!r.token_root && !r.fault && mutations==88192u && fixture_alloc_calls==allocations && fixture_live_bytes==bytes);
+  ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  printf("http-token-tree-4096-slots-88192-mutations-reference-ok max_height=%zu\n",fixture_token_observed_height);return 0;
+}
+static int fixture_token_tree_kernel(void) {
+  KuHttpConnection connections[64]={{0}};KuHttpActiveSet active={connections,64,NULL};KuHttpReactor r;
+  uint64_t reference[FIXTURE_TOKEN_CAPACITY]={0};int pairs[64][2],replacement[2];
+  CHECK(ku_http_reactor_init(&r,&active,0u));r.next_token=UINT64_MAX-2000u;
+  for(size_t i=0;i<64u;i++) {
+    CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pairs[i]));
+    ku_http_reactor_interest(&r,i,pairs[i][0],KU_HTTP_POLL_READ,UINT64_MAX-i,-1);
+    CHECK(!r.fault && r.registrations[i].registered);reference[i]=r.registrations[i].token;
+    CHECK(!fixture_token_reference(&r,reference));
+  }
+  int invalid=dup(pairs[0][0]);CHECK(invalid>=0 && !close(invalid));uint64_t failed=r.next_token+1u;
+  ku_http_reactor_interest(&r,65u,invalid,KU_HTTP_POLL_READ,1u,65);
+  CHECK(r.fault && !r.registrations[65].registered && !r.registrations[65].token
+      && !r.registrations[65].tree_left && !r.registrations[65].tree_right && !r.registrations[65].tree_parent
+      && ku_http_reactor_lookup(&r,failed)==SIZE_MAX);
+  r.fault=0;CHECK(!fixture_token_reference(&r,reference));
+  size_t old=r.token_root-1u;CHECK(old<64u && r.registrations[old].tree_left && r.registrations[old].tree_right);
+  CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,replacement));int recycled=pairs[old][0];
+  CHECK(!close(recycled) && dup2(replacement[0],recycled)==recycled && !close(replacement[0]));
+  uint64_t stale=reference[old];ku_http_reactor_interest(&r,64u,recycled,KU_HTTP_POLL_READ,777u,64);
+  CHECK(!r.fault && !r.registrations[old].registered && r.registrations[64].registered);
+  reference[old]=0;reference[64]=r.registrations[64].token;
+  CHECK(ku_http_reactor_lookup(&r,stale)==SIZE_MAX && !fixture_token_reference(&r,reference));
+  KuHttpPollFd items[68]={{0}};char byte;
+  CHECK(write(replacement[1],"t",1)==1 && ku_http_reactor_wait(&r,items,1000)>0 && (items[64].revents&KU_HTTP_POLL_READ));
+  CHECK(read(recycled,&byte,1)==1 && byte=='t');
+  for(size_t i=0;i<r.capacity;i++)if(reference[i])ku_http_reactor_delete(&r,i);
+  CHECK(!r.fault && !r.token_root && !r.fd_count);
+  for(size_t i=0;i<64u;i++)CHECK(!close(pairs[i][0]) && !close(pairs[i][1]));
+  CHECK(!close(replacement[1]));ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  puts("http-token-tree-kernel-failure-alias-rotation-publication-ok");return 0;
+}
 static int fixture_fd_index_clusters(void) {
   KuHttpConnection connections[8]={{0}};KuHttpActiveSet active={connections,8,NULL};KuHttpReactor r;
   CHECK(ku_http_reactor_init(&r,&active,0u));
@@ -8406,17 +8527,17 @@ static int fixture_fd_index_clusters(void) {
   puts("http-persistent-fd-index-collision-backshift-ok");return 0;
 }
 static int fixture_fd_index_init_failures(void) {
-  for(size_t fail=1u;fail<=5u;fail++) {
+  for(size_t fail=1u;fail<=4u;fail++) {
     KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
     fixture_alloc_calls=0;fixture_fail_alloc=fail;
     CHECK(!ku_http_reactor_init(&r,&active,1u));
-    CHECK(r.descriptor==-1 && !r.registrations && !r.hash && !r.fd_entries && !r.work && !r.idle_heap);
+    CHECK(r.descriptor==-1 && !r.registrations && !r.fd_entries && !r.work && !r.idle_heap);
     CHECK(!active.reactor && !fixture_live_allocs && !fixture_live_bytes);
   }
   fixture_fail_alloc=0;fixture_alloc_calls=0;
   KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
   CHECK(ku_http_reactor_init_pending(&r,&active,1u,2u));
-  CHECK(fixture_alloc_calls==5u);
+  CHECK(fixture_alloc_calls==4u);
   CHECK(fixture_live_bytes==ku_http_reactor_pending_storage_bytes(1u,1u,2u)-sizeof(r));
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
   CHECK(!ku_http_reactor_init(&r,&active,(size_t)UINT32_MAX));
@@ -8548,6 +8669,8 @@ static int fixture_closed_event_source(void) {
   puts("http-persistent-closed-event-source-fault-ok");return 0;
 }
 int main(int argc,char** argv) {
+  if(argc>1 && !strcmp(argv[1],"token-tree-stress"))return fixture_token_tree_stress();
+  if(argc>1 && !strcmp(argv[1],"token-tree-kernel"))return fixture_token_tree_kernel();
   if(argc>1 && !strcmp(argv[1],"fd-index-clusters"))return fixture_fd_index_clusters();
   if(argc>1 && !strcmp(argv[1],"fd-index-init-failures"))return fixture_fd_index_init_failures();
   if(argc>1 && !strcmp(argv[1],"failed-new-alias"))return fixture_failed_new_preserves_alias();
@@ -8619,13 +8742,19 @@ int main(int argc,char** argv) {
     CHECK(reactor.ready[i].generation==UINT64_MAX-10u);found=1;
   }
   CHECK(found && read(recycled,&byte,1)==1 && byte=='b');
-  /* Exercise finite open-address back-shift deletion across repeated churn.
-   * It must preserve every other live full-width token and leave no tombstones. */
+  /* One intrusive node belongs to each registration, including its short
+   * pre-kernel pending state. Preserve full-width keys across slot reuse. */
   for(uint64_t round=0;round<1024u;round++) {
-    for(uint64_t i=0;i<4u;i++) CHECK(ku_http_reactor_hash_add(&reactor,UINT64_C(1000000)+round*4u+i,6u));
     for(uint64_t i=0;i<4u;i++) {
-      uint64_t token=UINT64_C(1000000)+round*4u+i;
-      CHECK(ku_http_reactor_lookup(&reactor,token)==6u);ku_http_reactor_hash_remove(&reactor,token);
+      uint64_t token=UINT64_C(0x100000000)+round*4u+i;size_t index=2u+(size_t)i;
+      CHECK(ku_http_reactor_hash_add(&reactor,token,index));
+      reactor.registrations[index].generation=UINT64_MAX-round;
+      reactor.registrations[index].registered=1;
+    }
+    for(uint64_t i=0;i<4u;i++) {
+      uint64_t token=UINT64_C(0x100000000)+round*4u+i;size_t index=2u+(size_t)i;
+      CHECK(ku_http_reactor_lookup(&reactor,token)==index);ku_http_reactor_hash_remove(&reactor,token);
+      reactor.registrations[index]=(KuHttpRegistration){0};
       CHECK(ku_http_reactor_lookup(&reactor,token)==SIZE_MAX);
       CHECK(ku_http_reactor_lookup(&reactor,reactor.registrations[0].token)==0u);
       CHECK(ku_http_reactor_lookup(&reactor,reactor.registrations[1].token)==1u);
@@ -8673,6 +8802,8 @@ int main(int argc,char** argv) {
     // registration. Root serializes execution; product code is unchanged.
     let mut failures = Vec::new();
     for scenario in [
+        "token-tree-stress",
+        "token-tree-kernel",
         "fd-index-clusters",
         "fd-index-init-failures",
         "failed-new-alias",
@@ -8695,6 +8826,22 @@ int main(int argc,char** argv) {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ));
+        } else if scenario.starts_with("token-tree-") {
+            let expected = if scenario == "token-tree-stress" {
+                "http-token-tree-4096-slots-88192-mutations-reference-ok max_height="
+            } else {
+                "http-token-tree-kernel-failure-alias-rotation-publication-ok"
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout
+                .lines()
+                .filter(|line| line.starts_with(expected))
+                .count()
+                != 1
+            {
+                failures.push(format!("{scenario}: missing scenario receipt: {stdout}"));
+            }
+            println!("{scenario}: {stdout}");
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
