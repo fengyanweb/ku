@@ -9,7 +9,7 @@ on:
         description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, pg-input-lifetime, pg-input-guard, pg-input-windows, pg-typed-self, arena-residency, poll-budget-contract]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, pg-input-lifetime, pg-input-guard, pg-read-screen, pg-input-windows, pg-typed-self, arena-residency, poll-budget-contract]
       prepatch:
         description: 'Full prepatch commit for explicit paired screens; wake/PG probes require their frozen baseline'
         type: string
@@ -22,7 +22,7 @@ on:
         description: 'pg-typed-self: PG or ordinary /ok SELF, db-mechanism joint confirmation; pg-input-guard: ordinary db/200rps, ok/2000rps or typed db-typed/200rps'
         type: choice
         default: db
-        options: [db, ok, db-typed, db-mechanism]
+        options: [db, ok, db-typed, db-mechanism, db-memory-queue]
       screen_variants:
         description: 'Up to seven full commit ablations, comma-separated, in one serial followup-screen; no extra formal matrix'
         type: string
@@ -95,7 +95,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'pg-input-lifetime' || inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-input-windows' || inputs.scope == 'pg-typed-self' || inputs.scope == 'arena-residency' || inputs.scope == 'poll-budget-contract') && format('-{0}', inputs.scope) || '' }}
+  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'pg-input-lifetime' || inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-read-screen' || inputs.scope == 'pg-input-windows' || inputs.scope == 'pg-typed-self' || inputs.scope == 'arena-residency' || inputs.scope == 'poll-budget-contract') && format('-{0}', inputs.scope) || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -211,7 +211,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - if: inputs.self_workload != 'db-mechanism'
+      - if: inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: '1.27.2'
@@ -220,9 +220,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          case "$KU_PG_SELF_WORKLOAD" in db|ok|db-mechanism) ;; *) echo 'unsupported SELF workload' >&2; exit 1 ;; esac
+          case "$KU_PG_SELF_WORKLOAD" in db|ok|db-mechanism|db-memory-queue) ;; *) echo 'unsupported SELF workload' >&2; exit 1 ;; esac
           sudo apt-get update -qq
-          if [ "$KU_PG_SELF_WORKLOAD" = db-mechanism ]; then
+          if [ "$KU_PG_SELF_WORKLOAD" = db-mechanism ] || [ "$KU_PG_SELF_WORKLOAD" = db-memory-queue ]; then
             sudo apt-get install -y --no-install-recommends clang-18 libpq-dev postgresql-16
           else
             rustup toolchain install 1.99.1 --profile minimal --no-self-update
@@ -236,7 +236,7 @@ jobs:
             done
           fi
           mkdir -p "$RUNNER_TEMP/ku-pg-current-tools/bin" "$RUNNER_TEMP/ku-pg-current-1.99.1"
-          if [ "$KU_PG_SELF_WORKLOAD" != db-mechanism ]; then
+          if [ "$KU_PG_SELF_WORKLOAD" != db-mechanism ] && [ "$KU_PG_SELF_WORKLOAD" != db-memory-queue ]; then
           pg_perf_binary="$(readlink -e "/usr/lib/linux-tools/$(uname -r)/perf" || true)"
           if [ -z "$pg_perf_binary" ] || [ ! -x "$pg_perf_binary" ]; then
             pg_perf_binary="$(find -L /usr/lib/linux-tools* /usr/lib/linux-azure-tools* -maxdepth 2 -type f -name perf -print 2>/dev/null | sort -V | tail -n 1 || true)"
@@ -246,7 +246,7 @@ jobs:
           fi
           ln -s "${CARGO_HOME:-$HOME/.cargo}" "$RUNNER_TEMP/ku-pg-current-tools/cargo"
           ln -s "${RUSTUP_HOME:-$HOME/.rustup}" "$RUNNER_TEMP/ku-pg-current-tools/rustup"
-          if [ "$KU_PG_SELF_WORKLOAD" != db-mechanism ]; then
+          if [ "$KU_PG_SELF_WORKLOAD" != db-mechanism ] && [ "$KU_PG_SELF_WORKLOAD" != db-memory-queue ]; then
             ln -s "$(dirname "$(dirname "$(command -v go)")")" "$RUNNER_TEMP/ku-pg-current-tools/go"
           fi
           printf 'KU_PG_CURRENT_BUILD=%s\n' "$RUNNER_TEMP/ku-pg-current-1.99.1" >> "$GITHUB_ENV"
@@ -290,8 +290,18 @@ jobs:
             --root "$RUNNER_TEMP/ku-normal-memory-observation" --tools "$RUNNER_TEMP/ku-pg-current-tools" \
             --normal-manifest "$KU_PG_CURRENT_BUILD/B/manifest.json" --typed-manifest "$KU_PG_CURRENT_BUILD/BP/manifest.json" \
             > "$RUNNER_TEMP/ku-normal-memory-observation.log" 2>&1
+      - name: Observe two adjacent baseline cleanup boundaries once
+        if: inputs.self_workload == 'db-memory-queue'
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B tests/benchmarks/cross_stack/stock_workqueue_probe.py \
+            --root "$RUNNER_TEMP/ku-normal-memory-observation" --tools "$RUNNER_TEMP/ku-pg-current-tools" \
+            --normal-manifest "$KU_PG_CURRENT_BUILD/B/manifest.json" --typed-manifest "$KU_PG_CURRENT_BUILD/BP/manifest.json" \
+            > "$RUNNER_TEMP/ku-normal-memory-observation.log" 2>&1
       - name: Validate the exact fp sampling format on this boot
-        if: inputs.self_workload != 'db-mechanism'
+        if: inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'
         timeout-minutes: 1
         shell: bash
         run: |
@@ -299,6 +309,7 @@ jobs:
           sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --preflight --callchains \
             --root "$KU_PG_CURRENT_BUILD" --tools "$RUNNER_TEMP/ku-pg-current-tools" --current-product "$KU_PG_PRODUCT"
       - name: Observe only the selected current caller question
+        if: inputs.self_workload != 'db-memory-queue'
         timeout-minutes: ${{ inputs.self_workload == 'db-mechanism' && 8 || 6 }}
         shell: bash
         run: |
@@ -307,7 +318,7 @@ jobs:
           pg_self_sampling=(--callchains --preflight-root "$KU_PG_CURRENT_BUILD")
           if [ "$KU_PG_SELF_WORKLOAD" = ok ]; then
             pg_self_args=(--workload ok --only B)
-          elif [ "$KU_PG_SELF_WORKLOAD" = db-mechanism ]; then
+          elif [ "$KU_PG_SELF_WORKLOAD" = db-mechanism ] || [ "$KU_PG_SELF_WORKLOAD" = db-memory-queue ]; then
             pg_self_args=(--mechanism --mechanism-recipe "$GITHUB_WORKSPACE/tests/benchmarks/cross_stack/pg_owner_mechanism.py")
             pg_self_sampling=()
           fi
@@ -316,7 +327,7 @@ jobs:
             --normal-manifest "$KU_PG_CURRENT_BUILD/B/manifest.json" --typed-manifest "$KU_PG_CURRENT_BUILD/BP/manifest.json" \
             --current-product "$KU_PG_PRODUCT" "${pg_self_sampling[@]}" "${pg_self_args[@]}" > "$RUNNER_TEMP/ku-pg-current-observation.log" 2>&1
       - name: Preserve the existing build and observation archive formats
-        if: always() && inputs.self_workload != 'db-mechanism'
+        if: always() && inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'
         timeout-minutes: 3
         shell: bash
         run: |
@@ -333,7 +344,7 @@ jobs:
           PY
             fi
           done
-      - if: always() && inputs.self_workload != 'db-mechanism'
+      - if: always() && inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ku-pg-current-build-reuse
@@ -342,7 +353,7 @@ jobs:
             ${{ runner.temp }}/ku-pg-current-1.99.1/prepared-current.json
             ${{ runner.temp }}/ku-pg-current-1.99.1/reuse-provenance
           retention-days: 14
-      - if: always() && inputs.self_workload != 'db-mechanism'
+      - if: always() && inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ku-pg-typed-self
@@ -363,6 +374,16 @@ jobs:
             ${{ runner.temp }}/ku-normal-memory-observation/frozen-memory-observer-plan.json
             ${{ runner.temp }}/ku-normal-memory-observation/observer/*.json
             ${{ runner.temp }}/ku-normal-memory-observation/observer/*.log
+            ${{ runner.temp }}/ku-normal-memory-observation/observer/*.txt
+            ${{ runner.temp }}/ku-normal-memory-observation/drain-observer/*.json
+            ${{ runner.temp }}/ku-normal-memory-observation/drain-observer/*.txt
+            ${{ runner.temp }}/ku-normal-memory-observation/frozen-drain-plan.json
+            ${{ runner.temp }}/ku-normal-memory-observation/window-*/window.json
+            ${{ runner.temp }}/ku-normal-memory-observation/window-*/**/client.json
+            ${{ runner.temp }}/ku-normal-memory-observation/window-*/**/resources.json
+            ${{ runner.temp }}/ku-normal-memory-observation/window-*/**/service.json
+            ${{ runner.temp }}/ku-normal-memory-observation/window-*/**/full-lifecycle.json
+            ${{ runner.temp }}/ku-normal-memory-observation/window-*/**/termination.json
             ${{ runner.temp }}/ku-normal-memory-observation/normal-memory-window/window.json
             ${{ runner.temp }}/ku-normal-memory-observation/normal-memory-window/**/client.json
             ${{ runner.temp }}/ku-normal-memory-observation/normal-memory-window/**/resources.json
@@ -396,7 +417,7 @@ jobs:
           if-no-files-found: warn
 
   pg-input-guard:
-    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-input-guard'
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-read-screen')
     name: Linux ARM64 ordinary or typed candidate relative guard
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
@@ -496,6 +517,7 @@ jobs:
             ~/.cargo/git
           key: ${{ steps.pg_guard_cargo_restore.outputs.cache-primary-key }}
       - name: Check the shared PG and ordinary Task network contracts
+        if: inputs.scope != 'pg-read-screen'
         timeout-minutes: 5
         shell: bash
         env:
@@ -538,13 +560,50 @@ jobs:
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/first-pg-owner-detectors.log"
           fi
       - name: Complete the one frozen27-window candidate guard
+        if: inputs.scope != 'pg-read-screen'
         timeout-minutes: 20
         shell: bash
         run: |
           set -euo pipefail
           sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase diagnostic --build-set diagnostic --pg-input-guard --pg-input-guard-workload "$KU_PG_GUARD_WORKLOAD" --root "$KU_PG_GUARD_ROOT" --source "$GITHUB_WORKSPACE" --tools "$KU_PG_GUARD_ROOT/tools" --baseline "$KU_PG_BASELINE" --candidate "$KU_PG_CANDIDATE" --prepatch "$KU_PG_BASELINE" > "$KU_PG_GUARD_ROOT/guard.log" 2>&1
+      - name: Prepare only the typed candidate from its existing CLI
+        if: inputs.scope == 'pg-read-screen'
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$KU_PG_GUARD_WORKLOAD" = db
+          python3 -B tests/benchmarks/cross_stack/pg_read_screen.py --phase prepare \
+            --root "$KU_PG_GUARD_ROOT" --source "$GITHUB_WORKSPACE" --tools "$KU_PG_GUARD_ROOT/tools" > "$KU_PG_GUARD_ROOT/read-prepare.log" 2>&1
+      - name: Check the new read boundary and related PG contracts
+        if: inputs.scope == 'pg-read-screen'
+        timeout-minutes: 5
+        shell: bash
+        env:
+          KU_CC: clang-18 -O2
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$KU_PG_GUARD_ROOT/cli-cache-1.99.1"
+          export KU_BIN="$KU_PG_GUARD_ROOT/B/build/ku-cargo/release/ku"
+          cd "$KU_PG_GUARD_ROOT/B/src"
+          mkdir -p "$KU_PG_GUARD_ROOT/contracts"
+          for read_test in native_pg_async_fresh_send_waits_without_empty_probes_or_lost_readiness native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins native_pg_async_rows_share_owner_turn_budgets_without_empty_growth_charges native_pg_typed_single_row_binary_values_validate_types_and_survive_reset; do
+            cargo +1.99.1 test --release --locked --test native_pg_query_poll_test "$read_test" -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/$read_test-O2.log" 2>&1
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/$read_test-O2.log"
+          done
+          KU_CC='clang-18 -O2 -fsanitize=address,undefined -fno-omit-frame-pointer' ASAN_OPTIONS='detect_leaks=1:halt_on_error=1' UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+            cargo +1.99.1 test --release --locked --test native_pg_query_poll_test native_pg_async_fresh_send_waits_without_empty_probes_or_lost_readiness -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/read-boundary-detectors.log" 2>&1
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/read-boundary-detectors.log"
+      - name: Run only the fixed twelve normal full-path screen windows
+        if: inputs.scope == 'pg-read-screen'
+        timeout-minutes: 9
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B tests/benchmarks/cross_stack/pg_read_screen.py --phase run \
+            --root "$KU_PG_GUARD_ROOT" --source "$GITHUB_WORKSPACE" --tools "$KU_PG_GUARD_ROOT/tools" > "$KU_PG_GUARD_ROOT/read-screen.log" 2>&1
       - name: Preserve the original raw evidence without changing results
-        if: always()
+        if: always() && inputs.scope != 'pg-read-screen'
         timeout-minutes: 3
         shell: bash
         run: |
@@ -556,11 +615,14 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ku-pg-input-guard-core
+          name: ${{ inputs.scope == 'pg-read-screen' && 'ku-pg-read-screen-core' || 'ku-pg-input-guard-core' }}
           include-hidden-files: true
           path: |
             ${{ runner.temp }}/ku-pg-input-guard/B/build/ku-native/.ku/build/release/c/*/ku-server.c
             ${{ runner.temp }}/ku-pg-input-guard/BP/build/ku-native/.ku/build/release/c/*/ku-server.c
+            ${{ runner.temp }}/ku-pg-input-guard/pg-read-screen
+            ${{ runner.temp }}/ku-pg-input-guard/read-prepare.log
+            ${{ runner.temp }}/ku-pg-input-guard/read-screen.log
             ${{ runner.temp }}/ku-pg-input-guard/pg-input-guard-observation
             ${{ runner.temp }}/ku-pg-input-guard/pg-input-guard-ok-observation
             ${{ runner.temp }}/ku-pg-input-guard/pg-input-guard-typed-observation
@@ -576,7 +638,7 @@ jobs:
             ${{ runner.temp }}/ku-pg-input-guard/verified-pg-contract-cache.json
           retention-days: 14
           if-no-files-found: warn
-      - if: always()
+      - if: always() && inputs.scope != 'pg-read-screen'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ku-pg-input-guard-full
@@ -1652,7 +1714,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'pg-input-lifetime' && inputs.scope != 'pg-input-guard' && inputs.scope != 'pg-input-windows' && inputs.scope != 'pg-typed-self' && inputs.scope != 'arena-residency' && inputs.scope != 'poll-budget-contract')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'pg-input-lifetime' && inputs.scope != 'pg-input-guard' && inputs.scope != 'pg-read-screen' && inputs.scope != 'pg-input-windows' && inputs.scope != 'pg-typed-self' && inputs.scope != 'arena-residency' && inputs.scope != 'poll-budget-contract')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30

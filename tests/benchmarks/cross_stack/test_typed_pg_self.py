@@ -227,7 +227,7 @@ class TypedPgSelfTests(unittest.TestCase):
         import subprocess,textwrap
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
         choice=workflow.split('\n      self_workload:\n',1)[1].split('\n      screen_variants:',1)[0]
-        self.assertIn('default: db',choice);self.assertIn('options: [db, ok, db-typed, db-mechanism]',choice)
+        self.assertIn('default: db',choice);self.assertIn('options: [db, ok, db-typed, db-mechanism, db-memory-queue]',choice)
         prefix,job=workflow.split('\n  pg-typed-self:\n',1);job,suffix=job.split('\n  pg-input-guard:\n',1)
         self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-typed-self'",job)
         self.assertNotIn('KU_PG_SELF_WORKLOAD',prefix+suffix)
@@ -336,11 +336,13 @@ class TypedPgSelfTests(unittest.TestCase):
     def test_mechanism_workflow_skips_unrelated_setup_and_large_archive(self):
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
         job=workflow.split('\n  pg-typed-self:\n',1)[1].split('\n  pg-input-guard:\n',1)[0]
-        self.assertIn("- if: inputs.self_workload != 'db-mechanism'\n        uses: actions/setup-go",job)
-        self.assertIn("if: inputs.self_workload != 'db-mechanism'\n        timeout-minutes: 1",job)
+        self.assertIn("- if: inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'\n        uses: actions/setup-go",job)
+        self.assertIn("if: inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'\n        timeout-minutes: 1",job)
         self.assertIn('pg_self_sampling=()',job)
         self.assertIn("if: always() && inputs.self_workload != 'db-mechanism'",job)
         self.assertIn('mechanism-probe/**/resources.json',job);self.assertIn('mechanism-derived/**/*.c',job)
         self.assertNotIn('mechanism-derived/**/bin',job);self.assertNotIn('cargo +1.99.1 build',job)
+        self.assertIn("if: inputs.self_workload != 'db-memory-queue'",job)
+        self.assertIn('stock_workqueue_probe.py',job);self.assertIn('drain-observer/*.txt',job)
 
 if __name__=='__main__':unittest.main()

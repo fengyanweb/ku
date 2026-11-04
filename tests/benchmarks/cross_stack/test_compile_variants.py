@@ -226,9 +226,9 @@ class HostedWorkflowContracts(unittest.TestCase):
         text,_=self.workflow()
         selection=text.split('\n      self_workload:\n',1)[1].split('\n      screen_variants:',1)[0]
         self.assertIn('pg-input-guard: ordinary db/200rps, ok/2000rps or typed db-typed/200rps',selection)
-        self.assertIn('default: db',selection);self.assertIn('options: [db, ok, db-typed, db-mechanism]',selection)
+        self.assertIn('default: db',selection);self.assertIn('options: [db, ok, db-typed, db-mechanism, db-memory-queue]',selection)
         job=text.split('\n  pg-input-guard:\n',1)[1].split('\n  pg-input-windows:\n',1)[0]
-        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-input-guard'",job)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-read-screen')",job)
         self.assertIn("KU_PG_GUARD_WORKLOAD: ${{ inputs.self_workload || 'db' }}",job)
         self.assertIn('pg_input_guard_workload=os.environ[\'KU_PG_GUARD_WORKLOAD\']',job)
         self.assertEqual(job.count('--pg-input-guard-workload "$KU_PG_GUARD_WORKLOAD"'),3)
@@ -250,7 +250,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         expected_scopes=['full','windows-service','windows-pg-host','macos-service','service-recovery','windows-roll',
             'task-main-path','windows-task-main-path','http-short-proof','performance-v2','performance-v2-builds',
             'performance-v2-finish','performance-v2-validation','performance-followup-diagnostic','followup-screen',
-            'pg-input-lifetime','pg-input-guard','pg-input-windows','pg-typed-self','arena-residency','poll-budget-contract']
+            'pg-input-lifetime','pg-input-guard','pg-read-screen','pg-input-windows','pg-typed-self','arena-residency','poll-budget-contract']
         scope=text.split('\n      scope:\n',1)[1].split('\n      prepatch:',1)[0]
         self.assertIn('type: choice',scope);self.assertIn('default: full',scope)
         options=next(line.strip()[len('options: '):] for line in scope.splitlines() if line.strip().startswith('options: '))
