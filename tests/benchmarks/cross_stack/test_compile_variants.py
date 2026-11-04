@@ -225,8 +225,8 @@ class HostedWorkflowContracts(unittest.TestCase):
     def test_pg_input_guard_workload_is_fixed_scoped_and_forwarded_to_every_phase(self):
         text,_=self.workflow()
         selection=text.split('\n      self_workload:\n',1)[1].split('\n      screen_variants:',1)[0]
-        self.assertIn('pg-input-guard: original db/200rps or ordinary ok/text/2000rps',selection)
-        self.assertIn('default: db',selection);self.assertIn('options: [db, ok]',selection)
+        self.assertIn('pg-input-guard: ordinary db/200rps, ok/2000rps or typed db-typed/200rps',selection)
+        self.assertIn('default: db',selection);self.assertIn('options: [db, ok, db-typed]',selection)
         job=text.split('\n  pg-input-guard:\n',1)[1].split('\n  pg-input-windows:\n',1)[0]
         self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-input-guard'",job)
         self.assertIn("KU_PG_GUARD_WORKLOAD: ${{ inputs.self_workload || 'db' }}",job)
@@ -234,13 +234,16 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertEqual(job.count('--pg-input-guard-workload "$KU_PG_GUARD_WORKLOAD"'),3)
         self.assertIn('ku-pg-input-guard/pg-input-guard-observation',job)
         self.assertIn('ku-pg-input-guard/pg-input-guard-ok-observation',job)
+        self.assertIn('ku-pg-input-guard/pg-input-guard-typed-observation',job)
+        for raw in ('pg-input-guard','pg-input-guard-typed','pg-typed-parent-identities.json','build-identities.json'):
+            self.assertIn('${{ runner.temp }}/ku-pg-input-guard/'+raw,job)
         self.assertIn('rustup default 1.99.1',job)
         check=next(line.strip() for line in job.splitlines() if 'case "$KU_PG_GUARD_WORKLOAD"' in line)
-        for workload in ('db','ok','cpu','ok;db',''):
+        for workload in ('db','ok','db-typed','cpu','ok;db',''):
             with self.subTest(workload=workload):
                 result=subprocess.run(['bash','-c',check],capture_output=True,text=True,
                     env={'KU_PG_GUARD_WORKLOAD':workload},timeout=5)
-                self.assertEqual(result.returncode,0 if workload in ('db','ok') else 1)
+                self.assertEqual(result.returncode,0 if workload in ('db','ok','db-typed') else 1)
 
     def test_only_explicit_performance_dispatch_selects_one_arm_job(self):
         text,job=self.workflow()

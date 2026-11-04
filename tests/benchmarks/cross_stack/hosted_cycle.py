@@ -41,8 +41,8 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 def validate_screen_selection(a,build_set):
     guard_workload=getattr(a,'pg_input_guard_workload','db')
-    if guard_workload not in ('db','ok') or (guard_workload!='db' and not getattr(a,'pg_input_guard',False)):
-        raise ValueError('--pg-input-guard-workload requires pg-input-guard and must be db or ok')
+    if guard_workload not in ('db','ok','db-typed') or (guard_workload!='db' and not getattr(a,'pg_input_guard',False)):
+        raise ValueError('--pg-input-guard-workload requires pg-input-guard and must be db, ok or db-typed')
     if getattr(a,'pg_input_guard',False):
         others=('task_json_screen','common_http_screen','final_task_json','pg_failure_probe',
             'normal_self_probe','pg_queue_screen','pg_driver_screen','memory_owner_probe','http_short_screen')
@@ -51,8 +51,8 @@ def validate_screen_selection(a,build_set):
         if (a.baseline not in (PG_INPUT_PREPATCH,PG_CURRENT_BASELINE) or getattr(a,'prepatch',None)!=a.baseline
                 or not re.fullmatch('[0-9a-f]{40}',a.candidate) or a.candidate==a.baseline):
             raise ValueError('--pg-input-guard requires explicit matching frozen F166/current d05 baseline and distinct full candidate')
-        if guard_workload=='ok' and a.baseline!=PG_CURRENT_BASELINE:
-            raise ValueError('ordinary ok guard requires the frozen current d05 baseline')
+        if guard_workload in ('ok','db-typed') and a.baseline!=PG_CURRENT_BASELINE:
+            raise ValueError('ordinary ok/typed PG guard requires the frozen current d05 baseline')
     if getattr(a,'http_short_screen',False):
         if getattr(a,'http_short_goal','cpu') not in ('cpu','memory'):
             raise ValueError('--http-short-goal must be cpu or memory')
@@ -365,12 +365,13 @@ def pg_driver_plan(versions):
 def pg_input_guard_plan(versions,candidate=PG_INPUT_CANDIDATE,baseline=PG_INPUT_PREPATCH,workload='db'):
     if baseline not in (PG_INPUT_PREPATCH,PG_CURRENT_BASELINE) or not re.fullmatch('[0-9a-f]{40}',candidate) or candidate==baseline:
         raise ValueError('explicit full candidate commit different from the frozen baseline required')
-    if workload not in ('db','ok') or (workload=='ok' and baseline!=PG_CURRENT_BASELINE):
-        raise ValueError('guard workload must be db, or ok with the frozen current d05 baseline')
-    rate,contract=(200,'pg-strict') if workload=='db' else (2000,'text')
-    controls=[dict(name='A',phase='environment-control',workload=workload,contract=contract,
+    if workload not in ('db','ok','db-typed') or (workload in ('ok','db-typed') and baseline!=PG_CURRENT_BASELINE):
+        raise ValueError('guard workload must be db, or ok/db-typed with the frozen current d05 baseline')
+    rate,contract=(2000,'text') if workload=='ok' else (200,'typed-pg-strict' if workload=='db-typed' else 'pg-strict')
+    window_workload='db' if workload=='db-typed' else workload
+    controls=[dict(name='A',phase='environment-control',workload=window_workload,contract=contract,
         group=g,rate=rate,warmup_seconds=3,score_seconds=15) for g in (1,2,3)]
-    windows=[dict(name=name,phase='normal',workload=workload,contract=contract,
+    windows=[dict(name=name,phase='normal',workload=window_workload,contract=contract,
         group=group,rate=rate,warmup_seconds=3,score_seconds=15)
         for group in range(1,13) for name in (('A','B') if group%2 else ('B','A'))]
     plan=dict(schema='ku-hosted-pg-input-guard-v1',versions=versions,prepatch=baseline,
@@ -391,19 +392,27 @@ def pg_input_guard_plan(versions,candidate=PG_INPUT_CANDIDATE,baseline=PG_INPUT_
                 'Normal helpers/text/async/int, fixed2000rps, original HTTP/driver/resources/deadlines and natural cleanup. '
                 'Candidate-relative CPU and steady cgroup memory guard only; no PG workload, R, pressure, JSON, compute, '
                 'replacement, automatic adoption or original16-goal qualification. Unknown never passes.')
+    if workload=='db-typed':
+        plan.update(pg_input_guard_workload=workload,typed_parent_roles={'A':'AP','B':'BP'},
+            purpose='Three independent typed-A PG controls, then exactly12 balanced serial typed A/B PG pairs. '
+                'A/B are explicit AP/BP aliases, each native-generated from its own verified baseline/candidate CLI. '
+                'Normal helpers/text/async/typed, fixed200rps, original SQL/data/driver/resources/deadlines and natural cleanup. '
+                'CPU and middle60% cgroup memory guards only; no ordinary/typed pooling, R, pressure, JSON, compute, '
+                'replacement, automatic adoption or original16-goal qualification. Unknown never passes.')
     return plan
 
 
 def pg_input_guard_comparison(rows,complete,environment,workload='db'):
-    if workload not in ('db','ok'):raise ValueError('guard workload must be db or ok')
+    if workload not in ('db','ok','db-typed'):raise ValueError('guard workload must be db, ok or db-typed')
     result=dict(complete=complete,eligible_for_root_review=False,candidate_accepted=False,
         formal_qualified=False,normal_score_eligible=False,comparisons={},reasons=[],
         environment_qualification=environment)
-    if workload=='ok':
+    if workload in ('ok','db-typed'):
         result['pg_input_guard_workload']=workload
+        expected=('ok','text',2000,3,15) if workload=='ok' else ('db','typed-pg-strict',200,3,15)
         if any((r.get('workload'),r.get('contract'),r.get('rate'),r.get('warmup_seconds'),r.get('window_seconds'))
-                !=('ok','text',2000,3,15) for r in rows):
-            result['reasons'].append('ordinary ok windows must retain the frozen workload/contract/rate/duration')
+                !=expected for r in rows):
+            result['reasons'].append(workload+' windows must retain the frozen workload/contract/rate/duration')
     if not environment or environment.get('quality')!='pass':
         result['reasons'].append('environment controls unresolved or failed')
     controls=[r for r in rows if r.get('phase')=='environment-control']
@@ -557,12 +566,14 @@ def common_typed_guard_plan(versions,kind):
               'Original full_cpu_us/correct definition and middle60% service cgroup memory; no expanded cold-start claim, pooling with common55, original16 or automatic adoption.')
 
 
-def prepare_common_typed_guards(a,state,main_plan,main_bindings,client,protocol):
+def prepare_common_typed_guards(a,state,main_plan,main_bindings,client,protocol,*,kinds=('json','pg')):
     """Only native-generate typed arms using each parent's already verified CLI."""
+    if kinds not in (('json','pg'),('pg',)):raise ValueError('only complete common guards or PG-only typed generation supported')
     root=a.root/'common-typed-guards';root.mkdir(exist_ok=True);Builder=shared_cli_builder(a.root)
     bindings={};versions={}
-    for name,parent,mode in (('AJ','A',{'ku_json':'typed'}),('BJ','B',{'ku_json':'typed'}),
-            ('AP','A',{'ku_pg_read':'typed'}),('BP','B',{'ku_pg_read':'typed'})):
+    arms=(('AJ','A',{'ku_json':'typed'}),('BJ','B',{'ku_json':'typed'})) if 'json' in kinds else ()
+    arms+= (('AP','A',{'ku_pg_read':'typed'}),('BP','B',{'ku_pg_read':'typed'}))
+    for name,parent,mode in arms:
         owner=load(a.root/parent/'manifest.json');bl.require_rust_manifest(owner)
         commit=main_plan['versions'][parent]['source_commit']
         if owner['candidate_base']!=commit:raise ValueError('typed parent source identity differs: '+parent)
@@ -592,6 +603,7 @@ def prepare_common_typed_guards(a,state,main_plan,main_bindings,client,protocol)
             raise ValueError('typed arm is not the required same-parent CLI public mode: '+name)
     plans={}
     for kind,names in (('json',('AJ','BJ')),('pg',('AP','BP'))):
+        if kind not in kinds:continue
         for field in ('expanded source','driver ELF','libpq'):
             if bindings[names[0]]['files'][field]['sha256']!=bindings[names[1]]['files'][field]['sha256']:
                 raise ValueError('typed paired input/dependency differs: '+kind+'/'+field)
@@ -900,6 +912,22 @@ def complete_build(a,state,build_set,prepatch,variants):
     typed_bindings={}
     if build_set=='followup-screen' and getattr(a,'common_http_screen',False) and prepatch==PG_CURRENT_BASELINE:
         typed_bindings=prepare_common_typed_guards(a,state,plan,identities,client,protocol)
+    if getattr(a,'pg_input_guard',False) and getattr(a,'pg_input_guard_workload','db')=='db-typed':
+        typed_bindings=prepare_common_typed_guards(a,state,plan,identities,client,protocol,kinds=('pg',))
+        typed_versions={name:dict(root=str(a.root/role),stack='ku',source_commit=versions[name]['source_commit'],
+            binary_sha256=typed_bindings[role]['files']['ELF']['sha256'],rust_toolchain=bl.RUST_TOOLCHAIN)
+            for name,role in (('A','AP'),('B','BP'))}
+        plan=pg_input_guard_plan(typed_versions,a.candidate,a.prepatch,'db-typed')
+        save(a.root/'frozen-plan.json',plan)
+        typed_index=load(a.root/'common-typed-guards/identity.json')
+        typed_index['main_plan_sha256']=sha(a.root/'frozen-plan.json')
+        save(a.root/'common-typed-guards/identity.json',typed_index)
+        identities={name:fc.version_identity(plan,name) for name in typed_versions}
+        save(a.root/'build-identities.json',identities)
+        save(a.root/'pg-typed-parent-identities.json',dict(
+            aliases={'A':'AP','B':'BP'},bindings=typed_bindings,
+            CLI_rebuilt=False,ordinary_windows_imported=0,
+            scope='Only the27-window frozen pg-input guard is executed; the common6-pair plan is build provenance, not a second run.'))
     dependencies={};abi={}
     for binary in sorted({f['path'] for v in [*identities.values(),*typed_bindings.values()] for k,f in v['files'].items() if k in ('ELF','Ku CLI','driver ELF')}):
         linked=subprocess.run(['ldd',binary],capture_output=True,text=True,check=True,timeout=30).stdout
@@ -1753,19 +1781,19 @@ def pg_queue_screen(a,state):
     if plan!=expected_plan:raise ValueError('matching frozen A/B diagnostic plan required')
     bindings={name:fc.version_identity(plan,name) for name in ('A','B')}
     expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
-        pg_execution_mode='async',pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+        pg_execution_mode='async',pg_read_mode='typed' if guard and guard_workload=='db-typed' else 'int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
     if any(x['stack']!='ku' or x['build_mode']!=expected for x in bindings.values()):raise ValueError('normal A/B Release modes required')
     if bindings['A']['source_commit']!=prepatch or bindings['B']['source_commit']==prepatch:raise ValueError('A/B source identities differ from the frozen pair')
     if (short or guard) and bindings['A']['files']['expanded source']['sha256']!=bindings['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
     if guard and bindings['B']['source_commit']!=a.candidate:raise ValueError('exact frozen PG input candidate required')
-    guard_directory='pg-input-guard'+('-ok' if guard_workload=='ok' else '')
+    guard_directory='pg-input-guard'+('-ok' if guard_workload=='ok' else '-typed' if guard_workload=='db-typed' else '')
     directory=a.root/(guard_directory if guard else 'http-short-screen' if short else 'pg-queue-screen');directory.mkdir(exist_ok=False)
     fixture=db.Database(a.root/'fixture',state['uid'],state['gid']);original=fc.Harness;private=None;environment=None
     result=dict(schema='ku-hosted-pg-input-guard-v1' if guard else 'ku-http-short-screen-v1' if short else 'ku-pg-queue-screen-v1',diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
         candidate_accepted=False,goal_status='unknown',execution_complete=False,rows=[],stopped=[],purpose=plan['purpose'])
     if short:result['http_short_goal']=plan['http_short_goal']
-    if guard and guard_workload=='ok':result['pg_input_guard_workload']=guard_workload
+    if guard and guard_workload!='db':result['pg_input_guard_workload']=guard_workload
     began=time.monotonic()
     class QueueHarness(original):
         def __init__(self,*args,**kwargs):
@@ -1777,7 +1805,7 @@ def pg_queue_screen(a,state):
         save(directory/'identity.json',dict(bindings=bindings,resources=plan['resources'],quality_policy=plan['quality_policy'],
             database_limits=load(fixture.state_path)['limits'],boot_sha256=sha('/proc/sys/kernel/random/boot_id'),purpose=plan['purpose'],
             **({'http_short_goal':plan['http_short_goal'],'adoption_thresholds':plan['adoption_thresholds']} if short else {}),
-            **({'pg_input_guard_workload':guard_workload} if guard and guard_workload=='ok' else {})))
+            **({'pg_input_guard_workload':guard_workload} if guard and guard_workload!='db' else {})))
         for config in plan['windows']:
             name=config['name'];phase=config['phase'];workload=config.get('workload','db')
             output=directory/(('environment-controls' if phase=='environment-control' else workload) if short or guard else phase)/f"g{config['group']}-{name}"
@@ -2671,7 +2699,7 @@ def main(argv=None):
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
     p.add_argument('--pg-input-guard',action='store_true',help='Explicit matching F166/current d05 baseline/prepatch and distinct candidate: fixed3 controls+12 pairs, current Rust1.99.1 only')
-    p.add_argument('--pg-input-guard-workload',choices=['db','ok'],default='db',help='PG input guard only: original db/200rps or current d05 ordinary ok/text/2000rps; frozen into identity and plan')
+    p.add_argument('--pg-input-guard-workload',choices=['db','ok','db-typed'],default='db',help='PG input guard only: original db/200rps, current d05 ok/2000rps or typed-PG/200rps; separate27-window plans, never pooled')
     p.add_argument('--pg-queue-screen',action='store_true',help='Eight normal A/B PG fix diagnostic windows; frozen f39c673 prepatch required, no matrix or formal capacity claim')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv)

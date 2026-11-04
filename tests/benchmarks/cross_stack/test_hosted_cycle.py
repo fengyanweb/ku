@@ -157,6 +157,33 @@ class HostedCycleTests(unittest.TestCase):
                     changed=json.loads(json.dumps(rows));changed[3][field]=value
                     self.assertFalse(h.pg_input_guard_comparison(changed,True,{'quality':'pass'},'ok')['eligible_for_root_review'])
 
+    def test_pg_input_typed_plan_is_distinct_fixed27_and_rejects_ordinary_contract(self):
+        base=dict(baseline=h.PG_CURRENT_BASELINE,candidate='c'*40,prepatch=h.PG_CURRENT_BASELINE,
+            screen_variants=[],pg_input_guard=True)
+        typed=h.hosted_identity(types.SimpleNamespace(**base,pg_input_guard_workload='db-typed'),'diagnostic')
+        self.assertEqual(typed['pg_input_guard_workload'],'db-typed')
+        self.assertNotEqual(typed,h.hosted_identity(types.SimpleNamespace(**base),'diagnostic'))
+        plan=h.pg_input_guard_plan({},base['candidate'],base['baseline'],'db-typed')
+        self.assertEqual((plan['maximum_windows'],plan['maximum_replacements'],plan['minimum_pairs']),(27,0,12))
+        self.assertEqual(plan['typed_parent_roles'],{'A':'AP','B':'BP'})
+        self.assertTrue(all((c['workload'],c['contract'],c['rate'],c['warmup_seconds'],c['score_seconds'])==
+            ('db','typed-pg-strict',200,3,15) for c in plan['windows']))
+        self.assertEqual(plan['guard_thresholds'],h.pg_input_guard_plan({})['guard_thresholds'])
+        for changed in ({'baseline':h.PG_INPUT_PREPATCH,'prepatch':h.PG_INPUT_PREPATCH},{'pg_input_guard':False}):
+            with self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(**dict(base,pg_input_guard_workload='db-typed',**changed)),'diagnostic')
+        with self.assertRaises(ValueError):h.pg_input_guard_plan({},'c'*40,h.PG_INPUT_PREPATCH,'db-typed')
+        rows=[dict(c,window_seconds=c['score_seconds'],observation_complete=True,functional_valid=True,
+            accounting_valid=True,all_correct=True,natural_reclamation=True,arrival_schedule_quality='pass',
+            environment_quality='pass',measurement_invalid=False,observed_environment_faults=[],
+            diagnostic_quality={'valid':True},comparison_contract='typed-pg-strict',
+            full_cpu_us=100,memory={'steady_median_bytes':1000}) for c in plan['windows']]
+        with patch.object(fc,'paired_interval',return_value=dict(status='estimated',estimate=1,lower95=.99,upper95=1.02)):
+            self.assertTrue(h.pg_input_guard_comparison(rows,True,{'quality':'pass'},'db-typed')['eligible_for_root_review'])
+            for field,value in (('contract','pg-strict'),('workload','ok'),('rate',201),('window_seconds',16)):
+                changed=json.loads(json.dumps(rows));changed[7][field]=value
+                self.assertFalse(h.pg_input_guard_comparison(changed,True,{'quality':'pass'},'db-typed')['eligible_for_root_review'])
+
     def test_pg_input_guard_comparison_never_passes_unknown_or_partial(self):
         rows=[dict(c,observation_complete=True,functional_valid=True,accounting_valid=True,all_correct=True,
             natural_reclamation=True,arrival_schedule_quality='pass',environment_quality='pass',measurement_invalid=False,
@@ -213,10 +240,10 @@ class HostedCycleTests(unittest.TestCase):
             self.assertEqual(calls,[('A','ku'),('B','ku'),('Driver','driver',True)])
 
     def test_pg_input_guard_runner_stops_controls_or_invalid_window_without_replacement(self):
-        for issue in ('none','ok','workload-mismatch','control-quality','environment-unknown','environment-fail','arrival','cleanup','database','flags','business'):
+        for issue in ('none','ok','typed','typed-mode-mismatch','workload-mismatch','control-quality','environment-unknown','environment-fail','arrival','cleanup','database','flags','business'):
             with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
-                root=Path(temp);guard_workload='ok' if issue in ('ok','workload-mismatch') else 'db'
-                baseline=h.PG_CURRENT_BASELINE if guard_workload=='ok' else h.PG_INPUT_PREPATCH
+                root=Path(temp);guard_workload='ok' if issue in ('ok','workload-mismatch') else 'db-typed' if issue.startswith('typed') else 'db'
+                baseline=h.PG_CURRENT_BASELINE if guard_workload in ('ok','db-typed') else h.PG_INPUT_PREPATCH
                 plan=h.pg_input_guard_plan({n:dict(root=str(root/n),stack='ku') for n in ('A','B')},
                     h.PG_INPUT_CANDIDATE,baseline,'db' if issue=='workload-mismatch' else guard_workload)
                 h.save(root/'frozen-plan.json',plan);manifest=root/'fixture/manifest.json';state_path=root/'fixture/state.json'
@@ -225,6 +252,7 @@ class HostedCycleTests(unittest.TestCase):
                     stop=lambda:dict(forced=issue=='database',cgroup_removed=True,after={'process_count':0}))
                 mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',
                     pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+                if guard_workload=='db-typed' and issue!='typed-mode-mismatch':mode['pg_read_mode']='typed'
                 if issue=='flags':mode['native_flags']['server']=['-std=c11','-O3','-pthread']
                 patches.enter_context(patch.object(h.os,'geteuid',return_value=0));database=patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
                 patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:dict(stack='ku',build_mode=mode,
@@ -236,14 +264,15 @@ class HostedCycleTests(unittest.TestCase):
                     'unknown' if issue=='environment-unknown' else 'fail' if issue=='environment-fail' else 'pass'}))
                 def window(p,name,workload,rate,warmup,duration,output,**kwargs):
                     control='environment-controls' in Path(output).parts;measured.append((name,workload,control))
-                    self.assertEqual((workload,rate,warmup,duration),(guard_workload,2000 if guard_workload=='ok' else 200,3,15))
+                    self.assertEqual((workload,rate,warmup,duration),('db' if guard_workload=='db-typed' else guard_workload,2000 if guard_workload=='ok' else 200,3,15))
                     if guard_workload=='ok':self.assertIn('pg-input-guard-ok',Path(output).parts)
+                    if guard_workload=='db-typed':self.assertIn('pg-input-guard-typed',Path(output).parts)
                     row=dict(status='observed',score_started=True,functional_valid=not(issue=='control-quality' and control),accounting_valid=True,
                         all_correct=True,natural_reclamation=True,arrival_schedule_quality='fail' if issue=='arrival' and not control else 'pass',
                         environment_quality='unknown' if control else 'pass',measurement_invalid=False,
-                        contract='text' if guard_workload=='ok' else 'pg-strict',rate=rate,warmup_seconds=warmup,window_seconds=duration,
+                        contract='text' if guard_workload=='ok' else 'typed-pg-strict' if guard_workload=='db-typed' else 'pg-strict',rate=rate,warmup_seconds=warmup,window_seconds=duration,
                         full_cpu_us=97 if name=='B' else 100,memory={'steady_median_bytes':1000},comparison_contract='same-pg',cleanup=[{'natural':True}])
-                    self.assertEqual(kwargs['job']['contract'],'text' if guard_workload=='ok' else 'pg-strict')
+                    self.assertEqual(kwargs['job']['contract'],'text' if guard_workload=='ok' else 'typed-pg-strict' if guard_workload=='db-typed' else 'pg-strict')
                     for part in ('warmup','score'):
                         report=Path(output)/part/'client.json';h.save(report,dict(service_cost=dict(before={'observed':True},after={'observed':True},
                             driver_headroom={'fraction_of_quota':.3,'saturated':False})))
@@ -251,14 +280,14 @@ class HostedCycleTests(unittest.TestCase):
                     row['score_report']=str(Path(output)/'score/client.json');return row
                 patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,pg_input_guard=True,
                     candidate=h.PG_INPUT_CANDIDATE,prepatch=baseline,pg_input_guard_workload=guard_workload)
-                if issue in ('flags','business','workload-mismatch'):
+                if issue in ('flags','business','workload-mismatch','typed-mode-mismatch'):
                     with self.assertRaises(ValueError):h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
                     self.assertEqual(measured,[]);database.assert_not_called();continue
                 result=h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
                 self.assertEqual(len(measured),1 if issue=='control-quality' else 3 if issue.startswith('environment') else 4 if issue in ('arrival','cleanup') else 27)
-                self.assertEqual(result['execution_complete'],issue in ('none','ok'));self.assertFalse(result['candidate_accepted'])
+                self.assertEqual(result['execution_complete'],issue in ('none','ok','typed'));self.assertFalse(result['candidate_accepted'])
                 self.assertEqual(env.call_count,0 if issue=='control-quality' else 1)
-                if issue in ('none','ok'):
+                if issue in ('none','ok','typed'):
                     self.assertEqual([x[2] for x in measured[:3]],[True]*3)
                     self.assertEqual(result['environment_qualification']['quality'],'pass')
                     self.assertTrue(result['comparison']['eligible_for_root_review'])
@@ -1354,8 +1383,8 @@ class HostedCycleTests(unittest.TestCase):
             with self.assertRaises(ValueError):h.common_typed_guard_plan({**versions,'BT':versions[names[1]]},kind)
 
     def test_common_typed_preparation_uses_each_parent_cli_without_rebuilding_it(self):
-        for incorrect in (False,True):
-            with self.subTest(incorrect=incorrect),tempfile.TemporaryDirectory() as temp:
+        for incorrect,kinds in ((False,('json','pg')),(True,('json','pg')),(False,('pg',))):
+            with self.subTest(incorrect=incorrect,kinds=kinds),tempfile.TemporaryDirectory() as temp:
                 root=Path(temp);tools=root/'tools';tools.mkdir();calls=[]
                 main={'versions':{n:dict(source_commit=h.PG_CURRENT_BASELINE if n=='A' else 'b'*40) for n in ('A','B')}}
                 for n in ('A','B'):
@@ -1396,11 +1425,12 @@ class HostedCycleTests(unittest.TestCase):
                         patch.object(h.bl.os,'getegid',return_value=1),patch.object(fc,'version_identity',side_effect=identity):
                     if incorrect:
                         with self.assertRaisesRegex(ValueError,'same-parent CLI public mode'):
-                            h.prepare_common_typed_guards(types.SimpleNamespace(root=root,tools=tools,source=root/'checkout'),{'uid':1,'gid':1,'steps':{}},main,owner_bindings,{},root/'protocol.json')
+                            h.prepare_common_typed_guards(types.SimpleNamespace(root=root,tools=tools,source=root/'checkout'),{'uid':1,'gid':1,'steps':{}},main,owner_bindings,{},root/'protocol.json',kinds=kinds)
                     else:
-                        bindings=h.prepare_common_typed_guards(types.SimpleNamespace(root=root,tools=tools,source=root/'checkout'),{'uid':1,'gid':1,'steps':{}},main,owner_bindings,{},root/'protocol.json')
-                        self.assertEqual(set(bindings),{'AJ','BJ','AP','BP'})
-                        self.assertEqual([x[0] for x in calls],['AJ','BJ','AP','BP'])
+                        bindings=h.prepare_common_typed_guards(types.SimpleNamespace(root=root,tools=tools,source=root/'checkout'),{'uid':1,'gid':1,'steps':{}},main,owner_bindings,{},root/'protocol.json',kinds=kinds)
+                        names=['AJ','BJ','AP','BP'] if 'json' in kinds else ['AP','BP']
+                        self.assertEqual(set(bindings),set(names))
+                        self.assertEqual([x[0] for x in calls],names)
                         for name,source,cli,kw in calls:
                             self.assertEqual(source,(root/name/'src').resolve());self.assertEqual(cli,root/name[0]/'cli')
                             self.assertEqual(kw.get('ku_json'), 'typed' if name.endswith('J') else None)
