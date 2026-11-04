@@ -1313,8 +1313,16 @@ class HostedCycleTests(unittest.TestCase):
                         service_env={'KU_HTTP_WORKER_POLICY':'elastic'},declared_worker_policy='elastic',
                         stacks={'ku':{'build':{'cli':str(root/n/'cli')}}}))
                 h.save(root/'frozen-plan.json',main);before=(root/'frozen-plan.json').read_bytes()
-                class Builder:
-                    def __init__(self,d,source,**kw):self.d=d;self.source=source;self.kw=kw
+                def snapshot(checkout,commit,destination):
+                    self.assertEqual(checkout,root/'checkout')
+                    self.assertEqual(commit,main['versions'][destination.parent.name[0]]['source_commit'])
+                    destination.mkdir(parents=True)
+                    (destination/'Cargo.toml').write_text('[package]\nname="ku"\nversion="0.0.19"\nedition="2021"\n')
+                    (destination/'Cargo.lock').write_text('version = 4\n')
+                class Builder(h.bl.Builder):
+                    def __init__(self,d,source,**kw):
+                        super().__init__(d,source,**kw)
+                        self.d=self.root;self.kw=kw
                     def ku(self):raise AssertionError('typed supplements must never rebuild the CLI')
                     def ku_native(self,cli):
                         calls.append((self.d.name,self.source,cli,self.kw))
@@ -1332,16 +1340,18 @@ class HostedCycleTests(unittest.TestCase):
                             ('expanded source','1'*64 if j else '2'*64),('driver ELF','d'*64),('libpq','e'*64))})
                 owner_bindings={n:{'files':{'Ku CLI':{'sha256':n.lower()*64}}} for n in ('A','B')}
                 with patch.object(h,'shared_cli_builder',return_value=Builder),patch.object(h.bl,'require_rust_manifest'),\
-                        patch.object(fc,'version_identity',side_effect=identity):
+                        patch.object(h,'snapshot',side_effect=snapshot),patch.object(h.bl.platform,'system',return_value='Linux'),\
+                        patch.object(h.bl.platform,'machine',return_value='aarch64'),patch.object(h.bl.os,'geteuid',return_value=1),\
+                        patch.object(h.bl.os,'getegid',return_value=1),patch.object(fc,'version_identity',side_effect=identity):
                     if incorrect:
                         with self.assertRaisesRegex(ValueError,'same-parent CLI public mode'):
-                            h.prepare_common_typed_guards(types.SimpleNamespace(root=root,tools=tools),{'uid':1,'gid':1,'steps':{}},main,owner_bindings,{},root/'protocol.json')
+                            h.prepare_common_typed_guards(types.SimpleNamespace(root=root,tools=tools,source=root/'checkout'),{'uid':1,'gid':1,'steps':{}},main,owner_bindings,{},root/'protocol.json')
                     else:
-                        bindings=h.prepare_common_typed_guards(types.SimpleNamespace(root=root,tools=tools),{'uid':1,'gid':1,'steps':{}},main,owner_bindings,{},root/'protocol.json')
+                        bindings=h.prepare_common_typed_guards(types.SimpleNamespace(root=root,tools=tools,source=root/'checkout'),{'uid':1,'gid':1,'steps':{}},main,owner_bindings,{},root/'protocol.json')
                         self.assertEqual(set(bindings),{'AJ','BJ','AP','BP'})
                         self.assertEqual([x[0] for x in calls],['AJ','BJ','AP','BP'])
                         for name,source,cli,kw in calls:
-                            self.assertEqual(source,root/name[0]/'src');self.assertEqual(cli,root/name[0]/'cli')
+                            self.assertEqual(source,(root/name/'src').resolve());self.assertEqual(cli,root/name[0]/'cli')
                             self.assertEqual(kw.get('ku_json'), 'typed' if name.endswith('J') else None)
                             self.assertEqual(kw.get('ku_pg_read'),None if name.endswith('J') else 'typed')
                         self.assertFalse(h.load(root/'common-typed-guards/identity.json')['CLI_rebuilt'])

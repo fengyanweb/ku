@@ -545,9 +545,10 @@ def prepare_common_typed_guards(a,state,main_plan,main_bindings,client,protocol)
         if owner['candidate_base']!=commit:raise ValueError('typed parent source identity differs: '+parent)
         def native(name=name,owner=owner,commit=commit,mode=mode):
             d=a.root/name;d.mkdir(exist_ok=True)
+            snapshot(a.source,commit,d/'src')
             if not (d/'tools').exists():(d/'tools').symlink_to(a.tools,target_is_directory=True)
             if (d/'tools').resolve()!=a.tools.resolve():raise ValueError('typed native tools differ')
-            b=Builder(d,Path(owner['source_root']),uid=state['uid'],gid=state['gid'],candidate=commit,**mode)
+            b=Builder(d,d/'src',uid=state['uid'],gid=state['gid'],candidate=commit,**mode)
             try:b.ku_native(Path(owner['stacks']['ku']['build']['cli']));return b.finish()
             except BaseException as error:b.finish(failed=repr(error));raise
         step(state,a.root,'build-'+name,native)

@@ -415,21 +415,27 @@ class ReuseBuildTests(unittest.TestCase):
             self.assertEqual((root/'good/B/build/bin/ku-server').read_bytes(),b'B')
 
     def test_reuse_selection_and_state_identity_match_the_explicit_hosted_flag(self):
-        for selected,common in ((None,None),(False,False),(True,False),(True,True)):
-            with self.subTest(selected=selected,common=common),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+        cases=[(selected,common,'f'*40) for selected,common in ((None,None),(False,False),(True,False),(True,True))]
+        for selected,common,prepatch in [*cases,(True,True,r.h.PG_CURRENT_BASELINE)]:
+            with self.subTest(selected=selected,common=common,prepatch=prepatch),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
                 root=Path(d);fresh=root/'fresh';tools=root/'tools';tools.mkdir()
                 args=types.SimpleNamespace(root=fresh,source=root/'source',tools=tools,archive=root/'inert.tgz',
                     archive_sha256='1'*64,source_run='123',baseline=r.h.BASELINE,
-                    candidate='b'*40,prepatch='f'*40,screen_variants=[])
+                    candidate='b'*40,prepatch=prepatch,screen_variants=[])
                 if selected is not None:args.task_json_screen=selected
                 if common is not None:args.common_http_screen=common
+                ir_raw=b'enum TaskOp {\n    JsonDecode {\n}\n'
                 def extract(archive,root,digest,expected):
                     for name in expected:(root/name).mkdir(parents=True)
                     # Even capable normal cached builds must not implicitly
                     # change the requested experiment to a Task JSON screen.
                     ir=root/'B/src/src/ir/task.rs';ir.parent.mkdir(parents=True)
-                    ir.write_text('enum TaskOp {\n    JsonDecode {\n}\n')
-                    return {}
+                    ir.write_bytes(ir_raw)
+                    cli=root/'B/cli.json';r.h.save(cli,dict(candidate_base=args.candidate,failure=None,
+                        source_files={'src/ir/task.rs':hashlib.sha256(ir_raw).hexdigest()}))
+                    r.h.save(root/'B/manifest.json',dict(candidate_base=args.candidate,stacks={'ku':{'build':dict(
+                        cli_build_receipt=r.TOKEN+'/B/cli.json',cli_build_receipt_sha256='f'*64)}}))
+                    return {'B/cli.json':dict(original_sha256='f'*64,archived_sha256=r.h.sha(cli))}
                 patches.enter_context(patch.object(r.os,'geteuid',return_value=1))
                 patches.enter_context(patch.object(r.platform,'system',return_value='Linux'))
                 patches.enter_context(patch.object(r.platform,'machine',return_value='aarch64'))
@@ -438,15 +444,48 @@ class ReuseBuildTests(unittest.TestCase):
                 patches.enter_context(patch.object(r,'validate_protocol_inputs',return_value={}))
                 verify=patches.enter_context(patch.object(r,'verify_manifest'))
                 patches.enter_context(patch.object(r,'new_driver'))
+                patches.enter_context(patch.object(r.subprocess,'check_output',return_value=ir_raw))
                 patches.enter_context(patch.object(r.h,'complete_build',return_value={'execution_complete':True}))
                 self.assertTrue(r.prepare(args)['execution_complete'])
                 expected={'A','B','R',*(['BT'] if selected else [])}
                 self.assertEqual(set(extract_mock.call_args.args[3]),expected)
                 self.assertEqual({call.args[1] for call in verify.call_args_list},expected)
+                for call in verify.call_args_list:
+                    current=common and prepatch==r.h.PG_CURRENT_BASELINE and call.args[1] in ('A','B','BT')
+                    self.assertEqual(call.kwargs,{'require_current_rust':True} if current else {})
                 state=r.h.load(fresh/'hosted-state.json')
                 self.assertEqual(state['identity'],r.h.hosted_identity(args,'followup-screen'))
                 self.assertIs(state['identity']['task_json_screen'],selected is True)
                 self.assertIs(state['identity']['common_http_screen'],common is True)
+
+    def test_task_support_recovers_only_missing_ir_from_same_git_and_cli_source_receipt(self):
+        raw=b'enum TaskOp {\n    JsonDecode {\n}\n';commit='b'*40
+        for issue in ('none','git-source','manifest-commit','cli-commit','source-hash','receipt-hash','original-receipt-hash','existing-file'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);cli=root/'B/cli.json';destination=root/'B/src/src/ir/task.rs'
+                r.h.save(cli,dict(candidate_base='c'*40 if issue=='cli-commit' else commit,failure=None,
+                    source_files={'src/ir/task.rs':'0'*64 if issue=='source-hash' else hashlib.sha256(raw).hexdigest()}))
+                r.h.save(root/'B/manifest.json',dict(candidate_base='c'*40 if issue=='manifest-commit' else commit,
+                    stacks={'ku':{'build':dict(cli_build_receipt=r.TOKEN+'/B/cli.json',cli_build_receipt_sha256='f'*64)}}))
+                mapping={'B/cli.json':dict(original_sha256='0'*64 if issue=='original-receipt-hash' else 'f'*64,
+                    archived_sha256='0'*64 if issue=='receipt-hash' else r.h.sha(cli))}
+                if issue=='existing-file':destination.parent.mkdir(parents=True);destination.write_bytes(b'keep conflicting file')
+                with patch.object(r.subprocess,'check_output',return_value=b'wrong Git source' if issue=='git-source' else raw) as git:
+                    if issue!='none':
+                        with self.assertRaises(ValueError):r.restore_task_json_support(root/'repo',root,commit,mapping)
+                        self.assertFalse((root/'reuse-task-json-source-recovery.json').exists())
+                        if issue=='existing-file':self.assertEqual(destination.read_bytes(),b'keep conflicting file')
+                        else:self.assertFalse(destination.exists())
+                    else:
+                        self.assertFalse(destination.exists())
+                        r.restore_task_json_support(root/'repo',root,commit,mapping)
+                        r.h.require_task_json_support(root)
+                        self.assertEqual(destination.read_bytes(),raw)
+                        git.assert_called_once_with(['git','-C',str(root/'repo'),'show',commit+':src/ir/task.rs'],timeout=10)
+                        receipt=r.h.load(root/'reuse-task-json-source-recovery.json')
+                        self.assertTrue(receipt['restored']);self.assertTrue(receipt['cli_source_file_hash_checked'])
+                        self.assertFalse(receipt['original_file_in_archive']);self.assertEqual(receipt['source_commit'],commit)
+                        self.assertEqual(receipt['path'],'B/src/src/ir/task.rs')
 
     def test_reuse_rejects_common_http_without_explicit_task_before_reading_archive(self):
         args=types.SimpleNamespace(common_http_screen=True,task_json_screen=False)

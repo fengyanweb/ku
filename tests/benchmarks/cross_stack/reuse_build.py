@@ -150,6 +150,32 @@ def restore_json_inputs(source, root, commits, mapping):
         scope='source JSON only; git-committed bytes restored without changing protocol expectations or compiled artifacts'))
 
 
+def restore_task_json_support(source,root,commit,mapping):
+    """Recover only the omitted product IR file, bound to the original CLI receipt."""
+    if not re.fullmatch('[0-9a-f]{40}',commit):raise ValueError('full Task JSON product commit required')
+    manifest=translated(h.load(root/'B/manifest.json'),root)
+    if manifest.get('candidate_base')!=commit:raise ValueError('Task JSON source commit differs from cached B')
+    build=manifest['stacks']['ku']['build'];receipt=Path(build['cli_build_receipt'])
+    entry=mapping[receipt.relative_to(root).as_posix()]
+    if entry['original_sha256']!=build['cli_build_receipt_sha256']:raise ValueError('original Task JSON CLI receipt differs')
+    checked(receipt,entry['archived_sha256']);cli=h.load(receipt)
+    if cli.get('candidate_base')!=commit or cli.get('failure') is not None:
+        raise ValueError('Task JSON source differs from the CLI build identity')
+    relative='src/ir/task.rs';raw=subprocess.check_output(['git','-C',str(source),'show',commit+':'+relative],timeout=10)
+    if not 0<len(raw)<=MAX_FILE:raise ValueError('Task JSON Git source byte limit')
+    digest=hashlib.sha256(raw).hexdigest();recorded=cli.get('source_files',{}).get(relative)
+    if recorded is not None and recorded!=digest:raise ValueError('Task JSON Git source differs from CLI source receipt')
+    destination=root/'B/src'/relative;restored=not destination.exists()
+    if restored:destination.parent.mkdir(parents=True,exist_ok=True);destination.write_bytes(raw)
+    checked(destination,digest)
+    h.save(root/'reuse-task-json-source-recovery.json',dict(path=destination.relative_to(root).as_posix(),
+        source_path=relative,source_commit=commit,source='product Git object',sha256=digest,bytes=len(raw),restored=restored,
+        original_file_in_archive=destination.relative_to(root).as_posix() in mapping,
+        cli_source_file_sha256=recorded,cli_source_file_hash_checked=recorded is not None,
+        cli_receipt_original_sha256=entry['original_sha256'],cli_receipt_archived_sha256=entry['archived_sha256'],
+        scope='Only IR support source is verified from Git; this does not claim the archive contained its original file or import compiled artifacts/measurements.'))
+
+
 def validate_protocol_inputs(root, name, mapping):
     base=root/name/'src/tests/benchmarks/cross_stack';path=base/'protocol.json'
     checked(path,mapping[path.relative_to(root).as_posix()]['original_sha256'])
@@ -579,12 +605,16 @@ def prepare(a):
     expected={'A':a.prepatch,**{f'C{i+1}':c for i,c in enumerate(a.screen_variants)},'B':a.candidate,'R':a.candidate}
     if getattr(a,'task_json_screen',False):expected['BT']=a.candidate
     mapping=extract_builds(a.archive,a.root,a.archive_sha256,expected)
-    if getattr(a,'task_json_screen',False):h.require_task_json_support(a.root)
+    if getattr(a,'task_json_screen',False):
+        restore_task_json_support(a.source,a.root,a.candidate,mapping)
+        h.require_task_json_support(a.root)
     restore_json_inputs(a.source,a.root,expected,mapping)
     input_checks={name:validate_protocol_inputs(a.root,name,mapping) for name in expected}
     h.save(a.root/'reuse-input-preflight.json',dict(versions=input_checks,network_requests=0))
     for name,commit in expected.items():
-        verify_manifest(a.root,name,commit,mapping)
+        if getattr(a,'common_http_screen',False) and a.prepatch==h.PG_CURRENT_BASELINE and name in ('A','B','BT'):
+            verify_manifest(a.root,name,commit,mapping,require_current_rust=True)
+        else:verify_manifest(a.root,name,commit,mapping)
         (a.root/name/'tools').symlink_to(a.tools,target_is_directory=True)
     new_driver(a)
     identity=h.hosted_identity(a,'followup-screen')
