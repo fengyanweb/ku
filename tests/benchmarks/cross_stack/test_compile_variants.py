@@ -226,7 +226,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         text,_=self.workflow()
         selection=text.split('\n      self_workload:\n',1)[1].split('\n      screen_variants:',1)[0]
         self.assertIn('pg-input-guard: ordinary db/200rps, ok/2000rps or typed db-typed/200rps',selection)
-        self.assertIn('default: db',selection);self.assertIn('options: [db, ok, db-typed, db-mechanism, db-memory-queue]',selection)
+        self.assertIn('default: db',selection);self.assertIn('options: [db, ok, db-typed, db-mechanism, db-memory-queue, db-memory-stock]',selection)
         job=text.split('\n  pg-input-guard:\n',1)[1].split('\n  pg-input-windows:\n',1)[0]
         self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-read-screen')",job)
         self.assertIn("KU_PG_GUARD_WORKLOAD: ${{ inputs.self_workload || 'db' }}",job)

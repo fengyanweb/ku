@@ -227,7 +227,7 @@ class TypedPgSelfTests(unittest.TestCase):
         import subprocess,textwrap
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
         choice=workflow.split('\n      self_workload:\n',1)[1].split('\n      screen_variants:',1)[0]
-        self.assertIn('default: db',choice);self.assertIn('options: [db, ok, db-typed, db-mechanism, db-memory-queue]',choice)
+        self.assertIn('default: db',choice);self.assertIn('options: [db, ok, db-typed, db-mechanism, db-memory-queue, db-memory-stock]',choice)
         prefix,job=workflow.split('\n  pg-typed-self:\n',1);job,suffix=job.split('\n  pg-input-guard:\n',1)
         self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-typed-self'",job)
         self.assertNotIn('KU_PG_SELF_WORKLOAD',prefix+suffix)
@@ -378,13 +378,58 @@ class TypedPgSelfTests(unittest.TestCase):
     def test_mechanism_workflow_skips_unrelated_setup_and_large_archive(self):
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
         job=workflow.split('\n  pg-typed-self:\n',1)[1].split('\n  pg-input-guard:\n',1)[0]
-        self.assertIn("- if: inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'\n        uses: actions/setup-go",job)
-        self.assertIn("if: inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'\n        timeout-minutes: 1",job)
+        self.assertIn("- if: inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue' && inputs.self_workload != 'db-memory-stock'\n        uses: actions/setup-go",job)
+        self.assertIn("if: inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue' && inputs.self_workload != 'db-memory-stock'\n        timeout-minutes: 1",job)
         self.assertIn('pg_self_sampling=()',job)
         self.assertIn("if: always() && inputs.self_workload != 'db-mechanism'",job)
         self.assertIn('mechanism-probe/**/resources.json',job);self.assertIn('mechanism-derived/**/*.c',job)
         self.assertNotIn('mechanism-derived/**/bin',job);self.assertNotIn('cargo +1.99.1 build',job)
-        self.assertIn("if: inputs.self_workload != 'db-memory-queue'",job)
+        self.assertIn("if: inputs.self_workload != 'db-memory-queue' && inputs.self_workload != 'db-memory-stock'",job)
         self.assertIn('stock_workqueue_probe.py',job);self.assertIn('drain-observer/*.txt',job)
+
+    def test_direct_stock_mode_reuses_cache_and_installs_only_its_small_layout_tool(self):
+        import hashlib,subprocess,textwrap
+        checkout=Path(__file__).resolve().parents[3]
+        workflow=(checkout/'.github/workflows/native-three-os.yml').read_text()
+        job=workflow.split('\n  pg-typed-self:\n',1)[1].split('\n  pg-input-guard:\n',1)[0]
+        setup=job.split('- name: Reuse the existing compiler, paths and software sampler setup',1)[1]
+        setup=textwrap.dedent(setup.split('run: |\n',1)[1].split('          mkdir -p',1)[0])
+        stubs='sudo() { printf "%s\\n" "$*"; }; rustup() { printf "rustup %s\\n" "$*"; }; apt-cache() { return 1; };\n'
+        for workload in ('db-memory-stock','db-memory-queue','db-mechanism','db','ok'):
+            with self.subTest(workload=workload):
+                result=subprocess.run(['bash','-eu'],input=stubs+setup,text=True,capture_output=True,
+                    env={'KU_PG_SELF_WORKLOAD':workload},timeout=5)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual('install -y --no-install-recommends pahole' in result.stdout,workload=='db-memory-stock')
+                if workload in ('db-memory-stock','db-memory-queue','db-mechanism'):
+                    self.assertNotIn('rustup ',result.stdout);self.assertNotIn('linux-tools',result.stdout)
+                    self.assertNotIn('llvm-18',result.stdout)
+        self.assertIn('key: ku-pg-baseline-d05-rust1.99.1-',job)
+        self.assertIn('reuse_build.prepare_current_typed_pg_cache(',job)
+        source=checkout/'tests/benchmarks/cross_stack/direct_stock_probe.py'
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),
+            'a05a7ad63ce49e874ca4b40bb55bc2f94a455d47029e5eafb57bc66d4548fca6')
+
+    def test_direct_stock_workflow_runs_once_and_preserves_nested_raw_and_lifecycle(self):
+        workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
+        job=workflow.split('\n  pg-typed-self:\n',1)[1].split('\n  pg-input-guard:\n',1)[0]
+        direct=job.split('- name: Observe one baseline target stock boundary once',1)[1].split('- name:',1)[0]
+        self.assertIn("if: inputs.self_workload == 'db-memory-stock'",direct)
+        self.assertEqual(direct.count('direct_stock_probe.py'),1)
+        self.assertIn('--root "$RUNNER_TEMP/ku-normal-memory-observation"',direct)
+        self.assertIn('--normal-manifest "$KU_PG_CURRENT_BUILD/B/manifest.json"',direct)
+        self.assertIn('--typed-manifest "$KU_PG_CURRENT_BUILD/BP/manifest.json"',direct)
+        self.assertNotIn('continue-on-error',direct);self.assertNotIn('typed_pg_self.py',direct)
+        for name in ('Validate the exact fp sampling format on this boot',
+                     'Observe only the selected current caller question',
+                     'Preserve the existing build and observation archive formats'):
+            selected=job.split('- name: '+name,1)[1].split('shell: bash',1)[0]
+            self.assertIn("inputs.self_workload != 'db-memory-stock'",selected)
+        for pattern in ('observer/direct-stock/*.json','observer/direct-stock/*.txt',
+                        'observer/*.json','observer/*.txt','normal-memory-window/window.json',
+                        'normal-memory-window/**/client.json','normal-memory-window/**/resources.json',
+                        'normal-memory-window/**/service.json','normal-memory-window/**/full-lifecycle.json',
+                        'normal-memory-window/**/termination.json'):
+            self.assertIn('${{ runner.temp }}/ku-normal-memory-observation/'+pattern,job)
 
 if __name__=='__main__':unittest.main()

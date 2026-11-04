@@ -22,7 +22,7 @@ on:
         description: 'pg-typed-self: PG or ordinary /ok SELF, db-mechanism joint confirmation; pg-input-guard: ordinary db/200rps, ok/2000rps or typed db-typed/200rps'
         type: choice
         default: db
-        options: [db, ok, db-typed, db-mechanism, db-memory-queue]
+        options: [db, ok, db-typed, db-mechanism, db-memory-queue, db-memory-stock]
       screen_variants:
         description: 'Up to seven full commit ablations, comma-separated, in one serial followup-screen; no extra formal matrix'
         type: string
@@ -211,7 +211,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - if: inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'
+      - if: inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue' && inputs.self_workload != 'db-memory-stock'
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: '1.27.2'
@@ -220,10 +220,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          case "$KU_PG_SELF_WORKLOAD" in db|ok|db-mechanism|db-memory-queue) ;; *) echo 'unsupported SELF workload' >&2; exit 1 ;; esac
+          case "$KU_PG_SELF_WORKLOAD" in db|ok|db-mechanism|db-memory-queue|db-memory-stock) ;; *) echo 'unsupported SELF workload' >&2; exit 1 ;; esac
           sudo apt-get update -qq
-          if [ "$KU_PG_SELF_WORKLOAD" = db-mechanism ] || [ "$KU_PG_SELF_WORKLOAD" = db-memory-queue ]; then
+          if [ "$KU_PG_SELF_WORKLOAD" = db-mechanism ] || [ "$KU_PG_SELF_WORKLOAD" = db-memory-queue ] || [ "$KU_PG_SELF_WORKLOAD" = db-memory-stock ]; then
             sudo apt-get install -y --no-install-recommends clang-18 libpq-dev postgresql-16
+            if [ "$KU_PG_SELF_WORKLOAD" = db-memory-stock ]; then
+              sudo apt-get install -y --no-install-recommends pahole
+            fi
           else
             rustup toolchain install 1.99.1 --profile minimal --no-self-update
             rustup default 1.99.1
@@ -236,7 +239,7 @@ jobs:
             done
           fi
           mkdir -p "$RUNNER_TEMP/ku-pg-current-tools/bin" "$RUNNER_TEMP/ku-pg-current-1.99.1"
-          if [ "$KU_PG_SELF_WORKLOAD" != db-mechanism ] && [ "$KU_PG_SELF_WORKLOAD" != db-memory-queue ]; then
+          if [ "$KU_PG_SELF_WORKLOAD" != db-mechanism ] && [ "$KU_PG_SELF_WORKLOAD" != db-memory-queue ] && [ "$KU_PG_SELF_WORKLOAD" != db-memory-stock ]; then
           pg_perf_binary="$(readlink -e "/usr/lib/linux-tools/$(uname -r)/perf" || true)"
           if [ -z "$pg_perf_binary" ] || [ ! -x "$pg_perf_binary" ]; then
             pg_perf_binary="$(find -L /usr/lib/linux-tools* /usr/lib/linux-azure-tools* -maxdepth 2 -type f -name perf -print 2>/dev/null | sort -V | tail -n 1 || true)"
@@ -246,7 +249,7 @@ jobs:
           fi
           ln -s "${CARGO_HOME:-$HOME/.cargo}" "$RUNNER_TEMP/ku-pg-current-tools/cargo"
           ln -s "${RUSTUP_HOME:-$HOME/.rustup}" "$RUNNER_TEMP/ku-pg-current-tools/rustup"
-          if [ "$KU_PG_SELF_WORKLOAD" != db-mechanism ] && [ "$KU_PG_SELF_WORKLOAD" != db-memory-queue ]; then
+          if [ "$KU_PG_SELF_WORKLOAD" != db-mechanism ] && [ "$KU_PG_SELF_WORKLOAD" != db-memory-queue ] && [ "$KU_PG_SELF_WORKLOAD" != db-memory-stock ]; then
             ln -s "$(dirname "$(dirname "$(command -v go)")")" "$RUNNER_TEMP/ku-pg-current-tools/go"
           fi
           printf 'KU_PG_CURRENT_BUILD=%s\n' "$RUNNER_TEMP/ku-pg-current-1.99.1" >> "$GITHUB_ENV"
@@ -300,8 +303,18 @@ jobs:
             --root "$RUNNER_TEMP/ku-normal-memory-observation" --tools "$RUNNER_TEMP/ku-pg-current-tools" \
             --normal-manifest "$KU_PG_CURRENT_BUILD/B/manifest.json" --typed-manifest "$KU_PG_CURRENT_BUILD/BP/manifest.json" \
             > "$RUNNER_TEMP/ku-normal-memory-observation.log" 2>&1
+      - name: Observe one baseline target stock boundary once
+        if: inputs.self_workload == 'db-memory-stock'
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B tests/benchmarks/cross_stack/direct_stock_probe.py \
+            --root "$RUNNER_TEMP/ku-normal-memory-observation" --tools "$RUNNER_TEMP/ku-pg-current-tools" \
+            --normal-manifest "$KU_PG_CURRENT_BUILD/B/manifest.json" --typed-manifest "$KU_PG_CURRENT_BUILD/BP/manifest.json" \
+            > "$RUNNER_TEMP/ku-normal-memory-observation.log" 2>&1
       - name: Validate the exact fp sampling format on this boot
-        if: inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'
+        if: inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue' && inputs.self_workload != 'db-memory-stock'
         timeout-minutes: 1
         shell: bash
         run: |
@@ -309,7 +322,7 @@ jobs:
           sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --preflight --callchains \
             --root "$KU_PG_CURRENT_BUILD" --tools "$RUNNER_TEMP/ku-pg-current-tools" --current-product "$KU_PG_PRODUCT"
       - name: Observe only the selected current caller question
-        if: inputs.self_workload != 'db-memory-queue'
+        if: inputs.self_workload != 'db-memory-queue' && inputs.self_workload != 'db-memory-stock'
         timeout-minutes: ${{ inputs.self_workload == 'db-mechanism' && 8 || 6 }}
         shell: bash
         run: |
@@ -318,7 +331,7 @@ jobs:
           pg_self_sampling=(--callchains --preflight-root "$KU_PG_CURRENT_BUILD")
           if [ "$KU_PG_SELF_WORKLOAD" = ok ]; then
             pg_self_args=(--workload ok --only B)
-          elif [ "$KU_PG_SELF_WORKLOAD" = db-mechanism ] || [ "$KU_PG_SELF_WORKLOAD" = db-memory-queue ]; then
+          elif [ "$KU_PG_SELF_WORKLOAD" = db-mechanism ] || [ "$KU_PG_SELF_WORKLOAD" = db-memory-queue ] || [ "$KU_PG_SELF_WORKLOAD" = db-memory-stock ]; then
             pg_self_args=(--mechanism --mechanism-recipe "$GITHUB_WORKSPACE/tests/benchmarks/cross_stack/pg_owner_mechanism.py")
             pg_self_sampling=()
           fi
@@ -327,7 +340,7 @@ jobs:
             --normal-manifest "$KU_PG_CURRENT_BUILD/B/manifest.json" --typed-manifest "$KU_PG_CURRENT_BUILD/BP/manifest.json" \
             --current-product "$KU_PG_PRODUCT" "${pg_self_sampling[@]}" "${pg_self_args[@]}" > "$RUNNER_TEMP/ku-pg-current-observation.log" 2>&1
       - name: Preserve the existing build and observation archive formats
-        if: always() && inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'
+        if: always() && inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue' && inputs.self_workload != 'db-memory-stock'
         timeout-minutes: 3
         shell: bash
         run: |
@@ -344,7 +357,7 @@ jobs:
           PY
             fi
           done
-      - if: always() && inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'
+      - if: always() && inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue' && inputs.self_workload != 'db-memory-stock'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ku-pg-current-build-reuse
@@ -353,7 +366,7 @@ jobs:
             ${{ runner.temp }}/ku-pg-current-1.99.1/prepared-current.json
             ${{ runner.temp }}/ku-pg-current-1.99.1/reuse-provenance
           retention-days: 14
-      - if: always() && inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue'
+      - if: always() && inputs.self_workload != 'db-mechanism' && inputs.self_workload != 'db-memory-queue' && inputs.self_workload != 'db-memory-stock'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ku-pg-typed-self
@@ -375,6 +388,8 @@ jobs:
             ${{ runner.temp }}/ku-normal-memory-observation/observer/*.json
             ${{ runner.temp }}/ku-normal-memory-observation/observer/*.log
             ${{ runner.temp }}/ku-normal-memory-observation/observer/*.txt
+            ${{ runner.temp }}/ku-normal-memory-observation/observer/direct-stock/*.json
+            ${{ runner.temp }}/ku-normal-memory-observation/observer/direct-stock/*.txt
             ${{ runner.temp }}/ku-normal-memory-observation/drain-observer/*.json
             ${{ runner.temp }}/ku-normal-memory-observation/drain-observer/*.txt
             ${{ runner.temp }}/ku-normal-memory-observation/frozen-drain-plan.json
@@ -387,6 +402,9 @@ jobs:
             ${{ runner.temp }}/ku-normal-memory-observation/normal-memory-window/window.json
             ${{ runner.temp }}/ku-normal-memory-observation/normal-memory-window/**/client.json
             ${{ runner.temp }}/ku-normal-memory-observation/normal-memory-window/**/resources.json
+            ${{ runner.temp }}/ku-normal-memory-observation/normal-memory-window/**/service.json
+            ${{ runner.temp }}/ku-normal-memory-observation/normal-memory-window/**/full-lifecycle.json
+            ${{ runner.temp }}/ku-normal-memory-observation/normal-memory-window/**/termination.json
             ${{ runner.temp }}/ku-pg-current-observation/summary.json
             ${{ runner.temp }}/ku-pg-current-observation/results.json
             ${{ runner.temp }}/ku-pg-current-observation/frozen-plan.json
