@@ -11,11 +11,13 @@ INPUTS={'B':'59ede7cdba403d4d038c3720ab65f1cd940efd1038d07df782743a35eb9887ae',
         'BP':'d9b5ea46dd2b401ae368471a822efa8467efa64c50e4b5966681c0d2a21bc4a0'}
 
 
-def mechanism_plan(versions, original_bindings, recipe):
+def mechanism_plan(versions, original_bindings, recipe, *, product=None):
+    product=h.PG_CURRENT_BASELINE if product is None else product
+    if not re.fullmatch('[0-9a-f]{40}',product):raise ValueError('full mechanism product required')
     return dict(schema='ku-current-pg-mechanism-v1',versions=versions,
         original_bindings=original_bindings,recipe=recipe,entry_sha256=h.sha(__file__),
         resources=copy.deepcopy(h.RESOURCES),quality_policy=copy.deepcopy(h.POLICY),
-        current_product=h.PG_CURRENT_BASELINE,workload='db',contract='pg-strict',rate=200,
+        current_product=product,workload='db',contract='pg-strict',rate=200,
         warmup_seconds=3,score_seconds=15,order=[['B','mechanism'],['BP','mechanism']],
         maximum_windows=2,maximum_replacements=0,observation_alarm_seconds=420,
         diagnostic_only=True,instrumented=True,formal_qualified=False,normal_score_eligible=False,
@@ -26,14 +28,32 @@ def mechanism_plan(versions, original_bindings, recipe):
             'score and warmup request denominators remain separately retained.')
 
 
-def prepare_mechanism(a, source_plan, original_bindings):
+def prepare_mechanism(a, source_plan, original_bindings, *, product=None, expected_files=None):
     """Compile only two private derived C programs from verified current cache."""
     from compile_variants import Commands, clean_environment
     import reuse_build
-    expected={'B':reuse_build.CURRENT_PG_FILES,'BP':reuse_build.CURRENT_TYPED_PG_FILES}
+    if product is None:
+        if expected_files is not None:raise ValueError('alternate expected files require an explicit candidate product')
+        product=h.PG_CURRENT_BASELINE
+        expected={'B':reuse_build.CURRENT_PG_FILES,'BP':reuse_build.CURRENT_TYPED_PG_FILES}
+    else:
+        if not re.fullmatch('[0-9a-f]{40}',product) or product==h.PG_CURRENT_BASELINE:
+            raise ValueError('explicit distinct full candidate product required')
+        if (not isinstance(expected_files,dict) or set(expected_files)!={'B','BP'}
+                or any(not isinstance(files,dict) or not files or any(not isinstance(v,str)
+                    or not re.fullmatch('[0-9a-f]{64}',v) for v in files.values()) for files in expected_files.values())):
+            raise ValueError('explicit candidate requires complete B/BP file SHA256 identities')
+        expected=copy.deepcopy(expected_files)
+    if set(source_plan.get('versions',{}))!={'B','BP'} or set(original_bindings)!={'B','BP'}:
+        raise ValueError('exact ordinary and typed mechanism parents required')
     for name in ('B','BP'):
+        if (source_plan['versions'][name].get('source_commit')!=product
+                or original_bindings[name].get('source_commit')!=product):
+            raise ValueError('mechanism parent source product differs: '+name)
         if {key:value['sha256'] for key,value in original_bindings[name]['files'].items()}!=expected[name]:
-            raise ValueError('mechanism requires exact cached d05 Rust1.99.1 inputs: '+name)
+            raise ValueError('mechanism requires exact declared normal input files: '+name)
+        if fc.version_identity(source_plan,name)!=original_bindings[name]:
+            raise ValueError('mechanism parent files changed before derivation: '+name)
     recipe=a.mechanism_recipe
     if recipe.is_symlink() or not recipe.is_file() or recipe.stat().st_size>256<<10:
         raise ValueError('bounded plain mechanism recipe required')
@@ -52,6 +72,7 @@ def prepare_mechanism(a, source_plan, original_bindings):
         if h.sha(recipe)!=recipe_sha:raise ValueError('mechanism recipe changed while deriving C')
         arm=directory/name;arm.mkdir();generated=arm/'mechanism.c';generated.write_text(derived)
         manifest=copy.deepcopy(h.load(Path(source_plan['versions'][name]['root'])/'manifest.json'))
+        if manifest.get('candidate_base')!=product:raise ValueError('mechanism manifest product differs: '+name)
         stack=manifest['stacks']['ku'];build=stack['build'];native=build['native']['server']
         invocation=native['compiler_invocation'];libraries=invocation['library_inputs']
         if len(libraries)!=1 or libraries[0]['role']!='libpq' or invocation['flags']!=['-std=c11','-O2','-pthread']:
@@ -84,15 +105,15 @@ def prepare_mechanism(a, source_plan, original_bindings):
         stack['command']=[str(binary)];build.update(instrumented='pg-owner-mechanism-v1',normal_score_eligible=False)
         manifest.update(diagnostic_only=True,normal_score_eligible=False)
         h.save(arm/'manifest.json',manifest)
-        versions[name]=dict(root=str(arm),stack='ku',source_commit=h.PG_CURRENT_BASELINE,
+        versions[name]=dict(root=str(arm),stack='ku',source_commit=product,
             binary_sha256=h.sha(binary),diagnostic_only=True,normal_score_eligible=False,
             artifacts=copy.deepcopy(source_plan['versions'][name].get('artifacts',{})))
         receipts[name]=dict(path=str(receipt),sha256=h.sha(receipt))
         if fc.version_identity(source_plan,name)!=old:raise ValueError('cached source/ELF/CLI/driver changed during mechanism derivation')
-    plan=mechanism_plan(versions,original_bindings,dict(path=str(recipe),sha256=recipe_sha))
+    plan=mechanism_plan(versions,original_bindings,dict(path=str(recipe),sha256=recipe_sha),product=product)
     plan['original_versions']=copy.deepcopy(source_plan['versions'])
     bindings={name:fc.version_identity(plan,name) for name in versions}
-    h.save(a.root/'mechanism-build.json',dict(original_bindings=original_bindings,bindings=bindings,
+    h.save(a.root/'mechanism-build.json',dict(product=product,expected_parent_files=expected,original_bindings=original_bindings,bindings=bindings,
         compile_receipts=receipts,recipe=plan['recipe'],product_Rust_rebuilt=False,
         original_artifacts_unchanged=True,instrumented=True,normal_score_eligible=False))
     h.save(a.root/'frozen-plan.json',plan)

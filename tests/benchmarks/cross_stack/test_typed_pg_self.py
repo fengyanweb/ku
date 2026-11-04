@@ -249,6 +249,12 @@ class TypedPgSelfTests(unittest.TestCase):
         self.assertTrue(p['instrumented']);self.assertFalse(p['normal_score_eligible']);self.assertFalse(p['formal_qualified'])
         self.assertNotIn('event',p);self.assertNotIn('perf_frequency',p)
         self.assertEqual(p['original_bindings']['B'],{'frozen':1})
+        self.assertEqual(p['current_product'],t.h.PG_CURRENT_BASELINE)
+        candidate='c'*40
+        q=t.mechanism_plan({}, {}, {'sha256':'b'*64},product=candidate)
+        self.assertEqual(q['current_product'],candidate)
+        self.assertEqual(q['maximum_windows'],2);self.assertFalse(q['normal_score_eligible'])
+        with self.assertRaises(ValueError):t.mechanism_plan({}, {}, {},product='short')
 
     def test_mechanism_records_are_bounded_and_no_missing_output_passes(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -332,6 +338,42 @@ class TypedPgSelfTests(unittest.TestCase):
                 self.assertEqual(build['native']['server']['source_sha256'],bindings[name]['files']['expanded source']['sha256'])
                 self.assertNotEqual(new[name]['files']['ELF']['sha256'],bindings[name]['files']['ELF']['sha256'])
                 self.assertTrue(build['instrumented']);self.assertFalse(m['normal_score_eligible'])
+            # The alternate path must explicitly bind both real source commits
+            # and every normal file; it cannot override the cached default.
+            candidate='c'*40
+            for name in versions:
+                manifests[name]['candidate_base']=candidate
+                t.h.save(root/name/'manifest.json',manifests[name])
+                versions[name]['source_commit']=candidate
+            bindings={n:t.fc.version_identity(plan,n)for n in versions}
+            expected={n:{key:value['sha256']for key,value in bindings[n]['files'].items()}for n in versions}
+            with patch.object(cv,'Commands',FakeCommands):
+                args=types.SimpleNamespace(root=root/'candidate-out',tools=root,mechanism_recipe=recipe)
+                args.root.mkdir()
+                with self.assertRaisesRegex(ValueError,'explicit distinct full candidate'):
+                    t.prepare_mechanism(args,plan,bindings,product='short',expected_files=expected)
+                with self.assertRaisesRegex(ValueError,'explicit candidate'):
+                    t.prepare_mechanism(args,plan,bindings,product=candidate)
+                with self.assertRaisesRegex(ValueError,'explicit candidate product'):
+                    t.prepare_mechanism(args,plan,bindings,expected_files=expected)
+                with self.assertRaisesRegex(ValueError,'source product'):
+                    t.prepare_mechanism(args,plan,bindings)
+                mixed=copy.deepcopy(bindings);mixed['BP']['source_commit']=t.h.PG_CURRENT_BASELINE
+                with self.assertRaisesRegex(ValueError,'source product'):
+                    t.prepare_mechanism(args,plan,mixed,product=candidate,expected_files=expected)
+                mixed_plan=copy.deepcopy(plan);mixed_plan['versions']['B']['source_commit']=t.h.PG_CURRENT_BASELINE
+                with self.assertRaisesRegex(ValueError,'source product'):
+                    t.prepare_mechanism(args,mixed_plan,bindings,product=candidate,expected_files=expected)
+                incomplete=copy.deepcopy(expected);incomplete['B'].pop('driver ELF')
+                with self.assertRaisesRegex(ValueError,'exact declared'):
+                    t.prepare_mechanism(args,plan,bindings,product=candidate,expected_files=incomplete)
+                self.assertEqual(len(commands),6)
+                derived,new=t.prepare_mechanism(args,plan,bindings,product=candidate,expected_files=expected)
+            self.assertEqual(len(commands),12);self.assertEqual(derived['current_product'],candidate)
+            self.assertEqual({n:new[n]['source_commit'] for n in new},{'B':candidate,'BP':candidate})
+            self.assertTrue(all(v['source_commit']==candidate for v in derived['versions'].values()))
+            self.assertTrue(derived['instrumented']);self.assertFalse(derived['normal_score_eligible'])
+            self.assertEqual(t.h.load(args.root/'mechanism-build.json')['product'],candidate)
 
     def test_mechanism_workflow_skips_unrelated_setup_and_large_archive(self):
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
