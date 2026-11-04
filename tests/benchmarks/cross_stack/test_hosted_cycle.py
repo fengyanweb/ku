@@ -117,6 +117,46 @@ class HostedCycleTests(unittest.TestCase):
             with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(**dict(current,**change)),'diagnostic')
         with self.assertRaises(ValueError):h.pg_input_guard_plan({},'c'*40,h.BASELINE)
 
+    def test_pg_input_guard_ok_has_fixed_plan_distinct_identity_and_exclusive_scope(self):
+        import hashlib
+        self.assertEqual(hashlib.sha256(h.encoded(h.pg_input_guard_plan({}))).hexdigest(),
+            'b65fe42352fb4a097d9c758f2418e055637253d27be65348b80c72ccb7f48e83')
+        self.assertEqual(h.pg_input_guard_plan({}),h.pg_input_guard_plan({},workload='db'))
+        base=dict(baseline=h.PG_CURRENT_BASELINE,candidate='c'*40,prepatch=h.PG_CURRENT_BASELINE,
+            screen_variants=[],pg_input_guard=True)
+        legacy=h.hosted_identity(types.SimpleNamespace(**base),'diagnostic')
+        explicit_db=h.hosted_identity(types.SimpleNamespace(**base,pg_input_guard_workload='db'),'diagnostic')
+        self.assertEqual(legacy,explicit_db);self.assertNotIn('pg_input_guard_workload',legacy)
+        ok=h.hosted_identity(types.SimpleNamespace(**base,pg_input_guard_workload='ok'),'diagnostic')
+        self.assertEqual(ok,dict(legacy,pg_input_guard_workload='ok'))
+        plan=h.pg_input_guard_plan({},base['candidate'],base['baseline'],'ok')
+        self.assertEqual((plan['maximum_windows'],plan['maximum_replacements'],len(plan['windows'])),(27,0,27))
+        self.assertEqual(plan['pg_input_guard_workload'],'ok')
+        self.assertEqual(plan['guard_thresholds'],h.pg_input_guard_plan({})['guard_thresholds'])
+        self.assertTrue(all((c['workload'],c['contract'],c['rate'],c['warmup_seconds'],c['score_seconds'])
+            ==('ok','text',2000,3,15) for c in plan['windows']))
+        self.assertEqual([(c['group'],c['name']) for c in plan['windows'][3:]],
+            [(g,n) for g in range(1,13) for n in (('A','B') if g%2 else ('B','A'))])
+        for change in ({'pg_input_guard':False},{'pg_input_guard_workload':'cpu'},
+                {'baseline':h.PG_INPUT_PREPATCH,'prepatch':h.PG_INPUT_PREPATCH}):
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(**dict(base,**dict({'pg_input_guard_workload':'ok'},**change))),'diagnostic')
+        for workload in ('cpu','db;ok'):
+            with self.assertRaises(ValueError):h.pg_input_guard_plan({},base['candidate'],base['baseline'],workload)
+
+    def test_pg_input_guard_ok_comparison_rejects_mixed_workload_and_changed_contract(self):
+        plan=h.pg_input_guard_plan({},'c'*40,h.PG_CURRENT_BASELINE,'ok')
+        rows=[dict(c,window_seconds=15,observation_complete=True,functional_valid=True,accounting_valid=True,all_correct=True,
+            natural_reclamation=True,arrival_schedule_quality='pass',environment_quality='pass',measurement_invalid=False,
+            observed_environment_faults=[],diagnostic_quality={'valid':True},comparison_contract='same-ok',full_cpu_us=100,
+            memory={'steady_median_bytes':1000}) for c in plan['windows']]
+        with patch.object(fc,'paired_interval',return_value=dict(status='estimated',lower95=.99,upper95=1.02)):
+            self.assertTrue(h.pg_input_guard_comparison(rows,True,{'quality':'pass'},'ok')['eligible_for_root_review'])
+            for field,value in (('workload','db'),('contract','pg-strict'),('rate',200),('warmup_seconds',5),('window_seconds',10)):
+                with self.subTest(field=field):
+                    changed=json.loads(json.dumps(rows));changed[3][field]=value
+                    self.assertFalse(h.pg_input_guard_comparison(changed,True,{'quality':'pass'},'ok')['eligible_for_root_review'])
+
     def test_pg_input_guard_comparison_never_passes_unknown_or_partial(self):
         rows=[dict(c,observation_complete=True,functional_valid=True,accounting_valid=True,all_correct=True,
             natural_reclamation=True,arrival_schedule_quality='pass',environment_quality='pass',measurement_invalid=False,
@@ -173,9 +213,12 @@ class HostedCycleTests(unittest.TestCase):
             self.assertEqual(calls,[('A','ku'),('B','ku'),('Driver','driver',True)])
 
     def test_pg_input_guard_runner_stops_controls_or_invalid_window_without_replacement(self):
-        for issue in ('none','control-quality','environment-unknown','environment-fail','arrival','cleanup','database','flags','business'):
+        for issue in ('none','ok','workload-mismatch','control-quality','environment-unknown','environment-fail','arrival','cleanup','database','flags','business'):
             with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
-                root=Path(temp);plan=h.pg_input_guard_plan({n:dict(root=str(root/n),stack='ku') for n in ('A','B')})
+                root=Path(temp);guard_workload='ok' if issue in ('ok','workload-mismatch') else 'db'
+                baseline=h.PG_CURRENT_BASELINE if guard_workload=='ok' else h.PG_INPUT_PREPATCH
+                plan=h.pg_input_guard_plan({n:dict(root=str(root/n),stack='ku') for n in ('A','B')},
+                    h.PG_INPUT_CANDIDATE,baseline,'db' if issue=='workload-mismatch' else guard_workload)
                 h.save(root/'frozen-plan.json',plan);manifest=root/'fixture/manifest.json';state_path=root/'fixture/state.json'
                 h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'});h.save(state_path,{'limits':{}})
                 fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=state_path,
@@ -185,7 +228,7 @@ class HostedCycleTests(unittest.TestCase):
                 if issue=='flags':mode['native_flags']['server']=['-std=c11','-O3','-pthread']
                 patches.enter_context(patch.object(h.os,'geteuid',return_value=0));database=patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
                 patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:dict(stack='ku',build_mode=mode,
-                    source_commit=h.PG_INPUT_PREPATCH if n=='A' else h.PG_INPUT_CANDIDATE,
+                    source_commit=baseline if n=='A' else h.PG_INPUT_CANDIDATE,
                     files={'expanded source':{'sha256':'a'*64 if issue=='business' and n=='A' else 'b'*64}})))
                 patches.enter_context(patch.object(fc,'service_termination_succeeded',side_effect=lambda s,t:t.get('natural') is True))
                 patches.enter_context(patch.object(h,'sha',return_value='f'*64));measured=[]
@@ -193,28 +236,36 @@ class HostedCycleTests(unittest.TestCase):
                     'unknown' if issue=='environment-unknown' else 'fail' if issue=='environment-fail' else 'pass'}))
                 def window(p,name,workload,rate,warmup,duration,output,**kwargs):
                     control='environment-controls' in Path(output).parts;measured.append((name,workload,control))
+                    self.assertEqual((workload,rate,warmup,duration),(guard_workload,2000 if guard_workload=='ok' else 200,3,15))
+                    if guard_workload=='ok':self.assertIn('pg-input-guard-ok',Path(output).parts)
                     row=dict(status='observed',score_started=True,functional_valid=not(issue=='control-quality' and control),accounting_valid=True,
                         all_correct=True,natural_reclamation=True,arrival_schedule_quality='fail' if issue=='arrival' and not control else 'pass',
                         environment_quality='unknown' if control else 'pass',measurement_invalid=False,
+                        contract='text' if guard_workload=='ok' else 'pg-strict',rate=rate,warmup_seconds=warmup,window_seconds=duration,
                         full_cpu_us=97 if name=='B' else 100,memory={'steady_median_bytes':1000},comparison_contract='same-pg',cleanup=[{'natural':True}])
-                    self.assertEqual(kwargs['job']['contract'],'pg-strict')
+                    self.assertEqual(kwargs['job']['contract'],'text' if guard_workload=='ok' else 'pg-strict')
                     for part in ('warmup','score'):
                         report=Path(output)/part/'client.json';h.save(report,dict(service_cost=dict(before={'observed':True},after={'observed':True},
                             driver_headroom={'fraction_of_quota':.3,'saturated':False})))
                         h.save(Path(output)/part/'driver-cleanup.json',dict(process_reaped=not(issue=='cleanup' and not control),cgroup_removed=True,after={'process_count':0}))
                     row['score_report']=str(Path(output)/'score/client.json');return row
-                patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,pg_input_guard=True,candidate=h.PG_INPUT_CANDIDATE)
-                if issue in ('flags','business'):
+                patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,pg_input_guard=True,
+                    candidate=h.PG_INPUT_CANDIDATE,prepatch=baseline,pg_input_guard_workload=guard_workload)
+                if issue in ('flags','business','workload-mismatch'):
                     with self.assertRaises(ValueError):h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
                     self.assertEqual(measured,[]);database.assert_not_called();continue
                 result=h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
                 self.assertEqual(len(measured),1 if issue=='control-quality' else 3 if issue.startswith('environment') else 4 if issue in ('arrival','cleanup') else 27)
-                self.assertEqual(result['execution_complete'],issue=='none');self.assertFalse(result['candidate_accepted'])
+                self.assertEqual(result['execution_complete'],issue in ('none','ok'));self.assertFalse(result['candidate_accepted'])
                 self.assertEqual(env.call_count,0 if issue=='control-quality' else 1)
-                if issue=='none':
+                if issue in ('none','ok'):
                     self.assertEqual([x[2] for x in measured[:3]],[True]*3)
                     self.assertEqual(result['environment_qualification']['quality'],'pass')
                     self.assertTrue(result['comparison']['eligible_for_root_review'])
+                    if issue=='ok':
+                        self.assertEqual(h.load(root/'pg-input-guard-ok/identity.json')['pg_input_guard_workload'],'ok')
+                        self.assertTrue((root/'pg-input-guard-ok-observation/summary.json').is_file())
+                        self.assertFalse((root/'pg-input-guard').exists())
                 else:self.assertFalse(result['comparison']['eligible_for_root_review'])
 
     def test_http_short_plan_is_three_original_controls_and_only_twenty_business_windows(self):
