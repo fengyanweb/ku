@@ -408,7 +408,7 @@ class TypedPgSelfTests(unittest.TestCase):
         self.assertIn('reuse_build.prepare_current_typed_pg_cache(',job)
         source=checkout/'tests/benchmarks/cross_stack/direct_stock_probe.py'
         self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),
-            '43a7d9a26280c6fad4d31cb4fcf89e7d106710a4980ed7347c8af82694b3453e')
+            '9ccc1c410dc6c7c02e99510d70fa6448857af1fc9c3543fad31b047de9955ba8')
 
     def test_direct_stock_definition_failure_keeps_exact_command_error_and_traceback(self):
         import direct_stock_probe as stock
@@ -476,9 +476,9 @@ class TypedPgSelfTests(unittest.TestCase):
                     patch.object(Path,'write_text',side_effect=lambda text: writes.append(text)),patch.object(Path,'read_text',return_value=fields),\
                     patch.object(probe,'_append_definition',side_effect=append):
                 probe._prepare()
-            self.assertEqual(len(commands),7);self.assertTrue(commands[0].startswith('p:'))
+            self.assertEqual(len(commands),5);self.assertTrue(commands[0].startswith('p:'))
             self.assertTrue(all(command.startswith(('f:','f64:')) for command in commands[1:]))
-            self.assertEqual(sum('%return ' in command for command in commands),3)
+            self.assertEqual(sum('%return ' in command for command in commands),2)
             self.assertTrue(all('$arg1' in command for command in commands))
             self.assertNotIn('%x0','\n'.join(commands));self.assertEqual(probe.info['backend'],'fprobe')
             self.assertTrue(probe.info['miss_counts_unknown']);self.assertEqual(probe.info['profile_before'],{})
@@ -515,6 +515,29 @@ class TypedPgSelfTests(unittest.TestCase):
             info=json.loads((Path(temp)/'direct-stock-finish.json').read_text())['info']
             self.assertFalse(info['observation_complete']);self.assertTrue(info['positive_pair_only'])
             self.assertEqual(info['observation_failures'],['fprobe_miss_counts_unknown'])
+
+    def test_direct_stock_four_profiles_accept_complete_target_drain_pairs_only(self):
+        import direct_stock_probe as stock
+        with tempfile.TemporaryDirectory() as temp:
+            domain=types.SimpleNamespace(__init__=object(),remove=object())
+            probe=stock.DirectStock(types.SimpleNamespace(Domain=domain),Path(temp))
+            self.assertEqual(set(probe.names),{'ce','cr','de','dr'})
+            raw=('worker-10 [002] d.... 1.000001: '+probe.names['de']+': stock=0x10 index=1 n1=65 c1=0x99\n'
+                 'worker-10 [002] d.... 1.000002: '+probe.names['dr']+': stock=0x10 index=1 n1=0\n'
+                 'other-11 [003] d.... 1.000003: '+probe.names['dr']+': stock=0x20 index=0 n0=0\n').encode()
+            association=stock.trace_readback(raw,probe.names)
+            self.assertTrue(association['target_pairs_complete']);self.assertEqual(len(association['pairs']),1)
+            self.assertEqual(association['unknown_target_drain_returns'],1)
+            pair=association['pairs'][0];self.assertEqual((pair['pages_before'],pair['pages_after']),(65,0))
+            self.assertEqual(pair['cached_before'],0x99);self.assertTrue(pair['same_CPU'])
+            probe.old_init=domain.__init__;probe.old_remove=domain.remove;probe.target={'memcg':'0x99'}
+            probe.info.update(backend='kprobe',association=association,
+                profile_after={key:{'hits':1,'missed':0}for key in probe.names},
+                per_CPU_stats={'cpu0':'overrun: 0\ncommit overrun: 0\ndropped events: 0\n'})
+            with patch.object(probe,'_cleanup'),patch.object(stock.time,'sleep'):probe.__exit__(None,None,None)
+            info=json.loads((Path(temp)/'direct-stock-finish.json').read_text())['info']
+            self.assertTrue(info['observation_complete']);self.assertFalse(info['positive_pair_only'])
+            self.assertIn('deliberately not probed',info['refill_boundary'])
 
     def test_direct_stock_wrapper_retains_window_but_does_not_promote_unknown_misses(self):
         import direct_stock_probe as stock,memory_bracket_probe as bracket

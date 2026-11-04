@@ -61,7 +61,7 @@ def trace_readback(data,names):
 
 
 class DirectStock:
-    SYMBOLS=('memory_current_read','drain_stock','refill_stock')
+    SYMBOLS=('memory_current_read','drain_stock')
     MAX_LINES=2048
     MAX_BYTES=2<<20
     MAX_MARKERS=128
@@ -70,13 +70,13 @@ class DirectStock:
         self.lh,self.output=lh,Path(output)
         self.base=self.instance=None
         self.definitions=[];self.paths={};self.markers=[];self.target=None
-        self.names={key:'s'+str(os.getpid())+'_'+key for key in ('ce','cr','de','dr','fe','fr')}
+        self.names={key:'s'+str(os.getpid())+'_'+key for key in ('ce','cr','de','dr')}
         self.group='ku_stock_'+str(os.getpid())
         self.info={'diagnostic_only':True,'normal_score_eligible':False,'available':False,
             'return_boundary':'drain_return is compact all-cgroup metadata: stock/index and7post-page counts only. '
                 'Only pairs linked to target-filtered drain_entry are target-attributed; unmatched returns stay unknown target.',
-            'refill_boundary':'refill entry/return are target-only attempts. Entry nr_pages does not prove insertion: '
-                'local_trylock/non-spinning fallbacks can uncharge instead.'}
+            'refill_boundary':'refill_stock is deliberately not probed in this four-probe observer. '
+                'Its absence cannot exclude refill work; the original six-probe records remain separate.'}
 
     def mark(self,event,**values):
         record={'event':event,'monotonic_ns':time.monotonic_ns(),'tid':threading.get_native_id(),**values}
@@ -219,9 +219,7 @@ class DirectStock:
             'ce':('p','memory_current_read','css=$arg1:x64'),
             'cr':('r64','memory_current_read','css=$arg1:x64 value=$retval:u64'),
             'de':('p','drain_stock','stock=$arg1:x64 index=$arg2:s32 '+pages+' '+pointers),
-            'dr':('r64','drain_stock','stock=$arg1:x64 index=$arg2:s32 '+pages),
-            'fe':('p','refill_stock','memcg=$arg1:x64 pages=$arg2:u32'),
-            'fr':('r64','refill_stock','memcg=$arg1:x64 pages=$arg2:u32')}
+            'dr':('r64','drain_stock','stock=$arg1:x64 index=$arg2:s32 '+pages)}
         def define(backend):
             self.info.update(backend=backend,probe_definitions={},formats={})
             self.interface=self.base/('dynamic_events' if backend=='fprobe' else 'kprobe_events')
@@ -257,7 +255,7 @@ class DirectStock:
                 'Captured target entry/return pairs can be positive evidence; missing events cannot exclude a path, '
                 'establish full charge totals or establish observation_complete.')
         self.info['profile_before']=self._profile()
-        if self.info['backend']=='kprobe' and len(self.info['profile_before'])!=6:
+        if self.info['backend']=='kprobe' and len(self.info['profile_before'])!=len(self.names):
             raise RuntimeError('all owned kprobe profile counters required')
         self.info.update(available=True,private_instance=str(self.instance),group=self.group,
                          kernel=platform.release(),uname=list(os.uname()),script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
@@ -296,12 +294,11 @@ class DirectStock:
         css=mappings[0]['css'];memcg=css-self.css_offset
         self.target={'path':str(domain.path),'inode':domain.path.stat().st_ino,'css':hex(css),'memcg':hex(memcg),'mappings':mappings}
         for key in ('ce','cr'):(self.paths[key]/'filter').write_text('css == '+hex(css))
-        for key in ('fe','fr'):(self.paths[key]/'filter').write_text('memcg == '+hex(memcg))
         predicate=' || '.join('(index == '+str(i)+' && c'+str(i)+' == '+hex(memcg)+')' for i in range(7))
         (self.paths['de']/'filter').write_text(predicate)
         # The cached target has been cleared by return. Do not mislabel this as target-only.
         (self.paths['dr']/'filter').write_text('index >= 0 && index < 7')
-        for key in ('de','dr','fe','fr'):(self.paths[key]/'enable').write_text('1')
+        for key in ('de','dr'):(self.paths[key]/'enable').write_text('1')
         self.info['target']=self.target;self.mark('target-mapped',**self.target)
         (self.output/'target-mapping-trace.txt').write_bytes(self._trace_bytes())
         save(self.output/'target-mapping.json',self.target)
@@ -348,7 +345,7 @@ class DirectStock:
                 readback=trace_readback(b''.join(lines[:self.MAX_LINES]),self.names)
                 save(self.output/'direct-stock-association.json',readback)
                 self.info['association']={key:value for key,value in readback.items() if key not in ('records','pairs')}
-                self.info['pair_counts']={family:sum(p['entry']['kind']==family for p in readback['pairs']) for family in ('ce','de','fe')}
+                self.info['pair_counts']={family:sum(p['entry']['kind']==family for p in readback['pairs']) for family in ('ce','de')}
                 self.info['per_CPU_stats']={p.parent.name:self.original_read_text(p)[:4096]
                     for p in sorted((self.instance/'per_cpu').glob('cpu*/stats'))[:32]}
                 self.info['profile_after']=self._profile()
@@ -376,7 +373,7 @@ class DirectStock:
             if not self.target:failures.append('target_not_mapped')
             after=self.info.get('profile_after',{})
             if self.info.get('backend')=='fprobe':failures.append('fprobe_miss_counts_unknown')
-            elif len(after)!=6 or any(value['missed'] for value in after.values()):failures.append('kprobe_profile_missing_or_missed')
+            elif set(after)!=set(self.names) or any(value['missed'] for value in after.values()):failures.append('kprobe_profile_missing_or_missed')
             stats=self.info.get('per_CPU_stats',{})
             if not stats:failures.append('per_CPU_stats_missing')
             for text in stats.values():
