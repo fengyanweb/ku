@@ -441,7 +441,8 @@ def prepare_current_pg_guard_cache(archive,a):
     if root.exists() and (root.is_symlink() or any(p.name!='tools' for p in root.iterdir())):
         raise ValueError('current cache requires fresh guard root')
     cache=root/'verified-current-cache'
-    restored,bindings,observations=restore_current_pg_builds(archive,cache,source)
+    typed_cache={'typed':True} if getattr(a,'pg_read_screen',False) else {}
+    restored,bindings,observations=restore_current_pg_builds(archive,cache,source,**typed_cache)
     normal,driver=restored['B'],restored['Driver'];binding,actual=bindings['B'],observations['B']
     unchanged=subprocess.run(['git','-C',str(source),'diff','--quiet',h.PG_CURRENT_BASELINE,
         a.candidate,'--','tests/benchmarks/cross_stack'],timeout=10)
@@ -465,6 +466,7 @@ def prepare_current_pg_guard_cache(archive,a):
         rust_toolchain='1.99.1',candidate_source=a.candidate,verified_cache=str(cache),
         driver_source_matches_candidate=True,benchmark_inputs_match_candidate=True,imported_measurement_windows=0,
         reused_steps=['build-A','build-Driver'],new_candidate_build_still_required=True,
+        typed_baseline_restored='BP' in restored,
         original_normal_binding=binding,restored_normal_binding=actual))
     return state
 

@@ -431,6 +431,7 @@ jobs:
       KU_PG_BASELINE: d05ca1551d4585011499d81d0ae828c4173306ff
       KU_PG_CANDIDATE: ${{ inputs.product_commit || 'e9d619af2f1061d8ec826c736eecbddcfee6a05a' }}
       KU_PG_GUARD_WORKLOAD: ${{ inputs.self_workload || 'db' }}
+      KU_PG_READ_SCREEN: ${{ inputs.scope == 'pg-read-screen' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -486,7 +487,8 @@ jobs:
           a=SimpleNamespace(root=Path(os.environ['KU_PG_GUARD_ROOT']),source=Path(os.environ['GITHUB_WORKSPACE']),
               baseline=os.environ['KU_PG_BASELINE'],prepatch=os.environ['KU_PG_BASELINE'],
               candidate=os.environ['KU_PG_CANDIDATE'],screen_variants=[],pg_input_guard=True,
-              pg_input_guard_workload=os.environ['KU_PG_GUARD_WORKLOAD'])
+              pg_input_guard_workload=os.environ['KU_PG_GUARD_WORKLOAD'],
+              pg_read_screen=os.environ['KU_PG_READ_SCREEN']=='true')
           reuse_build.prepare_pg_input_guard_cache(
               Path(os.environ['RUNNER_TEMP'])/'ku-pg-guard-build-cache/ku-pg-current-1.99.1/ku-performance-v2-evidence.tar.gz',a,source_run='41630973206')
           PY
