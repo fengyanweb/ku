@@ -585,7 +585,7 @@ jobs:
           fi
           rustup toolchain install 1.99.1 --profile minimal --no-self-update
           clang --version
-      - name: Run only input lifetime, typed ownership and notification pins
+      - name: Run PG and shared Task ownership contracts
         shell: bash
         run: |
           set -euo pipefail
@@ -594,6 +594,11 @@ jobs:
           for test in native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins native_pg_typed_single_row_binary_values_validate_types_and_survive_reset native_pg_async_notification_pins_survive_close_and_owner_cancellation; do
             cargo +1.99.1 test --release --locked --test native_pg_query_poll_test "$test" -- --exact --nocapture > "$RUNNER_TEMP/ku-pg-input-windows/$test.log" 2>&1
           done
+          cargo +1.99.1 test --release --locked --test native_task_driver_test native_task_driver_admission_wake_retirement_and_shutdown_execute_in_c -- --exact --nocapture --test-threads=1 > "$RUNNER_TEMP/ku-pg-input-windows/task-driver.log" 2>&1
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/ku-pg-input-windows/task-driver.log"
+          cargo +1.99.1 test --release --locked --test native_http_test native_http_async_handlers_use_owner_tasks_timers_and_retire_after_timeout -- --exact --nocapture --test-threads=1 > "$RUNNER_TEMP/ku-pg-input-windows/http-task.log" 2>&1
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/ku-pg-input-windows/http-task.log"
+          if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/ku-pg-input-windows/task-driver.log" "$RUNNER_TEMP/ku-pg-input-windows/http-task.log"; then exit 1; fi
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
