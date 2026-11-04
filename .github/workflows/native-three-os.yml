@@ -517,6 +517,7 @@ jobs:
           include-hidden-files: true
           path: |
             ${{ runner.temp }}/ku-pg-input-guard/B/build/ku-native/.ku/build/release/c/*/ku-server.c
+            ${{ runner.temp }}/ku-pg-input-guard/BP/build/ku-native/.ku/build/release/c/*/ku-server.c
             ${{ runner.temp }}/ku-pg-input-guard/pg-input-guard-observation
             ${{ runner.temp }}/ku-pg-input-guard/pg-input-guard-ok-observation
             ${{ runner.temp }}/ku-pg-input-guard/pg-input-guard-typed-observation
