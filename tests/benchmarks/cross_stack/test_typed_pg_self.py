@@ -22,6 +22,49 @@ class TypedPgSelfTests(unittest.TestCase):
         self.assertNotIn('only',normal)
         with self.assertRaises(ValueError):t.frozen_plan({},only='B')
 
+    def test_ok_is_only_current_ordinary_three_windows_with_fp_and_no_score(self):
+        pg=t.frozen_plan({},only='BP')
+        p=t.frozen_plan({},current_product=t.h.PG_CURRENT_BASELINE,callchains=True,only='B',workload='ok')
+        self.assertEqual((p['workload'],p['contract'],p['rate'],p['warmup_seconds'],p['score_seconds']),('ok','text',2000,3,15))
+        self.assertEqual(p['order'],[['B',turn] for turn in ('before','sample','after')])
+        self.assertEqual((p['maximum_windows'],p['maximum_replacements']),(3,0))
+        for key in ('resources','quality_policy','event','perf_frequency','maximum_control_cpu_ratio','observation_alarm_seconds'):
+            self.assertEqual(p[key],pg[key])
+        self.assertTrue(p['callchains']);self.assertFalse(p['formal_qualified']);self.assertFalse(p['normal_score_eligible'])
+        for changes in ({'only':None},{'only':'BP'},{'current_product':None},{'current_product':'b'*40},{'callchains':False}):
+            with self.subTest(changes=changes),self.assertRaises(ValueError):
+                t.frozen_plan({},**dict(dict(current_product=t.h.PG_CURRENT_BASELINE,callchains=True,only='B',workload='ok'),**changes))
+
+    def test_ok_requires_exact_cached_cli_elf_library_and_driver_for_both_arms(self):
+        import reuse_build as rb
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);protocol=root/'protocol.json';protocol.write_text('{}');receipt=root/'build.json'
+            versions={'rustc':'rustc 1.99.1 (fixed)','cargo':'cargo 1.99.1 (fixed)'}
+            receipt.write_text(json.dumps(dict(rust_toolchain='1.99.1',failure=None,exact_versions=versions,
+                commands=[dict(label='ku-cli',command=['cargo','+1.99.1','build','--locked','--release'],exit_code=0)])))
+            mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',
+                native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+            bindings={};paths=[]
+            for name,files in (('B',rb.CURRENT_PG_FILES),('BP',rb.CURRENT_TYPED_PG_FILES)):
+                path=root/name/'manifest.json';path.parent.mkdir();paths.append(path)
+                path.write_text(json.dumps(dict(candidate_base=t.h.PG_CURRENT_BASELINE,protocol=str(protocol),client={'command':['driver']},
+                    rust_toolchain='1.99.1',versions=versions,build_receipt=str(receipt),stacks={'ku':{'build':dict(
+                        rust_toolchain='1.99.1',cli_build_receipt=str(receipt),cli_build_receipt_sha256=t.h.sha(receipt),
+                        native={'server':{'binary_sha256':files['ELF']}})}})))
+                bindings[name]=dict(build_mode={**mode,'pg_read_mode':'int' if name=='B' else 'typed'},
+                    files={key:{'sha256':value} for key,value in files.items()})
+            with patch.object(t.fc,'version_identity',side_effect=lambda p,n:bindings[n]):
+                plan,actual,_=t.identify(*paths,current_product=t.h.PG_CURRENT_BASELINE,callchains=True,only='B',workload='ok')
+                self.assertEqual(set(actual),{'B','BP'});self.assertEqual(plan['only'],'B')
+            for name,key in (('B','ELF'),('BP','ELF'),('B','Ku CLI'),('B','driver ELF'),('B','libpq')):
+                changed=copy.deepcopy(bindings)
+                # Shared dependencies may agree with each other and still be the wrong cached build.
+                for arm in (('B','BP') if key in ('Ku CLI','driver ELF','libpq') else (name,)):
+                    changed[arm]['files'][key]['sha256']='0'*64
+                with self.subTest(name=name,key=key),patch.object(t.fc,'version_identity',side_effect=lambda p,n:changed[n]):
+                    with self.assertRaisesRegex(ValueError,'exact cached'):
+                        t.identify(*paths,current_product=t.h.PG_CURRENT_BASELINE,callchains=True,only='B',workload='ok')
+
     def test_drift_uses_same_cpu_field_and_unknown_never_passes(self):
         rows=[dict(turn=x,cpu_us=v,full_cpu_us=v+1) for x,v in [('before',100),('sample',120),('after',105)]]
         self.assertTrue(t.drift(rows)['drift_valid'])
@@ -152,5 +195,51 @@ class TypedPgSelfTests(unittest.TestCase):
                 self.assertFalse(result['attribution_eligible']);self.assertIs(t.fc.Harness,original)
                 self.assertFalse((root/'normal-self-probe/B').exists())
                 self.assertEqual(set(result['controls']),{'BP'})
+
+    def test_ok_runs_only_b_and_preserves_pc_fp_exports_and_cleanup(self):
+        import io
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);private=root/'private.json';state=root/'state.json'
+            private.write_text(json.dumps({'db_url':'x','db_cgroup':'x'}));state.write_text('{"limits":{}}')
+            fixture=types.SimpleNamespace(start=lambda:None,stop=lambda:{'forced':False,'cgroup_removed':True,'after':{'process_count':0}},manifest_path=private,state_path=state)
+            calls=[];original_open=Path.open;original=t.fc.Harness
+            def open_file(path,*args,**kwargs):
+                return io.BytesIO(b'bounded kernel fixture') if str(path) in ('/proc/kallsyms','/sys/kernel/notes') else original_open(path,*args,**kwargs)
+            def window(plan,name,workload,rate,warm,score,output,**kwargs):
+                calls.append((name,output.name,workload,rate,warm,score,kwargs['job']['contract']))
+                t.h.save(output/'score/normal-self-observations.json',{'record_complete':True,'symbols':{'complete':True}})
+                t.h.save(output/'score/client.json',{'ledger':{'correct_total':30000,'scheduled_to_attempt':{}}})
+                return dict(cpu_us=100,full_cpu_us=102)
+            with patch.object(t.h.db,'Database',return_value=fixture),patch.object(t.h,'sha',return_value='a'*64),\
+                    patch.object(Path,'open',open_file),patch.object(t.fc,'version_identity',return_value={}),\
+                    patch.object(t.fc,'window',side_effect=window),patch.object(t.h,'normal_diagnostic_quality',return_value=(True,{})),\
+                    patch.object(t,'exports',return_value=True) as exports:
+                result=t.observe(types.SimpleNamespace(root=root,tools=root),
+                    t.frozen_plan({},current_product=t.h.PG_CURRENT_BASELINE,only='B',workload='ok',callchains=True),
+                    {'B':{},'BP':{}},{'uid':1,'gid':1})
+            self.assertEqual(calls,[('B',turn,'ok',2000,3,15,'text') for turn in ('before','sample','after')])
+            self.assertTrue(result['execution_complete']);self.assertTrue(result['attribution_controls_passed'])
+            self.assertFalse(result['candidate_accepted']);self.assertFalse(result['normal_score_eligible'])
+            self.assertFalse((root/'normal-self-probe/BP').exists());self.assertIs(t.fc.Harness,original)
+            exports.assert_called_once();self.assertEqual(exports.call_args.kwargs,{'callchains':True})
+
+    def test_workflow_ok_choice_only_selects_b_inside_the_cached_typed_self_job(self):
+        import subprocess,textwrap
+        workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
+        choice=workflow.split('\n      self_workload:\n',1)[1].split('\n      screen_variants:',1)[0]
+        self.assertIn('default: db',choice);self.assertIn('options: [db, ok]',choice)
+        prefix,job=workflow.split('\n  pg-typed-self:\n',1);job,suffix=job.split('\n  pg-input-guard:\n',1)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.scope == 'pg-typed-self'",job)
+        self.assertNotIn('KU_PG_SELF_WORKLOAD',prefix+suffix)
+        self.assertNotIn('cargo +1.99.1 build',job);self.assertNotIn('typed_pg_self.py --prepare',job)
+        setup=next(line.strip() for line in job.splitlines() if 'case "$KU_PG_SELF_WORKLOAD"' in line)
+        observed=job.split('- name: Observe only the selected current caller question',1)[1].split('- name: Preserve',1)[0]
+        args=textwrap.dedent(observed.split('run: |\n',1)[1].split('          sudo -n',1)[0])
+        for workload,expected in (('db',['--only','BP']),('ok',['--workload','ok','--only','B']),('other',None)):
+            with self.subTest(workload=workload):
+                checked=subprocess.run(['bash','-eu'],input=setup+'\n'+args+'\nprintf "%s\\n" "${pg_self_args[@]}"\n',
+                    text=True,capture_output=True,env={'KU_PG_SELF_WORKLOAD':workload},timeout=5)
+                if expected is None:self.assertNotEqual(checked.returncode,0)
+                else:self.assertEqual(checked.returncode,0,checked.stderr);self.assertEqual(checked.stdout.splitlines(),expected)
 
 if __name__=='__main__':unittest.main()

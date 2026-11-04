@@ -15,9 +15,14 @@ on:
         type: string
         default: ''
       product_commit:
-        description: 'Optional full 40-hex product commit for pg-input-windows and pg-input-guard only'
+        description: 'Optional full 40-hex product commit for pg-input-windows, pg-input-guard or fresh followup-screen only'
         type: string
         default: ''
+      self_workload:
+        description: 'pg-typed-self only: original typed PG caller capture, or fixed current ordinary /ok SELF'
+        type: choice
+        default: db
+        options: [db, ok]
       screen_variants:
         description: 'Up to seven full commit ablations, comma-separated, in one serial followup-screen; no extra formal matrix'
         type: string
@@ -231,6 +236,7 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       KU_PG_PRODUCT: d05ca1551d4585011499d81d0ae828c4173306ff
+      KU_PG_SELF_WORKLOAD: ${{ inputs.self_workload || 'db' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -244,6 +250,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          case "$KU_PG_SELF_WORKLOAD" in db|ok) ;; *) echo 'unsupported SELF workload' >&2; exit 1 ;; esac
           rustup toolchain install 1.99.1 --profile minimal --no-self-update
           rustup default 1.99.1
           sudo apt-get update -qq
@@ -301,15 +308,19 @@ jobs:
           set -euo pipefail
           sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --preflight --callchains \
             --root "$KU_PG_CURRENT_BUILD" --tools "$RUNNER_TEMP/ku-pg-current-tools" --current-product "$KU_PG_PRODUCT"
-      - name: Observe only the previously missing typed PG caller question
+      - name: Observe only the selected current caller question
         timeout-minutes: 6
         shell: bash
         run: |
           set -euo pipefail
+          pg_self_args=(--only BP)
+          if [ "$KU_PG_SELF_WORKLOAD" = ok ]; then
+            pg_self_args=(--workload ok --only B)
+          fi
           sudo -n python3 -B tests/benchmarks/cross_stack/typed_pg_self.py --callchains \
             --root "$KU_PG_CURRENT_ROOT" --tools "$RUNNER_TEMP/ku-pg-current-tools" \
             --normal-manifest "$KU_PG_CURRENT_BUILD/B/manifest.json" --typed-manifest "$KU_PG_CURRENT_BUILD/BP/manifest.json" \
-            --current-product "$KU_PG_PRODUCT" --preflight-root "$KU_PG_CURRENT_BUILD" --only BP > "$RUNNER_TEMP/ku-pg-current-observation.log" 2>&1
+            --current-product "$KU_PG_PRODUCT" --preflight-root "$KU_PG_CURRENT_BUILD" "${pg_self_args[@]}" > "$RUNNER_TEMP/ku-pg-current-observation.log" 2>&1
       - name: Preserve the existing build and observation archive formats
         if: always()
         timeout-minutes: 3
@@ -1158,7 +1169,9 @@ jobs:
       KU_PERFORMANCE_V2_PG_QUEUE_SCREEN: ${{ inputs.pg_queue_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_REUSE_RUN: ${{ inputs.reuse_build_run }}
       KU_PERFORMANCE_V2_REUSE_SHA256: ${{ inputs.reuse_build_sha256 }}
-      KU_PERFORMANCE_V2_CANDIDATE: ${{ inputs.reuse_product_commit || github.sha }}
+      KU_PERFORMANCE_V2_REUSE_PRODUCT_COMMIT: ${{ inputs.reuse_product_commit }}
+      KU_PERFORMANCE_V2_PRODUCT_COMMIT: ${{ inputs.product_commit }}
+      KU_PERFORMANCE_V2_CANDIDATE: ${{ inputs.scope == 'followup-screen' && inputs.product_commit || inputs.reuse_product_commit || github.sha }}
 
     steps:
       - name: Check out the exact candidate and baseline history
@@ -1173,6 +1186,18 @@ jobs:
 
       - name: Verify runner entry contracts without starting workloads
         run: |
+          if [ -n "$KU_PERFORMANCE_V2_PRODUCT_COMMIT" ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = followup-screen
+            if [[ ! "$KU_PERFORMANCE_V2_PRODUCT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+              echo 'product_commit must be a full 40-hex commit' >&2
+              exit 1
+            fi
+            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
+            test -z "$KU_PERFORMANCE_V2_REUSE_SHA256"
+            test -z "$KU_PERFORMANCE_V2_REUSE_PRODUCT_COMMIT"
+            test "$KU_PERFORMANCE_V2_CANDIDATE" = "$KU_PERFORMANCE_V2_PRODUCT_COMMIT"
+            git cat-file -e "${KU_PERFORMANCE_V2_PRODUCT_COMMIT}^{commit}"
+          fi
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$KU_PERFORMANCE_V2_PREPATCH" = b765f9bc5d3a6e71353a562e27cef7b4cbb35f69
@@ -1394,7 +1419,12 @@ jobs:
               --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS" \
               "${performance_task_json_args[@]}"
           else
-            test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
+            if [ -n "$KU_PERFORMANCE_V2_PRODUCT_COMMIT" ]; then
+              test "$KU_PERFORMANCE_V2_SCOPE" = followup-screen
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = "$KU_PERFORMANCE_V2_PRODUCT_COMMIT"
+            else
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
+            fi
             test -z "$KU_PERFORMANCE_V2_REUSE_SHA256"
             python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build --build-set "$performance_build_set" \
               --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \

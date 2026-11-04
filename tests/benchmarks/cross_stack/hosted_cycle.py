@@ -1110,8 +1110,10 @@ def window_quality(row):
     return invalid,signature
 
 
-def screen_pairs(rows,case,slo,numerator='B',denominator='A'):
-    pairs=[];good=[]
+def screen_pairs(rows,case,slo,numerator='B',denominator='A',*,resource_guard=False):
+    if resource_guard and (numerator,denominator)!=('B','A'):
+        raise ValueError('common HTTP resource guard requires ordinary B/A')
+    pairs=[];good=[];memory=[]
     for group in range(1,4):
         selected={r['name']:r for r in rows if r['turn'].startswith('group-%d-'%group)}
         a,b,ref=(selected.get(n) for n in (denominator,numerator,case['reference']))
@@ -1130,13 +1132,29 @@ def screen_pairs(rows,case,slo,numerator='B',denominator='A'):
             p99_absolute_pass=all(type(x)in(int,float) and x<=slo for x in (p99a,p99b)))
         pairs.append(pair)
         if valid and pair['cpu_B_over_A'] is not None:good.append((b['full_cpu_us'],a['full_cpu_us']))
+        if valid and resource_guard:
+            memory.append((b.get('memory',{}).get('steady_median_bytes'),a.get('memory',{}).get('steady_median_bytes')))
     ci=fc.paired_interval([p[0] for p in good],[p[1] for p in good],minimum=3)
-    return dict(numerator_name=numerator,denominator_name=denominator,ratio_keys_B_A_alias_for_declared_names=True,pairs=pairs,valid_pair_count=len(good),cpu_paired_bootstrap95=ci,
+    result=dict(numerator_name=numerator,denominator_name=denominator,ratio_keys_B_A_alias_for_declared_names=True,pairs=pairs,valid_pair_count=len(good),cpu_paired_bootstrap95=ci,
         all_three_cpu_directions_lower=len(good)>=3 and all(x<y for x,y in good),
         cpu_upper95_below_one=ci.get('status')=='estimated' and ci['upper95']<1,
         confidence_note='Only3 short paired windows; percentile bootstrap is descriptive and stationarity is unproven. '
                         'No average of p99 values; resource/tail regressions and cancellation regressions require root review.',
         adopted=False,formal_qualified=False)
+    if resource_guard:
+        memory_ci=fc.paired_interval([p[0] for p in memory],[p[1] for p in memory],minimum=3)
+        def review(interval):
+            status=('unknown' if interval.get('status')!='estimated' else
+                'within_relative_bounds' if interval['lower95']<=1 and interval['upper95']<=1.03 else 'outside_relative_bounds')
+            return dict(status=status,lower95_maximum=1,upper95_maximum=1.03,interval=interval)
+        metrics={'full_cpu_us':review(ci),'memory.steady_median_bytes':review(memory_ci)}
+        result.update(memory_paired_bootstrap95=memory_ci,memory_pair_count=len(memory),
+            relative_resource_guard_for_root_review=dict(metrics=metrics,
+                all_metrics_within_bounds=all(x['status']=='within_relative_bounds' for x in metrics.values()),
+                automatic_adoption=False,original_goal_status='not_evaluated',
+                scope='Ordinary B/A only; unchanged CPU and memory bounds; three short paired windows remain descriptive. '
+                      'Memory is whole service cgroup memory.current, middle60% median; neither equivalence nor original-goal acceptance.'))
+    return result
 
 
 def task_json_screen(rows,case,slo):
@@ -2100,8 +2118,9 @@ def diagnostic(a,state,followup=False):
                         no_retry=True));break
             controls=[r.get('full_cpu_us') for r in case_rows if r['name']=='B']
             save(directory/case['workload']/'comparison.json',dict(rows=case_rows,
-                paired_screen=screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']]) if followup else None,
-                candidate_screens={n:screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']],n,'B' if n=='BT' else 'A')
+                paired_screen=screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']],resource_guard=plan.get('common_http_screen') is True) if followup else None,
+                candidate_screens={n:screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']],n,'B' if n=='BT' else 'A',
+                    resource_guard=plan.get('common_http_screen') is True and n=='B')
                     for n in plan.get('candidate_versions',['B']) if any(r['name']==n for r in case_rows)} if followup else {},
                 task_json_screen=task_json_screen(case_rows,case,plan['latency_slo_ms'][case['workload']]) if followup else None,
                 worker_policy_screen=screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']],'B','BF')

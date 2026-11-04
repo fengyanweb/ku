@@ -1317,6 +1317,47 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(h.task_json_screen(broken,case,100)['valid_pair_count'],0)
                 self.assertFalse(h.diagnostic_axes(plan,broken,len(broken),[],control,[],True,gate)['normal_windows_qualified'])
 
+    def test_common_http_resource_review_retains_all_memory_pairs_and_never_adopts(self):
+        rows=[]
+        for group in range(1,4):
+            for name in ('A','B','R','BT'):
+                rows.append(dict(turn=f'group-{group}-{name}',name=name,full_cpu_us=10,
+                    latency={'p99_ms':1},memory={'steady_median_bytes':95 if name=='B' else 100},
+                    comparison_contract='same',functional_valid=True,accounting_valid=True,all_correct=True,
+                    natural_reclamation=True,arrival_schedule_quality='pass',environment_quality='pass',
+                    measurement_invalid=False,observed_environment_faults=[]))
+        case={'reference':'R'}
+        result=h.screen_pairs(rows,case,100,resource_guard=True)
+        self.assertEqual(result['memory_pair_count'],3)
+        self.assertAlmostEqual(result['memory_paired_bootstrap95']['estimate'],.95)
+        self.assertEqual(result['memory_paired_bootstrap95']['pairs'],[(95,100)]*3)
+        review=result['relative_resource_guard_for_root_review']
+        self.assertTrue(review['all_metrics_within_bounds'])
+        self.assertFalse(review['automatic_adoption']);self.assertEqual(review['original_goal_status'],'not_evaluated')
+        self.assertFalse(result['adopted']);self.assertFalse(result['formal_qualified'])
+        self.assertNotIn('memory_paired_bootstrap95',h.screen_pairs(rows,case,100))
+        self.assertNotIn('relative_resource_guard_for_root_review',h.task_json_screen(rows,case,100))
+        with self.assertRaisesRegex(ValueError,'ordinary B/A'):
+            h.screen_pairs(rows,case,100,'BT','B',resource_guard=True)
+        for change in ('missing','growth','quality'):
+            broken=json.loads(json.dumps(rows))
+            b=next(r for r in broken if r['name']=='B')
+            if change=='missing':b['memory'].clear()
+            elif change=='growth':
+                for row in broken:
+                    if row['name']=='B':row['memory']['steady_median_bytes']=120
+            else:b['arrival_schedule_quality']='fail'
+            with self.subTest(change=change):
+                bad=h.screen_pairs(broken,case,100,resource_guard=True)
+                self.assertFalse(bad['relative_resource_guard_for_root_review']['all_metrics_within_bounds'])
+                self.assertNotEqual(bad['relative_resource_guard_for_root_review']['metrics']['memory.steady_median_bytes']['status'],'within_relative_bounds')
+                self.assertFalse(bad['adopted'])
+        for lower,upper,accepted in ((1,1.03,True),(1.00001,1.03,False),(1,1.03001,False)):
+            interval=dict(status='estimated',estimate=1,lower95=lower,upper95=upper)
+            with self.subTest(lower=lower,upper=upper),patch.object(fc,'paired_interval',return_value=interval):
+                checked=h.screen_pairs(rows,case,100,resource_guard=True)
+                self.assertEqual(checked['relative_resource_guard_for_root_review']['all_metrics_within_bounds'],accepted)
+
     def test_build_derives_task_json_only_from_the_frozen_product_snapshot(self):
         from unittest.mock import Mock
         for supported,requested,final in ((False,None,False),(True,None,False),(False,False,False),(True,False,False),(False,True,False),(True,True,False),(True,False,True),(False,False,True)):
@@ -1414,6 +1455,38 @@ class HostedCycleTests(unittest.TestCase):
             self.assertIn('test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true',phase)
             self.assertIn('performance_task_json_args+=(--common-http-screen)',phase)
             self.assertEqual(phase.count('"${performance_task_json_args[@]}"'),count)
+
+    def test_followup_product_binding_accepts_only_explicit_fresh_full_commits(self):
+        import subprocess,textwrap
+        workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
+        job=workflow.split('\n  performance-v2:\n',1)[1].split('\n  full-tests:\n',1)[0]
+        self.assertIn("KU_PERFORMANCE_V2_CANDIDATE: ${{ inputs.scope == 'followup-screen' && inputs.product_commit || inputs.reuse_product_commit || github.sha }}",job)
+        entry=job.split('- name: Verify runner entry contracts',1)[1].split('- name: Install only the fixed Rust',1)[0]
+        validation=textwrap.dedent(entry.split('run: |\n',1)[1].split('          if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN"',1)[0])
+        build=job.split('- name: Build frozen',1)[1].split('- name: Run the one',1)[0]
+        fresh=textwrap.dedent(build.split('\n          else\n',1)[1].split('            test -z "$KU_PERFORMANCE_V2_REUSE_SHA256"',1)[0])
+        env=dict(os.environ,KU_PERFORMANCE_V2_SCOPE='followup-screen',KU_PERFORMANCE_V2_PRODUCT_COMMIT='b'*40,
+            KU_PERFORMANCE_V2_CANDIDATE='b'*40,KU_PERFORMANCE_V2_REUSE_RUN='',KU_PERFORMANCE_V2_REUSE_SHA256='',
+            KU_PERFORMANCE_V2_REUSE_PRODUCT_COMMIT='',GITHUB_SHA='a'*40)
+        cases=[({},True),({'KU_PERFORMANCE_V2_PRODUCT_COMMIT':'','KU_PERFORMANCE_V2_CANDIDATE':'a'*40},True),
+            ({'KU_PERFORMANCE_V2_SCOPE':'performance-v2'},False),
+            ({'KU_PERFORMANCE_V2_SCOPE':'performance-followup-diagnostic'},False),
+            ({'KU_PERFORMANCE_V2_PRODUCT_COMMIT':'b'*39},False),
+            ({'KU_PERFORMANCE_V2_PRODUCT_COMMIT':'b'*41},False),
+            ({'KU_PERFORMANCE_V2_PRODUCT_COMMIT':'main'},False),
+            ({'KU_PERFORMANCE_V2_CANDIDATE':'c'*40},False),
+            ({'KU_PERFORMANCE_V2_REUSE_RUN':'123'},False),
+            ({'KU_PERFORMANCE_V2_REUSE_SHA256':'c'*64},False),
+            ({'KU_PERFORMANCE_V2_REUSE_PRODUCT_COMMIT':'b'*40},False),
+            ({'KU_PERFORMANCE_V2_PRODUCT_COMMIT':'','KU_PERFORMANCE_V2_CANDIDATE':'a'*40,'KU_PERFORMANCE_V2_SCOPE':'performance-v2'},True)]
+        for changed,accepted in cases:
+            with self.subTest(changed=changed):
+                checked=subprocess.run(['bash','-eu'],input='git() { return 0; }\n'+validation+'\n'+fresh,
+                    text=True,capture_output=True,env=dict(env,**changed),timeout=5)
+                self.assertEqual(checked.returncode==0,accepted,checked.stderr)
+        missing=subprocess.run(['bash','-eu'],input='git() { return 1; }\n'+validation,
+            text=True,capture_output=True,env=env,timeout=5)
+        self.assertNotEqual(missing.returncode,0)
 
     def test_screen_uses_selected_candidate_normalized_cpu_and_its_own_tails(self):
         rows=[]
