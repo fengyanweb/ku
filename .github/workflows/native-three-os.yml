@@ -586,17 +586,17 @@ jobs:
         run: |
           set -euo pipefail
           sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase diagnostic --build-set diagnostic --pg-input-guard --pg-input-guard-workload "$KU_PG_GUARD_WORKLOAD" --root "$KU_PG_GUARD_ROOT" --source "$GITHUB_WORKSPACE" --tools "$KU_PG_GUARD_ROOT/tools" --baseline "$KU_PG_BASELINE" --candidate "$KU_PG_CANDIDATE" --prepatch "$KU_PG_BASELINE" > "$KU_PG_GUARD_ROOT/guard.log" 2>&1
-      - name: Prepare only the typed candidate from its existing CLI
+      - name: Prepare the selected normal screen from verified builds
         if: inputs.scope == 'pg-read-screen'
         timeout-minutes: 3
         shell: bash
         run: |
           set -euo pipefail
-          test "$KU_PG_GUARD_WORKLOAD" = db
-          python3 -B tests/benchmarks/cross_stack/pg_read_screen.py --phase prepare \
+          case "$KU_PG_GUARD_WORKLOAD" in db|ok) ;; *) echo 'unsupported normal screen workload' >&2; exit 1 ;; esac
+          python3 -B tests/benchmarks/cross_stack/pg_read_screen.py --phase prepare --workload "$KU_PG_GUARD_WORKLOAD" \
             --root "$KU_PG_GUARD_ROOT" --source "$GITHUB_WORKSPACE" --tools "$KU_PG_GUARD_ROOT/tools" > "$KU_PG_GUARD_ROOT/read-prepare.log" 2>&1
       - name: Check the new read boundary and related PG contracts
-        if: inputs.scope == 'pg-read-screen'
+        if: inputs.scope == 'pg-read-screen' && inputs.self_workload != 'ok'
         timeout-minutes: 5
         shell: bash
         env:
@@ -615,7 +615,7 @@ jobs:
             cargo +1.99.1 test --release --locked --test native_pg_query_poll_test native_pg_async_fresh_send_waits_without_empty_probes_or_lost_readiness -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/read-boundary-detectors.log" 2>&1
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/read-boundary-detectors.log"
       - name: Prepare native candidate-only I/O observations without rebuilding Rust
-        if: inputs.scope == 'pg-read-screen'
+        if: inputs.scope == 'pg-read-screen' && inputs.self_workload != 'ok'
         timeout-minutes: 2
         shell: bash
         run: |
@@ -623,20 +623,47 @@ jobs:
           python3 -B tests/benchmarks/cross_stack/pg_read_candidate_mechanism.py --phase prepare \
             --root "$KU_PG_GUARD_ROOT" --source "$GITHUB_WORKSPACE" --tools "$KU_PG_GUARD_ROOT/tools" > "$KU_PG_GUARD_ROOT/read-mechanism-prepare.log" 2>&1
       - name: Confirm candidate I/O and event counts once per PG path
-        if: inputs.scope == 'pg-read-screen'
+        if: inputs.scope == 'pg-read-screen' && inputs.self_workload != 'ok'
         timeout-minutes: 7
         shell: bash
         run: |
           set -euo pipefail
           sudo -n python3 -B tests/benchmarks/cross_stack/pg_read_candidate_mechanism.py --phase observe \
             --root "$KU_PG_GUARD_ROOT" --source "$GITHUB_WORKSPACE" --tools "$KU_PG_GUARD_ROOT/tools" > "$KU_PG_GUARD_ROOT/read-mechanism.log" 2>&1
-      - name: Run only the fixed twelve normal full-path screen windows
+      - name: Check the current HTTP first-read contract
+        if: inputs.scope == 'pg-read-screen' && inputs.self_workload == 'ok'
+        timeout-minutes: 5
+        shell: bash
+        env:
+          KU_CC: clang-18 -O2
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$KU_PG_GUARD_ROOT/cli-cache-1.99.1"
+          export KU_BIN="$KU_PG_GUARD_ROOT/B/build/ku-cargo/release/ku"
+          cd "$KU_PG_GUARD_ROOT/B/src"
+          mkdir -p "$KU_PG_GUARD_ROOT/contracts"
+          http_read_test=native_http_validates_unmaterialized_headers_and_owns_route_snapshot
+          cargo +1.99.1 test --release --locked --test native_http_test "$http_read_test" -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/http-first-read-O2.log" 2>&1
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/http-first-read-O2.log"
+          grep -F 'http-owner-first-read-no-peek' "$KU_PG_GUARD_ROOT/contracts/http-first-read-O2.log"
+          if grep -Ei 'skip(ped)?:' "$KU_PG_GUARD_ROOT/contracts/http-first-read-O2.log"; then exit 1; fi
+          for http_socket_test in native_http_reuses_framed_requests_and_yields_idle_connections native_http_async_idle_probe_preserves_reuse_partial_pipeline_and_half_close native_http_reset_retires_async_work_but_write_half_close_keeps_response; do
+            cargo +1.99.1 test --release --locked --test native_http_test "$http_socket_test" -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/$http_socket_test-O2.log" 2>&1
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/$http_socket_test-O2.log"
+            if grep -Ei 'skip(ped)?:' "$KU_PG_GUARD_ROOT/contracts/$http_socket_test-O2.log"; then exit 1; fi
+          done
+          KU_CC='clang-18 -O2 -g -fno-omit-frame-pointer -fsanitize=address,undefined' ASAN_OPTIONS='detect_leaks=1:halt_on_error=1' UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+            cargo +1.99.1 test --release --locked --test native_http_test "$http_read_test" -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/http-first-read-detectors.log" 2>&1
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/http-first-read-detectors.log"
+          grep -F 'http-owner-first-read-no-peek' "$KU_PG_GUARD_ROOT/contracts/http-first-read-detectors.log"
+          if grep -Ei 'skip(ped)?:' "$KU_PG_GUARD_ROOT/contracts/http-first-read-detectors.log"; then exit 1; fi
+      - name: Run only the fixed normal full-path screen windows
         if: inputs.scope == 'pg-read-screen'
         timeout-minutes: 9
         shell: bash
         run: |
           set -euo pipefail
-          sudo -n python3 -B tests/benchmarks/cross_stack/pg_read_screen.py --phase run \
+          sudo -n python3 -B tests/benchmarks/cross_stack/pg_read_screen.py --phase run --workload "$KU_PG_GUARD_WORKLOAD" \
             --root "$KU_PG_GUARD_ROOT" --source "$GITHUB_WORKSPACE" --tools "$KU_PG_GUARD_ROOT/tools" > "$KU_PG_GUARD_ROOT/read-screen.log" 2>&1
       - name: Preserve the original raw evidence without changing results
         if: always() && inputs.scope != 'pg-read-screen'

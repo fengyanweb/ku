@@ -32,18 +32,20 @@ def mode(typed=False):
         native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
 
 
-def make_plan(versions,candidate,resources,policy):
-    if set(versions)!={'A','B','AP','BP'} or not re.fullmatch('[0-9a-f]{40}',candidate) or candidate==BASELINE:
+def make_plan(versions,candidate,resources,policy,workload='db'):
+    expected={'A','B'} if workload=='ok' else {'A','B','AP','BP'}
+    if workload not in ('db','ok') or set(versions)!=expected or not re.fullmatch('[0-9a-f]{40}',candidate) or candidate==BASELINE:
         raise ValueError('exact normal/typed d05 and distinct full candidate required')
     if any(versions[n]['source_commit']!=(BASELINE if n in ('A','AP') else candidate) for n in versions):
         raise ValueError('normal/typed source roles differ')
     windows=[]
-    for path,names,contract in (('ordinary',('A','B'),'pg-strict'),('typed',('AP','BP'),'typed-pg-strict')):
+    paths=(('ok',('A','B'),'text'),) if workload=='ok' else (('ordinary',('A','B'),'pg-strict'),('typed',('AP','BP'),'typed-pg-strict'))
+    for path,names,contract in paths:
         for group in range(1,4):
             order=names if group%2 else names[::-1]
-            windows.extend(dict(path=path,name=n,group=group,phase='normal',workload='db',rate=200,
+            windows.extend(dict(path=path,name=n,group=group,phase='normal',workload=workload,rate=2000 if workload=='ok' else 200,
                 warmup_seconds=3,score_seconds=15,contract=contract) for n in order)
-    return dict(schema='ku-pg-read-credit-coarse-v1',candidate=candidate,baseline=BASELINE,versions=versions,
+    plan=dict(schema='ku-pg-read-credit-coarse-v1',candidate=candidate,baseline=BASELINE,versions=versions,
         resources=copy.deepcopy(resources),quality_policy=copy.deepcopy(policy),windows=windows,
         maximum_windows=12,maximum_replacements=0,observation_alarm_seconds=480,
         bootstrap_seed=20261023,bootstrap_resamples=20000,minimum_pairs=3,latency_p99_SLO_ms=250,
@@ -55,6 +57,12 @@ def make_plan(versions,candidate,resources,policy):
         candidate_accepted=False,purpose='Exactly ordinary3pairs then typed3pairs AB/BA/AB; original200rps '
             'business/SQL/driver/resources/deadline/cancel/quantum/strict reset and natural cleanup. '
             'Net-benefit-space screen only; no inherited scores, replacement, appended windows, formal3% guard or automatic adoption.')
+    if workload=='ok':
+        plan.update(schema='ku-http-normal-coarse-v1',screen_workload='ok',maximum_windows=6,
+            purpose='Exactly ordinary /ok3pairs AB/BA/AB; original2000rps HTTP/driver/resources/deadline/cancel/quantum '
+                'and natural cleanup. No typed preparation or PG observation. Net-benefit-space screen only; '
+                'no inherited scores, replacement, appended windows, formal3% guard or automatic adoption.')
+    return plan
 
 
 def check_exact_hashes(binding,expected,protocol_sha):
@@ -85,10 +93,13 @@ def prepare(a):
     if os.geteuid()==0:raise ValueError('native-only preparation must run as the original build user')
     original=h.load(a.root/'frozen-plan.json');declared=h.load(a.root/'build-identities.json');state=h.load(a.root/'hosted-state.json')
     candidate=original.get('candidate')
+    workload=getattr(a,'workload','db')
     if original.get('prepatch')!=BASELINE or set(original.get('versions',{}))!={'A','B'}:
         raise ValueError('existing ordinary d05 A/B build-only root required')
     if original['resources']!=h.RESOURCES or original['quality_policy']!=h.POLICY:
         raise ValueError('original resource/quality contract differs')
+    if original.get('pg_input_guard_workload','db')!=workload:
+        raise ValueError('screen workload differs from the original normal build plan')
     identity=state['identity']
     if identity.get('candidate')!=candidate or identity.get('baseline')!=BASELINE or identity.get('rust_toolchain')!='1.99.1':
         raise ValueError('hosted-state build identity differs')
@@ -102,39 +113,42 @@ def prepare(a):
             h.sha(h.load(Path(original['versions'][n]['root'])/'manifest.json')['protocol'])!=protocol_sha for n in ('A','B')):
         raise ValueError('normal actual protocol differs from fixed Driver protocol')
     directory=a.root/'pg-read-screen';directory.mkdir(exist_ok=False)
-    cached=a.root/'verified-current-cache/BP';cm=h.load(cached/'manifest.json')
-    cached_spec=dict(root=str(cached),stack='ku',source_commit=BASELINE,
-        binary_sha256=reuse.CURRENT_TYPED_PG_FILES['ELF'],
-        artifacts={'protocol':dict(path=cm['protocol'],sha256=h.sha(cm['protocol']))})
-    cached_binding=check_binding({'versions':{'AP':cached_spec}},'AP',typed=True,exact=reuse.CURRENT_TYPED_PG_FILES)
-    ap=a.root/'AP'
-    if ap.exists() or state['steps'].get('build-AP') or state['steps'].get('build-BP'):
-        raise ValueError('fresh native typed preparation required; retained attempts are not overwritten')
-    ap.mkdir();h.save(ap/'manifest.json',copy.deepcopy(cm))
-    state['steps']['build-AP']=dict(state='completed',result=copy.deepcopy(cm),build_repeated=False,
-        provenance='Exact verified-current-cache/BP byte identities; no old windows imported')
-    h.save(a.root/'hosted-state.json',state)
-    h.prepare_common_typed_guards(a,state,original,bindings,client,protocol,kinds=('pg',))
+    cached_binding=None;typed_pairs=(('AP','A'),('BP','B')) if workload=='db' else ()
+    if typed_pairs:
+        cached=a.root/'verified-current-cache/BP';cm=h.load(cached/'manifest.json')
+        cached_spec=dict(root=str(cached),stack='ku',source_commit=BASELINE,
+            binary_sha256=reuse.CURRENT_TYPED_PG_FILES['ELF'],
+            artifacts={'protocol':dict(path=cm['protocol'],sha256=h.sha(cm['protocol']))})
+        cached_binding=check_binding({'versions':{'AP':cached_spec}},'AP',typed=True,exact=reuse.CURRENT_TYPED_PG_FILES)
+        ap=a.root/'AP'
+        if ap.exists() or state['steps'].get('build-AP') or state['steps'].get('build-BP'):
+            raise ValueError('fresh native typed preparation required; retained attempts are not overwritten')
+        ap.mkdir();h.save(ap/'manifest.json',copy.deepcopy(cm))
+        state['steps']['build-AP']=dict(state='completed',result=copy.deepcopy(cm),build_repeated=False,
+            provenance='Exact verified-current-cache/BP byte identities; no old windows imported')
+        h.save(a.root/'hosted-state.json',state)
+        h.prepare_common_typed_guards(a,state,original,bindings,client,protocol,kinds=('pg',))
     versions=copy.deepcopy(original['versions'])
     for name in ('A','B'):
         versions[name]['artifacts']={**versions[name].get('artifacts',{}),
             'protocol':dict(path=str(protocol),sha256=protocol_sha)}
-    for name,parent in (('AP','A'),('BP','B')):
+    for name,parent in typed_pairs:
         m=h.load(a.root/name/'manifest.json');binary=m['stacks']['ku']['command'][0]
         versions[name]=dict(root=str(a.root/name),stack='ku',source_commit=versions[parent]['source_commit'],
             binary_sha256=h.sha(binary),rust_toolchain='1.99.1',
             artifacts={'protocol':dict(path=str(protocol),sha256=h.sha(protocol))})
-    plan=make_plan(versions,candidate,h.RESOURCES,h.POLICY)
+    plan=make_plan(versions,candidate,h.RESOURCES,h.POLICY,workload)
     all_bindings={n:check_binding(plan,n,typed=n.endswith('P'),exact=reuse.CURRENT_PG_FILES if n=='A' else reuse.CURRENT_TYPED_PG_FILES if n=='AP' else None) for n in versions}
-    for n,parent in (('AP','A'),('BP','B')):
+    for n,parent in typed_pairs:
         if all_bindings[n]['files']['Ku CLI']['sha256']!=all_bindings[parent]['files']['Ku CLI']['sha256']:
             raise ValueError('typed arm not using its original normal parent CLI: '+n)
-    for field in ('expanded source','driver ELF','libpq','declared:protocol'):
-        if all_bindings['AP']['files'][field]['sha256']!=all_bindings['BP']['files'][field]['sha256']:
-            raise ValueError('typed paired input differs: '+field)
+    if typed_pairs:
+        for field in ('expanded source','driver ELF','libpq','declared:protocol'):
+            if all_bindings['AP']['files'][field]['sha256']!=all_bindings['BP']['files'][field]['sha256']:
+                raise ValueError('typed paired input differs: '+field)
     if {n:fc.version_identity(original,n) for n in ('A','B')}!=bindings:
         raise ValueError('normal artifacts changed during typed preparation')
-    for name in ('B','BP'):
+    for name in (('B','BP') if typed_pairs else ('B',)):
         exported=directory/'inputs'/name;exported.mkdir(parents=True)
         shutil.copyfile(all_bindings[name]['files']['generated C']['path'],exported/'server.c')
         native=h.load(a.root/name/'manifest.json')['stacks']['ku']['build']['native']['server']
@@ -144,17 +158,18 @@ def prepare(a):
     h.save(directory/'prepare.json',dict(entry_sha256=h.sha(__file__),normal_plan_sha256=h.sha(a.root/'frozen-plan.json'),
         helper_sha256={n:h.sha(Path(h.__file__).parent/n) for n in ('hosted_cycle.py','focus_cycle.py','build_linux.py','reuse_build.py')},
         cached_typed_binding=cached_binding,baseline_native_rebuilt=False,new_Rust_CLI_builds=0,
-        candidate_typed_native_only=True,imported_measurement_windows=0,uid=state['uid'],gid=state['gid']))
+        candidate_typed_native_only=bool(typed_pairs),imported_measurement_windows=0,uid=state['uid'],gid=state['gid']))
     h.save(a.root/'hosted-state.json',state)
-    return dict(prepared=True,window_count=12,CLI_rebuilt=False,plan=str(directory/'frozen-plan.json'))
+    return dict(prepared=True,window_count=plan['maximum_windows'],CLI_rebuilt=False,plan=str(directory/'frozen-plan.json'))
 
 
 def comparison(plan,rows,complete):
     out=dict(execution_complete=complete,paths={},reasons=[],worth_expanded_validation=False,
         original_3pct_guard_passed=False,candidate_accepted=False,formal_qualified=False)
-    if not complete or len(rows)!=12:
-        out['reasons'].append('incomplete fixed12 windows; no replacement or expansion');return out
-    for path,names in (('ordinary',('A','B')),('typed',('AP','BP'))):
+    if not complete or len(rows)!=plan['maximum_windows']:
+        out['reasons'].append('incomplete fixed'+str(plan['maximum_windows'])+' windows; no replacement or expansion');return out
+    paths=(('ok',('A','B')),) if plan.get('screen_workload')=='ok' else (('ordinary',('A','B')),('typed',('AP','BP')))
+    for path,names in paths:
         selected=[r for r in rows if r['path']==path];pairs=[]
         for group in range(1,4):
             pair={r['name']:r for r in selected if r['group']==group}
@@ -184,7 +199,7 @@ def comparison(plan,rows,complete):
 def run(a):
     if os.geteuid()!=0:raise ValueError('run phase requires root cgroup control')
     directory=a.root/'pg-read-screen';plan=h.load(directory/'frozen-plan.json');prepared=h.load(directory/'prepare.json')
-    if plan!=make_plan(plan['versions'],plan['candidate'],h.RESOURCES,h.POLICY):raise ValueError('frozen12 plan differs')
+    if plan!=make_plan(plan['versions'],plan['candidate'],h.RESOURCES,h.POLICY,getattr(a,'workload','db')):raise ValueError('frozen screen plan differs')
     if prepared['entry_sha256']!=h.sha(__file__) or prepared['normal_plan_sha256']!=h.sha(a.root/'frozen-plan.json'):
         raise ValueError('entry or original normal plan changed')
     if any(h.sha(Path(h.__file__).parent/n)!=v for n,v in prepared['helper_sha256'].items()):raise ValueError('helper changed after preparation')
@@ -206,11 +221,12 @@ def run(a):
         fixture.start();private=h.load(fixture.manifest_path);fc.Harness=PrivateHarness
         h.save(directory/'identity.json',dict(bindings=bindings,kernel=platform.release(),boot_sha256=h.sha('/proc/sys/kernel/random/boot_id'),
             private_database_limits=h.load(fixture.state_path)['limits'],resources=plan['resources'],quality_policy=plan['quality_policy'],
-            scope='One live fixture shared serially by all12 windows; no independent environment qualification or formal acceptance.'))
+            scope='One live fixture shared serially by all'+str(plan['maximum_windows'])+' windows; no independent environment qualification or formal acceptance.'))
         for config in plan['windows']:
             name=config['name'];dest=output/config['path']/f"g{config['group']}-{name}"
             if fc.version_identity(plan,name)!=bindings[name]:raise ValueError('identity changed before window')
-            row=fc.window(plan,name,'db',200,3,15,dest,binding=bindings[name],job={'phase':'diagnostic','contract':config['contract']})
+            row=fc.window(plan,name,config['workload'],config['rate'],config['warmup_seconds'],config['score_seconds'],dest,
+                binding=bindings[name],job={'phase':'diagnostic','contract':config['contract']})
             row.update(path=config['path'],group=config['group'],phase='normal')
             valid,_=h.normal_diagnostic_quality(row);p99=row.get('latency',{}).get('p99_ms')
             valid=valid and type(p99) in (int,float) and 0<=p99<=plan['latency_p99_SLO_ms']
@@ -227,14 +243,15 @@ def run(a):
         except Exception as error:result['database_cleanup']={'error':repr(error)}
         for s,handler in previous.items():signal.signal(s,handler)
         cleanup=result['database_cleanup'];dbok=cleanup.get('forced') is False and cleanup.get('cgroup_removed') is True and cleanup.get('after',{}).get('process_count')==0
-        result.update(seconds=time.monotonic()-began,execution_complete=len(result['rows'])==12 and not result['stopped'] and dbok and 'observer_error' not in result)
+        result.update(seconds=time.monotonic()-began,execution_complete=len(result['rows'])==plan['maximum_windows'] and not result['stopped'] and dbok and 'observer_error' not in result)
         result['comparison']=comparison(plan,result['rows'],result['execution_complete']);h.save(directory/'summary.json',result)
     return dict(execution_complete=result['execution_complete'],comparison=result['comparison'],summary=str(directory/'summary.json'))
 
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True,type=Path);p.add_argument('--source',required=True,type=Path)
-    p.add_argument('--tools',required=True,type=Path);p.add_argument('--phase',choices=('prepare','run'),required=True);a=p.parse_args()
+    p.add_argument('--tools',required=True,type=Path);p.add_argument('--phase',choices=('prepare','run'),required=True)
+    p.add_argument('--workload',choices=('db','ok'),default='db');a=p.parse_args()
     a.root=a.root.resolve();a.source=a.source.resolve();a.tools=a.tools.resolve();helpers(a.source)
     if not a.tools.is_dir():raise ValueError('existing fixed tools directory required')
     result=prepare(a) if a.phase=='prepare' else run(a);print(json.dumps(result),flush=True)

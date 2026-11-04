@@ -441,7 +441,7 @@ def prepare_current_pg_guard_cache(archive,a):
     if root.exists() and (root.is_symlink() or any(p.name!='tools' for p in root.iterdir())):
         raise ValueError('current cache requires fresh guard root')
     cache=root/'verified-current-cache'
-    typed_cache={'typed':True} if getattr(a,'pg_read_screen',False) else {}
+    typed_cache={'typed':True} if getattr(a,'pg_read_screen',False) and getattr(a,'pg_input_guard_workload','db')=='db' else {}
     restored,bindings,observations=restore_current_pg_builds(archive,cache,source,**typed_cache)
     normal,driver=restored['B'],restored['Driver'];binding,actual=bindings['B'],observations['B']
     unchanged=subprocess.run(['git','-C',str(source),'diff','--quiet',h.PG_CURRENT_BASELINE,

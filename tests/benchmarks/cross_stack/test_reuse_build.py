@@ -133,12 +133,12 @@ class ReuseBuildTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'fresh guard root'):r.prepare_current_pg_guard_cache(Path(temp)/'archive',a)
 
     def test_current_screen_restores_typed_bytes_but_imports_no_candidate_or_scores(self):
-        for screen in (False,True):
-            with self.subTest(screen=screen),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+        for screen,workload,typed in ((False,'db',False),(True,'db',True),(True,'ok',False)):
+            with self.subTest(screen=screen,workload=workload),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
                 root=Path(temp)/'fresh';cache=root/'verified-current-cache'
                 a=types.SimpleNamespace(root=root,source=Path(temp)/'source',baseline=r.h.PG_CURRENT_BASELINE,
                     prepatch=r.h.PG_CURRENT_BASELINE,candidate='c'*40,screen_variants=[],
-                    pg_input_guard=True,pg_read_screen=screen)
+                    pg_input_guard=True,pg_read_screen=screen,pg_input_guard_workload=workload)
                 normal={'client':{}};driver={'client':{'source_sha256':hashlib.sha256(b'go').hexdigest()}}
                 def restore(archive,destination,source,*,typed=False):
                     restored={'B':normal,'Driver':driver}
@@ -150,11 +150,11 @@ class ReuseBuildTests(unittest.TestCase):
                 patches.enter_context(patch.object(r.subprocess,'run',return_value=types.SimpleNamespace(returncode=0)))
                 patches.enter_context(patch.object(r.subprocess,'check_output',return_value=b'go'))
                 state=r.prepare_current_pg_guard_cache(Path(temp)/'same-archive',a)
-                self.assertEqual((cache/'BP/manifest.json').is_file(),screen)
+                self.assertEqual((cache/'BP/manifest.json').is_file(),typed)
                 self.assertEqual(set(state['steps']),{'build-A','build-Driver'})
                 self.assertEqual(state['imported_measurement_windows'],0)
                 self.assertFalse((root/'B').exists())
-                self.assertEqual(r.h.load(root/'verified-baseline-cache.json')['typed_baseline_restored'],screen)
+                self.assertEqual(r.h.load(root/'verified-baseline-cache.json')['typed_baseline_restored'],typed)
 
     def test_current_manifest_binds_redacted_cli_receipt_and_rejects_historical_rust(self):
         for rust in ('1.99.1','1.89.0'):
