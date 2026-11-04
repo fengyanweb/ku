@@ -1230,6 +1230,88 @@ fn native_pg_async_large_utf8_row_yields_at_byte_quantum_and_detaches_storage() 
 }
 
 #[test]
+fn native_pg_first_http_owner_submission_preserves_real_notifications_and_progress() {
+    for typed in [false, true] {
+        run_first_http_owner_submission(typed);
+    }
+}
+
+fn run_first_http_owner_submission(typed: bool) {
+    let directory = TempDir::new("pg-first-owner-wake");
+    let prefix = fixture().split_once("fn main(): null! {").unwrap().0;
+    let query = if typed {
+        "client.query_one_typed(\"SELECT 3\", [], [], [\"int4\"])?"
+    } else {
+        "client.query(\"SELECT 3\", [])?"
+    };
+    let source = format!(
+        r#"{prefix}
+import http from "std.http"
+fn main(): null! {{
+    client = pg.client({{conninfo: "hostaddr=127.0.0.1", max_connections: 1}})?
+    async fn read(): HttpResponse! {{
+        result = {query}
+        return ok(http.text("done"))
+    }}
+    app = http.service()
+    app.get("/read", read)
+    app.listen("127.0.0.1:0")?
+    return ok(null)
+}}
+"#
+    );
+    let mut harness = query_stub_harness_source(&directory, &source).replacen(
+        "int main(void) {",
+        "static int ku_legacy_query_tests(void) {",
+        1,
+    );
+    if typed {
+        for (needle, replacement) in [
+            ("int PQsendQueryParams(PGconn* conn, const char* sql, int count, const void* types, const char* const* values, const int* lengths, const int* formats, int format) {", "int PQsendQueryParams(PGconn* conn, const char* sql, int count, const void* types, const char* const* values, const int* lengths, const int* formats, int format) { if(format==1){ if(count)bad_calls++;param_sends++;return send_query(conn,sql); }"),
+            ("static int result_format(const PGresult* result, int column) {", "static int result_format(const PGresult* result, int column) { if(result->mode==T_OK)return 1;"),
+            ("unsigned int PQftype(const PGresult* result,int column) {", "unsigned int PQftype(const PGresult* result,int column) { if(result->mode==T_OK)return 23u;"),
+        ] {
+            assert!(harness.contains(needle), "typed first PG seam missing: {needle}");
+            harness = harness.replacen(needle, replacement, 1);
+        }
+    }
+    for (needle,replacement) in [
+        ("static uint32_t ku_task_0_resume(void* raw) {", "static uint32_t ku_task_0_resume(void* raw) { first_owner_resumes++;"),
+        ("static uint32_t ku_task_blocking_take_pg(const KuTaskDriverTicketV1* ticket,", "static size_t first_owner_resumes,first_owner_pre_step_take,first_owner_steps;\nstatic uint32_t first_owner_take(const KuTaskDriverTicketV1*,KuTaskBlockingTokenV1*,KuResult_pg_result*);\nstatic void first_owner_notify(const KuTaskDriverTicketV1*);\nstatic uint32_t ku_task_blocking_take_pg(const KuTaskDriverTicketV1* ticket,"),
+        ("return ku_task_blocking_take(ticket,token,0,9u,NULL,output);", "return first_owner_take(ticket,token,output);"),
+        ("if(pool->accepted!=UINT64_MAX)pool->accepted++;", "if(pool->accepted!=UINT64_MAX)pool->accepted++;\n      first_owner_notify(ticket);"),
+        ("done=ku_pg_async_step(operation,events,ku_pg_now_ms(),cancelled);", "if(!operation->diagnostic_steps)first_owner_steps++;\n    done=ku_pg_async_step(operation,events,ku_pg_now_ms(),cancelled);"),
+    ] {
+        assert!(harness.contains(needle),"real first PG owner seam missing: {needle}");
+        harness=harness.replacen(needle,replacement,1);
+    }
+    harness.push_str(NATIVE_THREAD_LIFECYCLE_HARNESS);
+    harness.push_str(PG_FIRST_OWNER_WAKE_SUITE);
+    let path = directory.path().join("pg-first-owner-wake.c");
+    fs::write(&path, harness).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "pg-first-owner-wake") else {
+        return;
+    };
+    let mut command = Command::new(executable);
+    if let Ok(case) = std::env::var("KU_PG_FIRST_OWNER_ONLY_CASE") {
+        command.env("KU_PG_FIRST_OWNER_ONLY_CASE", case);
+    }
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS)
+        .expect("first PG owner fixture exceeded bounds");
+    assert!(
+        output.status.success(),
+        "first PG owner fixture failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg first owner wake closed loop\n"
+    );
+    eprintln!("typed={typed}: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
 fn native_pg_task_fresh_cancel_observer_checks_real_job_state_and_generation() {
     let directory = TempDir::new("pg-task-fresh-cancel");
     let sync_fixture = fixture()
@@ -3752,6 +3834,151 @@ int main(void) {
   async_drop_output(op,&b,1);ku_pg_client_close_owned(opened.value);
   CHECK(live_connections==0 && live_results==0 && b.bytes==0);
   puts("pg async large row closed loop");return 0;
+}
+"#;
+
+const PG_FIRST_OWNER_WAKE_SUITE: &str = r#"
+static size_t first_owner_environment_refs;
+static int first_owner_inject;
+static void first_owner_retain(void* raw) {(void)raw;first_owner_environment_refs++;}
+static void first_owner_release(void* raw) {(void)raw;if(first_owner_environment_refs<=1u)abort();first_owner_environment_refs--;}
+static int first_owner_notify_thread(void* raw) {
+  const KuTaskDriverTicketV1* ticket=(const KuTaskDriverTicketV1*)raw;
+  return ku_task_driver_wake(ticket)==KU_TASK_DRIVER_OK?0:1;
+}
+static void first_owner_notify(const KuTaskDriverTicketV1* ticket) {
+  if(first_owner_inject) {
+    KuTestThread thread={0};
+    if(!ku_test_thread_start(&thread,first_owner_notify_thread,(void*)ticket)
+        || !ku_test_thread_join(&thread,3000u) || thread.outcome)abort();
+  }
+}
+static uint32_t first_owner_take(const KuTaskDriverTicketV1* ticket,
+    KuTaskBlockingTokenV1* token,KuResult_pg_result* output) {
+  KuTaskBlockingPoolV1* pool=(KuTaskBlockingPoolV1*)token->pool;
+  int before=0;
+  if(pool && !ku_task_blocking_lock(pool)) {
+    KuTaskBlockingJobV1* job=ku_task_blocking_find(pool,token);
+    before=job && job->pg_operation && !job->pg_operation->diagnostic_steps;
+    ku_task_blocking_unlock(pool);
+  }
+  uint32_t status=ku_task_blocking_take(ticket,token,0,9u,NULL,output);
+  if(before && status==KU_TASK_DRIVER_PENDING)first_owner_pre_step_take++;
+  return status;
+}
+static int first_owner_case(unsigned scenario) {
+  clock_ms=1000;clock_step=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
+  track_runtime_allocations=1;first_owner_inject=scenario==2u;
+  KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);CHECK(opened.ok);
+  KuPgClient* client=opened.value;int held_slot=-1;
+  if(scenario==6u || scenario==7u) {
+    PGconn* held=NULL;KuError error={0};held_slot=ku_pg_client_acquire(client,&held,&error,clock_ms+10000u);
+    CHECK(held_slot>=0 && held);
+    if(scenario==6u) {ku_pg_client_release(client,held_slot,1,clock_ms+10000u);held_slot=-1;}
+  }
+  KuHttpTaskRuntime runtime={0};KuTaskDriverSlotV1 slots[2]={0};size_t ring[2]={0};
+  KuTaskBlockingPoolV1 pool={0};KuHttpLoopGroup group={0};KuHttpWake wake={0};
+  CHECK(ku_http_mutex_init(&group.lock) && ku_http_wake_init(&wake));
+  group.count=group.created=1;group.tasks=&runtime;
+  KuHttpLoopOwner* loop=&group.loops[0];loop->group=&group;loop->index=0;loop->wake=&wake;
+  uint64_t deadline=ku_task_driver_now_ms()+5000u;
+  size_t fixed=ku_task_driver_fixed_storage_bytes(2u)+ku_task_blocking_fixed_bytes(2u);
+  CHECK(ku_task_driver_init_external(&runtime.driver,sizeof(runtime.driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,2u,ring,2u,fixed+65536u,1u,deadline,&group,ku_http_task_event_wake)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_init(&pool,2u,1u,deadline)==KU_TASK_DRIVER_OK);
+  runtime.blocking=&pool;
+  CHECK(ku_task_driver_attach_blocking(&runtime.driver,&pool,sizeof(pool),ku_task_blocking_close,
+      ku_task_blocking_ready,pool.storage,pool.storage_bytes)==KU_TASK_DRIVER_OK);
+  KuEnvHeader environment={first_owner_retain,first_owner_release,0};first_owner_environment_refs=1u;
+  KuTaskPgCapture capture={0};CHECK(ku_task_pg_capture_acquire(client,&environment,clock_ms+10000u,&capture));
+  KuTaskValueV1 work={0};CHECK(ku_task_0_start_value(&runtime.driver,&capture,&work)==KU_TASK_DRIVER_OK);
+  KuTaskInstance_0* instance=(KuTaskInstance_0*)work.owner.lease.control->context;
+  ku_http_current_loop=scenario==1u?NULL:loop;
+  first_owner_resumes=first_owner_pre_step_take=first_owner_steps=0;
+  int before_user=user_sends;
+  uint64_t next=UINT64_MAX;int force_io=0;
+  for(size_t turn=0;turn<16u && !instance->blocking.pool;turn++) {
+    uint32_t status=scenario==8u?ku_http_task_compute_slice(&runtime,0u,ku_task_driver_now_ms(),deadline,NULL,NULL,&next,&force_io)
+        :ku_http_task_pump(&runtime,0u,1u,&next);
+    CHECK(status<=KU_TASK_DRIVER_PENDING);
+  }
+  CHECK(instance->blocking.pool && !first_owner_steps && user_sends==before_user);
+  KuTaskBlockingJobV1* job=&pool.jobs[instance->blocking.slot];
+  CHECK(job->state==KU_TASK_BLOCKING_NET_WAIT && job->pg_ready);
+  size_t resumes_before=first_owner_resumes;
+  CHECK(ku_http_task_pump(&runtime,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  fprintf(stderr,"first-owner scenario=%u resumes-before-step=%zu empty-takes=%zu queued=%zu steps=%zu\n",
+      scenario,first_owner_resumes-resumes_before,first_owner_pre_step_take,runtime.driver.queued,first_owner_steps);
+  if(scenario==1u || scenario==2u)CHECK(first_owner_pre_step_take==1u && first_owner_resumes>resumes_before);
+  else CHECK(!first_owner_pre_step_take && first_owner_resumes==resumes_before);
+  first_owner_inject=0;
+  if(scenario==3u) {uint32_t cancelled=ku_task_control_request_cancel(&work.owner.lease,KU_TASK_CONTROL_CANCELLED,deadline);CHECK(cancelled==KU_TASK_CONTROL_OK || cancelled==KU_TASK_CONTROL_PENDING);}
+  if(scenario==4u)clock_ms=job->pg_operation->deadline;
+  if(scenario==5u)CHECK(ku_task_driver_request_close(&runtime.driver,deadline)==KU_TASK_DRIVER_OK);
+  KuTaskNetPollV1 interests[2]={0};uint64_t net_deadline=UINT64_MAX;
+  CHECK(ku_http_task_net_interests(&runtime,0u,interests,2u,&net_deadline)<=2u);
+  CHECK(first_owner_steps==1u);
+  if(scenario==3u || scenario==4u || scenario==5u)CHECK(user_sends==before_user);
+  if(scenario==6u) {
+    unsigned long long stop=ku_test_real_now_ms()+3000u;int ready=0;
+    while(!ready && ku_test_real_now_ms()<stop) {
+      CHECK(!ku_task_blocking_lock(&pool));ready=job->pg_operation->connect_ready;
+      ku_task_blocking_unlock(&pool);if(!ready)ku_test_thread_yield();
+    }
+    CHECK(ready && runtime.driver.queued);
+  }
+  if(scenario==7u) {
+    CHECK(job->pg_operation->waiting && !runtime.driver.queued);
+    ku_pg_client_release(client,held_slot,0,clock_ms+10000u);held_slot=-1;
+    CHECK(job->pg_ready && runtime.driver.queued);
+  }
+  if(scenario==9u) {
+    for(size_t turn=0;turn<128u && ku_task_control_atomic_load(&work.owner.lease.control->phase)==KU_TASK_CONTROL_LIVE;turn++) {
+      for(size_t index=0;index<pool.capacity;index++) {
+        KuTaskBlockingJobV1* pending=&pool.jobs[index];
+        if(pending->state==KU_TASK_BLOCKING_NET_WAIT)
+          CHECK(ku_task_net_dispatch(&pool,0u,index,pending->generation,3u)==KU_TASK_DRIVER_OK);
+      }
+      CHECK(ku_http_task_pump(&runtime,0u,4u,&next)<=KU_TASK_DRIVER_PENDING);
+    }
+    CHECK(user_sends==before_user+1 && !pool.resident);
+    KuTaskAdapterOutcomeV1 result={0};
+    CHECK(ku_task_value_take(&work,NULL,&result)==KU_TASK_CONTROL_OK);
+    CHECK(result.result_kind==8u && result.value.http_response.ok
+        && equals(result.value.http_response.value.body,"done"));
+    ku_task_outcome_drop(&result);
+  }
+  CHECK(ku_task_value_drop(&work,deadline)==KU_TASK_DRIVER_OK);
+  /* Publish generated cleanup before I/O. The separate a06 pre-send gap is
+   * not fixed by this fixture or by suppressing the initial self wake. */
+  CHECK(ku_http_task_pump(&runtime,0u,4u,&next)<=KU_TASK_DRIVER_PENDING);
+  for(size_t turn=0;turn<128u && runtime.driver.resident;turn++) {
+    for(size_t index=0;index<pool.capacity;index++) {
+      KuTaskBlockingJobV1* pending=&pool.jobs[index];
+      if(pending->state==KU_TASK_BLOCKING_NET_WAIT)
+        CHECK(ku_task_net_dispatch(&pool,0u,index,pending->generation,0u)==KU_TASK_DRIVER_OK);
+    }
+    CHECK(ku_http_task_pump(&runtime,0u,4u,&next)<=KU_TASK_DRIVER_PENDING);
+  }
+  CHECK(!runtime.driver.resident && !runtime.driver.reserved_bytes && !runtime.driver.fault && !pool.resident && !pool.fault);
+  CHECK(first_owner_environment_refs==1u);
+  CHECK(ku_task_driver_request_close(&runtime.driver,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && runtime.driver.workers_exited!=1u;turn++)
+    CHECK(ku_http_task_pump(&runtime,0u,4u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_blocking_finish(&pool,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_join(&runtime.driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&runtime.driver)==KU_TASK_DRIVER_OK);
+  ku_http_current_loop=NULL;ku_http_wake_close(&wake);ku_http_mutex_destroy(&group.lock);
+  ku_pg_client_close_owned(client);
+  CHECK(!live_connections && !live_results && !live_runtime_allocations && !runtime_bytes && !bad_calls);
+  track_runtime_allocations=0;
+  return 0;
+}
+int main(void) {
+  const char* selected=getenv("KU_PG_FIRST_OWNER_ONLY_CASE");
+  if(selected)CHECK(!first_owner_case((unsigned)atoi(selected)));
+  else for(unsigned scenario=0;scenario<10u;scenario++)CHECK(!first_owner_case(scenario));
+  puts("pg first owner wake closed loop");return 0;
 }
 "#;
 

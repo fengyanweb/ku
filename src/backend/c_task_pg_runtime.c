@@ -2,6 +2,10 @@
  * Only connection establishment enters the worker ring; SQL/reset are stepped
  * by the immutable Task owner. A stable job stays registered through all pool
  * notification pins, even after its result has become logically complete. */
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+/* Defined by the HTTP bridge; observes its existing owner-thread identity. */
+static int ku_http_task_driver_is_current_owner(KuTaskDriverV1*,size_t);
+#endif
 static int ku_task_pg_reserve(void* raw,size_t bytes) {
   KuTaskBlockingJobV1* job=(KuTaskBlockingJobV1*)raw;
   KuTaskBlockingOutputV1 output={job->pg_pool,job,{NULL,NULL},{0,0},KU_TASK_DRIVER_OK,NULL,0,0,0};
@@ -132,6 +136,30 @@ static uint32_t ku_task_blocking_submit_pg_inputs(const KuTaskDriverTicketV1* ti
     }
     operation->task_phase_context=control;operation->task_phase=ku_task_pg_diagnostic_phase;
     int attached=job->net_owner && (ticket->driver->external_loops || ticket->driver->io_wait);
+    int owner_scans_first=0;
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+    /* Only this currently executing HTTP fixed owner is guaranteed to scan
+     * its newly published NET_WAIT job after the callback returns. Generic
+     * external loops and direct adapter callers retain their original wake. */
+    KuTaskDriverExecutionV1* executing=ku_task_driver_execution;
+    if(owner && ticket->driver->external_loops && ticket->driver->fixed_owner
+        && !ticket->driver->closing && !ticket->driver->fault
+        && owner->state==KU_TASK_DRIVER_RUNNING && owner->binding==control
+        && owner->driver_lease.control==control && !owner->cancel_pending
+        && !owner->deadline_fired && !owner->cleanup_fault
+        && executing && executing->driver==ticket->driver && executing->slot==ticket->slot
+        && executing->generation==ticket->generation && executing->control==control
+        && owner->owner_worker==job->net_owner && owner->executor_worker==job->net_owner
+        && job->net_owner<=ticket->driver->workers_created
+        && ku_http_task_driver_is_current_owner(ticket->driver,job->net_owner)) {
+      KuTaskDriverWorkerV1* worker=&ticket->driver->workers[job->net_owner-1u];
+#if defined(_WIN32)
+      owner_scans_first=worker->pumping && worker->owner_bound && worker->owner_thread==GetCurrentThreadId();
+#else
+      owner_scans_first=worker->pumping && worker->owner_bound && pthread_equal(worker->owner_thread,pthread_self());
+#endif
+    }
+#endif
     ku_task_driver_unlock(ticket->driver);
     if(attached) {
       operation->fresh_cancel_context=job;operation->fresh_cancel=ku_task_pg_fresh_cancel;
@@ -140,7 +168,11 @@ static uint32_t ku_task_blocking_submit_pg_inputs(const KuTaskDriverTicketV1* ti
       if(pool->closing || ku_task_control_atomic_load(&control->phase)!=KU_TASK_CONTROL_LIVE)
         if(ku_task_blocking_cancel_job_locked(pool,job)!=KU_TASK_DRIVER_OK)status=KU_TASK_DRIVER_INTERNAL;
       if(pool->accepted!=UINT64_MAX)pool->accepted++;
-      (void)ku_task_driver_wake(ticket);ku_task_blocking_unlock(pool);
+      /* Do not touch notified: it may already carry a real concurrent wake.
+       * pg_ready/NET_WAIT and WAIT publication remain the progress source. */
+      if(!owner_scans_first || status!=KU_TASK_DRIVER_OK || pool->closing || job->cancelled)
+        (void)ku_task_driver_wake(ticket);
+      ku_task_blocking_unlock(pool);
       status=ku_task_driver_set_intent(ticket,KU_TASK_DRIVER_WAIT);
       return status==KU_TASK_DRIVER_OK?KU_TASK_DRIVER_PENDING:status;
     }

@@ -205,6 +205,16 @@ typedef struct KuHttpTaskRuntime {
   uint32_t fixed_reserved;
   @BLOCKING_FIELD@
 } KuHttpTaskRuntime;
+/* The loop/group/tasks bindings are immutable while this real HTTP owner
+ * thread is alive. No new scope flag, per-pump TLS write or public ABI field. */
+static int ku_http_task_driver_is_current_owner(KuTaskDriverV1* driver,size_t owner) {
+  KuHttpLoopOwner* current=ku_http_current_loop;
+  if(!current || !current->group || !current->wake || current->index<0
+      || owner!=(size_t)current->index+1u || !current->group->tasks
+      || driver->event_context!=current->group || driver->event_wake!=ku_http_task_event_wake)return 0;
+  KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)current->group->tasks;
+  return &runtime->driver==driver;
+}
 static void ku_http_task_blocking_retired(void* raw) {
   KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)raw;
   runtime->driver.event_wake(runtime->driver.event_context,0u);

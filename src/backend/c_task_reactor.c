@@ -179,6 +179,14 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
   int queue_connect=0;
   if(job->kind==9u) {
     KuPgAsyncOp* operation=job->pg_operation;
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+    /* This owner no longer needs a redundant first-resume observation. Read
+     * the pinned control before protocol work, including a cancellation that
+     * arrived after submit but before this scan. No SEND/RESET fence is removed
+     * or replaced; the historical narrower pre-send gap remains separate. */
+    if(ku_http_task_driver_is_current_owner(job->ticket.driver,job->net_owner))
+      cancelled=cancelled || ku_task_pg_fresh_cancel(job,generation);
+#endif
     done=ku_pg_async_step(operation,events,ku_pg_now_ms(),cancelled);
     queue_connect=operation->phase==KU_PG_ASYNC_CONNECT && !operation->connect_ready;
     if(done && ku_pg_async_can_dispose(operation)) {
