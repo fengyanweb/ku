@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """One owned normal-Release allocator observation. Never a performance score."""
-import argparse, copy, json, os, platform, re, shlex, shutil, signal, subprocess, tempfile, time
+import argparse, copy, json, os, platform, re, select, shlex, shutil, signal, subprocess, sys, tempfile, time, types
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import focus_cycle as fc
@@ -10,6 +10,144 @@ import linux_harness as lh
 BASE='166453a1d2768bbce19796d9c7823be73cc84ccb'
 ELF='234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b'
 XML_LIMIT=1<<20
+
+STOCK_CHILD = r'''
+import json,mmap,os,signal,sys,time
+role,cpu=sys.argv[1:];signal.alarm(50);os.sched_setaffinity(0,{int(cpu)})
+maps=[];progress=0;total=0
+def touch(size):
+ global total
+ m=mmap.mmap(-1,size,flags=mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS)
+ for i in range(0,size,4096):m[i]=1
+ maps.append(m);total+=size
+def ack():
+ value=dict(pid=os.getpid(),role=role,affinity=sorted(os.sched_getaffinity(0)),progress=progress,
+  touched_bytes=total,monotonic_ns=time.monotonic_ns(),cgroup=open('/proc/self/cgroup').read())
+ os.write(1,(json.dumps(value)+'\n').encode())
+if role=='service':touch(2<<20)
+ack()
+while True:
+ command=os.read(0,1)
+ if not command:break
+ if role=='service' and command==b't':touch(4096)
+ elif role=='observer' and command in (b'0',b'2'):
+  assert os.sched_getaffinity(0)=={int(command)};touch(512<<10)
+ else:raise ValueError('fixed stock experiment command required')
+ progress+=1;ack()
+'''
+
+
+def stock_only(a):
+    """Six fixed observations of accounting, never a candidate/product score."""
+    a.root=a.root.resolve();a.root.mkdir(parents=True,exist_ok=False);evidence=a.root/'evidence';evidence.mkdir()
+    cgroot=Path('/sys/fs/cgroup')/('ku-stock-'+str(os.getpid())+'-'+os.urandom(4).hex())
+    original=set(os.sched_getaffinity(0));domains=[];processes=[];logs=[];latest={}
+    result=dict(schema='ku-memory-current-stock-only-v1',diagnostic_only=True,performance_score=False,
+        candidate_accepted=False,execution_complete=False,maximum_seconds=60,operation_seconds=45,
+        child_seconds=50,total_cgroup_limit_bytes=64<<20,groups=3,observer_touch_bytes=512<<10,
+        service_initial_bytes=2<<20,service_prime_bytes=4096,maximum_replacements=0,pairs=[],cleanup=[],
+        kernel_release=platform.release(),page_bytes=os.sysconf('SC_PAGESIZE'),
+        parent=dict(pid=os.getpid(),original_affinity=sorted(original),original_cgroup=(Path('/proc/self/cgroup')).read_text()),
+        boundary='Kernel-accounting mechanism only. No product, database, HTTP, reclaim, cache drop, stock flush, '
+            'candidate score or historical-guard causal conclusion. memory.current is never replaced by RSS.')
+    began=time.monotonic();handlers={s:signal.getsignal(s) for s in (signal.SIGALRM,signal.SIGTERM)}
+    def stop(*unused):raise TimeoutError('stock-only operation deadline')
+    def exchange(process,command=None):
+        if command is not None:process.stdin.write(command);process.stdin.flush()
+        raw=b'';deadline=time.monotonic()+3
+        while not raw.endswith(b'\n'):
+            ready,_,_=select.select([process.stdout],[],[],max(0,deadline-time.monotonic()))
+            if not ready or len(raw)>4096:raise TimeoutError('stock-only bounded child acknowledgement')
+            part=os.read(process.stdout.fileno(),4096)
+            if not part:raise RuntimeError('stock-only child exited before acknowledgement')
+            raw+=part
+        value=json.loads(raw)
+        if value['pid']!=process.pid:raise ValueError('owned child identity changed')
+        return value
+    def checkpoint():
+        out=dict(monotonic_ns=time.monotonic_ns(),parent_affinity=sorted(os.sched_getaffinity(0)),processes={})
+        for role,domain,process in zip(('service','observer'),domains,processes):
+            proc=Path('/proc')/str(process.pid)
+            if str(process.pid) not in (domain.path/'cgroup.procs').read_text().split():raise ValueError('owned child left its domain')
+            out['processes'][role]=dict(pid=process.pid,cgroup=(proc/'cgroup').read_text(),
+                affinity=sorted(os.sched_getaffinity(process.pid)),progress=latest[role],
+                stat=(proc/'stat').read_text(),wchan=(proc/'wchan').read_text(),domain=domain.snapshot())
+        return out
+    h.save(evidence/'plan.json',dict(result,entry_sha256=h.sha(__file__),child_sha256=__import__('hashlib').sha256(STOCK_CHILD.encode()).hexdigest()))
+    try:
+        if result['page_bytes']!=4096:raise ValueError('fixed experiment requires4096-byte pages')
+        if not {0,2}<=original:raise ValueError('fixed CPUs0 and2 must already be allowed')
+        required={'cpu','memory','pids'};delegated=set((cgroot.parent/'cgroup.subtree_control').read_text().split())
+        result['parent']['delegated_controllers']=sorted(delegated)
+        h.save(evidence/'plan.json',dict(result,entry_sha256=h.sha(__file__)))
+        if not required<=delegated:raise ValueError('existing parent must already delegate cpu/memory/pids; global policy unchanged')
+        enabled=required|({'cpuset'}&delegated);result['owned_controllers']=sorted(enabled)
+        os.sched_setaffinity(0,{2});result['parent']['experiment_affinity']=sorted(os.sched_getaffinity(0))
+        for s in handlers:signal.signal(s,stop)
+        signal.alarm(45);cgroot.mkdir()
+        settings={'memory.max':str(64<<20),'memory.swap.max':'0','pids.max':'4',
+            'cgroup.subtree_control':' '.join('+'+v for v in sorted(enabled))}
+        if 'cpuset' in enabled:settings.update({'cpuset.cpus':'0,2','cpuset.mems':(cgroot.parent/'cpuset.mems.effective').read_text().strip()})
+        for key,value in settings.items():
+            (cgroot/key).write_text(value)
+        owner=types.SimpleNamespace(cgroup_root=cgroot);uid=int(os.environ.get('SUDO_UID','0'));gid=int(os.environ.get('SUDO_GID','0'))
+        for role,cpu in (('service',0),('observer',2)):
+            domain=lh.Domain(owner,role,1,32<<20,'0' if role=='service' else '0,2');domains.append(domain)
+            command=[sys.executable,'-B',str(Path(lh.__file__).resolve()),'__child',str(domain.path),
+                str(uid),str(gid),str(a.root),'--',sys.executable,'-I','-u','-c',STOCK_CHILD,role,str(cpu)]
+            log=(evidence/(role+'-stderr.log')).open('xb');logs.append(log)
+            process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=log,bufsize=0,start_new_session=True)
+            processes.append(process);latest[role]=exchange(process)
+            result.setdefault('children',[]).append(dict(role=role,pid=process.pid,command=command,cgroup=str(domain.path),initial=latest[role],limits=domain.settings))
+        for group in range(1,4):
+            latest['service']=exchange(processes[0],b't');time.sleep(.05)
+            for label,cpu in (('offCPU',2),('sameCPU',0)):
+                os.sched_setaffinity(processes[1].pid,{cpu})
+                if os.sched_getaffinity(processes[1].pid)!={cpu}:raise ValueError('sleeping observer affinity not set before checkpoint')
+                before=checkpoint();h.save(evidence/f'g{group}-{label}-before.json',before)
+                latest['observer']=exchange(processes[1],str(cpu).encode());time.sleep(.05);after=checkpoint()
+                h.save(evidence/f'g{group}-{label}-after.json',after)
+                for endpoint in (before,after):
+                    service=endpoint['processes']['service']
+                    if service['affinity']!=[0] or 'pipe_read' not in service['wchan']:
+                        raise ValueError('service must remain blocked on its command pipe on CPU0')
+                if after['processes']['observer']['affinity']!=[cpu]:raise ValueError('observer affinity differs from condition')
+                if before['processes']['service']['progress']!=after['processes']['service']['progress']:
+                    raise ValueError('service progress changed within observer condition')
+                row=dict(group=group,condition=label,observer_cpu=cpu,before=before,after=after,
+                    service_current_delta=after['processes']['service']['domain']['memory_current']-before['processes']['service']['domain']['memory_current'],
+                    service_rss_delta=after['processes']['service']['domain']['sum_rss_bytes']-before['processes']['service']['domain']['sum_rss_bytes'])
+                result['pairs'].append(row);h.save(evidence/'observations.json',result['pairs'])
+        result['observation_complete']=True
+    except BaseException as error:result['error']=repr(error)
+    finally:
+        signal.alarm(0);signal.signal(signal.SIGTERM,signal.SIG_IGN)
+        for process in processes:
+            try:
+                process.stdin.close();process.wait(timeout=1)
+            except (OSError,subprocess.TimeoutExpired):
+                try:process.kill();process.wait(timeout=1)
+                except Exception as error:result.setdefault('process_cleanup_errors',[]).append(dict(pid=process.pid,error=repr(error)))
+            finally:process.stdout.close()
+        for domain in domains:
+            try:
+                domain.kill();after=domain.snapshot();removed=domain.remove()
+                result['cleanup'].append(dict(cgroup=str(domain.path),after=after,removed=removed))
+            except Exception as error:result['cleanup'].append(dict(cgroup=str(domain.path),error=repr(error)))
+        try:
+            if cgroot.exists():
+                for path in cgroot.iterdir():
+                    if path.is_dir():path.rmdir()
+                cgroot.rmdir()
+            result['owned_parent_removed']=not cgroot.exists()
+        except OSError as error:result['owned_parent_cleanup_error']=repr(error)
+        for log in logs:log.close()
+        os.sched_setaffinity(0,original)
+        for s,handler in handlers.items():signal.signal(s,handler)
+        result['parent']['restored_affinity']=sorted(os.sched_getaffinity(0));result['seconds']=time.monotonic()-began
+        result['execution_complete']=result.get('observation_complete') is True and len(result['pairs'])==6 and len(result['cleanup'])==2 and not result.get('process_cleanup_errors') and all(v.get('removed') is True and v['after']['process_count']==0 for v in result['cleanup']) and result.get('owned_parent_removed') is True
+        h.save(evidence/'summary.json',result)
+    return 0 if result['execution_complete'] else 2
 
 
 def xml_totals(raw):
@@ -101,10 +239,15 @@ def inferior(service,gdb,directory,label,identity,trim=False):
 
 
 def main(argv=None):
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--root',required=True,type=Path);p.add_argument('--manifest',required=True,type=Path)
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--root',required=True,type=Path);p.add_argument('--manifest',type=Path)
+    p.add_argument('--stock-only',action='store_true',help='One fixed three-group cgroup accounting probe; no product, database or allocator attach')
     a=p.parse_args(argv)
     if os.geteuid()!=0 or platform.system()!='Linux' or platform.machine() not in ('arm64','aarch64'):p.error('owned Linux ARM64/cgroup root required')
     if any(v for k,v in os.environ.items() if k.startswith(('LD_','MALLOC_')) or k=='GLIBC_TUNABLES'):p.error('normal allocator/library environment required')
+    if a.stock_only:
+        if a.manifest is not None:p.error('--stock-only cannot use a product manifest')
+        return stock_only(a)
+    if a.manifest is None:p.error('--manifest is required outside --stock-only')
     gdb=shutil.which('gdb')
     if not gdb:p.error('gdb unavailable; no service started')
     a.root=a.root.resolve();a.manifest=a.manifest.resolve(strict=True)

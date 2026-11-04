@@ -23,6 +23,125 @@ from linux_harness import (arrival_cpu, business_send_end, measurement_clock, qu
 from linux_harness import result_assessment
 import linux_harness
 import focus_cycle
+import normal_arena_read as arena
+
+
+class NormalArenaStockTests(unittest.TestCase):
+    """Synthetic pipes/proc/cgroups only; never starts a Linux probe or process."""
+
+    def test_explicit_stock_cli_never_requires_product_or_gdb_and_old_mode_still_does(self):
+        import io
+        with mock.patch.object(arena.os,'geteuid',return_value=0),mock.patch.object(arena.platform,'system',return_value='Linux'), \
+                mock.patch.object(arena.platform,'machine',return_value='aarch64'),mock.patch.dict(os.environ,{},clear=True), \
+                mock.patch.object(arena,'stock_only',return_value=0) as stock,mock.patch.object(arena.shutil,'which',return_value=None) as which, \
+                mock.patch.object(arena.sys,'stderr',io.StringIO()):
+            self.assertEqual(arena.main(['--stock-only','--root','/unused']),0);stock.assert_called_once();which.assert_not_called()
+            for arguments in (['--stock-only','--root','/unused','--manifest','/unused/product'],['--root','/unused'],
+                    ['--root','/unused','--manifest','/unused/product']):
+                with self.assertRaises(SystemExit):arena.main(arguments)
+            self.assertEqual(stock.call_count,1)
+
+    def run_synthetic_stock(self,issue=None):
+        from contextlib import ExitStack
+        with tempfile.TemporaryDirectory() as temporary,ExitStack() as stack:
+            root=Path(temporary);sysroot=root/'sys';proc=root/'proc';sysroot.mkdir();(proc/'self').mkdir(parents=True)
+            (sysroot/'cgroup.subtree_control').write_text('cpu memory' if issue=='delegation' else 'cpu memory pids' if issue=='without-cpuset' else 'cpu memory pids cpuset')
+            (sysroot/'cpuset.mems.effective').write_text('0');(proc/'self/cgroup').write_text('0::/existing-coordinator\n')
+            real_path=Path;original_rmdir=Path.rmdir;events=[];processes=[];domains=[];affinity={0:{0,1,2,3}}
+            def mapped(value):
+                if str(value)=='/sys/fs/cgroup':return sysroot
+                if str(value)=='/proc':return proc
+                if str(value)=='/proc/self/cgroup':return proc/'self/cgroup'
+                return real_path(value)
+            def rmdir(path):
+                if path==sysroot or sysroot in path.parents:
+                    for item in path.iterdir():
+                        if item.is_file():item.unlink()
+                return original_rmdir(path)
+            class Domain:
+                def __init__(self,owner,role,cores,memory,cpus):
+                    self.label=role;self.path=owner.cgroup_root/role;self.path.mkdir();self.settings=dict(memory=memory,cpus=cpus)
+                    self.process=None;domains.append(self)
+                    self.outer_memory=(owner.cgroup_root/'memory.max').read_text();(self.path/'cgroup.procs').write_text('')
+                def snapshot(self):
+                    events.append(('snapshot',self.label));alive=self.process is not None and self.process.returncode is None
+                    return dict(memory_current=123456,sum_rss_bytes=120000,process_count=int(alive),memory_stat={'anon':120000},memory_events={'oom':0})
+                def kill(self):events.append(('kill',self.label))
+                def remove(self):self.path.rmdir();return True
+            class Pipe:
+                def __init__(self,process):self.process=process
+                def write(self,data):
+                    events.append(('command',self.process.role,data));self.process.progress+=1;self.process.ack()
+                def flush(self):pass
+                def close(self):pass
+                def fileno(self):return self.process.pid
+            class Process:
+                def __init__(self,command,**kwargs):
+                    self.command=command;self.role=command[-2];self.pid=9001+len(processes);self.progress=0;self.returncode=None
+                    self.stdin=Pipe(self);self.stdout=Pipe(self);self.domain=next(d for d in domains if d.label==self.role)
+                    self.domain.process=self;self.domain.path.joinpath('cgroup.procs').write_text(str(self.pid));affinity[self.pid]={int(command[-1])}
+                    directory=proc/str(self.pid);directory.mkdir();(directory/'cgroup').write_text('0::/'+str(self.domain.path.relative_to(sysroot))+'\n')
+                    (directory/'stat').write_text(str(self.pid)+' (probe) S fixture');(directory/'wchan').write_text('anon_pipe_read')
+                    processes.append(self);self.ack()
+                def ack(self):
+                    self.raw=(json.dumps(dict(pid=self.pid,progress=self.progress,affinity=sorted(affinity[self.pid])))+'\n').encode()
+                def wait(self,timeout):self.returncode=0;self.domain.path.joinpath('cgroup.procs').write_text('');return 0
+                def kill(self):self.returncode=-9
+            def pin(pid,cpus):events.append(('pin',pid,tuple(sorted(cpus))));affinity[pid]=set(cpus)
+            patches=[mock.patch.object(arena,'Path',side_effect=mapped),mock.patch.object(Path,'rmdir',rmdir),
+                mock.patch.object(arena.lh,'Domain',Domain),mock.patch.object(arena.subprocess,'Popen',Process),
+                mock.patch.object(arena.os,'getpid',return_value=9000),mock.patch.object(arena.os,'sysconf',return_value=4096),
+                mock.patch.object(arena.os,'sched_getaffinity',side_effect=lambda pid:affinity[pid],create=True),
+                mock.patch.object(arena.os,'sched_setaffinity',side_effect=pin,create=True),
+                mock.patch.object(arena.os,'read',side_effect=lambda fd,n:next(p for p in processes if p.pid==fd).raw),
+                mock.patch.object(arena.select,'select',side_effect=lambda r,w,e,t:([] if issue=='ack-timeout' else r,[],[])),
+                mock.patch.object(arena.signal,'signal'),mock.patch.object(arena.signal,'getsignal',return_value=signal.SIG_DFL),
+                mock.patch.object(arena.signal,'alarm'),mock.patch.object(arena.time,'sleep')]
+            for patch in patches:stack.enter_context(patch)
+            code=arena.stock_only(types.SimpleNamespace(root=root/'output'))
+            value=json.loads((root/'output/evidence/summary.json').read_text());plan=json.loads((root/'output/evidence/plan.json').read_text())
+            return code,value,plan,events,[p.command for p in processes],[d.settings for d in domains],[d.outer_memory for d in domains]
+
+    def test_fixed_three_pairs_bound_real_commands_and_pin_before_checkpoint_before_wakeup(self):
+        code,value,plan,events,commands,limits,outer=self.run_synthetic_stock()
+        self.assertEqual(code,0);self.assertEqual((value['maximum_seconds'],value['operation_seconds'],value['child_seconds']),(60,45,50))
+        self.assertEqual((value['groups'],value['maximum_replacements'],value['total_cgroup_limit_bytes']),(3,0,64<<20))
+        self.assertEqual(value['parent']['restored_affinity'],[0,1,2,3]);self.assertEqual(plan['page_bytes'],4096)
+        self.assertEqual(plan['parent']['original_cgroup'],'0::/existing-coordinator\n');self.assertTrue(plan['kernel_release'])
+        self.assertEqual([(p['group'],p['condition']) for p in value['pairs']],[(g,c) for g in (1,2,3) for c in ('offCPU','sameCPU')])
+        self.assertEqual([c[-2:] for c in commands],[['service','0'],['observer','2']])
+        for command in commands:
+            self.assertIn('__child',command);self.assertIn(arena.STOCK_CHILD,command);self.assertIn('-I',command)
+        self.assertEqual(limits,[dict(memory=32<<20,cpus='0'),dict(memory=32<<20,cpus='0,2')]);self.assertEqual(outer,[str(64<<20)]*2)
+        observer_commands=[(i,e) for i,e in enumerate(events) if e[:2]==('command','observer')]
+        self.assertEqual([e[2] for i,e in observer_commands],[b'2',b'0']*3)
+        for index,event in observer_commands:
+            pin=max(i for i,e in enumerate(events[:index]) if e[:2]==('pin',9002))
+            self.assertEqual(events[pin][2],(int(event[2]),))
+            self.assertEqual(events[pin+1:index],[('snapshot','service'),('snapshot','observer')])
+        for pair in value['pairs']:
+            self.assertEqual(pair['before']['processes']['service']['progress'],pair['after']['processes']['service']['progress'])
+
+    def test_missing_delegation_or_ack_deadline_preserves_failure_and_restores_affinity(self):
+        for issue in ('delegation','ack-timeout'):
+            with self.subTest(issue=issue):
+                code,value,plan,events,commands,limits,outer=self.run_synthetic_stock(issue)
+                self.assertEqual(code,2);self.assertFalse(value['execution_complete']);self.assertEqual(value['pairs'],[])
+                self.assertEqual(value['parent']['restored_affinity'],[0,1,2,3]);self.assertTrue(value['owned_parent_removed'])
+                self.assertIn('delegate' if issue=='delegation' else 'acknowledgement',value['error'])
+                if issue=='delegation':self.assertEqual(commands,[])
+
+    def test_affinity_probe_works_without_enabling_an_undelegated_cpuset_controller(self):
+        code,value,plan,events,commands,limits,outer=self.run_synthetic_stock('without-cpuset')
+        self.assertEqual(code,0);self.assertEqual(value['owned_controllers'],['cpu','memory','pids'])
+        self.assertEqual(plan['parent']['delegated_controllers'],['cpu','memory','pids'])
+
+    def test_stock_job_has_no_historical_build_download_or_install(self):
+        workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
+        job=workflow.split('\n  arena-residency:\n',1)[1].split('\n  pg-typed-self:\n',1)[0]
+        self.assertIn('timeout-minutes: 3',job);self.assertIn('--stock-only --root "$RUNNER_TEMP/stock-read"',job)
+        for forbidden in ('download-artifact','apt-get','rustup','clang','gdb','--manifest','reuse_build','41582847043'):
+            self.assertNotIn(forbidden,job)
 
 
 def clock(origin=100_000_000_000, uncertainty=1000):

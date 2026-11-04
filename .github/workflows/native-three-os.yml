@@ -165,62 +165,31 @@ jobs:
 
   arena-residency:
     if: github.event_name == 'workflow_dispatch' && inputs.scope == 'arena-residency'
-    name: Linux ARM64 normal Release arena residency question
+    name: Linux ARM64 one fixed cgroup stock-accounting question
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 10
+    timeout-minutes: 3
     permissions:
       contents: read
-      actions: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install only existing binary dependencies and bounded debugger
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends clang-18 libpq-dev postgresql-16 gdb
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: ku-pg-input-guard-full
-          path: ${{ runner.temp }}/arena-download
-          run-id: 41582847043
-          github-token: ${{ github.token }}
-      - name: Verify the unchanged default A and driver without building or importing scores
-        shell: bash
-        env:
-          PYTHONPATH: tests/benchmarks/cross_stack
-        run: |
-          set -euo pipefail
-          python3 -B - <<'PY'
-          import os
-          from pathlib import Path
-          from types import SimpleNamespace
-          import reuse_build
-          a=SimpleNamespace(root=Path(os.environ['RUNNER_TEMP'])/'arena-cache',source=Path(os.environ['GITHUB_WORKSPACE']),
-              baseline='166453a1d2768bbce19796d9c7823be73cc84ccb',prepatch='166453a1d2768bbce19796d9c7823be73cc84ccb',
-              candidate='5857373ef316c9b67789141038a93b46e62a2f20',screen_variants=[],pg_input_guard=True)
-          reuse_build.prepare_pg_input_guard_cache(
-              Path(os.environ['RUNNER_TEMP'])/'arena-download/ku-performance-v2-evidence.tar.gz',a)
-          PY
-      - name: Answer only live versus retained allocator pages
-        timeout-minutes: 3
+      - name: Observe exactly three offCPU then sameCPU pairs without any product
+        timeout-minutes: 2
         shell: bash
         run: |
           set -euo pipefail
           sudo -n python3 -B tests/benchmarks/cross_stack/normal_arena_read.py \
-            --root "$RUNNER_TEMP/arena-read" --manifest "$RUNNER_TEMP/arena-cache/A/manifest.json" \
-            > "$RUNNER_TEMP/arena-read.log" 2>&1
+            --stock-only --root "$RUNNER_TEMP/stock-read" \
+            > "$RUNNER_TEMP/stock-read.log" 2>&1
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ku-normal-arena-residency
+          name: ku-stock-accounting-observation
           path: |
-            ${{ runner.temp }}/arena-read/evidence
-            ${{ runner.temp }}/arena-read.log
-            ${{ runner.temp }}/arena-cache/verified-baseline-cache.json
+            ${{ runner.temp }}/stock-read/evidence
+            ${{ runner.temp }}/stock-read.log
           retention-days: 14
           if-no-files-found: warn
 
