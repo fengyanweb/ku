@@ -1265,6 +1265,16 @@ fn main(): null! {{
         "static int ku_legacy_query_tests(void) {",
         1,
     );
+    let connect_return = "  op->connect_ready=1;\n}";
+    assert_eq!(harness.matches(connect_return).count(), 1);
+    harness = format!(
+        "static void first_owner_connect_return(void);\n{}",
+        harness.replacen(
+            connect_return,
+            "  op->connect_ready=1;\n  first_owner_connect_return();\n}",
+            1,
+        )
+    );
     if typed {
         for (needle, replacement) in [
             ("int PQsendQueryParams(PGconn* conn, const char* sql, int count, const void* types, const char* const* values, const int* lengths, const int* formats, int format) {", "int PQsendQueryParams(PGconn* conn, const char* sql, int count, const void* types, const char* const* values, const int* lengths, const int* formats, int format) { if(format==1){ if(count)bad_calls++;param_sends++;return send_query(conn,sql); }"),
@@ -3839,7 +3849,12 @@ int main(void) {
 
 const PG_FIRST_OWNER_WAKE_SUITE: &str = r#"
 static size_t first_owner_environment_refs;
-static int first_owner_inject;
+static int first_owner_inject,first_owner_hold_connect;
+static KuTestEvent first_owner_connect_observed,first_owner_connect_release;
+static void first_owner_connect_return(void) {
+  if(first_owner_hold_connect && (!ku_test_event_set(&first_owner_connect_observed)
+      || !ku_test_event_wait(&first_owner_connect_release,3000u)))abort();
+}
 static void first_owner_retain(void* raw) {(void)raw;first_owner_environment_refs++;}
 static void first_owner_release(void* raw) {(void)raw;if(first_owner_environment_refs<=1u)abort();first_owner_environment_refs--;}
 static int first_owner_notify_thread(void* raw) {
@@ -3869,6 +3884,9 @@ static uint32_t first_owner_take(const KuTaskDriverTicketV1* ticket,
 static int first_owner_case(unsigned scenario) {
   clock_ms=1000;clock_step=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
   track_runtime_allocations=1;first_owner_inject=scenario==2u;
+  first_owner_hold_connect=scenario==6u;
+  if(first_owner_hold_connect)CHECK(ku_test_event_init(&first_owner_connect_observed)
+      && ku_test_event_init(&first_owner_connect_release));
   KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);CHECK(opened.ok);
   KuPgClient* client=opened.value;int held_slot=-1;
   if(scenario==6u || scenario==7u) {
@@ -3920,12 +3938,31 @@ static int first_owner_case(unsigned scenario) {
   CHECK(first_owner_steps==1u);
   if(scenario==3u || scenario==4u || scenario==5u)CHECK(user_sends==before_user);
   if(scenario==6u) {
+    CHECK(ku_test_event_wait(&first_owner_connect_observed,3000u));
+    /* connect_ready is still worker-private in RUNNING. The event makes this
+     * intermediate observation race-free; it is not the completion receipt. */
+    CHECK(!ku_task_blocking_lock(&pool));
+    CHECK(job->state==KU_TASK_BLOCKING_RUNNING && job->pg_operation
+        && job->pg_operation->connect_ready);
+    CHECK(!ku_task_driver_lock(&runtime.driver));CHECK(!runtime.driver.queued);
+    ku_task_driver_unlock(&runtime.driver);ku_task_blocking_unlock(&pool);
+    fputs("first-owner worker-private-ready=1 state=RUNNING queued=0\n",stderr);
+    CHECK(ku_test_event_set(&first_owner_connect_release));
     unsigned long long stop=ku_test_real_now_ms()+3000u;int ready=0;
     while(!ready && ku_test_real_now_ms()<stop) {
-      CHECK(!ku_task_blocking_lock(&pool));ready=job->pg_operation->connect_ready;
+      CHECK(!ku_task_blocking_lock(&pool));
+      /* The worker holds pool through NET_WAIT and driver_wake. Acquire that
+       * publication before reading its result, then follow pool -> driver. */
+      if(job->state==KU_TASK_BLOCKING_NET_WAIT) {
+        CHECK(job->pg_operation && job->pg_operation->connect_ready);
+        CHECK(!ku_task_driver_lock(&runtime.driver));
+        KuTaskDriverSlotV1* owner=ku_task_driver_find(&work.ticket);
+        ready=owner && owner->state==KU_TASK_DRIVER_QUEUED && runtime.driver.queued;
+        ku_task_driver_unlock(&runtime.driver);
+      }
       ku_task_blocking_unlock(&pool);if(!ready)ku_test_thread_yield();
     }
-    CHECK(ready && runtime.driver.queued);
+    CHECK(ready);
   }
   if(scenario==7u) {
     CHECK(job->pg_operation->waiting && !runtime.driver.queued);
@@ -3966,6 +4003,8 @@ static int first_owner_case(unsigned scenario) {
   for(size_t turn=0;turn<16u && runtime.driver.workers_exited!=1u;turn++)
     CHECK(ku_http_task_pump(&runtime,0u,4u,&next)<=KU_TASK_DRIVER_PENDING);
   CHECK(ku_task_blocking_finish(&pool,deadline)==KU_TASK_DRIVER_OK);
+  if(first_owner_hold_connect)CHECK(ku_test_event_destroy(&first_owner_connect_observed)
+      && ku_test_event_destroy(&first_owner_connect_release));
   CHECK(ku_task_driver_join(&runtime.driver,deadline)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_destroy(&runtime.driver)==KU_TASK_DRIVER_OK);
   ku_http_current_loop=NULL;ku_http_wake_close(&wake);ku_http_mutex_destroy(&group.lock);
