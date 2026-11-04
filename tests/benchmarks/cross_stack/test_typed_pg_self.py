@@ -408,7 +408,77 @@ class TypedPgSelfTests(unittest.TestCase):
         self.assertIn('reuse_build.prepare_current_typed_pg_cache(',job)
         source=checkout/'tests/benchmarks/cross_stack/direct_stock_probe.py'
         self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),
-            'a05a7ad63ce49e874ca4b40bb55bc2f94a455d47029e5eafb57bc66d4548fca6')
+            '967209964325545933a7a9ae905594f988fb088de149e6d7ac6f344c786d3fe1')
+
+    def test_direct_stock_definition_failure_keeps_exact_command_error_and_traceback(self):
+        import direct_stock_probe as stock
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);output=root/'output';output.mkdir();(root/'error_log').write_text('trace_kprobe: caret and exact parse reason\n')
+            probe=stock.DirectStock(types.SimpleNamespace(),output);probe.base=root;probe.instance=None
+            command='p:owned/ce memory_current_read css=$arg1:x64';original_open=Path.open
+            def opened(path,*args,**kwargs):
+                if path==root/'kprobe_events':raise OSError(22,'fixture EINVAL')
+                return original_open(path,*args,**kwargs)
+            with patch.object(Path,'open',opened),self.assertRaises(OSError):probe._append_definition(command)
+            failure=json.loads((output/'probe-definition-failure.json').read_text())['failures'][0]
+            self.assertEqual(failure['definition'],command);self.assertEqual(failure['errno'],22)
+            self.assertIn('fixture EINVAL',failure['traceback'])
+            self.assertEqual(failure['error_log_before'],failure['error_log_after'])
+            self.assertIn('caret and exact parse reason',failure['error_log_after'][str(root/'error_log')]['text'])
+            self.assertTrue((output/'probe-definition-failure.txt').is_file())
+
+    def test_direct_stock_fallback_reuses_arg_fields_and_does_not_fabricate_miss_profile(self):
+        import direct_stock_probe as stock,io
+        with tempfile.TemporaryDirectory() as temp:
+            probe=stock.DirectStock(types.SimpleNamespace(),Path(temp));commands=[];writes=[]
+            symbols=''.join('ffff000000000010 t '+name+'\n' for name in probe.SYMBOLS);original_open=Path.open
+            def opened(path,*args,**kwargs):
+                return io.StringIO(symbols) if str(path)=='/proc/kallsyms' else original_open(path,*args,**kwargs)
+            def append(command):
+                commands.append(command)
+                if command.startswith('p:'):raise OSError(22,'fixture kprobe rejection')
+            fields='css value stock index n0 n6 c0 c6 memcg pages'
+            with patch.object(probe,'_btf_layout',return_value=({'offset':1},{'offset':8},{'offset':0})),\
+                    patch.object(stock.platform,'machine',return_value='aarch64'),patch.object(stock.os,'cpu_count',return_value=4),\
+                    patch.object(Path,'open',opened),patch.object(Path,'is_file',return_value=True),patch.object(Path,'mkdir'),\
+                    patch.object(Path,'write_text',side_effect=lambda text: writes.append(text)),patch.object(Path,'read_text',return_value=fields),\
+                    patch.object(probe,'_append_definition',side_effect=append):
+                probe._prepare()
+            self.assertEqual(len(commands),7);self.assertTrue(commands[0].startswith('p:'))
+            self.assertTrue(all(command.startswith(('f:','f64:')) for command in commands[1:]))
+            self.assertEqual(sum('%return ' in command for command in commands),3)
+            self.assertTrue(all('$arg1' in command for command in commands))
+            self.assertNotIn('%x0','\n'.join(commands));self.assertEqual(probe.info['backend'],'fprobe')
+            self.assertTrue(probe.info['miss_counts_unknown']);self.assertEqual(probe.info['profile_before'],{})
+
+    def test_direct_stock_fprobe_pair_records_never_claim_complete_with_unknown_misses(self):
+        import direct_stock_probe as stock
+        with tempfile.TemporaryDirectory() as temp:
+            domain=types.SimpleNamespace(__init__=object(),remove=object())
+            probe=stock.DirectStock(types.SimpleNamespace(Domain=domain),Path(temp))
+            probe.old_init=domain.__init__;probe.old_remove=domain.remove;probe.target={'memcg':'0x1'}
+            probe.info.update(backend='fprobe',association={'target_pairs_complete':True},
+                per_CPU_stats={'cpu0':'overrun: 0\ncommit overrun: 0\ndropped events: 0\n'})
+            with patch.object(probe,'_cleanup'),patch.object(stock.time,'sleep'):
+                probe.__exit__(None,None,None)
+            info=json.loads((Path(temp)/'direct-stock-finish.json').read_text())['info']
+            self.assertFalse(info['observation_complete']);self.assertTrue(info['positive_pair_only'])
+            self.assertEqual(info['observation_failures'],['fprobe_miss_counts_unknown'])
+
+    def test_direct_stock_wrapper_retains_window_but_does_not_promote_unknown_misses(self):
+        import direct_stock_probe as stock,memory_bracket_probe as bracket
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);original=bracket.MemoryBracketProbe
+            def observed(argv):
+                stock.save(root/'summary.json',{'execution_complete':True,'window_qualified':True,'window':{'kept':True}})
+                stock.save(root/'observer/direct-stock/direct-stock-finish.json',{'info':{
+                    'observation_complete':False,'positive_pair_only':True,'miss_counts_unknown':True}})
+                return 0
+            with patch.object(bracket,'main',side_effect=observed):code=stock.main(['--root',str(root)])
+            result=json.loads((root/'summary.json').read_text())
+            self.assertEqual(code,2);self.assertFalse(result['execution_complete']);self.assertFalse(result['observation_complete'])
+            self.assertTrue(result['window_qualified']);self.assertEqual(result['window'],{'kept':True})
+            self.assertTrue(result['positive_pair_only']);self.assertIs(bracket.MemoryBracketProbe,original)
 
     def test_direct_stock_workflow_runs_once_and_preserves_nested_raw_and_lifecycle(self):
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()

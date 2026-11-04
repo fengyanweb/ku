@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import threading
 import time
+import traceback
 
 
 def save(path,value):
@@ -133,9 +134,36 @@ class DirectStock:
 
     def _append_definition(self,text):
         # Never truncate kprobe_events or remove an event not created here.
-        with (self.base/'kprobe_events').open('a') as stream:stream.write(text+'\n')
+        def errors():
+            result={}
+            for root in (self.base,self.instance):
+                if root is None:continue
+                path=root/'error_log'
+                try:
+                    with path.open('r') as stream:raw=stream.read(16385)
+                    result[str(path)]={'text':raw[:16384],'truncated':len(raw)>16384}
+                except OSError as error:result[str(path)]={'error':repr(error)}
+            return result
+        interface=getattr(self,'interface',self.base/'kprobe_events')
+        attempt={'definition':text,'interface':str(interface),
+                 'before_ns':time.monotonic_ns(),'error_log_before':errors()}
+        self.info['last_definition_attempt']=attempt
+        try:
+            with interface.open('a') as stream:stream.write(text+'\n')
+        except OSError as error:
+            attempt.update(after_ns=time.monotonic_ns(),errno=error.errno,error=repr(error),
+                           traceback=traceback.format_exc()[-16384:],error_log_after=errors())
+            failures=self.info.setdefault('definition_failures',[])
+            if len(failures)<16:failures.append(attempt)
+            else:self.info['definition_failure_overflow']=True
+            save(self.output/'probe-definition-failure.json',{'failures':failures,
+                'boundary':'error_log is read-only and may include other writers. Match the exact failed command/caret; '
+                           'do not attribute older/unrelated lines or EINVAL alone to a cause.'})
+            (self.output/'probe-definition-failure.txt').write_text(json.dumps(attempt,indent=2)+'\n')
+            raise
 
     def _profile(self):
+        if self.info.get('backend')=='fprobe':return {}
         result={}
         for line in (self.base/'kprobe_profile').read_text().splitlines():
             fields=line.split()
@@ -143,6 +171,11 @@ class DirectStock:
             for key,name in self.names.items():
                 if name in fields[0]:result[key]={'hits':int(fields[-2]),'missed':int(fields[-1]),'raw':line}
         return result
+
+    def _clear_definitions(self):
+        for directory in self.paths.values():(directory/'enable').write_text('0')
+        for name in reversed(self.definitions):self._append_definition('-:'+self.group+'/'+name)
+        self.definitions.clear();self.paths.clear()
 
     def _prepare(self):
         if platform.machine()!='aarch64':raise RuntimeError('this fixed observation is for the actual ARM64 cache')
@@ -171,17 +204,33 @@ class DirectStock:
             'dr':('r64','drain_stock','stock=$arg1:x64 index=$arg2:s32 '+pages),
             'fe':('p','refill_stock','memcg=$arg1:x64 pages=$arg2:u32'),
             'fr':('r64','refill_stock','memcg=$arg1:x64 pages=$arg2:u32')}
-        self.info['probe_definitions']={};self.info['formats']={}
-        for key,(kind,function,fields) in specifications.items():
-            definition=kind+':'+self.group+'/'+self.names[key]+' '+function+' '+fields
-            self._append_definition(definition);self.definitions.append(self.names[key])
-            directory=self.instance/'events'/self.group/self.names[key]
-            fmt=(directory/'format').read_text()
-            required=('css','value') if key=='cr' else ('css',) if key=='ce' else ('stock','index','n0','n6','c0','c6') if key=='de' else ('stock','index','n0','n6') if key=='dr' else ('memcg','pages')
-            if not all(re.search(r'\b'+name+r'\b',fmt) for name in required):raise RuntimeError('probe fields missing: '+key)
-            self.paths[key]=directory;self.info['probe_definitions'][key]=definition;self.info['formats'][key]=fmt
+        def define(backend):
+            self.info.update(backend=backend,probe_definitions={},formats={})
+            self.interface=self.base/('dynamic_events' if backend=='fprobe' else 'kprobe_events')
+            for key,(kind,function,fields) in specifications.items():
+                if backend=='fprobe':
+                    returning=kind.startswith('r');kind='f64' if returning else 'f'
+                    if returning:function+='%return'
+                definition=kind+':'+self.group+'/'+self.names[key]+' '+function+' '+fields
+                self._append_definition(definition);self.definitions.append(self.names[key])
+                directory=self.instance/'events'/self.group/self.names[key]
+                fmt=(directory/'format').read_text()
+                required=('css','value') if key=='cr' else ('css',) if key=='ce' else ('stock','index','n0','n6','c0','c6') if key=='de' else ('stock','index','n0','n6') if key=='dr' else ('memcg','pages')
+                if not all(re.search(r'\b'+name+r'\b',fmt) for name in required):raise RuntimeError('probe fields missing: '+key)
+                self.paths[key]=directory;self.info['probe_definitions'][key]=definition;self.info['formats'][key]=fmt
+        try:define('kprobe')
+        except OSError as error:
+            self.info['kprobe_create_failed']=repr(error)
+            self._clear_definitions()
+            if not (self.base/'dynamic_events').is_file():raise RuntimeError('official fprobe dynamic_events unavailable') from error
+            define('fprobe')
+            self.info.update(miss_counts_unknown=True,
+                miss_count_boundary='No verified per-owned-fprobe miss-count interface. '
+                'Captured target entry/return pairs can be positive evidence; missing events cannot exclude a path, '
+                'establish full charge totals or establish observation_complete.')
         self.info['profile_before']=self._profile()
-        if len(self.info['profile_before'])!=6:raise RuntimeError('all owned kprobe profile counters required')
+        if self.info['backend']=='kprobe' and len(self.info['profile_before'])!=6:
+            raise RuntimeError('all owned kprobe profile counters required')
         self.info.update(available=True,private_instance=str(self.instance),group=self.group,
                          kernel=platform.release(),uname=list(os.uname()),script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
         (self.instance/'tracing_on').write_text('1')
@@ -234,7 +283,8 @@ class DirectStock:
         self.original_read_text=Path.read_text
         try:self._prepare()
         except BaseException as error:
-            self.info['prepare_error']=repr(error);self._cleanup();save(self.output/'direct-stock-identity.json',self.info);raise
+            self.info.update(prepare_error=repr(error),prepare_traceback=traceback.format_exc()[-16384:])
+            self._cleanup();save(self.output/'direct-stock-identity.json',self.info);raise
         self.old_init=self.lh.Domain.__init__;self.old_remove=self.lh.Domain.remove;owner=self
         def init(domain,*args,**kwargs):
             result=owner.old_init(domain,*args,**kwargs)
@@ -297,7 +347,8 @@ class DirectStock:
             if self.info.get('owned_definition_remove_errors'):failures.append('owned_definition_remove_errors')
             if not self.target:failures.append('target_not_mapped')
             after=self.info.get('profile_after',{})
-            if len(after)!=6 or any(value['missed'] for value in after.values()):failures.append('kprobe_profile_missing_or_missed')
+            if self.info.get('backend')=='fprobe':failures.append('fprobe_miss_counts_unknown')
+            elif len(after)!=6 or any(value['missed'] for value in after.values()):failures.append('kprobe_profile_missing_or_missed')
             stats=self.info.get('per_CPU_stats',{})
             if not stats:failures.append('per_CPU_stats_missing')
             for text in stats.values():
@@ -306,9 +357,11 @@ class DirectStock:
                     if len(matches)!=1 or int(matches[0]):failures.append('trace_'+field.replace(' ','_'))
             if not self.info.get('association',{}).get('target_pairs_complete'):failures.append('target_entry_return_incomplete')
             self.info['observation_complete']=not failures;self.info['observation_failures']=failures
+            self.info['positive_pair_only']=failures==['fprobe_miss_counts_unknown']
             save(self.output/'direct-stock-finish.json',{'info':self.info,'markers':self.markers,'hooks_restored':True,
                 'metric_changed':False,'no_pressure_or_flush':True,'target_mapped':self.target is not None})
-        if failures and not any(exc):raise RuntimeError('direct stock observation incomplete: '+','.join(failures))
+        if failures and not self.info['positive_pair_only'] and not any(exc):
+            raise RuntimeError('direct stock observation incomplete: '+','.join(failures))
 
 
 def main(argv=None):
@@ -324,7 +377,19 @@ def main(argv=None):
             try:return super().__exit__(*exc)
             finally:self.direct.__exit__(*exc)
     mb.MemoryBracketProbe=DirectMemory
-    try:return mb.main(argv)
+    try:
+        code=mb.main(argv)
+        parser=argparse.ArgumentParser(add_help=False);parser.add_argument('--root',type=Path,required=True)
+        root=parser.parse_known_args(argv)[0].root
+        finish=root/'observer/direct-stock/direct-stock-finish.json'
+        if finish.is_file():
+            info=json.loads(finish.read_text())['info'];summary=root/'summary.json'
+            if summary.is_file() and not info.get('observation_complete'):
+                result=json.loads(summary.read_text())
+                result.update(execution_complete=False,observation_complete=False,
+                    positive_pair_only=info.get('positive_pair_only',False),direct_stock_observation=info)
+                save(summary,result);return 2
+        return code
     finally:mb.MemoryBracketProbe=original
 
 
