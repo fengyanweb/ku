@@ -486,6 +486,14 @@ jobs:
           KU_CC='clang-18 -O2 -fsanitize=address,undefined -fno-omit-frame-pointer' ASAN_OPTIONS='detect_leaks=1:halt_on_error=1' UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
             cargo +1.99.1 test --release --locked --test native_task_driver_test native_task_driver_admission_wake_retirement_and_shutdown_execute_in_c -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/task-driver-detectors.log" 2>&1
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/task-driver-detectors.log"
+          if [ "$KU_PG_GUARD_WORKLOAD" = db ] && grep -q '^fn native_pg_first_http_owner_submission_preserves_real_notifications_and_progress' tests/native_pg_query_poll_test.rs; then
+            first_pg_test=native_pg_first_http_owner_submission_preserves_real_notifications_and_progress
+            cargo +1.99.1 test --release --locked --test native_pg_query_poll_test "$first_pg_test" -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/first-pg-owner-O2.log" 2>&1
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/first-pg-owner-O2.log"
+            KU_CC='clang-18 -O2 -fsanitize=address,undefined -fno-omit-frame-pointer' ASAN_OPTIONS='detect_leaks=1:halt_on_error=1' UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+              cargo +1.99.1 test --release --locked --test native_pg_query_poll_test "$first_pg_test" -- --exact --nocapture --test-threads=1 > "$KU_PG_GUARD_ROOT/contracts/first-pg-owner-detectors.log" 2>&1
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$KU_PG_GUARD_ROOT/contracts/first-pg-owner-detectors.log"
+          fi
       - name: Complete the one frozen27-window candidate guard
         timeout-minutes: 20
         shell: bash
