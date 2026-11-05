@@ -25,12 +25,16 @@ $script:releaseWorkRoot = $null
 $script:toolWrapper = $null
 $script:expectedTlsHeaderHash = $null
 $script:expectedRustDependencies = $null
+$releaseConfiguration = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'release-toolchain.json') -Raw -Encoding utf8 | ConvertFrom-Json
+if ($releaseConfiguration.schema -cne 'ku-release-toolchain-v1' -or $releaseConfiguration.toolchain -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Invalid release toolchain configuration' }
+$script:releaseToolchain = [string]$releaseConfiguration.toolchain
+$script:releasePython = if ($IsWindows) { 'python' } else { 'python3' }
 
 function Get-HostContract {
     $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-    if ($IsWindows -and $architecture -eq "X64") { return @{ Target = "x86_64-pc-windows-msvc"; Executable = "ku.exe"; ObjectFormat = "coff-x86_64"; Archive = "ku_native_tls.lib"; Flavor = "msvc"; LinkContract = "rust-1.89.0-windows-msvc-v1"; Crt = "msvc-dynamic" } }
-    if ($IsLinux -and $architecture -eq "X64") { return @{ Target = "x86_64-unknown-linux-gnu"; Executable = "ku"; ObjectFormat = "elf-x86_64"; Archive = "libku_native_tls.a"; Flavor = "gnu"; LinkContract = "rust-1.89.0-linux-gnu-v1"; Crt = "system-dynamic" } }
-    if ($IsMacOS -and $architecture -eq "Arm64") { return @{ Target = "aarch64-apple-darwin"; Executable = "ku"; ObjectFormat = "macho-arm64"; Archive = "libku_native_tls.a"; Flavor = "apple"; LinkContract = "rust-1.89.0-darwin-v1"; Crt = "system-dynamic" } }
+    if ($IsWindows -and $architecture -eq "X64") { return @{ Target = "x86_64-pc-windows-msvc"; Executable = "ku.exe"; ObjectFormat = "coff-x86_64"; Archive = "ku_native_tls.lib"; Flavor = "msvc"; LinkContract = "rust-$($script:releaseToolchain)-windows-msvc-v1"; Crt = "msvc-dynamic" } }
+    if ($IsLinux -and $architecture -eq "X64") { return @{ Target = "x86_64-unknown-linux-gnu"; Executable = "ku"; ObjectFormat = "elf-x86_64"; Archive = "libku_native_tls.a"; Flavor = "gnu"; LinkContract = "rust-$($script:releaseToolchain)-linux-gnu-v1"; Crt = "system-dynamic" } }
+    if ($IsMacOS -and $architecture -eq "Arm64") { return @{ Target = "aarch64-apple-darwin"; Executable = "ku"; ObjectFormat = "macho-arm64"; Archive = "libku_native_tls.a"; Flavor = "apple"; LinkContract = "rust-$($script:releaseToolchain)-darwin-v1"; Crt = "system-dynamic" } }
     throw "release packaging supports only x86_64 Windows, x86_64 Linux, and arm64 macOS; current architecture is '$architecture'"
 }
 
@@ -758,13 +762,13 @@ function Test-RustDependencyContracts([string]$WorkRoot, [hashtable]$Contract, [
         $rustSource = Join-Path $WorkRoot 'release-dependency-probe.rs'
         [IO.File]::WriteAllText($rustSource, 'pub fn release_probe() -> usize { 17 }', $utf8)
         $name = 'librelease_probe-0123456789abcdef.rlib'; $library = Join-Path $source $name
-        [void](Invoke-CheckedTool 'rustc' @('+1.89.0', '--edition=2021', '--crate-name', 'release_probe', '--crate-type', 'rlib', '--target', $Contract.Target, '-o', $library, $rustSource) $WorkRoot $WorkRoot 'rust-dependency-probe-build' 30000 $Wrapper)
+        [void](Invoke-CheckedTool 'rustc' @(("+$script:releaseToolchain"), '--edition=2021', '--crate-name', 'release_probe', '--crate-type', 'rlib', '--target', $Contract.Target, '-o', $library, $rustSource) $WorkRoot $WorkRoot 'rust-dependency-probe-build' 30000 $Wrapper)
         foreach ($ignoredName in @('release_probe.d', 'release_probe.pdb', 'release_probe.exe', 'release_probe.dll')) { [IO.File]::WriteAllText((Join-Path $source $ignoredName), 'must not enter a release dependency directory', $utf8) }
         $macroRoot = Join-Path $WorkRoot 'proc-macro-cargo'; $macroDirectory = Join-Path $macroRoot 'release/deps'; Ensure-PlainDirectory $macroDirectory
         $macroName = switch ($Contract.ObjectFormat) { 'coff-x86_64' { 'release_macro_probe-0123456789abcdef.dll' }; 'elf-x86_64' { 'librelease_macro_probe-0123456789abcdef.so' }; 'macho-arm64' { 'librelease_macro_probe-0123456789abcdef.dylib' } }
         $macroLibrary = Join-Path $macroDirectory $macroName; $macroSource = Join-Path $WorkRoot 'release-macro-probe.rs'
         [IO.File]::WriteAllText($macroSource, 'extern crate proc_macro; #[proc_macro] pub fn release_probe(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }', $utf8)
-        [void](Invoke-CheckedTool 'rustc' @('+1.89.0', '--edition=2021', '--crate-name', 'release_macro_probe', '--crate-type', 'proc-macro', '--target', $Contract.Target, '-o', $macroLibrary, $macroSource) $WorkRoot $WorkRoot 'proc-macro-probe-build' 30000 $Wrapper)
+        [void](Invoke-CheckedTool 'rustc' @(("+$script:releaseToolchain"), '--edition=2021', '--crate-name', 'release_macro_probe', '--crate-type', 'proc-macro', '--target', $Contract.Target, '-o', $macroLibrary, $macroSource) $WorkRoot $WorkRoot 'proc-macro-probe-build' 30000 $Wrapper)
         $macroRecord = @{ reason = 'compiler-artifact'; target = @{ name = 'release_macro_probe'; kind = @('proc-macro'); crate_types = @('proc-macro') }; filenames = @($macroLibrary) }
         $finish = '{"reason":"build-finished","success":true}'
         $macroJson = ($macroRecord | ConvertTo-Json -Depth 8 -Compress) + "`n" + $finish + "`n"
@@ -844,7 +848,7 @@ fn main() {
 '@
     [IO.File]::WriteAllText($mainSource, $source, [Text.UTF8Encoding]::new($false))
     $binary = Join-Path $WorkRoot $(if ($IsWindows) { "validate_tls_archive.exe" } else { "validate_tls_archive" })
-    [void](Invoke-CheckedTool "rustc" @("+1.89.0", "--edition=2021", "-C", "panic=abort", "-o", $binary, $mainSource) $WorkRoot $WorkRoot "archive-validator-build" 30000 $Wrapper)
+    [void](Invoke-CheckedTool "rustc" @("+$script:releaseToolchain", "--edition=2021", "-C", "panic=abort", "-o", $binary, $mainSource) $WorkRoot $WorkRoot "archive-validator-build" 30000 $Wrapper)
     if (-not (Test-PlainFile $binary)) { throw "native TLS archive validator was not produced" }
     return $binary
 }
@@ -907,12 +911,12 @@ function Test-PackagedRunnerConsumer([string]$Bundle, [hashtable]$Contract, [str
     $dependenciesMoved = $false; $standaloneSourceMoved = $false
     try {
         foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
-        [Environment]::SetEnvironmentVariable('RUSTUP_TOOLCHAIN', '1.89.0', 'Process')
+        # The product must select the matching compiler itself; do not force it here.
         if ([IO.Path]::GetFileName($Bundle) -in @('release', 'debug', 'deps')) { throw "runner consumer bundle path could enable development-library fallback" }
         if (-not (Test-PlainDirectory $dependencies) -or (Test-Path -LiteralPath $retiredDependencies)) { throw "runner consumer cannot isolate its dependency directory" }
         [IO.Directory]::Move($dependencies, $retiredDependencies); $dependenciesMoved = $true
         $missing = Invoke-BoundedTool $ku @('build', '--offline', $source, '-o', $missingOutput) $consumerRoot $WorkRoot 'runner-missing-deps-build' 180000 $Wrapper
-        if ($missing.ExitCode -eq 0 -or (Test-Path -LiteralPath $missingOutput) -or $missing.Output -notmatch 'error\[E0463\]') { throw "packaged runner without dependencies did not fail with the expected missing-crate error: $($missing.Output)" }
+        if ($missing.ExitCode -eq 0 -or (Test-Path -LiteralPath $missingOutput) -or $missing.Output -notmatch '(?i)runtime|manifest|runner') { throw "packaged runner without dependencies did not fail with the expected precompile runtime-manifest diagnosis: $($missing.Output)" }
         [IO.Directory]::Move($retiredDependencies, $dependencies); $dependenciesMoved = $false
         [void](Invoke-CheckedTool $ku @('build', '--offline', $source, '-o', $executable) $consumerRoot $WorkRoot 'packaged-runner-build' 180000 $Wrapper)
         Assert-ExecutableArchitecture $executable $Contract
@@ -1119,9 +1123,11 @@ function Assert-Vsix([string]$Path, [string]$Version) {
 function Assert-Bundle([string]$Bundle, [hashtable]$Contract, [string]$Version, [string]$BuildId) {
     if (-not (Test-PlainDirectory $Bundle)) { throw "release bundle must be a plain directory" }
     Assert-RustDependencies (Join-Path $Bundle 'deps') $Contract
+    $manifestTool = Join-Path $PSScriptRoot '../.github/scripts/runtime-bundle.py'
+    [void](Invoke-CheckedTool $script:releasePython @('-B', $manifestTool, 'verify', '--bundle', $Bundle, '--version', $Version, '--target', $Contract.Target) $repo $script:releaseWorkRoot 'runner-manifest-verify' 30000 $script:toolWrapper)
     $vsixName = "ku-language-$Version.vsix"
     $expectedFiles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($relative in @($Contract.Executable, "libku.rlib", $vsixName, "native-tls/v1/$($Contract.Target)/manifest.kutls", "native-tls/v1/$($Contract.Target)/include/ku_native_tls.h", "native-tls/v1/$($Contract.Target)/lib/$($Contract.Archive)")) { [void]$expectedFiles.Add($relative.Replace('\', '/')) }
+    foreach ($relative in @($Contract.Executable, "libku.rlib", $vsixName, "ku-runtime.json", "ku-runtime-deps.json", "native-tls/v1/$($Contract.Target)/manifest.kutls", "native-tls/v1/$($Contract.Target)/include/ku_native_tls.h", "native-tls/v1/$($Contract.Target)/lib/$($Contract.Archive)")) { [void]$expectedFiles.Add($relative.Replace('\', '/')) }
     foreach ($name in $script:expectedRustDependencies.Keys) { [void]$expectedFiles.Add("deps/$name") }
     if ($IsWindows -and (Test-PlainFile (Join-Path $Bundle "ku.pdb"))) { [void]$expectedFiles.Add("ku.pdb") }
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); $pending = [Collections.Generic.Stack[string]]::new(); $pending.Push($Bundle); $entries = 0; $total = 0L
@@ -1559,7 +1565,7 @@ time.sleep(60)
         $script:archiveVerifier = New-NativeTlsArchiveVerifier $Repo $workRoot $wrapper
 
         $module = Join-Path $workRoot 'native_tls_archive.rs'; $moduleTests = Join-Path $workRoot $(if ($IsWindows) { 'native_tls_archive_tests.exe' } else { 'native_tls_archive_tests' })
-        [void](Invoke-CheckedTool 'rustc' @('+1.89.0', '--edition=2021', '--test', '-o', $moduleTests, $module) $workRoot $workRoot 'archive-validator-tests-build' 30000 $wrapper)
+        [void](Invoke-CheckedTool 'rustc' @(("+$script:releaseToolchain"), '--edition=2021', '--test', '-o', $moduleTests, $module) $workRoot $workRoot 'archive-validator-tests-build' 30000 $wrapper)
         [void](Invoke-CheckedTool $moduleTests @('--nocapture') $workRoot $workRoot 'archive-validator-tests-run' 30000 $wrapper)
 
         function Add-SelfTestVsixEntry([IO.Compression.ZipArchive]$Archive, [string]$Name, [string]$Content) {
@@ -1672,12 +1678,12 @@ if (-not (Test-PlainDirectory $workBase)) { throw "release packaging requires a 
 $workOwner = [Guid]::NewGuid().ToString("N"); $workRoot = New-OwnedDirectory $workBase ".kr-" $workOwner; $wrapper = New-ToolWrapper $workRoot
 $script:releaseWorkRoot = $workRoot; $script:toolWrapper = $wrapper; $script:expectedTlsHeaderHash = (Get-FileHash -LiteralPath $tlsHeaderSource -Algorithm SHA256).Hash.ToLowerInvariant()
 try {
-    $rustcOutput = Invoke-CheckedTool "rustc" @("+1.89.0", "-vV") $repo $workRoot "rustc" 30000 $wrapper
-    if ($rustcOutput -notmatch "(?m)^host: $([regex]::Escape($contract.Target))$") { throw "Rust 1.89.0 host does not match release target '$($contract.Target)'" }
+    $rustcOutput = Invoke-CheckedTool "rustc" @("+$script:releaseToolchain", "-vV") $repo $workRoot "rustc" 30000 $wrapper
+    if ($rustcOutput -notmatch "(?m)^host: $([regex]::Escape($contract.Target))$") { throw "Publisher Rust host does not match release target '$($contract.Target)'" }
     $script:archiveVerifier = New-NativeTlsArchiveVerifier $repo $workRoot $wrapper
     Write-Host "Building Ku $version for $($contract.Target)..."
     $cargoTarget = Join-Path $workRoot "cargo"
-    $cargoBuild = Invoke-BoundedTool "cargo" @("+1.89.0", "build", "--locked", "--release", "--target", $contract.Target, "--target-dir", $cargoTarget, "--message-format=json-render-diagnostics", "--color", "never") $repo $workRoot "cargo-build" 900000 $wrapper
+    $cargoBuild = Invoke-BoundedTool "cargo" @("+$script:releaseToolchain", "build", "--locked", "--release", "--target", $contract.Target, "--target-dir", $cargoTarget, "--message-format=json-render-diagnostics", "--color", "never") $repo $workRoot "cargo-build" 900000 $wrapper
     if ($cargoBuild.ExitCode -ne 0) { throw "cargo failed with exit code $($cargoBuild.ExitCode):`n$($cargoBuild.Output)" }
     $procMacroArtifacts = Get-CargoProcMacroArtifacts $cargoBuild.Stdout $cargoTarget $contract
     $tlsOutputRoot = Join-Path $workRoot "tls-pack"
@@ -1699,6 +1705,11 @@ try {
     $pdb = Join-Path $targetRelease "ku.pdb"; if ($IsWindows -and (Test-PlainFile $pdb)) { Copy-PlainFile $pdb (Join-Path $candidate "ku.pdb") 512MB }
     Copy-PlainFile $vsixPath (Join-Path $candidate $vsixName) 128MB
     Copy-TlsPack $tlsPack (Join-Path $candidate "native-tls/v1/$($contract.Target)") $contract $buildId
+    $rustcIdentityPath = Join-Path $workRoot 'publisher-rustc.txt'
+    [IO.File]::WriteAllText($rustcIdentityPath, $rustcOutput, $utf8)
+    $sourceCommit = (Invoke-CheckedTool 'git' @('rev-parse', 'HEAD') $repo $workRoot 'source-identity' 30000 $wrapper).Trim()
+    $manifestTool = Join-Path $repo '.github/scripts/runtime-bundle.py'
+    [void](Invoke-CheckedTool $script:releasePython @('-B', $manifestTool, 'create', '--bundle', $candidate, '--version', $version, '--commit', $sourceCommit, '--target', $contract.Target, '--repo', $repo, '--rustc-version-file', $rustcIdentityPath) $repo $workRoot 'runner-manifest-create' 30000 $wrapper)
     Assert-Bundle $candidate $contract $version $buildId
     Test-PackagedRunnerConsumer $candidate $contract $workRoot $wrapper
     Test-PackagedTlsConsumer $candidate $contract $workRoot $wrapper

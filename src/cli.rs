@@ -44,7 +44,6 @@ const MAX_IMPORT_EXPANDED_ITEMS: usize = 65_536;
 const MAX_IMPORT_CLONED_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_IMPORT_EDGES: usize = 16_384;
 const MAX_IMPORT_BINDINGS: usize = 16_384;
-const MAX_RLIB_DIRECTORY_ENTRIES: usize = 16_384;
 const MAX_LIBPQ_LIBRARY_DIRECTORY_ENTRIES: usize = 128;
 const MAX_PINNED_LINK_LIBRARY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_NATIVE_TLS_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -89,7 +88,10 @@ fn remaining_build_phase_timeout(
     Ok(remaining.min(phase_limit))
 }
 
-fn run_build_process_bounded(command: &mut Command, timeout: Duration) -> io::Result<ExitStatus> {
+pub(crate) fn run_build_process_bounded(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<ExitStatus> {
     if timeout == Duration::ZERO {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -227,7 +229,7 @@ impl Drop for BuildTemporaryPath {
     }
 }
 
-fn run_build_process_capture_stdout(
+pub(crate) fn run_build_process_capture_stdout(
     command: &mut Command,
     timeout: Duration,
     max_bytes: usize,
@@ -852,92 +854,27 @@ impl BuildProcessTree {
         Err("process-tree containment is unavailable on this host".to_string())
     }
 }
-const HELP: &str = "\
-ku - simple, small, fast language tool
-
-Usage:
-  ku <file.ku>          Run a Ku source file
-  ku create <name>      Create a new Ku project directory
-  ku create <name> --template <template>
-                        Create a project from a built-in template
-  ku create --list      List built-in project templates
-  ku init               Initialize the current directory as a Ku project
-  ku init --template <template>
-                        Initialize the current directory from a template
-  ku template list      List built-in project templates
-  ku supervise [limits] -- <entry>...
-                        Run isolated workers with OS memory limits (see --help)
-  ku service [options] -- <native-program> [args...]
-                        Manage a resident HTTP instance (see service --help)
-  ku run [--locked|--offline] [file.ku]
-                        Run a package entry or Ku source file
-  ku check [--locked|--offline] [file.ku]
-                        Check a package entry or Ku source file without running it
-  ku check --deny-unused [file.ku]
-                        Treat unused local bindings as errors
-  ku check --json       Check nearest ku.mod package and emit JSON Lines diagnostics
-  ku check --json [--deny-unused] <file.ku>
-                        Check and emit JSON Lines diagnostics
-  ku ir <file.ku>       Print checked Ku IR draft
-  ku llvm <file.ku>     Emit prototype LLVM text IR
-  ku build [--locked|--offline] [file.ku]
-                        Build a runnable executable package
-  ku build .            Build the nearest ku.mod package
-  ku build -o <path> [file.ku]
-                        Build to an explicit executable path
-  ku build --release [file.ku]
-                        Build with release profile
-  ku build --profile <debug|release|small|fast> [file.ku]
-  ku build --emit-c [file.ku]
-                        Also emit prototype native C source under .ku/build
-  ku build --emit-ir [file.ku]
-                        Also emit checked Ku IR draft under .ku/build
-  ku build --backend c [--target <target>] [file.ku]
-                        Build one native binary for host, x86_64-linux,
-                        aarch64-linux, x86_64-windows, or aarch64-darwin
-  ku build --native [--locked|--offline] <file.ku>
-                        Compatibility form: emit prototype native C source beside file
-  ku package gc [path]
-                        Remove unused package cache entries for a package
-  ku package pack [path]
-                        Create a deterministic source package artifact
-  ku package publish [path]
-                        Publish through the configured HTTPS registry
-  ku package yank [path]
-                        Withdraw one published version without deleting its artifact
-  ku package resolve [path] [--locked|--offline]
-                        Resolve and cache the complete dependency graph
-  ku version            Print version
-  ku -v                 Print version
-  ku -h                 Print this help
-  ku -help              Print this help
-  ku --help             Print this help
-  ku help               Print this help
-
-Examples:
-  ku create hello
-  ku create HelloWorld --template http
-  ku init --template cli
-  ku template list
-  ku run
-  ku run examples\\hello.ku
-  ku check
-  ku check examples\\error.ku
-  ku ir examples\\function.ku
-  ku llvm examples\\function.ku
-  ku build examples\\hello.ku
-  ku build --release -o dist\\hello.exe examples\\hello.ku
-  ku build --backend c --release --target x86_64-linux .
-  ku build --native examples\\function.ku
-  ku package gc .
-  ku package pack .
-  ku package publish .
-  ku package yank .
-  ku package resolve . --locked
-";
+const HELP: &str = crate::cli_contract::TOP_LEVEL_HELP;
 
 pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
+    let hint = crate::cli_contract::error_hint(&args);
+    dispatch_cli(args).map_err(|mut error| {
+        if error.message.contains(HELP) && !error.message.contains(&hint) {
+            error.message.push('\n');
+            error.message.push_str(&hint);
+        }
+        error
+    })
+}
+
+fn dispatch_cli(args: Vec<String>) -> Result<(), KuError> {
+    if let Some(result) = crate::cli_contract::intercept(&args) {
+        let text = result.map_err(command_error)?;
+        print!("{text}");
+        return Ok(());
+    }
     match args.get(1).map(String::as_str) {
+        Some("doctor") => crate::runner_bundle::run_doctor(&args),
         Some("create") => run_create_command(&args),
         Some("init") => run_init_command(&args),
         Some("template") => run_template_command(&args),
@@ -2683,22 +2620,15 @@ fn build_executable_to(
         })?;
     drop(runner_file);
 
-    let exe_dir = env::current_exe()
-        .map_err(|err| KuError::message(format!("failed to locate ku executable: {err}")))?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| KuError::message("failed to locate ku executable directory"))?;
-    let target_dir = if exe_dir.file_name().is_some_and(|name| name == "deps") {
-        exe_dir
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| KuError::message("failed to locate ku target directory"))?
-    } else {
-        exe_dir
-    };
-    let lib = find_ku_rlib(&target_dir)?;
-    let dependency_dirs = find_dependency_dirs(&target_dir);
-    let mut command = Command::new("rustc");
+    let bundle =
+        crate::runner_bundle::RuntimeBundle::load(config.target.map(|target| target.rust_triple))?;
+    let compiler = bundle.compiler()?;
+    if bundle.mode == "source-development" {
+        bundle.link_probe(&compiler)?;
+    }
+    let prepared = bundle.prepare(&temp_dir.join("runtime"))?;
+    let lib = &prepared.runtime;
+    let mut command = compiler.command();
     command
         .arg("--edition=2021")
         .arg(&runner)
@@ -2706,14 +2636,8 @@ fn build_executable_to(
         .arg(format!("ku={}", lib.display()))
         .arg("-o")
         .arg(temporary_output);
-    for deps in &dependency_dirs {
-        command
-            .arg("-L")
-            .arg(format!("dependency={}", deps.display()));
-    }
-    if let Some(target) = config.target {
-        command.arg("--target").arg(target.rust_triple);
-    }
+    crate::runner_bundle::add_search_paths(&mut command, &prepared);
+    command.arg("--target").arg(&bundle.target);
     if let Some(opt_level) = config.profile.rustc_opt_level() {
         command.arg("-C").arg(format!("opt-level={opt_level}"));
         command.arg("-C").arg("debuginfo=0");
@@ -2725,6 +2649,12 @@ fn build_executable_to(
         command.arg("-C").arg("strip=symbols");
     }
     if config.verbose {
+        println!(
+            "Runner compiler: {} ({}, source={})",
+            compiler.executable.display(),
+            compiler.identity.release,
+            compiler.source
+        );
         println!("rustc command: {command:?}");
     }
     let status = match run_build_process_bounded(&mut command, RUSTC_PROCESS_TIMEOUT) {
@@ -2738,7 +2668,7 @@ fn build_executable_to(
     temp_guard.cleanup();
     if !status.success() {
         return Err(KuError::message(format!(
-            "ku build failed: rustc exited with {status}\nhelp: make sure Rust is installed and libku.rlib plus its dependency directory match the selected target"
+            "ku build failed: rustc exited with {status}\nhelp: run `ku doctor --backend runner`; keep the compiler diagnostics above. If E0514 is reported, the bundle/compiler identities are still inconsistent; do not mix runtime files"
         )));
     }
     let verified = validate_runner_output_candidate(temporary_output, config.target)?;
@@ -6896,6 +6826,18 @@ fn compile_c_source(
     static_link: bool,
     verbose: bool,
 ) -> Result<(), KuError> {
+    compile_c_source_with_output(source, output, target, profile, static_link, verbose, false)
+}
+
+fn compile_c_source_with_output(
+    source: &Path,
+    output: &Path,
+    target: Option<&BuildTarget>,
+    profile: BuildProfile,
+    static_link: bool,
+    verbose: bool,
+    quiet_stdout: bool,
+) -> Result<(), KuError> {
     let link_started = Instant::now();
     let link_deadline = link_started
         .checked_add(NATIVE_LINK_TOTAL_TIMEOUT)
@@ -7265,6 +7207,9 @@ fn compile_c_source(
             "C compiler execution",
         )
         .map_err(|error| KuError::message(error.to_string()))?;
+        if quiet_stdout {
+            command.stdout(Stdio::null());
+        }
         match run_build_process_bounded(&mut command, compiler_timeout) {
             Ok(status) if status.success() => {
                 let verified = match validate_link_output_candidate(
@@ -7428,6 +7373,7 @@ fn compile_c_source(
                         }),
                     },
                     MsvcCompileOptions {
+                        quiet_stdout,
                         profile,
                         static_link,
                         verbose,
@@ -7715,6 +7661,7 @@ struct MsvcNativeTlsLink<'a> {
 
 #[derive(Clone, Copy)]
 struct MsvcCompileOptions {
+    quiet_stdout: bool,
     profile: BuildProfile,
     static_link: bool,
     verbose: bool,
@@ -7824,6 +7771,9 @@ fn compile_with_msvc(
         "MSVC compiler execution",
     )
     .map_err(|error| KuError::message(error.to_string()))?;
+    if options.quiet_stdout {
+        command.stdout(Stdio::null());
+    }
     let result = run_build_process_bounded(&mut command, timeout);
     let _ = fs::remove_file(&obj);
     match result {
@@ -8111,7 +8061,7 @@ fn split_command_words(value: &str) -> Result<Vec<String>, &'static str> {
     Ok(words)
 }
 
-struct TempBuildDir {
+pub(crate) struct TempBuildDir {
     path: PathBuf,
 }
 
@@ -8121,7 +8071,7 @@ impl TempBuildDir {
         Self { path }
     }
 
-    fn create_private(label: &str) -> io::Result<Self> {
+    pub(crate) fn create_private(label: &str) -> io::Result<Self> {
         const MAX_ATTEMPTS: usize = 8;
         for _ in 0..MAX_ATTEMPTS {
             let path = unique_build_tool_path(label, "dir")?;
@@ -8146,7 +8096,7 @@ impl TempBuildDir {
         ))
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
@@ -8183,82 +8133,6 @@ fn raw_string_literal(source: &str) -> String {
         }
     }
     format!("{source:?}")
-}
-
-fn find_ku_rlib(exe_dir: &Path) -> Result<PathBuf, KuError> {
-    let direct = exe_dir.join("libku.rlib");
-    let deps = exe_dir.join("deps");
-    let mut candidates = Vec::new();
-    if direct.is_file() {
-        candidates.push(direct.clone());
-    }
-    if let Ok(entries) = fs::read_dir(&deps) {
-        for (index, entry) in entries.enumerate() {
-            if index >= MAX_RLIB_DIRECTORY_ENTRIES {
-                return Err(KuError::message(format!(
-                    "ku build stopped after scanning {MAX_RLIB_DIRECTORY_ENTRIES} entries in '{}'; remove stale target artifacts and retry",
-                    deps.display()
-                )));
-            }
-            let entry = entry.map_err(|err| {
-                KuError::message(format!(
-                    "failed to inspect Rust dependency directory '{}': {err}",
-                    deps.display()
-                ))
-            })?;
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if name.starts_with("libku-") && name.ends_with(".rlib") && path.is_file() {
-                candidates.push(path);
-            }
-        }
-    }
-    candidates.sort_by_key(|path| {
-        fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-    });
-    candidates.pop().ok_or_else(|| {
-        KuError::message(format!(
-            "ku build needs libku.rlib next to the ku executable; looked in {} and {}",
-            direct.display(),
-            deps.display()
-        ))
-    })
-}
-
-fn find_dependency_dirs(exe_dir: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    push_existing_dir(&mut dirs, exe_dir.join("deps"));
-    if exe_dir.file_name().is_some_and(|name| name == "release") {
-        if let Some(repo) = exe_dir.parent().and_then(Path::parent) {
-            push_existing_dir(&mut dirs, repo.join("target").join("release").join("deps"));
-        }
-    }
-    if exe_dir.file_name().is_some_and(|name| name == "debug") {
-        if let Some(repo) = exe_dir.parent().and_then(Path::parent) {
-            push_existing_dir(&mut dirs, repo.join("target").join("debug").join("deps"));
-        }
-    }
-    if exe_dir.file_name().is_some_and(|name| name == "release") {
-        if let Some(repo) = exe_dir.parent() {
-            push_existing_dir(&mut dirs, repo.join("target").join("release").join("deps"));
-        }
-    }
-    if exe_dir.file_name().is_some_and(|name| name == "debug") {
-        if let Some(repo) = exe_dir.parent() {
-            push_existing_dir(&mut dirs, repo.join("target").join("debug").join("deps"));
-        }
-    }
-    dirs
-}
-
-fn push_existing_dir(dirs: &mut Vec<PathBuf>, path: PathBuf) {
-    if path.is_dir() && !dirs.iter().any(|existing| existing == &path) {
-        dirs.push(path);
-    }
 }
 
 fn expected_ku_file(path: &str) -> KuError {
@@ -10602,6 +10476,28 @@ impl<'a> TopLevelReferenceRewriter<'a> {
 fn namespace_lookup(path: &str, namespaces: &NamespaceMaps) -> Option<String> {
     let (namespace, name) = path.split_once('.')?;
     namespaces.get(namespace)?.get(name).cloned()
+}
+
+/// A bounded real link probe using the same C compiler selection as native build.
+pub(crate) fn doctor_c_toolchain() -> KuResult<String> {
+    let temporary =
+        TempBuildDir::create_private("doctor-c").map_err(|e| KuError::message(e.to_string()))?;
+    let source = temporary.path().join("probe.c");
+    let output = temporary
+        .path()
+        .join(if cfg!(windows) { "probe.exe" } else { "probe" });
+    fs::write(&source, "int main(void) { return 0; }\n")
+        .map_err(|e| KuError::message(e.to_string()))?;
+    compile_c_source_with_output(
+        &source,
+        &output,
+        None,
+        BuildProfile::Debug,
+        false,
+        false,
+        true,
+    )?;
+    Ok("host C compiler/linker probe passed (database/TLS dependencies are separate)".into())
 }
 
 #[cfg(test)]

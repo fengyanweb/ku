@@ -497,7 +497,7 @@ def close_finished_output_streams(
     errors.raise_if_any()
 
 
-def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.CompletedProcess[bytes]:
+def run_bounded(command: list[str], cwd: Path, label: str, *, check: bool = True) -> subprocess.CompletedProcess[bytes]:
     creation_flags = 0
     if os.name == "nt":
         # No child/compiler code may run before the kill-on-close Job owns it.
@@ -635,7 +635,7 @@ def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.Complet
             errors.add("output reader failed", CleanupFailure(reader_errors.summary()))
     if primary is None and overflow.is_set():
         primary = SystemExit(f"native CI verification failed: {label} produced more than {MAX_CAPTURE_BYTES} bytes of output")
-    if primary is None and return_code != 0:
+    if primary is None and return_code != 0 and check:
         stdout_text = stdout.decode("utf-8", errors="replace")
         stderr_text = stderr.decode("utf-8", errors="replace")
         primary = SystemExit(f"native CI verification failed: {label} exited with {return_code}\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}")

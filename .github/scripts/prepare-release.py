@@ -280,6 +280,10 @@ def prepare_release(assets: Path, tag: str, commit: str, repo: Path) -> dict:
             extracted = temporary / "extracted"
             extracted.mkdir()
             EXPORTER.verify_archive(snapshot, manifest["files"], extracted)
+            try:
+                EXPORTER.RUNTIME_BUNDLE.verify(extracted, version, commit, target)
+            except (ValueError, OSError, KeyError, TypeError) as error:
+                raise PrepareError('archive runtime bundle identity is invalid: ' + str(error)) from error
             release = json_object(read_file(extracted / "RELEASE.json", MAX_JSON))
             if any(release.get(key) != value for key, value in (
                     ("version", version), ("target", target), ("commit", commit))):

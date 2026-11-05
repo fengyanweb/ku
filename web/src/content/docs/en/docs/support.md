@@ -2,7 +2,7 @@
 title: Platform and backend support
 description: Distinguish Ku release platforms, interpreter, runner, native C, Task subset, and LLVM support.
 kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-28'
+verifiedAt: '2026-10-29'
 sources:
   [
     'docs/syntax.md',
@@ -21,7 +21,7 @@ sources:
 
 ## Choose a platform and execution path
 
-Use [installation](/en/docs/install/) and the actual [release assets](https://github.com/fengyanweb/ku/releases) to select a CLI for your system and architecture. A source build, CI job or isolated deployment rehearsal does not by itself publish a downloadable platform package. The Linux ARM64 release-candidate rehearsal covers its sample service and dependencies; a real application, its production SLO and canary acceptance are separate.
+Follow [installation](/en/docs/install/) to choose the CLI for your system and architecture. Precompiled packages support macOS ARM64, Linux x64 and Windows x64. Linux ARM64 requires a source build.
 
 | Capability                 | Interpreter `ku run` / default runner                                     | Native C                                                  | Native Task path                                                                  |
 | -------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------- |
@@ -84,6 +84,8 @@ Database clients are native-only. A real-server check applies to its driver, pla
 Ku remains under development. Complete self-hosted checking/IR/backend, generic Task network scheduling and a complete database/platform matrix are not promised. Rust supplies the bootstrap toolchain. Version 0.0.x does not guarantee source or generated C/FFI ABI compatibility.
 
 ## Known issues
+
+Runner builds fail with E0514 when Rust does not match the bundled runtime. See [installation](/en/docs/install/) for Rust, linker and Windows SDK requirements, and [build troubleshooting](/en/docs/guide/errors/#runner-build).
 
 As of 2026-10-28, the three-platform release gates and package verification for 0.0.19 have passed. These latency issues remain:
 

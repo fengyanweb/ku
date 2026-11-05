@@ -25,6 +25,11 @@ import tarfile
 import tempfile
 import time
 
+_RUNTIME_SPEC = importlib.util.spec_from_file_location("ku_runtime_bundle", Path(__file__).with_name("runtime-bundle.py"))
+assert _RUNTIME_SPEC and _RUNTIME_SPEC.loader
+RUNTIME_BUNDLE = importlib.util.module_from_spec(_RUNTIME_SPEC)
+_RUNTIME_SPEC.loader.exec_module(RUNTIME_BUNDLE)
+
 MAX_FILES = 1000
 MAX_BYTES = 1024 * 1024 * 1024
 MAX_METADATA = 16 * 1024 * 1024
@@ -455,7 +460,7 @@ def production_packages(metadata: dict) -> list[dict]:
     return [by_id[identity] for identity in seen]
 
 
-def collect_licenses(stage: Stager, metadata_path: Path, repo: Path, sysroot: Path) -> dict:
+def collect_licenses(stage: Stager, metadata_path: Path, repo: Path, sysroot: Path, publisher_toolchain: str | None = None) -> dict:
     metadata = json.loads(read_bounded(metadata_path, MAX_METADATA))
     packages = production_packages(metadata)
     plain(repo, directory=True)
@@ -558,7 +563,7 @@ def collect_licenses(stage: Stager, metadata_path: Path, repo: Path, sysroot: Pa
         "ku_license": KU_LICENSE,
         "ku_materials": ["LICENSE", "NOTICE"],
         "cargo": records,
-        "rust": {"required_toolchain": "1.89.0", "materials": rust_paths},
+        "rust": {"required_toolchain": publisher_toolchain or RUNTIME_BUNDLE.toolchain_config(Path(__file__).resolve().parents[2]), "materials": rust_paths},
     }
 
 
@@ -641,7 +646,7 @@ def export_release(bundle: Path, output: Path, repo: Path, version: str,
     if os.path.lexists(asset_path) or os.path.lexists(manifest_path):
         raise ExportError("release output already exists; refusing overwrite")
     release = {"format": "ku-release-v1", "version": version, "target": target, "commit": commit,
-               "rust_toolchain": "1.89.0", "status": "experimental",
+               "rust_toolchain": "pending-runtime-validation", "status": "experimental",
                "ku_license": KU_LICENSE}
     with tempfile.TemporaryDirectory(prefix="ku-export-") as temporary:
         temporary = Path(temporary).resolve()
@@ -652,7 +657,7 @@ def export_release(bundle: Path, output: Path, repo: Path, version: str,
             stage.add(path.relative_to(bundle).as_posix(), source=path)
         executable = "ku.exe" if target.endswith("windows-msvc") else "ku"
         archive = "ku_native_tls.lib" if target.endswith("windows-msvc") else "libku_native_tls.a"
-        required = {executable, "libku.rlib", f"ku-language-{version}.vsix",
+        required = {executable, "libku.rlib", "ku-runtime.json", "ku-runtime-deps.json", f"ku-language-{version}.vsix",
                     f"native-tls/v1/{target}/manifest.kutls",
                     f"native-tls/v1/{target}/include/ku_native_tls.h",
                     f"native-tls/v1/{target}/lib/{archive}"}
@@ -661,9 +666,18 @@ def export_release(bundle: Path, output: Path, repo: Path, version: str,
         allowed = required | ({"ku.pdb"} if target.endswith("windows-msvc") else set())
         if any(name not in allowed and not dependency_name(name, target) for name in stage.files):
             raise ExportError("bundle contains an unexpected file")
+        try:
+            runtime = RUNTIME_BUNDLE.verify(bundle, version, commit, target)
+            closure = RUNTIME_BUNDLE.read_json(bundle / runtime['dependency_manifest'])
+            listed = {row['path'] for row in closure['files']}
+            if {name for name in stage.files if name.startswith('deps/')} != {name for name in listed if name.startswith('deps/')}:
+                raise ValueError('exported dependencies differ from same-build runtime closure')
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            raise ExportError('runtime bundle validation failed: ' + str(error)) from error
+        release['rust_toolchain'] = runtime['rustc']['release']
         if executable == "ku" and stage.files[executable]["mode"] != 0o755:
             raise ExportError("Unix ku executable does not have its executable mode")
-        stage.add("THIRD_PARTY.json", data=json_bytes(collect_licenses(stage, metadata, repo, rust_sysroot)))
+        stage.add("THIRD_PARTY.json", data=json_bytes(collect_licenses(stage, metadata, repo, rust_sysroot, runtime["rustc"]["toolchain"])))
         stage.add("RELEASE.json", data=json_bytes(release))
         instructions = f"""# Ku {version} ({target})
 
@@ -672,8 +686,17 @@ Extract the whole archive into an empty directory and keep its layout intact.
 Run ./{executable} --version (PowerShell: .\\{executable} --version).
 Optionally add that directory to PATH. Install ku-language-{version}.vsix in VS Code.
 
-The default runner backend requires Rust 1.89.0 for this target and its native
-linker. libku.rlib and deps/ must stay beside ku. deps/ contains matching Rust
+Running/checking Ku source does not require Rust. The default build backend is
+Runner: it needs the exact publisher compiler recorded in ku-runtime.json
+(Rust {runtime['rustc']['release']} for this bundle) plus the target native linker.
+Ku automatically selects a matching installed compiler without changing your
+Rust default, project override or toolchain file. Diagnose with:
+  ku doctor --backend runner
+If that exact compiler is missing, explicitly install it with:
+  ku doctor --install-runner-toolchain
+KU_RUNNER_RUSTC may explicitly select an absolute compiler path; a mismatched
+explicit compiler is rejected. The complete ku-runtime.json,
+ku-runtime-deps.json, libku.rlib and deps/ must stay beside ku. deps/ contains matching Rust
 RLIBs and Cargo-emitted procedural-macro libraries for that exact toolchain and
 platform; do not replace them with another build. The native C backend needs a
 working target C compiler/linker. Keep native-tls/ beside ku for automatic
@@ -684,7 +707,14 @@ matching dynamic libraries. This is not a universal executable for all OSes.
 The default runner embeds the entry source only. Imported modules are loaded
 from their original source locations at runtime, so those source locations must
 remain available. For self-contained deployment of the complete local import
-graph, use ku build --native with the target C compiler/linker.
+graph, use ku build --backend c --release with the target C compiler/linker.
+The historical --native form without -o only emits C; it is not this command.
+
+中文：运行/检查源码不需要 Rust；默认 build 使用 Runner。保留整个安装包。
+编译前可执行 ku doctor --backend runner；缺少匹配工具链时，显式执行
+ku doctor --install-runner-toolchain。该操作不会修改全局 Rust 默认版本。
+完整说明 / Details: https://github.com/fengyanweb/ku/blob/{commit}/docs/cli-runtime-bundle.md
+English: https://github.com/fengyanweb/ku/blob/{commit}/docs/cli-runtime-bundle.en.md
 
 SHA256SUMS covers every payload file except SHA256SUMS itself. The separate
 asset manifest also covers SHA256SUMS and the complete compressed archive.

@@ -754,3 +754,106 @@ fn main() {
         result.stderr
     );
 }
+
+#[test]
+fn command_help_is_consistent_and_has_no_project_side_effects() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = unique_temp_dir("command-help-contract");
+    fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    for command in [
+        "build",
+        "run",
+        "check",
+        "create",
+        "init",
+        "doctor",
+        "ir",
+        "llvm",
+        "template",
+        "package",
+        "supervise",
+        "service",
+    ] {
+        let long = run_with_timeout_in(
+            root.clone(),
+            &ku_binary(),
+            &["help", command],
+            Duration::from_secs(5),
+        );
+        let short = run_with_timeout_in(
+            root.clone(),
+            &ku_binary(),
+            &[command, "--help"],
+            Duration::from_secs(5),
+        );
+        assert_eq!(long.code, Some(0), "{command}: {}", long.stderr);
+        assert_eq!(short.code, Some(0), "{command}: {}", short.stderr);
+        assert_eq!(long.stdout, short.stdout, "{command}");
+    }
+    let create = run_with_timeout_in(
+        root.clone(),
+        &ku_binary(),
+        &["create", "must-not-exist", "--help"],
+        Duration::from_secs(5),
+    );
+    assert_eq!(create.code, Some(0));
+    assert!(!root.join("must-not-exist").exists());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_json_contains_only_json_even_when_a_c_compiler_prints_stdout() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = unique_temp_dir("doctor-stdout-contract");
+    fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    let compiler = root.join("c-driver");
+    fs::write(
+        &compiler,
+        b"#!/bin/sh\nprintf '%s\\n' DOCTOR_COMPILER_STDOUT_SENTINEL\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700)).unwrap();
+    for extra in [&[][..], &["--backend", "c"][..]] {
+        let mut command = Command::new(ku_binary());
+        command
+            .arg("doctor")
+            .arg("--json")
+            .args(extra)
+            .env("KU_CC", format!("\"{}\"", compiler.display()))
+            .current_dir(&root);
+        let output = run_bounded(
+            &mut command,
+            Duration::from_secs(30),
+            SHORT_PROCESS_OUTPUT_LIMITS,
+        )
+        .unwrap();
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("DOCTOR_COMPILER_STDOUT_SENTINEL"), "{text}");
+        let value = ku::stdlib::json::eval(
+            "decode",
+            &[ku::value::Value::String(text.clone())],
+            ku::span::Span::default(),
+        )
+        .unwrap();
+        assert!(
+            matches!(value, Some(ku::value::Value::Result { ok: true, .. })),
+            "stdout is not one JSON document: {text}"
+        );
+        assert!(text.contains("ku-doctor-v1"));
+        assert_eq!(output.status.success(), extra.is_empty());
+    }
+}

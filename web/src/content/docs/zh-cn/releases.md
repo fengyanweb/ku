@@ -2,7 +2,7 @@
 title: '版本与发布记录'
 description: '版本与发布记录'
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-23'
+verifiedAt: '2026-10-29'
 sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.18.md']
 ---
 

@@ -67,6 +67,17 @@ class PrepareReleaseTests(unittest.TestCase):
         executable = "ku.exe" if target.endswith("windows-msvc") else "ku"
         payloads = {"RELEASE.json": encoded(release or {"version": VERSION, "target": target, "commit": COMMIT}),
                     executable: b"fake target data, not executed\n", "deps/libprobe.rlib": b"fake library"}
+        with tempfile.TemporaryDirectory(prefix='ku-runtime-identity-fixture-') as runtime_temporary:
+            runtime_root = Path(runtime_temporary).resolve()
+            for name, value in {executable: payloads[executable], 'libku.rlib': b'fake Ku runtime',
+                                'deps/libprobe.rlib': b'fake library'}.items():
+                path = runtime_root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(value)
+            compiler = 'release: 1.89.0\ncommit-hash: ' + 'b'*40 + '\ncommit-date: 2025-08-04\nhost: ' + target + '\n'
+            PREPARE.EXPORTER.RUNTIME_BUNDLE.create(runtime_root, VERSION, COMMIT, target, compiler, '1.89.0')
+            for name in ('ku-runtime.json', 'ku-runtime-deps.json', 'libku.rlib'):
+                payloads[name] = (runtime_root / name).read_bytes()
         if extra:
             payloads.update(extra)
         specs = {}
