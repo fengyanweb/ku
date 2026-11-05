@@ -267,12 +267,3 @@ jobs:
           if not summary["passed"]:
               raise SystemExit("formal acceptance has no complete passing result for the frozen source and plan")
           PY
-
-      - name: Upload plan, report, logs and cost evidence on every outcome
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: multiloop-sustained-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ku-multiloop-sustained
-          if-no-files-found: error
-          retention-days: 30

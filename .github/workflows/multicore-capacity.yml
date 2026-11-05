@@ -127,15 +127,6 @@ jobs:
           set -euo pipefail
           python3 -u -B tests/acceptance/multicore_capacity.py --ku target/release/ku --output "$RUNNER_TEMP/capacity/report.json" --mode "$KU_CAPACITY_SCOPE" 2>&1 | tee "$RUNNER_TEMP/capacity/driver.log"
 
-      - name: Preserve compact reports and diagnostic evidence on every outcome
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: multicore-capacity-${{ matrix.os }}-${{ inputs.scope }}-${{ github.sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/capacity
-          if-no-files-found: error
-          retention-days: 30
-
   windows-regression:
     if: (github.event_name == 'workflow_dispatch' && inputs.scope != 'diagnose' && inputs.scope != 'waiting') || contains(fromJSON('["run-multicore-capacity","run-multicore-all"]'), github.event.label.name)
     name: Windows affected native regressions
@@ -180,12 +171,3 @@ jobs:
           $env:KU_BIN = Join-Path $env:GITHUB_WORKSPACE 'target/release/ku.exe'
           cargo test --locked --release --test native_task_source_test --test native_http_test -- --nocapture --test-threads=1 2>&1 | Tee-Object "$env:RUNNER_TEMP/capacity/affected-regressions.log"
           if ($LASTEXITCODE -ne 0) { throw 'The affected native regressions failed' }
-
-      - name: Preserve Windows affected-path results on every outcome
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: multicore-capacity-windows-regression-${{ github.sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/capacity
-          if-no-files-found: error
-          retention-days: 30

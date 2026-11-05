@@ -16,7 +16,7 @@ permissions:
 
 concurrency:
   group: native-three-os-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
   quality:
@@ -144,14 +144,6 @@ jobs:
       - name: Require detector self-test and real Task paths
         shell: bash
         run: python3 -B .github/scripts/task-tsan-gate.py --logs "$RUNNER_TEMP/ku-task-tsan"
-
-      - name: Retain exact toolchain, command and bounded diagnostic evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: native-task-tsan-evidence
-          path: ${{ runner.temp }}/ku-task-tsan
-          if-no-files-found: error
 
   task-main-path:
     if: github.event_name == 'workflow_dispatch' && inputs.scope == 'task-main-path'
@@ -833,21 +825,6 @@ jobs:
             Remove-Item -LiteralPath $caddyRoot -Recurse -Force
           }
 
-      - name: Retain resident service and PostgreSQL acceptance evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: service-lifecycle-${{ matrix.os }}
-          path: |
-            ${{ runner.temp }}/ku-resident-service.json
-            ${{ runner.temp }}/ku-caddy-service.json
-            ${{ runner.temp }}/ku-http-pg-lifecycle.json
-            ${{ runner.temp }}/ku-native-blocking-retirement.json
-            ${{ runner.temp }}/ku-runtime-matrix.json
-            ${{ runner.temp }}/ku-windows-host-task.json
-            ${{ runner.temp }}/ku-service-memory-provider.json
-          if-no-files-found: error
-
   release-contract:
     if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
     name: ${{ matrix.os }} release scripts and clean CheckOnly
@@ -941,17 +918,14 @@ jobs:
             target: x86_64-windows
             ku_binary: target/release/ku.exe
             python: python
-            artifact: native_ci-x86_64-windows.exe
           - os: ubuntu-24.04
             target: x86_64-linux
             ku_binary: target/release/ku
             python: python3
-            artifact: native_ci-x86_64-linux.tar
           - os: macos-15
             target: aarch64-darwin
             ku_binary: target/release/ku
             python: python3
-            artifact: native_ci-aarch64-darwin.tar
     env:
       CARGO_INCREMENTAL: "0"
       PYTHONDONTWRITEBYTECODE: "1"
@@ -990,20 +964,12 @@ jobs:
           --target "${{ matrix.target }}"
           --artifact-dir "${{ runner.temp }}/ku-native-${{ matrix.target }}"
 
-      - name: Upload verified portable native file
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          path: ${{ runner.temp }}/ku-native-${{ matrix.target }}/${{ matrix.artifact }}
-          if-no-files-found: error
-          retention-days: 7
-          archive: false
-
   release-bundle:
     name: ${{ matrix.target }} release download bundle
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
+    timeout-minutes: 45
+    strategy: &release-bundle-matrix
       fail-fast: false
       matrix:
         include:
@@ -1016,13 +982,14 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             python: python3
-    env:
+    env: &release-bundle-env
       CARGO_INCREMENTAL: "0"
       PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUTF8: "1"
       RUST_BACKTRACE: "1"
 
-    steps:
-      - name: Check out the exact release tag
+    steps: &release-bundle-steps
+      - name: Check out the exact package source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -1086,46 +1053,6 @@ jobs:
             --metadata $metadataPath --rust-sysroot $sysroot.Trim()
           if ($LASTEXITCODE -ne 0) { throw 'Release archive validation failed' }
 
-      - name: Upload the verified release files
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ku-release-${{ matrix.target }}
-          path: ${{ runner.temp }}/ku-release-assets/*
-          if-no-files-found: error
-          retention-days: 14
-
-  installed-pg:
-    name: ${{ matrix.target }} actual installed CLI PostgreSQL lifecycle
-    if: github.event_name == 'push'
-    needs: [release-bundle]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-            python: python
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            python: python3
-          - os: macos-15
-            target: aarch64-apple-darwin
-            python: python3
-    env:
-      PYTHONDONTWRITEBYTECODE: "1"
-      PYTHONUTF8: "1"
-
-    steps:
-      - name: Check out the exact archive source commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
       - name: Prepare the existing PostgreSQL fixture tools on Linux
         if: runner.os == 'Linux'
         shell: bash
@@ -1187,27 +1114,26 @@ jobs:
           & (Join-Path $runtimeDirectory 'pg_config.exe') --version
           if ($LASTEXITCODE -ne 0) { throw 'Selected pg_config failed' }
 
-      - name: Verify current-run artifact bytes and installed sync/async PG lifecycles
+      - name: Verify the exported archive and installed sync/async PG lifecycles
+        timeout-minutes: 15
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = (Get-Content -LiteralPath editors/vscode-ku/package.json -Raw -Encoding utf8 | ConvertFrom-Json).version
+          $report = Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json'
           & ${{ matrix.python }} -B .github/scripts/verify-installed-pg.py `
-            --repo $env:GITHUB_WORKSPACE --version $version `
+            --repo $env:GITHUB_WORKSPACE --version $env:RELEASE_VERSION `
             --target '${{ matrix.target }}' --commit $env:GITHUB_SHA `
-            --output (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json')
-          if ($LASTEXITCODE -ne 0) { throw 'Actual installed CLI PostgreSQL acceptance failed' }
-
-      - name: Retain bounded installed-archive PG evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: installed-pg-${{ matrix.target }}
-          path: ${{ runner.temp }}/ku-installed-pg*.json
-          if-no-files-found: error
-          retention-days: 14
+            --assets (Join-Path $env:RUNNER_TEMP 'ku-release-assets') `
+            --output $report
+          $verifyExit = $LASTEXITCODE
+          if (Test-Path -LiteralPath $report -PathType Leaf) {
+            $result = Get-Content -LiteralPath $report -Raw -Encoding utf8 | ConvertFrom-Json
+            $result | Select-Object status, target, commit, archive_sha256, fixture_cleanup_confirmed, failure_kind |
+              ConvertTo-Json -Compress | Write-Output
+          }
+          if ($verifyExit -ne 0) { throw 'Actual installed CLI PostgreSQL acceptance failed' }
 
       - name: Remove the owned PostgreSQL import-library link directory
         if: always()
@@ -1224,75 +1150,81 @@ jobs:
             Remove-Item -LiteralPath $env:KU_PG_LIB -Recurse -Force
           }
 
-  verify-release:
-    name: Verify the complete release asset set
-    if: github.event_name == 'push'
-    needs: [release-bundle]
+      - name: Stage the verified package on this run's release draft
+        if: startsWith(github.ref, 'refs/tags/v')
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KU_RELEASE_ID: ${{ needs.release-draft.outputs.release-id }}
+          KU_RELEASE_NONCE: ${{ needs.release-draft.outputs.release-nonce }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ${{ matrix.python }} -B .github/scripts/release-draft.py stage `
+            --repo $env:GITHUB_WORKSPACE --target '${{ matrix.target }}' `
+            --assets (Join-Path $env:RUNNER_TEMP 'ku-release-assets') `
+            --report (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json')
+          if ($LASTEXITCODE -ne 0) { throw 'Release asset staging failed' }
+
+  release-draft:
+    name: Open the draft for this verified tag run
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [quality, borrow-sanitizers, task-tsan, full-tests, release-contract, native]
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      release-id: ${{ steps.create.outputs.release-id }}
+      release-nonce: ${{ steps.create.outputs.release-nonce }}
     steps:
-      - name: Check out the release verification script
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-
-      - name: Download the three actual release bundle artifacts
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          pattern: ku-release-*
-          path: ${{ runner.temp }}/ku-release-preflight
-          merge-multiple: true
-
-      - name: Verify actual artifacts before creating a release tag
+      - name: Create this run's unpublished release
+        id: create
         shell: bash
-        run: |
-          set -euo pipefail
-          release_tag="$(python3 -c 'import json; print("v" + json.load(open("editors/vscode-ku/package.json", encoding="utf-8"))["version"])')"
-          python3 -B .github/scripts/prepare-release.py \
-            --assets "$RUNNER_TEMP/ku-release-preflight" \
-            --tag "$release_tag" --commit "$GITHUB_SHA" \
-            --repo "$GITHUB_WORKSPACE"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/release-draft.py create --repo "$GITHUB_WORKSPACE"
+
+  release-bundle-tag:
+    name: ${{ matrix.target }} verify and stage tagged release bundle
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [release-draft]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    strategy: *release-bundle-matrix
+    env: *release-bundle-env
+    steps: *release-bundle-steps
 
   publish-release:
-    name: Publish all verified release bundles together
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [quality, borrow-sanitizers, task-tsan, full-tests, release-contract, native, release-bundle, verify-release, installed-pg]
+    name: Verify and publish the complete release
+    if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.release-draft.outputs.release-id != ''
+    needs: [release-draft, release-bundle-tag]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
-      actions: read
+    env:
+      KU_RELEASE_ID: ${{ needs.release-draft.outputs.release-id }}
+      KU_RELEASE_NONCE: ${{ needs.release-draft.outputs.release-nonce }}
     steps:
-      - name: Check out the release notes and verification script
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-
-      - name: Download only the three release bundle artifacts
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          pattern: ku-release-*
-          path: ${{ runner.temp }}/ku-publish-assets
-          merge-multiple: true
-
-      - name: Verify exact assets and publish an experimental release
+      - name: Verify the actual draft assets and publish
+        id: publish
+        if: ${{ !cancelled() && needs.release-draft.result == 'success' && needs.release-bundle-tag.result == 'success' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 -B .github/scripts/prepare-release.py \
-            --assets "$RUNNER_TEMP/ku-publish-assets" \
-            --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" \
-            --repo "$GITHUB_WORKSPACE"
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
-            --title "Ku $GITHUB_REF_NAME（实验预发行版）" \
-            --notes-file "$RUNNER_TEMP/ku-publish-assets/RELEASE-NOTES.md"
-          gh release upload "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            "$RUNNER_TEMP/ku-publish-assets/"*.tar.gz \
-            "$RUNNER_TEMP/ku-publish-assets/"*.manifest.json \
-            "$RUNNER_TEMP/ku-publish-assets/SHA256SUMS"
-          gh release edit "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" --draft=false
+        run: python3 -B .github/scripts/release-draft.py publish --repo "$GITHUB_WORKSPACE"
+      - name: Remove this run's unpublished draft after failure
+        if: always() && steps.publish.outcome != 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/release-draft.py cleanup --repo "$GITHUB_WORKSPACE"
