@@ -9,7 +9,7 @@ on:
         description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, pg-input-lifetime, pg-input-guard, pg-read-screen, pg-input-windows, pg-typed-self, arena-residency, poll-budget-contract]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, pg-input-lifetime, pg-input-guard, pg-read-screen, memory-aa, pg-input-windows, pg-typed-self, arena-residency, poll-budget-contract]
       prepatch:
         description: 'Full prepatch commit for explicit paired screens; wake/PG probes require their frozen baseline'
         type: string
@@ -95,7 +95,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'pg-input-lifetime' || inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-read-screen' || inputs.scope == 'pg-input-windows' || inputs.scope == 'pg-typed-self' || inputs.scope == 'arena-residency' || inputs.scope == 'poll-budget-contract') && format('-{0}', inputs.scope) || '' }}
+  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'pg-input-lifetime' || inputs.scope == 'pg-input-guard' || inputs.scope == 'pg-read-screen' || inputs.scope == 'memory-aa' || inputs.scope == 'pg-input-windows' || inputs.scope == 'pg-typed-self' || inputs.scope == 'arena-residency' || inputs.scope == 'poll-budget-contract') && format('-{0}', inputs.scope) || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -431,6 +431,80 @@ jobs:
             ${{ runner.temp }}/ku-pg-current-observation/inputs/**/bin/ku-server
             ${{ runner.temp }}/ku-pg-current-observation/normal-self-probe/**/maps.log
             ${{ runner.temp }}/ku-pg-current-observation/normal-self-probe/**/symbol-identities.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  memory-aa:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'memory-aa'
+    name: Linux ARM64 fixed same-binary memory resolution
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore only the verified Rust1.99.1 d05 build bytes
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/ku-pg-guard-build-cache
+          key: ku-pg-baseline-d05-rust1.99.1-2f1163c34bd45ad4172acf28f1a94f38f7b382a271ba99c6469592beb0744142
+          fail-on-cache-miss: true
+      - name: Install fixture dependencies before the fixed quiet interval
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-18 libpq-dev postgresql-16
+      - name: Prepare exact identical A and A build identities without rebuilding
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B tests/benchmarks/cross_stack/memory_aa.py --phase prepare \
+            --root "$RUNNER_TEMP/ku-memory-aa" --source "$GITHUB_WORKSPACE" \
+            --archive "$RUNNER_TEMP/ku-pg-guard-build-cache/ku-pg-current-1.99.1/ku-performance-v2-evidence.tar.gz"
+      - name: Run the single bounded controlled A A plan
+        timeout-minutes: 13
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B tests/benchmarks/cross_stack/memory_aa.py --phase run \
+            --root "$RUNNER_TEMP/ku-memory-aa" --source "$GITHUB_WORKSPACE" \
+            > "$RUNNER_TEMP/ku-memory-aa/run.log" 2>&1
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ku-memory-aa-core
+          path: |
+            ${{ runner.temp }}/ku-memory-aa/prepare.json
+            ${{ runner.temp }}/ku-memory-aa/frozen-plan.json
+            ${{ runner.temp }}/ku-memory-aa/platform.json
+            ${{ runner.temp }}/ku-memory-aa/observer-placement.json
+            ${{ runner.temp }}/ku-memory-aa/results.json
+            ${{ runner.temp }}/ku-memory-aa/summary.json
+            ${{ runner.temp }}/ku-memory-aa/cooldown.json
+            ${{ runner.temp }}/ku-memory-aa/cooldown-end.json
+            ${{ runner.temp }}/ku-memory-aa/run.log
+            ${{ runner.temp }}/ku-memory-aa/windows/**/window.json
+            ${{ runner.temp }}/ku-memory-aa/windows/**/full-lifecycle.json
+            ${{ runner.temp }}/ku-memory-aa/windows/**/termination.json
+            ${{ runner.temp }}/ku-memory-aa/windows/**/identity.json
+            ${{ runner.temp }}/ku-memory-aa/windows/**/service/service.json
+            ${{ runner.temp }}/ku-memory-aa/windows/**/service/service.log
+            ${{ runner.temp }}/ku-memory-aa/windows/**/score/client.json
+            ${{ runner.temp }}/ku-memory-aa/windows/**/score/resources.json
+            ${{ runner.temp }}/ku-memory-aa/windows/**/score/driver-cleanup.json
+            ${{ runner.temp }}/ku-memory-aa/windows/**/score/runtime-metrics.json
+            ${{ runner.temp }}/ku-memory-aa/windows/**/score/client.log
+            ${{ runner.temp }}/ku-memory-aa/windows/**/score/events.csv.gz
+            ${{ runner.temp }}/ku-memory-aa/windows/**/warmup/client.json
+            ${{ runner.temp }}/ku-memory-aa/windows/**/warmup/resources.json
+            ${{ runner.temp }}/ku-memory-aa/windows/**/warmup/driver-cleanup.json
+            ${{ runner.temp }}/ku-memory-aa/windows/**/warmup/client.log
+            ${{ runner.temp }}/ku-memory-aa/windows/**/warmup/events.csv.gz
           retention-days: 14
           if-no-files-found: warn
 
@@ -1325,7 +1399,7 @@ jobs:
           printf '42\n' | diff -u - "$fixture/actual.txt"
 
   performance-v2:
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)
+    if: github.event_name == 'workflow_dispatch' && inputs.scope != 'memory-aa' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)
     name: Linux ARM64 serial performance evidence (goal status is separate)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
@@ -1793,7 +1867,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'pg-input-lifetime' && inputs.scope != 'pg-input-guard' && inputs.scope != 'pg-read-screen' && inputs.scope != 'pg-input-windows' && inputs.scope != 'pg-typed-self' && inputs.scope != 'arena-residency' && inputs.scope != 'poll-budget-contract')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'pg-input-lifetime' && inputs.scope != 'pg-input-guard' && inputs.scope != 'pg-read-screen' && inputs.scope != 'memory-aa' && inputs.scope != 'pg-input-windows' && inputs.scope != 'pg-typed-self' && inputs.scope != 'arena-residency' && inputs.scope != 'poll-budget-contract')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
