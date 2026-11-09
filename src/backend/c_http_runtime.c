@@ -4086,7 +4086,11 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   /* Configuration limits bound all products below on every supported target.
      One receipt includes every owner array; no Task/connection consumes an
      independent copy of the service's configured byte budget. */
-  size_t fixed_bytes=(size_t)slot_count*(sizeof(KuHttpConnection)+sizeof(int)+sizeof(KuHttpPollConnection))
+  size_t poll_connection_bytes=0;
+#if !defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  poll_connection_bytes=(size_t)slot_count*sizeof(KuHttpPollConnection);
+#endif
+  size_t fixed_bytes=(size_t)slot_count*(sizeof(KuHttpConnection)+sizeof(int))+poll_connection_bytes
       +(size_t)request_limit*sizeof(KuHttpJob*)
       +poll_capacity*sizeof(KuHttpPollFd)+(size_t)max_pending*sizeof(KuHttpPendingItem)+net_bytes;
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
@@ -4104,7 +4108,8 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   owner->connection_base=connections;
   KuHttpPollFd* poll_items=(KuHttpPollFd*)calloc(poll_capacity,sizeof(KuHttpPollFd));
   int* active_indices=(int*)calloc((size_t)slot_count,sizeof(int));
-  KuHttpPollConnection* poll_connections=(KuHttpPollConnection*)calloc((size_t)slot_count,sizeof(KuHttpPollConnection));
+  KuHttpPollConnection* poll_connections=poll_connection_bytes?
+      (KuHttpPollConnection*)calloc((size_t)slot_count,sizeof(KuHttpPollConnection)):NULL;
   void* net_storage=net_bytes?calloc(1,net_bytes):NULL;
 #if defined(KU_HTTP_HAS_TASK_NET)
   KuTaskNetPollV1* net_interests=(KuTaskNetPollV1*)net_storage;
@@ -4112,7 +4117,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   KuHttpActiveSet active={.connections=connections,.indices=active_indices,.capacity=slot_count,.free_head=-1,.request_limit=request_limit};
   KuHttpPending pending={0};pending.cap=max_pending;
   pending.items=(KuHttpPendingItem*)calloc((size_t)max_pending,sizeof(KuHttpPendingItem));
-  if((slot_count && (!connections || !active_indices || !poll_connections))
+  if((slot_count && (!connections || !active_indices || (poll_connection_bytes && !poll_connections)))
       || !poll_items || !pending.items || (net_bytes && !net_storage)) {
     free(connections);free(poll_items);free(pending.items);free(active_indices);free(poll_connections);free(net_storage);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
