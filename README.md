@@ -64,3 +64,13 @@ ku build --backend c --release hello.ku -o hello
 ## 历史版本
 
 [0.0.19](docs/v0.0.19.md)、[0.0.18](docs/v0.0.18.md)、[0.0.17](docs/v0.0.17.md) 及更早版本保留原版本说明。历史性能数据仅适用于其记录的源码、负载、平台和资源条件。
+
+## 反馈
+
+通过 [GitHub Issues](https://github.com/fengyanweb/ku/issues) 或邮件 [kagura.gc@qq.com](mailto:kagura.gc@qq.com) 反馈问题。请附 Ku 版本、操作系统、最小复现程序和错误输出。
+
+## 赞赏支持
+
+欢迎通过[爱发电](https://afdian.com/a/ku-lang)或微信赞赏支持 Ku 的开发与文档维护。赞赏完全自愿，不影响使用。
+
+<a href="web/public/images/wechat-donation.png"><img src="web/public/images/wechat-donation.png" alt="Ku 项目微信赞赏码" width="220"></a>

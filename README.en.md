@@ -63,3 +63,13 @@ On Windows, use `target\release\ku.exe`.
 ## History
 
 [0.0.19](docs/v0.0.19.md), [0.0.18](docs/v0.0.18.md), its [historical revision](docs/v0.0.18-r1.md), [0.0.17](docs/v0.0.17.md), and [0.0.16](docs/v0.0.16.md) remain available with their original release identities. Historical performance results apply only to their recorded commit, workload, platform, and limits.
+
+## Feedback
+
+Report problems through [GitHub Issues](https://github.com/fengyanweb/ku/issues) or email [kagura.gc@qq.com](mailto:kagura.gc@qq.com). Include the Ku version, operating system, a minimal reproducer, and error output.
+
+## Support Ku
+
+You can support Ku development and documentation through [Afdian](https://afdian.com/a/ku-lang) or WeChat. Support is voluntary and does not affect access to Ku.
+
+<a href="web/public/images/wechat-donation.png"><img src="web/public/images/wechat-donation.png" alt="WeChat appreciation QR code for Ku" width="220"></a>
