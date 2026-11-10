@@ -2,12 +2,12 @@
 +++ b/Cargo.toml
 @@ -6,16 +6,25 @@
  license = "Apache-2.0"
- 
+
  [workspace]
 -members = ["crates/ku-native-tls"]
 +members = ["crates/ku-native-tls", "crates/ku-web"]
  resolver = "2"
- 
+
 +[features]
 +default = []
 +browser = []
@@ -37,7 +37,7 @@
 +    #[cfg(feature = "browser")]
 +    browser_origin: Option<String>,
  }
- 
+
  #[derive(Debug, Default)]
 @@ -286,6 +288,8 @@
  impl Clone for Env {
@@ -67,7 +67,7 @@
 +    pub(crate) fn set_browser_origin(&mut self, origin: &str) {
 +        self.browser_origin = Some(origin.to_owned());
      }
- 
+
      pub fn push_scope(&mut self) {
 @@ -383,6 +399,8 @@
                  span,
@@ -89,7 +89,7 @@
                  owned_bindings: HashSet::new(),
 @@ -533,6 +553,8 @@
      }
- 
+
      pub(crate) fn assign_owned(&mut self, name: &str, value: Value, span: Span) -> KuResult<()> {
 +        #[cfg(feature = "browser")]
 +        crate::browser::preflight_args(std::slice::from_ref(&value), span)?;
@@ -98,7 +98,7 @@
              if let Some(binding) = scope.bindings.get(name) {
 @@ -568,7 +590,11 @@
      }
- 
+
      pub fn get(&self, name: &str, span: Span) -> KuResult<Value> {
 -        self.with_value(name, span, |value| Ok(value.clone()))
 +        self.with_value(name, span, |value| {
@@ -107,7 +107,7 @@
 +            Ok(value.clone())
 +        })
      }
- 
+
      /// A synchronous scalar subtree may share this cell only while its type
 @@ -1071,6 +1097,8 @@
          let Value::String(value) = &mut binding.value else {
@@ -141,9 +141,9 @@
 +#[cfg(target_arch = "wasm32")]
 +use web_time::Instant;
 +use std::{borrow::Cow, fmt};
- 
+
  use crate::span::Span;
- 
+
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -1,24 +1,40 @@
@@ -180,7 +180,7 @@
  pub mod span;
  pub mod stdlib;
  pub mod token;
- 
+
  pub use runtime::{interpreter, value};
 +
 +#[cfg(feature = "browser")]
@@ -205,14 +205,14 @@
 -    time::{Duration, Instant},
 +    time::Duration,
  };
- 
+
  const STAGES: usize = 24;
 --- a/src/runtime/interpreter/http_io.rs
 +++ b/src/runtime/interpreter/http_io.rs
 @@ -1,6 +1,10 @@
  //! One socket owner for the interpreter HTTP transport. Ku handlers and their
  //! Values remain on the caller; only parsed/wire data crosses this boundary.
- 
+
 +#[cfg(not(target_arch = "wasm32"))]
 +use std::time::Instant;
 +#[cfg(target_arch = "wasm32")]
@@ -227,7 +227,7 @@
 -    time::{Duration, Instant},
 +    time::Duration,
  };
- 
+
  const READ_CHUNK: usize = 8192;
 --- a/src/runtime/interpreter/netpoll.rs
 +++ b/src/runtime/interpreter/netpoll.rs
@@ -243,7 +243,7 @@
 -    time::{Duration, Instant},
 +    time::Duration,
  };
- 
+
  #[cfg(unix)]
 @@ -39,6 +43,7 @@
  /// Wait for one batch, retaining the borrowed socket owners until the OS call
@@ -256,7 +256,7 @@
 @@ -116,6 +121,7 @@
      }
  }
- 
+
 +#[cfg(not(target_arch = "wasm32"))]
  fn timeout_millis(deadline: Option<Instant>) -> i32 {
      let Some(deadline) = deadline else {
@@ -287,12 +287,12 @@
 -    time::{Duration, Instant},
 +    time::Duration,
  };
- 
+
  use crate::{
 @@ -32,7 +36,10 @@
      value::{BorrowProjection, BorrowedValue, HttpListenerLease, Value, ValueProjection},
  };
- 
+
 +#[cfg(not(target_arch = "wasm32"))]
  const MAX_CALL_DEPTH: usize = 512;
 +#[cfg(target_arch = "wasm32")]
@@ -323,7 +323,7 @@
 +        let result = result.map_err(|error| crate::browser::contextualize(name, error));
 +        result?.into_call_value(span, "function")
      }
- 
+
      fn call_function_flow(
 @@ -447,7 +459,11 @@
          span: Span,
@@ -358,7 +358,7 @@
          if let Some(result) =
              execution::try_execute_borrowed_string(self, function, &mut args, depth)
 @@ -519,6 +544,8 @@
- 
+
              let mut leases = Vec::new();
              let mut env = Env::new();
 +            #[cfg(feature = "browser")]
@@ -368,7 +368,7 @@
                      value.require_owned_root(param.span)?;
 @@ -618,6 +645,10 @@
      }
- 
+
      fn call_function_value_flow(&mut self, call: FunctionValueCall<'_>) -> KuResult<Flow> {
 +        #[cfg(feature = "browser")]
 +        if crate::browser::active() && call.is_async {
@@ -415,7 +415,7 @@
 +        });
          result
      }
- 
+
 @@ -1089,10 +1129,7 @@
                  if let Some(value) = self.take_pending_fail() {
                      return Ok(Flow::fail(value));
@@ -429,7 +429,7 @@
              }
              Stmt::Expr { expr, .. } => {
 @@ -1744,7 +1781,7 @@
- 
+
      fn eval(&mut self, expr: &Expr, env: &mut Env, depth: usize) -> KuResult<Value> {
          self.tick(expr.span)?;
 -        match &expr.kind {
@@ -447,7 +447,7 @@
 +        if let Ok(value) = &browser_result { crate::browser::preflight_args(std::slice::from_ref(value), expr.span)?; }
 +        browser_result
      }
- 
+
      fn eval_index_expr(
 @@ -3006,7 +3046,12 @@
              if self.pending_fail.is_some() {
@@ -465,7 +465,7 @@
      }
 @@ -3081,6 +3126,8 @@
      }
- 
+
      fn tick(&mut self, span: Span) -> KuResult<()> {
 +        #[cfg(feature = "browser")]
 +        crate::browser::charge(1, span)?;
@@ -486,7 +486,7 @@
          stdlib::eval_builtin(name, std::slice::from_ref(first), span)
 @@ -6589,6 +6633,8 @@
  }
- 
+
  fn eval_binary(op: BinaryOp, left: Value, right: Value, span: Span) -> KuResult<Value> {
 +    #[cfg(feature = "browser")]
 +    { crate::browser::preflight_args(std::slice::from_ref(&left), span)?; crate::browser::preflight_args(std::slice::from_ref(&right), span)?; }
@@ -529,7 +529,7 @@
 -    time::{Duration, Instant},
 +    time::Duration,
  };
- 
+
  use crate::{
 --- a/src/runtime/task.rs
 +++ b/src/runtime/task.rs
@@ -548,13 +548,13 @@
 -    time::{Duration, Instant},
 +    time::Duration,
  };
- 
+
  use crate::{
 --- a/src/stdlib/array.rs
 +++ b/src/stdlib/array.rs
 @@ -9,6 +9,8 @@
  };
- 
+
  pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
 +    #[cfg(feature = "browser")]
 +    crate::browser::preflight_args(args, span)?;
@@ -577,7 +577,7 @@
 +++ b/src/stdlib/compiler.rs
 @@ -14,6 +14,8 @@
  const MAX_AST_OUTPUT_BYTES: usize = 1_000_000;
- 
+
  pub fn eval(module: &str, function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
 +    #[cfg(feature = "browser")]
 +    crate::browser::preflight_args(args, span)?;
@@ -588,7 +588,7 @@
 +++ b/src/stdlib/core.rs
 @@ -6,6 +6,8 @@
  };
- 
+
  pub fn eval_builtin(name: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
 +    #[cfg(feature = "browser")]
 +    crate::browser::preflight_args(args, span)?;
@@ -609,15 +609,15 @@
 @@ -63,6 +63,7 @@
  /// truncated into a shorter route.
  pub const MAX_REQUEST_PATH_SEGMENTS: usize = 64;
- 
+
 +#[cfg(not(target_arch = "wasm32"))]
  static DEFAULT_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
- 
+
  pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
 @@ -296,6 +297,7 @@
      message: String,
  }
- 
+
 +#[cfg(not(target_arch = "wasm32"))]
  fn http_request(config: HttpRequest) -> Result<HttpResponse, HttpError> {
      let method = config.method.to_ascii_uppercase();
@@ -625,7 +625,7 @@
 @@ -342,6 +344,7 @@
      response_to_value(response, config.max_body_bytes)
  }
- 
+
 +#[cfg(not(target_arch = "wasm32"))]
  fn default_agent() -> &'static ureq::Agent {
      DEFAULT_AGENT.get_or_init(|| {
@@ -633,7 +633,7 @@
 @@ -352,6 +355,7 @@
      })
  }
- 
+
 +#[cfg(not(target_arch = "wasm32"))]
  fn response_to_value(
      response: ureq::Response,
@@ -651,7 +651,7 @@
 +++ b/src/stdlib/json.rs
 @@ -15,6 +15,8 @@
  const MAX_JSON_OUTPUT_BYTES: usize = 1_000_000;
- 
+
  pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
 +    #[cfg(feature = "browser")]
 +    crate::browser::preflight_args(args, span)?;
@@ -660,7 +660,7 @@
              expect_arg_count(&format!("json.{function}"), args.len(), 1, span)?;
 @@ -51,6 +53,8 @@
  }
- 
+
  pub fn stringify_value(value: &Value, span: Span) -> KuResult<String> {
 +    #[cfg(feature = "browser")]
 +    crate::browser::preflight_args(std::slice::from_ref(value), span)?;
@@ -669,7 +669,7 @@
      if output.len() > MAX_JSON_OUTPUT_BYTES {
 @@ -60,6 +64,8 @@
  }
- 
+
  fn parse_json(text: &str, span: Span) -> KuResult<Value> {
 +    #[cfg(feature = "browser")]
 +    crate::browser::allocation(text.len().checked_mul(8).ok_or_else(|| crate::browser::fail(span))?, span)?;
@@ -687,7 +687,7 @@
 +#[cfg(target_arch = "wasm32")]
 +#[path = "../browser/time.rs"]
  pub mod time;
- 
+
  pub fn eval_builtin(name: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
 @@ -33,6 +37,12 @@
      let Some((module, function)) = dotted_name(callee) else {
@@ -706,7 +706,7 @@
 +++ b/src/stdlib/object.rs
 @@ -6,6 +6,8 @@
  };
- 
+
  pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
 +    #[cfg(feature = "browser")]
 +    crate::browser::preflight_args(args, span)?;
@@ -717,7 +717,7 @@
 +++ b/src/stdlib/string.rs
 @@ -9,6 +9,8 @@
  };
- 
+
  pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
 +    #[cfg(feature = "browser")]
 +    crate::browser::preflight_args(args, span)?;
