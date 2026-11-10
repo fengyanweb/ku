@@ -11,6 +11,7 @@ sources:
     'editors/vscode-ku/src/completionModel.ts',
     '.github/scripts/export-release.py',
   ]
+slug: zh-cn/v0.0.19/docs/tools/vscode
 ---
 
 Ku 插件为 VS Code 1.85 及以上版本提供语法高亮、代码片段、补全、格式化和编译器诊断。请同时[安装 Ku CLI](/zh-cn/v0.0.19/docs/install/)，插件通过 CLI 检查和运行程序。

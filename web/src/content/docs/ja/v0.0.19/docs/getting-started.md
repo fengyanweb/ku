@@ -11,6 +11,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: ja/v0.0.19/docs/getting-started
 ---
 
 まず [Ku をインストール](/ja/v0.0.19/docs/install/)して、`ku --version` が実行できることを確認してください。

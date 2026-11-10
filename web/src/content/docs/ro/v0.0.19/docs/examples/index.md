@@ -4,6 +4,7 @@ description: 'Exemplele extinse sunt momentan în engleză. Paginile englezești
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['examples/README.md', 'docs/v0.0.18-r1.md']
+slug: ro/v0.0.19/docs/examples
 ---
 
 Exemplele extinse sunt momentan în engleză. Paginile englezești legate indică backendul și fișierele, serverele sau bazele de date necesare. [examples/README.md](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/README.md).

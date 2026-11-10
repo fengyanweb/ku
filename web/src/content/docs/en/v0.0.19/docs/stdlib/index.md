@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['src/stdlib/metadata.rs', 'src/stdlib/mod.rs', 'docs/syntax.md']
 sidebar:
   order: 0
+slug: en/v0.0.19/docs/stdlib
 ---
 
 The standard library ships with Ku. Import modules through `std`; no separate package installation is required. Each reference describes interfaces, return values, errors and examples.

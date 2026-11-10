@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['docs/package.md', 'src/package.rs']
 sidebar:
   order: 3
+slug: en/v0.0.19/docs/guide/packages
 ---
 
 The standard library ships with Ku. Use imports for your own modules and third-party packages. There is no officially hosted public package directory; the repository provides a self-hosted registry implementation.

@@ -16,6 +16,7 @@ sources:
   ]
 sidebar:
   order: 4
+slug: zh-cn/v0.0.19/docs/stdlib/json
 ---
 
 `std.json` 提供 JSON 编码与解码。通用同步 `json.encode` 对值进行只读编码，`json.decode` 将 JSON 文本解析为独立持有内容的动态值；两者返回 Result。`stringify`、`parse` 和 `try_parse` 作为兼容名称保留。这些接口均包含在 0.0.19 中。当前仍使用旧 JSON 默认实现，不使用 yyjson。

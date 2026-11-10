@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
+slug: pl/v0.0.19/docs/project
 ---
 
 Ku to język programowania i zestaw narzędzi: interpreter, domyślny wykonywalny runner i natywna kompilacja C obsługiwanego podzbioru.

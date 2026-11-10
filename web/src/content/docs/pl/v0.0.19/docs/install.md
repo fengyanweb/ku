@@ -10,6 +10,7 @@ sources:
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
+slug: pl/v0.0.19/docs/install
 ---
 
 Pobierz **Ku 0.0.19** dla swojego komputera. Każdy pakiet tej eksperymentalnej wersji wstępnej zawiera narzędzie wiersza poleceń, interpreter i rozszerzenie VS Code.

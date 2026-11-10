@@ -11,6 +11,7 @@ sources:
     'docs/protocol-foundation.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: ja/v0.0.19/docs/stdlib
 ---
 
 標準ライブラリの仕様は[構文リファレンス](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)、バックエンドごとの制限は[対応範囲](/ja/v0.0.19/docs/support/)をご覧ください。

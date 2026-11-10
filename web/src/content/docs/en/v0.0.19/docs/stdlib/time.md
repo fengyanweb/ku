@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['src/stdlib/time.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 6
+slug: en/v0.0.19/docs/stdlib/time
 ---
 
 Import with `import time from "std.time"`. Use a wall clock for dates and a monotonic clock for elapsed work.

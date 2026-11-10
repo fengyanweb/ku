@@ -12,6 +12,7 @@ sources:
     'examples/result.ku',
     'docs/v0.0.18-r1.md',
   ]
+slug: ru/v0.0.19/docs/guide/language
 ---
 
 Это руководство знакомит с основным синтаксисом. Нормативными остаются [спецификация синтаксиса](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) и [спецификация семантики](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) репозитория. Это учебные фрагменты; различия описаны в [поддержке бэкендов](/ru/v0.0.19/docs/support/).

@@ -12,6 +12,7 @@ sources:
     'examples/result.ku',
     'docs/v0.0.18-r1.md',
   ]
+slug: de/v0.0.19/docs/guide/language
 ---
 
 Dieser Leitfaden führt die grundlegende Syntax ein. Maßgeblich bleiben der [Syntaxreferenz](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) und der [Semantikreferenz](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) des Repositorys. Die Fragmente dienen dem Lernen; Unterschiede stehen unter [Backend-Unterstützung](/de/v0.0.19/docs/support/).

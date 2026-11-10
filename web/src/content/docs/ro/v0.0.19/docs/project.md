@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
+slug: ro/v0.0.19/docs/project
 ---
 
 Ku este un limbaj și un set de instrumente: interpretor, runner executabil implicit și compilare C nativă pentru submulțimea suportată.

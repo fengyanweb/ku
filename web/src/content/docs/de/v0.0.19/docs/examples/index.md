@@ -4,6 +4,7 @@ description: 'Die erweiterten Beispiele liegen derzeit auf Englisch vor. Die ver
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['examples/README.md', 'docs/v0.0.18-r1.md']
+slug: de/v0.0.19/docs/examples
 ---
 
 Die erweiterten Beispiele liegen derzeit auf Englisch vor. Die verlinkten englischen Seiten nennen Backend und benötigte Dateien, Server oder Datenbanken. [examples/README.md](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/README.md).

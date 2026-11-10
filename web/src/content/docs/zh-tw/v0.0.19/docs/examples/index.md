@@ -4,6 +4,7 @@ description: '擴充範例目前以英文提供。各參考頁說明適用後端
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['examples/README.md', 'docs/v0.0.18-r1.md']
+slug: zh-tw/v0.0.19/docs/examples
 ---
 
 擴充範例目前以英文提供。各參考頁說明適用後端及所需檔案、伺服器或資料庫；以下連結明確前往英文文件。 [examples/README.md](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/README.md).

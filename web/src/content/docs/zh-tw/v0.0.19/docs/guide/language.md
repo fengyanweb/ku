@@ -12,6 +12,7 @@ sources:
     'examples/result.ku',
     'docs/v0.0.18-r1.md',
   ]
+slug: zh-tw/v0.0.19/docs/guide/language
 ---
 
 這裡介紹核心寫法，完整規則以倉庫[語法參考](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)和[語義參考](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)為準。下列為教學片段，後端差異見[支援矩陣](/zh-tw/v0.0.19/docs/support/)。

@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
+slug: tr/v0.0.19/docs/project
 ---
 
 Ku bir programlama dili ve araç zinciridir: yorumlayıcı, varsayılan yürütülebilir runner ve desteklenen alt küme için yerel C derlemesi.

@@ -12,6 +12,7 @@ sources:
     'examples/result.ku',
     'docs/v0.0.18-r1.md',
   ]
+slug: ko/v0.0.19/docs/guide/language
 ---
 
 이 안내는 핵심 문법을 소개합니다. 저장소의 [문법 명세](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)과 [의미 명세](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)이 기준입니다. 아래는 학습용 코드 조각입니다. 차이점은 [백엔드 지원](/ko/v0.0.19/docs/support/)을 참고하세요.

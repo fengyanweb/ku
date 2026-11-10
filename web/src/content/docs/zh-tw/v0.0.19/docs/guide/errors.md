@@ -11,6 +11,7 @@ sources:
     'src/stdlib/json.rs',
     'docs/v0.0.18-r1.md',
   ]
+slug: zh-tw/v0.0.19/docs/guide/errors
 ---
 
 編譯器診斷可能隨實驗版本收斂。報告問題時同時提供 CLI 版本、Git commit、後端、完整命令和最小原始碼，避免把不同版本的行為混在一起。

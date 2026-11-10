@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['src/stdlib/fs.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 5
+slug: zh-cn/v0.0.19/docs/stdlib/fs
 ---
 
 通过 `import fs from "std.fs"` 导入。相对路径按当前 `.ku` 源文件所在目录解析，不是按终端当前目录；绝对路径保持绝对路径。

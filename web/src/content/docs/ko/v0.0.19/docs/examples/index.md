@@ -4,6 +4,7 @@ description: '확장 예제는 현재 영어로 제공합니다. 다음 영어 �
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['examples/README.md', 'docs/v0.0.18-r1.md']
+slug: ko/v0.0.19/docs/examples
 ---
 
 확장 예제는 현재 영어로 제공합니다. 다음 영어 페이지에서 적용 백엔드와 필요한 파일, 서버 또는 데이터베이스 조건을 안내합니다. [examples/README.md](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/README.md).

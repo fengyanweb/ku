@@ -11,6 +11,7 @@ sources:
     'docs/protocol-foundation.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: zh-tw/v0.0.19/docs/stdlib
 ---
 
 標準函式庫行為見[語法參考](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)，各後端限制見[支援矩陣](/zh-tw/v0.0.19/docs/support/)。

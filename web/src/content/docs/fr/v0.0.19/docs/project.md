@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
+slug: fr/v0.0.19/docs/project
 ---
 
 Ku est un langage de programmation et une chaîne d’outils : interpréteur, runner exécutable par défaut et compilation C native d’un sous-ensemble pris en charge.

@@ -4,6 +4,7 @@ description: 'Genişletilmiş örnekler şu anda İngilizcedir. Bağlantılı İ
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['examples/README.md', 'docs/v0.0.18-r1.md']
+slug: tr/v0.0.19/docs/examples
 ---
 
 Genişletilmiş örnekler şu anda İngilizcedir. Bağlantılı İngilizce sayfalar gerekli arka uç ve dosya, sunucu veya veritabanı ön koşullarını belirtir. [examples/README.md](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/README.md).

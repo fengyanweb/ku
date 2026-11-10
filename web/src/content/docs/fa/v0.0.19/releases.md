@@ -11,6 +11,7 @@ sources:
     'Cargo.toml',
     'docs/v0.0.18-r1.md',
   ]
+slug: fa/v0.0.19/releases
 ---
 
 ## 0.0.19

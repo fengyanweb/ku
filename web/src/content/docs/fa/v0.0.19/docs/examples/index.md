@@ -4,6 +4,7 @@ description: 'نمونه‌های گسترش‌یافته فعلاً انگلی�
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['examples/README.md', 'docs/v0.0.18-r1.md']
+slug: fa/v0.0.19/docs/examples
 ---
 
 نمونه‌های گسترش‌یافته فعلاً انگلیسی هستند. صفحه‌های انگلیسی پیوندشده، مسیر اجرا و فایل، سرور یا پایگاه دادهٔ لازم را مشخص می‌کنند. [examples/README.md](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/README.md).

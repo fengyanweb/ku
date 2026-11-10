@@ -11,6 +11,7 @@ sources:
     'docs/protocol-foundation.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: fa/v0.0.19/docs/stdlib
 ---
 
 [مرجع نحو](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) کتابخانهٔ استاندارد را توضیح می‌دهد. محدودیت‌های مسیرهای اجرا را در [جدول پشتیبانی](/fa/v0.0.19/docs/support/) ببینید.

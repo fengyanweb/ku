@@ -10,6 +10,7 @@ sources:
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
+slug: fr/v0.0.19/docs/install
 ---
 
 Téléchargez **Ku 0.0.19** pour votre ordinateur. Chaque paquet de cette préversion expérimentale contient l’outil en ligne de commande, l’interpréteur et l’extension VS Code.

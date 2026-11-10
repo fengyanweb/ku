@@ -11,6 +11,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: el/v0.0.19/docs/getting-started
 ---
 
 Πρώτα [εγκαταστήστε το Ku](/el/v0.0.19/docs/install/) και επιβεβαιώστε ότι εκτελείται το `ku --version`.

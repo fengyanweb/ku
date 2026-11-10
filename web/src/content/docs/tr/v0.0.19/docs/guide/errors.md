@@ -11,6 +11,7 @@ sources:
     'src/stdlib/json.rs',
     'docs/v0.0.18-r1.md',
   ]
+slug: tr/v0.0.19/docs/guide/errors
 ---
 
 Derleyici tanıları deneysel geliştirme sırasında değişebilir. Sorun bildirirken CLI sürümünü, Git commitini, arka ucu, tam komutu ve en küçük kaynak örneğini ekleyin.

@@ -11,6 +11,7 @@ sources:
     'src/stdlib/json.rs',
     'docs/v0.0.18-r1.md',
   ]
+slug: ko/v0.0.19/docs/guide/errors
 ---
 
 실험적 개발 과정에서 컴파일러 진단은 달라질 수 있습니다. 문제를 보고할 때 CLI 버전, Git 커밋, 백엔드, 전체 명령, 최소 소스를 포함하세요.

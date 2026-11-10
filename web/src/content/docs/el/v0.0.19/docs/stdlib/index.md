@@ -11,6 +11,7 @@ sources:
     'docs/protocol-foundation.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: el/v0.0.19/docs/stdlib
 ---
 
 Η [αναφορά σύνταξης](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) περιγράφει την τυπική βιβλιοθήκη. Δείτε τον [πίνακα υποστήριξης](/el/v0.0.19/docs/support/) για τα όρια backend.

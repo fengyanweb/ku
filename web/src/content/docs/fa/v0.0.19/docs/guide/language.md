@@ -12,6 +12,7 @@ sources:
     'examples/result.ku',
     'docs/v0.0.18-r1.md',
   ]
+slug: fa/v0.0.19/docs/guide/language
 ---
 
 این راهنما نحو اصلی را معرفی می‌کند. [مرجع نحو](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) و [مرجع معناشناسی](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) مخزن مرجع معتبرند. این‌ها قطعه‌کدهای آموزشی‌اند؛ تفاوت‌ها را در [پشتیبانی از مسیرهای اجرا](/fa/v0.0.19/docs/support/) ببینید.

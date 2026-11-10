@@ -11,6 +11,7 @@ sources:
     'docs/protocol-foundation.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: it/v0.0.19/docs/stdlib
 ---
 
 Il [riferimento di sintassi](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) descrive la libreria standard. Consulta la [matrice di supporto](/it/v0.0.19/docs/support/) per i limiti dei backend.

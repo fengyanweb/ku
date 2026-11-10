@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: zh-tw/v0.0.19/docs/stdlib/json
 ---
 
 `std.json` 提供 JSON 編解碼。`json.encode` 只讀編碼輸入，`json.decode` 產生獨立持有內容的 `KuValue`，兩者皆返回 Result。`stringify`、`parse` 與 `try_parse` 保留相容。

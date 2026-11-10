@@ -11,6 +11,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: fa/v0.0.19/docs/getting-started
 ---
 
 ابتدا [Ku را نصب کنید](/fa/v0.0.19/docs/install/) و مطمئن شوید `ku --version` اجرا می‌شود.

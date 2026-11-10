@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
+slug: zh-tw/v0.0.19/docs/project
 ---
 
 Ku 是程式語言與工具鏈，提供解釋器、預設可執行 runner，以及僅涵蓋受支援子集的原生 C 編譯路徑。

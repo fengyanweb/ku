@@ -4,6 +4,7 @@ description: Write Hello Ku, check your source, and distinguish interpretation f
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-30'
 sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
+slug: en/v0.0.19/docs/getting-started
 ---
 
 [Install Ku](/en/v0.0.19/docs/install/) first, then run `ku -v` (equivalent to `ku --version`) and confirm it reports `ku 0.0.19`.

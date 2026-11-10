@@ -10,6 +10,7 @@ sources:
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
+slug: fa/v0.0.19/docs/install
 ---
 
 **Ku 0.0.19** را برای رایانهٔ خود دانلود کنید. هر بستهٔ این پیش‌انتشار آزمایشی شامل ابزار خط فرمان، مفسر و افزونهٔ VS Code است.

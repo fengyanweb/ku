@@ -4,6 +4,7 @@ description: 'Ku commands, complete shorthand reference, option scope and Runner
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-30'
 sources: ['src/cli.rs', 'docs/package.md', 'docs/process-execution.md']
+slug: en/v0.0.19/docs/tools/cli
 ---
 
 Use `ku -v` to print the version and `ku --help` for the installed CLI's top-level help.

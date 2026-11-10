@@ -11,6 +11,7 @@ sources:
     'src/stdlib/json.rs',
     'docs/v0.0.18-r1.md',
   ]
+slug: pl/v0.0.19/docs/guide/errors
 ---
 
 Diagnostyka kompilatora może się zmieniać podczas eksperymentalnego rozwoju. W zgłoszeniu problemu podaj wersję CLI, commit Git, zaplecze, pełne polecenie i minimalne źródło.

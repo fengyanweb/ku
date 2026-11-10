@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['src/stdlib/metadata.rs', 'src/stdlib/mod.rs', 'docs/syntax.md']
 sidebar:
   order: 0
+slug: zh-cn/v0.0.19/docs/stdlib
 ---
 
 Ku 标准库随 CLI 一起分发，直接通过 `std` 导入，无需另装包。按任务选择下列模块；每个参考页列出接口、返回值、错误和示例。

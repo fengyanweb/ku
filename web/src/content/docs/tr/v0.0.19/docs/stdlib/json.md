@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: tr/v0.0.19/docs/stdlib/json
 ---
 
 `std.json`, JSON kodlar ve çözer. `json.encode` girdiyi salt okunur ödünç alır; `json.decode` bağımsız sahiplikli `KuValue` oluşturur. İkisi de Result döndürür. `stringify`, `parse`, `try_parse` uyumlu adlar olarak kalır.

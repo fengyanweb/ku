@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
+slug: de/v0.0.19/docs/project
 ---
 
 Ku ist eine Programmiersprache mit Toolchain: Interpreter, ausführbarer Standard-Runner und native C-Kompilierung einer unterstützten Teilmenge.

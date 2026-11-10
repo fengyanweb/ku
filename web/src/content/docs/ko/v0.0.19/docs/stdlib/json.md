@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: ko/v0.0.19/docs/stdlib/json
 ---
 
 `std.json`은 JSON을 인코딩하고 디코딩합니다. `json.encode`는 입력을 읽기 전용으로 빌리고 `json.decode`는 독립 소유 `KuValue`를 만듭니다. 둘 다 Result를 반환합니다. `stringify`, `parse`, `try_parse`는 호환 이름입니다.

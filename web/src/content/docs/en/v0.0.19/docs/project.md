@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
+slug: en/v0.0.19/docs/project
 ---
 
 The project is **Ku programming language / Ku 编程语言**, with the CLI named `ku`. Ku is a programming language and toolchain with explicit ownership and Result-based error handling. Run through the interpreter, build an executable runner, or compile supported programs through the native C backend. The current version is Ku 0.0.19.

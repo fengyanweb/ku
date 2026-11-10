@@ -11,6 +11,7 @@ sources:
     'docs/protocol-foundation.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: tr/v0.0.19/docs/stdlib
 ---
 
 [Sözdizimi başvurusu](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) standart kütüphaneyi açıklar. Arka uç sınırları için [destek matrisine](/tr/v0.0.19/docs/support/) bakın.

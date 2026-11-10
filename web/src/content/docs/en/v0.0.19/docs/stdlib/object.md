@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['src/stdlib/object.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 3
+slug: en/v0.0.19/docs/stdlib/object
 ---
 
 Object literals associate string keys with values. Use `get_or` for an explicit fallback, or a Result lookup when a missing field is an error.

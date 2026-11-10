@@ -11,6 +11,7 @@ sources:
     'docs/protocol-foundation.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: de/v0.0.19/docs/stdlib
 ---
 
 Die [Syntaxreferenz](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) beschreibt die Standardbibliothek. Backend-Grenzen stehen in der [Unterstützungsmatrix](/de/v0.0.19/docs/support/).

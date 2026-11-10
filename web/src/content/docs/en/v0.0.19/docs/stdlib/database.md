@@ -16,6 +16,7 @@ sources:
   ]
 sidebar:
   order: 9
+slug: en/v0.0.19/docs/stdlib/database
 ---
 
 Ku provides bounded, pooled clients through `std.pg`, `std.redis`, and `std.mysql`. These are **native C APIs**. The interpreter and its default packaged runner do not implement database clients. Constructors return Results; a connected client is move-only and is released at scope exit or by consuming `client.close()`.

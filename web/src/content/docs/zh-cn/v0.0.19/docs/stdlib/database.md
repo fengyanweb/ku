@@ -16,6 +16,7 @@ sources:
   ]
 sidebar:
   order: 9
+slug: zh-cn/v0.0.19/docs/stdlib/database
 ---
 
 Ku 通过 `std.pg`、`std.redis`、`std.mysql` 提供有界连接池客户端。这些是 **native C 接口**，解释器和默认打包 runner 尚未实现。构造函数返回 Result；client 只能转移，拥有它的作用域结束时释放，也可调用会消费它的 `client.close()`。

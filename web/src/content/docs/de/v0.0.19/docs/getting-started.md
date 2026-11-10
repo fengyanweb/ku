@@ -11,6 +11,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: de/v0.0.19/docs/getting-started
 ---
 
 [Installieren Sie zuerst Ku](/de/v0.0.19/docs/install/) und prüfen Sie, ob `ku --version` funktioniert.

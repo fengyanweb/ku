@@ -11,6 +11,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: tr/v0.0.19/docs/getting-started
 ---
 
 Önce [Ku kurulumunu](/tr/v0.0.19/docs/install/) yapın ve `ku --version` komutunun çalıştığını doğrulayın.

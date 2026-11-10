@@ -13,6 +13,7 @@ sources:
   ]
 sidebar:
   order: 0
+slug: zh-cn/v0.0.19/docs/guide/language
 ---
 
 从变量、函数和错误处理开始，再了解资源的归属。详细规则见[语法参考](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)和[语言语义](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)。下列为教学片段，后端差异见[支持矩阵](/zh-cn/v0.0.19/docs/support/)。

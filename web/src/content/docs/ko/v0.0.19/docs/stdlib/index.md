@@ -11,6 +11,7 @@ sources:
     'docs/protocol-foundation.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: ko/v0.0.19/docs/stdlib
 ---
 
 표준 라이브러리는 [문법 참조](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)를, 백엔드별 제한은 [지원 표](/ko/v0.0.19/docs/support/)를 참고하세요.

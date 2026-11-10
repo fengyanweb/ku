@@ -4,6 +4,7 @@ description: 'Расширенные примеры пока описаны по
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['examples/README.md', 'docs/v0.0.18-r1.md']
+slug: ru/v0.0.19/docs/examples
 ---
 
 Расширенные примеры пока описаны по-английски. Следующие ссылки явно ведут к английским страницам, где указаны бэкенд и необходимые файлы, серверы или базы данных. [examples/README.md](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/README.md).

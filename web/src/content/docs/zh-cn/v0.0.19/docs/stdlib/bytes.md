@@ -7,6 +7,7 @@ sources:
   ['src/stdlib/metadata.rs', 'src/backend/c.rs', 'tests/native_net_test.rs']
 sidebar:
   order: 10
+slug: zh-cn/v0.0.19/docs/stdlib/bytes
 ---
 
 `std.bytes` 保存拥有内容的二进制数据，可包含 NUL 和非 UTF-8 字节。此模块仅用于生成的 native C 程序，解释器尚未实现。

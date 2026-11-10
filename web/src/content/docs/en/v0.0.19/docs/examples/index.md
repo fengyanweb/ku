@@ -4,6 +4,7 @@ description: 'Find runnable Ku examples by task.'
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-28'
 sources: ['examples/README.md', 'examples/http_server.ku', 'examples/json.ku']
+slug: en/v0.0.19/docs/examples
 ---
 
 Examples are organized by task. Each linked page supplies a complete program, execution instructions and backend requirements. File, server and database prerequisites are stated explicitly.

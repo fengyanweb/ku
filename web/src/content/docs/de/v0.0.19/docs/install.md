@@ -10,6 +10,7 @@ sources:
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
+slug: de/v0.0.19/docs/install
 ---
 
 Laden Sie **Ku 0.0.19** für Ihren Computer herunter. Jedes Paket dieser experimentellen Vorabversion enthält das Kommandozeilenprogramm, den Interpreter und die VS-Code-Erweiterung.

@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
+slug: ja/v0.0.19/docs/project
 ---
 
 Ku はプログラミング言語とツールチェーンです。インタープリター、既定の実行可能 runner、対応する部分集合のネイティブ C コンパイルを提供します。

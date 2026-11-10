@@ -10,6 +10,7 @@ sources:
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
+slug: ja/v0.0.19/docs/install
 ---
 
 お使いのコンピューター向けの **Ku 0.0.19** をダウンロードしてください。この実験的プレリリースの各パッケージには、コマンドラインツール、インタープリター、VS Code 拡張機能が含まれています。

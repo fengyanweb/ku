@@ -6,6 +6,7 @@ verifiedAt: '2026-10-28'
 sources: ['docs/concurrency.md', 'docs/semantics.md']
 sidebar:
   order: 1
+slug: zh-cn/v0.0.19/docs/guide/concurrency
 ---
 
 Task 是异步函数调用返回的一次性句柄。调用提交任务，工作可能在 `await` 前执行，但不保证立即开始或执行顺序；`await` 获取结果；`T!` 中的可恢复错误继续使用 `?` 或 `try/catch` 处理。

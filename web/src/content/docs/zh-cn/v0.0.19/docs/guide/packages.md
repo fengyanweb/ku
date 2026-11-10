@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['docs/package.md', 'src/package.rs']
 sidebar:
   order: 3
+slug: zh-cn/v0.0.19/docs/guide/packages
 ---
 
 标准库随 Ku 分发；自己的模块和第三方包通过 import 使用。当前没有官方托管的公共包目录，仓库内的 registry 是可自行部署的参考服务。

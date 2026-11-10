@@ -4,6 +4,7 @@ description: '按任务查找可以运行的 Ku 示例。'
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-28'
 sources: ['examples/README.md', 'examples/http_server.ku', 'examples/json.ku']
+slug: zh-cn/v0.0.19/docs/examples
 ---
 
 这些示例按任务组织。每个链接包含完整程序、运行方式以及后端要求。需要输入文件、服务器或数据库时，页面会明确列出准备步骤。

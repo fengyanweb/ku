@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: it/v0.0.19/docs/stdlib/json
 ---
 
 `std.json` codifica e decodifica JSON. `json.encode` prende l’ingresso in prestito in sola lettura; `json.decode` produce un `KuValue` con proprietà indipendente. Entrambi restituiscono Result. `stringify`, `parse` e `try_parse` rimangono compatibili.

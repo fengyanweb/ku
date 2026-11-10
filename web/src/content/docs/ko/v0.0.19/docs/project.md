@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
+slug: ko/v0.0.19/docs/project
 ---
 
 Ku는 프로그래밍 언어와 도구 체인입니다. 인터프리터, 기본 실행 가능한 runner, 지원 부분집합의 네이티브 C 컴파일을 제공합니다.

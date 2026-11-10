@@ -11,6 +11,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: zh-tw/v0.0.19/docs/getting-started
 ---
 
 先完成[安裝](/zh-tw/v0.0.19/docs/install/)，並確認 `ku --version` 可執行。

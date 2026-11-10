@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['src/stdlib/config.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 7
+slug: zh-cn/v0.0.19/docs/stdlib/config
 ---
 
 通过 `import config from "std.config"` 导入。本模块读取文件；`config.env()` **不会**读取或合并进程环境变量。

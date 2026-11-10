@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: ro/v0.0.19/docs/stdlib/json
 ---
 
 `std.json` codifică și decodifică JSON. `json.encode` împrumută intrarea doar pentru citire; `json.decode` creează un `KuValue` cu proprietate independentă. Ambele returnează Result. `stringify`, `parse` și `try_parse` rămân compatibile.

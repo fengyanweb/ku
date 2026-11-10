@@ -11,6 +11,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: ro/v0.0.19/docs/getting-started
 ---
 
 Mai întâi [instalează Ku](/ro/v0.0.19/docs/install/) și confirmă că `ku --version` funcționează.

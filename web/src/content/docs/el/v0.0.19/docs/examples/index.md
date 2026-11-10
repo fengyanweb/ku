@@ -4,6 +4,7 @@ description: 'Τα διευρυμένα παραδείγματα είναι πρ
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['examples/README.md', 'docs/v0.0.18-r1.md']
+slug: el/v0.0.19/docs/examples
 ---
 
 Τα διευρυμένα παραδείγματα είναι προς το παρόν στα αγγλικά. Οι συνδεδεμένες αγγλικές σελίδες αναφέρουν backend και απαραίτητα αρχεία, διακομιστές ή βάσεις δεδομένων. [examples/README.md](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/README.md).

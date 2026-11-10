@@ -4,6 +4,7 @@ description: 用 Ku 编写 Hello Ku，检查源码并了解解释运行与构建
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-30'
 sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
+slug: zh-cn/v0.0.19/docs/getting-started
 ---
 
 先完成[安装](/zh-cn/v0.0.19/docs/install/)，运行 `ku -v`（等价于 `ku --version`），确认输出 `ku 0.0.19`。

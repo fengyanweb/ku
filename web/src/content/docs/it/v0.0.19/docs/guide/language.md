@@ -12,6 +12,7 @@ sources:
     'examples/result.ku',
     'docs/v0.0.18-r1.md',
   ]
+slug: it/v0.0.19/docs/guide/language
 ---
 
 Questa guida introduce la sintassi essenziale. Il [riferimento sintattico](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) e il [riferimento semantico](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) del repository rimangono autorevoli. Sono frammenti didattici; per le differenze consulta il [supporto dei backend](/it/v0.0.19/docs/support/).

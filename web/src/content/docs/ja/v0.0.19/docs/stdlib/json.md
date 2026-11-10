@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: ja/v0.0.19/docs/stdlib/json
 ---
 
 `std.json` は JSON をエンコード・デコードします。`json.encode` は入力を読み取り専用で借用し、`json.decode` は内容を独立所有する `KuValue` を生成します。どちらも Result を返します。`stringify`、`parse`、`try_parse` は互換名です。

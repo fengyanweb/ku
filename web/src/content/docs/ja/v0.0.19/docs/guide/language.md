@@ -12,6 +12,7 @@ sources:
     'examples/result.ku',
     'docs/v0.0.18-r1.md',
   ]
+slug: ja/v0.0.19/docs/guide/language
 ---
 
 このガイドでは中心となる構文を紹介します。リポジトリの[構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)と[意味仕様](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)が正式な定義です。以下は学習用の断片です。差異については[バックエンドの対応範囲](/ja/v0.0.19/docs/support/)を参照してください。

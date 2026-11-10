@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['src/stdlib/mod.rs', 'src/stdlib/metadata.rs']
 sidebar:
   order: 12
+slug: zh-cn/v0.0.19/docs/stdlib/compiler
 ---
 
 `std.lexer` 和 `std.parser` 用于查看源码处理的调试摘要，不是稳定的公开 Token 或 AST 数据模型。

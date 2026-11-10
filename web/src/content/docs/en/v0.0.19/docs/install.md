@@ -10,6 +10,7 @@ sources:
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
+slug: en/v0.0.19/docs/install
 ---
 
 Download **Ku 0.0.19** for your computer. Each experimental prerelease package includes the command-line tool, interpreter and VS Code extension.

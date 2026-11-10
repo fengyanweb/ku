@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: fa/v0.0.19/docs/stdlib/json
 ---
 
 `std.json` برای کدگذاری و کدگشایی JSON است. `json.encode` ورودی را فقط‌خواندنی قرض می‌گیرد؛ `json.decode` یک `KuValue` با مالکیت مستقل می‌سازد. هر دو Result برمی‌گردانند. نام‌های سازگار `stringify`، `parse` و `try_parse` حفظ شده‌اند.

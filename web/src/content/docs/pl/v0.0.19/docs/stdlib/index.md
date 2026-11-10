@@ -11,6 +11,7 @@ sources:
     'docs/protocol-foundation.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: pl/v0.0.19/docs/stdlib
 ---
 
 [Specyfikacja składni](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) opisuje bibliotekę standardową. Ograniczenia zapleczy podaje [macierz obsługi](/pl/v0.0.19/docs/support/).

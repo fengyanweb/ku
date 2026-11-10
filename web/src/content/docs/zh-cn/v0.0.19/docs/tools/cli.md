@@ -4,6 +4,7 @@ description: 'Ku 常用命令、完整简写、参数作用域与 Runner 构建�
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-30'
 sources: ['src/cli.rs', 'docs/package.md', 'docs/process-execution.md']
+slug: zh-cn/v0.0.19/docs/tools/cli
 ---
 
 先用 `ku -v` 查看版本，`ku --help` 查看当前安装的总帮助。

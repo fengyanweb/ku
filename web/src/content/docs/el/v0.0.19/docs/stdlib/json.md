@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: el/v0.0.19/docs/stdlib/json
 ---
 
 Το `std.json` κωδικοποιεί και αποκωδικοποιεί JSON. Το `json.encode` δανείζεται την είσοδο μόνο για ανάγνωση· το `json.decode` δημιουργεί ανεξάρτητα κατεχόμενο `KuValue`. Και τα δύο επιστρέφουν Result. Τα `stringify`, `parse`, `try_parse` διατηρούνται για συμβατότητα.

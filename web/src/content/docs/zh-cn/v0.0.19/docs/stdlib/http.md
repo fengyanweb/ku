@@ -18,6 +18,7 @@ sources:
   ]
 sidebar:
   order: 8
+slug: zh-cn/v0.0.19/docs/stdlib/http
 ---
 
 `std.http` 提供 HTTP 客户端、路由注册和完整响应对象。下面的服务端和客户端分别保存为两个文件。

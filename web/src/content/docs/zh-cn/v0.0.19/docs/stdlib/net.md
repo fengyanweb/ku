@@ -7,6 +7,7 @@ sources:
   ['src/stdlib/metadata.rs', 'src/backend/c.rs', 'docs/protocol-foundation.md']
 sidebar:
   order: 11
+slug: zh-cn/v0.0.19/docs/stdlib/net
 ---
 
 `std.net` 连接 TCP 服务端，读写[二进制数据](/zh-cn/v0.0.19/docs/stdlib/bytes/)。这是 native C 接口，不提供 TCP 服务端，也不是 HTTP 客户端或解释器网络接口。

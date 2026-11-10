@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['src/stdlib/mod.rs', 'src/stdlib/metadata.rs']
 sidebar:
   order: 12
+slug: en/v0.0.19/docs/stdlib/compiler
 ---
 
 `std.lexer` and `std.parser` expose debugging summaries. They are not stable public Token or AST data models.

@@ -12,6 +12,7 @@ sources:
   ]
 sidebar:
   order: 2
+slug: en/v0.0.19/docs/guide/errors
 ---
 
 Compiler diagnostics can change during experimental development. Include the CLI version, Git commit, backend, full command, and minimal source when reporting a problem.

@@ -6,6 +6,7 @@ verifiedAt: '2026-10-28'
 sources: ['src/stdlib/string.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 1
+slug: zh-cn/v0.0.19/docs/stdlib/string
 ---
 
 字符串函数用于检查 UTF-8 文本或生成新字符串。只读检查后原值仍可使用。模块形式 `string.len(text)` 与方法形式 `text.len()` 调用同一操作。

@@ -6,6 +6,7 @@ verifiedAt: '2026-10-28'
 sources: ['docs/concurrency.md', 'docs/semantics.md']
 sidebar:
   order: 1
+slug: en/v0.0.19/docs/guide/concurrency
 ---
 
 A Task is the single-use handle returned by an async function call. Calling submits the task; work may run before `await`, but submission does not guarantee immediate execution or ordering. `await` retrieves its result. Recoverable errors in `T!` still use `?` or `try/catch`.

@@ -15,6 +15,7 @@ sources:
     'src/backend/c_http_runtime.c',
     'src/backend/c_task_pg_runtime.c',
   ]
+slug: zh-cn/v0.0.19/docs/support
 ---
 
 <span id="execution"></span>

@@ -13,6 +13,7 @@ sources:
   ]
 sidebar:
   order: 0
+slug: en/v0.0.19/docs/guide/language
 ---
 
 This guide introduces core syntax. The repository's [syntax reference](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) and [language semantics](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) remain authoritative. These are teaching fragments; see [backend support](/en/v0.0.19/docs/support/) for differences.

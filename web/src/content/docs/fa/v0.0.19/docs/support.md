@@ -5,6 +5,7 @@ kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-28'
 sources:
   ['docs/v0.0.19.md', 'docs/concurrency.md', 'docs/v0.0.19-known-issues.md']
+slug: fa/v0.0.19/docs/support
 ---
 
 <span id="execution"></span>

@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['src/stdlib/config.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 7
+slug: en/v0.0.19/docs/stdlib/config
 ---
 
 Import with `import config from "std.config"`. This module loads files; `config.env()` does **not** read or merge the process environment.

@@ -11,6 +11,7 @@ sources:
     'src/stdlib/json.rs',
     'docs/v0.0.18-r1.md',
   ]
+slug: de/v0.0.19/docs/guide/errors
 ---
 
 Compilerdiagnosen können sich während der experimentellen Entwicklung ändern. Geben Sie bei Problemmeldungen CLI-Version, Git-Commit, Backend, vollständigen Befehl und minimalen Quelltext an.

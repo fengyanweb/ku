@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
+slug: zh-cn/v0.0.19/docs/project
 ---
 
 项目名称为 **Ku 编程语言 / Ku programming language**，CLI 名称为 `ku`。Ku 是具有显式所有权与 Result 错误处理的编程语言与工具链，提供解释运行、可执行 runner 和已支持程序的原生 C 编译路径。当前版本为 Ku 0.0.19。

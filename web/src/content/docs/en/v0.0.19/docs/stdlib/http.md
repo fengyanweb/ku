@@ -18,6 +18,7 @@ sources:
   ]
 sidebar:
   order: 8
+slug: en/v0.0.19/docs/stdlib/http
 ---
 
 `std.http` provides an HTTP client, route registration, and complete response values. Save the server and client below in separate files.

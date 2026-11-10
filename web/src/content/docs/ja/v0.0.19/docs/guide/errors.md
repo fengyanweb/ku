@@ -11,6 +11,7 @@ sources:
     'src/stdlib/json.rs',
     'docs/v0.0.18-r1.md',
   ]
+slug: ja/v0.0.19/docs/guide/errors
 ---
 
 実験的開発中はコンパイラー診断が変わることがあります。問題を報告するときは、CLI のバージョン、Git コミット、バックエンド、完全なコマンド、最小のソースを添えてください。

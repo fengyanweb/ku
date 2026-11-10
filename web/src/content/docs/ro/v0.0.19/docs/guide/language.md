@@ -12,6 +12,7 @@ sources:
     'examples/result.ku',
     'docs/v0.0.18-r1.md',
   ]
+slug: ro/v0.0.19/docs/guide/language
 ---
 
 Ghidul introduce sintaxa de bază. [Referința de sintaxă](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) și [referința semantică](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) ale depozitului rămân normative. Acestea sunt fragmente didactice; diferențele sunt descrise la [suportul backendurilor](/ro/v0.0.19/docs/support/).

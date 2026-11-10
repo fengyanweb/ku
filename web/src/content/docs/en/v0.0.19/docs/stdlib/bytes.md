@@ -7,6 +7,7 @@ sources:
   ['src/stdlib/metadata.rs', 'src/backend/c.rs', 'tests/native_net_test.rs']
 sidebar:
   order: 10
+slug: en/v0.0.19/docs/stdlib/bytes
 ---
 
 `std.bytes` represents owned binary data, including NUL and bytes that are not UTF-8. This module is available in generated native C programs; the interpreter does not implement it.

@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['src/stdlib/time.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 6
+slug: zh-cn/v0.0.19/docs/stdlib/time
 ---
 
 通过 `import time from "std.time"` 导入。日期使用墙上时钟，测量一段工作的耗时使用单调时钟。

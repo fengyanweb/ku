@@ -12,6 +12,7 @@ sources:
     'examples/result.ku',
     'docs/v0.0.18-r1.md',
   ]
+slug: pl/v0.0.19/docs/guide/language
 ---
 
 Przewodnik wprowadza podstawową składnię. Nadrzędne pozostają [specyfikacja składni](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) i [specyfikacja semantyki](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) repozytorium. To fragmenty dydaktyczne; różnice opisuje [obsługa zapleczy](/pl/v0.0.19/docs/support/).

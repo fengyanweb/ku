@@ -12,6 +12,7 @@ sources:
     'examples/result.ku',
     'docs/v0.0.18-r1.md',
   ]
+slug: fr/v0.0.19/docs/guide/language
 ---
 
 Ce guide présente la syntaxe essentielle. Le [référence syntaxique](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) et le [référence sémantique](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) du dépôt restent les références faisant autorité. Ces fragments sont pédagogiques ; consultez la [prise en charge des backends](/fr/v0.0.19/docs/support/) pour les différences.

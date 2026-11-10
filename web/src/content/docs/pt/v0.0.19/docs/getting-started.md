@@ -11,6 +11,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: pt/v0.0.19/docs/getting-started
 ---
 
 Primeiro [instale o Ku](/pt/v0.0.19/docs/install/) e confirme que `ku --version` funciona.

@@ -11,6 +11,7 @@ sources:
     'docs/protocol-foundation.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: ro/v0.0.19/docs/stdlib
 ---
 
 [Referința de sintaxă](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) descrie biblioteca standard. Vezi [matricea de suport](/ro/v0.0.19/docs/support/) pentru limitele backendurilor.

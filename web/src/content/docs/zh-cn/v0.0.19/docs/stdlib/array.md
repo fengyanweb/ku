@@ -6,6 +6,7 @@ verifiedAt: '2026-10-28'
 sources: ['src/stdlib/array.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 2
+slug: zh-cn/v0.0.19/docs/stdlib/array
 ---
 
 数组保存同一种元素类型，类型写作 `[T]`，下标从 0 开始。需要把缺少元素作为可恢复错误处理时，使用 `try_get`。

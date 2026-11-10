@@ -10,6 +10,7 @@ sources:
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
+slug: tr/v0.0.19/docs/install
 ---
 
 Bilgisayarınız için **Ku 0.0.19** paketini indirin. Bu deneysel ön sürümün her paketi komut satırı aracını, yorumlayıcıyı ve VS Code eklentisini içerir.

@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['src/stdlib/object.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 3
+slug: zh-cn/v0.0.19/docs/stdlib/object
 ---
 
 对象字面量用字符串键关联值。缺键时需要默认值，使用 `get_or`；需要明确错误，使用带 `?` 的读取。

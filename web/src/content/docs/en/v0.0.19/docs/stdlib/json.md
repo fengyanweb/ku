@@ -16,6 +16,7 @@ sources:
   ]
 sidebar:
   order: 4
+slug: en/v0.0.19/docs/stdlib/json
 ---
 
 `std.json` encodes and decodes JSON. The general synchronous `json.encode` interface reads its input without consuming it; `json.decode` parses text into an independently owned dynamic value. Both return Result. `stringify`, `parse`, and `try_parse` remain compatibility names. These interfaces are included in 0.0.19. The previous JSON implementation remains the default; yyjson is not used.

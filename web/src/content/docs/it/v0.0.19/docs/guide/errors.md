@@ -11,6 +11,7 @@ sources:
     'src/stdlib/json.rs',
     'docs/v0.0.18-r1.md',
   ]
+slug: it/v0.0.19/docs/guide/errors
 ---
 
 Le diagnostiche del compilatore possono cambiare durante lo sviluppo sperimentale. Quando segnali un problema, includi versione CLI, commit Git, backend, comando completo e sorgente minimo.

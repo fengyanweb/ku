@@ -12,6 +12,7 @@ sources:
   ]
 sidebar:
   order: 2
+slug: zh-cn/v0.0.19/docs/guide/errors
 ---
 
 编译器诊断可能随实验版本收敛。报告问题时同时提供 CLI 版本、Git commit、后端、完整命令和最小源码，避免把不同版本的行为混在一起。

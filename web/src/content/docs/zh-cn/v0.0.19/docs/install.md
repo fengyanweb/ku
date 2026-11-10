@@ -10,6 +10,7 @@ sources:
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
+slug: zh-cn/v0.0.19/docs/install
 ---
 
 下载适合你电脑的 **Ku 0.0.19**。当前为实验预发行版，平台包已包含命令行工具、解释器和 VS Code 插件。

@@ -12,6 +12,7 @@ sources:
     'examples/result.ku',
     'docs/v0.0.18-r1.md',
   ]
+slug: el/v0.0.19/docs/guide/language
 ---
 
 Ο οδηγός εισάγει τη βασική σύνταξη. Η [αναφορά σύνταξης](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) και η [σημασιολογική αναφορά](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) του αποθετηρίου παραμένουν οι κανονιστικές πηγές. Πρόκειται για διδακτικά αποσπάσματα· δείτε την [υποστήριξη backend](/el/v0.0.19/docs/support/) για τις διαφορές.

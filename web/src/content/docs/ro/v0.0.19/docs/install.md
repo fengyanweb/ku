@@ -10,6 +10,7 @@ sources:
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
+slug: ro/v0.0.19/docs/install
 ---
 
 Descarcă **Ku 0.0.19** pentru calculatorul tău. Fiecare pachet al acestei versiuni preliminare experimentale include instrumentul de linie de comandă, interpretorul și extensia VS Code.

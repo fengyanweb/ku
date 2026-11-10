@@ -12,6 +12,7 @@ sources:
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
+slug: pt/v0.0.19/docs/project
 ---
 
 Ku é uma linguagem e uma cadeia de ferramentas: interpretador, runner executável padrão e compilação C nativa de um subconjunto compatível.

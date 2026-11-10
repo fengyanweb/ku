@@ -6,6 +6,7 @@ verifiedAt: '2026-10-23'
 sources: ['src/stdlib/fs.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 5
+slug: en/v0.0.19/docs/stdlib/fs
 ---
 
 Import with `import fs from "std.fs"`. Relative paths resolve from the directory of the current `.ku` source file, rather than the shell's working directory. Absolute paths remain absolute.

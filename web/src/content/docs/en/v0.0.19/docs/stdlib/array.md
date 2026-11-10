@@ -6,6 +6,7 @@ verifiedAt: '2026-10-28'
 sources: ['src/stdlib/array.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 2
+slug: en/v0.0.19/docs/stdlib/array
 ---
 
 An array holds values of one element type, written `[T]`. Indices start at zero. Use `try_get` when a missing index should be a recoverable error.

@@ -10,6 +10,7 @@ sources:
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
+slug: ko/v0.0.19/docs/install
 ---
 
 컴퓨터에 맞는 **Ku 0.0.19**를 다운로드하세요. 이 실험적 사전 릴리스의 각 패키지에는 명령줄 도구, 인터프리터, VS Code 확장이 포함되어 있습니다.

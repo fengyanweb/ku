@@ -11,6 +11,7 @@ sources:
     'src/stdlib/json.rs',
     'docs/v0.0.18-r1.md',
   ]
+slug: ro/v0.0.19/docs/guide/errors
 ---
 
 Diagnosticele compilatorului se pot schimba în dezvoltarea experimentală. Include versiunea CLI, commitul Git, backendul, comanda completă și sursa minimă când raportezi o problemă.

@@ -6,6 +6,7 @@ verifiedAt: '2026-10-28'
 sources: ['src/stdlib/string.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 1
+slug: en/v0.0.19/docs/stdlib/string
 ---
 
 Use string functions to inspect UTF-8 text or produce a new string. Read-only inspections leave the original available. Module calls and methods, such as `string.len(text)` and `text.len()`, refer to the same operation.

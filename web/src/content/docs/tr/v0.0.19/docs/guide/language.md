@@ -12,6 +12,7 @@ sources:
     'examples/result.ku',
     'docs/v0.0.18-r1.md',
   ]
+slug: tr/v0.0.19/docs/guide/language
 ---
 
 Bu kılavuz temel sözdizimini tanıtır. Deponun [sözdizimi başvurusu](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) ve [anlam başvurusu](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) belirleyici olmaya devam eder. Bunlar öğretici parçalardır; farklar için [arka uç desteğine](/tr/v0.0.19/docs/support/) bakın.

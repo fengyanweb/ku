@@ -11,6 +11,7 @@ sources:
     'editors/vscode-ku/src/completionModel.ts',
     '.github/scripts/export-release.py',
   ]
+slug: en/v0.0.19/docs/tools/vscode
 ---
 
 The Ku extension provides syntax highlighting, snippets, completion, formatting and compiler diagnostics for VS Code 1.85 or newer. Install the [Ku CLI](/en/v0.0.19/docs/install/) as well; the extension invokes it to check and run programs.

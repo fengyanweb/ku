@@ -11,6 +11,7 @@ sources:
     'docs/v0.0.18.md',
     'docs/v0.0.18-r1.md',
   ]
+slug: ko/v0.0.19/docs/getting-started
 ---
 
 먼저 [Ku를 설치](/ko/v0.0.19/docs/install/)하고 `ku --version`이 실행되는지 확인하세요.

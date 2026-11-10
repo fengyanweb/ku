@@ -7,6 +7,7 @@ sources:
   ['src/stdlib/metadata.rs', 'src/backend/c.rs', 'docs/protocol-foundation.md']
 sidebar:
   order: 11
+slug: en/v0.0.19/docs/stdlib/net
 ---
 
 `std.net` opens a TCP client and exchanges [binary values](/en/v0.0.19/docs/stdlib/bytes/). It is a native C API, not a TCP server, HTTP client, or interpreter networking API.
