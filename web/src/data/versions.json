@@ -18,8 +18,8 @@
   "languageVersion": "0.0.20",
   "releaseTag": "v0.0.20",
   "releaseChannel": "release",
-  "releaseCommit": "",
+  "releaseCommit": "780e3955473eaaf1d7b101ed68c946c7173866c9",
   "docsSourceRef": "v0.0.20",
   "releaseUrl": "https://github.com/fengyanweb/ku/releases/tag/v0.0.20",
-  "verifiedAt": "2026-11-09"
+  "verifiedAt": "2026-11-10"
 }
