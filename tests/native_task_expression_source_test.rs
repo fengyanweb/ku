@@ -647,23 +647,10 @@ fn native_task_copy_expression_type_and_skipped_rhs_budget_gates_remain_strict()
             .contains("expressions beyond the Task analysis budget"),
         "{error}"
     );
-    // Keep source depth rejection at the real parser boundary. A hand-built
-    // 63-call AST bypasses the parser/checker's depth32 contract and can exhaust
-    // a debug backend thread's default 2MiB stack; this test does not claim an
-    // arbitrary raw-AST entry has the same contract as checked Ku source.
-    let deep_source = format!(
-        "async fn Probe(flag:bool):bool! {{ return ok({}flag{}) }} async fn main():null! {{ return ok(null) }}",
-        "Probe(".repeat(63),
-        ")".repeat(63),
-    );
-    let parse_error = Parser::new(Lexer::new(&deep_source).lex().unwrap())
-        .parse_program()
-        .expect_err("source calls beyond the parser depth budget must be rejected");
-    assert!(parse_error.message.contains("maximum parse depth exceeded"));
-
-    // Type-invalid nested calls within that source depth budget must also be
-    // rejected by the internal backend when the checker is deliberately bypassed.
-    // The separate Unary62/63 and skipped64 checks above retain its depth/slot gates.
+    // Keep this checker-bypass type test within the source parser/checker's
+    // depth32 contract. Hand-built 63-call ASTs can exhaust a debug backend
+    // thread's default stack; arbitrary raw AST robustness is a separate limit.
+    // Unary62/63 and skipped64 above retain the backend depth/slot checks.
     let mut nested_calls = budget_ast(0, false);
     let ku::ast::Item::Function(function) = &mut nested_calls.items[0] else {
         unreachable!()

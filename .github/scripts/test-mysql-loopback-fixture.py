@@ -79,7 +79,7 @@ class MysqlFixtureTests(unittest.TestCase):
         stack.enter_context(patch.object(F, "socket", fake_socket))
         identity = identity if identity is not None else f"{UUID}\t{self.root / 'data'}\t23456\n".encode()
 
-        def command_result(command: list[str], cwd: Path, label: str, timeout: int = 30) -> bytes:
+        def command_result(command: list[str], cwd: Path, label: str, timeout: int = 30, *, stdout_only: bool = False) -> bytes:
             if "identity" in label:
                 return identity
             if "acceptance" in label:
@@ -1094,7 +1094,7 @@ class PosixMysqlFixtureTests(unittest.TestCase):
         stack.enter_context(patch.object(F, "PosixMysqlProcess", return_value=owner))
         stack.enter_context(patch.object(F.socket, "socket"))
         identity = identity if identity is not None else f"8.0.42\t{self.root / 'data'}/\t23456\t{self.installed}/\t{self.root / 'empty-plugins'}/\t{self.installed / 'share/mysql'}/\t{self.installed / 'share/mysql/charsets'}/\n".encode()
-        def run(command, cwd, label, timeout=30):
+        def run(command, cwd, label, timeout=30, *, stdout_only=False):
             if "identity" in label:
                 return identity
             if "acceptance" in label:

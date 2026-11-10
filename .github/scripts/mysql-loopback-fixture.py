@@ -138,11 +138,21 @@ def write_json(path: Path, value: dict, *, replace: bool = False) -> None:
     write_private(path, json.dumps(value, indent=2) + "\n", replace=replace)
 
 
-def run(command: list[str], cwd: Path, label: str, timeout: int = 30) -> bytes:
+def run(command: list[str], cwd: Path, label: str, timeout: int = 30, *, stdout_only: bool = False) -> bytes:
     previous = BOUNDS.COMMAND_TIMEOUT_SECONDS
     BOUNDS.COMMAND_TIMEOUT_SECONDS = timeout
     try:
         result = BOUNDS.run_bounded(command, cwd, label)
+        if stdout_only:
+            # Client warnings belong to stderr, never to a machine-readable
+            # result's last tab-separated field (or a JSON document).
+            if PRIVATE_LOG_ROOT is not None:
+                private = result.stderr[:MAX_SERVER_LOG_BYTES].decode("utf-8", errors="ignore")
+                write_private(PRIVATE_LOG_ROOT / "command-stderr.log", private, replace=True)
+                write_json(PRIVATE_LOG_ROOT / "command-streams.json",
+                           {"stdout_bytes": len(result.stdout), "stderr_bytes": len(result.stderr)}, replace=True)
+                print(f"Machine query streams: stdout_bytes={len(result.stdout)} stderr_bytes={len(result.stderr)}", flush=True)
+            return result.stdout
         return result.stdout + result.stderr
     except (SystemExit, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         # Initializer output may contain an as-yet unknown random root password.
@@ -596,7 +606,7 @@ def verify(args: argparse.Namespace) -> None:
                 server.wait_ready()
                 identity = run(client_command(root, "mysql.exe", "--batch", "--raw", "--skip-column-names", "--default-character-set=utf8mb4",
                                              "--execute=SELECT @@server_uuid, @@datadir, @@port"),
-                               root, "verify private MySQL identity", 5).decode("utf-8").strip().split("\t")
+                               root, "verify private MySQL identity", 5, stdout_only=True).decode("utf-8").strip().split("\t")
                 expected_dir = str(root / "data").replace("\\", "/").rstrip("/").casefold()
                 if len(identity) != 3 or identity[0] != manifest["server_uuid"] or identity[1].replace("\\", "/").rstrip("/").casefold() != expected_dir or identity[2] != str(config["port"]):
                     raise RuntimeError("MySQL identity is not the newly created private instance")
@@ -845,7 +855,7 @@ def posix_sdk_identity(root: Path, include: Path, library: Path) -> dict:
              "print(json.dumps({'version':lib.mysql_get_client_info().decode('ascii'),"
              "'version_id':lib.mysql_get_client_version()}))")
     output = run([sys.executable, "-B", "-I", "-c", probe, str(root / "sdk" / "lib" / library.name)],
-                 root, "read explicit client SDK version", 5)
+                 root, "read explicit client SDK version", 5, stdout_only=True)
     if len(output) > 1024:
         raise ValueError("SDK version output exceeds its byte bound")
     identity = json.loads(output, object_pairs_hook=no_duplicates)
@@ -990,6 +1000,28 @@ POSIX_VERIFY_STAGES = {
 POSIX_RESOURCE_FIELDS = ("datadir", "basedir", "plugin_dir", "lc_messages_dir", "character_sets_dir")
 
 
+def public_charset_path(value: str, basedir: Path) -> str:
+    """Expose only a short resource path relative to a fixed known prefix."""
+    if (len(value) > 512 or not re.fullmatch(r"/[A-Za-z0-9_./+ -]+", value)
+            or any(secret and secret in value for secret in SECRETS)):
+        return "redacted"
+    try:
+        actual = Path(value).resolve()
+        prefixes = (("basedir-share", basedir / "share"),
+                    ("usr-local-share", Path("/usr/local/share")), ("usr-share", Path("/usr/share")))
+        for label, prefix in prefixes:
+            try:
+                relative = actual.relative_to(prefix.resolve()).as_posix()
+            except ValueError:
+                continue
+            if (len(relative) <= 48 and re.fullmatch(r"[A-Za-z0-9_+.-]+(?:/[A-Za-z0-9_+.-]+)*", relative)
+                    and not any(part in (".", "..") for part in relative.split("/"))):
+                return label + ":" + relative
+        return "outside-known-prefix"
+    except (OSError, RuntimeError, ValueError):
+        return "unavailable"
+
+
 def record_posix_failure_stage(root: Path, stage: str, owner) -> None:
     """Keep categorical state before normal cleanup; never copy private logs."""
     try:
@@ -1023,7 +1055,7 @@ def posix_failure_summary(phase: str, error: BaseException, root: Path) -> None:
                 ("missing-file", (b"no such file or directory",)),
                 ("port-in-use", (b"address already in use",)),
                 ("plugin-load", (b"can't open shared library", b"couldn't load plugin")))
-    for name in ("server.log", "command-error.log"):
+    for name in ("server.log", "command-error.log", "command-stderr.log"):
         try:
             output = bounded_bytes(root / name, MAX_SERVER_LOG_BYTES)
         except (OSError, ValueError):
@@ -1050,6 +1082,11 @@ def posix_failure_summary(phase: str, error: BaseException, root: Path) -> None:
                 and type(state["reader_failed"]) is bool):
             summary += (f" stage={state['stage']} server={state['server']} exit={state['exit']}"
                         f" reader_failed={int(state['reader_failed'])} log_hints={','.join(hints) or 'none'}")
+            if state["stage"] in {"identity-check", "resource-check"} and present(root / "command-streams.json"):
+                streams = read_json(root / "command-streams.json")
+                if (set(streams) == {"stdout_bytes", "stderr_bytes"}
+                        and all(type(value) is int and 0 <= value <= 4 * MAX_SERVER_LOG_BYTES for value in streams.values())):
+                    summary += f" query_stdout_bytes={streams['stdout_bytes']} query_stderr_bytes={streams['stderr_bytes']}"
             if state["stage"] == "resource-check":
                 matches = read_json(root / "resource-check.json")
                 if (set(matches) == set(POSIX_RESOURCE_FIELDS)
@@ -1057,6 +1094,14 @@ def posix_failure_summary(phase: str, error: BaseException, root: Path) -> None:
                     flags = ",".join(f"{field}:{int(matches[field])}" for field in POSIX_RESOURCE_FIELDS)
                     mismatched = ",".join(field for field in POSIX_RESOURCE_FIELDS if not matches[field])
                     summary += f" path_matches={flags} mismatched={mismatched or 'none'}"
+                    if not matches["character_sets_dir"] and present(root / "charset-paths.json"):
+                        paths = read_json(root / "charset-paths.json")
+                        allowed = r"(?:(?:basedir-share|usr-local-share|usr-share):[A-Za-z0-9_+./-]{1,48}|redacted|outside-known-prefix|unavailable)"
+                        if (set(paths) == {"actual", "expected"}
+                                and all(isinstance(value, str) and re.fullmatch(allowed, value)
+                                        and not any(secret and secret in value for secret in SECRETS)
+                                        for value in paths.values())):
+                            summary += f" cs_actual={paths['actual']} cs_expected={paths['expected']}"
     except (OSError, RuntimeError, ValueError, TypeError, KeyError):
         pass
     try:
@@ -1149,6 +1194,7 @@ def posix_verify(args: argparse.Namespace) -> None:
         record.unlink(missing_ok=True)
         (root / "failure-stage.json").unlink(missing_ok=True)
         (root / "resource-check.json").unlink(missing_ok=True)
+        (root / "charset-paths.json").unlink(missing_ok=True)
         if present(root / "server.pid") or present(root / "server.active"):
             raise ValueError("POSIX database markers already exist; refusing reuse")
         with socket.socket() as reservation:
@@ -1170,7 +1216,7 @@ def posix_verify(args: argparse.Namespace) -> None:
                 owner.wait_ready()
                 client = [manifest["client"], f"--defaults-file={root / 'admin.cnf'}", "--batch", "--raw", "--skip-column-names"]
                 stage = "identity-query"
-                identity = run(client + ["--execute=SELECT VERSION(), @@datadir, @@port, @@basedir, @@plugin_dir, @@lc_messages_dir, @@character_sets_dir"], root, "verify private POSIX server identity", 5).decode("utf-8").strip().split("\t")
+                identity = run(client + ["--execute=SELECT VERSION(), @@datadir, @@port, @@basedir, @@plugin_dir, @@lc_messages_dir, @@character_sets_dir"], root, "verify private POSIX server identity", 5, stdout_only=True).decode("utf-8").strip().split("\t")
                 expected_paths = [root / "data", Path(manifest["basedir"]), root / "empty-plugins",
                                   Path(manifest["basedir"]) / "share" / "mysql",
                                   Path(manifest["basedir"]) / "share" / "mysql" / "charsets"]
@@ -1183,6 +1229,10 @@ def posix_verify(args: argparse.Namespace) -> None:
                 if not all(path_matches.values()):
                     try:
                         write_json(root / "resource-check.json", path_matches, replace=True)
+                        if not path_matches["character_sets_dir"]:
+                            write_json(root / "charset-paths.json",
+                                       {"actual": public_charset_path(identity[6], Path(manifest["basedir"])),
+                                        "expected": public_charset_path(str(expected_paths[4]), Path(manifest["basedir"]))}, replace=True)
                     except (OSError, RuntimeError, ValueError):
                         pass  # Preserve the original mismatch and cleanup.
                     raise RuntimeError("POSIX server resources do not match the explicit private installation")
