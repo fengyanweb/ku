@@ -987,6 +987,7 @@ POSIX_VERIFY_STAGES = {
     "configure", "start", "ready", "identity-query", "identity-check",
     "resource-check", "live-query", "health-check", "shutdown-query", "shutdown-wait",
 }
+POSIX_RESOURCE_FIELDS = ("datadir", "basedir", "plugin_dir", "lc_messages_dir", "character_sets_dir")
 
 
 def record_posix_failure_stage(root: Path, stage: str, owner) -> None:
@@ -1049,6 +1050,13 @@ def posix_failure_summary(phase: str, error: BaseException, root: Path) -> None:
                 and type(state["reader_failed"]) is bool):
             summary += (f" stage={state['stage']} server={state['server']} exit={state['exit']}"
                         f" reader_failed={int(state['reader_failed'])} log_hints={','.join(hints) or 'none'}")
+            if state["stage"] == "resource-check":
+                matches = read_json(root / "resource-check.json")
+                if (set(matches) == set(POSIX_RESOURCE_FIELDS)
+                        and all(type(matches[field]) is bool for field in POSIX_RESOURCE_FIELDS)):
+                    flags = ",".join(f"{field}:{int(matches[field])}" for field in POSIX_RESOURCE_FIELDS)
+                    mismatched = ",".join(field for field in POSIX_RESOURCE_FIELDS if not matches[field])
+                    summary += f" path_matches={flags} mismatched={mismatched or 'none'}"
     except (OSError, RuntimeError, ValueError, TypeError, KeyError):
         pass
     try:
@@ -1140,6 +1148,7 @@ def posix_verify(args: argparse.Namespace) -> None:
         record = root / "verification.json"
         record.unlink(missing_ok=True)
         (root / "failure-stage.json").unlink(missing_ok=True)
+        (root / "resource-check.json").unlink(missing_ok=True)
         if present(root / "server.pid") or present(root / "server.active"):
             raise ValueError("POSIX database markers already exist; refusing reuse")
         with socket.socket() as reservation:
@@ -1169,7 +1178,13 @@ def posix_verify(args: argparse.Namespace) -> None:
                 if len(identity) != 7 or identity[0] != manifest["version"] or identity[2] != str(config["port"]):
                     raise RuntimeError("POSIX server identity does not match its newly created fixture")
                 stage = "resource-check"
-                if any(Path(actual).resolve() != expected.resolve() for actual, expected in zip([identity[1], *identity[3:]], expected_paths)):
+                path_matches = {field: Path(actual).resolve() == expected.resolve()
+                                for field, actual, expected in zip(POSIX_RESOURCE_FIELDS, [identity[1], *identity[3:]], expected_paths)}
+                if not all(path_matches.values()):
+                    try:
+                        write_json(root / "resource-check.json", path_matches, replace=True)
+                    except (OSError, RuntimeError, ValueError):
+                        pass  # Preserve the original mismatch and cleanup.
                     raise RuntimeError("POSIX server resources do not match the explicit private installation")
                 os.environ.update({"KU_MYSQL_TEST_CONFIG_FILE": str(root / "db.json"), "KU_BIN": str(ku),
                                    "KU_MYSQL_LIB": str(root / "sdk" / "lib"), "KU_MYSQL_INCLUDE": str(root / "sdk" / "include")})

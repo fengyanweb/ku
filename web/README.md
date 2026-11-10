@@ -29,7 +29,7 @@ npm run build
 
 `/{语言}/playground/` 覆盖官网全部 16 种语言，在访问者的专用浏览器 Worker 内检查和运行，不上传用户源码。每次任务使用新实例；停止、离页、隐藏和执行期限到达时直接销毁 Worker。原生网络、数据库、进程、任意磁盘及原生 async 调度不属于浏览器能力。
 
-构建工具固定在 `scripts/wasm-toolchain.json`：Rust **1.99.1**、`wasm32-unknown-unknown`、wasm-bindgen crate/CLI **0.2.100**。首次准备工具（不改变全局默认 Rust）：
+Rust **1.99.1** 由仓库根目录 `rust-toolchain.toml` 固定；`scripts/wasm-toolchain.json` 固定 `wasm32-unknown-unknown` 和 wasm-bindgen crate/CLI **0.2.100**。首次准备工具（不改变全局默认 Rust）：
 
 ```sh
 rustup target add --toolchain 1.99.1 wasm32-unknown-unknown

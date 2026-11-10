@@ -29,7 +29,7 @@ For a noindex local preview, run `npm run build:preview` without production envi
 
 `/{locale}/playground/` supports all 16 website languages and checks and executes inside a dedicated browser Worker without uploading user source. Each job gets a fresh instance; stop, navigation, page hiding and deadlines terminate the Worker. Native networking, databases, processes, arbitrary disk access and native async scheduling are outside the browser capability contract.
 
-`scripts/wasm-toolchain.json` pins Rust **1.99.1**, `wasm32-unknown-unknown` and wasm-bindgen crate/CLI **0.2.100**. Prepare the tools once without changing the global default toolchain:
+The repository root `rust-toolchain.toml` pins Rust **1.99.1**; `scripts/wasm-toolchain.json` pins `wasm32-unknown-unknown` and wasm-bindgen crate/CLI **0.2.100**. Prepare the tools once without changing the global default toolchain:
 
 ```sh
 rustup target add --toolchain 1.99.1 wasm32-unknown-unknown
