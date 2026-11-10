@@ -327,7 +327,7 @@ impl Drop for DomainState {
 fn reserve_worker(domain: &DomainState) -> Result<(), ProviderError> {
     domain
         .active_workers
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
             (active < domain.worker_slots).then_some(active + 1)
         })
         .map(|_| ())

@@ -4470,7 +4470,7 @@ fn decode_hex_array<const N: usize>(value: &str) -> Result<[u8; N], ()> {
         return Err(());
     }
     let mut output = [0u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         output[index] = (decode_hex_digit(pair[0])? << 4) | decode_hex_digit(pair[1])?;
     }
     Ok(output)

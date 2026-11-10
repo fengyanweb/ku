@@ -1,6 +1,9 @@
 {
   "sidebar": [
     {
+      "slug": ""
+    },
+    {
       "label": "开始使用",
       "translations": {
         "de": "Hier beginnen",
@@ -51,16 +54,68 @@
       },
       "items": [
         {
-          "slug": "docs/guide/language"
+          "autogenerate": {
+            "directory": "docs/guide"
+          }
         },
         {
-          "slug": "docs/stdlib"
-        },
+          "autogenerate": {
+            "directory": "docs/tools"
+          }
+        }
+      ]
+    },
+    {
+      "label": "标准库",
+      "translations": {
+        "de": "Standardbibliothek",
+        "el": "Τυπική βιβλιοθήκη",
+        "en": "Standard library",
+        "es": "Biblioteca estándar",
+        "fa": "کتابخانهٔ استاندارد",
+        "fr": "Bibliothèque standard",
+        "it": "Libreria standard",
+        "ja": "標準ライブラリ",
+        "ko": "표준 라이브러리",
+        "pl": "Biblioteka standardowa",
+        "pt": "Biblioteca padrão",
+        "ro": "Biblioteca standard",
+        "ru": "Стандартная библиотека",
+        "tr": "Standart kütüphane",
+        "zh-cn": "标准库",
+        "zh-tw": "標準函式庫"
+      },
+      "items": [
         {
-          "slug": "docs/stdlib/json"
-        },
+          "autogenerate": {
+            "directory": "docs/stdlib"
+          }
+        }
+      ]
+    },
+    {
+      "label": "示例",
+      "translations": {
+        "de": "Beispiele",
+        "el": "Παραδείγματα",
+        "en": "Examples",
+        "es": "Ejemplos",
+        "fa": "مثال‌ها",
+        "fr": "Exemples",
+        "it": "Esempi",
+        "ja": "サンプル",
+        "ko": "예제",
+        "pl": "Przykłady",
+        "pt": "Exemplos",
+        "ro": "Exemple",
+        "ru": "Примеры",
+        "tr": "Örnekler",
+        "zh-cn": "示例",
+        "zh-tw": "範例"
+      },
+      "items": [
         {
-          "slug": "docs/guide/errors"
+          "slug": "docs/examples"
         }
       ]
     },

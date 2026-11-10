@@ -1,0 +1,75 @@
+---
+import { archiveFromPath } from '../data/versions';
+import { versionDestinationInfo } from '../i18n/routes';
+
+// Preserve the plugin's UI, scripts and version filters. Only the internal
+// navigation attributes of its select/notice/search/banner are corrected.
+const markup = await Astro.slots.render('default');
+const decodePath = (value: string) =>
+  value
+    .replace(/&#(?:x([\da-f]+)|(\d+));/gi, (entity, hex, decimal) => {
+      const point = parseInt(hex ?? decimal, hex ? 16 : 10);
+      return point <= 0x10ffff ? String.fromCodePoint(point) : entity;
+    })
+    .replace(/&amp;/g, '&');
+const output = markup.replace(
+  /(<(?:option\b[^>]*\svalue|a\b[^>]*\shref)=")([^"<>]*)(")/g,
+  (match, start: string, path: string, end: string) => {
+    path = decodePath(path);
+    if (!path.startsWith('/') || path.startsWith('//')) return match;
+    const target = versionDestinationInfo(
+      Astro.url.pathname,
+      archiveFromPath(path)?.slug,
+    );
+    const escape = (value: string) =>
+      value.replaceAll('&', '&amp;').replaceAll('"', '&quot;');
+    const href =
+      target.path + (target.fallback ? '?ku_language_fallback=1' : '');
+    return `${start}${escape(href)}${end} data-ku-version-target="${escape(target.path)}" data-ku-anchors="${escape(JSON.stringify(target.anchors))}"${target.fallback ? ' data-ku-fallback="true"' : ''}`;
+  },
+);
+---
+
+<Fragment set:html={output} />
+
+<script>
+  import { navigationUrl } from '../i18n/preference-client';
+  function updateVersionLinks() {
+    document
+      .querySelectorAll<HTMLAnchorElement>('a[data-ku-version-target]')
+      .forEach((link) => {
+        link.href = navigationUrl(
+          link.dataset.kuVersionTarget!,
+          JSON.parse(link.dataset.kuAnchors || '[]'),
+          !!link.dataset.kuFallback,
+        );
+      });
+  }
+  updateVersionLinks();
+  window.addEventListener('pageshow', updateVersionLinks);
+  window.addEventListener('hashchange', updateVersionLinks);
+  document.addEventListener(
+    'change',
+    (event) => {
+      const select = event.target;
+      if (
+        !(select instanceof HTMLSelectElement) ||
+        !select.closest('starlight-version-select')
+      )
+        return;
+      const option = select.selectedOptions[0];
+      if (!option?.dataset.kuVersionTarget) return;
+      // The upstream handler assigns pathname and preserves invalid hashes.
+      // Handle this select once, with the same URL policy as version links.
+      event.stopImmediatePropagation();
+      location.assign(
+        navigationUrl(
+          option.dataset.kuVersionTarget,
+          JSON.parse(option.dataset.kuAnchors || '[]'),
+          !!option.dataset.kuFallback,
+        ),
+      );
+    },
+    true,
+  );
+</script>

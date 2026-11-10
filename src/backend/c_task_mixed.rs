@@ -138,13 +138,12 @@ pub(super) fn validate(program: &IrProgram, tasks: &TaskProgram) -> KuResult<()>
                     IrExprKind::MakeClosure {
                         function_id,
                         captures,
-                    } if !async_ids.contains(function_id) => {
-                        if captures
+                    } if !async_ids.contains(function_id)
+                        && captures
                             .iter()
-                            .any(|(name, _, _)| aliases.contains(&local(name)))
-                        {
-                            failure = true;
-                        }
+                            .any(|(name, _, _)| aliases.contains(&local(name))) =>
+                    {
+                        failure = true;
                     }
                     _ => {}
                 }

@@ -1,29 +1,32 @@
 ---
 title: 'Projeto e contribuições'
 description: 'Estado do projeto Ku, código público, limites de licença e relatos de problemas reproduzíveis.'
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.20'
+verifiedAt: '2026-10-28'
 sources:
   [
     'README.md',
     'Cargo.toml',
+    'LICENSE',
     'editors/vscode-ku/package.json',
-    'docs/v0.0.18.md',
+    'docs/v0.0.20.md',
     'docs/syntax.md',
   ]
 ---
 
-Esta documentação descreve o escopo congelado da pré-versão experimental v0.0.18. A publicação efetiva e os downloads estão registrados no GitHub Releases. O projeto se chama **Ku programming language / Ku 编程语言**, com a CLI denominada `ku`. Ku é uma pequena linguagem de programação e interpretador em desenvolvimento. A versão pública atual é a preliminar experimental v0.0.18.
+Ku é uma linguagem e uma cadeia de ferramentas: interpretador, runner executável padrão e compilação C nativa de um subconjunto compatível.
 
 ## Código-fonte e licença
 
-Consulte o [código no GitHub](https://github.com/fengyanweb/ku) e a [página da versão](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). O código é visível publicamente, mas o código próprio do Ku **não tem concessão de licença de código aberto**. A extensão do editor está marcada como `UNLICENSED`. Publicar código ou binários não concede automaticamente uma licença de código aberto.
+Ku e a extensão para VS Code são distribuídos sob **Apache-2.0**. Consulte o [código-fonte](https://github.com/fengyanweb/ku), a [versão 0.0.20](https://github.com/fengyanweb/ku/releases/tag/v0.0.20) e o [texto da licença](https://github.com/fengyanweb/ku/blob/v0.0.20/LICENSE).
 
-Os avisos de terceiros nos arquivos de versões aplicam-se somente aos respectivos componentes. Eles não estabelecem permissões para usar, modificar ou redistribuir o próprio Ku. Qualquer autorização necessária deve vir explicitamente do mantenedor; este site não cria novos compromissos de licença.
+Os componentes de terceiros mantêm suas próprias licenças. Os pacotes incluem os textos e avisos correspondentes.
 
 ## Relate um problema
 
 Use os [Issues](https://github.com/fengyanweb/ku/issues) do repositório para relatos reproduzíveis. Inclua:
+
+Feedback por e-mail: [kagura.gc@qq.com](mailto:kagura.gc@qq.com)
 
 - Versão do Ku, commit Git para fontes de desenvolvimento e sistema / arquitetura de destino.
 - Comando completo, backend e código-fonte `.ku` mínimo.
@@ -34,10 +37,8 @@ Não envie tokens, senhas, strings de conexão reais ou logs com dados empresari
 
 ## Antes de contribuir
 
-O [contrato de sintaxe](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) e o [contrato semântico](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) definem o comportamento da linguagem. Verifique CI, implementação e contratos em conjunto. Uma meta no registro de trabalho não é um recurso implementado.
+Mantenha as alterações focadas e inclua uma reprodução mínima, o escopo e as verificações pertinentes. Código, documentação e exemplos devem corresponder à mesma versão. Os responsáveis revisam as contribuições antes de integrá-las.
 
-Mantenha as alterações focadas e explique reprodução, causa, alcance e validação. Revise o conteúdo do site junto ao código correspondente. Preserve testes existentes, alterações na árvore de trabalho e evidências únicas. O mantenedor determina a aceitação de contribuições e os acordos de licença; este site não inventa um acordo de contribuição.
-
-Este site é estático. Seus textos, navegação e código não exigem backend empresarial. A busca carrega um índice Pagefind no navegador; o site não oferece execução remota de código Ku.
+O site não oferece execução de código Ku online.
 
 Continue com os [primeiros passos](/pt/docs/getting-started/), os [limites de suporte](/pt/docs/support/) e as [notas de versão](/pt/releases/).

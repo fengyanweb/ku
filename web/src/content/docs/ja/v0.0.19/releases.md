@@ -1,0 +1,45 @@
+---
+title: 'リリースノート'
+description: 'Ku 0.0.18 — リリースノート'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
+sources:
+  [
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-worklog.md',
+    'docs/history.md',
+    'Cargo.toml',
+    'docs/v0.0.18-r1.md',
+  ]
+---
+
+## 0.0.19
+
+現在のドキュメントは実験的プレリリース Ku 0.0.19 を対象とし、CLI と VS Code 拡張機能のバージョンも 0.0.19 です。公開状況、ファイル、チェックサムは実際の GitHub Release を確認してください。
+
+[Release · SHA256SUMS](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) · [Installation](/ja/v0.0.19/docs/install/) · [Release notes (English)](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19.en.md) · [Known issues (English)](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19-known-issues.en.md)
+
+## v0.0.18
+
+呼び出しチェーンのレシーバー再評価、ネイティブ C の浮動小数点定数、`time.date(Time): Date!` を修正し、VS Code 拡張機能を更新します。
+
+- JSON: `encode`／`decode` は `stringify`／`parse` と共通で、`1e20` の往復修正を含みます。
+
+[Ku 0.0.18 をダウンロード](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · [プラットフォームとバックエンドの対応範囲](/ja/v0.0.18/docs/support/)
+
+## v0.0.17 · 実験的プレリリース
+
+主な変更：
+
+- 同期の読み取り専用借用パラメーターは `&name: T` を使用し、呼び出しでは通常の引数を渡します。通常の所有パラメーターはムーブ意味論を維持します。
+- セルフホスト構文解析器サブセットに、波括弧付き `while` を追加しました。入れ子の深さと文の数には上限があります。
+- クロスプラットフォームテストの標準出力切断チェックを修正しました。業務 API の追加ではありません。
+- アーカイブには、既定のランナーに対応する Rust 依存ファイルと、ターゲット用 TLS パックを含みます。適切な外部ツールチェーンは引き続き必要です。
+
+ダウンロード対象は Windows x64、Linux x64、macOS arm64 です。リリース成果物 7 件の内訳は、プラットフォームアーカイブ 3 件、マニフェスト 3 件、`SHA256SUMS` です。[インストール](https://github.com/fengyanweb/ku/releases/tag/v0.0.17)と[完全なリリースノート](https://github.com/fengyanweb/ku/releases/tag/v0.0.17)をご覧ください。
+
+### 互換性と制約
+
+Ku は実験段階であり、本番環境で使用できる状態ではありません。0.0.x ではソースや生成 C/FFI ABI の互換性を約束しません。更新時には関連するネイティブ成果物を再コンパイルしてください。非同期パラメーターの借用、完全なセルフホスト、完全なネイティブ async は、このリリースの範囲外です。
+
+既定のランナーに埋め込まれるのはエントリーソースだけで、インポートしたモジュールには元の場所が必要です。データベースクライアントはネイティブ専用です。各ドライバーの実サーバー、TLS、セッション状態の制約を確認してください。Ku 自体のコードには引き続きオープンソースライセンスの許諾がありません。

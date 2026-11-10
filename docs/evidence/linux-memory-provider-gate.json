@@ -1,0 +1,29 @@
+{
+  "kind": "resident-hard-memory-provider-gate-followup",
+  "source_run": "https://github.com/fengyanweb/ku/actions/runs/39685630202",
+  "artifact": "service-lifecycle-ubuntu-24.04/ku-service-memory-provider.json",
+  "source_commit": "eafe8382354570c26715146794ea767798d413f5",
+  "original_status": "failed",
+  "observed": {
+    "worker_memory_limit_bytes": 67108864,
+    "memory_peak_bytes": 67108864,
+    "memory_limit_observed": false,
+    "launcher_signal": 9,
+    "replacement_generation": 2,
+    "recovery_ms": 301.213,
+    "other_instance_ok": 10,
+    "cgroup_remaining": 0
+  },
+  "diagnosis": "The old provider sampled only leaf memory.events. Ku service also enforces the same 64 MiB aggregate limit on its own private parent domain. An aggregate-domain limit event is a supported explanation but the original deleted groups cannot uniquely establish it.",
+  "change": "Capture the private parent memory.events.local baseline before worker admission and its final counters, preserve bounded leaf/parent raw evidence, and correlate new parent or leaf oom with an OOM-killed leaf process. Shared delegation and host ancestors are never sampled. Old parent events and a global oom_kill alone do not prove the configured limit caused termination.",
+  "local_tests": {
+    "host": "macOS arm64",
+    "pure_event_accounting_passed": 3,
+    "service_supervision_existing_passed": 7,
+    "python_ast_parse": "passed",
+    "actual_linux_cgroup_execution": "pending new exact-source CI"
+  },
+  "kernel_reference": "https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files",
+  "old_36_memory_cases_rerun": false,
+  "status": "local logic passed; real Linux provider acceptance pending"
+}

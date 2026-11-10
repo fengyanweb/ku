@@ -1,17 +1,13 @@
 ---
 title: 快速开始
 description: 用 Ku 编写 Hello Ku，检查源码并了解解释运行与构建的区别。
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
-sources:
-  - examples/hello.ku
-  - README.md
-  - docs/syntax.md
-  - docs/v0.0.18.md
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
+sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
 slug: zh-cn/v0.0.18/docs/getting-started
 ---
 
-本文档对应 v0.0.18 实验预发行版的冻结范围；实际公开状态与下载资产以 GitHub Release 为准。本页使用 v0.0.17 已有的基础语法与 CLI。先完成[安装](/zh-cn/v0.0.18/docs/install/)，并确认 `ku --version` 可执行。
+先完成[安装](/zh-cn/v0.0.18/docs/install/)，并确认 `ku --version` 输出 `ku 0.0.18`。
 
 ## 写下第一个程序
 
@@ -86,4 +82,4 @@ ku run
 
 包通过 `ku.mod` 指定入口。`ku create --list` 查看真实模板列表；当前没有 `ku test` 或 `ku fmt` 命令。
 
-继续阅读[语言指南](/zh-cn/v0.0.18/docs/guide/language/)、[错误与排查](/zh-cn/v0.0.18/docs/guide/errors/)和[后端支持](/zh-cn/v0.0.18/docs/support/)。本页的输出是示例预期，不代替你所在平台的安装验证。
+继续阅读[语言指南](/zh-cn/v0.0.18/docs/guide/language/)、[错误与排查](/zh-cn/v0.0.18/docs/guide/errors/)和[后端支持](/zh-cn/v0.0.18/docs/support/)。

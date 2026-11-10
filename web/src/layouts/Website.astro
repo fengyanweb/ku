@@ -6,6 +6,7 @@ import Theme from '../components/Theme.astro';
 import LanguageSwitch from '../components/LanguageSwitch.astro';
 import LanguageNotice from '../components/LanguageNotice.astro';
 import { project } from '../data/site';
+import { playgroundMessages } from '../playground/messages';
 import {
   localeDefinitions,
   locales,
@@ -24,8 +25,16 @@ const localized = locales.includes(Astro.url.pathname.split('/')[1] as Locale);
 const links = [
   [t.documentation, `/${locale}/docs/getting-started/`],
   [t.languageGuide, `/${locale}/docs/guide/language/`],
+  [t.libraryGroup, `/${locale}/docs/stdlib/`],
   [t.releases, `/${locale}/releases/`],
+  [t.supportKu, `/${locale}/support/`],
 ];
+if (Astro.url.pathname === `/${locale}/`) {
+  links.splice(1, 0, [
+    playgroundMessages(locale).page.nav,
+    `/${locale}/playground/`,
+  ]);
+}
 const messages = {
   searchEmpty: t.searchEmpty,
   searching: t.searching,
@@ -125,18 +134,17 @@ const messages = {
         <a href={`/${locale}/docs/project/`}>{t.project}</a>
         <a href={`/${locale}/docs/support/`}>{t.support}</a>
         <a href={`${project.repository}/issues`}>{t.reportIssue} ↗</a>
+        <a href={`mailto:${project.feedbackEmail}`}>{t.emailFeedback}</a>
       </nav>
       <div class="footer-note">
         {t.experimental}
         <br />
         <span>
-          Ku {project.version} · {t.sourceAvailable}
+          {project.version} ·{' '}
+          <a href={`/${locale}/docs/project/`}>{t.sourceAvailable}</a>
         </span>
       </div>
     </footer>
-    <div class="shell" data-pagefind-ignore>
-      <LanguageNotice locale={locale} />
-    </div>
     <dialog class="search-dialog" data-search-dialog aria-label={t.searchDocs}>
       <form method="dialog" class="search-top">
         <label for="ku-search">{t.searchTitle}</label>

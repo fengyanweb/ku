@@ -1,18 +1,20 @@
 ---
-title: Başlangıç
-description: Hello Ku yazın, kaynak kodunuzu denetleyin ve yorumlama ile
-  derlemeyi ayırt edin.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Başlangıç'
+description: 'Hello Ku yazın, kaynak kodunuzu denetleyin ve yorumlama ile derlemeyi ayırt edin.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - examples/hello.ku
-  - README.md
-  - docs/syntax.md
-  - docs/v0.0.18.md
+  [
+    'examples/hello.ku',
+    'README.md',
+    'docs/syntax.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: tr/v0.0.18/docs/getting-started
 ---
 
-Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır. Bu sayfa v0.0.17 içinde zaten bulunan temel sözdizimini ve CLI komutlarını kullanır. Önce [Ku kurulumunu](/tr/v0.0.18/docs/install/) yapın ve `ku --version` komutunun çalıştığını doğrulayın.
+Önce [Ku kurulumunu](/tr/v0.0.18/docs/install/) yapın ve `ku --version` komutunun çalıştığını doğrulayın.
 
 ## İlk programınızı yazın
 
@@ -87,4 +89,4 @@ ku run
 
 Paketin giriş noktası `ku.mod` içinde yapılandırılır. `ku create --list` kullanılabilir şablonları listeler. Şu anda `ku test` veya `ku fmt` komutları yoktur.
 
-[Dil kılavuzu](/tr/v0.0.18/docs/guide/language/), [sorun giderme](/tr/v0.0.18/docs/guide/errors/) ve [arka uç desteği](/tr/v0.0.18/docs/support/) ile devam edin. Buradaki çıktılar beklenen örneklerdir ve platformunuzdaki kurulum doğrulamasının yerini tutmaz.
+[Dil kılavuzu](/tr/v0.0.18/docs/guide/language/), [sorun giderme](/tr/v0.0.18/docs/guide/errors/) ve [arka uç desteği](/tr/v0.0.18/docs/support/) ile devam edin.

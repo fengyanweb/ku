@@ -1,12 +1,12 @@
 ---
 title: Getting started
 description: Write Hello Ku, check your source, and distinguish interpretation from compilation.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
+kuVersion: '0.0.20'
+verifiedAt: '2026-10-30'
+sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
 ---
 
-This documentation describes the frozen scope of the v0.0.18 experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases. This page uses basic syntax and CLI commands already present in v0.0.17. [Install Ku](/en/docs/install/) first and confirm that `ku --version` runs.
+[Install Ku](/en/docs/install/) first, then run `ku -v` (equivalent to `ku --version`) and confirm it reports `ku 0.0.20`.
 
 ## Write your first program
 
@@ -18,7 +18,9 @@ fn main() {
 }
 ```
 
-`fn main()` is the entry point. `println` writes one line of text. Ku does not use `let` or `let mut`.
+`fn main()` is the program entry point, and `println` writes one line of text. This program needs no return type annotation, `!`, `?`, or `return ok(null)`. The entry function itself is still required. Ku does not use `let` or `let mut`.
+
+Operations such as reading a file or parsing JSON may return a Result. Use [`T!` and `?` as explained in error handling](/en/docs/guide/errors/#result-operators) when working with those results.
 
 ## Check and run
 
@@ -26,10 +28,10 @@ From the file's directory:
 
 ```sh
 ku check hello.ku
-ku run hello.ku
+ku ./hello.ku
 ```
 
-`check` checks lexical, syntax, and basic semantic errors without running the program. The expected standard output when running is:
+`check` checks lexical, syntax, and basic semantic errors without running the program. `ku ./hello.ku` is equivalent to `ku run ./hello.ku`; Windows also accepts `ku .\hello.ku`. This shorthand accepts only one source-file path. The expected standard output when running is:
 
 ```text
 Hello Ku
@@ -73,12 +75,14 @@ Note: `ku build --native hello.ku` **without `-o` emits C source only**, without
 Use a built in template when you need a package directory:
 
 ```sh
-ku create HelloWorld --template basic
+ku create HelloWorld -t basic
 cd HelloWorld
 ku check
 ku run
 ```
 
-The package entry is configured in `ku.mod`. `ku create --list` lists available templates. There are currently no `ku test` or `ku fmt` commands.
+`-t` is short for `--template`; use `ku init -t basic` to initialize the current empty directory. The package entry is configured in `ku.mod`. `ku create --list` lists available templates. There are currently no `ku test` or `ku fmt` commands.
 
-Continue with the [language guide](/en/docs/guide/language/), [troubleshooting](/en/docs/guide/errors/), and [backend support](/en/docs/support/). The outputs here are expected examples and do not replace installation verification on your platform.
+Continue with the [language guide](/en/docs/guide/language/), [troubleshooting](/en/docs/guide/errors/), and [backend support](/en/docs/support/).
+
+See the [CLI reference](/en/docs/tools/cli/) for full commands and their shorthands.

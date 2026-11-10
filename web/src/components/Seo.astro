@@ -1,6 +1,7 @@
 ---
 import { locales, localeDefinitions, type Locale } from '../i18n/locales';
 import { translationsForPath } from '../i18n/routes';
+import { project } from '../data/site';
 interface Props {
   title: string;
   description: string;
@@ -8,6 +9,8 @@ interface Props {
 }
 const { title, description, locale } = Astro.props;
 const path = Astro.url.pathname;
+const translations = translationsForPath(path);
+const defaultPage = translations.find(({ locale }) => locale === 'en');
 const localized = locales.includes(path.split('/')[1] as Locale);
 const indexable =
   import.meta.env.INDEXABLE === 'true' && !!Astro.site && localized;
@@ -27,8 +30,15 @@ const indexable =
 />
 {Astro.site && localized && (
   <>
+    {defaultPage && (
+      <link
+        rel="alternate"
+        hreflang="x-default"
+        href={new URL(defaultPage.path, Astro.site)}
+      />
+    )}
     <link rel="canonical" href={new URL(path, Astro.site)} />
-    {translationsForPath(path).map(({ locale: key, path: translatedPath }) => (
+    {translations.map(({ locale: key, path: translatedPath }) => (
       <link
         rel="alternate"
         hreflang={localeDefinitions[key].lang}
@@ -44,11 +54,12 @@ const indexable =
     set:html={JSON.stringify({
       '@context': 'https://schema.org',
       '@type': 'WebSite',
-      name: 'Ku',
+      name: project.name,
+      alternateName: project.nameZh,
       description,
       url: new URL(path, Astro.site).href,
       inLanguage: localeDefinitions[locale].lang,
-      sameAs: 'https://github.com/fengyanweb/ku',
+      sameAs: project.repository,
     }).replace(/</g, '\\u003c')}
   />
 )}

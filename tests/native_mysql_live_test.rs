@@ -104,7 +104,9 @@ fn plain(path: &Path, directory: bool) {
 }
 
 fn private_fixture() -> (PathBuf, String) {
-    assert!(cfg!(windows), "this fixture currently requires Windows");
+    if cfg!(not(windows)) {
+        std::panic::panic_any("this fixture currently requires Windows");
+    }
     let config = PathBuf::from(
         env::var_os("KU_MYSQL_TEST_CONFIG_FILE")
             .expect("run this ignored test through mysql-loopback-fixture.py verify"),

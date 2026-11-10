@@ -2,7 +2,7 @@
   "name": "ku-language",
   "displayName": "Ku Language",
   "description": "Syntax highlighting, snippets, and editor intelligence for Ku",
-  "version": "0.0.19",
+  "version": "0.0.20",
   "publisher": "ku-lang",
   "license": "Apache-2.0",
   "repository": {
@@ -14,9 +14,14 @@
     "vscode": "^1.85.0"
   },
   "main": "./out/language.js",
-  "extensionKind": ["workspace"],
+  "extensionKind": [
+    "workspace"
+  ],
   "capabilities": {
-    "untrustedWorkspaces": { "supported": false, "description": "Ku checks and executable discovery run a locally installed CLI. Trust the workspace to enable these features." },
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Ku checks and executable discovery run a locally installed CLI. Trust the workspace to enable these features."
+    },
     "virtualWorkspaces": false
   },
   "activationEvents": [
@@ -31,7 +36,9 @@
     "onCommand:ku.packageGc",
     "onCommand:ku.showVersion"
   ],
-  "categories": ["Programming Languages"],
+  "categories": [
+    "Programming Languages"
+  ],
   "scripts": {
     "compile": "tsc -p .",
     "typecheck": "tsc -p . --noEmit",
@@ -49,13 +56,41 @@
   },
   "contributes": {
     "commands": [
-      { "command": "ku.runCurrentFile", "title": "Ku Run", "icon": "$(play)" },
-      { "command": "ku.checkCurrentFile", "title": "Ku: Check Current File", "icon": "$(check)" },
-      { "command": "ku.showIr", "title": "Ku: Show IR", "icon": "$(symbol-misc)" },
-      { "command": "ku.buildCurrentFile", "title": "Ku: Build Current File", "icon": "$(package)" },
-      { "command": "ku.buildNativeC", "title": "Ku: Emit Native C Source", "icon": "$(gear)" },
-      { "command": "ku.packageGc", "title": "Ku: Package GC", "icon": "$(trash)" },
-      { "command": "ku.showVersion", "title": "Ku: Show Version", "icon": "$(versions)" }
+      {
+        "command": "ku.runCurrentFile",
+        "title": "Ku Run",
+        "icon": "$(play)"
+      },
+      {
+        "command": "ku.checkCurrentFile",
+        "title": "Ku: Check Current File",
+        "icon": "$(check)"
+      },
+      {
+        "command": "ku.showIr",
+        "title": "Ku: Show IR",
+        "icon": "$(symbol-misc)"
+      },
+      {
+        "command": "ku.buildCurrentFile",
+        "title": "Ku: Build Current File",
+        "icon": "$(package)"
+      },
+      {
+        "command": "ku.buildNativeC",
+        "title": "Ku: Emit Native C Source",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "ku.packageGc",
+        "title": "Ku: Package GC",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "ku.showVersion",
+        "title": "Ku: Show Version",
+        "icon": "$(versions)"
+      }
     ],
     "configuration": {
       "title": "Ku",
@@ -89,19 +124,34 @@
     "languages": [
       {
         "id": "ku",
-        "aliases": ["Ku", "ku"],
-        "extensions": [".ku"],
+        "aliases": [
+          "Ku",
+          "ku"
+        ],
+        "extensions": [
+          ".ku"
+        ],
         "configuration": "./language-configuration.json"
       },
       {
         "id": "ku-mod",
-        "aliases": ["Ku Mod", "ku.mod"],
-        "filenames": ["ku.mod"]
+        "aliases": [
+          "Ku Mod",
+          "ku.mod"
+        ],
+        "filenames": [
+          "ku.mod"
+        ]
       },
       {
         "id": "ku-lock",
-        "aliases": ["Ku Lock", "ku.lock"],
-        "filenames": ["ku.lock"]
+        "aliases": [
+          "Ku Lock",
+          "ku.lock"
+        ],
+        "filenames": [
+          "ku.lock"
+        ]
       }
     ],
     "grammars": [
@@ -136,25 +186,69 @@
     },
     "menus": {
       "editor/context": [
-        { "command": "ku.runCurrentFile", "when": "editorLangId == ku", "group": "navigation@1" }
+        {
+          "command": "ku.runCurrentFile",
+          "when": "editorLangId == ku",
+          "group": "navigation@1"
+        }
       ],
       "explorer/context": [
-        { "command": "ku.runCurrentFile", "when": "resourceExtname == .ku", "group": "navigation@1" }
+        {
+          "command": "ku.runCurrentFile",
+          "when": "resourceExtname == .ku",
+          "group": "navigation@1"
+        }
       ],
       "editor/title": [
-        { "command": "ku.runCurrentFile", "when": "resourceLangId == ku", "group": "navigation@1" },
-        { "command": "ku.checkCurrentFile", "when": "resourceLangId == ku", "group": "navigation@2" },
-        { "command": "ku.showIr", "when": "resourceLangId == ku", "group": "navigation@3" },
-        { "command": "ku.buildCurrentFile", "when": "resourceLangId == ku", "group": "navigation@4" }
+        {
+          "command": "ku.runCurrentFile",
+          "when": "resourceLangId == ku",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ku.checkCurrentFile",
+          "when": "resourceLangId == ku",
+          "group": "navigation@2"
+        },
+        {
+          "command": "ku.showIr",
+          "when": "resourceLangId == ku",
+          "group": "navigation@3"
+        },
+        {
+          "command": "ku.buildCurrentFile",
+          "when": "resourceLangId == ku",
+          "group": "navigation@4"
+        }
       ],
       "commandPalette": [
-        { "command": "ku.runCurrentFile", "when": "resourceLangId == ku" },
-        { "command": "ku.checkCurrentFile", "when": "resourceLangId == ku" },
-        { "command": "ku.showIr", "when": "resourceLangId == ku" },
-        { "command": "ku.buildCurrentFile", "when": "resourceLangId == ku" },
-        { "command": "ku.buildNativeC", "when": "resourceLangId == ku" },
-        { "command": "ku.packageGc", "when": "resourceLangId == ku" },
-        { "command": "ku.showVersion" }
+        {
+          "command": "ku.runCurrentFile",
+          "when": "resourceLangId == ku"
+        },
+        {
+          "command": "ku.checkCurrentFile",
+          "when": "resourceLangId == ku"
+        },
+        {
+          "command": "ku.showIr",
+          "when": "resourceLangId == ku"
+        },
+        {
+          "command": "ku.buildCurrentFile",
+          "when": "resourceLangId == ku"
+        },
+        {
+          "command": "ku.buildNativeC",
+          "when": "resourceLangId == ku"
+        },
+        {
+          "command": "ku.packageGc",
+          "when": "resourceLangId == ku"
+        },
+        {
+          "command": "ku.showVersion"
+        }
       ]
     }
   }

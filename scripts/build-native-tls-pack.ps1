@@ -33,10 +33,17 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 }
 
 $kuTlsReleaseConfiguration = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'release-toolchain.json') -Raw -Encoding utf8 | ConvertFrom-Json
-if ($kuTlsReleaseConfiguration.schema -cne 'ku-release-toolchain-v1' -or $kuTlsReleaseConfiguration.toolchain -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Invalid release toolchain configuration' }
-$kuTlsReleaseToolchain = [string]$kuTlsReleaseConfiguration.toolchain
-# Changing the publisher requires revalidating the native archive/link contract.
-if ($kuTlsReleaseToolchain -cne '1.89.0') { throw 'The validated native TLS ABI requires an explicit migration before changing the publisher toolchain' }
+$kuTlsProjectToolchainPath = Join-Path $PSScriptRoot '../rust-toolchain.toml'
+if (Test-Path -LiteralPath (Join-Path $PSScriptRoot '../rust-toolchain')) { throw 'Use the single rust-toolchain.toml configuration' }
+$kuTlsProjectToolchainText = Get-Content -LiteralPath $kuTlsProjectToolchainPath -Raw -Encoding utf8
+$kuTlsProjectToolchainSections = [regex]::Matches($kuTlsProjectToolchainText, '(?ms)^\s*\[toolchain\]\s*(?:#[^\n]*)?\n(.*?)(?=^\s*\[|\z)')
+if ($kuTlsProjectToolchainSections.Count -ne 1) { throw 'Project toolchain requires one toolchain section' }
+$kuTlsProjectToolchainChannels = [regex]::Matches($kuTlsProjectToolchainSections[0].Groups[1].Value, '(?m)^\s*channel\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*(?:#[^\n]*)?$')
+if ($kuTlsProjectToolchainChannels.Count -ne 1 -or [regex]::Matches($kuTlsProjectToolchainSections[0].Groups[1].Value, '(?m)^\s*channel\s*=').Count -ne 1) { throw 'Project toolchain requires one exact stable channel' }
+$kuTlsReleaseToolchain = $kuTlsProjectToolchainChannels[0].Groups[1].Value
+if ($kuTlsReleaseConfiguration.schema -cne 'ku-release-toolchain-v1' -or $kuTlsReleaseConfiguration.toolchain -cne $kuTlsReleaseToolchain) { throw 'Release toolchain must match rust-toolchain.toml' }
+# Every publisher migration must pass the exact native-static-libs and archive
+# validation below; changing this version never relabels an existing archive.
 
 $kuTlsPathComparison = if ($IsWindows) {
     [System.StringComparison]::OrdinalIgnoreCase
@@ -1412,7 +1419,7 @@ try {
         $kuTlsToolProbeTimeoutMs
     if ($kuTlsRustc.ExitCode -ne 0 -or
         $kuTlsRustc.Output -notmatch ('^rustc ' + [regex]::Escape($kuTlsReleaseToolchain) + ' \(')) {
-        throw "native TLS packs require the exact Rust 1.89.0 toolchain"
+        throw "native TLS packs require the exact Rust $kuTlsReleaseToolchain toolchain"
     }
 
     $kuTlsCargo = Invoke-KuTlsBoundedProcess `

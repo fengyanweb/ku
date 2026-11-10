@@ -820,6 +820,12 @@ fn doctor_json_contains_only_json_even_when_a_c_compiler_prints_stdout() {
     let root = unique_temp_dir("doctor-stdout-contract");
     fs::create_dir_all(&root).unwrap();
     let _cleanup = Cleanup(root.clone());
+    // This stdout contract is independent of a development SDK's size and
+    // manifest validation. Exercise a real standalone CLI; SDK integrity is
+    // covered by the Runner bundle tests and packaged consumer gate.
+    let cli = root.join("ku");
+    fs::copy(ku_binary(), &cli).unwrap();
+    fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
     let compiler = root.join("c-driver");
     fs::write(
         &compiler,
@@ -828,7 +834,7 @@ fn doctor_json_contains_only_json_even_when_a_c_compiler_prints_stdout() {
     .unwrap();
     fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700)).unwrap();
     for extra in [&[][..], &["--backend", "c"][..]] {
-        let mut command = Command::new(ku_binary());
+        let mut command = Command::new(&cli);
         command
             .arg("doctor")
             .arg("--json")

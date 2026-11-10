@@ -337,7 +337,7 @@ impl FlightRecord {
         if self.selection.first_anomaly.load(Ordering::Acquire) != self.sequence
             || self
                 .snapshots
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                     (n < MAX_SNAPSHOTS).then_some(n + 1)
                 })
                 .is_err()

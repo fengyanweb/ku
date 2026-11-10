@@ -15978,17 +15978,21 @@ fn expr_mentions_native_tls_config(expr: &IrExpr) -> bool {
     } = &expr.kind
     {
         if name == "__ku_object"
-            && args.chunks_exact(2).any(|field| match &field[0].kind {
-                IrExprKind::Literal(key) if key == "\"tls\"" => {
-                    !matches!(&field[1].kind, IrExprKind::Literal(value) if value == "false")
-                }
-                IrExprKind::Literal(key)
-                    if key == "\"tls_server_name\"" || key == "\"tls_ca_pem\"" =>
-                {
-                    true
-                }
-                _ => false,
-            })
+            && args
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|field| match &field[0].kind {
+                    IrExprKind::Literal(key) if key == "\"tls\"" => {
+                        !matches!(&field[1].kind, IrExprKind::Literal(value) if value == "false")
+                    }
+                    IrExprKind::Literal(key)
+                        if key == "\"tls_server_name\"" || key == "\"tls_ca_pem\"" =>
+                    {
+                        true
+                    }
+                    _ => false,
+                })
         {
             return true;
         }

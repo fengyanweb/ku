@@ -19,7 +19,7 @@ Keep the full extracted tree, including:
 
 The actual CLI location determines its installation root. Relative manifest paths identify the same-build CLI, runtime and dependencies, with sizes and SHA checks. Resolution does not choose by mtime, fall back to ancestor target trees or borrow a Ku runtime from the project directory. Missing manifests, invalid paths, missing/corrupt files and mixed bundles fail explicitly. Relocating the whole bundle is supported; copying its executable alone cannot preserve Runner builds.
 
-Release toolchain **T=1.89.0** is configured in [`scripts/release-toolchain.json`](../scripts/release-toolchain.json), separately from the source MSRV. Changing T requires rebuilding the CLI, rlib, dependencies and affected native/TLS packs together.
+Release toolchain **T=1.99.1** is configured in [`scripts/release-toolchain.json`](../scripts/release-toolchain.json), separately from the source MSRV. Changing T requires rebuilding the CLI, rlib, dependencies and affected native/TLS packs together.
 
 Before compiling, Ku checks the full compiler release/commit/host and runtime target ABI. A matching standalone system rustc is usable; otherwise an already-installed exact Rustup toolchain T is selected. Probe and compilation use the same resolved compiler, rather than probing one compiler and invoking another through PATH.
 

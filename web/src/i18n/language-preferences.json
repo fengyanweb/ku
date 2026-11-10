@@ -1,66 +1,82 @@
 {
   "de": {
     "notice": "Beim ersten Besuch wird anhand der IP-Region vereinfachtes Chinesisch oder Englisch ausgewählt. Die manuelle Auswahl einer dieser beiden Sprachen wird in diesem Browser gespeichert.",
-    "fallback": "Diese Seite ist noch nicht in der ausgewählten Sprache verfügbar. Sie wurden zur Startseite dieser Sprache weitergeleitet."
+    "fallback": "Diese Seite ist noch nicht in der ausgewählten Sprache verfügbar. Sie wurden zur Startseite dieser Sprache weitergeleitet.",
+    "documentFallback": "Diese Seite ist in der gewählten Sprache noch nicht verfügbar. Angezeigt wird die englische Dokumentation derselben Version."
   },
   "el": {
     "notice": "Στην πρώτη επίσκεψη επιλέγονται απλοποιημένα κινεζικά ή αγγλικά βάσει της περιοχής της διεύθυνσης IP. Η χειροκίνητη επιλογή μίας από αυτές τις δύο γλώσσες αποθηκεύεται σε αυτόν τον φυλλομετρητή.",
-    "fallback": "Αυτή η σελίδα δεν έχει ακόμη μετάφραση στην επιλεγμένη γλώσσα. Έγινε επιστροφή στην αρχική σελίδα αυτής της γλώσσας."
+    "fallback": "Αυτή η σελίδα δεν έχει ακόμη μετάφραση στην επιλεγμένη γλώσσα. Έγινε επιστροφή στην αρχική σελίδα αυτής της γλώσσας.",
+    "documentFallback": "Αυτή η σελίδα δεν είναι διαθέσιμη στην επιλεγμένη γλώσσα. Εμφανίζεται η αγγλική τεκμηρίωση της ίδιας έκδοσης."
   },
   "en": {
     "notice": "Your first visit uses your IP region to choose Simplified Chinese or English. Manual choices of these two languages are saved in this browser.",
-    "fallback": "This page is not yet translated into your selected language. You have been returned to that language’s home page."
+    "fallback": "This page is not yet translated into your selected language. You have been returned to that language’s home page.",
+    "documentFallback": "This page is not available in the selected language. You are viewing the English documentation for the same version."
   },
   "es": {
     "notice": "En la primera visita se elige chino simplificado o inglés según la región de la IP. La elección manual de uno de estos dos idiomas se guarda en este navegador.",
-    "fallback": "Esta página aún no está traducida al idioma seleccionado. Se ha vuelto a la página de inicio de ese idioma."
+    "fallback": "Esta página aún no está traducida al idioma seleccionado. Se ha vuelto a la página de inicio de ese idioma.",
+    "documentFallback": "Esta página no está disponible en el idioma seleccionado. Se muestra la documentación en inglés de la misma versión."
   },
   "fa": {
     "notice": "در نخستین بازدید، بر اساس منطقهٔ نشانی IP، چینی ساده‌شده یا انگلیسی انتخاب می‌شود. انتخاب دستی یکی از این دو زبان در همین مرورگر ذخیره می‌شود.",
-    "fallback": "این صفحه هنوز به زبان انتخاب‌شده ترجمه نشده است. به صفحهٔ اصلی آن زبان بازگشته‌اید."
+    "fallback": "این صفحه هنوز به زبان انتخاب‌شده ترجمه نشده است. به صفحهٔ اصلی آن زبان بازگشته‌اید.",
+    "documentFallback": "این صفحه به زبان انتخاب‌شده موجود نیست. مستندات انگلیسی همان نسخه نمایش داده می‌شود."
   },
   "fr": {
     "notice": "Lors de la première visite, le chinois simplifié ou l’anglais est choisi selon la région de l’adresse IP. Le choix manuel de l’une de ces deux langues est enregistré dans ce navigateur.",
-    "fallback": "Cette page n’est pas encore traduite dans la langue sélectionnée. Vous avez été redirigé vers la page d’accueil de cette langue."
+    "fallback": "Cette page n’est pas encore traduite dans la langue sélectionnée. Vous avez été redirigé vers la page d’accueil de cette langue.",
+    "documentFallback": "Cette page n’est pas disponible dans la langue choisie. La documentation anglaise de la même version est affichée."
   },
   "it": {
     "notice": "Alla prima visita viene scelto il cinese semplificato o l’inglese in base alla regione dell’indirizzo IP. La scelta manuale di una di queste due lingue viene salvata in questo browser.",
-    "fallback": "Questa pagina non è ancora tradotta nella lingua selezionata. Sei stato reindirizzato alla pagina iniziale di quella lingua."
+    "fallback": "Questa pagina non è ancora tradotta nella lingua selezionata. Sei stato reindirizzato alla pagina iniziale di quella lingua.",
+    "documentFallback": "Questa pagina non è disponibile nella lingua selezionata. Viene mostrata la documentazione inglese della stessa versione."
   },
   "ja": {
     "notice": "初回アクセスでは IP アドレスの地域に応じて簡体字中国語または英語を表示します。この 2 言語を手動で選択した場合は、その設定をこのブラウザーに保存します。",
-    "fallback": "このページには、選択した言語の翻訳がまだありません。その言語のホームページに戻りました。"
+    "fallback": "このページには、選択した言語の翻訳がまだありません。その言語のホームページに戻りました。",
+    "documentFallback": "このページには選択した言語の翻訳がありません。同じバージョンの英語ドキュメントを表示しています。"
   },
   "ko": {
     "notice": "첫 방문 시 IP 주소의 지역에 따라 중국어 간체 또는 영어를 선택합니다. 이 두 언어 중 하나를 직접 선택하면 해당 선택을 이 브라우저에 저장합니다.",
-    "fallback": "이 페이지에는 아직 선택한 언어의 번역이 없습니다. 해당 언어의 홈페이지로 돌아왔습니다."
+    "fallback": "이 페이지에는 아직 선택한 언어의 번역이 없습니다. 해당 언어의 홈페이지로 돌아왔습니다.",
+    "documentFallback": "이 페이지는 선택한 언어로 제공되지 않습니다. 같은 버전의 영어 문서를 표시합니다."
   },
   "pl": {
     "notice": "Podczas pierwszej wizyty region adresu IP decyduje o wyborze chińskiego uproszczonego lub angielskiego. Ręczny wybór jednego z tych dwóch języków jest zapisywany w tej przeglądarce.",
-    "fallback": "Ta strona nie została jeszcze przetłumaczona na wybrany język. Nastąpił powrót na stronę główną w tym języku."
+    "fallback": "Ta strona nie została jeszcze przetłumaczona na wybrany język. Nastąpił powrót na stronę główną w tym języku.",
+    "documentFallback": "Ta strona nie jest dostępna w wybranym języku. Wyświetlana jest angielska dokumentacja tej samej wersji."
   },
   "pt": {
     "notice": "Na primeira visita, o idioma é definido como chinês simplificado ou inglês conforme a região do IP. A escolha manual de um desses dois idiomas é salva neste navegador.",
-    "fallback": "Esta página ainda não foi traduzida para o idioma selecionado. Você voltou à página inicial desse idioma."
+    "fallback": "Esta página ainda não foi traduzida para o idioma selecionado. Você voltou à página inicial desse idioma.",
+    "documentFallback": "Esta página não está disponível no idioma selecionado. É apresentada a documentação em inglês da mesma versão."
   },
   "ro": {
     "notice": "La prima vizită se alege chineza simplificată sau engleza în funcție de regiunea adresei IP. Alegerea manuală a uneia dintre aceste două limbi este salvată în acest browser.",
-    "fallback": "Această pagină nu este încă tradusă în limba selectată. Ai revenit la pagina principală în acea limbă."
+    "fallback": "Această pagină nu este încă tradusă în limba selectată. Ai revenit la pagina principală în acea limbă.",
+    "documentFallback": "Această pagină nu este disponibilă în limba selectată. Este afișată documentația în engleză pentru aceeași versiune."
   },
   "ru": {
     "notice": "При первом посещении упрощённый китайский или английский выбирается по региону IP-адреса. Ручной выбор одного из этих двух языков сохраняется в этом браузере.",
-    "fallback": "Эта страница ещё не переведена на выбранный язык. Выполнен переход на главную страницу на этом языке."
+    "fallback": "Эта страница ещё не переведена на выбранный язык. Выполнен переход на главную страницу на этом языке.",
+    "documentFallback": "Эта страница недоступна на выбранном языке. Показана английская документация той же версии."
   },
   "tr": {
     "notice": "İlk ziyarette IP adresinin bölgesine göre Basitleştirilmiş Çince veya İngilizce seçilir. Bu iki dilden birini elle seçtiğinizde tercihiniz bu tarayıcıya kaydedilir.",
-    "fallback": "Bu sayfa henüz seçtiğiniz dile çevrilmemiş. O dilin ana sayfasına döndünüz."
+    "fallback": "Bu sayfa henüz seçtiğiniz dile çevrilmemiş. O dilin ana sayfasına döndünüz.",
+    "documentFallback": "Bu sayfa seçilen dilde mevcut değil. Aynı sürümün İngilizce belgeleri gösteriliyor."
   },
   "zh-cn": {
     "notice": "首次访问按 IP 所属地区选择简体中文或英文；手动选择这两种语言的偏好保存在本浏览器中。",
-    "fallback": "此页面尚无所选语言译文，已返回该语言首页。"
+    "fallback": "此页面尚无所选语言译文，已返回该语言首页。",
+    "documentFallback": "此页面暂无所选语言的译文，当前显示同版本的英文文档。"
   },
   "zh-tw": {
     "notice": "首次造訪時依 IP 所屬地區選擇簡體中文或英文；手動選擇這兩種語言的偏好會儲存在此瀏覽器中。",
-    "fallback": "此頁面尚無所選語言的譯文，已返回該語言的首頁。"
+    "fallback": "此頁面尚無所選語言的譯文，已返回該語言的首頁。",
+    "documentFallback": "此頁面暫無所選語言的譯文，目前顯示相同版本的英文文件。"
   }
 }

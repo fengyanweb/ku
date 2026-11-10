@@ -2,6 +2,8 @@
 param(
     [switch]$InstallExtension,
     [switch]$CheckOnly,
+    [ValidateNotNullOrEmpty()]
+    [string]$ExistingVsix,
     [Parameter(DontShow = $true)]
     [switch]$ArchiveInternal,
     [Parameter(DontShow = $true)]
@@ -13,7 +15,7 @@ Set-StrictMode -Version Latest
 if ($PSVersionTable.PSVersion.Major -lt 7) { throw "package-release.ps1 requires PowerShell 7 or newer" }
 if ($CheckOnly -and $InstallExtension) { throw "-CheckOnly cannot be combined with -InstallExtension" }
 if ($ArchiveInternal -and $InstallExtension) { throw "archive packaging cannot install the VS Code extension" }
-if ($SelfTest -and ($CheckOnly -or $InstallExtension -or $ArchiveInternal)) { throw "-SelfTest cannot be combined with packaging switches" }
+if ($SelfTest -and ($CheckOnly -or $InstallExtension -or $ArchiveInternal -or $PSBoundParameters.ContainsKey('ExistingVsix'))) { throw "-SelfTest cannot be combined with packaging switches or -ExistingVsix" }
 $utf8 = [Text.UTF8Encoding]::new($false, $true)
 $outputUtf8 = [Text.UTF8Encoding]::new($false, $false)
 $OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
@@ -26,8 +28,15 @@ $script:toolWrapper = $null
 $script:expectedTlsHeaderHash = $null
 $script:expectedRustDependencies = $null
 $releaseConfiguration = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'release-toolchain.json') -Raw -Encoding utf8 | ConvertFrom-Json
-if ($releaseConfiguration.schema -cne 'ku-release-toolchain-v1' -or $releaseConfiguration.toolchain -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Invalid release toolchain configuration' }
-$script:releaseToolchain = [string]$releaseConfiguration.toolchain
+$projectToolchainPath = Join-Path $PSScriptRoot '../rust-toolchain.toml'
+if (Test-Path -LiteralPath (Join-Path $PSScriptRoot '../rust-toolchain')) { throw 'Use the single rust-toolchain.toml configuration' }
+$projectToolchainText = Get-Content -LiteralPath $projectToolchainPath -Raw -Encoding utf8
+$projectToolchainSections = [regex]::Matches($projectToolchainText, '(?ms)^\s*\[toolchain\]\s*(?:#[^\n]*)?\n(.*?)(?=^\s*\[|\z)')
+if ($projectToolchainSections.Count -ne 1) { throw 'Project toolchain requires one toolchain section' }
+$projectToolchainChannels = [regex]::Matches($projectToolchainSections[0].Groups[1].Value, '(?m)^\s*channel\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*(?:#[^\n]*)?$')
+if ($projectToolchainChannels.Count -ne 1 -or [regex]::Matches($projectToolchainSections[0].Groups[1].Value, '(?m)^\s*channel\s*=').Count -ne 1) { throw 'Project toolchain requires one exact stable channel' }
+$script:releaseToolchain = $projectToolchainChannels[0].Groups[1].Value
+if ($releaseConfiguration.schema -cne 'ku-release-toolchain-v1' -or $releaseConfiguration.toolchain -cne $script:releaseToolchain) { throw 'Release toolchain must match rust-toolchain.toml' }
 $script:releasePython = if ($IsWindows) { 'python' } else { 'python3' }
 
 function Get-HostContract {
@@ -1664,6 +1673,11 @@ $cargoText = [IO.File]::ReadAllText($cargoPath, $utf8); $versionMatches = [regex
 if ($versionMatches.Count -lt 1) { throw "cannot read Ku package version" }
 $version = $versionMatches[0].Groups['value'].Value
 if (-not (Test-PathSafeSemVer $version)) { throw "Ku version is not a path-safe SemVer value" }
+if ($ExistingVsix) {
+    $ExistingVsix = [IO.Path]::GetFullPath($ExistingVsix)
+    if (-not (Test-PlainFile $ExistingVsix)) { throw "ExistingVsix must be a plain VSIX file: '$ExistingVsix'" }
+    Assert-Vsix $ExistingVsix $version
+}
 $packageJson = Get-Content -LiteralPath (Join-Path $extensionSource "package.json") -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
 $packageLock = Get-Content -LiteralPath (Join-Path $extensionSource "package-lock.json") -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
 $lockRoot = $packageLock["packages"][""]
@@ -1678,6 +1692,13 @@ if (-not (Test-PlainDirectory $workBase)) { throw "release packaging requires a 
 $workOwner = [Guid]::NewGuid().ToString("N"); $workRoot = New-OwnedDirectory $workBase ".kr-" $workOwner; $wrapper = New-ToolWrapper $workRoot
 $script:releaseWorkRoot = $workRoot; $script:toolWrapper = $wrapper; $script:expectedTlsHeaderHash = (Get-FileHash -LiteralPath $tlsHeaderSource -Algorithm SHA256).Hash.ToLowerInvariant()
 try {
+    $extensionWork = Join-Path $workRoot "extension"
+    $vsixName = "ku-language-$version.vsix"; $vsixPath = Join-Path $extensionWork $vsixName
+    if ($ExistingVsix) {
+        Ensure-PlainDirectory $extensionWork
+        Copy-PlainFile $ExistingVsix $vsixPath 128MB
+        Assert-Vsix $vsixPath $version
+    }
     $rustcOutput = Invoke-CheckedTool "rustc" @("+$script:releaseToolchain", "-vV") $repo $workRoot "rustc" 30000 $wrapper
     if ($rustcOutput -notmatch "(?m)^host: $([regex]::Escape($contract.Target))$") { throw "Publisher Rust host does not match release target '$($contract.Target)'" }
     $script:archiveVerifier = New-NativeTlsArchiveVerifier $repo $workRoot $wrapper
@@ -1690,13 +1711,14 @@ try {
     [void](Invoke-CheckedTool "pwsh" @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $builderPath, "-Target", $contract.Target, "-OutputRoot", $tlsOutputRoot) $repo $workRoot "tls-pack" 600000 $wrapper)
     $tlsPack = Join-Path $tlsOutputRoot $contract.Target
 
-    $extensionWork = Join-Path $workRoot "extension"; Copy-ExtensionSource $extensionSource $extensionWork
-    $nodeVersion = Invoke-CheckedTool "node" @("--version") $extensionWork $workRoot "node-version" 30000 $wrapper
-    if ($nodeVersion.Trim() -notmatch '^v(?<major>[0-9]+)\.[0-9]+\.[0-9]+$' -or [int]$Matches.major -lt 22) { throw "VS Code release packaging requires Node.js 22 or newer; found '$($nodeVersion.Trim())'" }
-    [void](Invoke-CheckedTool "npm" @("ci", "--ignore-scripts", "--no-audit", "--no-fund") $extensionWork $workRoot "npm-ci" 300000 $wrapper)
-    [void](Invoke-CheckedTool "npm" @("test") $extensionWork $workRoot "npm-test" 180000 $wrapper)
-    $vsixName = "ku-language-$version.vsix"; $vsixPath = Join-Path $extensionWork $vsixName
-    [void](Invoke-CheckedTool "npx" @("--no-install", "vsce", "package", "--out", $vsixPath) $extensionWork $workRoot "vsce-package" 300000 $wrapper)
+    if (-not $ExistingVsix) {
+        Copy-ExtensionSource $extensionSource $extensionWork
+        $nodeVersion = Invoke-CheckedTool "node" @("--version") $extensionWork $workRoot "node-version" 30000 $wrapper
+        if ($nodeVersion.Trim() -notmatch '^v(?<major>[0-9]+)\.[0-9]+\.[0-9]+$' -or [int]$Matches.major -lt 22) { throw "VS Code release packaging requires Node.js 22 or newer; found '$($nodeVersion.Trim())'" }
+        [void](Invoke-CheckedTool "npm" @("ci", "--ignore-scripts", "--no-audit", "--no-fund") $extensionWork $workRoot "npm-ci" 300000 $wrapper)
+        [void](Invoke-CheckedTool "npm" @("test") $extensionWork $workRoot "npm-test" 180000 $wrapper)
+        [void](Invoke-CheckedTool "npx" @("--no-install", "vsce", "package", "--out", $vsixPath) $extensionWork $workRoot "vsce-package" 300000 $wrapper)
+    }
 
     $targetRelease = Join-Path $cargoTarget "$($contract.Target)/release"; $candidate = Join-Path $workRoot "bundle"; Ensure-PlainDirectory $candidate
     Copy-ExecutableFile (Join-Path $targetRelease $contract.Executable) (Join-Path $candidate $contract.Executable) 512MB
@@ -1707,9 +1729,15 @@ try {
     Copy-TlsPack $tlsPack (Join-Path $candidate "native-tls/v1/$($contract.Target)") $contract $buildId
     $rustcIdentityPath = Join-Path $workRoot 'publisher-rustc.txt'
     [IO.File]::WriteAllText($rustcIdentityPath, $rustcOutput, $utf8)
+    # Query the actual same-build CLI. The source path is still present here;
+    # metadata creation never substitutes the currently installed daily CLI.
+    $cliIdentity = Invoke-BoundedTool (Join-Path $targetRelease $contract.Executable) @('doctor', '--json') $repo $workRoot 'publisher-cli-identity' 30000 $wrapper
+    if ($cliIdentity.ExitCode -ne 0) { throw "Cannot read the actual CLI build identity: $($cliIdentity.Output)" }
+    $buildIdentityPath = Join-Path $workRoot 'publisher-build-identity.json'
+    [IO.File]::WriteAllText($buildIdentityPath, $cliIdentity.Stdout, $utf8)
     $sourceCommit = (Invoke-CheckedTool 'git' @('rev-parse', 'HEAD') $repo $workRoot 'source-identity' 30000 $wrapper).Trim()
     $manifestTool = Join-Path $repo '.github/scripts/runtime-bundle.py'
-    [void](Invoke-CheckedTool $script:releasePython @('-B', $manifestTool, 'create', '--bundle', $candidate, '--version', $version, '--commit', $sourceCommit, '--target', $contract.Target, '--repo', $repo, '--rustc-version-file', $rustcIdentityPath) $repo $workRoot 'runner-manifest-create' 30000 $wrapper)
+    [void](Invoke-CheckedTool $script:releasePython @('-B', $manifestTool, 'create', '--bundle', $candidate, '--version', $version, '--commit', $sourceCommit, '--target', $contract.Target, '--repo', $repo, '--rustc-version-file', $rustcIdentityPath, '--build-identity-file', $buildIdentityPath) $repo $workRoot 'runner-manifest-create' 30000 $wrapper)
     Assert-Bundle $candidate $contract $version $buildId
     Test-PackagedRunnerConsumer $candidate $contract $workRoot $wrapper
     Test-PackagedTlsConsumer $candidate $contract $workRoot $wrapper

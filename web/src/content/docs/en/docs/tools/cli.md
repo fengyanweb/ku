@@ -1,7 +1,7 @@
 ---
 title: 'Command-line tools'
 description: 'Ku commands, complete shorthand reference, option scope and Runner requirements.'
-kuVersion: '0.0.19'
+kuVersion: '0.0.20'
 verifiedAt: '2026-10-30'
 sources: ['src/cli.rs', 'docs/package.md', 'docs/process-execution.md']
 ---

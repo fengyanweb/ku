@@ -6580,15 +6580,14 @@ impl Checker {
                 captured.http_callable_body_uncertain |=
                     binding.closure_provenance.http_callable_body_uncertain;
                 (params.clone(), body.clone(), *body_id, captured)
-            } else if let Some(function) = self.functions.get(name) {
+            } else {
+                let function = self.functions.get(name)?;
                 (
                     function.value_params.clone(),
                     function.body.clone(),
                     function.body_id,
                     ClosureProvenance::empty(),
                 )
-            } else {
-                return None;
             };
         if body.is_empty() {
             return None;

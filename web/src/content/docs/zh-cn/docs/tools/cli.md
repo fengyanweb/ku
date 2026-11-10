@@ -1,7 +1,7 @@
 ---
 title: '命令行工具'
 description: 'Ku 常用命令、完整简写、参数作用域与 Runner 构建依赖。'
-kuVersion: '0.0.19'
+kuVersion: '0.0.20'
 verifiedAt: '2026-10-30'
 sources: ['src/cli.rs', 'docs/package.md', 'docs/process-execution.md']
 ---

@@ -1,18 +1,19 @@
 ---
-title: 플랫폼 및 백엔드 지원
-description: Ku 릴리스 플랫폼, 인터프리터, 러너, 네이티브 C, Task 부분집합, LLVM 지원의 차이.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: '플랫폼 및 백엔드 지원'
+description: 'Ku 릴리스 플랫폼, 인터프리터, 러너, 네이티브 C, Task 부분집합, LLVM 지원의 차이.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - docs/syntax.md
-  - docs/v0.0.18.md
-  - docs/v0.0.18-worklog.md
-  - docs/protocol-foundation.md
-  - .github/workflows/native-three-os.yml
+  [
+    'docs/syntax.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-worklog.md',
+    'docs/protocol-foundation.md',
+    '.github/workflows/native-three-os.yml',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: ko/v0.0.18/docs/support
 ---
-
-이 문서는 실험적 사전 릴리스 v0.0.18의 확정된 범위를 설명합니다. 실제 공개 상태와 다운로드는 GitHub Releases에서 확인하세요.
 
 ## 공개된 CLI 플랫폼
 
@@ -20,7 +21,7 @@ v0.0.18 실험적 사전 릴리스는 Windows x64(MSVC), Linux x64(GNU), macOS a
 
 ## 실행 경로
 
-| 기능                                      | 인터프리터 `ku run`         | 기본 `ku build` 러너              | 동기 네이티브 C                   | 개발 네이티브 Task                        | LLVM 텍스트 프로토타입 |
+| 기능                                      | 인터프리터 `ku run`         | 기본 `ku build` 러너              | 동기 네이티브 C                   | 네이티브 Task (부분집합)                  | LLVM 텍스트 프로토타입 |
 | ----------------------------------------- | --------------------------- | --------------------------------- | --------------------------------- | ----------------------------------------- | ---------------------- |
 | 기본 언어, 함수, 제어 흐름                | 구현됨                      | 인터프리터 경로                   | 부분집합 구현                     | 제한된 타입 부분집합                      | 제한된 프로토타입      |
 | JSON                                      | 지원                        | 지원                              | 지원                              | 미지원                                    | 미지원                 |
@@ -33,9 +34,9 @@ v0.0.18 실험적 사전 릴리스는 Windows x64(MSVC), Linux x64(GNU), macOS a
 
 ## 네이티브 Task 부분집합
 
-현재 개발 브랜치에는 제한된 `async fn main(): null!` 소스 경로가 있습니다. 명시된 기본 타입, 문자열, 평탄 배열, 단일 계층 Result, Task 시작/이동/await, 일부 제어 흐름, 제한된 파일/디렉터리 백그라운드 작업을 포함합니다. 공개된 v0.0.18 패키지의 완전한 async 백엔드가 아닙니다.
+이 릴리스는 제한된 네이티브 C 경로 `async fn main(): null!`을 포함합니다. 명시된 기본형, 문자열, 평면 배열, 단일 계층 Results, Task 시작/이동/await, 일부 제어 흐름과 제한된 파일/디렉터리 백그라운드 작업을 지원합니다. 로컬 TCP/TLS는 고정 blocking pool을 사용합니다. 범용 네트워크 readiness나 완전한 M:N은 아닙니다. 정확한 범위는 이 버전의 동시성 문서를 참조하세요.
 
-범용 Task 네트워크 대기, 완전한 M:N 실행, 임의의 동적 힙 조합, 모든 비동기 캡처/함수 조합, 완전한 장시간 연속 부하 검증은 아직 미완료입니다. 정확한 허용 및 거부 부분집합은 [동시성 계약](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md)을 참고하세요.
+범용 Task 네트워크 대기, 완전한 M:N 실행, 임의의 동적 힙 조합, 모든 비동기 캡처/함수 조합, 완전한 장시간 연속 부하 검증은 아직 미완료입니다. 정확한 허용 및 거부 부분집합은 [동시성 계약](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/concurrency.md)을 참고하세요.
 
 ## 데이터베이스 및 네트워크 제한
 
@@ -47,35 +48,27 @@ Redis는 평문 TCP를 사용합니다. MySQL은 Oracle/MariaDB에서 일관된 
 
 Ku의 셀프 호스팅 렉서와 파서는 한정된 부분집합과 차등 검사를 갖습니다. 완전한 셀프 호스팅 파서, 검사기, IR, 백엔드는 아직 미완료이며 Rust가 계속 부트스트랩 도구 모음을 제공합니다. 0.0.x 버전은 소스나 생성 C/FFI ABI 호환성을 약속하지 않습니다.
 
-작업 로그와 과거 CI 결과가 입증하는 것은 명시된 범위와 커밋뿐입니다. [릴리스 노트](/ko/v0.0.18/releases/)로 공개된 변경과 개발 작업을 구분하세요. 이 웹사이트는 현재 브랜치의 모든 CI, 프로덕션 워크로드, 데이터베이스 검증을 통과했다고 보고하지 않습니다.
+## v0.0.18 범위와 제한
 
-> v0.0.18 추가 정보는 현재 영어로 제공하며 기존 번역은 유지합니다. [English](/en/v0.0.18/docs/support/) · [简体中文](/zh-cn/v0.0.18/docs/support/)
+- JSON: `encode`/`decode`는 `stringify`/`parse`와 같으며 `1e20` 왕복 수정을 포함합니다.
+- 네이티브 Task는 명시한 제한 부분집합이며 종료 수용·정리 수정이 완전한 M:N이나 범용 네트워크 대기를 의미하지 않습니다.
+- HTTP는 제한된 socket readiness, 큐, 응답, keep-alive와 선택적인 제한 진단을 제공하지만 모든 부하 인수 완료는 아닙니다.
+- `ku supervise`는 전체 프로그램 worker, 수용, 큐 바이트, 출력과 정리를 관리합니다. 요청이나 Task마다 worker를 두거나 일반 `ku run`에 자동 적용하지 않습니다.
 
-## v0.0.18 release scope and known limits
+**알려진 HTTP 문제:** HTTP 504 오류가 간헐적으로 발생할 수 있습니다. 원인은 아직 확인되지 않았습니다.
 
-This release freezes already implemented and verified functionality. It remains an **experimental prerelease**, not a production-readiness claim. [The v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) is the authority for actual publication, assets and checksums; a skipped publishing job is not release evidence.
+### 프로세스 메모리 경계
 
-- JSON keeps the previous implementation as its default. `json.encode` / `json.decode` share the `stringify` / `parse` entry points. The float round-trip correction for `1e20` is included; yyjson replacement and performance exploration have ended.
-- Task/native async support remains the documented bounded subset. Shutdown admission and cleanup fixes do not imply a complete M:N runtime or universal network suspension.
-- HTTP uses bounded socket readiness, queues and response handling, with keep-alive support and optional bounded diagnostic records. These changes do not imply that all workload acceptance has passed.
-- `ku supervise` controls whole-program workers, admission, queue bytes, output and cleanup. It is not one worker per HTTP request or per Task, and it is not automatically applied to ordinary `ku run`.
+| 프로세스 메모리 경계 | `ku supervise`                                                                                                                                                                                                                   |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux                | cgroup v2 커널 계상 메모리입니다. 쓰기 가능하고 위임된 domain root와 `memory`, `pids`, `memory.max`, `memory.swap.max`, `memory.oom.group`, `pids.max`, `cgroup.kill`이 필요합니다. 권한이나 제어가 없으면 실행 전에 거부합니다. |
+| Windows              | 중첩 Job Objects가 개별 worker와 그룹의 커밋된 가상 메모리를 제한하며 RSS가 아닙니다. 중단된 앱 스레드를 풀기 전 초기 commit을 확인하고 호스트 정책이 Job 할당을 거부할 수 있습니다.                                             |
+| macOS                | 이 격리를 네이티브 지원하지 않아 시작 전에 거부합니다. 필요하면 올바른 Linux 호스트나 VM을 사용하세요. 자동 VM 전달은 없습니다.                                                                                                  |
 
-**Known HTTP issue:** HTTP 504 occurred historically, including a seven-request cluster. This round's 60-second and 180-second short tests did not reproduce it. The root cause is unconfirmed, and formal 30-minute stability acceptance has not passed. It is retained as a known issue for v0.0.18 and is not a separate release blocker. The earliest three historical 504s lack enough evidence for a unique reconstruction. Do not describe the issue as repaired or long-term stability as accepted.
+worker 자원 영역은 Ku와 외부 라이브러리 할당을 계상합니다. Linux cgroup과 Windows commit은 다른 지표입니다. `memory.max`는 순간 초과를 허용할 수 있으며 모든 물리 메모리의 항상 절대 상한을 보장하지 않습니다.
 
-**Deferred, not completed:** complete M:N, general Task network scheduling, the complete database platform matrix, and further long-running workload acceptance belong to later versions. General value copy/release follow-up and AST analysis remain paused. No unrelated memory-limit validation is being repeated.
+조정기 자체는 OS 하드 메모리 제한이 없고 예약·수용 장부도 정확한 RSS가 아닙니다. Task 전체 heap을 정밀 측정하지 않으며 공유 풀, 캐시, 라이브러리를 Task별 정확히 배분할 수 없습니다. 외부 DB, 호스트/VM, 컴파일러와 일반 `ku run`은 worker 한도의 자동 대상이 아닙니다.
 
-### Process memory boundary
+OS가 worker를 종료하면 실패를 보고하고 정리 확인 후에만 예약을 반환합니다. 일부 할당은 사전 실패할 수 있지만 외부 라이브러리 메모리 고갈이 보통 Result가 되지는 않을 수 있습니다. **DB 작업은 자동 재시도하지 않습니다**. worker 종료는 rollback의 증거가 아니며 부작용은 미확인일 수 있습니다.
 
-| Host | `ku supervise` guarantee and prerequisite |
-| --- | --- |
-| Linux | cgroup v2 kernel charged memory; a writable, delegated domain root with `memory` and `pids` enabled is required. Required interfaces include `memory.max`, `memory.swap.max`, `memory.oom.group`, `pids.max` and `cgroup.kill`. Missing controls or permissions cause refusal before application execution. |
-| Windows | Nested Job Object limits for individual workers and the worker group, measured as committed virtual memory, not RSS. Initial process commit is checked before its suspended application thread is released. Host policy can reject Job assignment. |
-| macOS | This isolation mode is not supported natively and is explicitly rejected before starting the application. Use a suitably configured Linux host/VM when required; there is no automatic VM bridge. |
-
-Worker accounting covers applicable Ku and third-party library allocations in that worker's resource domain. Linux cgroup accounting and Windows commit are different metrics. Linux `memory.max` may permit transient overshoot; these mechanisms do not promise an absolute ceiling on all physical memory at every instant.
-
-The coordinator itself has no OS memory hard limit. Its bounded admission/control reserve is an accounting policy, not a coordinator RSS limit. A single Task's entire heap is not precisely metered; shared connection pools, caches and library allocations cannot be exactly attributed to each Task. External databases, the host/VM and build compilers lie outside the worker domain.
-
-When an OS limit terminates a worker, the coordinator reports failure and only returns reserved capacity after confirmed cleanup. Some allocation failures can be reported before allocation, but third-party exhaustion is not guaranteed to become an ordinary Result. **Database operations are never automatically retried**; an exited worker does not prove rollback, and side effects may be unknown.
-
-See the [process execution contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/process-execution.md), [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md) and [HTTP acceptance record](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/http-stability-acceptance.md). Cross-platform CI and installation checks establish only their reported targets and scope, not a completed real-database matrix.
+[`ku supervise`](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/process-execution.md) · [Task](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/concurrency.md) · [HTTP 504](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/http-stability-acceptance.md)

@@ -1,0 +1,15 @@
+{
+  "sidebar": [
+    {
+      "label": "0.0.17",
+      "items": [
+        {
+          "autogenerate": {
+            "directory": ""
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": []
+}

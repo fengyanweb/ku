@@ -2,9 +2,14 @@ name: Native three-OS gate
 
 on:
   push:
+    tags-ignore: ['**']
   pull_request:
   workflow_dispatch:
     inputs:
+      candidate_tag:
+        description: 'Optional unique ku-vVERSION-candidate-SHA12-NONCE draft; full scope only'
+        type: string
+        default: ''
       scope:
         description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
         type: choice
@@ -63,9 +68,14 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
-          rustup component add rustfmt clippy --toolchain 1.89.0
+          if [ "$RUNNER_OS" = Windows ]; then
+            toolchain="$(python -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          else
+            toolchain="$(python3 -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          fi
+          rustup toolchain install "$toolchain" --no-self-update
+          rustup default "$toolchain"
+          rustup component add rustfmt clippy --toolchain "$toolchain"
           rustc --version --verbose
 
       - name: Check Rust formatting
@@ -81,8 +91,6 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: editors/vscode-ku/package-lock.json
 
       - name: Install VS Code extension dependencies from lockfile
         working-directory: editors/vscode-ku
@@ -119,8 +127,13 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          if [ "$RUNNER_OS" = Windows ]; then
+            toolchain="$(python -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          else
+            toolchain="$(python3 -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          fi
+          rustup toolchain install "$toolchain" --no-self-update
+          rustup default "$toolchain"
           clang --version
 
       - name: Verify borrowed lifetimes, checked Task and synchronous arithmetic, source-free cleanup
@@ -171,20 +184,25 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          if [ "$RUNNER_OS" = Windows ]; then
+            toolchain="$(python -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          else
+            toolchain="$(python3 -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          fi
+          rustup toolchain install "$toolchain" --no-self-update
+          rustup default "$toolchain"
 
       - name: Require detector self-test and real Task paths
         shell: bash
         run: python3 -B .github/scripts/task-tsan-gate.py --logs "$RUNNER_TEMP/ku-task-tsan"
 
-      - name: Retain exact toolchain, command and bounded diagnostic evidence
+      - name: Summarize bounded verification evidence without uploading
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: native-task-tsan-evidence
-          path: ${{ runner.temp }}/ku-task-tsan
-          if-no-files-found: error
+        shell: pwsh
+        run: |
+          $python = if ($IsWindows) { 'python' } else { 'python3' }
+          & $python -B .github/scripts/release-transfer.py summary --path "${{ runner.temp }}/ku-task-tsan"
+          if ($LASTEXITCODE) { throw 'Verification evidence summary failed' }
 
   task-main-path:
     if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'task-main-path' || inputs.scope == 'windows-task-main-path')
@@ -211,10 +229,15 @@ jobs:
         run: |
           set -euo pipefail
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          if [ "$RUNNER_OS" = Windows ]; then
+            toolchain="$(python -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          else
+            toolchain="$(python3 -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          fi
+          rustup toolchain install "$toolchain" --no-self-update
+          rustup default "$toolchain"
           if [ "$RUNNER_OS" = Linux ]; then
-            rustup component add rustfmt clippy --toolchain 1.89.0
+            rustup component add rustfmt clippy --toolchain "$toolchain"
           fi
           rustc --version --verbose
           command -v clang
@@ -394,8 +417,13 @@ jobs:
         run: |
           set -euo pipefail
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          if [ "$RUNNER_OS" = Windows ]; then
+            toolchain="$(python -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          else
+            toolchain="$(python3 -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          fi
+          rustup toolchain install "$toolchain" --no-self-update
+          rustup default "$toolchain"
           rustc --version --verbose
           test "$(uname -m)" = aarch64
           command -v clang
@@ -489,8 +517,13 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = aarch64
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update --component llvm-tools-preview
-          rustup default 1.89.0
+          if [ "$RUNNER_OS" = Windows ]; then
+            toolchain="$(python -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          else
+            toolchain="$(python3 -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          fi
+          rustup toolchain install "$toolchain" --no-self-update --component llvm-tools-preview
+          rustup default "$toolchain"
           rustc --version --verbose
 
       - name: Install the fixed Go compiler without dependency cache
@@ -526,14 +559,12 @@ jobs:
           test "$(stat -c %g "$KU_PERFORMANCE_V2_ROOT")" = "$(id -g)"
           go version
 
-      - name: Download the exact optional prior build archive
+      - name: Reject retired Actions-artifact build reuse
         if: inputs.reuse_build_run != ''
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: ku-performance-v2-evidence
-          path: ${{ runner.temp }}/ku-reused-build
-          run-id: ${{ inputs.reuse_build_run }}
-          github-token: ${{ github.token }}
+        shell: bash
+        run: |
+          echo 'Actions artifact reuse is retired; keep reuse_build_run empty for a fresh explicitly requested performance scope.' >&2
+          exit 1
 
       - name: Build frozen sources and plans as the benchmark user
         timeout-minutes: 35
@@ -623,16 +654,13 @@ jobs:
           sudo -n chown "$(id -u):$(id -g)" \
             "$KU_PERFORMANCE_V2_ROOT/ku-performance-v2-evidence.tar.gz" "$KU_PERFORMANCE_V2_ROOT/archive.json"
 
-      - name: Retain one short-lived evidence artifact (not a performance pass)
+      - name: Summarize bounded verification evidence without uploading
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ku-performance-v2-evidence
-          path: |
-            ${{ runner.temp }}/ku-performance-v2/ku-performance-v2-evidence.tar.gz
-            ${{ runner.temp }}/ku-performance-v2/archive.json
-          retention-days: 1
-          if-no-files-found: error
+        shell: pwsh
+        run: |
+          $python = if ($IsWindows) { 'python' } else { 'python3' }
+          & $python -B .github/scripts/release-transfer.py summary --path "${{ runner.temp }}/ku-performance-v2/ku-performance-v2-evidence.tar.gz" --path "${{ runner.temp }}/ku-performance-v2/archive.json"
+          if ($LASTEXITCODE) { throw 'Verification evidence summary failed' }
 
   full-tests:
     if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')
@@ -658,9 +686,14 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup component add clippy rustfmt --toolchain 1.89.0
-          rustup default 1.89.0
+          if [ "$RUNNER_OS" = Windows ]; then
+            toolchain="$(python -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          else
+            toolchain="$(python3 -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          fi
+          rustup toolchain install "$toolchain" --no-self-update
+          rustup component add clippy rustfmt --toolchain "$toolchain"
+          rustup default "$toolchain"
           rustc --version --verbose
 
       - name: Prepare exact shared database client link inputs on Linux
@@ -1124,20 +1157,13 @@ jobs:
             Remove-Item -LiteralPath $caddyRoot -Recurse -Force
           }
 
-      - name: Retain resident service and PostgreSQL acceptance evidence
+      - name: Summarize bounded verification evidence without uploading
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: service-lifecycle-${{ matrix.os }}
-          path: |
-            ${{ runner.temp }}/ku-resident-service.json
-            ${{ runner.temp }}/ku-caddy-service.json
-            ${{ runner.temp }}/ku-http-pg-lifecycle.json
-            ${{ runner.temp }}/ku-native-blocking-retirement.json
-            ${{ runner.temp }}/ku-runtime-matrix.json
-            ${{ runner.temp }}/ku-windows-host-task.json
-            ${{ runner.temp }}/ku-service-memory-provider.json
-          if-no-files-found: error
+        shell: pwsh
+        run: |
+          $python = if ($IsWindows) { 'python' } else { 'python3' }
+          & $python -B .github/scripts/release-transfer.py summary --path "${{ runner.temp }}/ku-resident-service.json" --path "${{ runner.temp }}/ku-caddy-service.json" --path "${{ runner.temp }}/ku-http-pg-lifecycle.json" --path "${{ runner.temp }}/ku-native-blocking-retirement.json" --path "${{ runner.temp }}/ku-runtime-matrix.json" --path "${{ runner.temp }}/ku-windows-host-task.json" --path "${{ runner.temp }}/ku-service-memory-provider.json"
+          if ($LASTEXITCODE) { throw 'Verification evidence summary failed' }
 
   mariadb-live:
     if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
@@ -1159,8 +1185,13 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          if [ "$RUNNER_OS" = Windows ]; then
+            toolchain="$(python -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          else
+            toolchain="$(python3 -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          fi
+          rustup toolchain install "$toolchain" --no-self-update
+          rustup default "$toolchain"
 
       - name: Install MariaDB executable and client SDK files without a system instance
         shell: bash
@@ -1251,16 +1282,19 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          if [ "$RUNNER_OS" = Windows ]; then
+            toolchain="$(python -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          else
+            toolchain="$(python3 -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          fi
+          rustup toolchain install "$toolchain" --no-self-update
+          rustup default "$toolchain"
           rustc --version --verbose
 
       - name: Install the release packaging Node runtime
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: editors/vscode-ku/package-lock.json
 
       - name: Record the release packaging Node runtime
         run: |
@@ -1344,8 +1378,13 @@ jobs:
         shell: bash
         run: |
           rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          if [ "$RUNNER_OS" = Windows ]; then
+            toolchain="$(python -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          else
+            toolchain="$(python3 -B .github/scripts/runtime-bundle.py toolchain --repo .)"
+          fi
+          rustup toolchain install "$toolchain" --no-self-update
+          rustup default "$toolchain"
           rustc --version --verbose
 
       - name: Build Ku CLI
@@ -1367,310 +1406,62 @@ jobs:
           --target "${{ matrix.target }}"
           --artifact-dir "${{ runner.temp }}/ku-native-${{ matrix.target }}"
 
-      - name: Upload verified portable native file
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          path: ${{ runner.temp }}/ku-native-${{ matrix.target }}/${{ matrix.artifact }}
-          if-no-files-found: error
-          retention-days: 7
-          archive: false
+      - name: Summarize bounded verification evidence without uploading
+        if: always()
+        shell: pwsh
+        run: |
+          $python = if ($IsWindows) { 'python' } else { 'python3' }
+          & $python -B .github/scripts/release-transfer.py summary --path "${{ runner.temp }}/ku-native-${{ matrix.target }}/${{ matrix.artifact }}"
+          if ($LASTEXITCODE) { throw 'Verification evidence summary failed' }
 
   release-bundle:
-    name: ${{ matrix.target }} release download bundle
-    if: github.event_name == 'push'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-            python: python
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            python: python3
-          - os: macos-15
-            target: aarch64-apple-darwin
-            python: python3
-    env:
-      CARGO_INCREMENTAL: "0"
-      PYTHONDONTWRITEBYTECODE: "1"
-      RUST_BACKTRACE: "1"
-
-    steps:
-      - name: Check out the exact release tag
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Install the configured publisher toolchain
-        shell: pwsh
-        run: |
-          $toolchain = (Get-Content scripts/release-toolchain.json -Raw | ConvertFrom-Json).toolchain
-          rustup toolchain install $toolchain --profile minimal --no-self-update
-          if ($LASTEXITCODE) { throw 'Publisher toolchain installation failed' }
-          "KU_RELEASE_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
-
-      - name: Install the release packaging Node runtime
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: editors/vscode-ku/package-lock.json
-
-      - name: Validate the package version and any release tag
-        id: version
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $version = (Get-Content -LiteralPath editors/vscode-ku/package.json -Raw -Encoding utf8 | ConvertFrom-Json).version
-          if ($version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
-            throw 'The release package version must be canonical SemVer'
-          }
-          $tagPattern = '\Av' + [regex]::Escape($version) + '(?:-r[1-9][0-9]{0,8})?\z'
-          if ($env:GITHUB_REF_TYPE -ceq 'tag' -and $env:GITHUB_REF_NAME -cnotmatch $tagPattern) {
-            throw 'The release tag must match the package version, optionally followed by -rN'
-          }
-          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      - name: Build and verify the actual host bundle
-        shell: pwsh
-        run: >-
-          pwsh -NoLogo -NoProfile -NonInteractive
-          -File scripts/package-release.ps1
-
-      - name: Test the archive exporter on this platform
-        run: ${{ matrix.python }} -B .github/scripts/test-export-release.py
-
-      - name: Export a verified source-free archive and third-party notices
-        shell: pwsh
-        env:
-          RELEASE_VERSION: ${{ steps.version.outputs.value }}
-          RELEASE_TARGET: ${{ matrix.target }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $metadataPath = Join-Path $env:RUNNER_TEMP 'ku-release-cargo-metadata.json'
-          $metadata = & cargo +$env:KU_RELEASE_TOOLCHAIN metadata --locked --format-version 1 --filter-platform $env:RELEASE_TARGET
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot collect locked Cargo dependency metadata' }
-          $metadata | Out-File -FilePath $metadataPath -Encoding utf8
-          $sysroot = & rustc +$env:KU_RELEASE_TOOLCHAIN --print sysroot
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the pinned Rust license materials' }
-          & ${{ matrix.python }} -B .github/scripts/export-release.py `
-            --bundle (Join-Path $env:GITHUB_WORKSPACE "release/$env:RELEASE_TARGET") `
-            --output (Join-Path $env:RUNNER_TEMP 'ku-release-assets') `
-            --repo $env:GITHUB_WORKSPACE --version $env:RELEASE_VERSION `
-            --target $env:RELEASE_TARGET --commit $env:GITHUB_SHA `
-            --metadata $metadataPath --rust-sysroot $sysroot.Trim()
-          if ($LASTEXITCODE -ne 0) { throw 'Release archive validation failed' }
-
-      - name: Upload the verified release files
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ku-release-${{ matrix.target }}
-          path: ${{ runner.temp }}/ku-release-assets/*
-          if-no-files-found: error
-          retention-days: 14
+    name: Same-batch SDK build and installed consumer matrix
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full')
+    uses: ./.github/workflows/cli-runtime-bundle.yml
+    with:
+      candidate_tag: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_tag || '' }}
+    permissions:
+      contents: write
 
   installed-pg:
-    name: ${{ matrix.target }} actual installed CLI PostgreSQL lifecycle
-    if: github.event_name == 'push'
-    needs: [release-bundle]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-            python: python
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            python: python3
-          - os: macos-15
-            target: aarch64-apple-darwin
-            python: python3
-    env:
-      PYTHONDONTWRITEBYTECODE: "1"
-      PYTHONUTF8: "1"
-
-    steps:
-      - name: Check out the exact archive source commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Prepare the existing PostgreSQL fixture tools on Linux
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libpq-dev postgresql
-          source_lib="$(pg_config --libdir)/libpq.so"
-          test -e "$source_lib"
-          private_lib="$(mktemp -d "$RUNNER_TEMP/ku-installed-pg-link-XXXXXXXX")"
-          chmod 700 "$private_lib"
-          ln -s "$source_lib" "$private_lib/libpq.so"
-          printf 'KU_PG_LIB=%s\n' "$private_lib" >> "$GITHUB_ENV"
-          pg_config --version
-
-      - name: Prepare the existing PostgreSQL fixture tools on macOS
-        if: runner.os == 'macOS'
-        shell: bash
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: "1"
-        run: |
-          set -euo pipefail
-          brew install libpq postgresql@17
-          source_lib="$(brew --prefix libpq)/lib/libpq.dylib"
-          test -e "$source_lib"
-          private_lib="$(mktemp -d "$RUNNER_TEMP/ku-installed-pg-link-XXXXXXXX")"
-          chmod 700 "$private_lib"
-          ln -s "$source_lib" "$private_lib/libpq.dylib"
-          printf 'KU_PG_LIB=%s\n' "$private_lib" >> "$GITHUB_ENV"
-          printf '%s\n' "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
-          "$(brew --prefix postgresql@17)/bin/pg_config" --version
-
-      - name: Prepare the existing PostgreSQL fixture tools on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace($env:PGROOT) -or
-              -not [IO.Path]::IsPathFullyQualified($env:PGROOT)) {
-            throw 'The Windows runner did not provide an absolute PGROOT'
-          }
-          $selected = (Resolve-Path -LiteralPath $env:PGROOT).Path
-          $importLibrary = Join-Path $selected 'lib\libpq.lib'
-          $runtimeDirectory = Join-Path $selected 'bin'
-          foreach ($tool in @('pg_config.exe', 'initdb.exe', 'pg_ctl.exe', 'psql.exe', 'libpq.dll')) {
-            if (-not (Test-Path -LiteralPath (Join-Path $runtimeDirectory $tool) -PathType Leaf)) {
-              throw "The selected PostgreSQL install is missing $tool"
-            }
-          }
-          if (-not (Test-Path -LiteralPath $importLibrary -PathType Leaf)) {
-            throw 'The selected PostgreSQL install is missing libpq.lib'
-          }
-          $privateLib = Join-Path $env:RUNNER_TEMP ('ku-installed-pg-link-' + [Guid]::NewGuid().ToString('N'))
-          New-Item -ItemType Directory -Path $privateLib | Out-Null
-          Copy-Item -LiteralPath $importLibrary -Destination (Join-Path $privateLib 'libpq.lib')
-          "KU_PG_LIB=$privateLib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "KU_PG_RUNTIME_DIR=$runtimeDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          $runtimeDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & (Join-Path $runtimeDirectory 'pg_config.exe') --version
-          if ($LASTEXITCODE -ne 0) { throw 'Selected pg_config failed' }
-
-      - name: Verify current-run artifact bytes and installed sync/async PG lifecycles
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $version = (Get-Content -LiteralPath editors/vscode-ku/package.json -Raw -Encoding utf8 | ConvertFrom-Json).version
-          & ${{ matrix.python }} -B .github/scripts/verify-installed-pg.py `
-            --repo $env:GITHUB_WORKSPACE --version $version `
-            --target '${{ matrix.target }}' --commit $env:GITHUB_SHA `
-            --output (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json')
-          if ($LASTEXITCODE -ne 0) { throw 'Actual installed CLI PostgreSQL acceptance failed' }
-
-      - name: Retain bounded installed-archive PG evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: installed-pg-${{ matrix.target }}
-          path: ${{ runner.temp }}/ku-installed-pg*.json
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Remove the owned PostgreSQL import-library link directory
-        if: always()
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if (-not [string]::IsNullOrWhiteSpace($env:KU_PG_LIB)) {
-            $parent = [IO.Path]::GetFullPath((Split-Path -Path $env:KU_PG_LIB -Parent))
-            $expected = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
-            $leaf = Split-Path -Path $env:KU_PG_LIB -Leaf
-            if ($parent -ne $expected -or $leaf -notlike 'ku-installed-pg-link-*') {
-              throw 'Refusing to clean an unowned PostgreSQL import-library path'
-            }
-            Remove-Item -LiteralPath $env:KU_PG_LIB -Recurse -Force
-          }
-
-  verify-release:
-    name: Verify the complete release asset set
-    if: github.event_name == 'push'
+    name: Confirm the installed CLI PostgreSQL matrix
+    if: ${{ always() && needs.release-bundle.result == 'success' }}
     needs: [release-bundle]
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 2
     steps:
-      - name: Check out the release verification script
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Download the three actual release bundle artifacts
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          pattern: ku-release-*
-          path: ${{ runner.temp }}/ku-release-preflight
-          merge-multiple: true
-
-      - name: Verify actual artifacts before creating a release tag
-        shell: bash
+      - name: Require same-job actual installed archive checks on all three platforms
         run: |
-          set -euo pipefail
-          release_tag="$(python3 -c 'import json; print("v" + json.load(open("editors/vscode-ku/package.json", encoding="utf-8"))["version"])')"
-          python3 -B .github/scripts/prepare-release.py \
-            --assets "$RUNNER_TEMP/ku-release-preflight" \
-            --tag "$release_tag" --commit "$GITHUB_SHA" \
-            --repo "$GITHUB_WORKSPACE"
+          echo 'The reusable SDK matrix completed its existing verify-installed-pg.py --assets checks on Windows, Linux and macOS.' >> "$GITHUB_STEP_SUMMARY"
 
-  publish-release:
-    name: Publish all verified release bundles together
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [quality, borrow-sanitizers, task-tsan, full-tests, release-contract, native, release-bundle, verify-release, installed-pg]
+  verify-release:
+    name: Verify all candidate assets after every required gate
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'full' && inputs.candidate_tag != ''
+    needs: [quality, borrow-sanitizers, task-tsan, full-tests, mariadb-live, release-contract, native, release-bundle, installed-pg]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
-      actions: read
     steps:
-      - name: Check out the release notes and verification script
+      - name: Check out the same release verification source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-
-      - name: Download only the three release bundle artifacts
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          pattern: ku-release-*
-          path: ${{ runner.temp }}/ku-publish-assets
-          merge-multiple: true
-
-      - name: Verify exact assets and publish an experimental release
+      - name: Verify six candidate files and attach final checksums without publishing
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
         run: |
           set -euo pipefail
-          python3 -B .github/scripts/prepare-release.py \
-            --assets "$RUNNER_TEMP/ku-publish-assets" \
-            --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" \
-            --repo "$GITHUB_WORKSPACE"
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
-            --title "Ku $GITHUB_REF_NAME（实验预发行版）" \
-            --notes-file "$RUNNER_TEMP/ku-publish-assets/RELEASE-NOTES.md"
-          gh release upload "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            "$RUNNER_TEMP/ku-publish-assets/"*.tar.gz \
-            "$RUNNER_TEMP/ku-publish-assets/"*.manifest.json \
-            "$RUNNER_TEMP/ku-publish-assets/SHA256SUMS"
-          gh release edit "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" --draft=false
+          version="$(python3 -c 'import json; print(json.load(open("editors/vscode-ku/package.json"))["version"])')"
+          assets="$RUNNER_TEMP/ku-candidate-assets"
+          python3 -B .github/scripts/release-transfer.py download \
+            --repository "$GITHUB_REPOSITORY" --candidate-tag "$CANDIDATE_TAG" \
+            --version "$version" --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
+            --directory "$assets"
+          python3 -B .github/scripts/release-transfer.py complete \
+            --repository "$GITHUB_REPOSITORY" --candidate-tag "$CANDIDATE_TAG" \
+            --version "$version" --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
+            --directory "$assets" --repo "$GITHUB_WORKSPACE"
+          echo 'All required checks and the complete actual archive set passed; candidate remains draft. Final tag/publication is a separate authorized action.' >> "$GITHUB_STEP_SUMMARY"

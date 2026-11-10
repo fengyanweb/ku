@@ -1,0 +1,437 @@
+{
+  "date": "2026-10-21",
+  "source_base_commit": "17d0a8a4e36f49ec2622154fb4ebc1867ff4ee00",
+  "tested_source_change": {
+    "path": "src/backend/c_task_adapter.rs",
+    "sha256": "e73c373c54785eef1d653235e0058cb9bf0fc067ed736ce2d59b834dc079608e",
+    "change": "Reject request addresses overlapping owned result buffers before reading the HTTP receipt extension fields."
+  },
+  "environment": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "rust_toolchain": "1.89.0",
+    "c_compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "ku_cc": "clang -fsanitize=address,undefined -fno-omit-frame-pointer -g",
+    "asan_options": "halt_on_error=1",
+    "ubsan_options": "halt_on_error=1:print_stacktrace=1"
+  },
+  "original_failure": {
+    "ci_job": "https://github.com/fengyanweb/ku/actions/runs/39685630202/job/119518840184",
+    "target": "native_task_start_charge_test",
+    "function": "ku_task_2_take_payload",
+    "diagnostic": "AddressSanitizer heap-buffer-overflow READ of size 8",
+    "trigger": "Existing kind-8 rejection fixture passes an owned one-byte string buffer as the request address. The new receipt-field check dereferenced it before the existing deep-alias guard.",
+    "macos_before_fix_reproduced": true,
+    "macos_after_fix_target_passed": true
+  },
+  "full_first_step_gate": {
+    "workflow": ".github/workflows/native-three-os.yml",
+    "job": "borrow-sanitizers",
+    "target_selection": "All 53 --test values from the first run command, extracted directly from the workflow.",
+    "cargo_options": [
+      "+1.89.0",
+      "test",
+      "--offline",
+      "--locked",
+      "--no-fail-fast",
+      "-j2"
+    ],
+    "test_options": [
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 370.016,
+    "targets_completed": 53,
+    "tests_passed": 171,
+    "tests_failed": 0,
+    "tests_ignored": 0,
+    "address_sanitizer_diagnostics": 0,
+    "undefined_behavior_diagnostics": 0,
+    "results": [
+      {
+        "target": "bootstrap_ast_canonical_performance_test",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.63
+      },
+      {
+        "target": "borrow_allocation_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.91
+      },
+      {
+        "target": "borrow_native_test",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.96
+      },
+      {
+        "target": "native_cleanup_catch_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.72
+      },
+      {
+        "target": "native_cleanup_escape_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.93
+      },
+      {
+        "target": "native_closure_cleanup_zero_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.89
+      },
+      {
+        "target": "native_closure_drop_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.75
+      },
+      {
+        "target": "native_error_slot_test",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.83
+      },
+      {
+        "target": "native_first_cleanup_timeout_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.02
+      },
+      {
+        "target": "native_forward_call_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.66
+      },
+      {
+        "target": "native_generic_import_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.46
+      },
+      {
+        "target": "native_generic_test",
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.79
+      },
+      {
+        "target": "native_outer_finally_test",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.69
+      },
+      {
+        "target": "native_sync_aggregate_owners_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.84
+      },
+      {
+        "target": "native_sync_arithmetic_pilot_test",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 2.08
+      },
+      {
+        "target": "native_sync_borrow_arguments_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.77
+      },
+      {
+        "target": "native_sync_integer_matrix_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.65
+      },
+      {
+        "target": "native_sync_map_closure_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.73
+      },
+      {
+        "target": "native_sync_tls_isolation_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.72
+      },
+      {
+        "target": "native_sync_zero_return_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.82
+      },
+      {
+        "target": "native_task_adapter_test",
+        "passed": 12,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 20.41
+      },
+      {
+        "target": "native_task_await_progress_test",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 4.13
+      },
+      {
+        "target": "native_task_cleanup_commit_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.11
+      },
+      {
+        "target": "native_task_cleanup_wait_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.57
+      },
+      {
+        "target": "native_task_control_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.95
+      },
+      {
+        "target": "native_task_driver_test",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 8.51
+      },
+      {
+        "target": "native_task_empty_scope_adapter_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 2.42
+      },
+      {
+        "target": "native_task_exit_bridge_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.24
+      },
+      {
+        "target": "native_task_expression_pending_test",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 10.38
+      },
+      {
+        "target": "native_task_expression_safety_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.22
+      },
+      {
+        "target": "native_task_expression_source_test",
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 21.7
+      },
+      {
+        "target": "native_task_frame_c_test",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 7.45
+      },
+      {
+        "target": "native_task_if_ir_test",
+        "passed": 29,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.16
+      },
+      {
+        "target": "native_task_if_source_test",
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 122.54
+      },
+      {
+        "target": "native_task_integer_test",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.72
+      },
+      {
+        "target": "native_task_join_retry_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.82
+      },
+      {
+        "target": "native_task_math_source_test",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 16.12
+      },
+      {
+        "target": "native_task_publishing_deadline_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.22
+      },
+      {
+        "target": "native_task_receipt_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.16
+      },
+      {
+        "target": "native_task_runtime_deadline_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.52
+      },
+      {
+        "target": "native_task_scope_adapter_test",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 3.59
+      },
+      {
+        "target": "native_task_scope_frame_test",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 7.71
+      },
+      {
+        "target": "native_task_scope_session_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.29
+      },
+      {
+        "target": "native_task_short_circuit_owner_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.25
+      },
+      {
+        "target": "native_task_source_safety_test",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 2.34
+      },
+      {
+        "target": "native_task_source_test",
+        "passed": 16,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 24.44
+      },
+      {
+        "target": "native_task_start_alias_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.4
+      },
+      {
+        "target": "native_task_start_charge_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 13.3
+      },
+      {
+        "target": "native_task_start_failure_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.28
+      },
+      {
+        "target": "native_task_start_parameters_test",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 4.37
+      },
+      {
+        "target": "native_task_wait_test",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 1.29
+      },
+      {
+        "target": "native_template_stream_test",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.87
+      },
+      {
+        "target": "native_temporary_string_method_test",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "seconds": 0.66
+      }
+    ]
+  },
+  "required_asan_compiler_guard": {
+    "target": "borrow_allocation_test",
+    "additional_ku_cc_flag": "-DKU_BORROW_REQUIRE_ASAN",
+    "passed": 1,
+    "failed": 0,
+    "seconds": 2.21
+  },
+  "boundaries": [
+    "This is macOS address/undefined instrumentation, not the Linux LeakSanitizer result. The unchanged Linux detect_leaks=1 CI gate must pass on the final commit.",
+    "The adapter template change alters generated native C, including multiloop_service.ku. A pre-fix sustained run is not final acceptance for this source.",
+    "No broad Value copy/free or AST analysis was performed. No website code was changed."
+  ]
+}

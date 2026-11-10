@@ -1,0 +1,4977 @@
+{
+  "schema_version": 2,
+  "status": "Final Windows Caddy rolling follow-up passed; three-platform supervisor recovery passed. Validation reuses unchanged-component full baseline results; original full and all intermediate failures remain historical failures.",
+  "source": {
+    "head_commit": "a31c1135ca82e3e15c426a2ef522522038ea8735",
+    "head_tree": "626d3a7bd0fedcc981f5d0d7ffd0a32c813999ff",
+    "pr_checkout_merge_commit": "cd49b394267fd2dcdb87b5c7d565314e64340b7e",
+    "pr_checkout_tree_matches_head": true,
+    "src_tree": "450f894e46e8c766fcb306428c39085d70b4e956",
+    "src_tree_matches_9ac5": true,
+    "change_boundary": "Final source includes the captured event-driver repair. Later capture/checkpoint helpers and a Cargo example around existing bounded_process add no dependency; source identity is separate from auxiliary acceptance."
+  },
+  "scope_note": "Current results use one final PR full run. Skipped release/tag and platform-inapplicable steps never count as passed; focused historical follow-ups are explicitly separate. No website publication. No database automatic retry.",
+  "formal_report": "formal-30m-linux.json",
+  "formal_scope_note": "Independent formal run is documented separately; this file does not promote a successful formal run into missing platform checks.",
+  "run": {
+    "id": 39698998227,
+    "event": "pull_request",
+    "status": "completed",
+    "conclusion": "failure",
+    "html_url": "https://github.com/fengyanweb/ku/actions/runs/39698998227",
+    "head_sha": "a31c1135ca82e3e15c426a2ef522522038ea8735",
+    "run_started_at": "2026-10-22T00:19:26Z",
+    "updated_at": "2026-10-22T00:40:49Z",
+    "jobs": [
+      {
+        "job_id": 119563325718,
+        "name": "windows-2025 release scripts and clean CheckOnly",
+        "status": "completed",
+        "conclusion": "success",
+        "passed_steps": [
+          "Record the release packaging Node runtime",
+          "Snapshot the clean checkout including ignored paths",
+          "Exercise bounded release-process and crash-recovery contracts",
+          "Build and validate the archive path without publishing",
+          "Require CheckOnly to leave tracked, untracked and ignored paths unchanged",
+          "Post Install the release packaging Node runtime"
+        ],
+        "failed_steps": [],
+        "skipped_steps": []
+      },
+      {
+        "job_id": 119563325724,
+        "name": "windows-2025 unfiltered workspace test suite",
+        "status": "completed",
+        "conclusion": "failure",
+        "passed_steps": [
+          "Build Ku CLI",
+          "Verify resident deployment budget and rollback contracts",
+          "Build and verify the native TLS target pack",
+          "Require a source-free native TLS C consumer",
+          "Require native PostgreSQL client linking and startup on Windows",
+          "Require native MySQL client linking and startup on Windows",
+          "Reject platform-specific clippy warnings",
+          "Run every default test target without stopping at the first failure",
+          "Verify native scheduler probe correctness, not performance",
+          "Verify resident hard memory provider recovery or explicit platform rejection",
+          "Verify native blocking retirement and resident replacement",
+          "Verify short native runtime matrix with actual bounded blocking regression",
+          "Retain resident service and PostgreSQL acceptance evidence"
+        ],
+        "failed_steps": [
+          "Verify real HTTP to PostgreSQL lifecycle on Windows"
+        ],
+        "skipped_steps": [
+          "Require native PostgreSQL client linking and startup",
+          "Require native MySQL client linking and startup",
+          "Verify focused service and blocking lifecycle regressions",
+          "Verify native resident recovery, rolling and rollback through HAProxy",
+          "Verify real HTTP to PostgreSQL lifecycle",
+          "Verify actual isolated Windows host task registration, recovery and stop"
+        ]
+      },
+      {
+        "job_id": 119563325752,
+        "name": "ubuntu-24.04 unfiltered workspace test suite",
+        "status": "completed",
+        "conclusion": "success",
+        "passed_steps": [
+          "Build Ku CLI",
+          "Verify resident deployment budget and rollback contracts",
+          "Build and verify the native TLS target pack",
+          "Require a source-free native TLS C consumer",
+          "Require native PostgreSQL client linking and startup",
+          "Require native MySQL client linking and startup",
+          "Run every default test target without stopping at the first failure",
+          "Verify native scheduler probe correctness, not performance",
+          "Verify resident hard memory provider recovery or explicit platform rejection",
+          "Verify native blocking retirement and resident replacement",
+          "Verify short native runtime matrix with actual bounded blocking regression",
+          "Verify native resident recovery, rolling and rollback through HAProxy",
+          "Verify real HTTP to PostgreSQL lifecycle",
+          "Retain resident service and PostgreSQL acceptance evidence"
+        ],
+        "failed_steps": [],
+        "skipped_steps": [
+          "Require native PostgreSQL client linking and startup on Windows",
+          "Require native MySQL client linking and startup on Windows",
+          "Reject platform-specific clippy warnings",
+          "Verify focused service and blocking lifecycle regressions",
+          "Verify real HTTP to PostgreSQL lifecycle on Windows",
+          "Verify actual isolated Windows host task registration, recovery and stop"
+        ]
+      },
+      {
+        "job_id": 119563325783,
+        "name": "ubuntu-24.04 release scripts and clean CheckOnly",
+        "status": "completed",
+        "conclusion": "success",
+        "passed_steps": [
+          "Record the release packaging Node runtime",
+          "Snapshot the clean checkout including ignored paths",
+          "Exercise bounded release-process and crash-recovery contracts",
+          "Build and validate the archive path without publishing",
+          "Require CheckOnly to leave tracked, untracked and ignored paths unchanged",
+          "Post Install the release packaging Node runtime"
+        ],
+        "failed_steps": [],
+        "skipped_steps": []
+      },
+      {
+        "job_id": 119563325790,
+        "name": "Native borrow and Task ASan, UBSan and leak checks",
+        "status": "completed",
+        "conclusion": "success",
+        "passed_steps": [
+          "Verify borrowed lifetimes, checked Task and synchronous arithmetic, source-free cleanup",
+          "Verify synchronous HTTP failure isolation under sanitizers",
+          "Verify HTTP lexical capture and owned response regression under sanitizers",
+          "Verify native HTTP async owner, timer and retirement under sanitizers",
+          "Verify native HTTP async TCP owner waits under sanitizers",
+          "Verify scheduler probe rows and actual cancellation reclamation under sanitizers"
+        ],
+        "failed_steps": [],
+        "skipped_steps": []
+      },
+      {
+        "job_id": 119563325803,
+        "name": "x86_64-linux native build and run",
+        "status": "completed",
+        "conclusion": "success",
+        "passed_steps": [
+          "Build Ku CLI",
+          "Test bounded native verification harness",
+          "Test isolated PostgreSQL fixture safety",
+          "Test isolated MySQL fixture safety without database access",
+          "Build and run target-native fixture",
+          "Upload verified portable native file"
+        ],
+        "failed_steps": [],
+        "skipped_steps": []
+      },
+      {
+        "job_id": 119563325805,
+        "name": "macos-15 unfiltered workspace test suite",
+        "status": "completed",
+        "conclusion": "failure",
+        "passed_steps": [
+          "Build Ku CLI",
+          "Verify resident deployment budget and rollback contracts",
+          "Build and verify the native TLS target pack",
+          "Require a source-free native TLS C consumer",
+          "Require native PostgreSQL client linking and startup",
+          "Require native MySQL client linking and startup",
+          "Reject platform-specific clippy warnings",
+          "Run every default test target without stopping at the first failure",
+          "Verify native scheduler probe correctness, not performance",
+          "Verify resident hard memory provider recovery or explicit platform rejection",
+          "Verify native blocking retirement and resident replacement",
+          "Verify short native runtime matrix with actual bounded blocking regression",
+          "Retain resident service and PostgreSQL acceptance evidence"
+        ],
+        "failed_steps": [
+          "Verify native resident recovery, rolling and rollback through HAProxy"
+        ],
+        "skipped_steps": [
+          "Require native PostgreSQL client linking and startup on Windows",
+          "Require native MySQL client linking and startup on Windows",
+          "Verify focused service and blocking lifecycle regressions",
+          "Verify real HTTP to PostgreSQL lifecycle",
+          "Verify real HTTP to PostgreSQL lifecycle on Windows",
+          "Verify actual isolated Windows host task registration, recovery and stop"
+        ]
+      },
+      {
+        "job_id": 119563325819,
+        "name": "x86_64-windows native build and run",
+        "status": "completed",
+        "conclusion": "success",
+        "passed_steps": [
+          "Build Ku CLI",
+          "Test bounded native verification harness",
+          "Test isolated PostgreSQL fixture safety",
+          "Test isolated MySQL fixture safety without database access",
+          "Build and run target-native fixture",
+          "Upload verified portable native file"
+        ],
+        "failed_steps": [],
+        "skipped_steps": []
+      },
+      {
+        "job_id": 119563325867,
+        "name": "aarch64-darwin native build and run",
+        "status": "completed",
+        "conclusion": "success",
+        "passed_steps": [
+          "Build Ku CLI",
+          "Test bounded native verification harness",
+          "Test isolated PostgreSQL fixture safety",
+          "Test isolated MySQL fixture safety without database access",
+          "Build and run target-native fixture",
+          "Upload verified portable native file"
+        ],
+        "failed_steps": [],
+        "skipped_steps": []
+      },
+      {
+        "job_id": 119563325876,
+        "name": "macos-15 release scripts and clean CheckOnly",
+        "status": "completed",
+        "conclusion": "success",
+        "passed_steps": [
+          "Record the release packaging Node runtime",
+          "Snapshot the clean checkout including ignored paths",
+          "Exercise bounded release-process and crash-recovery contracts",
+          "Build and validate the archive path without publishing",
+          "Require CheckOnly to leave tracked, untracked and ignored paths unchanged",
+          "Post Install the release packaging Node runtime"
+        ],
+        "failed_steps": [],
+        "skipped_steps": []
+      },
+      {
+        "job_id": 119563325938,
+        "name": "Rust format, check and clippy",
+        "status": "completed",
+        "conclusion": "success",
+        "passed_steps": [
+          "Check Rust formatting",
+          "Check every workspace Cargo target",
+          "Reject clippy warnings in every workspace Cargo target",
+          "Test VS Code extension models and formatter",
+          "Test release archive validation and license collection",
+          "Post Install the editor test Node runtime"
+        ],
+        "failed_steps": [],
+        "skipped_steps": []
+      },
+      {
+        "job_id": 119563326533,
+        "name": "Linux native Task selected-path ThreadSanitizer gate",
+        "status": "completed",
+        "conclusion": "success",
+        "passed_steps": [
+          "Verify required TSan runner contracts",
+          "Require detector self-test and real Task paths",
+          "Retain exact toolchain, command and bounded diagnostic evidence"
+        ],
+        "failed_steps": [],
+        "skipped_steps": []
+      },
+      {
+        "job_id": 119563326835,
+        "name": "${{ matrix.target }} release download bundle",
+        "status": "completed",
+        "conclusion": "skipped",
+        "passed_steps": [],
+        "failed_steps": [],
+        "skipped_steps": []
+      },
+      {
+        "job_id": 119563327944,
+        "name": "Verify the complete release asset set",
+        "status": "completed",
+        "conclusion": "skipped",
+        "passed_steps": [],
+        "failed_steps": [],
+        "skipped_steps": []
+      },
+      {
+        "job_id": 119570341635,
+        "name": "Publish all verified release bundles together",
+        "status": "completed",
+        "conclusion": "skipped",
+        "passed_steps": [],
+        "failed_steps": [],
+        "skipped_steps": []
+      }
+    ],
+    "job_totals": {
+      "success": 10,
+      "failure": 2,
+      "skipped": 3
+    }
+  },
+  "default_test_step_counts": {
+    "linux": {
+      "scope": "default workspace test step only",
+      "test_result_blocks": 129,
+      "passed": 2007,
+      "failed": 0,
+      "ignored": 7,
+      "ignored_tests": [
+        "registry_server::tests::registry_tls_concurrency_keep_alive_and_overload_load_gate",
+        "runtime::task::tests::million_concurrent_demand_stress_report",
+        "native_mysql_client_live_linux_loopback_roundtrip",
+        "native_mysql_client_live_loopback_roundtrip",
+        "native_pg_query_poller_live_loopback_roundtrip",
+        "native_redis_live_loopback_acl_and_binary_roundtrip",
+        "native_task_tsan_instrumentation_and_runtime_probe"
+      ],
+      "python_contract_suites": [
+        {
+          "discovered": 11,
+          "result": "OK (skipped=1)",
+          "skipped": 1
+        },
+        {
+          "discovered": 19,
+          "result": "OK (skipped=3)",
+          "skipped": 3
+        }
+      ]
+    },
+    "macos": {
+      "scope": "default workspace test step only",
+      "test_result_blocks": 129,
+      "passed": 2007,
+      "failed": 0,
+      "ignored": 7,
+      "ignored_tests": [
+        "registry_server::tests::registry_tls_concurrency_keep_alive_and_overload_load_gate",
+        "runtime::task::tests::million_concurrent_demand_stress_report",
+        "native_mysql_client_live_loopback_roundtrip",
+        "native_mysql_client_live_macos_loopback_roundtrip",
+        "native_pg_query_poller_live_loopback_roundtrip",
+        "native_redis_live_loopback_acl_and_binary_roundtrip",
+        "native_task_tsan_instrumentation_and_runtime_probe"
+      ],
+      "python_contract_suites": [
+        {
+          "discovered": 11,
+          "result": "OK (skipped=1)",
+          "skipped": 1
+        },
+        {
+          "discovered": 19,
+          "result": "OK (skipped=3)",
+          "skipped": 3
+        }
+      ]
+    },
+    "windows": {
+      "scope": "default workspace test step only",
+      "test_result_blocks": 129,
+      "passed": 2001,
+      "failed": 0,
+      "ignored": 6,
+      "ignored_tests": [
+        "registry_server::tests::registry_tls_concurrency_keep_alive_and_overload_load_gate",
+        "runtime::task::tests::million_concurrent_demand_stress_report",
+        "native_mysql_client_live_loopback_roundtrip",
+        "native_pg_query_poller_live_loopback_roundtrip",
+        "native_redis_live_loopback_acl_and_binary_roundtrip",
+        "native_task_tsan_instrumentation_and_runtime_probe"
+      ],
+      "python_contract_suites": [
+        {
+          "discovered": 11,
+          "result": "OK",
+          "skipped": 0
+        },
+        {
+          "discovered": 19,
+          "result": "OK",
+          "skipped": 0
+        }
+      ]
+    }
+  },
+  "detector_counts": {
+    "asan_first_step": {
+      "scope": "first ASan/UBSan/leak step with the 53 explicitly selected targets",
+      "test_result_blocks": 53,
+      "passed": 171,
+      "failed": 0,
+      "ignored": 0,
+      "selected_target_count": 53
+    }
+  },
+  "artifacts": [
+    {
+      "id": 12393405031,
+      "name": "service-lifecycle-windows-2025",
+      "size_in_bytes": 39623,
+      "digest": "sha256:1140425dc5cc313a3ab6a4533a784f55a4a4e7747387bd4079c876f2b75e675d",
+      "expired": false,
+      "local_archive_directory": "final-ci-a31c113-windows",
+      "zip_sha256": "1140425dc5cc313a3ab6a4533a784f55a4a4e7747387bd4079c876f2b75e675d",
+      "download_integrity": "ZIP CRC checked"
+    },
+    {
+      "id": 12392605767,
+      "name": "native-task-tsan-evidence",
+      "size_in_bytes": 19510,
+      "digest": "sha256:0e80b8d928c9593f4b93cf570de986b8f0d8727fb0cbf7c569f9aff47231188f",
+      "expired": false
+    },
+    {
+      "id": 12392186465,
+      "name": "native_ci-aarch64-darwin.tar",
+      "size_in_bytes": 92160,
+      "digest": "sha256:e017505e73e28f6c57ad2e1e634702f82f9e57b124dd30030e088e55c92b92e2",
+      "expired": false
+    },
+    {
+      "id": 12392118194,
+      "name": "service-lifecycle-ubuntu-24.04",
+      "size_in_bytes": 27487,
+      "digest": "sha256:7c6f06685cd3249160a5bd205b8638a824b12cbabe4b39e98b561fc6c199c549",
+      "expired": false,
+      "local_archive_directory": "final-ci-a31c113-linux",
+      "zip_sha256": "7c6f06685cd3249160a5bd205b8638a824b12cbabe4b39e98b561fc6c199c549",
+      "download_integrity": "ZIP CRC checked"
+    },
+    {
+      "id": 12392076417,
+      "name": "native_ci-x86_64-windows.exe",
+      "size_in_bytes": 203264,
+      "digest": "sha256:234aa3d85da0527b9e64c4a8e6ebf9c77bf09fba89d8bd6e590aef3e985dfaaf",
+      "expired": false
+    },
+    {
+      "id": 12391724613,
+      "name": "service-lifecycle-macos-15",
+      "size_in_bytes": 26138,
+      "digest": "sha256:988aa4d0d853b782c8a2689eda5447d7ea42e41d4c34595b682cc97db7d1ffee",
+      "expired": false,
+      "local_archive_directory": "final-ci-a31c113-macos",
+      "zip_sha256": "988aa4d0d853b782c8a2689eda5447d7ea42e41d4c34595b682cc97db7d1ffee",
+      "download_integrity": "ZIP CRC checked"
+    },
+    {
+      "id": 12390739967,
+      "name": "native_ci-x86_64-linux.tar",
+      "size_in_bytes": 71680,
+      "digest": "sha256:ab9dbe264fd9226e7a1670d947a62b1ad7b83ff0fe9a8114b07dc61a4540af6d",
+      "expired": false
+    }
+  ],
+  "reports": [
+    {
+      "file": "ku-http-pg-lifecycle.json",
+      "archive_directory": "final-ci-a31c113-linux",
+      "sha256": "6f3178bbb695e4881694d283a00214e29602bf1a2e353b3fae1a2d055f9acff4",
+      "platform": "Linux",
+      "status": "passed",
+      "cli_sha256": "bd5dc30a225f5dcd2558fe2bcad4c372ab08caa7986f741f9e2f0a5748655be2",
+      "fixture_sha256": "a864b30eb59e4d5ff94a347ca2304011803e53a3b213894395eb004d2b64f2af",
+      "cleanup_errors": [],
+      "event_loops": 4,
+      "parameters": {
+        "blocking_threads": 8,
+        "database_connections": 4,
+        "native_c_profile": "debug",
+        "database_waiters": 8,
+        "database_pending_bytes": 1048576,
+        "acquire_timeout_ms": 100,
+        "query_timeout_ms": 150,
+        "handler_timeout_ms": 2000,
+        "fault_recovery_deadline_seconds": 5,
+        "http_client_connection_policy": "one connection per isolated fault request",
+        "database_transport": "private Python fault proxy, capacity eight connections",
+        "tls": "disabled only inside isolated loopback fixture"
+      },
+      "checks": {
+        "parameters_fields_unicode_null": "passed",
+        "write_side_effect": "exactly one row",
+        "large_result": "10000 rows, 2 columns, last row verified",
+        "timeout_and_new_request_recovery": "error:execution_unknown",
+        "commit_acknowledgement_lost": {
+          "reported": "error:execution_unknown",
+          "actual_rows": 1,
+          "replayed": false
+        },
+        "database_disconnect_recovery": {
+          "first": "error:execution_unknown",
+          "next": "passed"
+        },
+        "bounded_dependency_pressure_recovery": {
+          "error:acquire_timeout": 6,
+          "error:execution_unknown": 6
+        },
+        "cancel_confirmed_and_local_charge_retired": 7,
+        "normal_drain_exit": 0,
+        "database_connections_after_exit": 0
+      },
+      "postgres_version": "16.15 (Ubuntu 16.15-1.pgdg24.04+2)",
+      "build_seconds": 0.41645301799997014,
+      "current_phase": "fixture:finished",
+      "phase_details": {},
+      "database_connections_after_dependency_pressure": 1,
+      "database_connections_before_exit": 1
+    },
+    {
+      "file": "ku-native-blocking-retirement.json",
+      "archive_directory": "final-ci-a31c113-linux",
+      "sha256": "156a83017940a0ecaa5192e03d8c96c5769f634dac413b93939cbfb8e67282b8",
+      "kind": "native-blocking-service-retirement",
+      "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+      "status": "passed",
+      "cli_sha256": "bd5dc30a225f5dcd2558fe2bcad4c372ab08caa7986f741f9e2f0a5748655be2",
+      "native_sha256": "a15568f61a6c9adef0b27f3fdaadf64b8c8e65d27d34113d5cef1b2b4ff186e7",
+      "cleanup_errors": [],
+      "plan": {
+        "handler_timeout_ms": 1000,
+        "native_cleanup_grace_ms": 1000,
+        "native_drain_timeout_ms": 200,
+        "supervisor_drain_timeout_ms": 1500,
+        "replacement_ready_deadline_seconds": 10,
+        "event_loops": 4,
+        "blocking_threads": 5,
+        "held_requests": 1,
+        "surviving_instance_requests": 10
+      },
+      "held_http_status": "HTTP/1.1 504 Gateway Timeout",
+      "held_http_response_ms": 1000.567,
+      "first_not_ready_ms": 2277.813,
+      "replacement_ready_ms": 2701.729,
+      "duration_seconds": 3.616,
+      "replacement_status": {
+        "phase": "ready",
+        "generation": 2,
+        "last_reason": "runtime_unfinished_work",
+        "last_exit_code": 75,
+        "unfinished_work_possible": true,
+        "database_outcome": "unknown",
+        "database_retry": false
+      },
+      "surviving_instance_successes": 10
+    },
+    {
+      "file": "ku-resident-service.json",
+      "archive_directory": "final-ci-a31c113-linux",
+      "sha256": "d85fc0cf586effabb749cf059e8e9eab7d00f28eac81fa762da58ccd99e66e81",
+      "kind": "resident-service-acceptance",
+      "platform": "Linux",
+      "passed": true,
+      "cli_sha256": "bd5dc30a225f5dcd2558fe2bcad4c372ab08caa7986f741f9e2f0a5748655be2",
+      "cleanup_errors": [],
+      "parameters": {
+        "service_options": {
+          "startup_timeout_ms": 5000,
+          "probe_timeout_ms": 100,
+          "probe_interval_ms": 100,
+          "failure_threshold": 3,
+          "drain_timeout_ms": 1000,
+          "restart_limit": 5,
+          "restart_window_ms": 60000,
+          "backoff_ms": 100,
+          "max_backoff_ms": 5000
+        },
+        "deployment_budget": {
+          "max_parallel_instances": 3,
+          "reserved_memory_bytes": 1610612736,
+          "event_threads": 12,
+          "blocking_threads": 12,
+          "database_connections": 24,
+          "database_waiters": 96,
+          "database_pending_bytes": 3145728,
+          "total_threads": 53,
+          "management_threads": 2,
+          "supervisor_reserve_bytes": 33554432,
+          "thread_stack_bytes": 2097152,
+          "per_instance": {
+            "reserved_memory_bytes": 536870912,
+            "event_threads": 4,
+            "blocking_threads": 4,
+            "database_connections": 8,
+            "database_waiters": 32,
+            "database_pending_bytes": 1048576,
+            "total_threads": 17
+          }
+        },
+        "recovery_deadline_seconds": 10,
+        "operation_timeout_seconds": 15,
+        "proxy_threads": 1,
+        "tls": "loopback HTTP only; no TLS in this isolated fixture"
+      },
+      "results": {
+        "proxy_config": "passed",
+        "normal_proxy": "passed",
+        "native_exit_recovery": {
+          "passed": true,
+          "recovery_ms": 242.138,
+          "old_generation": 1,
+          "new_generation": 2,
+          "surviving_requests": 10
+        },
+        "rolling": {
+          "passed": true,
+          "duration_ms": 526.347,
+          "deployment": {
+            "old_slot": "a",
+            "new_slot": "spare"
+          }
+        },
+        "rollback": {
+          "passed": true,
+          "duration_ms": 489.209,
+          "verified_proxy_requests": 20
+        }
+      },
+      "complete_runtime_acceptance": false,
+      "duration_seconds": 2.526,
+      "haproxy_version": "HAProxy version 2.8.16-0ubuntu0.24.04.3 2026/06/19 - https://haproxy.org/",
+      "steady_resource_snapshot": {
+        "process_count": 8,
+        "thread_count": 32,
+        "sum_rss_bytes": 78061568,
+        "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit"
+      },
+      "rolling_resource_snapshot": {
+        "process_count": 11,
+        "thread_count": 47,
+        "sum_rss_bytes": 89415680,
+        "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit"
+      }
+    },
+    {
+      "file": "ku-runtime-matrix.json",
+      "archive_directory": "final-ci-a31c113-linux",
+      "sha256": "b3c68444ab4622c470d28fcf4f31d7c8a63f45f1337591ba171c80b8bedd9cf1",
+      "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+      "status": "passed",
+      "cli_sha256": "bd5dc30a225f5dcd2558fe2bcad4c372ab08caa7986f741f9e2f0a5748655be2",
+      "native_sha256": "4c487fc86d0b12cd3e74f4cf75b80f65d2cd7b1e4b3932773ebd596b6d4de492",
+      "fixture_sha256": "15b27b0ab711bf73c851e0f8c8ac0c82754ed3165d66f2525b41a6d4850b457d",
+      "environment": {
+        "machine": "x86_64",
+        "logical_cpus": 4,
+        "transport": "private loopback HTTP, no TLS or external proxy",
+        "database": "not accessed by this matrix",
+        "native_c_compiler_override": null,
+        "load_generator_cpu_affinity": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "cgroup_files": {
+          "/sys/fs/cgroup/system.slice/hosted-compute-agent.service/cpu.max": "max 100000",
+          "/sys/fs/cgroup/system.slice/hosted-compute-agent.service/memory.max": "max",
+          "/sys/fs/cgroup/system.slice/hosted-compute-agent.service/cpuset.cpus.effective": "0-3"
+        },
+        "physical_memory_bytes": 16760344576
+      },
+      "host_logical_cpus": 4,
+      "generated_c_sha256": {
+        ".ku/build/release/c/puuPfNTq_22Ows8zltnOMBdBTJzQTyWL6f-Cz_VnAtU/matrix.c": "2ca40e5bb9cd686b45490a268f1c26cccd864a3cb7a00a4fd922a8cc79aee3c9"
+      },
+      "runs": [
+        {
+          "loops": 1,
+          "status": "passed",
+          "failed_checks": [],
+          "idle": {
+            "before": {
+              "fds": 9,
+              "threads": 8,
+              "rss_bytes": 2437120,
+              "cpu_seconds": 0.0
+            },
+            "after": {
+              "fds": 9,
+              "threads": 8,
+              "rss_bytes": 2437120,
+              "cpu_seconds": 0.0
+            },
+            "one_core_cpu_percent": 0.0,
+            "sample_errors": []
+          },
+          "cpu": {
+            "seconds": 5.0194862920000105,
+            "requests_per_second": 196.03599706374055,
+            "completed": 984,
+            "counts": {
+              "success": 984
+            },
+            "p95_ms": 41.3,
+            "p99_ms": 42.1,
+            "native_cpu_seconds": 0.29,
+            "generator_cpu_seconds": 0.28585974700000005,
+            "cumulative_loop_requests_after_cpu": [
+              {
+                "id": 0,
+                "requests": 984
+              }
+            ]
+          },
+          "recovery": {
+            "before": {
+              "fds": 9,
+              "threads": 8,
+              "rss_bytes": 2437120,
+              "cpu_seconds": 0.0
+            },
+            "after": {
+              "fds": 9,
+              "threads": 8,
+              "rss_bytes": 2752512,
+              "cpu_seconds": 0.74
+            },
+            "rss_delta_bytes": 315392,
+            "descriptor_delta": 0,
+            "sample_errors": {},
+            "passed": true,
+            "recovery_seconds": 0.0003170420000060403
+          },
+          "normal_drain": {
+            "exit": 0,
+            "passed": true
+          },
+          "fairness": {
+            "passed": true,
+            "routes": {
+              "/ok": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 0.5,
+                "p99_ms": 0.6
+              },
+              "/timer": {
+                "arrivals": 100,
+                "completed": 100,
+                "counts": {
+                  "success": 100
+                },
+                "p95_ms": 25.8,
+                "p99_ms": 25.8
+              },
+              "/hot": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 7.3,
+                "p99_ms": 7.3
+              },
+              "/cpu": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 0.6,
+                "p99_ms": 0.6
+              }
+            }
+          },
+          "all_reported_checks_passed": true
+        },
+        {
+          "loops": 2,
+          "status": "passed",
+          "failed_checks": [],
+          "idle": {
+            "before": {
+              "fds": 11,
+              "threads": 9,
+              "rss_bytes": 2453504,
+              "cpu_seconds": 0.0
+            },
+            "after": {
+              "fds": 11,
+              "threads": 9,
+              "rss_bytes": 2453504,
+              "cpu_seconds": 0.0
+            },
+            "one_core_cpu_percent": 0.0,
+            "sample_errors": []
+          },
+          "cpu": {
+            "seconds": 5.023534238000025,
+            "requests_per_second": 195.87803195539703,
+            "completed": 984,
+            "counts": {
+              "success": 984
+            },
+            "p95_ms": 41.9,
+            "p99_ms": 42.5,
+            "native_cpu_seconds": 0.29,
+            "generator_cpu_seconds": 0.28242979700000004,
+            "cumulative_loop_requests_after_cpu": [
+              {
+                "id": 0,
+                "requests": 492
+              },
+              {
+                "id": 1,
+                "requests": 492
+              }
+            ]
+          },
+          "recovery": {
+            "before": {
+              "fds": 11,
+              "threads": 9,
+              "rss_bytes": 2453504,
+              "cpu_seconds": 0.0
+            },
+            "after": {
+              "fds": 11,
+              "threads": 9,
+              "rss_bytes": 2961408,
+              "cpu_seconds": 0.74
+            },
+            "rss_delta_bytes": 507904,
+            "descriptor_delta": 0,
+            "sample_errors": {},
+            "passed": true,
+            "recovery_seconds": 0.00044126499994945334
+          },
+          "normal_drain": {
+            "exit": 0,
+            "passed": true
+          },
+          "fairness": {
+            "passed": true,
+            "routes": {
+              "/ok": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 0.6,
+                "p99_ms": 0.6
+              },
+              "/timer": {
+                "arrivals": 100,
+                "completed": 100,
+                "counts": {
+                  "success": 100
+                },
+                "p95_ms": 25.6,
+                "p99_ms": 25.7
+              },
+              "/hot": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 6.9,
+                "p99_ms": 7.0
+              },
+              "/cpu": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 0.6,
+                "p99_ms": 0.7
+              }
+            }
+          },
+          "all_reported_checks_passed": true
+        },
+        {
+          "loops": 4,
+          "status": "passed",
+          "failed_checks": [],
+          "idle": {
+            "before": {
+              "fds": 15,
+              "threads": 11,
+              "rss_bytes": 2486272,
+              "cpu_seconds": 0.0
+            },
+            "after": {
+              "fds": 15,
+              "threads": 11,
+              "rss_bytes": 2486272,
+              "cpu_seconds": 0.0
+            },
+            "one_core_cpu_percent": 0.0,
+            "sample_errors": []
+          },
+          "cpu": {
+            "seconds": 5.024240256999974,
+            "requests_per_second": 195.8505066769153,
+            "completed": 984,
+            "counts": {
+              "success": 984
+            },
+            "p95_ms": 41.9,
+            "p99_ms": 42.5,
+            "native_cpu_seconds": 0.29,
+            "generator_cpu_seconds": 0.2670143600000001,
+            "cumulative_loop_requests_after_cpu": [
+              {
+                "id": 0,
+                "requests": 246
+              },
+              {
+                "id": 1,
+                "requests": 246
+              },
+              {
+                "id": 2,
+                "requests": 246
+              },
+              {
+                "id": 3,
+                "requests": 246
+              }
+            ]
+          },
+          "recovery": {
+            "before": {
+              "fds": 15,
+              "threads": 11,
+              "rss_bytes": 2486272,
+              "cpu_seconds": 0.0
+            },
+            "after": {
+              "fds": 15,
+              "threads": 11,
+              "rss_bytes": 3072000,
+              "cpu_seconds": 0.73
+            },
+            "rss_delta_bytes": 585728,
+            "descriptor_delta": 0,
+            "sample_errors": {},
+            "passed": true,
+            "recovery_seconds": 0.0003829060000271056
+          },
+          "normal_drain": {
+            "exit": 0,
+            "passed": true
+          },
+          "fairness": {
+            "passed": true,
+            "routes": {
+              "/ok": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 0.6,
+                "p99_ms": 0.6
+              },
+              "/timer": {
+                "arrivals": 100,
+                "completed": 100,
+                "counts": {
+                  "success": 100
+                },
+                "p95_ms": 25.6,
+                "p99_ms": 25.7
+              },
+              "/hot": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 6.7,
+                "p99_ms": 6.8
+              },
+              "/cpu": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 0.6,
+                "p99_ms": 0.6
+              }
+            }
+          },
+          "all_reported_checks_passed": true
+        }
+      ],
+      "controlled_blocking_regression": {
+        "test": "native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline",
+        "binary_sha256": "ae04b5a105380ae538fdcbb28f201cecf73536605044895fb105d7c266c1750c",
+        "exit": 0,
+        "passed": true
+      },
+      "check_names": [
+        "A03_slow_io",
+        "A05_cancel_reuse",
+        "A08_blocking_lifetime",
+        "A13_normal_drain",
+        "A13_partial_startup",
+        "A18_recovery",
+        "all_loops_worked",
+        "cpu",
+        "fairness",
+        "http_real_waits",
+        "idle",
+        "timer_real_waits"
+      ]
+    },
+    {
+      "file": "ku-service-memory-provider.json",
+      "archive_directory": "final-ci-a31c113-linux",
+      "sha256": "80e4097d500aae2b0a04898c34c8a3362cf0c4581556aa221d1da63185797222",
+      "kind": "resident-hard-memory-provider",
+      "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+      "status": "passed",
+      "cli_sha256": "bd5dc30a225f5dcd2558fe2bcad4c372ab08caa7986f741f9e2f0a5748655be2",
+      "cleanup_errors": [],
+      "plan": {
+        "worker_memory_bytes": 67108864,
+        "event_loops": 2,
+        "blocking_threads": 2,
+        "pressure_target_bytes": 268435456,
+        "replacement_deadline_seconds": 15,
+        "pressure_requests": 1
+      },
+      "guarantee": "Linux cgroup v2 actual memory/oom evidence",
+      "recovery_ms": 300.742,
+      "limit_event_scope": "private_domain",
+      "cgroup_before": [],
+      "cgroup_after": [],
+      "pressure_result": {
+        "transport_or_limit_result": "RemoteDisconnected",
+        "detail": "Remote end closed connection without response"
+      },
+      "replacement_status": {
+        "phase": "ready",
+        "generation": 2,
+        "restarts": 1,
+        "last_reason": "os_memory_limit",
+        "limit_metric": "linux_cgroup_v2_charged_memory_bytes",
+        "memory_peak_bytes": 67108864,
+        "memory_limit_observed": true,
+        "memory_limit_evidence": {
+          "worker": {
+            "max": 0,
+            "oom": 0,
+            "oom_kill": 3
+          },
+          "private_domain_before": {
+            "max": 0,
+            "oom": 0,
+            "oom_kill": 0
+          },
+          "private_domain_after": {
+            "max": 25,
+            "oom": 1,
+            "oom_kill": 0
+          }
+        },
+        "last_exit_code": null,
+        "last_launcher_signal": 9,
+        "launcher_status": "launcher_terminated_by_signal",
+        "unfinished_work_possible": true,
+        "database_outcome": "unknown",
+        "database_retry": false
+      },
+      "other_instance_successes": 10
+    },
+    {
+      "file": "ku-native-blocking-retirement.json",
+      "archive_directory": "final-ci-a31c113-macos",
+      "sha256": "a8f1652f5c17ea2e65164986c477646bb808105db11f3facd5c891eb61d5adb2",
+      "kind": "native-blocking-service-retirement",
+      "platform": "macOS-15.7.9-arm64-arm-64bit-Mach-O",
+      "status": "passed",
+      "cli_sha256": "23bc797c74a5c16b5e3fe2be354a001218f6bf578783b48f4d55040d5039a1d3",
+      "native_sha256": "690d7160804f9f0d122ddc744d6da0a79d15e7ced3701f50e4cd3d4ff9576432",
+      "cleanup_errors": [],
+      "plan": {
+        "handler_timeout_ms": 1000,
+        "native_cleanup_grace_ms": 1000,
+        "native_drain_timeout_ms": 200,
+        "supervisor_drain_timeout_ms": 1500,
+        "replacement_ready_deadline_seconds": 10,
+        "event_loops": 4,
+        "blocking_threads": 5,
+        "held_requests": 1,
+        "surviving_instance_requests": 10
+      },
+      "held_http_status": "HTTP/1.1 504 Gateway Timeout",
+      "held_http_response_ms": 1002.866,
+      "first_not_ready_ms": 2531.544,
+      "replacement_ready_ms": 3168.809,
+      "duration_seconds": 5.281,
+      "replacement_status": {
+        "phase": "ready",
+        "generation": 2,
+        "last_reason": "runtime_unfinished_work",
+        "last_exit_code": 75,
+        "unfinished_work_possible": true,
+        "database_outcome": "unknown",
+        "database_retry": false
+      },
+      "surviving_instance_successes": 10
+    },
+    {
+      "file": "ku-resident-service.json",
+      "archive_directory": "final-ci-a31c113-macos",
+      "sha256": "6e07a9246eb232efd48cf44f94740ad388493a885d080196dc2d889b66b4bf04",
+      "kind": "resident-service-acceptance",
+      "platform": "Darwin",
+      "passed": false,
+      "failure": "ConnectionRefusedError: [Errno 61] Connection refused",
+      "cli_sha256": "23bc797c74a5c16b5e3fe2be354a001218f6bf578783b48f4d55040d5039a1d3",
+      "cleanup_errors": [],
+      "parameters": {
+        "service_options": {
+          "startup_timeout_ms": 5000,
+          "probe_timeout_ms": 100,
+          "probe_interval_ms": 100,
+          "failure_threshold": 3,
+          "drain_timeout_ms": 1000,
+          "restart_limit": 5,
+          "restart_window_ms": 60000,
+          "backoff_ms": 100,
+          "max_backoff_ms": 5000
+        },
+        "deployment_budget": {
+          "max_parallel_instances": 3,
+          "reserved_memory_bytes": 1610612736,
+          "event_threads": 12,
+          "blocking_threads": 12,
+          "database_connections": 24,
+          "database_waiters": 96,
+          "database_pending_bytes": 3145728,
+          "total_threads": 53,
+          "management_threads": 2,
+          "supervisor_reserve_bytes": 33554432,
+          "thread_stack_bytes": 2097152,
+          "per_instance": {
+            "reserved_memory_bytes": 536870912,
+            "event_threads": 4,
+            "blocking_threads": 4,
+            "database_connections": 8,
+            "database_waiters": 32,
+            "database_pending_bytes": 1048576,
+            "total_threads": 17
+          }
+        },
+        "recovery_deadline_seconds": 10,
+        "operation_timeout_seconds": 15,
+        "proxy_threads": 1,
+        "tls": "loopback HTTP only; no TLS in this isolated fixture"
+      },
+      "results": {
+        "proxy_config": "passed",
+        "normal_proxy": "passed"
+      },
+      "complete_runtime_acceptance": false,
+      "duration_seconds": 1.851,
+      "haproxy_version": "HAProxy version 3.4.4-7f03ae6 2026/08/27 - https://haproxy.org/",
+      "steady_resource_snapshot": {
+        "process_count": 8,
+        "thread_count": 32,
+        "sum_rss_bytes": 84426752,
+        "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit"
+      },
+      "failure_evidence_boundary": "Raw report completed proxy_config and normal_proxy only; no traceback or service/proxy log field was retained. Exact failing call within status/kill/surviving-request/replacement section is not identified."
+    },
+    {
+      "file": "ku-runtime-matrix.json",
+      "archive_directory": "final-ci-a31c113-macos",
+      "sha256": "c22058d6c0a6dbd21d4e25c5d582540bdf6cbcf56aceecc5d8cc188a0871a078",
+      "platform": "macOS-15.7.9-arm64-arm-64bit-Mach-O",
+      "status": "passed",
+      "cli_sha256": "23bc797c74a5c16b5e3fe2be354a001218f6bf578783b48f4d55040d5039a1d3",
+      "native_sha256": "9daa74e5e32e5758e898b192397da96b73a71f248c1942ac6fa527716b661513",
+      "fixture_sha256": "15b27b0ab711bf73c851e0f8c8ac0c82754ed3165d66f2525b41a6d4850b457d",
+      "environment": {
+        "machine": "arm64",
+        "logical_cpus": 3,
+        "transport": "private loopback HTTP, no TLS or external proxy",
+        "database": "not accessed by this matrix",
+        "native_c_compiler_override": null,
+        "sysctl_hardware": {
+          "physical_memory_bytes": "7516192768",
+          "model": "VirtualMac2,1",
+          "cpu": "Apple M1 (Virtual)"
+        },
+        "cpu_quota": "no cgroup quota on this native macOS host; competing host work is not excluded by the OS"
+      },
+      "host_logical_cpus": 3,
+      "generated_c_sha256": {
+        ".ku/build/release/c/qTB1gxWqdbXx9uxzajIKAoVgjz7WN77ZO3aBwzezF0k/matrix.c": "2ca40e5bb9cd686b45490a268f1c26cccd864a3cb7a00a4fd922a8cc79aee3c9"
+      },
+      "runs": [
+        {
+          "loops": 1,
+          "status": "passed",
+          "failed_checks": [],
+          "idle": {
+            "before": {
+              "fds": 9,
+              "threads": 8,
+              "rss_bytes": 2654208,
+              "cpu_seconds": 0.0
+            },
+            "after": {
+              "fds": 9,
+              "threads": 8,
+              "rss_bytes": 2654208,
+              "cpu_seconds": 0.0
+            },
+            "one_core_cpu_percent": 0.0,
+            "sample_errors": []
+          },
+          "cpu": {
+            "seconds": 5.1946663329999865,
+            "requests_per_second": 1849.396936039939,
+            "completed": 9607,
+            "counts": {
+              "success": 9607
+            },
+            "p95_ms": 6.4,
+            "p99_ms": 13.9,
+            "native_cpu_seconds": 3.46,
+            "generator_cpu_seconds": 2.749288,
+            "cumulative_loop_requests_after_cpu": [
+              {
+                "id": 0,
+                "requests": 9607
+              }
+            ]
+          },
+          "recovery": {
+            "before": {
+              "fds": 9,
+              "threads": 8,
+              "rss_bytes": 2654208,
+              "cpu_seconds": 0.0
+            },
+            "after": {
+              "fds": 9,
+              "threads": 8,
+              "rss_bytes": 14909440,
+              "cpu_seconds": 4.29
+            },
+            "rss_delta_bytes": 12255232,
+            "descriptor_delta": 0,
+            "sample_errors": {},
+            "passed": true,
+            "recovery_seconds": 0.0009027500000229338
+          },
+          "normal_drain": {
+            "exit": 0,
+            "passed": true
+          },
+          "fairness": {
+            "passed": true,
+            "routes": {
+              "/ok": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 2.5,
+                "p99_ms": 5.1
+              },
+              "/cpu": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 4.6,
+                "p99_ms": 12.7
+              },
+              "/timer": {
+                "arrivals": 100,
+                "completed": 100,
+                "counts": {
+                  "success": 100
+                },
+                "p95_ms": 29.4,
+                "p99_ms": 38.4
+              },
+              "/hot": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 66.2,
+                "p99_ms": 88.4
+              }
+            }
+          },
+          "all_reported_checks_passed": true
+        },
+        {
+          "loops": 2,
+          "status": "passed",
+          "failed_checks": [],
+          "idle": {
+            "before": {
+              "fds": 11,
+              "threads": 9,
+              "rss_bytes": 2605056,
+              "cpu_seconds": 0.01
+            },
+            "after": {
+              "fds": 11,
+              "threads": 9,
+              "rss_bytes": 2605056,
+              "cpu_seconds": 0.01
+            },
+            "one_core_cpu_percent": 0.0,
+            "sample_errors": []
+          },
+          "cpu": {
+            "seconds": 5.124792707999973,
+            "requests_per_second": 2503.1256347159297,
+            "completed": 12828,
+            "counts": {
+              "success": 12828
+            },
+            "p95_ms": 5.5,
+            "p99_ms": 7.9,
+            "native_cpu_seconds": 5.59,
+            "generator_cpu_seconds": 3.5220940000000005,
+            "cumulative_loop_requests_after_cpu": [
+              {
+                "id": 0,
+                "requests": 6380
+              },
+              {
+                "id": 1,
+                "requests": 6448
+              }
+            ]
+          },
+          "recovery": {
+            "before": {
+              "fds": 11,
+              "threads": 9,
+              "rss_bytes": 2605056,
+              "cpu_seconds": 0.01
+            },
+            "after": {
+              "fds": 11,
+              "threads": 9,
+              "rss_bytes": 15024128,
+              "cpu_seconds": 6.22
+            },
+            "rss_delta_bytes": 12419072,
+            "descriptor_delta": 0,
+            "sample_errors": {},
+            "passed": true,
+            "recovery_seconds": 0.0016585419999728401
+          },
+          "normal_drain": {
+            "exit": 0,
+            "passed": true
+          },
+          "fairness": {
+            "passed": true,
+            "routes": {
+              "/ok": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 1.6,
+                "p99_ms": 9.0
+              },
+              "/cpu": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 2.4,
+                "p99_ms": 10.5
+              },
+              "/timer": {
+                "arrivals": 100,
+                "completed": 100,
+                "counts": {
+                  "success": 100
+                },
+                "p95_ms": 28.6,
+                "p99_ms": 37.0
+              },
+              "/hot": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 33.0,
+                "p99_ms": 77.5
+              }
+            }
+          },
+          "all_reported_checks_passed": true
+        },
+        {
+          "loops": 4,
+          "status": "passed",
+          "failed_checks": [],
+          "idle": {
+            "before": {
+              "fds": 15,
+              "threads": 11,
+              "rss_bytes": 2719744,
+              "cpu_seconds": 0.01
+            },
+            "after": {
+              "fds": 15,
+              "threads": 11,
+              "rss_bytes": 2719744,
+              "cpu_seconds": 0.01
+            },
+            "one_core_cpu_percent": 0.0,
+            "sample_errors": []
+          },
+          "cpu": {
+            "seconds": 5.09271775000002,
+            "requests_per_second": 1973.4060463099415,
+            "completed": 10050,
+            "counts": {
+              "success": 10050
+            },
+            "p95_ms": 6.6,
+            "p99_ms": 10.7,
+            "native_cpu_seconds": 8.65,
+            "generator_cpu_seconds": 2.5626479999999994,
+            "cumulative_loop_requests_after_cpu": [
+              {
+                "id": 0,
+                "requests": 2492
+              },
+              {
+                "id": 1,
+                "requests": 2451
+              },
+              {
+                "id": 2,
+                "requests": 2600
+              },
+              {
+                "id": 3,
+                "requests": 2507
+              }
+            ]
+          },
+          "recovery": {
+            "before": {
+              "fds": 15,
+              "threads": 11,
+              "rss_bytes": 2719744,
+              "cpu_seconds": 0.01
+            },
+            "after": {
+              "fds": 15,
+              "threads": 11,
+              "rss_bytes": 15187968,
+              "cpu_seconds": 9.26
+            },
+            "rss_delta_bytes": 12468224,
+            "descriptor_delta": 0,
+            "sample_errors": {},
+            "passed": true,
+            "recovery_seconds": 0.0007955830000128117
+          },
+          "normal_drain": {
+            "exit": 0,
+            "passed": true
+          },
+          "fairness": {
+            "passed": true,
+            "routes": {
+              "/ok": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 1.2,
+                "p99_ms": 4.2
+              },
+              "/cpu": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 2.1,
+                "p99_ms": 2.4
+              },
+              "/hot": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 33.9,
+                "p99_ms": 44.7
+              },
+              "/timer": {
+                "arrivals": 100,
+                "completed": 100,
+                "counts": {
+                  "success": 100
+                },
+                "p95_ms": 29.5,
+                "p99_ms": 33.7
+              }
+            }
+          },
+          "all_reported_checks_passed": true
+        }
+      ],
+      "controlled_blocking_regression": {
+        "test": "native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline",
+        "binary_sha256": "3d695fe948a01275de20321944642eab234625fe9c9b947cb356652a8acc0a7d",
+        "exit": 0,
+        "passed": true
+      },
+      "check_names": [
+        "A03_slow_io",
+        "A05_cancel_reuse",
+        "A08_blocking_lifetime",
+        "A13_normal_drain",
+        "A13_partial_startup",
+        "A18_recovery",
+        "all_loops_worked",
+        "cpu",
+        "fairness",
+        "http_real_waits",
+        "idle",
+        "timer_real_waits"
+      ]
+    },
+    {
+      "file": "ku-service-memory-provider.json",
+      "archive_directory": "final-ci-a31c113-macos",
+      "sha256": "ecdb2864f20d8f3ef9e9d2e50a9fa08a80b741bf79221870b85b16b2f7aaa870",
+      "kind": "resident-hard-memory-provider",
+      "platform": "macOS-15.7.9-arm64-arm-64bit-Mach-O",
+      "status": "passed",
+      "cli_sha256": "23bc797c74a5c16b5e3fe2be354a001218f6bf578783b48f4d55040d5039a1d3",
+      "cleanup_errors": [],
+      "plan": {
+        "worker_memory_bytes": 67108864,
+        "event_loops": 2,
+        "blocking_threads": 2,
+        "pressure_target_bytes": 268435456,
+        "replacement_deadline_seconds": 15,
+        "pressure_requests": 1
+      },
+      "guarantee": "macOS native hard mode explicitly unavailable; no RSS-sampling substitute",
+      "unsupported_provider": {
+        "exit": 1,
+        "stderr": "ku service: strict process memory execution is unavailable on this platform; run Ku inside a Linux VM or host with a delegated cgroup v2 memory+pids domain, or on Windows with Job Object commit limits; macOS RLIMIT_AS and sampled RSS are not equivalent providers\n",
+        "application_started": false
+      },
+      "replacement_status": {},
+      "other_instance_successes": 0
+    },
+    {
+      "file": "ku-http-pg-lifecycle.json",
+      "archive_directory": "final-ci-a31c113-windows",
+      "sha256": "fd616d70d2f5f5e9f5e2bb84ca9b6b46a7b780d9e6edcc51af0c6ae4b8ab457c",
+      "platform": "nt",
+      "status": "failed",
+      "failure": "AssertionError: ",
+      "cli_sha256": "0b1a2c070d0577fc62caec39f77d6a18cbf627dd712fafa1be9d9c93b76a9295",
+      "fixture_sha256": "d1aeeb74000abf0e56c82ba7fa65342f076eae0094bf4966e7f9638a59b16ee5",
+      "cleanup_errors": [],
+      "event_loops": 4,
+      "parameters": {
+        "blocking_threads": 8,
+        "database_connections": 4,
+        "native_c_profile": "debug",
+        "database_waiters": 8,
+        "database_pending_bytes": 1048576,
+        "acquire_timeout_ms": 100,
+        "query_timeout_ms": 150,
+        "handler_timeout_ms": 2000,
+        "fault_recovery_deadline_seconds": 5,
+        "http_client_connection_policy": "one connection per isolated fault request",
+        "database_transport": "private Python fault proxy, capacity eight connections",
+        "tls": "disabled only inside isolated loopback fixture"
+      },
+      "checks": {
+        "parameters_fields_unicode_null": "passed"
+      },
+      "postgres_version": "17.11",
+      "build_seconds": 0.875,
+      "current_phase": "cleanup:finished",
+      "phase_details": {
+        "error_count": 0
+      },
+      "windows_pg_directory_acl": {
+        "exit_code": 0,
+        "child_psmodulepath_removed": true,
+        "parent_psmodulepath_present": true,
+        "owner_unchanged": true,
+        "parent_sddl_unchanged": true,
+        "current_user_modify_inheritable": true,
+        "current_user_sid_rule_matches": true,
+        "engine_version": "5.1.26100.33438",
+        "scope": "private fixture root and inherited children only"
+      },
+      "write_verification_observation": {
+        "read_unicode_null": "passed",
+        "insert_response_matches_expected_payload": true,
+        "psql_count_with_id_and_payload_filter": 0,
+        "write_side_effect_check": "not passed",
+        "attribution": "Stored field bytes versus verifier command-line encoding are not distinguished by this report."
+      }
+    },
+    {
+      "file": "ku-native-blocking-retirement.json",
+      "archive_directory": "final-ci-a31c113-windows",
+      "sha256": "b5ba94848b8ddfe0430255afc0fef2f8a48f5d13ac67aae95514d5c62d16a6ae",
+      "kind": "native-blocking-service-retirement",
+      "platform": "Windows-2025Server-10.0.26100-SP0",
+      "status": "passed",
+      "cli_sha256": "0b1a2c070d0577fc62caec39f77d6a18cbf627dd712fafa1be9d9c93b76a9295",
+      "native_sha256": "d3b806e782d188b137e5ed77f0cd8d052a818eb68e333195ad7fa95535f5370a",
+      "cleanup_errors": [],
+      "plan": {
+        "handler_timeout_ms": 1000,
+        "native_cleanup_grace_ms": 1000,
+        "native_drain_timeout_ms": 200,
+        "supervisor_drain_timeout_ms": 1500,
+        "replacement_ready_deadline_seconds": 10,
+        "event_loops": 4,
+        "blocking_threads": 5,
+        "held_requests": 1,
+        "surviving_instance_requests": 10
+      },
+      "held_http_status": "HTTP/1.1 504 Gateway Timeout",
+      "held_http_response_ms": 1000.0,
+      "first_not_ready_ms": 1578.0,
+      "replacement_ready_ms": 2719.0,
+      "duration_seconds": 15.125,
+      "replacement_status": {
+        "phase": "ready",
+        "generation": 2,
+        "last_reason": "runtime_unfinished_work",
+        "last_exit_code": 75,
+        "unfinished_work_possible": true,
+        "database_outcome": "unknown",
+        "database_retry": false
+      },
+      "surviving_instance_successes": 10
+    },
+    {
+      "file": "ku-runtime-matrix.json",
+      "archive_directory": "final-ci-a31c113-windows",
+      "sha256": "b280ffbec5bd0b7a81e2a988302b179993a73a510a1d9b7b0b6d6c3a75edd53f",
+      "platform": "Windows-2025Server-10.0.26100-SP0",
+      "status": "passed",
+      "cli_sha256": "0b1a2c070d0577fc62caec39f77d6a18cbf627dd712fafa1be9d9c93b76a9295",
+      "native_sha256": "535190963175f737d4990cc5427a3fcfbe74218fc96ba33f11963c0abf5144a4",
+      "fixture_sha256": "15b27b0ab711bf73c851e0f8c8ac0c82754ed3165d66f2525b41a6d4850b457d",
+      "environment": {
+        "machine": "AMD64",
+        "logical_cpus": 4,
+        "transport": "private loopback HTTP, no TLS or external proxy",
+        "database": "not accessed by this matrix",
+        "native_c_compiler_override": null,
+        "cpu_quota": "not measured by this driver; CI/host resource metadata must be retained separately"
+      },
+      "host_logical_cpus": 4,
+      "generated_c_sha256": {
+        ".ku\\build\\release\\c\\o3ahsz7SNOlDy_uB7QrQuP9U8oYHhO3fc-HTHarYD_g\\matrix.c": "32c8dc5051722ed22c89a636983633b914fc7462301f26bac76f8cbed327fcfb"
+      },
+      "runs": [
+        {
+          "loops": 1,
+          "status": "passed",
+          "failed_checks": [],
+          "idle": {
+            "before": {
+              "handles": 73,
+              "threads": 10,
+              "rss_bytes": 5840896,
+              "cpu_seconds": 0.0
+            },
+            "after": {
+              "handles": 73,
+              "threads": 10,
+              "rss_bytes": 5840896,
+              "cpu_seconds": 0.0
+            },
+            "one_core_cpu_percent": 0.0,
+            "sample_errors": []
+          },
+          "cpu": {
+            "seconds": 5.0150000000001,
+            "requests_per_second": 3171.6849451644434,
+            "completed": 15906,
+            "counts": {
+              "success": 15906
+            },
+            "p95_ms": 16.0,
+            "p99_ms": 16.1,
+            "native_cpu_seconds": 4.828125,
+            "generator_cpu_seconds": 5.109375,
+            "cumulative_loop_requests_after_cpu": [
+              {
+                "id": 0,
+                "requests": 16098
+              }
+            ]
+          },
+          "recovery": {
+            "before": {
+              "handles": 83,
+              "threads": 10,
+              "rss_bytes": 6062080,
+              "cpu_seconds": 0.046875
+            },
+            "after": {
+              "handles": 83,
+              "threads": 10,
+              "rss_bytes": 6582272,
+              "cpu_seconds": 5.5625
+            },
+            "rss_delta_bytes": 520192,
+            "descriptor_delta": 0,
+            "sample_errors": {},
+            "passed": true,
+            "recovery_seconds": 0.015999999999849024
+          },
+          "normal_drain": {
+            "exit": 0,
+            "passed": true
+          },
+          "windows_first_use_and_repeats": {
+            "cold": {
+              "handles": 73,
+              "threads": 10,
+              "rss_bytes": 5840896
+            },
+            "stage_order": [
+              "/resource-sync",
+              "/timer",
+              "/resource-file"
+            ],
+            "first_cycle_stage_handles": [
+              81,
+              81,
+              83
+            ],
+            "first_cycle_stage_rss_bytes": [
+              5914624,
+              5967872,
+              6062080
+            ],
+            "cold_to_first_recovered": {
+              "rss_delta_bytes": 221184,
+              "descriptor_delta": 10
+            },
+            "recovered_handles_by_cycle": [
+              83,
+              83,
+              83,
+              83
+            ],
+            "repeat_stage_handles": [
+              [
+                83,
+                83,
+                83
+              ],
+              [
+                83,
+                83,
+                83
+              ],
+              [
+                83,
+                83,
+                83
+              ]
+            ],
+            "rss_delta_from_first_recovered_by_cycle": [
+              0,
+              0,
+              4096,
+              16384
+            ],
+            "handle_delta_from_first_recovered_by_cycle": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "all_stages_and_cycles_passed": true,
+            "passed": true
+          },
+          "fairness": {
+            "passed": true,
+            "routes": {
+              "/ok": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 16.0,
+                "p99_ms": 31.0
+              },
+              "/hot": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 16.1,
+                "p99_ms": 32.0
+              },
+              "/timer": {
+                "arrivals": 100,
+                "completed": 100,
+                "counts": {
+                  "success": 100
+                },
+                "p95_ms": 47.1,
+                "p99_ms": 47.1
+              },
+              "/cpu": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 16.0,
+                "p99_ms": 31.1
+              }
+            }
+          },
+          "all_reported_checks_passed": true
+        },
+        {
+          "loops": 2,
+          "status": "passed",
+          "failed_checks": [],
+          "idle": {
+            "before": {
+              "handles": 78,
+              "threads": 11,
+              "rss_bytes": 5865472,
+              "cpu_seconds": 0.015625
+            },
+            "after": {
+              "handles": 78,
+              "threads": 11,
+              "rss_bytes": 5865472,
+              "cpu_seconds": 0.015625
+            },
+            "one_core_cpu_percent": 0.0,
+            "sample_errors": []
+          },
+          "cpu": {
+            "seconds": 5.030999999999949,
+            "requests_per_second": 3270.721526535513,
+            "completed": 16455,
+            "counts": {
+              "success": 16455
+            },
+            "p95_ms": 16.0,
+            "p99_ms": 16.1,
+            "native_cpu_seconds": 5.65625,
+            "generator_cpu_seconds": 5.890625,
+            "cumulative_loop_requests_after_cpu": [
+              {
+                "id": 0,
+                "requests": 8408
+              },
+              {
+                "id": 1,
+                "requests": 8239
+              }
+            ]
+          },
+          "recovery": {
+            "before": {
+              "handles": 88,
+              "threads": 11,
+              "rss_bytes": 6078464,
+              "cpu_seconds": 0.09375
+            },
+            "after": {
+              "handles": 88,
+              "threads": 11,
+              "rss_bytes": 6971392,
+              "cpu_seconds": 6.609375
+            },
+            "rss_delta_bytes": 892928,
+            "descriptor_delta": 0,
+            "sample_errors": {},
+            "passed": true,
+            "recovery_seconds": 0.0
+          },
+          "normal_drain": {
+            "exit": 0,
+            "passed": true
+          },
+          "windows_first_use_and_repeats": {
+            "cold": {
+              "handles": 78,
+              "threads": 11,
+              "rss_bytes": 5865472
+            },
+            "stage_order": [
+              "/resource-sync",
+              "/timer",
+              "/resource-file"
+            ],
+            "first_cycle_stage_handles": [
+              86,
+              86,
+              88
+            ],
+            "first_cycle_stage_rss_bytes": [
+              5959680,
+              6004736,
+              6078464
+            ],
+            "cold_to_first_recovered": {
+              "rss_delta_bytes": 212992,
+              "descriptor_delta": 10
+            },
+            "recovered_handles_by_cycle": [
+              88,
+              88,
+              88,
+              88
+            ],
+            "repeat_stage_handles": [
+              [
+                88,
+                88,
+                88
+              ],
+              [
+                88,
+                88,
+                88
+              ],
+              [
+                88,
+                88,
+                88
+              ]
+            ],
+            "rss_delta_from_first_recovered_by_cycle": [
+              0,
+              8192,
+              73728,
+              86016
+            ],
+            "handle_delta_from_first_recovered_by_cycle": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "all_stages_and_cycles_passed": true,
+            "passed": true
+          },
+          "fairness": {
+            "passed": true,
+            "routes": {
+              "/ok": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 31.0,
+                "p99_ms": 32.0
+              },
+              "/timer": {
+                "arrivals": 100,
+                "completed": 100,
+                "counts": {
+                  "success": 100
+                },
+                "p95_ms": 47.1,
+                "p99_ms": 63.0
+              },
+              "/hot": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 16.1,
+                "p99_ms": 16.1
+              },
+              "/cpu": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 0.1,
+                "p99_ms": 31.0
+              }
+            }
+          },
+          "all_reported_checks_passed": true
+        },
+        {
+          "loops": 4,
+          "status": "passed",
+          "failed_checks": [],
+          "idle": {
+            "before": {
+              "handles": 88,
+              "threads": 13,
+              "rss_bytes": 5918720,
+              "cpu_seconds": 0.015625
+            },
+            "after": {
+              "handles": 88,
+              "threads": 13,
+              "rss_bytes": 5918720,
+              "cpu_seconds": 0.015625
+            },
+            "one_core_cpu_percent": 0.0,
+            "sample_errors": []
+          },
+          "cpu": {
+            "seconds": 5.031000000000176,
+            "requests_per_second": 3250.248459550671,
+            "completed": 16352,
+            "counts": {
+              "success": 16352
+            },
+            "p95_ms": 16.0,
+            "p99_ms": 16.1,
+            "native_cpu_seconds": 5.453125,
+            "generator_cpu_seconds": 5.765625,
+            "cumulative_loop_requests_after_cpu": [
+              {
+                "id": 0,
+                "requests": 4072
+              },
+              {
+                "id": 1,
+                "requests": 4082
+              },
+              {
+                "id": 2,
+                "requests": 4157
+              },
+              {
+                "id": 3,
+                "requests": 4233
+              }
+            ]
+          },
+          "recovery": {
+            "before": {
+              "handles": 98,
+              "threads": 13,
+              "rss_bytes": 6139904,
+              "cpu_seconds": 0.078125
+            },
+            "after": {
+              "handles": 98,
+              "threads": 13,
+              "rss_bytes": 6598656,
+              "cpu_seconds": 5.90625
+            },
+            "rss_delta_bytes": 458752,
+            "descriptor_delta": 0,
+            "sample_errors": {},
+            "passed": true,
+            "recovery_seconds": 0.015999999999849024
+          },
+          "normal_drain": {
+            "exit": 0,
+            "passed": true
+          },
+          "windows_first_use_and_repeats": {
+            "cold": {
+              "handles": 88,
+              "threads": 13,
+              "rss_bytes": 5918720
+            },
+            "stage_order": [
+              "/resource-sync",
+              "/timer",
+              "/resource-file"
+            ],
+            "first_cycle_stage_handles": [
+              96,
+              96,
+              98
+            ],
+            "first_cycle_stage_rss_bytes": [
+              6057984,
+              6103040,
+              6139904
+            ],
+            "cold_to_first_recovered": {
+              "rss_delta_bytes": 221184,
+              "descriptor_delta": 10
+            },
+            "recovered_handles_by_cycle": [
+              98,
+              98,
+              98,
+              98
+            ],
+            "repeat_stage_handles": [
+              [
+                98,
+                98,
+                98
+              ],
+              [
+                98,
+                98,
+                98
+              ],
+              [
+                98,
+                98,
+                98
+              ]
+            ],
+            "rss_delta_from_first_recovered_by_cycle": [
+              0,
+              16384,
+              61440,
+              69632
+            ],
+            "handle_delta_from_first_recovered_by_cycle": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "all_stages_and_cycles_passed": true,
+            "passed": true
+          },
+          "fairness": {
+            "passed": true,
+            "routes": {
+              "/ok": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 31.0,
+                "p99_ms": 31.1
+              },
+              "/timer": {
+                "arrivals": 100,
+                "completed": 100,
+                "counts": {
+                  "success": 100
+                },
+                "p95_ms": 47.1,
+                "p99_ms": 63.0
+              },
+              "/hot": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 16.0,
+                "p99_ms": 31.0
+              },
+              "/cpu": {
+                "arrivals": 50,
+                "completed": 50,
+                "counts": {
+                  "success": 50
+                },
+                "p95_ms": 0.1,
+                "p99_ms": 15.1
+              }
+            }
+          },
+          "all_reported_checks_passed": true
+        }
+      ],
+      "controlled_blocking_regression": {
+        "test": "native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline",
+        "binary_sha256": "e2b70bed958028267547c7b19b09c8efdba20f92a9f322aa496b0db989f1f91e",
+        "exit": 0,
+        "passed": true
+      },
+      "check_names": [
+        "A03_slow_io",
+        "A05_cancel_reuse",
+        "A08_blocking_lifetime",
+        "A13_normal_drain",
+        "A13_partial_startup",
+        "A18_recovery",
+        "A18_windows_first_use_and_repeats",
+        "all_loops_worked",
+        "cpu",
+        "fairness",
+        "http_real_waits",
+        "idle",
+        "timer_real_waits"
+      ]
+    },
+    {
+      "file": "ku-service-memory-provider.json",
+      "archive_directory": "final-ci-a31c113-windows",
+      "sha256": "e93bf8d5465aeda86a77a4d5a52d13276d389285397dfc8225dd844939e6ad3a",
+      "kind": "resident-hard-memory-provider",
+      "platform": "Windows-2025Server-10.0.26100-SP0",
+      "status": "passed",
+      "cli_sha256": "0b1a2c070d0577fc62caec39f77d6a18cbf627dd712fafa1be9d9c93b76a9295",
+      "cleanup_errors": [],
+      "plan": {
+        "worker_memory_bytes": 67108864,
+        "event_loops": 2,
+        "blocking_threads": 2,
+        "pressure_target_bytes": 268435456,
+        "replacement_deadline_seconds": 15,
+        "pressure_requests": 1
+      },
+      "guarantee": "Windows configured Job commit limit, pressure process failure and replacement; no OS-kill or OOM inference from exit code",
+      "recovery_ms": 406.0,
+      "pressure_result": {
+        "transport_or_limit_result": "ConnectionResetError",
+        "detail": "[WinError 10054] An existing connection was forcibly closed by the remote host"
+      },
+      "replacement_status": {
+        "phase": "ready",
+        "generation": 2,
+        "restarts": 1,
+        "last_reason": "process_exit",
+        "limit_metric": "windows_job_committed_memory_bytes",
+        "memory_peak_bytes": 63393792,
+        "memory_limit_observed": null,
+        "memory_limit_evidence": null,
+        "last_exit_code": 1,
+        "last_launcher_signal": null,
+        "launcher_status": "nonzero_exit",
+        "unfinished_work_possible": true,
+        "database_outcome": "unknown",
+        "database_retry": false
+      },
+      "other_instance_successes": 10
+    }
+  ],
+  "historical_runs": [
+    {
+      "run_id": 39688666439,
+      "head_sha": "d1738ef42ae82387815047c9f6d163917ae48f5d",
+      "scope": "previous full source",
+      "conclusion": "failure",
+      "boundary": "All three default suites passed. Windows memory auxiliary failed before pressure: slot a already has a supervisor; three slots did not retire. Linux/macOS later checks passed; Windows later checks skipped. Not final-source certification."
+    },
+    {
+      "run_id": 39692288889,
+      "head_sha": "fcfce156e013470a417b65551ec834360ab763f1",
+      "scope": "Windows service follow-up",
+      "conclusion": "failure",
+      "boundary": "Fresh loopback connect TimeoutError plus successful Windows exclusive bind directly proved vacant ports in this new sample. Memory and blocking passed. Matrix failed missing baseline (incorrect zero) and cold +10 handles; no repeated-growth conclusion. PG/host skipped."
+    },
+    {
+      "run_id": 39694268070,
+      "head_sha": "9bdcaa5afd476da313f56b39a5ccd52119fbe0ed",
+      "scope": "Windows PG/host follow-up",
+      "conclusion": "failure",
+      "boundary": "PG initdb Permission denied before business checks. Real TaskScheduler registration/readback, retirement/replacement, stop and cleanup passed."
+    },
+    {
+      "run_id": 39695609762,
+      "head_sha": "432517e097c6d9ab9cc0e0e1b821d7022e8b923d",
+      "scope": "Windows PG/host follow-up",
+      "conclusion": "failure",
+      "boundary": "13 Python acceptance contracts: one incorrect literal-SID assertion failed on SDDL LA abbreviation. Actual PG child PowerShell failed to load Microsoft.PowerShell.Security with inherited module path. PG business checks empty. TaskScheduler passed."
+    },
+    {
+      "run_id": 39696743372,
+      "head_sha": "9ac5ed9da0215d90c93877b4903720f634b0036d",
+      "scope": "Windows PG/host follow-up",
+      "conclusion": "cancelled",
+      "boundary": "11 deployment and 15 acceptance Python contracts passed. ACL structured SID and private-root permissions passed; parent and owner unchanged. PG step 00:03:17Z to 00:15:28Z cancelled after missing progress. Stack directly captured pg_ctl-start 60-second TimeoutExpired followed by an unbounded second process.communicate -> stdout_thread.join -> Lock.acquire in Python timeout handling. Interrupted original JSON has no final status/failure and empty business checks: never passed. Host skipped. Pipe-holder identity not captured.",
+      "artifact_id": 12392100353,
+      "archive_directory": "final-ci-9ac5ed9-windows-pg-host"
+    }
+  ],
+  "historical_windows_resource_followup": {
+    "run_id": 39694841316,
+    "head_sha": "c926f08a10c3d8e22b94d4d5b4ad5b762f7252dd",
+    "conclusion": "success",
+    "artifact_id": 12390482229,
+    "evidence": {
+      "file": "ku-runtime-matrix.json",
+      "archive_directory": "final-ci-c926f08-windows-resource",
+      "sha256": "8d43a2efa2010de2bf9bcde5b724c17b0c1792de4b2b636cd5c3fb0f15ab6004",
+      "status": "passed",
+      "cli_sha256": "15b99906eb54a616db3514ed5932da8fe6339aa75e9c6e8e63d23ed0ea5d77fb",
+      "native_sha256": "3c676516c83d20f0868d12d2999c579c80e94978e4c836b6753afe9e2c4c236b",
+      "test_contracts": {
+        "count": 8,
+        "passed": 8,
+        "skipped": 0,
+        "windows_diagnostic_handle_test": "32 real Win32 samples; own process handle count after samples <= before. Absolute before/after counts were not printed."
+      },
+      "cold_boundary": "Cold +10 handles are retained first-use costs, not relabelled as released. Initial cycle plus three same-process repeats and final matrix all have descriptor delta 0 against first recovered cycle; +2 threshold unchanged.",
+      "runs": [
+        {
+          "loops": 1,
+          "first_use_and_repeats": {
+            "cold": {
+              "handles": 73,
+              "threads": 10,
+              "rss_bytes": 5804032
+            },
+            "stage_order": [
+              "/resource-sync",
+              "/timer",
+              "/resource-file"
+            ],
+            "first_cycle_stage_handles": [
+              81,
+              81,
+              83
+            ],
+            "first_cycle_stage_rss_bytes": [
+              5890048,
+              5951488,
+              6070272
+            ],
+            "cold_to_first_recovered": {
+              "rss_delta_bytes": 266240,
+              "descriptor_delta": 10
+            },
+            "recovered_handles_by_cycle": [
+              83,
+              83,
+              83,
+              83
+            ],
+            "repeat_stage_handles": [
+              [
+                83,
+                83,
+                83
+              ],
+              [
+                83,
+                83,
+                83
+              ],
+              [
+                83,
+                83,
+                83
+              ]
+            ],
+            "rss_delta_from_first_recovered_by_cycle": [
+              0,
+              4096,
+              4096,
+              4096
+            ],
+            "handle_delta_from_first_recovered_by_cycle": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "all_stages_and_cycles_passed": true,
+            "passed": true
+          },
+          "final_recovery": {
+            "rss_delta_bytes": 458752,
+            "descriptor_delta": 0,
+            "passed": true
+          }
+        },
+        {
+          "loops": 2,
+          "first_use_and_repeats": {
+            "cold": {
+              "handles": 78,
+              "threads": 11,
+              "rss_bytes": 5836800
+            },
+            "stage_order": [
+              "/resource-sync",
+              "/timer",
+              "/resource-file"
+            ],
+            "first_cycle_stage_handles": [
+              86,
+              86,
+              88
+            ],
+            "first_cycle_stage_rss_bytes": [
+              5926912,
+              5992448,
+              6098944
+            ],
+            "cold_to_first_recovered": {
+              "rss_delta_bytes": 262144,
+              "descriptor_delta": 10
+            },
+            "recovered_handles_by_cycle": [
+              88,
+              88,
+              88,
+              88
+            ],
+            "repeat_stage_handles": [
+              [
+                88,
+                88,
+                88
+              ],
+              [
+                88,
+                88,
+                88
+              ],
+              [
+                88,
+                88,
+                88
+              ]
+            ],
+            "rss_delta_from_first_recovered_by_cycle": [
+              0,
+              16384,
+              16384,
+              20480
+            ],
+            "handle_delta_from_first_recovered_by_cycle": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "all_stages_and_cycles_passed": true,
+            "passed": true
+          },
+          "final_recovery": {
+            "rss_delta_bytes": 581632,
+            "descriptor_delta": 0,
+            "passed": true
+          }
+        },
+        {
+          "loops": 4,
+          "first_use_and_repeats": {
+            "cold": {
+              "handles": 88,
+              "threads": 13,
+              "rss_bytes": 5894144
+            },
+            "stage_order": [
+              "/resource-sync",
+              "/timer",
+              "/resource-file"
+            ],
+            "first_cycle_stage_handles": [
+              96,
+              96,
+              98
+            ],
+            "first_cycle_stage_rss_bytes": [
+              6033408,
+              6074368,
+              6115328
+            ],
+            "cold_to_first_recovered": {
+              "rss_delta_bytes": 221184,
+              "descriptor_delta": 10
+            },
+            "recovered_handles_by_cycle": [
+              98,
+              98,
+              98,
+              98
+            ],
+            "repeat_stage_handles": [
+              [
+                98,
+                98,
+                98
+              ],
+              [
+                98,
+                98,
+                98
+              ],
+              [
+                98,
+                98,
+                98
+              ]
+            ],
+            "rss_delta_from_first_recovered_by_cycle": [
+              0,
+              28672,
+              32768,
+              106496
+            ],
+            "handle_delta_from_first_recovered_by_cycle": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "all_stages_and_cycles_passed": true,
+            "passed": true
+          },
+          "final_recovery": {
+            "rss_delta_bytes": 602112,
+            "descriptor_delta": 0,
+            "passed": true
+          }
+        }
+      ]
+    }
+  },
+  "known_limits": [
+    "Original full run 39698998227 failed its macOS proxy and Windows PostgreSQL auxiliary steps. The later focused runs cover their declared components separately; the historical full conclusion is still failure and no new full-run green is claimed.",
+    "Earlier seven HTTP 504 samples are not uniquely reconstructed. New scoped evidence and fixes do not manufacture missing historical timelines.",
+    "First-use Windows handles are a bounded retained cost in observed tests; no precise per-Task heap attribution or system-wide hard memory cap claim.",
+    "A19 actual multihost exercise lacks authorized hosts, ingress and database fault domains.",
+    "Run 39703806250 previously failed a Windows first /read after slow-query timeout with an unrecorded response body. The diagnostic follow-up used identical product source and passed; no unique cause or specific PG production repair for the earlier sample is claimed."
+  ],
+  "runtime_matrix_common_plan": {
+    "event_loops": [
+      1,
+      2,
+      4
+    ],
+    "blocking_threads_total": 5,
+    "thread_budget": 16,
+    "idle_seconds": 3,
+    "cpu_seconds": 5,
+    "cpu_client_concurrency": 8,
+    "fairness_seconds": 5,
+    "fairness_arrivals_per_second": 50,
+    "handler_timeout_ms": 1000,
+    "recovery_deadline_seconds": 5,
+    "ordinary_and_timer_p99_limit_ms": 250,
+    "rss_recovered_growth_limit_bytes": 16777216,
+    "descriptor_recovered_growth_limit": 2,
+    "native_c_profile": "release"
+  },
+  "performance_boundary": "Same-host short end-to-end workload; not CPU-saturation, linear-scaling, formal-duration, database-performance or exact Task heap evidence.",
+  "first_use_boundary": "First-use +10 Windows handles are retained, not released. Initial cycle plus three repeats and full matrix recovery use a fixed first-recovered baseline and unchanged +2 threshold; sampling errors never become zero counters.",
+  "focused_followups": [
+    {
+      "id": 39701941690,
+      "head_sha": "5b78aa85c1b9ca315db2ede1e234d65cab5554c4",
+      "event": "workflow_dispatch",
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/fengyanweb/ku/actions/runs/39701941690",
+      "run_started_at": "2026-10-22T00:48:50Z",
+      "updated_at": "2026-10-22T00:52:30Z",
+      "scope": "macos-service",
+      "source_identity_same_as_a31": {
+        "src": "450f894e46e8c766fcb306428c39085d70b4e956",
+        "Cargo.toml": "42a9312e82758b8f23c5cddafa235a1c7e1e5f12",
+        "Cargo.lock": "27916531e8a3ad8629e3844a4cf14e4e834010f5"
+      },
+      "actual_job": {
+        "id": 119572995969,
+        "name": "macos-15 resident service follow-up",
+        "conclusion": "failure",
+        "passed_steps": [
+          "Build Ku CLI",
+          "Verify resident deployment budget and rollback contracts",
+          "Build and verify the native TLS target pack",
+          "Require a source-free native TLS C consumer",
+          "Require native PostgreSQL client linking and startup",
+          "Require native MySQL client linking and startup",
+          "Reject platform-specific clippy warnings",
+          "Retain resident service and PostgreSQL acceptance evidence"
+        ],
+        "failed_steps": [
+          "Verify native resident recovery, rolling and rollback through HAProxy"
+        ],
+        "skipped_steps": [
+          "Prepare exact shared database client link inputs on Linux",
+          "Prepare an exact libpq import library on Windows",
+          "Locate the exact MySQL client import library on Windows",
+          "Require native PostgreSQL client linking and startup on Windows",
+          "Require native MySQL client linking and startup on Windows",
+          "Run every default test target without stopping at the first failure",
+          "Verify focused service and blocking lifecycle regressions",
+          "Verify native scheduler probe correctness, not performance",
+          "Verify resident hard memory provider recovery or explicit platform rejection",
+          "Verify native blocking retirement and resident replacement",
+          "Verify short native runtime matrix with actual bounded blocking regression",
+          "Verify real HTTP to PostgreSQL lifecycle",
+          "Verify real HTTP to PostgreSQL lifecycle on Windows",
+          "Verify actual isolated Windows host task registration, recovery and stop"
+        ]
+      },
+      "artifacts": [
+        {
+          "id": 12393820724,
+          "name": "service-lifecycle-macos-15",
+          "size_in_bytes": 1995,
+          "digest": "sha256:5cb1df0288b1cf057fd174e9e24c17374154660d2543cc193acad45825a468e3",
+          "zip_sha256": "5cb1df0288b1cf057fd174e9e24c17374154660d2543cc193acad45825a468e3",
+          "zip_integrity": "CRC checked",
+          "archive_directory": "final-ci-5b78aa8-macos-service"
+        }
+      ],
+      "reports": [
+        {
+          "file": "ku-resident-service.json",
+          "sha256": "51f24b3524cefbdfaa346bc45b90b2040eec84fa9544e42de84dbacc3bf55f67",
+          "platform": "Darwin",
+          "passed": false,
+          "failure": "RuntimeError: rolling requires a ready old slot and an absent distinct spare",
+          "cli_sha256": "23bc797c74a5c16b5e3fe2be354a001218f6bf578783b48f4d55040d5039a1d3",
+          "cleanup_errors": [],
+          "results": {
+            "proxy_config": "passed",
+            "normal_proxy": "passed",
+            "native_exit_recovery": {
+              "passed": true,
+              "recovery_ms": 655.843,
+              "old_generation": 1,
+              "new_generation": 2,
+              "surviving_requests": 10
+            }
+          },
+          "diagnostic": {
+            "stage": "rolling",
+            "stage_elapsed_ms": 2258.909,
+            "fault_target": {
+              "slot": "a",
+              "launcher_pid": 23619,
+              "native_pid": 23620,
+              "generation": 1
+            },
+            "failure_stage": "rolling",
+            "failure_elapsed_ms": 2491.936,
+            "trace": [
+              {
+                "file": "verify.py",
+                "line": 776,
+                "function": "main"
+              },
+              {
+                "file": "manage.py",
+                "line": 320,
+                "function": "roll"
+              }
+            ],
+            "ku_control_context": null,
+            "slot_last_status": {
+              "a": {
+                "phase": "absent",
+                "pid": 0,
+                "control_error": "ConnectionRefusedError: [Errno 61] Connection refused",
+                "control_failure": {
+                  "stage": "connect",
+                  "elapsed_ms": 0.171,
+                  "error_type": "ConnectionRefusedError",
+                  "errno": 61,
+                  "winerror": null,
+                  "detail": "[Errno 61] Connection refused"
+                }
+              },
+              "b": {
+                "phase": "ready",
+                "pid": 23624,
+                "generation": 1,
+                "last_reason": "initial_start",
+                "last_exit_generation": null,
+                "last_exit_code": null,
+                "last_launcher_signal": null,
+                "launcher_status": null,
+                "termination_requested": false,
+                "unfinished_work_possible": false,
+                "database_outcome": "not_observed",
+                "database_retry": false
+              },
+              "spare": {
+                "phase": "absent",
+                "pid": 0,
+                "control_error": "ConnectionRefusedError: [Errno 61] Connection refused",
+                "control_failure": {
+                  "stage": "connect",
+                  "elapsed_ms": 0.127,
+                  "error_type": "ConnectionRefusedError",
+                  "errno": 61,
+                  "winerror": null,
+                  "detail": "[Errno 61] Connection refused"
+                }
+              }
+            },
+            "surviving_b_requests": {
+              "attempted": 10,
+              "completed": 10,
+              "http_200": 10,
+              "status_codes": [
+                200,
+                200,
+                200,
+                200,
+                200,
+                200,
+                200,
+                200,
+                200,
+                200
+              ]
+            },
+            "owned_before_cleanup": [
+              {
+                "slot": "a",
+                "pid": 23618,
+                "returncode": 1
+              },
+              {
+                "slot": "b",
+                "pid": 23623,
+                "returncode": null
+              }
+            ],
+            "proxy_before_cleanup": {
+              "pid": 23617,
+              "returncode": null
+            },
+            "owned_after_cleanup": [
+              {
+                "slot": "a",
+                "pid": 23618,
+                "returncode": 1
+              },
+              {
+                "slot": "b",
+                "pid": 23623,
+                "returncode": 0
+              }
+            ],
+            "proxy_after_cleanup": {
+              "pid": 23617,
+              "returncode": -15
+            }
+          },
+          "initial_slot_status": {
+            "a": {
+              "phase": "ready",
+              "pid": 23619,
+              "generation": 1,
+              "last_reason": "initial_start",
+              "last_exit_generation": null,
+              "last_exit_code": null,
+              "last_launcher_signal": null,
+              "launcher_status": null,
+              "termination_requested": false,
+              "unfinished_work_possible": false,
+              "database_outcome": "not_observed",
+              "database_retry": false
+            },
+            "b": {
+              "phase": "ready",
+              "pid": 23624,
+              "generation": 1,
+              "last_reason": "initial_start",
+              "last_exit_generation": null,
+              "last_exit_code": null,
+              "last_launcher_signal": null,
+              "launcher_status": null,
+              "termination_requested": false,
+              "unfinished_work_possible": false,
+              "database_outcome": "not_observed",
+              "database_retry": false
+            }
+          },
+          "boundary": "Initial crash replacement reached ready, but old supervisor exited 1 before rolling. This CI does not contain stderr identifying why; a separate local reproduction cannot uniquely identify this sample. macOS PostgreSQL step was skipped."
+        }
+      ],
+      "python_contract_suites": [
+        {
+          "discovered": 11,
+          "result": "OK (skipped=1)",
+          "skipped": 1
+        },
+        {
+          "discovered": 19,
+          "result": "OK (skipped=3)",
+          "skipped": 3
+        }
+      ]
+    },
+    {
+      "id": 39702448682,
+      "head_sha": "5b78aa85c1b9ca315db2ede1e234d65cab5554c4",
+      "event": "workflow_dispatch",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/fengyanweb/ku/actions/runs/39702448682",
+      "run_started_at": "2026-10-22T00:53:50Z",
+      "updated_at": "2026-10-22T00:58:07Z",
+      "scope": "windows-pg-host",
+      "source_identity_same_as_a31": {
+        "src": "450f894e46e8c766fcb306428c39085d70b4e956",
+        "Cargo.toml": "42a9312e82758b8f23c5cddafa235a1c7e1e5f12",
+        "Cargo.lock": "27916531e8a3ad8629e3844a4cf14e4e834010f5"
+      },
+      "actual_job": {
+        "id": 119574629419,
+        "name": "windows-2025 resident service follow-up",
+        "conclusion": "success",
+        "passed_steps": [
+          "Build Ku CLI",
+          "Verify resident deployment budget and rollback contracts",
+          "Build and verify the native TLS target pack",
+          "Require a source-free native TLS C consumer",
+          "Require native PostgreSQL client linking and startup on Windows",
+          "Require native MySQL client linking and startup on Windows",
+          "Reject platform-specific clippy warnings",
+          "Verify real HTTP to PostgreSQL lifecycle on Windows",
+          "Verify actual isolated Windows host task registration, recovery and stop",
+          "Retain resident service and PostgreSQL acceptance evidence"
+        ],
+        "failed_steps": [],
+        "skipped_steps": [
+          "Prepare exact shared database client link inputs on Linux",
+          "Prepare exact shared database client link inputs on macOS",
+          "Require native PostgreSQL client linking and startup",
+          "Require native MySQL client linking and startup",
+          "Run every default test target without stopping at the first failure",
+          "Verify focused service and blocking lifecycle regressions",
+          "Verify native scheduler probe correctness, not performance",
+          "Verify resident hard memory provider recovery or explicit platform rejection",
+          "Verify native blocking retirement and resident replacement",
+          "Verify short native runtime matrix with actual bounded blocking regression",
+          "Verify native resident recovery, rolling and rollback through HAProxy",
+          "Verify real HTTP to PostgreSQL lifecycle"
+        ]
+      },
+      "artifacts": [
+        {
+          "id": 12393197329,
+          "name": "service-lifecycle-windows-2025",
+          "size_in_bytes": 5331,
+          "digest": "sha256:c411d403a7580120ed69e25e70ac53d99e2c906ff9a4b93bd25ae386baccf98a",
+          "zip_sha256": "c411d403a7580120ed69e25e70ac53d99e2c906ff9a4b93bd25ae386baccf98a",
+          "zip_integrity": "CRC checked",
+          "archive_directory": "final-ci-5b78aa8-windows-pg-host"
+        }
+      ],
+      "reports": [
+        {
+          "file": "ku-http-pg-lifecycle.json",
+          "sha256": "f86042d6114c943f638a5b8d4cd38257c1153ff5fcdcb9d47b4ffdcfaee50983",
+          "platform": "nt",
+          "status": "passed",
+          "cli_sha256": "a70205425a1f2f22fa9b2ff7d854545f77bb8914ea733491094bd44bc11a4f9f",
+          "cleanup_errors": [],
+          "event_loops": 4,
+          "checks": {
+            "parameters_fields_unicode_null": "passed",
+            "write_side_effect": "exactly one row",
+            "large_result": "10000 rows, 2 columns, last row verified",
+            "timeout_and_new_request_recovery": "error:execution_unknown",
+            "commit_acknowledgement_lost": {
+              "reported": "error:execution_unknown",
+              "actual_rows": 1,
+              "replayed": false
+            },
+            "database_disconnect_recovery": {
+              "first": "error:execution_unknown",
+              "next": "passed"
+            },
+            "bounded_dependency_pressure_recovery": {
+              "error:acquire_timeout": 7,
+              "error:execution_unknown": 5
+            },
+            "cancel_confirmed_and_local_charge_retired": 6,
+            "normal_drain_exit": 0,
+            "database_connections_after_exit": 0
+          },
+          "postgres_version": "17.11",
+          "current_phase": "fixture:finished",
+          "database_connections_after_dependency_pressure": 1,
+          "database_connections_before_exit": 1,
+          "psql_unicode_argv_literal_utf8_hex": "3f3f3f3f207061796c6f6164",
+          "write_observation": {
+            "server_encoding": "UTF8",
+            "client_encoding": "UTF8",
+            "total_count": 1,
+            "rows": [
+              {
+                "id_utf8_hex": "6e6f726d616c",
+                "payload_utf8_hex": "e4b8ade69687f09f9982207061796c6f6164",
+                "octet_length": 18
+              }
+            ]
+          },
+          "acl_proof": {
+            "exit_code": 0,
+            "child_psmodulepath_removed": true,
+            "parent_psmodulepath_present": true,
+            "current_user_modify_inheritable": true,
+            "parent_sddl_unchanged": true,
+            "owner_unchanged": true,
+            "scope": "private fixture root and inherited children only"
+          },
+          "database_metrics": {
+            "reserved_connections": 4,
+            "reserved_waiters": 8,
+            "pending_operations": 0,
+            "pending_bytes": 0,
+            "peak_pending_bytes": 672,
+            "rejections": 0,
+            "unknown_results": 8,
+            "confirmed_cancellations": 6
+          },
+          "observation_boundary": "The prior Unicode argv comparison was invalid on this Windows verifier: argv literal became 3f3f3f3f; actual stored bytes match UTF8 Chinese and emoji, one row. Does not retroactively change the earlier full CI failure."
+        },
+        {
+          "file": "ku-windows-host-task.json",
+          "sha256": "78704e4a8b59c257357db14ebc552d50a2500588c3e88866a85e7d9d574b14db",
+          "platform": "Windows-2025Server-10.0.26100-SP0",
+          "status": "passed",
+          "cli_sha256": "a70205425a1f2f22fa9b2ff7d854545f77bb8914ea733491094bd44bc11a4f9f",
+          "native_sha256": "38b278773db5c8026b673ed0f6012f7d740630694b0b776f4691c42c1f50b588",
+          "cleanup_errors": [],
+          "held_http_status": "HTTP/1.1 504 Gateway Timeout",
+          "held_http_response_ms": 1031.0,
+          "replacement_ready_ms": 2781.0,
+          "host_processes_after_cleanup": [],
+          "replacement_status": {
+            "phase": "ready",
+            "generation": 2,
+            "last_reason": "runtime_unfinished_work",
+            "last_exit_code": 75,
+            "unfinished_work_possible": true,
+            "database_outcome": "unknown",
+            "database_retry": false
+          },
+          "host_stop_exit": 0,
+          "surviving_instance_successes": 10,
+          "host_registration_readback": [
+            {
+              "principal": "LOCAL SERVICE",
+              "principal_sid": "S-1-5-19",
+              "logon_type": "ServiceAccount",
+              "action_count": 1,
+              "restart_count": 3,
+              "restart_interval": "PT1M"
+            },
+            {
+              "principal": "LOCAL SERVICE",
+              "principal_sid": "S-1-5-19",
+              "logon_type": "ServiceAccount",
+              "action_count": 1,
+              "restart_count": 3,
+              "restart_interval": "PT1M"
+            },
+            {
+              "principal": "LOCAL SERVICE",
+              "principal_sid": "S-1-5-19",
+              "logon_type": "ServiceAccount",
+              "action_count": 1,
+              "restart_count": 3,
+              "restart_interval": "PT1M"
+            }
+          ]
+        }
+      ],
+      "python_contract_suites": [
+        {
+          "discovered": 11,
+          "result": "OK",
+          "skipped": 0
+        },
+        {
+          "discovered": 19,
+          "result": "OK",
+          "skipped": 0
+        }
+      ]
+    }
+  ],
+  "current_coverage_note": "Windows Caddy config/replacement/rolling/rollback and per-slot/whole-tree resource checks passed on e40. Product src/Cargo match67d; deployment helper identity is separately recorded. This focused run adds no default, PG, host, memory, native or formal passes.",
+  "service_recovery_runs": [
+    {
+      "id": 39703806250,
+      "head_sha": "7859fc5ba52bf7289d0bc12a3fc8f24b0dcec326",
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/fengyanweb/ku/actions/runs/39703806250",
+      "run_started_at": "2026-10-22T01:07:07Z",
+      "updated_at": "2026-10-22T01:12:17Z",
+      "scope": "service-recovery",
+      "source_change_from_a31": [
+        "src/service_supervision.rs"
+      ],
+      "reuse_boundary": "C backend and Cargo inputs unchanged; this run validates only the Rust supervisor patch and selected service fixtures. Formal C-path evidence remains in its independent report. Skipped default/resource/memory/formal targets are not new passes.",
+      "jobs": [
+        {
+          "platform": "macos",
+          "job_id": 119578988502,
+          "name": "macos-15 resident service follow-up",
+          "conclusion": "failure",
+          "passed_steps": [
+            "Build Ku CLI",
+            "Verify resident deployment budget and rollback contracts",
+            "Build and verify the native TLS target pack",
+            "Require a source-free native TLS C consumer",
+            "Require native PostgreSQL client linking and startup",
+            "Require native MySQL client linking and startup",
+            "Reject platform-specific clippy warnings"
+          ],
+          "failed_steps": [
+            "Verify service control and resident lifecycle regressions",
+            "Retain resident service and PostgreSQL acceptance evidence"
+          ],
+          "skipped_steps": [
+            "Prepare exact shared database client link inputs on Linux",
+            "Prepare an exact libpq import library on Windows",
+            "Locate the exact MySQL client import library on Windows",
+            "Require native PostgreSQL client linking and startup on Windows",
+            "Require native MySQL client linking and startup on Windows",
+            "Run every default test target without stopping at the first failure",
+            "Verify focused service and blocking lifecycle regressions",
+            "Verify native scheduler probe correctness, not performance",
+            "Verify resident hard memory provider recovery or explicit platform rejection",
+            "Verify native blocking retirement and resident replacement",
+            "Verify short native runtime matrix with actual bounded blocking regression",
+            "Verify native resident recovery, rolling and rollback through HAProxy",
+            "Verify real HTTP to PostgreSQL lifecycle",
+            "Verify real HTTP to PostgreSQL lifecycle on Windows",
+            "Verify actual isolated Windows host task registration, recovery and stop"
+          ],
+          "failure_kind": "missing rustfmt component before regression execution",
+          "rst_regression_executed": false,
+          "artifact": "No JSON files produced; evidence upload failed after prior step failure.",
+          "archive_directory": "final-ci-7859fc5-macos-service-recovery",
+          "failure_log_sha256": "df6824b0a1a0abdf070aeddb226c5f5c391c9ead7365a4240b0ea0440f0277ec"
+        },
+        {
+          "platform": "linux",
+          "job_id": 119578988720,
+          "name": "ubuntu-24.04 resident service follow-up",
+          "conclusion": "failure",
+          "passed_steps": [
+            "Build Ku CLI",
+            "Verify resident deployment budget and rollback contracts",
+            "Build and verify the native TLS target pack",
+            "Require a source-free native TLS C consumer",
+            "Require native PostgreSQL client linking and startup",
+            "Require native MySQL client linking and startup",
+            "Reject platform-specific clippy warnings"
+          ],
+          "failed_steps": [
+            "Verify service control and resident lifecycle regressions",
+            "Retain resident service and PostgreSQL acceptance evidence"
+          ],
+          "skipped_steps": [
+            "Prepare exact shared database client link inputs on macOS",
+            "Prepare an exact libpq import library on Windows",
+            "Locate the exact MySQL client import library on Windows",
+            "Require native PostgreSQL client linking and startup on Windows",
+            "Require native MySQL client linking and startup on Windows",
+            "Run every default test target without stopping at the first failure",
+            "Verify focused service and blocking lifecycle regressions",
+            "Verify native scheduler probe correctness, not performance",
+            "Verify resident hard memory provider recovery or explicit platform rejection",
+            "Verify native blocking retirement and resident replacement",
+            "Verify short native runtime matrix with actual bounded blocking regression",
+            "Verify native resident recovery, rolling and rollback through HAProxy",
+            "Verify real HTTP to PostgreSQL lifecycle",
+            "Verify real HTTP to PostgreSQL lifecycle on Windows",
+            "Verify actual isolated Windows host task registration, recovery and stop"
+          ],
+          "failure_kind": "missing rustfmt component before regression execution",
+          "rst_regression_executed": false,
+          "artifact": "No JSON files produced; evidence upload failed after prior step failure.",
+          "archive_directory": "final-ci-7859fc5-linux-service-recovery",
+          "failure_log_sha256": "1e2d5f3f950f5c7c538bbe075a183e5905bfec5466c0571ada7c08d0dbaeafd1"
+        },
+        {
+          "platform": "windows",
+          "job_id": 119578988815,
+          "name": "windows-2025 resident service follow-up",
+          "conclusion": "failure",
+          "passed_steps": [
+            "Build Ku CLI",
+            "Verify resident deployment budget and rollback contracts",
+            "Build and verify the native TLS target pack",
+            "Require a source-free native TLS C consumer",
+            "Require native PostgreSQL client linking and startup on Windows",
+            "Require native MySQL client linking and startup on Windows",
+            "Reject platform-specific clippy warnings",
+            "Verify service control and resident lifecycle regressions",
+            "Retain resident service and PostgreSQL acceptance evidence"
+          ],
+          "failed_steps": [
+            "Verify real HTTP to PostgreSQL lifecycle on Windows"
+          ],
+          "skipped_steps": [
+            "Prepare exact shared database client link inputs on Linux",
+            "Prepare exact shared database client link inputs on macOS",
+            "Require native PostgreSQL client linking and startup",
+            "Require native MySQL client linking and startup",
+            "Run every default test target without stopping at the first failure",
+            "Verify focused service and blocking lifecycle regressions",
+            "Verify native scheduler probe correctness, not performance",
+            "Verify resident hard memory provider recovery or explicit platform rejection",
+            "Verify native blocking retirement and resident replacement",
+            "Verify short native runtime matrix with actual bounded blocking regression",
+            "Verify native resident recovery, rolling and rollback through HAProxy",
+            "Verify real HTTP to PostgreSQL lifecycle",
+            "Verify actual isolated Windows host task registration, recovery and stop"
+          ],
+          "service_regressions": {
+            "passed": 10,
+            "failed": 0,
+            "ignored": 0,
+            "rst_regression": "reset_control_peers_leave_the_same_coordinator_and_generation_running",
+            "rst_regression_executed": true,
+            "rst_regression_passed": true,
+            "platform_boundary": "Unix-only supervisor-loss test is cfg excluded on Windows, not ignored."
+          },
+          "postgres_report": {
+            "file": "ku-http-pg-lifecycle.json",
+            "sha256": "1e18b160d93d1a4a4ce45f84ee54e0902ede1cdae97e487ec2bda3d96d6da69d",
+            "status": "failed",
+            "failure": "JSONDecodeError: Expecting value: line 1 column 1 (char 0)",
+            "checks": {
+              "parameters_fields_unicode_null": "passed",
+              "write_side_effect": "exactly one row",
+              "large_result": "10000 rows, 2 columns, last row verified"
+            },
+            "current_phase": "cleanup:finished",
+            "phase_details": {
+              "error_count": 0
+            },
+            "cleanup_errors": [],
+            "write_observation": {
+              "server_encoding": "UTF8",
+              "client_encoding": "UTF8",
+              "total_count": 1,
+              "rows": [
+                {
+                  "id_utf8_hex": "6e6f726d616c",
+                  "payload_utf8_hex": "e4b8ade69687f09f9982207061796c6f6164",
+                  "octet_length": 18
+                }
+              ]
+            },
+            "psql_unicode_argv_literal_utf8_hex": "3f3f3f3f207061796c6f6164",
+            "cli_sha256": "6469d45daac182401cb760becc4ae26e91fa0b9cbbd28ace831509b283596c09",
+            "failure_site": {
+              "file": "tests/acceptance/http_pg_lifecycle.py",
+              "line": 545,
+              "operation": "json.loads(request(/read)) immediately after /slow returned error:execution_unknown",
+              "response_body": "not captured; exact non-JSON content and cause unconfirmed"
+            }
+          },
+          "archive_directory": "final-ci-7859fc5-windows-service-recovery",
+          "artifact": {
+            "id": 12394570597,
+            "zip_sha256": "2afdb8a113e538a7cf062332f27495952b2d372050566e7ef6c1be8d72ab6d7e",
+            "integrity": "ZIP CRC checked"
+          }
+        }
+      ]
+    },
+    {
+      "id": 39705058328,
+      "head_sha": "67d78d9fb43a3db258db56268c7e2eb02ef4764c",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/fengyanweb/ku/actions/runs/39705058328",
+      "run_started_at": "2026-10-22T01:20:01Z",
+      "updated_at": "2026-10-22T01:26:17Z",
+      "scope": "service-recovery",
+      "source_matches_7859": true,
+      "source_difference_from_a31": [
+        "src/service_supervision.rs"
+      ],
+      "reuse_boundary": "Same product src/Cargo as the previous attempt. Only rustfmt installation and bounded PG response/phase/trace diagnostics changed; requests, SQL workload, assertions and deadlines unchanged. No automatic request or database replay.",
+      "jobs": [
+        {
+          "platform": "macos",
+          "job_id": 119583055151,
+          "conclusion": "success",
+          "passed_steps": [
+            "Build Ku CLI",
+            "Verify resident deployment budget and rollback contracts",
+            "Build and verify the native TLS target pack",
+            "Require a source-free native TLS C consumer",
+            "Require native PostgreSQL client linking and startup",
+            "Require native MySQL client linking and startup",
+            "Reject platform-specific clippy warnings",
+            "Verify service control and resident lifecycle regressions",
+            "Verify native resident recovery, rolling and rollback through HAProxy",
+            "Verify real HTTP to PostgreSQL lifecycle",
+            "Retain resident service and PostgreSQL acceptance evidence"
+          ],
+          "skipped_steps": [
+            "Prepare exact shared database client link inputs on Linux",
+            "Prepare an exact libpq import library on Windows",
+            "Locate the exact MySQL client import library on Windows",
+            "Require native PostgreSQL client linking and startup on Windows",
+            "Require native MySQL client linking and startup on Windows",
+            "Run every default test target without stopping at the first failure",
+            "Verify focused service and blocking lifecycle regressions",
+            "Verify native scheduler probe correctness, not performance",
+            "Verify resident hard memory provider recovery or explicit platform rejection",
+            "Verify native blocking retirement and resident replacement",
+            "Verify short native runtime matrix with actual bounded blocking regression",
+            "Verify real HTTP to PostgreSQL lifecycle on Windows",
+            "Verify actual isolated Windows host task registration, recovery and stop"
+          ],
+          "reports": [
+            {
+              "file": "ku-http-pg-lifecycle.json",
+              "sha256": "e5653a6511ed2f1e1125db6cef77b3603eef64b7f3c2045c77904e6fbf6eb5f7",
+              "status": "passed",
+              "cli_sha256": "07fb7a3da6a34920458e138c51f16a93c72ea25e8a5b070de0f72326e7c0e3cd",
+              "cleanup_errors": [],
+              "checks": {
+                "parameters_fields_unicode_null": "passed",
+                "write_side_effect": "exactly one row",
+                "large_result": "10000 rows, 2 columns, last row verified",
+                "timeout_and_new_request_recovery": "error:execution_unknown",
+                "commit_acknowledgement_lost": {
+                  "reported": "error:execution_unknown",
+                  "actual_rows": 1,
+                  "replayed": false
+                },
+                "database_disconnect_recovery": {
+                  "first": "error:execution_unknown",
+                  "next": "passed"
+                },
+                "bounded_dependency_pressure_recovery": {
+                  "error:acquire_timeout": 4,
+                  "error:execution_unknown": 8
+                },
+                "cancel_confirmed_and_local_charge_retired": 9,
+                "normal_drain_exit": 0,
+                "database_connections_after_exit": 0
+              },
+              "postgres_version": "17.11 (Homebrew)",
+              "database_connections_after_dependency_pressure": 1,
+              "database_connections_before_exit": 1,
+              "write_observation": {
+                "server_encoding": "UTF8",
+                "client_encoding": "UTF8",
+                "total_count": 1,
+                "rows": [
+                  {
+                    "id_utf8_hex": "6e6f726d616c",
+                    "payload_utf8_hex": "e4b8ade69687f09f9982207061796c6f6164",
+                    "octet_length": 18
+                  }
+                ]
+              },
+              "current_phase": "fixture:finished",
+              "database_metrics": {
+                "reserved_connections": 4,
+                "reserved_waiters": 8,
+                "pending_operations": 0,
+                "pending_bytes": 0,
+                "peak_pending_bytes": 672,
+                "rejections": 0,
+                "unknown_results": 11,
+                "confirmed_cancellations": 9
+              },
+              "retry": false
+            },
+            {
+              "file": "ku-resident-service.json",
+              "sha256": "6de85950f7731dc1a19d3dcceef3a8ae479aa231e052c1e61dffdcae14b4750c",
+              "passed": true,
+              "cli_sha256": "07fb7a3da6a34920458e138c51f16a93c72ea25e8a5b070de0f72326e7c0e3cd",
+              "cleanup_errors": [],
+              "results": {
+                "proxy_config": "passed",
+                "normal_proxy": "passed",
+                "native_exit_recovery": {
+                  "passed": true,
+                  "recovery_ms": 730.645,
+                  "old_generation": 1,
+                  "new_generation": 2,
+                  "surviving_requests": 10
+                },
+                "rolling": {
+                  "passed": true,
+                  "duration_ms": 1274.199,
+                  "deployment": {
+                    "old_slot": "a",
+                    "new_slot": "spare"
+                  }
+                },
+                "rollback": {
+                  "passed": true,
+                  "duration_ms": 1754.614,
+                  "verified_proxy_requests": 20
+                }
+              },
+              "diagnostic": {
+                "stage": "completed_checks",
+                "owned_after_cleanup": [
+                  {
+                    "slot": "a",
+                    "pid": 13146,
+                    "returncode": 0
+                  },
+                  {
+                    "slot": "b",
+                    "pid": 13149,
+                    "returncode": 0
+                  },
+                  {
+                    "slot": "spare",
+                    "pid": 13204,
+                    "returncode": 0
+                  },
+                  {
+                    "slot": "a",
+                    "pid": 13376,
+                    "returncode": 0
+                  }
+                ],
+                "proxy_after_cleanup": {
+                  "pid": 13145,
+                  "returncode": -15
+                }
+              }
+            }
+          ],
+          "service_regressions": {
+            "passed": 11,
+            "failed": 0,
+            "ignored": 0,
+            "rst_regression_executed_and_passed": true,
+            "name": "reset_control_peers_leave_the_same_coordinator_and_generation_running"
+          },
+          "python_contract_suites": [
+            {
+              "discovered": 11,
+              "result": "OK (skipped=1)",
+              "skipped": 1
+            },
+            {
+              "discovered": 19,
+              "result": "OK (skipped=3)",
+              "skipped": 3
+            }
+          ],
+          "artifact": {
+            "id": 12394343153,
+            "name": "service-lifecycle-macos-15",
+            "size_in_bytes": 3772,
+            "digest": "sha256:6f7ba4e855e319fd87bf500f6532e2f8f6068559a9693b6e1c9c3d61a1209e7c",
+            "zip_sha256": "6f7ba4e855e319fd87bf500f6532e2f8f6068559a9693b6e1c9c3d61a1209e7c",
+            "integrity": "ZIP CRC checked",
+            "archive_directory": "final-ci-67d78d9-macos-service-recovery"
+          }
+        },
+        {
+          "platform": "windows",
+          "job_id": 119583055360,
+          "conclusion": "success",
+          "passed_steps": [
+            "Build Ku CLI",
+            "Verify resident deployment budget and rollback contracts",
+            "Build and verify the native TLS target pack",
+            "Require a source-free native TLS C consumer",
+            "Require native PostgreSQL client linking and startup on Windows",
+            "Require native MySQL client linking and startup on Windows",
+            "Reject platform-specific clippy warnings",
+            "Verify service control and resident lifecycle regressions",
+            "Verify real HTTP to PostgreSQL lifecycle on Windows",
+            "Verify actual isolated Windows host task registration, recovery and stop",
+            "Retain resident service and PostgreSQL acceptance evidence"
+          ],
+          "skipped_steps": [
+            "Prepare exact shared database client link inputs on Linux",
+            "Prepare exact shared database client link inputs on macOS",
+            "Require native PostgreSQL client linking and startup",
+            "Require native MySQL client linking and startup",
+            "Run every default test target without stopping at the first failure",
+            "Verify focused service and blocking lifecycle regressions",
+            "Verify native scheduler probe correctness, not performance",
+            "Verify resident hard memory provider recovery or explicit platform rejection",
+            "Verify native blocking retirement and resident replacement",
+            "Verify short native runtime matrix with actual bounded blocking regression",
+            "Verify native resident recovery, rolling and rollback through HAProxy",
+            "Verify real HTTP to PostgreSQL lifecycle"
+          ],
+          "reports": [
+            {
+              "file": "ku-http-pg-lifecycle.json",
+              "sha256": "72b0c711afca84daf579f7dccaa538d12fa73edb88dd9bb3151c3d122e160cdf",
+              "status": "passed",
+              "cli_sha256": "3b02d10fd79591eb4f3849241992b1e23b736bcf98a424212b33f9c0891dcea5",
+              "cleanup_errors": [],
+              "checks": {
+                "parameters_fields_unicode_null": "passed",
+                "write_side_effect": "exactly one row",
+                "large_result": "10000 rows, 2 columns, last row verified",
+                "timeout_and_new_request_recovery": "error:execution_unknown",
+                "commit_acknowledgement_lost": {
+                  "reported": "error:execution_unknown",
+                  "actual_rows": 1,
+                  "replayed": false
+                },
+                "database_disconnect_recovery": {
+                  "first": "error:execution_unknown",
+                  "next": "passed"
+                },
+                "bounded_dependency_pressure_recovery": {
+                  "error:acquire_timeout": 8,
+                  "error:execution_unknown": 4
+                },
+                "cancel_confirmed_and_local_charge_retired": 5,
+                "normal_drain_exit": 0,
+                "database_connections_after_exit": 0
+              },
+              "postgres_version": "17.11",
+              "database_connections_after_dependency_pressure": 1,
+              "database_connections_before_exit": 1,
+              "write_observation": {
+                "server_encoding": "UTF8",
+                "client_encoding": "UTF8",
+                "total_count": 1,
+                "rows": [
+                  {
+                    "id_utf8_hex": "6e6f726d616c",
+                    "payload_utf8_hex": "e4b8ade69687f09f9982207061796c6f6164",
+                    "octet_length": 18
+                  }
+                ]
+              },
+              "psql_unicode_argv_literal_utf8_hex": "3f3f3f3f207061796c6f6164",
+              "current_phase": "fixture:finished",
+              "database_metrics": {
+                "reserved_connections": 4,
+                "reserved_waiters": 8,
+                "pending_operations": 0,
+                "pending_bytes": 0,
+                "peak_pending_bytes": 672,
+                "rejections": 0,
+                "unknown_results": 7,
+                "confirmed_cancellations": 5
+              },
+              "retry": false
+            },
+            {
+              "file": "ku-windows-host-task.json",
+              "sha256": "85a9fba7af52066e1434f9c483296d7f757655505558ff73b098a3509a799de0",
+              "status": "passed",
+              "cli_sha256": "3b02d10fd79591eb4f3849241992b1e23b736bcf98a424212b33f9c0891dcea5",
+              "native_sha256": "e7eff87d0a368b46086f1fc6be2a9cbdbc793be982d31c9c663f6e6fa1e1553b",
+              "cleanup_errors": [],
+              "held_http_status": "HTTP/1.1 504 Gateway Timeout",
+              "held_http_response_ms": 1032.0,
+              "replacement_ready_ms": 2844.0,
+              "host_processes_after_cleanup": [],
+              "replacement_status": {
+                "phase": "ready",
+                "generation": 2,
+                "last_reason": "runtime_unfinished_work",
+                "last_exit_code": 75,
+                "unfinished_work_possible": true,
+                "database_outcome": "unknown",
+                "database_retry": false
+              },
+              "host_stop_exit": 0,
+              "surviving_instance_successes": 10,
+              "host_registration_readback": [
+                {
+                  "principal": "LOCAL SERVICE",
+                  "principal_sid": "S-1-5-19",
+                  "logon_type": "ServiceAccount",
+                  "action_count": 1,
+                  "restart_count": 3,
+                  "restart_interval": "PT1M"
+                },
+                {
+                  "principal": "LOCAL SERVICE",
+                  "principal_sid": "S-1-5-19",
+                  "logon_type": "ServiceAccount",
+                  "action_count": 1,
+                  "restart_count": 3,
+                  "restart_interval": "PT1M"
+                },
+                {
+                  "principal": "LOCAL SERVICE",
+                  "principal_sid": "S-1-5-19",
+                  "logon_type": "ServiceAccount",
+                  "action_count": 1,
+                  "restart_count": 3,
+                  "restart_interval": "PT1M"
+                }
+              ]
+            }
+          ],
+          "service_regressions": {
+            "passed": 10,
+            "failed": 0,
+            "ignored": 0,
+            "rst_regression_executed_and_passed": true,
+            "name": "reset_control_peers_leave_the_same_coordinator_and_generation_running"
+          },
+          "python_contract_suites": [
+            {
+              "discovered": 11,
+              "result": "OK",
+              "skipped": 0
+            },
+            {
+              "discovered": 19,
+              "result": "OK",
+              "skipped": 0
+            }
+          ],
+          "artifact": {
+            "id": 12395415689,
+            "name": "service-lifecycle-windows-2025",
+            "size_in_bytes": 5168,
+            "digest": "sha256:687ec1bf6d7bff97e5164ed2b78d51052ad6018753451da200e0e212aa92d141",
+            "zip_sha256": "687ec1bf6d7bff97e5164ed2b78d51052ad6018753451da200e0e212aa92d141",
+            "integrity": "ZIP CRC checked",
+            "archive_directory": "final-ci-67d78d9-windows-service-recovery"
+          }
+        },
+        {
+          "platform": "linux",
+          "job_id": 119583055362,
+          "conclusion": "success",
+          "passed_steps": [
+            "Build Ku CLI",
+            "Verify resident deployment budget and rollback contracts",
+            "Build and verify the native TLS target pack",
+            "Require a source-free native TLS C consumer",
+            "Require native PostgreSQL client linking and startup",
+            "Require native MySQL client linking and startup",
+            "Reject platform-specific clippy warnings",
+            "Verify service control and resident lifecycle regressions",
+            "Verify native resident recovery, rolling and rollback through HAProxy",
+            "Verify real HTTP to PostgreSQL lifecycle",
+            "Retain resident service and PostgreSQL acceptance evidence"
+          ],
+          "skipped_steps": [
+            "Prepare exact shared database client link inputs on macOS",
+            "Prepare an exact libpq import library on Windows",
+            "Locate the exact MySQL client import library on Windows",
+            "Require native PostgreSQL client linking and startup on Windows",
+            "Require native MySQL client linking and startup on Windows",
+            "Run every default test target without stopping at the first failure",
+            "Verify focused service and blocking lifecycle regressions",
+            "Verify native scheduler probe correctness, not performance",
+            "Verify resident hard memory provider recovery or explicit platform rejection",
+            "Verify native blocking retirement and resident replacement",
+            "Verify short native runtime matrix with actual bounded blocking regression",
+            "Verify real HTTP to PostgreSQL lifecycle on Windows",
+            "Verify actual isolated Windows host task registration, recovery and stop"
+          ],
+          "reports": [
+            {
+              "file": "ku-http-pg-lifecycle.json",
+              "sha256": "7042c13bc0b1ca4cb7aacfb2533301b39f14af41b875305ae99491845852fde3",
+              "status": "passed",
+              "cli_sha256": "a5ff2a91d546caf30b00249a21ad0bc3b5ef611a8d24e0906f17925580466891",
+              "cleanup_errors": [],
+              "checks": {
+                "parameters_fields_unicode_null": "passed",
+                "write_side_effect": "exactly one row",
+                "large_result": "10000 rows, 2 columns, last row verified",
+                "timeout_and_new_request_recovery": "error:execution_unknown",
+                "commit_acknowledgement_lost": {
+                  "reported": "error:execution_unknown",
+                  "actual_rows": 1,
+                  "replayed": false
+                },
+                "database_disconnect_recovery": {
+                  "first": "error:execution_unknown",
+                  "next": "passed"
+                },
+                "bounded_dependency_pressure_recovery": {
+                  "error:acquire_timeout": 5,
+                  "error:execution_unknown": 7
+                },
+                "cancel_confirmed_and_local_charge_retired": 8,
+                "normal_drain_exit": 0,
+                "database_connections_after_exit": 0
+              },
+              "postgres_version": "16.15 (Ubuntu 16.15-1.pgdg24.04+2)",
+              "database_connections_after_dependency_pressure": 1,
+              "database_connections_before_exit": 1,
+              "write_observation": {
+                "server_encoding": "UTF8",
+                "client_encoding": "UTF8",
+                "total_count": 1,
+                "rows": [
+                  {
+                    "id_utf8_hex": "6e6f726d616c",
+                    "payload_utf8_hex": "e4b8ade69687f09f9982207061796c6f6164",
+                    "octet_length": 18
+                  }
+                ]
+              },
+              "current_phase": "fixture:finished",
+              "database_metrics": {
+                "reserved_connections": 4,
+                "reserved_waiters": 8,
+                "pending_operations": 0,
+                "pending_bytes": 0,
+                "peak_pending_bytes": 672,
+                "rejections": 0,
+                "unknown_results": 10,
+                "confirmed_cancellations": 8
+              },
+              "retry": false
+            },
+            {
+              "file": "ku-resident-service.json",
+              "sha256": "b21152a670c9504a10f7a4e01db1d43f9c16381f269b68373de75befbe36d21f",
+              "passed": true,
+              "cli_sha256": "a5ff2a91d546caf30b00249a21ad0bc3b5ef611a8d24e0906f17925580466891",
+              "cleanup_errors": [],
+              "results": {
+                "proxy_config": "passed",
+                "normal_proxy": "passed",
+                "native_exit_recovery": {
+                  "passed": true,
+                  "recovery_ms": 241.664,
+                  "old_generation": 1,
+                  "new_generation": 2,
+                  "surviving_requests": 10
+                },
+                "rolling": {
+                  "passed": true,
+                  "duration_ms": 523.164,
+                  "deployment": {
+                    "old_slot": "a",
+                    "new_slot": "spare"
+                  }
+                },
+                "rollback": {
+                  "passed": true,
+                  "duration_ms": 486.591,
+                  "verified_proxy_requests": 20
+                }
+              },
+              "diagnostic": {
+                "stage": "completed_checks",
+                "owned_after_cleanup": [
+                  {
+                    "slot": "a",
+                    "pid": 8273,
+                    "returncode": 0
+                  },
+                  {
+                    "slot": "b",
+                    "pid": 8289,
+                    "returncode": 0
+                  },
+                  {
+                    "slot": "spare",
+                    "pid": 8327,
+                    "returncode": 0
+                  },
+                  {
+                    "slot": "a",
+                    "pid": 8354,
+                    "returncode": 0
+                  }
+                ],
+                "proxy_after_cleanup": {
+                  "pid": 8272,
+                  "returncode": -15
+                }
+              }
+            }
+          ],
+          "service_regressions": {
+            "passed": 11,
+            "failed": 0,
+            "ignored": 0,
+            "rst_regression_executed_and_passed": true,
+            "name": "reset_control_peers_leave_the_same_coordinator_and_generation_running"
+          },
+          "python_contract_suites": [
+            {
+              "discovered": 11,
+              "result": "OK (skipped=1)",
+              "skipped": 1
+            },
+            {
+              "discovered": 19,
+              "result": "OK (skipped=3)",
+              "skipped": 3
+            }
+          ],
+          "artifact": {
+            "id": 12394930637,
+            "name": "service-lifecycle-ubuntu-24.04",
+            "size_in_bytes": 3758,
+            "digest": "sha256:0c2c307ada7fac8a5406ee49184cb1646ff23adebdcd1de136a80183b79f2acc",
+            "zip_sha256": "0c2c307ada7fac8a5406ee49184cb1646ff23adebdcd1de136a80183b79f2acc",
+            "integrity": "ZIP CRC checked",
+            "archive_directory": "final-ci-67d78d9-linux-service-recovery"
+          }
+        }
+      ]
+    }
+  ],
+  "delivery_validation_source": {
+    "commit": "67d78d9fb43a3db258db56268c7e2eb02ef4764c",
+    "src_tree": "2f4902d918906c627a683ed50dfe9a2a54ea3a36",
+    "changed_product_file_from_full_baseline": "src/service_supervision.rs",
+    "covered_by": 39705058328,
+    "scope": "RST peer handling and existing resident service lifecycle; no claim that the old full run became green."
+  },
+  "windows_roll_runs": [
+    {
+      "id": 39708017769,
+      "head_sha": "54706c25340c7978ea7b7fc62c3e619c22ae7770",
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/fengyanweb/ku/actions/runs/39708017769",
+      "run_started_at": "2026-10-22T01:50:46Z",
+      "updated_at": "2026-10-22T01:55:23Z",
+      "scope": "windows-roll",
+      "source_tree": "4d3e0af940a686a53851b421f2df65fa54f23140",
+      "product_src_and_cargo_same_as_67d": true,
+      "changed_scope": "Deployment Caddy adapter, reference budget and fixture/workflow only. No new default/PG/host/memory/native/formal certification.",
+      "actual_job": {
+        "id": 119592519943,
+        "conclusion": "failure",
+        "passed_steps": [
+          "Build Ku CLI",
+          "Verify resident deployment budget and rollback contracts",
+          "Build and verify the native TLS target pack",
+          "Require a source-free native TLS C consumer",
+          "Require native PostgreSQL client linking and startup on Windows",
+          "Require native MySQL client linking and startup on Windows",
+          "Reject platform-specific clippy warnings",
+          "Retain resident service and PostgreSQL acceptance evidence"
+        ],
+        "failed_steps": [
+          "Verify Windows native recovery, rolling and rollback through pinned Caddy"
+        ],
+        "skipped_steps": [
+          "Prepare exact shared database client link inputs on Linux",
+          "Prepare exact shared database client link inputs on macOS",
+          "Require native PostgreSQL client linking and startup",
+          "Require native MySQL client linking and startup",
+          "Run every default test target without stopping at the first failure",
+          "Verify focused service and blocking lifecycle regressions",
+          "Verify service control and resident lifecycle regressions",
+          "Verify native scheduler probe correctness, not performance",
+          "Verify resident hard memory provider recovery or explicit platform rejection",
+          "Verify native blocking retirement and resident replacement",
+          "Verify short native runtime matrix with actual bounded blocking regression",
+          "Verify native resident recovery, rolling and rollback through HAProxy",
+          "Verify real HTTP to PostgreSQL lifecycle",
+          "Verify real HTTP to PostgreSQL lifecycle on Windows",
+          "Verify actual isolated Windows host task registration, recovery and stop"
+        ]
+      },
+      "python_contract_suites": [
+        {
+          "discovered": 18,
+          "result": "OK",
+          "skipped": 0
+        },
+        {
+          "discovered": 19,
+          "result": "OK",
+          "skipped": 0
+        }
+      ],
+      "artifact": {
+        "id": 12395179551,
+        "name": "service-lifecycle-windows-2025",
+        "size_in_bytes": 2703,
+        "digest": "sha256:7c1dd35a8c1d38bc658f90253647e88f4e0000a96fc9e5f5aaea624cb6fd5b73",
+        "zip_sha256": "7c1dd35a8c1d38bc658f90253647e88f4e0000a96fc9e5f5aaea624cb6fd5b73",
+        "integrity": "API digest matches SHA256 of downloaded ZIP; ZIP CRC checked",
+        "archive_directory": "final-ci-54706c2-windows-roll"
+      },
+      "report": {
+        "file": "ku-caddy-service.json",
+        "sha256": "fe73b0e51a7db876241752bfe31c008c52a2f7a249e884eb4b85623d241fe1a6",
+        "passed": false,
+        "failure": "RuntimeError: actual Caddy fixture resource sample exceeds frozen reservation: {'threads': 17, 'sum_rss_bytes': 70774784, 'thread_reservation': 34, 'memory_reservation_bytes': 134217728}",
+        "cli_sha256": "9b1fb89fe2047b169441c1e2e433da6eccd30e2b41c710dc311340ddb5d9ad36",
+        "caddy_sha256": "5f93a9bd555f3aac9d33af2756ba14b3519d8cca4ffd55256bdaeab444c9db2a",
+        "caddy_version": "v2.11.7 h1:yj0Y4fYZGPkSvibBJ1sTWE33xC0fxztVyXEW5iIdUT4=",
+        "base_commit": "54706c25340c7978ea7b7fc62c3e619c22ae7770",
+        "proxy_kind": "caddy",
+        "duration_seconds": 30.172,
+        "cleanup_errors": [],
+        "results": {
+          "proxy_config": "passed",
+          "normal_proxy": "passed",
+          "native_exit_recovery": {
+            "passed": true,
+            "recovery_ms": 391.0,
+            "old_generation": 1,
+            "new_generation": 2,
+            "surviving_requests": 10
+          }
+        },
+        "parameters": {
+          "service_options": {
+            "startup_timeout_ms": 5000,
+            "probe_timeout_ms": 100,
+            "probe_interval_ms": 100,
+            "failure_threshold": 3,
+            "drain_timeout_ms": 1000,
+            "restart_limit": 5,
+            "restart_window_ms": 60000,
+            "backoff_ms": 100,
+            "max_backoff_ms": 5000
+          },
+          "deployment_budget": {
+            "max_parallel_instances": 3,
+            "reserved_memory_bytes": 1744830464,
+            "event_threads": 12,
+            "blocking_threads": 12,
+            "database_connections": 24,
+            "database_waiters": 96,
+            "database_pending_bytes": 3145728,
+            "total_threads": 85,
+            "management_threads": 34,
+            "supervisor_reserve_bytes": 33554432,
+            "thread_stack_bytes": 2097152,
+            "per_instance": {
+              "reserved_memory_bytes": 536870912,
+              "event_threads": 4,
+              "blocking_threads": 4,
+              "database_connections": 8,
+              "database_waiters": 32,
+              "database_pending_bytes": 1048576,
+              "total_threads": 17
+            },
+            "management_memory_bytes": 134217728
+          },
+          "recovery_deadline_seconds": 10,
+          "operation_timeout_seconds": 15,
+          "proxy_threads": null,
+          "proxy_thread_note": "Caddy runtime threads are sampled and checked against management reservation; no OS thread hard limit",
+          "proxy_output_capacity_bytes": 65536,
+          "proxy_gomaxprocs": 1,
+          "tls": "loopback HTTP only; no TLS in this isolated fixture"
+        },
+        "diagnostic": {
+          "stage": "rolling_resource_snapshot",
+          "failure_stage": "rolling_resource_snapshot",
+          "failure_elapsed_ms": 25938.0,
+          "trace": [
+            {
+              "file": "verify.py",
+              "line": 945,
+              "function": "main"
+            },
+            {
+              "file": "manage.py",
+              "line": 391,
+              "function": "roll"
+            },
+            {
+              "file": "verify.py",
+              "line": 942,
+              "function": "capture_coexist"
+            },
+            {
+              "file": "verify.py",
+              "line": 686,
+              "function": "validate_caddy_resources"
+            }
+          ],
+          "fault_target": {
+            "slot": "a",
+            "launcher_pid": 6060,
+            "native_pid": 1600,
+            "generation": 1
+          },
+          "surviving_b_requests": {
+            "attempted": 10,
+            "completed": 10,
+            "http_200": 10,
+            "status_codes": [
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200
+            ]
+          },
+          "slot_last_status": {
+            "a": {
+              "phase": "ready",
+              "pid": 972,
+              "generation": 2,
+              "last_reason": "process_exit",
+              "last_exit_generation": 1,
+              "last_exit_code": 15,
+              "last_launcher_signal": null,
+              "launcher_status": "nonzero_exit",
+              "termination_requested": false,
+              "unfinished_work_possible": true,
+              "database_outcome": "unknown",
+              "database_retry": false
+            },
+            "b": {
+              "phase": "ready",
+              "pid": 7360,
+              "generation": 1,
+              "last_reason": "initial_start",
+              "last_exit_generation": null,
+              "last_exit_code": null,
+              "last_launcher_signal": null,
+              "launcher_status": null,
+              "termination_requested": false,
+              "unfinished_work_possible": false,
+              "database_outcome": "not_observed",
+              "database_retry": false
+            },
+            "spare": {
+              "phase": "absent",
+              "pid": 0,
+              "control_error": "TimeoutError: timed out",
+              "control_failure": {
+                "stage": "connect",
+                "elapsed_ms": 1000.0,
+                "error_type": "TimeoutError",
+                "errno": null,
+                "winerror": null,
+                "detail": "timed out"
+              }
+            }
+          },
+          "owned_before_cleanup": [
+            {
+              "slot": "a",
+              "pid": 5776,
+              "returncode": null
+            },
+            {
+              "slot": "b",
+              "pid": 1880,
+              "returncode": null
+            },
+            {
+              "slot": "spare",
+              "pid": 3156,
+              "returncode": 0
+            }
+          ],
+          "owned_after_cleanup": [
+            {
+              "slot": "a",
+              "pid": 5776,
+              "returncode": 0
+            },
+            {
+              "slot": "b",
+              "pid": 1880,
+              "returncode": 0
+            },
+            {
+              "slot": "spare",
+              "pid": 3156,
+              "returncode": 0
+            }
+          ],
+          "proxy_before_cleanup": {
+            "pid": 8012,
+            "returncode": null
+          },
+          "proxy_after_cleanup": {
+            "pid": 8012,
+            "returncode": 1
+          },
+          "sampled_processes_after_cleanup": []
+        },
+        "snapshots": {
+          "steady_resource_snapshot": {
+            "process_count": 8,
+            "thread_count": 65,
+            "sum_rss_bytes": 103059456,
+            "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit",
+            "management_usage": {
+              "threads": 17,
+              "sum_rss_bytes": 69197824,
+              "thread_reservation": 34,
+              "memory_reservation_bytes": 134217728
+            },
+            "sum_handles": 898,
+            "proxy": {
+              "pid": 8012,
+              "ppid": 2420,
+              "threads": 8,
+              "rss_bytes": 35639296,
+              "handles": 129
+            },
+            "processes": [
+              {
+                "pid": 1600,
+                "ppid": 6060,
+                "threads": 12,
+                "rss_bytes": 5484544,
+                "handles": 99
+              },
+              {
+                "pid": 1880,
+                "ppid": 2420,
+                "threads": 6,
+                "rss_bytes": 5828608,
+                "handles": 89
+              },
+              {
+                "pid": 2420,
+                "ppid": 4996,
+                "threads": 9,
+                "rss_bytes": 33558528,
+                "handles": 227
+              },
+              {
+                "pid": 4288,
+                "ppid": 7360,
+                "threads": 12,
+                "rss_bytes": 5521408,
+                "handles": 101
+              },
+              {
+                "pid": 5776,
+                "ppid": 2420,
+                "threads": 6,
+                "rss_bytes": 5799936,
+                "handles": 89
+              },
+              {
+                "pid": 6060,
+                "ppid": 5776,
+                "threads": 6,
+                "rss_bytes": 5595136,
+                "handles": 82
+              },
+              {
+                "pid": 7360,
+                "ppid": 1880,
+                "threads": 6,
+                "rss_bytes": 5632000,
+                "handles": 82
+              },
+              {
+                "pid": 8012,
+                "ppid": 2420,
+                "threads": 8,
+                "rss_bytes": 35639296,
+                "handles": 129
+              }
+            ]
+          },
+          "rolling_resource_snapshot": {
+            "process_count": 11,
+            "thread_count": 89,
+            "sum_rss_bytes": 121102336,
+            "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit",
+            "management_usage": {
+              "threads": 17,
+              "sum_rss_bytes": 70774784,
+              "thread_reservation": 34,
+              "memory_reservation_bytes": 134217728
+            },
+            "sum_handles": 1167,
+            "proxy": {
+              "pid": 8012,
+              "ppid": 2420,
+              "threads": 8,
+              "rss_bytes": 36573184,
+              "handles": 129
+            },
+            "processes": [
+              {
+                "pid": 972,
+                "ppid": 5776,
+                "threads": 6,
+                "rss_bytes": 5386240,
+                "handles": 79
+              },
+              {
+                "pid": 1880,
+                "ppid": 2420,
+                "threads": 6,
+                "rss_bytes": 5828608,
+                "handles": 89
+              },
+              {
+                "pid": 2420,
+                "ppid": 4996,
+                "threads": 9,
+                "rss_bytes": 34201600,
+                "handles": 229
+              },
+              {
+                "pid": 3156,
+                "ppid": 2420,
+                "threads": 6,
+                "rss_bytes": 5836800,
+                "handles": 89
+              },
+              {
+                "pid": 4288,
+                "ppid": 7360,
+                "threads": 12,
+                "rss_bytes": 5582848,
+                "handles": 107
+              },
+              {
+                "pid": 5776,
+                "ppid": 2420,
+                "threads": 6,
+                "rss_bytes": 5836800,
+                "handles": 89
+              },
+              {
+                "pid": 6736,
+                "ppid": 8568,
+                "threads": 12,
+                "rss_bytes": 5496832,
+                "handles": 99
+              },
+              {
+                "pid": 7360,
+                "ppid": 1880,
+                "threads": 6,
+                "rss_bytes": 5632000,
+                "handles": 82
+              },
+              {
+                "pid": 8012,
+                "ppid": 2420,
+                "threads": 8,
+                "rss_bytes": 36573184,
+                "handles": 129
+              },
+              {
+                "pid": 8568,
+                "ppid": 3156,
+                "threads": 6,
+                "rss_bytes": 5648384,
+                "handles": 82
+              },
+              {
+                "pid": 8624,
+                "ppid": 972,
+                "threads": 12,
+                "rss_bytes": 5079040,
+                "handles": 93
+              }
+            ]
+          }
+        },
+        "failure_classification": "Actual whole-tree sampled threads 89 exceed admitted total 85 during coexistence. Management sample 17 threads/70774784 bytes is below its own 34-thread/128MiB reservation. Resource accounting must be reconciled; rolling/rollback are not passed.",
+        "whole_tree_breakdown": "Steady=management17+2*(supervisor6+launcher6+native12)=65. Coexistence=management17+3*24=89. Per-instance configured thread reservation was17, not actual24. Extra thread origin has not been uniquely attributed."
+      }
+    },
+    {
+      "id": 39709674234,
+      "head_sha": "e40ab1b5faac143f36bdddc008afad05a7abdccc",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/fengyanweb/ku/actions/runs/39709674234",
+      "run_started_at": "2026-10-22T02:08:00Z",
+      "updated_at": "2026-10-22T02:13:20Z",
+      "scope": "windows-roll",
+      "source_tree": "dae64a28cc7d70f047f8eed7d4876e23f240f2b0",
+      "product_src_and_cargo_same_as_67d": true,
+      "scope_boundary": "Only Caddy deployment/reference budgets and management contracts are validated here; default/PG/host/memory/native/formal are skipped, not new passes.",
+      "actual_job": {
+        "id": 119597747748,
+        "conclusion": "success",
+        "passed_steps": [
+          "Build Ku CLI",
+          "Verify resident deployment budget and rollback contracts",
+          "Build and verify the native TLS target pack",
+          "Require a source-free native TLS C consumer",
+          "Require native PostgreSQL client linking and startup on Windows",
+          "Require native MySQL client linking and startup on Windows",
+          "Reject platform-specific clippy warnings",
+          "Verify Windows native recovery, rolling and rollback through pinned Caddy",
+          "Retain resident service and PostgreSQL acceptance evidence"
+        ],
+        "skipped_steps": [
+          "Prepare exact shared database client link inputs on Linux",
+          "Prepare exact shared database client link inputs on macOS",
+          "Require native PostgreSQL client linking and startup",
+          "Require native MySQL client linking and startup",
+          "Run every default test target without stopping at the first failure",
+          "Verify focused service and blocking lifecycle regressions",
+          "Verify service control and resident lifecycle regressions",
+          "Verify native scheduler probe correctness, not performance",
+          "Verify resident hard memory provider recovery or explicit platform rejection",
+          "Verify native blocking retirement and resident replacement",
+          "Verify short native runtime matrix with actual bounded blocking regression",
+          "Verify native resident recovery, rolling and rollback through HAProxy",
+          "Verify real HTTP to PostgreSQL lifecycle",
+          "Verify real HTTP to PostgreSQL lifecycle on Windows",
+          "Verify actual isolated Windows host task registration, recovery and stop"
+        ]
+      },
+      "python_contract_suites": [
+        {
+          "discovered": 21,
+          "result": "OK",
+          "skipped": 0
+        },
+        {
+          "discovered": 19,
+          "result": "OK",
+          "skipped": 0
+        }
+      ],
+      "artifact": {
+        "id": 12395979767,
+        "name": "service-lifecycle-windows-2025",
+        "size_in_bytes": 3138,
+        "digest": "sha256:9e68325ab8965643092a3ea5b327b0c4efb99dfa705318c9afb4a280bffa0e68",
+        "zip_sha256": "9e68325ab8965643092a3ea5b327b0c4efb99dfa705318c9afb4a280bffa0e68",
+        "integrity": "Downloaded ZIP SHA256 matches API digest; ZIP CRC checked",
+        "archive_directory": "final-ci-e40ab1b-windows-roll"
+      },
+      "report": {
+        "file": "ku-caddy-service.json",
+        "sha256": "fb7a1cf01632311b599872ebddd6384f9e6559fc1188a40313682eb4c7338893",
+        "passed": true,
+        "cli_sha256": "ad5b36793fba78055e31d9771bc0a6545e7d03b60dd6faffc6ae3b56b0113c01",
+        "caddy_sha256": "5f93a9bd555f3aac9d33af2756ba14b3519d8cca4ffd55256bdaeab444c9db2a",
+        "caddy_version": "v2.11.7 h1:yj0Y4fYZGPkSvibBJ1sTWE33xC0fxztVyXEW5iIdUT4=",
+        "base_commit": "e40ab1b5faac143f36bdddc008afad05a7abdccc",
+        "proxy_kind": "caddy",
+        "duration_seconds": 46.125,
+        "cleanup_errors": [],
+        "results": {
+          "proxy_config": "passed",
+          "normal_proxy": "passed",
+          "native_exit_recovery": {
+            "passed": true,
+            "recovery_ms": 219.0,
+            "old_generation": 1,
+            "new_generation": 2,
+            "surviving_requests": 10
+          },
+          "rolling": {
+            "passed": true,
+            "duration_ms": 17031.0,
+            "deployment": {
+              "old_slot": "a",
+              "new_slot": "spare"
+            }
+          },
+          "rollback": {
+            "passed": true,
+            "duration_ms": 15969.0,
+            "verified_proxy_requests": 20
+          }
+        },
+        "parameters": {
+          "service_options": {
+            "startup_timeout_ms": 5000,
+            "probe_timeout_ms": 100,
+            "probe_interval_ms": 100,
+            "failure_threshold": 3,
+            "drain_timeout_ms": 1000,
+            "restart_limit": 5,
+            "restart_window_ms": 60000,
+            "backoff_ms": 100,
+            "max_backoff_ms": 5000
+          },
+          "deployment_budget": {
+            "max_parallel_instances": 3,
+            "reserved_memory_bytes": 1744830464,
+            "event_threads": 12,
+            "blocking_threads": 12,
+            "database_connections": 24,
+            "database_waiters": 96,
+            "database_pending_bytes": 3145728,
+            "total_threads": 133,
+            "management_threads": 34,
+            "supervisor_reserve_bytes": 33554432,
+            "thread_stack_bytes": 2097152,
+            "per_instance": {
+              "reserved_memory_bytes": 536870912,
+              "event_threads": 4,
+              "blocking_threads": 4,
+              "database_connections": 8,
+              "database_waiters": 32,
+              "database_pending_bytes": 1048576,
+              "total_threads": 33,
+              "platform_thread_reserve": 16
+            },
+            "management_memory_bytes": 134217728
+          },
+          "recovery_deadline_seconds": 10,
+          "operation_timeout_seconds": 15,
+          "proxy_threads": null,
+          "proxy_thread_note": "Caddy runtime threads are sampled and checked against management reservation; no OS thread hard limit",
+          "proxy_output_capacity_bytes": 65536,
+          "proxy_gomaxprocs": 1,
+          "tls": "loopback HTTP only; no TLS in this isolated fixture"
+        },
+        "snapshots": {
+          "steady_resource_snapshot": {
+            "process_count": 8,
+            "thread_count": 64,
+            "sum_rss_bytes": 103043072,
+            "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit",
+            "management_usage": {
+              "threads": 16,
+              "sum_rss_bytes": 69242880,
+              "thread_reservation": 34,
+              "memory_reservation_bytes": 134217728
+            },
+            "instance_usage": {
+              "a": {
+                "threads": 24,
+                "sum_rss_bytes": 16871424,
+                "processes": [
+                  {
+                    "pid": 980,
+                    "role": "native",
+                    "threads": 12
+                  },
+                  {
+                    "pid": 7360,
+                    "role": "launcher",
+                    "threads": 6
+                  },
+                  {
+                    "pid": 7464,
+                    "role": "supervisor",
+                    "threads": 6
+                  }
+                ],
+                "thread_reservation": 33,
+                "memory_reservation_bytes": 536870912
+              },
+              "b": {
+                "threads": 24,
+                "sum_rss_bytes": 16928768,
+                "processes": [
+                  {
+                    "pid": 2824,
+                    "role": "launcher",
+                    "threads": 6
+                  },
+                  {
+                    "pid": 4232,
+                    "role": "supervisor",
+                    "threads": 6
+                  },
+                  {
+                    "pid": 4248,
+                    "role": "native",
+                    "threads": 12
+                  }
+                ],
+                "thread_reservation": 33,
+                "memory_reservation_bytes": 536870912
+              }
+            },
+            "reservation_errors": [],
+            "sum_handles": 898,
+            "proxy": {
+              "pid": 6880,
+              "ppid": 6928,
+              "slot": null,
+              "role": "proxy",
+              "threads": 7,
+              "rss_bytes": 35459072,
+              "handles": 129
+            },
+            "processes": [
+              {
+                "pid": 980,
+                "ppid": 7360,
+                "slot": "a",
+                "role": "native",
+                "threads": 12,
+                "rss_bytes": 5492736,
+                "handles": 99
+              },
+              {
+                "pid": 2824,
+                "ppid": 4232,
+                "slot": "b",
+                "role": "launcher",
+                "threads": 6,
+                "rss_bytes": 5623808,
+                "handles": 82
+              },
+              {
+                "pid": 4232,
+                "ppid": 6928,
+                "slot": "b",
+                "role": "supervisor",
+                "threads": 6,
+                "rss_bytes": 5812224,
+                "handles": 89
+              },
+              {
+                "pid": 4248,
+                "ppid": 2824,
+                "slot": "b",
+                "role": "native",
+                "threads": 12,
+                "rss_bytes": 5492736,
+                "handles": 101
+              },
+              {
+                "pid": 6880,
+                "ppid": 6928,
+                "slot": null,
+                "role": "proxy",
+                "threads": 7,
+                "rss_bytes": 35459072,
+                "handles": 129
+              },
+              {
+                "pid": 6928,
+                "ppid": 2120,
+                "slot": null,
+                "role": "manager",
+                "threads": 9,
+                "rss_bytes": 33783808,
+                "handles": 227
+              },
+              {
+                "pid": 7360,
+                "ppid": 7464,
+                "slot": "a",
+                "role": "launcher",
+                "threads": 6,
+                "rss_bytes": 5582848,
+                "handles": 82
+              },
+              {
+                "pid": 7464,
+                "ppid": 6928,
+                "slot": "a",
+                "role": "supervisor",
+                "threads": 6,
+                "rss_bytes": 5795840,
+                "handles": 89
+              }
+            ]
+          },
+          "rolling_resource_snapshot": {
+            "process_count": 11,
+            "thread_count": 88,
+            "sum_rss_bytes": 121094144,
+            "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit",
+            "management_usage": {
+              "threads": 16,
+              "sum_rss_bytes": 70877184,
+              "thread_reservation": 34,
+              "memory_reservation_bytes": 134217728
+            },
+            "instance_usage": {
+              "a": {
+                "threads": 24,
+                "sum_rss_bytes": 16261120,
+                "processes": [
+                  {
+                    "pid": 1508,
+                    "role": "launcher",
+                    "threads": 6
+                  },
+                  {
+                    "pid": 2524,
+                    "role": "native",
+                    "threads": 12
+                  },
+                  {
+                    "pid": 7464,
+                    "role": "supervisor",
+                    "threads": 6
+                  }
+                ],
+                "thread_reservation": 33,
+                "memory_reservation_bytes": 536870912
+              },
+              "b": {
+                "threads": 24,
+                "sum_rss_bytes": 16994304,
+                "processes": [
+                  {
+                    "pid": 2824,
+                    "role": "launcher",
+                    "threads": 6
+                  },
+                  {
+                    "pid": 4232,
+                    "role": "supervisor",
+                    "threads": 6
+                  },
+                  {
+                    "pid": 4248,
+                    "role": "native",
+                    "threads": 12
+                  }
+                ],
+                "thread_reservation": 33,
+                "memory_reservation_bytes": 536870912
+              },
+              "spare": {
+                "threads": 24,
+                "sum_rss_bytes": 16961536,
+                "processes": [
+                  {
+                    "pid": 7456,
+                    "role": "launcher",
+                    "threads": 6
+                  },
+                  {
+                    "pid": 8200,
+                    "role": "supervisor",
+                    "threads": 6
+                  },
+                  {
+                    "pid": 8360,
+                    "role": "native",
+                    "threads": 12
+                  }
+                ],
+                "thread_reservation": 33,
+                "memory_reservation_bytes": 536870912
+              }
+            },
+            "reservation_errors": [],
+            "sum_handles": 1167,
+            "proxy": {
+              "pid": 6880,
+              "ppid": 6928,
+              "slot": null,
+              "role": "proxy",
+              "threads": 7,
+              "rss_bytes": 36470784,
+              "handles": 129
+            },
+            "processes": [
+              {
+                "pid": 1508,
+                "ppid": 7464,
+                "slot": "a",
+                "role": "launcher",
+                "threads": 6,
+                "rss_bytes": 5378048,
+                "handles": 79
+              },
+              {
+                "pid": 2524,
+                "ppid": 1508,
+                "slot": "a",
+                "role": "native",
+                "threads": 12,
+                "rss_bytes": 5042176,
+                "handles": 93
+              },
+              {
+                "pid": 2824,
+                "ppid": 4232,
+                "slot": "b",
+                "role": "launcher",
+                "threads": 6,
+                "rss_bytes": 5623808,
+                "handles": 82
+              },
+              {
+                "pid": 4232,
+                "ppid": 6928,
+                "slot": "b",
+                "role": "supervisor",
+                "threads": 6,
+                "rss_bytes": 5812224,
+                "handles": 89
+              },
+              {
+                "pid": 4248,
+                "ppid": 2824,
+                "slot": "b",
+                "role": "native",
+                "threads": 12,
+                "rss_bytes": 5558272,
+                "handles": 107
+              },
+              {
+                "pid": 6880,
+                "ppid": 6928,
+                "slot": null,
+                "role": "proxy",
+                "threads": 7,
+                "rss_bytes": 36470784,
+                "handles": 129
+              },
+              {
+                "pid": 6928,
+                "ppid": 2120,
+                "slot": null,
+                "role": "manager",
+                "threads": 9,
+                "rss_bytes": 34406400,
+                "handles": 229
+              },
+              {
+                "pid": 7456,
+                "ppid": 8200,
+                "slot": "spare",
+                "role": "launcher",
+                "threads": 6,
+                "rss_bytes": 5640192,
+                "handles": 82
+              },
+              {
+                "pid": 7464,
+                "ppid": 6928,
+                "slot": "a",
+                "role": "supervisor",
+                "threads": 6,
+                "rss_bytes": 5840896,
+                "handles": 89
+              },
+              {
+                "pid": 8200,
+                "ppid": 6928,
+                "slot": "spare",
+                "role": "supervisor",
+                "threads": 6,
+                "rss_bytes": 5828608,
+                "handles": 89
+              },
+              {
+                "pid": 8360,
+                "ppid": 7456,
+                "slot": "spare",
+                "role": "native",
+                "threads": 12,
+                "rss_bytes": 5492736,
+                "handles": 99
+              }
+            ]
+          },
+          "final_resource_snapshot": {
+            "process_count": 8,
+            "thread_count": 56,
+            "sum_rss_bytes": 105902080,
+            "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit",
+            "management_usage": {
+              "threads": 16,
+              "sum_rss_bytes": 72687616,
+              "thread_reservation": 34,
+              "memory_reservation_bytes": 134217728
+            },
+            "instance_usage": {
+              "b": {
+                "threads": 16,
+                "sum_rss_bytes": 16891904,
+                "processes": [
+                  {
+                    "pid": 2824,
+                    "role": "launcher",
+                    "threads": 3
+                  },
+                  {
+                    "pid": 4232,
+                    "role": "supervisor",
+                    "threads": 3
+                  },
+                  {
+                    "pid": 4248,
+                    "role": "native",
+                    "threads": 10
+                  }
+                ],
+                "thread_reservation": 33,
+                "memory_reservation_bytes": 536870912
+              },
+              "a": {
+                "threads": 24,
+                "sum_rss_bytes": 16322560,
+                "processes": [
+                  {
+                    "pid": 4312,
+                    "role": "supervisor",
+                    "threads": 6
+                  },
+                  {
+                    "pid": 6612,
+                    "role": "native",
+                    "threads": 12
+                  },
+                  {
+                    "pid": 9140,
+                    "role": "launcher",
+                    "threads": 6
+                  }
+                ],
+                "thread_reservation": 33,
+                "memory_reservation_bytes": 536870912
+              }
+            },
+            "reservation_errors": [],
+            "sum_handles": 907,
+            "proxy": {
+              "pid": 6880,
+              "ppid": 6928,
+              "slot": null,
+              "role": "proxy",
+              "threads": 7,
+              "rss_bytes": 37720064,
+              "handles": 129
+            },
+            "processes": [
+              {
+                "pid": 2824,
+                "ppid": 4232,
+                "slot": "b",
+                "role": "launcher",
+                "threads": 3,
+                "rss_bytes": 5574656,
+                "handles": 82
+              },
+              {
+                "pid": 4232,
+                "ppid": 6928,
+                "slot": "b",
+                "role": "supervisor",
+                "threads": 3,
+                "rss_bytes": 5763072,
+                "handles": 89
+              },
+              {
+                "pid": 4248,
+                "ppid": 2824,
+                "slot": "b",
+                "role": "native",
+                "threads": 10,
+                "rss_bytes": 5554176,
+                "handles": 107
+              },
+              {
+                "pid": 4312,
+                "ppid": 6928,
+                "slot": "a",
+                "role": "supervisor",
+                "threads": 6,
+                "rss_bytes": 5824512,
+                "handles": 89
+              },
+              {
+                "pid": 6612,
+                "ppid": 9140,
+                "slot": "a",
+                "role": "native",
+                "threads": 12,
+                "rss_bytes": 5128192,
+                "handles": 101
+              },
+              {
+                "pid": 6880,
+                "ppid": 6928,
+                "slot": null,
+                "role": "proxy",
+                "threads": 7,
+                "rss_bytes": 37720064,
+                "handles": 129
+              },
+              {
+                "pid": 6928,
+                "ppid": 2120,
+                "slot": null,
+                "role": "manager",
+                "threads": 9,
+                "rss_bytes": 34967552,
+                "handles": 231
+              },
+              {
+                "pid": 9140,
+                "ppid": 4312,
+                "slot": "a",
+                "role": "launcher",
+                "threads": 6,
+                "rss_bytes": 5369856,
+                "handles": 79
+              }
+            ]
+          }
+        },
+        "diagnostic": {
+          "stage": "completed_checks",
+          "owned_after_cleanup": [
+            {
+              "slot": "a",
+              "pid": 7464,
+              "returncode": 0
+            },
+            {
+              "slot": "b",
+              "pid": 4232,
+              "returncode": 0
+            },
+            {
+              "slot": "spare",
+              "pid": 8200,
+              "returncode": 0
+            },
+            {
+              "slot": "a",
+              "pid": 4312,
+              "returncode": 0
+            }
+          ],
+          "proxy_after_cleanup": {
+            "pid": 6880,
+            "returncode": 1
+          },
+          "sampled_processes_after_cleanup": []
+        }
+      },
+      "budget_boundary": {
+        "platform_thread_reserve": 16,
+        "per_instance_total_threads": 33,
+        "global_total_threads": 133,
+        "management_threads": 34,
+        "management_memory_bytes": 134217728,
+        "meaning": "Explicit admission reservation plus per-slot and whole-tree actual snapshot checks; not an OS thread hard cap or a claim that extra threads are fixed OS threads. Native execution-thread budget is unchanged.",
+        "negative_contracts": "Old snapshot per-slot24>17/global89>85 is rejected. A slot34>33 is rejected even when whole-tree99<133."
+      },
+      "latency_boundary": {
+        "operation_timeout_seconds": 15,
+        "scope": "Existing per ready/active-health/retire-stage deadline, not one whole rolling-action deadline. No timeout increase.",
+        "rolling_total_ms": 17031.0,
+        "rollback_total_ms": 15969.0
+      },
+      "response_assertion_boundary": {
+        "rolling": "Twenty body probes; new revision observed and old slot retired. No all-twenty-new-body claim.",
+        "rollback": "Twenty of twenty bodies equal the previous revision."
+      },
+      "cleanup_boundary": "All four owned coordinator receipts are0; Caddy termination receipt is1 on Windows and its PID is confirmed gone. sampled_processes_after_cleanup is empty."
+    }
+  ],
+  "local_caddy_evidence": [
+    {
+      "file": "caddy-local-adapter-probe.json",
+      "sha256": "075d703a3cd9dd03e3d4af2e3512e4a152391067318263b23a845b146cace8fb",
+      "scope": "Caddy adapter/management and controlled HTTP peers; separate from real Ku fixture. Exact pre-final edit hashes of historical probes were not captured; final files retain the tested transport/render behavior plus budget validation34 and receive allowance arithmetic. No runtime/DB performance inference.",
+      "version": "2.11.7",
+      "official_release": "https://github.com/caddyserver/caddy/releases/tag/v2.11.7",
+      "official_license": "https://github.com/caddyserver/caddy/blob/v2.11.7/LICENSE",
+      "official_archive_sha256": "cda3030e5d5b13eb9f0b6fb541037f633bddd958c070c5f561d7a5cccb581665",
+      "archive_verified": true,
+      "caddy_validate": "passed",
+      "adapter": {
+        "initial_active_health_seconds": 10.133,
+        "atomic_load_and_second_active_health_total_seconds": 20.295,
+        "config_readback_exact": true,
+        "frontend_control_path_status": 404,
+        "frontend_private_header_removed": true
+      },
+      "health_probe": {
+        "initial_health_seconds": 10.155,
+        "changed_control_phase": "ready to draining",
+        "business_listener_kept_open": true,
+        "subsequent_proxy_requests": 50,
+        "requests_to_failed_backend": 0,
+        "healthy_backends_observed": 2
+      },
+      "permanent_regressions": {
+        "total": 18,
+        "passed": 17,
+        "skipped": 1,
+        "reason": "Windows-only exclusive-bind contract on macOS"
+      },
+      "post_probe_reported_file_hashes": {
+        "deploy/service/manage.py": "2f30e4e06d6973c51b8ebe5fcbfa99812cc34bd8c53b538c4487960862e5603d",
+        "deploy/service/test_manage.py": "c4b3cbf8c4c9ce17a2c33da41cc333b18807c87599c164fb3c7b23ad61034356"
+      },
+      "measurement_source_hash_boundary": "These reported hashes are not attestation of the exact pre-final historical probe edits; the source scope explicitly says those historical hashes were not captured.",
+      "cleanup": {
+        "probe_servers": "all reaped",
+        "caddy_processes": "all reaped",
+        "unique_download_directory_removed": true
+      }
+    },
+    {
+      "file": "mac-caddy-roll-first.json",
+      "sha256": "0ae4b600f111ecdf735260cc749ce39f4ff4326a727dcbbc9f2b1561f93a8bec",
+      "passed": true,
+      "platform": "Darwin",
+      "duration_seconds": 25.123,
+      "base_commit": "12c6de4f9af9dfd55d43f8a6f058a2984c5d92e4",
+      "cli_sha256": "cf7b01cc35c784122a7b97a80f9595cde3aae05969a72cb3ca2c06a705183f30",
+      "caddy_sha256": "0d746e47f39d9706883b3633bf419feb25973e6caaa8eabbf5b44421d59e3973",
+      "caddy_version": "v2.11.7 h1:yj0Y4fYZGPkSvibBJ1sTWE33xC0fxztVyXEW5iIdUT4=",
+      "verify_sha256": "153a4679df8ca2934b8daffa5060cf24c1fe25f1eafaedc889ffe434edfcbd55",
+      "cleanup_errors": [],
+      "fixture_identity_note": "Uncommitted verify/manage adaptation, CLI and proxy hashes recorded above; this run used management reservation 33 threads, before final reservation changed to 34 and Windows-only final sampling was added.",
+      "manage_sha256_at_measurement": null,
+      "manage_sha256_boundary": "unknown; final helper hash must not be substituted",
+      "management_thread_reservation_at_measurement": 33,
+      "results": {
+        "proxy_config": "passed",
+        "normal_proxy": "passed",
+        "native_exit_recovery": {
+          "passed": true,
+          "recovery_ms": 271.22,
+          "old_generation": 1,
+          "new_generation": 2,
+          "surviving_requests": 10
+        },
+        "rolling": {
+          "passed": true,
+          "duration_ms": 11001.052,
+          "deployment": {
+            "old_slot": "a",
+            "new_slot": "spare"
+          }
+        },
+        "rollback": {
+          "passed": true,
+          "duration_ms": 10465.331,
+          "verified_proxy_requests": 20
+        }
+      },
+      "scope": "Real Ku plus Caddy on local macOS; uncommitted pre-34-thread fixture, not the final Windows547 source identity."
+    }
+  ],
+  "final_reference_deployment_validation_source": {
+    "commit": "e40ab1b5faac143f36bdddc008afad05a7abdccc",
+    "tree": "dae64a28cc7d70f047f8eed7d4876e23f240f2b0",
+    "covered_by": 39709674234,
+    "product_src_cargo_same_as_67d": true,
+    "scope": "Windows Caddy rolling and explicit platform auxiliary thread reservation"
+  }
+}

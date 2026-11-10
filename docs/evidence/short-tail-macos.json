@@ -1,0 +1,428 @@
+{
+  "schema_version": 1,
+  "captured_utc": "2026-10-21T21:55:20.845330+00:00",
+  "status": "unresolved_tail; not a fixed-504 or sustained-pass claim",
+  "source_commit": "b173530f039b3ddabe6502215074d092856160d9",
+  "cli_sha256": "dc0a34eec2df593c7cb807b9d8ee787dff77393015a1ad5e722ce864dfa084de",
+  "native_sha256": "f9d20a65d77a5e21c7cc15bea6f4ed2f07bec639f636f7be0312c624c9385e03",
+  "fixture_sha256": "859d539562d5a2fa1693e22fa56949daed1aeab3eeb3b0c149e7d5a8f3282460",
+  "preflight": {
+    "arrivals": 250,
+    "completed": 250,
+    "counts": {
+      "success": 248,
+      "http_504": 2
+    },
+    "p50_ms": 8.7,
+    "p95_ms": 263.2,
+    "p99_ms": 1002.1,
+    "first_errors": [
+      {
+        "path": "/hot",
+        "status": 504,
+        "body": "b'Gateway Timeout'"
+      },
+      {
+        "path": "/hot",
+        "status": 504,
+        "body": "b'Gateway Timeout'"
+      }
+    ],
+    "end_metrics": {
+      "loops": [
+        {
+          "id": 0,
+          "accepted": 21,
+          "requests": 65,
+          "queued": 0,
+          "running": 0,
+          "resident": 0,
+          "connections": 0,
+          "pending": 0
+        },
+        {
+          "id": 1,
+          "accepted": 20,
+          "requests": 49,
+          "queued": 0,
+          "running": 0,
+          "resident": 0,
+          "connections": 0,
+          "pending": 0
+        },
+        {
+          "id": 2,
+          "accepted": 20,
+          "requests": 82,
+          "queued": 0,
+          "running": 0,
+          "resident": 0,
+          "connections": 0,
+          "pending": 0
+        },
+        {
+          "id": 3,
+          "accepted": 20,
+          "requests": 54,
+          "queued": 0,
+          "running": 0,
+          "resident": 0,
+          "connections": 0,
+          "pending": 0
+        }
+      ],
+      "accepted": 81,
+      "draining": false,
+      "outcomes": [
+        {
+          "id": 0,
+          "admitted": 65,
+          "success_responses": 64,
+          "rejected_responses": 0,
+          "timeout_responses": 10,
+          "other_responses": 0,
+          "peak_loop_delay_ms": 7,
+          "queued_bytes": 0,
+          "peak_queued_bytes": 730
+        },
+        {
+          "id": 1,
+          "admitted": 49,
+          "success_responses": 49,
+          "rejected_responses": 0,
+          "timeout_responses": 9,
+          "other_responses": 0,
+          "peak_loop_delay_ms": 35,
+          "queued_bytes": 0,
+          "peak_queued_bytes": 730
+        },
+        {
+          "id": 2,
+          "admitted": 82,
+          "success_responses": 81,
+          "rejected_responses": 0,
+          "timeout_responses": 5,
+          "other_responses": 0,
+          "peak_loop_delay_ms": 8,
+          "queued_bytes": 0,
+          "peak_queued_bytes": 730
+        },
+        {
+          "id": 3,
+          "admitted": 54,
+          "success_responses": 54,
+          "rejected_responses": 0,
+          "timeout_responses": 7,
+          "other_responses": 0,
+          "peak_loop_delay_ms": 8,
+          "queued_bytes": 0,
+          "peak_queued_bytes": 730
+        }
+      ],
+      "buffer_bytes": 0,
+      "peak_buffer_bytes": 30460,
+      "buffer_rejections": 0,
+      "output": {
+        "queued_records": 0,
+        "queued_bytes": 0,
+        "peak_bytes": 0,
+        "dropped_records": 0,
+        "dropped_bytes": 0,
+        "failures": 0,
+        "written_bytes": 0
+      },
+      "tasks": [
+        {
+          "id": 0,
+          "ready": 0,
+          "waiting": 0,
+          "running": 0,
+          "resident": 0,
+          "timers": 0,
+          "polls": 276298,
+          "peak_ready_delay_ms": 135,
+          "exited": 0
+        },
+        {
+          "id": 1,
+          "ready": 0,
+          "waiting": 0,
+          "running": 0,
+          "resident": 0,
+          "timers": 0,
+          "polls": 145393,
+          "peak_ready_delay_ms": 135,
+          "exited": 0
+        },
+        {
+          "id": 2,
+          "ready": 0,
+          "waiting": 0,
+          "running": 0,
+          "resident": 0,
+          "timers": 0,
+          "polls": 143464,
+          "peak_ready_delay_ms": 137,
+          "exited": 0
+        },
+        {
+          "id": 3,
+          "ready": 0,
+          "waiting": 0,
+          "running": 0,
+          "resident": 0,
+          "timers": 0,
+          "polls": 82599,
+          "peak_ready_delay_ms": 135,
+          "exited": 0
+        }
+      ],
+      "task_blocking": {
+        "resident": 0,
+        "queued": 0,
+        "running": 0,
+        "peak_resident": 0,
+        "peak_queued": 0,
+        "peak_running": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "finished": 0,
+        "output_charge_bytes": 0,
+        "workers_created": 0,
+        "workers_exited": 0,
+        "cancelled_still_running": 0,
+        "net_wait": 0,
+        "net_step": 0
+      }
+    },
+    "end_resources": {
+      "monotonic": 9.296454791,
+      "rss_bytes": 2293760,
+      "cpu_percent": 10.6,
+      "cpu_time": "0:00.85",
+      "threads": 11,
+      "fds": 15
+    }
+  },
+  "original_uninstrumented_capture": {
+    "artifact_matches_preflight": true,
+    "requests": 885,
+    "counts": {
+      "success": 885
+    },
+    "analysis": {
+      "artifact_equals_failed_preflight": true,
+      "first_trigger_request_id": 879,
+      "first_trigger_request_elapsed_ms": 116.33558300000146,
+      "observer_spawn_return_delay_ms": 655.3650839999996,
+      "observed": "Client tails208-912ms after hot response progression around prior84-94ms tails. At metrics, fixed-owner0/3 eachhas1ready and0running; ps shows two loopthreadsR (runnable/running). Allrequestscompleted200 and allTaskrecordsreturned0; no504 inthis onecapture.",
+      "not_established": "One-second threadsample containsidle poll snapshots; launch lag prevents correlating them to trigger-time readyTasks. Rstate doesnot distinguish actualCPUexecution from runnableCPUwait. No per-request internalpoll/CPUtimeline exists in unaltered artifact. Rootcause remainsunconfirmed; cannotprove lostwake, queuefairness, or externalCPUcontention.",
+      "static_contract": "pump32 returnsdeadline0 when itsownreadyFIFOremains; HTTP minimum maps0toOSpoll0. Cross-threadpublication afterpumpclears pumping underdriverlock sendsownerwake. Wake-drain occursafterpoll andbeforenextpump, so no statically foundlostwake gap. Idle OSwait isbounded by500mshealthD, not100ms.",
+      "decision": "No production source patch. No timeout/quantum/threshold change. No furtherloadrepeat. Prior-O3non-equivalent andinstrumented-O2success arenotacceptance evidence. This clientlongtail captureisnot aformal30minute pass."
+    }
+  },
+  "prestarted_observer": {
+    "method": "unaltered release native; original phase/request 32workers,N4,50RPS,max60s; separate prestartedlibproc observer10ms target, fixed501frame ring; common CLOCK_MONOTONIC; first in-flight>100ms stoparrivals, collectpreceding/following1second",
+    "state_enum": {
+      "1": "RUNNING: runnable or actually executing; compareCPUdeltas",
+      "2": "STOPPED",
+      "3": "WAITING",
+      "4": "UNINTERRUPTIBLE",
+      "5": "HALTED"
+    },
+    "cpu_units": "nanoseconds, microsecond granularity perXNU conversion",
+    "analysis": {
+      "request": {
+        "id": 84,
+        "path": "/hot",
+        "start_ns": 1244531468948000,
+        "worker": 7,
+        "category": "success",
+        "reported_elapsed": 0.13060979100000036,
+        "sample": null,
+        "end_ns": 1244531599623000
+      },
+      "trigger_age_ms": 117.383,
+      "metrics_start_lag_ms": 0.408,
+      "metrics_duration_ms": 2.803,
+      "thread_delta_bounds": {
+        "from_sample_start_ns": 1244531440344000,
+        "from_sample_end_ns": 1244531440580000,
+        "to_sample_start_ns": 1244531610844000,
+        "to_sample_end_ns": 1244531610965000,
+        "wall_start_to_start_ns": 170500000,
+        "note": "Countersread sequentiallywithin eachsweep; these areboundingnearby snapshots,notexactperrequestCPUownership"
+      },
+      "all_threads": [
+        {
+          "thread": 8276385376,
+          "bounded_cpu_delta_ns": 146000,
+          "inside_sample_states": {
+            "3": 5
+          }
+        },
+        {
+          "thread": 6163640544,
+          "bounded_cpu_delta_ns": 0,
+          "inside_sample_states": {
+            "3": 5
+          }
+        },
+        {
+          "thread": 6165786848,
+          "bounded_cpu_delta_ns": 771000,
+          "inside_sample_states": {
+            "3": 5
+          }
+        },
+        {
+          "thread": 6167933152,
+          "bounded_cpu_delta_ns": 0,
+          "inside_sample_states": {
+            "3": 5
+          }
+        },
+        {
+          "thread": 6170079456,
+          "bounded_cpu_delta_ns": 204000,
+          "inside_sample_states": {
+            "3": 5
+          }
+        },
+        {
+          "thread": 6172225760,
+          "bounded_cpu_delta_ns": 28950000,
+          "inside_sample_states": {
+            "1": 5
+          }
+        },
+        {
+          "thread": 6174372064,
+          "bounded_cpu_delta_ns": 0,
+          "inside_sample_states": {
+            "3": 5
+          }
+        },
+        {
+          "thread": 6176518368,
+          "bounded_cpu_delta_ns": 0,
+          "inside_sample_states": {
+            "3": 5
+          }
+        },
+        {
+          "thread": 6178664672,
+          "bounded_cpu_delta_ns": 29000,
+          "inside_sample_states": {
+            "3": 5
+          }
+        },
+        {
+          "thread": 6180810976,
+          "bounded_cpu_delta_ns": 0,
+          "inside_sample_states": {
+            "3": 5
+          }
+        },
+        {
+          "thread": 6182957280,
+          "bounded_cpu_delta_ns": 0,
+          "inside_sample_states": {
+            "3": 5
+          }
+        }
+      ],
+      "observed_runnable_thread": {
+        "id": 6172225760,
+        "inside_points": [
+          {
+            "sample_start_ns": 1244531538910000,
+            "sample_end_ns": 1244531538978000,
+            "state": 1,
+            "cpu_ns": 31193000,
+            "offset_from_request_start_ms": 69.962
+          },
+          {
+            "sample_start_ns": 1244531553954000,
+            "sample_end_ns": 1244531554123000,
+            "state": 1,
+            "cpu_ns": 34213000,
+            "offset_from_request_start_ms": 85.006
+          },
+          {
+            "sample_start_ns": 1244531586331000,
+            "sample_end_ns": 1244531586471000,
+            "state": 1,
+            "cpu_ns": 37445000,
+            "offset_from_request_start_ms": 117.383
+          },
+          {
+            "sample_start_ns": 1244531586550000,
+            "sample_end_ns": 1244531586621000,
+            "state": 1,
+            "cpu_ns": 37445000,
+            "offset_from_request_start_ms": 117.602
+          },
+          {
+            "sample_start_ns": 1244531597221000,
+            "sample_end_ns": 1244531597415000,
+            "state": 1,
+            "cpu_ns": 43250000,
+            "offset_from_request_start_ms": 128.273
+          }
+        ],
+        "between_first_last_wall_ns": 58311000,
+        "between_first_last_cpu_ns": 12057000,
+        "between_first_last_not_cpu_ns": 46254000,
+        "conclusion": "Threadrun_state1 at all fiveinsidepoints,but CPUcounteradvancesonly12.057msacross58.311mswall. This excludescontinuousCPUexecutionoverthatspan. Unsampledshortwaitsremainpossible; noexactrunnable-waitdurationclaim."
+      },
+      "largest_observer_gap": {
+        "previous_start_ns": 1244531440344000,
+        "previous_end_ns": 1244531440580000,
+        "next_start_ns": 1244531538910000,
+        "interval_ns": 98566000,
+        "previous_sweep_wall_ns": 236000
+      },
+      "confirmed": [
+        "Original unaltered nativeartifactmatchesfailedpreflight f9d20a65...",
+        "Onehotrequest130.675mscompleted200;90totalcompleted200afterfirsttriggerstoppedarrivals",
+        "OnlyonethreadwasRUNNINGatallfiveinsidepoints;othertenwereWAITINGatthosepoints;primarythreadboundedCPU28.95msover170.5msnearrequest",
+        "Observeritselfmissedplanned10msperiodby98.566msinterval;previoussweep0.236ms,soentiregapwasnotspentinsideathreadinfoquery",
+        "Metricsready2onowner3andpeakready16ms;these do notlocateclienttotal130msinserversolely"
+      ],
+      "not_proved": [
+        "CannotreadthreadstackwiththisAPI;WAITINGdoesnotidentifylockorI/O",
+        "SnapshotRUNNINGdoesnotprovecontinuouslyrunnablethroughunsampled98.566msgap",
+        "NoexactmappingofcthreadIDtoHTTPownerisexported;oneactiveCPUthreadandowner3readyarecorrelatedprocessobservations,notanidentityproof",
+        "No504occurredinthiscapturedwindow;originaltwo504cannotbeuniquelyattributedfromthisshorterlatencyalone",
+        "NoevidenceforchangingTaskquantum,timeout,M:N,orthreadpriority"
+      ],
+      "production_change": "None. Evidence supports significant off-CPU/observer scheduling gaps, not continuous Ku computation; no confirmed local runtime patch yet."
+    },
+    "calibration_cpu_units_validation": {
+      "observer_spin_process_ns": 15003000,
+      "libproc_self_thread_delta_ns": 15045000,
+      "ratio": 1.0027994401119775
+    },
+    "initial_calibration_overhead": {
+      "cpu_ns": 21850000,
+      "wall_ns": 1213108875,
+      "sweep_p50_ns": 146708,
+      "sweep_p99_ns": 984417,
+      "interval_p50_ns": 9806125,
+      "interval_p99_ns": 14846083,
+      "interval_max_ns": 18115417,
+      "note": "Priorprocess-relative timestamp calibration;CPU/intervaldeltasvalid. FinalclockhandshakeusesexplicitCLOCK_MONOTONIC."
+    }
+  },
+  "raw_window": {
+    "name": "libproc-first-stall-window.json.gz",
+    "sha256": "de25328958010f50a53e37680fe904b9d28a9332a00531dd3a16cc3d271430e2",
+    "retention": "bounded original window retained outside repository with the local acceptance evidence"
+  },
+  "decision": [
+    "不再重复本机短采集或扩大历史504诊断。",
+    "没有证据支持修改期限、Task量子或重做M:N；两个504仍未被证明修复。",
+    "正式验收另在列明CPU与配额的独立CI主机冻结同一方案，不能据此覆盖或解释本机失败。"
+  ]
+}

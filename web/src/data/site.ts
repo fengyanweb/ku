@@ -1,11 +1,17 @@
 import { versions } from './versions';
 export const project = {
-  name: 'Ku',
+  name: 'Ku Programming Language',
+  nameZh: 'Ku 编程语言',
+  website: 'https://ku-lang.com/',
   repository: 'https://github.com/fengyanweb/ku',
-  release: `https://github.com/fengyanweb/ku/releases/tag/v${versions.released}`,
-  version: versions.current,
+  release: versions.releaseUrl,
+  version: versions.languageVersion,
   releasedVersion: versions.released,
-  verifiedAt: '2026-10-20',
+  releaseTag: versions.releaseTag,
+  releaseCommit: versions.releaseCommit,
+  docsSourceRef: versions.docsSourceRef,
+  verifiedAt: versions.verifiedAt,
+  feedbackEmail: 'kagura.gc@qq.com',
 } as const;
 
 export { locales, type Locale } from '../i18n/locales';

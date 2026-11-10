@@ -2636,7 +2636,7 @@ fn finish_deep_local(
         let depth = machine.calls.len();
         if !full_depth_observed
             && depth != observed_depth
-            && depth % 64 == 0
+            && depth.is_multiple_of(64)
             && machine
                 .calls
                 .as_slice()
@@ -4709,7 +4709,7 @@ fn s9_deep_finish(
         {
             ChunkProgress::More { popped } => {
                 assert_eq!(popped, chunk);
-                if deepest || machine.calls.len() % 64 == 0 {
+                if deepest || machine.calls.len().is_multiple_of(64) {
                     s9_observe(machine, input, proof);
                 }
             }

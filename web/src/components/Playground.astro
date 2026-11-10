@@ -1,0 +1,295 @@
+---
+import { examples } from '../playground/examples';
+import { playgroundMessages } from '../playground/messages';
+import type { Locale } from '../i18n/locales';
+import '../styles/playground.css';
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const messages = playgroundMessages(locale);
+const label = messages.page;
+---
+
+<section
+  class="playground shell"
+  data-playground
+  data-locale={locale}
+  aria-labelledby="playground-title"
+>
+  <script
+    type="application/json"
+    data-playground-messages
+    set:html={JSON.stringify(messages).replace(/</g, '\\u003c')}
+  />
+  <header class="pg-heading">
+    <p class="eyebrow" dir="ltr">
+      KU PLAYGROUND
+    </p>
+    <h1 id="playground-title">{label.title}</h1>
+  </header>
+  <div class="pg-toolbar">
+    <label class="pg-example-label">
+      {label.example}
+      <select
+        data-examples
+        data-needs-editor
+        disabled
+        aria-label={label.example}
+      >
+        {examples.map((example) => (
+          <option value={example.id}>{messages.examples[example.id]}</option>
+        ))}
+      </select>
+    </label>
+    <button type="button" class="pg-button" data-retry-editor hidden>
+      {label.retry}
+    </button>
+    <button
+      type="button"
+      class="pg-button pg-primary"
+      data-action="run"
+      disabled
+    >
+      {label.run} <span aria-hidden="true">▷</span>
+    </button>
+    <button type="button" class="pg-button" data-action="check" disabled>
+      {label.check}
+    </button>
+    <button type="button" class="pg-button" data-action="stop" disabled>
+      {label.stop} <span aria-hidden="true">□</span>
+    </button>
+  </div>
+  <div class="pg-run-feedback">
+    <p class="pg-status" data-status role="status" aria-live="polite">
+      {label.initial}
+    </p>
+    <p class="pg-stale" data-stale role="status" hidden></p>
+  </div>
+  <div class="pg-workspace">
+    <section class="pg-source" aria-label={label.source}>
+      <div class="pg-panel-heading">
+        <h2>{label.source}</h2>
+        <span data-source-size dir="ltr"></span>
+      </div>
+      <div data-editor dir="ltr"></div>
+      <textarea
+        class="pg-source-preview"
+        data-source-preview
+        readonly
+        spellcheck="false"
+        aria-label={label.source}
+        dir="ltr"
+      >{examples[0].source}</textarea>
+      <div class="pg-source-tools">
+        <button type="button" class="pg-button" data-action="reset" disabled>
+          {label.reset}
+        </button>
+        <button type="button" class="pg-button" data-action="copy" disabled>
+          {label.copy}
+        </button>
+        <button type="button" class="pg-button" data-action="download" disabled>
+          {label.download}
+        </button>
+        <button type="button" class="pg-button" data-action="share" disabled>
+          {label.share}
+        </button>
+      </div>
+    </section>
+    <section class="pg-results" aria-label={label.stdout}>
+      <div class="pg-tabs" role="tablist" aria-label={label.results}>
+        <button
+          type="button"
+          role="tab"
+          id="pg-tab-stdout"
+          aria-controls="pg-panel-stdout"
+          aria-selected="true"
+          tabindex="0"
+          data-tab="stdout"
+        >
+          {label.stdout}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id="pg-tab-stderr"
+          aria-controls="pg-panel-stderr"
+          aria-selected="false"
+          tabindex="-1"
+          data-tab="stderr"
+        >
+          {label.stderr}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id="pg-tab-diagnostics"
+          aria-controls="pg-panel-diagnostics"
+          aria-selected="false"
+          tabindex="-1"
+          data-tab="diagnostics"
+        >
+          {label.diagnostics}
+        </button>
+      </div>
+      <div
+        class="pg-output"
+        role="tabpanel"
+        id="pg-panel-stdout"
+        aria-labelledby="pg-tab-stdout"
+        tabindex="0"
+        data-panel="stdout"
+      >
+        <pre data-stdout dir="auto">{label.empty}</pre>
+      </div>
+      <div
+        class="pg-output"
+        role="tabpanel"
+        id="pg-panel-stderr"
+        aria-labelledby="pg-tab-stderr"
+        tabindex="0"
+        data-panel="stderr"
+        hidden
+      >
+        <pre data-stderr dir="auto"></pre>
+      </div>
+      <div
+        class="pg-output"
+        role="tabpanel"
+        id="pg-panel-diagnostics"
+        aria-labelledby="pg-tab-diagnostics"
+        tabindex="0"
+        data-panel="diagnostics"
+        hidden
+      ></div>
+      <div class="pg-result-tools">
+        <button type="button" class="pg-button" data-action="clear" disabled>
+          {label.clear}
+        </button>
+      </div>
+    </section>
+  </div>
+  <p class="pg-notice" data-notice role="status" aria-live="polite"></p>
+  <div class="pg-share" data-share-container hidden>
+    <label>
+      {label.shareLink}
+      <input
+        type="text"
+        data-share-link
+        readonly
+        spellcheck="false"
+        dir="ltr"
+      />
+    </label>
+  </div>
+  <p class="pg-hint">
+    {label.shortcuts}
+    <br />
+    {label.local}
+  </p>
+  <details class="pg-modules">
+    <summary>{label.modules}</summary>
+    <label class="pg-file-label">
+      {label.addFiles}
+      <input
+        type="file"
+        accept=".ku"
+        multiple
+        data-file-input
+        data-needs-editor
+        disabled
+      />
+    </label>
+    <p class="pg-hint">{label.modulesHelp}</p>
+    <div data-files></div>
+  </details>
+  <details class="pg-engine">
+    <summary>
+      <span>{label.details}</span> · <span data-engine>{label.unloaded}</span>
+    </summary>
+    <pre data-engine-details dir="ltr">{label.waiting}</pre>
+    <p>{label.limits}</p>
+    <p>{label.unsupported}</p>
+  </details>
+  <dialog
+    class="pg-confirm"
+    data-confirm-dialog
+    aria-labelledby="pg-confirm-title"
+    aria-describedby="pg-confirm-message"
+  >
+    <h2 id="pg-confirm-title">{label.confirmTitle}</h2>
+    <p id="pg-confirm-message" data-confirm-message></p>
+    <div class="pg-confirm-actions">
+      <button type="button" class="pg-button" data-confirm-cancel autofocus>
+        {label.cancel}
+      </button>
+      <button type="button" class="pg-button pg-primary" data-confirm-accept>
+        {label.accept}
+      </button>
+    </div>
+  </dialog>
+  <noscript>
+    <p>{label.noscript}</p>
+  </noscript>
+</section>
+
+<script>
+  import type { PlaygroundMessages } from '../playground/messages';
+
+  let pageGeneration = 0;
+  let pending = new WeakMap<HTMLElement, number>();
+  const invalidate = () => {
+    pageGeneration++;
+    pending = new WeakMap();
+  };
+  document.addEventListener('astro:before-swap', invalidate);
+  window.addEventListener('pagehide', invalidate);
+
+  async function initializeRoot(root: HTMLElement) {
+    if (root.dataset.active || pending.has(root)) return;
+    const thisPage = pageGeneration;
+    pending.set(root, thisPage);
+    const retry = root.querySelector<HTMLButtonElement>('[data-retry-editor]')!;
+    const status = root.querySelector<HTMLElement>('[data-status]')!;
+    const messages: PlaygroundMessages = JSON.parse(
+      root.querySelector('[data-playground-messages]')!.textContent!,
+    );
+    retry.hidden = true;
+    retry.disabled = true;
+    status.textContent = messages.page.initial;
+    try {
+      const { mount } = await import('../playground/controller');
+      if (root.isConnected && pageGeneration === thisPage)
+        mount(root, messages.status);
+    } catch {
+      if (root.isConnected && pageGeneration === thisPage) {
+        status.textContent = messages.page.editorFailure;
+        retry.hidden = false;
+      }
+    } finally {
+      if (pending.get(root) === thisPage) {
+        pending.delete(root);
+        retry.disabled = false;
+      }
+    }
+  }
+
+  function initialize() {
+    document
+      .querySelectorAll<HTMLElement>('[data-playground]')
+      .forEach((root) => {
+        if (!root.dataset.bound) {
+          root.dataset.bound = 'true';
+          root
+            .querySelector<HTMLButtonElement>('[data-retry-editor]')!
+            .addEventListener('click', () => void initializeRoot(root));
+        }
+        void initializeRoot(root);
+      });
+  }
+  initialize();
+  document.addEventListener('astro:page-load', initialize);
+  window.addEventListener('pageshow', (event) => {
+    if (event.persisted) initialize();
+  });
+</script>

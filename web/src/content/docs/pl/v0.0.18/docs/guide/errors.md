@@ -1,17 +1,20 @@
 ---
-title: Błędy i rozwiązywanie problemów
-description: Diagnozuj błędy instalacji Ku, importów, własności, JSON i możliwości zaplecza.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Błędy i rozwiązywanie problemów'
+description: 'Diagnozuj błędy instalacji Ku, importów, własności, JSON i możliwości zaplecza.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - docs/diagnostics.md
-  - docs/syntax.md
-  - src/error.rs
-  - src/stdlib/json.rs
+  [
+    'docs/diagnostics.md',
+    'docs/syntax.md',
+    'src/error.rs',
+    'src/stdlib/json.rs',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: pl/v0.0.18/docs/guide/errors
 ---
 
-Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v0.0.18. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases. Diagnostyka kompilatora może się zmieniać podczas eksperymentalnego rozwoju. W zgłoszeniu problemu podaj wersję CLI, commit Git, zaplecze, pełne polecenie i minimalne źródło.
+Diagnostyka kompilatora może się zmieniać podczas eksperymentalnego rozwoju. W zgłoszeniu problemu podaj wersję CLI, commit Git, zaplecze, pełne polecenie i minimalne źródło.
 
 ## Rozpoznaj plik wykonywalny Ku
 
@@ -43,7 +46,7 @@ Wyjście to **JSON Lines**, jeden komunikat diagnostyczny na wiersz. Pola obejmu
 | `E0913`     | Pożyczony parametr async               | Użyj parametru z własnością; sklonuj u wywołującego, jeśli potrzebny jest oryginał  |
 | `E0918`     | `&value` w miejscu wywołania           | Przekaż zwykły argument; pożyczanie deklaruje sygnatura                             |
 
-To podsumowanie zarejestrowanej diagnostyki, a nie lista wszystkich błędów. Aktualny nadrzędny rejestr to [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs).
+To podsumowanie zarejestrowanej diagnostyki, a nie lista wszystkich błędów. Aktualny nadrzędny rejestr to [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/src/error.rs).
 
 ## Błędy wykonania mają osobny kontrakt
 
@@ -71,6 +74,8 @@ Pomyślny `ku check` potwierdza wyłącznie przejście sprawdzania frontendu. Na
 
 `ku build --native file.ku` bez `-o` jedynie zapisuje C. Aby skompilować i skonsolidować plik wykonywalny, użyj `ku build --backend c file.ku` i zainstaluj docelowy zestaw narzędzi C.
 
-Błędy bazy danych `execution_unknown` i `execution_completed_without_result` nie mogą powodować automatycznego ponawiania. Zachowaj dowody żądania i operacji biznesowej, a następnie ustal rzeczywisty stan wykonania. Weryfikacja lokalnej witryny nie wymaga połączenia z produkcyjną bazą danych.
+Błędy bazy danych `execution_unknown` i `execution_completed_without_result` nie mogą powodować automatycznego ponawiania. Zachowaj dowody żądania i operacji biznesowej, a następnie ustal rzeczywisty stan wykonania.
 
-Więcej szczegółów: [przewodnik diagnostyczny repozytorium](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md).
+Więcej szczegółów: [przewodnik diagnostyczny repozytorium](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/diagnostics.md).
+
+Błędy JSON mają zgodne domain/code między zapleczami, ale message może się różnić. ku run i runner mogą dodawać json parse failed:, a natywne C nie. Porównuj domain/code, nie całą wiadomość.

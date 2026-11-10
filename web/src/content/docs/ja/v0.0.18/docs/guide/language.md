@@ -1,18 +1,21 @@
 ---
-title: 言語ガイド
-description: Ku の変数、関数、制御フロー、所有権、モジュール、回復可能なエラーを学びます。
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: '言語ガイド'
+description: 'Ku の変数、関数、制御フロー、所有権、モジュール、回復可能なエラーを学びます。'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - docs/syntax.md
-  - docs/semantics.md
-  - examples/function.ku
-  - examples/control_flow.ku
-  - examples/result.ku
+  [
+    'docs/syntax.md',
+    'docs/semantics.md',
+    'examples/function.ku',
+    'examples/control_flow.ku',
+    'examples/result.ku',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: ja/v0.0.18/docs/guide/language
 ---
 
-本書は実験的プレリリース v0.0.18 の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。このガイドでは中心となる構文を紹介します。リポジトリの[構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)と[意味仕様](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md)が正式な定義です。以下は学習用の断片です。差異については[バックエンドの対応範囲](/ja/v0.0.18/docs/support/)を参照してください。
+このガイドでは中心となる構文を紹介します。リポジトリの[構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md)と[意味仕様](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/semantics.md)が正式な定義です。以下は学習用の断片です。差異については[バックエンドの対応範囲](/ja/v0.0.18/docs/support/)を参照してください。
 
 ## 変数と型
 
@@ -54,7 +57,11 @@ if (total == 10) {
 
 `for i in 5` は `0` から `4` まで反復します。`if` と `while` の条件には `bool` が必要です。複数の文には波括弧を使います。分岐式は `match` を使用し、`switch` はありません。
 
+<a id="ownership"></a>
+
 ## 所有権と読み取り専用の借用
+
+Owned 値は原則 move され、所有スコープ終了時に決定的に drop されます。独立した複製には `.clone()` が必要です。グローバルなトレーシング GC は導入しませんが、クロージャ環境などの内部共有構造は参照カウントを使う場合があり、実行時の管理コストは残ります。同期の読み取り専用借用は `&name: T` の宣言で決まります。通常の Owned パラメーターは読むだけでも値を move し得ます。呼び出しは `length(value)` のままで、`&value` ではありません。async 借用は非対応です。
 
 `int`、`float`、`bool`、`null` は Copy 値です。文字列、配列、オブジェクト、構造体、列挙型、Result、関数値は Owned です。代入と通常の引数は、既定で所有値をムーブします。独立した値が必要な場合は `.clone()` を使用してください。Task はクローンできません。
 

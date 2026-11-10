@@ -346,11 +346,11 @@ impl StopSignals {
                 [
                     (
                         libc::SIGINT,
-                        libc::signal(libc::SIGINT, stop as libc::sighandler_t),
+                        libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t),
                     ),
                     (
                         libc::SIGTERM,
-                        libc::signal(libc::SIGTERM, stop as libc::sighandler_t),
+                        libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t),
                     ),
                 ]
             };

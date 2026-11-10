@@ -1,18 +1,20 @@
 ---
-title: Biblioteca standard
-description: Găsește modulele bibliotecii standard Ku, semnăturile de bază și
-  limitele backendurilor.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Biblioteca standard'
+description: 'Găsește modulele bibliotecii standard Ku, semnăturile de bază și limitele backendurilor.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - src/stdlib/metadata.rs
-  - src/stdlib/mod.rs
-  - docs/syntax.md
-  - docs/protocol-foundation.md
+  [
+    'src/stdlib/metadata.rs',
+    'src/stdlib/mod.rs',
+    'docs/syntax.md',
+    'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: ro/v0.0.18/docs/stdlib
 ---
 
-Documentația descrie domeniul fixat al prelansării experimentale v0.0.18. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases. Aceste puncte de intrare principale au fost verificate în sursă; aceasta nu este o referință API exhaustivă. [Contractul de sintaxă](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) definește comportamentul. Vezi [matricea de suport](/ro/v0.0.18/docs/support/) pentru limitele backendurilor.
+[Referința de sintaxă](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md) descrie biblioteca standard. Vezi [matricea de suport](/ro/v0.0.18/docs/support/) pentru limitele backendurilor.
 
 ## Importarea modulelor
 
@@ -74,7 +76,3 @@ fn main(): null! {
 Creează mai întâi un `message.txt` UTF-8 lângă sursă. Un fișier absent sau o citire nereușită returnează eroare. Exemplul depinde de acel fișier de intrare. `try_read` și `try_write` rămân aliasuri compatibile cu aceleași tipuri de rezultat.
 
 `read_dir` returnează căi sortate, cu proprietate independentă, limitate la 10.000 de intrări și 1.000.000 de octeți de cale în total. Operațiile restrânse de fișier din Task nativ folosesc un pool fix de fundal. Aceasta nu demonstrează așteptare generică de rețea prin același mecanism.
-
-## Întreținerea referinței
-
-Metadatele interfeței publice sunt în [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs). Sunt verificate împreună cu implementările și contractele. Site-ul întreține momentan o referință selectată manual; nu a fost confirmată o comandă `ku doc` existentă.

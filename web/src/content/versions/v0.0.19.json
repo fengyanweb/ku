@@ -1,0 +1,156 @@
+{
+  "sidebar": [
+    {
+      "slug": ""
+    },
+    {
+      "label": "开始使用",
+      "translations": {
+        "de": "Hier beginnen",
+        "el": "Ξεκινήστε εδώ",
+        "en": "Start here",
+        "es": "Empieza aquí",
+        "fa": "شروع کار",
+        "fr": "Commencer ici",
+        "it": "Inizia qui",
+        "ja": "はじめに",
+        "ko": "시작하기",
+        "pl": "Zacznij tutaj",
+        "pt": "Comece aqui",
+        "ro": "Începe aici",
+        "ru": "Начните здесь",
+        "tr": "Buradan başlayın",
+        "zh-cn": "开始使用",
+        "zh-tw": "開始使用"
+      },
+      "items": [
+        {
+          "slug": "docs/install"
+        },
+        {
+          "slug": "docs/getting-started"
+        }
+      ]
+    },
+    {
+      "label": "语言与工具",
+      "translations": {
+        "de": "Sprache & Werkzeuge",
+        "el": "Γλώσσα και εργαλεία",
+        "en": "Language & tools",
+        "es": "Lenguaje y herramientas",
+        "fa": "زبان و ابزارها",
+        "fr": "Langage et outils",
+        "it": "Linguaggio e strumenti",
+        "ja": "言語とツール",
+        "ko": "언어 및 도구",
+        "pl": "Język i narzędzia",
+        "pt": "Linguagem e ferramentas",
+        "ro": "Limbaj și instrumente",
+        "ru": "Язык и инструменты",
+        "tr": "Dil ve araçlar",
+        "zh-cn": "语言与工具",
+        "zh-tw": "語言與工具"
+      },
+      "items": [
+        {
+          "autogenerate": {
+            "directory": "docs/guide"
+          }
+        },
+        {
+          "autogenerate": {
+            "directory": "docs/tools"
+          }
+        }
+      ]
+    },
+    {
+      "label": "标准库",
+      "translations": {
+        "de": "Standardbibliothek",
+        "el": "Τυπική βιβλιοθήκη",
+        "en": "Standard library",
+        "es": "Biblioteca estándar",
+        "fa": "کتابخانهٔ استاندارد",
+        "fr": "Bibliothèque standard",
+        "it": "Libreria standard",
+        "ja": "標準ライブラリ",
+        "ko": "표준 라이브러리",
+        "pl": "Biblioteka standardowa",
+        "pt": "Biblioteca padrão",
+        "ro": "Biblioteca standard",
+        "ru": "Стандартная библиотека",
+        "tr": "Standart kütüphane",
+        "zh-cn": "标准库",
+        "zh-tw": "標準函式庫"
+      },
+      "items": [
+        {
+          "autogenerate": {
+            "directory": "docs/stdlib"
+          }
+        }
+      ]
+    },
+    {
+      "label": "示例",
+      "translations": {
+        "de": "Beispiele",
+        "el": "Παραδείγματα",
+        "en": "Examples",
+        "es": "Ejemplos",
+        "fa": "مثال‌ها",
+        "fr": "Exemples",
+        "it": "Esempi",
+        "ja": "サンプル",
+        "ko": "예제",
+        "pl": "Przykłady",
+        "pt": "Exemplos",
+        "ro": "Exemple",
+        "ru": "Примеры",
+        "tr": "Örnekler",
+        "zh-cn": "示例",
+        "zh-tw": "範例"
+      },
+      "items": [
+        {
+          "slug": "docs/examples"
+        }
+      ]
+    },
+    {
+      "label": "项目",
+      "translations": {
+        "de": "Projekt",
+        "el": "Έργο",
+        "en": "Project",
+        "es": "Proyecto",
+        "fa": "پروژه",
+        "fr": "Projet",
+        "it": "Progetto",
+        "ja": "プロジェクト",
+        "ko": "프로젝트",
+        "pl": "Projekt",
+        "pt": "Projeto",
+        "ro": "Proiect",
+        "ru": "Проект",
+        "tr": "Proje",
+        "zh-cn": "项目",
+        "zh-tw": "專案"
+      },
+      "items": [
+        {
+          "slug": "docs/support"
+        },
+        {
+          "slug": "releases"
+        },
+        {
+          "slug": "docs/project"
+        }
+      ]
+    }
+  ],
+  "excluded": []
+}

@@ -352,6 +352,29 @@ impl RuntimeBundle {
                 "CLI and runtime source commit differ; reinstall the complete bundle",
             ));
         }
+        // Historical bundles predate the complete build-identity group. Once
+        // present, all fields must describe this CLI's actual source/build.
+        if let Value::Object(fields) = &m {
+            let keys = [
+                "build_source_sha256",
+                "build_identity_sha256",
+                "cargo_lock_sha256",
+            ];
+            if keys.iter().any(|key| fields.contains_key(*key)) {
+                for key in keys {
+                    if !hex_digest(&string(&m, key)?) {
+                        return Err(error(format!("invalid runtime {key}")));
+                    }
+                }
+                if string(&m, "build_source_sha256")? != env!("KU_BUILD_SOURCE_SHA256")
+                    || string(&m, "build_identity_sha256")? != build_identity()
+                {
+                    return Err(error(
+                        "CLI and runtime build identities differ; reinstall the complete bundle",
+                    ));
+                }
+            }
+        }
         let rustc = RustIdentity::from_json(member(&m, "rustc")?)?;
         if !rustc.compatible(&RustIdentity::built()) {
             return Err(error("CLI and runtime compiler identities differ"));
@@ -539,7 +562,6 @@ impl RuntimeBundle {
         })
     }
     pub fn compiler(&self) -> KuResult<Compiler> {
-        let installed = installed_toolchains();
         if let Some(path) = env::var_os("KU_RUNNER_RUSTC") {
             let path = PathBuf::from(path);
             if !path.is_absolute() {
@@ -553,34 +575,75 @@ impl RuntimeBundle {
             }
             return Ok(compiler);
         }
-        let mut system = "unavailable".to_string();
-        if let Some(path) = find_program("rustc") {
-            match probe_compiler(&path, "system rustc") {
-                Ok(c) => {
-                    system = format!("{} ({})", c.identity.release, c.identity.commit_hash);
-                    if self.rustc.compatible(&c.identity) {
-                        return Ok(c);
-                    }
-                }
-                Err(e) => system = e.message,
-            }
-        }
+        // Resolve the SDK's explicit installed toolchain before considering the
+        // caller's PATH/default/override. Rustup failures are not "not installed".
         if let Some(rustup) = find_program("rustup") {
+            let installed = installed_toolchains(&rustup).map_err(|e| {
+                self.compiler_error(format!(
+                    "cannot inspect installed Rustup toolchains: {}",
+                    e.message
+                ))
+            })?;
             if installed.iter().any(|s| s == &self.rustc.toolchain) {
                 let mut command = readonly_command(&rustup);
                 command.args(["which", "--toolchain", &self.rustc.toolchain, "rustc"]);
-                if let Ok(text) = capture(&mut command) {
-                    let path = PathBuf::from(text.trim());
-                    if path.is_absolute() {
-                        let c = probe_compiler(&path, "installed exact rustup toolchain")?;
-                        if self.rustc.compatible(&c.identity) {
-                            return Ok(c);
-                        }
-                    }
+                let text = capture(&mut command).map_err(|e| {
+                    self.compiler_error(format!(
+                        "cannot locate the installed exact Rustup compiler: {}",
+                        e.message
+                    ))
+                })?;
+                let path = PathBuf::from(text.trim());
+                if !path.is_absolute() || text.trim().lines().count() != 1 {
+                    return Err(self.compiler_error("Rustup returned an invalid compiler path"));
                 }
+                let compiler =
+                    probe_compiler(&path, "installed exact rustup toolchain").map_err(|e| {
+                        self.compiler_error(format!(
+                            "the installed exact Rustup compiler is unusable: {}",
+                            e.message
+                        ))
+                    })?;
+                if !self.rustc.compatible(&compiler.identity) {
+                    return Err(self.compiler_error(format!(
+                        "the installed exact Rustup compiler identity does not match: Rust {} commit {} host {}",
+                        compiler.identity.release, compiler.identity.commit_hash, compiler.identity.host
+                    )));
+                }
+                return Ok(compiler);
             }
         }
-        Err(error(format!("cannot build: the available Rust compiler does not match this Ku runtime.\nKu: {}\nRequired: Rust {} commit {} target {}\nSystem: {}\nExact toolchain: {} (not available or incompatible)\nRun: ku doctor --backend runner\nInstall explicitly: ku doctor --install-runner-toolchain\nThis does not change your global Rust default.",env!("CARGO_PKG_VERSION"),self.rustc.release,self.rustc.commit_hash,self.target,system,self.rustc.toolchain)))
+        // A real standalone compiler is a fallback only when Rustup/the exact
+        // installed toolchain is absent. Do not consult an ambient Rustup proxy.
+        let path = find_program("rustc").ok_or_else(|| {
+            self.compiler_error("the exact Rustup toolchain and a standalone rustc are unavailable")
+        })?;
+        let canonical = fs::canonicalize(&path)
+            .map_err(|e| self.compiler_error(format!("standalone compiler unavailable: {e}")))?;
+        if rustup_proxy_manager(&path, &canonical)
+            .map_err(|e| self.compiler_error(e.message))?
+            .is_some()
+        {
+            return Err(self.compiler_error("the exact toolchain is not installed; PATH rustc is a Rustup proxy, not an independent matching compiler"));
+        }
+        let compiler = probe_compiler(&path, "standalone system rustc").map_err(|e| {
+            self.compiler_error(format!("standalone compiler probe failed: {}", e.message))
+        })?;
+        if !self.rustc.compatible(&compiler.identity) {
+            return Err(self.compiler_error(format!(
+                "standalone compiler identity mismatch: Rust {} commit {} host {}",
+                compiler.identity.release, compiler.identity.commit_hash, compiler.identity.host
+            )));
+        }
+        Ok(compiler)
+    }
+    fn compiler_error(&self, reason: impl AsRef<str>) -> KuError {
+        error(format!(
+            "cannot build Runner: {}.\nSDK: {}\nKu: {}\nRequired: Rust {} commit {} host {} runtime target {}\nExact toolchain: {}\nRun: ku doctor --backend runner\nInstall explicitly: rustup toolchain install {} --profile minimal\nOr: ku doctor --install-runner-toolchain\nFor programs within native C support, use ku build --backend c.",
+            reason.as_ref(), self.root.display(), env!("CARGO_PKG_VERSION"),
+            self.rustc.release, self.rustc.commit_hash, self.rustc.host, self.target,
+            self.rustc.toolchain, self.rustc.toolchain
+        ))
     }
     pub fn link_probe(&self, compiler: &Compiler) -> KuResult<()> {
         let temp =
@@ -669,21 +732,38 @@ fn find_program(name: &str) -> Option<PathBuf> {
     }
     None
 }
-fn installed_toolchains() -> Vec<String> {
-    let Some(rustup) = find_program("rustup") else {
-        return vec![];
-    };
-    let mut c = readonly_command(&rustup);
+fn installed_toolchains(rustup: &Path) -> KuResult<Vec<String>> {
+    let mut c = readonly_command(rustup);
     c.args(["toolchain", "list"]);
-    capture(&mut c)
-        .ok()
-        .map(|s| {
-            s.lines()
-                .filter_map(|l| l.split_whitespace().next())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    let text = capture(&mut c)?;
+    if text.trim() == "no installed toolchains" {
+        return Ok(vec![]);
+    }
+    let mut installed = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let line = line.trim();
+        let (name, suffix) = line
+            .split_once(char::is_whitespace)
+            .map_or((line, ""), |(name, suffix)| (name, suffix.trim()));
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.+".contains(&b))
+            || !matches!(
+                suffix,
+                "" | "(default)" | "(active)" | "(active, default)" | "(default, active)"
+            )
+        {
+            return Err(error(
+                "Rustup returned a malformed installed-toolchain list",
+            ));
+        }
+        installed.push(name.to_string());
+    }
+    if installed.is_empty() {
+        return Err(error("Rustup returned an empty installed-toolchain list"));
+    }
+    Ok(installed)
 }
 fn supported_readonly_rustup(version: &str) -> bool {
     version
@@ -849,7 +929,20 @@ pub fn run_doctor(args: &[String]) -> KuResult<()> {
                 .unwrap_or_default(),
         ),
     );
-    let installed = installed_toolchains();
+    let installed = match find_program("rustup") {
+        Some(path) => match installed_toolchains(&path) {
+            Ok(installed) => installed,
+            Err(e) => {
+                fields.insert(
+                    "installed_toolchains_probe_error".into(),
+                    Value::String(e.message.clone()),
+                );
+                warnings.push(e.message);
+                vec![]
+            }
+        },
+        None => vec![],
+    };
     fields.insert(
         "system_rustc".into(),
         match find_program("rustc") {
@@ -1183,6 +1276,40 @@ mod tests {
             .unwrap_err()
             .message
             .contains("source commit"));
+        if let Value::Object(ref mut m) = manifest {
+            m.insert(
+                "source_commit".into(),
+                Value::String(env!("KU_BUILD_SOURCE_COMMIT").into()),
+            );
+            m.insert(
+                "build_source_sha256".into(),
+                Value::String(env!("KU_BUILD_SOURCE_SHA256").into()),
+            );
+            m.insert(
+                "build_identity_sha256".into(),
+                Value::String(build_identity().into()),
+            );
+            m.insert("cargo_lock_sha256".into(), Value::String("a".repeat(64)));
+        }
+        write_json(&root.join(MANIFEST), &manifest);
+        assert!(RuntimeBundle::at(&exe, None).is_ok());
+        if let Value::Object(ref mut m) = manifest {
+            m.remove("cargo_lock_sha256");
+        }
+        write_json(&root.join(MANIFEST), &manifest);
+        assert!(RuntimeBundle::at(&exe, None).is_err());
+        if let Value::Object(ref mut m) = manifest {
+            m.insert("cargo_lock_sha256".into(), Value::String("a".repeat(64)));
+            m.insert(
+                "build_identity_sha256".into(),
+                Value::String("f".repeat(64)),
+            );
+        }
+        write_json(&root.join(MANIFEST), &manifest);
+        assert!(RuntimeBundle::at(&exe, None)
+            .unwrap_err()
+            .message
+            .contains("build identities"));
     }
     #[test]
     fn bundle_paths_reject_traversal_windows_prefixes_and_link_components() {
@@ -1299,7 +1426,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn old_hardlinked_proxy_is_not_probed_or_allowed_to_install() {
+    fn old_proxy_and_invalid_rustup_lists_fail_without_installing() {
         use std::os::unix::fs::PermissionsExt;
         let temporary = TempBuildDir::create_private("old-rustup-readonly").unwrap();
         let manager = temporary.path().join("rustup");
@@ -1311,6 +1438,36 @@ mod tests {
             .unwrap_err()
             .message
             .contains("Rustup 1.28"));
+        assert!(!temporary.path().join("unexpected-probe").exists());
+        fs::write(
+            &manager,
+            b"#!/bin/sh\nprintf '1.99.1-aarch64-apple-darwin (active, default)\\n'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            installed_toolchains(&manager).unwrap(),
+            vec!["1.99.1-aarch64-apple-darwin"]
+        );
+        fs::write(
+            &manager,
+            b"#!/bin/sh\nprintf 'unexpected toolchain output\\n'\n",
+        )
+        .unwrap();
+        assert!(installed_toolchains(&manager)
+            .unwrap_err()
+            .message
+            .contains("malformed"));
+        fs::write(&manager, b"#!/bin/sh\nexit 23\n").unwrap();
+        assert!(installed_toolchains(&manager)
+            .unwrap_err()
+            .message
+            .contains("tool probe exited"));
+        fs::write(
+            &manager,
+            b"#!/bin/sh\nprintf 'no installed toolchains\\n'\n",
+        )
+        .unwrap();
+        assert!(installed_toolchains(&manager).unwrap().is_empty());
         assert!(!temporary.path().join("unexpected-probe").exists());
     }
 }

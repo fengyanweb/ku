@@ -1,116 +1,109 @@
 # Ku 官网与文档站
 
-Astro + Starlight 静态工程，源码在 `ku/web`；保留原有 `docs-site`。线上不需要常驻 Node 服务、业务后端或数据库。
+[English](README.en.md)
 
-## 运行与构建
+Astro + Starlight 静态站点，当前版本 **0.0.20**。在线体验使用真实 Ku 解释器的浏览器预览；构建需要完整 Ku 仓库中的浏览器适配源码，不需要数据库或执行后端。
 
-Node 24.18.0（最低 22.22.0）及 npm。在本目录运行：
+## 本地开发
+
+需要 Node.js 22.22.0 或更新版本。已验证 Node.js 24.18.0。
 
 ```sh
 npm ci
 npm run dev
 ```
 
+## 构建与上传
+
 ```sh
-npm run lint
-npm run check
 npm run build
-npm run preview
 ```
 
-搜索索引在 build 时生成，搜索验收使用 preview。preview 是仅本地使用的 loopback 静态服务器，复用生产入口判定函数以验证真实 HTTP 302；不是生产新增 Node 服务。终端打印实际地址，默认 `http://127.0.0.1:4321`，端口可用 `npm run preview -- --port 4322` 修改；Ctrl+C 停止。`dist/` 为最终静态产物，`.astro/` 为可重建缓存，均不提交。
+在本目录运行上述命令，会自动核对发行版并构建 WASM 和官网，完整网站输出到 `dist/`。将 `dist/` 里面的全部文件上传到网站根目录，保留 `_astro/` 静态资源和 `pagefind/` 搜索索引的目录结构。
 
-## 语言
+默认使用已确认的官网地址 `https://ku-lang.com` 并允许正常页面被搜索引擎收录。需要其他域名时通过 `SITE_URL` 指定。可选检查命令为 `npm run lint` 和 `npm run check`。
 
-`src/i18n/languages.json` 是语言清单的唯一配置源，共 16 种：德语、希腊语、英语、西班牙语、波斯语、法语、意大利语、日语、韩语、波兰语、巴西葡萄牙语、罗马尼亚语、俄语、土耳其语、简体中文、繁体中文。
+如需禁止索引的本地预览，在未设置 `SITE_URL`、`INDEXABLE` 等正式环境变量的终端运行 `npm run build:preview`。`npm run preview` 只启动预览服务器，不改变已有构建的索引设置。缺译回退页继续保留 `noindex`。
 
-- 官网：`/{locale}/`；每语言对应独立页面和 9 篇核心内容；本轮新增发布边界以简中/英文为完整版本，其余语言的英文补充有明确提示。
-- 正文：`src/content/docs/{locale}/`；界面文案：`src/i18n/{locale}.json`；Starlight 的附加界面词条：`src/content/i18n/{lang}.json`。后者按 BCP-47 lang 命名（zh-CN、zh-TW、pt-BR），与路由 locale 区分，避免词条未加载。
-- 波斯语为 `fa` / `فارسی`，使用 RTL；代码、终端和 API 标识保留 LTR。
-- 构建校验字典键、数组和路由结构；缺少字典会失败，不隐式用英文页面冒充完整译文。
-- 文档切换语言保持同一主题及文档版本。规范网址和 hreflang 保留语言、版本、主题三部分；不会把历史版 canonical 到当前版。
-- 更新 API 时同时核对 `docs/syntax.md`、`docs/semantics.md`、`src/stdlib/metadata.rs` 与实现，再同步译文；代码和 CLI 命令不要翻译。
+## WASM 在线体验与发行版绑定
+
+`/{语言}/playground/` 覆盖官网全部 16 种语言，在访问者的专用浏览器 Worker 内检查和运行，不上传用户源码。每次任务使用新实例；停止、离页、隐藏和执行期限到达时直接销毁 Worker。原生网络、数据库、进程、任意磁盘及原生 async 调度不属于浏览器能力。
+
+构建工具固定在 `scripts/wasm-toolchain.json`：Rust **1.99.1**、`wasm32-unknown-unknown`、wasm-bindgen crate/CLI **0.2.100**。首次准备工具（不改变全局默认 Rust）：
+
+```sh
+rustup target add --toolchain 1.99.1 wasm32-unknown-unknown
+cargo +1.99.1 install --locked --version 0.2.100 --root "$HOME/.cache/ku-web/wasm-bindgen-0.2.100" wasm-bindgen-cli
+npm run wasm
+```
+
+Windows 可使用相同的 Cargo 参数，将安装目录设置为用户目录下 `.cache/ku-web/wasm-bindgen-0.2.100`；或用 `KU_WASM_BINDGEN` 指定该版本的 CLI 完整路径。`KU_WASM_CACHE` 可指定本任务缓存目录。下载依赖需要代理时只在当前命令设置 `HTTPS_PROXY`/`HTTP_PROXY`。
+
+`npm run build`、`npm run build:preview` 和开发启动会先构建引擎。流水线每次在线核对 GitHub 最新已发布 release（包含实验预发行），要求标签、真实提交和 Ku 主包版本与 `src/data/versions.json` 一致。若 GitHub 已更新而网站/适配尚未更新，构建直接失败，不沿用旧 WASM。
+
+当前 GitHub `v0.0.20` 只发布了原生安装包，没有发布浏览器 WASM。构建会取该标签的真实源码，只叠加 `crates/ku-web/release-adapter.patch` 和浏览器入口源码，不把本地其他未提交的解释器改动带入引擎。产物明确标记 **browser preview**，不冒称 GitHub 已发布的 WASM 安装包。页面版本与构建 ID 来自运行中的 `engine_info()`。
+
+构建先在系统临时目录编译匹配的 WASM/JS/type/manifest，校验真实模块内存上限 **128 MiB**、版本和构建身份，再接入 Astro。最终 `dist/playground-build.json` 记录源发行版、各项 hash 和原始/gzip/Brotli 体积。生成目录 `src/generated/ku-web/` 与 Rust 缓存都不应当手工编辑；生成失败会终止整个构建。
+
+更新版本时先核对新的 GitHub release，更新 `versions.json` 与官网包版本，再基于新标签审查浏览器适配。显式运行 `npm run wasm -- --refresh-lock`，审查并保留 `crates/ku-web/release-Cargo.lock` 的依赖差异；常规构建始终使用 `--locked`。旧补丁不能干净应用或实际引擎身份不符时必须修复适配，禁止通过保留旧产物绕过。可单独运行 `node scripts/build-wasm.mjs --verify-release` 只读核对当前选择。
+
+## 版本与内容
+
+- `src/data/versions.json` 管理页面版本、下载标签和历史文档；`package.json` 与锁文件的版本必须一致。构建会检查，避免包名更新而页面仍显示旧版。
+- 当前文档为 0.0.20；0.0.19、0.0.18 与 0.0.17 使用各自的归档正文和路径。旧版本不得跳转到当前版本，也不得用当前正文覆盖。
+- `src/data/archive-pages.json` 列出已保留的历史页面。缺失任何页面时构建直接报错；新增归档时需显式登记，不能通过重新扫描空目录来掩盖丢失。
+- 首页和文档有16种语言；完整模块参考首先维护简体中文与英文。变更示例须用对应版本 Ku 检查并运行。
+- 安装页直接链接已发布的三平台包；不要填写不存在的安装器或下载地址。
+- 微信赞赏图为 `public/images/wechat-donation.png`，用于官网“支持 Ku”页及仓库根中英文 README，复用同一份原图；反馈渠道为 GitHub Issues 和 `kagura.gc@qq.com`。
+
+`dist/`、`.astro/` 和 `node_modules/` 均为生成文件，不提交。依赖按锁文件安装；`postinstall` 中的版本插件补丁用于保护现有多语言归档，不能跳过。
+
+## 部署说明
+
+用户自行部署。将完整 `dist/` 目录内的文件上传到网站根目录，包括 Pagefind 搜索索引与静态资源。不要启用 SPA 回退；深层页面对应自己的 `index.html`，不存在的路径返回404。
+
+静态服务器必须为 `.wasm` 返回 `application/wasm`、为 Worker/JS 返回 JavaScript MIME，不存在的引擎资源应返回真实 404。现有本地预览已配置这些 MIME；实际服务器仍需核验。哈希资源适合长期 immutable 缓存，HTML/版本资料保持可刷新，并保留上一构建的哈希资源窗口。若托管另有 CSP，只合并 `worker-src 'self'` 与所需的 `script-src 'wasm-unsafe-eval'`，不要开放通用 `unsafe-eval`；不需要 SharedArrayBuffer/COOP/COEP。
+
+根路径的语言选择、Cookie 与可信地区信息接入见 [Cloudflare 接入说明](deploy/cloudflare/CONNECTION.md)。本地预览不能证明线上地区分流已生效。
+
+源码使用 Apache-2.0，第三方组件遵循各自许可。
+
+## 本目录保留的入口与维护细则
+
+## 语言与搜索
+
+`src/i18n/languages.json` 是语言清单，共 16 种：德语、希腊语、英语、西班牙语、波斯语、法语、意大利语、日语、韩语、波兰语、巴西葡萄牙语、罗马尼亚语、俄语、土耳其语、简体中文、繁体中文。
+
+正文位于 `src/content/docs/{locale}/`，首页界面位于 `src/i18n/{locale}.json`，搜索界面位于 `src/content/i18n/{lang}.json`。后者使用 BCP-47（如 zh-CN、zh-TW、pt-BR），与 URL locale 区分。波斯语为 RTL，代码与终端保持 LTR。
+
+构建检查全部字典的键、数组、路由及搜索占位符。`src/i18n/routes.ts` 从真实内容生成译文和锚点关系；文档缺译时保留版本和主题，显示对应英文文档并提示，不把框架的合成回退页当成译文。版本切换优先进入同名文档，缺页时进入目标版本的文档入口。两类切换都保留查询参数和目标存在的锚点。canonical 与 hreflang 保留语言、版本和主题；x-default 使用对应英文页面。合成回退页 noindex，并排除 sitemap。首页搜索只查当前文档，文档搜索区分历史版本。
 
 ## 版本化文档
 
-使用官方插件目录收录的社区插件 [starlight-versions](https://starlight-versions.vercel.app/getting-started/)，固定 0.10.1。它仍标记为 early development；已针对本项目的多语言、搜索、现有布局和归档行为集成验证，不自动追随新版本。
+使用固定版本 `starlight-versions` 0.10.1。当前入口 `/{locale}/docs/…` 对应 **0.0.20**；`/{locale}/v0.0.19/…` 保留修改前的 0.0.19 文档，0.0.18 文档继续保留，版本菜单可切换；已有 0.0.17 归档继续保留。构建前检查归档元数据，缺失时直接报错，不自动用新内容重建旧快照。
 
-| 内容            | 路径示例                              | 维护方式                                 |
-| --------------- | ------------------------------------- | ---------------------------------------- |
-| 当前文档        | `/zh-cn/docs/guide/language/`         | 继续编辑 `src/content/docs/zh-cn/docs/…` |
-| 0.0.18 固定快照 | `/zh-cn/v0.0.18/docs/guide/language/` | 独立保留，不随当前文档更新               |
-| 当前发布记录    | `/zh-cn/releases/`                    | 随真实发布更新                           |
-| 历史发布记录    | `/zh-cn/v0.0.18/releases/`            | 与该版文档一起冻结                       |
+增加新快照前先完成内容校准，再在 versions.json 的 archives 末尾新增条目并运行构建。提交插件生成的 `src/content/docs/{locale}/{slug}/`、`src/content/versions/{slug}.json`、`src/content/docs/{slug}/.gitkeep` 与所需资源。不要重写已发布历史正文，不提前添加未准备好的快照，dev/build 也可能生成新归档。
 
-`src/data/versions.json` 集中管理当前版本与历史版本。当前文档保持原 URL，避免破坏已有链接。本轮把原 v0.0.18 开发快照定稿为该版冻结文档，当前文档和下载目标统一为 0.0.18。实际公开状态、安装包与 SHA256SUMS 仍以对应 GitHub Release 为准；构建成功或发布任务跳过不能当作已发布。此后该快照独立保留，不跟随下一版开发更新。
+`src/integrations/versioning.mjs` 保留纯多语言归档的根标记，防止 Git 不保留空目录导致归档被误判为新版本。`scripts/patch-versioning.mjs` 在 postinstall 修正 0.10.1 复制旧语言快照进入新版本的问题，只改一个排除条件，断言版本与源文本。升级时必须复核，不能通过 `npm ci --ignore-scripts` 绕过。历史目录已排除日常格式化。
 
-发布未来 0.1、1.0 文档时：
+## 根入口与自动语言
 
-1. 完成并核对当前所有语言的文档和兼容性说明。
-2. 在 versions.json 的 archives 中保留全部旧条目，每次只新增一个版本，例如 `{ "slug": "v0.1.0", "label": "0.1.0" }`。
-3. 执行 `npm run build`。插件首次遇到新版本时复制正文、内部链接、侧栏和所需资源，并生成 `src/content/versions/{slug}.json`。没有准备好正文时，不要提前新增版本，因为 dev/build 都可能创建归档。
-4. 提交新生成的 `src/content/docs/{locale}/{slug}/`、`src/content/versions/{slug}.json`、根目录 `src/content/docs/{slug}/.gitkeep` 及相应资源；它们是需要保留的历史资料。
-5. 更新 current 为下一开发版本，继续编辑未带版本的正文。旧档不重新生成，不删除旧条目，不把它们重定向到首页。
+保留现有平台无关入口 `src/entry/language.mjs` 与可选 Cloudflare 示例，具体接入见 `deploy/cloudflare/CONNECTION.md`。本次内容校准不迁移托管、不修改 DNS 或生产 Nginx。
 
-本地集成层 `src/integrations/versioning.mjs` 在插件识别快照前恢复/保留版本目录标记：纯多语言归档会留下空的根版本目录，Git 不保留空目录；缺少标记会让上游误判为新快照。标记只保存归档存在状态，不重写历史正文。历史目录已排除在日常格式化之外。本轮 v0.0.18 是首次发布定稿，因此仅本次同步现有开发快照；以后的版本不得重写已经发布的历史正文。
+- 显式语言 URL 直接访问，只有根路径 `/` 的 GET/HEAD 自动判定；其他根方法 405。
+- 有效且唯一的 `ku_lang=zh-cn` 或 `ku_lang=en` 手动偏好优先。没有偏好时，可信国家 CN 进入简中；其他、未知、读取失败均进入英文。
+- 返回 302 并保留 query，设置 `Cache-Control: private, no-store`。不读浏览器 GPS、时区或访客伪造的地区头，不存储 IP 或地区。
+- 菜单仍保留 16 种语言；简中与英文写一年 host-only、SameSite=Lax 偏好，HTTPS 使用 Secure。其他语言按现有白名单策略清除旧偏好。普通链接、初始渲染及修饰键打开新页不写偏好。
+- 切换语言尽量保留主题、版本、query 及目标页有效锚点。存储不可用时仍可导航。
 
-另有 `scripts/patch-versioning.mjs` 通过 `postinstall` 修正 0.10.1 复制旧语言快照进入新版本的已复现问题，只改一个目录排除条件。脚本断言依赖版本及源文本，重复执行安全；源码或版本不符即停止安装，升级插件时必须复核并在上游修复后移除。不要使用 `npm ci --ignore-scripts` 跳过此补丁。
+本地 dev/preview 国家恒为未知，可验证英文回退和手动偏好；受控注入可信 CN 元数据不等于真实大陆 IP 验收。根入口需由实际网关处理，不能恢复 `/ → /zh-cn/` 固定 301/308。仅上传 dist 时，根 index.html 只是无门页兜底，不能自行识别国家或产生服务器 302。
 
-版本切换和前后页导航保持主题，文档搜索按版本过滤；首页搜索只查当前文档。历史页有明确提示和返回当前文档的入口。发布记录也随该版本归档，避免历史页显示未来发布事实。
+实际 CDN 必须仅对精确根路径绕过共享缓存并清除旧根跳转，不能让一个人的偏好污染其他访客。未知生产代理链不得直接照搬请求头判定。Cloudflare 示例不是要求切换平台，也不是托管永久免费承诺。
 
-## 索引与部署
+## 构建与上线边界
 
-未设置正式地址时，页面带 `noindex, nofollow`，robots 禁止抓取，不输出虚构 canonical。正式构建需要在环境中提供确认的 HTTPS `SITE_URL` 和 `INDEXABLE=true`，再执行：
+用户自行部署 `dist/` 目录内的文件。线上更新需作为同一次构建完整替换 HTML、带哈希资源与 Pagefind 索引；回滚也恢复完整构建。静态深层页面应对应 index.html，不启用 SPA 回退，不存在的页面返回真实 404。
 
-```sh
-npm run build:production
-```
+正式环境的根入口、缓存、地区识别、公共 HTTP 状态仍由实际托管环境验证。本地预览和历史上传进度都不代表已经上线。
 
-正式构建生成各语言/版本自己的 canonical、对应译文 hreflang、WebSite JSON-LD、robots 和 sitemap；预览与生产分别构建。未提供域名时跳过 sitemap 的提示是预期行为。
-
-旧根入口的固定中文 301 和选择门页已移除。根路径必须由请求入口处理，不能再配置 `/ → /zh-cn/` 的 301/308。不要启用 SPA 回退，深层页面使用对应 index.html，不存在路径必须真实 404。仅上传 dist 到不支持请求处理的静态托管，不能获得真实 IP 地区分流。
-
-正式域名、托管平台、缓存与区域访问质量仍需上线验收。HTML 重新验证，带哈希资源可长期缓存；回滚时恢复一次构建的完整 HTML、资源和 Pagefind 索引。
-
-所有直接依赖固定版本，提交 package-lock.json。保留 postcss-selector-parser 7.1.6 的定向覆盖以处理旧依赖链已知问题，不使用 npm audit fix --force 随意降级框架。
-
-发布范围、接口与限制维护在 `src/content/docs/zh-cn/` 和 `src/content/docs/en/`。本地历史核查报告独立保留，不作为本次网站源码交付或公网部署证据。
-
-## 根入口自动语言选择（2026-10-19）
-
-当前仓库没有已确认的官网域名或托管配置。交付采用平台无关逻辑，以及一个**尚未部署**的 Cloudflare Workers Static Assets 接入示例，不因此迁移平台、购买套餐或改变 DNS。
-
-`src/entry/language.mjs` 是入口与 Cookie 规则的唯一来源：
-
-1. 仅无语言根路径 `/` 的 GET/HEAD 作判断；其他根方法 405，其他路径交给正常静态路由。
-2. 严格读取唯一且有效的 `ku_lang=zh-cn` / `ku_lang=en`，偏好优先，并且不访问地区来源。
-3. 没有有效偏好时，可信国家代码 CN → 简体中文；其它代码（含 HK/MO/TW）、空值或读取失败 → 英文。不读取浏览器语言、时区、URL 地区参数或访客自行设置的国家/代理请求头。
-4. 返回 302，Location 仅为站内固定语言前缀并保留查询参数；`Cache-Control: private, no-store`。自动跳转不写 Cookie，也不存 IP 或国家。
-
-首页与文档共用 `LanguageSwitch`，通过 Starlight 的 LanguageSelect 组件接口接入。菜单仍含全部 16 种语言，使用可抓取、可键盘访问的普通链接。只有明确的普通左键/Enter 激活才写偏好；修改键打开新页不改当前浏览器偏好。简中/英文写一年 host-only Cookie，Path=/、SameSite=Lax，HTTPS 添加 Secure；其它 14 种按本次白名单要求仅清除旧偏好，不进入有效 Cookie 值。普通正文链接、Logo、预取和初始渲染均不保存选择。
-
-`src/i18n/routes.ts` 从实际内容条目及渲染标题获取译文/锚点映射，保留主题与文档版本，不依赖框架生成的缺译回退 URL。没有目标译文时到目标语言首页的真实说明锚点，显示目标语言提示。有 JavaScript 时保留当前 query，原 hash 只有目标页确实存在该 ID 时保留；禁用 JavaScript 后链接仍可直接导航，但静态链接无法按每次请求动态附加 query 或验证当前 hash。文档元信息及 sitemap 只关联实际译文，框架缺译回退页设 noindex 并排除站点地图。
-
-本地 dev 与 preview 的地区恒为未知，因此根入口默认英文；可用菜单实际写入 Cookie 后重开 `/` 验证偏好。没有供访客伪造地区的 query/header 调试后门。CN/IPv4/IPv6 等边界通过受控测试注入可信元数据验证，不能把它称为真实公网位置验收。
-
-`src/pages/index.astro` 仅作错误接入纯静态托管时的无门页兜底：有 JS 读取同一 Cookie 并立即跳转，无 JS 则 meta refresh 到英文。它不是服务器 302，也不能识别国家；正确接入后根请求不会落到此文件。根 URI 的 fragment 不会发送给服务器；服务器只保留 query。浏览器是否继承 fragment 必须单独验收，不把浏览器行为说成服务器识别。
-
-### 可接地区来源与缓存
-
-参见 [Cloudflare 接入说明](deploy/cloudflare/CONNECTION.md)及 `wrangler.example.jsonc`：仅根 URI 配置 `run_worker_first: ["/"]`，否则 asset-first 会先返回根静态 HTML；正文/资源继续静态处理。Worker 只读取平台的 `request.cf.country`，不信任 `CF-IPCountry`、XFF 或 X-Real-IP。未使用离线 MMDB，所以没有数据库下载、更新任务、二进制数据或 DB-IP 署名。将来若确认现有网关是 Nginx，应在其真实配置中接同一规则和可信代理链，不能直接套未核验的生产片段。
-
-实际 CDN 必须对**精确根 URI /** 绕过共享缓存并清除旧根入口 301/200；不要只靠 Vary: Cookie，也不要把带 ku_lang 的全站请求都禁用缓存。没有账号配置证据时，代码通过不等于 CDN 规则已经生效。
-
-本方案不调用付费定位 API、不增加业务后端；并不意味着托管永久免费。Cloudflare 文档目前给 Workers Free 100,000 请求/日和 10ms CPU/次；Static Assets 的 worker-first 根请求超额可能返回 429，不会自动执行英文降级。应以实际账号计划及最新官方限制为准：[国家信息](https://developers.cloudflare.com/network/ip-geolocation/)、[Worker 静态路由](https://developers.cloudflare.com/workers/static-assets/routing/worker-script/)、[额度与超额行为](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/)。
-
-上线前只缺：正式规范域名（含 www/裸域策略）、实际托管/网关配置及发布和根路径缓存规则的管理权限；若经源站请求头接地区，还需实际可信代理链及是否允许绕过 CDN 直连。线上入口行为仍须按本节所列条件在实际托管环境验收；本地历史验收报告不替代公网发布证据。
-
-## v0.0.18 发布收尾范围（2026-10-20）
-
-简中/英文以及已有 v0.0.18 快照已同步发布范围、安装目标、JSON 旧默认、进程限制和后续计划。其他 14 种语言保留已有内容；新增的英文发布说明有本地语言提示并链接完整参考，不冒充已翻译内容。
-
-HTTP 已知问题准确记录为：历史出现过，本轮短测未复现，根因未确认，正式 30 分钟验收尚未通过；本版按维护方决定保留为已知问题，不单独阻塞发布。完整 M:N、通用网络调度、数据库完整平台矩阵移入后续版本，两个暂停项继续暂停。
-
-`ku supervise` 仅在具备委托 cgroup v2 条件的 Linux 或允许 Job Object 的 Windows 上启用，Windows 限制提交量，macOS 原生拒绝。协调器自身没有 OS 硬限，单 Task 完整堆未精确计量，不能宣称整个系统内存绝对封顶。详见各语言支持页与仓库 `docs/process-execution.md`。
-
-本轮只交付网站源码与构建验证，不把此前上传进度、预览或本地构建说成公网部署完成。
+当前版本的发行标签、源码提交和文档引用集中记录在 `src/data/versions.json`。

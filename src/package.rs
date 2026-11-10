@@ -4955,10 +4955,9 @@ fn pack_staging_kind(file_name: &str) -> Option<PackStagingKind> {
     let value = file_name.strip_prefix('.')?;
     let (stem, kind) = if let Some(stem) = value.strip_suffix(".tar.zst.tmp") {
         (stem, PackStagingKind::Archive)
-    } else if let Some(stem) = value.strip_suffix(".verify") {
-        (stem, PackStagingKind::Verification)
     } else {
-        return None;
+        let stem = value.strip_suffix(".verify")?;
+        (stem, PackStagingKind::Verification)
     };
     let mut nonce_parts = stem.rsplitn(4, '-');
     let nanos = nonce_parts.next()?;

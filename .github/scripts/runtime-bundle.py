@@ -19,6 +19,7 @@ MAX_MANIFEST = 1024 * 1024
 MAX_FILE = 512 * 1024 * 1024
 MAX_TOTAL = 1024 * 1024 * 1024
 SHA = re.compile(r"[0-9a-f]{64}\Z")
+BUILD_HASHES = ("build_source_sha256", "build_identity_sha256", "cargo_lock_sha256")
 
 
 def encoded(value):
@@ -80,10 +81,54 @@ def read_json(path):
 
 
 def toolchain_config(repo):
+    if (repo / "rust-toolchain").exists():
+        raise ValueError("use the single rust-toolchain.toml configuration")
+    path = repo / "rust-toolchain.toml"
+    if plain(path).st_size > MAX_MANIFEST:
+        raise ValueError("project toolchain configuration is oversized")
+    # This intentionally reads only the fixed project [toolchain].channel. No
+    # external TOML dependency is needed on Python 3.9 release hosts.
+    sections = re.findall(r"(?ms)^\s*\[toolchain\]\s*(?:#[^\n]*)?\n(.*?)(?=^\s*\[|\Z)",
+                          path.read_text(encoding="utf-8"))
+    channels = re.findall(r'(?m)^\s*channel\s*=\s*"(\d+\.\d+\.\d+)"\s*(?:#[^\n]*)?$',
+                          sections[0]) if len(sections) == 1 else []
+    assignments = re.findall(r"(?m)^\s*channel\s*=", sections[0]) if len(sections) == 1 else []
+    if len(channels) != 1 or len(assignments) != 1:
+        raise ValueError("project toolchain requires one exact stable channel")
     config = read_json(repo / "scripts/release-toolchain.json")
-    if config.get("schema") != "ku-release-toolchain-v1" or not re.fullmatch(r"\d+\.\d+\.\d+", config.get("toolchain", "")):
-        raise ValueError("invalid release toolchain configuration")
-    return config["toolchain"]
+    if config.get("schema") != "ku-release-toolchain-v1" or config.get("toolchain") != channels[0]:
+        raise ValueError("release toolchain must match rust-toolchain.toml")
+    return channels[0]
+
+
+def source_digest(repo):
+    names = [Path(name) for name in ("Cargo.toml", "Cargo.lock", "build.rs", "build_support/build_identity.rs")]
+    names.extend(path.relative_to(repo) for path in (repo / "src").rglob("*") if path.is_file())
+    result = hashlib.sha256()
+    # Rust compares path components ordinally. WindowsPath instead folds case;
+    # sorting a joined string would also misorder sibling x.rs and x/y.rs.
+    for name in sorted(names, key=lambda name: name.parts):
+        path = repo / name
+        plain(path)
+        data = path.read_bytes()
+        result.update(name.as_posix().encode())
+        result.update(b"\0")
+        result.update(len(data).to_bytes(8, "little"))
+        result.update(data)
+    return result.hexdigest()
+
+
+def build_provenance(report, repo, version, commit):
+    if (report.get("schema") != "ku-doctor-v1" or report.get("ku_version") != version
+            or report.get("source_commit") != commit):
+        raise ValueError("actual CLI build identity differs from requested SDK")
+    result = {key: report.get(key) for key in BUILD_HASHES[:2]}
+    if any(not isinstance(value, str) or not SHA.fullmatch(value) for value in result.values()):
+        raise ValueError("actual CLI build identity hashes are missing or invalid")
+    if result["build_source_sha256"] != source_digest(repo):
+        raise ValueError("source changed since the CLI was built; rebuild the complete SDK")
+    result["cargo_lock_sha256"] = digest(repo / "Cargo.lock")
+    return result
 
 
 def rust_identity(text, toolchain, target):
@@ -104,7 +149,7 @@ def rust_identity(text, toolchain, target):
     return result
 
 
-def create(root, version, commit, target, rustc_text, toolchain, features=()):
+def create(root, version, commit, target, rustc_text, toolchain, features=(), provenance=None):
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("full source commit required")
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
@@ -113,6 +158,11 @@ def create(root, version, commit, target, rustc_text, toolchain, features=()):
     cli = entry(root, "ku.exe" if target.endswith("windows-msvc") else "ku")
     identity = dict(ku_version=version, source_commit=commit, host=target, runtime_target=target,
                     rustc=compiler, profile="release", features=sorted(features), cli=cli)
+    if provenance is not None:
+        if (set(provenance) != set(BUILD_HASHES)
+                or any(not isinstance(value, str) or not SHA.fullmatch(value) for value in provenance.values())):
+            raise ValueError("invalid SDK build provenance")
+        identity.update(provenance)
     bundle_id = hashlib.sha256(encoded(identity)).hexdigest()
     files = [entry(root, "libku.rlib")]
     deps = root / "deps"
@@ -159,6 +209,10 @@ def verify(root, version=None, commit=None, target=None):
         raise ValueError('unsupported/mixed publisher identity or layout')
     rust_identity("\n".join(k.replace("_", "-") + ": " + compiler[k] for k in ("release", "commit_hash", "commit_date", "host")), compiler["release"], manifest["host"])
     identity = {key: manifest[key] for key in ("ku_version", "source_commit", "host", "runtime_target", "rustc", "profile", "features", "cli")}
+    if any(key in manifest for key in BUILD_HASHES):
+        if any(not isinstance(manifest.get(key), str) or not SHA.fullmatch(manifest[key]) for key in BUILD_HASHES):
+            raise ValueError("incomplete or invalid SDK build provenance")
+        identity.update((key, manifest[key]) for key in BUILD_HASHES)
     if hashlib.sha256(encoded(identity)).hexdigest() != manifest["bundle_id"]:
         raise ValueError("runtime bundle_id does not match identity")
     dep_path = relative_file(root, manifest["dependency_manifest"])
@@ -191,19 +245,28 @@ def verify(root, version=None, commit=None, target=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("create", "verify"))
-    parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("mode", choices=("create", "verify", "toolchain"))
+    parser.add_argument("--bundle", type=Path)
     parser.add_argument("--version")
     parser.add_argument("--commit")
     parser.add_argument("--target")
     parser.add_argument("--repo", type=Path)
     parser.add_argument("--rustc-version-file", type=Path)
+    parser.add_argument("--build-identity-file", type=Path)
     args = parser.parse_args()
+    if args.mode == "toolchain":
+        if not args.repo:
+            parser.error("toolchain requires --repo")
+        print(toolchain_config(args.repo))
+        return
+    if not args.bundle:
+        parser.error("create/verify requires --bundle")
     if args.mode == "create":
-        if not all((args.version, args.commit, args.target, args.repo, args.rustc_version_file)):
-            parser.error("create requires version/commit/target/repo/rustc-version-file")
+        if not all((args.version, args.commit, args.target, args.repo, args.rustc_version_file, args.build_identity_file)):
+            parser.error("create requires version/commit/target/repo/rustc-version-file/build-identity-file")
         value = create(args.bundle, args.version, args.commit, args.target,
-                       args.rustc_version_file.read_text(encoding="utf-8"), toolchain_config(args.repo))
+                       args.rustc_version_file.read_text(encoding="utf-8"), toolchain_config(args.repo),
+                       provenance=build_provenance(read_json(args.build_identity_file), args.repo, args.version, args.commit))
     else:
         value = verify(args.bundle, args.version, args.commit, args.target)
     print(json.dumps({"status": "verified", "bundle_id": value["bundle_id"], "target": value["runtime_target"]}))

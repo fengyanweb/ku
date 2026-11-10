@@ -1,0 +1,7 @@
+{
+  "wasmBindgen": "0.2.100",
+  "target": "wasm32-unknown-unknown",
+  "maximumMemoryBytes": 134217728,
+  "stackBytes": 2097152,
+  "repository": "fengyanweb/ku"
+}

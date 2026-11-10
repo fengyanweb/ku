@@ -1,8 +1,8 @@
 ---
 title: Language guide
 description: Learn Ku variables, functions, control flow, ownership, modules, and recoverable errors.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.20'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/syntax.md',
@@ -11,9 +11,11 @@ sources:
     'examples/control_flow.ku',
     'examples/result.ku',
   ]
+sidebar:
+  order: 0
 ---
 
-This documentation describes the frozen scope of the v0.0.18 experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases. This guide introduces core syntax. The repository's [syntax contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) and [semantic contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) remain authoritative. These are teaching fragments; see [backend support](/en/docs/support/) for differences.
+This guide introduces core syntax. The repository's [syntax reference](https://github.com/fengyanweb/ku/blob/v0.0.20/docs/syntax.md) and [language semantics](https://github.com/fengyanweb/ku/blob/v0.0.20/docs/semantics.md) remain authoritative. These are teaching fragments; see [backend support](/en/docs/support/) for differences.
 
 ## Variables and types
 
@@ -55,9 +57,11 @@ if (total == 10) {
 
 `for i in 5` iterates from `0` through `4`. `if` and `while` require `bool` conditions. Use braces for multiple statements. Branch expressions use `match`; there is no `switch`.
 
+<span id="ownership"></span>
+
 ## Ownership and read only borrowing
 
-`int`, `float`, `bool`, and `null` are Copy values. Strings, arrays, objects, structs, enums, Results, and function values are Owned. Assignment and ordinary arguments move owned values by default. Use `.clone()` when you need an independent value. Tasks cannot be cloned.
+`int`, `float`, `bool`, and `null` are Copy values. Strings, arrays, objects, structs, enums, Results, and function values are Owned. Assignment and ordinary arguments move owned values by default. Use `.clone()` when you need an independent value. Tasks and move-only native handles cannot be cloned. Owned values are dropped deterministically when their owning scope exits; copying is not implicit.
 
 ```ku
 original = "Ku"
@@ -66,15 +70,25 @@ println(original)
 println(copy)
 ```
 
-A synchronous function can declare a read only borrowed parameter:
+Ku ownership does not depend on a global tracing garbage collector. Some shared internal structures still use reference counting, including native closure environments.
+
+A synchronous function can declare a read only borrowed parameter. This complete example keeps the caller’s value:
 
 ```ku
 fn length(&text: str): int {
     return text.len()
 }
+
+fn main() {
+    text = "Ku"
+    println(length(text))
+    println(text)
+}
 ```
 
-Call it as `length(value)`, without `&` on the argument. Borrowed data cannot be mutated, moved out, or escape the call. Combinations such as borrowed async parameters remain unsupported. Read only borrowing does not guarantee arbitrary function purity.
+Expected output: `2`, then `Ku`.
+
+Call it as `length(value)`, without `&` on the argument. Borrowed data cannot be mutated, moved out, or escape the call. Combinations such as borrowed async parameters remain unsupported. An ordinary Owned parameter can still move its argument even when the function body only reads it. The parameter declaration determines whether ownership is retained. Read only borrowing does not prohibit I/O or internal state changes.
 
 ## Structs, objects, and modules
 
@@ -92,9 +106,11 @@ Dynamic objects use `{ name: "Ku" }`. A normal missing object index fails. `valu
 
 Standard library imports use dotted paths, such as `import json from "std.json"`. Local modules can use `import math from "./math"`. User defined top level exports start with an ASCII uppercase letter; lowercase names remain private to the file.
 
+<span id="errors"></span>
+
 ## Recoverable errors
 
-The return type `T!` can return either T or Error. `?` propagates a recoverable error; `fail` creates one:
+The return type `T!` is a Result: success contains a `T`, and failure contains an Error. After a call, `?` extracts the successful value; on failure it transfers control to an enclosing `try/catch`, or returns the error from the current `T!` function. Do not append `?` to an ordinary value. `fail` creates a recoverable error:
 
 ```ku
 fn read_name(): str! {
@@ -110,8 +126,10 @@ fn main() {
 }
 ```
 
+Here `main` uses a plain declaration because the error is caught inside it. Declare `T!` when errors should reach the caller; for an entry point this is `fn main(): null!`. The type suffix `!` is different from boolean negation such as `!ready`. See [error handling](/en/docs/guide/errors/#result-operators).
+
 Error has `domain`, `code`, and `message` fields. Ordinary `catch` does not catch `panic`, Task cancellation, or timeout. Cancellation cleanup in finally shares an absolute deadline budget; it does not guarantee completion of arbitrary user cleanup.
 
 ## Concurrency boundaries
 
-Application code obtains a single use Task handle by calling an `async fn`, then uses `await`. There are no application APIs named `task.spawn`, `Task.new`, or `thread.spawn`. The interpreter and native Task subset have different coverage. An example working in one backend does not prove full support in another. See [platform and backend support](/en/docs/support/).
+Application code obtains a single use Task handle by calling an `async fn`, then uses `await`. There are no application APIs named `task.spawn`, `Task.new`, or `thread.spawn`. The interpreter and native Task subset have different coverage. An example working in one backend does not prove full support in another. See [Task and async calls](/en/docs/guide/concurrency/) and [platform and backend support](/en/docs/support/).

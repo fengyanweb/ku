@@ -7,10 +7,7 @@ import { existsSync, readFileSync } from 'node:fs';
 
 const kuGrammar = JSON.parse(
   readFileSync(
-    new URL(
-      '../editors/vscode-ku/syntaxes/ku.tmLanguage.json',
-      import.meta.url,
-    ),
+    new URL('./src/data/ku.tmLanguage.json', import.meta.url),
     'utf8',
   ),
 );
@@ -20,6 +17,39 @@ const readJson = (path) =>
   JSON.parse(readFileSync(new URL(path, import.meta.url), 'utf8'));
 const languages = readJson('./src/i18n/languages.json');
 const versioning = readJson('./src/data/versions.json');
+const archivePages = readJson('./src/data/archive-pages.json');
+const packageMetadata = readJson('./package.json');
+const lockMetadata = readJson('./package-lock.json');
+if (
+  versioning.current !== versioning.released ||
+  versioning.current !== versioning.languageVersion ||
+  versioning.current !== packageMetadata.version ||
+  versioning.current !== lockMetadata.version ||
+  versioning.current !== lockMetadata.packages?.['']?.version
+)
+  throw new Error(
+    'Website package, lockfile and current release versions must agree.',
+  );
+// Each archived version has its own source and URL. Never redirect it to
+// current documentation or generate its contents from the current release.
+for (const archive of versioning.archives) {
+  if (
+    !existsSync(
+      new URL(`./src/content/versions/${archive.slug}.json`, import.meta.url),
+    )
+  )
+    throw new Error(`Missing preserved documentation archive: ${archive.slug}`);
+  const pages = archivePages[archive.slug];
+  if (!Array.isArray(pages) || pages.length === 0)
+    throw new Error(`Missing archived page inventory: ${archive.slug}`);
+  for (const page of pages) {
+    if (
+      !page.split('/').includes(archive.slug) ||
+      !existsSync(new URL(`./src/content/docs/${page}`, import.meta.url))
+    )
+      throw new Error(`Missing archived page: ${page}`);
+  }
+}
 const translations = Object.fromEntries(
   Object.keys(languages).map((locale) => [
     locale,
@@ -134,10 +164,15 @@ export default defineConfig({
       },
     }),
     starlight({
-      title: 'Ku',
+      title: Object.fromEntries(
+        Object.entries(languages).map(([locale, language]) => [
+          language.lang,
+          locale === 'zh-cn' ? 'Ku 编程语言' : 'Ku Programming Language',
+        ]),
+      ),
       disable404Route: true,
       description:
-        'Ku programming language — documentation and language guide.',
+        'Ku Programming Language — documentation and language guide.',
       defaultLocale: 'zh-cn',
       locales: languages,
       plugins: [
@@ -160,6 +195,10 @@ export default defineConfig({
         PageTitle: './src/components/DocPageTitle.astro',
         LanguageSelect: './src/components/DocLanguageSelect.astro',
         Footer: './src/components/DocFooter.astro',
+        SocialIcons: './src/components/DocSocialIcons.astro',
+        ThemeSelect: './src/components/DocThemeSelect.astro',
+        Search: './src/components/DocSearch.astro',
+        Banner: './src/components/DocBanner.astro',
       },
       expressiveCode: {
         shiki: { langs: [kuGrammar] },
@@ -174,11 +213,19 @@ export default defineConfig({
           label: '语言与工具',
           translations: groupTranslations('toolsGroup'),
           items: [
-            { slug: 'docs/guide/language' },
-            { slug: 'docs/stdlib' },
-            { slug: 'docs/stdlib/json' },
-            { slug: 'docs/guide/errors' },
+            { autogenerate: { directory: 'docs/guide' } },
+            { autogenerate: { directory: 'docs/tools' } },
           ],
+        },
+        {
+          label: '标准库',
+          translations: groupTranslations('libraryGroup'),
+          items: [{ autogenerate: { directory: 'docs/stdlib' } }],
+        },
+        {
+          label: '示例',
+          translations: groupTranslations('examplesGroup'),
+          items: [{ slug: 'docs/examples' }],
         },
         {
           label: '项目',

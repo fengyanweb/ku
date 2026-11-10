@@ -19,7 +19,7 @@ Rust 的 `rlib` 含编译器专有元数据，不是跨 rustc 版本的稳定分
 
 从真实 CLI 路径定位安装根，再按 manifest 中的相对路径检查同批 CLI、运行时和依赖的大小与 SHA。不会按 mtime 选较新库、向祖先 target 目录兜底，或从当前项目借另一份 Ku 库。丢失 manifest、非法路径、缺文件、损坏和混包都应明确失败。完整搬迁归档可以；只搬一个可执行文件不能保留 Runner 构建能力。
 
-发行工具链 **T=1.89.0** 由 [`scripts/release-toolchain.json`](../scripts/release-toolchain.json) 指定。源码 MSRV 与发行 T 分开记录；升级 T 时需要同批重建 CLI、rlib、依赖及受影响的 native/TLS pack。
+发行工具链 **T=1.99.1** 由 [`scripts/release-toolchain.json`](../scripts/release-toolchain.json) 指定。源码 MSRV 与发行 T 分开记录；升级 T 时需要同批重建 CLI、rlib、依赖及受影响的 native/TLS pack。
 
 编译前核对编译器完整 release/commit/host 与运行时目标 ABI。系统已有完整身份匹配的独立 rustc 可以使用；不匹配时选择 Rustup 已安装的精确 T。probe 与实际编译使用同一个已定位编译器，不再 probe 一份、从 PATH 编译另一份。
 

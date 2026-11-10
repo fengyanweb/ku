@@ -1,18 +1,19 @@
 ---
 title: 平台與後端支援
 description: 區分 Ku 已發佈平台、解釋器、預設 runner、native C、Task 子集與 LLVM 的能力。
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - docs/syntax.md
-  - docs/v0.0.18.md
-  - docs/v0.0.18-worklog.md
-  - docs/protocol-foundation.md
-  - .github/workflows/native-three-os.yml
+  [
+    'docs/syntax.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-worklog.md',
+    'docs/protocol-foundation.md',
+    '.github/workflows/native-three-os.yml',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: zh-tw/v0.0.18/docs/support
 ---
-
-本文檔對應 v0.0.18 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。
 
 ## 已發佈的 CLI 平台
 
@@ -20,7 +21,7 @@ v0.0.18 實驗預發行包覆蓋 Windows x64（MSVC）、Linux x64（GNU）、ma
 
 ## 執行方式
 
-| 能力                                   | 解釋器 `ku run`        | 預設 `ku build` runner | 同步 native C                     | 開發中 native Task     | LLVM 文字原型  |
+| 能力                                   | 解釋器 `ku run`        | 預設 `ku build` runner | 同步 native C                     | 原生 Task（受限子集）  | LLVM 文字原型  |
 | -------------------------------------- | ---------------------- | ---------------------- | --------------------------------- | ---------------------- | -------------- |
 | 基礎語言、函式與控制流                 | 有實作                 | 使用解釋器路徑         | 已實作子集                        | 有限 typed 子集        | 有限原型       |
 | JSON                                   | 支援                   | 支援                   | 支援                              | 不支援                 | 不支援         |
@@ -33,9 +34,9 @@ v0.0.18 實驗預發行包覆蓋 Windows x64（MSVC）、Linux x64（GNU）、ma
 
 ## native Task 目前做到哪裡
 
-目前開發分支有受限的 `async fn main(): null!` 原始碼路徑，覆蓋已列出的 primitive、字串、平面陣列、單層 Result、Task start/move/await、部分控制流，以及有界文件/目錄後台操作。它不是已發佈 v0.0.18 的完整 async 後端。
+本版包含受限 `async fn main(): null!` 原生 C 路徑，涵蓋明列的基本型別、字串、平面陣列、單層 Result、Task 啟動／移動／await、部分控制流程，以及有界檔案與目錄背景操作。局部 TCP/TLS 操作可經固定 blocking pool 執行；這不等同通用網路 readiness 或完整 M:N 調度。支援型別與可等待操作仍以本版並行文件為準。
 
-網絡通用 Task 等待、完整 M:N、任意動態堆組合、所有 async 捕獲/函式值組合和完整長期 soak 仍未完成。具體接受與拒絕範圍見[併發合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md)。
+網絡通用 Task 等待、完整 M:N、任意動態堆組合、所有 async 捕獲/函式值組合和完整長期 soak 仍未完成。具體接受與拒絕範圍見[併發合同](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/concurrency.md)。
 
 ## 資料庫與網絡邊界
 
@@ -47,35 +48,27 @@ Redis 仍為明文 TCP；MySQL 未提供跨 Oracle/MariaDB 一致的 fail-closed
 
 Ku 自舉 Lexer 和 Parser 已有有界子集及差分驗證；完整 Parser、checker、IR 與 backend 的自舉尚未完成，Rust 仍承擔 bootstrap 工具鏈。0.0.x 不承諾原始碼或生成 C/FFI ABI 向後兼容。
 
-工作日誌和歷史 CI 只證明對應範圍與提交。查看[發佈記錄](/zh-tw/v0.0.18/releases/)區分已發行變化和開發內容；本網站未把目前工作分支的全部 CI、生產負載或資料庫驗收寫成已通過。
+## v0.0.18 的支援範圍與限制
 
-> 以下 v0.0.18 新增發布資訊暫以英文提供；既有譯文保留。 [English](/en/v0.0.18/docs/support/) · [简体中文](/zh-cn/v0.0.18/docs/support/)
+- JSON: `encode`／`decode` 與 `stringify`／`parse` 共用實作，包含 `1e20` 浮點往返修正。
+- 原生 Task 保持明列的有界子集；退出准入與清理修正不等於完整 M:N 或通用網路掛起。
+- HTTP 提供有界 socket readiness、佇列、回應處理與 keep-alive，以及可選的有界診斷；不代表所有負載已完成驗收。
+- `ku supervise` 管理完整程式 worker、准入、佇列位元組、輸出與清理；不是每個請求或 Task 一個 worker，也不自動套用到普通 `ku run`。
 
-## v0.0.18 release scope and known limits
+**HTTP 已知問題：** 服務可能間歇出現 HTTP 504，原因尚未確認。
 
-This release freezes already implemented and verified functionality. It remains an **experimental prerelease**, not a production-readiness claim. [The v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) is the authority for actual publication, assets and checksums; a skipped publishing job is not release evidence.
+### 程序記憶體界線
 
-- JSON keeps the previous implementation as its default. `json.encode` / `json.decode` share the `stringify` / `parse` entry points. The float round-trip correction for `1e20` is included; yyjson replacement and performance exploration have ended.
-- Task/native async support remains the documented bounded subset. Shutdown admission and cleanup fixes do not imply a complete M:N runtime or universal network suspension.
-- HTTP uses bounded socket readiness, queues and response handling, with keep-alive support and optional bounded diagnostic records. These changes do not imply that all workload acceptance has passed.
-- `ku supervise` controls whole-program workers, admission, queue bytes, output and cleanup. It is not one worker per HTTP request or per Task, and it is not automatically applied to ordinary `ku run`.
+| 程序記憶體界線 | `ku supervise`                                                                                                                                                                                                            |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux          | 依 cgroup v2 核心計費量限制；須有可寫且已委派的 domain root，啟用 `memory`、`pids`，並提供 `memory.max`、`memory.swap.max`、`memory.oom.group`、`pids.max`、`cgroup.kill`。缺少控制項或權限時，在啟動應用程式前拒絕執行。 |
+| Windows        | 以巢狀 Job Object 限制個別 worker 與群組的提交虛擬記憶體，不是 RSS。解除暫停應用執行緒前先檢查初始 commit；宿主策略可能拒絕指派 Job。                                                                                     |
+| macOS          | 原生不支援此隔離模式，在啟動應用程式前拒絕。需要時使用已正確設定的 Linux 主機或 VM；不會自動轉送到 VM。                                                                                                                   |
 
-**Known HTTP issue:** HTTP 504 occurred historically, including a seven-request cluster. This round's 60-second and 180-second short tests did not reproduce it. The root cause is unconfirmed, and formal 30-minute stability acceptance has not passed. It is retained as a known issue for v0.0.18 and is not a separate release blocker. The earliest three historical 504s lack enough evidence for a unique reconstruction. Do not describe the issue as repaired or long-term stability as accepted.
+worker 資源域計費包含其 Ku 與第三方函式庫配置。Linux cgroup 計費與 Windows commit 是不同指標；`memory.max` 可能容許瞬間超限，不保證所有實體記憶體在任何時刻都絕不超限。
 
-**Deferred, not completed:** complete M:N, general Task network scheduling, the complete database platform matrix, and further long-running workload acceptance belong to later versions. General value copy/release follow-up and AST analysis remain paused. No unrelated memory-limit validation is being repeated.
+協調器本身沒有 OS 記憶體硬限制，控制預留與准入帳本也不是精確 RSS。單一 Task 的完整 heap 未精確計量，共享連線池、快取與函式庫配置無法逐 Task 精確歸屬。外部資料庫、宿主／VM、建置器及普通 `ku run` 不會自動受 worker 額度約束。
 
-### Process memory boundary
+OS 限制終止 worker 時，協調器報告失敗，確認清理完成後才歸還預留額度。部分配置失敗可提前回報，但第三方記憶體耗盡不保證轉成普通 Result。**資料庫操作不會自動重試**；worker 退出不代表已回滾，副作用可能仍未知。
 
-| Host | `ku supervise` guarantee and prerequisite |
-| --- | --- |
-| Linux | cgroup v2 kernel charged memory; a writable, delegated domain root with `memory` and `pids` enabled is required. Required interfaces include `memory.max`, `memory.swap.max`, `memory.oom.group`, `pids.max` and `cgroup.kill`. Missing controls or permissions cause refusal before application execution. |
-| Windows | Nested Job Object limits for individual workers and the worker group, measured as committed virtual memory, not RSS. Initial process commit is checked before its suspended application thread is released. Host policy can reject Job assignment. |
-| macOS | This isolation mode is not supported natively and is explicitly rejected before starting the application. Use a suitably configured Linux host/VM when required; there is no automatic VM bridge. |
-
-Worker accounting covers applicable Ku and third-party library allocations in that worker's resource domain. Linux cgroup accounting and Windows commit are different metrics. Linux `memory.max` may permit transient overshoot; these mechanisms do not promise an absolute ceiling on all physical memory at every instant.
-
-The coordinator itself has no OS memory hard limit. Its bounded admission/control reserve is an accounting policy, not a coordinator RSS limit. A single Task's entire heap is not precisely metered; shared connection pools, caches and library allocations cannot be exactly attributed to each Task. External databases, the host/VM and build compilers lie outside the worker domain.
-
-When an OS limit terminates a worker, the coordinator reports failure and only returns reserved capacity after confirmed cleanup. Some allocation failures can be reported before allocation, but third-party exhaustion is not guaranteed to become an ordinary Result. **Database operations are never automatically retried**; an exited worker does not prove rollback, and side effects may be unknown.
-
-See the [process execution contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/process-execution.md), [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md) and [HTTP acceptance record](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/http-stability-acceptance.md). Cross-platform CI and installation checks establish only their reported targets and scope, not a completed real-database matrix.
+[`ku supervise`](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/process-execution.md) · [Task](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/concurrency.md) · [HTTP 504](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/http-stability-acceptance.md)

@@ -1,17 +1,20 @@
 ---
-title: 標準ライブラリ
-description: Ku の標準ライブラリモジュール、主要なシグネチャ、バックエンドの制約。
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: '標準ライブラリ'
+description: 'Ku の標準ライブラリモジュール、主要なシグネチャ、バックエンドの制約。'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - src/stdlib/metadata.rs
-  - src/stdlib/mod.rs
-  - docs/syntax.md
-  - docs/protocol-foundation.md
+  [
+    'src/stdlib/metadata.rs',
+    'src/stdlib/mod.rs',
+    'docs/syntax.md',
+    'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: ja/v0.0.18/docs/stdlib
 ---
 
-本書は実験的プレリリース v0.0.18 の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。主要なエントリーポイントをソースと照合していますが、網羅的な API リファレンスではありません。動作は[構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)で定義されます。バックエンドの制約は[対応表](/ja/v0.0.18/docs/support/)をご覧ください。
+標準ライブラリの仕様は[構文リファレンス](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md)、バックエンドごとの制限は[対応範囲](/ja/v0.0.18/docs/support/)をご覧ください。
 
 ## モジュールをインポートする
 
@@ -73,7 +76,3 @@ fn main(): null! {
 先にソースと同じ場所に UTF-8 の `message.txt` を作成してください。ファイルがない場合や読み込み失敗時はエラーを返します。この例は、その入力ファイルに依存します。`try_read` と `try_write` は、同じ結果型を持つ互換エイリアスです。
 
 `read_dir` はソート済みの独立した所有パスを返します。上限は 10,000 件、パス合計 1,000,000 バイトです。制限付きネイティブ Task のファイル操作は、固定バックグラウンドプールを使用します。同じ仕組みで汎用ネットワーク待機が実現していることを意味しません。
-
-## リファレンスの保守
-
-公開インターフェースのメタデータは [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs) にあります。実装と仕様と併せて確認します。このウェブサイトでは現在、内容を選定した手動リファレンスを管理しています。既存の `ku doc` コマンドは確認されていません。

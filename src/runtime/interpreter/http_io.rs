@@ -56,7 +56,7 @@ impl BufferBudget {
     fn charge(self: &Arc<Self>, bytes: usize) -> Option<BufferCharge> {
         if let Ok(previous) =
             self.current
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     current
                         .checked_add(bytes)
                         .filter(|next| *next <= self.limit)
@@ -70,7 +70,7 @@ impl BufferBudget {
         } else {
             let _ = self
                 .rejected
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                     Some(count.saturating_add(1))
                 });
             None
@@ -160,7 +160,7 @@ impl HttpTraceSink {
             HttpTraceEvent::Flight(_) => (&self.state.flight, 32),
         };
         if counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 (count < limit).then_some(count + 1)
             })
             .is_err()
@@ -220,7 +220,7 @@ struct HttpTraceCounters {
 }
 
 fn increment(counter: &AtomicUsize) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_add(1))
     });
 }

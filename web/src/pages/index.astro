@@ -1,15 +1,22 @@
 ---
 // The request entry handles / before this static fallback is served. A purely
 // static host has no trusted country metadata; its fallback is English.
+import { project } from '../data/site';
 ---
 
 <!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <meta name="msvalidate.01" content="1A0FA5E43B1D5A5460109460A923F40E" />
+    <meta name="baidu-site-verification" content="codeva-Slz5iwucDj" />
     <meta name="viewport" content="width=device-width" />
-    <meta name="robots" content="noindex, nofollow" />
-    <title>Ku</title>
+    <meta name="robots" content="noindex, follow" />
+    <meta
+      name="description"
+      content="Ku Programming Language / Ku 编程语言 — an experimental language with an interpreter, static checking, native C compilation, a standard library, and VS Code tools."
+    />
+    <title>{project.name} / {project.nameZh}</title>
     <noscript>
       <meta http-equiv="refresh" content="0;url=/en/" />
     </noscript>

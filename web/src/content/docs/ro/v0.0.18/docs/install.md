@@ -1,24 +1,22 @@
 ---
-title: Instalare și descărcare
-description: Descarcă versiunea preliminară experimentală Ku 0.0.18 și înțelege
-  cerințele de platformă și compilare.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Instalare și descărcare'
+description: 'Descarcă versiunea preliminară experimentală Ku 0.0.18 și înțelege cerințele de platformă și compilare.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - Cargo.toml
-  - docs/v0.0.18.md
-  - docs/history.md
-  - .github/scripts/export-release.py
+  [
+    'Cargo.toml',
+    'docs/v0.0.18.md',
+    'docs/history.md',
+    '.github/scripts/export-release.py',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: ro/v0.0.18/docs/install
 ---
 
-> Actualizările v0.0.18 de mai jos sunt momentan în engleză; restul traducerii este păstrat. [English](/en/v0.0.18/docs/support/) · [简体中文](/zh-cn/v0.0.18/docs/support/)
-
-This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) and its assets; documentation alone does not establish completed publication or production readiness.
-
 ## Alege platforma
 
-Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). `native_ci-*` artifacts are CI examples, not CLI installers.
+[Descarcă Ku 0.0.18](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · `SHA256SUMS` · `.manifest.json`
 
 | Sistem  | Arhitectură           | Arhivă                                       |
 | ------- | --------------------- | -------------------------------------------- |
@@ -26,7 +24,7 @@ Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.
 | Windows | x64 / MSVC            | `ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`   |
 | Linux   | x64 / GNU             | `ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz` |
 
-Nu au fost verificate arhive pentru alte platforme. Suportul pentru compilare încrucișată nu înseamnă că fiecare sistem sau arhitectură are un pachet publicat.
+Pachetele precompilate sunt oferite pentru cele trei platforme indicate. Compilarea încrucișată nu implică un pachet publicat pentru fiecare sistem.
 
 ## Extragere și verificare
 
@@ -46,6 +44,118 @@ Nu au fost verificate arhive pentru alte platforme. Suportul pentru compilare î
 
 Versiunea raportată trebuie să fie `0.0.18`. Opțional, adaugă directorul în `PATH`, apoi rulează `ku --version`. Instalează `ku-language-0.0.18.vsix` inclus pentru integrarea VS Code.
 
+Instalare de copiat: macOS necesită curl, tar și shasum; Linux curl, tar, awk și sha256sum; Windows PowerShell și tar.exe. Blocurile verifică SHA256 și rulează Hello Ku. PATH se schimbă doar în subshellul POSIX sau se restaurează în PowerShell, nu global. Sursa Windows este UTF-8 fără BOM și acceptă căi cu spații.
+
+### macOS · Apple Silicon
+
+```sh
+(
+  set -eu
+  base="https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1"
+  archive="ku-v0.0.18-aarch64-apple-darwin.tar.gz"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/Ku install.XXXXXX")"
+  cd "$work"
+  curl --fail --location --output "$archive" "$base/$archive"
+  curl --fail --location --output SHA256SUMS "$base/SHA256SUMS"
+  awk -v name="$archive" '$2 == name { print }' SHA256SUMS > archive.sha256
+  test "$(wc -l < archive.sha256 | tr -d ' ')" = 1
+  shasum -a 256 -c archive.sha256
+  mkdir "Ku 0.0.18"
+  tar -xzf "$archive" -C "Ku 0.0.18"
+  cd "Ku 0.0.18"
+  export PATH="$PWD:$PATH"
+  ku --version
+  cat > hello.ku <<'KU'
+fn main() {
+    println("Hello Ku")
+}
+KU
+  ku check hello.ku
+  ku run hello.ku
+  printf 'Ku directory: %s\n' "$PWD"
+)
+```
+
+### Linux · x64 GNU
+
+```sh
+(
+  set -eu
+  base="https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1"
+  archive="ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/Ku install.XXXXXX")"
+  cd "$work"
+  curl --fail --location --output "$archive" "$base/$archive"
+  curl --fail --location --output SHA256SUMS "$base/SHA256SUMS"
+  awk -v name="$archive" '$2 == name { print }' SHA256SUMS > archive.sha256
+  test "$(wc -l < archive.sha256 | tr -d ' ')" = 1
+  sha256sum -c archive.sha256
+  mkdir "Ku 0.0.18"
+  tar -xzf "$archive" -C "Ku 0.0.18"
+  cd "Ku 0.0.18"
+  export PATH="$PWD:$PATH"
+  ku --version
+  cat > hello.ku <<'KU'
+fn main() {
+    println("Hello Ku")
+}
+KU
+  ku check hello.ku
+  ku run hello.ku
+  printf 'Ku directory: %s\n' "$PWD"
+)
+```
+
+### Windows · x64
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$base = 'https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1'
+$archive = 'ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz'
+$work = Join-Path ([IO.Path]::GetTempPath()) ('Ku install ' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $work | Out-Null
+$archivePath = Join-Path $work $archive
+$sumsPath = Join-Path $work 'SHA256SUMS'
+Invoke-WebRequest -Uri "$base/$archive" -OutFile $archivePath
+Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $sumsPath
+$pattern = '^[0-9a-fA-F]{64}\s+' + [regex]::Escape($archive) + '$'
+$lines = @(Get-Content -LiteralPath $sumsPath | Where-Object { $_ -match $pattern })
+if ($lines.Count -ne 1) { throw 'Missing or ambiguous SHA256SUMS entry' }
+$expected = ($lines[0] -split '\s+')[0]
+$actual = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+if ($actual -ne $expected) { throw 'SHA256 mismatch; do not extract or run' }
+$kuDir = Join-Path $work 'Ku 0.0.18'
+New-Item -ItemType Directory -Path $kuDir | Out-Null
+tar -xzf $archivePath -C $kuDir
+if ($LASTEXITCODE -ne 0) { throw 'Archive extraction failed' }
+$hello = @'
+fn main() {
+    println("Hello Ku")
+}
+'@
+[IO.File]::WriteAllText((Join-Path $kuDir 'hello.ku'), $hello + "`n", [Text.UTF8Encoding]::new($false))
+$previousPath = $env:Path
+Push-Location -LiteralPath $kuDir
+try {
+    $env:Path = "$kuDir;$env:Path"
+    ku.exe --version
+    if ($LASTEXITCODE -ne 0) { throw 'Version check failed' }
+    ku.exe check hello.ku
+    if ($LASTEXITCODE -ne 0) { throw 'Source check failed' }
+    ku.exe run hello.ku
+    if ($LASTEXITCODE -ne 0) { throw 'Program failed' }
+} finally {
+    $env:Path = $previousPath
+    Pop-Location
+}
+Write-Output "Ku directory: $kuDir"
+```
+
+```text
+ku 0.0.18
+Hello Ku
+```
+
 ## Cerințe de rulare și compilare
 
 | Operație                                | Cerințe suplimentare                                                                     |
@@ -57,21 +167,33 @@ Versiunea raportată trebuie să fie `0.0.18`. Opțional, adaugă directorul în
 
 Lansatorul implicit încorporează doar sursa punctului de intrare. Modulele importate se încarcă în continuare din locațiile originale. Distribuirea întregului graf de importuri locale independent de surse necesită compilare nativă prin C și rămâne supusă [limitelor backendurilor](/ro/v0.0.18/docs/support/).
 
-## Încearcă sursa de dezvoltare
-
-Dintr-o copie locală a depozitului:
+Runnerul implicit apelează rustc. Selectează explicit Rust 1.89.0 conform RELEASE.json și rlibs incluse; alt Rust implicit poate cauza E0514. Ku trebuie să fie în PATH temporar.
 
 ```sh
+rustup run 1.89.0 ku build hello.ku
+```
+
+PowerShell:
+
+```powershell
+rustup run 1.89.0 ku.exe build hello.ku
+```
+
+## Construirea surselor corespunzătoare
+
+Comenzile următoare compilează codul sursă publicat.
+
+```sh
+git clone --branch v0.0.18-r1 --depth 1 https://github.com/fengyanweb/ku.git
+cd ku
 cargo +1.89.0 run --locked --release -- --version
 cargo +1.89.0 run --locked --release -- run examples/hello.ku
 ```
 
-The CLI and Cargo version for this release is `0.0.18`. Record the Git commit, target and toolchain when building source; source-build success does not prove publication of a release artifact.
-
 ## Dezinstalare
 
-Pentru instalarea din arhivă, șterge directorul extras, anulează intrarea adăugată în `PATH` și dezinstalează extensia VS Code. Păstrează mai întâi sursele și configurația create acolo. Nu a fost verificat un instalator separat cu un clic, instalarea prin manager de pachete sau comanda `ku uninstall`.
+Instalarea folosește arhive. Salvează sursele și setările create în directorul instalării, apoi șterge directorul, intrările `PATH` adăugate și extensia VS Code.
 
-Urmează: [rulează primul program](/ro/v0.0.18/docs/getting-started/). Sursa contractului de instalare: [arhivele versiunilor](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/history.md).
+Urmează: [rulează primul program](/ro/v0.0.18/docs/getting-started/). Sursa contractului de instalare: [arhivele versiunilor](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/history.md).
 
-`ku supervise` has platform-specific prerequisites and memory metrics; see [support boundaries](/ro/v0.0.18/docs/support/). The macOS CLI can run programs, but this isolation mode is not natively supported.
+Condițiile și măsurile de memorie `ku supervise` sunt în [suport](/ro/v0.0.18/docs/support/). CLI macOS rulează programe, dar nu suportă nativ acest mod de izolare.

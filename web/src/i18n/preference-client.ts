@@ -16,20 +16,29 @@ export function updateLanguageLinks() {
   document
     .querySelectorAll<HTMLAnchorElement>('a[data-ku-language]')
     .forEach((link) => {
-      const target = new URL(link.href);
-      target.search = location.search;
-      if (!link.dataset.kuFallback) {
-        const anchors: string[] = JSON.parse(link.dataset.kuAnchors || '[]');
-        try {
-          target.hash = anchors.includes(
-            decodeURIComponent(location.hash.slice(1)),
-          )
-            ? location.hash
-            : '';
-        } catch {
-          target.hash = '';
-        }
-      }
-      link.href = target.pathname + target.search + target.hash;
+      link.href = navigationUrl(
+        link.href,
+        JSON.parse(link.dataset.kuAnchors || '[]'),
+        !!link.dataset.kuFallback,
+      );
     });
+}
+
+export function navigationUrl(
+  path: string,
+  anchors: string[],
+  fallback = false,
+) {
+  const target = new URL(path, location.origin);
+  target.search = location.search;
+  target.searchParams.delete('ku_language_fallback');
+  if (fallback) target.searchParams.set('ku_language_fallback', '1');
+  try {
+    target.hash = anchors.includes(decodeURIComponent(location.hash.slice(1)))
+      ? location.hash
+      : '';
+  } catch {
+    target.hash = '';
+  }
+  return target.pathname + target.search + target.hash;
 }

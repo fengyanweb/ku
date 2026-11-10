@@ -320,10 +320,9 @@ fn compile_harness_linked(
     };
     let mut candidates: Vec<(PathBuf, Vec<String>)> = Vec::new();
     if require_tsan {
-        assert!(
-            cfg!(target_os = "linux"),
-            "required Task TSan gate is Linux-only"
-        );
+        if cfg!(not(target_os = "linux")) {
+            std::panic::panic_any("required Task TSan gate is Linux-only");
+        }
         assert!(
             libpq_dir.is_none(),
             "required Task TSan gate excludes external libpq"

@@ -1,77 +1,85 @@
 ---
 title: 'Instalação e downloads'
-description: 'Baixe a versão preliminar experimental Ku 0.0.18 e entenda os requisitos de plataforma e compilação.'
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+description: 'Baixe o Ku 0.0.20 para seu computador. Cada pacote inclui a ferramenta de linha de comando, o interpretador e a extensão do VS Code.'
+kuVersion: '0.0.20'
+verifiedAt: '2026-11-09'
 sources:
   [
     'Cargo.toml',
-    'docs/v0.0.18.md',
+    'docs/v0.0.20.md',
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
 ---
 
-> As atualizações de v0.0.18 abaixo estão por enquanto em inglês; o restante da tradução foi preservado. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
+Baixe o **Ku 0.0.20** para seu computador. Cada pacote inclui a ferramenta de linha de comando, o interpretador e a extensão do VS Code.
 
-This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) and its assets; documentation alone does not establish completed publication or production readiness.
+## 1. Baixar o Ku
 
-## Escolha a plataforma
+| Sistema | Arquitetura           | Baixar                                                                                                                          |
+| ------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| macOS   | Apple Silicon / ARM64 | [Baixar macOS (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.20/ku-v0.0.20-aarch64-apple-darwin.tar.gz)     |
+| Windows | x64                   | [Baixar Windows (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.20/ku-v0.0.20-x86_64-pc-windows-msvc.tar.gz) |
+| Linux   | x64 / GNU             | [Baixar Linux (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.20/ku-v0.0.20-x86_64-unknown-linux-gnu.tar.gz) |
 
-Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). `native_ci-*` artifacts are CI examples, not CLI installers.
+## 2. Extrair e executar
 
-| Sistema | Arquitetura           | Arquivo                                      |
-| ------- | --------------------- | -------------------------------------------- |
-| macOS   | Apple Silicon / arm64 | `ku-v0.0.18-aarch64-apple-darwin.tar.gz`     |
-| Windows | x64 / MSVC            | `ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`   |
-| Linux   | x64 / GNU             | `ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz` |
+Extraia o **pacote completo** para uma pasta vazia, como `ku` na sua pasta de usuário. Mantenha todos os arquivos juntos; não mova apenas o executável. Abra um terminal nessa pasta.
 
-Não foram verificados arquivos para outras plataformas. O suporte à compilação cruzada não significa que todo sistema operacional ou arquitetura tenha um pacote publicado.
-
-## Extraia e verifique
-
-1. Verifique o arquivo compactado com `SHA256SUMS` da versão. Um `.manifest.json` separado descreve a integridade do arquivo e do seu conteúdo. As somas de verificação verificam a integridade; não são assinaturas do publicador.
-2. Extraia **todo o arquivo compactado** em um diretório vazio e leia `README-INSTALL.md`. Preserve a organização relativa de `ku`, `libku.rlib`, `deps/` e `native-tls/`.
-3. Confira a versão nesse diretório. No macOS / Linux:
+macOS / Linux:
 
 ```sh
 ./ku --version
 ```
 
-No Windows PowerShell:
+Windows PowerShell:
 
 ```powershell
 .\ku.exe --version
 ```
 
-A versão informada deve ser `0.0.18`. Opcionalmente, adicione este diretório a `PATH` e execute `ku --version`. Instale o arquivo incluído `ku-language-0.0.18.vsix` para integração com o VS Code.
+A saída deve ser `ku 0.0.20`. Você já pode executar e verificar arquivos `.ku`; essas operações não exigem a instalação do Rust.
 
-## Requisitos de execução e compilação
+<details>
+<summary>Opcional: usar ku em qualquer pasta</summary>
 
-| Operação                                | Requisitos adicionais                                                                             |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `ku run hello.ku` / `ku check hello.ku` | CLI do Ku para a plataforma correspondente                                                        |
-| `ku build hello.ku` padrão              | Rust **1.89.0** para o destino e seu vinculador de sistema; manter as dependências Rust incluídas |
-| `ku build --backend c hello.ku`         | Compilador e vinculador C funcionais para o destino                                               |
-| Programa nativo de banco de dados       | Bibliotecas dinâmicas externas correspondentes do cliente de banco de dados; não estão incluídas  |
-
-O executor padrão incorpora apenas o código-fonte de entrada. Os módulos importados continuam sendo carregados de seus locais originais. A implantação de um grafo completo de importações locais independente dos fontes exige compilação nativa em C e continua sujeita aos [limites de suporte dos backends](/pt/docs/support/).
-
-## Experimente o código de desenvolvimento
-
-A partir de uma cópia local do repositório:
+Se você extraiu para `~/ku`, adicione esta linha ao arquivo de inicialização do seu shell, como `~/.zshrc` ou `~/.bashrc`:
 
 ```sh
-cargo +1.89.0 run --locked --release -- --version
-cargo +1.89.0 run --locked --release -- run examples/hello.ku
+export PATH="$HOME/ku:$PATH"
 ```
 
-The CLI and Cargo version for this release is `0.0.18`. Record the Git commit, target and toolchain when building source; source-build success does not prove publication of a release artifact.
+No Windows, abra «Editar as variáveis de ambiente da sua conta», edite o `Path` do usuário e adicione o caminho completo da pasta extraída, por exemplo `%USERPROFILE%\ku`. Mantenha as entradas existentes.
 
-## Desinstale
+Abra um novo terminal e execute `ku --version`.
 
-Em uma instalação por arquivo compactado, remova o diretório extraído, desfaça as entradas `PATH` adicionadas e desinstale a extensão do VS Code. Primeiro preserve os arquivos-fonte e a configuração que criou nesse local. Não foram verificados um instalador separado de um clique, instalação por gerenciador de pacotes ou um comando `ku uninstall`.
+</details>
 
-Próximo passo: [execute o primeiro programa](/pt/docs/getting-started/). Fonte do contrato de instalação: [arquivos de versões](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/history.md).
+## 3. Instalar a extensão do VS Code
 
-`ku supervise` has platform-specific prerequisites and memory metrics; see [support boundaries](/pt/docs/support/). The macOS CLI can run programs, but this isolation mode is not natively supported.
+Na visualização Extensões do VS Code, selecione **… → Instalar do VSIX…**, abra `ku-language-0.0.20.vsix` na pasta extraída e recarregue a janela.
+
+Se o Ku não estiver no `PATH`, defina `ku.executablePath` como o caminho completo de `ku` (`ku.exe` no Windows).
+
+<details>
+<summary>Verificar o download</summary>
+
+Compare o SHA-256 do pacote com [SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.20/SHA256SUMS). A [página da versão](https://github.com/fengyanweb/ku/releases/tag/v0.0.20) também oferece um `.manifest.json` por pacote com as somas de verificação dos arquivos. Veja outras instruções em `README-INSTALL.md` dentro do pacote.
+
+</details>
+
+<details>
+<summary>Compilar seus próprios programas Ku</summary>
+
+`ku run` e `ku check` não exigem Rust. O `ku build` padrão exige um vinculador do sistema e a identidade exata do compilador Rust registrada no SDK instalado; os pacotes v0.0.20 usam **Rust 1.99.1**. `ku build --backend c` exige um compilador C e um vinculador para o destino. Programas nativos de banco de dados também precisam das bibliotecas cliente correspondentes, não incluídas no pacote.
+
+</details>
+
+<details>
+<summary>Desinstalar</summary>
+
+Preserve os arquivos-fonte e as configurações que criou. Depois remova a pasta extraída, a entrada adicionada ao `PATH` e a extensão do VS Code.
+
+</details>
+
+[Próximo passo: executar seu primeiro programa](/pt/docs/getting-started/)

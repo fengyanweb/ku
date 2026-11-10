@@ -3524,7 +3524,7 @@ const NATIVE_TLS_LINUX_CONTRACT: NativeTlsLinkContract = NativeTlsLinkContract {
     flavor: "gnu",
     object_format: "elf-x86_64",
     archive_name: "libku_native_tls.a",
-    link_contract: "rust-1.89.0-linux-gnu-v1",
+    link_contract: "rust-1.99.1-linux-gnu-v1",
     crt: "system-dynamic",
     native_libraries: NATIVE_TLS_LINUX_LIBRARIES,
 };
@@ -3533,7 +3533,7 @@ const NATIVE_TLS_WINDOWS_GNU_CONTRACT: NativeTlsLinkContract = NativeTlsLinkCont
     flavor: "gnu",
     object_format: "coff-x86_64",
     archive_name: "libku_native_tls.a",
-    link_contract: "rust-1.89.0-windows-gnu-v1",
+    link_contract: "rust-1.99.1-windows-gnu-v1",
     crt: "mingw-dynamic",
     native_libraries: NATIVE_TLS_WINDOWS_GNU_LIBRARIES,
 };
@@ -3542,7 +3542,7 @@ const NATIVE_TLS_WINDOWS_MSVC_CONTRACT: NativeTlsLinkContract = NativeTlsLinkCon
     flavor: "msvc",
     object_format: "coff-x86_64",
     archive_name: "ku_native_tls.lib",
-    link_contract: "rust-1.89.0-windows-msvc-v1",
+    link_contract: "rust-1.99.1-windows-msvc-v1",
     crt: "msvc-dynamic",
     native_libraries: NATIVE_TLS_WINDOWS_MSVC_LIBRARIES,
 };
@@ -3551,7 +3551,7 @@ const NATIVE_TLS_DARWIN_CONTRACT: NativeTlsLinkContract = NativeTlsLinkContract 
     flavor: "apple",
     object_format: "macho-arm64",
     archive_name: "libku_native_tls.a",
-    link_contract: "rust-1.89.0-darwin-v1",
+    link_contract: "rust-1.99.1-darwin-v1",
     crt: "system-dynamic",
     native_libraries: NATIVE_TLS_DARWIN_LIBRARIES,
 };
@@ -3848,7 +3848,7 @@ fn parse_manifest_sha256(value: &str, field: &str) -> Result<[u8; 32], KuError> 
         )));
     }
     let mut output = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let nibble = |byte: u8| -> u8 {
             if byte.is_ascii_digit() {
                 byte - b'0'
@@ -7819,7 +7819,9 @@ fn decode_utf16le(bytes: &[u8], what: &str) -> Result<String, KuError> {
         )));
     }
     let units = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect::<Vec<_>>();
     String::from_utf16(&units)

@@ -461,7 +461,12 @@ impl JsonProof {
                         object.slots = JsonCost::constant(if values.len() > 10 { 16 } else { 8 });
                         object.encoded = JsonCost::constant(2);
                         object.depth = 1;
-                        for (args, values) in args.chunks_exact(2).zip(values.chunks_exact(2)) {
+                        for (args, values) in args
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .zip(values.as_chunks::<2>().0.iter())
+                        {
                             if !matches!(args[0].kind, IrExprKind::Literal(_))
                                 || values[0].ty != IrType::Str
                                 || values[0].bytes.0[0] > 64

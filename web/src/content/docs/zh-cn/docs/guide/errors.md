@@ -1,8 +1,8 @@
 ---
 title: 错误与排查
 description: 定位 Ku 安装、导入、所有权、JSON 与后端能力错误。
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.20'
+verifiedAt: '2026-10-28'
 sources:
   [
     'docs/diagnostics.md',
@@ -10,9 +10,57 @@ sources:
     'src/error.rs',
     'src/stdlib/json.rs',
   ]
+sidebar:
+  order: 2
 ---
 
-本文档对应 v0.0.18 实验预发行版的冻结范围；实际公开状态与下载资产以 GitHub Release 为准。编译器诊断可能随实验版本收敛。报告问题时同时提供 CLI 版本、Git commit、后端、完整命令和最小源码，避免把不同版本的行为混在一起。
+编译器诊断可能随实验版本收敛。报告问题时同时提供 CLI 版本、Git commit、后端、完整命令和最小源码，避免把不同版本的行为混在一起。
+
+<a id="result-operators"></a>
+
+## 什么时候写 `!` 和 `?`
+
+先看符号出现的位置：
+
+| 写法               | 含义                                                                       | 例子                   |
+| ------------------ | -------------------------------------------------------------------------- | ---------------------- |
+| 类型后的 `!`       | `T!` 表示 Result：成功值是 `T`，失败值是 Error。                           | `fn read_name(): str!` |
+| 表达式后的 `?`     | 成功时取出值；失败时交给所在的 `try/catch`，或从当前返回 `T!` 的函数传出。 | `name = read_name()?`  |
+| 布尔表达式前的 `!` | 对 `bool` 取反，与 Result 无关。                                           | `!ready`               |
+
+`!` 不是每个函数都需要的后缀，`?` 也不是每次调用都要写。`println(...)`、`text.len()` 和普通数组索引返回普通值，不加 `?`。`?` 不表示可选值，也不会把错误转成 `null`。
+
+### 普通入口
+
+只做普通计算，或者在函数内通过 `try/catch` 处理错误时，可以写 `fn main()`，省略返回类型。`main` 函数本身仍是必需的入口。
+
+```ku
+fn main() {
+    ready = false
+    println(!ready)
+}
+```
+
+这个程序输出 `true`，不需要 `: null!` 或 `return ok(null)`。
+
+### 将错误传出
+
+函数要把可恢复错误交给调用者时，声明返回 `T!`；成功时用 `ok(value)` 返回：
+
+```ku
+fn read_name(): str! {
+    return ok("Ku")
+}
+
+fn main(): null! {
+    println(read_name()?)
+    return ok(null)
+}
+```
+
+这里 `read_name()` 返回 Result，`?` 取出其中的字符串。若它返回错误，后续语句不再执行，错误从 `main` 传出，CLI 报错并以非零状态退出。`null!` 表示成功时不返回业务值，失败时仍能传出 Error。
+
+不能只删除这个例子中的 `: null!` 而保留函数外层的 `?`；若要在普通 `main` 内自行处理错误，应把相应调用放入 `try/catch`，如下面的 JSON 示例。`try` 中仍使用 `?` 检查 Result；仅把一次返回 Result 的调用放进 `try`，不会自动解包或触发 `catch`。
 
 ## 先确认运行的是哪一个 Ku
 
@@ -44,7 +92,7 @@ ku check --json hello.ku
 | `E0913` | async 函数声明 borrowed 参数 | 改为 owned 参数；需要保留原值时由调用者 clone            |
 | `E0918` | 在调用处写 `&value`          | 调用写普通实参，借用模式由函数签名声明                   |
 
-这些是已登记诊断的摘要，不是完整错误码清单。当前唯一登记来源是 [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs)。
+这些是已登记诊断的摘要，不是完整错误码清单。当前唯一登记来源是 [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.20/src/error.rs)。
 
 ## 可恢复错误与编译器诊断不同
 
@@ -55,7 +103,7 @@ import json from "std.json"
 
 fn main() {
     try {
-        json.parse("[1,]")?
+        json.decode("[1,]")?
     } catch (error) {
         println(error.domain)
         println(error.code)
@@ -64,7 +112,7 @@ fn main() {
 }
 ```
 
-示例故意触发 JSON 解析错误并捕获，程序正常退出。解析错误的 `byte N` 为从 0 开始的 UTF-8 字节位置，中文或 emoji 前后的字节偏移不等于字符数。
+示例故意触发 JSON 解析错误并捕获，程序正常退出。此片段以 `ku run` 为例；同一输入在支持 JSON 的后端都返回 `json/parse_error`，但 `message` 可不同：解释器消息带 `json parse failed: ` 前缀，native C 的消息可省略该前缀。程序应按 `domain/code` 处理错误，不依赖完整消息文本。解析错误的 `byte N` 为从 0 开始的 UTF-8 字节位置，中文或 emoji 前后的字节偏移不等于字符数。
 
 ## native 编译被拒绝
 
@@ -72,6 +120,6 @@ fn main() {
 
 `ku build --native file.ku` 不带 `-o` 时仅写 C 文件。希望编译和链接二进制时使用 `ku build --backend c file.ku`，并确认目标 C 工具链存在。
 
-数据库的 `execution_unknown` / `execution_completed_without_result` 表示不能安全自动重放；保留请求和业务证据，先核对真实执行状态。官网本地验证不需要连接生产数据库。
+数据库的 `execution_unknown` / `execution_completed_without_result` 表示不能安全自动重放；保留请求和业务证据，先核对真实执行状态。
 
-更多规则见[仓库诊断说明](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md)。
+更多规则见[仓库诊断说明](https://github.com/fengyanweb/ku/blob/v0.0.20/docs/diagnostics.md)。

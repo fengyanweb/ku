@@ -9,7 +9,9 @@ use std::{env, fs, panic, process::Command};
 #[test]
 #[ignore = "requires the explicit Linux Task TSan job and working instrumented runtime"]
 fn native_task_tsan_instrumentation_and_runtime_probe() {
-    assert!(cfg!(target_os = "linux"));
+    if cfg!(not(target_os = "linux")) {
+        std::panic::panic_any("assertion failed: cfg!(target_os = \"linux\")");
+    }
     assert_eq!(env::var("KU_NATIVE_REQUIRE_TSAN").as_deref(), Ok("1"));
     assert_eq!(
         env::var("TSAN_OPTIONS").as_deref(),

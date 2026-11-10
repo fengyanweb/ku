@@ -1,0 +1,331 @@
+.playground {
+  padding-block: 3rem 5rem;
+}
+.pg-heading {
+  max-width: 52rem;
+  margin-bottom: 2rem;
+}
+.pg-heading h1 {
+  font-size: clamp(2rem, 5vw, 3.5rem);
+  line-height: 1.15;
+  margin-block: 0.5rem 1rem;
+}
+.pg-heading p {
+  color: var(--ku-muted);
+}
+.pg-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.5rem;
+}
+.pg-example-label {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-inline-end: auto;
+  font-size: 0.9rem;
+}
+.pg-example-label select {
+  max-width: 17rem;
+  border: 1px solid var(--ku-line);
+  border-radius: 6px;
+  padding: 0.55rem;
+  color: var(--ku-ink);
+  background: var(--ku-paper);
+  font: inherit;
+}
+.pg-button {
+  border: 1px solid var(--ku-line);
+  border-radius: 6px;
+  padding: 0.55rem 0.85rem;
+  color: var(--ku-ink);
+  background: transparent;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.pg-button:hover:not(:disabled) {
+  border-color: var(--ku-muted);
+}
+.pg-button:focus-visible,
+.pg-tabs button:focus-visible,
+.pg-diagnostic:focus-visible {
+  outline: 2px solid var(--ku-accent);
+  outline-offset: 2px;
+}
+.pg-primary {
+  background: var(--ku-accent);
+  border-color: var(--ku-accent);
+  color: #242720;
+}
+.pg-button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.pg-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  border: 1px solid var(--ku-line);
+  border-radius: var(--ku-radius);
+  overflow: hidden;
+}
+.pg-source,
+.pg-results {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.pg-source {
+  border-inline-end: 1px solid var(--ku-line);
+}
+.pg-panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.8rem 1rem;
+  min-height: 3.1rem;
+  border-bottom: 1px solid var(--ku-line);
+}
+.pg-panel-heading h2 {
+  margin: 0;
+  font: 500 0.8rem var(--ku-mono);
+}
+.pg-panel-heading span {
+  font-size: 0.75rem;
+  color: var(--ku-muted);
+}
+.pg-source-preview {
+  resize: vertical;
+  min-height: 380px;
+  width: 100%;
+  border: 0;
+  margin: 0;
+  padding: 1rem;
+  color: var(--ku-ink);
+  background: var(--ku-paper);
+  font: 14px/1.6 var(--ku-mono);
+}
+.pg-source [data-editor] {
+  height: 420px;
+  max-width: 100%;
+}
+.pg-source [data-editor]:empty {
+  display: none;
+}
+.pg-source-tools,
+.pg-result-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.65rem;
+  border-top: 1px solid var(--ku-line);
+  margin-top: auto;
+}
+.pg-tabs {
+  display: flex;
+  min-height: 3.1rem;
+  border-bottom: 1px solid var(--ku-line);
+}
+.pg-tabs button {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 0.6rem 0.3rem;
+  font: inherit;
+  font-size: 0.8rem;
+  color: var(--ku-muted);
+  cursor: pointer;
+}
+.pg-tabs button[aria-selected='true'] {
+  color: var(--ku-ink);
+  border-bottom-color: var(--ku-accent);
+}
+.pg-output {
+  min-height: 380px;
+  height: 420px;
+  overflow: auto;
+  padding: 1rem;
+}
+.pg-output pre,
+.pg-engine pre,
+.pg-modules pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 0.85rem/1.65 var(--ku-mono);
+}
+.pg-diagnostic {
+  display: block;
+  width: 100%;
+  padding: 0.75rem;
+  margin-bottom: 0.5rem;
+  text-align: start;
+  color: var(--ku-ink);
+  background: transparent;
+  border: 1px solid var(--ku-line);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 0.85rem/1.6 var(--ku-mono);
+  cursor: pointer;
+}
+.pg-run-feedback {
+  min-width: 0;
+  margin-bottom: 1rem;
+  text-align: end;
+}
+.pg-status {
+  min-height: 1.6em;
+  margin: 0;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+.pg-run-feedback .pg-stale {
+  margin-block: 0.5rem 0;
+}
+.pg-notice,
+.pg-stale {
+  font-size: 0.85rem;
+  border-inline-start: 3px solid var(--ku-accent);
+  padding-inline-start: 0.7rem;
+  overflow-wrap: anywhere;
+}
+.pg-notice:empty {
+  display: none;
+}
+.pg-share {
+  margin-block: 1rem;
+}
+.pg-share label {
+  display: block;
+  font-size: 0.85rem;
+}
+.pg-share input {
+  display: block;
+  width: 100%;
+  padding: 0.65rem;
+  margin-top: 0.5rem;
+  border: 1px solid var(--ku-line);
+  border-radius: 6px;
+  color: var(--ku-ink);
+  background: var(--ku-paper);
+  font: 0.8rem var(--ku-mono);
+}
+.pg-hint {
+  color: var(--ku-muted);
+  font-size: 0.8rem;
+  line-height: 1.7;
+}
+.pg-modules,
+.pg-engine {
+  border-top: 1px solid var(--ku-line);
+  padding-block: 1rem;
+  font-size: 0.85rem;
+}
+.pg-modules summary,
+.pg-engine summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.pg-modules [data-files] {
+  margin-top: 1rem;
+}
+.pg-modules [data-files] details {
+  margin-bottom: 0.75rem;
+}
+.pg-modules mark {
+  color: var(--ku-ink);
+  background: color-mix(in srgb, var(--ku-accent) 45%, transparent);
+  outline: 1px solid var(--ku-accent);
+}
+.pg-modules mark:empty::before {
+  content: ' ';
+}
+.pg-modules pre,
+.pg-engine pre {
+  margin-top: 1rem;
+}
+.pg-file-label {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 1rem;
+}
+.pg-file-label input {
+  max-width: 100%;
+}
+.pg-engine p {
+  color: var(--ku-muted);
+  margin-block: 0.8rem 0;
+}
+.playground [hidden] {
+  display: none !important;
+}
+.pg-confirm {
+  width: min(28rem, calc(100vw - 2rem));
+  border: 1px solid var(--ku-line);
+  border-radius: var(--ku-radius);
+  padding: 1.5rem;
+  color: var(--ku-ink);
+  background: var(--ku-paper);
+  font: inherit;
+}
+.pg-confirm::backdrop {
+  background: rgb(0 0 0 / 0.45);
+}
+.pg-confirm h2 {
+  font-size: 1.1rem;
+  margin: 0 0 1rem;
+}
+.pg-confirm p {
+  font-size: 0.9rem;
+  line-height: 1.7;
+  white-space: pre-line;
+}
+.pg-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  margin-top: 1.3rem;
+}
+@media (max-width: 760px) {
+  .playground {
+    padding-block: 2rem 3rem;
+  }
+  .pg-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .pg-run-feedback {
+    text-align: start;
+  }
+  .pg-source {
+    border-inline-end: 0;
+    border-bottom: 1px solid var(--ku-line);
+  }
+  .pg-source [data-editor] {
+    height: 360px;
+  }
+  .pg-output {
+    height: 250px;
+    min-height: 250px;
+  }
+  .pg-example-label {
+    flex-basis: 100%;
+    margin-bottom: 0.3rem;
+  }
+  .pg-example-label select {
+    flex: 1;
+    max-width: 100%;
+    min-width: 0;
+  }
+  .pg-source-tools .pg-button {
+    padding-inline: 0.6rem;
+  }
+}

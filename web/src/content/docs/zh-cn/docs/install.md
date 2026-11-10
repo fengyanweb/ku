@@ -1,75 +1,87 @@
 ---
 title: 安装与下载
-description: 下载 Ku 0.0.18 实验预发行包，了解平台、构建工具与安装验证。
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+description: '下载适合你电脑的 Ku 0.0.20。平台包包含命令行工具、解释器和 VS Code 插件。'
+kuVersion: '0.0.20'
+verifiedAt: '2026-11-09'
 sources:
   [
     'Cargo.toml',
-    'docs/v0.0.18.md',
+    'docs/v0.0.20.md',
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
 ---
 
-本页安装目标为 **v0.0.18 实验预发行版**，不是稳定版，也不代表生产就绪。请以实际 [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) 及其资产为准，文档本身不能证明发布任务已执行。
+下载适合你电脑的 **Ku 0.0.20**。平台包包含命令行工具、解释器和 VS Code 插件。
 
-## 选择对应平台
+## 1. 下载 Ku
 
-从 [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) 下载以下目标归档、并列 manifest 与 `SHA256SUMS`。`native_ci-*` 是 CI 样例，不是 CLI 安装包。
+| 系统    | 架构                  | 下载                                                                                                                          |
+| ------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| macOS   | Apple Silicon / ARM64 | [下载 macOS (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.20/ku-v0.0.20-aarch64-apple-darwin.tar.gz)     |
+| Windows | x64                   | [下载 Windows (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.20/ku-v0.0.20-x86_64-pc-windows-msvc.tar.gz) |
+| Linux   | x64 / GNU             | [下载 Linux (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.20/ku-v0.0.20-x86_64-unknown-linux-gnu.tar.gz) |
 
-| 系统    | 架构                  | 归档文件                                     |
-| ------- | --------------------- | -------------------------------------------- |
-| macOS   | Apple Silicon / arm64 | `ku-v0.0.18-aarch64-apple-darwin.tar.gz`     |
-| Windows | x64 / MSVC            | `ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`   |
-| Linux   | x64 / GNU             | `ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz` |
+## 2. 解压并运行
 
-没有核实的其他平台安装包。跨平台编译能力也不表示任意操作系统或架构已有发行包。
+将**整个安装包**解压到一个空文件夹，例如用户目录下的 `ku` 文件夹。保留解压后的全部文件，不要只移动可执行文件。在该文件夹打开终端。
 
-## 解压与验证
-
-1. 对照 Release 的 `SHA256SUMS` 校验归档；并列 `.manifest.json` 提供归档和文件清单信息。校验和用于检查完整性，不是发布者签名。
-2. 把**完整归档**解压到一个空目录，阅读其中的 `README-INSTALL.md`。保留 `ku`、`libku.rlib`、`deps/` 和 `native-tls/` 的相对布局。
-3. 在解压目录检查版本。macOS / Linux：
+macOS / Linux：
 
 ```sh
-./ku --version
+./ku -v
 ```
 
 Windows PowerShell：
 
 ```powershell
-.\ku.exe --version
+.\ku.exe -v
 ```
 
-应显示版本 `0.0.18`。需要从任意目录调用时，把该目录加入 `PATH`，再执行 `ku --version`。VS Code 扩展通过归档内的 `ku-language-0.0.18.vsix` 安装。
+`ku -v` 等价于 `ku --version`，显示 `ku 0.0.20` 即可。现在就能运行和检查 `.ku` 文件，这两项操作不需要安装 Rust。
 
-## 运行与构建需要什么
+<details>
+<summary>可选：在任意目录使用 ku</summary>
 
-| 操作                                    | 额外要求                                                       |
-| --------------------------------------- | -------------------------------------------------------------- |
-| `ku run hello.ku` / `ku check hello.ku` | 对应平台的 Ku CLI                                              |
-| 默认 `ku build hello.ku`                | 匹配目标的 Rust **1.89.0** 及系统 linker；保留随包的 Rust 依赖 |
-| `ku build --backend c hello.ku`         | 可工作的目标 C 编译器与 linker                                 |
-| native 数据库程序                       | 另外安装对应数据库客户端动态库；发行包未包含这些库             |
-
-默认 build 的 runner 只嵌入入口源码，导入模块仍从原路径读取。完整本地 import graph 的源码无关部署需要 native C 构建，并受[后端支持范围](/zh-cn/docs/support/)约束。
-
-## 从源码试用开发分支
-
-在已取得的仓库根目录执行：
+如果解压到了 `~/ku`，在所用 shell 的启动文件（如 `~/.zshrc` 或 `~/.bashrc`）中加入这一行：
 
 ```sh
-cargo +1.89.0 run --locked --release -- --version
-cargo +1.89.0 run --locked --release -- run examples/hello.ku
+export PATH="$HOME/ku:$PATH"
 ```
 
-本版 CLI 与 Cargo 版本统一为 `0.0.18`。从源码复现时记录 Git commit、平台与工具链；源码构建成功不等于安装包已经发布。
+Windows 打开“编辑账户的环境变量”，编辑用户 `Path`，新增解压文件夹的完整路径，例如 `%USERPROFILE%\ku`。保留原有条目。
 
-## 卸载
+重新打开终端，运行 `ku -v` 确认。
 
-归档式安装可移除自行解压的 Ku 目录，撤销自己添加的 `PATH` 项，并在 VS Code 中卸载扩展。删除前保留该目录里自行创建的源码和配置。当前未核实独立的一键安装器、包管理器安装入口或 `ku uninstall` 命令。
+</details>
 
-下一步：[运行第一个程序](/zh-cn/docs/getting-started/)。安装合同来源：[发布归档说明](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/history.md)。
+## 3. 安装 VS Code 插件
 
-`ku supervise` 的系统条件与内存边界见[支持范围](/zh-cn/docs/support/)。macOS CLI 可运行程序，但原生不支持该隔离模式。
+在 VS Code 扩展面板选择 **… → 从 VSIX 安装…**，选择解压目录里的 `ku-language-0.0.20.vsix`，然后重新加载窗口。
+
+如果没有配置 `PATH`，将设置项 `ku.executablePath` 指向 `ku`（Windows 为 `ku.exe`）的完整路径。
+
+<details>
+<summary>校验下载文件</summary>
+
+将安装包的 SHA-256 与 [SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.20/SHA256SUMS) 对照。[发布页](https://github.com/fengyanweb/ku/releases/tag/v0.0.20)还为每个平台提供 `.manifest.json` 文件清单与校验值。包内 `README-INSTALL.md` 提供进一步说明。
+
+</details>
+
+<details>
+<summary>编译自己的 Ku 程序</summary>
+
+`ku run` 和 `ku check` 不需要 Rust。默认 `ku build` 需要系统链接器，以及与安装包 SDK 记录完全匹配的 Rust 编译器；v0.0.20 发行包使用 **Rust 1.99.1**。`ku build --backend c` 需要目标平台的 C 编译器和链接器。原生数据库程序还需要对应的数据库客户端库，安装包不附带这些库。
+
+</details>
+
+<details>
+<summary>卸载</summary>
+
+先保留自行创建的源码与配置，再删除解压文件夹、自己添加的 `PATH` 条目，并在 VS Code 中卸载插件。
+
+</details>
+
+[下一步：运行第一个程序](/zh-cn/docs/getting-started/)
+
+更多工具命令和简写见[命令行参考](/zh-cn/docs/tools/cli/)。

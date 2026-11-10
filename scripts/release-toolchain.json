@@ -1,5 +1,5 @@
 {
   "schema": "ku-release-toolchain-v1",
-  "toolchain": "1.89.0",
-  "policy": "The CLI hotfix retains the validated 1.89.0 publisher toolchain and matching native TLS ABI. Consumers may keep newer default Rust: Ku selects the exact installed runtime compiler. MSRV is independent. A future publisher upgrade must rebuild and validate the entire bundle and TLS ABI."
+  "toolchain": "1.99.1",
+  "policy": "rust-toolchain.toml is the project and publisher source of truth; release tools reject a different value here. The current candidate uses Rust 1.99.1 and requires newly built CLI, Runner libraries, dependencies and native TLS packs. Historical published bundles retain their original compiler identity."
 }

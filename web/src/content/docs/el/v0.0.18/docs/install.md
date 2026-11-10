@@ -1,24 +1,22 @@
 ---
-title: Εγκατάσταση και λήψη
-description: Κατεβάστε την πειραματική προέκδοση Ku 0.0.18 και κατανοήστε τις
-  απαιτήσεις πλατφόρμας και κατασκευής.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Εγκατάσταση και λήψη'
+description: 'Κατεβάστε την πειραματική προέκδοση Ku 0.0.18 και κατανοήστε τις απαιτήσεις πλατφόρμας και κατασκευής.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - Cargo.toml
-  - docs/v0.0.18.md
-  - docs/history.md
-  - .github/scripts/export-release.py
+  [
+    'Cargo.toml',
+    'docs/v0.0.18.md',
+    'docs/history.md',
+    '.github/scripts/export-release.py',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: el/v0.0.18/docs/install
 ---
 
-> Οι νέες πληροφορίες για τη v0.0.18 ακολουθούν προς το παρόν στα αγγλικά· η υπόλοιπη μετάφραση διατηρείται. [English](/en/v0.0.18/docs/support/) · [简体中文](/zh-cn/v0.0.18/docs/support/)
-
-This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) and its assets; documentation alone does not establish completed publication or production readiness.
-
 ## Επιλέξτε πλατφόρμα
 
-Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). `native_ci-*` artifacts are CI examples, not CLI installers.
+[Λήψη Ku 0.0.18](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · `SHA256SUMS` · `.manifest.json`
 
 | Σύστημα | Αρχιτεκτονική         | Αρχείο                                       |
 | ------- | --------------------- | -------------------------------------------- |
@@ -26,7 +24,7 @@ Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.
 | Windows | x64 / MSVC            | `ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`   |
 | Linux   | x64 / GNU             | `ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz` |
 
-Δεν έχουν επαληθευτεί αρχεία για άλλες πλατφόρμες. Η υποστήριξη διασταυρούμενης μεταγλώττισης δεν σημαίνει ότι υπάρχει δημοσιευμένο πακέτο για κάθε λειτουργικό σύστημα ή αρχιτεκτονική.
+Προμεταγλωττισμένα πακέτα παρέχονται για τις τρεις παραπάνω πλατφόρμες. Η διασταυρούμενη μεταγλώττιση δεν σημαίνει δημοσιευμένο πακέτο για κάθε σύστημα.
 
 ## Αποσυμπίεση και επαλήθευση
 
@@ -46,6 +44,118 @@ Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.
 
 Η αναφερόμενη έκδοση πρέπει να είναι `0.0.18`. Προαιρετικά προσθέστε τον κατάλογο στο `PATH` και εκτελέστε `ku --version`. Εγκαταστήστε το παρεχόμενο `ku-language-0.0.18.vsix` για ενσωμάτωση με το VS Code.
 
+Εγκατάσταση με αντιγραφή: macOS απαιτεί curl, tar, shasum, Linux curl, tar, awk, sha256sum και Windows PowerShell με tar.exe. Τα τμήματα ελέγχουν SHA256 και εκτελούν Hello Ku. Το PATH ισχύει μόνο στο POSIX subshell ή επαναφέρεται στο PowerShell· δεν αλλάζει καθολικά. Η πηγή Windows γράφεται UTF-8 χωρίς BOM και υποστηρίζονται διαδρομές με κενά.
+
+### macOS · Apple Silicon
+
+```sh
+(
+  set -eu
+  base="https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1"
+  archive="ku-v0.0.18-aarch64-apple-darwin.tar.gz"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/Ku install.XXXXXX")"
+  cd "$work"
+  curl --fail --location --output "$archive" "$base/$archive"
+  curl --fail --location --output SHA256SUMS "$base/SHA256SUMS"
+  awk -v name="$archive" '$2 == name { print }' SHA256SUMS > archive.sha256
+  test "$(wc -l < archive.sha256 | tr -d ' ')" = 1
+  shasum -a 256 -c archive.sha256
+  mkdir "Ku 0.0.18"
+  tar -xzf "$archive" -C "Ku 0.0.18"
+  cd "Ku 0.0.18"
+  export PATH="$PWD:$PATH"
+  ku --version
+  cat > hello.ku <<'KU'
+fn main() {
+    println("Hello Ku")
+}
+KU
+  ku check hello.ku
+  ku run hello.ku
+  printf 'Ku directory: %s\n' "$PWD"
+)
+```
+
+### Linux · x64 GNU
+
+```sh
+(
+  set -eu
+  base="https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1"
+  archive="ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/Ku install.XXXXXX")"
+  cd "$work"
+  curl --fail --location --output "$archive" "$base/$archive"
+  curl --fail --location --output SHA256SUMS "$base/SHA256SUMS"
+  awk -v name="$archive" '$2 == name { print }' SHA256SUMS > archive.sha256
+  test "$(wc -l < archive.sha256 | tr -d ' ')" = 1
+  sha256sum -c archive.sha256
+  mkdir "Ku 0.0.18"
+  tar -xzf "$archive" -C "Ku 0.0.18"
+  cd "Ku 0.0.18"
+  export PATH="$PWD:$PATH"
+  ku --version
+  cat > hello.ku <<'KU'
+fn main() {
+    println("Hello Ku")
+}
+KU
+  ku check hello.ku
+  ku run hello.ku
+  printf 'Ku directory: %s\n' "$PWD"
+)
+```
+
+### Windows · x64
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$base = 'https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1'
+$archive = 'ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz'
+$work = Join-Path ([IO.Path]::GetTempPath()) ('Ku install ' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $work | Out-Null
+$archivePath = Join-Path $work $archive
+$sumsPath = Join-Path $work 'SHA256SUMS'
+Invoke-WebRequest -Uri "$base/$archive" -OutFile $archivePath
+Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $sumsPath
+$pattern = '^[0-9a-fA-F]{64}\s+' + [regex]::Escape($archive) + '$'
+$lines = @(Get-Content -LiteralPath $sumsPath | Where-Object { $_ -match $pattern })
+if ($lines.Count -ne 1) { throw 'Missing or ambiguous SHA256SUMS entry' }
+$expected = ($lines[0] -split '\s+')[0]
+$actual = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+if ($actual -ne $expected) { throw 'SHA256 mismatch; do not extract or run' }
+$kuDir = Join-Path $work 'Ku 0.0.18'
+New-Item -ItemType Directory -Path $kuDir | Out-Null
+tar -xzf $archivePath -C $kuDir
+if ($LASTEXITCODE -ne 0) { throw 'Archive extraction failed' }
+$hello = @'
+fn main() {
+    println("Hello Ku")
+}
+'@
+[IO.File]::WriteAllText((Join-Path $kuDir 'hello.ku'), $hello + "`n", [Text.UTF8Encoding]::new($false))
+$previousPath = $env:Path
+Push-Location -LiteralPath $kuDir
+try {
+    $env:Path = "$kuDir;$env:Path"
+    ku.exe --version
+    if ($LASTEXITCODE -ne 0) { throw 'Version check failed' }
+    ku.exe check hello.ku
+    if ($LASTEXITCODE -ne 0) { throw 'Source check failed' }
+    ku.exe run hello.ku
+    if ($LASTEXITCODE -ne 0) { throw 'Program failed' }
+} finally {
+    $env:Path = $previousPath
+    Pop-Location
+}
+Write-Output "Ku directory: $kuDir"
+```
+
+```text
+ku 0.0.18
+Hello Ku
+```
+
 ## Απαιτήσεις εκτέλεσης και κατασκευής
 
 | Ενέργεια                                | Πρόσθετες απαιτήσεις                                                                                    |
@@ -57,21 +167,33 @@ Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.
 
 Ο προεπιλεγμένος εκκινητής ενσωματώνει μόνο την πηγή του σημείου εισόδου. Οι εισαγόμενες μονάδες εξακολουθούν να φορτώνονται από τις αρχικές θέσεις τους. Η ανάπτυξη πλήρους τοπικού γράφου εισαγωγών ανεξάρτητα από τις πηγές απαιτεί εγγενή μεταγλώττιση μέσω C και υπόκειται στα [όρια υποστήριξης backend](/el/v0.0.18/docs/support/).
 
-## Δοκιμάστε την πηγή ανάπτυξης
-
-Από ένα τοπικό αντίγραφο του αποθετηρίου:
+Το προεπιλεγμένο runner καλεί rustc. Επιλέξτε ρητά Rust 1.89.0 σύμφωνα με RELEASE.json και τα παρεχόμενα rlibs· διαφορετικό προεπιλεγμένο Rust μπορεί να προκαλέσει E0514. Το Ku πρέπει να βρίσκεται στο προσωρινό PATH.
 
 ```sh
+rustup run 1.89.0 ku build hello.ku
+```
+
+PowerShell:
+
+```powershell
+rustup run 1.89.0 ku.exe build hello.ku
+```
+
+## Κατασκευή της αντίστοιχης πηγής
+
+Οι παρακάτω εντολές μεταγλωττίζουν τον δημοσιευμένο πηγαίο κώδικα.
+
+```sh
+git clone --branch v0.0.18-r1 --depth 1 https://github.com/fengyanweb/ku.git
+cd ku
 cargo +1.89.0 run --locked --release -- --version
 cargo +1.89.0 run --locked --release -- run examples/hello.ku
 ```
 
-The CLI and Cargo version for this release is `0.0.18`. Record the Git commit, target and toolchain when building source; source-build success does not prove publication of a release artifact.
-
 ## Απεγκατάσταση
 
-Για εγκατάσταση από συμπιεσμένο αρχείο, αφαιρέστε τον κατάλογο αποσυμπίεσης, αναιρέστε κάθε προσθήκη στο `PATH` και απεγκαταστήστε την επέκταση VS Code. Πρώτα διατηρήστε όσα αρχεία πηγής και ρυθμίσεων δημιουργήσατε εκεί. Δεν έχει επαληθευτεί ξεχωριστός εγκαταστάτης με ένα κλικ, εγκατάσταση μέσω διαχειριστή πακέτων ή εντολή `ku uninstall`.
+Η εγκατάσταση γίνεται από αρχεία. Κρατήστε τις δικές σας πηγές και ρυθμίσεις στον φάκελο εγκατάστασης και αφαιρέστε έπειτα φάκελο, πρόσθετες εγγραφές `PATH` και επέκταση VS Code.
 
-Επόμενο: [εκτελέστε το πρώτο σας πρόγραμμα](/el/v0.0.18/docs/getting-started/). Πηγή της σύμβασης εγκατάστασης: [αρχεία εκδόσεων](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/history.md).
+Επόμενο: [εκτελέστε το πρώτο σας πρόγραμμα](/el/v0.0.18/docs/getting-started/). Πηγή της σύμβασης εγκατάστασης: [αρχεία εκδόσεων](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/history.md).
 
-`ku supervise` has platform-specific prerequisites and memory metrics; see [support boundaries](/el/v0.0.18/docs/support/). The macOS CLI can run programs, but this isolation mode is not natively supported.
+Προϋποθέσεις και μέτρα μνήμης του `ku supervise` βρίσκονται στην [υποστήριξη](/el/v0.0.18/docs/support/). Το CLI macOS εκτελεί προγράμματα, αλλά δεν υποστηρίζει εγγενώς αυτή την απομόνωση.

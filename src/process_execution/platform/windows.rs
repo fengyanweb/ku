@@ -106,7 +106,7 @@ impl Domain {
     ) -> Result<Worker, ProviderError> {
         self.inner
             .active_workers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < self.inner.worker_slots).then_some(active + 1)
             })
             .map_err(|_| {

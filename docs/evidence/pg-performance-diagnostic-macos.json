@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "scope": "Focused macOS PostgreSQL performance-error follow-up; no replay of the complete correctness/fault suite",
+  "parameters": {
+    "loops": 2,
+    "c_profile": "release",
+    "clients": 8,
+    "pg_connections": 4,
+    "pg_waiters": 8,
+    "acquire_timeout_ms": 100,
+    "query_timeout_ms": 150,
+    "seconds_per_attempt": 5,
+    "database_retry": false,
+    "transport": "Private Python fault proxy with connection capacity 8. Proxy and Python HTTP clients share the same Python process. Measurements include that fixture cost."
+  },
+  "observations": [
+    {
+      "source_report": "pg-performance-release-2.json",
+      "report_sha256": "5491f9270cb3a982d07f0359effaa336554f595486ee287fb1447d6d030cad80",
+      "cli_sha256": "72e5a9d3a47e1fdda215152cec7261a1dc6931aca0eef3d42c7980d42ca81dad",
+      "fixture_sha256": "a864b30eb59e4d5ff94a347ca2304011803e53a3b213894395eb004d2b64f2af",
+      "status": "failed",
+      "completed": 6382,
+      "successes": 6333,
+      "errors": {
+        "JSONDecodeError": 49
+      },
+      "error_examples": null,
+      "seconds": 5.02839575,
+      "rps": 1269.1920678677689,
+      "p99_ms": 102.9,
+      "pg_connections_before_exit": null,
+      "normal_drain_exit": null,
+      "pg_connections_after_exit": null
+    },
+    {
+      "source_report": "pg-performance-diagnostic-2.json",
+      "report_sha256": "aa0f8a63579e96ee2a8cae00a627710e208a38cae1ad21bfe7db191898777eb0",
+      "cli_sha256": "aef4dd8f829840b91f7ec145b93541c70cbdff8994661504cdc26fec034227b0",
+      "fixture_sha256": "a864b30eb59e4d5ff94a347ca2304011803e53a3b213894395eb004d2b64f2af",
+      "status": "passed",
+      "completed": 10914,
+      "successes": 10914,
+      "errors": {},
+      "error_examples": [],
+      "seconds": 5.002480791999999,
+      "rps": 2181.7175225247724,
+      "p99_ms": 7.6,
+      "pg_connections_before_exit": 4,
+      "normal_drain_exit": 0,
+      "pg_connections_after_exit": 0
+    },
+    {
+      "source_report": "pg-performance-diagnostic-repeat-2.json",
+      "report_sha256": "d7f7752d9a5155b952600c47ebdb2bb097fd39a1bfb8cccdc87e6af03cfd0b60",
+      "cli_sha256": "aef4dd8f829840b91f7ec145b93541c70cbdff8994661504cdc26fec034227b0",
+      "fixture_sha256": "a864b30eb59e4d5ff94a347ca2304011803e53a3b213894395eb004d2b64f2af",
+      "status": "passed",
+      "completed": 11537,
+      "successes": 11537,
+      "errors": {},
+      "error_examples": [],
+      "seconds": 5.002688665999999,
+      "rps": 2306.159901256586,
+      "p99_ms": 6.8,
+      "pg_connections_before_exit": 4,
+      "normal_drain_exit": 0,
+      "pg_connections_after_exit": 0
+    }
+  ],
+  "conclusion": {
+    "confirmed": "Two same-parameter focused attempts on the newer frozen CLI completed without errors and cleaned all four PostgreSQL connections after normal drain.",
+    "unresolved": "The earlier 49 JSONDecodeError instances lack response bodies. They cannot be retroactively classified as acquire_timeout, malformed JSON, or another error. A later pass is not proof of their cause or repair.",
+    "production_changes": "None. No reproduced pool or PostgreSQL error justified changing the production implementation.",
+    "driver_changes": "Classify literal error:<code> responses explicitly; retain at most 12 bounded error examples including response body; record the 100ms acquire budget and actual proxy/client topology.",
+    "pool_review": "Existing registered-waiter admission and timeout handoff code are present. Condition-variable wake order is not a strict FIFO promise. No new starvation condition was reproduced.",
+    "not_claimed": [
+      "pure Ku server capacity",
+      "root cause of the old 49 errors",
+      "formal sustained PostgreSQL acceptance",
+      "database replay or retries"
+    ]
+  }
+}

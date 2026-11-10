@@ -1,19 +1,24 @@
 ---
 title: JSON reference
 description: Ku JSON encoding, decoding, KuValue conversion, error codes, and backend support.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.20'
+verifiedAt: '2026-10-28'
 sources:
   [
     'src/stdlib/json.rs',
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
+    'src/ir/task_lower.rs',
+    'src/backend/c_task.rs',
+    'src/runtime/interpreter.rs',
   ]
+sidebar:
+  order: 4
 ---
 
-`json.encode` / `json.decode` are available in v0.0.18 and share the `stringify` / `parse` implementations. Compatibility names remain available. The previous JSON implementation remains the default; yyjson is not used.
+`std.json` encodes and decodes JSON. The general synchronous `json.encode` interface reads its input without consuming it; `json.decode` parses text into an independently owned dynamic value. Both return Result. `stringify`, `parse`, and `try_parse` remain compatibility names. These interfaces remain available in 0.0.20. The previous JSON implementation remains the default; yyjson is not used.
 
 ## Import and interfaces
 
@@ -23,27 +28,27 @@ import json from "std.json"
 
 | Interface                    | Returns    | Meaning                                                  |
 | ---------------------------- | ---------- | -------------------------------------------------------- |
-| `json.stringify(&value:any)` | `str!`     | Read only encoding into new compact JSON text            |
-| `json.parse(text:str)`       | `KuValue!` | Strict parsing into an independently owned dynamic value |
-| `json.try_parse(text:str)`   | `KuValue!` | Compatibility alias for `parse`                          |
-| `json.encode(&value:any)`    | `str!`     | Development branch alias for `stringify`                 |
-| `json.decode(text:str)`      | `KuValue!` | Development branch alias for `parse`                     |
+| `json.encode(&value:any)`    | `str!`     | Read-only encoding into new compact JSON text            |
+| `json.decode(text:str)`      | `KuValue!` | Strict parsing into an independently owned dynamic value |
+| `json.stringify(&value:any)` | `str!`     | Compatibility name for `encode`                          |
+| `json.parse(text:str)`       | `KuValue!` | Compatibility name for `decode`                          |
+| `json.try_parse(text:str)`   | `KuValue!` | Compatibility name for `decode`                          |
 
-`!` denotes Result. Use `?` to propagate errors or `try/catch` to handle them. Encoding does not consume or mutate the input.
+`!` denotes Result. Use `?` to propagate errors or `try/catch` to handle them. The general synchronous encoding interface does not consume or mutate its input. The native Task literal subset below has separate ownership restrictions.
 
 ## Encode and read values
 
-This is a complete basic example. The development branch has a broader regression example in [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku).
+This is a complete basic example. A more complete example is available in [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.20/examples/json.ku).
 
 ```ku
 import json from "std.json"
 
 fn main(): null! {
     value = { name: "Ku", count: 7 }
-    text = json.stringify(value)?
+    text = json.encode(value)?
     println(text)
 
-    decoded = json.parse(text)?
+    decoded = json.decode(text)?
     println(decoded["name"]?.as_str()?)
     println(decoded["count"]?.as_int()? + 1)
     return ok(null)
@@ -59,6 +64,17 @@ Ku
 ```
 
 A parsed `KuValue` cannot participate directly in integer arithmetic. Convert with `.as_int()?` or `.as_str()?` first. A mismatched type returns an error. Missing object keys also return errors rather than automatic defaults.
+
+## Reading dynamic values
+
+| Operation                      | Returns               | Failure                                                               |
+| ------------------------------ | --------------------- | --------------------------------------------------------------------- |
+| `value["key"]` followed by `?` | Owned `KuValue` field | Missing key or invalid receiver                                       |
+| `value.as_int()`               | `int!`                | `value/type_mismatch` unless already an integer; no string conversion |
+| `value.as_str()`               | `str!`                | `value/type_mismatch` unless already a string                         |
+| `value.take("key")`            | `KuValue!`            | Consumes the object to take a subtree; missing key/type errors        |
+
+There is no implicit number/string coercion or default value on missing keys. These methods are distinct from typed object field access and `get_or`.
 
 ## Data and boundaries
 
@@ -83,6 +99,26 @@ Recoverable errors use the `json` domain. Common codes are `parse_error`, `strin
 
 ## Backend support
 
-The interpreter, default packaged runner, and synchronous native C backend have JSON implementations. **The restricted native Task subset and LLVM do not support JSON.** Default runner imports still depend on their source locations; JSON support does not imply a fully independent package.
+The interpreter, default packaged runner and synchronous native C backend support the general interfaces above. The native Task path supports only the encoding subset below; generic Task parsing/decoding is not supported. LLVM does not provide this library. Default runner imports still depend on source locations.
 
-Signatures and limits on this page were checked against source and contracts. Execution verification must name the version, commit, and backend. See the complete [JSON syntax contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json).
+See the complete [JSON syntax contract](https://github.com/fengyanweb/ku/blob/v0.0.20/docs/syntax.md#127-json).
+
+## Scalar JSON objects in native Tasks
+
+Save as `task-json.ku` and compile with `ku build --backend c --profile release task-json.ku -o task-json`:
+
+```ku
+import json from "std.json"
+
+async fn main(): null! {
+    text = json.encode({message: "中😀", count: 2, ready: true, missing: null})?
+    println(text)
+    return ok(null)
+}
+```
+
+Expected output is `{"count":2,"message":"中😀","missing":null,"ready":true}`.
+
+Native Task `json.encode` / `json.stringify` accepts exactly one **object literal**, with at most 64 distinct keys and only `int`, `bool`, `null` or `str` values. Fields are evaluated left to right, then keys are emitted in deterministic order. Owned string expressions move as they normally do when constructing this literal; explicitly clone a string if it must remain available.
+
+An existing dynamic object variable, arrays, nested objects and floats are outside this lowering path. Duplicate literal keys are rejected during compilation; this differs from general JSON parsing, which retains the last duplicate. Result errors still require `?` or `try/catch`. This subset does not replace the default JSON implementation or enable arbitrary JSON operations in async code.

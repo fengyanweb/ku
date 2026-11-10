@@ -1,77 +1,85 @@
 ---
 title: 'インストールとダウンロード'
-description: 'Ku 0.0.18 実験的プレリリースのダウンロードと、プラットフォームおよびビルドの要件。'
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+description: 'お使いのコンピューター向けの Ku 0.0.20 をダウンロードしてください。各パッケージには、コマンドラインツール、インタープリター、VS Code 拡張機能が含まれています。'
+kuVersion: '0.0.20'
+verifiedAt: '2026-11-09'
 sources:
   [
     'Cargo.toml',
-    'docs/v0.0.18.md',
+    'docs/v0.0.20.md',
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
 ---
 
-> v0.0.18 の追加情報は現在英語で掲載しています。既存の翻訳は保持しています。 [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
+お使いのコンピューター向けの **Ku 0.0.20** をダウンロードしてください。各パッケージには、コマンドラインツール、インタープリター、VS Code 拡張機能が含まれています。
 
-This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) and its assets; documentation alone does not establish completed publication or production readiness.
+## 1. Ku をダウンロード
 
-## プラットフォームを選ぶ
+| システム | アーキテクチャ        | ダウンロード                                                                                                                          |
+| -------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS    | Apple Silicon / ARM64 | [ダウンロード macOS (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.20/ku-v0.0.20-aarch64-apple-darwin.tar.gz)     |
+| Windows  | x64                   | [ダウンロード Windows (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.20/ku-v0.0.20-x86_64-pc-windows-msvc.tar.gz) |
+| Linux    | x64 / GNU             | [ダウンロード Linux (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.20/ku-v0.0.20-x86_64-unknown-linux-gnu.tar.gz) |
 
-Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). `native_ci-*` artifacts are CI examples, not CLI installers.
+## 2. 展開して実行
 
-| システム | アーキテクチャ        | アーカイブ                                   |
-| -------- | --------------------- | -------------------------------------------- |
-| macOS    | Apple Silicon / arm64 | `ku-v0.0.18-aarch64-apple-darwin.tar.gz`     |
-| Windows  | x64 / MSVC            | `ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`   |
-| Linux    | x64 / GNU             | `ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz` |
+**パッケージ全体**を空のフォルダーに展開します。たとえば、ホームフォルダー内の `ku` を使用できます。展開したファイルはすべて一緒に置き、実行ファイルだけを移動しないでください。そのフォルダーでターミナルを開きます。
 
-その他のプラットフォーム向けアーカイブは検証されていません。クロスコンパイルへの対応は、すべての OS やアーキテクチャ向けパッケージの公開を意味しません。
-
-## 展開と検証
-
-1. リリースの `SHA256SUMS` と照合してアーカイブを検証します。別の `.manifest.json` には、アーカイブとファイルの整合性が記載されています。チェックサムは整合性の確認であり、公開者の署名ではありません。
-2. **アーカイブ全体**を空のディレクトリに展開し、`README-INSTALL.md` を読みます。`ku`、`libku.rlib`、`deps/`、`native-tls/` の相対配置を維持してください。
-3. そのディレクトリからバージョンを確認します。macOS / Linux の場合：
+macOS / Linux：
 
 ```sh
 ./ku --version
 ```
 
-Windows PowerShell の場合：
+Windows PowerShell：
 
 ```powershell
 .\ku.exe --version
 ```
 
-表示されるバージョンは `0.0.18` です。必要に応じてこのディレクトリを `PATH` に追加し、`ku --version` を実行してください。VS Code 連携には、同梱の `ku-language-0.0.18.vsix` をインストールします。
+`ku 0.0.20` と表示されれば準備完了です。`.ku` ファイルの実行とチェックには、Rust のインストールは必要ありません。
 
-## 実行とビルドの要件
+<details>
+<summary>任意：どのフォルダーからでも ku を使う</summary>
 
-| 操作                                    | 追加要件                                                                                    |
-| --------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `ku run hello.ku` / `ku check hello.ku` | 対応するプラットフォームの Ku CLI                                                           |
-| 既定の `ku build hello.ku`              | ターゲット用 Rust **1.89.0** とシステムリンカー。同梱の Rust 依存ファイルを保持してください |
-| `ku build --backend c hello.ku`         | 動作するターゲット用 C コンパイラーとリンカー                                               |
-| ネイティブのデータベースプログラム      | 対応する外部データベースクライアント動的ライブラリ。同梱されていません                      |
-
-既定のランナーに埋め込まれるのはエントリーソースだけです。インポートしたモジュールは引き続き元の場所から読み込みます。ローカルのインポートグラフ全体をソースに依存せず配布するにはネイティブ C コンパイルが必要で、[バックエンドの対応範囲](/ja/docs/support/)にも制約されます。
-
-## 開発ソースを試す
-
-ローカルにチェックアウトしたリポジトリで実行します：
+`~/ku` に展開した場合、シェルの起動ファイル（`~/.zshrc` や `~/.bashrc` など）に次の行を追加します：
 
 ```sh
-cargo +1.89.0 run --locked --release -- --version
-cargo +1.89.0 run --locked --release -- run examples/hello.ku
+export PATH="$HOME/ku:$PATH"
 ```
 
-The CLI and Cargo version for this release is `0.0.18`. Record the Git commit, target and toolchain when building source; source-build success does not prove publication of a release artifact.
+Windows では「アカウントの環境変数を編集」を開き、ユーザーの `Path` に展開先フォルダーの完全なパス（例：`%USERPROFILE%\ku`）を追加します。既存の項目は残してください。
 
-## アンインストール
+新しいターミナルを開き、`ku --version` を実行します。
 
-アーカイブからインストールした場合、展開先ディレクトリを削除し、追加した `PATH` の設定を戻し、VS Code 拡張機能をアンインストールします。その場所に作成したソースファイルや設定は、先に保管してください。専用のワンクリックインストーラー、パッケージマネージャーによるインストール、`ku uninstall` コマンドは検証されていません。
+</details>
 
-次へ：[最初のプログラムを実行する](/ja/docs/getting-started/)。インストールに関する仕様の出典：[リリースアーカイブ](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/history.md)。
+## 3. VS Code 拡張機能をインストール
 
-`ku supervise` has platform-specific prerequisites and memory metrics; see [support boundaries](/ja/docs/support/). The macOS CLI can run programs, but this isolation mode is not natively supported.
+VS Code の拡張機能ビューで **… → VSIX からのインストール…** を選び、展開先の `ku-language-0.0.20.vsix` を開いてウィンドウを再読み込みします。
+
+Ku を `PATH` に追加しない場合は、`ku.executablePath` に `ku`（Windows では `ku.exe`）の完全なパスを設定します。
+
+<details>
+<summary>ダウンロードを検証</summary>
+
+パッケージの SHA-256 を [SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.20/SHA256SUMS) と比較できます。[リリースページ](https://github.com/fengyanweb/ku/releases/tag/v0.0.20)には、各パッケージのファイルとチェックサムを記録した `.manifest.json` もあります。詳細はパッケージ内の `README-INSTALL.md` を参照してください。
+
+</details>
+
+<details>
+<summary>自分の Ku プログラムをコンパイルする</summary>
+
+`ku run` と `ku check` に Rust は不要です。既定の `ku build` にはシステムリンカーと、インストール済み SDK に記録されたものと完全に一致する Rust コンパイラーが必要です。v0.0.20 パッケージは **Rust 1.99.1** を使用します。`ku build --backend c` には対象プラットフォームの C コンパイラーとリンカーが必要です。ネイティブのデータベースプログラムには、同梱されていない対応クライアントライブラリーも必要です。
+
+</details>
+
+<details>
+<summary>アンインストール</summary>
+
+自分で作成したソースや設定を保存してから、展開先フォルダー、追加した `PATH` の項目、VS Code 拡張機能を削除します。
+
+</details>
+
+[次のステップ：最初のプログラムを実行](/ja/docs/getting-started/)

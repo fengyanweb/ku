@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "ku"
-version = "0.0.19"
+version = "0.0.20"
 dependencies = [
  "chrono",
  "ed25519-dalek",

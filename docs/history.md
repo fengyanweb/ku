@@ -1,3 +1,7 @@
+# 当前发行：0.0.20
+
+[中文发布说明](v0.0.20.md) · [English release notes](v0.0.20.en.md)
+
 # Ku 发布与历史
 
 当前发布合同按操作系统/CPU target 隔离，避免 Windows、Linux 和 macOS 产物互相覆盖。一个 bundle 只对应一个 target，不宣称存在三系统通用二进制。

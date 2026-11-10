@@ -629,7 +629,7 @@ fn elf(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(), 
                 MAX_SYMBOL_TABLE_BYTES,
                 "ELF symbols",
             )?;
-            for x in symbol_table.chunks_exact(24) {
+            for x in symbol_table.as_chunks::<24>().0.iter() {
                 let name = cstr(&strings, u32le(x) as usize, "ELF symbol")?;
                 let section = u16le(&x[6..]) as usize;
                 record_symbol(
@@ -753,7 +753,7 @@ fn macho(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<()
         MAX_SYMBOL_TABLE_BYTES,
         "Mach-O symbols",
     )?;
-    for s in symbol_table.chunks_exact(16) {
+    for s in symbol_table.as_chunks::<16>().0.iter() {
         let mut name = cstr(&strings, u32le(s) as usize, "Mach-O symbol")?;
         if let Some(x) = name.strip_prefix(b"_") {
             name = x;

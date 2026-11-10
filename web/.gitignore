@@ -1,7 +1,11 @@
 node_modules/
 dist/
 .astro/
+src/generated/
 .env
 .env.*
 !.env.example
 .DS_Store
+/ku-website-v*.zip
+/ku-website-v*.zip.sha256
+/.package-*/

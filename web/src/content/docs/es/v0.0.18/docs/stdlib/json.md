@@ -1,21 +1,21 @@
 ---
-title: Referencia de JSON
-description: Codificación y decodificación JSON en Ku, conversión de KuValue,
-  códigos de error y compatibilidad de backends.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Referencia de JSON'
+description: 'Codificación y decodificación JSON en Ku, conversión de KuValue, códigos de error y compatibilidad de backends.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - src/stdlib/json.rs
-  - src/stdlib/metadata.rs
-  - docs/syntax.md
-  - examples/json.ku
-  - docs/v0.0.18.md
+  [
+    'src/stdlib/json.rs',
+    'src/stdlib/metadata.rs',
+    'docs/syntax.md',
+    'examples/json.ku',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: es/v0.0.18/docs/stdlib/json
 ---
 
-> Las novedades de v0.0.18 aparecen a continuación en inglés; se conserva el resto de la traducción. [English](/en/v0.0.18/docs/support/) · [简体中文](/zh-cn/v0.0.18/docs/support/)
-
-`json.encode` / `json.decode` are available in v0.0.18 and share the `stringify` / `parse` implementations. Compatibility names remain available. The previous JSON implementation remains the default; yyjson is not used.
+`std.json` codifica y decodifica JSON. `json.encode` toma la entrada prestada en solo lectura; `json.decode` crea un `KuValue` de propiedad independiente. Ambos devuelven Result. `stringify`, `parse` y `try_parse` siguen siendo compatibles.
 
 ## Importación e interfaces
 
@@ -28,24 +28,24 @@ import json from "std.json"
 | `json.stringify(&value:any)` | `str!`     | Codificación de solo lectura en un nuevo texto JSON compacto       |
 | `json.parse(text:str)`       | `KuValue!` | Análisis estricto en un valor dinámico con propiedad independiente |
 | `json.try_parse(text:str)`   | `KuValue!` | Alias de compatibilidad de `parse`                                 |
-| `json.encode(&value:any)`    | `str!`     | Alias de `stringify` en la rama de desarrollo                      |
-| `json.decode(text:str)`      | `KuValue!` | Alias de `parse` en la rama de desarrollo                          |
+| `json.encode(&value:any)`    | `str!`     | Alias de `stringify` incluido en esta versión                      |
+| `json.decode(text:str)`      | `KuValue!` | Alias de `parse` incluido en esta versión                          |
 
 `!` indica Result. Usa `?` para propagar errores o `try/catch` para gestionarlos. La codificación no consume ni modifica la entrada.
 
 ## Codifica y lee valores
 
-Este es un ejemplo básico completo. La rama de desarrollo incluye un ejemplo de regresión más amplio en [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku).
+Ejemplo básico completo; más usos en [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/examples/json.ku).
 
 ```ku
 import json from "std.json"
 
 fn main(): null! {
     value = { name: "Ku", count: 7 }
-    text = json.stringify(value)?
+    text = json.encode(value)?
     println(text)
 
-    decoded = json.parse(text)?
+    decoded = json.decode(text)?
     println(decoded["name"]?.as_str()?)
     println(decoded["count"]?.as_int()? + 1)
     return ok(null)
@@ -77,7 +77,7 @@ Las entradas admitidas incluyen cadenas, booleanos, enteros, números finitos de
 | Claves de objeto duplicadas | El análisis conserva el último valor                                                                     |
 | Orden de claves             | La codificación ordena por bytes UTF-8                                                                   |
 
-A float such as `1.0` may encode as `1`. When an integer-looking float is outside int64, the encoder adds `.0` to keep decoding on the float path: `1e20` encodes as `100000000000000000000.0` and decodes again. Finite binary64 values do not preserve original spelling, a float tag or the sign of negative zero.
+`1.0` puede codificarse como `1`. Si el texto entero de un float supera int64, se añade `.0`: `1e20` pasa a `100000000000000000000.0` y vuelve a decodificarse. Los binary64 finitos no conservan escritura original, etiqueta float ni signo del cero negativo. Esta corrección está incluida.
 
 ## Errores
 
@@ -87,4 +87,4 @@ Los errores recuperables utilizan el dominio `json`. Los códigos habituales son
 
 El intérprete, el ejecutor empaquetado predeterminado y el backend C nativo síncrono tienen implementaciones de JSON. **El subconjunto nativo restringido de Tasks y LLVM no admiten JSON.** Las importaciones del ejecutor predeterminado siguen dependiendo de sus ubicaciones de origen; la compatibilidad con JSON no implica un paquete completamente independiente.
 
-Las firmas y los límites de esta página se contrastaron con el código y los contratos. La verificación de ejecución debe indicar versión, commit y backend. Consulta el [contrato completo de sintaxis JSON](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json).
+[std.json](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md#127-json).

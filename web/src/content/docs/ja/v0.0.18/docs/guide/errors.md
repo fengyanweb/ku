@@ -1,17 +1,20 @@
 ---
-title: エラーとトラブルシューティング
-description: Ku のインストール、インポート、所有権、JSON、バックエンド機能のエラーを診断します。
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'エラーとトラブルシューティング'
+description: 'Ku のインストール、インポート、所有権、JSON、バックエンド機能のエラーを診断します。'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - docs/diagnostics.md
-  - docs/syntax.md
-  - src/error.rs
-  - src/stdlib/json.rs
+  [
+    'docs/diagnostics.md',
+    'docs/syntax.md',
+    'src/error.rs',
+    'src/stdlib/json.rs',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: ja/v0.0.18/docs/guide/errors
 ---
 
-本書は実験的プレリリース v0.0.18 の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。実験的開発中はコンパイラー診断が変わることがあります。問題を報告するときは、CLI のバージョン、Git コミット、バックエンド、完全なコマンド、最小のソースを添えてください。
+実験的開発中はコンパイラー診断が変わることがあります。問題を報告するときは、CLI のバージョン、Git コミット、バックエンド、完全なコマンド、最小のソースを添えてください。
 
 ## Ku 実行ファイルを確認する
 
@@ -43,7 +46,7 @@ ku check --json hello.ku
 | `E0913` | 非同期パラメーターを借用している      | 所有パラメーターを使い、元の値が必要なら呼び出し側でクローンする |
 | `E0918` | 呼び出し側で `&value` と書いている    | 通常の引数を渡す。借用はシグネチャで宣言する                     |
 
-これは登録済み診断の概要であり、すべてのエラーの一覧ではありません。現在の正式な登録情報は [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs) にあります。
+これは登録済み診断の概要であり、すべてのエラーの一覧ではありません。現在の正式な登録情報は [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/src/error.rs) にあります。
 
 ## 実行時エラーには別の仕様がある
 
@@ -71,6 +74,8 @@ fn main() {
 
 `-o` なしの `ku build --native file.ku` は C だけを書き出します。実行ファイルをコンパイルおよびリンクするには、`ku build --backend c file.ku` を使用し、ターゲット用 C ツールチェーンをインストールしてください。
 
-データベースエラー `execution_unknown` と `execution_completed_without_result` を理由に自動再実行してはいけません。リクエストと業務上の証拠を保管し、まず実際の実行状態を確認してください。ローカルのウェブサイトの検証に本番データベースへの接続は不要です。
+データベースエラー `execution_unknown` と `execution_completed_without_result` を理由に自動再実行してはいけません。リクエストと業務上の証拠を保管し、まず実際の実行状態を確認してください。
 
-詳しくは[リポジトリの診断ガイド](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md)を参照してください。
+詳しくは[リポジトリの診断ガイド](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/diagnostics.md)を参照してください。
+
+JSON エラーの domain/code はバックエンド間で共通ですが、message の全文は異なる場合があります。ku run と runner には json parse failed: が付き、ネイティブ C には付かない場合があります。全文ではなく domain/code で判断してください。

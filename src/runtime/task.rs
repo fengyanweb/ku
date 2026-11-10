@@ -217,7 +217,7 @@ impl BlockingRetirement {
         if let Some(state) = &state {
             state
                 .pending_blocking
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                     pending.checked_add(1)
                 })
                 .map_err(|_| {
@@ -227,7 +227,7 @@ impl BlockingRetirement {
         let resident =
             match metrics
                 .resident
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     current.checked_add(1)
                 }) {
                 Ok(previous) => previous + 1,
@@ -430,7 +430,7 @@ enum ProducerAdmission<'a> {
 
 impl<'a> ProducerAdmission<'a> {
     fn begin(gate: &'a AtomicUsize) -> Self {
-        match gate.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        match gate.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             if current & PRODUCER_CLOSED_BIT != 0 {
                 None
             } else {
@@ -505,7 +505,7 @@ impl<'a> TaskSubmissionReservation<'a> {
                 .runtime
                 .inner
                 .queued_tasks
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     (current < self.runtime.inner.task_queue_limit).then_some(current + 1)
                 })
                 .is_err()
@@ -1166,7 +1166,7 @@ impl TaskRuntime {
             if self
                 .inner
                 .active_tasks
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     (current < self.inner.max_tasks).then_some(current + 1)
                 })
                 .is_err()
