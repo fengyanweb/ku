@@ -14,7 +14,7 @@ on:
         description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]
+        options: [full, mariadb-live, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]
       prepatch:
         description: 'Full prepatch commit for followup-screen only; blank uses the current frozen 9567271 baseline'
         type: string
@@ -663,7 +663,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Verification evidence summary failed' }
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'mariadb-live' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -1166,7 +1166,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Verification evidence summary failed' }
 
   mariadb-live:
-    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'mariadb-live'
     name: Linux MariaDB private-loopback query acceptance
     runs-on: ubuntu-24.04
     timeout-minutes: 15

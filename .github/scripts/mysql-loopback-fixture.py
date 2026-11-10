@@ -983,6 +983,28 @@ def write_posix_startup(root: Path, config: dict, admin: dict, product: str) -> 
     write_private(root / "admin.cnf", text, replace=True)
 
 
+POSIX_VERIFY_STAGES = {
+    "configure", "start", "ready", "identity-query", "identity-check",
+    "resource-check", "live-query", "health-check", "shutdown-query", "shutdown-wait",
+}
+
+
+def record_posix_failure_stage(root: Path, stage: str, owner) -> None:
+    """Keep categorical state before normal cleanup; never copy private logs."""
+    try:
+        value = {"stage": stage if stage in POSIX_VERIFY_STAGES else "unknown",
+                 "server": "not-started", "exit": None, "reader_failed": False}
+        if owner is not None and owner.process is not None:
+            code = owner.process.poll()
+            value["server"] = "running" if code is None else "exited"
+            if type(code) is int and -128 <= code <= 255:
+                value["exit"] = code
+            value["reader_failed"] = owner.failed.is_set() is True
+        write_json(root / "failure-stage.json", value, replace=True)
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError):
+        pass  # A diagnostic fault must not replace the original failure.
+
+
 def posix_failure_summary(phase: str, error: BaseException, root: Path) -> None:
     # Never format error text, command output or log lines: initialization can
     # contain a root password not present in SECRETS. Only fixed labels and a
@@ -994,11 +1016,21 @@ def posix_failure_summary(phase: str, error: BaseException, root: Path) -> None:
                     "KeyboardInterrupt", "SystemExit"}:
         kind = "unknown"
     codes: list[str] = []
+    hints: list[str] = []
+    patterns = (("unknown-option", (b"unknown option", b"unknown variable")),
+                ("permission", (b"permission denied",)),
+                ("missing-file", (b"no such file or directory",)),
+                ("port-in-use", (b"address already in use",)),
+                ("plugin-load", (b"can't open shared library", b"couldn't load plugin")))
     for name in ("server.log", "command-error.log"):
         try:
             output = bounded_bytes(root / name, MAX_SERVER_LOG_BYTES)
         except (OSError, ValueError):
             continue
+        lowered = output.lower()
+        for label, fragments in patterns:
+            if label not in hints and any(fragment in lowered for fragment in fragments) and len(hints) < 2:
+                hints.append(label)
         for match in re.finditer(rb"\[ERROR\]\s+\[(MY-[0-9]{6})\]", output):
             code = match[1].decode("ascii")
             if code not in codes:
@@ -1009,7 +1041,18 @@ def posix_failure_summary(phase: str, error: BaseException, root: Path) -> None:
             break
     summary = f"POSIX database fixture failure: phase={phase} error={kind} mysql_errors={','.join(codes) or 'unknown'}"
     try:
-        print(summary, file=sys.stderr, flush=True)
+        state = read_json(root / "failure-stage.json")
+        if (set(state) == {"stage", "server", "exit", "reader_failed"}
+                and state["stage"] in POSIX_VERIFY_STAGES
+                and state["server"] in {"not-started", "running", "exited"}
+                and (state["exit"] is None or type(state["exit"]) is int and -128 <= state["exit"] <= 255)
+                and type(state["reader_failed"]) is bool):
+            summary += (f" stage={state['stage']} server={state['server']} exit={state['exit']}"
+                        f" reader_failed={int(state['reader_failed'])} log_hints={','.join(hints) or 'none'}")
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+        pass
+    try:
+        print(summary[:512], file=sys.stderr, flush=True)
     except (OSError, RuntimeError, ValueError):
         # Diagnostics must not replace the primary failure or prevent cleanup.
         pass
@@ -1096,6 +1139,7 @@ def posix_verify(args: argparse.Namespace) -> None:
     with operation(root):
         record = root / "verification.json"
         record.unlink(missing_ok=True)
+        (root / "failure-stage.json").unlink(missing_ok=True)
         if present(root / "server.pid") or present(root / "server.active"):
             raise ValueError("POSIX database markers already exist; refusing reuse")
         with socket.socket() as reservation:
@@ -1104,32 +1148,43 @@ def posix_verify(args: argparse.Namespace) -> None:
         primary = None
         cleanup = BOUNDS.CleanupErrors()
         text = ""
+        stage = "configure"
         try:
             with posix_environment(root):
                 write_posix_startup(root, config, admin, manifest["product"])
                 for name in ("server.log",):
                     (root / name).unlink(missing_ok=True)
+                stage = "start"
                 owner = PosixMysqlProcess(root, posix_server_command(root, manifest, config["port"]))
                 owner.start()
+                stage = "ready"
                 owner.wait_ready()
                 client = [manifest["client"], f"--defaults-file={root / 'admin.cnf'}", "--batch", "--raw", "--skip-column-names"]
+                stage = "identity-query"
                 identity = run(client + ["--execute=SELECT VERSION(), @@datadir, @@port, @@basedir, @@plugin_dir, @@lc_messages_dir, @@character_sets_dir"], root, "verify private POSIX server identity", 5).decode("utf-8").strip().split("\t")
                 expected_paths = [root / "data", Path(manifest["basedir"]), root / "empty-plugins",
                                   Path(manifest["basedir"]) / "share" / "mysql",
                                   Path(manifest["basedir"]) / "share" / "mysql" / "charsets"]
+                stage = "identity-check"
                 if len(identity) != 7 or identity[0] != manifest["version"] or identity[2] != str(config["port"]):
                     raise RuntimeError("POSIX server identity does not match its newly created fixture")
+                stage = "resource-check"
                 if any(Path(actual).resolve() != expected.resolve() for actual, expected in zip([identity[1], *identity[3:]], expected_paths)):
                     raise RuntimeError("POSIX server resources do not match the explicit private installation")
                 os.environ.update({"KU_MYSQL_TEST_CONFIG_FILE": str(root / "db.json"), "KU_BIN": str(ku),
                                    "KU_MYSQL_LIB": str(root / "sdk" / "lib"), "KU_MYSQL_INCLUDE": str(root / "sdk" / "include")})
+                stage = "live-query"
                 output = run([str(test), "--exact", POSIX_LIVE_TESTS[sys.platform], "--ignored", "--nocapture", "--test-threads=1"], REPO, "live POSIX MySQL query acceptance", TEST_TIMEOUT)
                 text = require_live_pass(output)
+                stage = "health-check"
                 if owner.failed.is_set() or owner.process.poll() is not None:
                     raise RuntimeError("POSIX server did not remain healthy during acceptance")
+                stage = "shutdown-query"
                 run([manifest["admin"], f"--defaults-file={root / 'admin.cnf'}", "shutdown"], root, "stop private POSIX server", 15)
+                stage = "shutdown-wait"
                 owner.process.wait(timeout=15)
         except BaseException as error:
+            record_posix_failure_stage(root, stage, owner)
             primary = error
         finally:
             if owner is not None:
