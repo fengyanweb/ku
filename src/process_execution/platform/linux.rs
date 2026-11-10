@@ -86,8 +86,8 @@ impl Domain {
             .ok()
             .filter(|value| *value > 0)
             .ok_or_else(|| ProviderError::new("could not determine the kernel page size"))?;
-        if config.worker_memory_bytes % page_size != 0
-            || config.total_worker_memory_bytes % page_size != 0
+        if !config.worker_memory_bytes.is_multiple_of(page_size)
+            || !config.total_worker_memory_bytes.is_multiple_of(page_size)
         {
             return Err(ProviderError::new(format!(
                 "Linux memory byte limits must be multiples of the kernel page size ({page_size})"

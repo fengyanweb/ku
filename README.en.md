@@ -41,6 +41,7 @@ Backend coverage differs. Database drivers need native output and their client l
 - [Guides and library reference](web/src/content/docs/en/docs): language syntax, ownership, errors, HTTP, Task, JSON, time, databases, and platform limits.
 - [Runnable examples](examples), [syntax contract](docs/syntax.md), and [semantic contract](docs/semantics.md).
 - [Task semantics and backend coverage](docs/concurrency.md).
+- [Network and database protocols](docs/protocol-foundation.md): connection options, TLS, and verified platform support.
 - [VS Code extension](editors/vscode-ku/README.md).
 - [Historical 0.0.19 seven-language fixed-load comparison](docs/performance-v0.0.19.en.md).
 - [Release notes](docs/v0.0.20.en.md) and [known limitations](docs/v0.0.20-known-issues.en.md).
@@ -57,8 +58,8 @@ cargo +1.99.1 build --locked --release
 ./target/release/ku run examples/hello.ku
 ```
 
-On Windows, use `target\release\ku.exe`. Existing regression tests and CI fixtures are maintained source; disposable probes and duplicate build artifacts should not be committed.
+On Windows, use `target\release\ku.exe`.
 
 ## History
 
-[0.0.18](docs/v0.0.18.md), its [historical revision](docs/v0.0.18-r1.md), [0.0.17](docs/v0.0.17.md), and [0.0.16](docs/v0.0.16.md) remain available with their original release identities. Historical performance results apply only to their recorded commit, workload, platform, and limits. Updated website source does not imply an online deployment.
+[0.0.19](docs/v0.0.19.md), [0.0.18](docs/v0.0.18.md), its [historical revision](docs/v0.0.18-r1.md), [0.0.17](docs/v0.0.17.md), and [0.0.16](docs/v0.0.16.md) remain available with their original release identities. Historical performance results apply only to their recorded commit, workload, platform, and limits.

@@ -21,7 +21,8 @@
     "build": "node scripts/build-site.mjs",
     "build:preview": "astro build",
     "build:production": "node scripts/require-production.mjs && astro build",
-    "preview": "node scripts/preview.mjs"
+    "preview": "node scripts/preview.mjs",
+    "package": "node scripts/package-site.mjs"
   },
   "dependencies": {
     "@astrojs/markdown-remark": "7.3.3",

@@ -9847,13 +9847,13 @@ fn main(): null! {
 static KuTestEvent fixture_all_running,fixture_release_workers;
 static size_t fixture_started;
 static int fixture_fail_next_spawn;
-static size_t fixture_zero_allocations;
+static size_t fixture_zero_allocations,fixture_zero_worker_arrays,fixture_zero_slot_arrays;
 static void* fixture_worker_handles(size_t count,size_t bytes) {
-  if(!count) {fixture_zero_allocations++;return NULL;}
+  if(!count) {fixture_zero_allocations++;fixture_zero_worker_arrays++;return NULL;}
   return malloc(bytes);
 }
 static void* fixture_zero_calloc(size_t count,size_t bytes) {
-  if(!count) {fixture_zero_allocations++;return NULL;}
+  if(!count) {fixture_zero_allocations++;fixture_zero_slot_arrays++;return NULL;}
   return calloc(count,bytes);
 }
 static int fixture_worker_spawn_failed(void) {
@@ -9969,7 +9969,11 @@ int main(void) {
     CHECK(!group.loops[0].handler_workers && !group.failure);
     ku_http_wake_close(&group.wake);ku_http_mutex_destroy(&group.lock);
   }
-  CHECK(fixture_zero_allocations>=8u);
+  /* Each zero-slot owner allocates two slot arrays and one worker array.
+   * poll_connections is now omitted when poll_connection_bytes is zero on
+   * every backend; it must not be counted as another calloc(0) witness. */
+  CHECK(fixture_zero_worker_arrays==2u && fixture_zero_slot_arrays==4u);
+  CHECK(fixture_zero_allocations==fixture_zero_worker_arrays+fixture_zero_slot_arrays);
   fixture_elastic_transport(server);
   for(int fixed=0;fixed<2;fixed++) {
     fixture_started=0;fixture_fail_next_spawn=0;

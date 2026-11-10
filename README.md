@@ -57,6 +57,7 @@ ku build --backend c --release hello.ku -o hello
 - [语言指南与标准库](https://ku-lang.com/zh-cn/docs/getting-started/)：所有权、错误处理、HTTP、JSON、文件、时间和数据库。
 - [可运行示例](examples) · [语法合同](docs/syntax.md) · [语义合同](docs/semantics.md)。
 - [Task 和后端覆盖](docs/concurrency.md) · [CLI／SDK](docs/cli-runtime-bundle.md)。
+- [网络与数据库协议](docs/protocol-foundation.md)：连接选项、TLS 和已验证的平台支持。
 - [VS Code 扩展](editors/vscode-ku/README.zh-CN.md)：语法高亮、补全、格式化和真实 CLI 诊断。
 - [本版发布说明](docs/v0.0.20.md) · [已知问题和平台要求](docs/v0.0.20-known-issues.md)。
 
