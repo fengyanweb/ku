@@ -6652,6 +6652,7 @@ fn native_http_live_task_readiness_preserves_completion_cancel_and_owned_lease()
     };
     // Exercise the production bridge, lease validation and storage guard. Only
     // driver/result edges are deterministic stubs; no timing is an assertion.
+    // These bridge checks do not replace real HTTP or PG retirement coverage.
     let control_types = region(
         control,
         "typedef struct KuTaskControlV1 KuTaskControlV1;",
@@ -6707,8 +6708,9 @@ static KuHttpFailure ku_http_failure_current;
 typedef struct KuTaskDriverV1 { void* event_context; } KuTaskDriverV1;
 typedef struct { KuTaskDriverV1* driver; size_t slot; uint64_t generation; } KuTaskDriverTicketV1;
 static int locks,unlocks,phase_reads,takes,drops,releases,adopts,refunds,outcome_drops;
-static uint32_t ready_status,drop_status;
-static int slot_exists;
+static int value_checks,generated_checks,fast_drops;
+static uint32_t ready_status,drop_status,value_check_status,fast_drop_status;
+static int slot_exists,generated_control,retirement_pending;
 static size_t ku_task_control_atomic_load(KuAtomicRefcount* value) { phase_reads++; return *value; }
 #define CHECK(c) do { if(!(c)) { fprintf(stderr,"readiness check line %d: %s\n",__LINE__,#c); return 97; } } while(0)
 "#;
@@ -6722,8 +6724,19 @@ static int ku_task_driver_lock(KuTaskDriverV1* d) { (void)d; locks++; return 0; 
 static int ku_task_driver_unlock(KuTaskDriverV1* d) { (void)d; unlocks++; return 0; }
 static KuTaskDriverSlotV1* ku_task_driver_find(const KuTaskDriverTicketV1* t) { (void)t; return slot_exists ? &fixture_slot : NULL; }
 static uint32_t ku_task_driver_wait_ready_locked(KuTaskDriverSlotV1* s) { (void)s; return ready_status; }
+static uint32_t ku_task_value_check(KuTaskValueV1* v) {
+ (void)v; value_checks++; return value_check_status;
+}
+static int ku_http_task_generated_control(KuTaskValueV1* v) {
+ (void)v; generated_checks++; return generated_control;
+}
+static uint32_t ku_task_driver_owner_drop_taken_same_owner(const KuTaskDriverTicketV1* t,KuTaskControlOwnerV1* owner,uint64_t deadline) {
+ (void)t; (void)deadline; fast_drops++;
+ if(fast_drop_status==KU_TASK_DRIVER_OK) { owner->lease.control=NULL; if(!retirement_pending) slot_exists=0; }
+ return fast_drop_status;
+}
 static uint32_t ku_task_value_drop(KuTaskValueV1* v,uint64_t deadline) {
- (void)deadline; drops++; if(drop_status==KU_TASK_DRIVER_OK) { *v=(KuTaskValueV1){0}; slot_exists=0; } return drop_status;
+ (void)deadline; drops++; if(drop_status==KU_TASK_DRIVER_OK) { *v=(KuTaskValueV1){0}; if(!retirement_pending) slot_exists=0; } return drop_status;
 }
 static uint32_t ku_task_value_take(KuTaskValueV1* v,void* parent,KuTaskAdapterOutcomeV1* out) {
  (void)parent; takes++; out->result_kind=8; out->value.http_response.payload=42; *v=(KuTaskValueV1){0}; return 0;
@@ -6750,7 +6763,9 @@ static void reset(void) {
  runtime.handles=&handle; runtime.capacity=1; handle.used=1; handle.value.tag=KU_TASK_VALUE_LIVE;
  handle.value.owner.lease.control=&control; handle.value.ticket.driver=&runtime.driver;
  locks=unlocks=phase_reads=takes=drops=releases=adopts=refunds=outcome_drops=0;
- ready_status=KU_TASK_DRIVER_PENDING; drop_status=KU_TASK_DRIVER_OK; slot_exists=1;
+ value_checks=generated_checks=fast_drops=0;
+ ready_status=KU_TASK_DRIVER_PENDING; drop_status=value_check_status=KU_TASK_DRIVER_OK;
+ fast_drop_status=KU_TASK_DRIVER_PENDING; slot_exists=generated_control=1; retirement_pending=0;
 }
 int main(void) {
  void* task; KuStruct___ku_http_response response={0}; size_t charge;
@@ -6762,11 +6777,58 @@ int main(void) {
  CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_OK);
  CHECK(!task && response.payload==42 && charge==17 && locks==2 && unlocks==2);
  CHECK(takes==1 && drops==1 && releases==1 && adopts==1 && refunds==7 && outcome_drops==1);
+ CHECK(value_checks==1 && generated_checks==1 && fast_drops==1);
  CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_INVALID_ARGUMENT);
  CHECK(takes==1 && drops==1 && releases==1);
+ /* A successful private retirement consumes the owner without raw drop. */
+ reset(); task=&handle; control.phase=KU_TASK_CONTROL_COMPLETED;
+ ready_status=KU_TASK_DRIVER_WAIT_READY; fast_drop_status=KU_TASK_DRIVER_OK;
+ CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_OK);
+ CHECK(!task && response.payload==42 && charge==17 && !handle.value.owner.lease.control);
+ CHECK(takes==1 && fast_drops==1 && !drops && releases==1 && adopts==1 && refunds==7);
+ CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+ CHECK(takes==1 && fast_drops==1 && !drops && refunds==7);
+ /* A non-generated control retains the ordinary owner-drop path. */
+ reset(); task=&handle; control.phase=KU_TASK_CONTROL_COMPLETED;
+ ready_status=KU_TASK_DRIVER_WAIT_READY; generated_control=0; fast_drop_status=KU_TASK_DRIVER_OK;
+ CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_OK);
+ CHECK(value_checks==1 && generated_checks==1 && !fast_drops && drops==1 && refunds==7);
+ /* Owner consumption is not physical retirement. Both private success and
+  * raw fallback must keep response storage and its receipt until disposal. */
+ for(int fast=0;fast<2;fast++) {
+  reset(); task=&handle; control.phase=KU_TASK_CONTROL_COMPLETED;
+  ready_status=KU_TASK_DRIVER_WAIT_READY; retirement_pending=1;
+  fast_drop_status=fast ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_PENDING;
+  response.payload=-99; charge=99;
+  CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_PENDING);
+  CHECK(task==&handle && handle.finishing && handle.value.tag==KU_TASK_VALUE_EMPTY);
+  CHECK(handle.response.payload==42 && handle.retained_bytes==7 && response.payload==-99 && !charge);
+  CHECK(takes==1 && fast_drops==1 && drops==!fast && !adopts && !refunds && !releases);
+  CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_PENDING);
+  CHECK(takes==1 && fast_drops==1 && drops==!fast && !adopts && !refunds && !releases);
+  slot_exists=0;
+  CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_OK);
+  CHECK(!task && response.payload==42 && charge==17 && adopts==1 && refunds==7 && releases==1);
+  CHECK(takes==1 && fast_drops==1 && drops==!fast && outcome_drops==1);
+ }
+ /* Rejection must not admit the response, refund its charge, or free the
+  * handle. Error recovery remains with the caller and original owner. */
+ for(int mode=0;mode<3;mode++) {
+  reset(); task=&handle; control.phase=KU_TASK_CONTROL_COMPLETED;
+  ready_status=KU_TASK_DRIVER_WAIT_READY;
+  if(mode==0) value_check_status=KU_TASK_DRIVER_INTERNAL;
+  if(mode==1) fast_drop_status=KU_TASK_DRIVER_INTERNAL;
+  if(mode==2) drop_status=KU_TASK_DRIVER_INTERNAL;
+  response.payload=-99;
+  CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_INTERNAL);
+  CHECK(task==&handle && handle.used && !handle.finishing && handle.value.owner.lease.control==&control);
+  CHECK(takes==1 && value_checks==1 && generated_checks==(mode!=0) && fast_drops==(mode!=0));
+  CHECK(drops==(mode==2) && !adopts && !refunds && !releases && !charge && response.payload==-99);
+ }
  reset(); task=&handle; drop_status=KU_TASK_DRIVER_PENDING;
  CHECK(ku_http_task_poll(&runtime,&task,1,123,&response,&charge)==KU_TASK_DRIVER_PENDING);
  CHECK(handle.cancelled && drops==1 && !phase_reads && !takes && !releases);
+ CHECK(!value_checks && !generated_checks && !fast_drops);
  CHECK(handle.value.owner.lease.control==&control);
  drop_status=KU_TASK_DRIVER_OK;
  CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_OK);

@@ -2920,8 +2920,9 @@ static uint64_t ku_task_driver_deadlines_locked(KuTaskDriverV1* driver, uint64_t
   driver->next_deadline = next;
   return next;
 }
-/* Called only by this slot's executor, locked after its R2 poll returned terminal.
- * Its registry/execution leases protect these acquire reads. A terminal enum
+/* Called after this slot's sole executor returned terminal. The private HTTP
+ * post-take path additionally proves that no executor or wrapper can survive.
+ * Registry/execution leases protect these acquire reads. A terminal enum
  * alone is NOT cleanup ACK while the owner or a payload callback survives. */
 static uint32_t ku_task_driver_cleanup_ack_locked(
     KuTaskDriverV1* driver, KuTaskDriverSlotV1* slot, uint32_t outcome) {
@@ -2949,6 +2950,130 @@ static uint32_t ku_task_driver_cleanup_ack_locked(
    * lifecycle pin before returning. No callback or byte return occurs here. */
   slot->cleanup_acked_generation = slot->generation;
   return KU_TASK_DRIVER_CLEANUP_ACK;
+}
+/* The executor has returned terminal and the logical owner has been released.
+ * Both the ordinary pump and the private HTTP terminal-only retirement use
+ * this exact ACK/binding transition. Lease release/disposal stays unlocked. */
+static int ku_task_driver_retire_terminal_locked(KuTaskDriverV1* driver,size_t index,
+    uint32_t outcome,KuTaskControlLeaseV1* registry) {
+  KuTaskDriverSlotV1* slot=&driver->slots[index];
+  if (slot->owner_location!=KU_TASK_DRIVER_OWNER_RELEASED || slot->wrapper_active) return 0;
+  uint32_t ack=ku_task_driver_cleanup_ack_locked(driver,slot,outcome);
+  /* Publish BOTH durable ACK and quarantine failure before binding retires.
+   * A faulted child's enqueue is disabled; this wakes its parent instead. */
+  ku_task_driver_wait_publish_locked(driver,index);
+  if (ack!=KU_TASK_DRIVER_CLEANUP_ACK) return 0;
+  if (!ku_task_driver_binding_remove(driver,slot->binding)) {
+    slot->cleanup_fault=KU_TASK_DRIVER_INTERNAL; driver->fault=KU_TASK_DRIVER_INTERNAL;
+    ku_task_driver_wait_publish_locked(driver,index);
+    return 0; /* Keep all registry/executor references and charged storage. */
+  }
+  *registry=slot->driver_lease; slot->driver_lease.control=NULL;
+  /* The disposer frees its allocation BEFORE returning this slot's budget.
+   * Retire its executable binding now, retaining count/bytes until disposed. */
+  slot->binding=NULL; slot->state=KU_TASK_DRIVER_RETIRING;
+  return 1;
+}
+/* Private HTTP post-take entry, not an alternative public/raw pump mode.
+ * A successful take already destroyed the frame and moved out its payload.
+ * With only owner/registry/execution leases left, no other valid caller can
+ * publish a wrapper or run control code concurrently. Finish this zero-resume
+ * retirement on the bound event-loop thread instead of scheduling another
+ * control poll. Public pump credits, live cleanup, and raw owner_drop do not
+ * change. An existing observer, child, wait, concurrent notification or other
+ * owner context falls back without consuming the owner or changing a queue
+ * link. A later retained lease still delays disposal and the budget return. */
+static uint32_t ku_task_driver_owner_drop_taken_same_owner(
+    const KuTaskDriverTicketV1* ticket,KuTaskControlOwnerV1* owner,uint64_t deadline) {
+  uint32_t checked=ku_task_driver_check_ticket(ticket);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  if (!ku_task_frame_storage_valid(owner,sizeof(*owner),sizeof(*owner),
+        KU_TASK_FRAME_ALIGNOF(KuTaskControlOwnerV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  checked=ku_task_control_check_lease(&owner->lease);
+  if (checked!=KU_TASK_CONTROL_OK) return checked;
+  KuTaskDriverV1* driver=ticket->driver;
+  if (!ku_task_driver_external_storage(driver,owner,sizeof(*owner),
+        KU_TASK_FRAME_ALIGNOF(KuTaskControlOwnerV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(ticket);
+  KuTaskControlV1* control=owner->lease.control;
+  checked=!slot ? KU_TASK_DRIVER_STALE : slot->binding!=control
+      ? KU_TASK_DRIVER_INVALID_ARGUMENT : slot->owner_location!=KU_TASK_DRIVER_OWNER_USER
+      ? KU_TASK_DRIVER_INVALID_STATE : KU_TASK_DRIVER_OK;
+  if (checked!=KU_TASK_DRIVER_OK) { ku_task_driver_unlock(driver); return checked; }
+  KuTaskDriverWorkerV1* worker=slot->owner_worker && slot->owner_worker<=driver->workers_created
+      ? &driver->workers[slot->owner_worker-1u] : NULL;
+#if defined(_WIN32)
+  int same_thread=worker && worker->owner_bound && worker->owner_thread==GetCurrentThreadId();
+#else
+  int same_thread=worker && worker->owner_bound && pthread_equal(worker->owner_thread,pthread_self());
+#endif
+  size_t phase=ku_task_control_atomic_load(&control->phase);
+  int eligible=driver->fixed_owner && driver->external_loops && !driver->closing
+      && !driver->fault && !driver->clock_fault && same_thread && !worker->pumping
+      && worker->state!=KU_TASK_DRIVER_WORKER_EXITED && !ku_task_driver_execution
+      && (slot->state==KU_TASK_DRIVER_TERMINAL_HELD || slot->state==KU_TASK_DRIVER_QUEUED)
+      && !slot->executor_worker && !slot->wrapper_active && !slot->blocking_pending
+      && !slot->notified && !slot->cancel_pending && !slot->cleanup_fault
+      && slot->driver_lease.control==control && slot->execution_lease.control==control
+      && !slot->deferred_owner.lease.control
+      && ku_task_control_is_payload_terminal(phase)
+      && ku_task_control_atomic_load(&control->payload)==KU_TASK_CONTROL_PAYLOAD_TAKEN
+      && !ku_task_control_atomic_load(&control->executor)
+      && !ku_task_control_atomic_load(&control->lifecycle_pin) && control->frame_destroyed
+      && ku_task_control_atomic_load(&control->references)==3u
+      && slot->timer_state==KU_TASK_DRIVER_TIMER_EMPTY
+      && slot->wait_state==KU_TASK_DRIVER_WAIT_EMPTY && slot->wait_kind==KU_TASK_DRIVER_WAIT_KIND_EMPTY
+      && !slot->waiter_epoch && !slot->scope_wait_started && !slot->scope_session_active
+      && !slot->scope_session_final && !slot->scope_receipts && !slot->scope_receipt_capacity
+      && !slot->scope_expected_mask;
+  if (!eligible) { ku_task_driver_unlock(driver); return KU_TASK_DRIVER_PENDING; }
+  if (slot->state==KU_TASK_DRIVER_QUEUED) {
+    if (slot->queue_worker!=slot->owner_worker || !driver->queued
+        || !ku_task_driver_unlink_local(driver,ticket->slot)) {
+      driver->fault=KU_TASK_DRIVER_INTERNAL;
+      ku_task_driver_unlock(driver); return KU_TASK_DRIVER_INTERNAL;
+    }
+    driver->queued--;
+  } else if (slot->queue_worker || slot->ready_previous || slot->ready_next) {
+    driver->fault=KU_TASK_DRIVER_INTERNAL;
+    ku_task_driver_unlock(driver); return KU_TASK_DRIVER_INTERNAL;
+  }
+  /* Claim the terminal generation before unlocking: new driver wrappers and
+   * non-owning wakes cannot requeue it. Registry/execution leases stay in the
+   * slot. The original owner drop below sees TAKEN and refs==3, so it cannot
+   * call payload/frame/dispose callbacks while this claim is outstanding. */
+  slot->state=KU_TASK_DRIVER_RETIRING;
+  ku_task_driver_unlock(driver);
+  uint32_t dropped=ku_task_control_owner_drop(owner,deadline);
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  slot=ku_task_driver_find(ticket);
+  if (!slot || slot->state!=KU_TASK_DRIVER_RETIRING || slot->binding!=control) {
+    driver->fault=KU_TASK_DRIVER_INTERNAL;
+    ku_task_driver_unlock(driver); return KU_TASK_DRIVER_INTERNAL;
+  }
+  if (dropped!=KU_TASK_CONTROL_OK) {
+    /* Preserve a still-live owner on an unexpected R2 rejection. No ACK,
+     * binding removal or budget return has occurred; the raw path can retry. */
+    slot->state=KU_TASK_DRIVER_TERMINAL_HELD;
+    ku_task_driver_enqueue(driver,ticket->slot);
+    ku_task_driver_unlock(driver); return dropped;
+  }
+  slot->owner_location=KU_TASK_DRIVER_OWNER_RELEASED;
+  KuTaskControlLeaseV1 execution=slot->execution_lease,registry={0};
+  slot->execution_lease.control=NULL;
+  int retired=ku_task_driver_retire_terminal_locked(driver,ticket->slot,(uint32_t)phase,&registry);
+  if (!retired) {
+    slot->execution_lease=execution; execution.control=NULL;
+    slot->state=KU_TASK_DRIVER_TERMINAL_HELD; /* Same quarantine as a failed pump ACK. */
+  }
+  ku_task_driver_signal(driver);
+  ku_task_driver_unlock(driver);
+  if (execution.control) ku_task_control_lease_release(&execution);
+  if (registry.control) ku_task_control_lease_release(&registry);
+  /* Owner consumption succeeded even if ACK quarantined the resident slot.
+   * The HTTP caller retains its ticket and still waits for physical disposal. */
+  return KU_TASK_DRIVER_OK;
 }
 /* This stack-only record is private to the sole RUNNING executor. Pure ready
  * continuations need not release/reclaim R2 executor between dispatch budgets:
@@ -3167,28 +3292,8 @@ static int ku_task_driver_run_one_mode_locked(KuTaskDriverWorkerV1* worker,size_
       ku_task_driver_scope_unregister_locked(slot);
     }
     KuTaskControlLeaseV1 registry = {0};
-    int retire = terminal && slot->owner_location == KU_TASK_DRIVER_OWNER_RELEASED && !slot->wrapper_active;
-    if (retire) {
-      uint32_t ack = ku_task_driver_cleanup_ack_locked(driver, slot, outcome);
-      /* Publish BOTH durable ACK and quarantine failure before binding retires.
-       * A faulted child's enqueue is disabled; this wakes its parent instead. */
-      ku_task_driver_wait_publish_locked(driver, index);
-      if (ack != KU_TASK_DRIVER_CLEANUP_ACK) retire = 0;
-      else if (!ku_task_driver_binding_remove(driver,slot->binding)) {
-        slot->cleanup_fault=KU_TASK_DRIVER_INTERNAL; driver->fault=KU_TASK_DRIVER_INTERNAL;
-        ku_task_driver_wait_publish_locked(driver,index);
-        retire=0; /* Keep all registry/executor references and charged storage. */
-      }
-    }
-    if (retire) {
-      registry = slot->driver_lease; slot->driver_lease.control = NULL;
-      /* The disposer frees its allocation BEFORE returning this slot's budget.
-       * Another builder may legitimately receive the same malloc address in
-       * that interval. Retire the executable binding now, while keeping its
-       * generation/count/bytes until final disposed acknowledgement. */
-      slot->binding = NULL;
-      slot->state = KU_TASK_DRIVER_RETIRING;
-    } else {
+    int retire = terminal && ku_task_driver_retire_terminal_locked(driver,index,outcome,&registry);
+    if (!retire) {
       slot->execution_lease = execution; execution.control = NULL;
       int poll_fault = !terminal && outcome != KU_TASK_CONTROL_PENDING;
       slot->state = terminal ? KU_TASK_DRIVER_TERMINAL_HELD

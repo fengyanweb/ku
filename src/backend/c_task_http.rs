@@ -29,6 +29,17 @@ pub(super) fn emit(
 ) -> KuResult<()> {
     out.check()?;
     let blocking = task::uses_blocking_io(tasks);
+    // The private post-take shortcut is only for these generated HTTP roots.
+    // Keep this stricter disposal witness separate from the public Value/raw ABI.
+    out.push_str("static int ku_http_task_generated_control(KuTaskValueV1* value) {\n  KuTaskControlV1* control=value->owner.lease.control;\n  switch(value->function_id) {\n");
+    for function in &tasks.functions {
+        if !is_handler(function) {
+            continue;
+        }
+        let id = function.id.0;
+        out.push_str(&format!("  case {id}: return control->context==(void*)control && control->operations.resume==ku_task_{id}_resume && control->operations.cleanup==ku_task_{id}_cleanup && control->operations.drop_frame==ku_task_{id}_drop_frame && control->operations.drop_payload==ku_task_{id}_drop_payload && control->operations.take_payload==ku_task_{id}_take_payload && control->operations.dispose==ku_task_{id}_dispose;\n"));
+    }
+    out.push_str("  default: return 0;\n  }\n}\n");
     out.push_str(
         &BRIDGE
             .replace(
@@ -457,7 +468,21 @@ static uint32_t ku_http_task_poll(void* raw,void** task,int cancel,uint64_t dead
       ku_task_outcome_drop(&outcome);
       handle->retired=handle->value.ticket;
       if(handle->value.tag!=KU_TASK_VALUE_EMPTY) {
-        status=ku_task_value_drop(&handle->value,deadline);
+        /* Keep the ordinary generated-value identity checks. Only a taken,
+         * fully cleaned root on this fixed owner may retire without another
+         * pump turn; observers, children and raw contexts use the old path.
+         * These opaque roots only complete in the preceding owner pump/slice:
+         * each has already spent its execution credits. A rejected shortcut
+         * immediately enters finishing via raw drop, so it cannot accumulate
+         * for a later batch of credit-free work. No live resume is run here. */
+        status=ku_task_value_check(&handle->value);
+        if(status!=KU_TASK_DRIVER_OK) return status;
+        status=ku_http_task_generated_control(&handle->value)
+            ? ku_task_driver_owner_drop_taken_same_owner(
+                &handle->value.ticket,&handle->value.owner,deadline)
+            : KU_TASK_DRIVER_PENDING;
+        if(status==KU_TASK_DRIVER_PENDING) status=ku_task_value_drop(&handle->value,deadline);
+        else if(status==KU_TASK_DRIVER_OK) handle->value=(KuTaskValueV1){0};
         if(status!=KU_TASK_DRIVER_OK) return status;
       }
       handle->finishing=1;

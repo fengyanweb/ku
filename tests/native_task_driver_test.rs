@@ -637,6 +637,225 @@ int main(void) {
 }
 
 #[test]
+fn native_task_driver_taken_http_owner_retires_without_a_second_poll() {
+    let ast = Parser::new(
+        Lexer::new(
+            "async fn Work(): int! { return ok(17) } async fn main(): null! { return ok(null) }",
+        )
+        .lex()
+        .unwrap(),
+    )
+    .parse_program()
+    .unwrap();
+    Checker::new().check(&ast).unwrap();
+    let tasks = ir::task_lower::lower_program(&ast).unwrap();
+    let mut generated = c::generate_native_task_c_source(&tasks, &Default::default()).unwrap();
+    for (old, new) in [
+        (
+            "typedef struct KuString {",
+            format!(
+                "{ALLOCATION_HOOK}\n{NATIVE_THREAD_LIFECYCLE_HARNESS}\ntypedef struct KuString {{"
+            ),
+        ),
+        (
+            "int main(void) {",
+            "static int fixture_original_main(void) {".to_string(),
+        ),
+    ] {
+        assert_eq!(
+            generated.matches(old).count(),
+            1,
+            "terminal retire fixture: {old}"
+        );
+        generated = generated.replacen(old, &new, 1);
+    }
+    // Retain a distinct, valid observer after eligibility was read but before
+    // owner consumption. This precisely exercises the unlocked retirement gap.
+    let entry = "static uint32_t ku_task_driver_owner_drop_taken_same_owner(\n";
+    assert_eq!(generated.matches(entry).count(), 1);
+    generated = generated.replacen(entry,
+        &format!("static KuTaskControlLeaseV1 fixture_late_lease;\nstatic int fixture_retain_in_gap;\n{entry}"), 1);
+    let drop = "  uint32_t dropped=ku_task_control_owner_drop(owner,deadline);";
+    assert_eq!(generated.matches(drop).count(), 1);
+    generated = generated.replacen(drop,
+        &format!("  if(fixture_retain_in_gap) {{ fixture_retain_in_gap=0; if(ku_task_control_lease_retain(&owner->lease,&fixture_late_lease)!=KU_TASK_CONTROL_OK) abort(); }}\n{drop}"), 1);
+    generated.push_str(r#"
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"taken retire line %d: %s\n",__LINE__,#c); return 1; } } while(0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+typedef struct FixtureOtherOwner {
+  KuTaskValueV1* value;
+  uint64_t deadline;
+  uint32_t status;
+} FixtureOtherOwner;
+static int fixture_other_owner(void* raw) {
+  FixtureOtherOwner* other=(FixtureOtherOwner*)raw;
+  other->status=ku_task_driver_owner_drop_taken_same_owner(
+      &other->value->ticket,&other->value->owner,other->deadline);
+  return 0;
+}
+static int fixture_completed(KuTaskDriverV1* driver,KuTaskValueV1* value) {
+  CHECK(ku_task_0_start_value(driver,value)==KU_TASK_DRIVER_OK);
+  uint64_t next=UINT64_MAX;
+  for(size_t turn=0;turn<16u && ku_task_control_status(&value->owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+    CHECK(ku_task_driver_pump(driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_control_status(&value->owner.lease)==KU_TASK_CONTROL_COMPLETED);
+  return 0;
+}
+static int fixture_take(KuTaskValueV1* value) {
+  KuTaskAdapterOutcomeV1 outcome={0};
+  CHECK(ku_task_value_take(value,NULL,&outcome)==KU_TASK_CONTROL_OK);
+  CHECK(outcome.value.integer.ok && outcome.value.integer.value==17);
+  ku_task_outcome_drop(&outcome); return 0;
+}
+int main(void) {
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[4]={0}; size_t ring[4]={0};
+  size_t fixed=ku_task_driver_fixed_storage_bytes(4u);
+  uint64_t now=ku_task_driver_now_ms(),deadline=now+10000u,next=UINT64_MAX;
+  CHECK(now!=UINT64_MAX && deadline>now);
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,4u,ring,4u,fixed+8u*sizeof(KuTaskInstance_0),1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_set_fixed_owner(&driver)==KU_TASK_DRIVER_OK);
+  KuTaskValueV1 value={0}; CHECK(!fixture_completed(&driver,&value));
+  KuTaskDriverTicketV1 first=value.ticket;
+  KuTaskDriverSlotV1* slot=&slots[first.slot];
+  CHECK(slot->state==KU_TASK_DRIVER_TERMINAL_HELD && !driver.queued);
+  /* An available payload still needs its original owner/drop arbitration. */
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_PENDING);
+  CHECK(value.owner.lease.control && slot->state==KU_TASK_DRIVER_TERMINAL_HELD && !driver.queued);
+  CHECK(!fixture_take(&value));
+  CHECK(slot->state==KU_TASK_DRIVER_QUEUED && driver.queued==1u && driver.workers[0].local_queued==1u);
+  CHECK(ku_task_control_atomic_load(&value.owner.lease.control->references)==3u);
+  /* The owner thread is real OS identity, not merely a valid owner index. */
+  FixtureOtherOwner other={&value,deadline,0}; KuTestThread thread;
+  CHECK(ku_test_thread_start(&thread,fixture_other_owner,&other));
+  CHECK(ku_test_thread_join(&thread,2000u) && !thread.outcome && other.status==KU_TASK_DRIVER_PENDING);
+  CHECK(value.owner.lease.control && driver.queued==1u);
+  /* A current wrapper/notification, job, wait or scope must never be erased. */
+  CHECK(ku_task_driver_wrapper_begin(&value.ticket,&value.owner.lease)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_PENDING);
+  ku_task_driver_wrapper_end(&value.ticket);
+  slot->notified=1u;
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_PENDING);
+  CHECK(slot->notified==1u && driver.queued==1u); slot->notified=0u;
+  slot->blocking_pending=1u;
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_PENDING);
+  CHECK(slot->blocking_pending==1u); slot->blocking_pending=0u;
+  slot->scope_session_active=1u;
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_PENDING);
+  CHECK(slot->scope_session_active==1u); slot->scope_session_active=0u;
+  slot->waiter_epoch=1u;
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_PENDING);
+  CHECK(slot->waiter_epoch==1u); slot->waiter_epoch=0u;
+  driver.workers[0].pumping=1u;
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_PENDING);
+  driver.workers[0].pumping=0u;
+  driver.fixed_owner=0u;
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_PENDING);
+  driver.fixed_owner=1u;
+  uint64_t polls=driver.polls;
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(!value.owner.lease.control); value=(KuTaskValueV1){0};
+  CHECK(slot->state==KU_TASK_DRIVER_FREE && slot->cleanup_acked_generation==first.generation);
+  CHECK(!driver.resident && !driver.queued && !driver.binding_count && !driver.reserved_bytes
+      && !driver.workers[0].local_queued && driver.polls==polls && !driver.fault);
+  CHECK(ku_task_driver_wake(&first)==KU_TASK_DRIVER_STALE);
+  /* Retiring the FIFO head cannot consume or reorder another live task's
+   * exact public pump(1) credit. Its still-available result remains intact. */
+  KuTaskValueV1 head={0},tail={0};
+  CHECK(!fixture_completed(&driver,&head)); CHECK(!fixture_take(&head));
+  CHECK(ku_task_0_start_value(&driver,&tail)==KU_TASK_DRIVER_OK);
+  CHECK(driver.queued==2u && driver.workers[0].local_queued==2u);
+  polls=driver.polls;
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&head.ticket,&head.owner,deadline)==KU_TASK_DRIVER_OK);
+  head=(KuTaskValueV1){0};
+  CHECK(driver.queued==1u && driver.workers[0].local_queued==1u && driver.polls==polls);
+  CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK && driver.polls==polls+1u);
+  CHECK(ku_task_control_status(&tail.owner.lease)==KU_TASK_CONTROL_COMPLETED);
+  CHECK(!fixture_take(&tail));
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&tail.ticket,&tail.owner,deadline)==KU_TASK_DRIVER_OK);
+  tail=(KuTaskValueV1){0}; CHECK(!driver.resident && !driver.queued && !driver.reserved_bytes);
+  /* A real retained observer prevents private retirement. The unchanged raw
+   * drop/pump path ACKs but retains physical charge until that lease leaves. */
+  CHECK(!fixture_completed(&driver,&value)); CHECK(!fixture_take(&value));
+  KuTaskDriverTicketV1 observed=value.ticket; KuTaskControlLeaseV1 observer={0};
+  CHECK(ku_task_control_lease_retain(&value.owner.lease,&observer)==KU_TASK_CONTROL_OK);
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_PENDING);
+  CHECK(value.owner.lease.control && driver.queued==1u);
+  CHECK(ku_task_value_drop(&value,deadline)==KU_TASK_DRIVER_OK);
+  polls=driver.polls;
+  CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK && driver.polls==polls+1u);
+  CHECK(slots[observed.slot].state==KU_TASK_DRIVER_RETIRING && driver.resident==1u
+      && driver.reserved_bytes && slots[observed.slot].cleanup_acked_generation==observed.generation);
+  CHECK(ku_task_control_status(&observer)==KU_TASK_CONTROL_COMPLETED);
+  CHECK(ku_task_control_lease_release(&observer)==KU_TASK_CONTROL_OK);
+  CHECK(!driver.resident && !driver.reserved_bytes && slots[observed.slot].state==KU_TASK_DRIVER_FREE);
+  /* A lease acquired in the unlocked gap may outlive both driver references.
+   * Retirement ACK is durable, but no budget/slot reuse precedes its disposer. */
+  CHECK(!fixture_completed(&driver,&value)); CHECK(!fixture_take(&value));
+  KuTaskDriverTicketV1 late=value.ticket; polls=driver.polls; fixture_retain_in_gap=1;
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(!fixture_retain_in_gap && !value.owner.lease.control && fixture_late_lease.control);
+  value=(KuTaskValueV1){0};
+  CHECK(slots[late.slot].state==KU_TASK_DRIVER_RETIRING && driver.resident==1u
+      && driver.reserved_bytes && !driver.queued && driver.polls==polls
+      && slots[late.slot].cleanup_acked_generation==late.generation
+      && !slots[late.slot].binding && !slots[late.slot].driver_lease.control
+      && !slots[late.slot].execution_lease.control);
+  CHECK(ku_task_control_status(&fixture_late_lease)==KU_TASK_CONTROL_COMPLETED);
+  CHECK(ku_task_driver_wake(&late)==KU_TASK_DRIVER_OK && !driver.queued);
+  CHECK(ku_task_control_lease_release(&fixture_late_lease)==KU_TASK_CONTROL_OK);
+  CHECK(!driver.resident && !driver.reserved_bytes && slots[late.slot].state==KU_TASK_DRIVER_FREE);
+  /* Cancellation before execution retains the original cleanup executor and
+   * deadline. The terminal-only post-take helper cannot execute a LIVE task. */
+  CHECK(ku_task_0_start_value(&driver,&value)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_driver_request_cancel(&value.ticket,&value.owner.lease,KU_TASK_CONTROL_CANCELLED,deadline)==KU_TASK_CONTROL_OK);
+  CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_control_status(&value.owner.lease)==KU_TASK_CONTROL_CANCELLED);
+  CHECK(ku_task_control_cleanup_deadline(value.owner.lease.control)==deadline);
+  CHECK(ku_task_driver_owner_drop_taken_same_owner(&value.ticket,&value.owner,deadline)==KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_value_drop(&value,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(!driver.resident && !driver.reserved_bytes && !driver.fault);
+  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  puts("task-taken-owner-retire-and-fallback-ok"); return 0;
+}
+"#);
+    let directory = TempDir::new("task-driver-taken-owner");
+    let c_file = directory.path().join("taken-owner.c");
+    fs::write(&c_file, generated).expect("write taken-owner regression");
+    let Some(executable) = compile_harness(directory.path(), &c_file, "taken-owner") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute terminal retirement"
+        );
+        return;
+    };
+    fs::remove_file(&c_file).expect("remove temporary taken-owner C");
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .expect("terminal retirement and fallbacks remain bounded");
+    assert!(
+        output.status.success(),
+        "taken-owner regression failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "task-taken-owner-retire-and-fallback-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_task_driver_admission_wake_retirement_and_shutdown_execute_in_c() {
     let generated = fixture_source();
     for forbidden in ["run_source", "const SOURCE", "task.spawn", "Task.new"] {
