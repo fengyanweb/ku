@@ -118,6 +118,11 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
             | "time.elapsed"
             | "time.from_unix"
             | "time.from_millis"
+            | "time.duration"
+            | "time.add"
+            | "time.sub"
+            | "time.diff"
+            | "time.compare"
             | "time.is_leap"
             | "time.days_in_month"
             | "time.sleep"
@@ -278,11 +283,19 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("config", "env") => vec![],
         ("config", "env_file") => vec![str_arg()],
         ("config", "yaml") => vec![str_arg()],
-        ("time", "now" | "instant" | "unix" | "millis" | "steady_millis" | "date") => {
+        ("time", "now" | "instant" | "steady_millis" | "date") => {
             vec![]
         }
-        ("time", "elapsed") => vec![ArgRule::Is(TypePattern::ObjectAny)],
+        // The checker owns time's overload/arity rules. These signatures keep
+        // optional inputs read-only and provide the public object shape; native
+        // IR refines Time/Duration to separate, tagged Copy ABI values.
+        ("time", "elapsed" | "unix" | "millis") => vec![ArgRule::Is(TypePattern::ObjectAny)],
         ("time", "from_unix" | "from_millis" | "is_leap") => vec![int_arg()],
+        ("time", "duration") => vec![int_arg(), str_arg()],
+        ("time", "add" | "sub" | "diff" | "compare") => vec![
+            ArgRule::Is(TypePattern::ObjectAny),
+            ArgRule::Is(TypePattern::ObjectAny),
+        ],
         ("time", "days_in_month") => vec![int_arg(), int_arg()],
         ("time", "sleep") => vec![ArgRule::Is(TypePattern::Any)],
         ("task", "stats") => vec![],
@@ -373,8 +386,13 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("json", "stringify" | "encode") => TypePattern::ResultOf(Box::new(TypePattern::String)),
         ("config", "env" | "env_file") => TypePattern::ObjectAny,
         ("config", "yaml") => TypePattern::ResultOf(Box::new(TypePattern::ObjectAny)),
-        ("time", "instant" | "date" | "from_unix" | "from_millis") => TypePattern::ObjectAny,
-        ("time", "now" | "elapsed" | "unix" | "millis" | "steady_millis") => TypePattern::Int,
+        ("time", "instant" | "date" | "from_unix" | "from_millis" | "add" | "sub" | "diff") => {
+            TypePattern::ObjectAny
+        }
+        ("time", "duration") => TypePattern::ResultOf(Box::new(TypePattern::ObjectAny)),
+        ("time", "now" | "elapsed" | "unix" | "millis" | "steady_millis" | "compare") => {
+            TypePattern::Int
+        }
         ("time", "is_leap") => TypePattern::Bool,
         ("time", "days_in_month") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
         ("time", "sleep") => TypePattern::ResultOf(Box::new(TypePattern::Null)),
@@ -606,7 +624,7 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         | ("kuvalue", "as_int" | "as_str" | "take")
         | ("json", "parse" | "try_parse" | "decode" | "stringify" | "encode")
         | ("config", "yaml")
-        | ("time", "days_in_month" | "sleep")
+        | ("time", "duration" | "days_in_month" | "sleep")
         | ("http", "get" | "post" | "request")
         | ("pg", "client")
         | ("pg_client", "query" | "query_one_typed")
@@ -616,7 +634,9 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         | ("bytes", "from_str" | "from_array")
         | ("net", "client") => FailureMode::ReturnsResult,
         ("zstd" | "gzip" | "deflate", "compress" | "decompress") => FailureMode::ReturnsResult,
-        ("config", "env_file") | ("task", "stats" | "stress") => FailureMode::MayPanic,
+        ("config", "env_file")
+        | ("task", "stats" | "stress")
+        | ("time", "from_unix" | "from_millis" | "add" | "sub" | "diff") => FailureMode::MayPanic,
         _ => FailureMode::Never,
     }
 }

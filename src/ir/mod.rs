@@ -384,9 +384,9 @@ pub(crate) fn ir_expr_is_borrowed(expr: &IrExpr) -> bool {
 fn ir_type_is_owned(ty: &IrType) -> bool {
     match ty {
         IrType::Str | IrType::Array(_) | IrType::Result(_) | IrType::Closure { .. } => true,
-        // The native Time ABI is a tagged, by-value pair. It is intentionally
-        // distinct from a dynamic object and carries no heap ownership.
-        IrType::Named(name) => name != TIME_TYPE,
+        // Native Time/Duration are tagged, by-value pairs, distinct from
+        // dynamic objects and carrying no heap ownership.
+        IrType::Named(name) => name != TIME_TYPE && name != DURATION_TYPE,
         _ => false,
     }
 }
@@ -2823,7 +2823,7 @@ impl<'a> FunctionLowerer<'a> {
         if struct_name == "__ku_error_type" && matches!(field_name, "domain" | "code" | "message") {
             return IrType::Str;
         }
-        if struct_name == TIME_TYPE {
+        if struct_name == TIME_TYPE || struct_name == DURATION_TYPE {
             return match field_name {
                 "kind" => IrType::Str,
                 "millis" => IrType::Int,
@@ -5915,6 +5915,7 @@ pub(crate) fn http_constant_object_table(name: &str) -> Option<&'static str> {
 /// ordinary dynamic objects with fields named `kind`/`millis` are never
 /// misclassified as values returned by `time.instant()`.
 const TIME_TYPE: &str = "__ku_time";
+const DURATION_TYPE: &str = "__ku_duration";
 
 fn time_builtin_ir_type(module: &str, function: &str, args: &[IrExpr]) -> Option<IrType> {
     if module != "time" {
@@ -5922,6 +5923,18 @@ fn time_builtin_ir_type(module: &str, function: &str, args: &[IrExpr]) -> Option
     }
     match function {
         "instant" if args.is_empty() => Some(IrType::Named(TIME_TYPE.to_string())),
+        "from_unix" | "from_millis" if args.len() == 1 => {
+            Some(IrType::Named(TIME_TYPE.to_string()))
+        }
+        "duration" if args.len() == 1 || args.len() == 2 => Some(IrType::Result(Box::new(
+            IrType::Named(DURATION_TYPE.to_string()),
+        ))),
+        "add" | "sub" if args.len() == 2 => Some(IrType::Named(TIME_TYPE.to_string())),
+        "diff" if args.len() == 2 => Some(IrType::Named(DURATION_TYPE.to_string())),
+        "compare" if args.len() == 2 => Some(IrType::Int),
+        "is_leap" if args.len() == 1 => Some(IrType::Bool),
+        "days_in_month" if args.len() == 2 => Some(IrType::Result(Box::new(IrType::Int))),
+        "sleep" if args.len() == 1 => Some(IrType::Result(Box::new(IrType::Null))),
         "now" | "elapsed" | "unix" | "millis" | "steady_millis" => Some(IrType::Int),
         _ => None,
     }
@@ -5999,7 +6012,7 @@ fn is_copy_ir_type(ty: &IrType) -> bool {
     matches!(
         ty,
         IrType::Int | IrType::Float | IrType::Bool | IrType::Null
-    ) || matches!(ty, IrType::Named(name) if name == TIME_TYPE)
+    ) || matches!(ty, IrType::Named(name) if name == TIME_TYPE || name == DURATION_TYPE)
 }
 
 /// A visible name either resolves to a binding site owned and boxable by this
