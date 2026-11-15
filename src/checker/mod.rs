@@ -10754,54 +10754,21 @@ fn http_route_type() -> Type {
 }
 
 fn http_status_type() -> Type {
-    Type::Object(HashMap::from([
-        ("ok".to_string(), Type::Int),
-        ("created".to_string(), Type::Int),
-        ("accepted".to_string(), Type::Int),
-        ("noContent".to_string(), Type::Int),
-        ("movedPermanently".to_string(), Type::Int),
-        ("found".to_string(), Type::Int),
-        ("seeOther".to_string(), Type::Int),
-        ("notModified".to_string(), Type::Int),
-        ("temporaryRedirect".to_string(), Type::Int),
-        ("permanentRedirect".to_string(), Type::Int),
-        ("badRequest".to_string(), Type::Int),
-        ("unauthorized".to_string(), Type::Int),
-        ("forbidden".to_string(), Type::Int),
-        ("notFound".to_string(), Type::Int),
-        ("methodNotAllowed".to_string(), Type::Int),
-        ("notAcceptable".to_string(), Type::Int),
-        ("requestTimeout".to_string(), Type::Int),
-        ("conflict".to_string(), Type::Int),
-        ("gone".to_string(), Type::Int),
-        ("contentTooLarge".to_string(), Type::Int),
-        ("uriTooLong".to_string(), Type::Int),
-        ("unsupportedMedia".to_string(), Type::Int),
-        ("rangeNotSatisfiable".to_string(), Type::Int),
-        ("unprocessable".to_string(), Type::Int),
-        ("tooManyRequests".to_string(), Type::Int),
-        ("headerTooLarge".to_string(), Type::Int),
-        ("internalError".to_string(), Type::Int),
-        ("notImplemented".to_string(), Type::Int),
-        ("badGateway".to_string(), Type::Int),
-        ("serviceUnavailable".to_string(), Type::Int),
-        ("gatewayTimeout".to_string(), Type::Int),
-    ]))
+    Type::Object(
+        crate::stdlib::http::HTTP_STATUS_CODES
+            .iter()
+            .map(|(name, _, _)| ((*name).to_string(), Type::Int))
+            .collect(),
+    )
 }
 
 fn http_code_type() -> Type {
-    Type::Object(HashMap::from([
-        ("SUCCESS".to_string(), Type::Int),
-        ("CREATED".to_string(), Type::Int),
-        ("ACCEPTED".to_string(), Type::Int),
-        ("NO_CONTENT".to_string(), Type::Int),
-        ("BAD_REQUEST".to_string(), Type::Int),
-        ("UNAUTHORIZED".to_string(), Type::Int),
-        ("FORBIDDEN".to_string(), Type::Int),
-        ("NOT_FOUND".to_string(), Type::Int),
-        ("VALIDATION_FAILED".to_string(), Type::Int),
-        ("INTERNAL_ERROR".to_string(), Type::Int),
-    ]))
+    Type::Object(
+        crate::stdlib::http::HTTP_CODE_ALIASES
+            .iter()
+            .map(|(name, _)| ((*name).to_string(), Type::Int))
+            .collect(),
+    )
 }
 
 fn std_module_object_type(module: &str, span: Span) -> KuResult<Type> {

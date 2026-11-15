@@ -978,6 +978,31 @@ impl<'a> FunctionLowerer<'a> {
             }
             ExprKind::Field { target, name } => {
                 if let ExprKind::Field {
+                    target: module,
+                    name: table,
+                } = &target.kind
+                {
+                    if self.std_http
+                        && matches!(&module.kind, ExprKind::Variable(module) if module == "http")
+                        && self.local("http").is_none()
+                        && !self.signatures.contains_key("http")
+                        && matches!(table.as_str(), "status" | "code")
+                    {
+                        let value =
+                            crate::stdlib::http::constant_code(table, name).ok_or_else(|| {
+                                unsupported("an unknown HTTP status constant", expression.span)
+                            })?;
+                        return self.constant(TaskConstant::Int(value), IrType::Int);
+                    }
+                }
+                if self.std_http
+                    && matches!(&target.kind, ExprKind::Variable(module) if module == "http")
+                    && self.local("http").is_none()
+                    && matches!(name.as_str(), "status" | "code")
+                {
+                    return Err(unsupported("HTTP constant objects as Task values; read a status/code member into an int instead", expression.span));
+                }
+                if let ExprKind::Field {
                     target: request,
                     name: map,
                 } = &target.kind

@@ -84,6 +84,12 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
             | "string.ends_with"
             | "string.replace"
             | "string.slice"
+            | "zstd.compress"
+            | "zstd.decompress"
+            | "gzip.compress"
+            | "gzip.decompress"
+            | "deflate.compress"
+            | "deflate.decompress"
             | "array.len"
             | "array.is_empty"
             | "array.first"
@@ -184,7 +190,16 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
 pub(crate) fn supports_borrowed_call(name: &str) -> bool {
     matches!(
         name,
-        "len"
+        "zstd.compress"
+            | "zstd.decompress"
+            | "gzip.compress"
+            | "gzip.decompress"
+            | "deflate.compress"
+            | "deflate.decompress"
+            | "string.trim"
+            | "string.lower"
+            | "string.upper"
+            | "len"
             | "str"
             | "print"
             | "println"
@@ -233,6 +248,9 @@ pub(crate) fn builtin_signature(name: &str) -> Option<Signature> {
 pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature> {
     let name = format!("{module}.{function}");
     let args = match (module, function) {
+        ("zstd" | "gzip" | "deflate", "compress" | "decompress") => {
+            vec![ArgRule::Is(TypePattern::Native(BYTES)), int_arg()]
+        }
         ("fs", "read") => vec![str_arg()],
         ("fs", "try_read") => vec![str_arg()],
         ("fs", "write") => vec![str_arg(), str_arg()],
@@ -333,6 +351,9 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         )))),
         ("lexer", "scan") => TypePattern::ArrayOf(Box::new(TypePattern::String)),
         ("parser", "parse") => TypePattern::String,
+        ("zstd" | "gzip" | "deflate", "compress" | "decompress") => {
+            TypePattern::ResultOf(Box::new(TypePattern::Native(BYTES)))
+        }
         ("string", "len" | "byte_len") => TypePattern::Int,
         ("string", "chars") => TypePattern::ArrayOf(Box::new(TypePattern::String)),
         ("string", "contains" | "starts_with" | "ends_with") => TypePattern::Bool,
@@ -594,6 +615,7 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         | ("redis", "client")
         | ("bytes", "from_str" | "from_array")
         | ("net", "client") => FailureMode::ReturnsResult,
+        ("zstd" | "gzip" | "deflate", "compress" | "decompress") => FailureMode::ReturnsResult,
         ("config", "env_file") | ("task", "stats" | "stress") => FailureMode::MayPanic,
         _ => FailureMode::Never,
     }
@@ -615,7 +637,17 @@ pub(crate) const MYSQL_RESULT: &str = "__ku_mysql_result";
 pub(crate) fn module_requires_import(module: &str) -> bool {
     matches!(
         module,
-        "fs" | "http" | "config" | "task" | "pg" | "redis" | "mysql" | "bytes" | "net"
+        "fs" | "http"
+            | "config"
+            | "task"
+            | "pg"
+            | "redis"
+            | "mysql"
+            | "bytes"
+            | "net"
+            | "zstd"
+            | "gzip"
+            | "deflate"
     )
 }
 
@@ -637,6 +669,9 @@ pub(crate) fn is_std_module(module: &str) -> bool {
             | "mysql"
             | "bytes"
             | "net"
+            | "zstd"
+            | "gzip"
+            | "deflate"
     )
 }
 

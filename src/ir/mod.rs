@@ -23,7 +23,9 @@ use budget::{LowerBudget, LowerLimits};
 macro_rules! emit_ir_instruction {
     ($lower:expr, $instruction:expr) => {{
         $lower.admit_instruction()?;
-        $lower.current.instructions.push($instruction);
+        let instruction = $instruction;
+        $lower.record_scope_owner(&instruction);
+        $lower.current.instructions.push(instruction);
     }};
 }
 mod monomorph;
@@ -1237,6 +1239,10 @@ struct FunctionLowerer<'a> {
     next_temp_id: usize,
     try_handlers: Vec<IrTryHandler>,
     cleanup_attempts: Vec<IrCleanupAttempt>,
+    loops: Vec<IrLoopContext>,
+    /// Declaration order, including temporary owners. The C emitter applies
+    /// its final owning/borrowed classification to cleanup markers.
+    scope_owners: Vec<String>,
     pending_borrow_temporaries: Vec<PendingBorrowTemporary>,
     pattern_bindings: HashMap<String, IrExpr>,
     /// Program-global FunctionId allocator, shared between the top-level lowerer
@@ -1329,6 +1335,24 @@ struct IrTryHandler {
     /// The reason belongs to this pending return, never the whole frame.
     /// Every incoming return edge overwrites it, including loop reentry.
     return_reason: Option<String>,
+    finally_scope: Option<Rc<IrFinallyScope>>,
+}
+
+#[derive(Debug)]
+struct IrFinallyScope {
+    body: Vec<Stmt>,
+    aliases: HashMap<String, String>,
+    patterns: HashMap<String, IrExpr>,
+    owner_floor: usize,
+}
+
+#[derive(Debug, Clone)]
+struct IrLoopContext {
+    break_block: BlockId,
+    continue_block: BlockId,
+    handler_floor: usize,
+    cleanup_floor: usize,
+    owner_floor: usize,
 }
 
 /// A shared return-finally is a termination cleanup attempt only when its
@@ -1385,6 +1409,8 @@ impl<'a> FunctionLowerer<'a> {
             next_temp_id: 0,
             try_handlers: Vec::new(),
             cleanup_attempts: Vec::new(),
+            loops: Vec::new(),
+            scope_owners: Vec::new(),
             pending_borrow_temporaries: Vec::new(),
             pattern_bindings: HashMap::new(),
             next_function_id,
@@ -1733,12 +1759,8 @@ impl<'a> FunctionLowerer<'a> {
                 let iterable = self.lower_expr(iterable)?;
                 self.lower_for(name, iterable, body, *span)?;
             }
-            Stmt::Break { span } | Stmt::Continue { span } => {
-                return Err(KuError::runtime(
-                    "break/continue are not supported by IR/native lowering yet",
-                    *span,
-                ));
-            }
+            Stmt::Break { span } => self.lower_loop_control(false, *span)?,
+            Stmt::Continue { span } => self.lower_loop_control(true, *span)?,
             Stmt::Function(function) => self.lower_local_function(function)?,
             Stmt::Try {
                 body,
@@ -1855,8 +1877,10 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn lower_while(&mut self, condition: &Expr, body: &[Stmt]) -> KuResult<()> {
+        let owner_floor = self.scope_owners.len();
         let cond_id = self.next_block("while_cond")?;
         let body_id = self.next_block("while_body")?;
+        let backedge_id = self.next_block("while_backedge")?;
         let after_id = self.next_block("while_after")?;
         self.current.terminator = IrTerminator::Jump(cond_id);
         self.finish_current()?;
@@ -1871,17 +1895,31 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(body_id, "while_body");
-        self.lower_scoped_statements(body)?;
+        self.loops.push(IrLoopContext {
+            break_block: after_id,
+            continue_block: backedge_id,
+            handler_floor: self.try_handlers.len(),
+            cleanup_floor: self.cleanup_attempts.len(),
+            owner_floor,
+        });
+        let result = self.lower_scoped_statements(body);
+        self.loops.pop();
+        result?;
         if self.current.terminator == IrTerminator::Next {
-            // A tight compute loop remains cancellable even when its body has no
-            // calls. `emit_safepoint` creates an explicit timeout return edge, so
-            // an enclosing try/finally sees the same structured return route.
-            self.emit_safepoint()?;
-            self.current.terminator = IrTerminator::Jump(cond_id);
+            self.current.terminator = IrTerminator::Jump(backedge_id);
         }
         self.finish_current()?;
 
+        self.start_block(backedge_id, "while_backedge");
+        self.emit_loop_scope_cleanup(owner_floor)?;
+        // Both normal fallthrough and continue retain the same cooperative
+        // poll. An abrupt edge must never turn a call-free loop into a spin.
+        self.emit_safepoint()?;
+        self.current.terminator = IrTerminator::Jump(cond_id);
+        self.finish_current()?;
+
         self.start_block(after_id, "while_after");
+        self.emit_loop_scope_cleanup(owner_floor)?;
         Ok(())
     }
 
@@ -1931,6 +1969,7 @@ impl<'a> FunctionLowerer<'a> {
         // must not re-run calls/array construction used to compute the iterable.
         let iter_id = self.next_block("for_iter")?;
         let body_id = self.next_block("for_body")?;
+        let backedge_id = self.next_block("for_backedge")?;
         let after_id = self.next_block("for_after")?;
         self.current.terminator = IrTerminator::Jump(iter_id);
         self.finish_current()?;
@@ -1946,17 +1985,158 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(body_id, "for_body");
-        self.lower_statements(body)?;
+        // The iterable and hidden ForEach snapshot predate this floor. Their
+        // owner survives continue; the emitter retires it at after_id.
+        let owner_floor = self.scope_owners.len();
+        self.loops.push(IrLoopContext {
+            break_block: after_id,
+            continue_block: backedge_id,
+            handler_floor: self.try_handlers.len(),
+            cleanup_floor: self.cleanup_attempts.len(),
+            owner_floor,
+        });
+        let result = self.lower_statements(body);
+        self.loops.pop();
+        result?;
         if self.current.terminator == IrTerminator::Next {
-            // `for` can iterate up to the full i64/array range. Poll on every
-            // back-edge just like `while`, otherwise a handler with a call-free
-            // loop can ignore its cooperative deadline indefinitely.
-            self.emit_safepoint()?;
-            self.current.terminator = IrTerminator::Jump(iter_id);
+            self.current.terminator = IrTerminator::Jump(backedge_id);
         }
         self.finish_current()?;
 
+        self.start_block(backedge_id, "for_backedge");
+        self.emit_loop_scope_cleanup(owner_floor)?;
+        self.emit_safepoint()?;
+        self.current.terminator = IrTerminator::Jump(iter_id);
+        self.finish_current()?;
+
         self.start_block(after_id, "for_after");
+        self.emit_loop_scope_cleanup(owner_floor)?;
+        Ok(())
+    }
+
+    fn lower_loop_control(&mut self, is_continue: bool, span: Span) -> KuResult<()> {
+        let context =
+            self.loops.last().cloned().ok_or_else(|| {
+                KuError::runtime("break/continue requires an enclosing loop", span)
+            })?;
+
+        // Expand only the finally scopes actually crossed by this transfer.
+        // Each copy resolves names at the try's lexical entry, not at the exit
+        // site (which can contain shadowing body/catch locals). Removing that
+        // handler before lowering also prevents an overriding return, fail,
+        // break or continue from re-entering the same finally.
+        let handlers = self.try_handlers.clone();
+        let mut guarded_attempts = HashSet::new();
+        let result = (|| {
+            for index in (context.handler_floor..handlers.len()).rev() {
+                self.try_handlers = handlers[..index].to_vec();
+                let Some(scope) = &handlers[index].finally_scope else {
+                    continue;
+                };
+                self.guard_loop_cleanup_escape(
+                    context.cleanup_floor,
+                    Some(index),
+                    &mut guarded_attempts,
+                )?;
+                self.emit_loop_scope_cleanup(scope.owner_floor)?;
+                let aliases = std::mem::replace(&mut self.local_names, scope.aliases.clone());
+                let patterns =
+                    std::mem::replace(&mut self.pattern_bindings, scope.patterns.clone());
+                let finally_owner_floor = self.scope_owners.len();
+                let result = self.lower_scoped_statements(&scope.body);
+                self.local_names = aliases;
+                self.pattern_bindings = patterns;
+                result?;
+                if self.current.terminator != IrTerminator::Next {
+                    return Ok(());
+                }
+                self.emit_loop_scope_cleanup(finally_owner_floor)?;
+            }
+            self.guard_loop_cleanup_escape(context.cleanup_floor, None, &mut guarded_attempts)?;
+            self.emit_loop_scope_cleanup(context.owner_floor)?;
+            self.current.terminator = IrTerminator::Jump(if is_continue {
+                context.continue_block
+            } else {
+                context.break_block
+            });
+            Ok(())
+        })();
+        self.try_handlers = handlers;
+        result
+    }
+
+    fn guard_loop_cleanup_escape(
+        &mut self,
+        cleanup_floor: usize,
+        destination_handler: Option<usize>,
+        guarded: &mut HashSet<usize>,
+    ) -> KuResult<()> {
+        // A nested try's own finally still runs before crossing the attempt's
+        // lexical floor. Only the outward transfer is suppressed, never the
+        // nested cleanup preceding it. Loops born inside this attempt remain
+        // ordinary local control and are excluded by cleanup_floor.
+        for index in (cleanup_floor..self.cleanup_attempts.len()).rev() {
+            let attempt = self.cleanup_attempts[index].clone();
+            if destination_handler.is_some_and(|index| index >= attempt.handler_floor) {
+                break;
+            }
+            if !guarded.insert(index) {
+                continue;
+            }
+            let ordinary = self.next_block("loop_cleanup_escape")?;
+            self.current.terminator = IrTerminator::Branch {
+                condition: IrExpr {
+                    kind: IrExprKind::Local(attempt.reason),
+                    ty: IrType::Bool,
+                },
+                then_block: attempt.finish_block,
+                else_block: ordinary,
+            };
+            self.finish_current()?;
+            self.start_block(ordinary, "loop_cleanup_escape");
+        }
+        Ok(())
+    }
+
+    fn record_scope_owner(&mut self, instruction: &IrInst) {
+        let name = match instruction {
+            IrInst::Temp { id, .. } | IrInst::BindOk { id, .. } => format!("%t{}", id.0),
+            IrInst::Let { name, .. }
+            | IrInst::BindError { name, .. }
+            | IrInst::CellNew { name, .. } => name.clone(),
+            _ => return,
+        };
+        self.scope_owners.push(name);
+    }
+
+    fn emit_loop_scope_cleanup(&mut self, floor: usize) -> KuResult<()> {
+        if floor == self.scope_owners.len() {
+            return Ok(());
+        }
+        // These are compiler metadata strings, not runtime reads or moves.
+        // The emitter filters its existing OwnedLocal table, including borrowed
+        // aliases and moved-from slots, and clears each released owner in place.
+        let args = self.scope_owners[floor..]
+            .iter()
+            .map(|name| IrExpr {
+                kind: IrExprKind::Literal(format!("\"{name}\"")),
+                ty: IrType::Str,
+            })
+            .collect();
+        emit_ir_instruction!(
+            self,
+            IrInst::Expr(IrExpr {
+                ty: IrType::Void,
+                kind: IrExprKind::Call {
+                    callee: Box::new(IrExpr {
+                        kind: IrExprKind::Local("__ku_loop_scope_cleanup".into()),
+                        ty: IrType::Function,
+                    }),
+                    args,
+                    kind: IrCallKind::Intrinsic("__ku_loop_scope_cleanup".into()),
+                },
+            })
+        );
         Ok(())
     }
 
@@ -2022,6 +2202,16 @@ impl<'a> FunctionLowerer<'a> {
                 }
             );
         }
+        let finally_scope = (!finally_body.is_empty()).then(|| {
+            Rc::new(IrFinallyScope {
+                body: finally_body.to_vec(),
+                aliases: self.local_names.clone(),
+                patterns: self.pattern_bindings.clone(),
+                // Error and pending-return owners belong to the enclosing try,
+                // not its body/catch, and must survive until finally resolves.
+                owner_floor: self.scope_owners.len(),
+            })
+        });
         emit_ir_instruction!(
             self,
             IrInst::BeginTry {
@@ -2036,6 +2226,7 @@ impl<'a> FunctionLowerer<'a> {
             return_block: finally_return_id,
             return_name: return_name.clone(),
             return_reason: return_reason.clone(),
+            finally_scope: finally_scope.clone(),
         });
         let body_result = self.lower_scoped_statements(body);
         self.try_handlers.pop();
@@ -2073,6 +2264,7 @@ impl<'a> FunctionLowerer<'a> {
                         return_block: finally_return_id,
                         return_name: return_name.clone(),
                         return_reason: return_reason.clone(),
+                        finally_scope: finally_scope.clone(),
                     });
                 }
                 let result = lower.lower_statements(catch_body);
@@ -2610,10 +2802,23 @@ impl<'a> FunctionLowerer<'a> {
         })
     }
 
+    fn is_http_module_root(&self, expression: &Expr) -> bool {
+        matches!(&expression.kind, ExprKind::Variable(name) if name == "http")
+            && self.static_place_type(expression).is_none()
+            && !self.signatures.contains_key("http")
+    }
+
     fn field_type(&self, target: &IrType, field_name: &str) -> IrType {
         let IrType::Named(struct_name) = target else {
             return IrType::Unknown;
         };
+        if let Some(table) = http_constant_object_table(struct_name) {
+            return if crate::stdlib::http::constant_code(table, field_name).is_some() {
+                IrType::Int
+            } else {
+                IrType::Unknown
+            };
+        }
         if struct_name == "__ku_error_type" && matches!(field_name, "domain" | "code" | "message") {
             return IrType::Str;
         }
@@ -3047,7 +3252,9 @@ impl<'a> FunctionLowerer<'a> {
         let module = match &receiver.ty {
             IrType::Array(_) => "array",
             IrType::Str => "string",
-            IrType::Named(n) if n == "__ku_object" => "object",
+            IrType::Named(n) if n == "__ku_object" || http_constant_object_table(n).is_some() => {
+                "object"
+            }
             IrType::Named(n) if n == "__ku_value" => "kuvalue",
             IrType::Named(n) if n == metadata::REDIS_CLIENT => "redis",
             IrType::Named(n) if n == metadata::BYTES => "bytes",
@@ -3205,6 +3412,12 @@ impl<'a> FunctionLowerer<'a> {
                 ty: literal_type(literal),
             }),
             ExprKind::Variable(name) => {
+                if self.is_http_module_root(expr) {
+                    return Err(KuError::runtime(
+                        "native C cannot store the complete http module as a value; use http.status, http.code or a direct http function call",
+                        expr.span,
+                    ));
+                }
                 if let Some(value) = self.pattern_bindings.get(name) {
                     return Ok(value.clone());
                 }
@@ -3668,7 +3881,10 @@ impl<'a> FunctionLowerer<'a> {
                 // when present, Err{object, missing_key} when absent. `?` unwraps
                 // it to a KuValue.
                 if let IrType::Named(name) = &target.ty {
-                    if name == "__ku_object" || name == "__ku_value" {
+                    if name == "__ku_object"
+                        || name == "__ku_value"
+                        || http_constant_object_table(name).is_some()
+                    {
                         // `obj[key]?` on a KuObject or a KuValue (e.g. json.parse
                         // result) yields Result<KuValue>. The KuValue variant checks
                         // the tag is an object at runtime.
@@ -3710,6 +3926,45 @@ impl<'a> FunctionLowerer<'a> {
                 })
             }
             ExprKind::Field { target, name } => {
+                // Constants are compiler-known only for the actual module root,
+                // never for a lexical value merely spelled `http`. Reading a
+                // direct scalar need not materialize the whole owned table.
+                if let ExprKind::Field {
+                    target: module,
+                    name: table,
+                } = &target.kind
+                {
+                    if self.is_http_module_root(module)
+                        && matches!(table.as_str(), "status" | "code")
+                    {
+                        let code =
+                            crate::stdlib::http::constant_code(table, name).ok_or_else(|| {
+                                KuError::runtime(
+                                    format!("http.{table} has no field '{name}'"),
+                                    expr.span,
+                                )
+                            })?;
+                        return Ok(IrExpr {
+                            kind: IrExprKind::Literal(code.to_string()),
+                            ty: IrType::Int,
+                        });
+                    }
+                }
+                if self.is_http_module_root(target) {
+                    let (intrinsic, ty) = match name.as_str() {
+                        "status" => ("__ku_http_status_object", HTTP_STATUS_OBJECT_TYPE),
+                        "code" => ("__ku_http_code_object", HTTP_CODE_OBJECT_TYPE),
+                        _ => return Err(KuError::runtime(
+                            "native C http functions must be called directly; builtin function values are not supported",
+                            expr.span,
+                        )),
+                    };
+                    return self.emit_temp(intrinsic_expr(
+                        intrinsic,
+                        vec![],
+                        IrType::Named(ty.to_string()),
+                    ));
+                }
                 if let ExprKind::Variable(enum_name) = &target.kind {
                     if let Some(layout) = self
                         .layouts
@@ -3788,6 +4043,27 @@ impl<'a> FunctionLowerer<'a> {
                 // sibling fields — out. `lower_field_target` builds the projection
                 // chain without an intervening move.
                 let target = self.lower_field_target(target)?;
+                if let IrType::Named(ty) = &target.ty {
+                    if let Some(table) = http_constant_object_table(ty) {
+                        if crate::stdlib::http::constant_code(table, name).is_none() {
+                            return Err(KuError::runtime(
+                                format!("http.{table} has no field '{name}'"),
+                                expr.span,
+                            ));
+                        }
+                        return self.emit_temp(intrinsic_expr(
+                            "__ku_http_constant_get",
+                            vec![
+                                target,
+                                IrExpr {
+                                    kind: IrExprKind::Literal(format!("{name:?}")),
+                                    ty: IrType::Str,
+                                },
+                            ],
+                            IrType::Int,
+                        ));
+                    }
+                }
                 let ty = self.field_type(&target.ty, name);
                 let field = IrExpr {
                     kind: IrExprKind::Field {
@@ -5211,7 +5487,19 @@ fn ir_expr_needs_post_call_safepoint(expr: &IrExpr) -> bool {
         IrExprKind::Call {
             kind: IrCallKind::Intrinsic(name),
             ..
-        } => name == "array.map",
+        } => matches!(
+            name.as_str(),
+            "array.map"
+                | "string.trim"
+                | "string.lower"
+                | "string.upper"
+                | "zstd.compress"
+                | "zstd.decompress"
+                | "gzip.compress"
+                | "gzip.decompress"
+                | "deflate.compress"
+                | "deflate.decompress"
+        ),
         _ => false,
     }
 }
@@ -5610,6 +5898,18 @@ const HTTP_RESPONSE_TYPE: &str = "__ku_http_response";
 /// Stage 8a: the synthetic IR type of the request struct passed to `fn(req)`
 /// route handlers (fields `method`/`path`/`body`).
 const HTTP_REQUEST_TYPE: &str = "__ku_http_request";
+pub(crate) const HTTP_STATUS_OBJECT_TYPE: &str = "__ku_http_status";
+pub(crate) const HTTP_CODE_OBJECT_TYPE: &str = "__ku_http_code";
+
+/// These are ordinary owned KuObject values. The nominal marker only preserves
+/// the known integer fields while lowering aliases; the backend ABI is unchanged.
+pub(crate) fn http_constant_object_table(name: &str) -> Option<&'static str> {
+    match name {
+        HTTP_STATUS_OBJECT_TYPE => Some("status"),
+        HTTP_CODE_OBJECT_TYPE => Some("code"),
+        _ => None,
+    }
+}
 /// Dedicated by-value native Time ABI. Kept separate from `__ku_object` so
 /// ordinary dynamic objects with fields named `kind`/`millis` are never
 /// misclassified as values returned by `time.instant()`.

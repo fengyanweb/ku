@@ -20,6 +20,9 @@ use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
 
+#[path = "cli_compression.rs"]
+mod native_compression;
+
 use crate::{
     ast::*,
     backend,
@@ -2576,7 +2579,8 @@ fn build_executable_to(
     output: &Path,
     config: RunnerBuildConfig<'_>,
 ) -> Result<PathBuf, KuError> {
-    check_source_with_dependency_mode(path, source, config.dependency_mode)?;
+    let program = checked_program_with_dependency_mode(path, source, config.dependency_mode)?;
+    reject_native_only_compression(&program)?;
     validate_native_output_name(output)?;
     let output_directory = link_output_directory(output);
     fs::create_dir_all(output_directory).map_err(|err| {
@@ -2771,6 +2775,8 @@ struct CSourceFeatures {
     libpq: bool,
     libmysql: bool,
     native_tls: bool,
+    zstd: bool,
+    zlib: bool,
 }
 
 impl CSourceFeatures {
@@ -2793,6 +2799,8 @@ impl CSourceFeatures {
             native_tls: text
                 .lines()
                 .any(|line| line == "#define KU_FEATURE_NATIVE_TLS 1"),
+            zstd: text.lines().any(|line| line == "#define KU_FEATURE_ZSTD 1"),
+            zlib: text.lines().any(|line| line == "#define KU_FEATURE_ZLIB 1"),
         })
     }
 }
@@ -5507,7 +5515,12 @@ fn verify_native_binary_dynamic_dependencies_file(
     libpq_requirement: Option<&LibpqRuntimeDependency>,
     mysql_requirement: Option<&MysqlRuntimeDependency>,
 ) -> Result<(), String> {
-    if !features.libpq && !features.libmysql && !features.native_tls {
+    if !features.libpq
+        && !features.libmysql
+        && !features.native_tls
+        && !features.zstd
+        && !features.zlib
+    {
         return Ok(());
     }
     let names = match target.binary_format {
@@ -5532,6 +5545,15 @@ fn verify_native_binary_dynamic_dependencies_file(
     {
         return Err(
             "linked output records a dynamic ku-native-tls dependency; the v1 contract requires the verified static archive"
+                .to_string(),
+        );
+    }
+    if names
+        .iter()
+        .any(|name| dynamic_dependency_is_compression_library(name, features.zstd, features.zlib))
+    {
+        return Err(
+            "linked output records a dynamic zstd/zlib dependency; native compression requires the verified static codec archive (target CRT dependencies remain permitted)"
                 .to_string(),
         );
     }
@@ -5629,6 +5651,39 @@ fn dynamic_dependency_is_native_tls_library(name: &[u8]) -> bool {
             || lower
                 .windows(b"ku-native-tls".len())
                 .any(|window| window == b"ku-native-tls"))
+}
+
+fn dynamic_dependency_is_compression_library(name: &[u8], zstd: bool, zlib: bool) -> bool {
+    let basename = name
+        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .unwrap_or(name);
+    let lower = basename
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let stem = if let Some(stem) = lower.strip_suffix(b".dll") {
+        stem
+    } else if let Some(stem) = lower.strip_suffix(b".dylib") {
+        stem
+    } else if let Some(index) = lower.windows(3).position(|part| part == b".so") {
+        if index + 3 != lower.len() && lower.get(index + 3) != Some(&b'.') {
+            return false;
+        }
+        &lower[..index]
+    } else {
+        return false;
+    };
+    let family = |prefix: &[u8], numbered: bool| {
+        stem == prefix
+            || stem.strip_prefix(prefix).is_some_and(|tail| {
+                tail.first().is_some_and(|byte| {
+                    matches!(*byte, b'.' | b'-') || (numbered && byte.is_ascii_digit())
+                })
+            })
+    };
+    (zstd && (family(b"zstd", true) || family(b"libzstd", true)))
+        || (zlib && (family(b"zlib", true) || family(b"libz", false) || stem == b"zlibwapi"))
 }
 
 fn dynamic_dependency_matches_selected_loader(
@@ -6858,6 +6913,7 @@ fn compile_c_source_with_output(
     let features = CSourceFeatures::inspect(source)?;
     validate_c_target_features(features, target)?;
     let needs_native_tls = features.native_tls;
+    let needs_compression = features.zstd || features.zlib;
     validate_native_tls_link_mode(needs_native_tls, static_link)?;
     let native_tls_root = needs_native_tls
         .then(|| resolve_native_tls_pack_root(env::var_os("KU_NATIVE_TLS_PACK")))
@@ -6956,8 +7012,10 @@ fn compile_c_source_with_output(
             && candidate.kind == CCompilerKind::Clang;
         let needs_native_tls_probe = needs_native_tls
             && (target.is_none() || candidate.kind == CCompilerKind::Preconfigured);
+        let needs_compression_probe = needs_compression
+            && (target.is_none() || candidate.kind == CCompilerKind::Preconfigured);
         let probed_compiler_target = if declared_target.is_none()
-            && (needs_database_clang_probe || needs_native_tls_probe)
+            && (needs_database_clang_probe || needs_native_tls_probe || needs_compression_probe)
         {
             match probe_clang_default_target(&candidate, link_deadline) {
                 Ok(target) => Some(target),
@@ -6984,6 +7042,46 @@ fn compile_c_source_with_output(
                     }
                     compiler_failures
                         .push(format!("{} target probe failed: {error}", candidate.label));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let injected_native_target = if target.is_some() && declared_target.is_none() {
+            native_output_target
+                .as_ref()
+                .and_then(|output_target| match candidate.kind {
+                    CCompilerKind::Clang => Some(output_target.rust_triple),
+                    CCompilerKind::ZigCc => Some(output_target.c_triple),
+                    CCompilerKind::Preconfigured => None,
+                })
+        } else {
+            None
+        };
+        let effective_native_target = declared_target
+            .or(injected_native_target)
+            .or(probed_compiler_target.as_deref());
+        let compression_inputs = if needs_compression {
+            let output_target = native_output_target
+                .as_ref()
+                .expect("supported native compression output has a validated target");
+            let resolved = native_compression::compiler_target(
+                output_target,
+                effective_native_target,
+                &candidate.label,
+            )
+            .and_then(|selected| {
+                native_compression::validate_link_mode(true, &selected, static_link)?;
+                native_compression::resolve(&selected, features.zstd, features.zlib)
+            });
+            match resolved {
+                Ok(inputs) => Some(inputs),
+                Err(error) => {
+                    if candidate.explicitly_configured {
+                        return Err(error);
+                    }
+                    compiler_failures.push(format!("{}: {error}", candidate.label));
                     continue;
                 }
             }
@@ -7125,6 +7223,12 @@ fn compile_c_source_with_output(
             .as_ref()
             .map(NativeTlsPack::stage_for_link)
             .transpose()?;
+        // Keep the private header tree and every opened archive alive until
+        // the compiler has terminated (including failure/timeout cleanup).
+        let staged_compression = compression_inputs
+            .as_ref()
+            .map(native_compression::CompressionInputs::stage_for_link)
+            .transpose()?;
         let mysql_requirement = libmysql_library
             .as_ref()
             .map(|library| {
@@ -7139,9 +7243,13 @@ fn compile_c_source_with_output(
         let output_staging = LinkOutputStaging::create(output)?;
         let temporary_output = output_staging.path();
         let mut command = Command::new(&candidate.program);
-        for arg in &candidate.args {
-            command.arg(arg);
-        }
+        add_c_compiler_arguments(
+            &mut command,
+            &candidate.args,
+            staged_compression
+                .as_ref()
+                .map_or(&[], |inputs| inputs.include_dirs.as_slice()),
+        );
         for argument in target_arguments {
             command.arg(argument);
         }
@@ -7158,6 +7266,10 @@ fn compile_c_source_with_output(
             .arg(compiler_output);
         if needs_native_tls {
             command.arg("-DKU_NATIVE_TLS_ENABLED=1");
+        }
+        if compression_inputs.as_ref().and_then(|inputs| inputs.abi) == Some("msvc") {
+            // clang's GNU driver otherwise leaves its CRT default implicit.
+            command.arg("-fms-runtime-lib=dll");
         }
         if needs_libmysql {
             let header = libmysql_include
@@ -7196,6 +7308,11 @@ fn compile_c_source_with_output(
             command.arg(strip_verbatim(pack.archive.path()));
             for library in pack.contract.native_libraries {
                 command.arg(library);
+            }
+        }
+        if let Some(compression) = &staged_compression {
+            for archive in &compression.archives {
+                command.arg(strip_verbatim(archive.path()));
             }
         }
         if verbose {
@@ -7338,6 +7455,16 @@ fn compile_c_source_with_output(
                     .as_ref()
                     .map(NativeTlsPack::stage_for_link)
                     .transpose()?;
+                let msvc_compression_inputs = if needs_compression {
+                    let selected = native_compression::compiler_target(
+                        native_output_target.as_ref().expect("validated MSVC output target"),
+                        Some("x86_64-pc-windows-msvc"), "cl (MSVC)",
+                    )?;
+                    native_compression::validate_link_mode(true, &selected, static_link)?;
+                    Some(native_compression::resolve(&selected, features.zstd, features.zlib)?)
+                } else { None };
+                let staged_msvc_compression = msvc_compression_inputs.as_ref()
+                    .map(native_compression::CompressionInputs::stage_for_link).transpose()?;
                 let libpq_requirement = msvc_libpq_library
                     .as_ref()
                     .map(|library| {
@@ -7371,6 +7498,7 @@ fn compile_c_source_with_output(
                                 native_libraries: pack.contract.native_libraries,
                             }
                         }),
+                        compression: staged_msvc_compression.as_ref(),
                     },
                     MsvcCompileOptions {
                         quiet_stdout,
@@ -7446,6 +7574,46 @@ fn c_compiler_supports_explicit_target(
     target.matches_host()
         || candidate.kind != CCompilerKind::Preconfigured
         || candidate.explicitly_configured
+}
+
+fn add_c_compiler_arguments(
+    command: &mut Command,
+    arguments: &[String],
+    codec_includes: &[PathBuf],
+) {
+    if codec_includes.is_empty() {
+        command.args(arguments);
+        return;
+    }
+    // Keep compiler-wrapper/subcommand prefixes (e.g. `zig cc`, `ccache clang`)
+    // in place. Only ordinary -I search options move behind pinned headers.
+    let mut includes = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if matches!(argument.as_str(), "-Xclang" | "-Xpreprocessor") {
+            command.arg(argument);
+            index += 1;
+            if let Some(next) = arguments.get(index) {
+                command.arg(next);
+            }
+        } else if argument == "-I" {
+            includes.push(argument);
+            index += 1;
+            if let Some(directory) = arguments.get(index) {
+                includes.push(directory);
+            }
+        } else if argument.starts_with("-I") {
+            includes.push(argument);
+        } else {
+            command.arg(argument);
+        }
+        index += 1;
+    }
+    for include in codec_includes {
+        command.arg("-I").arg(strip_verbatim(include));
+    }
+    command.args(includes);
 }
 
 fn compiler_declared_target(candidate: &CCompilerCandidate) -> Result<Option<&str>, KuError> {
@@ -7651,6 +7819,7 @@ struct MsvcDatabaseLinks<'a> {
     libmysql_header: Option<&'a MysqlHeaderSelection>,
     libmysql_family: Option<MysqlClientFamily>,
     native_tls: Option<MsvcNativeTlsLink<'a>>,
+    compression: Option<&'a native_compression::StagedCompressionInputs>,
 }
 
 #[derive(Clone, Copy)]
@@ -7699,12 +7868,17 @@ fn compile_with_msvc(
     if let Some(opt) = options.profile.msvc_opt_flag() {
         command.arg(opt);
     }
-    if database.native_tls.is_some() {
-        // ku-native-tls is built against the dynamic MSVC CRT. Make the
+    if database.native_tls.is_some() || database.compression.is_some() {
+        // Verified native packs are built against the dynamic MSVC CRT. Make the
         // choice explicit so a project-wide default cannot silently mix CRTs.
         command.arg("/MD");
     } else if options.static_link {
         command.arg("/MT");
+    }
+    if let Some(compression) = database.compression {
+        for include in &compression.include_dirs {
+            command.arg("/I").arg(strip_verbatim(include));
+        }
     }
     match (database.libmysql_header, database.libmysql_family) {
         (Some(header), Some(family)) => {
@@ -7735,7 +7909,11 @@ fn compile_with_msvc(
     command.arg(format!("/Fo:{}", obj.display()));
     // Keep a single `/link` boundary: every following argument is consumed by
     // link.exe, so emitting another `/link` for a second database is invalid.
-    if database.libpq.is_some() || database.libmysql.is_some() || database.native_tls.is_some() {
+    if database.libpq.is_some()
+        || database.libmysql.is_some()
+        || database.native_tls.is_some()
+        || database.compression.is_some()
+    {
         command.arg("/link");
         if let Some(library) = database.libpq {
             command.arg(strip_verbatim(library));
@@ -7758,6 +7936,16 @@ fn compile_with_msvc(
             command.arg(strip_verbatim(native_tls.archive));
             for library in native_tls.native_libraries {
                 command.arg(library);
+            }
+        }
+        if let Some(compression) = database.compression {
+            for archive in &compression.archives {
+                if !path_is_plain_regular_file(archive.path()) {
+                    return Err(KuError::message(
+                        "private compression archive changed before MSVC linking",
+                    ));
+                }
+                command.arg(strip_verbatim(archive.path()));
             }
         }
     }
@@ -8256,8 +8444,26 @@ pub fn run_source_with_dependency_mode(
     dependency_mode: DependencyResolveMode,
 ) -> Result<(), KuError> {
     let program = checked_program_with_dependency_mode(file, source, dependency_mode)?;
+    reject_native_only_compression(&program)?;
     run_program_with_stack(program, source_base_dir(file))
         .map_err(|err| KuError::message(err.diagnostic(file, source)))
+}
+
+fn reject_native_only_compression(program: &Program) -> Result<(), KuError> {
+    // The module loader already registers the complete dependency closure.
+    // Inspect its capability markers instead of rescanning function ASTs.
+    if let Some(module) = program.items.iter().find_map(|item| match item {
+        Item::Module(module) => module
+            .name
+            .strip_prefix("std:")
+            .filter(|module| matches!(*module, "zstd" | "gzip" | "deflate")),
+        _ => None,
+    }) {
+        return Err(KuError::message(format!(
+            "std.{module} currently requires native C; the interpreter/runner does not implement this module\nhelp: use `ku build --backend c` and run the generated executable"
+        )));
+    }
+    Ok(())
 }
 
 fn run_program_with_stack(program: Program, base_dir: PathBuf) -> Result<(), KuError> {
@@ -13660,6 +13866,206 @@ fn main(): null! {
         assert!(error.contains("dynamic CRT/system runtime"));
         assert!(error.contains("omit --static"));
         fs::remove_dir_all(dir).expect("remove native TLS marker fixture");
+    }
+
+    #[test]
+    fn compression_feature_markers_are_exact_and_independent() {
+        let directory = TempBuildDir::create_private("compression-marker-test").unwrap();
+        let source = directory.path().join("marker.c");
+        fs::write(&source, "static const char *text = \"#define KU_FEATURE_ZSTD 1\";\n#define KU_FEATURE_ZLIB 10\n").unwrap();
+        let features = CSourceFeatures::inspect(&source).unwrap();
+        assert!(!features.zstd && !features.zlib);
+        fs::write(&source, "#define KU_FEATURE_ZSTD 1\n").unwrap();
+        let features = CSourceFeatures::inspect(&source).unwrap();
+        assert!(features.zstd && !features.zlib);
+        fs::write(&source, "#define KU_FEATURE_ZLIB 1\n").unwrap();
+        let features = CSourceFeatures::inspect(&source).unwrap();
+        assert!(!features.zstd && features.zlib);
+    }
+
+    #[test]
+    fn pinned_codec_headers_preserve_compiler_wrappers_and_unicode_arguments() {
+        let include = PathBuf::from("verified headers 中文");
+        for prefix in ["cc", "clang"] {
+            let arguments = [
+                prefix,
+                "-Iold headers",
+                "--target=x86_64-linux-gnu",
+                "-I",
+                "another path",
+            ]
+            .map(str::to_owned);
+            let mut command = Command::new("unused-compiler-wrapper");
+            add_c_compiler_arguments(&mut command, &arguments, std::slice::from_ref(&include));
+            let actual = command
+                .get_args()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                [
+                    prefix,
+                    "--target=x86_64-linux-gnu",
+                    "-I",
+                    "verified headers 中文",
+                    "-Iold headers",
+                    "-I",
+                    "another path"
+                ]
+            );
+            let mut unused = Command::new("unused-compiler-wrapper");
+            add_c_compiler_arguments(&mut unused, &arguments, &[]);
+            assert_eq!(
+                unused.get_args().collect::<Vec<_>>(),
+                arguments
+                    .iter()
+                    .map(std::ffi::OsStr::new)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn compression_modules_fail_before_runner_output_or_interpreter_execution() {
+        let directory = TempBuildDir::create_private("compression-runner-test").unwrap();
+        for module in ["zstd", "gzip", "deflate"] {
+            let source = format!(
+                r#"import {{bytes,{module}}} from "std"
+fn main(): null! {{
+    input=bytes.from_array([1])?
+    {module}.compress(input, 100)?
+    return ok(null)
+}}"#
+            );
+            let entry = directory.path().join(format!("{module}.ku"));
+            fs::write(&entry, &source).unwrap();
+            let path = entry.to_str().unwrap();
+            let output = directory.path().join(format!("{module}-runner"));
+            let error = build_executable_to(
+                path,
+                &source,
+                &output,
+                RunnerBuildConfig {
+                    profile: BuildProfile::Debug,
+                    target: None,
+                    lto: false,
+                    strip: false,
+                    verbose: false,
+                    dependency_mode: DependencyResolveMode::Update,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("--backend c"), "{error}");
+            assert!(!output.exists());
+            let error = run_source(path, &source).unwrap_err().to_string();
+            assert!(error.contains("--backend c"), "{error}");
+        }
+        // Ordinary programs retain their existing backend semantics.
+        reject_native_only_compression(&parse_source("fn main() { println(1) }").unwrap()).unwrap();
+    }
+
+    #[test]
+    fn compression_imported_dependency_is_rejected_by_registered_capability() {
+        let directory = TempBuildDir::create_private("compression-transitive-test").unwrap();
+        let dependency = r#"import {bytes,gzip} from "std"
+fn Zip(): null! { input=bytes.from_array([1])? gzip.compress(input,100)? return ok(null) }"#;
+        fs::write(directory.path().join("codec.ku"), dependency).unwrap();
+        let source = "import {Zip} from \"./codec.ku\" fn main(): null! { Zip()? return ok(null) }";
+        let entry = directory.path().join("main.ku");
+        fs::write(&entry, source).unwrap();
+        let program = checked_program_with_dependency_mode(
+            entry.to_str().unwrap(),
+            source,
+            DependencyResolveMode::Update,
+        )
+        .unwrap();
+        let error = reject_native_only_compression(&program)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("std.gzip") && error.contains("--backend c"));
+    }
+
+    #[test]
+    fn compression_dynamic_codec_sidecars_are_rejected_in_all_output_formats() {
+        let directory = TempBuildDir::create_private("compression-loader-test").unwrap();
+        let features = CSourceFeatures {
+            zstd: true,
+            zlib: true,
+            ..CSourceFeatures::default()
+        };
+        let fixtures = [
+            (
+                "x86_64-linux",
+                dependency_elf(&["libc.so.6", "libzstd.so.1"]),
+                dependency_elf(&["libc.so.6"]),
+            ),
+            (
+                "x86_64-windows",
+                dependency_pe(&["KERNEL32.dll", "libz.dll"]),
+                dependency_pe(&["KERNEL32.dll", "VCRUNTIME140.dll"]),
+            ),
+            (
+                "aarch64-darwin",
+                dependency_macho(&["/usr/lib/libSystem.B.dylib", "@rpath/libz.1.dylib"]),
+                dependency_macho(&["/usr/lib/libSystem.B.dylib"]),
+            ),
+        ];
+        for (slug, rejected, accepted) in fixtures {
+            let target = resolve_build_target(Some(slug)).unwrap().unwrap();
+            let file = directory.path().join(slug);
+            fs::write(&file, rejected).unwrap();
+            let mut opened = fs::File::open(&file).unwrap();
+            let length = opened.metadata().unwrap().len();
+            let error = verify_native_binary_dynamic_dependencies_file(
+                &mut opened,
+                length,
+                &target,
+                features,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains("dynamic zstd/zlib"), "{error}");
+            drop(opened);
+            fs::write(&file, accepted).unwrap();
+            let mut opened = fs::File::open(&file).unwrap();
+            let length = opened.metadata().unwrap().len();
+            verify_native_binary_dynamic_dependencies_file(
+                &mut opened,
+                length,
+                &target,
+                features,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        for name in [
+            "zstd.dll",
+            "LIBZSTD-1.DLL",
+            "zlib1.dll",
+            "zlibwapi.dll",
+            "libz.so.1",
+            "libzstd.1.dylib",
+        ] {
+            assert!(
+                dynamic_dependency_is_compression_library(name.as_bytes(), true, true),
+                "{name}"
+            );
+        }
+        for name in [
+            "libz3.so.4",
+            "libzone.dylib",
+            "libzstd.a",
+            "zstd_static.lib",
+            "libc.so.6",
+        ] {
+            assert!(
+                !dynamic_dependency_is_compression_library(name.as_bytes(), true, true),
+                "{name}"
+            );
+        }
     }
 
     #[test]

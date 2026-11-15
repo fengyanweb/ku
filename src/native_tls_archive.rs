@@ -46,6 +46,7 @@ const REQUIRED: [&[u8]; 17] = [
 pub(crate) enum NativeTlsArchiveFormat {
     CoffX86_64,
     ElfX86_64,
+    ElfArm64,
     MachOArm64,
 }
 
@@ -56,6 +57,8 @@ struct Member {
 }
 struct Evidence {
     symbols: BTreeSet<Vec<u8>>,
+    required: BTreeSet<Vec<u8>>,
+    tls: bool,
     symbol_count: usize,
     build_id: bool,
     build_id_scan_bytes: u64,
@@ -168,7 +171,11 @@ fn trim_bsd_name_padding(name: &[u8]) -> Result<&[u8], String> {
         .iter()
         .rposition(|byte| *byte != 0)
         .map_or(0, |i| i + 1);
-    if name.len() - end > 7 {
+    // LLVM aligns the combined header/name to eight bytes (up to seven
+    // zeroes). Apple cctools rounds the name and the 60-byte header
+    // separately, adding four more zeroes (up to eleven). Both layouts are
+    // emitted by supported toolchains. Embedded NULs still reach safe_name.
+    if name.len() - end > 11 {
         return Err("BSD member name padding exceeds alignment maximum".into());
     }
     Ok(&name[..end])
@@ -307,9 +314,14 @@ fn record_symbol(
     if ev.symbol_count > MAX_SYMBOLS {
         return Err("aggregate symbol limit exceeded".into());
     }
-    if defined && external && REQUIRED.contains(&name) && !ev.symbols.insert(name.to_vec()) {
+    if defined && external && ev.required.contains(name) && !ev.symbols.insert(name.to_vec()) {
         return Err(format!(
-            "duplicate TLS ABI symbol {}",
+            "duplicate {} symbol {}",
+            if ev.tls {
+                "TLS ABI"
+            } else {
+                "static library API"
+            },
             String::from_utf8_lossy(name)
         ));
     }
@@ -399,6 +411,9 @@ fn scan_build_id(
     id: &[u8],
     ev: &mut Evidence,
 ) -> Result<(), String> {
+    if !ev.tls {
+        return Ok(());
+    }
     ev.build_id_scan_ranges = ev
         .build_id_scan_ranges
         .checked_add(1)
@@ -432,6 +447,9 @@ fn coff(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(),
     let bigobj = h[..4] == [0, 0, 0xff, 0xff];
     let (header_size, ns, sym_rel, count, symbol_size) = if bigobj {
         if m.len < 56 {
+            if !ev.tls {
+                return Err("codec static archive contains a COFF import member".into());
+            }
             if u16le(&h[6..]) != 0x8664 {
                 return Err("wrong-target COFF import member".into());
             }
@@ -445,6 +463,9 @@ fn coff(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(),
             0xdc, 0xb8,
         ];
         if u16le(&big[4..]) < 2 || u16le(&big[6..]) != 0x8664 || big[12..28] != CLASS {
+            if !ev.tls {
+                return Err("codec static archive contains a COFF import member".into());
+            }
             if u16le(&big[6..]) != 0x8664 {
                 return Err("wrong-target COFF import member".into());
             }
@@ -544,6 +565,9 @@ fn coff(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(),
         )?;
         let section = member_range(m, section_rel, 40, "COFF section")?;
         read_at(file, section, &mut s, "COFF section")?;
+        if !ev.tls && (s[..8].starts_with(b".idata") || s[..8].starts_with(b".didat")) {
+            return Err("codec static archive contains a COFF import section".into());
+        }
         let n = u32le(&s[16..]) as u64;
         let relative = u32le(&s[20..]) as u64;
         let characteristics = u32le(&s[36..]);
@@ -557,11 +581,23 @@ fn coff(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(),
 }
 
 fn elf(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(), String> {
+    elf_machine(file, m, id, ev, 62)
+}
+fn elf_machine(
+    file: &mut File,
+    m: &Member,
+    id: &[u8],
+    ev: &mut Evidence,
+    machine: u16,
+) -> Result<(), String> {
     let mut h = [0; 64];
     let header = member_range(m, 0, 64, "ELF header")?;
     read_at(file, header, &mut h, "ELF header")?;
-    if &h[..6] != b"\x7fELF\x02\x01" || u16le(&h[16..]) != 1 || u16le(&h[18..]) != 62 {
-        return Err("expected x86_64 ELF64 relocatable object".into());
+    if &h[..6] != b"\x7fELF\x02\x01" || u16le(&h[16..]) != 1 || u16le(&h[18..]) != machine {
+        return Err(format!(
+            "expected {} ELF64 relocatable object",
+            if machine == 62 { "x86_64" } else { "aarch64" }
+        ));
     }
     let shoff = u64le(&h[40..]);
     let ents = u16le(&h[58..]) as usize;
@@ -789,6 +825,8 @@ fn validate_with_scan_limit(
     let build_id_prefix = kmp_prefix(expected_build_id)?;
     let mut ev = Evidence {
         symbols: BTreeSet::new(),
+        required: REQUIRED.into_iter().map(Vec::from).collect(),
+        tls: true,
         symbol_count: 0,
         build_id: false,
         build_id_scan_bytes: 0,
@@ -815,6 +853,9 @@ fn validate_with_scan_limit(
         match format {
             NativeTlsArchiveFormat::CoffX86_64 => coff(file, &m, expected_build_id, &mut ev)?,
             NativeTlsArchiveFormat::ElfX86_64 => elf(file, &m, expected_build_id, &mut ev)?,
+            NativeTlsArchiveFormat::ElfArm64 => {
+                elf_machine(file, &m, expected_build_id, &mut ev, 183)?
+            }
             NativeTlsArchiveFormat::MachOArm64 => macho(file, &m, expected_build_id, &mut ev)?,
         }
     }
@@ -848,6 +889,64 @@ pub(crate) fn validate(
         expected_build_id,
         file_len.min(MAX_BUILD_ID_SCAN_BYTES),
     )
+}
+
+/// Validate an ordinary C static archive with the same bounded member, object,
+/// section and symbol readers. TLS packs still use `validate` and its original
+/// Rust object/build-id requirements; codec libraries cannot bypass that API.
+pub(crate) fn validate_static(
+    file: &mut File,
+    file_len: u64,
+    format: NativeTlsArchiveFormat,
+    required: &[&[u8]],
+) -> Result<(), String> {
+    if file_len > MAX_ARCHIVE_BYTES {
+        return Err(format!(
+            "archive exceeds the {MAX_ARCHIVE_BYTES}-byte validation limit"
+        ));
+    }
+    if required.is_empty()
+        || required.len() > 128
+        || required
+            .iter()
+            .any(|name| name.is_empty() || name.len() > MAX_NAME || name.contains(&0))
+    {
+        return Err("invalid required static library API symbol list".into());
+    }
+    let mut ev = Evidence {
+        symbols: BTreeSet::new(),
+        required: required.iter().map(|name| name.to_vec()).collect(),
+        tls: false,
+        symbol_count: 0,
+        build_id: false,
+        build_id_scan_bytes: 0,
+        build_id_scan_limit: 0,
+        build_id_scan_ranges: 0,
+        build_id_prefix: Vec::new(),
+        section_count: 0,
+        rcgu: false,
+        objects: 0,
+    };
+    for member in members(file, file_len)? {
+        match format {
+            NativeTlsArchiveFormat::CoffX86_64 => coff(file, &member, &[], &mut ev)?,
+            NativeTlsArchiveFormat::ElfX86_64 => elf(file, &member, &[], &mut ev)?,
+            NativeTlsArchiveFormat::ElfArm64 => elf_machine(file, &member, &[], &mut ev, 183)?,
+            NativeTlsArchiveFormat::MachOArm64 => macho(file, &member, &[], &mut ev)?,
+        }
+    }
+    if ev.objects == 0 {
+        return Err("static archive contains no target objects".into());
+    }
+    for symbol in &ev.required {
+        if !ev.symbols.contains(symbol.as_slice()) {
+            return Err(format!(
+                "missing defined static library API symbol {}",
+                String::from_utf8_lossy(symbol)
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1097,6 +1196,8 @@ mod tests {
         let id = b"fixture-build-id";
         let mut evidence = Evidence {
             symbols: BTreeSet::new(),
+            required: REQUIRED.into_iter().map(Vec::from).collect(),
+            tls: true,
             symbol_count: 0,
             build_id: false,
             build_id_scan_bytes: 0,
@@ -1129,6 +1230,11 @@ mod tests {
             NativeTlsArchiveFormat::ElfX86_64 => {
                 ar("ku_native_tls.fixture.rcgu.o", &elf_fixture(id))
             }
+            NativeTlsArchiveFormat::ElfArm64 => {
+                let mut object = elf_fixture(id);
+                object[18..20].copy_from_slice(&183u16.to_le_bytes());
+                ar("ku_native_tls.fixture.rcgu.o", &object)
+            }
             NativeTlsArchiveFormat::MachOArm64 => {
                 ar("ku_native_tls.fixture.rcgu.o", &macho_fixture(id))
             }
@@ -1159,6 +1265,45 @@ mod tests {
             validate(&mut file, bytes.len() as u64, format, id).unwrap();
             drop(file);
             std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn ordinary_static_archives_keep_target_and_symbol_checks_without_tls_identity() {
+        for (object, format, other) in [
+            (
+                coff_fixture(b"ordinary-C-data"),
+                NativeTlsArchiveFormat::CoffX86_64,
+                NativeTlsArchiveFormat::ElfX86_64,
+            ),
+            (
+                elf_fixture(b"ordinary-C-data"),
+                NativeTlsArchiveFormat::ElfX86_64,
+                NativeTlsArchiveFormat::MachOArm64,
+            ),
+            (
+                macho_fixture(b"ordinary-C-data"),
+                NativeTlsArchiveFormat::MachOArm64,
+                NativeTlsArchiveFormat::CoffX86_64,
+            ),
+        ] {
+            let bytes = ar("codec.o", &object);
+            let (path, mut file) = temp(&bytes);
+            validate_static(&mut file, bytes.len() as u64, format, &[REQUIRED[0]]).unwrap();
+            assert!(validate(&mut file, bytes.len() as u64, format, b"ordinary-C-data").is_err());
+            assert!(validate_static(&mut file, bytes.len() as u64, other, &[REQUIRED[0]]).is_err());
+            assert!(validate_static(
+                &mut file,
+                bytes.len() as u64,
+                format,
+                &[b"missing_codec_entry"]
+            )
+            .is_err());
+            assert!(
+                validate_static(&mut file, bytes.len() as u64 - 1, format, &[REQUIRED[0]]).is_err()
+            );
+            drop(file);
+            std::fs::remove_file(path).unwrap();
         }
     }
 
@@ -1238,7 +1383,19 @@ mod tests {
         ] {
             assert!(!is_bsd_symbol_table(trim_bsd_name_padding(name).unwrap()));
         }
-        assert!(trim_bsd_name_padding(b"name\0\0\0\0\0\0\0\0").is_err());
+        assert!(trim_bsd_name_padding(b"name\0\0\0\0\0\0\0\0\0\0\0\0").is_err());
+        // cctools' round(name,8)+4 layout for a nine-byte member name.
+        let mut archive = b"!<arch>\n".to_vec();
+        let mut name = b"adler32.o".to_vec();
+        name.extend_from_slice(&[0; 11]);
+        append_bsd_member(&mut archive, &name, b"payload");
+        let (path, mut file) = temp(&archive);
+        let parsed = members(&mut file, archive.len() as u64).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, b"adler32.o");
+        assert_eq!(parsed[0].len, 7);
+        drop(file);
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

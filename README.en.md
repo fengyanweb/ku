@@ -40,7 +40,7 @@ Backend coverage differs. Database drivers need native output and their client l
 
 - [Guides and library reference](web/src/content/docs/en/docs): language syntax, ownership, errors, HTTP, Task, JSON, time, databases, and platform limits.
 - [Runnable examples](examples), [syntax contract](docs/syntax.md), and [semantic contract](docs/semantics.md).
-- [Task semantics and backend coverage](docs/concurrency.md).
+- [Task semantics and backend coverage](docs/concurrency.md), [native C capabilities and platforms](docs/native-capabilities.en.md).
 - [Network and database protocols](docs/protocol-foundation.md): connection options, TLS, and verified platform support.
 - [VS Code extension](editors/vscode-ku/README.md).
 - [Historical 0.0.19 seven-language fixed-load comparison](docs/performance-v0.0.19.en.md).

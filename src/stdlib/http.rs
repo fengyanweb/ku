@@ -216,18 +216,12 @@ pub fn status_object_value() -> Value {
 }
 
 pub fn code_object_value() -> Value {
-    Value::Object(HashMap::from([
-        ("SUCCESS".to_string(), Value::Int(200)),
-        ("CREATED".to_string(), Value::Int(201)),
-        ("ACCEPTED".to_string(), Value::Int(202)),
-        ("NO_CONTENT".to_string(), Value::Int(204)),
-        ("BAD_REQUEST".to_string(), Value::Int(400)),
-        ("UNAUTHORIZED".to_string(), Value::Int(401)),
-        ("FORBIDDEN".to_string(), Value::Int(403)),
-        ("NOT_FOUND".to_string(), Value::Int(404)),
-        ("VALIDATION_FAILED".to_string(), Value::Int(422)),
-        ("INTERNAL_ERROR".to_string(), Value::Int(500)),
-    ]))
+    Value::Object(
+        HTTP_CODE_ALIASES
+            .iter()
+            .map(|(name, code)| ((*name).to_string(), Value::Int(*code)))
+            .collect(),
+    )
 }
 
 pub fn status_text(status: i64) -> &'static str {
@@ -238,7 +232,9 @@ pub fn status_text(status: i64) -> &'static str {
         .unwrap_or("Unknown")
 }
 
-const HTTP_STATUS_CODES: &[(&str, i64, &str)] = &[
+// One definition feeds interpreter values, checker fields and native lowering.
+// Do not maintain another partial status table in a backend or the checker.
+pub(crate) const HTTP_STATUS_CODES: &[(&str, i64, &str)] = &[
     ("ok", 200, "OK"),
     ("created", 201, "Created"),
     ("accepted", 202, "Accepted"),
@@ -272,6 +268,31 @@ const HTTP_STATUS_CODES: &[(&str, i64, &str)] = &[
     ("serviceUnavailable", 503, "Service Unavailable"),
     ("gatewayTimeout", 504, "Gateway Timeout"),
 ];
+
+pub(crate) const HTTP_CODE_ALIASES: &[(&str, i64)] = &[
+    ("SUCCESS", 200),
+    ("CREATED", 201),
+    ("ACCEPTED", 202),
+    ("NO_CONTENT", 204),
+    ("BAD_REQUEST", 400),
+    ("UNAUTHORIZED", 401),
+    ("FORBIDDEN", 403),
+    ("NOT_FOUND", 404),
+    ("VALIDATION_FAILED", 422),
+    ("INTERNAL_ERROR", 500),
+];
+
+pub(crate) fn constant_code(table: &str, name: &str) -> Option<i64> {
+    match table {
+        "status" => HTTP_STATUS_CODES
+            .iter()
+            .find_map(|(field, code, _)| (*field == name).then_some(*code)),
+        "code" => HTTP_CODE_ALIASES
+            .iter()
+            .find_map(|(field, code)| (*field == name).then_some(*code)),
+        _ => None,
+    }
+}
 
 #[derive(Debug)]
 struct HttpRequest {

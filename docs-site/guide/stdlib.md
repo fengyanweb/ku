@@ -27,6 +27,8 @@ fn main(): null! {
 
 `text.len()` 计 Unicode 标量值；`text.byte_len()` 直接返回 UTF-8 字节数，不消费字符串。例如 `"中😀"` 分别为 2 个字符、7 个字节。`text.chars()` 将字符串线性拆成独立字符字符串数组；`text.slice(start, end)?` 仍使用字符下标。
 
+`text.trim()` 去除首尾 Unicode 空白；`text.lower()`／`text.upper()` 按 Unicode 规则转换大小写，与系统 locale 无关，结果可能包含多个字符。三者只读原字符串并返回独立字符串，不需要先 `.clone()`；`" Straße ".trim().upper()` 得到 `"STRASSE"`。解释器和 Runner 已支持；当前开发分支补齐了同步 native C 实现并完成 macOS C11 O2 回归，尚未包含在已发布的 0.0.20 包内，也不扩大 native Task 字符串子集。
+
 ## json
 
 ```ku
@@ -47,7 +49,7 @@ fn main(): null! {
 
 当前底层恢复 Ku 原有的直接解析与编码实现。支持中文、emoji、转义与内嵌 NUL；对象键稳定排序，重复键解码保留最后一个值。整数严格限于 signed 64-bit，越界不会转成 float；float 使用有限 binary64，保持 Ku 最短固定小数输出；仅当该文本不含小数点/指数且超出 int64 范围时追加 `.0`，例如 `1e20` 输出 `100000000000000000000.0`，可再次解码为同一个 binary64 值。范围内的 float `1.0` 仍输出 `1`，`-0.0` 仍输出 `-0`；不承诺保留 float 标签或负零符号。追加 `.0` 同样计入输出上限。NaN、Infinity、函数、Task、资源句柄等返回错误。
 
-默认严格 JSON，错误为 `Err(Error)`，使用 `?` 或 `try/catch`；解析消息包含从 0 开始的 UTF-8 `byte N`。输入、输出各限 1,000,000 字节；深度预算为 32，保留 33 层空容器允许、34 层拒绝的旧边界。解释器、默认打包 runner、同步 native C 已接入；受限 native Task 子集与 LLVM 不支持 JSON。完整规则见 仓库 `docs/syntax.md` 的 JSON 接口章节，正常及错误处理示例见仓库 `examples/json.ku`。
+默认严格 JSON，错误为 `Err(Error)`，使用 `?` 或 `try/catch`；解析消息包含从 0 开始的 UTF-8 `byte N`。输入、输出各限 1,000,000 字节；深度预算为 32，保留 33 层空容器允许、34 层拒绝的旧边界。解释器、默认打包 runner、同步 native C 已接入；受限 native Task 已支持局部 JSON 值跨 `await`、字符串键索引、`take`、显式转换和编码。任意 JSON 的 Task 参数、捕获、公开返回值及动态整数索引未扩大，详见仓库 `docs/native-task-json.md` 和 `examples/task_json.ku`。LLVM 尚不支持 JSON。完整规则见仓库 `docs/syntax.md` 的 JSON 接口章节，正常及错误处理示例见仓库 `examples/json.ku`。
 
 ## time
 
@@ -271,6 +273,10 @@ return http.html("<h1>ok</h1>")
 return http.redirect("/login")
 println(http.statusText(http.status.notFound))
 ```
+
+`http.status` 使用 `created`、`notFound` 等成员名；`http.code` 保留 `CREATED`、`NOT_FOUND` 等已有兼容别名。`http.statusText(code)` 返回标准描述，未知值返回 `"Unknown"`。取得的常量对象独立持有，修改或复制它不会改变模块的原始常量；静态成员和字符串键访问遵循同一对象规则。
+
+上述常量和 `statusText` 在解释器及 Runner 可用；已发布 0.0.20 的 native C 仍需使用等价整数，如 `http.json(201, value)`。当前开发分支已补齐同步 native C，仍须完成集成及平台验收；受支持的 async handler 可读取已知常量成员为整数，但不支持整个常量对象或 `statusText` 作为 Task 操作。
 
 HTTP status 是协议状态码；业务 `body.code/msg/data` 由开发者自己维护。`_req` 只保留给适配器/测试 mock 等必须带参数但暂时不用的场景。
 

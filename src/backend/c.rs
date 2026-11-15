@@ -7,12 +7,18 @@ use output::COutput;
 
 #[path = "c_int.rs"]
 mod checked_int;
+#[path = "c_compression.rs"]
+mod compression;
 #[path = "c_database_budget.rs"]
 mod database_budget;
 #[path = "c_http_short.rs"]
 mod http_short;
+#[path = "c_http_status.rs"]
+mod http_status;
 #[path = "c_service_output.rs"]
 mod service_output;
+#[path = "c_string_unicode.rs"]
+mod string_unicode;
 #[path = "c_sync.rs"]
 mod sync;
 
@@ -34,6 +40,10 @@ mod task_mixed;
 mod task_range;
 #[path = "c_task_root.rs"]
 mod task_root;
+
+fn c_object_type_name(name: &str) -> bool {
+    name == "__ku_object" || crate::ir::http_constant_object_table(name).is_some()
+}
 
 // Whole generated-file bytes, including shared runtimes and all specializations.
 // This is independent of the checker's generic AST/type admission budget.
@@ -781,6 +791,19 @@ fn generate_c_source_with_frames_attempt(
     // bodies can already refer to the earlier clone/drop prototypes.
     emit_array_helper_bodies(&mut out, program, &frame_array_elements)?;
     emit_bytes_runtime(&mut out, program, task_bytes);
+    compression::emit(
+        &mut out,
+        program_uses_intrinsic(program, "zstd.compress")
+            || program_uses_intrinsic(program, "zstd.decompress"),
+        [
+            "gzip.compress",
+            "gzip.decompress",
+            "deflate.compress",
+            "deflate.decompress",
+        ]
+        .iter()
+        .any(|name| program_uses_intrinsic(program, name)),
+    );
     emit_windows_socket_runtime(&mut out, program, task_net);
     emit_net_runtime(&mut out, program, task_net, task_native_tls);
     emit_string_chars_helper(&mut out, program)?;
@@ -798,7 +821,14 @@ fn generate_c_source_with_frames_attempt(
     }
     emit_array_try_get_helpers(&mut out, program)?;
     emit_string_slice_helper(&mut out, program)?;
+    string_unicode::emit(
+        &mut out,
+        program_uses_intrinsic(program, "string.trim"),
+        program_uses_intrinsic(program, "string.lower")
+            || program_uses_intrinsic(program, "string.upper"),
+    )?;
     emit_object_result_helpers(&mut out, program, task_json)?;
+    http_status::emit(&mut out, program)?;
     emit_closure_value_wrappers(&mut out, program)?;
     if program_uses_object(program) || task_json {
         // JSON returns Result<str> and its typed writers borrow fully-defined
@@ -1938,7 +1968,7 @@ fn emit_struct_forward_decls(out: &mut COutput, program: &IrProgram) {
 }
 
 fn is_runtime_object_name(name: &str) -> bool {
-    matches!(name, "__ku_value" | "__ku_object")
+    name == "__ku_value" || c_object_type_name(name)
 }
 
 /// An array element whose ABI is available before user aggregate layouts:
@@ -2547,6 +2577,46 @@ fn emit_inst(
     initial_temps: &HashSet<usize>,
 ) -> KuResult<()> {
     out.check()?;
+    if let IrInst::Expr(IrExpr {
+        kind:
+            IrExprKind::Call {
+                kind: IrCallKind::Intrinsic(name),
+                args,
+                ..
+            },
+        ty,
+    }) = inst
+    {
+        if name == "__ku_loop_scope_cleanup" {
+            if *ty != IrType::Void {
+                return Err(unsupported("loop scope cleanup must have a void result"));
+            }
+            let mut names = HashSet::new();
+            for arg in args {
+                let IrExprKind::Literal(raw) = &arg.kind else {
+                    return Err(unsupported(
+                        "loop scope cleanup requires internal literal names",
+                    ));
+                };
+                let key = raw
+                    .strip_prefix('"')
+                    .and_then(|raw| raw.strip_suffix('"'))
+                    .filter(|name| !name.contains(['"', '\\']))
+                    .ok_or_else(|| unsupported("invalid loop scope cleanup name"))?;
+                names.insert(key);
+            }
+            for local in owned_locals.iter().rev() {
+                if local.borrowed || !names.contains(local.source_name.as_str()) {
+                    continue;
+                }
+                emit_drop_expr(out, &local.ty, &local.name)?;
+                if matches!(local.ty, IrType::Cell(_)) {
+                    out.push_str(&format!("  {} = NULL;\n", local.name));
+                }
+            }
+            return Ok(());
+        }
+    }
     match inst {
         IrInst::Temp { id, ty, value } => {
             if sync::emit_math_temp(out, *id, value)? {
@@ -3435,7 +3505,7 @@ fn c_move_place(expr: &IrExpr) -> KuResult<Option<String>> {
             let IrType::Named(type_name) = &target.ty else {
                 return Ok(None);
             };
-            if type_name == "__ku_object"
+            if c_object_type_name(type_name)
                 || type_name == "__ku_value"
                 || type_name == "__ku_http_server"
                 || type_name == "__ku_time"
@@ -3517,7 +3587,7 @@ fn c_value_expr(expr: &IrExpr) -> KuResult<String> {
             }
         }
         if let Some(place) = c_move_place(expr)? {
-            return Ok(if name == "__ku_object" {
+            return Ok(if c_object_type_name(name) {
                 format!("ku_object_move(&{place})")
             } else if name == "__ku_value" {
                 format!("ku_value_move(&{place})")
@@ -3581,7 +3651,7 @@ fn c_clone_expr(expr: &IrExpr) -> KuResult<String> {
         IrType::Named(name) if name == "__ku_error_type" => {
             Ok(format!("ku_error_clone({})", c_expr(expr)?))
         }
-        IrType::Named(name) if name == "__ku_object" => {
+        IrType::Named(name) if c_object_type_name(name) => {
             Ok(format!("ku_object_clone({})", c_expr(expr)?))
         }
         IrType::Named(name) if name == "__ku_value" => {
@@ -3645,7 +3715,7 @@ fn c_error_expr(value: &IrExpr, default_code: &str) -> KuResult<String> {
 fn dynamic_object_store_target(target: &IrLValue) -> bool {
     match target {
         IrLValue::Field { target, .. } | IrLValue::Index { target, .. } => {
-            matches!(&target.ty, IrType::Named(name) if name == "__ku_object")
+            matches!(&target.ty, IrType::Named(name) if c_object_type_name(name))
         }
         IrLValue::Local(_) => false,
     }
@@ -3792,7 +3862,7 @@ fn c_type(ty: &IrType) -> KuResult<String> {
         IrType::Array(inner) => c_array_type(inner),
         IrType::Result(inner) => c_result_type(inner),
         IrType::Named(name) if name == "__ku_error_type" => Ok("KuError".to_string()),
-        IrType::Named(name) if name == "__ku_object" => Ok("KuObject*".to_string()),
+        IrType::Named(name) if c_object_type_name(name) => Ok("KuObject*".to_string()),
         IrType::Named(name) if name == "__ku_value" => Ok("KuValue".to_string()),
         IrType::Named(name) if name == "__ku_time" => Ok("KuTime".to_string()),
         // Stage 8a: the native HTTP server is a heap pointer shared between route
@@ -4911,7 +4981,7 @@ fn collect_kuvalue_array_element_type(ty: &IrType, output: &mut Vec<IrType>) {
 fn kuvalue_array_element_supported(ty: &IrType) -> bool {
     match ty {
         IrType::Int | IrType::Float | IrType::Bool | IrType::Str | IrType::Null => true,
-        IrType::Named(name) => name == "__ku_object" || name == "__ku_value",
+        IrType::Named(name) => c_object_type_name(name) || name == "__ku_value",
         IrType::Array(inner) => kuvalue_array_element_supported(inner),
         _ => false,
     }
@@ -5129,7 +5199,7 @@ fn collect_json_writer_types(ty: &IrType, program: &IrProgram, output: &mut Vec<
 fn json_typed_root_required(ty: &IrType) -> bool {
     match ty {
         IrType::Array(_) | IrType::Result(_) => true,
-        IrType::Named(name) => name != "__ku_object" && name != "__ku_value",
+        IrType::Named(name) => !c_object_type_name(name) && name != "__ku_value",
         _ => false,
     }
 }
@@ -5176,7 +5246,7 @@ fn json_typed_write_call(
             "ku_json_write_typed_{}({output}, {expression}, {depth}, {error})",
             c_type_suffix(ty)?
         )),
-        IrType::Named(name) if name == "__ku_object" => Ok(format!(
+        IrType::Named(name) if c_object_type_name(name) => Ok(format!(
             "ku_json_write_value({output}, ku_v_object({expression}), {depth}, {error})"
         )),
         IrType::Named(name) if name == "__ku_value" => Ok(format!(
@@ -6820,7 +6890,7 @@ fn try_emit_object_construction(out: &mut COutput, target: &str, value: &IrExpr)
     else {
         return Ok(false);
     };
-    if name != "__ku_object" {
+    if !c_object_type_name(name) {
         return Ok(false);
     }
     out.push_str(&format!(
@@ -6878,7 +6948,7 @@ fn ku_value_wrap(ty: &IrType, expr: &str) -> KuResult<String> {
         IrType::Float => Ok(format!("ku_v_float({expr})")),
         IrType::Bool => Ok(format!("ku_v_bool({expr})")),
         IrType::Null => Ok("ku_v_null()".to_string()),
-        IrType::Named(name) if name == "__ku_object" => Ok(format!("ku_v_object({expr})")),
+        IrType::Named(name) if c_object_type_name(name) => Ok(format!("ku_v_object({expr})")),
         IrType::Named(name) if name == "__ku_value" => Ok(expr.to_string()),
         IrType::Array(element) => Ok(format!(
             "ku_v_typed_array_{}({expr})",
@@ -6916,7 +6986,7 @@ fn ku_value_borrow_wrap(ty: &IrType, expr: &str) -> KuResult<Option<String>> {
         IrType::Float => format!("ku_v_float({expr})"),
         IrType::Bool => format!("ku_v_bool({expr})"),
         IrType::Null => "ku_v_null()".to_string(),
-        IrType::Named(name) if name == "__ku_object" => format!("ku_v_object({expr})"),
+        IrType::Named(name) if c_object_type_name(name) => format!("ku_v_object({expr})"),
         IrType::Named(name) if name == "__ku_value" => expr.to_string(),
         IrType::Closure {
             params,
@@ -8111,7 +8181,7 @@ fn program_uses_object(program: &IrProgram) -> bool {
 
 fn ir_type_uses_object(ty: &IrType) -> bool {
     match ty {
-        IrType::Named(name) => name == "__ku_object" || name == "__ku_value",
+        IrType::Named(name) => c_object_type_name(name) || name == "__ku_value",
         IrType::Array(inner) | IrType::Result(inner) => ir_type_uses_object(inner),
         _ => false,
     }
@@ -8139,7 +8209,7 @@ fn expr_uses_object(expr: &IrExpr) -> bool {
     match &expr.kind {
         IrExprKind::Call { callee, args, kind } => {
             matches!(kind, IrCallKind::Intrinsic(name)
-                if name == "__ku_object"
+                if c_object_type_name(name)
                     || name == "json.stringify"
                     || name == "json.encode"
                     || name == "json.parse"
@@ -15977,7 +16047,7 @@ fn expr_mentions_native_tls_config(expr: &IrExpr) -> bool {
         ..
     } = &expr.kind
     {
-        if name == "__ku_object"
+        if c_object_type_name(name)
             && args
                 .as_chunks::<2>()
                 .0
@@ -16644,8 +16714,8 @@ fn c_net_intrinsic_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
 /// Lower a `string.<method>` intrinsic. The receiver and any string arguments are
 /// read as borrows (`c_expr`): the helpers only read them, so the caller's cleanup
 /// still owns and drops the originals. Byte/codepoint-exact to the interpreter's
-/// Rust semantics; the Unicode-table-dependent methods (trim/lower/upper) are loud
-/// gaps rather than silent ASCII-only divergences.
+/// Rust semantics, including Unicode transforms generated from the same pinned
+/// Rust implementation used by the interpreter.
 fn c_string_method_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
     let recv = args
         .first()
@@ -16689,11 +16759,7 @@ fn c_string_method_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
             arg(1)?,
             arg(2)?
         )),
-        // Exact parity needs a Unicode case/whitespace table; ASCII-only versions
-        // would silently diverge from the interpreter on non-ASCII input.
-        "trim" | "lower" | "upper" => Err(unsupported(format!(
-            "native C string.{method}() needs Unicode support and is not implemented yet"
-        ))),
+        "trim" | "lower" | "upper" => Ok(format!("ku_string_unicode_{method}({})", c_expr(recv)?)),
         other => Err(unsupported(format!(
             "native C string.{other}() is not implemented yet"
         ))),
@@ -16701,6 +16767,14 @@ fn c_string_method_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
 }
 
 fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String> {
+    if let Some((module, method)) = name.split_once('.') {
+        if matches!(module, "zstd" | "gzip" | "deflate") {
+            return compression::intrinsic_expr(module, method, args);
+        }
+    }
+    if let Some(expr) = http_status::expression(name, args)? {
+        return Ok(expr);
+    }
     if let Some(expr) = c_http_intrinsic_expr(name, args)? {
         return Ok(expr);
     }
@@ -17211,7 +17285,7 @@ fn c_zero_value(ty: &IrType) -> KuResult<String> {
         IrType::Float => Ok("0.0".to_string()),
         IrType::Bool => Ok("false".to_string()),
         IrType::Str => Ok("(KuString){0}".to_string()),
-        IrType::Named(name) if name == "__ku_object" => Ok("NULL".to_string()),
+        IrType::Named(name) if c_object_type_name(name) => Ok("NULL".to_string()),
         IrType::Named(name) if name == "__ku_value" => Ok("ku_v_null()".to_string()),
         IrType::Named(name) if name == "__ku_time" => Ok("(KuTime){0}".to_string()),
         IrType::Named(name) if name == "__ku_http_server" => Ok("NULL".to_string()),
@@ -17236,7 +17310,7 @@ fn c_zero_initializer(ty: &IrType) -> KuResult<String> {
         IrType::Float => Ok("0.0".to_string()),
         IrType::Bool => Ok("false".to_string()),
         IrType::Str => Ok("(KuString){0}".to_string()),
-        IrType::Named(name) if name == "__ku_object" => Ok("NULL".to_string()),
+        IrType::Named(name) if c_object_type_name(name) => Ok("NULL".to_string()),
         IrType::Named(name) if name == "__ku_value" => Ok("ku_v_null()".to_string()),
         IrType::Named(name) if name == "__ku_time" => Ok("(KuTime){0}".to_string()),
         IrType::Named(name) if name == "__ku_http_server" => Ok("NULL".to_string()),
@@ -17286,7 +17360,7 @@ fn c_move_value(ty: &IrType, place: &str) -> KuResult<String> {
             "ku_result_move_{}(&{place})",
             c_type_suffix(inner)?
         )),
-        IrType::Named(name) if name == "__ku_object" => Ok(format!("ku_object_move(&{place})")),
+        IrType::Named(name) if c_object_type_name(name) => Ok(format!("ku_object_move(&{place})")),
         IrType::Named(name) if name == "__ku_value" => Ok(format!("ku_value_move(&{place})")),
         IrType::Named(name) if name == "__ku_time" => Ok(place.to_string()),
         IrType::Named(name) if name == "__ku_http_server" => Ok(place.to_string()),
@@ -17320,7 +17394,7 @@ fn c_clone_value(ty: &IrType, expression: &str) -> KuResult<String> {
         IrType::Named(name) if name == "__ku_error_type" => {
             Ok(format!("ku_error_clone({expression})"))
         }
-        IrType::Named(name) if name == "__ku_object" => {
+        IrType::Named(name) if c_object_type_name(name) => {
             Ok(format!("ku_object_clone({expression})"))
         }
         IrType::Named(name) if name == "__ku_value" => Ok(format!("ku_value_clone({expression})")),
@@ -17361,7 +17435,7 @@ fn c_drop_value(ty: &IrType, expression: &str) -> KuResult<String> {
         IrType::Named(name) if name == "__ku_error_type" => {
             Ok(format!("ku_error_drop(&{expression});"))
         }
-        IrType::Named(name) if name == "__ku_object" => {
+        IrType::Named(name) if c_object_type_name(name) => {
             Ok(format!("ku_object_drop({expression});"))
         }
         IrType::Named(name) if name == "__ku_value" => {
@@ -17622,7 +17696,7 @@ fn emit_drop_expr(out: &mut COutput, ty: &IrType, expression: &str) -> KuResult<
             out.push_str(&format!("  ku_error_drop(&{});\n", expression));
             Ok(())
         }
-        IrType::Named(name) if name == "__ku_object" => {
+        IrType::Named(name) if c_object_type_name(name) => {
             out.push_str(&format!("  ku_object_drop({expression});\n"));
             out.push_str(&format!("  {expression} = NULL;\n"));
             Ok(())
