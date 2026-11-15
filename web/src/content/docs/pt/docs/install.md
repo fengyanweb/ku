@@ -71,7 +71,7 @@ Compare o SHA-256 do pacote com [SHA256SUMS](https://github.com/fengyanweb/ku/re
 <details>
 <summary>Compilar seus próprios programas Ku</summary>
 
-`ku run` e `ku check` não exigem Rust. O `ku build` padrão exige um vinculador do sistema e a identidade exata do compilador Rust registrada no SDK instalado; os pacotes v0.0.20 usam **Rust 1.99.1**. `ku build --backend c` exige um compilador C e um vinculador para o destino. Programas nativos de banco de dados também precisam das bibliotecas cliente correspondentes, não incluídas no pacote.
+`ku run` e `ku check` não exigem Rust. `ku build --backend runner` exige um vinculador do sistema e a identidade exata do compilador Rust registrada no SDK instalado; os pacotes v0.0.20 usam **Rust 1.99.1**. `ku build --backend c` exige um compilador C e um vinculador para o destino. Programas nativos de banco de dados também precisam das bibliotecas cliente correspondentes, não incluídas no pacote.
 
 </details>
 

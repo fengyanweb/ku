@@ -59,13 +59,13 @@ Prima atribuire declară o variabilă. Un tip explicit folosește `name:type = v
 
 ## Construirea unui executabil
 
-Pagina de instalare enumeră instrumentele necesare. Pentru backendul implicit:
+Pagina de instalare enumeră instrumentele necesare. Pentru Runner:
 
 ```sh
-ku build hello.ku
+ku build --backend runner hello.ku
 ```
 
-Backendul implicit împachetează un lansator al interpretorului. Compilarea nativă prin C necesită un compilator C separat:
+`--backend runner` împachetează un lansator al interpretorului. Compilarea nativă prin C necesită un compilator C separat:
 
 ```sh
 ku build --backend c hello.ku

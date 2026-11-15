@@ -59,13 +59,13 @@ println(count)
 
 ## 構建可執行文件
 
-安裝頁列出了構建工具前置要求。預設構建：
+安裝頁列出了構建工具前置要求。Runner 構建：
 
 ```sh
-ku build hello.ku
+ku build --backend runner hello.ku
 ```
 
-預設後端生成解釋器打包型可執行文件。native C 後端需要單獨的 C 編譯器：
+`--backend runner`生成解釋器打包型可執行文件。native C 後端需要單獨的 C 編譯器：
 
 ```sh
 ku build --backend c hello.ku

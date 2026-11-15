@@ -71,7 +71,7 @@ Compară SHA-256 al pachetului cu [SHA256SUMS](https://github.com/fengyanweb/ku/
 <details>
 <summary>Compilarea propriilor programe Ku</summary>
 
-`ku run` și `ku check` nu necesită Rust. `ku build` implicit necesită un linker de sistem și identitatea exactă a compilatorului Rust înregistrată în SDK-ul instalat; pachetele v0.0.20 folosesc **Rust 1.99.1**. `ku build --backend c` necesită un compilator C și un linker pentru platforma țintă. Programele native pentru baze de date necesită și bibliotecile client corespunzătoare, care nu sunt incluse.
+`ku run` și `ku check` nu necesită Rust. `ku build --backend runner` necesită un linker de sistem și identitatea exactă a compilatorului Rust înregistrată în SDK-ul instalat; pachetele v0.0.20 folosesc **Rust 1.99.1**. `ku build --backend c` necesită un compilator C și un linker pentru platforma țintă. Programele native pentru baze de date necesită și bibliotecile client corespunzătoare, care nu sunt incluse.
 
 </details>
 

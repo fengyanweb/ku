@@ -59,13 +59,13 @@ Pierwsze przypisanie deklaruje zmienną. Jawny typ zapisuje się jako `name:type
 
 ## Budowanie pliku wykonywalnego
 
-Strona instalacji wymienia wymagane narzędzia. Dla domyślnego zaplecza:
+Strona instalacji wymienia wymagane narzędzia. Dla Runnera:
 
 ```sh
-ku build hello.ku
+ku build --backend runner hello.ku
 ```
 
-Domyślne zaplecze pakuje program uruchamiający interpreter. Natywna kompilacja przez C wymaga osobnego kompilatora C:
+`--backend runner` pakuje program uruchamiający interpreter. Natywna kompilacja przez C wymaga osobnego kompilatora C:
 
 ```sh
 ku build --backend c hello.ku

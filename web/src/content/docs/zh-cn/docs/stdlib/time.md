@@ -135,7 +135,7 @@ time.sleep(duration:Duration): null!
 
 ## 执行支持
 
-完整日历和时长 API 支持 `ku run` 与默认打包 runner。同步 native C 当前支持 `now()`、`instant()`、`elapsed(Time)`、`millis()` / `millis(Time)`（Time 来自 `instant()`）和 `steady_millis()`，不支持完整日历解析、格式化、自造 Time 对象与同步 sleep。native Task 有单独受限的整数 sleep 路径；LLVM 不提供完整时间库。
+完整日历和时长 API 支持 `ku run` 与`ku build --backend runner`。同步 native C 当前支持 `now()`、`instant()`、`elapsed(Time)`、`millis()` / `millis(Time)`（Time 来自 `instant()`）和 `steady_millis()`，不支持完整日历解析、格式化、自造 Time 对象与同步 sleep。native Task 有单独受限的整数 sleep 路径；LLVM 不提供完整时间库。
 
 <span id="native-task-wait"></span>
 

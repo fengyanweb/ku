@@ -71,7 +71,7 @@ Windows 打开“编辑账户的环境变量”，编辑用户 `Path`，新增�
 <details>
 <summary>编译自己的 Ku 程序</summary>
 
-`ku run` 和 `ku check` 不需要 Rust。默认 `ku build` 需要系统链接器，以及与安装包 SDK 记录完全匹配的 Rust 编译器；v0.0.20 发行包使用 **Rust 1.99.1**。`ku build --backend c` 需要目标平台的 C 编译器和链接器。原生数据库程序还需要对应的数据库客户端库，安装包不附带这些库。
+`ku run` 和 `ku check` 不需要 Rust。`ku build --backend runner` 需要系统链接器，以及与安装包 SDK 记录完全匹配的 Rust 编译器；v0.0.20 发行包使用 **Rust 1.99.1**。`ku build --backend c` 需要目标平台的 C 编译器和链接器。原生数据库程序还需要对应的数据库客户端库，安装包不附带这些库。
 
 </details>
 

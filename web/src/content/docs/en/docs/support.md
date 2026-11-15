@@ -23,7 +23,7 @@ sources:
 
 Choose the CLI package for your system and architecture on the [installation page](/en/docs/install/). Available packages and checksums are listed in the [Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.20).
 
-| Capability                 | Interpreter `ku run` / default runner                                     | Native C                                                  | Native Task path                                                                  |
+| Capability                 | Interpreter `ku run` / Runner (`--backend runner`)                        | Native C                                                  | Native Task path                                                                  |
 | -------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------- |
 | Language and local imports | Interpreter; runner embeds the entry but still needs local import sources | Supported source graph is expanded during generation      | Restricted typed subset                                                           |
 | JSON                       | General encode/decode                                                     | General synchronous encode/decode                         | Encode a scalar object literal only; no general decode                            |
@@ -32,7 +32,7 @@ Choose the CLI package for your system and architecture on the [installation pag
 | Time                       | Calendar, durations and waits                                             | Selected clocks                                           | Integer-millisecond sleep                                                         |
 | TCP, TLS and file I/O      | See the individual module                                                 | Selected native interfaces                                | Only explicitly lowered operations; not arbitrary network suspension              |
 
-See [HTTP](/en/docs/stdlib/http/), [JSON](/en/docs/stdlib/json/), [time](/en/docs/stdlib/time/) and [database clients](/en/docs/stdlib/database/) for parameters, errors and complete examples. Type checking is separate from backend compilation. Default runner builds need a matching Rust toolchain and archive layout; native builds need a target C compiler and relevant native libraries. The LLVM text backend remains a limited prototype.
+See [HTTP](/en/docs/stdlib/http/), [JSON](/en/docs/stdlib/json/), [time](/en/docs/stdlib/time/) and [database clients](/en/docs/stdlib/database/) for parameters, errors and complete examples. Type checking is separate from backend compilation. `ku build --backend runner` needs a matching Rust toolchain and archive layout; native builds need a target C compiler and relevant native libraries. The LLVM text backend remains a limited prototype.
 
 ## Task support
 

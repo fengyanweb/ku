@@ -135,7 +135,7 @@ Recoverable errors have domain `time`, with codes such as `invalid_date`, `inval
 
 ## Execution support
 
-The full calendar/duration API above is for `ku run` and the default packaged runner. Synchronous native C currently supports `now()`, `instant()`, `elapsed(Time)`, `millis()` / `millis(Time)` for values produced by `instant()`, and `steady_millis()`. Calendar parsing, formatting, configuration-like Time objects, and synchronous sleep are not part of that native subset. Native Task has its separately restricted integer sleep path; LLVM does not provide this complete library.
+The full calendar/duration API above is for `ku run` and `ku build --backend runner`. Synchronous native C currently supports `now()`, `instant()`, `elapsed(Time)`, `millis()` / `millis(Time)` for values produced by `instant()`, and `steady_millis()`. Calendar parsing, formatting, configuration-like Time objects, and synchronous sleep are not part of that native subset. Native Task has its separately restricted integer sleep path; LLVM does not provide this complete library.
 
 ## Native Task wait
 

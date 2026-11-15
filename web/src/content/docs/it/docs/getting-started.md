@@ -59,13 +59,13 @@ La prima assegnazione dichiara una variabile. Un tipo esplicito si indica con `n
 
 ## Compila un eseguibile
 
-La pagina di installazione elenca gli strumenti di compilazione necessari. Per il backend predefinito:
+La pagina di installazione elenca gli strumenti di compilazione necessari. Per Runner:
 
 ```sh
-ku build hello.ku
+ku build --backend runner hello.ku
 ```
 
-Il backend predefinito impacchetta un runner con interprete. La compilazione nativa in C richiede un compilatore C separato:
+`--backend runner` impacchetta un runner con interprete. La compilazione nativa in C richiede un compilatore C separato:
 
 ```sh
 ku build --backend c hello.ku

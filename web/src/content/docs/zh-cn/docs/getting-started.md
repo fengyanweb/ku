@@ -54,13 +54,13 @@ println(count)
 
 ## 构建可执行文件
 
-安装页列出了构建工具前置要求。默认构建：
+安装页列出了构建工具前置要求。Runner 构建：
 
 ```sh
-ku build hello.ku
+ku build --backend runner hello.ku
 ```
 
-默认后端生成解释器打包型可执行文件。native C 后端需要单独的 C 编译器：
+`--backend runner`生成解释器打包型可执行文件。native C 后端需要单独的 C 编译器：
 
 ```sh
 ku build --backend c hello.ku

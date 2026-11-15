@@ -59,13 +59,13 @@ Die erste Zuweisung deklariert eine Variable. Ein expliziter Typ wird mit `name:
 
 ## Eine ausführbare Datei erstellen
 
-Die Installationsseite nennt die benötigten Build-Werkzeuge. Für das Standard-Backend:
+Die Installationsseite nennt die benötigten Build-Werkzeuge. Für den Runner:
 
 ```sh
-ku build hello.ku
+ku build --backend runner hello.ku
 ```
 
-Das Standard-Backend verpackt einen Interpreter-Runner. Die native C-Kompilierung erfordert einen separaten C-Compiler:
+`--backend runner` verpackt einen Interpreter-Runner. Die native C-Kompilierung erfordert einen separaten C-Compiler:
 
 ```sh
 ku build --backend c hello.ku

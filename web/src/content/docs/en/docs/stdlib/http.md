@@ -22,7 +22,7 @@ sidebar:
 
 `std.http` provides an HTTP client, route registration, and complete response values. Save the server and client below in separate files.
 
-The first server and client examples use **the interpreter (`ku run`) or the default runner**. Native C supports synchronous JSON responses but not the module-level HTTP client. Use the [native C example](#native-c) or the [named async handler example](#named-async-native-handlers) for native programs.
+The first server and client examples use **the interpreter (`ku run`) or `ku build --backend runner`**. Native C supports synchronous JSON responses but not the module-level HTTP client. Use the [native C example](#native-c) or the [named async handler example](#named-async-native-handlers) for native programs.
 
 ## Start a server
 
@@ -151,7 +151,7 @@ Client errors use domain `http`; codes include `invalid_method`, `invalid_url`, 
 | `req.headers` | object of strings | Request headers; lowercase names |
 | `req.body`    | str               | UTF-8 request body               |
 
-Use `req.query.get_or("q", "")` for an optional field in interpreted code. Ordinary missing-key reads fail in the interpreter; native HTTP request-map field reads currently return an empty string for a missing key. Do not rely on a missing required field being rejected consistently across these paths. Inline `fn(req)` gives the checker the request-field context. The interpreter and default runner do not expose a nominal `HttpRequest` parameter type for ordinary handlers; native async handler annotations are described below.
+Use `req.query.get_or("q", "")` for an optional field in interpreted code. Ordinary missing-key reads fail in the interpreter; native HTTP request-map field reads currently return an empty string for a missing key. Do not rely on a missing required field being rejected consistently across these paths. Inline `fn(req)` gives the checker the request-field context. The interpreter and Runner (`--backend runner`) do not expose a nominal `HttpRequest` parameter type for ordinary handlers; native async handler annotations are described below.
 
 ## Responses and status codes
 
@@ -231,7 +231,7 @@ The listener holds the bound socket until it is run, explicitly closed, or its l
 
 ## Execution support
 
-`ku run` and the default packaged runner support the complete server/client examples above. Synchronous native C supports `app.listen(...)` with `text/html/json/empty/redirect` responses. `http.json(value)` and `http.json(status, value)` use the synchronous JSON writer and set `application/json; charset=utf-8`; they return a response, not a Result. Invalid status or unsupported encoding fails the handler (500), rather than becoming an ordinary recoverable Result. Native C does not implement `http.statusText`, the module-level HTTP client, or `bind/run/close`. Named async native handlers use the restricted path below; it does not provide the complete interface above. LLVM does not provide this HTTP library.
+`ku run` and `ku build --backend runner` support the complete server/client examples above. Synchronous native C supports `app.listen(...)` with `text/html/json/empty/redirect` responses. `http.json(value)` and `http.json(status, value)` use the synchronous JSON writer and set `application/json; charset=utf-8`; they return a response, not a Result. Invalid status or unsupported encoding fails the handler (500), rather than becoming an ordinary recoverable Result. Native C does not implement `http.statusText`, the module-level HTTP client, or `bind/run/close`. Named async native handlers use the restricted path below; it does not provide the complete interface above. LLVM does not provide this HTTP library.
 
 For a server that can also be compiled to native C, save the following as `native-server.ku`. `/users/42` returns the plain text `42` in this version:
 

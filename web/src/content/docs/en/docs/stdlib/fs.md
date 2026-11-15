@@ -70,4 +70,4 @@ Handle errors with `?` or the `try/catch` shown above. There is no public binary
 
 ## Execution support
 
-The six calls are implemented for the interpreter, default packaged runner, and synchronous native C. The restricted native Task path also supports these file/directory operations through its bounded background pool; the call itself can suspend without an additional `await`. A running OS operation is not forcibly rolled back by cancellation, and the native Task path rejects submissions from `finally`. LLVM does not implement this complete module.
+The six calls are implemented for the interpreter, Runner, and synchronous native C. The restricted native Task path also supports these file/directory operations through its bounded background pool; the call itself can suspend without an additional `await`. A running OS operation is not forcibly rolled back by cancellation, and the native Task path rejects submissions from `finally`. LLVM does not implement this complete module.

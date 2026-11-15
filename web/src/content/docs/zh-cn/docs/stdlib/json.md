@@ -99,7 +99,7 @@ Ku
 
 ## 后端支持
 
-解释器、默认打包 runner 和同步 native C 支持上面的通用接口。native Task 只支持下文编码子集，不支持通用解析/解码；LLVM 不提供此库。默认 runner 的 import 仍依赖原始源码位置。
+解释器、`ku build --backend runner` 和同步 native C 支持上面的通用接口。native Task 只支持下文编码子集，不支持通用解析/解码；LLVM 不提供此库。Runner（`--backend runner`） 的 import 仍依赖原始源码位置。
 
 完整行为见[JSON 语法合同](https://github.com/fengyanweb/ku/blob/v0.0.20/docs/syntax.md#127-json)。
 

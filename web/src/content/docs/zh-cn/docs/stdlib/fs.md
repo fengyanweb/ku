@@ -70,4 +70,4 @@ fn main(): null! {
 
 ## 执行支持
 
-六个接口支持解释器、默认打包 runner 和同步 native C。受限 native Task 路径也通过固定容量的后台池支持这些文件和目录操作，调用本身可挂起，无需额外 `await`。取消不能撤回已经执行的 OS 操作，native Task 在 `finally` 中不允许提交这类操作。LLVM 不提供完整文件模块。
+六个接口支持解释器、`ku build --backend runner` 和同步 native C。受限 native Task 路径也通过固定容量的后台池支持这些文件和目录操作，调用本身可挂起，无需额外 `await`。取消不能撤回已经执行的 OS 操作，native Task 在 `finally` 中不允许提交这类操作。LLVM 不提供完整文件模块。

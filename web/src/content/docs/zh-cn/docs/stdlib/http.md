@@ -22,7 +22,7 @@ sidebar:
 
 `std.http` 提供 HTTP 客户端、路由注册和完整响应对象。下面的服务端和客户端分别保存为两个文件。
 
-下面的服务端与客户端示例使用**解释器（`ku run`）或默认 runner**。native C 支持同步 JSON 响应，但不提供模块级 HTTP 客户端。原生程序可参考[同步 native C 示例](#native-c)或[具名 async handler 示例](#具名-async-native-handler)。
+下面的服务端与客户端示例使用**解释器（`ku run`）或Runner（`--backend runner`）**。native C 支持同步 JSON 响应，但不提供模块级 HTTP 客户端。原生程序可参考[同步 native C 示例](#native-c)或[具名 async handler 示例](#具名-async-native-handler)。
 
 ## 启动服务
 
@@ -151,7 +151,7 @@ HTTP 404、500 等状态仍然返回 `Ok(HttpResponse)`，应检查 `response.st
 | `req.headers` | 字符串值对象 | 请求 header，名称小写 |
 | `req.body`    | str          | UTF-8 请求体          |
 
-解释器中可选查询参数使用 `req.query.get_or("q", "")`。普通缺键读取在解释器中报错，而 native HTTP 请求映射的字段读取目前在缺键时返回空字符串。不要依赖这两条路径一致地拒绝缺失必填字段。使用内联 `fn(req)`，检查器才能从路由上下文识别请求字段。解释器和默认 runner 的普通 handler 路径没有公开的 `HttpRequest` 名义参数类型；native async handler 的类型注解见下文。
+解释器中可选查询参数使用 `req.query.get_or("q", "")`。普通缺键读取在解释器中报错，而 native HTTP 请求映射的字段读取目前在缺键时返回空字符串。不要依赖这两条路径一致地拒绝缺失必填字段。使用内联 `fn(req)`，检查器才能从路由上下文识别请求字段。解释器和Runner（`--backend runner`） 的普通 handler 路径没有公开的 `HttpRequest` 名义参数类型；native async handler 的类型注解见下文。
 
 ## 响应与状态码
 
@@ -231,7 +231,7 @@ listener 持有绑定的 socket，直到开始运行、显式关闭或最后一�
 
 ## 执行支持
 
-`ku run` 和默认打包 runner 支持上面的完整服务端、客户端示例。同步 native C 支持 `app.listen(...)` 和 `text/html/json/empty/redirect` 响应。`http.json(value)`、`http.json(status, value)` 使用同步 JSON writer，设置 `application/json; charset=utf-8`，返回响应而非 Result；状态非法或编码不支持时 handler 失败（500），不是普通可恢复 Result。native C 不支持 `http.statusText`、模块级 HTTP 客户端及 `bind/run/close`。具名 async native handler 使用下文受限路径，不提供上面的完整接口；LLVM 不提供本 HTTP 库。
+`ku run` 和`ku build --backend runner` 支持上面的完整服务端、客户端示例。同步 native C 支持 `app.listen(...)` 和 `text/html/json/empty/redirect` 响应。`http.json(value)`、`http.json(status, value)` 使用同步 JSON writer，设置 `application/json; charset=utf-8`，返回响应而非 Result；状态非法或编码不支持时 handler 失败（500），不是普通可恢复 Result。native C 不支持 `http.statusText`、模块级 HTTP 客户端及 `bind/run/close`。具名 async native handler 使用下文受限路径，不提供上面的完整接口；LLVM 不提供本 HTTP 库。
 
 需要编译为 native C 时，保存下列服务为 `native-server.ku`。这个版本的 `/users/42` 返回纯文本 `42`：
 

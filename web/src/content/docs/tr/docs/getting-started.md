@@ -59,13 +59,13 @@ println(count)
 
 ## Yürütülebilir dosya oluşturun
 
-Kurulum sayfası gerekli derleme araçlarını listeler. Varsayılan arka uç için:
+Kurulum sayfası gerekli derleme araçlarını listeler. Runner için:
 
 ```sh
-ku build hello.ku
+ku build --backend runner hello.ku
 ```
 
-Varsayılan arka uç bir yorumlayıcı çalıştırıcısını paketler. C üzerinden yerel derleme ayrı bir C derleyicisi gerektirir:
+`--backend runner` bir yorumlayıcı çalıştırıcısını paketler. C üzerinden yerel derleme ayrı bir C derleyicisi gerektirir:
 
 ```sh
 ku build --backend c hello.ku

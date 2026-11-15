@@ -36,9 +36,9 @@ Owned arguments transfer ownership into an async call. Clone explicitly if the c
 
 ## Operations that can wait
 
-This table applies to **0.0.20**. The default runner follows the interpreter; native Task uses a separate bounded typed subset.
+This table applies to **0.0.20**. `ku build --backend runner` follows the interpreter; native Task uses a separate bounded typed subset.
 
-| Operation                 | Interpreter / default runner                               | Restricted native Task                                                                                              |
+| Operation                 | Interpreter / Runner (`--backend runner`)                  | Restricted native Task                                                                                              |
 | ------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | async calls and await     | Single-use Tasks                                           | Listed combinations of primitives, strings, flat arrays, single-layer Results, and function values                  |
 | Integer `time.sleep(ms)?` | Blocking-worker wait                                       | Driver timer; no file background worker occupied                                                                    |

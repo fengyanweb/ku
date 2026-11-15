@@ -95,4 +95,4 @@ This is a small flat-configuration reader, not a complete YAML implementation. N
 
 `config.yaml` errors use `{ domain: "config", code: "read_failed", message: ... }`, including parse failures. `env` and `env_file` do not return Result; use `yaml` where recoverable file/parse errors are required. `?` is only appropriate on `yaml`, not `env/env_file`.
 
-The module is implemented for `ku run` and the default packaged runner. Synchronous native C, native Task, and LLVM do not provide these configuration APIs. Async interpreted calls can use the existing blocking-worker path; that does not change file syntax or return types.
+The module is implemented for `ku run` and `ku build --backend runner`. Synchronous native C, native Task, and LLVM do not provide these configuration APIs. Async interpreted calls can use the existing blocking-worker path; that does not change file syntax or return types.

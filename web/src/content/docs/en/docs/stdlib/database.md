@@ -18,7 +18,7 @@ sidebar:
   order: 9
 ---
 
-Ku provides bounded, pooled clients through `std.pg`, `std.redis`, and `std.mysql`. These are **native C APIs**. The interpreter and its default packaged runner do not implement database clients. Constructors return Results; a connected client is move-only and is released at scope exit or by consuming `client.close()`.
+Ku provides bounded, pooled clients through `std.pg`, `std.redis`, and `std.mysql`. These are **native C APIs**. The interpreter and its Runner do not implement database clients. Constructors return Results; a connected client is move-only and is released at scope exit or by consuming `client.close()`.
 
 ## Build and dependencies
 

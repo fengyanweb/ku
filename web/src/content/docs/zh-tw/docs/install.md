@@ -71,7 +71,7 @@ Windows 開啟「編輯帳戶的環境變數」，編輯使用者 `Path`，新�
 <details>
 <summary>編譯自己的 Ku 程式</summary>
 
-`ku run` 和 `ku check` 不需要 Rust。預設 `ku build` 需要系統連結器，以及與套件 SDK 記錄完全相符的 Rust 編譯器；v0.0.20 發行套件使用 **Rust 1.99.1**。`ku build --backend c` 需要目標平台的 C 編譯器和連結器。原生資料庫程式還需要相符的資料庫用戶端函式庫，套件不包含這些函式庫。
+`ku run` 和 `ku check` 不需要 Rust。`ku build --backend runner` 需要系統連結器，以及與套件 SDK 記錄完全相符的 Rust 編譯器；v0.0.20 發行套件使用 **Rust 1.99.1**。`ku build --backend c` 需要目標平台的 C 編譯器和連結器。原生資料庫程式還需要相符的資料庫用戶端函式庫，套件不包含這些函式庫。
 
 </details>
 

@@ -71,7 +71,7 @@ Confronta lo SHA-256 del pacchetto con [SHA256SUMS](https://github.com/fengyanwe
 <details>
 <summary>Compilare i propri programmi Ku</summary>
 
-`ku run` e `ku check` non richiedono Rust. `ku build` richiede un linker di sistema e l’esatta identità del compilatore Rust registrata nell’SDK installato; i pacchetti v0.0.20 usano **Rust 1.99.1**. `ku build --backend c` richiede un compilatore C e un linker per la destinazione. I programmi nativi per database richiedono anche le librerie client corrispondenti, non incluse nel pacchetto.
+`ku run` e `ku check` non richiedono Rust. `ku build --backend runner` richiede un linker di sistema e l’esatta identità del compilatore Rust registrata nell’SDK installato; i pacchetti v0.0.20 usano **Rust 1.99.1**. `ku build --backend c` richiede un compilatore C e un linker per la destinazione. I programmi nativi per database richiedono anche le librerie client corrispondenti, non incluse nel pacchetto.
 
 </details>
 

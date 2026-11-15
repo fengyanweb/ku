@@ -36,9 +36,9 @@ Owned 参数传入异步函数时转移所有权，需要保留来源时显式 c
 
 ## 哪些操作可以等待
 
-下表对应 **0.0.20**。默认 runner 使用解释器路径，native Task 是独立的有界 typed 子集。
+下表对应 **0.0.20**。Runner（`--backend runner`） 使用解释器路径，native Task 是独立的有界 typed 子集。
 
-| 操作                       | 解释器 / 默认 runner                    | 受限 native Task                                                                    |
+| 操作                       | 解释器 / Runner（`--backend runner`）   | 受限 native Task                                                                    |
 | -------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------- |
 | async 调用与 await         | 支持一次性 Task                         | 已列出的 primitive、字符串、平面数组、单层 Result 和函数值组合                      |
 | 整数毫秒 `time.sleep(ms)?` | 通过 blocking worker 等待               | driver timer 等待；不占文件后台 worker                                              |

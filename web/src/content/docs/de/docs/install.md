@@ -71,7 +71,7 @@ Vergleichen Sie die SHA-256-Prüfsumme des Pakets mit [SHA256SUMS](https://githu
 <details>
 <summary>Eigene Ku-Programme kompilieren</summary>
 
-`ku run` und `ku check` benötigen kein Rust. Der Standard-Build mit `ku build` benötigt einen System-Linker und die exakte Rust-Compiler-Identität aus dem installierten SDK; v0.0.20-Pakete verwenden **Rust 1.99.1**. `ku build --backend c` benötigt C-Compiler und Linker der Zielplattform. Native Datenbankprogramme benötigen zusätzlich passende, nicht mitgelieferte Clientbibliotheken.
+`ku run` und `ku check` benötigen kein Rust. `ku build --backend runner` benötigt einen System-Linker und die exakte Rust-Compiler-Identität aus dem installierten SDK; v0.0.20-Pakete verwenden **Rust 1.99.1**. `ku build --backend c` benötigt C-Compiler und Linker der Zielplattform. Native Datenbankprogramme benötigen zusätzlich passende, nicht mitgelieferte Clientbibliotheken.
 
 </details>
 

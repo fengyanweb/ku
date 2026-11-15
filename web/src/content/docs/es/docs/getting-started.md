@@ -59,13 +59,13 @@ La primera asignación declara una variable. Para indicar un tipo explícito se 
 
 ## Genera un ejecutable
 
-La página de instalación enumera las herramientas de compilación necesarias. Para el backend predeterminado:
+La página de instalación enumera las herramientas de compilación necesarias. Para Runner:
 
 ```sh
-ku build hello.ku
+ku build --backend runner hello.ku
 ```
 
-El backend predeterminado empaqueta un ejecutor con intérprete. La compilación nativa en C requiere un compilador de C independiente:
+`--backend runner` empaqueta un ejecutor con intérprete. La compilación nativa en C requiere un compilador de C independiente:
 
 ```sh
 ku build --backend c hello.ku

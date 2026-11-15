@@ -59,13 +59,13 @@ La première affectation déclare une variable. Un type explicite s'écrit `name
 
 ## Construire un exécutable
 
-La page d'installation indique les outils de compilation nécessaires. Pour le backend par défaut :
+La page d'installation indique les outils de compilation nécessaires. Pour le Runner :
 
 ```sh
-ku build hello.ku
+ku build --backend runner hello.ku
 ```
 
-Le backend par défaut empaquette un lanceur avec interpréteur. La compilation native en C nécessite un compilateur C distinct :
+`--backend runner` empaquette un lanceur avec interpréteur. La compilation native en C nécessite un compilateur C distinct :
 
 ```sh
 ku build --backend c hello.ku

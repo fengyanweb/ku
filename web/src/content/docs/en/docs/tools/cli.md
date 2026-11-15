@@ -6,7 +6,7 @@ verifiedAt: '2026-10-30'
 sources: ['src/cli.rs', 'docs/package.md', 'docs/process-execution.md']
 ---
 
-Use `ku -v` to print the version and `ku --help` for the installed CLI's top-level help.
+Use `ku -v` to print the version and `ku --help` for the installed CLI's top-level help. Build examples select a backend explicitly; consult `ku build --help` for the installed version's default.
 
 ## Everyday commands
 
@@ -29,7 +29,7 @@ ku ./hello.ku
 | `ku check main.ku`                              | Check without executing                                           |
 | `ku check --json main.ku`                       | Emit JSON Lines diagnostics; silent on success                    |
 | `ku run main.ku`                                | Interpret a program                                               |
-| `ku build main.ku`                              | Build using Debug / Runner defaults                               |
+| `ku build --backend c main.ku`                  | Native C build using the Debug profile                            |
 | `ku build --backend c --release main.ku -o app` | Compile and link a native C program                               |
 | `ku ir main.ku`                                 | Print optimized Ku IR                                             |
 | `ku llvm empty.ku`                              | Emit experimental LLVM text IR, not an executable                 |
@@ -75,13 +75,13 @@ Prefix special filenames with a relative path, such as `ku ./-hello.ku`, or `ku 
 
 ## Which artifact is built?
 
-| Invocation                                       | Artifact and requirements                                                                                                             |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `ku build hello.ku`                              | Default Debug / Runner: a Rust wrapper packages interpreter execution; requires Rust matching the bundled runtime and a system linker |
-| `ku build --backend c --release hello.ku -o app` | A native C executable; requires a supported C compiler/linker and native libraries used by the program                                |
-| `ku build --emit-c hello.ku`                     | Still Runner by default, with additional C output; neither a C-only build nor a workaround for mismatched Runner toolchains           |
-| `ku build --backend llvm empty.ku`               | Currently LLVM text IR, without a complete executable-linking path                                                                    |
-| `ku package pack`                                | A source distribution, distinct from the program artifacts above                                                                      |
+| Invocation                                       | Artifact and requirements                                                                                                     |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `ku build --backend runner hello.ku`             | Debug / Runner: a Rust wrapper packages interpreter execution; requires Rust matching the bundled runtime and a system linker |
+| `ku build --backend c --release hello.ku -o app` | A native C executable; requires a supported C compiler/linker and native libraries used by the program                        |
+| `ku build --backend runner --emit-c hello.ku`    | Runner with additional C output; neither a C-only build nor a workaround for mismatched Runner toolchains                     |
+| `ku build --backend llvm empty.ku`               | Currently LLVM text IR, without a complete executable-linking path                                                            |
+| `ku package pack`                                | A source distribution, distinct from the program artifacts above                                                              |
 
 `check`, `run` and implicit execution need no Rust/C compiler. Runner embeds the entry file only; local imports still need their original module sources at runtime. Native C expands the import graph into a program independent of Ku source. Default output is under `.ku/build/<profile>/`; use the actual path printed by the CLI. Give Windows executables an `.exe` suffix.
 

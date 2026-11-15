@@ -1,6 +1,6 @@
 ---
 title: 平台与后端支持
-description: 区分 Ku 已发布平台、解释器、默认 runner、native C、Task 子集与 LLVM 的能力。
+description: 区分 Ku 已发布平台、解释器、Runner、native C、Task 子集与 LLVM 的能力。
 kuVersion: '0.0.20'
 verifiedAt: '2026-10-28'
 sources:
@@ -23,16 +23,16 @@ sources:
 
 按[安装说明](/zh-cn/docs/install/)和实际[发行资产](https://github.com/fengyanweb/ku/releases)选择系统与架构对应的 CLI。源码构建、CI 作业或隔离安装预演不等于已发布相应平台的下载包。Linux ARM64 RC 预演只覆盖样例服务及其依赖；真实应用、生产 SLO 与灰度验收需要单独完成。
 
-| 能力                       | 解释器 `ku run` / 默认 runner             | Native C                         | Native Task 路径                                                 |
-| -------------------------- | ----------------------------------------- | -------------------------------- | ---------------------------------------------------------------- |
-| 语言与本地 import          | runner 嵌入入口，但仍需本地 import 原源码 | 生成时展开受支持的源码图         | 受限的带类型子集                                                 |
-| JSON                       | 通用编码与解码                            | 通用同步编码与解码               | 只编码标量对象字面量，不提供通用解码                             |
-| HTTP                       | 客户端与同步 handler                      | 同步服务端子集，包含 `http.json` | 具名 async handler 及受支持的请求/响应类型                       |
-| PostgreSQL / Redis / MySQL | 没有数据库客户端实现                      | 有界连接池，需匹配目标平台的依赖 | 受支持 async HTTP handler 内的 PG query 挂起，不是通用数据库异步 |
-| 时间                       | 日历、Duration 与等待                     | 部分时钟接口                     | 整数毫秒 sleep                                                   |
-| TCP、TLS 与文件 I/O        | 见各模块说明                              | 部分 native 接口                 | 仅明确支持的降低路径，不是任意网络挂起                           |
+| 能力                       | 解释器 `ku run` / Runner（`--backend runner`） | Native C                         | Native Task 路径                                                 |
+| -------------------------- | ---------------------------------------------- | -------------------------------- | ---------------------------------------------------------------- |
+| 语言与本地 import          | runner 嵌入入口，但仍需本地 import 原源码      | 生成时展开受支持的源码图         | 受限的带类型子集                                                 |
+| JSON                       | 通用编码与解码                                 | 通用同步编码与解码               | 只编码标量对象字面量，不提供通用解码                             |
+| HTTP                       | 客户端与同步 handler                           | 同步服务端子集，包含 `http.json` | 具名 async handler 及受支持的请求/响应类型                       |
+| PostgreSQL / Redis / MySQL | 没有数据库客户端实现                           | 有界连接池，需匹配目标平台的依赖 | 受支持 async HTTP handler 内的 PG query 挂起，不是通用数据库异步 |
+| 时间                       | 日历、Duration 与等待                          | 部分时钟接口                     | 整数毫秒 sleep                                                   |
+| TCP、TLS 与文件 I/O        | 见各模块说明                                   | 部分 native 接口                 | 仅明确支持的降低路径，不是任意网络挂起                           |
 
-参数、返回值、错误和完整示例见 [HTTP](/zh-cn/docs/stdlib/http/)、[JSON](/zh-cn/docs/stdlib/json/)、[时间](/zh-cn/docs/stdlib/time/)与[数据库](/zh-cn/docs/stdlib/database/)。类型检查与后端编译是两个步骤。默认 runner 构建需要匹配的 Rust 工具链及发行归档布局；native 构建需要目标 C 编译器和相应原生库。LLVM 文本后端仍为有限原型。
+参数、返回值、错误和完整示例见 [HTTP](/zh-cn/docs/stdlib/http/)、[JSON](/zh-cn/docs/stdlib/json/)、[时间](/zh-cn/docs/stdlib/time/)与[数据库](/zh-cn/docs/stdlib/database/)。类型检查与后端编译是两个步骤。Runner（`--backend runner`） 构建需要匹配的 Rust 工具链及发行归档布局；native 构建需要目标 C 编译器和相应原生库。LLVM 文本后端仍为有限原型。
 
 ## Task 支持
 

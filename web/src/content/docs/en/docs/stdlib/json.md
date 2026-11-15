@@ -99,7 +99,7 @@ Recoverable errors use the `json` domain. Common codes are `parse_error`, `strin
 
 ## Backend support
 
-The interpreter, default packaged runner and synchronous native C backend support the general interfaces above. The native Task path supports only the encoding subset below; generic Task parsing/decoding is not supported. LLVM does not provide this library. Default runner imports still depend on source locations.
+The interpreter, Runner and synchronous native C backend support the general interfaces above. The native Task path supports only the encoding subset below; generic Task parsing/decoding is not supported. LLVM does not provide this library. Runner imports still depend on source locations.
 
 See the complete [JSON syntax contract](https://github.com/fengyanweb/ku/blob/v0.0.20/docs/syntax.md#127-json).
 

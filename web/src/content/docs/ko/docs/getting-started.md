@@ -59,13 +59,13 @@ println(count)
 
 ## 실행 파일 빌드
 
-필요한 빌드 도구는 설치 페이지에 있습니다. 기본 백엔드에서는:
+필요한 빌드 도구는 설치 페이지에 있습니다. Runner를 선택하려면:
 
 ```sh
-ku build hello.ku
+ku build --backend runner hello.ku
 ```
 
-기본 백엔드는 인터프리터 러너를 패키징합니다. 네이티브 C 컴파일에는 별도의 C 컴파일러가 필요합니다:
+`--backend runner`는 인터프리터 러너를 패키징합니다. 네이티브 C 컴파일에는 별도의 C 컴파일러가 필요합니다:
 
 ```sh
 ku build --backend c hello.ku

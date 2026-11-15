@@ -71,7 +71,7 @@ Paketin SHA-256 değerini [SHA256SUMS](https://github.com/fengyanweb/ku/releases
 <details>
 <summary>Kendi Ku programlarınızı derleyin</summary>
 
-`ku run` ve `ku check` Rust gerektirmez. Varsayılan `ku build`, sistem bağlayıcısını ve kurulu SDK’da kayıtlı kimlikle tam eşleşen Rust derleyicisini gerektirir; v0.0.20 paketleri **Rust 1.99.1** kullanır. `ku build --backend c`, hedef platformun C derleyicisini ve bağlayıcısını gerektirir. Yerel veritabanı programları ayrıca pakette bulunmayan uyumlu istemci kitaplıklarına ihtiyaç duyar.
+`ku run` ve `ku check` Rust gerektirmez. `ku build --backend runner`, sistem bağlayıcısını ve kurulu SDK’da kayıtlı kimlikle tam eşleşen Rust derleyicisini gerektirir; v0.0.20 paketleri **Rust 1.99.1** kullanır. `ku build --backend c`, hedef platformun C derleyicisini ve bağlayıcısını gerektirir. Yerel veritabanı programları ayrıca pakette bulunmayan uyumlu istemci kitaplıklarına ihtiyaç duyar.
 
 </details>
 

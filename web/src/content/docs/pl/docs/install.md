@@ -71,7 +71,7 @@ Porównaj sumę SHA-256 pakietu z [SHA256SUMS](https://github.com/fengyanweb/ku/
 <details>
 <summary>Kompilowanie własnych programów Ku</summary>
 
-`ku run` i `ku check` nie wymagają Rust. Domyślne `ku build` wymaga linkera systemowego oraz dokładnej tożsamości kompilatora Rust zapisanej w zainstalowanym SDK; pakiety v0.0.20 używają **Rust 1.99.1**. `ku build --backend c` wymaga kompilatora C i linkera dla platformy docelowej. Natywne programy bazodanowe wymagają też odpowiednich bibliotek klienckich, których pakiet nie zawiera.
+`ku run` i `ku check` nie wymagają Rust. `ku build --backend runner` wymaga linkera systemowego oraz dokładnej tożsamości kompilatora Rust zapisanej w zainstalowanym SDK; pakiety v0.0.20 używają **Rust 1.99.1**. `ku build --backend c` wymaga kompilatora C i linkera dla platformy docelowej. Natywne programy bazodanowe wymagają też odpowiednich bibliotek klienckich, których pakiet nie zawiera.
 
 </details>
 

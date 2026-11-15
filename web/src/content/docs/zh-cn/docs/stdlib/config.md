@@ -95,4 +95,4 @@ true
 
 `config.yaml` 失败返回 `{ domain: "config", code: "read_failed", message: ... }`，解析错误也使用这个 code。`env/env_file` 不返回 Result；需要可恢复的文件或解析错误时使用 `yaml`。只有 `yaml` 使用 `?`，不要给 `env/env_file` 加 `?`。
 
-本模块支持 `ku run` 与默认打包 runner；同步 native C、native Task、LLVM 尚无这些配置 API。解释器中的 async 调用可经现有 blocking-worker 路径执行，不改变文件格式和返回类型。
+本模块支持 `ku run` 与`ku build --backend runner`；同步 native C、native Task、LLVM 尚无这些配置 API。解释器中的 async 调用可经现有 blocking-worker 路径执行，不改变文件格式和返回类型。

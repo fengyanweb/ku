@@ -54,13 +54,13 @@ The first assignment declares a variable. An explicit type uses `name:type = val
 
 ## Build an executable
 
-The installation page lists the required build tools. For the default backend:
+The installation page lists the required build tools. For the Runner:
 
 ```sh
-ku build hello.ku
+ku build --backend runner hello.ku
 ```
 
-The default backend packages an interpreter runner. Native C compilation requires a separate C compiler:
+`--backend runner` packages an interpreter runner. Native C compilation requires a separate C compiler:
 
 ```sh
 ku build --backend c hello.ku

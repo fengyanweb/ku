@@ -59,13 +59,13 @@ A primeira atribuição declara uma variável. Um tipo explícito usa `name:type
 
 ## Gere um executável
 
-A página de instalação lista as ferramentas de compilação necessárias. Para o backend padrão:
+A página de instalação lista as ferramentas de compilação necessárias. Para o Runner:
 
 ```sh
-ku build hello.ku
+ku build --backend runner hello.ku
 ```
 
-O backend padrão empacota um executor com interpretador. A compilação nativa em C exige um compilador C separado:
+`--backend runner` empacota um executor com interpretador. A compilação nativa em C exige um compilador C separado:
 
 ```sh
 ku build --backend c hello.ku

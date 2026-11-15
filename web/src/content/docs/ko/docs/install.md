@@ -71,7 +71,7 @@ Ku를 `PATH`에 추가하지 않았다면 `ku.executablePath`를 `ku`(Windows에
 <details>
 <summary>자신의 Ku 프로그램 컴파일</summary>
 
-`ku run`과 `ku check`에는 Rust가 필요하지 않습니다. 기본 `ku build`에는 시스템 링커와 설치된 SDK에 기록된 식별 정보가 정확히 일치하는 Rust 컴파일러가 필요합니다. v0.0.20 패키지는 **Rust 1.99.1**을 사용합니다. `ku build --backend c`에는 대상 플랫폼의 C 컴파일러와 링커가 필요합니다. 네이티브 데이터베이스 프로그램에는 패키지에 포함되지 않은 해당 클라이언트 라이브러리도 필요합니다.
+`ku run`과 `ku check`에는 Rust가 필요하지 않습니다. `ku build --backend runner`에는 시스템 링커와 설치된 SDK에 기록된 식별 정보가 정확히 일치하는 Rust 컴파일러가 필요합니다. v0.0.20 패키지는 **Rust 1.99.1**을 사용합니다. `ku build --backend c`에는 대상 플랫폼의 C 컴파일러와 링커가 필요합니다. 네이티브 데이터베이스 프로그램에는 패키지에 포함되지 않은 해당 클라이언트 라이브러리도 필요합니다.
 
 </details>
 

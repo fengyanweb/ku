@@ -71,7 +71,7 @@ Compare the archive’s SHA-256 with [SHA256SUMS](https://github.com/fengyanweb/
 <details>
 <summary>Compiling your own Ku programs</summary>
 
-`ku run` and `ku check` do not require Rust. The default `ku build` needs a system linker and the exact Rust compiler identity recorded by the installed SDK; v0.0.20 packages use **Rust 1.99.1**. `ku build --backend c` needs a target C compiler and linker. Native database programs also need matching database client libraries, which are not bundled.
+`ku run` and `ku check` do not require Rust. `ku build --backend runner` needs a system linker and the exact Rust compiler identity recorded by the installed SDK; v0.0.20 packages use **Rust 1.99.1**. `ku build --backend c` needs a target C compiler and linker. Native database programs also need matching database client libraries, which are not bundled.
 
 </details>
 
