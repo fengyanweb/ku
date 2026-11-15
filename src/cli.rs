@@ -7308,12 +7308,7 @@ fn compile_c_source_with_output(
         }
         if let Some(pack) = &staged_native_tls_pack {
             command.arg(strip_verbatim(pack.archive.path()));
-            for library in pack.contract.native_libraries {
-                if pack.contract.flavor == "msvc" && library.starts_with('/') {
-                    command.arg("-Xlinker");
-                }
-                command.arg(library);
-            }
+            add_gnu_native_tls_libraries(&mut command, pack.contract);
         }
         if let Some(compression) = &staged_compression {
             for archive in &compression.archives {
@@ -7585,6 +7580,17 @@ fn add_gnu_msvc_dynamic_crt(command: &mut Command, required: bool) {
             "-Xlinker",
             "/DEFAULTLIB:msvcrt",
         ]);
+    }
+}
+
+fn add_gnu_native_tls_libraries(command: &mut Command, contract: NativeTlsLinkContract) {
+    for library in contract.native_libraries {
+        // MSVC system-library names must reach the linker, which searches the
+        // SDK library paths. Clang treats a bare .lib as an input file instead.
+        if contract.flavor == "msvc" {
+            command.arg("-Xlinker");
+        }
+        command.arg(library);
     }
 }
 
@@ -14320,6 +14326,50 @@ fn Zip(): null! { input=bytes.from_array([1])? gzip.compress(input,100)? return 
                 .expect("select MSVC TLS contract"),
             NATIVE_TLS_WINDOWS_MSVC_CONTRACT
         );
+        let mut command = Command::new("clang");
+        add_gnu_native_tls_libraries(&mut command, NATIVE_TLS_WINDOWS_MSVC_CONTRACT);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-Xlinker",
+                "bcrypt.lib",
+                "-Xlinker",
+                "advapi32.lib",
+                "-Xlinker",
+                "kernel32.lib",
+                "-Xlinker",
+                "ntdll.lib",
+                "-Xlinker",
+                "userenv.lib",
+                "-Xlinker",
+                "ws2_32.lib",
+                "-Xlinker",
+                "dbghelp.lib",
+                "-Xlinker",
+                "/defaultlib:msvcrt",
+            ]
+            .map(std::ffi::OsStr::new)
+        );
+        for contract in [
+            NATIVE_TLS_WINDOWS_GNU_CONTRACT,
+            NATIVE_TLS_LINUX_CONTRACT,
+            NATIVE_TLS_DARWIN_CONTRACT,
+            NativeTlsLinkContract {
+                native_libraries: &["-framework", "Security"],
+                ..NATIVE_TLS_DARWIN_CONTRACT
+            },
+        ] {
+            let mut command = Command::new("clang");
+            add_gnu_native_tls_libraries(&mut command, contract);
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                contract
+                    .native_libraries
+                    .iter()
+                    .map(std::ffi::OsStr::new)
+                    .collect::<Vec<_>>()
+            );
+        }
         let zig = CCompilerCandidate {
             label: "zig cc".to_string(),
             program: "zig".to_string(),
