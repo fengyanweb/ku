@@ -57,4 +57,6 @@ CLI 默认从自身安装目录的 `native-compression/v1/<target>/` 读取可�
 
 这里不承诺不同压缩算法、平台或上游版本的编码字节完全相同，也不把上游单库速度作为 Ku 的整服务成绩。
 
-官方资料：[Zstandard 1.5.7](https://github.com/meta/zstd/releases/tag/v1.5.7)、[zlib 1.4](https://www.zlib.net/)、[zlib 内存配置](https://github.com/madler/zlib/blob/v1.4/zconf.h.in)。选择 stock zlib；本接口没有同时接入 zlib-ng，也没有改变 `ureq` 的传递依赖后端。
+实现选择 stock zlib：它直接提供这里使用的稳定 `z_stream`、gzip/raw window 和 `zalloc/zfree` 接口。zlib-ng 也提供兼容模式及架构优化，但需要另行冻结兼容构建和 CPU 分派配置；目前没有 Ku 完整调用收益证据，因此保留单一实现。这个选择不宣称 zlib 更快，也不改变 `ureq` 的传递依赖后端。
+
+官方资料：[Zstandard 1.5.7](https://github.com/meta/zstd/releases/tag/v1.5.7)、[zlib 1.4](https://www.zlib.net/)、[zlib 内存配置](https://github.com/madler/zlib/blob/v1.4/zconf.h.in)、[zlib-ng 构建与兼容模式](https://github.com/zlib-ng/zlib-ng)。

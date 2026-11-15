@@ -57,4 +57,6 @@ Static codec linking and whole-program `--static` are separate settings. On Linu
 
 Encoded bytes are not promised identical across different formats, platforms or upstream versions. Upstream library benchmarks are not Ku service results.
 
-References: [Zstandard 1.5.7](https://github.com/meta/zstd/releases/tag/v1.5.7), [zlib 1.4](https://www.zlib.net/), [zlib memory configuration](https://github.com/madler/zlib/blob/v1.4/zconf.h.in). This interface selects stock zlib, does not also integrate zlib-ng, and leaves `ureq`'s transitive compression backend unchanged.
+Stock zlib directly supplies the stable `z_stream`, gzip/raw window and `zalloc/zfree` interfaces used here. zlib-ng also provides a compatibility mode and architecture optimizations, but would require separately frozen compatibility builds and CPU dispatch configuration. Without Ku end-to-end benefit evidence, this interface keeps one implementation. This does not claim zlib is faster or change `ureq`'s transitive compression backend.
+
+References: [Zstandard 1.5.7](https://github.com/meta/zstd/releases/tag/v1.5.7), [zlib 1.4](https://www.zlib.net/), [zlib memory configuration](https://github.com/madler/zlib/blob/v1.4/zconf.h.in), [zlib-ng builds and compatibility](https://github.com/zlib-ng/zlib-ng).

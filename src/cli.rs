@@ -7267,10 +7267,12 @@ fn compile_c_source_with_output(
         if needs_native_tls {
             command.arg("-DKU_NATIVE_TLS_ENABLED=1");
         }
-        if compression_inputs.as_ref().and_then(|inputs| inputs.abi) == Some("msvc") {
-            // clang's GNU driver otherwise leaves its CRT default implicit.
-            command.arg("-fms-runtime-lib=dll");
-        }
+        let msvc_dynamic_crt = compression_inputs.as_ref().and_then(|inputs| inputs.abi)
+            == Some("msvc")
+            || native_tls_pack
+                .as_ref()
+                .is_some_and(|pack| pack.contract.crt == "msvc-dynamic");
+        add_gnu_msvc_dynamic_crt(&mut command, msvc_dynamic_crt);
         if needs_libmysql {
             let header = libmysql_include
                 .as_ref()
@@ -7307,6 +7309,9 @@ fn compile_c_source_with_output(
         if let Some(pack) = &staged_native_tls_pack {
             command.arg(strip_verbatim(pack.archive.path()));
             for library in pack.contract.native_libraries {
+                if pack.contract.flavor == "msvc" && library.starts_with('/') {
+                    command.arg("-Xlinker");
+                }
                 command.arg(library);
             }
         }
@@ -7565,6 +7570,22 @@ fn compile_c_source_with_output(
         "C compiler not found for native build\nhelp: {target_help}; tried {}",
         tried.join(", ")
     )))
+}
+
+fn add_gnu_msvc_dynamic_crt(command: &mut Command, required: bool) {
+    if required {
+        // The GNU-style clang MSVC driver in supported LLVM versions injects
+        // libcmt at link time even when -fms-runtime-lib=dll sets /MD macros
+        // and object directives. Select the pack's CRT at both stages; mixing
+        // static UCRT objects and imported /MD symbols is not a valid fallback.
+        command.args([
+            "-fms-runtime-lib=dll",
+            "-Xlinker",
+            "/NODEFAULTLIB:libcmt",
+            "-Xlinker",
+            "/DEFAULTLIB:msvcrt",
+        ]);
+    }
 }
 
 fn c_compiler_supports_explicit_target(
@@ -13881,6 +13902,27 @@ fn main(): null! {
         fs::write(&source, "#define KU_FEATURE_ZLIB 1\n").unwrap();
         let features = CSourceFeatures::inspect(&source).unwrap();
         assert!(!features.zstd && features.zlib);
+    }
+
+    #[test]
+    fn native_pack_dynamic_crt_selects_the_same_compile_and_link_runtime() {
+        let mut unused = Command::new("clang");
+        add_gnu_msvc_dynamic_crt(&mut unused, false);
+        assert_eq!(unused.get_args().count(), 0);
+
+        let mut command = Command::new("clang");
+        add_gnu_msvc_dynamic_crt(&mut command, true);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-fms-runtime-lib=dll",
+                "-Xlinker",
+                "/NODEFAULTLIB:libcmt",
+                "-Xlinker",
+                "/DEFAULTLIB:msvcrt",
+            ]
+            .map(std::ffi::OsStr::new)
+        );
     }
 
     #[test]
