@@ -87,6 +87,8 @@ ku build --backend c --release .\hello.ku -o ".\dist\hello-native.exe"
 
 native `net.client` 启用 TLS 时，保留安装包中与 `ku` 相邻的 `native-tls/v1/<target>/`。CLI 自动定位同目标的 pack，并检查 manifest、header 和静态库；完整搬迁安装目录不需要重新设置路径。预构建 TLS 库在链接时进入程序，部署后不依赖 Ku 安装目录或 TLS pack，但仍依赖目标操作系统的 CRT 和系统网络库。
 
+当前源码打包时，macOS CLI、TLS 和可选压缩库统一使用 `MACOSX_DEPLOYMENT_TARGET=11.0`，避免依赖库意外要求比最终程序更新的系统。构建脚本结束后恢复调用者的环境。最低链接目标不等于已在该旧系统完成运行验证；平台结果以实际测试系统为准。
+
 含可选压缩模块的配套包将依赖放在 `native-compression/v1/<target>/`，供 `bytes`、`zstd`、`gzip` 与 `deflate` 的同步 C 路径自动发现；模块规则见[原生压缩文档](compression.md)。只有使用相应 codec 的程序才链接它。旧安装包中没有这些模块时，不应将另一个版本的库或包改名混入。
 
 数据库客户端动态库不包含在 Ku 安装包内。PostgreSQL 使用绝对目录 `KU_PG_LIB`；MySQL/MariaDB 使用 `KU_MYSQL_LIB` 和对应头文件。库的 CPU 架构、目标 ABI 和客户端家族必须与构建目标一致。构建成功后，部署环境仍须提供匹配的客户端动态库及其依赖；`--static` 不能替代这些依赖检查。不要将 C 编译成功、交叉编译成功或源码检查当成目标机器运行通过。
