@@ -34,7 +34,7 @@ import json from "std.json"
 | `json.parse(text:str)`       | `KuValue!` | Compatibility name for `decode`                          |
 | `json.try_parse(text:str)`   | `KuValue!` | Compatibility name for `decode`                          |
 
-`!` denotes Result. Use `?` to propagate errors or `try/catch` to handle them. The general synchronous encoding interface does not consume or mutate its input. The native Task literal subset below has separate ownership restrictions.
+`!` denotes Result. Use `?` to propagate errors or `try/catch` to handle them. Encoding does not consume or mutate its input. The Task section below explains local JSON ownership and type restrictions.
 
 ## Encode and read values
 
@@ -99,7 +99,7 @@ Recoverable errors use the `json` domain. Common codes are `parse_error`, `strin
 
 ## Backend support
 
-The interpreter, Runner and synchronous native C backend support the general interfaces above. The native Task path supports only the encoding subset below; generic Task parsing/decoding is not supported. LLVM does not provide this library. Runner imports still depend on source locations.
+The interpreter, Runner and synchronous native C backend support the general interfaces above. Native Tasks support local JSON decoding, string-key reads, subtree transfer, conversions and re-encoding within the scope below. LLVM does not provide this library. Runner imports still depend on source locations.
 
 See the complete [JSON syntax contract](https://github.com/fengyanweb/ku/blob/v0.0.20/docs/syntax.md#127-json).
 
@@ -119,6 +119,37 @@ async fn main(): null! {
 
 Expected output is `{"count":2,"message":"中😀","missing":null,"ready":true}`.
 
-Native Task `json.encode` / `json.stringify` accepts exactly one **object literal**, with at most 64 distinct keys and only `int`, `bool`, `null` or `str` values. Fields are evaluated left to right, then keys are emitted in deterministic order. Owned string expressions move as they normally do when constructing this literal; explicitly clone a string if it must remain available.
+This scalar-field example remains a minimal starting point. Dynamic object literals constructed inside Tasks allow at most 64 distinct keys and evaluate fields left to right. Duplicate literal keys are rejected during compilation, unlike JSON decoding, which retains the last duplicate. Owned strings and dynamic JSON fields move into the constructed object under the existing ownership rules.
 
-An existing dynamic object variable, arrays, nested objects and floats are outside this lowering path. Duplicate literal keys are rejected during compilation; this differs from general JSON parsing, which retains the last duplicate. Result errors still require `?` or `try/catch`. This subset does not replace the default JSON implementation or enable arbitrary JSON operations in async code.
+## Local values across waits in native Tasks
+
+0.0.20 already supports local `json.decode()` results surviving `await`, string-key indexing, `take`, `as_int`, `as_str` and `json.encode`. The following is the released [examples/task_json.ku](https://github.com/fengyanweb/ku/blob/v0.0.20/examples/task_json.ku):
+
+```ku
+import json from "std.json"
+import time from "std.time"
+async fn tick():int! { time.sleep(2)? return ok(1) }
+async fn main():null! {
+    decoded=json.decode("{\"counter\":7,\"data\":{\"message\":\"中文😀\",\"items\":[1,true,null]}}")?
+    selected=decoded["counter"]?
+    counter=selected.as_int()?
+    copied=decoded["data"]?
+    next=(await tick())?
+    data=decoded.take("data")?
+    body=json.encode({counter:counter+next,id:"rid",data:data,copy:copied})?
+    println(body)
+    return ok(null)
+}
+```
+
+After the wait, the encoded output's `counter` field is 8. Both `data` and `copy` retain the nested object, Chinese text, emoji and decoded array. Results still use `?` or `try/catch`, without implicit unwrapping. See the complete [Task JSON guide](https://github.com/fengyanweb/ku/blob/v0.0.20/docs/native-task-json.en.md).
+
+- `json.encode(value)` reads its input; the original remains usable afterward.
+- `value["key"]` returns an independently owned value, which remains valid after releasing its original root.
+- `value.take("key")` consumes the original root and transfers the subtree. Do not read the consumed root afterward.
+- `as_int()` and `as_str()` consume their conversion input. Dynamic fields move into an output object when it is constructed.
+- Allocations prepay the Task byte budget and refund only after physical release. Returns, errors, cancellation and deadlines clean up their owners. This ledger covers Ku-requested heap bytes, not RSS, allocator internals or all third-party memory.
+
+The existing default JSON engine, strict syntax and depth rules above are unchanged. Input and output are each limited to 1,000,000 bytes. Insufficient budget returns an error. An individual JSON operation is size-bounded but does not suspend internally; this is not instruction-level preemption.
+
+Decoded JSON objects, arrays, strings, numbers, booleans and null can be retained, transferred and re-encoded. This does not add integer indexing of dynamic JSON or heterogeneous array literals. Task parameters, public outcomes and closure captures have not been expanded to arbitrary JSON; native Task floating-point locals and unlisted operations retain their existing subset restrictions. Unsupported programs are rejected during compilation.

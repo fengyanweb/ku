@@ -15,33 +15,33 @@ ku build --backend runner --release hello.ku -o hello-runner
 
 下表限定原生后端的实际范围，不表示解释器的全部功能都可原生构建。回归入口供核对具体行为；已有测试不代表每次开发组合都已完成平台验收。
 
-| 能力 | 范围与回归 |
-| --- | --- |
-| 类型与运算 | 已检查的整数、浮点、布尔、null、字符串和比较；[整数边界](../tests/native_sync_integer_matrix_test.rs)。 |
+| 能力             | 范围与回归                                                                                                                                                                       |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 类型与运算       | 已检查的整数、浮点、布尔、null、字符串和比较；[整数边界](../tests/native_sync_integer_matrix_test.rs)。                                                                          |
 | 容器与自定义类型 | 数组、动态对象、tagged 动态值、非递归布局的 struct／enum、复杂 Result；[容器](../tests/native_collection_test.rs)、[聚合值寿命](../tests/native_sync_aggregate_owners_test.rs)。 |
-| 函数与模块 | 函数值、捕获闭包、模块导入与现有泛型具体化；[闭包释放](../tests/native_closure_drop_test.rs)、[泛型导入](../tests/native_generic_import_test.rs)。 |
-| 所有权与错误 | owned 值、只读借用、显式 clone、`?` 与 `try/catch/finally`；[借用](../tests/borrow_native_test.rs)、[退出清理](../tests/native_cleanup_escape_test.rs)。 |
-| 文件与时间 | `std.fs`／`std.time` 原生实现及有界目录读取；[文件、时间与 JSON 回归](../tests/native_run_test.rs)。 |
-| JSON | 同步 DOM／typed 接口和既有默认引擎；Task 局部 JSON 可跨 `await`，具体范围见 [Task JSON](native-task-json.md)。 |
-| Task | 受限的源码 Task、挂起恢复、计时器、取消、期限与资源账本；[并发合同](concurrency.md)、[Task 回归](../tests/native_task_source_test.rs)。这不是完整 async／await 或完整 M:N。 |
-| HTTP | 同步及受支持的具名 async handler、持久连接、有界流水线与协作式超时；[HTTP 回归](../tests/native_http_test.rs)。 |
-| 数据库 | native PostgreSQL、typed PG、Redis、MySQL client；连接池、结果独立寿命及既有清理合同见 [协议文档](protocol-foundation.md)。不自动重试业务 SQL。 |
-| 网络与 TLS | owned bytes、move-only `net.client`、TLS client 和匹配目标的 TLS pack；[安装要求](cli-runtime-bundle.md)、[网络回归](../tests/native_net_test.rs)。 |
+| 函数与模块       | 函数值、捕获闭包、模块导入与现有泛型具体化；[闭包释放](../tests/native_closure_drop_test.rs)、[泛型导入](../tests/native_generic_import_test.rs)。                               |
+| 所有权与错误     | owned 值、只读借用、显式 clone、`?` 与 `try/catch/finally`；[借用](../tests/borrow_native_test.rs)、[退出清理](../tests/native_cleanup_escape_test.rs)。                         |
+| 文件与时间       | `std.fs`／`std.time` 原生实现及有界目录读取；[文件、时间与 JSON 回归](../tests/native_run_test.rs)。                                                                             |
+| JSON             | 同步 DOM／typed 接口和既有默认引擎；Task 局部 JSON 可跨 `await`，具体范围见 [Task JSON](native-task-json.md)。                                                                   |
+| Task             | 受限的源码 Task、挂起恢复、计时器、取消、期限与资源账本；[并发合同](concurrency.md)、[Task 回归](../tests/native_task_source_test.rs)。这不是完整 async／await 或完整 M:N。      |
+| HTTP             | 同步及受支持的具名 async handler、持久连接、有界流水线与协作式超时；[HTTP 回归](../tests/native_http_test.rs)。                                                                  |
+| 数据库           | native PostgreSQL、typed PG、Redis、MySQL client；连接池、结果独立寿命及既有清理合同见 [协议文档](protocol-foundation.md)。不自动重试业务 SQL。                                  |
+| 网络与 TLS       | owned bytes、move-only `net.client`、TLS client 和匹配目标的 TLS pack；[安装要求](cli-runtime-bundle.md)、[网络回归](../tests/native_net_test.rs)。                              |
 
 只读借用不消费原值；借用结果不能逃出所有者寿命。资源释放必须覆盖返回、错误、取消和部分初始化。生成 C 的内部 helper 不是可供第三方任意并发调用的稳定 ABI。
 
-## 正在补齐的能力
+## 当前源码新增能力
 
-以下修改处于开发验证中，不能据此认为已经包含在 0.0.20 安装包中。
+以下能力已完成 Linux x86_64、macOS Apple Silicon 和 Windows x86_64 的正常 C11 O2 功能回归及真实 CLI／SDK 验证。它们属于当前源码，不包含在原公开 0.0.20 安装包中。
 
-| 能力 | 当前验证入口 |
-| --- | --- |
-| HTTP 状态常量、独立常量对象及 `statusText` | [状态常量回归](../tests/native_http_status_test.rs)。 |
-| Unicode `trim`／`lower`／`upper` | macOS C11 O2 [Unicode、借用与中断回收](../tests/native_unicode_string_test.rs)回归通过；其他平台待验证。 |
-| 同步嵌套循环的 `break`／`continue` | macOS C11 O2 [finally 次序、循环回收与期限](../tests/native_loop_control_test.rs)回归通过；其他平台待验证。 |
-| 可选 Zstandard、gzip、DEFLATE 接口 | [输出上限、损坏输入与释放](../tests/native_compression_test.rs)。 |
+| 能力                                       | 当前验证入口                                                           |
+| ------------------------------------------ | ---------------------------------------------------------------------- |
+| HTTP 状态常量、独立常量对象及 `statusText` | [状态常量回归](../tests/native_http_status_test.rs)。                  |
+| Unicode `trim`／`lower`／`upper`           | [Unicode、借用与中断回收](../tests/native_unicode_string_test.rs)。    |
+| 同步嵌套循环的 `break`／`continue`         | [finally 次序、循环回收与期限](../tests/native_loop_control_test.rs)。 |
+| 可选 Zstandard、gzip、DEFLATE 接口         | [输出上限、损坏输入与释放](../tests/native_compression_test.rs)。      |
 
-这些项目尚需完成最终集成及相关平台运行验证。压缩实现已通过 macOS 的限额、损坏输入和分配失败回收检查，公共 CLI 的依赖校验仍在修复验证。受支持 Task 的循环控制已有独立实现；同步循环的修改不扩大 Task 类型或 finally 子集。
+验证覆盖功能、限额、损坏输入、所有权和失败回收，不代表性能目标或长期负载验收通过。受支持 Task 的循环控制已有独立实现；同步循环的修改不扩大 Task 类型或 finally 子集。
 
 ## 平台与部署
 
