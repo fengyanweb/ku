@@ -32,6 +32,10 @@ ku build --backend runner --release hello.ku -o hello-runner
 
 当前源码支持同步 `time.unix()` 和 `time.unix(time.instant())`，返回 Unix 秒整数；传入 Time 时只读原值。毫秒转秒沿用解释器的向零截断规则，例如 `-1001` 毫秒转换为 `-1` 秒。普通动态对象不能替代 native Time。
 
+同步时间接口还支持 `from_unix`、`from_millis`、`duration`、`add/sub/diff/compare`、`is_leap`、`days_in_month` 和整数／Duration `sleep`。Time 与 Duration 使用不同标签；转换和运算不消费输入，Duration 可以复制，差值可以为负。`duration`、`days_in_month`、`sleep` 沿用 Result 错误；裸值构造或运算失败沿用运行错误，并先退役当前 native frame 的 owner。`from_unix` 只检查乘法溢出，`from_millis` 另检查日期范围，两者不能互换。
+
+`date`、`datetime`、`format`、`parse`、`parts`、`weekday` 尚未接入 native C；使用这些接口时需选择解释器／Runner。native Task 的时间能力仍限定为原有整数毫秒定时器，不自动扩大为上述同步接口。
+
 ## 当前源码新增能力
 
 以下能力已完成 Linux x86_64、macOS Apple Silicon 和 Windows x86_64 的正常 C11 O2 功能回归及真实 CLI／SDK 验证。它们属于当前源码，不包含在原公开 0.0.20 安装包中。

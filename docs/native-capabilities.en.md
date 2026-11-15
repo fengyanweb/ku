@@ -32,6 +32,10 @@ Read-only borrowing does not consume the original value, and a borrow cannot out
 
 Current source supports synchronous `time.unix()` and `time.unix(time.instant())`, returning Unix seconds as an integer without consuming the Time value. Millisecond conversion truncates toward zero, matching the interpreter: `-1001` milliseconds becomes `-1` second. An ordinary dynamic object cannot substitute for a native Time.
 
+Synchronous time APIs also support `from_unix`, `from_millis`, `duration`, `add/sub/diff/compare`, `is_leap`, `days_in_month`, and integer/Duration `sleep`. Time and Duration have distinct tags. Conversion and arithmetic preserve their inputs; Duration is copyable and differences may be negative. `duration`, `days_in_month`, and `sleep` retain Result errors. Failures from bare-value constructors or arithmetic remain runtime errors and retire native frame owners before propagation. `from_unix` checks multiplication overflow; `from_millis` additionally validates the calendar range.
+
+`date`, `datetime`, `format`, `parse`, `parts`, and `weekday` are not yet connected to native C; use the interpreter or Runner for these APIs. Native Task time support remains limited to the existing integer-millisecond timer and does not automatically include these synchronous APIs.
+
 ## Capabilities added in current source
 
 The following capabilities passed normal C11 O2 functional regressions and real CLI/SDK validation on Linux x86_64, macOS Apple Silicon and Windows x86_64. They are included in current source, not in the original public 0.0.20 packages.

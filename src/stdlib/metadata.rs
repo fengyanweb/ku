@@ -869,6 +869,14 @@ mod borrow_tests {
         );
         assert_eq!(argument_modes("http.text", 2), [View, Owned]);
         assert_eq!(argument_modes("unregistered", 2), [Owned, Owned]);
+        for function in ["duration", "add", "sub", "diff", "compare"] {
+            let signature = dotted_signature("time", function).unwrap();
+            assert_eq!(signature.arg_modes, vec![View; signature.args.len()]);
+        }
+        assert_eq!(
+            dotted_signature("time", "duration").unwrap().failure,
+            FailureMode::ReturnsResult
+        );
         assert!(!supports_borrowed_call("array.push"));
         assert!(!supports_borrowed_call("array.first"));
         assert!(!supports_borrowed_call("unregistered"));

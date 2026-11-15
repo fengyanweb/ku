@@ -21,6 +21,8 @@ mod service_output;
 mod string_unicode;
 #[path = "c_sync.rs"]
 mod sync;
+#[path = "c_time.rs"]
+mod time;
 
 #[path = "c_task.rs"]
 mod task;
@@ -43,6 +45,18 @@ mod task_root;
 
 fn c_object_type_name(name: &str) -> bool {
     name == "__ku_object" || crate::ir::http_constant_object_table(name).is_some()
+}
+
+fn c_time_scalar_name(name: &str) -> bool {
+    matches!(name, "__ku_time" | "__ku_duration")
+}
+
+fn c_time_prefix(name: &str) -> &'static str {
+    if name == "__ku_duration" {
+        "__ku_duration"
+    } else {
+        "ku_time"
+    }
 }
 
 // Whole generated-file bytes, including shared runtimes and all specializations.
@@ -402,7 +416,8 @@ fn generate_c_source_with_frames_attempt(
 ) -> KuResult<String> {
     crate::ir::verify_borrow_contract(program)?;
     sync::validate_program(program)?;
-    let checked_integer_runtime = sync::uses_checked_integer(program)
+    let checked_integer_runtime = time::uses_runtime(program)
+        || sync::uses_checked_integer(program)
         || frames.is_some_and(|(tasks, _, _)| task::uses_checked_integer(tasks));
     sync::validate_identifiers(program, checked_integer_runtime)?;
     let task_net = frames.is_some_and(|(tasks, _, _)| {
@@ -569,6 +584,7 @@ fn generate_c_source_with_frames_attempt(
          static int64_t ku_time_elapsed(KuTime previous) {\n  ku_time_validate(previous);\n  int64_t now = ku_time_now_millis();\n  if ((previous.millis > 0 && now < INT64_MIN + previous.millis) ||\n      (previous.millis < 0 && now > INT64_MAX + previous.millis)) {\n    ku_time_fail(\"time.elapsed: elapsed milliseconds overflow\");\n  }\n  return now - previous.millis;\n}\n\
          static void ku_time_print(KuTime value) {\n  ku_time_validate(value);\n  ku_output_printf(\"{ kind: time.time, millis: %lld }\", (long long)value.millis);\n}\n\n",
     );
+    out.push_str(time::DURATION_SCALAR);
     out.check()?;
     // Socket headers shared by the native HTTP and Redis runtimes. `winsock2.h`
     // must precede any `windows.h`; on POSIX both runtimes use poll(2) rather
@@ -790,6 +806,7 @@ fn generate_c_source_with_frames_attempt(
     // signature closure elements are complete only at this point. Result helper
     // bodies can already refer to the earlier clone/drop prototypes.
     emit_array_helper_bodies(&mut out, program, &frame_array_elements)?;
+    time::emit(&mut out, program);
     emit_bytes_runtime(&mut out, program, task_bytes);
     compression::emit(
         &mut out,
@@ -2964,9 +2981,10 @@ fn emit_print(out: &mut COutput, value: &IrExpr) -> KuResult<()> {
                 c_expr(value)?
             ));
         }
-        IrType::Named(ref name) if name == "__ku_time" => {
+        IrType::Named(ref name) if c_time_scalar_name(name) => {
             out.push_str(&format!(
-                "  ku_time_print({});\n  ku_output_flush();\n",
+                "  {}_print({});\n  ku_output_flush();\n",
+                c_time_prefix(name),
                 c_expr(value)?
             ));
         }
@@ -3266,12 +3284,23 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
             ))
         }
         IrExprKind::Binary { left, op, right }
-            if matches!(&left.ty, IrType::Named(name) if name == "__ku_time")
-                && matches!(&right.ty, IrType::Named(name) if name == "__ku_time")
+            if matches!(&left.ty, IrType::Named(name) if c_time_scalar_name(name))
+                && matches!(&right.ty, IrType::Named(name) if c_time_scalar_name(name))
                 && matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) =>
         {
             Ok(format!(
-                "(ku_time_equal({}, {}) {} true)",
+                "({}({}, {}) {} true)",
+                if left.ty != right.ty {
+                    "__ku_duration_mixed_equal".to_string()
+                } else {
+                    format!(
+                        "{}_equal",
+                        c_time_prefix(match &left.ty {
+                            IrType::Named(name) => name,
+                            _ => unreachable!(),
+                        })
+                    )
+                },
                 c_expr(left)?,
                 c_expr(right)?,
                 if *op == BinaryOp::Equal { "==" } else { "!=" }
@@ -3383,10 +3412,22 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                 .join(", ");
             Ok(format!("{callee}({args})"))
         }
-        IrExprKind::Field { target, name } if matches!(&target.ty, IrType::Named(type_name) if type_name == "__ku_time") => {
+        IrExprKind::Field { target, name } if matches!(&target.ty, IrType::Named(type_name) if c_time_scalar_name(type_name)) =>
+        {
+            let IrType::Named(type_name) = &target.ty else {
+                unreachable!()
+            };
             match name.as_str() {
-                "kind" => Ok(format!("ku_time_kind({})", c_expr(target)?)),
-                "millis" => Ok(format!("ku_time_value_millis({})", c_expr(target)?)),
+                "kind" => Ok(format!(
+                    "{}_kind({})",
+                    c_time_prefix(type_name),
+                    c_expr(target)?
+                )),
+                "millis" => Ok(format!(
+                    "{}_value_millis({})",
+                    c_time_prefix(type_name),
+                    c_expr(target)?
+                )),
                 _ => Err(unsupported(format!(
                     "native Time value has no field '{name}'"
                 ))),
@@ -3508,7 +3549,7 @@ fn c_move_place(expr: &IrExpr) -> KuResult<Option<String>> {
             if c_object_type_name(type_name)
                 || type_name == "__ku_value"
                 || type_name == "__ku_http_server"
-                || type_name == "__ku_time"
+                || c_time_scalar_name(type_name)
                 || enum_type_name(type_name).is_some()
             {
                 return Ok(None);
@@ -3536,7 +3577,7 @@ fn c_value_expr(expr: &IrExpr) -> KuResult<String> {
     // value; ordinary assignment/passing copies either one. Keep this after the
     // explicit clone intrinsic so `time.instant().clone()` is lowered as a copy
     // instead of falling through to the generic intrinsic dispatcher.
-    if matches!(&expr.ty, IrType::Named(name) if name == "__ku_http_server" || name == "__ku_time")
+    if matches!(&expr.ty, IrType::Named(name) if name == "__ku_http_server" || c_time_scalar_name(name))
     {
         return c_expr(expr);
     }
@@ -3657,7 +3698,7 @@ fn c_clone_expr(expr: &IrExpr) -> KuResult<String> {
         IrType::Named(name) if name == "__ku_value" => {
             Ok(format!("ku_value_clone({})", c_expr(expr)?))
         }
-        IrType::Named(name) if name == "__ku_time" => c_expr(expr),
+        IrType::Named(name) if c_time_scalar_name(name) => c_expr(expr),
         IrType::Closure { .. } => Ok(format!(
             "ku_closure_clone_{}({})",
             c_type_suffix(&expr.ty)?,
@@ -3757,7 +3798,7 @@ fn c_lvalue(target: &IrLValue) -> KuResult<String> {
     match target {
         IrLValue::Local(name) => Ok(c_ident(name)),
         IrLValue::Field { target, name } => {
-            if matches!(&target.ty, IrType::Named(type_name) if type_name == "__ku_time") {
+            if matches!(&target.ty, IrType::Named(type_name) if c_time_scalar_name(type_name)) {
                 return match name.as_str() {
                     // `millis` is the one public Time field backed by physical
                     // storage in KuTime. `kind` is a virtual discriminator
@@ -3813,7 +3854,7 @@ fn c_place_expr(expr: &IrExpr) -> KuResult<String> {
         IrExprKind::Temp(id) => Ok(format!("t{}", id.0)),
         IrExprKind::CellLoad(cell) => Ok(format!("({})->value", c_expr(cell)?)),
         IrExprKind::Field { target, name } => {
-            if matches!(&target.ty, IrType::Named(type_name) if type_name == "__ku_time") {
+            if matches!(&target.ty, IrType::Named(type_name) if c_time_scalar_name(type_name)) {
                 return match name.as_str() {
                     "millis" => Ok(format!("({}).millis", c_place_expr(target)?)),
                     "kind" => Err(unsupported("native Time.kind is read-only")),
@@ -3864,7 +3905,7 @@ fn c_type(ty: &IrType) -> KuResult<String> {
         IrType::Named(name) if name == "__ku_error_type" => Ok("KuError".to_string()),
         IrType::Named(name) if c_object_type_name(name) => Ok("KuObject*".to_string()),
         IrType::Named(name) if name == "__ku_value" => Ok("KuValue".to_string()),
-        IrType::Named(name) if name == "__ku_time" => Ok("KuTime".to_string()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok("KuTime".to_string()),
         // Stage 8a: the native HTTP server is a heap pointer shared between route
         // registration and the accept loop (never copied by value).
         IrType::Named(name) if name == "__ku_http_server" => Ok("KuHttpServer*".to_string()),
@@ -5175,7 +5216,7 @@ fn collect_json_writer_types(ty: &IrType, program: &IrProgram, output: &mut Vec<
             output.push(ty.clone());
             collect_json_writer_types(element, program, output);
         }
-        IrType::Named(name) if name == "__ku_time" || name == "__ku_error_type" => {
+        IrType::Named(name) if c_time_scalar_name(name) || name == "__ku_error_type" => {
             if !output.contains(ty) {
                 output.push(ty.clone());
             }
@@ -5252,10 +5293,12 @@ fn json_typed_write_call(
         IrType::Named(name) if name == "__ku_value" => Ok(format!(
             "ku_json_write_value({output}, {expression}, {depth}, {error})"
         )),
-        IrType::Named(name) if name == "__ku_time" || name == "__ku_error_type" => Ok(format!(
-            "ku_json_write_typed_{}({output}, {expression}, {depth}, {error})",
-            c_type_suffix(ty)?
-        )),
+        IrType::Named(name) if c_time_scalar_name(name) || name == "__ku_error_type" => {
+            Ok(format!(
+                "ku_json_write_typed_{}({output}, {expression}, {depth}, {error})",
+                c_type_suffix(ty)?
+            ))
+        }
         IrType::Named(name) if json_struct_layout(program, name).is_some() => Ok(format!(
             "ku_json_write_typed_{}({output}, {expression}, {depth}, {error})",
             c_type_suffix(ty)?
@@ -5338,9 +5381,9 @@ fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -
             out.push_str(&format!("    if (!{element_call}) return false;\n"));
             out.push_str("  }\n  return ku_json_write_byte(output, ']', error);\n}\n");
         }
-        IrType::Named(name) if name == "__ku_time" => {
+        IrType::Named(name) if c_time_scalar_name(name) => {
             out.push_str(
-                "  ku_time_validate(value);\n\
+                &                "  ku_time_validate(value);\n\
                  \x20 if (!ku_json_write_byte(output, '{', error)\n\
                  \x20     || !ku_json_write_string(output, ku_string_static((const uint8_t*)\"kind\", 4), error)\n\
                  \x20     || !ku_json_write_byte(output, ':', error)\n\
@@ -5349,7 +5392,9 @@ fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -
                  \x20     || !ku_json_write_string(output, ku_string_static((const uint8_t*)\"millis\", 6), error)\n\
                  \x20     || !ku_json_write_byte(output, ':', error)\n\
                  \x20     || !ku_json_write_value(output, ku_v_int(value.millis), depth + 1, error)) return false;\n\
-                 \x20 return ku_json_write_byte(output, '}', error);\n}\n",
+                 \x20 return ku_json_write_byte(output, '}', error);\n}\n"
+                .replace("ku_time_validate", &format!("{}_validate", c_time_prefix(name)))
+                .replace("ku_time_kind", &format!("{}_kind", c_time_prefix(name)))
             );
         }
         IrType::Named(name) if name == "__ku_error_type" => {
@@ -17039,6 +17084,9 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
             }
         }
     }
+    if let Some(expression) = time::intrinsic_expr(name, args)? {
+        return Ok(expression);
+    }
     if name == "time.now" {
         if !args.is_empty() {
             return Err(unsupported("native C time.now expects no arguments"));
@@ -17306,7 +17354,7 @@ fn c_zero_value(ty: &IrType) -> KuResult<String> {
         IrType::Str => Ok("(KuString){0}".to_string()),
         IrType::Named(name) if c_object_type_name(name) => Ok("NULL".to_string()),
         IrType::Named(name) if name == "__ku_value" => Ok("ku_v_null()".to_string()),
-        IrType::Named(name) if name == "__ku_time" => Ok("(KuTime){0}".to_string()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok("(KuTime){0}".to_string()),
         IrType::Named(name) if name == "__ku_http_server" => Ok("NULL".to_string()),
         IrType::Named(name) if pg_native_suffix(name).is_some() => Ok("NULL".to_string()),
         IrType::Array(_) | IrType::Named(_) | IrType::Result(_) | IrType::Closure { .. } => {
@@ -17331,7 +17379,7 @@ fn c_zero_initializer(ty: &IrType) -> KuResult<String> {
         IrType::Str => Ok("(KuString){0}".to_string()),
         IrType::Named(name) if c_object_type_name(name) => Ok("NULL".to_string()),
         IrType::Named(name) if name == "__ku_value" => Ok("ku_v_null()".to_string()),
-        IrType::Named(name) if name == "__ku_time" => Ok("(KuTime){0}".to_string()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok("(KuTime){0}".to_string()),
         IrType::Named(name) if name == "__ku_http_server" => Ok("NULL".to_string()),
         IrType::Named(name) if pg_native_suffix(name).is_some() => Ok("NULL".to_string()),
         IrType::Array(_) | IrType::Named(_) | IrType::Result(_) | IrType::Closure { .. } => {
@@ -17381,7 +17429,7 @@ fn c_move_value(ty: &IrType, place: &str) -> KuResult<String> {
         )),
         IrType::Named(name) if c_object_type_name(name) => Ok(format!("ku_object_move(&{place})")),
         IrType::Named(name) if name == "__ku_value" => Ok(format!("ku_value_move(&{place})")),
-        IrType::Named(name) if name == "__ku_time" => Ok(place.to_string()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok(place.to_string()),
         IrType::Named(name) if name == "__ku_http_server" => Ok(place.to_string()),
         IrType::Named(name) if name == "__ku_error_type" => Ok(format!("ku_error_move(&{place})")),
         IrType::Named(name) => Ok(format!("{}(&{place})", c_named_move_function(name))),
@@ -17417,7 +17465,7 @@ fn c_clone_value(ty: &IrType, expression: &str) -> KuResult<String> {
             Ok(format!("ku_object_clone({expression})"))
         }
         IrType::Named(name) if name == "__ku_value" => Ok(format!("ku_value_clone({expression})")),
-        IrType::Named(name) if name == "__ku_time" => Ok(expression.to_string()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok(expression.to_string()),
         // Stage 8a: the server value is a shared heap pointer, cloned by copy.
         IrType::Named(name) if name == "__ku_http_server" => Ok(expression.to_string()),
         IrType::Named(name) => Ok(format!("{}({expression})", c_named_clone_function(name))),
@@ -17460,7 +17508,7 @@ fn c_drop_value(ty: &IrType, expression: &str) -> KuResult<String> {
         IrType::Named(name) if name == "__ku_value" => {
             Ok(format!("ku_value_drop(&{expression});"))
         }
-        IrType::Named(name) if name == "__ku_time" => Ok(String::new()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok(String::new()),
         // Stage 8a: the server outlives every local (freed by the accept loop on
         // exit, or reclaimed by the OS), so a local going out of scope drops nothing.
         IrType::Named(name) if name == "__ku_http_server" => Ok(String::new()),
@@ -17534,7 +17582,12 @@ fn c_type_suffix(ty: &IrType) -> KuResult<String> {
         IrType::Str => Ok("str".to_string()),
         IrType::Null => Ok("null".to_string()),
         IrType::Named(name) if name == "__ku_value" => Ok("kuvalue".to_string()),
-        IrType::Named(name) if name == "__ku_time" => Ok("time".to_string()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok(if name == "__ku_duration" {
+            "duration"
+        } else {
+            "time"
+        }
+        .to_string()),
         IrType::Named(name) if name == "__ku_http_server" => Ok("http_server".to_string()),
         IrType::Named(name) if name == "__ku_bytes" => Ok("bytes".to_string()),
         IrType::Named(name) if pg_native_suffix(name).is_some() => {
@@ -17571,7 +17624,7 @@ fn unsupported(message: impl Into<String>) -> KuError {
 fn is_c_owned_type(ty: &IrType) -> bool {
     match ty {
         IrType::Str | IrType::Array(_) | IrType::Result(_) | IrType::Closure { .. } => true,
-        IrType::Named(name) => name != "__ku_time",
+        IrType::Named(name) => !c_time_scalar_name(name),
         _ => false,
     }
 }
@@ -17724,7 +17777,7 @@ fn emit_drop_expr(out: &mut COutput, ty: &IrType, expression: &str) -> KuResult<
             out.push_str(&format!("  ku_value_drop(&{expression});\n"));
             Ok(())
         }
-        IrType::Named(name) if name == "__ku_time" => Ok(()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok(()),
         // Stage 8a: the HTTP server outlives every local (freed by the accept loop,
         // or reclaimed at process exit), so a local scope drop is a no-op.
         IrType::Named(name) if name == "__ku_http_server" => Ok(()),

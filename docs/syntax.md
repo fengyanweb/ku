@@ -1527,7 +1527,7 @@ time.millis(value: Time | Duration): int
 time.from_unix(seconds:int): Time
 time.from_millis(ms:int): Time
 time.date(): Date
-time.date(value: Time): Date
+time.date(value: Time): Date!
 time.date(value: Time, zone:str): Date!
 time.date(year:int, month:int, day:int): Date!
 time.datetime(year:int, month:int, day:int, hour:int, minute:int, second:int): Time!

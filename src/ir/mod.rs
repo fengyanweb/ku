@@ -5444,7 +5444,8 @@ impl<'a> FunctionLowerer<'a> {
 /// float/mixed/dynamic expressions retain their separate existing semantics.
 pub(crate) fn ir_expr_needs_sync_guard(expr: &IrExpr) -> bool {
     if matches!(&expr.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), .. }
-        if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response"))
+        if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response"
+            | "time.from_unix" | "time.from_millis" | "time.add" | "time.sub" | "time.diff"))
     {
         return true;
     }
@@ -5491,6 +5492,7 @@ fn ir_expr_needs_post_call_safepoint(expr: &IrExpr) -> bool {
         } => matches!(
             name.as_str(),
             "array.map"
+                | "time.sleep"
                 | "string.trim"
                 | "string.lower"
                 | "string.upper"

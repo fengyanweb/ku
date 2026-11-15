@@ -3361,6 +3361,217 @@ fn native_kuvalue_as_int_as_str_chain() {
 }
 
 #[test]
+fn native_time_constructors_duration_and_arithmetic_preserve_contracts() {
+    use chrono::TimeZone;
+    // Pin native range checks to the actual locked calendar implementation.
+    for (millis, valid) in [
+        (-8_334_601_228_800_001, false),
+        (-8_334_601_228_800_000, true),
+        (8_210_266_876_799_999, true),
+        (8_210_266_876_800_000, false),
+    ] {
+        assert_eq!(
+            chrono::Utc.timestamp_millis_opt(millis).single().is_some(),
+            valid
+        );
+    }
+    let dir = unique_temp_dir("time-duration");
+    fs::write(dir.join("main.ku"), r#"
+import { time, json } from "std"
+fn ku_time_duration(): int { return 7 }
+fn ku_time_add(): int { return 8 }
+fn ku_duration_kind(): int { return 9 }
+fn main(): null! {
+    KU_TIME_DURATION = 1
+    ku_time_sleep = 2
+    if (ku_time_duration() != 7 || ku_time_add() != 8 || ku_duration_kind() != 9 || KU_TIME_DURATION != 1 || ku_time_sleep != 2) panic("internal time helper shadowed user name")
+    t = time.from_millis(1782210600123)
+    if (time.millis(time.from_unix(-1)) != -1000) panic("seconds constructor")
+    zero = time.duration(0)?
+    epoch = time.from_unix(0)
+    if (epoch == zero || zero == epoch || !(epoch != zero) || !(zero != epoch)) panic("mixed time tags compare equal")
+    if (time.millis(time.from_unix(9223372036854775)) != 9223372036854775000) panic("constructor incorrectly validates calendar range")
+    if (time.millis(time.from_millis(-8334601228800000)) != -8334601228800000) panic("minimum calendar millis")
+    if (time.millis(time.from_millis(8210266876799999)) != 8210266876799999) panic("maximum calendar millis")
+    unit = "s" + ""
+    d = time.duration(5, unit)?
+    if (unit != "s" || d.kind != "time.duration" || time.millis(d) != 5000) panic("duration input or unit")
+    copied = d.clone()
+    copied.millis = 7
+    if (time.millis(d) != 5000 || copied == d) panic("duration copy aliases source")
+    later = time.add(t, d)
+    if (time.millis(t) != 1782210600123 || time.millis(d) != 5000) panic("arithmetic consumed source")
+    if (time.compare(later, t) != 1 || time.compare(t, later) != -1 || time.compare(t, t) != 0) panic("compare")
+    if (time.sub(later, d) != t || time.millis(time.diff(later, t)) != 5000) panic("duration arithmetic")
+    negative = time.diff(t, later)
+    if (negative.millis != -5000 || negative.kind != "time.duration") panic("signed diff")
+    if (json.encode(d)? != "{\"kind\":\"time.duration\",\"millis\":5000}") panic("duration JSON")
+    for u in ["ms", "s", "m", "h", "d"] {
+        value = time.duration(2, u)?
+        if (time.millis(value) <= 0) panic("duration unit")
+    }
+    if (time.millis(time.duration(9)?) != 9) panic("default unit")
+    if (!time.is_leap(-400) || time.is_leap(1900) || !time.is_leap(2000)) panic("Gregorian leap rule")
+    if (time.days_in_month(2028, 2)? != 29 || time.days_in_month(2026, 12)? != 31) panic("calendar month")
+    caught = 0
+    for u in ["bad中🙂", "s\0", "S"] {
+        try { invalid = time.duration(1, u)? }
+        catch (e) {
+            if (e.domain != "time" || e.code != "invalid_duration" || !e.message.contains(u)) panic("unit error")
+            caught += 1
+        }
+    }
+    try { invalid = time.duration(-1)? } catch(e) { if(e.code != "invalid_duration") panic("negative duration"); caught += 1 }
+    try { invalid = time.duration(9223372036854775807, "s")? } catch(e) { if(e.message != "time calculation overflow") panic("duration overflow"); caught += 1 }
+    try { time.sleep(negative)? } catch(e) { if(e.code != "invalid_duration") panic("negative sleep"); caught += 1 }
+    try { invalid = time.days_in_month(2147483647, 12)? } catch(e) { if(e.code != "invalid_date" || !e.message.contains("2147483647")) panic("year boundary"); caught += 1 }
+    if (caught != 7) panic("missing time error")
+    time.sleep(time.duration(0)?)?
+    time.sleep(1)?
+    println("native-time-duration-ok")
+    return ok(null)
+}
+"#.replace("\\0", "\0")).expect("write time duration fixture");
+    let Some(exe) = native_build(&dir, "main.ku", "time-duration") else {
+        return;
+    };
+    let (stdout, code) = run_binary(&exe);
+    assert_eq!(code, Some(0));
+    assert_eq!(stdout.replace('\r', ""), "native-time-duration-ok\n");
+    // A raw helper under an already short HTTP deadline must return promptly,
+    // without changing or extending that deadline to the requested sleep.
+    let generated = fs::read_to_string(native_generated_c(&dir, "time-duration")).unwrap();
+    let harness = dir.join("sleep-deadline.c");
+    fs::write(
+        &harness,
+        format!(
+            r#"
+#define main ku_generated_main
+{generated}
+#undef main
+int main(void) {{
+  __ku_handler_deadline = __ku_handler_now_ms() + 1;
+  unsigned long long deadline = __ku_handler_deadline;
+  KuResult_null result = __ku_time_sleep(10);
+  if (result.ok || !__ku_handler_timed_out || __ku_handler_deadline != deadline) return 2;
+  ku_result_drop_null(&result);
+  __ku_handler_timed_out = 0;
+  __ku_handler_deadline = __ku_handler_now_ms();
+  result = __ku_time_sleep(0);
+  if (result.ok || !__ku_handler_timed_out) return 3;
+  ku_result_drop_null(&result);
+  return 0;
+}}
+"#
+        ),
+    )
+    .unwrap();
+    if let Some(exe) = compile_c_harness(&dir, &harness, "sleep-deadline") {
+        assert_eq!(run_binary(&exe).1, Some(0));
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_time_invalid_constructors_fail_and_wrong_kinds_are_rejected() {
+    let dir = unique_temp_dir("time-invalid");
+    for expression in [
+        "time.from_unix(9223372036854775807)",
+        "time.from_millis(8210266876800000)",
+        "time.from_millis(-8334601228800001)",
+        "time.add(t, time.duration(9223372036854775807)?)",
+        "time.diff(t, other)",
+    ] {
+        fs::write(
+            dir.join("main.ku"),
+            format!(
+                r#"
+fn main(): null! {{
+    t = time.from_unix(1)
+    other = time.from_unix(0)
+    other.millis = -9223372036854775807 - 1
+    println({expression})
+    return ok(null)
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let Some(exe) = native_build(&dir, "main.ku", "time-invalid") else {
+            return;
+        };
+        let output = run_bounded(&mut Command::new(exe), RUN_TIMEOUT, RUN_OUTPUT_LIMITS).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{expression}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("time/invalid_"),
+            "{expression}: {:?}",
+            output.stderr
+        );
+    }
+    for expression in [
+        "time.add(t, t)",
+        "time.unix(time.duration(1)?)",
+        "time.sleep(t)",
+        "time.compare(t, time.duration(1)?)",
+    ] {
+        fs::write(
+            dir.join("main.ku"),
+            format!(
+                "fn main(): null! {{ t=time.instant()\nprintln({expression})\nreturn ok(null) }}"
+            ),
+        )
+        .unwrap();
+        let output = run_bounded(
+            Command::new(ku_binary())
+                .current_dir(&dir)
+                .args(["build", "--native", "main.ku"]),
+            BUILD_TIMEOUT,
+            BUILD_OUTPUT_LIMITS,
+        )
+        .unwrap();
+        assert!(
+            !output.status.success(),
+            "wrong native time kind accepted: {expression}"
+        );
+    }
+    fs::write(
+        dir.join("main.ku"),
+        r#"
+fn OwnerFailure(): int {
+    held = ["owned" + " value"]
+    invalid = time.from_millis(9223372036854775807)
+    println(held.len())
+    return 1
+}
+fn main() { println(OwnerFailure()) }
+"#,
+    )
+    .unwrap();
+    let generated = native_emit_c(&dir, "main.ku");
+    run_array_capacity_c_harness(
+        &dir,
+        &generated,
+        "time-fatal-owners",
+        r#"
+int main(void) {
+  for (unsigned round=0; round<16; ++round) {
+    __ku_sync_reset();
+    (void)OwnerFailure();
+    KuSyncExitSignal signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_HTTP_JSON_FATAL);
+    CHECK(strstr(__ku_sync_error_message(signal),"time millis outside supported range")!=NULL);
+    CHECK(!__ku_call_depth && NO_LIVE_ALLOCATIONS());
+    KuTime next=__ku_time_from_millis(0);
+    CHECK(next.tag==KU_TIME_TAG && __ku_sync_take().kind==KU_SYNC_EXIT_NONE);
+  }
+  return 0;
+}
+"#,
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_time_wall_object_elapsed_and_steady_clock() {
     let dir = unique_temp_dir("time-native");
     fs::write(
