@@ -250,9 +250,10 @@ jobs:
 
       - name: Verify the same archive's installed sync and async PostgreSQL lifecycles
         shell: pwsh
+        working-directory: ${{ runner.temp }}
         run: |
           $ErrorActionPreference = 'Stop'
-          & ${{ matrix.python }} -B .github/scripts/verify-installed-pg.py `
+          & ${{ matrix.python }} -B (Join-Path $env:GITHUB_WORKSPACE '.github/scripts/verify-installed-pg.py') `
             --repo $env:GITHUB_WORKSPACE --version $env:RELEASE_VERSION `
             --target '${{ matrix.target }}' --commit $env:GITHUB_SHA `
             --output (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json') `
