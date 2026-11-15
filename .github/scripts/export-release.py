@@ -30,6 +30,11 @@ assert _RUNTIME_SPEC and _RUNTIME_SPEC.loader
 RUNTIME_BUNDLE = importlib.util.module_from_spec(_RUNTIME_SPEC)
 _RUNTIME_SPEC.loader.exec_module(RUNTIME_BUNDLE)
 
+_COMPRESSION_SPEC = importlib.util.spec_from_file_location("ku_native_compression_build", Path(__file__).with_name("build-native-compression.py"))
+assert _COMPRESSION_SPEC and _COMPRESSION_SPEC.loader
+NATIVE_COMPRESSION = importlib.util.module_from_spec(_COMPRESSION_SPEC)
+_COMPRESSION_SPEC.loader.exec_module(NATIVE_COMPRESSION)
+
 MAX_FILES = 1000
 MAX_BYTES = 1024 * 1024 * 1024
 MAX_METADATA = 16 * 1024 * 1024
@@ -626,9 +631,46 @@ def verify_archive(archive: Path, expected: dict, destination: Path):
         raise ExportError("extracted file set differs from manifest")
 
 
+def add_native_compression(stage: Stager, root: Path, target: str) -> list[dict]:
+    """Export only verified optional pack payload, never its build/cache tree."""
+    if not root.is_absolute():
+        raise ExportError("--native-compression-root must be an absolute private pack root")
+    plain(root, directory=True)
+    records = []
+    for codec in ("zstd", "zlib"):
+        relative = f"native-compression/v1/{target}/{codec}"
+        leaf = root / relative
+        plain(leaf, directory=True)
+        # Check every allowed input's directory components before even reading
+        # a manifest; no symlink/junction can redirect verification elsewhere.
+        archive = NATIVE_COMPRESSION.archive_name(codec, target)
+        names = ["manifest.json", "LICENSE", "lib/" + archive,
+                 *["include/" + name for name in NATIVE_COMPRESSION.HEADER_NAMES[codec]]]
+        for name in names:
+            plain(leaf / name)
+        try:
+            manifest = NATIVE_COMPRESSION.validate_pack(leaf, codec, target)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            raise ExportError("native compression pack validation failed: " + str(error)) from error
+        for name in names:
+            stage.add(relative + "/" + name, source=leaf / name)
+        # Validate the copied snapshot too. A source changing between initial
+        # verification and copying must not create a mixed final SDK.
+        copied = NATIVE_COMPRESSION.validate_pack(stage.root / relative, codec, target)
+        if copied != manifest:
+            raise ExportError("native compression pack changed during export")
+        records.append({"name": codec, "version": copied["version"],
+                        "license": copied["license"]["spdx"],
+                        "source": copied["source"],
+                        "materials": [relative + "/LICENSE"],
+                        "manifest": relative + "/manifest.json"})
+    return records
+
+
 def export_release(bundle: Path, output: Path, repo: Path, version: str,
                    target: str, commit: str, metadata: Path, rust_sysroot: Path,
-                   verify_install: bool = False) -> dict:
+                   verify_install: bool = False,
+                   native_compression_root: Path | None = None) -> dict:
     if not VERSION.fullmatch(version):
         raise ExportError("version must be a canonical 0.x.y version without v")
     if target not in TARGETS:
@@ -677,7 +719,10 @@ def export_release(bundle: Path, output: Path, repo: Path, version: str,
         release['rust_toolchain'] = runtime['rustc']['release']
         if executable == "ku" and stage.files[executable]["mode"] != 0o755:
             raise ExportError("Unix ku executable does not have its executable mode")
-        stage.add("THIRD_PARTY.json", data=json_bytes(collect_licenses(stage, metadata, repo, rust_sysroot, runtime["rustc"]["toolchain"])))
+        attribution = collect_licenses(stage, metadata, repo, rust_sysroot, runtime["rustc"]["toolchain"])
+        if native_compression_root is not None:
+            attribution["native_compression"] = add_native_compression(stage, native_compression_root, target)
+        stage.add("THIRD_PARTY.json", data=json_bytes(attribution))
         stage.add("RELEASE.json", data=json_bytes(release))
         instructions = f"""# Ku {version} ({target})
 
@@ -725,6 +770,16 @@ Ku's own code is licensed under Apache-2.0. The original LICENSE and NOTICE are
 included at the archive root. Third-party components retain their respective
 licenses and copyright notices in THIRD_PARTY/ and THIRD_PARTY.json.
 """
+        if native_compression_root is not None:
+            instructions += """
+Optional native compression packs (Zstandard 1.5.7 and zlib 1.4) are included
+under native-compression/v1/ for automatic installed-CLI discovery. Keep their
+layout and original LICENSE files intact. Programs using std.zstd, std.gzip or
+std.deflate require the native C backend and a matching C compiler; the codec
+archives are linked statically and need no codec shared-library sidecar when
+deployed. System C runtime requirements still apply. Unused codecs are not
+linked. Running/checking or Runner builds do not implement these bytes APIs.
+"""
         stage.add("README-INSTALL.md", data=instructions.encode("utf-8"))
         sums = "".join(f"{spec['sha256']}  {name}\n" for name, spec in sorted(stage.files.items()))
         stage.add("SHA256SUMS", data=sums.encode("utf-8"))
@@ -764,6 +819,8 @@ def main() -> int:
         parser.add_argument(f"--{argument}", required=True, type=Path)
     for argument in ("version", "target", "commit"):
         parser.add_argument(f"--{argument}", required=True)
+    parser.add_argument("--native-compression-root", type=Path,
+                        help="explicit optional private build root containing both verified codec packs; no cache/source material is exported")
     arguments = parser.parse_args()
     try:
         result = export_release(**vars(arguments), verify_install=True)

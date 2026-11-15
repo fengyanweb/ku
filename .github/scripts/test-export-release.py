@@ -11,7 +11,10 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
+import socket
+import struct
 import subprocess
 from pathlib import Path
 import sys
@@ -27,6 +30,44 @@ SPEC = importlib.util.spec_from_file_location("ku_export", Path(__file__).with_n
 assert SPEC and SPEC.loader
 EXPORT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EXPORT)
+
+
+def compression_pack_fixture(root, target, codec):
+    """Native object headers suffice for packaging tests, never runtime proof."""
+    builder = EXPORT.NATIVE_COMPRESSION
+    leaf = root / 'native-compression/v1' / target / codec
+    (leaf / 'lib').mkdir(parents=True)
+    (leaf / 'include').mkdir()
+    if target == 'aarch64-apple-darwin':
+        body = struct.pack('<IIIIIIII', 0xfeedfacf, 0x100000c, 0, 1, 0, 0, 0, 0)
+    elif target.endswith('linux-gnu'):
+        body = bytearray(64)
+        body[:7] = b'\x7fELF\x02\x01\x01'
+        struct.pack_into('<HH', body, 16, 1, 183 if target.startswith('aarch64-') else 62)
+        body = bytes(body)
+    else:
+        body = struct.pack('<HHIIIHH', 0x8664, 1, 0, 0, 0, 0, 0) + bytes(40)
+    header = f'{"fixture.o/":<16}{0:<12}{0:<6}{0:<6}{100644:<8}{len(body):<10}`\n'.encode()
+    library = leaf / 'lib' / builder.archive_name(codec, target)
+    library.write_bytes(b'!<arch>\n' + header + body + (b'\n' if len(body) & 1 else b''))
+    for name in builder.HEADER_NAMES[codec]:
+        text = ('#define ZLIB_VERSION "1.4"\n' if codec == 'zlib' else
+                '#define ZSTD_VERSION_MAJOR 1\n#define ZSTD_VERSION_MINOR 5\n#define ZSTD_VERSION_RELEASE 7\n')
+        (leaf / 'include' / name).write_text(text, encoding='utf-8')
+    (leaf / 'LICENSE').write_text('upstream fixture license bytes\n', encoding='utf-8')
+    _, _, object_format, abi, crt = builder.TARGETS[target]
+    source = builder.SOURCES[codec]
+    manifest = {'format': 'ku-native-compression-pack-v1', 'codec': codec,
+                'version': source['version'], 'target': target,
+                'object_format': object_format, 'abi': abi, 'crt': crt,
+                'archive': builder.record_file(library),
+                'headers': [builder.record_file(leaf / 'include' / name) for name in builder.HEADER_NAMES[codec]],
+                'license': dict(builder.record_file(leaf / 'LICENSE'), spdx=source['license']),
+                'source': {'url': source['url'], 'sha256': source['sha256']},
+                'runtime_dependency': 'none',
+                'build': {'profile': 'Release', 'optimization': 'O2', 'multithread': False}}
+    (leaf / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+    return leaf
 
 
 class RuntimeConsumerReportTests(unittest.TestCase):
@@ -128,6 +169,210 @@ class RuntimeConsumerReportTests(unittest.TestCase):
             self.consumer.write_report(self.path, {'status': 'next complete report'})
         self.assertEqual(self.path.read_bytes(), self.original)
         self.assertEqual(list(self.root.glob('*.writing')), [])
+
+    def test_explicit_tls_certificate_tool_does_not_fall_back(self):
+        for value in ('relative-openssl', str(self.root / 'missing-openssl')):
+            with self.subTest(value=value), mock.patch.object(self.consumer.shutil, 'which') as which:
+                with self.assertRaisesRegex(RuntimeError, 'KU_TEST_OPENSSL must name an existing absolute'):
+                    self.consumer.tls_fixture_openssl({'KU_TEST_OPENSSL': value})
+                which.assert_not_called()
+
+    def installed_tls_orchestration(self, failure=None):
+        """Only the archive/lifetime protocol is mocked, not claimed as TLS proof.
+
+        The actual consumer uses ssl and the installed CLI. This unit test has
+        a real bounded socket peer but substitutes the compiler/client process
+        edges and certificate context, making SDK/source visibility assertions
+        independent of a C toolchain or a test certificate utility.
+        """
+        target = 'x86_64-pc-windows-msvc' if os.name == 'nt' else 'x86_64-unknown-linux-gnu'
+        install = self.root / '搬迁 SDK with spaces'
+        install.mkdir()
+        ku = install / ('ku.exe' if os.name == 'nt' else 'ku')
+        ku.write_bytes(b'installed package compiler bytes')
+        pack = install / 'native-tls/v1' / target
+        archive = 'ku_native_tls.lib' if os.name == 'nt' else 'libku_native_tls.a'
+        for name in ('manifest.kutls', 'include/ku_native_tls.h', 'lib/' + archive):
+            path = pack / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(('same archive TLS payload: ' + name).encode())
+        before = {p.relative_to(install).as_posix(): p.read_bytes() for p in install.rglob('*') if p.is_file()}
+        report, calls, endpoint = {}, [], {}
+
+        class WrappedSocket:
+            def __init__(self, value):
+                self.value = value
+            def __enter__(self):
+                return self
+            def __exit__(self, *ignored):
+                self.close()
+            def close(self):
+                self.value.close()
+            def recv(self, count):
+                return self.value.recv(count)
+            def sendall(self, value):
+                self.value.sendall(value)
+            def version(self):
+                return 'TLSv1.3'
+
+        context = SimpleNamespace(wrap_socket=lambda value, server_side: WrappedSocket(value))
+
+        def fixture(directory, env):
+            (directory / 'localhost-key.pem').write_text('private test fixture, must not be reported')
+            return 'public test certificate\n', context
+
+        def invoke(command, cwd, env, seconds=300):
+            calls.append([str(p) for p in command])
+            self.assertNotIn('KU_NATIVE_TLS_PACK', env)
+            self.assertNotIn('KU_NATIVE_TLS_LINK_REQUIRED', env)
+            if Path(command[0]) == ku:
+                self.assertTrue(ku.is_file())
+                self.assertEqual(command[1:6], ['build', '--backend', 'c', '--release', '--verbose'])
+                source = (cwd / 'main.ku').read_text()
+                endpoint['port'] = int(re.search(r'port: (\d+)', source)[1])
+                self.assertIn('tls_server_name: "localhost"', source)
+                self.assertIn('bytes.from_array([65, 0, 255])', source)
+                if failure == 'build':
+                    return subprocess.CompletedProcess(command, 31, b'fixture compiler failure', b'')
+                artifact = cwd / '.ku/build/release/client.c'
+                artifact.parent.mkdir(parents=True)
+                artifact.write_bytes(b'/* fixture only */ void ku_tls_v1_client_new(void);\n')
+                Path(command[-1]).write_bytes(b'fixture executable bytes')
+                return subprocess.CompletedProcess(command, 0, ('native c ok: ' + str(artifact) + '\n').encode(), b'')
+            self.assertFalse(install.exists())
+            self.assertFalse(ku.exists())
+            self.assertTrue((self.root / 'installed-sdk-unavailable-for-tls').is_dir())
+            self.assertFalse(any(Path(command[0]).parent.parent.glob('build project*')))
+            self.assertEqual(Path(command[0]).parent.name, '搬迁 TLS program')
+            self.assertEqual(cwd.name, 'unrelated working directory')
+            if failure == 'run':
+                return subprocess.CompletedProcess(command, 32, b'', b'fixture runtime failure')
+            with socket.create_connection(('127.0.0.1', endpoint['port']), timeout=2) as client:
+                client.sendall(bytes((65, 0, 255)))
+                reply = bytearray()
+                while len(reply) < 3:
+                    part = client.recv(3-len(reply))
+                    self.assertTrue(part)
+                    reply.extend(part)
+            stdout = (str(len(reply)) + '\n' + ''.join(str(value) + '\n' for value in reply)).encode()
+            return subprocess.CompletedProcess(command, 0, stdout, b'')
+
+        with mock.patch.object(self.consumer, 'installed_tls_fixture', side_effect=fixture), mock.patch.object(self.consumer, 'invoke', side_effect=invoke):
+            arguments = (install, self.root, {'KU_NATIVE_TLS_PACK': '/must-not-use/source/pack', 'KU_NATIVE_TLS_LINK_REQUIRED': '1'}, report, self.path, target)
+            if failure:
+                with self.assertRaisesRegex(RuntimeError, 'native TLS build failed|incorrect result or exit'):
+                    self.consumer.installed_native_tls_consumer(*arguments, checkout_hidden=True)
+            else:
+                self.consumer.installed_native_tls_consumer(*arguments, checkout_hidden=True)
+        self.assertEqual({p.relative_to(install).as_posix(): p.read_bytes() for p in install.rglob('*') if p.is_file()}, before)
+        self.assertEqual(list(self.root.glob('ku-installed-tls-*')), [])
+        self.assertFalse((self.root / 'installed-sdk-unavailable-for-tls').exists())
+        self.assertTrue(report['installed_native_tls']['peer_stopped'])
+        self.assertTrue(report['installed_native_tls']['installation_restored'])
+        self.assertNotIn('private test fixture, must not be reported', json.dumps(report))
+        self.assertEqual(len(calls), 1 if failure == 'build' else 2)
+        return report['installed_native_tls']
+
+    def test_installed_tls_uses_archive_pack_and_moved_source_free_binary(self):
+        detail = self.installed_tls_orchestration()
+        self.assertEqual(detail['status'], 'passed')
+        self.assertTrue(detail['source_removed_before_run'])
+        self.assertTrue(detail['sdk_unavailable_during_run'])
+        self.assertTrue(detail['checkout_hidden_during_build'])
+        self.assertTrue(detail['binary_echo'])
+        self.assertEqual(detail['tls_version'], 'TLSv1.3')
+
+    def test_installed_tls_failure_restores_archive_and_stops_owned_peer(self):
+        for stage in ('build', 'run'):
+            with self.subTest(stage=stage):
+                # Each failure owns a distinct SDK and peer lifecycle.
+                with tempfile.TemporaryDirectory(prefix='tls-failure-', dir=self.root) as nested:
+                    original = self.root
+                    self.root = Path(nested)
+                    try:
+                        self.assertEqual(self.installed_tls_orchestration(stage)['status'], 'failed')
+                    finally:
+                        self.root = original
+
+    def installed_compression_orchestration(self, failure=None):
+        """Real file moves/removal with mocked process edges, not codec proof."""
+        target = 'x86_64-pc-windows-msvc' if os.name == 'nt' else 'x86_64-unknown-linux-gnu'
+        install = self.root / '搬迁 codec SDK with spaces'
+        install.mkdir()
+        ku = install / ('ku.exe' if os.name == 'nt' else 'ku')
+        ku.write_bytes(b'installed package compiler bytes')
+        for codec in ('zstd', 'zlib'):
+            compression_pack_fixture(install, target, codec)
+        before = {p.relative_to(install).as_posix(): p.read_bytes() for p in install.rglob('*') if p.is_file()}
+        env = {name: '/must-not-use/development-pack' for name in ('KU_ZSTD_LIB', 'KU_ZSTD_INCLUDE', 'KU_ZLIB_LIB', 'KU_ZLIB_INCLUDE')}
+        calls, report = [], {}
+
+        def invoke(command, cwd, selected_env, seconds=300):
+            calls.append([str(p) for p in command])
+            for name in env:
+                self.assertNotIn(name, selected_env)
+            if Path(command[0]) == ku:
+                self.assertTrue(ku.is_file())
+                self.assertEqual(command[1:6], ['build', '--backend', 'c', '--release', '--verbose'])
+                source = (cwd / 'main.ku').read_text(encoding='utf-8')
+                for module in ('zstd', 'gzip', 'deflate'):
+                    self.assertIn(module + '.compress(source, 4096)?', source)
+                if failure == 'build':
+                    return subprocess.CompletedProcess(command, 31, b'fixture compiler failure', b'')
+                artifact = cwd / '.ku/build/release/codec.c'
+                artifact.parent.mkdir(parents=True)
+                artifact.write_bytes(b'#define KU_FEATURE_ZSTD 1\n#define KU_FEATURE_ZLIB 1\nku_zstd_compress ku_gzip_compress ku_deflate_compress\n')
+                Path(command[-1]).write_bytes(b'fixture executable bytes')
+                return subprocess.CompletedProcess(command, 0, ('native c ok: ' + str(artifact) + '\n').encode(), b'')
+            self.assertFalse(install.exists())
+            self.assertFalse(ku.exists())
+            self.assertTrue((self.root / 'installed-sdk-unavailable-for-compression').is_dir())
+            self.assertFalse(any(Path(command[0]).parent.parent.glob('codec build project*')))
+            self.assertEqual(Path(command[0]).parent.name, '搬迁 codec program')
+            self.assertEqual(cwd.name, 'unrelated working directory')
+            self.assertEqual(seconds, 15)
+            return subprocess.CompletedProcess(command, 32 if failure == 'run' else 0,
+                b'' if failure == 'run' else b'installed-native-compression-roundtrip-ok\n', b'')
+
+        with mock.patch.object(self.consumer, 'invoke', side_effect=invoke):
+            arguments = (install, self.root, env, report, self.path, target)
+            if failure:
+                with self.assertRaisesRegex(RuntimeError, 'native compression build failed|incorrect result or exit'):
+                    self.consumer.installed_native_compression_consumer(*arguments, checkout_hidden=True)
+            else:
+                self.consumer.installed_native_compression_consumer(*arguments, checkout_hidden=True)
+        self.assertEqual({p.relative_to(install).as_posix(): p.read_bytes() for p in install.rglob('*') if p.is_file()}, before)
+        self.assertEqual(list(self.root.glob('ku-installed-compression-*')), [])
+        self.assertFalse((self.root / 'installed-sdk-unavailable-for-compression').exists())
+        self.assertTrue(report['installed_native_compression']['installation_restored'])
+        self.assertEqual(len(calls), 1 if failure == 'build' else 2)
+        return report['installed_native_compression']
+
+    def test_installed_compression_uses_moved_archive_without_source_or_sdk(self):
+        detail = self.installed_compression_orchestration()
+        self.assertEqual(detail['status'], 'passed')
+        for key in ('source_removed_before_run', 'sdk_unavailable_during_run', 'checkout_hidden_during_build', 'binary_roundtrip', 'unicode_roundtrip', 'output_bound'):
+            self.assertTrue(detail[key])
+        self.assertEqual(set(detail['installed_packs']), {'zstd', 'zlib'})
+
+    def test_installed_compression_failures_restore_original_sdk(self):
+        for stage in ('build', 'run'):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory(prefix='codec-failure-', dir=self.root) as nested:
+                original = self.root
+                self.root = Path(nested)
+                try:
+                    self.assertEqual(self.installed_compression_orchestration(stage)['status'], 'failed')
+                finally:
+                    self.root = original
+
+    def test_old_plain_bundle_does_not_acquire_optional_codec_dependency(self):
+        install = self.root / 'plain SDK'
+        install.mkdir()
+        report = {}
+        with mock.patch.object(self.consumer, 'invoke') as invoked:
+            self.consumer.installed_native_compression_consumer(install, self.root, {}, report, self.path, 'x86_64-unknown-linux-gnu')
+        invoked.assert_not_called()
+        self.assertEqual(report['installed_native_compression']['status'], 'not_in_archive')
 
 
 class ReleaseExportTests(unittest.TestCase):
@@ -252,6 +497,94 @@ class ReleaseExportTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 EXPORT.RUNTIME_BUNDLE.relative_file(self.bundle, name)
 
+    def optional_compression_root(self):
+        root = self.root / 'private codec cache 中文'
+        for codec in ('zstd', 'zlib'):
+            compression_pack_fixture(root, self.target, codec)
+        return root
+
+    def test_explicit_optional_compression_exports_only_verified_payload(self):
+        root = self.optional_compression_root()
+        self.put(root / 'sources/upstream.tar.gz', b'not an SDK payload')
+        self.put(root / 'build/debug.log', b'not an SDK payload')
+        self.put(root / f'native-compression/v1/{self.target}/zstd/extra-private-file', b'not an SDK payload')
+        result = self.run_export(native_compression_root=root)
+        manifest = json.loads(Path(result['manifest_path']).read_text(encoding='utf-8'))
+        exported = {name for name in manifest['files'] if name.startswith('native-compression/')}
+        expected = set()
+        for codec in ('zstd', 'zlib'):
+            prefix = f'native-compression/v1/{self.target}/{codec}/'
+            expected.update(prefix + name for name in ('manifest.json', 'LICENSE',
+                'lib/' + EXPORT.NATIVE_COMPRESSION.archive_name(codec, self.target),
+                *['include/' + name for name in EXPORT.NATIVE_COMPRESSION.HEADER_NAMES[codec]]))
+        self.assertEqual(exported, expected)
+        extracted = self.root / 'codec extracted'
+        extracted.mkdir()
+        EXPORT.verify_archive(Path(result['asset_path']), manifest['files'], extracted)
+        for codec in ('zstd', 'zlib'):
+            leaf = extracted / 'native-compression/v1' / self.target / codec
+            EXPORT.NATIVE_COMPRESSION.validate_pack(leaf, codec, self.target)
+        attribution = json.loads((extracted / 'THIRD_PARTY.json').read_text(encoding='utf-8'))
+        self.assertEqual([row['name'] for row in attribution['native_compression']], ['zstd', 'zlib'])
+        self.assertNotIn(str(root), json.dumps(attribution))
+        self.assertFalse(any(name.startswith(('sources/', 'build/')) for name in manifest['files']))
+
+    def test_optional_compression_refuses_missing_mixed_or_unlicensed_pack(self):
+        root = self.optional_compression_root()
+        leaf = root / 'native-compression/v1' / self.target / 'zlib'
+        path = leaf / 'manifest.json'
+        original = path.read_bytes()
+        for change in ('wrong-target', 'wrong-license', 'wrong-build', 'duplicate-key', 'mixed-header'):
+            with self.subTest(change=change):
+                data = json.loads(original)
+                header = leaf / 'include/zlib.h'
+                saved = header.read_bytes()
+                if change == 'wrong-target':
+                    data['target'] = 'aarch64-apple-darwin'
+                elif change == 'wrong-license':
+                    data['license']['spdx'] = 'Apache-2.0'
+                elif change == 'wrong-build':
+                    data['build']['multithread'] = True
+                elif change == 'mixed-header':
+                    header.write_bytes(b'wrong installed header')
+                path.write_text(json.dumps(data), encoding='utf-8')
+                if change == 'duplicate-key':
+                    path.write_text('{"codec":"different",' + original.decode()[1:], encoding='utf-8')
+                with self.assertRaises(EXPORT.ExportError):
+                    self.run_export(native_compression_root=root)
+                path.write_bytes(original)
+                header.write_bytes(saved)
+                self.assertEqual(list(self.output.glob('*.tar.gz')), [])
+        (leaf / 'LICENSE').unlink()
+        with self.assertRaises(OSError):
+            self.run_export(native_compression_root=root)
+
+    def test_optional_compression_detects_mutation_during_snapshot_copy(self):
+        root = self.optional_compression_root()
+        original_add = EXPORT.Stager.add
+
+        def changed_copy(stage, name, **arguments):
+            if name.endswith('/include/zstd.h'):
+                arguments['source'].write_bytes(b'changed between verification and copying')
+            return original_add(stage, name, **arguments)
+
+        with mock.patch.object(EXPORT.Stager, 'add', new=changed_copy), self.assertRaises(ValueError):
+            self.run_export(native_compression_root=root)
+        self.assertEqual(list(self.output.glob('*.tar.gz')), [])
+
+    def test_optional_compression_rejects_linked_pack_file(self):
+        root = self.optional_compression_root()
+        leaf = root / 'native-compression/v1' / self.target / 'zstd'
+        path = leaf / 'include/zstd.h'
+        saved = self.root / 'external-header.h'
+        path.rename(saved)
+        try:
+            path.symlink_to(saved)
+        except OSError as error:
+            self.skipTest('platform cannot create a file symlink: ' + str(error))
+        with self.assertRaisesRegex(EXPORT.ExportError, 'symlink/reparse'):
+            self.run_export(native_compression_root=root)
+
     def test_roundtrip_hashes_original_licenses_and_file_set(self):
         result = self.run_export()
         archive = Path(result["asset_path"])
@@ -262,6 +595,7 @@ class ReleaseExportTests(unittest.TestCase):
         self.assertEqual(manifest["ku_license"], "Apache-2.0")
         self.assertEqual(manifest["size"], archive.stat().st_size)
         self.assertEqual(result["sha256"], hashlib.sha256(archive.read_bytes()).hexdigest())
+        self.assertFalse(any(name.startswith('native-compression/') for name in manifest['files']))
         self.assertEqual(manifest["files"]["ku"]["mode"], 0o755)
         extracted = self.root / "extract"
         extracted.mkdir()

@@ -16,9 +16,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
+import ssl
 import stat
 import sys
 import tempfile
+import threading
 import time
 
 sys.dont_write_bytecode = True
@@ -185,6 +188,338 @@ def management_invocation(name):
 def relocate_checkout_entry(source, destination):
     """CI-owned source/target entries may be on a different Windows volume."""
     shutil.move(str(source), str(destination))
+
+
+def tls_fixture_openssl(env):
+    """Locate an existing certificate fixture tool; never install one."""
+    explicit = env.get('KU_TEST_OPENSSL')
+    if explicit is not None:
+        path = Path(explicit)
+        if not path.is_absolute() or not path.is_file():
+            raise RuntimeError('KU_TEST_OPENSSL must name an existing absolute OpenSSL executable')
+        return path
+    candidates = []
+    if sys.platform == 'darwin':
+        candidates += [Path('/opt/homebrew/opt/openssl@3/bin/openssl'), Path('/usr/local/opt/openssl@3/bin/openssl')]
+    found = shutil.which('openssl', path=env.get('PATH'))
+    if found:
+        candidates.append(Path(found))
+    if os.name == 'nt':
+        if env.get('PGROOT'):
+            candidates.append(Path(env['PGROOT']) / 'bin/openssl.exe')
+        git = shutil.which('git', path=env.get('PATH'))
+        if git:
+            candidates += [Path(git).parent.parent / 'usr/bin/openssl.exe', Path(git).parent.parent / 'mingw64/bin/openssl.exe']
+    for candidate in candidates:
+        if candidate.is_absolute() and candidate.is_file():
+            return candidate
+    raise RuntimeError('installed native TLS acceptance requires an existing OpenSSL certificate fixture tool; set KU_TEST_OPENSSL. This is a test-tool requirement, not a Ku runtime dependency')
+
+
+def installed_tls_fixture(directory, env):
+    certificate, key = directory / 'localhost.pem', directory / 'localhost-key.pem'
+    tool = tls_fixture_openssl(env)
+    result = invoke([tool, 'req', '-x509', '-sha256', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256',
+                     '-nodes', '-days', '1', '-subj', '/CN=localhost',
+                     '-addext', 'subjectAltName=DNS:localhost',
+                     '-addext', 'basicConstraints=critical,CA:FALSE',
+                     '-addext', 'keyUsage=critical,digitalSignature',
+                     '-addext', 'extendedKeyUsage=serverAuth',
+                     '-keyout', key, '-out', certificate], directory, env, seconds=15)
+    if result.returncode:
+        # Do not include any key material or arbitrary tool output in reports.
+        raise RuntimeError('OpenSSL localhost certificate fixture creation failed; certificate tool exit=' + str(result.returncode))
+    key.chmod(0o600)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(certificate, key)
+    return certificate.read_text(encoding='ascii'), context
+
+
+def installed_native_tls_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False):
+    """Run a moved archive's TLS program after its source and SDK disappear.
+
+    The binary payload and native API mirror native_run_test's source-free TLS
+    contract. Certificate files and the one loopback peer are private to this
+    bounded temporary scope. The actual installed CLI must discover its own
+    verified target pack; no source-tree compiler or substitute pack is used.
+    """
+    detail = {'status': 'running', 'target': target, 'scope': 'installed archive -> Release C11 O2 -> moved source-free TLS executable',
+              'checkout_hidden_during_build': checkout_hidden,
+              'installed_pack_files': {}, 'source_removed_before_run': False, 'sdk_unavailable_during_run': False,
+              'installation_restored': False, 'peer_stopped': False}
+    report['installed_native_tls'] = detail
+    write_report(report_path, report)
+    build_env = dict(env)
+    for name in ('KU_NATIVE_TLS_PACK', 'KU_NATIVE_TLS_LINK_REQUIRED'):
+        build_env.pop(name, None)
+    ku = install / ('ku.exe' if os.name == 'nt' else 'ku')
+    pack = install / 'native-tls/v1' / target
+    archive = 'ku_native_tls.lib' if target.endswith('windows-msvc') else 'libku_native_tls.a'
+    for relative in ('manifest.kutls', 'include/ku_native_tls.h', 'lib/' + archive):
+        path = pack / relative
+        if not path.is_file():
+            raise RuntimeError('installed archive is missing its native TLS pack file: ' + relative)
+        detail['installed_pack_files'][relative] = EXPORT.file_hash(path)
+    with tempfile.TemporaryDirectory(prefix='ku-installed-tls-', dir=root) as temporary, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        temporary = Path(temporary)
+        project = temporary / 'build project 中文'
+        project.mkdir()
+        deployment = temporary / '搬迁 TLS program'
+        deployment.mkdir()
+        unrelated = temporary / 'unrelated working directory'
+        unrelated.mkdir()
+        certificate, context = installed_tls_fixture(temporary, build_env)
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)
+        listener.settimeout(.1)
+        port = listener.getsockname()[1]
+        source = project / 'main.ku'
+        source.write_text('''import bytes from "std.bytes"
+import net from "std.net"
+fn main(): null! {{
+    payload = bytes.from_array([65, 0, 255])?
+    client = net.client({{host: "127.0.0.1", port: {port}, tls: true,
+        tls_server_name: "localhost", tls_ca_pem: {certificate},
+        connect_timeout_ms: 3000, read_timeout_ms: 3000,
+        write_timeout_ms: 3000, max_read_bytes: 32}})?
+    client.write(payload)?
+    reply = client.read(3)?
+    println(reply.len())
+    println(reply.get(0)?)
+    println(reply.get(1)?)
+    println(reply.get(2)?)
+    client.close()
+    return ok(null)
+}}
+'''.format(port=port, certificate=json.dumps(certificate)), encoding='utf-8')
+        detail['source_sha256'] = EXPORT.file_hash(source)
+        program = project / ('tls-client.exe' if os.name == 'nt' else 'tls-client')
+        retired = root / 'installed-sdk-unavailable-for-tls'
+        installation_retired = False
+        stop = threading.Event()
+        peer_result = {}
+        peer = None
+        active = []
+
+        def serve():
+            until = time.monotonic() + 10
+            try:
+                while not stop.is_set() and time.monotonic() < until:
+                    try:
+                        connection, _ = listener.accept()
+                        break
+                    except socket.timeout:
+                        continue
+                else:
+                    if not stop.is_set():
+                        raise TimeoutError('installed TLS client never connected')
+                    return
+                active.append(connection)
+                connection.settimeout(3)
+                with connection, context.wrap_socket(connection, server_side=True) as tls:
+                    active.append(tls)
+                    request = bytearray()
+                    while len(request) < 3:
+                        part = tls.recv(3-len(request))
+                        if not part:
+                            raise RuntimeError('installed TLS client closed before its binary payload')
+                        request.extend(part)
+                    if request != bytes((65, 0, 255)):
+                        raise RuntimeError('installed TLS client changed its binary payload')
+                    peer_result['tls_version'] = tls.version()
+                    tls.sendall(bytes((66, 0, 254)))
+                    peer_result['binary_echo'] = True
+            except BaseException as error:
+                peer_result['error'] = type(error).__name__ + ': ' + str(error)[:400]
+
+        primary = None
+        try:
+            built = invoke([ku, 'build', '--backend', 'c', '--release', '--verbose', source.name, '-o', program], project, build_env)
+            detail['build_exit'] = built.returncode
+            detail['build_stdout_sha256'] = hashlib.sha256(built.stdout).hexdigest()
+            detail['build_stderr_sha256'] = hashlib.sha256(built.stderr).hexdigest()
+            if built.returncode:
+                raise RuntimeError('installed archive native TLS build failed: ' + (output(built)+built.stderr.decode(errors='replace'))[-4000:])
+            emitted = reported_artifact(output(built), 'native c ok: ', project, temporary)
+            if b'ku_tls_v1_client_new' not in emitted.read_bytes():
+                raise RuntimeError('installed TLS build did not emit the native TLS engine path')
+            detail['generated_c_sha256'] = EXPORT.file_hash(emitted)
+            detail['binary_sha256'] = EXPORT.file_hash(program)
+            deployed = deployment / program.name
+            shutil.move(str(program), str(deployed))
+            shutil.rmtree(project)
+            detail['source_removed_before_run'] = not project.exists()
+            if retired.exists():
+                raise RuntimeError('TLS SDK quarantine destination unexpectedly exists')
+            relocate_checkout_entry(install, retired)
+            installation_retired = True
+            detail['sdk_unavailable_during_run'] = not install.exists() and not ku.exists()
+            if not detail['source_removed_before_run'] or not detail['sdk_unavailable_during_run']:
+                raise RuntimeError('native TLS execution still has its original source or SDK')
+            peer = threading.Thread(target=serve, name='installed-native-tls-peer')
+            peer.start()
+            started = invoke([deployed], unrelated, build_env, seconds=15)
+            detail['run_exit'] = started.returncode
+            detail['run_stdout_sha256'] = hashlib.sha256(started.stdout).hexdigest()
+            detail['run_stderr_sha256'] = hashlib.sha256(started.stderr).hexdigest()
+            if started.returncode or output(started) != '3\n66\n0\n254\n' or started.stderr:
+                raise RuntimeError('moved source-free installed TLS program returned an incorrect result or exit')
+            peer.join(timeout=5)
+            if peer.is_alive() or peer_result.get('error') or not peer_result.get('binary_echo'):
+                raise RuntimeError('installed TLS loopback peer failed: ' + str(peer_result))
+            detail['tls_version'] = peer_result['tls_version']
+            detail['binary_echo'] = True
+        except BaseException as error:
+            primary = error
+        finally:
+            cleanup = OWNER.CleanupErrors()
+            stop.set()
+            cleanup.attempt('TLS listener close', listener.close)
+            for connection in active:
+                cleanup.attempt('TLS accepted socket close', connection.close)
+            if peer is not None:
+                peer.join(timeout=5)
+                if peer.is_alive():
+                    cleanup.add('TLS peer thread still running')
+            detail['peer_stopped'] = peer is None or not peer.is_alive()
+            if installation_retired:
+                if retired.is_dir() and not install.exists():
+                    cleanup.attempt('restore installed SDK after TLS run', lambda: relocate_checkout_entry(retired, install))
+                else:
+                    cleanup.add('SDK restore paths changed; existing paths left untouched')
+            detail['installation_restored'] = install.is_dir() and ku.is_file() and not retired.exists()
+            if not detail['installation_restored']:
+                cleanup.add('installed SDK restoration unconfirmed')
+            detail['status'] = 'passed' if primary is None and not cleanup.failed else 'failed'
+            write_report(report_path, report)
+            cleanup.raise_if_any(primary)
+
+
+def installed_native_compression_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False):
+    """Consume optional codec packs from this final moved archive only.
+
+    The source exercises the same public bytes/codec contracts as the native
+    integration suite. The resulting app must remain runnable after all source
+    and generated C are deleted and the complete installed SDK is unavailable.
+    """
+    detail = {'status': 'running', 'target': target,
+              'scope': 'installed archive -> Release C11 O2 -> moved source-free compression executable',
+              'checkout_hidden_during_build': checkout_hidden, 'installed_packs': {},
+              'source_removed_before_run': False, 'sdk_unavailable_during_run': False,
+              'installation_restored': False}
+    report['installed_native_compression'] = detail
+    packs = install / 'native-compression/v1' / target
+    if not (install / 'native-compression').exists():
+        detail['status'] = 'not_in_archive'
+        write_report(report_path, report)
+        return
+    write_report(report_path, report)
+    for codec in ('zstd', 'zlib'):
+        leaf = packs / codec
+        manifest = EXPORT.NATIVE_COMPRESSION.validate_pack(leaf, codec, target)
+        detail['installed_packs'][codec] = {
+            'version': manifest['version'], 'target': manifest['target'],
+            'manifest_sha256': EXPORT.file_hash(leaf / 'manifest.json'),
+            'archive_sha256': manifest['archive']['sha256'],
+            'headers': {row['name']: row['sha256'] for row in manifest['headers']},
+            'license_sha256': manifest['license']['sha256']}
+    build_env = dict(env)
+    for name in ('KU_ZSTD_LIB', 'KU_ZSTD_INCLUDE', 'KU_ZLIB_LIB', 'KU_ZLIB_INCLUDE'):
+        build_env.pop(name, None)
+    ku = install / ('ku.exe' if os.name == 'nt' else 'ku')
+    with tempfile.TemporaryDirectory(prefix='ku-installed-compression-', dir=root) as temporary:
+        temporary = Path(temporary)
+        project = temporary / 'codec build project 中文'
+        project.mkdir()
+        deployment = temporary / '搬迁 codec program'
+        deployment.mkdir()
+        unrelated = temporary / 'unrelated working directory'
+        unrelated.mkdir()
+        source = project / 'main.ku'
+        source.write_text('''import {bytes, zstd, gzip, deflate} from "std"
+fn main(): null! {
+    source = bytes.from_array([0, 1, 127, 128, 255])?
+    z = zstd.compress(source, 4096)?
+    g = gzip.compress(source, 4096)?
+    d = deflate.compress(source, 4096)?
+    if (source.len() != 5 || source.get(4)? != 255) { fail "codec consumed input" }
+    rz = zstd.decompress(z, 5)?
+    rg = gzip.decompress(g, 5)?
+    rd = deflate.decompress(d, 5)?
+    if (rz.len() != 5 || rg.len() != 5 || rd.len() != 5) { fail "roundtrip length" }
+    i = 0
+    while (i < 5) {
+        if (rz.get(i)? != source.get(i)? || rg.get(i)? != source.get(i)? || rd.get(i)? != source.get(i)?) {
+            fail "roundtrip bytes"
+        }
+        i = i + 1
+    }
+    text = bytes.from_str("中文😀")?
+    encoded = gzip.compress(text, 4096)?
+    decoded = gzip.decompress(encoded, 4096)?
+    if (decoded.to_str()? != "中文😀") { fail "Unicode roundtrip" }
+    limited = false
+    try { gzip.decompress(g, 4)? } catch(error) { limited = error.code == "output_limit" }
+    if (!limited) { fail "output bound" }
+    println("installed-native-compression-roundtrip-ok")
+    return ok(null)
+}
+''', encoding='utf-8')
+        detail['source_sha256'] = EXPORT.file_hash(source)
+        program = project / ('codec.exe' if os.name == 'nt' else 'codec')
+        retired = root / 'installed-sdk-unavailable-for-compression'
+        installation_retired = False
+        primary = None
+        try:
+            built = invoke([ku, 'build', '--backend', 'c', '--release', '--verbose', source.name, '-o', program], project, build_env)
+            detail['build_exit'] = built.returncode
+            detail['build_stdout_sha256'] = hashlib.sha256(built.stdout).hexdigest()
+            detail['build_stderr_sha256'] = hashlib.sha256(built.stderr).hexdigest()
+            if built.returncode:
+                raise RuntimeError('installed archive native compression build failed: ' + (output(built)+built.stderr.decode(errors='replace'))[-4000:])
+            emitted = reported_artifact(output(built), 'native c ok: ', project, temporary)
+            generated = emitted.read_bytes()
+            for marker in (b'#define KU_FEATURE_ZSTD 1', b'#define KU_FEATURE_ZLIB 1', b'ku_zstd_compress', b'ku_gzip_compress', b'ku_deflate_compress'):
+                if marker not in generated:
+                    raise RuntimeError('installed compression build is missing a native codec path: ' + marker.decode())
+            detail['generated_c_sha256'] = EXPORT.file_hash(emitted)
+            detail['binary_sha256'] = EXPORT.file_hash(program)
+            deployed = deployment / program.name
+            shutil.move(str(program), str(deployed))
+            shutil.rmtree(project)
+            detail['source_removed_before_run'] = not project.exists()
+            if retired.exists():
+                raise RuntimeError('compression SDK quarantine destination unexpectedly exists')
+            relocate_checkout_entry(install, retired)
+            installation_retired = True
+            detail['sdk_unavailable_during_run'] = not install.exists() and not ku.exists()
+            if not detail['source_removed_before_run'] or not detail['sdk_unavailable_during_run']:
+                raise RuntimeError('compression execution still has its original source or SDK')
+            result = invoke([deployed], unrelated, build_env, seconds=15)
+            detail['run_exit'] = result.returncode
+            detail['run_stdout_sha256'] = hashlib.sha256(result.stdout).hexdigest()
+            detail['run_stderr_sha256'] = hashlib.sha256(result.stderr).hexdigest()
+            if result.returncode or output(result) != 'installed-native-compression-roundtrip-ok\n' or result.stderr:
+                raise RuntimeError('moved source-free installed compression program returned an incorrect result or exit')
+            detail['binary_roundtrip'] = True
+            detail['unicode_roundtrip'] = True
+            detail['output_bound'] = True
+        except BaseException as error:
+            primary = error
+        finally:
+            cleanup = OWNER.CleanupErrors()
+            if installation_retired:
+                if retired.is_dir() and not install.exists():
+                    cleanup.attempt('restore installed SDK after compression run', lambda: relocate_checkout_entry(retired, install))
+                else:
+                    cleanup.add('SDK restore paths changed; existing paths left untouched')
+            detail['installation_restored'] = install.is_dir() and ku.is_file() and not retired.exists()
+            if not detail['installation_restored']:
+                cleanup.add('installed SDK restoration unconfirmed')
+            detail['status'] = 'passed' if primary is None and not cleanup.failed else 'failed'
+            write_report(report_path, report)
+            cleanup.raise_if_any(primary)
 
 
 def reported_artifact(text, prefix, cwd, owned_root):
@@ -832,11 +1167,15 @@ def run(args, report):
                         retired.append((old, destination))
                 success("source-and-target-unavailable", ["build", "hello.ku", "-o", "without-source"])
                 execute_and_remove("source-and-target-unavailable-result", project / "without-source")
+                installed_native_tls_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
+                installed_native_compression_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
             finally:
                 for old, destination in reversed(retired):
                     relocate_checkout_entry(destination, old)
         else:
             report["cases"].append({"name": "source-and-target-unavailable", "status": "not_requested_local;CI flag required"})
+            installed_native_tls_consumer(install, root, env, report, args.output, target)
+            installed_native_compression_consumer(install, root, env, report, args.output, target)
         exercise_cli_contracts()
         # Exercise the native path separately; it must not consume runner rlibs.
         success("native-doctor", ["doctor", "--backend", "c"])

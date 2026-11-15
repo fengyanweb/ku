@@ -108,11 +108,56 @@ jobs:
           if ($LASTEXITCODE) { throw 'Runner manifest tests failed' }
           & ${{ matrix.python }} -B .github/scripts/test-export-release.py
           if ($LASTEXITCODE) { throw 'Exporter contract tests failed' }
+          & ${{ matrix.python }} -B .github/scripts/test-build-native-compression.py
+          if ($LASTEXITCODE) { throw 'Optional compression pack contract tests failed' }
           & ${{ matrix.python }} -B .github/scripts/test-prepare-release.py
           if ($LASTEXITCODE) { throw 'Final release/transfer contract tests failed' }
       - name: Build the real isolated same-batch installer tree
         shell: pwsh
         run: pwsh -NoLogo -NoProfile -NonInteractive -File scripts/package-release.ps1
+      - name: Build the private pinned optional compression packs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'ku-native-compression-private'
+          if (Test-Path -LiteralPath $root) { throw 'Private compression build root unexpectedly exists' }
+          "KU_NATIVE_COMPRESSION_ROOT=$root" >> $env:GITHUB_ENV
+          & ${{ matrix.python }} -B .github/scripts/build-native-compression.py --root $root --target '${{ matrix.target }}' --fetch
+          if ($LASTEXITCODE) { throw 'Private pinned compression dependency build failed' }
+      - name: Verify native HTTP, loop, Unicode and codec contracts with C11 O2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'cli-contract-target'
+          $env:KU_BIN = Join-Path $env:CARGO_TARGET_DIR $(if ($IsWindows) { 'debug/ku.exe' } else { 'debug/ku' })
+          if (-not (Test-Path -LiteralPath $env:KU_BIN -PathType Leaf)) { throw 'Same-batch source test CLI is missing' }
+          # These existing C harnesses accept GCC-driver syntax. Use the
+          # runner's existing clang; do not install or replace a compiler.
+          & clang --version
+          if ($LASTEXITCODE) { throw 'The existing clang driver is required by the native C harnesses' }
+          $env:KU_CC = 'clang -O2'
+          $packs = Join-Path $env:KU_NATIVE_COMPRESSION_ROOT 'native-compression/v1/${{ matrix.target }}'
+          $env:KU_ZSTD_LIB = Join-Path $packs 'zstd/lib'
+          $env:KU_ZSTD_INCLUDE = Join-Path $packs 'zstd/include'
+          $env:KU_ZLIB_LIB = Join-Path $packs 'zlib/lib'
+          $env:KU_ZLIB_INCLUDE = Join-Path $packs 'zlib/include'
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_http_status_test --test native_loop_control_test --test native_unicode_string_test --test native_compression_test -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Native HTTP/loop/Unicode/codec contracts failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_compression_test native_compression_public_project_runs_outside_source_with_space_and_unicode -- --ignored --exact --test-threads=1
+          if ($LASTEXITCODE) { throw 'Actual public three-codec C11 O2 project failed' }
+          if (-not $IsWindows) {
+            # One argv per line preserves space/Unicode paths; these absolute
+            # archives are the same verified private packs exported below.
+            $env:KU_COMPRESSION_TEST_CC = 'clang'
+            $env:KU_COMPRESSION_TEST_LINK_ARGS = @(
+              ('-I' + $env:KU_ZSTD_INCLUDE), ('-I' + $env:KU_ZLIB_INCLUDE),
+              (Join-Path $env:KU_ZSTD_LIB 'libzstd.a'), (Join-Path $env:KU_ZLIB_LIB 'libz.a')
+            ) -join "`n"
+            cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_compression_test native_compression_bounds_members_and_allocation_failures_release_owned_storage -- --ignored --exact --test-threads=1
+            if ($LASTEXITCODE) { throw 'Codec malformed-input/bounds/allocation-failure cleanup failed' }
+          } else {
+            Write-Output 'Windows: actual CLI/public codec execution above; the POSIX allocator C fixture is not claimed as executed with the MSVC /MD pack.'
+          }
       - name: Export the final source-free archive
         shell: pwsh
         run: |
@@ -125,7 +170,7 @@ jobs:
           $metadata | Out-File -FilePath $metadataPath -Encoding utf8
           $sysroot = & rustc +$env:KU_RELEASE_TOOLCHAIN --print sysroot
           if ($LASTEXITCODE) { throw 'Publisher sysroot missing' }
-          & ${{ matrix.python }} -B .github/scripts/export-release.py --bundle "release/${{ matrix.target }}" --output "$env:RUNNER_TEMP/cli-bundle-assets" --repo . --version $version --target '${{ matrix.target }}' --commit $env:GITHUB_SHA --metadata $metadataPath --rust-sysroot $sysroot.Trim()
+          & ${{ matrix.python }} -B .github/scripts/export-release.py --bundle "release/${{ matrix.target }}" --output "$env:RUNNER_TEMP/cli-bundle-assets" --repo . --version $version --target '${{ matrix.target }}' --commit $env:GITHUB_SHA --metadata $metadataPath --rust-sysroot $sysroot.Trim() --native-compression-root $env:KU_NATIVE_COMPRESSION_ROOT
           if ($LASTEXITCODE) { throw 'Actual archive validation failed' }
       - name: Install the unlike consumer Rust toolchain
         shell: pwsh
@@ -231,6 +276,25 @@ jobs:
             --path (Join-Path $env:RUNNER_TEMP 'cli-consumer-evidence.json') `
             --path (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json')
           if ($LASTEXITCODE) { throw 'Cannot summarize installation verification' }
+          $path = Join-Path $env:RUNNER_TEMP 'cli-consumer-evidence.json'
+          if (Test-Path -LiteralPath $path) {
+            $evidence = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+            $native = [ordered]@{target='${{ matrix.target }}'; installed_native_tls=$evidence.installed_native_tls; installed_native_compression=$evidence.installed_native_compression}
+            $text = ConvertTo-Json -InputObject $native -Depth 8 -Compress
+            if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 32768) { throw 'Native consumer metadata exceeds summary bound' }
+            Write-Output $text
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Native installed SDK checks: $text"
+          }
+      - name: Remove the owned private compression build root
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not [string]::IsNullOrWhiteSpace($env:KU_NATIVE_COMPRESSION_ROOT)) {
+            $expected = [IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP 'ku-native-compression-private'))
+            if ([IO.Path]::GetFullPath($env:KU_NATIVE_COMPRESSION_ROOT) -ne $expected) { throw 'Refusing to clean an unowned compression build root' }
+            if (Test-Path -LiteralPath $expected) { Remove-Item -LiteralPath $expected -Recurse -Force }
+          }
       - name: Remove the owned PostgreSQL import-library link directory
         if: always()
         shell: pwsh

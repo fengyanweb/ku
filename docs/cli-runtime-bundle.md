@@ -1,8 +1,8 @@
-# Runner 安装包与工具链
+# CLI、SDK 与构建工具链
 
 [English](cli-runtime-bundle.en.md) · [命令行完整参考](../web/src/content/docs/zh-cn/docs/tools/cli.md)
 
-开发接口参考，未发布。
+本文说明已发布安装包的目录布局、构建依赖和升级约定。
 
 ## 为什么会有 E0514
 
@@ -73,6 +73,14 @@ C 原生构建：
 ku build --backend c --release .\hello.ku -o ".\dist\hello-native.exe"
 & ".\dist\hello-native.exe"
 ```
+
+## Native C 的构建与部署依赖
+
+`--backend c` 使用目标平台的 C 编译器和链接器，失败时明确报错，不转为 Runner。普通 C 程序构建不读取 `libku.rlib`，也不为生成程序调用 Rust 编译器；`ku run` 和直接执行 `.ku` 的行为不因此改变。使用 `ku doctor --backend c` 检查 C 工具链；该检查不代表数据库库和其他可选原生依赖已经齐备。
+
+native `net.client` 启用 TLS 时，保留安装包中与 `ku` 相邻的 `native-tls/v1/<target>/`。CLI 自动定位同目标的 pack，并检查 manifest、header 和静态库；完整搬迁安装目录不需要重新设置路径。预构建 TLS 库在链接时进入程序，部署后不依赖 Ku 安装目录或 TLS pack，但仍依赖目标操作系统的 CRT 和系统网络库。
+
+数据库客户端动态库不包含在 Ku 安装包内。PostgreSQL 使用绝对目录 `KU_PG_LIB`；MySQL/MariaDB 使用 `KU_MYSQL_LIB` 和对应头文件。库的 CPU 架构、目标 ABI 和客户端家族必须与构建目标一致。构建成功后，部署环境仍须提供匹配的客户端动态库及其依赖；`--static` 不能替代这些依赖检查。不要将 C 编译成功、交叉编译成功或源码检查当成目标机器运行通过。
 
 ## 更新与失败处理
 

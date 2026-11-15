@@ -1,8 +1,8 @@
-# Runner bundles and toolchains
+# CLI, SDK and build toolchains
 
 [简体中文](cli-runtime-bundle.md) · [Complete CLI reference](../web/src/content/docs/en/docs/tools/cli.md)
 
-Development API reference; unreleased.
+This document describes published bundle layouts, build dependencies and upgrade requirements.
 
 ## Why E0514 occurs
 
@@ -73,6 +73,14 @@ Native C build:
 ku build --backend c --release .\hello.ku -o ".\dist\hello-native.exe"
 & ".\dist\hello-native.exe"
 ```
+
+## Native C build and deployment dependencies
+
+`--backend c` uses the target C compiler and linker. Failures are reported without switching to Runner. Building an ordinary C program does not read `libku.rlib` or invoke Rust to create the program; this does not change `ku run` or direct `.ku` execution. Use `ku doctor --backend c` to inspect the C toolchain. That check does not establish that database libraries or other optional native dependencies are available.
+
+For native `net.client` TLS, retain `native-tls/v1/<target>/` beside `ku`. The CLI discovers the matching target pack and validates its manifest, header and static library. Moving the whole installation does not require resetting its path. The prebuilt TLS library is linked into the executable: deployment does not require the Ku installation or TLS pack, but target CRT and system networking dependencies remain.
+
+Database client shared libraries are external to Ku bundles. PostgreSQL uses the absolute directory `KU_PG_LIB`; MySQL/MariaDB uses `KU_MYSQL_LIB` and matching headers. CPU architecture, target ABI and client-library family must match the build target. Deployment still requires compatible client libraries and their dependencies; `--static` does not bypass these checks. A successful C compile, cross-build or source review is not evidence that the result ran on its target machine.
 
 ## Updates and failures
 
