@@ -609,15 +609,25 @@ fn local_from_millis(millis: i64, span: Span) -> KuResult<DateTime<Local>> {
 }
 
 fn format_local(millis: i64, layout: &str, span: Span) -> KuResult<String> {
-    Ok(local_from_millis(millis, span)?
-        .format(&chrono_layout(layout))
-        .to_string())
+    format_datetime(local_from_millis(millis, span)?, layout, span)
 }
 
 fn format_zoned(millis: i64, layout: &str, zone: &str, span: Span) -> KuResult<String> {
-    Ok(zoned_datetime(millis, zone, span)?
+    format_datetime(zoned_datetime(millis, zone, span)?, layout, span)
+}
+
+fn format_datetime<Tz: TimeZone>(value: DateTime<Tz>, layout: &str, span: Span) -> KuResult<String>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    // A user layout can make Chrono's formatter return fmt::Error. to_string()
+    // treats that as a panic; write_to keeps invalid layouts on the Result path.
+    let mut text = String::new();
+    value
         .format(&chrono_layout(layout))
-        .to_string())
+        .write_to(&mut text)
+        .map_err(|_| time_error_at("invalid_format", "invalid time format", span))?;
+    Ok(text)
 }
 
 enum ZoneKind {

@@ -1759,9 +1759,26 @@ fn main(): null! {
         );
     }
 
+    for layout in ["%Q", "%", "%#z"] {
+        for zone in ["", ", \"utc\""] {
+            let source = format!(
+                "fn main(): null! {{ time.format(time.from_millis(0), {layout:?}{zone})? return ok(null) }}"
+            );
+            let err = run_err(&source);
+            assert!(
+                err.contains("invalid_format"),
+                "invalid layout {layout:?} must be an ordinary time error, got: {err}"
+            );
+        }
+    }
+
     let source = r#"
 fn main(): null! {
     epoch = time.from_millis(0)
+    if (time.format(epoch, "literal %%")? != "literal %" ||
+        time.format(epoch, "yyyy-MM-dd HH:mm:ss|%%|%:z", "utc")? != "1970-01-01 00:00:00|%|+00:00") {
+        panic("valid local or zoned format changed")
+    }
     if (time.format(epoch, "yyyy-MM-dd HH:mm:ss", "+23:59")? != "1970-01-01 23:59:00") {
         panic("positive offset boundary changed")
     }
