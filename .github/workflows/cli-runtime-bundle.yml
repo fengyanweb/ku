@@ -78,6 +78,15 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Build the private pinned optional compression packs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'ku-native-compression-private'
+          if (Test-Path -LiteralPath $root) { throw 'Private compression build root unexpectedly exists' }
+          "KU_NATIVE_COMPRESSION_ROOT=$root" >> $env:GITHUB_ENV
+          & ${{ matrix.python }} -B .github/scripts/build-native-compression.py --root $root --target '${{ matrix.target }}' --fetch
+          if ($LASTEXITCODE) { throw 'Private pinned compression dependency build failed' }
       - name: Read the single publisher toolchain configuration
         shell: pwsh
         run: |
@@ -115,15 +124,6 @@ jobs:
       - name: Build the real isolated same-batch installer tree
         shell: pwsh
         run: pwsh -NoLogo -NoProfile -NonInteractive -File scripts/package-release.ps1
-      - name: Build the private pinned optional compression packs
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $root = Join-Path $env:RUNNER_TEMP 'ku-native-compression-private'
-          if (Test-Path -LiteralPath $root) { throw 'Private compression build root unexpectedly exists' }
-          "KU_NATIVE_COMPRESSION_ROOT=$root" >> $env:GITHUB_ENV
-          & ${{ matrix.python }} -B .github/scripts/build-native-compression.py --root $root --target '${{ matrix.target }}' --fetch
-          if ($LASTEXITCODE) { throw 'Private pinned compression dependency build failed' }
       - name: Verify native HTTP, loop, Unicode and codec contracts with C11 O2
         shell: pwsh
         run: |

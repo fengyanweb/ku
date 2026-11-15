@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import hashlib
+import http.client
 import importlib.util
 import io
 import json
@@ -26,6 +27,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -83,8 +85,9 @@ def fetch_source(root, codec):
         if digest(destination) != spec['sha256']:
             raise ValueError('cached ' + codec + ' source SHA256 differs; refusing overwrite')
         return destination
-    hosts = ({'zlib.net', 'www.zlib.net'} if codec == 'zlib' else
-             {'github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com'})
+    hosts = {'github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com'}
+    if codec == 'zlib':
+        hosts |= {'zlib.net', 'www.zlib.net'}
 
     def allowed(url):
         parsed = urllib.parse.urlsplit(url)
@@ -101,46 +104,94 @@ def fetch_source(root, codec):
             allowed(new_url)
             return super().redirect_request(request, fp, code, message, headers, new_url)
 
-    allowed(spec['url'])
-    opener = urllib.request.build_opener(OfficialRedirects())
-    partial = None
-    try:
-        with tempfile.NamedTemporaryFile(prefix='.' + spec['filename'] + '.', suffix='.partial', dir=sources, delete=False) as copied:
-            partial = Path(copied.name)
-            deadline = time.monotonic() + 120
-            total, checksum = 0, hashlib.sha256()
-            request = urllib.request.Request(spec['url'], headers={'User-Agent': 'Ku-native-compression-builder/1'})
-            with opener.open(request, timeout=30) as response:
-                allowed(response.geturl())
-                if response.status != 200:
-                    raise ValueError('compression source download did not return HTTP 200')
-                length = response.headers.get('Content-Length')
-                if length is not None and not 0 < int(length) <= MAX_SOURCE_ARCHIVE:
-                    raise ValueError('compression source download exceeds its size bound')
-                while True:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError('compression source download exceeded 120 seconds')
-                    block = response.read(64 * 1024)
-                    if not block:
-                        break
-                    total += len(block)
-                    if total > MAX_SOURCE_ARCHIVE:
-                        raise ValueError('compression source download exceeds its size bound')
-                    checksum.update(block)
-                    copied.write(block)
-                if length is not None and total != int(length):
-                    raise ValueError('compression source download length differs from HTTP metadata')
-            if not total or checksum.hexdigest() != spec['sha256']:
-                raise ValueError('downloaded ' + codec + ' source SHA256 differs from its pinned official release')
-        partial.chmod(0o644)
-        # A link publishes the verified completed file without replacing a
-        # concurrently created source. The partial name is always removed.
-        os.link(partial, destination)
-        print('Fetched verified official compression source:', destination, flush=True)
-        return destination
-    finally:
-        if partial is not None:
-            partial.unlink(missing_ok=True)
+    # Use the upstream project's published release asset, not GitHub's
+    # automatically generated source tarball. Both origins require one pin.
+    urls = (spec['url'], 'https://github.com/madler/zlib/releases/download/v1.4/zlib-1.4.tar.gz') if codec == 'zlib' else (spec['url'],)
+    attempts = []
+    for url in urls:
+        allowed(url)
+        opener = urllib.request.build_opener(OfficialRedirects())
+        partial = None
+        total, checksum, magic = 0, hashlib.sha256(), bytearray()
+        complete, status, content_type, encoding, final_host = False, None, None, None, None
+        reason = 'transport_error'
+
+        def receipt():
+            # Fixed public request URLs and the final hostname only. A signed
+            # redirect query, response body, headers or credentials are never
+            # printed. Hex magic is explicitly limited to the first 16 bytes.
+            return {'codec': codec, 'source_url': url, 'final_host': final_host,
+                    'status': status, 'size': total, 'actual_sha256': checksum.hexdigest(),
+                    'expected_sha256': spec['sha256'],
+                    'sha256_scope': 'complete_response' if complete else 'received_prefix',
+                    'content_type': content_type, 'content_encoding': encoding,
+                    'magic16_hex': bytes(magic).hex()}
+
+        try:
+            with tempfile.NamedTemporaryFile(prefix='.' + spec['filename'] + '.', suffix='.partial', dir=sources, delete=False) as copied:
+                partial = Path(copied.name)
+                try:
+                    deadline = time.monotonic() + 120
+                    request = urllib.request.Request(url, headers={'User-Agent': 'Ku-native-compression-builder/1'})
+                    with opener.open(request, timeout=30) as response:
+                        status = response.status
+                        content_type = str(response.headers.get('Content-Type', ''))[:128]
+                        encoding = str(response.headers.get('Content-Encoding', ''))[:128]
+                        reason = 'unapproved_redirect'
+                        allowed(response.geturl())
+                        final_host = urllib.parse.urlsplit(response.geturl()).hostname
+                        reason = 'http_status'
+                        if status != 200:
+                            raise ValueError('compression source download did not return HTTP 200')
+                        reason = 'size_bound'
+                        length = response.headers.get('Content-Length')
+                        if length is not None and not 0 < int(length) <= MAX_SOURCE_ARCHIVE:
+                            raise ValueError('compression source download exceeds its size bound')
+                        while True:
+                            reason = 'timeout'
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError('compression source download exceeded 120 seconds')
+                            reason = 'transport_error'
+                            block = response.read(64 * 1024)
+                            if not block:
+                                complete = True
+                                break
+                            total += len(block)
+                            checksum.update(block)
+                            magic.extend(block[:16-len(magic)])
+                            reason = 'size_bound'
+                            if total > MAX_SOURCE_ARCHIVE:
+                                raise ValueError('compression source download exceeds its size bound')
+                            copied.write(block)
+                        reason = 'length_mismatch'
+                        if length is not None and total != int(length):
+                            raise ValueError('compression source download length differs from HTTP metadata')
+                    reason = 'sha256_mismatch'
+                    if not total or checksum.hexdigest() != spec['sha256']:
+                        raise ValueError('compression source SHA256 differs from its pinned official release')
+                except (ValueError, OSError, urllib.error.URLError, http.client.HTTPException) as error:
+                    if isinstance(error, urllib.error.HTTPError):
+                        status = error.code
+                        content_type = str(error.headers.get('Content-Type', ''))[:128]
+                        encoding = str(error.headers.get('Content-Encoding', ''))[:128]
+                        reason = 'http_status'
+                        error.close()
+                    elif isinstance(error, TimeoutError):
+                        reason = 'timeout'
+                    failed = dict(receipt(), failure=reason, error_type=type(error).__name__)
+                    attempts.append(failed)
+                    print('Compression source attempt failed: ' + json.dumps(failed, sort_keys=True), flush=True)
+                    continue
+            partial.chmod(0o644)
+            # Publishing is outside the retry handler: a concurrent cache file
+            # or filesystem error must not be mistaken for a download failure.
+            os.link(partial, destination)
+            print('Fetched verified official compression source: ' + json.dumps(receipt(), sort_keys=True), flush=True)
+            return destination
+        finally:
+            if partial is not None:
+                partial.unlink(missing_ok=True)
+    raise ValueError('pinned official compression sources failed: ' + json.dumps(attempts, sort_keys=True))
 
 
 def digest(path):

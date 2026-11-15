@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compression-pack ownership, provenance and target regressions; no builds."""
 import copy
+from contextlib import redirect_stdout
 import hashlib
 import importlib.util
 import io
@@ -109,10 +110,12 @@ class CompressionPackTests(unittest.TestCase):
             fetch.assert_called_once_with(self.root, 'zlib')
             self.assertEqual(build.call_args.args[3], source)
 
-    def fetch_response(self, payload, *, url=None, length=None, failure=False):
+    def fetch_response(self, payload, *, url=None, length=None, failure=False,
+                       content_type='application/gzip', encoding=''):
         class Response(io.BytesIO):
             status = 200
-            headers = {'Content-Length': str(len(payload) if length is None else length)}
+            headers = {'Content-Length': str(len(payload) if length is None else length),
+                       'Content-Type': content_type, 'Content-Encoding': encoding}
             def geturl(self):
                 return url or B.SOURCES['zlib']['url']
             def read(self, size=-1):
@@ -136,18 +139,71 @@ class CompressionPackTests(unittest.TestCase):
             self.assertEqual(opener.open.call_count, 1)
         self.assertFalse(any(self.root.rglob('*.partial')))
 
+    def test_zlib_official_fallback_keeps_same_pin_and_reports_both_payload_identities(self):
+        good = b'\x1f\x8bverified official fixture archive'
+        bad = b'<!DOCTYPE html>private-response-body-must-not-be-logged'
+        spec = copy.deepcopy(B.SOURCES['zlib'])
+        self.assertEqual(spec['sha256'], '02dd159783677a749c04adbdd02b55b8a2bcc7e054f51b76b549199a916ad584')
+        spec['sha256'] = hashlib.sha256(good).hexdigest()
+        urls = []
+
+        def opened(request, timeout):
+            urls.append(request.full_url)
+            self.assertEqual(timeout, 30)
+            alternate = request.full_url == 'https://github.com/madler/zlib/releases/download/v1.4/zlib-1.4.tar.gz'
+            return self.fetch_response(good if alternate else bad, url=request.full_url,
+                                       content_type='application/gzip' if alternate else 'text/html',
+                                       encoding='' if alternate else 'gzip')
+
+        log = io.StringIO()
+        with mock.patch.dict(B.SOURCES, {'zlib': spec}), mock.patch.object(B.urllib.request, 'build_opener', return_value=SimpleNamespace(open=opened)), redirect_stdout(log):
+            path = B.fetch_source(self.root, 'zlib')
+        self.assertEqual(urls, [spec['url'], 'https://github.com/madler/zlib/releases/download/v1.4/zlib-1.4.tar.gz'])
+        self.assertEqual(path.read_bytes(), good)
+        lines = log.getvalue().splitlines()
+        failed = json.loads(lines[0].removeprefix('Compression source attempt failed: '))
+        self.assertEqual(failed['failure'], 'sha256_mismatch')
+        self.assertEqual(failed['size'], len(bad))
+        self.assertEqual(failed['actual_sha256'], hashlib.sha256(bad).hexdigest())
+        self.assertEqual(failed['expected_sha256'], spec['sha256'])
+        self.assertEqual(failed['content_type'], 'text/html')
+        self.assertEqual(failed['content_encoding'], 'gzip')
+        self.assertEqual(failed['magic16_hex'], bad[:16].hex())
+        self.assertEqual(failed['sha256_scope'], 'complete_response')
+        succeeded = json.loads(lines[1].removeprefix('Fetched verified official compression source: '))
+        self.assertEqual(succeeded['source_url'], urls[1])
+        self.assertEqual(succeeded['actual_sha256'], spec['sha256'])
+        self.assertNotIn('private-response-body-must-not-be-logged', log.getvalue())
+        self.assertEqual(B.SOURCES['zlib']['url'], spec['url'])
+        self.assertFalse(any(self.root.rglob('*.partial')))
+
+    def test_zlib_fallback_is_bounded_and_does_not_log_transport_exception_text(self):
+        url_error = B.urllib.error.URLError('https://example.invalid/private?token=do-not-log')
+        opener = SimpleNamespace(open=mock.Mock(side_effect=url_error))
+        log = io.StringIO()
+        with mock.patch.object(B.urllib.request, 'build_opener', return_value=opener), redirect_stdout(log), self.assertRaises(ValueError) as raised:
+            B.fetch_source(self.root, 'zlib')
+        self.assertEqual(opener.open.call_count, 2)
+        self.assertNotIn('do-not-log', log.getvalue() + str(raised.exception))
+        rows = [json.loads(line.removeprefix('Compression source attempt failed: ')) for line in log.getvalue().splitlines()]
+        self.assertEqual([row['source_url'] for row in rows], [B.SOURCES['zlib']['url'], 'https://github.com/madler/zlib/releases/download/v1.4/zlib-1.4.tar.gz'])
+        self.assertTrue(all(row['size'] == 0 and row['magic16_hex'] == '' and row['sha256_scope'] == 'received_prefix' for row in rows))
+        self.assertEqual(list((self.root / 'sources').iterdir()), [])
+
     def test_failed_fetch_never_leaves_partial_or_replaces_bad_cached_source(self):
         payload = b'fixture source'
         for reason in ('bad-sha', 'oversize', 'bad-host', 'interrupted'):
             with self.subTest(reason=reason), tempfile.TemporaryDirectory(prefix='fetch-', dir=self.root) as directory:
                 cache = Path(directory)
-                response = self.fetch_response(payload,
-                    url='https://unrelated.invalid/source.tar.gz' if reason == 'bad-host' else None,
-                    length=B.MAX_SOURCE_ARCHIVE + 1 if reason == 'oversize' else None,
-                    failure=reason == 'interrupted')
-                opener = SimpleNamespace(open=mock.Mock(return_value=response))
+                def response(request, timeout):
+                    return self.fetch_response(payload,
+                        url='https://unrelated.invalid/source.tar.gz' if reason == 'bad-host' else request.full_url,
+                        length=B.MAX_SOURCE_ARCHIVE + 1 if reason == 'oversize' else None,
+                        failure=reason == 'interrupted')
+                opener = SimpleNamespace(open=mock.Mock(side_effect=response))
                 with mock.patch.object(B.urllib.request, 'build_opener', return_value=opener), self.assertRaises((ValueError, TimeoutError)):
                     B.fetch_source(cache, 'zlib')
+                self.assertEqual(opener.open.call_count, 2)
                 self.assertEqual(list((cache / 'sources').iterdir()), [])
         cached = self.root / 'sources/zlib-1.4.tar.gz'
         cached.parent.mkdir()
