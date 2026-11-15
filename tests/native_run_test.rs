@@ -3399,6 +3399,13 @@ fn main(): null! {
     copied = d.clone()
     copied.millis = 7
     if (time.millis(d) != 5000 || copied == d) panic("duration copy aliases source")
+    captured = d.clone()
+    read_duration = () => { return time.millis(captured) }
+    wrapped = ok(captured.clone())
+    first = wrapped?
+    values = [first, captured.clone()]
+    captured.millis = 8
+    if (read_duration() != 8 || values[0].millis != 5000 || values[1].millis != 5000) panic("duration context lifetime")
     later = time.add(t, d)
     if (time.millis(t) != 1782210600123 || time.millis(d) != 5000) panic("arithmetic consumed source")
     if (time.compare(later, t) != 1 || time.compare(t, later) != -1 || time.compare(t, t) != 0) panic("compare")
