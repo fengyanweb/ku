@@ -3381,6 +3381,17 @@ fn main(): null! {
     println(epoch > 0)
     println(steady_after >= steady_before)
     println(current)
+    seconds = time.unix()
+    println(seconds > 0)
+    println(time.unix(current) == current.millis / 1000)
+    println(time.millis(current) == current.millis)
+    println(time.unix(time.instant()) > 0)
+    for millis in [0, 1, 999, 1000, 1001, -1, -999, -1000, -1001,
+                   -9223372036854775807 - 1, 9223372036854775807] {
+        current.millis = millis
+        println(time.unix(current))
+        if (current.millis != millis) panic("time.unix consumed or changed Time")
+    }
     return ok(null)
 }
 "#,
@@ -3399,6 +3410,26 @@ fn main(): null! {
             |line| line.starts_with("{ kind: time.time, millis: ") && line.ends_with(" }")
         ),
         "unexpected Time display: {normalized:?}"
+    );
+    assert_eq!(
+        &lines[6..],
+        [
+            "true",
+            "true",
+            "true",
+            "true",
+            "0",
+            "0",
+            "0",
+            "1",
+            "1",
+            "0",
+            "0",
+            "-1",
+            "-1",
+            "-9223372036854775",
+            "9223372036854775"
+        ]
     );
     assert_eq!(code, Some(0));
 
@@ -3425,13 +3456,19 @@ fn main(): null! {
 }
 
 #[test]
-fn native_time_virtual_kind_field_is_not_assignable() {
+fn native_time_rejects_kind_assignment_and_forged_values() {
     let dir = unique_temp_dir("time-kind-read-only");
-    fs::write(
-        dir.join("main.ku"),
-        "import time from \"std.time\"\nfn main() { value = time.instant()\nvalue.kind = \"changed\"\n}\n",
-    )
-    .expect("write main.ku");
+    for (source, diagnostic) in [
+        (
+            "import time from \"std.time\"\nfn main() { value = time.instant()\nvalue.kind = \"changed\"\n}\n",
+            "native Time.kind is read-only",
+        ),
+        (
+            "import time from \"std.time\"\nfn main() { println(time.unix({ kind: \"time.time\", millis: 1000 })) }\n",
+            "native C time.unix(value) requires a value returned by time.instant()",
+        ),
+    ] {
+        fs::write(dir.join("main.ku"), source).expect("write main.ku");
 
     let mut command = Command::new(ku_binary());
     command
@@ -3444,15 +3481,16 @@ fn native_time_virtual_kind_field_is_not_assignable() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!output.status.success(), "Time.kind assignment must fail");
+    assert!(!output.status.success(), "invalid Time usage must fail");
     assert!(
-        combined.contains("native Time.kind is read-only"),
+        combined.contains(diagnostic),
         "unexpected diagnostic: {combined}"
     );
     assert!(
         !dir.join("main.c").exists(),
-        "an invalid Time.kind lvalue must not produce uncompilable C"
+        "invalid Time usage must not produce uncompilable C"
     );
+    }
     fs::remove_dir_all(&dir).ok();
 }
 

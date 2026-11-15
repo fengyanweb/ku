@@ -30,6 +30,8 @@ This table describes the native backend, rather than promising every interpreter
 
 Read-only borrowing does not consume the original value, and a borrow cannot outlive its owner. Cleanup covers returns, errors, cancellation and partial initialization. Generated C helpers are internal implementations, not a stable ABI for arbitrary concurrent third-party calls.
 
+Current source supports synchronous `time.unix()` and `time.unix(time.instant())`, returning Unix seconds as an integer without consuming the Time value. Millisecond conversion truncates toward zero, matching the interpreter: `-1001` milliseconds becomes `-1` second. An ordinary dynamic object cannot substitute for a native Time.
+
 ## Capabilities added in current source
 
 The following capabilities passed normal C11 O2 functional regressions and real CLI/SDK validation on Linux x86_64, macOS Apple Silicon and Windows x86_64. They are included in current source, not in the original public 0.0.20 packages.

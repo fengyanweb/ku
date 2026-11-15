@@ -5922,7 +5922,7 @@ fn time_builtin_ir_type(module: &str, function: &str, args: &[IrExpr]) -> Option
     }
     match function {
         "instant" if args.is_empty() => Some(IrType::Named(TIME_TYPE.to_string())),
-        "now" | "elapsed" | "millis" | "steady_millis" => Some(IrType::Int),
+        "now" | "elapsed" | "unix" | "millis" | "steady_millis" => Some(IrType::Int),
         _ => None,
     }
 }

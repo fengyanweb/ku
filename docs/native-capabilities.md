@@ -30,6 +30,8 @@ ku build --backend runner --release hello.ku -o hello-runner
 
 只读借用不消费原值；借用结果不能逃出所有者寿命。资源释放必须覆盖返回、错误、取消和部分初始化。生成 C 的内部 helper 不是可供第三方任意并发调用的稳定 ABI。
 
+当前源码支持同步 `time.unix()` 和 `time.unix(time.instant())`，返回 Unix 秒整数；传入 Time 时只读原值。毫秒转秒沿用解释器的向零截断规则，例如 `-1001` 毫秒转换为 `-1` 秒。普通动态对象不能替代 native Time。
+
 ## 当前源码新增能力
 
 以下能力已完成 Linux x86_64、macOS Apple Silicon 和 Windows x86_64 的正常 C11 O2 功能回归及真实 CLI／SDK 验证。它们属于当前源码，不包含在原公开 0.0.20 安装包中。

@@ -17062,6 +17062,25 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
             _ => Err(unsupported("native C time.elapsed expects one argument")),
         };
     }
+    if name == "time.unix" {
+        // Match the interpreter's signed millisecond division, including
+        // truncation toward zero before the epoch. Read/validate the Time once.
+        return match args {
+            [] => Ok("(ku_time_now_millis() / INT64_C(1000))".to_string()),
+            [value] if matches!(&value.ty, IrType::Named(type_name) if type_name == "__ku_time") => {
+                Ok(format!(
+                    "(ku_time_value_millis({}) / INT64_C(1000))",
+                    c_expr(value)?
+                ))
+            }
+            [_] => Err(unsupported(
+                "native C time.unix(value) requires a value returned by time.instant()",
+            )),
+            _ => Err(unsupported(
+                "native C time.unix expects zero or one argument",
+            )),
+        };
+    }
     if name == "time.millis" {
         return match args {
             [] => Ok("ku_time_now_millis()".to_string()),
