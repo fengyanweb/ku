@@ -229,6 +229,9 @@ class CompressionPackTests(unittest.TestCase):
             # native link/API tests belong to the product integration gate.
             command = [str(value) for value in command]
             commands.append(command)
+            if target == 'aarch64-apple-darwin':
+                self.assertEqual(env['MACOSX_DEPLOYMENT_TARGET'], '11.0')
+                self.assertEqual(os.environ.get('MACOSX_DEPLOYMENT_TARGET'), '15.5')
             if '--version' in command:
                 return subprocess.CompletedProcess(command, 0, b'fixture compiler identity\n', b'')
             if os.name == 'nt':
@@ -266,7 +269,7 @@ class CompressionPackTests(unittest.TestCase):
                     shutil.copyfile(cwd/name, prefix/'include'/name)
             return subprocess.CompletedProcess(command, 0, b'', b'')
 
-        with self.pinned_fixture(source), mock.patch.object(B, 'run', side_effect=run):
+        with self.pinned_fixture(source), mock.patch.object(B, 'run', side_effect=run), mock.patch.dict(os.environ, {'MACOSX_DEPLOYMENT_TARGET': '15.5'}):
             manifest = B.build_one(cache, target, 'zlib', source, cc=sys.executable, cmake=sys.executable)
             leaf = cache/'native-compression/v1'/target/'zlib'
             self.assertTrue(leaf.is_dir())

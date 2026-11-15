@@ -1391,8 +1391,16 @@ $kuTlsBuildPrefix = ".ktb-"
 $kuTlsStage = $null
 $kuTlsBuildRoot = $null
 $kuTlsPayload = $null
+$kuTlsUsesMacOsDeploymentTarget = $Target -ceq 'aarch64-apple-darwin'
+$kuTlsHadMacOsDeploymentTarget = Test-Path -LiteralPath 'Env:MACOSX_DEPLOYMENT_TARGET'
+$kuTlsSavedMacOsDeploymentTarget = [Environment]::GetEnvironmentVariable('MACOSX_DEPLOYMENT_TARGET', 'Process')
 
 try {
+    if ($kuTlsUsesMacOsDeploymentTarget) {
+        # Match Rust's ARM64 floor and the optional native packs. In particular,
+        # ring's C/assembly build must not inherit the publisher SDK's version.
+        [Environment]::SetEnvironmentVariable('MACOSX_DEPLOYMENT_TARGET', '11.0', 'Process')
+    }
     $kuTlsStage = New-KuTlsPrivateRoot `
         $kuTlsOutputRoot `
         $kuTlsStagePrefix `
@@ -1591,21 +1599,33 @@ fn main() {
 }
 finally {
     try {
-        if ($null -ne $kuTlsStage) {
-            Remove-KuTlsPrivateRoot `
-                $kuTlsStage `
-                $kuTlsOutputRoot `
-                $kuTlsStagePrefix `
-                $kuTlsOwnerToken
+        try {
+            if ($null -ne $kuTlsStage) {
+                Remove-KuTlsPrivateRoot `
+                    $kuTlsStage `
+                    $kuTlsOutputRoot `
+                    $kuTlsStagePrefix `
+                    $kuTlsOwnerToken
+            }
+        }
+        finally {
+            if ($null -ne $kuTlsBuildRoot) {
+                Remove-KuTlsPrivateRoot `
+                    $kuTlsBuildRoot `
+                    $kuTlsOutputRoot `
+                    $kuTlsBuildPrefix `
+                    $kuTlsOwnerToken
+            }
         }
     }
     finally {
-        if ($null -ne $kuTlsBuildRoot) {
-            Remove-KuTlsPrivateRoot `
-                $kuTlsBuildRoot `
-                $kuTlsOutputRoot `
-                $kuTlsBuildPrefix `
-                $kuTlsOwnerToken
+        # Restore even if either owned-directory cleanup fails, including when
+        # the caller intentionally had no explicit deployment target.
+        if ($kuTlsUsesMacOsDeploymentTarget) {
+            if ($kuTlsHadMacOsDeploymentTarget) {
+                [Environment]::SetEnvironmentVariable('MACOSX_DEPLOYMENT_TARGET', $kuTlsSavedMacOsDeploymentTarget, 'Process')
+            }
+            else { $env:MACOSX_DEPLOYMENT_TARGET = $null }
         }
     }
 }

@@ -420,7 +420,9 @@ def build_one(root, target, codec, archive, cc=None, cmake=None):
             proxy.symlink_to(compiler)
             env.update(CC=str(proxy), CFLAGS='-O2 -fPIC', CXXFLAGS='-O2 -fPIC', CPPFLAGS='', LDFLAGS='')
             if target == 'aarch64-apple-darwin':
-                env.setdefault('MACOSX_DEPLOYMENT_TARGET', '11.0')
+                # Keep publisher packs compatible with the same ARM64 floor as
+                # the CLI and TLS archive, independent of the host's SDK.
+                env['MACOSX_DEPLOYMENT_TARGET'] = '11.0'
             make = Path(shutil.which('make') or '')
             if not make.is_absolute() or not make.is_file():
                 raise ValueError('an existing make is required for private POSIX compression builds')

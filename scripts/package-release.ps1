@@ -1691,7 +1691,14 @@ $contract = Get-HostContract; $buildId = Get-NativeTlsBuildId $builderPath; $wor
 if (-not (Test-PlainDirectory $workBase)) { throw "release packaging requires a plain system temporary directory" }
 $workOwner = [Guid]::NewGuid().ToString("N"); $workRoot = New-OwnedDirectory $workBase ".kr-" $workOwner; $wrapper = New-ToolWrapper $workRoot
 $script:releaseWorkRoot = $workRoot; $script:toolWrapper = $wrapper; $script:expectedTlsHeaderHash = (Get-FileHash -LiteralPath $tlsHeaderSource -Algorithm SHA256).Hash.ToLowerInvariant()
+$publisherHadMacOsDeploymentTarget = Test-Path -LiteralPath 'Env:MACOSX_DEPLOYMENT_TARGET'
+$publisherSavedMacOsDeploymentTarget = [Environment]::GetEnvironmentVariable('MACOSX_DEPLOYMENT_TARGET', 'Process')
 try {
+    if ($IsMacOS) {
+        # Freeze the CLI, rlib, proc macros and TLS archive to one ARM64 floor,
+        # rather than allowing the current SDK version to leak into the pack.
+        [Environment]::SetEnvironmentVariable('MACOSX_DEPLOYMENT_TARGET', '11.0', 'Process')
+    }
     $extensionWork = Join-Path $workRoot "extension"
     $vsixName = "ku-language-$version.vsix"; $vsixPath = Join-Path $extensionWork $vsixName
     if ($ExistingVsix) {
@@ -1758,4 +1765,14 @@ try {
         Write-Output "release bundle switched with per-target locking and crash recovery: $published"
     }
 }
-finally { Remove-OwnedDirectory $workRoot $workBase ".kr-" $workOwner }
+finally {
+    try { Remove-OwnedDirectory $workRoot $workBase ".kr-" $workOwner }
+    finally {
+        if ($IsMacOS) {
+            if ($publisherHadMacOsDeploymentTarget) {
+                [Environment]::SetEnvironmentVariable('MACOSX_DEPLOYMENT_TARGET', $publisherSavedMacOsDeploymentTarget, 'Process')
+            }
+            else { $env:MACOSX_DEPLOYMENT_TARGET = $null }
+        }
+    }
+}

@@ -298,7 +298,11 @@ class RuntimeConsumerReportTests(unittest.TestCase):
                 artifact.parent.mkdir(parents=True)
                 artifact.write_bytes(b'/* fixture only */ void ku_tls_v1_client_new(void);\n')
                 Path(command[-1]).write_bytes(b'fixture executable bytes')
-                stderr = b'LINK : warning LNK4098: defaultlib conflicts with other libs\n' if failure == 'crt-warning' else b''
+                stderr = b''
+                if failure == 'crt-warning':
+                    stderr = b'LINK : warning LNK4098: defaultlib conflicts with other libs\n'
+                elif failure == 'deployment-warning':
+                    stderr = b"ld: warning: object file 'tls.a(ring.o)' was built for newer 'macOS' version (15.5) than being linked (15.0)\n"
                 return subprocess.CompletedProcess(command, 0, ('build profile: release\nc compiler command: fixture argv\nnative c ok: ' + str(artifact) + '\n').encode(), stderr)
             self.assertFalse(install.exists())
             self.assertFalse(ku.exists())
@@ -321,7 +325,7 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         with mock.patch.object(self.consumer, 'installed_tls_fixture', side_effect=fixture), mock.patch.object(self.consumer, 'invoke', side_effect=invoke):
             arguments = (install, self.root, {'KU_NATIVE_TLS_PACK': '/must-not-use/source/pack', 'KU_NATIVE_TLS_LINK_REQUIRED': '1'}, report, self.path, target)
             if failure:
-                with self.assertRaisesRegex(RuntimeError, 'native TLS build failed|incorrect result or exit|incompatible CRT/linker'):
+                with self.assertRaisesRegex(RuntimeError, 'native TLS build failed|incorrect result or exit|incompatible CRT/linker/deployment'):
                     self.consumer.installed_native_tls_consumer(*arguments, checkout_hidden=True)
             else:
                 self.consumer.installed_native_tls_consumer(*arguments, checkout_hidden=True)
@@ -331,7 +335,7 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertTrue(report['installed_native_tls']['peer_stopped'])
         self.assertTrue(report['installed_native_tls']['installation_restored'])
         self.assertNotIn('private test fixture, must not be reported', json.dumps(report))
-        self.assertEqual(len(calls), 1 if failure in ('build', 'crt-warning') else 2)
+        self.assertEqual(len(calls), 1 if failure in ('build', 'crt-warning', 'deployment-warning') else 2)
         return report['installed_native_tls']
 
     def test_installed_tls_uses_archive_pack_and_moved_source_free_binary(self):
@@ -344,7 +348,7 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertEqual(detail['tls_version'], 'TLSv1.3')
 
     def test_installed_tls_failure_restores_archive_and_stops_owned_peer(self):
-        for stage in ('build', 'run', 'crt-warning'):
+        for stage in ('build', 'run', 'crt-warning', 'deployment-warning'):
             with self.subTest(stage=stage):
                 # Each failure owns a distinct SDK and peer lifecycle.
                 with tempfile.TemporaryDirectory(prefix='tls-failure-', dir=self.root) as nested:
@@ -384,7 +388,11 @@ class RuntimeConsumerReportTests(unittest.TestCase):
                 artifact.parent.mkdir(parents=True)
                 artifact.write_bytes(b'#define KU_FEATURE_ZSTD 1\n#define KU_FEATURE_ZLIB 1\nku_zstd_compress ku_gzip_compress ku_deflate_compress\n')
                 Path(command[-1]).write_bytes(b'fixture executable bytes')
-                stderr = b'LINK : warning LNK4217: local runtime symbol imported\n' if failure == 'crt-warning' else b''
+                stderr = b''
+                if failure == 'crt-warning':
+                    stderr = b'LINK : warning LNK4217: local runtime symbol imported\n'
+                elif failure == 'deployment-warning':
+                    stderr = b"ld: warning: object file 'zstd.a(entropy.o)' was built for newer 'macOS' version (15.5) than being linked (15.0)\n"
                 return subprocess.CompletedProcess(command, 0, ('build profile: release\nc compiler command: fixture argv\nnative c ok: ' + str(artifact) + '\n').encode(), stderr)
             self.assertFalse(install.exists())
             self.assertFalse(ku.exists())
@@ -407,7 +415,7 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertEqual(list(self.root.glob('ku-installed-compression-*')), [])
         self.assertFalse((self.root / 'installed-sdk-unavailable-for-compression').exists())
         self.assertTrue(report['installed_native_compression']['installation_restored'])
-        self.assertEqual(len(calls), 1 if failure in ('build', 'crt-warning') else 2)
+        self.assertEqual(len(calls), 1 if failure in ('build', 'crt-warning', 'deployment-warning') else 2)
         return report['installed_native_compression']
 
     def test_installed_compression_uses_moved_archive_without_source_or_sdk(self):
@@ -418,7 +426,7 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertEqual(set(detail['installed_packs']), {'zstd', 'zlib'})
 
     def test_installed_compression_failures_restore_original_sdk(self):
-        for stage in ('build', 'run', 'crt-warning'):
+        for stage in ('build', 'run', 'crt-warning', 'deployment-warning'):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory(prefix='codec-failure-', dir=self.root) as nested:
                 original = self.root
                 self.root = Path(nested)

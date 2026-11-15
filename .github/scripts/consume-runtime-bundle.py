@@ -182,7 +182,7 @@ def native_without_rust(env, absent_home):
 
 
 def record_native_build_diagnostics(detail, result):
-    """Preserve bounded stderr and reject known CRT/link-contract warnings."""
+    """Preserve bounded stderr and reject known CRT/deployment mismatches."""
     detail['build_stderr_bytes'] = len(result.stderr)
     encoded = result.stderr.decode('utf-8', errors='replace').encode('utf-8')
     detail['build_stderr_excerpt'] = encoded[:4096].decode('utf-8', errors='ignore')
@@ -195,10 +195,12 @@ def record_native_build_diagnostics(detail, result):
                  r'(?:RuntimeLibrary|runtime librar(?:y|ies)|MSVCRT|LIBCMT|CRT)[^\r\n]{0,256}(?:mismatch|conflict)|'
                  r'(?:mismatch|conflict)[^\r\n]{0,256}(?:RuntimeLibrary|runtime librar(?:y|ies)|MSVCRT|LIBCMT|CRT)', text, re.I):
         codes.append('CRT/runtime-library mismatch')
+    if re.search(r"built for newer ['\"]?macOS['\"]? version[^\r\n]{0,256}than (?:being )?linked", text, re.I):
+        codes.append('macOS deployment-target mismatch')
     detail['build_link_contract_diagnostics'] = codes
     detail['build_link_contract_passed'] = result.returncode == 0 and not codes
     if codes:
-        raise RuntimeError('native build reported incompatible CRT/linker diagnostics: ' + ', '.join(codes))
+        raise RuntimeError('native build reported incompatible CRT/linker/deployment diagnostics: ' + ', '.join(codes))
 
 
 def invoke(command, cwd, env, seconds=300):
