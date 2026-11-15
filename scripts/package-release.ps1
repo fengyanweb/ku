@@ -924,16 +924,16 @@ function Test-PackagedRunnerConsumer([string]$Bundle, [hashtable]$Contract, [str
         if ([IO.Path]::GetFileName($Bundle) -in @('release', 'debug', 'deps')) { throw "runner consumer bundle path could enable development-library fallback" }
         if (-not (Test-PlainDirectory $dependencies) -or (Test-Path -LiteralPath $retiredDependencies)) { throw "runner consumer cannot isolate its dependency directory" }
         [IO.Directory]::Move($dependencies, $retiredDependencies); $dependenciesMoved = $true
-        $missing = Invoke-BoundedTool $ku @('build', '--offline', $source, '-o', $missingOutput) $consumerRoot $WorkRoot 'runner-missing-deps-build' 180000 $Wrapper
+        $missing = Invoke-BoundedTool $ku @('build', '--backend', 'runner', '--offline', $source, '-o', $missingOutput) $consumerRoot $WorkRoot 'runner-missing-deps-build' 180000 $Wrapper
         if ($missing.ExitCode -eq 0 -or (Test-Path -LiteralPath $missingOutput) -or $missing.Output -notmatch '(?i)runtime|manifest|runner') { throw "packaged runner without dependencies did not fail with the expected precompile runtime-manifest diagnosis: $($missing.Output)" }
         [IO.Directory]::Move($retiredDependencies, $dependencies); $dependenciesMoved = $false
-        [void](Invoke-CheckedTool $ku @('build', '--offline', $source, '-o', $executable) $consumerRoot $WorkRoot 'packaged-runner-build' 180000 $Wrapper)
+        [void](Invoke-CheckedTool $ku @('build', '--backend', 'runner', '--offline', $source, '-o', $executable) $consumerRoot $WorkRoot 'packaged-runner-build' 180000 $Wrapper)
         Assert-ExecutableArchitecture $executable $Contract
         # Check ordinary local imports without imposing the native backend's
         # source-independent import-graph contract on the runner backend.
         $output = Invoke-CheckedTool $executable @() $WorkRoot $WorkRoot 'packaged-runner-import-run' 30000 $Wrapper
         if ($output.Replace("`r", '').TrimEnd("`n") -cne 'packaged runner consumer ok') { throw "packaged imported runner returned unexpected output: '$output'" }
-        [void](Invoke-CheckedTool $ku @('build', '--offline', $standaloneSource, '-o', $standaloneExecutable) $consumerRoot $WorkRoot 'packaged-standalone-runner-build' 180000 $Wrapper)
+        [void](Invoke-CheckedTool $ku @('build', '--backend', 'runner', '--offline', $standaloneSource, '-o', $standaloneExecutable) $consumerRoot $WorkRoot 'packaged-standalone-runner-build' 180000 $Wrapper)
         Assert-ExecutableArchitecture $standaloneExecutable $Contract
         [IO.Directory]::Move($dependencies, $retiredDependencies); $dependenciesMoved = $true
         $output = Invoke-CheckedTool $executable @() $WorkRoot $WorkRoot 'packaged-runner-run' 30000 $Wrapper

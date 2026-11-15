@@ -144,6 +144,35 @@ def verify_installation(installed: Path, repo: Path, version: str, target: str) 
     return receipt
 
 
+def verify_default_native_installation(installed: Path, repo: Path, target: str) -> dict:
+    """Use the final archive's omitted-backend build, then remove its sources."""
+    executable = installed / ("ku.exe" if target.endswith("windows-msvc") else "ku")
+    receipt = {"format": "ku-installed-default-native-v1", "status": "running", "target": target,
+               "executable_sha256": file_hash(executable), "backend": "c", "profile": "release"}
+    with tempfile.TemporaryDirectory(prefix="ku-installed-default-c-") as temporary:
+        working = Path(temporary).resolve()
+        project = working / "project 中文 with spaces"
+        project.mkdir()
+        source = canonical_example(read_bounded(repo / "examples/hello.ku", 65536))
+        (project / "hello.ku").write_bytes(source)
+        receipt["source_sha256"] = hashlib.sha256(source).hexdigest()
+        program = working / ("hello-default-c.exe" if target.endswith("windows-msvc") else "hello-default-c")
+        build, text = install_command(executable, ["build", "--release", "--verbose", "hello.ku", "-o", str(program)], project)
+        if ("build profile: release" not in text or "c compiler command:" not in text
+                or "rustc command:" in text or not program.is_file()):
+            raise ExportError("installed omitted-backend build did not execute the Release C compiler")
+        receipt["build"] = build
+        receipt["binary_sha256"] = file_hash(program)
+        shutil.rmtree(project)
+        receipt["source_tree_removed"] = not project.exists()
+        run, text = install_command(program, [], working)
+        if text != "Hello Ku\n":
+            raise ExportError("installed default C program returned an incorrect result")
+        receipt["run"] = run
+    receipt.update(status="passed", temporary_tree_removed=not working.exists())
+    return receipt
+
+
 def run_runtime_check(arguments: list[str], repo: Path, working: Path,
                       timeout_seconds: float = 180) -> subprocess.CompletedProcess:
     """Reuse the existing suspended Windows Job/POSIX session owner and bounds."""
@@ -731,11 +760,17 @@ Extract the whole archive into an empty directory and keep its layout intact.
 Run ./{executable} --version (PowerShell: .\\{executable} --version).
 Optionally add that directory to PATH. Install ku-language-{version}.vsix in VS Code.
 
-Running/checking Ku source does not require Rust. The default build backend is
-Runner: it needs the exact publisher compiler recorded in ku-runtime.json
+Running/checking Ku source does not require Rust. This source build defaults
+to native C: ku build --release main.ku needs the target C compiler/linker,
+does not use libku.rlib or rustc, and does not fall back to Runner on failure.
+Use ku doctor --backend c to inspect the C toolchain. This does not change the
+default of previously published packages; follow their own installation notes.
+
+The interpreter wrapper remains available with ku build --backend runner.
+It needs the exact publisher compiler recorded in ku-runtime.json
 (Rust {runtime['rustc']['release']} for this bundle) plus the target native linker.
-Ku automatically selects a matching installed compiler without changing your
-Rust default, project override or toolchain file. Diagnose with:
+Ku selects a matching installed compiler without changing your Rust default,
+project override or toolchain file. Diagnose the explicit Runner backend with:
   ku doctor --backend runner
 If that exact compiler is missing, explicitly install it with:
   ku doctor --install-runner-toolchain
@@ -749,15 +784,17 @@ matching TLS pack discovery; no extra setting is needed in this bundle layout.
 External database client libraries are not bundled; database programs need the
 matching dynamic libraries. This is not a universal executable for all OSes.
 
-The default runner embeds the entry source only. Imported modules are loaded
+The explicit Runner backend embeds the entry source only. Imported modules are loaded
 from their original source locations at runtime, so those source locations must
 remain available. For self-contained deployment of the complete local import
 graph, use ku build --backend c --release with the target C compiler/linker.
 The historical --native form without -o only emits C; it is not this command.
 
-中文：运行/检查源码不需要 Rust；默认 build 使用 Runner。保留整个安装包。
-编译前可执行 ku doctor --backend runner；缺少匹配工具链时，显式执行
-ku doctor --install-runner-toolchain。该操作不会修改全局 Rust 默认版本。
+中文：运行/检查源码不需要 Rust；本源码构建的默认 build 使用原生 C，需目标 C
+编译器，失败不回退。旧发布包的默认值以其安装说明为准。保留整个安装包。
+显式 ku build --backend runner 仍需精确 Rust 工具链；可执行
+ku doctor --backend runner，缺少时显式 ku doctor --install-runner-toolchain。
+该操作不会修改全局 Rust 默认版本。
 完整说明 / Details: https://github.com/fengyanweb/ku/blob/{commit}/docs/cli-runtime-bundle.md
 English: https://github.com/fengyanweb/ku/blob/{commit}/docs/cli-runtime-bundle.en.md
 
@@ -798,6 +835,7 @@ linked. Running/checking or Runner builds do not implement these bytes APIs.
                     "size": compressed.stat().st_size, "files": stage.files}
         if verify_install:
             manifest["installation_check"] = verify_installation(verified, repo, version, target)
+            default_native_check = verify_default_native_installation(verified, repo, target)
             runtime_check = verify_runtime_installation(verified, repo, target)
         # Exclusive creation also closes the race with another publisher.
         with asset_path.open("xb") as destination, compressed.open("rb") as source:
@@ -810,6 +848,7 @@ linked. Running/checking or Runner builds do not implement these bytes APIs.
         # Side-channel evidence stays in the single CLI JSON result. The exact
         # six-file release asset set and strict installation manifest stay intact.
         result["runtime_installation"] = runtime_check
+        result["default_native_installation"] = default_native_check
     return result
 
 

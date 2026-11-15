@@ -2,7 +2,7 @@
 
 [简体中文](cli-runtime-bundle.md) · [Complete CLI reference](../web/src/content/docs/en/docs/tools/cli.md)
 
-This document describes published bundle layouts, build dependencies and upgrade requirements.
+This document describes bundle layouts, build dependencies and upgrade requirements. Current source builds default to native C; published 0.0.20 packages retain their Runner default. Runner diagnostics and examples below select `--backend runner` explicitly; `ku run` is unchanged.
 
 ## Why E0514 occurs
 
@@ -21,7 +21,7 @@ The actual CLI location determines its installation root. Relative manifest path
 
 Release toolchain **T=1.99.1** is configured in [`scripts/release-toolchain.json`](../scripts/release-toolchain.json), separately from the source MSRV. Changing T requires rebuilding the CLI, rlib, dependencies and affected native/TLS packs together.
 
-Before compiling, Ku checks the full compiler release/commit/host and runtime target ABI. A matching standalone system rustc is usable; otherwise an already-installed exact Rustup toolchain T is selected. Probe and compilation use the same resolved compiler, rather than probing one compiler and invoking another through PATH.
+Before an explicit Runner build, Ku checks the full compiler release/commit/host and runtime target ABI. A matching standalone system rustc is usable; otherwise an already-installed exact Rustup toolchain T is selected. Probe and compilation use the same resolved compiler, rather than probing one compiler and invoking another through PATH. Ordinary native C builds do not read those rlibs or require T.
 
 Explicit `KU_RUNNER_RUSTC` must name an **absolute compiler path**, taking priority over automatic selection. A mismatch fails instead of being silently ignored. The command does not modify global defaults, directory overrides or project `rust-toolchain.toml`. Read-only probes disable Rustup auto-installation; only explicit installation requests download tools.
 
@@ -57,17 +57,24 @@ If the matching toolchain is absent and Rustup is available, explicitly install 
 
 ```powershell
 ku doctor --install-runner-toolchain
-ku build .\hello.ku
+ku build --backend runner .\hello.ku
 ```
 
 Installation requests only the bundle's required exact toolchain without changing the system default. Use the output path reported by the CLI; default output is not necessarily `hello.exe` in the current directory. An explicit output is also supported:
 
 ```powershell
-ku build .\hello.ku -o ".\dist\hello.exe"
+ku build --backend runner .\hello.ku -o ".\dist\hello.exe"
 & ".\dist\hello.exe"
 ```
 
-Native C build:
+The current source's default native build:
+
+```powershell
+ku build --release .\hello.ku -o ".\dist\hello-native.exe"
+& ".\dist\hello-native.exe"
+```
+
+To explicitly select C in both current source builds and older installed packages:
 
 ```powershell
 ku build --backend c --release .\hello.ku -o ".\dist\hello-native.exe"
@@ -76,9 +83,11 @@ ku build --backend c --release .\hello.ku -o ".\dist\hello-native.exe"
 
 ## Native C build and deployment dependencies
 
-`--backend c` uses the target C compiler and linker. Failures are reported without switching to Runner. Building an ordinary C program does not read `libku.rlib` or invoke Rust to create the program; this does not change `ku run` or direct `.ku` execution. Use `ku doctor --backend c` to inspect the C toolchain. That check does not establish that database libraries or other optional native dependencies are available.
+Current source builds with no `--backend`, or with `--backend c`, use the target C compiler and linker; `--backend native-c` is an alias. Missing compilers, dependencies and unsupported programs fail explicitly without switching to Runner. Building an ordinary C program does not read `libku.rlib` or invoke Rust to create the program; this does not change `ku run` or direct `.ku` execution. Use `ku doctor --backend c` to inspect the C toolchain. That check does not establish that database libraries or other optional native dependencies are available.
 
 For native `net.client` TLS, retain `native-tls/v1/<target>/` beside `ku`. The CLI discovers the matching target pack and validates its manifest, header and static library. Moving the whole installation does not require resetting its path. The prebuilt TLS library is linked into the executable: deployment does not require the Ku installation or TLS pack, but target CRT and system networking dependencies remain.
+
+Packages providing the optional compression modules place their dependencies in `native-compression/v1/<target>/` for automatic discovery by the synchronous C `bytes`, `zstd`, `gzip` and `deflate` paths; see the [native compression contracts](compression.en.md). Only programs using a codec link it. Do not rename and mix libraries or packs from another version into older installations that lack these modules.
 
 Database client shared libraries are external to Ku bundles. PostgreSQL uses the absolute directory `KU_PG_LIB`; MySQL/MariaDB uses `KU_MYSQL_LIB` and matching headers. CPU architecture, target ABI and client-library family must match the build target. Deployment still requires compatible client libraries and their dependencies; `--static` does not bypass these checks. A successful C compile, cross-build or source review is not evidence that the result ran on its target machine.
 

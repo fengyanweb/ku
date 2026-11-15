@@ -1947,7 +1947,7 @@ fn run_build_command(args: &[String]) -> Result<(), KuError> {
             let llvm_output = write_llvm_ir_artifact(&plan, options.dependency_mode)?;
             println!("llvm ir ok: {}", llvm_output.display());
             return Err(KuError::message(format!(
-                "LLVM backend does not link executables yet; wrote {}\nhelp: use `ku build` for a runnable wrapper, or `ku build --emit-llvm` when you only need text IR",
+                "LLVM backend does not link executables yet; wrote {}\nhelp: use `ku build` for a native executable, `ku build --backend runner` for the interpreter wrapper, or `ku build --emit-llvm` when you need the additional text IR artifact",
                 llvm_output.display()
             )));
         }
@@ -1962,7 +1962,7 @@ fn parse_build_options(args: &[String]) -> Result<BuildOptions, KuError> {
         output: None,
         profile: BuildProfile::Debug,
         target: None,
-        backend: BuildBackend::Runner,
+        backend: BuildBackend::C,
         emit_c: false,
         emit_ir: false,
         emit_llvm: false,
@@ -7972,6 +7972,13 @@ fn compile_with_msvc(
     }
     if options.verbose {
         println!("msvc: {} (env from {})", cl.display(), vcvars.display());
+        // Printing Command itself would also expose the explicitly restored
+        // vcvars environment. The reproducible compiler argv is sufficient.
+        println!(
+            "c compiler command: {:?} {:?}",
+            command.get_program(),
+            command.get_args().collect::<Vec<_>>()
+        );
     }
 
     let timeout = remaining_build_phase_timeout(
@@ -11141,10 +11148,39 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_build_defaults_to_c_without_changing_explicit_backends() {
+        let default = parse_build_options(&["ku".into(), "build".into(), "main.ku".into()])
+            .expect("ordinary build options");
+        assert_eq!(default.backend, BuildBackend::C);
+        assert_eq!(default.profile, BuildProfile::Debug);
+        for (name, expected) in [
+            ("c", BuildBackend::C),
+            ("native-c", BuildBackend::C),
+            ("runner", BuildBackend::Runner),
+            ("interp", BuildBackend::Runner),
+            ("interpreter", BuildBackend::Runner),
+            ("llvm", BuildBackend::Llvm),
+            ("ll", BuildBackend::Llvm),
+        ] {
+            let options = parse_build_options(&[
+                "ku".into(),
+                "build".into(),
+                "--backend".into(),
+                name.into(),
+                "main.ku".into(),
+            ])
+            .expect("explicit backend remains available");
+            assert_eq!(options.backend, expected, "{name}");
+        }
+    }
+
+    #[test]
     fn dependency_mode_flags_are_single_and_propagate_to_built_runner() {
         let args = vec![
             "ku".to_string(),
             "build".to_string(),
+            "--backend".to_string(),
+            "runner".to_string(),
             "src/main.ku".to_string(),
             "--offline".to_string(),
         ];

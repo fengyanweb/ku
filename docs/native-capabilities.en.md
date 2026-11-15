@@ -2,10 +2,11 @@
 
 [中文](native-capabilities.md)
 
-Ku 0.0.20 uses a target C compiler to produce a standalone native program. The program does not use a Runner to reread Ku sources. `ku build` still defaults to the Runner; select native C explicitly:
+Native C uses a target C compiler to produce a standalone program, without a Runner rereading Ku sources. Current source builds default to native C; published 0.0.20 packages retain their Runner default. Choose a backend explicitly across versions:
 
 ```sh
 ku build --backend c --release hello.ku -o hello
+ku build --backend runner --release hello.ku -o hello-runner
 ```
 
 Emitting C, linking an executable and running it on the target are separate steps. The compatibility command `ku build --native hello.ku`, without `-o`, only emits C.
@@ -50,4 +51,4 @@ Ordinary native C programs do not use `libku.rlib`. TLS packs must match the tar
 
 Recursive value layouts, object destructuring, optional chaining, captured `for` iteration bindings and standard-library functions without native implementations are still rejected. Task parameters, results, captures and finally blocks retain their documented subset restrictions. Unsupported features or missing dependencies must produce errors, without silently switching to the Runner.
 
-Making native C the default requires capability, ownership, platform, installation and real-project validation. It does not require every performance scenario to beat Rust, and does not waive adoption requirements for separate performance changes. Existing `ku run` and direct `.ku` execution behavior remains unchanged.
+The source default does not imply that every interpreter feature or performance goal is complete. Capability, ownership, platform, installation and real-project acceptance retain their own evidence requirements, as do separate performance changes. Existing `ku run` and direct `.ku` execution behavior remains unchanged.

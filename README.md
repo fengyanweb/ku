@@ -24,11 +24,14 @@ fn main() {
 }
 ```
 
-`ku run` 和 `ku check` 不要求安装 Rust。默认 Runner `ku build` 需要与 SDK 完整编译器身份匹配的 Rust **1.99.1** 及系统链接器；预编译 `libku.rlib` 不能跨任意 rustc 版本使用。原生 C 构建需要目标 C 编译器和程序使用的原生库：
+`ku run` 和 `ku check` 不要求安装 Rust。当前源码的 `ku build` 默认使用原生 C，需要目标 C 编译器及程序使用的原生库；已发布的 0.0.20 安装包仍默认使用 Runner。跨版本可显式选择后端：
 
 ```sh
 ku build --backend c --release hello.ku -o hello
+ku build --backend runner --release hello.ku -o hello-runner
 ```
+
+Runner 需要与 SDK 完整编译器身份匹配的 Rust **1.99.1** 及系统链接器；预编译 `libku.rlib` 不能跨任意 rustc 版本使用。原生构建不静默回退到 Runner。
 
 源码开发固定使用 Rust 1.99.1：`cargo +1.99.1 build --locked --release`。完整兼容规则见 [CLI 与 SDK](docs/cli-runtime-bundle.md)。
 
@@ -46,7 +49,7 @@ ku build --backend c --release hello.ku -o hello
 | 解释执行 | `ku run hello.ku` |
 | 静态检查 | `ku check hello.ku` |
 | JSON 诊断 | `ku check --json hello.ku` |
-| 默认 Runner 构建 | `ku build --release hello.ku -o hello` |
+| Runner 构建 | `ku build --backend runner --release hello.ku -o hello` |
 | 原生 C 构建 | `ku build --backend c --release hello.ku -o hello` |
 | SDK 检查 | `ku doctor --backend runner` |
 

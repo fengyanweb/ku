@@ -177,6 +177,66 @@ class RuntimeConsumerReportTests(unittest.TestCase):
                     self.consumer.tls_fixture_openssl({'KU_TEST_OPENSSL': value})
                 which.assert_not_called()
 
+    def test_compiler_readback_distinguishes_default_c_from_explicit_runner(self):
+        for backend, marker in (('c', 'c compiler command:'), ('runner', 'rustc command:')):
+            with self.subTest(backend=backend):
+                result = subprocess.CompletedProcess([], 0, ('build profile: release\n' + marker + ' compiler argv\n').encode(), b'')
+                self.consumer.assert_build_backend(result, backend, 'release')
+                other = 'runner' if backend == 'c' else 'c'
+                with self.assertRaisesRegex(RuntimeError, 'expected .* compiler command'):
+                    self.consumer.assert_build_backend(result, other, 'release')
+                with self.assertRaisesRegex(RuntimeError, 'expected .* profile'):
+                    self.consumer.assert_build_backend(result, backend, 'debug')
+        for text in ('build profile: release\n',
+                     'build profile: release\nc compiler command: cc\nrustc command: rustc\n',
+                     'build profile: release\nmsvc: cl (env from vcvars)\n'):
+            with self.subTest(text=text), self.assertRaisesRegex(RuntimeError, 'compiler command'):
+                self.consumer.assert_build_backend(subprocess.CompletedProcess([], 0, text.encode(), b''), 'c', 'release')
+
+    def test_native_environment_hides_rust_without_removing_separate_c_tools(self):
+        rust = self.root / 'Rust tools'
+        native = self.root / 'Native C tools 中文'
+        rust.mkdir()
+        native.mkdir()
+        rust_name = 'rustc.exe' if os.name == 'nt' else 'rustc'
+        (rust / rust_name).write_bytes(b'fixture only')
+        original = {'PATH': os.pathsep.join((str(rust), str(native))), 'KU_RUNNER_RUSTC': '/must/not/use/rustc', 'RUSTUP_TOOLCHAIN': 'unlike'}
+        before = dict(original)
+        with mock.patch.object(self.consumer.shutil, 'which', return_value=None):
+            selected = self.consumer.native_without_rust(original, self.root / 'absent-rustup')
+        self.assertEqual(original, before)
+        self.assertEqual(selected['PATH'], str(native))
+        self.assertNotIn('KU_RUNNER_RUSTC', selected)
+        self.assertNotIn('RUSTUP_TOOLCHAIN', selected)
+        self.assertEqual(selected['RUSTUP_AUTO_INSTALL'], '0')
+        with mock.patch.object(self.consumer.shutil, 'which', return_value='unexpected rustc'), self.assertRaisesRegex(RuntimeError, 'could not isolate Rust'):
+            self.consumer.native_without_rust(original, self.root / 'absent-rustup')
+
+    def test_native_build_diagnostics_reject_crt_warnings_on_either_stream_even_at_exit_zero(self):
+        for warning in ('warning LNK4098: defaultlib conflict', 'warning LNK4286: imported symbol',
+                        'warning LNK4217: locally defined symbol imported', 'error LNK2019: unresolved external',
+                        'error LNK1120: unresolved externals',
+                        "error LNK2038: mismatch detected for 'RuntimeLibrary': MD does not match MT",
+                        'warning: conflicting runtime libraries MSVCRT and LIBCMT'):
+            for stream in ('stdout', 'stderr'):
+                with self.subTest(warning=warning, stream=stream):
+                    data = (b'x' * 5000 + b'\n' + warning.encode())
+                    result = subprocess.CompletedProcess([], 0, data if stream == 'stdout' else b'', data if stream == 'stderr' else b'')
+                    detail = {}
+                    with self.assertRaisesRegex(RuntimeError, 'incompatible CRT/linker'):
+                        self.consumer.record_native_build_diagnostics(detail, result)
+                    self.assertFalse(detail['build_link_contract_passed'])
+                    self.assertTrue(detail['build_link_contract_diagnostics'])
+                    self.assertLessEqual(len(detail['build_stderr_excerpt'].encode('utf-8')), 4096)
+        detail = {}
+        warning = b'warning: unused local variable\n' + b'\xff' * 5000
+        self.consumer.record_native_build_diagnostics(detail, subprocess.CompletedProcess([], 0, b'', warning))
+        self.assertTrue(detail['build_link_contract_passed'])
+        self.assertEqual(detail['build_stderr_bytes'], len(warning))
+        self.assertTrue(detail['build_stderr_truncated'])
+        self.assertTrue(detail['build_stderr_excerpt'].startswith('warning: unused local variable'))
+        self.assertLessEqual(len(detail['build_stderr_excerpt'].encode('utf-8')), 4096)
+
     def installed_tls_orchestration(self, failure=None):
         """Only the archive/lifetime protocol is mocked, not claimed as TLS proof.
 
@@ -238,7 +298,8 @@ class RuntimeConsumerReportTests(unittest.TestCase):
                 artifact.parent.mkdir(parents=True)
                 artifact.write_bytes(b'/* fixture only */ void ku_tls_v1_client_new(void);\n')
                 Path(command[-1]).write_bytes(b'fixture executable bytes')
-                return subprocess.CompletedProcess(command, 0, ('native c ok: ' + str(artifact) + '\n').encode(), b'')
+                stderr = b'LINK : warning LNK4098: defaultlib conflicts with other libs\n' if failure == 'crt-warning' else b''
+                return subprocess.CompletedProcess(command, 0, ('build profile: release\nc compiler command: fixture argv\nnative c ok: ' + str(artifact) + '\n').encode(), stderr)
             self.assertFalse(install.exists())
             self.assertFalse(ku.exists())
             self.assertTrue((self.root / 'installed-sdk-unavailable-for-tls').is_dir())
@@ -260,7 +321,7 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         with mock.patch.object(self.consumer, 'installed_tls_fixture', side_effect=fixture), mock.patch.object(self.consumer, 'invoke', side_effect=invoke):
             arguments = (install, self.root, {'KU_NATIVE_TLS_PACK': '/must-not-use/source/pack', 'KU_NATIVE_TLS_LINK_REQUIRED': '1'}, report, self.path, target)
             if failure:
-                with self.assertRaisesRegex(RuntimeError, 'native TLS build failed|incorrect result or exit'):
+                with self.assertRaisesRegex(RuntimeError, 'native TLS build failed|incorrect result or exit|incompatible CRT/linker'):
                     self.consumer.installed_native_tls_consumer(*arguments, checkout_hidden=True)
             else:
                 self.consumer.installed_native_tls_consumer(*arguments, checkout_hidden=True)
@@ -270,7 +331,7 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertTrue(report['installed_native_tls']['peer_stopped'])
         self.assertTrue(report['installed_native_tls']['installation_restored'])
         self.assertNotIn('private test fixture, must not be reported', json.dumps(report))
-        self.assertEqual(len(calls), 1 if failure == 'build' else 2)
+        self.assertEqual(len(calls), 1 if failure in ('build', 'crt-warning') else 2)
         return report['installed_native_tls']
 
     def test_installed_tls_uses_archive_pack_and_moved_source_free_binary(self):
@@ -283,7 +344,7 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertEqual(detail['tls_version'], 'TLSv1.3')
 
     def test_installed_tls_failure_restores_archive_and_stops_owned_peer(self):
-        for stage in ('build', 'run'):
+        for stage in ('build', 'run', 'crt-warning'):
             with self.subTest(stage=stage):
                 # Each failure owns a distinct SDK and peer lifecycle.
                 with tempfile.TemporaryDirectory(prefix='tls-failure-', dir=self.root) as nested:
@@ -323,7 +384,8 @@ class RuntimeConsumerReportTests(unittest.TestCase):
                 artifact.parent.mkdir(parents=True)
                 artifact.write_bytes(b'#define KU_FEATURE_ZSTD 1\n#define KU_FEATURE_ZLIB 1\nku_zstd_compress ku_gzip_compress ku_deflate_compress\n')
                 Path(command[-1]).write_bytes(b'fixture executable bytes')
-                return subprocess.CompletedProcess(command, 0, ('native c ok: ' + str(artifact) + '\n').encode(), b'')
+                stderr = b'LINK : warning LNK4217: local runtime symbol imported\n' if failure == 'crt-warning' else b''
+                return subprocess.CompletedProcess(command, 0, ('build profile: release\nc compiler command: fixture argv\nnative c ok: ' + str(artifact) + '\n').encode(), stderr)
             self.assertFalse(install.exists())
             self.assertFalse(ku.exists())
             self.assertTrue((self.root / 'installed-sdk-unavailable-for-compression').is_dir())
@@ -337,7 +399,7 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         with mock.patch.object(self.consumer, 'invoke', side_effect=invoke):
             arguments = (install, self.root, env, report, self.path, target)
             if failure:
-                with self.assertRaisesRegex(RuntimeError, 'native compression build failed|incorrect result or exit'):
+                with self.assertRaisesRegex(RuntimeError, 'native compression build failed|incorrect result or exit|incompatible CRT/linker'):
                     self.consumer.installed_native_compression_consumer(*arguments, checkout_hidden=True)
             else:
                 self.consumer.installed_native_compression_consumer(*arguments, checkout_hidden=True)
@@ -345,7 +407,7 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertEqual(list(self.root.glob('ku-installed-compression-*')), [])
         self.assertFalse((self.root / 'installed-sdk-unavailable-for-compression').exists())
         self.assertTrue(report['installed_native_compression']['installation_restored'])
-        self.assertEqual(len(calls), 1 if failure == 'build' else 2)
+        self.assertEqual(len(calls), 1 if failure in ('build', 'crt-warning') else 2)
         return report['installed_native_compression']
 
     def test_installed_compression_uses_moved_archive_without_source_or_sdk(self):
@@ -356,7 +418,7 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertEqual(set(detail['installed_packs']), {'zstd', 'zlib'})
 
     def test_installed_compression_failures_restore_original_sdk(self):
-        for stage in ('build', 'run'):
+        for stage in ('build', 'run', 'crt-warning'):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory(prefix='codec-failure-', dir=self.root) as nested:
                 original = self.root
                 self.root = Path(nested)
@@ -633,14 +695,18 @@ class ReleaseExportTests(unittest.TestCase):
             self.assertTrue((installed / "SHA256SUMS").is_file())
             return {"format": "test-receipt", "target": target}
         with mock.patch.object(EXPORT, "verify_installation", side_effect=verify) as check, mock.patch.object(
+                EXPORT, "verify_default_native_installation", return_value={"status": "passed", "backend": "c"}) as native, mock.patch.object(
                 EXPORT, "verify_runtime_installation", return_value={"status": "passed"}) as runtime:
             result = self.run_export(verify_install=True)
         self.assertEqual(check.call_count, 1)
         runtime.assert_called_once_with(check.call_args.args[0], self.repo, self.target)
+        native.assert_called_once_with(check.call_args.args[0], self.repo, self.target)
         self.assertEqual(result["runtime_installation"], {"status": "passed"})
+        self.assertEqual(result['default_native_installation'], {'status': 'passed', 'backend': 'c'})
         manifest = json.loads(Path(result["manifest_path"]).read_bytes())
         self.assertEqual(manifest["installation_check"], {"format": "test-receipt", "target": self.target})
         self.assertNotIn("runtime_installation", manifest)
+        self.assertNotIn('default_native_installation', manifest)
         self.assertEqual(len(list(self.output.iterdir())), 2)
 
     def runtime_fixture(self):
@@ -720,6 +786,7 @@ class ReleaseExportTests(unittest.TestCase):
     def test_runtime_failure_does_not_publish_unchecked_archive(self):
         evidence = {"status": "failed", "temporary_tree_removed": True}
         with mock.patch.object(EXPORT, "verify_installation", return_value={}), mock.patch.object(
+                EXPORT, "verify_default_native_installation", return_value={}), mock.patch.object(
                 EXPORT, "verify_runtime_installation", side_effect=EXPORT.RuntimeSmokeError("runtime failed", evidence)):
             with self.assertRaisesRegex(EXPORT.RuntimeSmokeError, "runtime failed"):
                 self.run_export(verify_install=True)
@@ -840,6 +907,48 @@ class ReleaseExportTests(unittest.TestCase):
                 EXPORT, "install_command", return_value=({}, "ku 0.0.16\n")):
             with self.assertRaisesRegex(EXPORT.ExportError, "version does not match"):
                 EXPORT.verify_installation(self.bundle, self.repo, "0.0.17", self.target)
+
+    def test_default_native_installation_requires_real_c_command_and_source_free_run(self):
+        self.put(self.repo / 'examples/hello.ku', b'fn main(){println("Hello Ku")}\r\n')
+        calls = []
+
+        def command(executable, arguments, working):
+            calls.append((executable, arguments, working))
+            if len(calls) == 1:
+                self.assertEqual(executable, self.bundle / 'ku')
+                self.assertEqual(arguments[:4], ['build', '--release', '--verbose', 'hello.ku'])
+                self.assertNotIn('--backend', arguments)
+                self.assertEqual((working / 'hello.ku').read_bytes(), b'fn main(){println("Hello Ku")}\n')
+                Path(arguments[-1]).write_bytes(b'fixture native executable bytes')
+                return {'exit_code': 0}, 'build profile: release\nc compiler command: cc argv\n'
+            self.assertEqual(arguments, [])
+            self.assertFalse(calls[0][2].exists())
+            self.assertEqual(executable, Path(calls[0][1][-1]))
+            self.assertNotEqual(working, calls[0][2])
+            return {'exit_code': 0}, 'Hello Ku\n'
+
+        with mock.patch.object(EXPORT, 'install_command', side_effect=command):
+            receipt = EXPORT.verify_default_native_installation(self.bundle, self.repo, self.target)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(receipt['backend'], 'c')
+        self.assertEqual(receipt['profile'], 'release')
+        self.assertEqual(receipt['status'], 'passed')
+        self.assertTrue(receipt['source_tree_removed'])
+        self.assertTrue(receipt['temporary_tree_removed'])
+        self.assertFalse(calls[1][2].exists())
+
+    def test_default_native_installation_cannot_pass_with_runner_or_missing_native_artifact(self):
+        self.put(self.repo / 'examples/hello.ku', b'fn main(){println("Hello Ku")}\n')
+        for text in ('build profile: release\nrustc command: rustc argv\n',
+                     'build profile: release\nc compiler command: cc argv\n'):
+            def command(executable, arguments, working):
+                if 'rustc command:' in text:
+                    Path(arguments[-1]).write_bytes(b'existing wrong-backend executable')
+                return {'exit_code': 0}, text
+            with self.subTest(text=text), mock.patch.object(EXPORT, 'install_command', side_effect=command) as invoked:
+                with self.assertRaisesRegex(EXPORT.ExportError, 'did not execute the Release C compiler'):
+                    EXPORT.verify_default_native_installation(self.bundle, self.repo, self.target)
+            self.assertEqual(invoked.call_count, 1)
 
     def test_example_canonicalization_changes_only_crlf_and_requires_utf8(self):
         source = "\ufeff中文😀\r\nkeep\rcontent  \n".encode("utf-8")

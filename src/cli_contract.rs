@@ -32,7 +32,7 @@ macro_rules! alias_contracts {
             "  ku ir <file.ku>       Print checked Ku IR draft\n",
             "  ku llvm <file.ku>     Emit prototype LLVM text IR\n",
             "  ku build [options] [file.ku|project-directory]\n",
-            "                        Default: debug profile, runner backend\n",
+            "                        Default: debug profile, native C backend\n",
             "  ku package gc [path]\n",
             "  ku package pack [path]\n",
             "  ku package publish [path]\n",
@@ -51,9 +51,9 @@ macro_rules! alias_contracts {
             "Aliases and scopes:\n",
             $("  ", $scope, ": ", $canonical, " = ", $aliases, "\n    ", $note, "\n",)*
             "\nBuild output:\n",
-            "  Default runner packages the interpreter using the matching Rust toolchain.\n",
-            "  --backend c builds a native executable with a supported C compiler.\n",
-            "  --emit-c also emits C; it does not switch away from runner.\n",
+            "  Default native C builds an executable using a supported C compiler.\n",
+            "  --backend runner packages the interpreter using its matching Rust toolchain.\n",
+            "  --emit-c emits C without changing the selected backend.\n",
             "  --backend llvm currently emits text IR, not a linked executable.\n",
             "  Historical `ku build --native FILE` emits C only; adding -o/--output\n",
             "  selects a C executable. --native must immediately follow `build`.\n",
@@ -81,8 +81,8 @@ alias_contracts! {
     ("build", "--profile fast", "--fast", "Select the fast profile; this is separate from --release."),
     ("build", "--emit-llvm", "--emit-ll", "Also emit prototype LLVM text IR."),
     ("build", "--verbose", "-v", "Within build, -v prints build logs; it does not print Ku version."),
-    ("build", "--backend runner", "--backend interp, --backend interpreter", "Runner is the default and requires the bundle-matching Rust compiler for building."),
-    ("build", "--backend c", "--backend native-c", "Native C executable; requires a supported C toolchain."),
+    ("build", "--backend runner", "--backend interp, --backend interpreter", "Explicit interpreter wrapper; building requires the bundle-matching Rust compiler."),
+    ("build", "--backend c", "--backend native-c", "Default native C executable; requires a supported C toolchain."),
     ("build", "--backend llvm", "--backend ll", "Prototype text IR output; not a complete executable link path."),
 }
 
@@ -164,8 +164,8 @@ pub const COMMANDS: &[CommandContract] = &[
     },
     CommandContract {
         name: "build", usage: "ku build [options] [file.ku|project-directory]",
-        description: "Build a runnable program; defaults to debug profile and runner backend.",
-        notes: "Options: --output/-o PATH; --profile debug|release|small|fast; --target host|TARGET; --backend runner|c|llvm; --emit-c; --emit-ir; --emit-llvm/--emit-ll; --clean; --verbose/-v; --lto; --strip; --static; --locked|--offline.\nA pathless build or `ku build .` needs a valid ku.mod entry. --target host is the default host choice. Runner packages the interpreter and requires its bundle-matching Rust compiler. --backend c creates a native executable using a C compiler. --emit-c does not select the C backend. --backend llvm emits text IR only.\nCompatibility: --native must immediately follow build. `ku build --native FILE` emits C only; adding -o/--output builds a C executable. It is not an unconditional --backend c alias.\nExamples:\n  ku build ./hello.ku\n  ku build -v --release ./hello.ku -o ./dist/hello\n  ku build --backend c --release ./hello.ku -o ./dist/hello\n  ku doctor --backend runner",
+        description: "Build a native executable; defaults to debug profile and native C backend.",
+        notes: "Options: --output/-o PATH; --profile debug|release|small|fast; --target host|TARGET; --backend runner|c|llvm; --emit-c; --emit-ir; --emit-llvm/--emit-ll; --clean; --verbose/-v; --lto; --strip; --static; --locked|--offline.\nA pathless build or `ku build .` needs a valid ku.mod entry. --target host is the default host choice. Default C builds a native executable with a supported C compiler and its program dependencies. --backend runner explicitly packages the interpreter and requires its bundle-matching Rust compiler. --emit-c does not change the selected backend. --backend llvm emits text IR only.\nCompatibility: --native must immediately follow build. `ku build --native FILE` emits C only; adding -o/--output builds a C executable. It is not an unconditional --backend c alias.\nExamples:\n  ku build ./hello.ku\n  ku build -v --release ./hello.ku -o ./dist/hello\n  ku build --backend c --release ./hello.ku -o ./dist/hello\n  ku doctor --backend runner",
         value_options: BUILD_VALUES, flags: BUILD_FLAGS, maximum_paths: 1,
     },
     CommandContract {
@@ -440,7 +440,7 @@ mod tests {
         }
         assert!(help(&["ku", "build", "-o", "--help", "hello.ku", "-h"])
             .unwrap()
-            .contains("runner backend"));
+            .contains("native C backend"));
     }
 
     #[test]
@@ -528,7 +528,7 @@ mod tests {
         }
         let build = help(&["ku", "build", "--help"]).unwrap();
         assert!(build.contains("Within build, -v"));
-        assert!(build.contains("--emit-c does not select the C backend"));
+        assert!(build.contains("--emit-c does not change the selected backend"));
         assert!(build.contains("--native must immediately follow build"));
         let doctor = help(&["ku", "doctor", "--help"]).unwrap();
         assert!(doctor.contains("KU_RUNNER_RUSTC"));

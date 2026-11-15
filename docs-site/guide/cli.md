@@ -24,6 +24,7 @@ ku build --emit-c [file.ku]
 ku build --emit-ir [file.ku]
 ku build --emit-llvm [file.ku]
 ku build --backend c [file.ku]
+ku build --backend runner [file.ku]
 ku build --native [--locked|--offline] <file.ku>
 ku package gc [path]
 ku package pack [path]
@@ -51,6 +52,6 @@ ku-registry --help
 
 `ku check`、`ku run`、`ku build` 共用依赖解析器。每条命令可选择一个 `--locked` 或 `--offline`：前者固定 lock 图且不改写 lock，后者还禁止 registry 网络和 `file://` source 回读；重复或同时使用会报错。
 
-`ku build` 默认生成解释器打包型可执行文件，输出到 `.ku/build/<profile>/<name>`；有 `ku.mod` 时可以无参读取 `root + main`，默认 `src/main.ku`。`--emit-ir`、`--emit-c`、`--emit-llvm` 分别写入 `.ku/build/[<target>/]<profile>/{ir,c,llvm}/<binary-stem>.<ext>`；显式 `-o` 时三类目录都会增加 `<output-path-sha256>` 层。Windows 的 `app.exe` 使用 stem `app`。完整输出路径哈希只用于隔离并发构建，不是签名。
+当前源码的 `ku build` 默认生成原生 C 可执行文件；`--backend runner` 显式选择解释器打包。已发布的 0.0.20 安装包仍沿用 Runner 默认，跨版本可使用 `--backend c` 或 `--backend runner` 固定行为。输出到 `.ku/build/<profile>/<name>`；有 `ku.mod` 时可以无参读取 `root + main`，默认 `src/main.ku`。`--emit-ir`、`--emit-c`、`--emit-llvm` 分别写入 `.ku/build/[<target>/]<profile>/{ir,c,llvm}/<binary-stem>.<ext>`；显式 `-o` 时三类目录都会增加 `<output-path-sha256>` 层。Windows 的 `app.exe` 使用 stem `app`。完整输出路径哈希只用于隔离并发构建，不是签名。
 
 `ku build --native <file.ku>` 不带 `-o` 时是源码旁生成 `.c` 的单文件兼容模式，不链接；带 `-o` 时进入完整 native 生成、编译、链接和目标格式校验。跨系统发布使用 `ku build --backend c --release --target <target> .`，为 Windows、Linux、macOS 分别构建，不存在三系统通用单一二进制。同步程序的 KuString、array、dynamic object、Result/Error、closure 以及 fs/json/time native ABI 已接入，async native lowering 仍是明确边界。

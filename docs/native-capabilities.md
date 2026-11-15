@@ -2,10 +2,11 @@
 
 [English](native-capabilities.en.md)
 
-Ku 0.0.20 的原生 C 构建使用目标 C 编译器生成独立程序，不通过 Runner 回读 Ku 源码。当前默认 `ku build` 仍使用 Runner；显式原生构建为：
+原生 C 构建使用目标 C 编译器生成独立程序，不通过 Runner 回读 Ku 源码。当前源码的 `ku build` 默认选择原生 C；已发布的 0.0.20 安装包仍默认选择 Runner。跨版本使用显式后端命令：
 
 ```sh
 ku build --backend c --release hello.ku -o hello
+ku build --backend runner --release hello.ku -o hello-runner
 ```
 
 生成 C、完成链接和在目标机器运行是三个不同步骤。`ku build --native hello.ku` 不带 `-o` 的兼容用法只生成 C。
@@ -50,4 +51,4 @@ ku build --backend c --release hello.ku -o hello
 
 递归 value 布局、object 解构、optional chaining、捕获 `for` 迭代绑定，以及尚未映射的标准库能力仍会明确拒绝。Task 参数、返回、捕获及 finally 继续受各自文档中的子集限制。遇到不支持能力或缺少依赖时应报错，不静默换成 Runner。
 
-默认原生构建的切换须先完成能力、所有权、平台、安装和真实项目验证；不要求所有性能场景超过 Rust，也不免除独立性能修改的采用条件。`ku run` 与直接执行 `.ku` 的既有行为不因此改变。
+原生 C 成为源码默认入口，不表示所有解释器功能或性能目标均已完成。能力、所有权、平台、安装与真实项目仍按各自证据验收，独立性能修改的采用条件不变。`ku run` 与直接执行 `.ku` 的既有行为不因此改变。

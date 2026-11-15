@@ -15,6 +15,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import ssl
@@ -153,10 +154,57 @@ def output(result):
     return result.stdout.decode("utf-8", errors="replace").replace("\r\n", "\n")
 
 
+def assert_build_backend(result, backend, profile=None):
+    """Require actual compiler execution evidence for the requested backend."""
+    if backend not in ('c', 'runner'):
+        raise ValueError('consumer expects a concrete C or Runner executable backend')
+    text = output(result)
+    expected, forbidden = (('c compiler command:', 'rustc command:') if backend == 'c' else
+                           ('rustc command:', 'c compiler command:'))
+    if result.returncode or expected not in text or forbidden in text:
+        raise RuntimeError('build did not execute the expected ' + backend + ' compiler command')
+    if profile is not None and 'build profile: ' + profile not in text:
+        raise RuntimeError('build did not use the expected ' + backend + ' profile: ' + profile)
+
+
+def native_without_rust(env, absent_home):
+    """Hide Rust discovery while preserving the existing native tool paths."""
+    selected = dict(env, RUSTUP_HOME=str(absent_home), RUSTUP_AUTO_INSTALL='0')
+    selected.pop('KU_RUNNER_RUSTC', None)
+    selected.pop('RUSTUP_TOOLCHAIN', None)
+    names = ('rustup.exe', 'rustc.exe') if os.name == 'nt' else ('rustup', 'rustc')
+    selected['PATH'] = os.pathsep.join(entry for entry in env.get('PATH', '').split(os.pathsep)
+        if entry and not any((Path(entry) / name).is_file() for name in names))
+    for name in names:
+        if shutil.which(name, path=selected['PATH']) is not None:
+            raise RuntimeError('native consumer could not isolate Rust discovery: ' + name)
+    return selected
+
+
+def record_native_build_diagnostics(detail, result):
+    """Preserve bounded stderr and reject known CRT/link-contract warnings."""
+    detail['build_stderr_bytes'] = len(result.stderr)
+    encoded = result.stderr.decode('utf-8', errors='replace').encode('utf-8')
+    detail['build_stderr_excerpt'] = encoded[:4096].decode('utf-8', errors='ignore')
+    detail['build_stderr_truncated'] = len(encoded) > 4096
+    # Compiler/linker warnings may be forwarded on either stream. Inspect all
+    # bounded captured output, while storing only metadata and bounded stderr.
+    text = (result.stdout + b'\n' + result.stderr).decode('utf-8', errors='replace')
+    codes = sorted({code.upper() for code in re.findall(r'\bLNK(?:4098|4286|4217|2019|1120)\b', text, re.I)})
+    if re.search(r'\bLNK2038\b[^\r\n]*(?:RuntimeLibrary|CRT)|'
+                 r'(?:RuntimeLibrary|runtime librar(?:y|ies)|MSVCRT|LIBCMT|CRT)[^\r\n]{0,256}(?:mismatch|conflict)|'
+                 r'(?:mismatch|conflict)[^\r\n]{0,256}(?:RuntimeLibrary|runtime librar(?:y|ies)|MSVCRT|LIBCMT|CRT)', text, re.I):
+        codes.append('CRT/runtime-library mismatch')
+    detail['build_link_contract_diagnostics'] = codes
+    detail['build_link_contract_passed'] = result.returncode == 0 and not codes
+    if codes:
+        raise RuntimeError('native build reported incompatible CRT/linker diagnostics: ' + ', '.join(codes))
+
+
 def invoke(command, cwd, env, seconds=300):
     OWNER.COMMAND_TIMEOUT_SECONDS = seconds
     with environment(env):
-        return OWNER.run_bounded([str(p) for p in command], cwd, "Runner archive consumer", check=False)
+        return OWNER.run_bounded([str(p) for p in command], cwd, "installed archive consumer", check=False)
 
 
 def checked(command, cwd, env):
@@ -247,7 +295,7 @@ def installed_native_tls_consumer(install, root, env, report, report_path, targe
     detail = {'status': 'running', 'target': target, 'scope': 'installed archive -> Release C11 O2 -> moved source-free TLS executable',
               'checkout_hidden_during_build': checkout_hidden,
               'installed_pack_files': {}, 'source_removed_before_run': False, 'sdk_unavailable_during_run': False,
-              'installation_restored': False, 'peer_stopped': False}
+              'installation_restored': False, 'peer_stopped': False, 'functional_check_passed': False}
     report['installed_native_tls'] = detail
     write_report(report_path, report)
     build_env = dict(env)
@@ -339,8 +387,10 @@ fn main(): null! {{
             detail['build_exit'] = built.returncode
             detail['build_stdout_sha256'] = hashlib.sha256(built.stdout).hexdigest()
             detail['build_stderr_sha256'] = hashlib.sha256(built.stderr).hexdigest()
+            record_native_build_diagnostics(detail, built)
             if built.returncode:
                 raise RuntimeError('installed archive native TLS build failed: ' + (output(built)+built.stderr.decode(errors='replace'))[-4000:])
+            assert_build_backend(built, 'c', 'release')
             emitted = reported_artifact(output(built), 'native c ok: ', project, temporary)
             if b'ku_tls_v1_client_new' not in emitted.read_bytes():
                 raise RuntimeError('installed TLS build did not emit the native TLS engine path')
@@ -370,6 +420,7 @@ fn main(): null! {{
                 raise RuntimeError('installed TLS loopback peer failed: ' + str(peer_result))
             detail['tls_version'] = peer_result['tls_version']
             detail['binary_echo'] = True
+            detail['functional_check_passed'] = True
         except BaseException as error:
             primary = error
         finally:
@@ -407,7 +458,7 @@ def installed_native_compression_consumer(install, root, env, report, report_pat
               'scope': 'installed archive -> Release C11 O2 -> moved source-free compression executable',
               'checkout_hidden_during_build': checkout_hidden, 'installed_packs': {},
               'source_removed_before_run': False, 'sdk_unavailable_during_run': False,
-              'installation_restored': False}
+              'installation_restored': False, 'functional_check_passed': False}
     report['installed_native_compression'] = detail
     packs = install / 'native-compression/v1' / target
     if not (install / 'native-compression').exists():
@@ -476,8 +527,10 @@ fn main(): null! {
             detail['build_exit'] = built.returncode
             detail['build_stdout_sha256'] = hashlib.sha256(built.stdout).hexdigest()
             detail['build_stderr_sha256'] = hashlib.sha256(built.stderr).hexdigest()
+            record_native_build_diagnostics(detail, built)
             if built.returncode:
                 raise RuntimeError('installed archive native compression build failed: ' + (output(built)+built.stderr.decode(errors='replace'))[-4000:])
+            assert_build_backend(built, 'c', 'release')
             emitted = reported_artifact(output(built), 'native c ok: ', project, temporary)
             generated = emitted.read_bytes()
             for marker in (b'#define KU_FEATURE_ZSTD 1', b'#define KU_FEATURE_ZLIB 1', b'ku_zstd_compress', b'ku_gzip_compress', b'ku_deflate_compress'):
@@ -505,6 +558,7 @@ fn main(): null! {
             detail['binary_roundtrip'] = True
             detail['unicode_roundtrip'] = True
             detail['output_bound'] = True
+            detail['functional_check_passed'] = True
         except BaseException as error:
             primary = error
         finally:
@@ -582,6 +636,7 @@ def project_contract_fixture(project, source):
 
 def windows_readonly_installation(install, project, root, env, report, report_path, version):
     """One controlled RX fixture with original-DACL recovery and real probes."""
+    env = native_without_rust(env, root / 'absent-rustup-readonly')
     ku = install / 'ku.exe'
     backup = root / 'windows-readonly-dacl.json'
     input_path = root / 'windows-readonly-input.json'
@@ -653,10 +708,13 @@ def windows_readonly_installation(install, project, root, env, report, report_pa
         if failures:
             raise RuntimeError('read-only ACL preflight failed: ' + '; '.join(failures))
         built = project / 'readonly-result.exe'
-        command('read-only-install', [ku, 'build', 'hello.ku', '-o', built])
+        result = command('read-only-install', [ku, 'build', '--verbose', 'hello.ku', '-o', built])
+        assert_build_backend(result, 'c', 'debug')
         command('read-only-install-result', [built], 'Hello Ku\n')
         built.unlink()
         detail['build_and_run_passed'] = True
+        detail['backend'] = 'c'
+        detail['rust_tools_unavailable'] = True
     except BaseException as error:
         detail['failure'] = type(error).__name__ + ': ' + str(error)[-2000:]
         try:
@@ -796,6 +854,7 @@ def run(args, report):
         report.update(publisher=manifest["rustc"], consumer={"release": consumer_release, "host": consumer_host},
                       bundle_id=manifest["bundle_id"], installation_moved=True,
                       build_target_from_publisher="owned package target was deleted before archive export")
+        native_env = native_without_rust(env, root / 'absent-rustup-for-native')
 
         def record(name, result, expected_exit="zero"):
             report["cases"].append(dict(name=name, exit_code=result.returncode, expected_exit=expected_exit,
@@ -809,14 +868,17 @@ def run(args, report):
                 raise RuntimeError(name + ": " + output(result) + result.stderr.decode(errors="replace")[-4096:])
             return result
 
-        def failure(name, selected_env=None):
+        def failure(name, selected_env=None, backend='runner'):
             destination = project / ("preserved.exe" if os.name == "nt" else "preserved")
             destination.write_bytes(b"preexisting output must survive\n")
-            result = invoke([ku, "build", "hello.ku", "-o", destination], project, selected_env or env)
+            selection = [] if backend is None else ['--backend', backend]
+            result = invoke([ku, "build", *selection, '--verbose', "hello.ku", "-o", destination], project, selected_env or env)
             record(name, result, "nonzero-without-bare-E0514")
             text = output(result) + result.stderr.decode(errors="replace")
             if result.returncode == 0 or "E0514" in text or destination.read_bytes() != b"preexisting output must survive\n":
                 raise RuntimeError(name + " did not fail before compiler/output replacement: " + text[-4096:])
+            if backend is None and ('KU_CC' not in text or 'rustc command:' in text):
+                raise RuntimeError(name + ' did not clearly reject the unavailable C compiler without Runner fallback')
 
         def remove_executable(path):
             path = Path(path)
@@ -827,25 +889,28 @@ def run(args, report):
             if path.is_file():
                 path.unlink()
 
-        def execute_and_remove(name, destination, wanted=None):
+        def execute_and_remove(name, destination, wanted=None, selected_env=None):
             executable = Path(destination)
             if os.name == 'nt' and executable.suffix.lower() != '.exe':
                 executable = executable.with_suffix('.exe')
-            executed = invoke([executable], project, env)
+            executed = invoke([executable], project, selected_env or env)
             record(name, executed)
             if executed.returncode or output(executed) != (expected if wanted is None else wanted):
                 raise RuntimeError(name + ' produced incorrect executable output')
             report['cases'][-1]['binary_sha256'] = EXPORT.file_hash(executable)
             remove_executable(executable)
 
-        def build_run(name, arguments, destination, verbose_profile=None, entry="hello.ku", wanted=None):
-            result = success(name, ['build', *arguments, '-o', destination, entry])
+        def build_run(name, arguments, destination, verbose_profile=None, entry="hello.ku", wanted=None, backend='c'):
+            selected_env = native_env if backend == 'c' else env
+            arguments = list(arguments)
+            if not any(flag in arguments for flag in ('--verbose', '-v')):
+                arguments.append('--verbose')
+            result = success(name, ['build', *arguments, '-o', destination, entry], selected_env=selected_env)
+            assert_build_backend(result, backend, verbose_profile)
+            report['cases'][-1]['observed_backend'] = backend
             if verbose_profile is not None:
-                text = output(result)
-                if 'build profile: ' + verbose_profile not in text or 'rustc command:' not in text:
-                    raise RuntimeError(name + ' did not use expected Runner profile/verbose scope')
                 report['cases'][-1]['observed_build_profile'] = verbose_profile
-            execute_and_remove(name + '-result', destination, wanted)
+            execute_and_remove(name + '-result', destination, wanted, selected_env)
             return result
 
         def exercise_cli_contracts():
@@ -908,8 +973,9 @@ def run(args, report):
             suffix = '.exe' if os.name == 'nt' else ''
             destination = project / 'dist contract' / ('hello' + suffix)
             for flag in ('-o', '--output'):
-                result = success('contract-output-' + flag, ['build', flag, destination, 'hello.ku'])
-                executed = invoke([destination], project, env)
+                result = success('contract-output-' + flag, ['build', '--verbose', flag, destination, 'hello.ku'], selected_env=native_env)
+                assert_build_backend(result, 'c', 'debug')
+                executed = invoke([destination], project, native_env)
                 record('contract-output-' + flag + '-result', executed)
                 if executed.returncode or output(executed) != expected:
                     raise RuntimeError('output alias produced incorrect program')
@@ -921,10 +987,11 @@ def run(args, report):
             for flag in ('-v', '--verbose'):
                 build_run('contract-build-verbose-' + flag, [flag], project / ('contract-verbose' + suffix), 'debug')
             for backend in ('runner', 'interp', 'interpreter', 'c', 'native-c'):
-                build_run('contract-backend-' + backend, ['--backend', backend], project / ('contract-backend' + suffix))
+                selected_backend = 'c' if backend in ('c', 'native-c') else 'runner'
+                build_run('contract-backend-' + backend, ['--backend', backend], project / ('contract-backend' + suffix), backend=selected_backend)
             # LLVM is an explicitly limited text prototype. The ordinary
-            # Hello Runner cases above remain unchanged; this empty-main IR
-            # fixture is supported and its Runner executable emits no stdout.
+            # Hello cases above remain unchanged; this empty-main IR fixture
+            # is supported and its default C executable emits no stdout.
             llvm_source = project / 'llvm-empty.ku'
             llvm_source.write_text('fn main() {}\n', encoding='utf-8')
             report['cli_contract']['llvm_fixture'] = dict(source_sha256=hashlib.sha256(llvm_source.read_bytes()).hexdigest(),
@@ -974,9 +1041,10 @@ def run(args, report):
                 success('contract-project-run-omitted', ['run'], expected)
                 success('contract-project-check-omitted', ['check'])
                 for label, arguments in (('omitted', []), ('directory', ['.']), ('host', ['--target', 'host'])):
-                    success('contract-project-build-' + label, ['build', *arguments])
+                    built = success('contract-project-build-' + label, ['build', '--verbose', *arguments], selected_env=native_env)
+                    assert_build_backend(built, 'c', 'debug')
                     program = project / '.ku/build/debug' / ('hello' + suffix)
-                    result = invoke([program], project, env)
+                    result = invoke([program], project, native_env)
                     record('contract-project-build-' + label + '-result', result)
                     if result.returncode or output(result) != expected:
                         raise RuntimeError('project entry shorthand produced incorrect executable')
@@ -1023,6 +1091,7 @@ def run(args, report):
                     ku = install / 'ku.exe'
         success("implicit-run", ["hello.ku"], expected)
         success("explicit-run", ["run", "hello.ku"], expected)
+        build_run('default-native-without-rust-before-runner-setup', [], project / 'default-native-before-runner', 'debug')
         failure("exact-publisher-missing")
         installed = invoke([ku, "doctor", "--install-runner-toolchain"], project, env, seconds=660)
         record("explicit-install-exact-publisher", installed)
@@ -1051,7 +1120,8 @@ def run(args, report):
                 install = destination
                 ku = install / 'ku.exe'
                 try:
-                    success('cross-drive-original-build', ['build', 'hello.ku', '-o', 'cross-drive-result'])
+                    built = success('cross-drive-original-build', ['build', '--backend', 'runner', '--verbose', 'hello.ku', '-o', 'cross-drive-result'])
+                    assert_build_backend(built, 'runner', 'debug')
                     execute_and_remove('cross-drive-result', project / 'cross-drive-result')
                 finally:
                     shutil.move(str(install), str(old_install))
@@ -1063,7 +1133,8 @@ def run(args, report):
         before_project = b'[toolchain]\nchannel = "' + consumer_name.encode() + b'"\n'
         (project / "rust-toolchain.toml").write_bytes(before_project)
         configured = dict(env, RUSTUP_TOOLCHAIN=consumer_name)
-        success("original-build-project-and-env-unlike", ["build", "hello.ku"], selected_env=configured)
+        original = success("original-build-project-and-env-unlike", ["build", '--backend', 'runner', '--verbose', "hello.ku"], selected_env=configured)
+        assert_build_backend(original, 'runner', 'debug')
         built = project / ".ku/build/debug" / ("hello.exe" if os.name == "nt" else "hello")
         result = invoke([built], root, env)
         record("original-build-result", result)
@@ -1082,7 +1153,8 @@ def run(args, report):
         if result.returncode:
             raise RuntimeError("cannot prepare real unlike-compiler interference")
         os.utime(wrong, (time.time() + 3600, time.time() + 3600))
-        success("ignore-newer-incompatible-rlib", ["build", "hello.ku", "-o", "newer-ignored"])
+        built = success("ignore-newer-incompatible-rlib", ["build", '--backend', 'runner', '--verbose', "hello.ku", "-o", "newer-ignored"])
+        assert_build_backend(built, 'runner', 'debug')
         execute_and_remove("ignore-newer-incompatible-rlib-result", project / "newer-ignored")
         wrong.unlink()
         runtime_path = install / "ku-runtime.json"
@@ -1090,6 +1162,7 @@ def run(args, report):
         original_manifest = runtime_path.read_bytes()
         with changed(runtime_path, b"{invalid json"):
             failure("invalid-manifest")
+            build_run('default-native-does-not-read-runner-manifest', [], project / 'native-without-runner-manifest', 'debug')
         runtime_path.rename(root / "missing-manifest")
         try:
             failure("missing-manifest-no-development-fallback")
@@ -1130,6 +1203,7 @@ def run(args, report):
         success("no-rust-version", ["-v"], "ku " + metadata["version"] + "\n", no_rust)
         success("no-rust-interpreter", ["hello.ku"], expected, no_rust)
         failure("no-rust-runner", no_rust)
+        failure('default-native-missing-compiler-no-fallback', dict(env, KU_CC=str(root / 'missing-c-compiler')), backend=None)
         standalone = root / "standalone-compiler-bin"
         standalone.mkdir()
         selected = Path(checked([rustup, "which", "--toolchain", required, "rustc"], project, env).strip())
@@ -1141,17 +1215,19 @@ def run(args, report):
         else:
             direct["PATH"] = os.pathsep.join(p for p in env["PATH"].split(os.pathsep)
                 if not any((Path(p) / name).is_file() for name in ("rustup", "rustc")))
-        success("standalone-explicit-compiler-no-rustup", ["build", "hello.ku", "-o", "standalone-result"], selected_env=direct)
+        built = success("standalone-explicit-compiler-no-rustup", ["build", '--backend', 'runner', '--verbose', "hello.ku", "-o", "standalone-result"], selected_env=direct)
+        assert_build_backend(built, 'runner', 'debug')
         execute_and_remove("standalone-explicit-compiler-result", project / "standalone-result")
         # Common immutable env for both processes; no per-thread env mutation.
         OWNER.COMMAND_TIMEOUT_SECONDS = 300
         with environment(env), ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(OWNER.run_bounded, [str(ku), "build", "hello.ku", "-o", str(project / ("parallel-" + str(i)))], project, "parallel Runner consumer", check=False) for i in range(2)]
+            futures = [pool.submit(OWNER.run_bounded, [str(ku), "build", '--backend', 'runner', '--verbose', "hello.ku", "-o", str(project / ("parallel-" + str(i)))], project, "parallel Runner consumer", check=False) for i in range(2)]
             for i, future in enumerate(futures):
                 result = future.result()
                 record("parallel-build-" + str(i), result)
                 if result.returncode:
                     raise RuntimeError("parallel build failed")
+                assert_build_backend(result, 'runner', 'debug')
                 execute_and_remove("parallel-result-" + str(i), project / ("parallel-" + str(i)))
 
         if args.hide_checkout:
@@ -1165,8 +1241,7 @@ def run(args, report):
                         destination = root / ("retired-checkout-" + name)
                         relocate_checkout_entry(old, destination)
                         retired.append((old, destination))
-                success("source-and-target-unavailable", ["build", "hello.ku", "-o", "without-source"])
-                execute_and_remove("source-and-target-unavailable-result", project / "without-source")
+                build_run('source-and-target-unavailable', [], project / 'without-source', 'debug')
                 installed_native_tls_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
                 installed_native_compression_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
             finally:
@@ -1180,8 +1255,9 @@ def run(args, report):
         # Exercise the native path separately; it must not consume runner rlibs.
         success("native-doctor", ["doctor", "--backend", "c"])
         native = project / ("hello-native.exe" if os.name == "nt" else "hello-native")
-        success("native-build-independent", ["build", "--backend", "c", "--release", "hello.ku", "-o", native])
-        result = invoke([native], root, env)
+        compiled = success("native-build-independent", ["build", "--backend", "c", "--release", '--verbose', "hello.ku", "-o", native], selected_env=native_env)
+        assert_build_backend(compiled, 'c', 'release')
+        result = invoke([native], root, native_env)
         record("native-result", result)
         if result.returncode or output(result) != expected:
             raise RuntimeError("native guard output differs")
@@ -1203,8 +1279,9 @@ def run(args, report):
                 else:
                     probe.unlink()
                     raise RuntimeError('Unix installation was not actually read-only')
-                success("read-only-install", ["build", "hello.ku", "-o", "readonly-result"])
-                execute_and_remove("read-only-install-result", project / "readonly-result")
+                built = success("read-only-install", ["build", '--verbose', "hello.ku", "-o", "readonly-result"], selected_env=native_env)
+                assert_build_backend(built, 'c', 'debug')
+                execute_and_remove("read-only-install-result", project / "readonly-result", selected_env=native_env)
             finally:
                 for p, mode in modes:
                     p.chmod(mode)

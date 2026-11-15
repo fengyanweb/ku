@@ -32,9 +32,10 @@ From this repository:
 ku run examples/hello.ku
 ku check examples/json.ku
 ku build --backend c --profile release examples/hello.ku -o hello
+ku build --backend runner --profile release examples/hello.ku -o hello-runner
 ```
 
-Backend coverage differs. Database drivers need native output and their client libraries. Multi-loop HTTP and owner Task execution refer to the native C backend; a successful `ku check` does not prove that every backend supports a program.
+Current source builds default to native C. Published 0.0.20 packages retain their Runner default; use `--backend c` or `--backend runner` to choose explicitly across versions. Backend coverage differs. Database drivers need native output and their client libraries. Multi-loop HTTP and owner Task execution refer to the native C backend; a successful `ku check` does not prove that every backend supports a program.
 
 ## Documentation
 
@@ -50,7 +51,7 @@ Use `ku --help` and subcommand help for the installed version's options. Common 
 
 ## Build from source
 
-Source builds are pinned to Rust 1.99.1. Installed `ku run` and `ku check` do not require Rust. Default Runner `ku build` requires a compiler with the exact identity recorded by its SDK and a system linker; a precompiled rlib is not portable across arbitrary rustc versions. Native C output needs a supported C compiler and the native libraries used by the program. See [CLI and SDK compatibility](docs/cli-runtime-bundle.en.md).
+Source builds are pinned to Rust 1.99.1. Installed `ku run` and `ku check` do not require Rust. `ku build --backend runner` requires a compiler with the exact identity recorded by its SDK and a system linker; a precompiled rlib is not portable across arbitrary rustc versions. Native C output needs a supported C compiler and the native libraries used by the program; unsupported native programs do not silently fall back to the Runner. See [CLI and SDK compatibility](docs/cli-runtime-bundle.en.md).
 
 ```sh
 cargo +1.99.1 build --locked --release

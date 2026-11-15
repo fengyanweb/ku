@@ -111,6 +111,8 @@ jobs:
           if ($LASTEXITCODE) { throw 'Matching source CLI/library build failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test cli_v002_test -- --test-threads=1
           if ($LASTEXITCODE) { throw 'Real CLI integration failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test language_v004_test --test language_v010_test --test native_async_boundary_test -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Default native project/import and explicit Runner contracts failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --lib cli_contract -- --test-threads=1
           if ($LASTEXITCODE) { throw 'CLI contract tests failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --lib runner_bundle -- --test-threads=1

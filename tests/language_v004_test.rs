@@ -1256,6 +1256,8 @@ fn ku_build_creates_runnable_executable_wrapper() {
     run_cli(vec![
         "ku".to_string(),
         "build".to_string(),
+        "--backend".to_string(),
+        "runner".to_string(),
         source.to_string_lossy().to_string(),
     ])
     .expect("ku build should succeed");
