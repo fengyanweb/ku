@@ -2,11 +2,11 @@
 
 `std.zstd`, `std.gzip` and `std.deflate` use the existing `bytes` type in synchronous native C programs. They do not change HTTP compression, the JSON engine or the default allocator. Programs that do not use them do not link these libraries or initialize codec contexts, buffers or threads.
 
-| Module | Format | Implementation |
-|---|---|---|
-| `zstd` | Zstandard frames; encoder enables content checksums | Zstandard 1.5.7, compression level 3 |
-| `gzip` | RFC 1952 gzip members containing DEFLATE | zlib 1.4, default level and strategy |
-| `deflate` | One raw RFC 1951 DEFLATE stream, without a gzip/zlib wrapper | The same zlib 1.4 |
+| Module    | Format                                                       | Implementation                       |
+| --------- | ------------------------------------------------------------ | ------------------------------------ |
+| `zstd`    | Zstandard frames; encoder enables content checksums          | Zstandard 1.5.7, compression level 3 |
+| `gzip`    | RFC 1952 gzip members containing DEFLATE                     | zlib 1.4, default level and strategy |
+| `deflate` | One raw RFC 1951 DEFLATE stream, without a gzip/zlib wrapper | The same zlib 1.4                    |
 
 Each module provides:
 

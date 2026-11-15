@@ -2,11 +2,11 @@
 
 `std.zstd`、`std.gzip` 和 `std.deflate` 使用现有 `bytes` 类型，供同步 native C 程序调用。它们不改变 HTTP 的压缩策略、JSON 引擎或默认分配器。未使用这些模块的程序不会链接压缩库，也不会创建压缩上下文、线程或缓冲区。
 
-| 模块 | 压缩格式 | 实现 |
-|---|---|---|
-| `zstd` | Zstandard frame；编码启用内容校验和 | Zstandard 1.5.7，默认压缩级别 3 |
-| `gzip` | RFC 1952 gzip member，内部使用 DEFLATE | zlib 1.4，默认压缩级别及策略 |
-| `deflate` | RFC 1951 裸 DEFLATE stream，不带 gzip/zlib 包装 | 同一 zlib 1.4 |
+| 模块      | 压缩格式                                        | 实现                            |
+| --------- | ----------------------------------------------- | ------------------------------- |
+| `zstd`    | Zstandard frame；编码启用内容校验和             | Zstandard 1.5.7，默认压缩级别 3 |
+| `gzip`    | RFC 1952 gzip member，内部使用 DEFLATE          | zlib 1.4，默认压缩级别及策略    |
+| `deflate` | RFC 1951 裸 DEFLATE stream，不带 gzip/zlib 包装 | 同一 zlib 1.4                   |
 
 每个模块均提供两个方法：
 
