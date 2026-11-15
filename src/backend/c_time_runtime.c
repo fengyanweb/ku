@@ -1,5 +1,16 @@
 /* Optional synchronous scalar time operations, emitted after Result ABIs.
  * No clock/provider, worker, allocation, or calendar initialization at startup. */
+#if defined(__ku_time_sleep_enabled) && defined(_WIN32)
+/* Clock-only programs intentionally do not include windows.h. Declare the
+ * exact kernel32 ABI without introducing that header's user-name macros. */
+#if defined(_MSC_VER)
+__declspec(dllimport) void __stdcall Sleep(unsigned long milliseconds);
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((dllimport)) void __attribute__((stdcall)) Sleep(unsigned long milliseconds);
+#else
+void Sleep(unsigned long milliseconds);
+#endif
+#endif
 static KuError __ku_time_error(const char* code, const char* message) {
   return ku_error_make(ku_string_static((const uint8_t*)"time", 4),
       ku_string_static((const uint8_t*)code, strlen(code)),
@@ -114,7 +125,7 @@ static KuResult_null __ku_time_sleep(int64_t millis) {
       return (KuResult_null){false, 0, __ku_time_error("timeout", "handler deadline exceeded")};
     int64_t chunk = remaining > 10 ? 10 : remaining;
 #if defined(_WIN32)
-    Sleep((DWORD)chunk);
+    Sleep((unsigned long)chunk);
 #else
     struct timespec requested = {0, (long)(chunk * INT64_C(1000000))}, rest;
     while (nanosleep(&requested, &rest) != 0) {
