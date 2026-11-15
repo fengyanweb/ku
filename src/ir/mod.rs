@@ -2100,10 +2100,11 @@ impl<'a> FunctionLowerer<'a> {
 
     fn record_scope_owner(&mut self, instruction: &IrInst) {
         let name = match instruction {
-            IrInst::Temp { id, .. } | IrInst::BindOk { id, .. } => format!("%t{}", id.0),
-            IrInst::Let { name, .. }
-            | IrInst::BindError { name, .. }
-            | IrInst::CellNew { name, .. } => name.clone(),
+            IrInst::Temp { id, ty, .. } | IrInst::BindOk { id, ty, .. } if ir_type_is_owned(ty) => {
+                format!("%t{}", id.0)
+            }
+            IrInst::Let { name, ty, .. } if ir_type_is_owned(ty) => name.clone(),
+            IrInst::BindError { name, .. } | IrInst::CellNew { name, .. } => name.clone(),
             _ => return,
         };
         self.scope_owners.push(name);

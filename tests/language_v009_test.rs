@@ -1080,10 +1080,108 @@ fn main() {
             .any(|block| matches!(&block.terminator, ir::IrTerminator::Safepoint { .. })),
         "direct call lowering must exercise the safepoint path"
     );
+    assert!(
+        !ir.functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .any(
+                |instruction| matches!(instruction, ir::IrInst::Expr(ir::IrExpr {
+                kind: ir::IrExprKind::Call {kind: ir::IrCallKind::Intrinsic(name), ..},
+                ..
+            }) if name=="__ku_loop_scope_cleanup")
+            ),
+        "Copy-only loop temporaries must not create owning cleanup metadata"
+    );
 
     let llvm = backend::llvm::generate_llvm_ir(&ir).expect("generate LLVM after direct call");
     assert!(llvm.contains("call i64 @ku_fn0_double(i64 3)"));
     assert!(llvm.contains("br i1 false"));
+}
+
+#[test]
+fn llvm_backend_keeps_string_pointer_loops_with_c_cleanup_metadata() {
+    let ir = lower_checked_ir(
+        r#"
+fn echo(value:str):str { return value }
+fn main() {
+    index=0
+    while(index<2) {
+        message=echo("owned-pointer")
+        print(message)
+        index+=1
+    }
+}
+"#,
+    );
+    assert!(ir.functions.iter().flat_map(|f| &f.blocks).any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(instruction, ir::IrInst::Expr(ir::IrExpr {
+                kind: ir::IrExprKind::Call {kind: ir::IrCallKind::Intrinsic(name), ..},
+                ..
+            }) if name=="__ku_loop_scope_cleanup")
+        })
+    }));
+    let llvm = backend::llvm::generate_llvm_ir(&ir)
+        .expect("existing LLVM string-pointer loop ignores C-only cleanup metadata");
+    assert!(llvm.contains("call i8* @ku_fn0_echo(i8*"));
+    assert!(llvm.contains("br i1 false"));
+    assert!(!llvm.contains("__ku_loop_scope_cleanup"));
+
+    let mut invalid = ir.clone();
+    let marker = invalid
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            ir::IrInst::Expr(value)
+                if matches!(&value.kind, ir::IrExprKind::Call {
+                    kind: ir::IrCallKind::Intrinsic(name), ..
+                } if name=="__ku_loop_scope_cleanup") =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .expect("owned string loop cleanup marker");
+    if let ir::IrExprKind::Call { args, .. } = &mut marker.kind {
+        args[0].ty = ir::IrType::Int;
+    }
+    assert!(backend::llvm::generate_llvm_ir(&invalid)
+        .expect_err("C-only metadata still requires its exact internal shape")
+        .to_string()
+        .contains("loop cleanup placeholder"));
+}
+
+fn has_polled_for_backedge(
+    function: &ir::IrFunction,
+    loop_block: ir::BlockId,
+    body_block: ir::BlockId,
+) -> bool {
+    let mut cursor = body_block;
+    let mut visited = std::collections::HashSet::new();
+    let mut polled = false;
+    for _ in 0..=function.blocks.len() {
+        if cursor == loop_block {
+            return polled;
+        }
+        if !visited.insert(cursor) {
+            return false;
+        }
+        let Some(block) = function.blocks.iter().find(|block| block.id == cursor) else {
+            return false;
+        };
+        match &block.terminator {
+            ir::IrTerminator::Jump(next) => cursor = *next,
+            ir::IrTerminator::Safepoint { continue_block, .. } if !polled => {
+                polled = true;
+                cursor = *continue_block;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 #[test]
@@ -1109,23 +1207,23 @@ fn main() {
             _ => None,
         })
         .expect("for loop terminator");
-    let body = function
+    assert!(
+        has_polled_for_backedge(function, loop_block, body_block),
+        "the bounded acyclic back-edge must poll before resuming ForEach"
+    );
+    let mut invalid = function.clone();
+    let body = invalid
         .blocks
-        .iter()
+        .iter_mut()
         .find(|block| block.id == body_block)
         .expect("for body block");
-    let continue_block = match &body.terminator {
-        ir::IrTerminator::Safepoint { continue_block, .. } => *continue_block,
-        ref other => panic!("for back-edge must poll before iterating again, got {other:?}"),
-    };
-    let continuation = function
+    body.terminator = ir::IrTerminator::Jump(loop_block);
+    assert!(!has_polled_for_backedge(&invalid, loop_block, body_block));
+    invalid
         .blocks
-        .iter()
-        .find(|block| block.id == continue_block)
-        .expect("safepoint continuation block");
-    assert_eq!(
-        continuation.terminator,
-        ir::IrTerminator::Jump(loop_block),
-        "the successful poll must resume the ForEach terminator"
-    );
+        .iter_mut()
+        .find(|block| block.id == body_block)
+        .unwrap()
+        .terminator = ir::IrTerminator::Jump(body_block);
+    assert!(!has_polled_for_backedge(&invalid, loop_block, body_block));
 }
