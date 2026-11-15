@@ -1735,6 +1735,47 @@ fn main(): null! {
         err.to_string().contains("invalid_date"),
         "unexpected error: {err}"
     );
+
+    for zone in [
+        "中abc", "+é:00", "+00:é", "+00é0", "+24:00", "+00:60", "08:00", "+08-00",
+    ] {
+        let source = format!(
+            "fn main(): null! {{ time.format(time.from_millis(0), \"yyyy\", {zone:?})? return ok(null) }}"
+        );
+        let err = run_err(&source);
+        assert!(
+            err.contains("invalid_zone"),
+            "invalid offset {zone:?} must be an ordinary time error, got: {err}"
+        );
+    }
+
+    for year in [i32::MIN, i32::MAX] {
+        let source =
+            format!("fn main(): null! {{ time.days_in_month({year}, 12)? return ok(null) }}");
+        let err = run_err(&source);
+        assert!(
+            err.contains("invalid_date") && err.contains(&format!("invalid date: {year:04}-12-01")),
+            "year {year} must be rejected before computing the next year, got: {err}"
+        );
+    }
+
+    let source = r#"
+fn main(): null! {
+    epoch = time.from_millis(0)
+    if (time.format(epoch, "yyyy-MM-dd HH:mm:ss", "+23:59")? != "1970-01-01 23:59:00") {
+        panic("positive offset boundary changed")
+    }
+    if (time.format(epoch, "yyyy-MM-dd HH:mm:ss", "-23:59")? != "1969-12-31 00:01:00") {
+        panic("negative offset boundary changed")
+    }
+    if (time.days_in_month(2028, 2)? != 29 || time.days_in_month(2026, 12)? != 31) {
+        panic("valid leap month or year rollover changed")
+    }
+    return ok(null)
+}
+"#;
+    check_source("inline.ku", source).expect("time boundaries should check");
+    run_source("inline.ku", source).expect("valid time boundaries should run");
 }
 
 #[test]

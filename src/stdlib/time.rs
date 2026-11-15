@@ -638,15 +638,18 @@ fn zone_kind(zone: &str, span: Span) -> KuResult<ZoneKind> {
 }
 
 fn parse_fixed_offset(zone: &str) -> Option<FixedOffset> {
-    if zone.len() != 6 {
+    // Every position below belongs to the ASCII offset syntax. Check this
+    // before slicing: six UTF-8 bytes do not necessarily mean six characters.
+    let bytes = zone.as_bytes();
+    if bytes.len() != 6 || !bytes.is_ascii() {
         return None;
     }
-    let sign = match &zone[0..1] {
-        "+" => 1,
-        "-" => -1,
+    let sign = match bytes[0] {
+        b'+' => 1,
+        b'-' => -1,
         _ => return None,
     };
-    if &zone[3..4] != ":" {
+    if bytes[3] != b':' {
         return None;
     }
     let hours = zone[1..3].parse::<i32>().ok()?;
@@ -717,12 +720,14 @@ fn days_in_month(year: i32, month: u32, span: Span) -> KuResult<i64> {
             span,
         ));
     }
+    // Chrono's valid year range is narrower than i32. Validate the input
+    // before adding a year so even i32::MAX returns an error without overflow.
+    let current = validate_date(year, month, 1, span)?;
     let next = if month == 12 {
         validate_date(year + 1, 1, 1, span)?
     } else {
         validate_date(year, month + 1, 1, span)?
     };
-    let current = validate_date(year, month, 1, span)?;
     Ok((next - current).num_days())
 }
 
