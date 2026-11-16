@@ -1710,7 +1710,14 @@ impl<'a> FunctionLowerer<'a> {
                     }
                 }
                 let target = self.lower_lvalue_cached(target)?;
-                let left = self.lvalue_read_expr(&target);
+                let mut left = self.lvalue_read_expr(&target);
+                if matches!(&left.kind,IrExprKind::Call {kind:IrCallKind::Intrinsic(name),..}
+                    if matches!(name.as_str(),"__ku_calendar_field_int"|"__ku_calendar_field_str"))
+                {
+                    // The string getter creates an independent owner. Register
+                    // it before arithmetic/store, including signal exits.
+                    left = self.emit_temp(left)?;
+                }
                 let value = self.emit_temp(IrExpr {
                     ty: binary_type(*op, &left.ty, &right.ty),
                     kind: IrExprKind::Binary {
@@ -2444,13 +2451,15 @@ impl<'a> FunctionLowerer<'a> {
                     index: Box::new(index.clone()),
                 },
             },
-            IrLValue::Field { target, name } => IrExpr {
-                ty: self.field_type(&target.ty, name),
-                kind: IrExprKind::Field {
-                    target: Box::new(target.clone()),
-                    name: name.clone(),
-                },
-            },
+            IrLValue::Field { target, name } => self
+                .calendar_field_read(target, name)
+                .unwrap_or_else(|| IrExpr {
+                    ty: self.field_type(&target.ty, name),
+                    kind: IrExprKind::Field {
+                        target: Box::new(target.clone()),
+                        name: name.clone(),
+                    },
+                }),
         }
     }
 
@@ -2642,6 +2651,9 @@ impl<'a> FunctionLowerer<'a> {
             ExprKind::Variable(_) => self.lower_expr(expr),
             ExprKind::Field { target, name } => {
                 let target = self.lower_lvalue_target_expr(target)?;
+                if let Some(read) = self.calendar_field_read(&target, name) {
+                    return self.emit_temp(read);
+                }
                 let ty = self.field_type(&target.ty, name);
                 Ok(IrExpr {
                     kind: IrExprKind::Field {
@@ -2682,6 +2694,9 @@ impl<'a> FunctionLowerer<'a> {
             ExprKind::Variable(_) => self.lower_expr(expr),
             ExprKind::Field { target, name } => {
                 let target = self.lower_lvalue_target_expr_cached(target)?;
+                if let Some(read) = self.calendar_field_read(&target, name) {
+                    return self.emit_temp(read);
+                }
                 let ty = self.field_type(&target.ty, name);
                 Ok(IrExpr {
                     kind: IrExprKind::Field {
@@ -2922,6 +2937,29 @@ impl<'a> FunctionLowerer<'a> {
             .and_then(|layout| layout.fields.iter().find(|field| field.name == field_name))
             .map(|field| field.ty.clone())
             .unwrap_or(IrType::Unknown)
+    }
+
+    fn calendar_field_read(&self, target: &IrExpr, name: &str) -> Option<IrExpr> {
+        if !matches!(&target.ty,IrType::Named(marker) if matches!(marker.as_str(),"__ku_calendar_date"|"__ku_calendar_parts"))
+        {
+            return None;
+        }
+        let ty = self.field_type(&target.ty, name);
+        Some(intrinsic_expr(
+            if ty == IrType::Str {
+                "__ku_calendar_field_str"
+            } else {
+                "__ku_calendar_field_int"
+            },
+            vec![
+                target.clone(),
+                IrExpr {
+                    kind: IrExprKind::Literal(format!("{name:?}")),
+                    ty: IrType::Str,
+                },
+            ],
+            ty,
+        ))
     }
 
     /// Reuse storage only in an exact local/cell self-push assignment. The
@@ -4187,23 +4225,8 @@ impl<'a> FunctionLowerer<'a> {
                     }
                 }
                 let ty = self.field_type(&target.ty, name);
-                if matches!(&target.ty, IrType::Named(marker) if matches!(marker.as_str(), "__ku_calendar_date" | "__ku_calendar_parts"))
-                {
-                    return self.emit_temp(intrinsic_expr(
-                        if ty == IrType::Str {
-                            "__ku_calendar_field_str"
-                        } else {
-                            "__ku_calendar_field_int"
-                        },
-                        vec![
-                            target,
-                            IrExpr {
-                                kind: IrExprKind::Literal(format!("{name:?}")),
-                                ty: IrType::Str,
-                            },
-                        ],
-                        ty,
-                    ));
+                if let Some(read) = self.calendar_field_read(&target, name) {
+                    return self.emit_temp(read);
                 }
                 let field = IrExpr {
                     kind: IrExprKind::Field {
@@ -5664,6 +5687,8 @@ fn ir_expr_needs_post_call_safepoint(expr: &IrExpr) -> bool {
                 | "time.parse"
                 | "time.parts"
                 | "time.weekday"
+                | "__ku_calendar_field_int"
+                | "__ku_calendar_field_str"
                 | "time.sleep"
                 | "string.trim"
                 | "string.lower"
