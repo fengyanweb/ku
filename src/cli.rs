@@ -7328,11 +7328,7 @@ fn compile_c_source_with_output(
             }
         }
         let compiler_output = temporary_output;
-        command
-            .arg(source)
-            .arg("-std=c11")
-            .arg("-o")
-            .arg(compiler_output);
+        add_gnu_c_source_and_output(&mut command, source, compiler_output);
         if needs_native_tls {
             command.arg("-DKU_NATIVE_TLS_ENABLED=1");
         }
@@ -7687,6 +7683,17 @@ fn c_compiler_supports_explicit_target(
     target.matches_host()
         || candidate.kind != CCompilerKind::Preconfigured
         || candidate.explicitly_configured
+}
+
+fn add_gnu_c_source_and_output(command: &mut Command, source: &Path, output: &Path) {
+    // GCC's cc1 does not accept Rust's Windows verbatim paths, even though
+    // CreateProcess accepts them. Use the same external-tool path form as
+    // pinned headers, archives and the MSVC path already use.
+    command
+        .arg(strip_verbatim(source))
+        .arg("-std=c11")
+        .arg("-o")
+        .arg(strip_verbatim(output));
 }
 
 fn add_c_compiler_arguments(
@@ -14062,6 +14069,38 @@ fn main(): null! {
             ]
             .map(std::ffi::OsStr::new)
         );
+    }
+
+    #[test]
+    fn native_gnu_source_and_output_paths_preserve_drive_unc_and_unicode_arguments() {
+        for (source, output, expected_source, expected_output) in [
+            (
+                r"\\?\C:\目录 with spaces\main.c",
+                r"\\?\C:\目录 with spaces\main.exe",
+                r"C:\目录 with spaces\main.c",
+                r"C:\目录 with spaces\main.exe",
+            ),
+            (
+                r"\\?\UNC\host\share\main.c",
+                r"\\?\UNC\host\share\main.exe",
+                r"\\host\share\main.c",
+                r"\\host\share\main.exe",
+            ),
+            (
+                "normal path/中文.c",
+                "normal path/中文",
+                "normal path/中文.c",
+                "normal path/中文",
+            ),
+        ] {
+            let mut command = Command::new("unused-compiler");
+            add_gnu_c_source_and_output(&mut command, Path::new(source), Path::new(output));
+            let actual = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, [expected_source, "-std=c11", "-o", expected_output]);
+        }
     }
 
     #[test]
