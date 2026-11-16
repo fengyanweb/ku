@@ -42,7 +42,9 @@ fn check_type(ty: &IrType) -> KuResult<()> {
                 pending.extend(params.iter().map(|p| (p, depth + 1)));
                 pending.push((ret, depth + 1));
             }
-            IrType::Array(x) | IrType::Result(x) | IrType::Cell(x) => pending.push((x, depth + 1)),
+            IrType::Array(x) | IrType::Result(x) | IrType::Nullable(x) | IrType::Cell(x) => {
+                pending.push((x, depth + 1))
+            }
             _ => {}
         }
     }
@@ -69,6 +71,11 @@ impl Verifier<'_> {
                 IrExprKind::Field { target, .. } | IrExprKind::Index { target, .. } => {
                     cursor = target
                 }
+                IrExprKind::Call {
+                    kind: IrCallKind::Intrinsic(name),
+                    args,
+                    ..
+                } if name == "__ku_nullable_get" && args.len() == 1 => cursor = &args[0],
                 _ => return false,
             }
         }
@@ -177,9 +184,18 @@ impl Verifier<'_> {
                         }
                     }
                 } else if let IrCallKind::Intrinsic(name) = kind {
-                    let borrowed_read = name == "__ku_clone"
-                        || name == "__ku_enum_tag"
-                        || (name.starts_with("__ku_enum_payload:") && !ir_type_is_owned(&expr.ty));
+                    let borrowed_read =
+                        matches!(name.as_str(), "__ku_clone" | "__ku_clone_nullable")
+                            || name == "__ku_enum_tag"
+                            || matches!(
+                                name.as_str(),
+                                "__ku_nullable_get"
+                                    | "__ku_nullable_is_null"
+                                    | "__ku_calendar_field_str"
+                                    | "__ku_calendar_field_int"
+                            )
+                            || (name.starts_with("__ku_enum_payload:")
+                                && !ir_type_is_owned(&expr.ty));
                     if !borrowed_read {
                         let signature = metadata::builtin_signature(name).or_else(|| {
                             name.split_once('.')

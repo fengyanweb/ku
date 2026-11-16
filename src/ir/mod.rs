@@ -29,6 +29,7 @@ macro_rules! emit_ir_instruction {
     }};
 }
 mod monomorph;
+mod nullable;
 /// Internal typed frame IR. This does not open the CLI's native async boundary.
 pub mod task;
 /// Experimental bounded source Task lowering, distinct from synchronous IR.
@@ -314,6 +315,8 @@ pub enum IrType {
     Null,
     Array(Box<IrType>),
     Result(Box<IrType>),
+    /// A flat null tag and one typed payload. Existing non-null ABIs stay unchanged.
+    Nullable(Box<IrType>),
     Named(String),
     Function,
     Closure {
@@ -340,15 +343,16 @@ struct FunctionSig {
 /// fresh owned rvalue (a literal, call, or arithmetic result). A place is still owned
 /// by its binding, so it must not be materialized/moved when only borrowed.
 fn ir_expr_is_place(expr: &IrExpr) -> bool {
-    matches!(
-        expr.kind,
-        IrExprKind::Local(_)
-            | IrExprKind::Temp(_)
-            | IrExprKind::Field { .. }
-            | IrExprKind::Index { .. }
-            | IrExprKind::CapturedCell(_)
-            | IrExprKind::CellLoad(_)
-    )
+    matches!(&expr.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), .. } if name == "__ku_nullable_get")
+        || matches!(
+            expr.kind,
+            IrExprKind::Local(_)
+                | IrExprKind::Temp(_)
+                | IrExprKind::Field { .. }
+                | IrExprKind::Index { .. }
+                | IrExprKind::CapturedCell(_)
+                | IrExprKind::CellLoad(_)
+        )
 }
 
 /// A fresh root created while evaluating this call must outlive its borrowed
@@ -374,6 +378,11 @@ pub(crate) fn ir_expr_is_borrowed(expr: &IrExpr) -> bool {
         IrExprKind::Field { target, .. } | IrExprKind::Index { target, .. } => {
             ir_expr_is_borrowed(target)
         }
+        IrExprKind::Call {
+            kind: IrCallKind::Intrinsic(name),
+            args,
+            ..
+        } if name == "__ku_nullable_get" => args.first().is_some_and(ir_expr_is_borrowed),
         _ => false,
     }
 }
@@ -384,6 +393,7 @@ pub(crate) fn ir_expr_is_borrowed(expr: &IrExpr) -> bool {
 fn ir_type_is_owned(ty: &IrType) -> bool {
     match ty {
         IrType::Str | IrType::Array(_) | IrType::Result(_) | IrType::Closure { .. } => true,
+        IrType::Nullable(inner) => ir_type_is_owned(inner),
         // Native Time/Duration are tagged, by-value pairs, distinct from
         // dynamic objects and carrying no heap ownership.
         IrType::Named(name) => name != TIME_TYPE && name != DURATION_TYPE,
@@ -1035,6 +1045,7 @@ impl fmt::Display for IrType {
             IrType::Null => write!(f, "null"),
             IrType::Array(inner) => write!(f, "[{inner}]"),
             IrType::Result(inner) => write!(f, "{inner}!"),
+            IrType::Nullable(inner) => write!(f, "{inner} | null"),
             IrType::Named(name) => write!(f, "{}", enum_type_name(name).unwrap_or(name)),
             IrType::Function => write!(f, "function"),
             IrType::Closure { .. } => write!(f, "closure"),
@@ -1261,6 +1272,9 @@ struct FunctionLowerer<'a> {
     /// `CellLoad(CapturedCell(name))`; writes become
     /// `CellStore{CapturedCell(name), ..}`. Empty for top-level functions.
     captures: HashMap<String, IrType>,
+    /// Non-null/null read facts keyed by the stable IR binding name, never by a
+    /// source spelling that can be shadowed. Storage types remain Nullable.
+    nullable_facts: HashMap<String, bool>,
     /// Stage 6f: inside a lifted local-named-function body, the function's own
     /// name plus the lifted function id and its return type. A call to this name
     /// in the body lowers to a direct call to the lifted function threading the
@@ -1417,6 +1431,7 @@ impl<'a> FunctionLowerer<'a> {
             lifted_functions,
             boxed: HashSet::new(),
             captures: HashMap::new(),
+            nullable_facts: HashMap::new(),
             self_recurse: None,
             self_param_modes: Vec::new(),
             mixed_async: None,
@@ -1641,6 +1656,7 @@ impl<'a> FunctionLowerer<'a> {
                 // that the RHS merely referenced.
                 let value = self.emit_temp(value)?;
                 let target = self.lower_lvalue(target)?;
+                let value = nullable::coerce(value, Some(&self.lvalue_read_expr(&target).ty));
                 emit_ir_instruction!(self, IrInst::Store { target, value });
             }
             Stmt::CompoundAssign {
@@ -1817,6 +1833,9 @@ impl<'a> FunctionLowerer<'a> {
                     .as_ref()
                     .map(|value| self.lower_expr_with_expected(value, Some(&expected)))
                     .transpose()?;
+                let value = value.or_else(|| {
+                    matches!(expected, IrType::Nullable(_)).then(|| zero_expr(expected))
+                });
                 self.current.terminator = self.return_terminator(value)?;
             }
             Stmt::Print { value, .. } => {
@@ -1847,7 +1866,9 @@ impl<'a> FunctionLowerer<'a> {
         then_branch: &[Stmt],
         else_branch: &[Stmt],
     ) -> KuResult<()> {
-        let condition = self.lower_expr(condition)?;
+        let condition_expr = condition;
+        let condition = self.lower_expr(condition_expr)?;
+        let before_facts = self.nullable_facts.clone();
         let then_id = self.next_block("then")?;
         let else_id = self.next_block("else")?;
         let after_id = self.next_block("after")?;
@@ -1859,20 +1880,36 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(then_id, "then");
+        self.apply_nullable_condition(condition_expr, true);
         self.lower_scoped_statements(then_branch)?;
+        let then_falls = self.current.terminator == IrTerminator::Next;
+        let then_facts = self.nullable_facts.clone();
         if self.current.terminator == IrTerminator::Next {
             self.current.terminator = IrTerminator::Jump(after_id);
         }
         self.finish_current()?;
 
         self.start_block(else_id, "else");
+        self.nullable_facts = before_facts.clone();
+        self.apply_nullable_condition(condition_expr, false);
         self.lower_scoped_statements(else_branch)?;
+        let else_falls = self.current.terminator == IrTerminator::Next;
+        let else_facts = self.nullable_facts.clone();
         if self.current.terminator == IrTerminator::Next {
             self.current.terminator = IrTerminator::Jump(after_id);
         }
         self.finish_current()?;
 
         self.start_block(after_id, "after");
+        self.nullable_facts = match (then_falls, else_falls) {
+            (true, true) => then_facts
+                .into_iter()
+                .filter(|(name, fact)| else_facts.get(name) == Some(fact))
+                .collect(),
+            (true, false) => then_facts,
+            (false, true) => else_facts,
+            (false, false) => before_facts,
+        };
         Ok(())
     }
 
@@ -1886,7 +1923,9 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(cond_id, "while_cond");
-        let condition = self.lower_expr(condition)?;
+        let condition_expr = condition;
+        let condition = self.lower_expr(condition_expr)?;
+        let before_facts = self.nullable_facts.clone();
         self.current.terminator = IrTerminator::Branch {
             condition,
             then_block: body_id,
@@ -1895,6 +1934,7 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(body_id, "while_body");
+        self.apply_nullable_condition(condition_expr, true);
         self.loops.push(IrLoopContext {
             break_block: after_id,
             continue_block: backedge_id,
@@ -1919,6 +1959,10 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(after_id, "while_after");
+        self.nullable_facts = before_facts
+            .into_iter()
+            .filter(|(name, fact)| self.nullable_facts.get(name) == Some(fact))
+            .collect();
         self.emit_loop_scope_cleanup(owner_floor)?;
         Ok(())
     }
@@ -2573,7 +2617,14 @@ impl<'a> FunctionLowerer<'a> {
                 .map(|ty| match ty {
                     IrType::Cell(inner) => *inner,
                     other => other,
-                }),
+                })
+                .map(
+                    |ty| match (&ty, self.nullable_facts.get(self.local_ir_name(name))) {
+                        (IrType::Nullable(inner), Some(true)) => *inner.clone(),
+                        (IrType::Nullable(_), Some(false)) => IrType::Null,
+                        _ => ty,
+                    },
+                ),
             ExprKind::Field { target, name } => {
                 let target_ty = self.static_place_type(target)?;
                 Some(self.field_type(&target_ty, name))
@@ -2827,6 +2878,22 @@ impl<'a> FunctionLowerer<'a> {
             return match field_name {
                 "kind" => IrType::Str,
                 "millis" => IrType::Int,
+                _ => IrType::Unknown,
+            };
+        }
+        if struct_name == "__ku_calendar_date" {
+            return match field_name {
+                "kind" => IrType::Str,
+                "year" | "month" | "day" => IrType::Int,
+                _ => IrType::Unknown,
+            };
+        }
+        if struct_name == "__ku_calendar_parts" {
+            return match field_name {
+                "kind" | "zone" => IrType::Str,
+                "year" | "month" | "day" | "hour" | "minute" | "second" | "millis" | "weekday" => {
+                    IrType::Int
+                }
                 _ => IrType::Unknown,
             };
         }
@@ -3393,7 +3460,10 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn lower_expr(&mut self, expr: &Expr) -> KuResult<IrExpr> {
-        self.lower_expr_impl(expr, None)
+        let value = self.lower_expr_impl(expr, None)?;
+        let value = self.nullable_read(expr, value);
+        self.invalidate_nullable_call(expr);
+        Ok(value)
     }
 
     fn lower_expr_impl(
@@ -3487,7 +3557,15 @@ impl<'a> FunctionLowerer<'a> {
                 self.lower_logical_expr(left, *op, right)
             }
             ExprKind::Binary { left, op, right } => {
-                let mut left = self.lower_expr(left)?;
+                let null_compare = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual);
+                let mut left = if null_compare
+                    && matches!(right.kind, ExprKind::Literal(Literal::Null))
+                    && matches!(left.kind, ExprKind::Variable(_))
+                {
+                    self.lower_expr_impl(left, None)?
+                } else {
+                    self.lower_expr(left)?
+                };
                 if !is_pure_append_argument(right, "") {
                     if left.ty == IrType::Str {
                         left = self.snapshot_receiver_before_effects(left, true)?;
@@ -3495,7 +3573,36 @@ impl<'a> FunctionLowerer<'a> {
                         left = self.emit_temp(left)?;
                     }
                 }
-                let right = self.lower_expr(right)?;
+                let right = if null_compare
+                    && matches!(left.ty, IrType::Null)
+                    && matches!(right.kind, ExprKind::Variable(_))
+                {
+                    self.lower_expr_impl(right, None)?
+                } else {
+                    self.lower_expr(right)?
+                };
+                if null_compare {
+                    let operand = match (&left.ty, &right.ty) {
+                        (IrType::Nullable(_), IrType::Null) => Some(left.clone()),
+                        (IrType::Null, IrType::Nullable(_)) => Some(right.clone()),
+                        _ => None,
+                    };
+                    if let Some(operand) = operand {
+                        let test =
+                            intrinsic_expr("__ku_nullable_is_null", vec![operand], IrType::Bool);
+                        return self.emit_temp(if *op == BinaryOp::Equal {
+                            test
+                        } else {
+                            IrExpr {
+                                kind: IrExprKind::Unary {
+                                    op: UnaryOp::Not,
+                                    expr: Box::new(test),
+                                },
+                                ty: IrType::Bool,
+                            }
+                        });
+                    }
+                }
                 let ty = binary_type(*op, &left.ty, &right.ty);
                 self.emit_temp(IrExpr {
                     kind: IrExprKind::Binary {
@@ -4066,6 +4173,24 @@ impl<'a> FunctionLowerer<'a> {
                     }
                 }
                 let ty = self.field_type(&target.ty, name);
+                if matches!(&target.ty, IrType::Named(marker) if matches!(marker.as_str(), "__ku_calendar_date" | "__ku_calendar_parts"))
+                {
+                    return self.emit_temp(intrinsic_expr(
+                        if ty == IrType::Str {
+                            "__ku_calendar_field_str"
+                        } else {
+                            "__ku_calendar_field_int"
+                        },
+                        vec![
+                            target,
+                            IrExpr {
+                                kind: IrExprKind::Literal(format!("{name:?}")),
+                                ty: IrType::Str,
+                            },
+                        ],
+                        ty,
+                    ));
+                }
                 let field = IrExpr {
                     kind: IrExprKind::Field {
                         target: Box::new(target),
@@ -4191,7 +4316,9 @@ impl<'a> FunctionLowerer<'a> {
     fn lower_logical_expr(&mut self, left: &Expr, op: BinaryOp, right: &Expr) -> KuResult<IrExpr> {
         debug_assert!(matches!(op, BinaryOp::And | BinaryOp::Or));
 
-        let left = self.lower_expr(left)?;
+        let left_expr = left;
+        let left = self.lower_expr(left_expr)?;
+        let before_facts = self.nullable_facts.clone();
         let result_name = format!("__ku_logical_{}", self.next_temp_id);
         self.next_temp_id += 1;
         let right_id = self.next_block("logical_right")?;
@@ -4222,6 +4349,7 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(right_id, "logical_right");
+        self.apply_nullable_condition(left_expr, op == BinaryOp::And);
         let right = self.lower_expr(right)?;
         emit_ir_instruction!(
             self,
@@ -4236,6 +4364,10 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(after_id, "logical_after");
+        self.nullable_facts = before_facts
+            .into_iter()
+            .filter(|(name, fact)| self.nullable_facts.get(name) == Some(fact))
+            .collect();
         Ok(IrExpr {
             kind: IrExprKind::Local(result_name),
             ty: IrType::Bool,
@@ -4314,7 +4446,10 @@ impl<'a> FunctionLowerer<'a> {
             };
             return self.lower_closure_literal(params, body, expr.span, expected_params);
         }
-        self.lower_expr_impl(expr, deferred_safepoint)
+        let value = self.lower_expr_impl(expr, deferred_safepoint)?;
+        let value = self.nullable_read(expr, value);
+        self.invalidate_nullable_call(expr);
+        Ok(nullable::coerce(value, expected))
     }
 
     /// Resolve the cell pointer a newly-created nested closure must retain.
@@ -4684,6 +4819,7 @@ impl<'a> FunctionLowerer<'a> {
         value: IrExpr,
         deferred_safepoint: Option<&mut bool>,
     ) -> KuResult<IrExpr> {
+        let value = self.mark_nullable_clone(value);
         if let Some(deferred) = deferred_safepoint {
             *deferred |= ir_expr_needs_post_call_safepoint(&value);
             self.emit_temp_with_safepoint(value, false)
@@ -4697,6 +4833,7 @@ impl<'a> FunctionLowerer<'a> {
         value: IrExpr,
         post_call_safepoint: bool,
     ) -> KuResult<IrExpr> {
+        let value = self.mark_nullable_clone(value);
         // A void value (a call to a function with no return) has no result to
         // bind — binding it would emit invalid `void t0 = f(...)`. Hand the value
         // straight back; its only consumer is a statement position, which emits it
@@ -4903,6 +5040,17 @@ impl<'a> FunctionLowerer<'a> {
         span: Span,
         define_boxed: bool,
     ) -> KuResult<()> {
+        self.nullable_facts
+            .remove(self.local_ir_name(name).to_string().as_str());
+        let expected = self
+            .locals
+            .get(self.local_ir_name(name))
+            .or_else(|| self.captures.get(self.local_ir_name(name)))
+            .map(|ty| match ty {
+                IrType::Cell(inner) => inner.as_ref(),
+                ty => ty,
+            });
+        let value = nullable::coerce(value, expected);
         if let Some(cell) = self.assignment_cell(name) {
             emit_ir_instruction!(self, IrInst::CellStore { cell, value });
         } else if define_boxed && !self.locals.contains_key(self.local_ir_name(name)) {
@@ -5492,6 +5640,16 @@ fn ir_expr_needs_post_call_safepoint(expr: &IrExpr) -> bool {
         } => matches!(
             name.as_str(),
             "array.map"
+                | "array.concat"
+                | "array.first"
+                | "array.last"
+                | "__ku_clone_nullable"
+                | "time.date"
+                | "time.datetime"
+                | "time.format"
+                | "time.parse"
+                | "time.parts"
+                | "time.weekday"
                 | "time.sleep"
                 | "string.trim"
                 | "string.lower"
@@ -5581,7 +5739,17 @@ fn lower_type(ty: &TypeName, layouts: &IrLayoutTable) -> IrType {
             param_modes: param_modes.clone(),
             ret: Box::new(lower_type(return_type, layouts)),
         },
-        TypeName::Union(_) => IrType::Unknown,
+        TypeName::Union(parts) => {
+            let non_null: Vec<_> = parts
+                .iter()
+                .filter(|part| !matches!(part, TypeName::Null))
+                .collect();
+            if non_null.len() == 1 && parts.iter().any(|part| matches!(part, TypeName::Null)) {
+                nullable::nullable_type(lower_type(non_null[0], layouts))
+            } else {
+                IrType::Unknown
+            }
+        }
         TypeName::Custom(name) if layouts.enums.iter().any(|layout| layout.name == *name) => {
             enum_ir_type(name)
         }
@@ -5727,7 +5895,17 @@ fn lower_layout_type(
                 param_modes: param_modes.clone(),
                 ret: Box::new(lower(return_type, enum_names, struct_names)),
             },
-            TypeName::Union(_) => IrType::Unknown,
+            TypeName::Union(parts) => {
+                let non_null: Vec<_> = parts
+                    .iter()
+                    .filter(|part| !matches!(part, TypeName::Null))
+                    .collect();
+                if non_null.len() == 1 && parts.iter().any(|part| matches!(part, TypeName::Null)) {
+                    nullable::nullable_type(lower(non_null[0], enum_names, struct_names))
+                } else {
+                    IrType::Unknown
+                }
+            }
             TypeName::Custom(name) if enum_names.contains(name) => enum_ir_type(name),
             TypeName::Custom(name) if name == "KuValue" && !struct_names.contains(name) => {
                 IrType::Named("__ku_value".to_string())
@@ -5790,6 +5968,9 @@ fn intrinsic_expr(name: impl Into<String>, args: Vec<IrExpr>, ty: IrType) -> IrE
 }
 
 fn zero_expr(ty: IrType) -> IrExpr {
+    if matches!(ty, IrType::Nullable(_)) {
+        return intrinsic_expr("__ku_nullable_null", vec![], ty);
+    }
     IrExpr {
         kind: IrExprKind::Literal("<native-zero>".to_string()),
         ty,
@@ -5924,6 +6105,19 @@ fn time_builtin_ir_type(module: &str, function: &str, args: &[IrExpr]) -> Option
         return None;
     }
     match function {
+        "date" if args.is_empty() => Some(IrType::Named("__ku_calendar_date".into())),
+        "date" => Some(IrType::Result(Box::new(IrType::Named(
+            "__ku_calendar_date".into(),
+        )))),
+        "datetime" | "parse" => Some(IrType::Result(Box::new(IrType::Named(TIME_TYPE.into())))),
+        "format" if args.len() == 1 => Some(IrType::Str),
+        "format" => Some(IrType::Result(Box::new(IrType::Str))),
+        "parts" if args.len() == 1 => Some(IrType::Named("__ku_calendar_parts".into())),
+        "parts" => Some(IrType::Result(Box::new(IrType::Named(
+            "__ku_calendar_parts".into(),
+        )))),
+        "weekday" if args.len() == 1 => Some(IrType::Int),
+        "weekday" => Some(IrType::Result(Box::new(IrType::Int))),
         "instant" if args.is_empty() => Some(IrType::Named(TIME_TYPE.to_string())),
         "from_unix" | "from_millis" if args.len() == 1 => {
             Some(IrType::Named(TIME_TYPE.to_string()))
@@ -5982,6 +6176,9 @@ fn pattern_to_ir_type(pattern: &TypePattern, args: &[IrExpr]) -> Option<IrType> 
         TypePattern::ResultOf(inner) => {
             Some(IrType::Result(Box::new(pattern_to_ir_type(inner, args)?)))
         }
+        TypePattern::NullableOf(inner) => {
+            Some(nullable::nullable_type(pattern_to_ir_type(inner, args)?))
+        }
         TypePattern::SameAsArg(index) => args.get(*index).map(|arg| arg.ty.clone()),
     }
 }
@@ -6011,6 +6208,9 @@ fn dotted_name(expr: &Expr) -> Option<String> {
 /// `push_cell_new` separately admits owned ABI types, whose generated cell
 /// helpers move/drop the payload.
 fn is_copy_ir_type(ty: &IrType) -> bool {
+    if let IrType::Nullable(inner) = ty {
+        return is_copy_ir_type(inner);
+    }
     matches!(
         ty,
         IrType::Int | IrType::Float | IrType::Bool | IrType::Null

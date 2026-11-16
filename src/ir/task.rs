@@ -5,6 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use super::IrType;
+mod nullable;
 use crate::{error::KuError, error::KuResult, span::Span};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -145,8 +146,28 @@ pub enum TaskBinaryOp {
     GreaterEqual,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskCollectionOperation {
+    Concat,
+    First,
+    Last,
+    NullableNull,
+    NullableSome,
+    NullableClone,
+    NullableView,
+    NullableTake,
+    NullableIsNull,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOp {
+    /// Bounded synchronous collection work inside the existing Task frame.
+    Collection {
+        dst: SlotId,
+        source: Option<SlotId>,
+        other: Option<SlotId>,
+        operation: TaskCollectionOperation,
+    },
     /// Dedicated Jump marker. Cancellation enters cleanup with this marker's
     /// parent chain, so the body cannot be replayed by a later cancellation.
     FinallyEnter {
@@ -608,8 +629,12 @@ pub(crate) fn json_value_type(ty: &IrType) -> bool {
 pub(crate) fn local_json_type(ty: &IrType) -> bool {
     json_value_type(ty) || matches!(ty, IrType::Result(inner) if json_value_type(inner))
 }
+pub(crate) fn nullable_leaf(ty: &IrType) -> bool {
+    matches!(ty, IrType::Nullable(inner) if primitive(inner))
+}
 fn parameter_type(ty: &IrType) -> bool {
     primitive(ty)
+        || nullable_leaf(ty)
         || error_type(ty)
         || flat_array(ty)
         || result_type(ty)
@@ -655,11 +680,12 @@ pub(crate) fn http_type(ty: &IrType) -> bool {
 }
 
 fn result_type(ty: &IrType) -> bool {
-    matches!(ty, IrType::Result(inner) if primitive(inner) || flat_array(inner) || http_response_type(inner) || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
+    matches!(ty, IrType::Result(inner) if primitive(inner) || nullable_leaf(inner) || flat_array(inner) || http_response_type(inner) || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
 }
 
 fn copy_type(ty: &IrType) -> bool {
     matches!(ty, IrType::Int | IrType::Bool | IrType::Null)
+        || matches!(ty, IrType::Nullable(inner) if copy_type(inner))
 }
 
 /// These operations need the current allocation host even in a leaf Task.
@@ -669,7 +695,13 @@ pub(crate) fn requires_string_allocation_host(operation: &TaskOp) -> bool {
     // Only its str branch clones; int/bool branches neither clone nor allocate.
     matches!(
         operation,
-        TaskOp::Bytes { .. }
+        TaskOp::Collection {
+            operation: TaskCollectionOperation::Concat
+                | TaskCollectionOperation::First
+                | TaskCollectionOperation::Last
+                | TaskCollectionOperation::NullableClone,
+            ..
+        } | TaskOp::Bytes { .. }
             | TaskOp::ErrorField { .. }
             | TaskOp::HttpMapGet { .. }
             | TaskOp::PgResult { .. }
@@ -1011,6 +1043,7 @@ fn validate_shape(
     functions: &HashMap<TaskFunctionId, usize>,
     budget: &mut Budget,
 ) -> KuResult<SlotMasks> {
+    nullable::validate_views(function, budget)?;
     let get_slot = |id: SlotId| {
         function
             .slots
@@ -1085,6 +1118,54 @@ fn validate_shape(
         for (operation_index, operation) in state.operations.iter().enumerate() {
             budget.spend()?;
             match operation {
+                TaskOp::Collection {
+                    dst,
+                    source,
+                    other,
+                    operation: kind,
+                } => {
+                    has_error_projection |= requires_string_allocation_host(operation);
+                    if source == &Some(*dst) || other == &Some(*dst) {
+                        return Err(invalid("collection destination aliases input"));
+                    }
+                    let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                    let source = source.map(|slot| slot_type(get_slot(slot)?)).transpose()?;
+                    let other = other.map(|slot| slot_type(get_slot(slot)?)).transpose()?;
+                    let valid = match kind {
+                        TaskCollectionOperation::Concat => {
+                            matches!((source, other), (Some((left,false)), Some((right,false))) if flat_array(left) && left == right && destination == left && !destination_borrowed)
+                        }
+                        TaskCollectionOperation::First | TaskCollectionOperation::Last => {
+                            matches!(source, Some((IrType::Array(inner),false)) if flat_array(&IrType::Array(inner.clone())) && destination == &super::nullable::nullable_type(*inner.clone()) && !destination_borrowed && other.is_none())
+                        }
+                        TaskCollectionOperation::NullableNull => {
+                            nullable_leaf(destination)
+                                && !destination_borrowed
+                                && source.is_none()
+                                && other.is_none()
+                        }
+                        TaskCollectionOperation::NullableSome => {
+                            matches!((source,destination), (Some((source,false)),IrType::Nullable(inner)) if source == inner.as_ref() && !destination_borrowed && other.is_none())
+                        }
+                        TaskCollectionOperation::NullableClone => {
+                            matches!(source, Some((source,false)) if nullable_leaf(source) && source == destination && !destination_borrowed && other.is_none())
+                        }
+                        TaskCollectionOperation::NullableView => {
+                            matches!(source, Some((IrType::Nullable(inner),false)) if destination == inner.as_ref() && destination_borrowed == !copy_type(inner) && other.is_none())
+                        }
+                        TaskCollectionOperation::NullableTake => {
+                            matches!(source, Some((IrType::Nullable(inner),false)) if destination == inner.as_ref() && !destination_borrowed && other.is_none())
+                        }
+                        TaskCollectionOperation::NullableIsNull => {
+                            matches!(source, Some((source,false)) if nullable_leaf(source) && destination == &IrType::Bool && !destination_borrowed && other.is_none())
+                        }
+                    };
+                    if !valid {
+                        return Err(invalid(
+                            "invalid collection source, destination or ownership",
+                        ));
+                    }
+                }
                 TaskOp::FinallyEnter { cleanup } | TaskOp::FinallyLeave { cleanup } => {
                     has_finally = true;
                     if cleanup.0 >= function.states.len() {
@@ -1225,10 +1306,9 @@ fn validate_shape(
                 }
                 TaskOp::PrimitiveString { dst, src } => {
                     has_error_projection |= requires_string_allocation_host(operation);
-                    let (source, source_borrowed) = slot_type(get_slot(*src)?)?;
+                    let (source, _source_borrowed) = slot_type(get_slot(*src)?)?;
                     let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
                     if dst == src
-                        || source_borrowed
                         || destination_borrowed
                         || !primitive(source)
                         || destination != &IrType::Str
@@ -1238,7 +1318,7 @@ fn validate_shape(
                 }
                 TaskOp::StringLen { dst, src, .. } | TaskOp::StringClone { dst, src } => {
                     has_error_projection |= requires_string_allocation_host(operation);
-                    let (source, source_borrowed) = slot_type(get_slot(*src)?)?;
+                    let (source, _source_borrowed) = slot_type(get_slot(*src)?)?;
                     let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
                     let expected = if matches!(operation, TaskOp::StringLen { .. }) {
                         &IrType::Int
@@ -1246,7 +1326,6 @@ fn validate_shape(
                         &IrType::Str
                     };
                     if dst == src
-                        || source_borrowed
                         || destination_borrowed
                         || source != &IrType::Str
                         || destination != expected
@@ -1260,8 +1339,8 @@ fn validate_shape(
                     has_error_projection |= requires_string_allocation_host(operation);
                     budget.spend_many(2)?;
                     for source in [left, right] {
-                        let (ty, borrowed) = slot_type(get_slot(*source)?)?;
-                        if source == dst || borrowed || ty != &IrType::Str {
+                        let (ty, _borrowed) = slot_type(get_slot(*source)?)?;
+                        if source == dst || ty != &IrType::Str {
                             return Err(invalid("StringConcat requires distinct owned str destination and str inputs"));
                         }
                     }
@@ -1406,8 +1485,16 @@ fn validate_shape(
                                 && destination == &IrType::Int
                         }
                         TaskBinaryOp::Equal | TaskBinaryOp::NotEqual => {
-                            matches!(left_type, IrType::Int | IrType::Bool | IrType::Str)
-                                && left_type == right_type
+                            let left_payload = match left_type {
+                                IrType::Nullable(inner) => inner.as_ref(),
+                                ty => ty,
+                            };
+                            let right_payload = match right_type {
+                                IrType::Nullable(inner) => inner.as_ref(),
+                                ty => ty,
+                            };
+                            matches!(left_payload, IrType::Int | IrType::Bool | IrType::Str)
+                                && left_payload == right_payload
                                 && destination == &IrType::Bool
                         }
                         TaskBinaryOp::Less
@@ -1680,7 +1767,9 @@ fn validate_shape(
                     }
                 }
                 TaskOp::Print { value, .. } => {
-                    if !primitive(slot_type(get_slot(*value)?)?.0) {
+                    if !primitive(slot_type(get_slot(*value)?)?.0)
+                        && !nullable_leaf(slot_type(get_slot(*value)?)?.0)
+                    {
                         return Err(invalid("Print requires a primitive Value"));
                     }
                 }
@@ -2300,7 +2389,8 @@ impl ScopeLayout {
 /// Exhaustive: adding an owner-producing operation must update this selection.
 fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
     match operation {
-        TaskOp::Init { dst, .. }
+        TaskOp::Collection { dst, .. }
+        | TaskOp::Init { dst, .. }
         | TaskOp::InitCallable { dst, .. }
         | TaskOp::CloneCallable { dst, .. }
         | TaskOp::ArrayClone { dst, .. }
@@ -2669,7 +2759,21 @@ struct Initialized {
 
 fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initialized {
     match operation {
-        TaskOp::Init { dst, .. }
+        TaskOp::Collection {
+            dst,
+            source: Some(source),
+            operation: TaskCollectionOperation::NullableSome,
+            ..
+        } => {
+            state.must |= bit(*dst);
+            state.may |= bit(*dst);
+            if owned & bit(*source) != 0 {
+                state.must &= !bit(*source);
+                state.may &= !bit(*source);
+            }
+        }
+        TaskOp::Collection { dst, .. }
+        | TaskOp::Init { dst, .. }
         | TaskOp::InitCallable { dst, .. }
         | TaskOp::CloneCallable { dst, .. }
         | TaskOp::ArrayClone { dst, .. }
@@ -2769,6 +2873,7 @@ fn operation_work(operation: &TaskOp, budget: &mut Budget) -> KuResult<()> {
         }
         | TaskOp::Start { arguments, .. }
         | TaskOp::StartIndirect { arguments, .. } => budget.spend_many(arguments.len())?,
+        TaskOp::Collection { .. } => budget.spend_many(2)?,
         TaskOp::Unary { .. } => budget.spend()?,
         TaskOp::JsonEncodeObject { fields, .. } | TaskOp::JsonObject { fields, .. } => {
             budget.spend_many(fields.len())?
@@ -3082,6 +3187,11 @@ fn live_states(
                     | TaskOp::ScopeEnter { .. }
                     | TaskOp::ScopeExitBegin { .. }
                     | TaskOp::ScopeExitEnd { .. } => {}
+                    TaskOp::Collection {
+                        dst, source, other, ..
+                    } => {
+                        live = (live & !bit(*dst)) | source.map_or(0, bit) | other.map_or(0, bit);
+                    }
                     TaskOp::Init { dst, .. } | TaskOp::InitCallable { dst, .. } => {
                         live &= !bit(*dst)
                     }
@@ -3238,6 +3348,13 @@ fn validate_ownership_and_plan(
         budget.spend()?;
         for operation in &block.operations {
             operation_work(operation, budget)?;
+            if let TaskOp::Collection { source, other, .. } = operation {
+                for source in source.iter().chain(other) {
+                    if state.must & bit(*source) == 0 {
+                        return Err(invalid("collection reads an uninitialized operand"));
+                    }
+                }
+            }
             let source = match operation {
                 TaskOp::Copy { src, .. }
                 | TaskOp::CloneCallable { src, .. }
@@ -4144,6 +4261,17 @@ pub(crate) const MAX_SOURCE_LOGICAL_SLOTS: usize = 512;
 
 fn source_op_slots(operation: &mut TaskOp, visit: &mut impl FnMut(&mut SlotId)) {
     match operation {
+        TaskOp::Collection {
+            dst, source, other, ..
+        } => {
+            visit(dst);
+            if let Some(source) = source {
+                visit(source);
+            }
+            if let Some(other) = other {
+                visit(other);
+            }
+        }
         TaskOp::Init { dst, .. } | TaskOp::InitCallable { dst, .. } => visit(dst),
         TaskOp::CloneCallable { dst, src }
         | TaskOp::ArrayClone { dst, src }

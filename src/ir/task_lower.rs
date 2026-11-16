@@ -16,12 +16,13 @@ use crate::{
 
 use super::{
     task::{
-        self, SlotId, StateId, TaskBinaryOp, TaskConstant, TaskFunction, TaskFunctionId,
-        TaskLimits, TaskOp, TaskProgram, TaskScopeExitId, TaskScopeId, TaskSlot, TaskSlotType,
-        TaskState, TaskTerminator, TaskUnaryOp,
+        self, SlotId, StateId, TaskBinaryOp, TaskCollectionOperation, TaskConstant, TaskFunction,
+        TaskFunctionId, TaskLimits, TaskOp, TaskProgram, TaskScopeExitId, TaskScopeId, TaskSlot,
+        TaskSlotType, TaskState, TaskTerminator, TaskUnaryOp,
     },
     IrType,
 };
+mod nullable;
 
 #[derive(Debug)]
 pub struct NativeTaskProgram {
@@ -45,6 +46,13 @@ fn unsupported(message: &str, span: Span) -> KuError {
 
 fn primitive(ty: &TypeName) -> Option<IrType> {
     match ty {
+        TypeName::Union(parts) if parts.len() == 2 => {
+            let payload = parts.iter().find(|part| !matches!(part, TypeName::Null))?;
+            if !parts.iter().any(|part| matches!(part, TypeName::Null)) {
+                return None;
+            }
+            Some(super::nullable::nullable_type(primitive(payload)?))
+        }
         TypeName::Int => Some(IrType::Int),
         TypeName::Bool => Some(IrType::Bool),
         TypeName::Null => Some(IrType::Null),
@@ -100,7 +108,7 @@ fn value_slot(ty: IrType) -> TaskSlotType {
 fn owned_value(ty: &TaskSlotType) -> bool {
     matches!(ty, TaskSlotType::Callable { .. })
         || matches!(ty, TaskSlotType::Value { ty, borrowed: false }
-        if matches!(ty, IrType::Str | IrType::Result(_)) || task::flat_array(ty) || task::pg_params_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty) || task::local_json_type(ty))
+        if matches!(ty, IrType::Str | IrType::Result(_)) || matches!(ty, IrType::Nullable(inner) if inner.as_ref() == &IrType::Str) || task::flat_array(ty) || task::pg_params_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty) || task::local_json_type(ty))
 }
 
 fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
@@ -139,6 +147,13 @@ fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
 }
 
 fn copy_value(ty: &TaskSlotType) -> bool {
+    if let TaskSlotType::Value {
+        ty: IrType::Nullable(inner),
+        borrowed: false,
+    } = ty
+    {
+        return copy_value(&value_slot(*inner.clone()));
+    }
     matches!(
         ty,
         TaskSlotType::Value {
@@ -515,6 +530,8 @@ struct FunctionLowerer<'a> {
     budget: &'a mut Budget,
     function: TaskFunction,
     locals: Vec<HashMap<String, SlotId>>,
+    nullable_facts: HashMap<SlotId, bool>,
+    nullable_views: HashMap<SlotId, SlotId>,
     // ROOT is None. Slots never change their lexical birth scope; Task moves
     // across these owners are deliberately outside this first scoped subset.
     slot_owners: Vec<Option<TaskScopeId>>,
@@ -608,6 +625,8 @@ impl<'a> FunctionLowerer<'a> {
                 result: signature.result.clone(),
             },
             locals: vec![HashMap::new()],
+            nullable_facts: HashMap::new(),
+            nullable_views: HashMap::new(),
             slot_owners: Vec::new(),
             stable_slots: Vec::new(),
             scopes: Vec::new(),
@@ -707,6 +726,23 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn copy_or_move(&mut self, source: SlotId) -> KuResult<SlotId> {
+        if let Some(owner) = self.nullable_views.get(&source).copied() {
+            let ty = self.function.slots[source.0].ty.clone();
+            if matches!(ty, TaskSlotType::Value { borrowed: true, .. }) {
+                let TaskSlotType::Value { ty, .. } = ty else {
+                    unreachable!()
+                };
+                let destination = self.slot(value_slot(ty))?;
+                self.emit(TaskOp::Collection {
+                    dst: destination,
+                    source: Some(owner),
+                    other: None,
+                    operation: TaskCollectionOperation::NullableTake,
+                })?;
+                self.nullable_facts.remove(&owner);
+                return Ok(destination);
+            }
+        }
         let ty = self.function.slots[source.0].ty.clone();
         if self.in_finally_body && matches!(ty, TaskSlotType::Task { .. }) {
             return Err(unsupported(
@@ -882,9 +918,18 @@ impl<'a> FunctionLowerer<'a> {
                 self.logical_expression(left, *op, right, depth, expression.span)
             }
             ExprKind::Binary { left, op, right } => {
+                if let Some(result) = self.nullable_null_comparison(left, *op, right, depth)? {
+                    return Ok(result);
+                }
                 let source = self.expression(left, depth + 1)?;
                 if *op == BinaryOp::Add
-                    && self.function.slots[source.0].ty == value_slot(IrType::Str)
+                    && matches!(
+                        &self.function.slots[source.0].ty,
+                        TaskSlotType::Value {
+                            ty: IrType::Str,
+                            ..
+                        }
+                    )
                 {
                     return self.string_concat_expression(
                         source,
@@ -895,7 +940,7 @@ impl<'a> FunctionLowerer<'a> {
                     );
                 }
                 let equality = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual);
-                if equality && self.function.slots[source.0].ty == value_slot(IrType::Str) {
+                if equality && nullable::string_like(&self.function.slots[source.0].ty) {
                     return self.string_equality_expression(
                         source,
                         !matches!(&left.kind, ExprKind::Variable(_)),
@@ -906,6 +951,12 @@ impl<'a> FunctionLowerer<'a> {
                     );
                 }
                 let input_type = match &self.function.slots[source.0].ty {
+                    TaskSlotType::Value {
+                        ty: IrType::Nullable(inner),
+                        borrowed: false,
+                    } if equality && matches!(inner.as_ref(), IrType::Int | IrType::Bool) => {
+                        IrType::Nullable(inner.clone())
+                    }
                     TaskSlotType::Value {
                         ty: IrType::Int,
                         borrowed: false,
@@ -925,7 +976,24 @@ impl<'a> FunctionLowerer<'a> {
                 // Do not rely on C operand order or reread a live source slot.
                 let left = self.copy_or_move(source)?;
                 let right = self.expression(right, depth + 1)?;
-                if self.function.slots[right.0].ty != value_slot(input_type) {
+                let compatible = if equality {
+                    let left = match &input_type {
+                        IrType::Nullable(inner) => inner.as_ref(),
+                        ty => ty,
+                    };
+                    let right = match &self.function.slots[right.0].ty {
+                        TaskSlotType::Value {
+                            ty: IrType::Nullable(inner),
+                            ..
+                        } => inner.as_ref(),
+                        TaskSlotType::Value { ty, .. } => ty,
+                        _ => return Err(unsupported("Task equality operand", expression.span)),
+                    };
+                    left == right
+                } else {
+                    self.function.slots[right.0].ty == value_slot(input_type)
+                };
+                if !compatible {
                     return Err(unsupported(
                         "mixed binary operand types in a Task frame",
                         expression.span,
@@ -1141,18 +1209,31 @@ impl<'a> FunctionLowerer<'a> {
     ) -> KuResult<SlotId> {
         let snapshot = !temporary_left && !self.pure_array_index(right)?;
         let left = if snapshot {
-            let left = self.slot(value_slot(IrType::Str))?;
-            self.emit(TaskOp::StringClone {
-                dst: left,
-                src: source,
-            })?;
+            let ty = match &self.function.slots[source.0].ty {
+                TaskSlotType::Value { ty, .. } => ty.clone(),
+                _ => unreachable!(),
+            };
+            let left = self.slot(value_slot(ty.clone()))?;
+            if matches!(ty, IrType::Nullable(_)) {
+                self.emit(TaskOp::Collection {
+                    dst: left,
+                    source: Some(source),
+                    other: None,
+                    operation: TaskCollectionOperation::NullableClone,
+                })?;
+            } else {
+                self.emit(TaskOp::StringClone {
+                    dst: left,
+                    src: source,
+                })?;
+            }
             left
         } else {
             source
         };
         let temporary_right = !matches!(&right.kind, ExprKind::Variable(_));
         let right = self.expression(right, depth + 1)?;
-        if self.function.slots[right.0].ty != value_slot(IrType::Str) {
+        if !nullable::string_like(&self.function.slots[right.0].ty) {
             return Err(unsupported(
                 "mixed binary operand types in a Task frame",
                 span,
@@ -1199,7 +1280,13 @@ impl<'a> FunctionLowerer<'a> {
         }
         let temporary_right = !matches!(&right.kind, ExprKind::Variable(_));
         let right = self.expression(right, depth + 1)?;
-        if self.function.slots[right.0].ty != value_slot(IrType::Str) {
+        if !matches!(
+            &self.function.slots[right.0].ty,
+            TaskSlotType::Value {
+                ty: IrType::Str,
+                ..
+            }
+        ) {
             return Err(unsupported(
                 "mixed string concatenation operand types",
                 span,
@@ -1294,7 +1381,7 @@ impl<'a> FunctionLowerer<'a> {
     #[inline(never)]
     fn variable_expression(&mut self, name: &str, span: Span) -> KuResult<SlotId> {
         if let Some(local) = self.local(name) {
-            return Ok(local);
+            return self.nullable_variable_read(local);
         }
         let Some(signature) = self.signatures.get(name) else {
             return Err(unsupported(
@@ -1514,7 +1601,13 @@ impl<'a> FunctionLowerer<'a> {
     ) -> KuResult<SlotId> {
         let source = self.expression(object, depth + 1)?;
         let ty = self.function.slots[source.0].ty.clone();
-        if ty == value_slot(IrType::Str) {
+        if matches!(
+            &ty,
+            TaskSlotType::Value {
+                ty: IrType::Str,
+                ..
+            }
+        ) {
             let destination = self.slot(value_slot(if name == "clone" {
                 IrType::Str
             } else {
@@ -1566,6 +1659,9 @@ impl<'a> FunctionLowerer<'a> {
         span: Span,
         depth: usize,
     ) -> KuResult<SlotId> {
+        if let Some(value) = self.array_collection_call(object, name, args, span, depth)? {
+            return Ok(value);
+        }
         if matches!(&object.kind,ExprKind::Variable(module) if module=="json")
             && matches!(name, "encode" | "stringify")
             && self.std_json
@@ -2261,12 +2357,8 @@ impl<'a> FunctionLowerer<'a> {
         }
         let mut arguments = Vec::new();
         for (argument, expected) in args.iter().zip(&signature.parameters) {
-            let source = if matches!(&argument.kind, ExprKind::Array(_)) {
-                self.direct_argument_expression(argument, expected, depth + 1)?
-            } else {
-                self.expression(argument, depth + 1)?
-            };
-            if &self.function.slots[source.0].ty != expected {
+            let source = self.direct_argument_expression(argument, expected, depth + 1)?;
+            if !self.nullable_argument_matches(source, expected) {
                 return Err(unsupported(
                     "mismatched async argument types",
                     argument.span,
@@ -2304,7 +2396,7 @@ impl<'a> FunctionLowerer<'a> {
             &self.function.slots[source.0].ty,
             TaskSlotType::Value {
                 ty: IrType::Int | IrType::Bool | IrType::Null | IrType::Str,
-                borrowed: false
+                borrowed: _
             }
         ) {
             return Err(unsupported("str on this native Task value", args[0].span));
@@ -2326,11 +2418,22 @@ impl<'a> FunctionLowerer<'a> {
         if args.len() != 1 {
             return Err(unsupported("ok with other than one argument", span));
         }
-        let source = self.expression(&args[0], depth + 1)?;
+        let mut source = self.expression(&args[0], depth + 1)?;
+        let expected = match &self.function.result {
+            IrType::Result(inner) => Some(value_slot(*inner.clone())),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            source = self.nullable_coerce(source, &expected)?;
+        }
+        if self.nullable_views.contains_key(&source) {
+            source = self.copy_or_move(source)?;
+        }
         let TaskSlotType::Value { ty, .. } = &self.function.slots[source.0].ty else {
             return Err(unsupported("Task payloads inside Result", span));
         };
         if !matches!(ty, IrType::Int | IrType::Bool | IrType::Null | IrType::Str)
+            && !task::nullable_leaf(ty)
             && !task::flat_array(ty)
             && !task::http_response_type(ty)
         {
@@ -2369,7 +2472,8 @@ impl<'a> FunctionLowerer<'a> {
                 depth,
             );
         }
-        self.expression(argument, depth)
+        let value = self.expression(argument, depth)?;
+        self.nullable_coerce(value, expected)
     }
 
     fn bytes_operation(
@@ -2719,7 +2823,7 @@ impl<'a> FunctionLowerer<'a> {
         for (argument, expected) in args.iter().zip(parameters) {
             let expected = value_slot(expected.clone());
             let value = self.direct_argument_expression(argument, &expected, depth + 1)?;
-            if self.function.slots[value.0].ty != expected {
+            if !self.nullable_argument_matches(value, &expected) {
                 return Err(unsupported(
                     "mismatched async argument types",
                     argument.span,
@@ -2748,6 +2852,7 @@ impl<'a> FunctionLowerer<'a> {
         span: Span,
     ) -> KuResult<SlotId> {
         let condition = self.expression(left, depth + 1)?;
+        let before_facts = self.nullable_facts.clone();
         if self.function.slots[condition.0].ty != value_slot(IrType::Bool) {
             return Err(unsupported("non-bool logical operands", left.span));
         }
@@ -2766,6 +2871,7 @@ impl<'a> FunctionLowerer<'a> {
             else_state,
         })?;
         self.current = Some(right_state);
+        self.nullable_condition(left, op == BinaryOp::And);
         // Always lower/validate the RHS, even for a constant deciding LHS.
         // Nested Await/TryResult/logical expressions may replace current state.
         let right = self.expression(right, depth + 1)?;
@@ -2778,6 +2884,10 @@ impl<'a> FunctionLowerer<'a> {
         })?;
         self.terminate(TaskTerminator::Jump { target: join })?;
         self.current = Some(join);
+        self.nullable_facts = before_facts
+            .into_iter()
+            .filter(|(slot, fact)| self.nullable_facts.get(slot) == Some(fact))
+            .collect();
         Ok(destination)
     }
 
@@ -2818,7 +2928,8 @@ impl<'a> FunctionLowerer<'a> {
                 );
             }
         }
-        self.expression(value, depth)
+        let source = self.expression(value, depth)?;
+        self.nullable_coerce(source, expected)
     }
 
     fn bind(
@@ -2853,7 +2964,8 @@ impl<'a> FunctionLowerer<'a> {
                 // their successful endpoint may replace the existing binding.
                 // An explicit RHS move still consumes its source as usual.
                 let source = self.reassignment_expression(value, &expected, depth)?;
-                if self.function.slots[source.0].ty != expected {
+                self.nullable_facts.remove(&destination);
+                if !self.nullable_argument_matches(source, &expected) {
                     return Err(unsupported(
                         if copy {
                             "a mismatched Copy reassignment"
@@ -2911,8 +3023,13 @@ impl<'a> FunctionLowerer<'a> {
         } else {
             self.expression(value, depth)?
         };
+        let source = if let Some(annotation) = annotation {
+            self.nullable_coerce(source, &local_type(annotation, span)?)?
+        } else {
+            source
+        };
         if let Some(annotation) = annotation {
-            if self.function.slots[source.0].ty != local_type(annotation, span)? {
+            if !self.nullable_argument_matches(source, &local_type(annotation, span)?) {
                 return Err(unsupported("a mismatched local annotation", span));
             }
         }
@@ -3597,7 +3714,9 @@ impl<'a> FunctionLowerer<'a> {
         let header = self.state(TaskTerminator::Terminate)?;
         self.terminate(TaskTerminator::Jump { target: header })?;
         self.current = Some(header);
-        let condition = self.expression(condition, depth + 1)?;
+        let condition_expr = condition;
+        let condition = self.expression(condition_expr, depth + 1)?;
+        let before_facts = self.nullable_facts.clone();
         if self.function.slots[condition.0].ty != value_slot(IrType::Bool) {
             return Err(unsupported("non-bool while conditions", span));
         }
@@ -3618,6 +3737,7 @@ impl<'a> FunctionLowerer<'a> {
             has_continue: false,
             finally_depth: self.finalies.len(),
         });
+        self.nullable_condition(condition_expr, true);
         let end = self.lower_arm(body, body_entry, depth + 1)?;
         let context = self.loops.pop().expect("loop context exists");
         if let Some(end) = end {
@@ -3634,6 +3754,10 @@ impl<'a> FunctionLowerer<'a> {
             };
         }
         self.current = Some(after);
+        self.nullable_facts = before_facts
+            .into_iter()
+            .filter(|(slot, fact)| self.nullable_facts.get(slot) == Some(fact))
+            .collect();
         Ok(())
     }
 
@@ -3648,7 +3772,9 @@ impl<'a> FunctionLowerer<'a> {
         if depth >= 32 {
             return Err(unsupported("statement nesting beyond 32 Task levels", span));
         }
-        let condition = self.expression(condition, depth + 1)?;
+        let condition_expr = condition;
+        let condition = self.expression(condition_expr, depth + 1)?;
+        let before_facts = self.nullable_facts.clone();
         if self.function.slots[condition.0].ty != value_slot(IrType::Bool) {
             return Err(unsupported("non-bool if conditions", span));
         }
@@ -3661,8 +3787,22 @@ impl<'a> FunctionLowerer<'a> {
             then_state,
             else_state,
         })?;
+        self.nullable_condition(condition_expr, true);
         let then_end = self.lower_arm(then_branch, then_state, depth + 1)?;
+        let then_facts = self.nullable_facts.clone();
+        self.nullable_facts = before_facts.clone();
+        self.nullable_condition(condition_expr, false);
         let else_end = self.lower_arm(else_branch, else_state, depth + 1)?;
+        let else_facts = self.nullable_facts.clone();
+        self.nullable_facts = match (then_end.is_some(), else_end.is_some()) {
+            (true, true) => then_facts
+                .into_iter()
+                .filter(|(slot, fact)| else_facts.get(slot) == Some(fact))
+                .collect(),
+            (true, false) => then_facts,
+            (false, true) => else_facts,
+            _ => before_facts,
+        };
         if then_end.is_none() && else_end.is_none() {
             self.current = None;
             return Ok(());
