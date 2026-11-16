@@ -974,7 +974,15 @@ impl Checker {
                 let mut resolved = Vec::with_capacity(types.len());
                 for ty in types {
                     let ty = self.resolve_type_name_with_generics(ty, span, generics)?;
-                    if !resolved.iter().any(|existing| type_matches(existing, &ty)) {
+                    if !resolved.iter().any(|existing| {
+                        // A generic/unknown wildcard is not proof that a null
+                        // arm has the same representation as its payload.
+                        if existing == &Type::Null || ty == Type::Null {
+                            existing == &ty
+                        } else {
+                            type_matches(existing, &ty)
+                        }
+                    }) {
                         resolved.push(ty);
                     }
                 }

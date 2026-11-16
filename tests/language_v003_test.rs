@@ -132,6 +132,7 @@ fn main() {
 fn array_nullable_values_flow_through_parameters_returns_and_guards() {
     let source = r#"
 fn edge(values: [str]): str | null { return array.first(values) }
+fn generic_edge<T>(values: [T]): T | null { return array.first(values) }
 fn size(value: str | null): int {
     if (value == null) { return -1 }
     return value.len()
@@ -145,6 +146,8 @@ fn main() {
     if (size(item) != 2) panic("nullable argument")
     empty: [str] = []
     if (size(edge(empty)) != -1) panic("nullable return")
+    generic = generic_edge([0])
+    if (generic != null && generic + 1 != 1) panic("generic nullable return")
 }
 "#;
     check_source("inline.ku", source).expect("nullable parameters and returns check");
