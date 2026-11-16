@@ -3542,7 +3542,12 @@ fn main(): null! {
     try { invalid = time.parts(epoch, "Asia/Shanghai")? } catch(e) { if(e.code != "invalid_zone") fail "zone error"; caught += 1 }
     try { invalid = time.parse("1970-01-01tail", "yyyy-MM-dd", "utc")? } catch(e) { caught += 1 }
     try { invalid = time.date(time.from_unix(9223372036854775), "utc")? } catch(e) { caught += 1 }
-    if (caught != 6) fail "missing calendar failure"
+    date.kind = "invalid"
+    try { invalid = time.weekday(date, "utc")? } catch(e) { if(e.code != "invalid_time") fail "Date tag error code"; caught += 1 }
+    if (date.kind != "invalid") fail "weekday consumed invalid Date"
+    date.kind = "time.date"
+    if (time.weekday(date, "utc")? != 4) fail "valid Date after error"
+    if (caught != 7) fail "missing calendar failure"
     if (time.format(epoch, "yyyy", "utc")? != "1970") fail "valid call after errors"
     println("native-calendar-ok")
     return ok(null)

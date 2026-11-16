@@ -74,7 +74,7 @@ static void __ku_calendar_fatal(KuError* error) {
    * owned engine errors. Owner cleanup is handled by the adjacent SyncGuard. */
   const char* message="time/calendar_error: calendar conversion failed";
   if (ku_string_equal(error->code,ku_string_static((const uint8_t*)"invalid_time",12)))
-    message="time/invalid_time: time millis outside supported calendar range";
+    message="time/invalid_time: invalid calendar value or millis outside supported range";
   else if (ku_string_equal(error->code,ku_string_static((const uint8_t*)"invalid_date",12)))
     message="time/invalid_date: invalid calendar date";
   else if (ku_string_equal(error->code,ku_string_static((const uint8_t*)"out_of_memory",13)))
@@ -132,10 +132,10 @@ static KuResult_int __ku_calendar_weekday_date_result(KuObject* date,KuString zo
   const char* keys[]={"year","month","day"};
   KuValue* kind=ku_object_get(date,ku_string_static((const uint8_t*)"kind",4));
   if (!kind || kind->tag!=KU_STR || !ku_string_equal(kind->as.s,ku_string_static((const uint8_t*)"time.date",9)))
-    return (KuResult_int){false,0,__ku_calendar_static_error("invalid_date","expected Date value")};
+    return (KuResult_int){false,0,__ku_calendar_static_error("invalid_time","expected Time or Date value")};
   for (size_t i=0;i<3;i++) {
     KuValue* field=ku_object_get(date,ku_string_static((const uint8_t*)keys[i],strlen(keys[i])));
-    if (!field || field->tag!=KU_INT) return (KuResult_int){false,0,__ku_calendar_static_error("invalid_date","expected integer date field")};
+    if (!field || field->tag!=KU_INT) return (KuResult_int){false,0,__ku_calendar_static_error("invalid_time","expected integer date field")};
     input.numbers[i]=field->as.i;
   }
   return __ku_calendar_int_result(input);
