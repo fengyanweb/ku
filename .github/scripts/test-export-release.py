@@ -711,7 +711,7 @@ class ReleaseExportTests(unittest.TestCase):
         arguments.update(overrides)
         # Windows chmod cannot represent Unix execute bits. Simulate this input
         # target's source mode; the tar verifier still checks actual stored mode.
-        if os.name == "nt" and arguments["target"] != "x86_64-pc-windows-msvc":
+        if os.name == "nt" and "-windows-" not in arguments["target"]:
             original = EXPORT.plain
 
             def target_mode(path, directory=False):
@@ -1249,9 +1249,25 @@ class ReleaseExportTests(unittest.TestCase):
         result = self.run_export()
         self.assertIn(self.target, result["manifest_path"])
 
+    def test_windows_gnu_bundle_has_exe_and_gnu_archive_with_matching_host(self):
+        (self.bundle / "ku").rename(self.bundle / "ku.exe")
+        previous = self.bundle / f"native-tls/v1/{self.target}"
+        self.target = "x86_64-pc-windows-gnu"
+        current = self.bundle / f"native-tls/v1/{self.target}"
+        previous.rename(current)
+        self.put(self.bundle / "deps/sample_derive-0123456789abcdef.dll", b"GNU-host Cargo procedural macro")
+        self.make_runtime_manifest()
+        result = self.run_export()
+        self.assertIn(self.target, result["manifest_path"])
+        receipt = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+        self.assertIn("ku.exe", receipt["files"])
+        self.assertIn(f"native-tls/v1/{self.target}/lib/libku_native_tls.a", receipt["files"])
+        self.assertEqual(EXPORT.RUNTIME_BUNDLE.read_json(self.bundle / "ku-runtime.json")["rustc"]["host"], self.target)
+
     def test_target_specific_proc_macro_names(self):
         positive = {
             "x86_64-pc-windows-msvc": "deps/sample_derive-0123456789abcdef.dll",
+            "x86_64-pc-windows-gnu": "deps/sample_derive-0123456789abcdef.dll",
             "x86_64-unknown-linux-gnu": "deps/libsample_derive-0123456789abcdef.so",
             "aarch64-apple-darwin": "deps/libsample_derive-0123456789abcdef.dylib",
         }

@@ -3,6 +3,11 @@ name: CLI runtime bundle consumer
 on:
   workflow_call:
     inputs:
+      platform_set:
+        description: Official targets, Windows GNU only, or all four
+        required: false
+        default: official
+        type: string
       candidate_tag:
         description: 'Optional unique ku-vVERSION-candidate-SHA12-NONCE draft; empty never uploads'
         required: false
@@ -10,6 +15,12 @@ on:
         type: string
   workflow_dispatch:
     inputs:
+      platform_set:
+        description: Select only the platform work required by this run
+        required: false
+        default: official
+        type: choice
+        options: [official, windows-gnu, all]
       candidate_tag:
         description: 'Optional unique ku-vVERSION-candidate-SHA12-NONCE draft; empty never uploads'
         required: false
@@ -58,16 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-            python: python
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            python: python3
-          - os: macos-15
-            target: aarch64-apple-darwin
-            python: python3
+        include: ${{ fromJSON(inputs.platform_set == 'windows-gnu' && '[{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || inputs.platform_set == 'all' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"},{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"}]') }}
     env:
       CARGO_INCREMENTAL: '0'
       PYTHONDONTWRITEBYTECODE: '1'
@@ -78,6 +80,31 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Select the existing x64 MinGW compiler for Windows GNU
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @('C:\mingw64\bin\gcc.exe', 'C:\msys64\mingw64\bin\gcc.exe', 'C:\tools\mingw64\bin\gcc.exe')
+          $fromPath = Get-Command gcc -ErrorAction SilentlyContinue
+          if ($fromPath) { $candidates += $fromPath.Source }
+          $compiler = $null
+          foreach ($candidate in $candidates | Select-Object -Unique) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+              $machine = & $candidate -dumpmachine
+              if ($LASTEXITCODE -eq 0 -and $machine.Trim() -eq 'x86_64-w64-mingw32') { $compiler = (Resolve-Path -LiteralPath $candidate).Path; break }
+            }
+          }
+          if (-not $compiler) { throw 'The runner has no matching preinstalled x64 MinGW GCC; no implicit tool installation is allowed' }
+          $bin = Split-Path $compiler
+          foreach ($tool in @('g++.exe', 'ar.exe', 'windres.exe')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $bin $tool) -PathType Leaf)) { throw "The selected MinGW toolchain is incomplete: $tool" }
+          }
+          $bin >> $env:GITHUB_PATH
+          "KU_GNU_CC=$compiler" >> $env:GITHUB_ENV
+          "KU_CC=$compiler" >> $env:GITHUB_ENV
+          & $compiler --version
+          & (Join-Path $bin 'g++.exe') -dumpmachine
       - name: Build the private pinned optional compression packs
         shell: pwsh
         run: |
@@ -93,9 +120,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $toolchain = & ${{ matrix.python }} -B .github/scripts/runtime-bundle.py toolchain --repo .
           if ($LASTEXITCODE) { throw 'Project/publisher toolchain configuration mismatch' }
-          rustup toolchain install $toolchain --profile minimal --component rustfmt --component clippy --no-self-update
+          $publisher = if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu') { "$toolchain-x86_64-pc-windows-gnu" } else { $toolchain }
+          rustup toolchain install $publisher --profile minimal --component rustfmt --component clippy --no-self-update
           if ($LASTEXITCODE) { throw 'Publisher toolchain installation failed' }
-          "KU_RELEASE_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+          "KU_RELEASE_TOOLCHAIN=$publisher" >> $env:GITHUB_ENV
+          & rustc +$publisher -vV
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
@@ -127,7 +156,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Final release/transfer contract tests failed' }
       - name: Build the real isolated same-batch installer tree
         shell: pwsh
-        run: pwsh -NoLogo -NoProfile -NonInteractive -File scripts/package-release.ps1
+        run: pwsh -NoLogo -NoProfile -NonInteractive -File scripts/package-release.ps1 -Target '${{ matrix.target }}'
       - name: Verify native HTTP, loop, Unicode and codec contracts with C11 O2
         shell: pwsh
         run: |
@@ -137,9 +166,15 @@ jobs:
           if (-not (Test-Path -LiteralPath $env:KU_BIN -PathType Leaf)) { throw 'Same-batch source test CLI is missing' }
           # These existing C harnesses accept GCC-driver syntax. Use the
           # runner's existing clang; do not install or replace a compiler.
-          & clang --version
-          if ($LASTEXITCODE) { throw 'The existing clang driver is required by the native C harnesses' }
-          $env:KU_CC = 'clang -O2'
+          if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu') {
+            & $env:KU_GNU_CC --version
+            if ($LASTEXITCODE) { throw 'Selected GNU compiler is unavailable' }
+            $env:KU_CC = $env:KU_GNU_CC + ' -O2'
+          } else {
+            & clang --version
+            if ($LASTEXITCODE) { throw 'The existing clang driver is required by the native C harnesses' }
+            $env:KU_CC = 'clang -O2'
+          }
           $env:KU_NATIVE_CALENDAR_PACK = Join-Path (Get-Location) 'release/${{ matrix.target }}/native-calendar/v1/${{ matrix.target }}'
           $packs = Join-Path $env:KU_NATIVE_COMPRESSION_ROOT 'native-compression/v1/${{ matrix.target }}'
           $env:KU_ZSTD_LIB = Join-Path $packs 'zstd/lib'
@@ -202,15 +237,17 @@ jobs:
       - name: Install the unlike consumer Rust toolchain
         shell: pwsh
         run: |
-          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          $consumer = if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu') { '1.96.0-x86_64-pc-windows-gnu' } else { '1.96.0' }
+          rustup toolchain install $consumer --profile minimal --no-self-update
           if ($LASTEXITCODE) { throw 'Consumer toolchain unavailable' }
+          "KU_CONSUMER_TOOLCHAIN=$consumer" >> $env:GITHUB_ENV
       - name: Verify the source-free installer and its actual installation
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $archive = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/cli-bundle-assets" -Filter '*.tar.gz' -File)
           if ($archive.Count -ne 1) { throw 'Expected exactly one same-batch installer' }
-          & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --archive $archive[0].FullName --manifest ($archive[0].FullName + '.manifest.json') --repo . --output "$env:RUNNER_TEMP/cli-consumer-evidence.json" --consumer-toolchain 1.96.0 --hide-checkout --installer-run $env:INSTALLER_RUN_ID --expected-sdk-commit $env:SDK_SOURCE_COMMIT
+          & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --archive $archive[0].FullName --manifest ($archive[0].FullName + '.manifest.json') --repo . --output "$env:RUNNER_TEMP/cli-consumer-evidence.json" --consumer-toolchain $env:KU_CONSUMER_TOOLCHAIN --hide-checkout --installer-run $env:INSTALLER_RUN_ID --expected-sdk-commit $env:SDK_SOURCE_COMMIT
           if ($LASTEXITCODE) { throw 'Installed SDK verification failed' }
           $installed = Get-Content -LiteralPath "$env:RUNNER_TEMP/cli-consumer-evidence.json" -Raw | ConvertFrom-Json
           if ($installed.installed_native_time_array.status -ne 'passed') { throw 'This SDK must include and actually execute the matching native calendar/array modules' }
@@ -247,7 +284,7 @@ jobs:
           "$(brew --prefix postgresql@17)/bin/pg_config" --version
 
       - name: Prepare the existing PostgreSQL fixture tools on Windows
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.target != 'x86_64-pc-windows-gnu'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -276,6 +313,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Selected pg_config failed' }
 
       - name: Verify the same archive's installed sync and async PostgreSQL lifecycles
+        if: matrix.target != 'x86_64-pc-windows-gnu'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
@@ -302,9 +340,9 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          & ${{ matrix.python }} -B .github/scripts/release-transfer.py summary `
-            --path (Join-Path $env:RUNNER_TEMP 'cli-consumer-evidence.json') `
-            --path (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json')
+          $summaryArgs = @('-B', '.github/scripts/release-transfer.py', 'summary', '--path', (Join-Path $env:RUNNER_TEMP 'cli-consumer-evidence.json'))
+          if ('${{ matrix.target }}' -ne 'x86_64-pc-windows-gnu') { $summaryArgs += @('--path', (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json')) }
+          & ${{ matrix.python }} @summaryArgs
           if ($LASTEXITCODE) { throw 'Cannot summarize installation verification' }
           $path = Join-Path $env:RUNNER_TEMP 'cli-consumer-evidence.json'
           if (Test-Path -LiteralPath $path) {

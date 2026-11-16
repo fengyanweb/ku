@@ -603,6 +603,12 @@ def installed_native_time_array_consumer(install, root, env, report, report_path
         'archive_sha256': manifest['archive']['sha256']}
     build_env = dict(env)
     build_env.pop('KU_NATIVE_CALENDAR_PACK', None)
+    runtime_env = build_env
+    if target == 'x86_64-pc-windows-gnu':
+        system_root = Path(os.environ['SystemRoot']).resolve()
+        runtime_env = dict(build_env, PATH=os.pathsep.join(
+            (str(system_root / 'System32'), str(system_root))))
+        detail['runtime_search_path'] = 'Windows system directories only; no MinGW or SDK DLL search path'
     ku = install / ('ku.exe' if os.name == 'nt' else 'ku')
     with tempfile.TemporaryDirectory(prefix='ku-installed-time-array-', dir=root) as temporary:
         temporary = Path(temporary)
@@ -622,6 +628,11 @@ def installed_native_time_array_consumer(install, root, env, report, report_path
         primary = None
         try:
             entry = ku
+            if target == 'x86_64-pc-windows-gnu':
+                launcher = invoke([ku, '--version'], project, runtime_env)
+                detail['system_path_cli_exit'] = launcher.returncode
+                if launcher.returncode or not output(launcher).startswith('ku '):
+                    raise RuntimeError('GNU installed CLI requires an undeclared non-system runtime dependency')
             detail['cli_entry_kind'] = 'direct'
             if os.name != 'nt':
                 aliases = temporary / 'command aliases 中文'
@@ -657,7 +668,7 @@ def installed_native_time_array_consumer(install, root, env, report, report_path
             detail['sdk_unavailable_during_run'] = not install.exists() and not ku.exists()
             if not detail['source_removed_before_run'] or not detail['sdk_unavailable_during_run']:
                 raise RuntimeError('time-array execution still has its original source or SDK')
-            result = invoke([deployed], unrelated, build_env, seconds=15)
+            result = invoke([deployed], unrelated, runtime_env, seconds=15)
             detail['run_exit'] = result.returncode
             detail['run_stdout_sha256'] = hashlib.sha256(result.stdout).hexdigest()
             detail['run_stderr_sha256'] = hashlib.sha256(result.stderr).hexdigest()
@@ -1290,7 +1301,9 @@ def run(args, report):
         with changed(runtime_path, json.dumps(mixed).encode()):
             failure("CLI-manifest-mixed")
         mixed = json.loads(original_manifest)
-        mixed["runtime_target"] = "x86_64-pc-windows-gnu" if os.name == "nt" else "x86_64-pc-windows-msvc"
+        mixed["runtime_target"] = ("x86_64-pc-windows-msvc" if target == "x86_64-pc-windows-gnu"
+                                   else "x86_64-pc-windows-gnu" if os.name == "nt"
+                                   else "x86_64-pc-windows-msvc")
         with changed(runtime_path, json.dumps(mixed).encode()):
             failure("target-ABI-mismatch")
         escaped = json.loads(deps_path.read_text(encoding="utf-8"))

@@ -4,6 +4,8 @@ param(
     [switch]$CheckOnly,
     [ValidateNotNullOrEmpty()]
     [string]$ExistingVsix,
+    [ValidateSet('x86_64-pc-windows-msvc', 'x86_64-pc-windows-gnu', 'x86_64-unknown-linux-gnu', 'aarch64-apple-darwin')]
+    [string]$Target,
     [Parameter(DontShow = $true)]
     [switch]$ArchiveInternal,
     [Parameter(DontShow = $true)]
@@ -38,9 +40,22 @@ if ($projectToolchainChannels.Count -ne 1 -or [regex]::Matches($projectToolchain
 $script:releaseToolchain = $projectToolchainChannels[0].Groups[1].Value
 if ($releaseConfiguration.schema -cne 'ku-release-toolchain-v1' -or $releaseConfiguration.toolchain -cne $script:releaseToolchain) { throw 'Release toolchain must match rust-toolchain.toml' }
 $script:releasePython = if ($IsWindows) { 'python' } else { 'python3' }
+$script:requestedReleaseTarget = $Target
+# A GNU Windows publisher needs its GNU-host proc macros and rlibs as well as
+# target code. Select that installed compiler explicitly, without changing the
+# user's Rust default or default-host settings.
+$script:publisherToolchain = if ($Target -eq 'x86_64-pc-windows-gnu') { "$($script:releaseToolchain)-x86_64-pc-windows-gnu" } else { $script:releaseToolchain }
 
 function Get-HostContract {
     $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    if ($script:requestedReleaseTarget -eq 'x86_64-pc-windows-gnu') {
+        if (-not $IsWindows -or $architecture -ne 'X64') { throw 'Windows GNU packaging requires an x64 Windows host and the matching GNU-host Rust compiler' }
+        return @{ Target = 'x86_64-pc-windows-gnu'; Executable = 'ku.exe'; ObjectFormat = 'coff-x86_64'; Archive = 'libku_native_tls.a'; Flavor = 'gnu'; LinkContract = "rust-$($script:releaseToolchain)-windows-gnu-v1"; Crt = 'mingw-dynamic' }
+    }
+    if ($script:requestedReleaseTarget) {
+        $expected = if ($IsWindows -and $architecture -eq 'X64') { 'x86_64-pc-windows-msvc' } elseif ($IsLinux -and $architecture -eq 'X64') { 'x86_64-unknown-linux-gnu' } elseif ($IsMacOS -and $architecture -eq 'Arm64') { 'aarch64-apple-darwin' } else { '' }
+        if ($script:requestedReleaseTarget -cne $expected) { throw 'Release packaging cannot relabel a different host as the requested target' }
+    }
     if ($IsWindows -and $architecture -eq "X64") { return @{ Target = "x86_64-pc-windows-msvc"; Executable = "ku.exe"; ObjectFormat = "coff-x86_64"; Archive = "ku_native_tls.lib"; Flavor = "msvc"; LinkContract = "rust-$($script:releaseToolchain)-windows-msvc-v1"; Crt = "msvc-dynamic" } }
     if ($IsLinux -and $architecture -eq "X64") { return @{ Target = "x86_64-unknown-linux-gnu"; Executable = "ku"; ObjectFormat = "elf-x86_64"; Archive = "libku_native_tls.a"; Flavor = "gnu"; LinkContract = "rust-$($script:releaseToolchain)-linux-gnu-v1"; Crt = "system-dynamic" } }
     if ($IsMacOS -and $architecture -eq "Arm64") { return @{ Target = "aarch64-apple-darwin"; Executable = "ku"; ObjectFormat = "macho-arm64"; Archive = "libku_native_tls.a"; Flavor = "apple"; LinkContract = "rust-$($script:releaseToolchain)-darwin-v1"; Crt = "system-dynamic" } }
@@ -771,13 +786,13 @@ function Test-RustDependencyContracts([string]$WorkRoot, [hashtable]$Contract, [
         $rustSource = Join-Path $WorkRoot 'release-dependency-probe.rs'
         [IO.File]::WriteAllText($rustSource, 'pub fn release_probe() -> usize { 17 }', $utf8)
         $name = 'librelease_probe-0123456789abcdef.rlib'; $library = Join-Path $source $name
-        [void](Invoke-CheckedTool 'rustc' @(("+$script:releaseToolchain"), '--edition=2021', '--crate-name', 'release_probe', '--crate-type', 'rlib', '--target', $Contract.Target, '-o', $library, $rustSource) $WorkRoot $WorkRoot 'rust-dependency-probe-build' 30000 $Wrapper)
+        [void](Invoke-CheckedTool 'rustc' @(("+$script:publisherToolchain"), '--edition=2021', '--crate-name', 'release_probe', '--crate-type', 'rlib', '--target', $Contract.Target, '-o', $library, $rustSource) $WorkRoot $WorkRoot 'rust-dependency-probe-build' 30000 $Wrapper)
         foreach ($ignoredName in @('release_probe.d', 'release_probe.pdb', 'release_probe.exe', 'release_probe.dll')) { [IO.File]::WriteAllText((Join-Path $source $ignoredName), 'must not enter a release dependency directory', $utf8) }
         $macroRoot = Join-Path $WorkRoot 'proc-macro-cargo'; $macroDirectory = Join-Path $macroRoot 'release/deps'; Ensure-PlainDirectory $macroDirectory
         $macroName = switch ($Contract.ObjectFormat) { 'coff-x86_64' { 'release_macro_probe-0123456789abcdef.dll' }; 'elf-x86_64' { 'librelease_macro_probe-0123456789abcdef.so' }; 'macho-arm64' { 'librelease_macro_probe-0123456789abcdef.dylib' } }
         $macroLibrary = Join-Path $macroDirectory $macroName; $macroSource = Join-Path $WorkRoot 'release-macro-probe.rs'
         [IO.File]::WriteAllText($macroSource, 'extern crate proc_macro; #[proc_macro] pub fn release_probe(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }', $utf8)
-        [void](Invoke-CheckedTool 'rustc' @(("+$script:releaseToolchain"), '--edition=2021', '--crate-name', 'release_macro_probe', '--crate-type', 'proc-macro', '--target', $Contract.Target, '-o', $macroLibrary, $macroSource) $WorkRoot $WorkRoot 'proc-macro-probe-build' 30000 $Wrapper)
+        [void](Invoke-CheckedTool 'rustc' @(("+$script:publisherToolchain"), '--edition=2021', '--crate-name', 'release_macro_probe', '--crate-type', 'proc-macro', '--target', $Contract.Target, '-o', $macroLibrary, $macroSource) $WorkRoot $WorkRoot 'proc-macro-probe-build' 30000 $Wrapper)
         $macroRecord = @{ reason = 'compiler-artifact'; target = @{ name = 'release_macro_probe'; kind = @('proc-macro'); crate_types = @('proc-macro') }; filenames = @($macroLibrary) }
         $finish = '{"reason":"build-finished","success":true}'
         $macroJson = ($macroRecord | ConvertTo-Json -Depth 8 -Compress) + "`n" + $finish + "`n"
@@ -857,7 +872,7 @@ fn main() {
 '@
     [IO.File]::WriteAllText($mainSource, $source, [Text.UTF8Encoding]::new($false))
     $binary = Join-Path $WorkRoot $(if ($IsWindows) { "validate_tls_archive.exe" } else { "validate_tls_archive" })
-    [void](Invoke-CheckedTool "rustc" @("+$script:releaseToolchain", "--edition=2021", "-C", "panic=abort", "-o", $binary, $mainSource) $WorkRoot $WorkRoot "archive-validator-build" 30000 $Wrapper)
+    [void](Invoke-CheckedTool "rustc" @("+$script:publisherToolchain", "--edition=2021", "-C", "panic=abort", "-o", $binary, $mainSource) $WorkRoot $WorkRoot "archive-validator-build" 30000 $Wrapper)
     if (-not (Test-PlainFile $binary)) { throw "native TLS archive validator was not produced" }
     return $binary
 }
@@ -1608,7 +1623,7 @@ time.sleep(60)
         $script:archiveVerifier = New-NativeTlsArchiveVerifier $Repo $workRoot $wrapper
 
         $module = Join-Path $workRoot 'native_tls_archive.rs'; $moduleTests = Join-Path $workRoot $(if ($IsWindows) { 'native_tls_archive_tests.exe' } else { 'native_tls_archive_tests' })
-        [void](Invoke-CheckedTool 'rustc' @(("+$script:releaseToolchain"), '--edition=2021', '--test', '-o', $moduleTests, $module) $workRoot $workRoot 'archive-validator-tests-build' 30000 $wrapper)
+        [void](Invoke-CheckedTool 'rustc' @(("+$script:publisherToolchain"), '--edition=2021', '--test', '-o', $moduleTests, $module) $workRoot $workRoot 'archive-validator-tests-build' 30000 $wrapper)
         [void](Invoke-CheckedTool $moduleTests @('--nocapture') $workRoot $workRoot 'archive-validator-tests-run' 30000 $wrapper)
 
         function Add-SelfTestVsixEntry([IO.Compression.ZipArchive]$Archive, [string]$Name, [string]$Content) {
@@ -1740,12 +1755,12 @@ try {
         Copy-PlainFile $ExistingVsix $vsixPath 128MB
         Assert-Vsix $vsixPath $version
     }
-    $rustcOutput = Invoke-CheckedTool "rustc" @("+$script:releaseToolchain", "-vV") $repo $workRoot "rustc" 30000 $wrapper
+    $rustcOutput = Invoke-CheckedTool "rustc" @("+$script:publisherToolchain", "-vV") $repo $workRoot "rustc" 30000 $wrapper
     if ($rustcOutput -notmatch "(?m)^host: $([regex]::Escape($contract.Target))$") { throw "Publisher Rust host does not match release target '$($contract.Target)'" }
     $script:archiveVerifier = New-NativeTlsArchiveVerifier $repo $workRoot $wrapper
     Write-Host "Building Ku $version for $($contract.Target)..."
     $cargoTarget = Join-Path $workRoot "cargo"
-    $cargoBuild = Invoke-BoundedTool "cargo" @("+$script:releaseToolchain", "build", "--locked", "--release", "--target", $contract.Target, "--target-dir", $cargoTarget, "--message-format=json-render-diagnostics", "--color", "never") $repo $workRoot "cargo-build" 900000 $wrapper
+    $cargoBuild = Invoke-BoundedTool "cargo" @("+$script:publisherToolchain", "build", "--locked", "--release", "--target", $contract.Target, "--target-dir", $cargoTarget, "--message-format=json-render-diagnostics", "--color", "never") $repo $workRoot "cargo-build" 900000 $wrapper
     if ($cargoBuild.ExitCode -ne 0) { throw "cargo failed with exit code $($cargoBuild.ExitCode):`n$($cargoBuild.Output)" }
     $procMacroArtifacts = Get-CargoProcMacroArtifacts $cargoBuild.Stdout $cargoTarget $contract
     $tlsOutputRoot = Join-Path $workRoot "tls-pack"

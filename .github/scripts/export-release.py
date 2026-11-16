@@ -48,6 +48,7 @@ MAX_LICENSE_TOTAL = 64 * 1024 * 1024
 MAX_TAR_TRAILER = 64 * 1024
 TARGETS = {
     "x86_64-pc-windows-msvc",
+    "x86_64-pc-windows-gnu",
     "x86_64-unknown-linux-gnu",
     "aarch64-apple-darwin",
 }
@@ -109,12 +110,12 @@ def install_command(executable: Path, arguments: list[str], working: Path) -> tu
 
 def verify_installation(installed: Path, repo: Path, version: str, target: str) -> dict:
     """Use the files extracted from the final archive, outside the checkout."""
-    hosts = {("Windows", "amd64"): "x86_64-pc-windows-msvc",
-             ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
-             ("Darwin", "arm64"): "aarch64-apple-darwin"}
-    if hosts.get((platform.system(), platform.machine().lower())) != target:
+    hosts = {("Windows", "amd64"): {"x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"},
+             ("Linux", "x86_64"): {"x86_64-unknown-linux-gnu"},
+             ("Darwin", "arm64"): {"aarch64-apple-darwin"}}
+    if target not in hosts.get((platform.system(), platform.machine().lower()), set()):
         raise ExportError("installation check requires the release target's native host")
-    executable = installed / ("ku.exe" if target.endswith("windows-msvc") else "ku")
+    executable = installed / ("ku.exe" if "-windows-" in target else "ku")
     receipt = {"format": "ku-install-check-v1", "version": version, "target": target,
                "executable_sha256": file_hash(executable), "checks": [], "examples": {}}
     with tempfile.TemporaryDirectory(prefix="ku-install-check-") as temporary:
@@ -151,7 +152,7 @@ def verify_installation(installed: Path, repo: Path, version: str, target: str) 
 
 def verify_default_native_installation(installed: Path, repo: Path, target: str) -> dict:
     """Use the final archive's omitted-backend build, then remove its sources."""
-    executable = installed / ("ku.exe" if target.endswith("windows-msvc") else "ku")
+    executable = installed / ("ku.exe" if "-windows-" in target else "ku")
     receipt = {"format": "ku-installed-default-native-v1", "status": "running", "target": target,
                "executable_sha256": file_hash(executable), "backend": "c", "profile": "release"}
     with tempfile.TemporaryDirectory(prefix="ku-installed-default-c-") as temporary:
@@ -161,7 +162,7 @@ def verify_default_native_installation(installed: Path, repo: Path, target: str)
         source = canonical_example(read_bounded(repo / "examples/hello.ku", 65536))
         (project / "hello.ku").write_bytes(source)
         receipt["source_sha256"] = hashlib.sha256(source).hexdigest()
-        program = working / ("hello-default-c.exe" if target.endswith("windows-msvc") else "hello-default-c")
+        program = working / ("hello-default-c.exe" if "-windows-" in target else "hello-default-c")
         build, text = install_command(executable, ["build", "--release", "--verbose", "hello.ku", "-o", str(program)], project)
         if ("build profile: release" not in text or "c compiler command:" not in text
                 or "rustc command:" in text or not program.is_file()):
@@ -207,7 +208,7 @@ def run_runtime_check(arguments: list[str], repo: Path, working: Path,
 def verify_runtime_installation(installed: Path, repo: Path, target: str) -> dict:
     """Run the existing three-second fixture with the extracted CLI, not Cargo."""
     repo = repo.resolve()
-    executable = installed / ("ku.exe" if target.endswith("windows-msvc") else "ku")
+    executable = installed / ("ku.exe" if "-windows-" in target else "ku")
     driver = repo / "tests/acceptance/multiloop_load.py"
     fixture = repo / "tests/fixtures/multiloop_service.ku"
     receipt = {"format": "ku-installed-runtime-smoke-v1", "status": "running", "target": target,
@@ -320,7 +321,7 @@ def dependency_name(name: str, target: str) -> bool:
         return True
     # These are Cargo-emitted Rust procedural-macro libraries, not arbitrary
     # third-party database DLLs or operating-system SDK libraries.
-    if target == "x86_64-pc-windows-msvc":
+    if target in ("x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"):
         pattern = r"deps/[A-Za-z_][A-Za-z0-9_]*-[0-9a-f]{16}\.dll\Z"
     elif target == "x86_64-unknown-linux-gnu":
         pattern = r"deps/lib[A-Za-z_][A-Za-z0-9_]*-[0-9a-f]{16}\.so\Z"
@@ -731,7 +732,7 @@ def export_release(bundle: Path, output: Path, repo: Path, version: str,
         stage = Stager(staging)
         for path in walk_plain(bundle):
             stage.add(path.relative_to(bundle).as_posix(), source=path)
-        executable = "ku.exe" if target.endswith("windows-msvc") else "ku"
+        executable = "ku.exe" if "-windows-" in target else "ku"
         archive = "ku_native_tls.lib" if target.endswith("windows-msvc") else "libku_native_tls.a"
         required = {executable, "libku.rlib", "ku-runtime.json", "ku-runtime-deps.json", f"ku-language-{version}.vsix",
                     f"native-tls/v1/{target}/manifest.kutls",
