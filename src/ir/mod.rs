@@ -3146,6 +3146,7 @@ impl<'a> FunctionLowerer<'a> {
         modes: Option<&[ParamMode]>,
         callee_has_effects: bool,
         allow_request_string_projection: bool,
+        freeze_array_views: bool,
     ) -> KuResult<Vec<IrExpr>> {
         // Refuse wide argument staging before allocating the parallel vectors.
         self.budget.borrow_mut().spend(args.len(), self.span)?;
@@ -3171,6 +3172,17 @@ impl<'a> FunctionLowerer<'a> {
                 self.lower_expr_with_expected(arg, expected.and_then(|params| params.get(index)))?
             };
             if view {
+                // concat reads each input value at its source evaluation point.
+                // A later callback may replace a captured array cell; preserve
+                // this one completed View instead of rereading that cell later.
+                // Ordinary View calls and pure concat arguments keep their loans.
+                if freeze_array_views
+                    && remaining_effects != 0
+                    && matches!(value.ty, IrType::Array(_))
+                    && ir_expr_is_place(&value)
+                {
+                    value = self.snapshot_receiver_before_effects(value, true)?;
+                }
                 if !ir_type_is_owned(&value.ty) && (remaining_effects != 0 || callee_has_effects) {
                     value = self.emit_temp(value)?;
                 }
@@ -3634,6 +3646,7 @@ impl<'a> FunctionLowerer<'a> {
                             Some(&modes),
                             false,
                             true,
+                            false,
                         )?);
                         return self.finish_borrowing_call(
                             IrExpr {
@@ -3835,6 +3848,7 @@ impl<'a> FunctionLowerer<'a> {
                     .as_deref(),
                     false,
                     allow_request_string_projection,
+                    matches!(&probe_kind, IrCallKind::Intrinsic(name) if name == "array.concat"),
                 )?;
                 if let Some((layout, variant)) = self.enum_variant(callee) {
                     let fields = variant
