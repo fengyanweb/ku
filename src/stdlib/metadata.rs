@@ -13,6 +13,8 @@ pub(crate) enum TypePattern {
     StringOrStringArray,
     ArrayElementOfArg(usize),
     ResultOf(Box<TypePattern>),
+    /// A flat T-or-null result, used by non-consuming array first/last.
+    NullableOf(Box<TypePattern>),
     SameAsArg(usize),
     /// A dynamic tagged value (e.g. `json.parse` result). Maps to `Type::KuValue`.
     KuValue,
@@ -119,6 +121,11 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
             | "time.from_unix"
             | "time.from_millis"
             | "time.duration"
+            | "time.datetime"
+            | "time.format"
+            | "time.parse"
+            | "time.parts"
+            | "time.weekday"
             | "time.add"
             | "time.sub"
             | "time.diff"
@@ -297,6 +304,18 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
             ArgRule::Is(TypePattern::ObjectAny),
         ],
         ("time", "days_in_month") => vec![int_arg(), int_arg()],
+        ("time", "datetime") => vec![
+            int_arg(),
+            int_arg(),
+            int_arg(),
+            int_arg(),
+            int_arg(),
+            int_arg(),
+            str_arg(),
+        ],
+        ("time", "format") => vec![ArgRule::Is(TypePattern::ObjectAny), str_arg(), str_arg()],
+        ("time", "parse") => vec![str_arg(), str_arg(), str_arg()],
+        ("time", "parts" | "weekday") => vec![ArgRule::Is(TypePattern::ObjectAny), str_arg()],
         ("time", "sleep") => vec![ArgRule::Is(TypePattern::Any)],
         ("task", "stats") => vec![],
         ("task", "stress") => vec![int_arg(), int_arg(), int_arg()],
@@ -374,7 +393,9 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("string", "trim" | "lower" | "upper" | "replace") => TypePattern::String,
         ("array", "len") => TypePattern::Int,
         ("array", "is_empty") => TypePattern::Bool,
-        ("array", "first" | "last") => TypePattern::ArrayElementOfArg(0),
+        ("array", "first" | "last") => {
+            TypePattern::NullableOf(Box::new(TypePattern::ArrayElementOfArg(0)))
+        }
         ("array", "try_get") => TypePattern::ResultOf(Box::new(TypePattern::ArrayElementOfArg(0))),
         ("array", "push" | "concat") => TypePattern::SameAsArg(0),
         ("object", "get_or") => TypePattern::Unknown,
@@ -386,10 +407,16 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("json", "stringify" | "encode") => TypePattern::ResultOf(Box::new(TypePattern::String)),
         ("config", "env" | "env_file") => TypePattern::ObjectAny,
         ("config", "yaml") => TypePattern::ResultOf(Box::new(TypePattern::ObjectAny)),
-        ("time", "instant" | "date" | "from_unix" | "from_millis" | "add" | "sub" | "diff") => {
+        ("time", "instant" | "from_unix" | "from_millis" | "add" | "sub" | "diff") => {
             TypePattern::ObjectAny
         }
-        ("time", "duration") => TypePattern::ResultOf(Box::new(TypePattern::ObjectAny)),
+        ("time", "duration" | "datetime" | "parse") => {
+            TypePattern::ResultOf(Box::new(TypePattern::ObjectAny))
+        }
+        ("time", "format") => TypePattern::String,
+        ("time", "date") => calendar_date_pattern(),
+        ("time", "parts") => calendar_parts_pattern(),
+        ("time", "weekday") => TypePattern::Int,
         ("time", "now" | "elapsed" | "unix" | "millis" | "steady_millis" | "compare") => {
             TypePattern::Int
         }
@@ -624,7 +651,7 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         | ("kuvalue", "as_int" | "as_str" | "take")
         | ("json", "parse" | "try_parse" | "decode" | "stringify" | "encode")
         | ("config", "yaml")
-        | ("time", "duration" | "days_in_month" | "sleep")
+        | ("time", "duration" | "days_in_month" | "sleep" | "datetime" | "parse")
         | ("http", "get" | "post" | "request")
         | ("pg", "client")
         | ("pg_client", "query" | "query_one_typed")
@@ -636,7 +663,11 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         ("zstd" | "gzip" | "deflate", "compress" | "decompress") => FailureMode::ReturnsResult,
         ("config", "env_file")
         | ("task", "stats" | "stress")
-        | ("time", "from_unix" | "from_millis" | "add" | "sub" | "diff") => FailureMode::MayPanic,
+        | (
+            "time",
+            "from_unix" | "from_millis" | "add" | "sub" | "diff" | "date" | "format" | "parts"
+            | "weekday",
+        ) => FailureMode::MayPanic,
         _ => FailureMode::Never,
     }
 }
@@ -881,4 +912,24 @@ mod borrow_tests {
         assert!(!supports_borrowed_call("array.first"));
         assert!(!supports_borrowed_call("unregistered"));
     }
+}
+
+fn calendar_date_pattern() -> TypePattern {
+    TypePattern::ObjectFields(vec![
+        ("kind".into(), TypePattern::String),
+        ("year".into(), TypePattern::Int),
+        ("month".into(), TypePattern::Int),
+        ("day".into(), TypePattern::Int),
+    ])
+}
+
+fn calendar_parts_pattern() -> TypePattern {
+    let TypePattern::ObjectFields(mut fields) = calendar_date_pattern() else {
+        unreachable!()
+    };
+    for name in ["hour", "minute", "second", "millis", "weekday"] {
+        fields.push((name.into(), TypePattern::Int));
+    }
+    fields.push(("zone".into(), TypePattern::String));
+    TypePattern::ObjectFields(fields)
 }

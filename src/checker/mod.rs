@@ -10,6 +10,7 @@ use crate::{
 mod generic;
 #[cfg(test)]
 mod loop_analysis_tests;
+mod nullable;
 mod statement_depth;
 pub(crate) use generic::{native_local_generic_span, native_specialization_plan, GenericCallSite};
 
@@ -305,6 +306,9 @@ impl ClosureSummaryContext {
 struct VarType {
     binding_id: BindingId,
     ty: Type,
+    /// Read-only flow evidence for an existing T|null binding. Storage and
+    /// assignment checking always retain `ty`; this is never a representation.
+    narrowed_type: Option<Type>,
     mutable: bool,
     borrowed: bool,
     /// Move state at struct-field-path granularity. A key is a projection path
@@ -342,6 +346,7 @@ impl VarType {
         Self {
             binding_id,
             ty,
+            narrowed_type: None,
             mutable,
             borrowed: false,
             moves: BTreeMap::new(),
@@ -1273,9 +1278,11 @@ impl Checker {
             } => {
                 self.expect_condition(condition, *span)?;
                 let before = self.scopes.clone();
+                self.apply_nullable_condition(condition, true);
                 self.check_block(then_branch)?;
                 let then_scopes = self.scopes.clone();
                 self.scopes = before.clone();
+                self.apply_nullable_condition(condition, false);
                 self.check_block(else_branch)?;
                 let else_scopes = self.scopes.clone();
                 let then_falls = !block_stops_fallthrough(then_branch);
@@ -1297,6 +1304,7 @@ impl Checker {
                 self.check_loop_analysis_budget()?;
                 self.expect_condition(condition, *span)?;
                 let condition_exit = self.scopes.clone();
+                self.apply_nullable_condition(condition, true);
                 self.loop_depth += 1;
                 self.loop_break_states.push(Vec::new());
                 self.loop_continue_states.push(Vec::new());
@@ -1823,9 +1831,31 @@ impl Checker {
                     }
                 }
                 ExprKind::Binary { left, op, right } => {
-                    let left = self.check_expr(left)?;
-                    let right = self.check_expr(right)?;
-                    self.check_binary(*op, &left, &right, expr.span)
+                    let mut left_type = self.check_expr(left)?;
+                    let short_circuit = matches!(op, BinaryOp::And | BinaryOp::Or);
+                    let facts = short_circuit.then(|| self.nullable_facts());
+                    if short_circuit {
+                        self.apply_nullable_condition(left, *op == BinaryOp::And);
+                    }
+                    let mut right_type = self.check_expr(right)?;
+                    if let Some(facts) = facts {
+                        self.join_nullable_facts(&facts);
+                    }
+                    if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
+                        if matches!(right.kind, ExprKind::Literal(Literal::Null)) {
+                            if let ExprKind::Variable(name) = &left.kind {
+                                let declared = self.get_allow_moved(name, left.span)?.ty;
+                                if nullable::contains_null(&declared) { left_type = declared; }
+                            }
+                        }
+                        if matches!(left.kind, ExprKind::Literal(Literal::Null)) {
+                            if let ExprKind::Variable(name) = &right.kind {
+                                let declared = self.get_allow_moved(name, right.span)?.ty;
+                                if nullable::contains_null(&declared) { right_type = declared; }
+                            }
+                        }
+                    }
+                    self.check_binary(*op, &left_type, &right_type, expr.span)
                 }
                 ExprKind::Call { callee, args } => {
                     let mut checked_receiver = None;
@@ -2441,6 +2471,11 @@ impl Checker {
         })()
         .and_then(|ty| {
             self.reject_readonly_http_native_capture_read(expr, &ty)?;
+            if matches!(&expr.kind, ExprKind::Await(_))
+                || matches!(&expr.kind, ExprKind::Call { callee, .. } if self.nullable_call_may_mutate(callee))
+            {
+                self.invalidate_captured_nullable_facts();
+            }
             Ok(ty)
         });
         // Publish only this successful expression. Nested body checking and
@@ -2656,6 +2691,12 @@ impl Checker {
             }
             BinaryOp::Add if left == &Type::String && right == &Type::String => Ok(Type::String),
             BinaryOp::Equal | BinaryOp::NotEqual if type_matches(left, right) => Ok(Type::Bool),
+            BinaryOp::Equal | BinaryOp::NotEqual
+                if (left == &Type::Null && nullable::contains_null(right))
+                    || (right == &Type::Null && nullable::contains_null(left)) =>
+            {
+                Ok(Type::Bool)
+            }
             // A KuValue is a first-class tagged value: `==` / `!=` compare it
             // against anything (by tag + value); arithmetic stays rejected.
             BinaryOp::Equal | BinaryOp::NotEqual
@@ -3816,21 +3857,21 @@ impl Checker {
                 Ok(Type::DynamicObject)
             }
             "date" => match args.len() {
-                0 => Ok(Type::DynamicObject),
+                0 => Ok(calendar_date_type()),
                 1 => {
                     expect_dynamic_object_arg("time.date", &actuals[0], args[0].span)?;
-                    Ok(Type::Result(Box::new(Type::DynamicObject)))
+                    Ok(Type::Result(Box::new(calendar_date_type())))
                 }
                 2 => {
                     expect_dynamic_object_arg("time.date", &actuals[0], args[0].span)?;
                     expect_type_arg(&actuals[1], &Type::String, args[1].span)?;
-                    Ok(Type::Result(Box::new(Type::DynamicObject)))
+                    Ok(Type::Result(Box::new(calendar_date_type())))
                 }
                 3 => {
                     for (actual, arg) in actuals.iter().zip(args) {
                         expect_type_arg(actual, &Type::Int, arg.span)?;
                     }
-                    Ok(Type::Result(Box::new(Type::DynamicObject)))
+                    Ok(Type::Result(Box::new(calendar_date_type())))
                 }
                 _ => Err(KuError::runtime(
                     format!(
@@ -3921,12 +3962,12 @@ impl Checker {
             "parts" => match args.len() {
                 1 => {
                     expect_dynamic_object_arg("time.parts", &actuals[0], args[0].span)?;
-                    Ok(Type::DynamicObject)
+                    Ok(calendar_parts_type())
                 }
                 2 => {
                     expect_dynamic_object_arg("time.parts", &actuals[0], args[0].span)?;
                     expect_type_arg(&actuals[1], &Type::String, args[1].span)?;
-                    Ok(Type::Result(Box::new(Type::DynamicObject)))
+                    Ok(Type::Result(Box::new(calendar_parts_type())))
                 }
                 _ => Err(KuError::runtime(
                     format!(
@@ -4576,6 +4617,7 @@ impl Checker {
             },
             TypePattern::Native(name) => matches!(actual, Type::Native(n) if n == name),
             TypePattern::ArrayElementOfArg(_)
+            | TypePattern::NullableOf(_)
             | TypePattern::ResultOf(_)
             | TypePattern::SameAsArg(_) => true,
         }
@@ -4604,6 +4646,7 @@ impl Checker {
             TypePattern::Unknown
             | TypePattern::Any
             | TypePattern::ArrayElementOfArg(_)
+            | TypePattern::NullableOf(_)
             | TypePattern::ResultOf(_)
             | TypePattern::SameAsArg(_) => Type::Unknown,
         }
@@ -4651,6 +4694,9 @@ impl Checker {
             TypePattern::ResultOf(inner) => Ok(Type::Result(Box::new(
                 Self::stdlib_pattern_to_type(inner, actuals, span)?,
             ))),
+            TypePattern::NullableOf(inner) => Ok(nullable::make_nullable(
+                Self::stdlib_pattern_to_type(inner, actuals, span)?,
+            )),
             TypePattern::SameAsArg(index) => actuals
                 .get(*index)
                 .cloned()
@@ -4955,6 +5001,8 @@ impl Checker {
         // A closure executes later; its return/fail/? edges do not enter a try
         // surrounding the closure literal's creation.
         let saved_try_exit_collectors = std::mem::take(&mut self.try_exit_collectors);
+        let saved_nullable_facts = self.nullable_facts();
+        self.clear_nullable_facts();
         self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
         self.loop_depth = 0;
         self.recoverable_depth = 0;
@@ -5048,6 +5096,7 @@ impl Checker {
         self.loop_depth = saved_loop_depth;
         self.recoverable_depth = saved_recoverable_depth;
         self.try_exit_collectors = saved_try_exit_collectors;
+        self.restore_nullable_facts(&saved_nullable_facts);
         if inference_body_key.is_some() {
             self.function_value_inference_stack.pop();
         }
@@ -5142,6 +5191,8 @@ impl Checker {
         // Handler/async bodies are separate executions too; do not report their
         // abrupt exits to a try active where the function value is checked.
         let saved_try_exit_collectors = std::mem::take(&mut self.try_exit_collectors);
+        let saved_nullable_facts = self.nullable_facts();
+        self.clear_nullable_facts();
         self.current_return = function.return_type.cloned().unwrap_or(Type::Unknown);
         self.loop_depth = 0;
         self.recoverable_depth = 0;
@@ -5192,6 +5243,7 @@ impl Checker {
         if replayed_captures {
             self.pop_scope();
         }
+        self.restore_nullable_facts(&saved_nullable_facts);
         if let Some(expected_body_id) = function.body_id {
             let popped = self.readonly_function_body_stack.pop();
             debug_assert_eq!(popped, Some(expected_body_id));
@@ -5385,9 +5437,11 @@ impl Checker {
                 // the `if`, and a path moved on only one branch would look
                 // definitely-moved instead of `MaybeMoved`.
                 let before = self.scopes.clone();
+                self.apply_nullable_condition(condition, true);
                 let then_return = self.check_block_and_infer_return(then_branch)?;
                 let then_scopes = self.scopes.clone();
                 self.scopes = before.clone();
+                self.apply_nullable_condition(condition, false);
                 let else_return = self.check_block_and_infer_return(else_branch)?;
                 let else_scopes = self.scopes.clone();
                 let then_falls = !block_stops_fallthrough(then_branch);
@@ -5507,7 +5561,11 @@ impl Checker {
                         span,
                     ));
                 }
-                return Ok(var.clone());
+                let mut readable = var.clone();
+                if let Some(narrowed) = &var.narrowed_type {
+                    readable.ty = narrowed.clone();
+                }
+                return Ok(readable);
             }
         }
         Err(KuError::runtime(
@@ -7528,6 +7586,7 @@ impl Checker {
             if let Some(var) = scope.get_mut(name) {
                 // Reassigning the whole variable re-initializes every path.
                 var.reinit(&[]);
+                var.narrowed_type = None;
                 return;
             }
         }
@@ -7553,7 +7612,7 @@ impl Checker {
     }
 
     fn place_type(&self, place: &PlacePath) -> Option<Type> {
-        let mut ty = self.get_allow_moved(&place.root, Span::default()).ok()?.ty;
+        let mut ty = self.get(&place.root, Span::default()).ok()?.ty;
         for field in &place.path {
             ty = match &ty {
                 Type::Struct(name) => self.structs.get(name)?.fields.get(field)?.clone(),
@@ -7668,6 +7727,9 @@ impl Checker {
         for scope in self.scopes.iter_mut().rev() {
             if let Some(var) = scope.get_mut(&place.root) {
                 var.reinit(&place.path);
+                if place.path.is_empty() {
+                    var.narrowed_type = None;
+                }
                 return;
             }
         }
@@ -8316,6 +8378,7 @@ impl Checker {
         if let Some(condition) = condition {
             if self.charge_loop_analysis(condition.span).is_ok() {
                 let _ = self.expect_condition(condition, condition.span);
+                self.apply_nullable_condition(condition, true);
             }
         }
         self.push_scope();
@@ -8841,6 +8904,15 @@ fn bind_generic_type(expected: &Type, actual: &Type, bindings: &mut HashMap<Stri
             Type::Result(actual) => bind_generic_type(expected, actual, bindings),
             _ => false,
         },
+        Type::Union(_) if matches!(actual, Type::Union(_)) => {
+            let Type::Union(actuals) = actual else {
+                unreachable!()
+            };
+            actuals
+                .iter()
+                .all(|actual| bind_generic_type(expected, actual, bindings))
+        }
+        Type::Union(options) if actual == &Type::Null && options.contains(&Type::Null) => true,
         Type::Union(options) => options.iter().any(|option| {
             let mut candidate = bindings.clone();
             if bind_generic_type(option, actual, &mut candidate) && type_matches(option, actual) {
@@ -10110,6 +10182,12 @@ fn merge_moved_scopes(
             let then_moves = then_var.map(|value| &value.moves);
             let else_moves = else_var.map(|value| &value.moves);
             merge_var_moves(var, &[then_moves, else_moves]);
+            var.narrowed_type = match (then_var, else_var) {
+                (Some(left), Some(right)) if left.narrowed_type == right.narrowed_type => {
+                    left.narrowed_type.clone()
+                }
+                _ => None,
+            };
             var.ty = merge_function_value_branch_types(
                 &var.ty,
                 &[
@@ -10161,6 +10239,21 @@ fn merge_moved_scope_paths(
                 })
                 .collect();
             merge_var_moves(var, &branch_moves);
+            var.narrowed_type = paths.first().and_then(|path| {
+                path.get(index)
+                    .and_then(|scope| scope.get(name))
+                    .and_then(|first| {
+                        paths
+                            .iter()
+                            .all(|path| {
+                                path.get(index)
+                                    .and_then(|scope| scope.get(name))
+                                    .is_some_and(|next| next.narrowed_type == first.narrowed_type)
+                            })
+                            .then(|| first.narrowed_type.clone())
+                            .flatten()
+                    })
+            });
             let branch_types = paths
                 .iter()
                 .map(|path| {
@@ -11379,4 +11472,24 @@ mod tests {
         }
         eprintln!("{COMPLETED}");
     }
+}
+
+fn calendar_date_type() -> Type {
+    Type::Object(HashMap::from([
+        ("kind".into(), Type::String),
+        ("year".into(), Type::Int),
+        ("month".into(), Type::Int),
+        ("day".into(), Type::Int),
+    ]))
+}
+
+fn calendar_parts_type() -> Type {
+    let Type::Object(mut fields) = calendar_date_type() else {
+        unreachable!()
+    };
+    for field in ["hour", "minute", "second", "millis", "weekday"] {
+        fields.insert(field.into(), Type::Int);
+    }
+    fields.insert("zone".into(), Type::String);
+    Type::Object(fields)
 }
