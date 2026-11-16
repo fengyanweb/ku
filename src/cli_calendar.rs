@@ -259,7 +259,7 @@ pub(super) fn resolve(
             "ucrt.lib",
             "legacy_stdio_definitions.lib",
         ],
-        _ => &[
+        "x86_64-pc-windows-gnu" => &[
             "-ladvapi32",
             "-lbcrypt",
             "-lkernel32",
@@ -278,6 +278,11 @@ pub(super) fn resolve(
             "-lmsvcrt-os",
             "-luser32",
         ],
+        _ => {
+            return Err(error(
+                "native calendar has no verified system link contract for this target",
+            ))
+        }
     };
     let Some(Value::Array(tokens)) = libs.get("tokens") else {
         return Err(error("native calendar libraries must be an array"));

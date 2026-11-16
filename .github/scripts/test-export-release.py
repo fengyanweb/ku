@@ -150,9 +150,37 @@ class CalendarCoffArchiveTests(unittest.TestCase):
         payload = name + b'\0' + dll + b'\0'
         return bytearray(struct.pack('<HHHHIIHH', 0, 0xffff, 0, 0x8664, 0, len(payload), 0, flags)+payload)
 
-    def validate(self, objects):
+    def validate(self, objects, target='x86_64-pc-windows-msvc'):
         self.path.write_bytes(self.ar(objects))
-        return self.builder.validate_archive(self.path, 'x86_64-pc-windows-msvc')
+        return self.builder.validate_archive(self.path, target)
+
+    def test_windows_gnu_selects_a_gnu_host_and_its_own_archive_contract(self):
+        target = 'x86_64-pc-windows-gnu'
+        self.assertEqual(self.builder.compiler_toolchain('1.99.1', target, 'nt'),
+                         '1.99.1-x86_64-pc-windows-gnu')
+        self.assertEqual(self.builder.compiler_toolchain('1.99.1', 'x86_64-pc-windows-msvc', 'nt'), '1.99.1')
+        self.assertEqual(self.builder.compiler_toolchain('1.99.1', target, 'posix'), '1.99.1')
+        self.assertEqual(self.builder.archive_name(target), 'libku_native_calendar.a')
+        self.assertEqual(self.builder.archive_name('x86_64-pc-windows-msvc'), 'ku_native_calendar.lib')
+        self.assertEqual(self.validate([('calendar.o', self.coff())], target), 1)
+        self.assertEqual(self.builder.native_tokens('-lkernel32 -l:libpthread.a -lgcc_eh', target),
+                         ['-lkernel32', '-l:libpthread.a', '-lgcc_eh'])
+        for raw in ('kernel32.lib', '/defaultlib:msvcrt', '-l:../libpthread.a', '-l:other.a', '-Wl,--whole-archive'):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                self.builder.native_tokens(raw, target)
+        for other in ('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu', 'aarch64-apple-darwin'):
+            with self.subTest(target=other), self.assertRaises(ValueError):
+                self.builder.native_tokens('-l:libpthread.a', other)
+
+    def test_windows_gnu_requires_real_abi_definitions_and_identity(self):
+        target = 'x86_64-pc-windows-gnu'
+        imports = [('kernel32.dll', self.short_import(name)) for name in self.builder.CALENDAR_API]
+        for objects in ([('data.o', self.coff(names=[])), *imports],
+                        [('data.o', self.coff(names=[])), ('thunk.o', self.coff(section=b'.idata$5'))],
+                        [('calendar.o', self.coff(identity=b'another-build')),
+                         ('kernel32.dll', self.short_import(self.builder.BUILD_ID.encode()))]):
+            with self.subTest(objects=len(objects)), self.assertRaisesRegex(ValueError, 'defined ABI|build identity'):
+                self.validate(objects, target)
 
     def test_short_imports_and_real_bigobj_are_distinct(self):
         for big in (False, True):

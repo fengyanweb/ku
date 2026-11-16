@@ -39,6 +39,7 @@ TARGETS = {
     'x86_64-unknown-linux-gnu': 'elf-x86_64',
     'aarch64-unknown-linux-gnu': 'elf-arm64',
     'x86_64-pc-windows-msvc': 'coff-x86_64',
+    'x86_64-pc-windows-gnu': 'coff-x86_64',
 }
 SOURCE_FILES = tuple(sorted((
     'crates/ku-native-calendar/Cargo.toml',
@@ -121,6 +122,11 @@ def native_tokens(raw, target):
         elif target.endswith('-msvc'):
             if not re.fullmatch(r'[A-Za-z0-9_]+\.lib|/defaultlib:msvcrt', token):
                 raise ValueError('unsupported MSVC calendar link token: ' + token)
+        elif target == 'x86_64-pc-windows-gnu' and token == '-l:libpthread.a':
+            # A target rustc may explicitly select its static pthread import
+            # archive. Keep the named archive form GNU-only and bounded; paths,
+            # linker options and arbitrary -l: inputs are not accepted.
+            pass
         elif not re.fullmatch(r'-l[A-Za-z0-9_+.-]+', token):
             raise ValueError('unsupported calendar link token: ' + token)
         index += 1
@@ -265,7 +271,7 @@ def validate_archive(path, target):
             raise ValueError('calendar archive exceeds its native member bound')
     if offset != len(data) or objects == 0:
         raise ValueError('calendar archive has no complete native objects')
-    if target.endswith('-msvc') and (windows_definitions != CALENDAR_API or not windows_identity):
+    if target.startswith('x86_64-pc-windows-') and (windows_definitions != CALENDAR_API or not windows_identity):
         raise ValueError('calendar archive lacks defined ABI symbols or native object build identity')
     return objects
 
@@ -385,6 +391,13 @@ def dependency_licenses(metadata):
     return result
 
 
+def compiler_toolchain(toolchain, target, host_os):
+    # On a Windows runner, the short rustup name otherwise selects the runner's
+    # default MSVC host. A GNU SDK uses a GNU-host publisher; select it explicitly
+    # without changing the user's rustup default or default-host setting.
+    return toolchain + '-' + target if host_os == 'nt' and target == 'x86_64-pc-windows-gnu' else toolchain
+
+
 def build(target, output, toolchain=TOOLCHAIN, target_dir=None):
     if toolchain != TOOLCHAIN:
         raise ValueError('native calendar requires frozen Rust ' + TOOLCHAIN)
@@ -401,14 +414,18 @@ def build(target, output, toolchain=TOOLCHAIN, target_dir=None):
     env['CARGO_BUILD_JOBS'] = '1'
     if target.endswith('-apple-darwin'):
         env['MACOSX_DEPLOYMENT_TARGET'] = '11.0'
-    verbose = run(['rustc', '+'+toolchain, '-Vv'], env, 60).stdout.decode('utf-8')
+    selector = compiler_toolchain(toolchain, target, os.name)
+    verbose = run(['rustc', '+'+selector, '-Vv'], env, 60).stdout.decode('utf-8')
     if not re.search(r'^release: 1\.99\.1$', verbose, re.M):
         raise ValueError('the actual compiler is not the frozen release')
+    host = re.search(r'^host: (.+)$', verbose, re.M)
+    if host is None or (os.name == 'nt' and target == 'x86_64-pc-windows-gnu' and host[1] != target):
+        raise ValueError('native calendar compiler host differs from its selected toolchain')
     before = source_hash()
-    metadata = json.loads(run(['cargo', '+'+toolchain, 'metadata', '--locked', '--offline',
+    metadata = json.loads(run(['cargo', '+'+selector, 'metadata', '--locked', '--offline',
                               '--format-version=1', '--filter-platform', target], env, 120).stdout)
     license_text = dependency_licenses(metadata)
-    command = ['cargo', '+'+toolchain, 'rustc', '--locked', '--offline', '--release',
+    command = ['cargo', '+'+selector, 'rustc', '--locked', '--offline', '--release',
                '--message-format=json-render-diagnostics', '--color', 'never',
                '--manifest-path', ROOT/'Cargo.toml', '--target-dir', target_dir,
                '-p', 'ku-native-calendar', '--target', target, '--', '--print', 'native-static-libs']
@@ -454,6 +471,7 @@ def build(target, output, toolchain=TOOLCHAIN, target_dir=None):
                     'licenses': [record(stage/'LICENSE.ku'), record(stage/'LICENSE.chrono')],
                     'build': {'command': [str(part) for part in command], 'profile': 'release',
                               'panic': 'unwind', 'native_object_members': objects,
+                              'compiler_host': host[1], 'target': target,
                               'macos_deployment_target': '11.0' if target.endswith('-apple-darwin') else None}}
         (stage/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n', encoding='utf-8')
         for path in stage.rglob('*'):
