@@ -674,6 +674,14 @@ function Get-NativeTlsBuildId([string]$BuilderPath) {
     return $matches[0].Groups['value'].Value
 }
 
+function Test-CargoProcMacroSidecar([string]$Name, [string]$Stem, [hashtable]$Contract) {
+    if ($Contract.ObjectFormat -cne 'coff-x86_64') { return $false }
+    if ($Name -cmatch "^$Stem\.(?:pdb|dll\.lib|dll\.exp)$") { return $true }
+    # GNU ld emits an import archive alongside the actual loadable DLL. Keep
+    # the GNU prefix and suffix strict; this is never a runtime dependency.
+    return $Contract.Target -ceq 'x86_64-pc-windows-gnu' -and $Name -cmatch "^lib$Stem\.dll\.a$"
+}
+
 function Get-CargoProcMacroArtifacts([string]$Messages, [string]$CargoTarget, [hashtable]$Contract) {
     if (-not (Test-PlainDirectory $CargoTarget)) { throw "Cargo artifact root must be the private build directory" }
     $root = [IO.Path]::GetFullPath($CargoTarget)
@@ -713,7 +721,7 @@ function Get-CargoProcMacroArtifacts([string]$Messages, [string]$CargoTarget, [h
             if ($name -cnotmatch $libraryPattern) {
                 # Cargo may report Windows linker sidecars as well. They are
                 # checked for provenance but never copied into the bundle.
-                if ($Contract.ObjectFormat -eq 'coff-x86_64' -and $name -cmatch "^$stem\.(?:pdb|dll\.lib|dll\.exp)$") { continue }
+                if (Test-CargoProcMacroSidecar $name $stem $Contract) { continue }
                 throw "Cargo proc-macro artifact has an unexpected filename: '$name'"
             }
             $selected++; if ($selected -ne 1 -or -not $names.Add($name) -or $artifacts.Count -ge 1000) { throw "Cargo proc-macro artifact list contains duplicate or excessive libraries" }
@@ -780,6 +788,14 @@ function Assert-RustDependencies([string]$Directory, [hashtable]$Contract) {
 }
 
 function Test-RustDependencyContracts([string]$WorkRoot, [hashtable]$Contract, [string]$Wrapper) {
+    $sidecarStem = 'release_macro_probe-[0-9a-f]{16}'
+    $gnuSidecarContract = @{ Target = 'x86_64-pc-windows-gnu'; ObjectFormat = 'coff-x86_64' }
+    $gnuImportName = 'librelease_macro_probe-0123456789abcdef.dll.a'
+    if (-not (Test-CargoProcMacroSidecar $gnuImportName $sidecarStem $gnuSidecarContract)) { throw 'GNU import sidecar was not recognized' }
+    foreach ($invalid in @('release_macro_probe-0123456789abcdef.dll', 'release_macro_probe-0123456789abcdef.dll.a', 'libanother_crate-0123456789abcdef.dll.a', 'librelease_macro_probe-0123456789abcdef.dll.a.exe')) {
+        if (Test-CargoProcMacroSidecar $invalid $sidecarStem $gnuSidecarContract) { throw 'A runtime DLL or unrelated file was mistaken for a GNU import sidecar' }
+    }
+    if (Test-CargoProcMacroSidecar $gnuImportName $sidecarStem @{ Target = 'x86_64-pc-windows-msvc'; ObjectFormat = 'coff-x86_64' }) { throw 'GNU sidecar was accepted as an MSVC artifact' }
     $savedDependencies = $script:expectedRustDependencies
     try {
         $source = Join-Path $WorkRoot 'rust-dependency-source'; Ensure-PlainDirectory $source
@@ -794,6 +810,11 @@ function Test-RustDependencyContracts([string]$WorkRoot, [hashtable]$Contract, [
         [IO.File]::WriteAllText($macroSource, 'extern crate proc_macro; #[proc_macro] pub fn release_probe(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }', $utf8)
         [void](Invoke-CheckedTool 'rustc' @(("+$script:publisherToolchain"), '--edition=2021', '--crate-name', 'release_macro_probe', '--crate-type', 'proc-macro', '--target', $Contract.Target, '-o', $macroLibrary, $macroSource) $WorkRoot $WorkRoot 'proc-macro-probe-build' 30000 $Wrapper)
         $macroRecord = @{ reason = 'compiler-artifact'; target = @{ name = 'release_macro_probe'; kind = @('proc-macro'); crate_types = @('proc-macro') }; filenames = @($macroLibrary) }
+        if ($Contract.Target -eq 'x86_64-pc-windows-gnu') {
+            $sidecar = Join-Path $macroDirectory ('lib' + $macroName + '.a')
+            [IO.File]::WriteAllText($sidecar, 'GNU linker sidecar fixture; not a runtime DLL', $utf8)
+            $macroRecord.filenames = @($sidecar, $macroLibrary)
+        }
         $finish = '{"reason":"build-finished","success":true}'
         $macroJson = ($macroRecord | ConvertTo-Json -Depth 8 -Compress) + "`n" + $finish + "`n"
         $macros = Get-CargoProcMacroArtifacts $macroJson $macroRoot $Contract
