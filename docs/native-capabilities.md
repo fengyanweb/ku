@@ -34,7 +34,13 @@ ku build --backend runner --release hello.ku -o hello-runner
 
 同步时间接口还支持 `from_unix`、`from_millis`、`duration`、`add/sub/diff/compare`、`is_leap`、`days_in_month` 和整数／Duration `sleep`。Time 与 Duration 使用不同标签；转换和运算不消费输入，Duration 可以复制，差值可以为负。`duration`、`days_in_month`、`sleep` 沿用 Result 错误；裸值构造或运算失败沿用运行错误，并先退役当前 native frame 的 owner。`from_unix` 只检查乘法溢出，`from_millis` 另检查日期范围，两者不能互换。
 
-`date`、`datetime`、`format`、`parse`、`parts`、`weekday` 尚未接入 native C；使用这些接口时需选择解释器／Runner。native Task 的时间能力仍限定为原有整数毫秒定时器，不自动扩大为上述同步接口。
+当前源码的同步 native C 还支持 `date`、`datetime`、`format`、`parse`、`parts`、`weekday`。解释器与 native 共用锁定的 Chrono 日期引擎；构建时使用与 CLI、目标架构及源码匹配的 `native-calendar/v1/<target>/` 静态包，不调用解释器、Runner 或辅助进程。生成程序链接完成后不依赖该包、SDK、rustc 或 Ku 源码。
+
+日期接口保持既有返回约定：`date()` 返回 Date，带参数的 `date` 及 `datetime/parse` 返回 Result；`format(Time)`、`parts(Time)` 和单参数 `weekday` 返回裸值，带格式／时区的重载返回 Result。裸值接口失败沿用运行错误，Result 接口保留 `time` 错误域。输入只读，字符串、Date 和 parts 对象独立持有结果，原值或临时引擎存储释放后仍可使用。`SSS` 表示三位毫秒数字；分隔点由格式字符串提供，例如 `ss.SSS` 生成 `00.123`。
+
+时区仍限本地、UTC 与固定偏移，不新增命名时区数据库。以上是同步能力，不扩大 native Task 的时间接口或跨 `await` 类型范围。各平台实际运行结果按本批验证记录分别确认，不能以交叉编译代替执行。
+
+同步数组增加 `concat`、`first` 和 `last` 的原生实现。`concat` 返回独立数组；`first/last` 的静态返回类型为 `T | null`，空数组返回 null，有值时结果与原数组生命周期独立。使用 `if (value != null)` 明确缩窄后再执行元素运算；它们不是 Result，不能用 `?` 解包。数组原值不被修改或消费，用户 borrowed 参数的适用范围不因此扩大。详见 [数组接口](syntax.md#125-array)。
 
 ## 当前源码新增能力
 

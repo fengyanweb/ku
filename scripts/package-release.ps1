@@ -1052,6 +1052,29 @@ function Copy-TlsPack([string]$Source, [string]$Destination, [hashtable]$Contrac
     Assert-TlsPack $Destination $Contract $BuildId
 }
 
+function Get-CalendarArchiveName([hashtable]$Contract) {
+    if ($Contract.Target -eq 'x86_64-pc-windows-msvc') { return 'ku_native_calendar.lib' }
+    return 'libku_native_calendar.a'
+}
+
+function Assert-CalendarPack([string]$Leaf, [hashtable]$Contract) {
+    if (-not (Test-PlainDirectory $Leaf)) { throw 'calendar pack must be a plain existing directory' }
+    $calendarBuilder = Join-Path $PSScriptRoot '../.github/scripts/build-native-calendar.py'
+    [void](Invoke-CheckedTool $script:releasePython @('-B', $calendarBuilder, '--target', $Contract.Target, '--output', $Leaf, '--toolchain', $script:releaseToolchain, '--verify-only') $repo $script:releaseWorkRoot 'calendar-pack-verify' 30000 $script:toolWrapper)
+}
+
+function Copy-CalendarPack([string]$Source, [string]$Destination, [hashtable]$Contract) {
+    Assert-CalendarPack $Source $Contract
+    Ensure-PlainDirectory $Destination; Ensure-PlainDirectory (Join-Path $Destination 'include'); Ensure-PlainDirectory (Join-Path $Destination 'lib')
+    foreach ($name in @('manifest.json', 'LICENSE.ku', 'LICENSE.chrono')) {
+        Copy-PlainFile (Join-Path $Source $name) (Join-Path $Destination $name) 1MB
+    }
+    Copy-PlainFile (Join-Path $Source 'include/ku_native_calendar.h') (Join-Path $Destination 'include/ku_native_calendar.h') 64KB
+    $archive = 'lib/' + (Get-CalendarArchiveName $Contract)
+    Copy-PlainFile (Join-Path $Source $archive) (Join-Path $Destination $archive) 128MB
+    Assert-CalendarPack $Destination $Contract
+}
+
 function Read-VsixEntryUtf8([object]$Entry, [long]$Limit, [string]$Label) {
     if ($Entry.Length -eq 0 -or $Entry.Length -gt $Limit) { throw "VSIX $Label has an invalid uncompressed size" }
     $stream = $Entry.Open()
@@ -1137,6 +1160,17 @@ function Assert-Bundle([string]$Bundle, [hashtable]$Contract, [string]$Version, 
     $vsixName = "ku-language-$Version.vsix"
     $expectedFiles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($relative in @($Contract.Executable, "libku.rlib", $vsixName, "ku-runtime.json", "ku-runtime-deps.json", "native-tls/v1/$($Contract.Target)/manifest.kutls", "native-tls/v1/$($Contract.Target)/include/ku_native_tls.h", "native-tls/v1/$($Contract.Target)/lib/$($Contract.Archive)")) { [void]$expectedFiles.Add($relative.Replace('\', '/')) }
+    # Legacy self-test fixtures intentionally predate calendar packs. When a
+    # pack is present, its exact five-file contract is mandatory. The actual
+    # publisher below always constructs and copies the pack before this check.
+    $calendarRoot = Join-Path $Bundle 'native-calendar'
+    if (Test-Path -LiteralPath $calendarRoot) {
+        $calendarLeaf = Join-Path $calendarRoot "v1/$($Contract.Target)"
+        Assert-CalendarPack $calendarLeaf $Contract
+        foreach ($relative in @('manifest.json', 'LICENSE.ku', 'LICENSE.chrono', 'include/ku_native_calendar.h', ('lib/' + (Get-CalendarArchiveName $Contract)))) {
+            [void]$expectedFiles.Add("native-calendar/v1/$($Contract.Target)/$relative")
+        }
+    }
     foreach ($name in $script:expectedRustDependencies.Keys) { [void]$expectedFiles.Add("deps/$name") }
     if ($IsWindows -and (Test-PlainFile (Join-Path $Bundle "ku.pdb"))) { [void]$expectedFiles.Add("ku.pdb") }
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); $pending = [Collections.Generic.Stack[string]]::new(); $pending.Push($Bundle); $entries = 0; $total = 0L
@@ -1717,6 +1751,10 @@ try {
     $tlsOutputRoot = Join-Path $workRoot "tls-pack"
     [void](Invoke-CheckedTool "pwsh" @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $builderPath, "-Target", $contract.Target, "-OutputRoot", $tlsOutputRoot) $repo $workRoot "tls-pack" 600000 $wrapper)
     $tlsPack = Join-Path $tlsOutputRoot $contract.Target
+    $calendarPack = Join-Path $workRoot 'calendar-pack'
+    $calendarBuilder = Join-Path $repo '.github/scripts/build-native-calendar.py'
+    [void](Invoke-CheckedTool $script:releasePython @('-B', $calendarBuilder, '--target', $contract.Target, '--output', $calendarPack, '--toolchain', $script:releaseToolchain, '--target-dir', $cargoTarget) $repo $workRoot 'calendar-pack-build' 900000 $wrapper)
+    Assert-CalendarPack $calendarPack $contract
 
     if (-not $ExistingVsix) {
         Copy-ExtensionSource $extensionSource $extensionWork
@@ -1734,6 +1772,7 @@ try {
     $pdb = Join-Path $targetRelease "ku.pdb"; if ($IsWindows -and (Test-PlainFile $pdb)) { Copy-PlainFile $pdb (Join-Path $candidate "ku.pdb") 512MB }
     Copy-PlainFile $vsixPath (Join-Path $candidate $vsixName) 128MB
     Copy-TlsPack $tlsPack (Join-Path $candidate "native-tls/v1/$($contract.Target)") $contract $buildId
+    Copy-CalendarPack $calendarPack (Join-Path $candidate "native-calendar/v1/$($contract.Target)") $contract
     $rustcIdentityPath = Join-Path $workRoot 'publisher-rustc.txt'
     [IO.File]::WriteAllText($rustcIdentityPath, $rustcOutput, $utf8)
     # Query the actual same-build CLI. The source path is still present here;

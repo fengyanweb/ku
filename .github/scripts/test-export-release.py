@@ -70,6 +70,34 @@ def compression_pack_fixture(root, target, codec):
     return leaf
 
 
+def calendar_pack_fixture(root, target):
+    """Minimal object-container fixture; does not claim executable ABI proof."""
+    builder = EXPORT.NATIVE_CALENDAR
+    leaf = root / 'native-calendar/v1' / target
+    (leaf / 'lib').mkdir(parents=True)
+    (leaf / 'include').mkdir()
+    body = bytearray(64)
+    body[:7] = b'\x7fELF\x02\x01\x01'
+    struct.pack_into('<HH', body, 16, 1, 62)
+    body = bytes(body) + builder.BUILD_ID.encode()
+    ar_header = f'{"fixture.o/":<16}{0:<12}{0:<6}{0:<6}{100644:<8}{len(body):<10}`\n'.encode()
+    library = leaf / 'lib' / builder.archive_name(target)
+    library.write_bytes(b'!<arch>\n' + ar_header + body + (b'\n' if len(body) & 1 else b''))
+    shutil.copyfile(builder.ROOT / 'crates/ku-native-calendar/include' / builder.HEADER, leaf / 'include' / builder.HEADER)
+    shutil.copyfile(builder.ROOT / 'LICENSE', leaf / 'LICENSE.ku')
+    (leaf / 'LICENSE.chrono').write_bytes(b'chrono dependency license fixture\n')
+    manifest = {'schema_version': 1, 'abi_version': 1, 'build_id': builder.BUILD_ID,
+                'crate_version': '0.1.0', 'chrono_version': '0.4.45',
+                'rustc_version': '1.99.1', 'rustc_verbose': 'rustc 1.99.1\nrelease: 1.99.1\n',
+                'target': target, 'source_sha256': builder.source_hash(),
+                'archive': builder.record(library),
+                'header': builder.record(leaf / 'include' / builder.HEADER),
+                'native_static_libs': {'raw': '-lc -lm', 'tokens': ['-lc', '-lm']},
+                'licenses': [builder.record(leaf / 'LICENSE.ku'), builder.record(leaf / 'LICENSE.chrono')]}
+    (leaf / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+    return leaf
+
+
 class RuntimeConsumerReportTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -654,6 +682,61 @@ class ReleaseExportTests(unittest.TestCase):
             self.skipTest('platform cannot create a file symlink: ' + str(error))
         with self.assertRaisesRegex(EXPORT.ExportError, 'symlink/reparse'):
             self.run_export(native_compression_root=root)
+
+    def test_calendar_pack_exports_exact_payload_and_attribution(self):
+        leaf = calendar_pack_fixture(self.bundle, self.target)
+        expected = EXPORT.NATIVE_CALENDAR.validate_pack(leaf, self.target)
+        result = self.run_export()
+        manifest = json.loads(Path(result['manifest_path']).read_bytes())
+        relative = f'native-calendar/v1/{self.target}'
+        self.assertEqual({name for name in manifest['files'] if name.startswith('native-calendar/')},
+                         {relative + '/' + name for name in ('manifest.json', 'LICENSE.ku', 'LICENSE.chrono',
+                          'include/ku_native_calendar.h', 'lib/libku_native_calendar.a')})
+        extracted = self.root / 'calendar-extracted'
+        extracted.mkdir()
+        EXPORT.verify_archive(Path(result['asset_path']), manifest['files'], extracted)
+        attribution = json.loads((extracted/'THIRD_PARTY.json').read_bytes())['native_calendar']
+        self.assertEqual(attribution['source_sha256'], expected['source_sha256'])
+        self.assertEqual(attribution['chrono_version'], '0.4.45')
+        self.assertEqual(attribution['materials'], [relative+'/LICENSE.ku', relative+'/LICENSE.chrono'])
+        self.assertIn('native-calendar/v1/', (extracted/'README-INSTALL.md').read_text(encoding='utf-8'))
+
+    def test_calendar_pack_rejects_mixed_source_target_and_file_inventory(self):
+        leaf = calendar_pack_fixture(self.bundle, self.target)
+        path = leaf / 'manifest.json'
+        saved = path.read_bytes()
+        for key, value in [('source_sha256', 'a'*64), ('target', 'aarch64-apple-darwin'),
+                           ('rustc_version', '1.89.0'), ('abi_version', 2)]:
+            data = json.loads(saved)
+            data[key] = value
+            path.write_text(json.dumps(data))
+            with self.subTest(key=key), self.assertRaises(EXPORT.ExportError):
+                self.run_export()
+            path.write_bytes(saved)
+        extra = leaf/'private-cache'
+        extra.write_bytes(b'not an installation payload')
+        with self.assertRaises(EXPORT.ExportError):
+            self.run_export()
+        extra.unlink()
+        (leaf/'LICENSE.chrono').unlink()
+        with self.assertRaises(EXPORT.ExportError):
+            self.run_export()
+        self.assertEqual(list(self.output.glob('*.tar.gz')), [])
+
+    def test_calendar_pack_default_validation_needs_no_source_directory(self):
+        leaf = calendar_pack_fixture(self.bundle, self.target)
+        with mock.patch.object(EXPORT.NATIVE_CALENDAR, 'source_hash', side_effect=AssertionError('source touched')):
+            EXPORT.NATIVE_CALENDAR.validate_pack(leaf, self.target)
+        library = leaf/'lib'/EXPORT.NATIVE_CALENDAR.archive_name(self.target)
+        data = bytearray(library.read_bytes())
+        struct.pack_into('<H', data, 8+60+18, 183)
+        library.write_bytes(data)
+        path = leaf/'manifest.json'
+        manifest = json.loads(path.read_bytes())
+        manifest['archive'] = EXPORT.NATIVE_CALENDAR.record(library)
+        path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'wrong-target'):
+            EXPORT.NATIVE_CALENDAR.validate_pack(leaf, self.target)
 
     def test_roundtrip_hashes_original_licenses_and_file_set(self):
         result = self.run_export()

@@ -5,10 +5,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{
-    DateTime, Datelike, FixedOffset, Local, LocalResult, NaiveDate, NaiveDateTime, Offset,
-    TimeZone, Timelike, Utc,
-};
+use chrono::Utc;
+
+#[path = "time_calendar.rs"]
+mod calendar;
 
 use crate::{
     error::{KuError, KuResult},
@@ -20,7 +20,7 @@ use crate::{
     value::Value,
 };
 
-const DEFAULT_LAYOUT: &str = "yyyy-MM-dd HH:mm:ss";
+const DEFAULT_LAYOUT: &str = calendar::DEFAULT_LAYOUT;
 const MILLIS_PER_SECOND: i64 = 1_000;
 const MILLIS_PER_MINUTE: i64 = 60 * MILLIS_PER_SECOND;
 const MILLIS_PER_HOUR: i64 = 60 * MILLIS_PER_MINUTE;
@@ -176,25 +176,29 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
 
 fn eval_date(args: &[Value], span: Span) -> Value {
     match args.len() {
-        0 => date_value_from_local(Local::now()),
+        0 => date_from_calendar(calendar::date_now()),
         1 => {
             let Ok(millis) = expect_time(&args[0], span) else {
                 return result(Err(time_error("invalid_time", "expected Time object")));
             };
-            result(local_from_millis(millis, span).map(date_value_from_local))
+            result(calendar_result(calendar::date_at(millis, None), span).map(date_from_calendar))
         }
         2 => result((|| {
             let millis = expect_time(&args[0], span)?;
             let zone = expect_str(&args[1], span)?;
-            let date = zoned_datetime(millis, zone, span)?;
-            Ok(date_value(date.year(), date.month(), date.day()))
+            Ok(date_from_calendar(calendar_result(
+                calendar::date_at(millis, Some(zone)),
+                span,
+            )?))
         })()),
         3 => result((|| {
             let year = expect_i32(&args[0], span)?;
             let month = expect_u32(&args[1], span)?;
             let day = expect_u32(&args[2], span)?;
-            validate_date(year, month, day, span)?;
-            Ok(date_value(year, month, day))
+            Ok(date_from_calendar(calendar_result(
+                calendar::date(year, month, day),
+                span,
+            )?))
         })()),
         _ => result(Err(time_error(
             "invalid_arguments",
@@ -223,36 +227,39 @@ fn eval_datetime(args: &[Value], span: Span) -> Value {
         let hour = expect_u32(&args[3], span)?;
         let minute = expect_u32(&args[4], span)?;
         let second = expect_u32(&args[5], span)?;
-        let naive = make_naive_datetime(year, month, day, hour, minute, second, span)?;
-        let millis = if let Some(zone) = args.get(6) {
-            let zone = expect_str(zone, span)?;
-            datetime_in_zone(naive, zone, span)?
-        } else {
-            local_datetime_millis(naive, span)?
-        };
-        Ok(time_value(millis))
+        let zone = args
+            .get(6)
+            .map(|value| expect_str(value, span))
+            .transpose()?;
+        Ok(time_value(calendar_result(
+            calendar::datetime(year, month, day, hour, minute, second, zone),
+            span,
+        )?))
     })())
 }
 
 fn eval_format(args: &[Value], span: Span) -> Value {
     match args.len() {
         1 => match expect_time(&args[0], span) {
-            Ok(millis) => match format_local(millis, DEFAULT_LAYOUT, span) {
-                Ok(text) => Value::String(text),
-                Err(err) => result(Err(err)),
-            },
-            Err(err) => result(Err(err)),
+            Ok(millis) => {
+                match calendar_result(calendar::format(millis, DEFAULT_LAYOUT, None), span) {
+                    Ok(text) => Value::String(text),
+                    Err(error) => result(Err(error)),
+                }
+            }
+            Err(error) => result(Err(error)),
         },
         2 | 3 => result((|| {
             let millis = expect_time(&args[0], span)?;
             let layout = expect_str(&args[1], span)?;
-            let text = if let Some(zone) = args.get(2) {
-                let zone = expect_str(zone, span)?;
-                format_zoned(millis, layout, zone, span)?
-            } else {
-                format_local(millis, layout, span)?
-            };
-            Ok(Value::String(text))
+            let zone = args
+                .get(2)
+                .map(|value| expect_str(value, span))
+                .transpose()?;
+            Ok(Value::String(calendar_result(
+                calendar::format(millis, layout, zone),
+                span,
+            )?))
         })()),
         _ => result(Err(time_error(
             "invalid_arguments",
@@ -281,16 +288,14 @@ fn eval_parse(args: &[Value], span: Span) -> Value {
             .map(|value| expect_str(value, span))
             .transpose()?
             .unwrap_or(DEFAULT_LAYOUT);
-        let chrono_layout = chrono_layout(layout);
-        let naive = NaiveDateTime::parse_from_str(text, &chrono_layout)
-            .map_err(|err| time_error("invalid_format", format!("invalid time text: {err}")))?;
-        let millis = if let Some(zone) = args.get(2) {
-            let zone = expect_str(zone, span)?;
-            datetime_in_zone(naive, zone, span)?
-        } else {
-            local_datetime_millis(naive, span)?
-        };
-        Ok(time_value(millis))
+        let zone = args
+            .get(2)
+            .map(|value| expect_str(value, span))
+            .transpose()?;
+        Ok(time_value(calendar_result(
+            calendar::parse(text, layout, zone),
+            span,
+        )?))
     })())
 }
 
@@ -339,16 +344,19 @@ fn eval_duration(args: &[Value], span: Span) -> Value {
 fn eval_parts(args: &[Value], span: Span) -> Value {
     match args.len() {
         1 => match expect_time(&args[0], span) {
-            Ok(millis) => match local_from_millis(millis, span) {
-                Ok(local) => parts_value(local, "local"),
-                Err(err) => result(Err(err)),
+            Ok(millis) => match calendar_result(calendar::parts(millis, None), span) {
+                Ok(parts) => parts_value(parts),
+                Err(error) => result(Err(error)),
             },
-            Err(err) => result(Err(err)),
+            Err(error) => result(Err(error)),
         },
         2 => result((|| {
             let millis = expect_time(&args[0], span)?;
             let zone = expect_str(&args[1], span)?;
-            Ok(parts_value(zoned_datetime(millis, zone, span)?, zone))
+            Ok(parts_value(calendar_result(
+                calendar::parts(millis, Some(zone)),
+                span,
+            )?))
         })()),
         _ => result(Err(time_error(
             "invalid_arguments",
@@ -418,31 +426,22 @@ fn duration_value(millis: i64) -> Value {
     ]))
 }
 
-fn date_value_from_local(value: DateTime<Local>) -> Value {
-    date_value(value.year(), value.month(), value.day())
+fn date_from_calendar(date: calendar::Date) -> Value {
+    date_value(date.year, date.month, date.day)
 }
 
-fn parts_value<Tz: TimeZone>(value: DateTime<Tz>, zone: &str) -> Value
-where
-    Tz::Offset: std::fmt::Display,
-{
+fn parts_value(parts: calendar::Parts) -> Value {
     Value::Object(HashMap::from([
         ("kind".to_string(), Value::String("time.parts".to_string())),
-        ("year".to_string(), Value::Int(i64::from(value.year()))),
-        ("month".to_string(), Value::Int(i64::from(value.month()))),
-        ("day".to_string(), Value::Int(i64::from(value.day()))),
-        ("hour".to_string(), Value::Int(i64::from(value.hour()))),
-        ("minute".to_string(), Value::Int(i64::from(value.minute()))),
-        ("second".to_string(), Value::Int(i64::from(value.second()))),
-        (
-            "millis".to_string(),
-            Value::Int(i64::from(value.timestamp_subsec_millis())),
-        ),
-        (
-            "weekday".to_string(),
-            Value::Int(i64::from(value.weekday().number_from_monday())),
-        ),
-        ("zone".to_string(), Value::String(zone.to_string())),
+        ("year".to_string(), Value::Int(i64::from(parts.date.year))),
+        ("month".to_string(), Value::Int(i64::from(parts.date.month))),
+        ("day".to_string(), Value::Int(i64::from(parts.date.day))),
+        ("hour".to_string(), Value::Int(i64::from(parts.hour))),
+        ("minute".to_string(), Value::Int(i64::from(parts.minute))),
+        ("second".to_string(), Value::Int(i64::from(parts.second))),
+        ("millis".to_string(), Value::Int(i64::from(parts.millis))),
+        ("weekday".to_string(), Value::Int(i64::from(parts.weekday))),
+        ("zone".to_string(), Value::String(parts.zone)),
     ]))
 }
 
@@ -501,13 +500,13 @@ fn expect_int(value: &Value, span: Span) -> KuResult<i64> {
 }
 
 fn expect_i32(value: &Value, span: Span) -> KuResult<i32> {
-    i32::try_from(expect_int(value, span)?)
-        .map_err(|_| KuError::runtime("int is outside supported date range", span))
+    calendar::expect_i32(expect_int(value, span)?)
+        .map_err(|error| KuError::runtime(error.message.into_owned(), span))
 }
 
 fn expect_u32(value: &Value, span: Span) -> KuResult<u32> {
-    u32::try_from(expect_int(value, span)?)
-        .map_err(|_| KuError::runtime("int must be non-negative", span))
+    calendar::expect_u32(expect_int(value, span)?)
+        .map_err(|error| KuError::runtime(error.message.into_owned(), span))
 }
 
 fn expect_str(value: &Value, span: Span) -> KuResult<&str> {
@@ -517,175 +516,19 @@ fn expect_str(value: &Value, span: Span) -> KuResult<&str> {
     }
 }
 
-fn validate_date(year: i32, month: u32, day: u32, span: Span) -> KuResult<NaiveDate> {
-    NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| {
-        KuError::structured(
-            crate::error::KuErrorKind::Runtime,
-            "time",
-            "invalid_date",
-            format!("invalid date: {year:04}-{month:02}-{day:02}"),
-            span,
-        )
-    })
-}
-
-fn make_naive_datetime(
-    year: i32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-    second: u32,
-    span: Span,
-) -> KuResult<NaiveDateTime> {
-    let date = validate_date(year, month, day, span)?;
-    date.and_hms_opt(hour, minute, second).ok_or_else(|| {
-        KuError::structured(
-            crate::error::KuErrorKind::Runtime,
-            "time",
-            "invalid_time",
-            format!(
-                "invalid time: {year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
-            ),
-            span,
-        )
-    })
-}
-
-fn local_datetime_millis(value: NaiveDateTime, span: Span) -> KuResult<i64> {
-    match Local.from_local_datetime(&value) {
-        LocalResult::Single(value) => Ok(value.timestamp_millis()),
-        LocalResult::Ambiguous(_, _) => Err(time_error_at(
-            "invalid_time",
-            "local time is ambiguous",
-            span,
-        )),
-        LocalResult::None => Err(time_error_at(
-            "invalid_time",
-            "local time does not exist",
-            span,
-        )),
-    }
-}
-
-fn datetime_in_zone(value: NaiveDateTime, zone: &str, span: Span) -> KuResult<i64> {
-    match zone_kind(zone, span)? {
-        ZoneKind::Local => local_datetime_millis(value, span),
-        ZoneKind::Offset(offset) => offset
-            .from_local_datetime(&value)
-            .single()
-            .map(|value| value.timestamp_millis())
-            .ok_or_else(|| time_error_at("invalid_time", "invalid time for zone", span)),
-    }
-}
-
-fn zoned_datetime(millis: i64, zone: &str, span: Span) -> KuResult<DateTime<FixedOffset>> {
-    let utc = Utc.timestamp_millis_opt(millis).single().ok_or_else(|| {
-        time_error_at("invalid_time", "time millis outside supported range", span)
-    })?;
-    match zone_kind(zone, span)? {
-        ZoneKind::Local => {
-            let local = utc.with_timezone(&Local);
-            let offset = local.offset().fix();
-            Ok(local.with_timezone(&offset))
-        }
-        ZoneKind::Offset(offset) => Ok(utc.with_timezone(&offset)),
-    }
+fn calendar_result<T>(result: calendar::CalendarResult<T>, span: Span) -> KuResult<T> {
+    result.map_err(|error| time_error_at(error.code, error.message.into_owned(), span))
 }
 
 fn validate_time_millis(millis: i64, span: Span) -> KuResult<()> {
-    Utc.timestamp_millis_opt(millis)
-        .single()
-        .map(|_| ())
-        .ok_or_else(|| time_error_at("invalid_time", "time millis outside supported range", span))
-}
-
-fn local_from_millis(millis: i64, span: Span) -> KuResult<DateTime<Local>> {
-    Ok(Utc
-        .timestamp_millis_opt(millis)
-        .single()
-        .ok_or_else(|| time_error_at("invalid_time", "time millis outside supported range", span))?
-        .with_timezone(&Local))
-}
-
-fn format_local(millis: i64, layout: &str, span: Span) -> KuResult<String> {
-    format_datetime(local_from_millis(millis, span)?, layout, span)
-}
-
-fn format_zoned(millis: i64, layout: &str, zone: &str, span: Span) -> KuResult<String> {
-    format_datetime(zoned_datetime(millis, zone, span)?, layout, span)
-}
-
-fn format_datetime<Tz: TimeZone>(value: DateTime<Tz>, layout: &str, span: Span) -> KuResult<String>
-where
-    Tz::Offset: std::fmt::Display,
-{
-    // A user layout can make Chrono's formatter return fmt::Error. to_string()
-    // treats that as a panic; write_to keeps invalid layouts on the Result path.
-    let mut text = String::new();
-    value
-        .format(&chrono_layout(layout))
-        .write_to(&mut text)
-        .map_err(|_| time_error_at("invalid_format", "invalid time format", span))?;
-    Ok(text)
-}
-
-enum ZoneKind {
-    Local,
-    Offset(FixedOffset),
-}
-
-fn zone_kind(zone: &str, span: Span) -> KuResult<ZoneKind> {
-    match zone {
-        "local" => Ok(ZoneKind::Local),
-        "utc" | "UTC" => FixedOffset::east_opt(0)
-            .map(ZoneKind::Offset)
-            .ok_or_else(|| time_error_at("invalid_zone", "invalid zone: utc", span)),
-        _ => parse_fixed_offset(zone)
-            .map(ZoneKind::Offset)
-            .ok_or_else(|| time_error_at("invalid_zone", format!("invalid zone: {zone}"), span)),
-    }
-}
-
-fn parse_fixed_offset(zone: &str) -> Option<FixedOffset> {
-    // Every position below belongs to the ASCII offset syntax. Check this
-    // before slicing: six UTF-8 bytes do not necessarily mean six characters.
-    let bytes = zone.as_bytes();
-    if bytes.len() != 6 || !bytes.is_ascii() {
-        return None;
-    }
-    let sign = match bytes[0] {
-        b'+' => 1,
-        b'-' => -1,
-        _ => return None,
-    };
-    if bytes[3] != b':' {
-        return None;
-    }
-    let hours = zone[1..3].parse::<i32>().ok()?;
-    let minutes = zone[4..6].parse::<i32>().ok()?;
-    if hours > 23 || minutes > 59 {
-        return None;
-    }
-    FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60))
-}
-
-fn chrono_layout(layout: &str) -> String {
-    layout
-        .replace("yyyy", "%Y")
-        .replace("SSS", "%.3f")
-        .replace("MM", "%m")
-        .replace("dd", "%d")
-        .replace("HH", "%H")
-        .replace("mm", "%M")
-        .replace("ss", "%S")
+    calendar_result(calendar::validate_time_millis(millis), span)
 }
 
 fn weekday_value(value: &Value, zone: Option<&str>, span: Span) -> KuResult<i64> {
     match object_kind(value) {
         Some("time.date") => {
             let Value::Object(fields) = value else {
-                unreachable!();
+                unreachable!()
             };
             let year = match fields.get("year") {
                 Some(value) => expect_i32(value, span)?,
@@ -699,50 +542,22 @@ fn weekday_value(value: &Value, zone: Option<&str>, span: Span) -> KuResult<i64>
                 Some(value) => expect_u32(value, span)?,
                 None => return Err(KuError::runtime("date object missing day", span)),
             };
-            Ok(i64::from(
-                validate_date(year, month, day, span)?
-                    .weekday()
-                    .number_from_monday(),
-            ))
+            calendar_result(calendar::weekday_date(year, month, day), span)
         }
-        Some("time.time") => {
-            let millis = expect_time(value, span)?;
-            let weekday = if let Some(zone) = zone {
-                zoned_datetime(millis, zone, span)?
-                    .weekday()
-                    .number_from_monday()
-            } else {
-                local_from_millis(millis, span)?
-                    .weekday()
-                    .number_from_monday()
-            };
-            Ok(i64::from(weekday))
-        }
+        Some("time.time") => calendar_result(
+            calendar::weekday_time(expect_time(value, span)?, zone),
+            span,
+        ),
         _ => Err(expected_type("Time or Date", value, span)),
     }
 }
 
 fn days_in_month(year: i32, month: u32, span: Span) -> KuResult<i64> {
-    if month == 0 || month > 12 {
-        return Err(time_error_at(
-            "invalid_date",
-            format!("invalid month: {month}"),
-            span,
-        ));
-    }
-    // Chrono's valid year range is narrower than i32. Validate the input
-    // before adding a year so even i32::MAX returns an error without overflow.
-    let current = validate_date(year, month, 1, span)?;
-    let next = if month == 12 {
-        validate_date(year + 1, 1, 1, span)?
-    } else {
-        validate_date(year, month + 1, 1, span)?
-    };
-    Ok((next - current).num_days())
+    calendar_result(calendar::days_in_month(year, month), span)
 }
 
 fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    calendar::is_leap_year(year)
 }
 
 fn checked_add(left: i64, right: i64, code: &str, span: Span) -> KuResult<i64> {

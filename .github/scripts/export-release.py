@@ -35,6 +35,11 @@ assert _COMPRESSION_SPEC and _COMPRESSION_SPEC.loader
 NATIVE_COMPRESSION = importlib.util.module_from_spec(_COMPRESSION_SPEC)
 _COMPRESSION_SPEC.loader.exec_module(NATIVE_COMPRESSION)
 
+_CALENDAR_SPEC = importlib.util.spec_from_file_location("ku_native_calendar_build", Path(__file__).with_name("build-native-calendar.py"))
+assert _CALENDAR_SPEC and _CALENDAR_SPEC.loader
+NATIVE_CALENDAR = importlib.util.module_from_spec(_CALENDAR_SPEC)
+_CALENDAR_SPEC.loader.exec_module(NATIVE_CALENDAR)
+
 MAX_FILES = 1000
 MAX_BYTES = 1024 * 1024 * 1024
 MAX_METADATA = 16 * 1024 * 1024
@@ -735,6 +740,24 @@ def export_release(bundle: Path, output: Path, repo: Path, version: str,
         if not required.issubset(stage.files) or not any(RLIB_NAME.fullmatch(name) for name in stage.files):
             raise ExportError("bundle is missing required compiler, runner dependencies, VSIX or TLS pack")
         allowed = required | ({"ku.pdb"} if target.endswith("windows-msvc") else set())
+        calendar_relative = f"native-calendar/v1/{target}"
+        calendar_manifest = None
+        if os.path.lexists(bundle / 'native-calendar'):
+            leaf = bundle / calendar_relative
+            calendar_names = ['manifest.json', 'LICENSE.ku', 'LICENSE.chrono',
+                              'include/ku_native_calendar.h', 'lib/' + NATIVE_CALENDAR.archive_name(target)]
+            try:
+                plain(leaf, directory=True)
+                for name in calendar_names:
+                    plain(leaf / name)
+                expected_source = NATIVE_CALENDAR.source_hash()
+                calendar_manifest = NATIVE_CALENDAR.validate_pack(leaf, target, expected_source)
+                copied = NATIVE_CALENDAR.validate_pack(stage.root / calendar_relative, target, expected_source)
+                if copied != calendar_manifest:
+                    raise ValueError('calendar pack changed during export')
+            except (ValueError, OSError, KeyError, TypeError, AttributeError) as error:
+                raise ExportError('native calendar pack validation failed: ' + str(error)) from error
+            allowed |= {calendar_relative + '/' + name for name in calendar_names}
         if any(name not in allowed and not dependency_name(name, target) for name in stage.files):
             raise ExportError("bundle contains an unexpected file")
         try:
@@ -749,6 +772,14 @@ def export_release(bundle: Path, output: Path, repo: Path, version: str,
         if executable == "ku" and stage.files[executable]["mode"] != 0o755:
             raise ExportError("Unix ku executable does not have its executable mode")
         attribution = collect_licenses(stage, metadata, repo, rust_sysroot, runtime["rustc"]["toolchain"])
+        if calendar_manifest is not None:
+            attribution['native_calendar'] = {
+                'version': calendar_manifest['crate_version'],
+                'chrono_version': calendar_manifest['chrono_version'],
+                'source_sha256': calendar_manifest['source_sha256'],
+                'manifest': calendar_relative + '/manifest.json',
+                'materials': [calendar_relative + '/LICENSE.ku', calendar_relative + '/LICENSE.chrono'],
+            }
         if native_compression_root is not None:
             attribution["native_compression"] = add_native_compression(stage, native_compression_root, target)
         stage.add("THIRD_PARTY.json", data=json_bytes(attribution))
@@ -806,6 +837,16 @@ The VSIX uses Node/VS Code APIs; its npm build tools are not distributed.
 Ku's own code is licensed under Apache-2.0. The original LICENSE and NOTICE are
 included at the archive root. Third-party components retain their respective
 licenses and copyright notices in THIRD_PARTY/ and THIRD_PARTY.json.
+"""
+        if calendar_manifest is not None:
+            instructions += """
+Keep native-calendar/v1/ beside ku when compiling synchronous date, datetime,
+format, parse, parts or weekday calls. The matching calendar pack is discovered
+automatically and linked statically; the generated program does not need that
+pack, rustc, a Ku SDK or Ku source files at runtime. System runtime libraries
+and the operating system's local-time configuration still apply.
+中文：编译同步日期与格式化接口时，请保留 ku 旁的 native-calendar/v1/；
+链接后的程序不再需要该静态包、rustc、Ku SDK 或源码。
 """
         if native_compression_root is not None:
             instructions += """

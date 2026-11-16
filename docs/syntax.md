@@ -1463,17 +1463,27 @@ print(text.slice(1, 3)?)
 ```txt
 array.len(&values:[T]): int
 array.is_empty(&values:[T]): bool
-array.first(values:[T]): T
-array.last(values:[T]): T
+array.first(values:[T]): T | null
+array.last(values:[T]): T | null
 array.try_get(values:[T], index:int): T!
 array.push(values:[T], value:T): [T]
 array.concat(left:[T], right:[T]): [T]
 values.map(mapper): [U]
 ```
 
-`array.push` 和 `array.concat` 返回新数组，不会原地修改参数。
+`array.push` 和 `array.concat` 返回新数组，不会原地修改参数。`concat` 读取两边数组并产生独立结果，原数组和结果可以分别继续使用、释放；字符串与其他 owned 元素不会借用来源的临时存储。
 
-`array.first` / `array.last` 对空数组返回 `null`；需要带错误信息的越界访问时使用 `array.try_get`，错误 payload 是 Error 对象。
+`array.first` / `array.last` 的返回类型是 `T | null`：空数组返回 `null`，有值时返回生命周期独立的元素，不消费原数组。`0`、`false` 和空字符串都是有效元素，不代表缺失。这两个接口不是 Result，不能接 `?`；先通过显式 null 判断缩窄类型，再使用元素：
+
+```ku
+names = ["Ku"]
+name = names.first()
+if (name != null) {
+    println(name + "!")
+}
+```
+
+未排除 null 时，直接算术、字符串方法、字段读取或将结果当成必有的 `T` 参数会在检查阶段报错。重新赋值为 null 或可能修改捕获绑定的调用后，需要重新判断。需要带错误信息的越界访问时使用 `array.try_get`，其错误 payload 是 Error 对象。当前 native C 为受支持元素生成明确的可空布局，不将 null 伪装成元素零值；这不表示支持任意 union 布局。
 
 `values.map(mapper)` 是数组实例方法。`mapper` 是函数值，例如 `nums.map(x => x * 2)`。
 
@@ -1547,14 +1557,14 @@ time.compare(left: Time, right: Time): int
 time.parts(value: Time): object
 time.parts(value: Time, zone:str): object!
 time.weekday(value: Time | Date): int
-time.weekday(value: Time, zone:str): int!
+time.weekday(value: Time | Date, zone:str): int!
 time.is_leap(year:int): bool
 time.days_in_month(year:int, month:int): int!
 time.sleep(ms:int): null!
 time.sleep(duration: Duration): null!
 ```
 
-第一版不新增独立 VM 值类型，`Time` / `Date` / `Duration` 用普通 object 承载：
+解释器中的 `Time` / `Date` / `Duration` 用带 kind 的 object 承载；native C 的 Time／Duration 使用各自的标量标签，Date 使用独立对象，不能以普通动态对象替代：
 
 ```ku
 now = time.instant()
@@ -1584,7 +1594,11 @@ ss   秒 00-59
 SSS  毫秒 000-999
 ```
 
-`zone` 第一版支持 `"local"`、`"utc"`、`"+08:00"`、`"-05:30"` 这类固定偏移。
+`SSS` 本身只输出三位数字，不附加小数点。要显示毫秒，写 `"yyyy-MM-dd HH:mm:ss.SSS"`，例如 `"1970-01-01 00:00:00.123"`；用相同格式及相同时区解析可保留这三位毫秒。现有 Chrono `%` 格式指令仍交给同一引擎处理，非法指令返回格式错误；文本必须完整匹配，不能忽略尾部内容。
+
+`zone` 支持 `"local"`、`"utc"`／`"UTC"`、`"+08:00"`、`"-05:30"` 这类固定偏移。不支持 `"Asia/Shanghai"` 等命名时区。省略时区使用本地时区；本地时间遇到夏令时重复或不存在的时刻时返回错误，不擅自选择时间。`weekday` 返回周一 1 至周日 7；Date 已是年月日，额外 zone 参数不重新解释 Date。
+
+日期、格式化、解析和 parts 读取不消费输入；输出字符串与对象独立持有存储，原输入离开作用域后仍可使用。同步 native C 与解释器共用日期引擎；构建 native 日历程序时需要匹配目标的 calendar 静态包，链接后的程序不再依赖 SDK 或解释器。上述同步支持不扩大受限 native Task 的接口与跨 await 类型范围。
 
 示例：
 
@@ -1608,7 +1622,7 @@ fn main(): null! {
 }
 ```
 
-非法日期、非法时间、非法格式、非法时区和非法 duration 返回结构化 `Err({ domain:"time", code, message })`。`time.sleep` 在同步 main 中阻塞当前执行；在 async task 中会走 blocking worker，避免长时间占用 task worker。
+返回类型带 `!` 的重载遇到非法日期、时间、格式、时区或 duration 时返回结构化 `Err({ domain:"time", code, message })`；常见 code 为 `invalid_date`、`invalid_time`、`invalid_format`、`invalid_zone`。返回裸值的构造、运算或单参数读取接口不因此变成 Result，失败沿用运行错误，并按原有规则清理已持有的资源。只有 Result 使用 `?` 或 `try/catch`；不要给裸值调用添加 `?`。`time.sleep` 在同步 main 中阻塞当前执行；在 async task 中会走 blocking worker，避免长时间占用 task worker。
 
 ### 12.9 std.task 内部观测与压力测试
 

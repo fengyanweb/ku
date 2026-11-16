@@ -34,7 +34,13 @@ Current source supports synchronous `time.unix()` and `time.unix(time.instant())
 
 Synchronous time APIs also support `from_unix`, `from_millis`, `duration`, `add/sub/diff/compare`, `is_leap`, `days_in_month`, and integer/Duration `sleep`. Time and Duration have distinct tags. Conversion and arithmetic preserve their inputs; Duration is copyable and differences may be negative. `duration`, `days_in_month`, and `sleep` retain Result errors. Failures from bare-value constructors or arithmetic remain runtime errors and retire native frame owners before propagation. `from_unix` checks multiplication overflow; `from_millis` additionally validates the calendar range.
 
-`date`, `datetime`, `format`, `parse`, `parts`, and `weekday` are not yet connected to native C; use the interpreter or Runner for these APIs. Native Task time support remains limited to the existing integer-millisecond timer and does not automatically include these synchronous APIs.
+Current source also supports synchronous native C `date`, `datetime`, `format`, `parse`, `parts`, and `weekday`. The interpreter and native ABI share the pinned Chrono calendar engine. Building uses a static `native-calendar/v1/<target>/` pack matched to the CLI, target and source; no interpreter, Runner or auxiliary process executes these operations. The linked program does not require that pack, an SDK, rustc or Ku sources at runtime.
+
+Existing return conventions are preserved: `date()` returns Date; parameterized `date`, `datetime` and `parse` return Results. Single-argument `format(Time)`, `parts(Time)` and `weekday` return bare values, while format/zone overloads return Results. Bare-value failures remain runtime errors; Result failures retain the `time` error domain. Inputs remain readable and unchanged. Returned strings, Date and parts objects own their storage independently of inputs or temporary engine allocations. `SSS` means three millisecond digits; separators belong to the layout, so `ss.SSS` produces `00.123`.
+
+Zones remain local time, UTC and fixed offsets; no named-zone database is added. These are synchronous capabilities and do not expand native Task time calls or types that survive `await`. Target execution is recorded separately for this batch; cross-compilation alone does not establish a platform run.
+
+Synchronous arrays also gain native `concat`, `first` and `last`. `concat` returns an independently owned array. The static return type of `first/last` is `T | null`: empty arrays return null, and present results remain valid independently of the source array. Test `if (value != null)` before element operations. These are not Results and do not accept `?`. Inputs are neither modified nor consumed; this does not expand user borrowed-parameter support. See [array APIs](syntax.md#125-array).
 
 ## Capabilities added in current source
 
