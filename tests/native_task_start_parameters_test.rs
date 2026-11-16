@@ -68,6 +68,17 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                         map(task);
                     }
                 }
+                TaskOp::Collection {
+                    dst, source, other, ..
+                } => {
+                    map(dst);
+                    if let Some(source) = source {
+                        map(source);
+                    }
+                    if let Some(other) = other {
+                        map(other);
+                    }
+                }
                 TaskOp::ArrayMake { dst, elements } => {
                     map(dst);
                     for element in elements {

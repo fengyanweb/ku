@@ -3438,6 +3438,7 @@ fn main(): null! {
     println("native-time-duration-ok")
     return ok(null)
 }
+
 "#.replace("\\0", "\0")).expect("write time duration fixture");
     let Some(exe) = native_build(&dir, "main.ku", "time-duration") else {
         return;
@@ -3477,6 +3478,106 @@ int main(void) {{
         assert_eq!(run_binary(&exe).1, Some(0));
     }
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_calendar_overloads_keep_owned_outputs_and_calendar_errors() {
+    let dir = unique_temp_dir("calendar-contract");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    let source = r#"
+import time from "std.time"
+fn owned_text(): str! {
+    layout = "yyyy-MM-dd HH:mm:ss." + "SSS"
+    return time.format(time.from_millis(-1), layout, "utc")
+}
+fn main(): null! {
+    epoch = time.from_millis(0)
+    prior = time.from_millis(-1)
+    date = time.date(epoch, "utc")?
+    if (date.kind != "time.date" || date.year != 1970 || date.month != 1 || date.day != 1) fail "epoch date"
+    if (time.weekday(date) != 4 || time.weekday(epoch, "utc")? != 4) fail "weekday numbering"
+    if (time.weekday(date, "not-a-zone")? != 4) fail "Date ignores zone"
+    constructed = time.date(2000, 2, 29)?
+    if (constructed.day != 29 || time.weekday(constructed) != 2) fail "Gregorian date"
+    constructed.year += 4
+    previous_year = constructed.year
+    constructed.year++
+    constructed.day = 28
+    constructed.kind += ""
+    if (previous_year != 2004 || constructed.year != 2005 || time.weekday(constructed) != 1) fail "calendar field updates"
+    today = time.date()
+    local_date = time.date(epoch)?
+    if (today.month < 1 || today.month > 12 || local_date.day < 1) fail "local date"
+    local_parts = time.parts(epoch)
+    if (local_parts.zone != "local") fail "local parts zone"
+    formatted = time.format(epoch)
+    if (formatted.len() < 19) fail "default format"
+    local_text = time.format(epoch, "yyyy-MM-dd HH:mm:ss")?
+    local_roundtrip = time.parse(local_text)?
+    if (time.millis(local_roundtrip) != 0) fail "default parse local"
+    local_roundtrip2 = time.parse(local_text, "yyyy-MM-dd HH:mm:ss")?
+    if (time.millis(local_roundtrip2) != 0) fail "two-argument parse"
+    local_constructed = time.datetime(2000, 1, 1, 0, 0, 0)?
+    if (time.format(local_constructed, "yyyy-MM-dd")? != "2000-01-01") fail "local datetime"
+    fixed = time.datetime(1970, 1, 1, 8, 0, 0, "+08:00")?
+    if (time.millis(fixed) != 0 || time.millis(epoch) != 0) fail "fixed offset and input lifetime"
+    parts = time.parts(prior, "utc")?
+    if (parts.year != 1969 || parts.month != 12 || parts.day != 31 || parts.second != 59 || parts.millis != 999) fail "negative timestamp parts"
+    if (parts.zone != "utc" || parts.weekday != 3) fail "parts fields"
+    parts.hour -= 1
+    parts.zone += ""
+    if (parts.hour != 22 || parts.zone != "utc") fail "parts field updates"
+    next_day = time.parts(prior, "+08:00")?
+    if (next_day.year != 1970 || next_day.day != 1 || next_day.hour != 7) fail "offset crosses date"
+    if (owned_text()? != "1969-12-31 23:59:59.999") fail "owned format result"
+    layout = "中文🙂\0SSS"
+    text = time.format(prior, layout, "utc")?
+    if (text != "中文🙂\0999" || layout != "中文🙂\0SSS") fail "Unicode NUL or borrowed format input"
+    fractional = time.parse("1970-01-01 00:00:00.123", "yyyy-MM-dd HH:mm:ss.SSS", "utc")?
+    if (time.millis(fractional) != 123) fail "fractional parse"
+    caught = 0
+    try { invalid = time.date(1900, 2, 29)? } catch(e) { if(e.domain != "time" || e.code != "invalid_date") fail "date error"; caught += 1 }
+    try { invalid = time.datetime(2000, 1, 1, 24, 0, 0, "utc")? } catch(e) { caught += 1 }
+    try { invalid = time.format(epoch, "%Q", "utc")? } catch(e) { if(e.code != "invalid_format") fail "format error"; caught += 1 }
+    try { invalid = time.parts(epoch, "Asia/Shanghai")? } catch(e) { if(e.code != "invalid_zone") fail "zone error"; caught += 1 }
+    try { invalid = time.parse("1970-01-01tail", "yyyy-MM-dd", "utc")? } catch(e) { caught += 1 }
+    try { invalid = time.date(time.from_unix(9223372036854775), "utc")? } catch(e) { caught += 1 }
+    if (caught != 6) fail "missing calendar failure"
+    if (time.format(epoch, "yyyy", "utc")? != "1970") fail "valid call after errors"
+    println("native-calendar-ok")
+    return ok(null)
+}
+"#;
+    fs::write(dir.join("main.ku"), source.replace("\\0", "\0")).unwrap();
+    let generated = native_emit_c(&dir, "main.ku");
+    assert!(generated.contains("#define KU_FEATURE_NATIVE_CALENDAR 1"));
+    assert!(generated.contains("__ku_calendar_call_v1"));
+    assert!(generated.contains("__ku_calendar_release_v1"));
+    if env::var_os("KU_NATIVE_CALENDAR_PACK").is_none() {
+        eprintln!(
+            "calendar C emission checked; execution requires the matching private calendar pack"
+        );
+        return;
+    }
+    let executable = dir.join(exe_name("calendar"));
+    let built = run_bounded(
+        Command::new(ku_binary())
+            .current_dir(&dir)
+            .args(["build", "--backend", "c", "--release", "main.ku", "-o"])
+            .arg(&executable),
+        BUILD_TIMEOUT,
+        BUILD_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        built.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let (stdout, exit) = run_binary(&executable);
+    assert_eq!(exit, Some(0));
+    assert_eq!(stdout.replace('\r', ""), "native-calendar-ok\n");
 }
 
 #[test]
@@ -9779,4 +9880,38 @@ fn main(): null! {
     assert_eq!(code, Some(0));
 
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_calendar_output_allocation_failures_release_and_recover() {
+    if env::var_os("KU_NATIVE_CALENDAR_PACK").is_none() {
+        eprintln!("calendar output fault execution requires the matching private calendar pack");
+        return;
+    }
+    let dir = unique_temp_dir("calendar-output-oom");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    fs::write(
+        dir.join("main.ku"),
+        r#"
+import time from "std.time"
+fn main(): null! {
+    epoch=time.from_millis(0)
+    try { failed=time.parts(epoch,"utc")? println("unexpected-first-success") }
+    catch(error) { println(error.code) }
+    recovered=time.parts(epoch,"utc")?
+    println(recovered.year)
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let Some(exe) = native_build_with_object_oom_hook(&dir, "main.ku", "calendar-oom") else {
+        return;
+    };
+    for site in ["object_header", "object_entries", "string_clone"] {
+        let (stdout, stderr, code) = run_binary_with_object_oom(&exe, site, 1);
+        assert_eq!(code, Some(0), "{site}: {stderr}");
+        assert!(stderr.is_empty(), "{site}: {stderr}");
+        assert_eq!(stdout.replace('\r', ""), "out_of_memory\n1970\n", "{site}");
+    }
 }

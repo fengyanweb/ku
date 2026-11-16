@@ -100,3 +100,11 @@ Extract a new bundle into a separate empty directory, verify it, then switch PAT
 Missing matching compilers, linkers or target standard libraries need clear pre-compilation diagnostics. Finding `rustc` alone does not establish readiness. Restore a full verified bundle for missing/corrupt dependencies rather than copying one rlib from another version. If E0514 still occurs, retain detailed rustc errors and doctor identities for investigation; do not loop through compilers or increase timeouts.
 
 Subcommand help includes `ku help build`, `ku build --help` and `ku run --help` for public commands. Help exits without executing programs, initializing projects or building. Unknown commands/options fail. Existing `service` / `supervise` help remains available.
+
+## Native calendar library
+
+SDKs built from current source include a matching static calendar library, ABI header and license materials under `native-calendar/v1/<target>/`. The original public 0.0.20 packages do not contain these new files.
+
+The C backend uses this library to build `time.date/datetime/format/parse/parts/weekday`, sharing the interpreter's calendar engine without invoking an interpreter or helper process. Keep the complete SDK layout for automatic discovery; a Rust installation is not required to build these C programs. Missing packs and mismatched targets or source identities produce errors. Advanced use may set the absolute `KU_NATIVE_CALENDAR_PACK` path to a complete matching target pack.
+
+A linked executable no longer needs the SDK, Ku source or static archive at runtime. Other module dependencies remain separate, including database shared libraries. Programs that do not call these calendar APIs do not require the pack. Time zones are local time, UTC and fixed offsets; no named time-zone database is included.

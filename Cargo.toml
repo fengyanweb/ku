@@ -6,7 +6,7 @@ rust-version = "1.99.1"
 license = "Apache-2.0"
 
 [workspace]
-members = ["crates/ku-native-tls"]
+members = ["crates/ku-native-tls", "crates/ku-native-calendar"]
 resolver = "2"
 
 [dependencies]

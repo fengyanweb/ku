@@ -517,7 +517,10 @@ struct Manifest {
     license: FileDecl,
 }
 
-fn object<'a>(value: &'a Value, label: &str) -> Result<&'a HashMap<String, Value>, KuError> {
+pub(super) fn object<'a>(
+    value: &'a Value,
+    label: &str,
+) -> Result<&'a HashMap<String, Value>, KuError> {
     match value {
         Value::Object(fields) => Ok(fields),
         _ => Err(error(format!(
@@ -525,7 +528,7 @@ fn object<'a>(value: &'a Value, label: &str) -> Result<&'a HashMap<String, Value
         ))),
     }
 }
-fn text<'a>(fields: &'a HashMap<String, Value>, name: &str) -> Result<&'a str, KuError> {
+pub(super) fn text<'a>(fields: &'a HashMap<String, Value>, name: &str) -> Result<&'a str, KuError> {
     match fields.get(name) {
         Some(Value::String(value)) => Ok(value),
         _ => Err(error(format!(
@@ -541,7 +544,7 @@ fn require(fields: &HashMap<String, Value>, name: &str, expected: &str) -> Resul
     }
     Ok(())
 }
-fn keys(
+pub(super) fn keys(
     fields: &HashMap<String, Value>,
     required: &[&str],
     optional: &[&str],
@@ -557,7 +560,7 @@ fn keys(
     }
     Ok(())
 }
-fn sha256(text: &str) -> Result<[u8; 32], KuError> {
+pub(super) fn sha256(text: &str) -> Result<[u8; 32], KuError> {
     if text.len() != 64
         || !text
             .bytes()
@@ -708,7 +711,7 @@ fn parse_manifest(bytes: &[u8], codec: Codec, contract: Contract) -> Result<Mani
 /// Pack metadata instead requires unescaped ASCII keys and rejects duplicates
 /// before decoding, including in optional provenance objects. Values retain
 /// ordinary JSON escaping. This scanner does not replace JSON syntax checking.
-fn reject_duplicate_keys(bytes: &[u8]) -> Result<(), KuError> {
+pub(super) fn reject_duplicate_keys(bytes: &[u8]) -> Result<(), KuError> {
     enum Container {
         Object(HashSet<String>),
         Array,

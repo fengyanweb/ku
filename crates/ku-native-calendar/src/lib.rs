@@ -349,8 +349,8 @@ pub unsafe extern "C" fn __ku_calendar_call_v1(
 ) -> u32 {
     if input.is_null()
         || output.is_null()
-        || (input as usize) % align_of::<KuCalendarInputV1>() != 0
-        || (output as usize) % align_of::<KuCalendarOutputV1>() != 0
+        || !(input as usize).is_multiple_of(align_of::<KuCalendarInputV1>())
+        || !(output as usize).is_multiple_of(align_of::<KuCalendarOutputV1>())
     {
         return INVALID_ABI;
     }
@@ -417,7 +417,7 @@ pub unsafe extern "C" fn __ku_calendar_call_v1(
 /// Output is live, correctly sized, and unmodified since call_v1 or release_v1.
 /// A nonnull owner came from this library and has not been independently freed.
 pub unsafe extern "C" fn __ku_calendar_release_v1(output: *mut KuCalendarOutputV1) -> u32 {
-    if output.is_null() || (output as usize) % align_of::<KuCalendarOutputV1>() != 0 {
+    if output.is_null() || !(output as usize).is_multiple_of(align_of::<KuCalendarOutputV1>()) {
         return INVALID_ABI;
     }
     // SAFETY: The caller guarantees an initialized output object.
@@ -644,7 +644,7 @@ mod tests {
         request.text[1] = KuCalendarSliceV1::view(b"UTC");
         let mut out = KuCalendarOutputV1::empty();
         assert_eq!(call(&request, &mut out), OK);
-        assert_eq!(string(out.text), "前\01970-01-01后");
+        assert_eq!(string(out.text), "前\x001970-01-01后");
         release(&mut out);
         request.text[1] = KuCalendarSliceV1::view(b"UTC\0");
         assert_eq!(call(&request, &mut out), ERROR);

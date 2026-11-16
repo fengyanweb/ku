@@ -79,6 +79,7 @@ fn main() {
         "build_support/build_identity.rs".into(),
     ];
     files(&root, &root.join("src"), &mut sources);
+    files(&root, &root.join("crates/ku-native-calendar"), &mut sources);
     sources.sort();
     let mut hash = Sha256::new();
     for name in sources {

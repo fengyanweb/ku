@@ -1737,7 +1737,8 @@ fn main(): null! {
     );
 
     for zone in [
-        "中abc", "+é:00", "+00:é", "+00é0", "+24:00", "+00:60", "08:00", "+08-00",
+        "中abc", "+é:00", "+00:é", "+00é0", "+24:00", "+00:60", "08:00", "+08-00", "-00:-1",
+        "+00:-1", "++1:00",
     ] {
         let source = format!(
             "fn main(): null! {{ time.format(time.from_millis(0), \"yyyy\", {zone:?})? return ok(null) }}"
@@ -1892,6 +1893,7 @@ fn main(): null! {
     print(time.format(value))
     return ok(null)
 }
+
 "#;
     let err = run_source("inline.ku", source)
         .expect_err("out-of-range millis should be rejected")
@@ -1900,6 +1902,19 @@ fn main(): null! {
         err.contains("outside supported range"),
         "error should explain the range problem: {err}"
     );
+}
+
+#[test]
+fn std_time_bare_calendar_failures_are_errors_instead_of_hidden_results() {
+    // from_unix intentionally checks multiplication only. Calendar conversion
+    // has a narrower range, and bare overloads must fail at the call itself.
+    for operation in ["format", "parts", "weekday"] {
+        let source = format!(
+            "fn main() {{ value=time.from_unix(9223372036854775) ignored=time.{operation}(value) println(\"unreachable\") }}"
+        );
+        let error = run_err(&source);
+        assert!(error.contains("invalid_time"), "{operation}: {error}");
+    }
 }
 
 #[test]

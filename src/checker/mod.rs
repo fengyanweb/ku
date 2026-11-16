@@ -11126,6 +11126,26 @@ impl Default for Checker {
     }
 }
 
+fn calendar_date_type() -> Type {
+    Type::Object(HashMap::from([
+        ("kind".into(), Type::String),
+        ("year".into(), Type::Int),
+        ("month".into(), Type::Int),
+        ("day".into(), Type::Int),
+    ]))
+}
+
+fn calendar_parts_type() -> Type {
+    let Type::Object(mut fields) = calendar_date_type() else {
+        unreachable!()
+    };
+    for field in ["hour", "minute", "second", "millis", "weekday"] {
+        fields.insert(field.into(), Type::Int);
+    }
+    fields.insert("zone".into(), Type::String);
+    Type::Object(fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11480,24 +11500,4 @@ mod tests {
         }
         eprintln!("{COMPLETED}");
     }
-}
-
-fn calendar_date_type() -> Type {
-    Type::Object(HashMap::from([
-        ("kind".into(), Type::String),
-        ("year".into(), Type::Int),
-        ("month".into(), Type::Int),
-        ("day".into(), Type::Int),
-    ]))
-}
-
-fn calendar_parts_type() -> Type {
-    let Type::Object(mut fields) = calendar_date_type() else {
-        unreachable!()
-    };
-    for field in ["hour", "minute", "second", "millis", "weekday"] {
-        fields.insert(field.into(), Type::Int);
-    }
-    fields.insert("zone".into(), Type::String);
-    Type::Object(fields)
 }

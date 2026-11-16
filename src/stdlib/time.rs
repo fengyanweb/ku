@@ -96,7 +96,7 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
         }
         "date" => eval_date(args, span),
         "datetime" => eval_datetime(args, span),
-        "format" => eval_format(args, span),
+        "format" => eval_format(args, span)?,
         "parse" => eval_parse(args, span),
         "duration" => eval_duration(args, span),
         "add" => {
@@ -138,8 +138,8 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
                 std::cmp::Ordering::Greater => 1,
             })
         }
-        "parts" => eval_parts(args, span),
-        "weekday" => eval_weekday(args, span),
+        "parts" => eval_parts(args, span)?,
+        "weekday" => eval_weekday(args, span)?,
         "is_leap" => {
             expect_arg_count("time.is_leap", args.len(), 1, span)?;
             Value::Bool(is_leap_year(expect_int(&args[0], span)?))
@@ -238,17 +238,12 @@ fn eval_datetime(args: &[Value], span: Span) -> Value {
     })())
 }
 
-fn eval_format(args: &[Value], span: Span) -> Value {
-    match args.len() {
-        1 => match expect_time(&args[0], span) {
-            Ok(millis) => {
-                match calendar_result(calendar::format(millis, DEFAULT_LAYOUT, None), span) {
-                    Ok(text) => Value::String(text),
-                    Err(error) => result(Err(error)),
-                }
-            }
-            Err(error) => result(Err(error)),
-        },
+fn eval_format(args: &[Value], span: Span) -> KuResult<Value> {
+    Ok(match args.len() {
+        1 => Value::String(calendar_result(
+            calendar::format(expect_time(&args[0], span)?, DEFAULT_LAYOUT, None),
+            span,
+        )?),
         2 | 3 => result((|| {
             let millis = expect_time(&args[0], span)?;
             let layout = expect_str(&args[1], span)?;
@@ -268,7 +263,7 @@ fn eval_format(args: &[Value], span: Span) -> Value {
                 args.len()
             ),
         ))),
-    }
+    })
 }
 
 fn eval_parse(args: &[Value], span: Span) -> Value {
@@ -341,15 +336,12 @@ fn eval_duration(args: &[Value], span: Span) -> Value {
     })())
 }
 
-fn eval_parts(args: &[Value], span: Span) -> Value {
-    match args.len() {
-        1 => match expect_time(&args[0], span) {
-            Ok(millis) => match calendar_result(calendar::parts(millis, None), span) {
-                Ok(parts) => parts_value(parts),
-                Err(error) => result(Err(error)),
-            },
-            Err(error) => result(Err(error)),
-        },
+fn eval_parts(args: &[Value], span: Span) -> KuResult<Value> {
+    Ok(match args.len() {
+        1 => parts_value(calendar_result(
+            calendar::parts(expect_time(&args[0], span)?, None),
+            span,
+        )?),
         2 => result((|| {
             let millis = expect_time(&args[0], span)?;
             let zone = expect_str(&args[1], span)?;
@@ -365,15 +357,12 @@ fn eval_parts(args: &[Value], span: Span) -> Value {
                 args.len()
             ),
         ))),
-    }
+    })
 }
 
-fn eval_weekday(args: &[Value], span: Span) -> Value {
-    match args.len() {
-        1 => match weekday_value(&args[0], None, span) {
-            Ok(day) => Value::Int(day),
-            Err(err) => result(Err(err)),
-        },
+fn eval_weekday(args: &[Value], span: Span) -> KuResult<Value> {
+    Ok(match args.len() {
+        1 => Value::Int(weekday_value(&args[0], None, span)?),
         2 => result((|| {
             let zone = expect_str(&args[1], span)?;
             Ok(Value::Int(weekday_value(&args[0], Some(zone), span)?))
@@ -385,7 +374,7 @@ fn eval_weekday(args: &[Value], span: Span) -> Value {
                 args.len()
             ),
         ))),
-    }
+    })
 }
 
 fn now_millis(span: Span) -> KuResult<i64> {

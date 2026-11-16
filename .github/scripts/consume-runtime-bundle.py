@@ -578,6 +578,102 @@ fn main(): null! {
             cleanup.raise_if_any(primary)
 
 
+def installed_native_time_array_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False):
+    """Consume the target calendar pack from this final moved archive only.
+
+    The source exercises the public time and nullable array contracts as the native
+    integration suite. The resulting app must remain runnable after all source
+    and generated C are deleted and the complete installed SDK is unavailable.
+    """
+    detail = {'status': 'running', 'target': target,
+              'scope': 'installed archive -> Release C11 O2 -> moved source-free time/array executable',
+              'checkout_hidden_during_build': checkout_hidden, 'installed_packs': {},
+              'source_removed_before_run': False, 'sdk_unavailable_during_run': False,
+              'installation_restored': False, 'functional_check_passed': False}
+    report['installed_native_time_array'] = detail
+    leaf = install / 'native-calendar/v1' / target
+    if not (install / 'native-calendar').exists():
+        detail['status'] = 'not_in_archive'
+        write_report(report_path, report)
+        return
+    manifest = EXPORT.NATIVE_CALENDAR.validate_pack(leaf, target)
+    detail['installed_packs']['calendar'] = {
+        'build_id': manifest['build_id'], 'source_sha256': manifest['source_sha256'],
+        'manifest_sha256': EXPORT.file_hash(leaf / 'manifest.json'),
+        'archive_sha256': manifest['archive']['sha256']}
+    build_env = dict(env)
+    build_env.pop('KU_NATIVE_CALENDAR_PACK', None)
+    ku = install / ('ku.exe' if os.name == 'nt' else 'ku')
+    with tempfile.TemporaryDirectory(prefix='ku-installed-time-array-', dir=root) as temporary:
+        temporary = Path(temporary)
+        project = temporary / 'module build project 中文'
+        project.mkdir()
+        deployment = temporary / '搬迁 module program'
+        deployment.mkdir()
+        unrelated = temporary / 'unrelated working directory'
+        unrelated.mkdir()
+        source = project / 'main.ku'
+        fixture = Path(__file__).resolve().parents[2] / 'examples/native_time_array.ku'
+        source.write_text(fixture.read_text(encoding='utf-8'), encoding='utf-8')
+        detail['source_sha256'] = EXPORT.file_hash(source)
+        program = project / ('modules.exe' if os.name == 'nt' else 'modules')
+        retired = root / 'installed-sdk-unavailable-for-time-array'
+        installation_retired = False
+        primary = None
+        try:
+            built = invoke([ku, 'build', '--backend', 'c', '--release', '--verbose', source.name, '-o', program], project, build_env)
+            detail['build_exit'] = built.returncode
+            detail['build_stdout_sha256'] = hashlib.sha256(built.stdout).hexdigest()
+            detail['build_stderr_sha256'] = hashlib.sha256(built.stderr).hexdigest()
+            record_native_build_diagnostics(detail, built)
+            if built.returncode:
+                raise RuntimeError('installed archive native time-array build failed: ' + (output(built)+built.stderr.decode(errors='replace'))[-4000:])
+            assert_build_backend(built, 'c', 'release')
+            emitted = reported_artifact(output(built), 'native c ok: ', project, temporary)
+            generated = emitted.read_bytes()
+            for marker in (b'#define KU_FEATURE_NATIVE_CALENDAR 1', b'__ku_calendar_call_v1', b'__ku_array_first_', b'__ku_array_concat_'):
+                if marker not in generated:
+                    raise RuntimeError('installed module build is missing native implementation: ' + marker.decode())
+            detail['generated_c_sha256'] = EXPORT.file_hash(emitted)
+            detail['binary_sha256'] = EXPORT.file_hash(program)
+            deployed = deployment / program.name
+            shutil.move(str(program), str(deployed))
+            shutil.rmtree(project)
+            detail['source_removed_before_run'] = not project.exists()
+            if retired.exists():
+                raise RuntimeError('time-array SDK quarantine destination unexpectedly exists')
+            relocate_checkout_entry(install, retired)
+            installation_retired = True
+            detail['sdk_unavailable_during_run'] = not install.exists() and not ku.exists()
+            if not detail['source_removed_before_run'] or not detail['sdk_unavailable_during_run']:
+                raise RuntimeError('time-array execution still has its original source or SDK')
+            result = invoke([deployed], unrelated, build_env, seconds=15)
+            detail['run_exit'] = result.returncode
+            detail['run_stdout_sha256'] = hashlib.sha256(result.stdout).hexdigest()
+            detail['run_stderr_sha256'] = hashlib.sha256(result.stderr).hexdigest()
+            if result.returncode or output(result) != 'native-time-array-ok\n' or result.stderr:
+                raise RuntimeError('moved source-free installed time-array program returned an incorrect result or exit')
+            detail['binary_roundtrip'] = True
+            detail['unicode_roundtrip'] = True
+            detail['output_bound'] = True
+            detail['functional_check_passed'] = True
+        except BaseException as error:
+            primary = error
+        finally:
+            cleanup = OWNER.CleanupErrors()
+            if installation_retired:
+                if retired.is_dir() and not install.exists():
+                    cleanup.attempt('restore installed SDK after time-array run', lambda: relocate_checkout_entry(retired, install))
+                else:
+                    cleanup.add('SDK restore paths changed; existing paths left untouched')
+            detail['installation_restored'] = install.is_dir() and ku.is_file() and not retired.exists()
+            if not detail['installation_restored']:
+                cleanup.add('installed SDK restoration unconfirmed')
+            detail['status'] = 'passed' if primary is None and not cleanup.failed else 'failed'
+            write_report(report_path, report)
+            cleanup.raise_if_any(primary)
+
+
 def reported_artifact(text, prefix, cwd, owned_root):
     """Resolve CLI paths in its cwd and check actual directory identities.
 
@@ -1246,6 +1342,7 @@ def run(args, report):
                 build_run('source-and-target-unavailable', [], project / 'without-source', 'debug')
                 installed_native_tls_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
                 installed_native_compression_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
+                installed_native_time_array_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
             finally:
                 for old, destination in reversed(retired):
                     relocate_checkout_entry(destination, old)
@@ -1253,6 +1350,7 @@ def run(args, report):
             report["cases"].append({"name": "source-and-target-unavailable", "status": "not_requested_local;CI flag required"})
             installed_native_tls_consumer(install, root, env, report, args.output, target)
             installed_native_compression_consumer(install, root, env, report, args.output, target)
+            installed_native_time_array_consumer(install, root, env, report, args.output, target)
         exercise_cli_contracts()
         # Exercise the native path separately; it must not consume runner rlibs.
         success("native-doctor", ["doctor", "--backend", "c"])

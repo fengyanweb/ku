@@ -491,6 +491,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ku-native-calendar"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+]
+
+[[package]]
 name = "ku-native-tls"
 version = "0.1.0"
 dependencies = [

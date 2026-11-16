@@ -20,6 +20,8 @@ use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
 
+#[path = "cli_calendar.rs"]
+mod native_calendar;
 #[path = "cli_compression.rs"]
 mod native_compression;
 
@@ -2775,6 +2777,7 @@ struct CSourceFeatures {
     libpq: bool,
     libmysql: bool,
     native_tls: bool,
+    native_calendar: bool,
     zstd: bool,
     zlib: bool,
 }
@@ -2799,6 +2802,9 @@ impl CSourceFeatures {
             native_tls: text
                 .lines()
                 .any(|line| line == "#define KU_FEATURE_NATIVE_TLS 1"),
+            native_calendar: text
+                .lines()
+                .any(|line| line == "#define KU_FEATURE_NATIVE_CALENDAR 1"),
             zstd: text.lines().any(|line| line == "#define KU_FEATURE_ZSTD 1"),
             zlib: text.lines().any(|line| line == "#define KU_FEATURE_ZLIB 1"),
         })
@@ -5518,6 +5524,7 @@ fn verify_native_binary_dynamic_dependencies_file(
     if !features.libpq
         && !features.libmysql
         && !features.native_tls
+        && !features.native_calendar
         && !features.zstd
         && !features.zlib
     {
@@ -5547,6 +5554,13 @@ fn verify_native_binary_dynamic_dependencies_file(
             "linked output records a dynamic ku-native-tls dependency; the v1 contract requires the verified static archive"
                 .to_string(),
         );
+    }
+    if features.native_calendar
+        && names
+            .iter()
+            .any(|name| dynamic_dependency_is_native_calendar_library(name))
+    {
+        return Err("linked output records a dynamic native calendar dependency; the calendar contract requires the verified static archive".into());
     }
     if names
         .iter()
@@ -5651,6 +5665,25 @@ fn dynamic_dependency_is_native_tls_library(name: &[u8]) -> bool {
             || lower
                 .windows(b"ku-native-tls".len())
                 .any(|window| window == b"ku-native-tls"))
+}
+
+fn dynamic_dependency_is_native_calendar_library(name: &[u8]) -> bool {
+    let name = name
+        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .unwrap_or(name);
+    let lower = name.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    let dynamic_suffix = lower.ends_with(b".dll")
+        || lower.ends_with(b".dylib")
+        || lower.ends_with(b".so")
+        || lower.windows(4).any(|window| window == b".so.");
+    dynamic_suffix
+        && (lower
+            .windows(b"ku_native_calendar".len())
+            .any(|window| window == b"ku_native_calendar")
+            || lower
+                .windows(b"ku-native-calendar".len())
+                .any(|window| window == b"ku-native-calendar"))
 }
 
 fn dynamic_dependency_is_compression_library(name: &[u8], zstd: bool, zlib: bool) -> bool {
@@ -6914,6 +6947,7 @@ fn compile_c_source_with_output(
     validate_c_target_features(features, target)?;
     let needs_native_tls = features.native_tls;
     let needs_compression = features.zstd || features.zlib;
+    let needs_calendar = features.native_calendar;
     validate_native_tls_link_mode(needs_native_tls, static_link)?;
     let native_tls_root = needs_native_tls
         .then(|| resolve_native_tls_pack_root(env::var_os("KU_NATIVE_TLS_PACK")))
@@ -7012,7 +7046,7 @@ fn compile_c_source_with_output(
             && candidate.kind == CCompilerKind::Clang;
         let needs_native_tls_probe = needs_native_tls
             && (target.is_none() || candidate.kind == CCompilerKind::Preconfigured);
-        let needs_compression_probe = needs_compression
+        let needs_compression_probe = (needs_compression || needs_calendar)
             && (target.is_none() || candidate.kind == CCompilerKind::Preconfigured);
         let probed_compiler_target = if declared_target.is_none()
             && (needs_database_clang_probe || needs_native_tls_probe || needs_compression_probe)
@@ -7077,6 +7111,28 @@ fn compile_c_source_with_output(
             });
             match resolved {
                 Ok(inputs) => Some(inputs),
+                Err(error) => {
+                    if candidate.explicitly_configured {
+                        return Err(error);
+                    }
+                    compiler_failures.push(format!("{}: {error}", candidate.label));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let staged_calendar = if needs_calendar {
+            let resolved = native_compression::compiler_target(
+                native_output_target
+                    .as_ref()
+                    .expect("validated calendar target"),
+                effective_native_target,
+                &candidate.label,
+            )
+            .and_then(|selected| native_calendar::resolve(&selected, static_link));
+            match resolved {
+                Ok(pack) => Some(pack),
                 Err(error) => {
                     if candidate.explicitly_configured {
                         return Err(error);
@@ -7267,8 +7323,8 @@ fn compile_c_source_with_output(
         if needs_native_tls {
             command.arg("-DKU_NATIVE_TLS_ENABLED=1");
         }
-        let msvc_dynamic_crt = compression_inputs.as_ref().and_then(|inputs| inputs.abi)
-            == Some("msvc")
+        let msvc_dynamic_crt = staged_calendar.as_ref().is_some_and(|pack| pack.msvc)
+            || compression_inputs.as_ref().and_then(|inputs| inputs.abi) == Some("msvc")
             || native_tls_pack
                 .as_ref()
                 .is_some_and(|pack| pack.contract.crt == "msvc-dynamic");
@@ -7313,6 +7369,15 @@ fn compile_c_source_with_output(
         if let Some(compression) = &staged_compression {
             for archive in &compression.archives {
                 command.arg(strip_verbatim(archive.path()));
+            }
+        }
+        if let Some(calendar) = &staged_calendar {
+            command.arg(strip_verbatim(calendar.archive.path()));
+            for library in &calendar.libraries {
+                if calendar.msvc {
+                    command.arg("-Xlinker");
+                }
+                command.arg(library);
             }
         }
         if verbose {
@@ -7465,6 +7530,13 @@ fn compile_c_source_with_output(
                 } else { None };
                 let staged_msvc_compression = msvc_compression_inputs.as_ref()
                     .map(native_compression::CompressionInputs::stage_for_link).transpose()?;
+                let staged_msvc_calendar = if needs_calendar {
+                    let selected = native_compression::compiler_target(
+                        native_output_target.as_ref().expect("validated MSVC calendar target"),
+                        Some("x86_64-pc-windows-msvc"), "cl (MSVC)",
+                    )?;
+                    Some(native_calendar::resolve(&selected, static_link)?)
+                } else { None };
                 let libpq_requirement = msvc_libpq_library
                     .as_ref()
                     .map(|library| {
@@ -7499,6 +7571,7 @@ fn compile_c_source_with_output(
                             }
                         }),
                         compression: staged_msvc_compression.as_ref(),
+                        calendar: staged_msvc_calendar.as_ref(),
                     },
                     MsvcCompileOptions {
                         quiet_stdout,
@@ -7847,6 +7920,7 @@ struct MsvcDatabaseLinks<'a> {
     libmysql_family: Option<MysqlClientFamily>,
     native_tls: Option<MsvcNativeTlsLink<'a>>,
     compression: Option<&'a native_compression::StagedCompressionInputs>,
+    calendar: Option<&'a native_calendar::StagedCalendarInputs>,
 }
 
 #[derive(Clone, Copy)]
@@ -7895,7 +7969,10 @@ fn compile_with_msvc(
     if let Some(opt) = options.profile.msvc_opt_flag() {
         command.arg(opt);
     }
-    if database.native_tls.is_some() || database.compression.is_some() {
+    if database.native_tls.is_some()
+        || database.compression.is_some()
+        || database.calendar.is_some()
+    {
         // Verified native packs are built against the dynamic MSVC CRT. Make the
         // choice explicit so a project-wide default cannot silently mix CRTs.
         command.arg("/MD");
@@ -7940,6 +8017,7 @@ fn compile_with_msvc(
         || database.libmysql.is_some()
         || database.native_tls.is_some()
         || database.compression.is_some()
+        || database.calendar.is_some()
     {
         command.arg("/link");
         if let Some(library) = database.libpq {
@@ -7962,6 +8040,12 @@ fn compile_with_msvc(
             }
             command.arg(strip_verbatim(native_tls.archive));
             for library in native_tls.native_libraries {
+                command.arg(library);
+            }
+        }
+        if let Some(calendar) = database.calendar {
+            command.arg(strip_verbatim(calendar.archive.path()));
+            for library in &calendar.libraries {
                 command.arg(library);
             }
         }
@@ -14147,6 +14231,85 @@ fn Zip(): null! { input=bytes.from_array([1])? gzip.compress(input,100)? return 
         ] {
             assert!(
                 !dynamic_dependency_is_compression_library(name.as_bytes(), true, true),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn calendar_dynamic_sidecars_are_rejected_in_all_output_formats() {
+        let directory = TempBuildDir::create_private("calendar-loader-test").unwrap();
+        let features = CSourceFeatures {
+            native_calendar: true,
+            ..CSourceFeatures::default()
+        };
+        let fixtures = [
+            (
+                "x86_64-linux",
+                dependency_elf(&["libc.so.6", "libku_native_calendar.so.1"]),
+                dependency_elf(&["libc.so.6"]),
+            ),
+            (
+                "x86_64-windows",
+                dependency_pe(&["KERNEL32.dll", "ku_native_calendar.dll"]),
+                dependency_pe(&["KERNEL32.dll", "VCRUNTIME140.dll"]),
+            ),
+            (
+                "aarch64-darwin",
+                dependency_macho(&[
+                    "/usr/lib/libSystem.B.dylib",
+                    "@rpath/libku_native_calendar.dylib",
+                ]),
+                dependency_macho(&["/usr/lib/libSystem.B.dylib"]),
+            ),
+        ];
+        for (slug, rejected, accepted) in fixtures {
+            let target = resolve_build_target(Some(slug)).unwrap().unwrap();
+            let file = directory.path().join(slug);
+            fs::write(&file, rejected).unwrap();
+            let mut opened = fs::File::open(&file).unwrap();
+            let length = opened.metadata().unwrap().len();
+            let error = verify_native_binary_dynamic_dependencies_file(
+                &mut opened,
+                length,
+                &target,
+                features,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains("dynamic native calendar"), "{error}");
+            drop(opened);
+            fs::write(&file, accepted).unwrap();
+            let mut opened = fs::File::open(&file).unwrap();
+            let length = opened.metadata().unwrap().len();
+            verify_native_binary_dynamic_dependencies_file(
+                &mut opened,
+                length,
+                &target,
+                features,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        for name in [
+            "KU_NATIVE_CALENDAR.DLL",
+            "libku-native-calendar.so.1",
+            "@rpath/libku_native_calendar.dylib",
+        ] {
+            assert!(
+                dynamic_dependency_is_native_calendar_library(name.as_bytes()),
+                "{name}"
+            );
+        }
+        for name in [
+            "libku_native_calendar.a",
+            "ku_native_calendar.lib",
+            "libc.so.6",
+        ] {
+            assert!(
+                !dynamic_dependency_is_native_calendar_library(name.as_bytes()),
                 "{name}"
             );
         }

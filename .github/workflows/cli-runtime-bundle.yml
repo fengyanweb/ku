@@ -107,6 +107,8 @@ jobs:
           if ($LASTEXITCODE) { throw 'Rust formatting failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN clippy --locked --workspace --all-targets -- -D warnings
           if ($LASTEXITCODE) { throw 'Workspace check/clippy failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked -p ku-native-calendar
+          if ($LASTEXITCODE) { throw 'Native calendar engine/ABI contracts failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN build --locked --lib --bin ku
           if ($LASTEXITCODE) { throw 'Matching source CLI/library build failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test cli_v002_test -- --test-threads=1
@@ -138,6 +140,7 @@ jobs:
           & clang --version
           if ($LASTEXITCODE) { throw 'The existing clang driver is required by the native C harnesses' }
           $env:KU_CC = 'clang -O2'
+          $env:KU_NATIVE_CALENDAR_PACK = Join-Path (Get-Location) 'release/${{ matrix.target }}/native-calendar/v1/${{ matrix.target }}'
           $packs = Join-Path $env:KU_NATIVE_COMPRESSION_ROOT 'native-compression/v1/${{ matrix.target }}'
           $env:KU_ZSTD_LIB = Join-Path $packs 'zstd/lib'
           $env:KU_ZSTD_INCLUDE = Join-Path $packs 'zstd/include'
@@ -145,6 +148,28 @@ jobs:
           $env:KU_ZLIB_INCLUDE = Join-Path $packs 'zlib/include'
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_http_status_test --test native_loop_control_test --test native_unicode_string_test --test native_compression_test -- --test-threads=1
           if ($LASTEXITCODE) { throw 'Native HTTP/loop/Unicode/codec contracts failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_collection_test -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Native collection/nullable contracts failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_task_adapter_test native_task_nullable_array_owners_release_after_cancel_oom_and_budget_failure -- --exact --test-threads=1
+          if ($LASTEXITCODE) { throw 'Task nullable cancellation/allocation/budget cleanup failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_run_test native_time -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Native previous time module contracts failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_run_test native_calendar -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Native calendar module contracts failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_http_test native_calendar -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Native calendar HTTP recovery failed' }
+          if (-not $IsWindows) {
+            $normalCompiler = $env:KU_CC
+            try {
+              $env:KU_CC = 'clang -O2 -fsanitize=address,undefined -fno-omit-frame-pointer'
+              cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_collection_test nullable -- --test-threads=1
+              if ($LASTEXITCODE) { throw 'Nullable ASan/UBSan cleanup failed' }
+              cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_task_adapter_test native_task_nullable_array_owners_release_after_cancel_oom_and_budget_failure -- --exact --test-threads=1
+              if ($LASTEXITCODE) { throw 'Task nullable ASan/UBSan cleanup failed' }
+              cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_run_test native_calendar -- --test-threads=1
+              if ($LASTEXITCODE) { throw 'Calendar ASan/UBSan cleanup failed' }
+            } finally { $env:KU_CC = $normalCompiler }
+          }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_compression_test native_compression_public_project_runs_outside_source_with_space_and_unicode -- --ignored --exact --test-threads=1
           if ($LASTEXITCODE) { throw 'Actual public three-codec C11 O2 project failed' }
           if (-not $IsWindows) {
@@ -187,6 +212,8 @@ jobs:
           if ($archive.Count -ne 1) { throw 'Expected exactly one same-batch installer' }
           & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --archive $archive[0].FullName --manifest ($archive[0].FullName + '.manifest.json') --repo . --output "$env:RUNNER_TEMP/cli-consumer-evidence.json" --consumer-toolchain 1.96.0 --hide-checkout --installer-run $env:INSTALLER_RUN_ID --expected-sdk-commit $env:SDK_SOURCE_COMMIT
           if ($LASTEXITCODE) { throw 'Installed SDK verification failed' }
+          $installed = Get-Content -LiteralPath "$env:RUNNER_TEMP/cli-consumer-evidence.json" -Raw | ConvertFrom-Json
+          if ($installed.installed_native_time_array.status -ne 'passed') { throw 'This SDK must include and actually execute the matching native calendar/array modules' }
       - name: Prepare the existing PostgreSQL fixture tools on Linux
         if: runner.os == 'Linux'
         shell: bash
@@ -282,7 +309,7 @@ jobs:
           $path = Join-Path $env:RUNNER_TEMP 'cli-consumer-evidence.json'
           if (Test-Path -LiteralPath $path) {
             $evidence = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-            $native = [ordered]@{target='${{ matrix.target }}'; installed_native_tls=$evidence.installed_native_tls; installed_native_compression=$evidence.installed_native_compression}
+            $native = [ordered]@{target='${{ matrix.target }}'; installed_native_tls=$evidence.installed_native_tls; installed_native_compression=$evidence.installed_native_compression; installed_native_time_array=$evidence.installed_native_time_array}
             $text = ConvertTo-Json -InputObject $native -Depth 8 -Compress
             if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 32768) { throw 'Native consumer metadata exceeds summary bound' }
             Write-Output $text

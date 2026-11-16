@@ -837,6 +837,26 @@ fn task_stress_pattern() -> TypePattern {
     ])
 }
 
+fn calendar_date_pattern() -> TypePattern {
+    TypePattern::ObjectFields(vec![
+        ("kind".into(), TypePattern::String),
+        ("year".into(), TypePattern::Int),
+        ("month".into(), TypePattern::Int),
+        ("day".into(), TypePattern::Int),
+    ])
+}
+
+fn calendar_parts_pattern() -> TypePattern {
+    let TypePattern::ObjectFields(mut fields) = calendar_date_pattern() else {
+        unreachable!()
+    };
+    for name in ["hour", "minute", "second", "millis", "weekday"] {
+        fields.push((name.into(), TypePattern::Int));
+    }
+    fields.push(("zone".into(), TypePattern::String));
+    TypePattern::ObjectFields(fields)
+}
+
 #[cfg(test)]
 mod borrow_tests {
     use super::*;
@@ -912,24 +932,4 @@ mod borrow_tests {
         assert!(!supports_borrowed_call("array.first"));
         assert!(!supports_borrowed_call("unregistered"));
     }
-}
-
-fn calendar_date_pattern() -> TypePattern {
-    TypePattern::ObjectFields(vec![
-        ("kind".into(), TypePattern::String),
-        ("year".into(), TypePattern::Int),
-        ("month".into(), TypePattern::Int),
-        ("day".into(), TypePattern::Int),
-    ])
-}
-
-fn calendar_parts_pattern() -> TypePattern {
-    let TypePattern::ObjectFields(mut fields) = calendar_date_pattern() else {
-        unreachable!()
-    };
-    for name in ["hour", "minute", "second", "millis", "weekday"] {
-        fields.push((name.into(), TypePattern::Int));
-    }
-    fields.push(("zone".into(), TypePattern::String));
-    TypePattern::ObjectFields(fields)
 }

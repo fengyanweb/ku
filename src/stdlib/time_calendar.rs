@@ -377,7 +377,11 @@ fn parse_fixed_offset(zone: &str) -> Option<FixedOffset> {
         b'-' => -1,
         _ => return None,
     };
-    if bytes[3] != b':' {
+    if bytes[3] != b':'
+        || ![1, 2, 4, 5]
+            .iter()
+            .all(|index| bytes[*index].is_ascii_digit())
+    {
         return None;
     }
     let hours = zone[1..3].parse::<i32>().ok()?;
@@ -458,11 +462,11 @@ mod tests {
         let layout = "中文\0yyyy-MM-dd HH:mm:ss.SSS %G-W%V-%u %:z %%";
         assert_eq!(
             format(123, layout, Some("+08:00")).unwrap(),
-            "中文\01970-01-01 08:00:00.123 1970-W01-4 +08:00 %"
+            "中文\x001970-01-01 08:00:00.123 1970-W01-4 +08:00 %"
         );
         let layout = "前\0yyyy-MM-dd HH:mm:ss.SSS后";
         let encoded = format(123, layout, Some("UTC")).unwrap();
-        assert_eq!(encoded, "前\01970-01-01 00:00:00.123后");
+        assert_eq!(encoded, "前\x001970-01-01 00:00:00.123后");
         assert_eq!(parse(&encoded, layout, Some("UTC")).unwrap(), 123);
         assert_eq!(chrono_layout("MMm yyyy SSS").unwrap(), "%%M %Y %3f");
     }
@@ -527,7 +531,17 @@ mod tests {
                 "invalid_format"
             );
         }
-        for zone in ["Europe/Paris", "+24:00", "+08:60", "+08", "+é:00", "UTC\0"] {
+        for zone in [
+            "Europe/Paris",
+            "+24:00",
+            "+08:60",
+            "+08",
+            "+é:00",
+            "UTC\0",
+            "-00:-1",
+            "+00:-1",
+            "++1:00",
+        ] {
             assert_eq!(parts(0, Some(zone)).unwrap_err().code, "invalid_zone");
         }
         assert_eq!(

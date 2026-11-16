@@ -3111,6 +3111,67 @@ fn native_cooperative_handler_timeout_returns_504_and_server_stays_up() {
     assert_status(&after_map, "HTTP/1.1 200 OK");
 }
 
+#[test]
+fn native_calendar_errors_retire_request_and_allow_next_request() {
+    if env::var_os("KU_NATIVE_CALENDAR_PACK").is_none() {
+        eprintln!("calendar HTTP execution requires the matching private calendar pack");
+        return;
+    }
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = r#"
+import {http,time} from "std"
+fn Invalid(): HttpResponse! {
+    layout="owned-"+"%Q"
+    invalid=time.format(time.from_millis(0),layout,"utc")?
+    return ok(http.text("unreachable"))
+}
+fn Fatal(): HttpResponse {
+    owner=["owned"+" payload"]
+    invalid=time.parts(time.from_unix(9223372036854775))
+    return http.text("unreachable")
+}
+fn Valid(): HttpResponse! {
+    date=time.date(time.from_millis(0),"utc")?
+    body=time.format(time.from_millis(-1),"yyyy-MM-dd HH:mm:ss.SSS","utc")?
+    if (date.year != 1970) fail "wrong date"
+    return ok(http.text(body))
+}
+fn main():null! {
+    app=http.server({max_connections:4,max_active_requests:1,max_pending_requests:2})
+    app.get("/invalid",Invalid) app.get("/fatal",Fatal) app.get("/valid",Valid)
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let address = unused_local_address();
+    let Some(mut server) = spawn_finite_native_server("calendar-recovery", source, &address, 4)
+    else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for (path, status) in [
+        ("/invalid", "HTTP/1.1 500 Internal Server Error"),
+        ("/valid", "HTTP/1.1 200 OK"),
+        ("/fatal", "HTTP/1.1 500 Internal Server Error"),
+        ("/valid", "HTTP/1.1 200 OK"),
+    ] {
+        let response = http_response(
+            &address,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+            Duration::from_secs(3),
+        );
+        assert_status(&response, status);
+        if path == "/valid" {
+            assert!(response.ends_with("1969-12-31 23:59:59.999"), "{response}");
+        } else {
+            assert!(!response.contains("unreachable"));
+        }
+    }
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
+}
+
 // A timed-out handler enters `finally`, but cleanup code is still user code and
 // can itself fail to terminate. The native runtime must bound that cleanup so a
 // single request cannot pin the only active-request permit forever.

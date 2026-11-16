@@ -1,0 +1,52 @@
+import time from "std.time"
+
+fn head(values: [str]): str | null {
+    return values.first()
+}
+
+fn main(): null! {
+    epoch = time.from_millis(0)
+    prior = time.from_millis(-1)
+    parts = time.parts(prior, "utc")?
+    if (parts.year != 1969 || parts.month != 12 || parts.day != 31 || parts.millis != 999) {
+        fail "negative timestamp"
+    }
+    date = time.date(epoch, "+08:00")?
+    if (date.year != 1970 || date.month != 1 || date.day != 1 || time.weekday(date) != 4) {
+        fail "date or weekday"
+    }
+    leap = time.datetime(2000, 2, 29, 23, 59, 59, "utc")?
+    text = time.format(leap, "yyyy-MM-dd HH:mm:ss", "utc")?
+    if (text != "2000-02-29 23:59:59") fail "format"
+    parsed = time.parse(text, "yyyy-MM-dd HH:mm:ss", "utc")?
+    if (time.millis(parsed) != time.millis(leap)) fail "parse"
+    if (time.format(prior, "ss.SSS", "utc")? != "59.999") fail "milliseconds"
+    caught = 0
+    try { invalid = time.datetime(1900, 2, 29, 0, 0, 0, "utc")? } catch (e) { caught += 1 }
+    try { invalid = time.format(epoch, "%Q", "utc")? } catch (e) { caught += 1 }
+    try { invalid = time.parts(epoch, "not-a-zone")? } catch (e) { caught += 1 }
+    try { invalid = time.parse("1970-01-01tail", "yyyy-MM-dd", "utc")? } catch (e) { caught += 1 }
+    if (caught != 4) fail "error handling"
+    valid_parts = time.parts(epoch, "utc")?
+    if (valid_parts.year != 1970) fail "valid call after error"
+
+    values = ["Ku" + "!", ""]
+    combined = values.concat(["中文🙂"])
+    first = values.first()
+    returned = head(["function result"])
+    if (returned == null) fail "function return"
+    if (returned != "function result") fail "function result lifetime"
+    last = combined.last()
+    if (first == null || last == null) fail "nonempty array"
+    if (first != "Ku!" || last != "中文🙂") fail "array result"
+    if (values.len() != 2 || combined.len() != 3) fail "concat consumed input"
+    empty: [str] = []
+    if (head([]) != null || empty.last() != null) fail "empty array"
+    zero = [0].first()
+    falsity = [false].last()
+    blank = [""].first()
+    if (zero == null || falsity == null || blank == null) fail "null tag"
+    if (zero != 0 || falsity != false || blank != "") fail "zero values"
+    println("native-time-array-ok")
+    return ok(null)
+}
