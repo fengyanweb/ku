@@ -11,6 +11,22 @@ pub(super) fn string_like(ty: &TaskSlotType) -> bool {
 }
 
 impl FunctionLowerer<'_> {
+    pub(super) fn end_nullable_view(&mut self, view: SlotId) -> KuResult<()> {
+        if self.nullable_views.remove(&view).is_some()
+            && matches!(
+                self.function.slots[view.0].ty,
+                TaskSlotType::Value { borrowed: true, .. }
+            )
+        {
+            self.emit(TaskOp::Collection {
+                dst: view,
+                source: Some(view),
+                other: None,
+                operation: TaskCollectionOperation::NullableViewEnd,
+            })?;
+        }
+        Ok(())
+    }
     pub(super) fn nullable_argument_matches(
         &self,
         source: SlotId,

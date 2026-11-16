@@ -78,6 +78,14 @@ pub(super) fn validate_views(function: &TaskFunction, budget: &mut Budget) -> Ku
             }
             if let TaskOp::Collection {
                 dst,
+                operation: TaskCollectionOperation::NullableViewEnd,
+                ..
+            } = operation
+            {
+                live_views.remove(dst);
+            }
+            if let TaskOp::Collection {
+                dst,
                 source: Some(owner),
                 operation: TaskCollectionOperation::NullableView,
                 ..

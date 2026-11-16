@@ -733,6 +733,7 @@ impl<'a> FunctionLowerer<'a> {
                     unreachable!()
                 };
                 let destination = self.slot(value_slot(ty))?;
+                self.end_nullable_view(source)?;
                 self.emit(TaskOp::Collection {
                     dst: destination,
                     source: Some(owner),
@@ -1227,6 +1228,7 @@ impl<'a> FunctionLowerer<'a> {
                     src: source,
                 })?;
             }
+            self.end_nullable_view(source)?;
             left
         } else {
             source
@@ -1250,6 +1252,8 @@ impl<'a> FunctionLowerer<'a> {
             left,
             right,
         })?;
+        self.end_nullable_view(left)?;
+        self.end_nullable_view(right)?;
         if temporary_left || snapshot {
             self.emit(TaskOp::Drop { slot: left })?;
         }
@@ -1275,6 +1279,7 @@ impl<'a> FunctionLowerer<'a> {
             dst: left,
             src: source,
         })?;
+        self.end_nullable_view(source)?;
         if temporary_left {
             self.emit(TaskOp::Drop { slot: source })?;
         }
@@ -1298,6 +1303,7 @@ impl<'a> FunctionLowerer<'a> {
             left,
             right,
         })?;
+        self.end_nullable_view(right)?;
         // This owner is a lowering-only snapshot. Both input expressions retain
         // their ordinary ownership, including any explicit move in the RHS.
         self.emit(TaskOp::Drop { slot: left })?;
@@ -1625,6 +1631,7 @@ impl<'a> FunctionLowerer<'a> {
                     bytes: name == "byte_len",
                 }
             })?;
+            self.end_nullable_view(source)?;
             // Anonymous receivers have completed their last View use. Clear
             // them here, including in a loop condition reusing the same slots.
             // Named variables retain their existing owner and lexical lifetime.
@@ -2324,6 +2331,7 @@ impl<'a> FunctionLowerer<'a> {
                 value,
                 newline: name == "println",
             })?;
+            self.end_nullable_view(value)?;
             if !matches!(&args[0].kind, ExprKind::Variable(_))
                 && owned_value(&self.function.slots[value.0].ty)
             {
@@ -2403,6 +2411,7 @@ impl<'a> FunctionLowerer<'a> {
         }
         let dst = self.slot(value_slot(IrType::Str))?;
         self.emit(TaskOp::PrimitiveString { dst, src: source })?;
+        self.end_nullable_view(source)?;
         if !matches!(&args[0].kind, ExprKind::Variable(_))
             && owned_value(&self.function.slots[source.0].ty)
         {
@@ -3151,7 +3160,10 @@ impl<'a> FunctionLowerer<'a> {
                             continue;
                         }
                     }
-                    let source = self.expression(value, depth)?;
+                    let mut source = self.expression(value, depth)?;
+                    if self.nullable_views.contains_key(&source) {
+                        source = self.copy_or_move(source)?;
+                    }
                     let error = if self.function.slots[source.0].ty == value_slot(IrType::Str) {
                         let error = self.slot(value_slot(super::error_ir_type()))?;
                         self.emit(TaskOp::MakeError {
@@ -3178,6 +3190,7 @@ impl<'a> FunctionLowerer<'a> {
                         value: slot,
                         newline: false,
                     })?;
+                    self.end_nullable_view(slot)?;
                     if temporary && owned_value(&self.function.slots[slot.0].ty) {
                         self.emit(TaskOp::Drop { slot })?;
                     }
@@ -3192,6 +3205,7 @@ impl<'a> FunctionLowerer<'a> {
                         self.emit(TaskOp::Drop { slot: value })?;
                     } else {
                         self.emit(TaskOp::Read { slot: value })?;
+                        self.end_nullable_view(value)?;
                     }
                 }
                 _ => return Err(unsupported("this statement in a native Task", self.span)),

@@ -155,6 +155,7 @@ pub enum TaskCollectionOperation {
     NullableSome,
     NullableClone,
     NullableView,
+    NullableViewEnd,
     NullableTake,
     NullableIsNull,
 }
@@ -1125,7 +1126,9 @@ fn validate_shape(
                     operation: kind,
                 } => {
                     has_error_projection |= requires_string_allocation_host(operation);
-                    if source == &Some(*dst) || other == &Some(*dst) {
+                    if (source == &Some(*dst) && *kind != TaskCollectionOperation::NullableViewEnd)
+                        || other == &Some(*dst)
+                    {
                         return Err(invalid("collection destination aliases input"));
                     }
                     let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
@@ -1152,6 +1155,13 @@ fn validate_shape(
                         }
                         TaskCollectionOperation::NullableView => {
                             matches!(source, Some((IrType::Nullable(inner),false)) if destination == inner.as_ref() && destination_borrowed == !copy_type(inner) && other.is_none())
+                        }
+                        TaskCollectionOperation::NullableViewEnd => {
+                            matches!(source, Some((IrType::Str, true)))
+                                && destination == &IrType::Str
+                                && destination_borrowed
+                                && other.is_none()
+                                && matches!(operation, TaskOp::Collection {source:Some(source),..} if source==dst)
                         }
                         TaskCollectionOperation::NullableTake => {
                             matches!(source, Some((IrType::Nullable(inner),false)) if destination == inner.as_ref() && !destination_borrowed && other.is_none())
@@ -2389,6 +2399,10 @@ impl ScopeLayout {
 /// Exhaustive: adding an owner-producing operation must update this selection.
 fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
     match operation {
+        TaskOp::Collection {
+            operation: TaskCollectionOperation::NullableViewEnd,
+            ..
+        } => None,
         TaskOp::Collection { dst, .. }
         | TaskOp::Init { dst, .. }
         | TaskOp::InitCallable { dst, .. }
@@ -2759,6 +2773,14 @@ struct Initialized {
 
 fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initialized {
     match operation {
+        TaskOp::Collection {
+            dst,
+            operation: TaskCollectionOperation::NullableViewEnd,
+            ..
+        } => {
+            state.must &= !bit(*dst);
+            state.may &= !bit(*dst);
+        }
         TaskOp::Collection {
             dst,
             source: Some(source),
