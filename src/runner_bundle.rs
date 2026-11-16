@@ -1345,7 +1345,13 @@ mod tests {
         b.commit_hash = "f".repeat(40);
         assert!(!a.compatible(&b));
         b = a.clone();
-        b.host = "x86_64-pc-windows-gnu".into();
+        b.host = if a.host == "x86_64-pc-windows-gnu" {
+            "x86_64-pc-windows-msvc"
+        } else {
+            "x86_64-pc-windows-gnu"
+        }
+        .into();
+        assert_ne!(a.host, b.host, "the fixture must select a different ABI");
         assert!(!a.compatible(&b));
         b = a.clone();
         b.release = "1.96.0".into();

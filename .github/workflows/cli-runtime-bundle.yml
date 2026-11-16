@@ -128,6 +128,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
+      - name: Build the real GNU installer before its contract consumers
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        shell: pwsh
+        run: pwsh -NoLogo -NoProfile -NonInteractive -File scripts/package-release.ps1 -Target '${{ matrix.target }}'
       - name: Check the CLI and manifest contracts
         shell: pwsh
         run: |
@@ -155,6 +159,7 @@ jobs:
           & ${{ matrix.python }} -B .github/scripts/test-prepare-release.py
           if ($LASTEXITCODE) { throw 'Final release/transfer contract tests failed' }
       - name: Build the real isolated same-batch installer tree
+        if: matrix.target != 'x86_64-pc-windows-gnu'
         shell: pwsh
         run: pwsh -NoLogo -NoProfile -NonInteractive -File scripts/package-release.ps1 -Target '${{ matrix.target }}'
       - name: Verify native HTTP, loop, Unicode and codec contracts with C11 O2
