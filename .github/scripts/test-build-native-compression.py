@@ -57,10 +57,87 @@ class CompressionPackTests(unittest.TestCase):
                 output.addfile(member, io.BytesIO(contents))
         return path
 
-    def pinned_fixture(self, path):
-        spec = copy.deepcopy(B.SOURCES['zlib'])
+    def pinned_fixture(self, path, codec='zlib'):
+        spec = copy.deepcopy(B.SOURCES[codec])
         spec['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
-        return mock.patch.dict(B.SOURCES, {'zlib': spec})
+        return mock.patch.dict(B.SOURCES, {codec: spec})
+
+    def mingw_fixture(self):
+        directory = self.root/'existing MinGW tools'
+        directory.mkdir(exist_ok=True)
+        tools = [directory/name for name in ('gcc.exe', 'g++.exe', 'ninja.exe')]
+        for tool in tools:
+            tool.write_bytes(b'existing tool fixture; not executed\n')
+        return tools
+
+    def test_windows_gnu_requires_existing_matching_native_compilers(self):
+        gcc, cxx, ninja = self.mingw_fixture()
+        def run(command, cwd, env, timeout=600):
+            data = b'x86_64-w64-mingw32\n' if command[-1] == '-dumpmachine' else b'fixture GNU compiler\n'
+            return subprocess.CompletedProcess(command, 0, data, b'')
+        with mock.patch.object(B.shutil, 'which', return_value=str(ninja)), mock.patch.object(B, 'run', side_effect=run):
+            c, cpp, make, identity = B.mingw_toolchain(str(gcc), self.root, {})
+            self.assertEqual((c, cpp, make), (gcc, cxx, ninja))
+            self.assertEqual(identity['c']['target'], 'x86_64-w64-mingw32')
+            self.assertEqual(identity['cxx']['target'], 'x86_64-w64-mingw32')
+        with mock.patch.object(B.shutil, 'which', return_value=str(ninja)), mock.patch.object(B, 'run', return_value=subprocess.CompletedProcess([], 0, b'x86_64-pc-msys\n', b'')), self.assertRaisesRegex(ValueError, 'native x64 MinGW'):
+            B.mingw_toolchain(str(gcc), self.root, {})
+        cxx.unlink()
+        with mock.patch.object(B.shutil, 'which', return_value=str(ninja)), mock.patch.object(B, 'run') as never, self.assertRaisesRegex(ValueError, 'same-directory'):
+            B.mingw_toolchain(str(gcc), self.root, {})
+        never.assert_not_called()
+
+    def test_windows_gnu_cmake_uses_its_static_targets_and_confirmed_toolchain(self):
+        target = 'x86_64-pc-windows-gnu'
+        gcc, cxx, ninja = self.mingw_fixture()
+        for codec in ('zlib', 'zstd'):
+            with self.subTest(codec=codec):
+                prefix = codec + '-' + B.SOURCES[codec]['version']
+                files = {prefix+'/LICENSE': b'original upstream license\n'}
+                if codec == 'zlib':
+                    files.update({prefix+'/zlib.h': b'#define ZLIB_VERSION "1.4"\n', prefix+'/zconf.h': b'/* generated fixture */'})
+                else:
+                    files.update({prefix+'/lib/zstd.h': b'#define ZSTD_VERSION_MAJOR 1\n#define ZSTD_VERSION_MINOR 5\n#define ZSTD_VERSION_RELEASE 7\n', prefix+'/lib/zstd_errors.h': b'/* fixture */'})
+                source = self.tarball(files)
+                state = {}
+                def run(command, cwd, env, timeout=600):
+                    command = [str(item) for item in command]
+                    if command[-1] == '-dumpmachine':
+                        return subprocess.CompletedProcess(command, 0, b'x86_64-w64-mingw32\n', b'')
+                    if command[-1] == '--version':
+                        return subprocess.CompletedProcess(command, 0, b'fixture GNU compiler\n', b'')
+                    if '-S' in command:
+                        self.assertEqual(command[command.index('-G')+1], 'Ninja')
+                        self.assertIn('-DCMAKE_C_COMPILER='+str(gcc), command)
+                        self.assertIn('-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG', command)
+                        self.assertIn('-DCMAKE_MAKE_PROGRAM='+str(ninja), command)
+                        self.assertNotIn('-A', command)
+                        self.assertFalse(any('/O2' in item or 'MSVC_RUNTIME_LIBRARY' in item for item in command))
+                        self.assertFalse(any(key in env for key in ('CMAKE_GENERATOR', 'CMAKE_GENERATOR_PLATFORM', 'CMAKE_GENERATOR_TOOLSET', 'CMAKE_TOOLCHAIN_FILE')))
+                        build = Path(command[command.index('-B')+1]);state['build'] = build
+                        build.mkdir();(build/'zconf.h').write_bytes(b'/* generated fixture */')
+                        info = build/'CMakeFiles/3.31';info.mkdir(parents=True)
+                        (info/'CMakeCCompiler.cmake').write_text('set(CMAKE_C_COMPILER "'+gcc.as_posix()+'")\nset(CMAKE_C_COMPILER_ID "GNU")\n')
+                        if codec == 'zstd':
+                            self.assertIn('-DCMAKE_CXX_COMPILER='+str(cxx), command)
+                            self.assertIn('-DZSTD_MULTITHREAD_SUPPORT=OFF', command)
+                            (info/'CMakeCXXCompiler.cmake').write_text('set(CMAKE_CXX_COMPILER "'+cxx.as_posix()+'")\nset(CMAKE_CXX_COMPILER_ID "GNU")\n')
+                    else:
+                        self.assertEqual(command[command.index('--target')+1], 'zlibstatic' if codec == 'zlib' else 'libzstd_static')
+                        self.assertEqual(command[-2:], ['--parallel', '1'])
+                        (state['build']/('libzs.a' if codec == 'zlib' else 'libzstd.a')).write_bytes(static_archive(object_bytes(target)))
+                    return subprocess.CompletedProcess(command, 0, b'', b'')
+                cache = self.root/('GNU '+codec)
+                with self.pinned_fixture(source, codec), mock.patch.object(B, 'host_target'), mock.patch.object(B, 'run', side_effect=run), mock.patch.object(B.shutil, 'which', return_value=str(ninja)), mock.patch.dict(os.environ, {'CMAKE_GENERATOR': 'Visual Studio', 'CMAKE_GENERATOR_PLATFORM': 'x64', 'CMAKE_GENERATOR_TOOLSET': 'v143', 'CMAKE_TOOLCHAIN_FILE': 'unrelated-user-project.cmake'}):
+                    manifest = B.build_one(cache, target, codec, source, cc=str(gcc), cmake=str(ninja))
+                    leaf = cache/'native-compression/v1'/target/codec
+                    self.assertEqual((manifest['abi'], manifest['crt']), ('gnu', 'mingw-dynamic'))
+                    self.assertEqual(manifest['build']['gnu_toolchain']['c']['target'], 'x86_64-w64-mingw32')
+                    self.assertEqual((leaf/'lib'/B.archive_name(codec,target)).read_bytes(), static_archive(object_bytes(target)))
+                    self.assertEqual(os.environ['CMAKE_GENERATOR_PLATFORM'], 'x64')
+                    with mock.patch.object(B, 'run') as repeated:
+                        B.build_one(cache, target, codec, None)
+                        repeated.assert_not_called()
 
     def test_bad_source_hash_is_rejected_before_extracting(self):
         source = self.root/'wrong.tar.gz'

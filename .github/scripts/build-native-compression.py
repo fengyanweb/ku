@@ -3,7 +3,7 @@
 
 Supply verified upstream source archives with --zlib-source/--zstd-source, or
 place them in ROOT/sources. There is no implicit network access. POSIX builds
-use upstream configure/make; Windows uses an existing CMake/MSVC toolchain.
+use upstream configure/make; Windows uses existing CMake and MSVC or MinGW tools.
 Only private temporary prefixes are installed. Completed immutable packs are
 reused after their hashes, headers and native object architecture are checked.
 """
@@ -54,6 +54,7 @@ TARGETS = {
     'x86_64-unknown-linux-gnu': ('Linux', ('x86_64', 'AMD64'), 'elf-x86_64', 'gnu', 'system-dynamic'),
     'aarch64-unknown-linux-gnu': ('Linux', ('aarch64', 'ARM64', 'arm64'), 'elf-arm64', 'gnu', 'system-dynamic'),
     'x86_64-pc-windows-msvc': ('Windows', ('AMD64', 'x86_64'), 'coff-x86_64', 'msvc', 'msvc-dynamic'),
+    'x86_64-pc-windows-gnu': ('Windows', ('AMD64', 'x86_64'), 'coff-x86_64', 'gnu', 'mingw-dynamic'),
 }
 MAX_SOURCE_ARCHIVE = 16 * 1024 * 1024
 MAX_SOURCE_BYTES = 128 * 1024 * 1024
@@ -342,6 +343,39 @@ def record_file(path):
     return {'name': Path(path).name, 'size': plain(path, MAX_NATIVE_ARCHIVE).st_size, 'sha256': digest(path)}
 
 
+def mingw_toolchain(cc, work, env):
+    """Select existing matching tools; never install or mix another C++ toolchain."""
+    compiler = Path(cc or shutil.which('gcc') or shutil.which('x86_64-w64-mingw32-gcc') or '')
+    if not compiler.is_absolute() or not compiler.is_file():
+        raise ValueError('Windows GNU compression needs an existing absolute MinGW gcc executable')
+    compiler = compiler.resolve()
+    suffix = '.exe' if compiler.name.lower().endswith('.exe') else ''
+    name = compiler.name[:-len(suffix)] if suffix else compiler.name
+    companion = name[:-3] + 'g++' if name.endswith('gcc') else 'g++'
+    cxx = next((path.resolve() for path in (compiler.with_name(companion + suffix),
+                compiler.with_name('g++' + suffix)) if path.is_file()), None)
+    ninja = Path(shutil.which('ninja') or '')
+    if cxx is None or not ninja.is_absolute() or not ninja.is_file():
+        raise ValueError('Windows GNU compression needs matching same-directory g++ and an existing Ninja')
+    identities = []
+    for tool in (compiler, cxx):
+        machine = run([tool, '-dumpmachine'], work, env, 30).stdout.decode('utf-8').strip()
+        if machine != 'x86_64-w64-mingw32':
+            raise ValueError('compression compiler is not native x64 MinGW: ' + machine)
+        version = run([tool, '--version'], work, env, 30).stdout.decode(errors='replace')[:4096]
+        identities.append({'path': str(tool), 'target': machine, 'version': version})
+    return compiler, cxx, ninja.resolve(), {'c': identities[0], 'cxx': identities[1]}
+
+
+def mingw_cmake_options(compiler, cxx, ninja, codec):
+    options = ['-G', 'Ninja', '-DCMAKE_MAKE_PROGRAM=' + str(ninja),
+               '-DCMAKE_C_COMPILER=' + str(compiler), '-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG']
+    if codec == 'zstd':
+        options += ['-DCMAKE_CXX_COMPILER=' + str(cxx), '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG',
+                    '-DCMAKE_ASM_COMPILER=' + str(compiler)]
+    return options
+
+
 def check_headers(directory, codec):
     text = (directory / HEADER_NAMES[codec][0]).read_text(encoding='utf-8')
     if codec == 'zlib':
@@ -410,7 +444,10 @@ def build_one(root, target, codec, archive, cc=None, cmake=None):
             env.pop(name, None)
         env['CMAKE_BUILD_PARALLEL_LEVEL'] = '1'
         env['MSBUILDDISABLENODEREUSE'] = '1'
-        if os.name != 'nt':
+        windows = target.startswith('x86_64-pc-windows-')
+        gnu = target == 'x86_64-pc-windows-gnu'
+        toolchain = None
+        if not windows:
             compiler = Path(cc or shutil.which('clang') or shutil.which('cc') or '')
             if not compiler.is_absolute() or not compiler.is_file():
                 raise ValueError('a preinstalled host C compiler is required; use --cc with its absolute executable path')
@@ -440,30 +477,41 @@ def build_one(root, target, codec, archive, cc=None, cmake=None):
         else:
             cmake = Path(cmake or shutil.which('cmake') or '')
             if not cmake.is_absolute() or not cmake.is_file():
-                raise ValueError('an existing CMake >=3.15 and MSVC C/C++ tools are required; no tool installation is implicit')
+                raise ValueError('an existing CMake >=3.15 and matching Windows C/C++ tools are required; no tool installation is implicit')
             build = work/'cmake-build'
             project = source if codec == 'zlib' else source/'build/cmake'
             command = [cmake, '-S', project, '-B', build, '-DCMAKE_BUILD_TYPE=Release',
-                       '-DCMAKE_C_FLAGS_RELEASE=/O2 /DNDEBUG', '-DCMAKE_CXX_FLAGS_RELEASE=/O2 /DNDEBUG',
-                       '-DCMAKE_POLICY_DEFAULT_CMP0091=NEW', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL',
                        '-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF', '-DCMAKE_INSTALL_PREFIX='+str(prefix)]
-            if 'Ninja' not in env.get('CMAKE_GENERATOR', ''):
-                command += ['-A', 'x64']
-            if cc:
-                if not Path(cc).is_absolute() or not Path(cc).is_file():
-                    raise ValueError('--cc must name an existing absolute compiler executable')
-                command += ['-DCMAKE_C_COMPILER='+str(Path(cc).resolve())]
+            if gnu:
+                for name in ('CMAKE_GENERATOR', 'CMAKE_GENERATOR_PLATFORM', 'CMAKE_GENERATOR_TOOLSET',
+                             'CMAKE_GENERATOR_INSTANCE', 'CMAKE_TOOLCHAIN_FILE'):
+                    env.pop(name, None)
+                compiler, cxx, ninja, toolchain = mingw_toolchain(cc, work, env)
+                command += mingw_cmake_options(compiler, cxx, ninja, codec)
+            else:
+                command += ['-DCMAKE_C_FLAGS_RELEASE=/O2 /DNDEBUG', '-DCMAKE_CXX_FLAGS_RELEASE=/O2 /DNDEBUG',
+                            '-DCMAKE_POLICY_DEFAULT_CMP0091=NEW', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL']
+                if 'Ninja' not in env.get('CMAKE_GENERATOR', ''):
+                    command += ['-A', 'x64']
+                if cc:
+                    if not Path(cc).is_absolute() or not Path(cc).is_file():
+                        raise ValueError('--cc must name an existing absolute compiler executable')
+                    command += ['-DCMAKE_C_COMPILER='+str(Path(cc).resolve())]
             if codec == 'zlib':
                 command += ['-DZLIB_BUILD_STATIC=ON', '-DZLIB_BUILD_SHARED=OFF', '-DZLIB_BUILD_TESTING=OFF']
                 build_target = 'zlibstatic'
             else:
                 command += ['-DZSTD_BUILD_STATIC=ON', '-DZSTD_BUILD_SHARED=OFF', '-DZSTD_BUILD_PROGRAMS=OFF',
-                            '-DZSTD_BUILD_TESTS=OFF', '-DZSTD_BUILD_CONTRIB=OFF', '-DZSTD_MULTITHREAD_SUPPORT=OFF',
-                            '-DZSTD_USE_STATIC_RUNTIME=OFF', '-DACTIVATE_MULTITHREADED_COMPILATION=OFF']
+                            '-DZSTD_BUILD_TESTS=OFF', '-DZSTD_BUILD_CONTRIB=OFF', '-DZSTD_MULTITHREAD_SUPPORT=OFF']
+                if not gnu:
+                    command += ['-DZSTD_USE_STATIC_RUNTIME=OFF', '-DACTIVATE_MULTITHREADED_COMPILATION=OFF']
                 build_target = 'libzstd_static'
             run(command, work, env, 120)
             run([cmake, '--build', build, '--config', 'Release', '--target', build_target, '--parallel', '1'], work, env)
-            matches = list(build.rglob(archive_name(codec, target)))
+            # zlib 1.4 uses the WIN32 static suffix "s" for MinGW as well as
+            # MSVC. Normalize its genuine GNU-built libzs.a to the SDK's libz.a.
+            upstream_archive = 'libzs.a' if gnu and codec == 'zlib' else archive_name(codec, target)
+            matches = list(build.rglob(upstream_archive))
             if len(matches) != 1:
                 raise ValueError('expected exactly one upstream Release static library, found ' + str(matches))
             library = matches[0]
@@ -477,7 +525,23 @@ def build_one(root, target, codec, archive, cc=None, cmake=None):
                 used = re.search(r'set\(CMAKE_C_COMPILER "([^"]+)"\)', information)
                 if not used or not os.path.samefile(used[1], cc):
                     raise ValueError('CMake did not use the explicitly requested compiler')
-            method = 'upstream CMake static target /MD; parallel=1; /MP disabled'
+            if gnu:
+                if ('set(CMAKE_C_COMPILER_ID "GNU")' not in information
+                        or not (used := re.search(r'set\(CMAKE_C_COMPILER "([^"]+)"\)', information))
+                        or not os.path.samefile(used[1], compiler)):
+                    raise ValueError('CMake did not use the selected MinGW GNU C compiler')
+                if codec == 'zstd':
+                    cxx_information = list(build.glob('CMakeFiles/*/CMakeCXXCompiler.cmake'))
+                    if len(cxx_information) != 1:
+                        raise ValueError('CMake did not provide one GNU C++ compiler identity')
+                    cxx_information = cxx_information[0].read_text(encoding='utf-8')
+                    if ('set(CMAKE_CXX_COMPILER_ID "GNU")' not in cxx_information
+                            or not (used := re.search(r'set\(CMAKE_CXX_COMPILER "([^"]+)"\)', cxx_information))
+                            or not os.path.samefile(used[1], cxx)):
+                        raise ValueError('CMake did not use the selected MinGW GNU C++ compiler')
+                method = 'upstream CMake MinGW GNU static target; Ninja; parallel=1'
+            else:
+                method = 'upstream CMake static target /MD; parallel=1; /MP disabled'
         objects = validate_archive(library, target)
         leaf.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='.'+codec+'-staging-', dir=leaf.parent) as stage_directory:
@@ -486,7 +550,7 @@ def build_one(root, target, codec, archive, cc=None, cmake=None):
             (stage/'lib').mkdir()
             shutil.copyfile(library, stage/'lib'/archive_name(codec, target))
             for name in HEADER_NAMES[codec]:
-                header = source/name if codec == 'zlib' and os.name == 'nt' and name == 'zlib.h' else headers/name
+                header = source/name if codec == 'zlib' and windows and name == 'zlib.h' else headers/name
                 shutil.copyfile(header, stage/'include'/name)
             shutil.copyfile(source/'LICENSE', stage/'LICENSE')
             check_headers(stage/'include', codec)
@@ -501,6 +565,8 @@ def build_one(root, target, codec, archive, cc=None, cmake=None):
                         'build': {'method': method, 'profile': 'Release', 'optimization': 'O2', 'multithread': False,
                                   'native_object_members': objects, 'compiler': compiler_version,
                                   'omitted_nonbuild_archive_links': omitted_links}}
+            if toolchain is not None:
+                manifest['build']['gnu_toolchain'] = toolchain
             (stage/'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
             for path in stage.rglob('*'):
                 path.chmod(0o755 if path.is_dir() else 0o644)

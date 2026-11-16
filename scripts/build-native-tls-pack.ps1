@@ -1385,6 +1385,8 @@ if (Test-Path -LiteralPath $kuTlsDestination) {
 }
 
 $kuTlsContract = $kuTlsContracts[$Target]
+$kuTlsRequiresGnuHost = $IsWindows -and $Target -ceq 'x86_64-pc-windows-gnu'
+$kuTlsCompilerToolchain = if ($kuTlsRequiresGnuHost) { "${kuTlsReleaseToolchain}-x86_64-pc-windows-gnu" } else { $kuTlsReleaseToolchain }
 $kuTlsOwnerToken = [Guid]::NewGuid().ToString("N")
 $kuTlsStagePrefix = ".ktp-"
 $kuTlsBuildPrefix = ".ktb-"
@@ -1420,7 +1422,7 @@ try {
 
     $kuTlsRustc = Invoke-KuTlsBoundedProcess `
         "rustc" `
-        @("+$kuTlsReleaseToolchain", "--version") `
+        @("+$kuTlsCompilerToolchain", $(if ($kuTlsRequiresGnuHost) { '-vV' } else { '--version' })) `
         $kuTlsRepositoryRoot `
         $kuTlsBuildRoot `
         "rustc-version" `
@@ -1429,11 +1431,14 @@ try {
         $kuTlsRustc.Output -notmatch ('^rustc ' + [regex]::Escape($kuTlsReleaseToolchain) + ' \(')) {
         throw "native TLS packs require the exact Rust $kuTlsReleaseToolchain toolchain"
     }
+    if ($kuTlsRequiresGnuHost -and $kuTlsRustc.Output -notmatch '(?m)^host: x86_64-pc-windows-gnu\r?$') {
+        throw 'Windows GNU native TLS requires the explicitly selected GNU-host Rust compiler'
+    }
 
     $kuTlsCargo = Invoke-KuTlsBoundedProcess `
         "cargo" `
         @(
-            "+$kuTlsReleaseToolchain",
+            "+$kuTlsCompilerToolchain",
             "rustc",
             "--locked",
             "--release",
@@ -1529,7 +1534,7 @@ fn main() {
     $kuTlsValidatorBinary = Join-Path $kuTlsBuildRoot $(if ($IsWindows) { "validate_tls_archive.exe" } else { "validate_tls_archive" })
     $kuTlsValidatorBuild = Invoke-KuTlsBoundedProcess `
         "rustc" `
-        @("+$kuTlsReleaseToolchain", "--edition=2021", "-C", "panic=abort", "-o", $kuTlsValidatorBinary, $kuTlsValidatorSource) `
+        @("+$kuTlsCompilerToolchain", "--edition=2021", "-C", "panic=abort", "-o", $kuTlsValidatorBinary, $kuTlsValidatorSource) `
         $kuTlsBuildRoot `
         $kuTlsBuildRoot `
         "archive-validator-build" `
