@@ -98,6 +98,108 @@ def calendar_pack_fixture(root, target):
     return leaf
 
 
+class CalendarCoffArchiveTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='ku-calendar-coff-')
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name)/'calendar.lib'
+        self.builder = EXPORT.NATIVE_CALENDAR
+
+    @staticmethod
+    def ar(objects):
+        result = bytearray(b'!<arch>\n')
+        for name, body in objects:
+            header = f'{name + "/":<16}{0:<12}{0:<6}{0:<6}{100644:<8}{len(body):<10}`\n'.encode()
+            result += header + body + (b'\n' if len(body) & 1 else b'')
+        return result
+
+    def coff(self, *, big=False, names=None, identity=None, section=b'.rdata'):
+        names = sorted(self.builder.CALENDAR_API) if names is None else names
+        identity = self.builder.BUILD_ID.encode() if identity is None else identity
+        header, entry = (56, 20) if big else (20, 18)
+        data = header + 40
+        symbols = data + len(identity)
+        strings, offsets = bytearray(b'\0'), []
+        for name in names:
+            offsets.append(len(strings) + 4)
+            strings += name + b'\0'
+        string_offset = symbols + len(names) * entry
+        body = bytearray(string_offset + 4 + len(strings))
+        if big:
+            struct.pack_into('<HHHH', body, 0, 0, 0xffff, 2, 0x8664)
+            body[12:28] = self.builder.BIGOBJ_CLASS
+            struct.pack_into('<III', body, 44, 1, symbols, len(names))
+        else:
+            struct.pack_into('<HH', body, 0, 0x8664, 1)
+            struct.pack_into('<II', body, 8, symbols, len(names))
+        body[header:header+len(section)] = section
+        struct.pack_into('<II', body, header+16, len(identity), data)
+        struct.pack_into('<I', body, header+36, 0x40)
+        body[data:data+len(identity)] = identity
+        for index, offset in enumerate(offsets):
+            start = symbols + index * entry
+            struct.pack_into('<I', body, start+4, offset)
+            struct.pack_into('<i' if big else '<h', body, start+12, 1)
+            body[start+entry-2] = 2
+        struct.pack_into('<I', body, string_offset, len(strings)+4)
+        body[string_offset+4:] = strings
+        return body
+
+    @staticmethod
+    def short_import(name=b'Sleep', dll=b'kernel32.dll', flags=4):
+        payload = name + b'\0' + dll + b'\0'
+        return bytearray(struct.pack('<HHHHIIHH', 0, 0xffff, 0, 0x8664, 0, len(payload), 0, flags)+payload)
+
+    def validate(self, objects):
+        self.path.write_bytes(self.ar(objects))
+        return self.builder.validate_archive(self.path, 'x86_64-pc-windows-msvc')
+
+    def test_short_imports_and_real_bigobj_are_distinct(self):
+        for big in (False, True):
+            normal = self.coff(big=big)
+            short = self.short_import()
+            long = self.short_import(b'GetSystemTimePreciseAsFileTime')
+            self.assertLess(len(short), 56)
+            self.assertGreater(len(long), 56)
+            self.assertEqual(self.validate([('calendar.o', normal), ('kernel32.dll', short),
+                                           ('kernel32.dll', long),
+                                           ('bcrypt.dll', self.short_import(b'ProcessPrng', b'bcryptprimitives.dll')),
+                                           ('api.dll', self.short_import(b'WaitOnAddress', b'api-ms-win-core-synch-l1-2-0.dll'))]), 1)
+
+    def test_malformed_imports_never_pass_as_bigobj(self):
+        good = self.short_import(b'GetSystemTimePreciseAsFileTime')
+        bad = []
+        wrong = good.copy()
+        struct.pack_into('<H', wrong, 6, 0xaa64)
+        bad.append(wrong)
+        wrong = good.copy()
+        struct.pack_into('<I', wrong, 12, 1)
+        bad.append(wrong)
+        wrong = good.copy()
+        struct.pack_into('<H', wrong, 4, 1)
+        bad.append(wrong)
+        bad.extend((good[:19], good[:-1], self.short_import(dll=b'../kernel32.dll'),
+                    self.short_import(dll=b'private.dll'), self.short_import(name=b''),
+                    self.short_import(dll=b'api-ms-win-.dll'), self.short_import(dll=b'api-ms-win-core-synch.dll'),
+                    self.short_import(flags=0x8004), self.short_import(flags=3),
+                    self.short_import(flags=4 << 2)))
+        for import_body in bad:
+            with self.subTest(body=bytes(import_body[:20])), self.assertRaises(ValueError):
+                self.validate([('calendar.o', self.coff()), ('kernel32.dll', import_body)])
+
+    def test_imports_cannot_supply_api_definitions_or_build_identity(self):
+        imports = [('kernel32.dll', self.short_import(name)) for name in self.builder.CALENDAR_API]
+        with self.assertRaisesRegex(ValueError, 'defined ABI'):
+            self.validate([('data.o', self.coff(names=[])), *imports])
+        with self.assertRaisesRegex(ValueError, 'defined ABI'):
+            self.validate([('data.o', self.coff(names=[])), ('thunk.o', self.coff(section=b'.idata$5'))])
+        with self.assertRaisesRegex(ValueError, 'build identity'):
+            self.validate([('calendar.o', self.coff(identity=b'another-build')),
+                           ('kernel32.dll', self.short_import(self.builder.BUILD_ID.encode()))])
+        with self.assertRaisesRegex(ValueError, 'no complete native objects'):
+            self.validate([('kernel32.dll', self.short_import(self.builder.BUILD_ID.encode()))])
+
+
 class RuntimeConsumerReportTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

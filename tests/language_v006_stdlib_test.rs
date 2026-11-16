@@ -1913,7 +1913,10 @@ fn std_time_bare_calendar_failures_are_errors_instead_of_hidden_results() {
             "fn main() {{ value=time.from_unix(9223372036854775) ignored=time.{operation}(value) println(\"unreachable\") }}"
         );
         let error = run_err(&source);
-        assert!(error.contains("invalid_time"), "{operation}: {error}");
+        assert!(
+            error.contains("outside supported range"),
+            "{operation}: {error}"
+        );
     }
 }
 

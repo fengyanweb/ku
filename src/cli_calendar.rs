@@ -330,7 +330,7 @@ pub(super) fn resolve(
         .handle
         .try_clone()
         .map_err(|e| error(format!("cannot inspect native calendar archive: {e}")))?;
-    native_tls_archive::validate_static(
+    native_tls_archive::validate_rust_static(
         &mut opened,
         archive.identity.length,
         format,
@@ -340,6 +340,7 @@ pub(super) fn resolve(
             b"__ku_calendar_call_v1",
             b"__ku_calendar_release_v1",
         ],
+        BUILD_ID.as_bytes(),
     )
     .map_err(|e| error(format!("native calendar archive is invalid: {e}")))?;
     let staged = archive.stage_for_link("native calendar archive")?;
