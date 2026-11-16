@@ -621,7 +621,17 @@ def installed_native_time_array_consumer(install, root, env, report, report_path
         installation_retired = False
         primary = None
         try:
-            built = invoke([ku, 'build', '--backend', 'c', '--release', '--verbose', source.name, '-o', program], project, build_env)
+            entry = ku
+            detail['cli_entry_kind'] = 'direct'
+            if os.name != 'nt':
+                aliases = temporary / 'command aliases 中文'
+                aliases.mkdir()
+                entry = aliases / 'ku'
+                entry.symlink_to(ku)
+                if not entry.is_symlink() or not os.path.samefile(entry, ku):
+                    raise RuntimeError('time-array launcher does not resolve to the installed CLI')
+                detail['cli_entry_kind'] = 'posix-symlink'
+            built = invoke([entry, 'build', '--backend', 'c', '--release', '--verbose', source.name, '-o', program], project, build_env)
             detail['build_exit'] = built.returncode
             detail['build_stdout_sha256'] = hashlib.sha256(built.stdout).hexdigest()
             detail['build_stderr_sha256'] = hashlib.sha256(built.stderr).hexdigest()

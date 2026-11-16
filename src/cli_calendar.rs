@@ -104,12 +104,9 @@ pub(super) fn resolve(
         }
         root
     } else {
-        env::current_exe()
-            .map_err(|e| error(format!("cannot locate calendar SDK: {e}")))?
-            .parent()
-            .ok_or_else(|| error("Ku executable has no SDK directory"))?
-            .join("native-calendar/v1")
-            .join(target.rust_triple)
+        let executable =
+            env::current_exe().map_err(|e| error(format!("cannot locate calendar SDK: {e}")))?;
+        super::native_pack_root_beside(&executable, "native-calendar")?.join(target.rust_triple)
     };
     let root=fs::canonicalize(&root).map_err(|e|error(format!("native calendar target pack '{}' is unavailable: {e}; install the matching Ku SDK or set KU_NATIVE_CALENDAR_PACK",root.display())))?;
     if !super::path_is_plain_directory(&root) {

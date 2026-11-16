@@ -367,6 +367,52 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertTrue(detail['build_stderr_excerpt'].startswith('warning: unused local variable'))
         self.assertLessEqual(len(detail['build_stderr_excerpt'].encode('utf-8')), 4096)
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX launcher symlink regression')
+    def test_installed_time_array_orchestration_invokes_the_sdk_through_a_real_symlink(self):
+        # Exercise the consumer's entry/source/SDK lifetime protocol. Compiler
+        # and executable process edges are fixtures, not native runtime proof.
+        install = self.root/'SDK with spaces 中文'
+        install.mkdir()
+        ku = install/'ku'
+        ku.write_bytes(b'installed compiler fixture')
+        target = 'x86_64-unknown-linux-gnu'
+        calendar_pack_fixture(install, target)
+        report, calls = {}, []
+
+        def invoke(command, cwd, env, seconds=300):
+            calls.append(command)
+            if len(command) > 1:
+                entry = Path(command[0])
+                self.assertTrue(entry.is_symlink())
+                self.assertNotEqual(entry.parent, install)
+                self.assertTrue(os.path.samefile(entry, ku))
+                self.assertNotIn('KU_NATIVE_CALENDAR_PACK', env)
+                self.assertEqual(command[1:6], ['build', '--backend', 'c', '--release', '--verbose'])
+                source = cwd/'main.ku'
+                self.assertTrue(source.is_file())
+                emitted = cwd/'.ku/build/release/modules.c'
+                emitted.parent.mkdir(parents=True)
+                emitted.write_bytes(b'#define KU_FEATURE_NATIVE_CALENDAR 1\n__ku_calendar_call_v1\n__ku_array_first_\n__ku_array_concat_\n')
+                Path(command[-1]).write_bytes(b'compiled program fixture')
+                return subprocess.CompletedProcess(command, 0, ('build profile: release\nc compiler command: fixture\nnative c ok: '+str(emitted)+'\n').encode(), b'')
+            self.assertFalse(install.exists())
+            self.assertEqual(cwd.name, 'unrelated working directory')
+            self.assertFalse(any(Path(command[0]).parent.parent.glob('module build project*')))
+            return subprocess.CompletedProcess(command, 0, b'native-time-array-ok\n', b'')
+
+        with mock.patch.object(self.consumer, 'invoke', side_effect=invoke):
+            self.consumer.installed_native_time_array_consumer(
+                install, self.root, {'KU_NATIVE_CALENDAR_PACK': '/must/not/use'},
+                report, self.path, target)
+        detail = report['installed_native_time_array']
+        self.assertEqual(detail['status'], 'passed')
+        self.assertEqual(detail['cli_entry_kind'], 'posix-symlink')
+        self.assertTrue(detail['source_removed_before_run'])
+        self.assertTrue(detail['installation_restored'])
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(ku.is_file())
+        self.assertFalse(list(self.root.glob('ku-installed-time-array-*')))
+
     def installed_tls_orchestration(self, failure=None):
         """Only the archive/lifetime protocol is mocked, not claimed as TLS proof.
 

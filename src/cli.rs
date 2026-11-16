@@ -3604,6 +3604,22 @@ impl NativeTlsPack {
     }
 }
 
+/// Default native packs belong to the installed executable, not the directory
+/// containing a launcher symlink (for example ~/.cargo/bin/ku on macOS).
+/// Explicit pack overrides never use this fallback or require a resolvable CLI.
+fn native_pack_root_beside(executable: &Path, namespace: &str) -> Result<PathBuf, KuError> {
+    let executable = fs::canonicalize(executable).map_err(|error| {
+        KuError::message(format!(
+            "failed to resolve Ku executable '{}' for native SDK pack discovery: {error}",
+            executable.display()
+        ))
+    })?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| KuError::message("Ku executable has no parent for native SDK lookup"))?;
+    Ok(directory.join(namespace).join("v1"))
+}
+
 fn resolve_native_tls_pack_root(
     configured: Option<OsString>,
 ) -> Result<NativeTlsPackRoot, KuError> {
@@ -3633,10 +3649,7 @@ fn resolve_native_tls_pack_root_from(
         }
         path
     } else {
-        let parent = executable.parent().ok_or_else(|| {
-            KuError::message("the Ku executable has no parent directory for native TLS discovery")
-        })?;
-        parent.join("native-tls").join("v1")
+        native_pack_root_beside(executable, "native-tls")?
     };
     let canonical = fs::canonicalize(&requested).map_err(|error| {
         KuError::message(format!(
@@ -14343,13 +14356,61 @@ fn Zip(): null! { input=bytes.from_array([1])? gzip.compress(input,100)? return 
 
         let fallback = dir.join("bin").join("native-tls").join("v1");
         fs::create_dir_all(&fallback).expect("create sibling target-pack root");
+        fs::write(dir.join("bin/ku"), b"fixture executable").expect("create installed Ku fixture");
         let resolved = resolve_native_tls_pack_root_from(None, &dir.join("bin").join("ku"))
             .expect("resolve sibling target-pack root");
         assert_eq!(
             resolved.path,
             fs::canonicalize(&fallback).expect("canonicalize sibling target-pack root")
         );
+        let configured = resolve_native_tls_pack_root_from(
+            Some(fallback.clone().into_os_string()),
+            &dir.join("nonexistent-executable"),
+        )
+        .expect("explicit pack must not require default executable lookup");
+        assert_eq!(configured.path, resolved.path);
         fs::remove_dir_all(dir).expect("remove native TLS root fixture");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_pack_roots_follow_the_executable_symlink_before_selecting_the_sdk() {
+        let directory = TempBuildDir::create_private("native-pack-symlink").unwrap();
+        let sdk = directory.path().join("SDK with spaces 中文");
+        let command_dir = directory.path().join("command aliases");
+        fs::create_dir(&sdk).unwrap();
+        fs::create_dir(&command_dir).unwrap();
+        let executable = sdk.join("ku");
+        fs::write(&executable, b"installed executable fixture").unwrap();
+        let first = command_dir.join("ku-original");
+        let alias = command_dir.join("ku");
+        std::os::unix::fs::symlink("../SDK with spaces 中文/ku", &first).unwrap();
+        std::os::unix::fs::symlink("ku-original", &alias).unwrap();
+        for namespace in ["native-calendar", "native-tls", "native-compression"] {
+            let expected = sdk.join(namespace).join("v1");
+            fs::create_dir_all(&expected).unwrap();
+            assert_eq!(
+                native_pack_root_beside(&alias, namespace).unwrap(),
+                fs::canonicalize(&expected).unwrap(),
+                "{namespace} was resolved beside the launcher rather than the installed executable"
+            );
+        }
+        let tls = resolve_native_tls_pack_root_from(None, &alias).unwrap();
+        assert_eq!(
+            tls.path,
+            fs::canonicalize(sdk.join("native-tls/v1")).unwrap()
+        );
+        fs::remove_file(&executable).unwrap();
+        assert!(native_pack_root_beside(&alias, "native-calendar").is_err());
+        let explicit = resolve_native_tls_pack_root_from(
+            Some(sdk.join("native-tls/v1").into_os_string()),
+            &alias,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.path, tls.path,
+            "explicit override fell back through a broken launcher"
+        );
     }
 
     #[test]

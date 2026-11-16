@@ -378,13 +378,7 @@ fn resolve_with(
         let requested = if let Some(value) = library {
             absolute(value, codec.library_env)?
         } else {
-            let exe = executable()?;
-            let parent = exe
-                .parent()
-                .ok_or_else(|| error("Ku executable has no parent for compression SDK lookup"))?;
-            parent
-                .join("native-compression")
-                .join("v1")
+            super::native_pack_root_beside(&executable()?, "native-compression")?
                 .join(contract.target)
                 .join(codec.name)
                 .join("lib")
@@ -918,6 +912,49 @@ mod tests {
             );
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compression_default_discovery_follows_a_real_launcher_symlink() {
+        let directory = TempBuildDir::create_private("codec-sdk-symlink").unwrap();
+        let sdk = directory.path().join("SDK with spaces 中文");
+        let aliases = directory.path().join("command aliases");
+        fs::create_dir(&sdk).unwrap();
+        fs::create_dir(&aliases).unwrap();
+        let executable = sdk.join("ku");
+        fs::write(&executable, b"fixture executable").unwrap();
+        let alias = aliases.join("ku");
+        std::os::unix::fs::symlink(&executable, &alias).unwrap();
+        let leaf = sdk.join("native-compression/v1/aarch64-apple-darwin/zstd");
+        fs::create_dir_all(leaf.join("lib")).unwrap();
+        fs::create_dir(leaf.join("include")).unwrap();
+        fs::write(leaf.join("manifest.json"), b"\0").unwrap();
+        let check = |result: Result<CompressionInputs, KuError>| {
+            let error = match result {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("intentionally invalid manifest was accepted"),
+            };
+            assert!(
+                error.contains("contains NUL"),
+                "did not reach the real SDK manifest: {error}"
+            );
+        };
+        check(resolve_with(
+            &target(),
+            true,
+            false,
+            |_| None,
+            || Ok(alias.clone()),
+        ));
+        fs::remove_file(executable).unwrap();
+        check(resolve_with(
+            &target(),
+            true,
+            false,
+            |name| (name == "KU_ZSTD_LIB").then(|| leaf.join("lib").into_os_string()),
+            || panic!("explicit compression override followed a broken executable symlink"),
+        ));
     }
 
     #[test]
