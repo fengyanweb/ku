@@ -12,10 +12,10 @@ use std::{
 
 use crate::error::KuResult;
 use crate::ir::task::{
-    SlotId, TaskBinaryOp, TaskBytesOperation, TaskConstant, TaskFinallyPlan, TaskFramePlan,
-    TaskFunction, TaskFunctionFrame, TaskIndirectCallPlan, TaskJsonOperation, TaskLimits,
-    TaskNetOperation, TaskOp, TaskProgram, TaskScopeExitPlan, TaskScopeFrame, TaskSlotType,
-    TaskTerminator, TaskUnaryOp,
+    SlotId, TaskBinaryOp, TaskBytesOperation, TaskCollectionOperation, TaskConstant,
+    TaskFinallyPlan, TaskFramePlan, TaskFunction, TaskFunctionFrame, TaskIndirectCallPlan,
+    TaskJsonOperation, TaskLimits, TaskNetOperation, TaskOp, TaskProgram, TaskScopeExitPlan,
+    TaskScopeFrame, TaskSlotType, TaskTerminator, TaskUnaryOp,
 };
 use crate::ir::IrType;
 
@@ -491,6 +491,7 @@ impl<'a> FrameEmitter<'a> {
                     if frame.hosted
                         && !*borrowed
                         && (matches!(ty, IrType::Str | IrType::Result(_))
+                            || (crate::ir::task::nullable_leaf(ty) && super::is_c_owned_type(ty))
                             || crate::ir::task::flat_array(ty)
                             || crate::ir::task::pg_params_array(ty)
                             || crate::ir::task::error_type(ty)
@@ -733,6 +734,7 @@ impl<'a> FrameEmitter<'a> {
             TaskSlotType::Value { ty, borrowed } => {
                 !*borrowed
                     && (matches!(ty, IrType::Str | IrType::Result(_))
+                        || (crate::ir::task::nullable_leaf(ty) && super::is_c_owned_type(ty))
                         || crate::ir::task::flat_array(ty)
                         || crate::ir::task::pg_params_array(ty)
                         || crate::ir::task::error_type(ty)
@@ -3189,6 +3191,52 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         ),
                         state,
                     )?;
+                } else if matches!(self.slot_type(*left)?, IrType::Nullable(_))
+                    || matches!(self.slot_type(*right)?, IrType::Nullable(_))
+                {
+                    if !matches!(op, TaskBinaryOp::Equal | TaskBinaryOp::NotEqual) {
+                        return Err(unsupported(
+                            "nullable Task arithmetic requires a non-null proof",
+                        ));
+                    }
+                    let left_type = self.slot_type(*left)?;
+                    let right_type = self.slot_type(*right)?;
+                    let inner = match (left_type, right_type) {
+                        (IrType::Nullable(inner), _) | (_, IrType::Nullable(inner)) => {
+                            inner.as_ref()
+                        }
+                        _ => unreachable!(),
+                    };
+                    let place = |slot: SlotId, ty: &IrType| -> KuResult<(String, String)> {
+                        let place = self.place(slot);
+                        Ok(match ty {
+                            IrType::Nullable(_) => {
+                                (format!("{place}.is_null"), format!("{place}.value"))
+                            }
+                            IrType::Null => ("true".into(), c_zero_initializer(inner)?),
+                            _ => ("false".into(), place),
+                        })
+                    };
+                    let (left_null, left_value) = place(*left, left_type)?;
+                    let (right_null, right_value) = place(*right, right_type)?;
+                    let equal = if inner == &IrType::Str {
+                        format!("ku_string_equal({left_value},{right_value})")
+                    } else {
+                        format!("({left_value}=={right_value})")
+                    };
+                    let equal = format!(
+                        "(({left_null} || {right_null}) ? ({left_null} && {right_null}) : {equal})"
+                    );
+                    out.push_str(&format!(
+                        "  {}={}({equal});\n",
+                        self.place(*dst),
+                        if *op == TaskBinaryOp::NotEqual {
+                            "!"
+                        } else {
+                            ""
+                        }
+                    ));
+                    self.set_init(out, *dst, true);
                 } else if self.slot_type(*left)? == &IrType::Str {
                     let negate = match op {
                         TaskBinaryOp::Equal => "",
@@ -3310,6 +3358,152 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     self.place(*src)
                 ));
                 self.set_init(out, *dst, true);
+            }
+            TaskOp::Collection {
+                dst,
+                source,
+                other,
+                operation,
+            } => {
+                let destination = self.place(*dst);
+                match operation {
+                    TaskCollectionOperation::Concat => {
+                        let left_slot = source.ok_or_else(|| unsupported("concat source"))?;
+                        let right_slot = other.ok_or_else(|| unsupported("concat other"))?;
+                        let left = self.place(left_slot);
+                        let right = self.place(right_slot);
+                        let IrType::Array(element) = self.slot_type(*dst)? else {
+                            return Err(unsupported("concat type"));
+                        };
+                        out.push_str(&format!("  if ({left}.len>SIZE_MAX-{right}.len || {left}.len+{right}.len>10000u) {{\n"));
+                        self.emit_runtime_error(
+                            out,
+                            &format!(
+                                "ku_error_make({},{},{})",
+                                c_static_utf8_string("task"),
+                                c_static_utf8_string("memory_limit"),
+                                c_static_utf8_string("native Task array size limit exceeded")
+                            ),
+                        )?;
+                        out.push_str(&format!("  }}\n  {{ size_t count={left}.len+{right}.len; void* data=NULL; uint32_t allocated=ku_task_host_allocate_array((KuTaskAdapterHostV1*)clock->host,count,sizeof({}),&data);\n",c_type(element)?));
+                        self.emit_array_allocation_check(out, "allocated")?;
+                        out.push_str(&format!(
+                            "  {destination}=({}){{0,data,count}};\n",
+                            c_type(self.slot_type(*dst)?)?
+                        ));
+                        self.set_init(out, *dst, true);
+                        out.push_str("  for (size_t index=0;index<count;index++) {\n");
+                        let value = format!("(index<{left}.len ? {left}.data[index] : {right}.data[index-{left}.len])");
+                        if element.as_ref() == &IrType::Str {
+                            out.push_str(&format!("    uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{value},&{destination}.data[index]);\n"));
+                            self.emit_array_allocation_check(out, "cloned")?;
+                        } else {
+                            out.push_str(&format!("    {destination}.data[index]={value};\n"));
+                        }
+                        out.push_str(&format!("    {destination}.len++;\n  }}\n  }}\n"));
+                    }
+                    TaskCollectionOperation::First | TaskCollectionOperation::Last => {
+                        let source = self.place(source.ok_or_else(|| unsupported("edge source"))?);
+                        out.push_str(&format!(
+                            "  {destination}={};\n",
+                            c_zero_initializer(self.slot_type(*dst)?)?
+                        ));
+                        self.set_init(out, *dst, true);
+                        if let IrType::Nullable(inner) = self.slot_type(*dst)? {
+                            let index = if *operation == TaskCollectionOperation::First {
+                                "0".into()
+                            } else {
+                                format!("{source}.len-1u")
+                            };
+                            out.push_str(&format!("  if ({source}.len) {{\n"));
+                            if inner.as_ref() == &IrType::Str {
+                                out.push_str(&format!("  uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source}.data[{index}],&{destination}.value);\n"));
+                                self.emit_string_allocation_check(out, "cloned")?;
+                            } else {
+                                out.push_str(&format!(
+                                    "  {destination}.value={source}.data[{index}];\n"
+                                ));
+                            }
+                            out.push_str(&format!("  {destination}.is_null=false;\n  }}\n"));
+                        }
+                    }
+                    TaskCollectionOperation::NullableNull => {
+                        out.push_str(&format!(
+                            "  {destination}={};\n",
+                            c_zero_initializer(self.slot_type(*dst)?)?
+                        ));
+                        self.set_init(out, *dst, true);
+                    }
+                    TaskCollectionOperation::NullableSome => {
+                        let source = source.ok_or_else(|| unsupported("nullable Some source"))?;
+                        let ty = self.slot_type(source)?;
+                        out.push_str(&format!(
+                            "  {destination}=({}){{false,{}}};\n",
+                            c_type(self.slot_type(*dst)?)?,
+                            c_move_value(ty, &self.place(source))?
+                        ));
+                        if super::is_c_owned_type(ty) {
+                            self.set_init(out, source, false);
+                        }
+                        self.set_init(out, *dst, true);
+                    }
+                    TaskCollectionOperation::NullableClone => {
+                        let source =
+                            self.place(source.ok_or_else(|| unsupported("nullable clone source"))?);
+                        let IrType::Nullable(inner) = self.slot_type(*dst)? else {
+                            return Err(unsupported("nullable clone type"));
+                        };
+                        out.push_str(&format!(
+                            "  {destination}={};\n",
+                            c_zero_initializer(self.slot_type(*dst)?)?
+                        ));
+                        self.set_init(out, *dst, true);
+                        out.push_str(&format!("  if (!{source}.is_null) {{\n"));
+                        if inner.as_ref() == &IrType::Str {
+                            out.push_str(&format!("  uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source}.value,&{destination}.value);\n"));
+                            self.emit_string_allocation_check(out, "cloned")?;
+                        } else {
+                            out.push_str(&format!("  {destination}.value={source}.value;\n"));
+                        }
+                        out.push_str(&format!("  {destination}.is_null=false;\n  }}\n"));
+                    }
+                    TaskCollectionOperation::NullableView
+                    | TaskCollectionOperation::NullableTake => {
+                        let source_slot =
+                            source.ok_or_else(|| unsupported("nullable projection source"))?;
+                        let source = self.place(source_slot);
+                        out.push_str(&format!("  if ({source}.is_null) {{\n"));
+                        self.emit_runtime_error(
+                            out,
+                            &format!(
+                                "ku_error_make({},{},{})",
+                                c_static_utf8_string("array"),
+                                c_static_utf8_string("null_value"),
+                                c_static_utf8_string("cannot read an empty array result")
+                            ),
+                        )?;
+                        out.push_str("  }\n");
+                        out.push_str(&format!("  {destination}={source}.value;\n"));
+                        if *operation == TaskCollectionOperation::NullableTake {
+                            out.push_str(&format!(
+                                "  {source}={};\n",
+                                c_zero_initializer(self.slot_type(source_slot)?)?
+                            ));
+                        }
+                        self.set_init(out, *dst, true);
+                    }
+                    TaskCollectionOperation::NullableIsNull => {
+                        let source = self
+                            .place(source.ok_or_else(|| unsupported("nullable predicate source"))?);
+                        out.push_str(&format!("  {destination}={source}.is_null;\n"));
+                        self.set_init(out, *dst, true);
+                    }
+                    TaskCollectionOperation::NullableViewEnd => {
+                        // A projection owns no payload. End only its temporary
+                        // witness; the nullable source retains the allocation.
+                        self.set_init(out, *dst, false);
+                    }
+                }
             }
             TaskOp::StringLen { dst, src, bytes } => {
                 let source = self.place(*src);
@@ -3810,6 +4004,18 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             TaskOp::Print { value, newline } => {
                 let place = self.place(*value);
                 let expression = match self.slot_type(*value)? {
+                    IrType::Nullable(inner) => {
+                        let payload = match inner.as_ref() {
+                            IrType::Int => format!("ku_output_printf(\"%lld\",(long long){place}.value) < 0"),
+                            IrType::Bool => format!("ku_output_write({place}.value ? \"true\" : \"false\",{place}.value ? 4u : 5u) < 0"),
+                            IrType::Str => format!("ku_output_write({place}.value.ptr,{place}.value.len) < 0"),
+                            IrType::Null => "ku_output_write(\"null\",4u) < 0".into(),
+                            _ => return Err(unsupported("unsupported Task nullable output")),
+                        };
+                        format!(
+                            "({place}.is_null ? (ku_output_write(\"null\",4u)<0) : ({payload}))"
+                        )
+                    }
                     IrType::Int => format!("ku_output_printf(\"%lld\",(long long){place}) < 0"),
                     IrType::Bool => format!(
                         "ku_output_write({place} ? \"true\" : \"false\",{place} ? 4u : 5u) < 0"
@@ -4168,6 +4374,7 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
         return Ok(());
     }
     match ty {
+        IrType::Nullable(inner) if crate::ir::task::nullable_leaf(ty) => require_slot_type(inner),
         IrType::Int | IrType::Bool | IrType::Null | IrType::Str => Ok(()),
         IrType::Array(_)
             if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) =>
@@ -4243,6 +4450,7 @@ pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
         ));
     }
     match ty {
+        IrType::Nullable(_) => Ok(format!("({place}).is_null")),
         IrType::Named(name) if name == "__ku_net_client" => Ok(format!("({place}) == NULL")),
         IrType::Named(name) if name == "__ku_bytes" => Ok(format!("({place}).ptr == NULL && ({place}).len == 0 && ({place}).capacity == 0 && ({place}).storage == 0")),
         IrType::Int | IrType::Bool | IrType::Null => Ok(format!("({place}) == 0")),

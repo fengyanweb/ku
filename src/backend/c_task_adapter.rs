@@ -74,6 +74,7 @@ fn supported_type(ty: &IrType) -> bool {
         return true;
     }
     match ty {
+        IrType::Nullable(_) => crate::ir::task::nullable_leaf(ty),
         IrType::Int | IrType::Bool | IrType::Null | IrType::Str => true,
         IrType::Result(inner) => {
             matches!(
@@ -87,6 +88,7 @@ fn supported_type(ty: &IrType) -> bool {
 
 fn owned(ty: &IrType) -> bool {
     matches!(ty, IrType::Str | IrType::Result(_))
+        || (crate::ir::task::nullable_leaf(ty) && super::is_c_owned_type(ty))
         || crate::ir::task::flat_array(ty)
         || crate::ir::task::pg_params_array(ty)
         || crate::ir::task::error_type(ty)
@@ -112,6 +114,7 @@ fn active_strings(ty: &IrType, place: &str, body: &impl Fn(&str) -> String) -> S
             .collect();
     }
     match ty {
+        IrType::Nullable(inner) => format!("  if (!({place}).is_null) {{\n{}  }}\n",active_strings(inner,&format!("({place}).value"),body)),
         IrType::Str => body(place),
         IrType::Array(inner) if inner.as_ref() == &IrType::Str => format!(
             "  for (size_t array_index=0;array_index<({place}).len;array_index++) {{\n{}  }}\n",
@@ -291,7 +294,7 @@ fn array_input_guard(
                 ..
             } => 3,
             TaskSlotType::Value {
-                ty: IrType::Str | IrType::Array(_),
+                ty: IrType::Str | IrType::Array(_) | IrType::Nullable(_),
                 ..
             } => 1,
             TaskSlotType::Value { ty, .. }

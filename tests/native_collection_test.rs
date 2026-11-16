@@ -594,20 +594,25 @@ fn main() {
 const ALLOCATION_HOOKS: &str = r#"
 static size_t test_allocations = 0, test_requested_bytes = 0, test_live = 0;
 static int test_fail_allocations = 0;
+static size_t test_attempts = 0, test_fail_at = 0;
+static int test_should_fail(void) {
+  test_attempts++;
+  return test_fail_allocations || (test_fail_at && test_attempts == test_fail_at);
+}
 static void* test_malloc(size_t size) {
-  if (test_fail_allocations) return NULL;
+  if (test_should_fail()) return NULL;
   void* result = malloc(size);
   if (result) { test_allocations++; test_requested_bytes += size; test_live++; }
   return result;
 }
 static void* test_calloc(size_t count, size_t size) {
-  if (test_fail_allocations) return NULL;
+  if (test_should_fail()) return NULL;
   void* result = calloc(count, size);
   if (result) { test_allocations++; test_requested_bytes += count * size; test_live++; }
   return result;
 }
 static void* test_realloc(void* pointer, size_t size) {
-  if (test_fail_allocations) return NULL;
+  if (test_should_fail()) return NULL;
   int was_null = pointer == NULL;
   void* result = realloc(pointer, size);
   if (result) {
@@ -793,4 +798,341 @@ fn native_collection_growth_is_geometric_and_ownership_balanced() {
             "{mode} emitted the wrong failure"
         );
     }
+}
+
+const CONCAT_OPTIONAL_SOURCE: &str = r#"
+struct Piece { text: str, words: [str] }
+fn Edge(values: [str]): str | null { return array.first(values) }
+fn OptionalLength(value: str | null): int {
+    if (value == null) { return -1 }
+    return value.len()
+}
+fn main() {
+    empty: [int] = []
+    ints = [0, 2]
+    joined = array.concat(ints, [3])
+    if (joined.len() != 3 || joined[0] != 0 || joined[1] != 2 || joined[2] != 3) panic("concat order")
+    joined[0] = 9
+    if (ints[0] != 0 || ints.len() != 2) panic("concat changed input")
+    if (array.concat(empty, empty).len() != 0) panic("empty concat")
+
+    original = ["before" + "!"]
+    change = () => { original = ["after"]; return ["right" + "!"] }
+    snapshot = array.concat(original, change())
+    if (snapshot[0] != "before!" || snapshot[1] != "right!" || original[0] != "after") panic("concat receiver order")
+    words = ["owned" + "!", "last" + "!"]
+    copies = array.concat(words, [""])
+    first = array.first(words)
+    last = array.last(words)
+    words = ["replacement"]
+    if (copies[0] != "owned!" || copies[1] != "last!") panic("concat result lifetime")
+    if (first == null || last == null) panic("nonempty null")
+    if (first != null && first != "owned!") panic("first lifetime")
+    if (last != null && last != "last!") panic("last lifetime")
+    first = null
+    if (first != null) panic("nullable assignment")
+
+    zero = array.first([0])
+    flag = array.last([false])
+    blank = array.first([""])
+    if (zero == null || flag == null || blank == null) panic("zero sentinel")
+    if (zero != null && zero != 0) panic("zero value")
+    if (flag != null && flag != false) panic("false value")
+    if (blank != null && blank.len() != 0) panic("empty string value")
+    if (array.first(empty) != null || array.last(empty) != null) panic("empty edge")
+    if (array.first([0]) != 0 || array.last([false]) != false) panic("nullable payload equality")
+    empty_text: [str] = []
+    if (OptionalLength(Edge(empty_text)) != -1) panic("empty function return")
+    returned = Edge(["returned" + "!"])
+    if (OptionalLength(returned) != 9) panic("owned nullable parameter")
+
+    pieces = [Piece { text: "part" + "!", words: ["nested" + "!"] }]
+    combined = array.concat(pieces, pieces)
+    piece = array.first(pieces)
+    pieces = []
+    if (combined.len() != 2 || combined[1].text != "part!") panic("struct concat")
+    if (piece != null && piece.words[0] != "nested!") panic("struct edge lifetime")
+    if (piece == null) panic("struct edge null")
+    nested = [["deep" + "!"], ["tail" + "!"]]
+    deep = array.first(nested)
+    nested_copy = array.concat(nested, nested)
+    nested = []
+    if (deep != null && deep[0] != "deep!") panic("nested edge lifetime")
+    if (nested_copy[3][0] != "tail!") panic("nested concat lifetime")
+    singleton: [str] = ["single" + "!"]
+    singleton_first = array.first(singleton)
+    singleton_last = array.last(singleton)
+    if (singleton_first != null && singleton_first != "single!") panic("single first")
+    if (singleton_last != null && singleton_last != "single!") panic("single last")
+    println("array-optional-ok")
+}
+"#;
+
+#[test]
+fn native_collection_concat_and_nullable_edges_preserve_values_and_owners() {
+    run_source("native-array-optional.ku", CONCAT_OPTIONAL_SOURCE)
+        .expect("interpreter checks independent array and nullable results");
+    let Some(stdout) = native_stdout("array-optional", CONCAT_OPTIONAL_SOURCE) else {
+        return;
+    };
+    assert_eq!(stdout, "array-optional-ok\n");
+}
+
+#[test]
+fn native_collection_nullable_containers_print_and_encode_without_boxing_scalars() {
+    let source = r#"
+import json from "std.json"
+fn main(): null! {
+    empty: [int] = []
+    println(array.first(empty))
+    println(array.first([0]))
+    println(array.first([false]))
+    first = array.first(["owned" + "!"])
+    none: [str] = []
+    nested = array.first([["nested" + "!"]])
+    println(json.encode(first)?)
+    println(json.encode(nested)?)
+    println(json.encode({a:array.first(none),b:first.clone(),c:nested.clone()})?)
+    if (first != null && first != "owned!") panic("JSON consumed a borrowed nullable root")
+    operations = [() => { return 7 }]
+    operation = array.first(operations)
+    operations = []
+    if (operation == null) panic("closure edge")
+    if (operation != null && operation() != 7) panic("closure edge owner")
+    results = [ok("result" + "!")]
+    result = array.last(results)
+    results = []
+    if (result != null) println(result?)
+    dynamic_values = [json.decode("null")?,json.decode("0")?,json.decode("\"owned\"")?]
+    dynamic_null = array.first(dynamic_values)
+    if (dynamic_null != null) panic("dynamic null became present")
+    dynamic_some = array.last(dynamic_values)
+    if (dynamic_some == null) panic("dynamic string became null")
+    println(json.encode(dynamic_some)?)
+    dynamic_some = json.decode("null")?
+    if (dynamic_some != null) panic("dynamic null assignment became present")
+    println(json.encode(dynamic_values)?)
+    return ok(null)
+}
+"#;
+    let mut ast = Parser::new(
+        Lexer::new(source)
+            .tokenize()
+            .expect("lex nullable containers"),
+    )
+    .parse_program()
+    .expect("parse nullable containers");
+    ast.items.insert(
+        0,
+        ku::ast::Item::Module(ku::ast::ModuleDecl {
+            name: "std:json".into(),
+            span: Default::default(),
+        }),
+    );
+    Checker::new()
+        .check(&ast)
+        .expect("check nullable containers");
+    let program =
+        ir::optimize_program(&ir::lower_program(&ast).expect("lower nullable containers"));
+    let generated = c::generate_c_source(&program).expect("emit flat nullable containers");
+    assert!(generated.contains("struct __ku_nullable_type_int { bool is_null; int64_t value; }"));
+    let Some(stdout) = native_c_stdout("nullable-containers", generated) else {
+        return;
+    };
+    assert_eq!(stdout, "null\n0\nfalse\n\"owned!\"\n[\"nested!\"]\n{\"a\":null,\"b\":\"owned!\",\"c\":[\"nested!\"]}\nresult!\n\"owned\"\n[null,0,\"owned\"]\n");
+}
+
+const OPTIONAL_FAILURE_MAIN: &str = r#"
+#undef main
+static void optional_require(int condition, const char* message) {
+  if (!condition) { fputs(message, stderr); fputc('\n', stderr); exit(98); }
+}
+static void optional_fault(size_t ordinal) {
+  test_attempts = 0; test_fail_at = ordinal; __ku_sync_reset();
+}
+int main(void) {
+  const uint8_t bytes[] = { 'A', 0, 0xe7, 0x95, 0x8c };
+  KuString a = ku_string_concat(ku_string_static(bytes, sizeof(bytes)), ku_string_static((const uint8_t*)"!", 1));
+  KuString b = ku_string_concat(ku_string_static((const uint8_t*)"B", 1), ku_string_static((const uint8_t*)"!", 1));
+  KuString values[] = { a, b };
+  KuArray_str source = ku_array_make_str(2, values);
+  const size_t baseline = test_live;
+  size_t failures = 0, successes = 0;
+  /* The output array and all four element allocations are failed in turn. */
+  for (size_t ordinal = 1; ordinal <= 6; ordinal++) {
+    optional_fault(ordinal);
+    KuArray_str result = __ku_array_concat_str(source, source);
+    test_fail_at = 0;
+    KuSyncExitSignal signal = __ku_sync_take();
+    if (signal.kind != KU_SYNC_EXIT_NONE) {
+      failures++;
+      optional_require(result.len == 0 && !result.data, "partial concat returned live data");
+    } else {
+      successes++;
+      optional_require(result.len == 4 && result.data[0].ptr != source.data[0].ptr,
+          "concat did not independently own elements");
+      optional_require(result.data[0].len == sizeof(bytes) + 1
+          && memcmp(result.data[0].ptr, bytes, sizeof(bytes)) == 0, "concat lost embedded NUL");
+    }
+    ku_array_drop_str(&result);
+    optional_require(test_live == baseline, "concat failure leaked partial elements");
+    optional_require(source.len == 2 && source.data[0].len == sizeof(bytes) + 1,
+        "concat failure changed the source");
+  }
+  optional_require(failures == 5 && successes == 1, "concat fault plan did not cover every allocation");
+  for (size_t last = 0; last <= 1; last++) {
+    optional_fault(1);
+    __ku_nullable_type_str result = last ? __ku_array_last_str(source) : __ku_array_first_str(source);
+    test_fail_at = 0;
+    optional_require(__ku_sync_take().kind != KU_SYNC_EXIT_NONE && result.is_null,
+        "edge allocation failure was not reported");
+    __ku_nullable_drop_str(&result);
+    optional_require(test_live == baseline, "edge allocation failure leaked");
+    optional_fault(2);
+    result = last ? __ku_array_last_str(source) : __ku_array_first_str(source);
+    test_fail_at = 0;
+    optional_require(__ku_sync_take().kind == KU_SYNC_EXIT_NONE && !result.is_null,
+        "edge could not recover after allocation failure");
+    optional_require(result.value.ptr != source.data[last].ptr, "edge borrowed owned input storage");
+    __ku_nullable_drop_str(&result);
+    optional_require(test_live == baseline, "edge successful result leaked");
+  }
+  KuArray_str empty = {0};
+  optional_fault(1);
+  __ku_nullable_type_str edge = __ku_array_first_str(empty);
+  optional_require(edge.is_null && test_attempts == 0, "empty edge allocated or accessed data");
+  test_fail_at = 0;
+  KuArray_str invalid = {SIZE_MAX, source.data, SIZE_MAX};
+  optional_fault(0);
+  KuArray_str overflow = __ku_array_concat_str(invalid, source);
+  optional_require(__ku_sync_take().kind != KU_SYNC_EXIT_NONE && !overflow.data && test_attempts == 0,
+      "concat overflow reached allocation or read");
+  ku_array_drop_str(&source);
+  optional_require(test_live == 0, "array source remained live");
+  KuString text = ku_string_concat(ku_string_static((const uint8_t*)"part",4), ku_string_static((const uint8_t*)"!",1));
+  KuString word = ku_string_concat(ku_string_static((const uint8_t*)"nested",6), ku_string_static((const uint8_t*)"!",1));
+  KuStruct_Piece piece = {text, ku_array_make_str(1, &word)};
+  KuArray_struct_Piece pieces = ku_array_make_struct_Piece(1, &piece);
+  const size_t piece_baseline = test_live;
+  failures = 0; successes = 0;
+  for (size_t ordinal = 1; ordinal <= 8; ordinal++) {
+    optional_fault(ordinal);
+    KuArray_struct_Piece result = __ku_array_concat_struct_Piece(pieces, pieces);
+    test_fail_at = 0;
+    if (__ku_sync_take().kind != KU_SYNC_EXIT_NONE) {
+      failures++;
+      optional_require(!result.data && result.len == 0, "partial struct concat escaped");
+    } else {
+      successes++;
+      optional_require(result.len == 2 && result.data[1].words.data[0].len == 7,
+          "deep concat lost a nested field");
+    }
+    ku_array_drop_struct_Piece(&result);
+    optional_require(test_live == piece_baseline, "partial struct clone leaked");
+  }
+  optional_require(failures == 7 && successes == 1, "nested fault plan did not cover every allocation");
+  for (size_t ordinal = 1; ordinal <= 4; ordinal++) {
+    optional_fault(ordinal);
+    __ku_nullable_type_struct_Piece result = __ku_array_first_struct_Piece(pieces);
+    test_fail_at = 0;
+    int failed = __ku_sync_take().kind != KU_SYNC_EXIT_NONE;
+    optional_require(failed == (ordinal <= 3) && result.is_null == failed,
+        "partial struct edge failure contract");
+    __ku_nullable_drop_struct_Piece(&result);
+    optional_require(test_live == piece_baseline, "partial struct edge leaked");
+  }
+  ku_array_drop_struct_Piece(&pieces);
+  optional_require(test_live == 0, "deep array owners remained live");
+  puts("array-optional-faults-ok");
+  return 0;
+}
+"#;
+
+#[test]
+fn native_collection_array_results_rollback_every_partial_allocation() {
+    let program = ir::optimize_program(&checked_ir(CONCAT_OPTIONAL_SOURCE));
+    let generated = c::generate_c_source(&program).expect("emit typed array failure artifact");
+    let generated = generated.replacen(
+        "typedef struct KuString",
+        &format!("{ALLOCATION_HOOKS}\n#define main ku_collection_generated_main\ntypedef struct KuString"),
+        1,
+    );
+    let Some(stdout) = native_c_stdout(
+        "array-optional-faults",
+        format!("{generated}\n{OPTIONAL_FAILURE_MAIN}"),
+    ) else {
+        return;
+    };
+    assert_eq!(stdout, "array-optional-faults-ok\n");
+}
+
+#[test]
+fn native_collection_task_results_keep_budgeted_owners_across_await() {
+    let source = r#"
+async fn Tick(): int! { return ok(1) }
+async fn Integers(): null! {
+    values = [0, 2]
+    joined = array.concat(values, [3])
+    zero = array.first(values)
+    empty: [int] = []
+    absent = array.last(empty)
+    flag = array.first([false])
+    if (absent != null) fail "empty Task array edge"
+    println(absent)
+    if (zero == null || flag == null) fail "Task sentinel collision"
+    if (zero != null) println(zero)
+    if (flag != null) println(flag)
+    if (values.len() != 2 || joined.len() != 3) fail "Task concat consumed input"
+    println(joined.try_get(2)?)
+    return ok(null)
+}
+async fn Size(value: str | null): int! {
+    if (value == null) { return ok(-1) }
+    return ok(value.len())
+}
+async fn Text(value: str | null): str! {
+    if (value == null) fail "empty"
+    return ok(value)
+}
+async fn Strings(): null! {
+    words = ["owned" + "!", "last" + "!"]
+    first = array.first(words)
+    last = array.last(words)
+    joined = array.concat(words, [""])
+    marker = Tick()
+    marker_value = (await marker)?
+    words = []
+    if (first == null || last == null) fail "Task string edge null"
+    if (first != null) println(first)
+    if (last != null) println(last)
+    println(joined.try_get(1)?)
+    println((await Size(first))?)
+    empty: [str] = []
+    println((await Size(array.first(empty)))?)
+    text_edge = array.first(joined)
+    println((await Text(text_edge))?)
+    return ok(null)
+}
+async fn main(): null! {
+    done = (await Integers())?
+    done = (await Strings())?
+    return ok(null)
+}
+"#;
+    let ast = Parser::new(Lexer::new(source).tokenize().expect("lex Task arrays"))
+        .parse_program()
+        .expect("parse Task arrays");
+    Checker::new().check(&ast).expect("check Task arrays");
+    let native = ir::task_lower::lower_program(&ast).expect("lower real Task array program");
+    let generated = c::generate_native_task_c_source(&native, &Default::default())
+        .expect("emit budgeted Task arrays");
+    assert!(generated.contains("ku_task_host_allocate_array"));
+    assert!(generated.contains("ku_task_host_clone_string"));
+    let Some(stdout) = native_c_stdout("task-array-optional", generated) else {
+        return;
+    };
+    assert_eq!(
+        stdout,
+        "null\n0\nfalse\n3\nowned!\nlast!\nlast!\n6\n-1\nowned!\n"
+    );
 }

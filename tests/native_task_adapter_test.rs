@@ -2826,6 +2826,169 @@ int main(void) {
 "#;
 
 #[test]
+fn native_task_nullable_array_owners_release_after_cancel_oom_and_budget_failure() {
+    let source = r#"
+import time from "std.time"
+async fn Inspect(left: str, right: str, stop: bool): int! {
+    values = [left, right]
+    joined = array.concat(values, values)
+    edge = array.first(joined)
+    if (stop) { time.sleep(60000)? }
+    if (edge == null) { fail "missing edge" }
+    return ok(joined.len() + edge.len() + values.len() - 2)
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let mut ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_program()
+        .unwrap();
+    ast.items.insert(
+        0,
+        ku::ast::Item::Module(ku::ast::ModuleDecl {
+            name: "std:time".into(),
+            span: Default::default(),
+        }),
+    );
+    Checker::new().check(&ast).unwrap();
+    let native = ir::task_lower::lower_program(&ast).unwrap();
+    let mut concat = None;
+    let mut edge = None;
+    for operation in native.tasks.functions[0]
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+    {
+        match operation {
+            TaskOp::Collection { dst, operation, .. } => match operation {
+                TaskCollectionOperation::Concat => concat = Some(dst.0),
+                TaskCollectionOperation::First => edge = Some(dst.0),
+                _ => {}
+            },
+            TaskOp::Move { dst, src } => {
+                if concat == Some(src.0) {
+                    concat = Some(dst.0);
+                }
+                if edge == Some(src.0) {
+                    edge = Some(dst.0);
+                }
+            }
+            _ => {}
+        }
+    }
+    let declarations = r#"
+static KuTestEvent array_entered,array_proceed;
+static size_t array_calls,array_fail_at,array_gate_at;
+static void* array_malloc(size_t bytes) {
+  fixture_alloc_lock(); size_t call=++array_calls;
+  int fail=call==array_fail_at; fixture_alloc_unlock();
+  return fail ? NULL : fixture_malloc(bytes);
+}
+"#;
+    let hooks = format!(
+        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{}\n{ALLOCATION_HOOK}\n{}\n{declarations}",
+        native_task_ledger::LEDGER_LOCK,
+        native_task_ledger::LOCKED_ALLOCATIONS
+    );
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    let generated = generated
+        .replacen(
+            "typedef struct KuString {",
+            &format!("{hooks}typedef struct KuString {{"),
+            1,
+        )
+        .replacen(
+            "int main(void) {",
+            "static int fixture_unused_main(void) {",
+            1,
+        )
+        .replacen(
+            "void* data=malloc(bytes);",
+            "void* data=array_malloc(bytes);",
+            1,
+        )
+        .replacen(
+            "uint8_t* bytes=(uint8_t*)malloc(capacity);",
+            "uint8_t* bytes=(uint8_t*)array_malloc(capacity);",
+            1,
+        );
+    let runtime = ARRAY_SNAPSHOT_MAIN
+        .split_once("int main(void) {")
+        .unwrap()
+        .0;
+    let main = NULLABLE_ARRAY_OWNER_MAIN
+        .replace("@CONCAT@", &concat.unwrap().to_string())
+        .replace("@EDGE@", &edge.unwrap().to_string());
+    run_finally_adapter_generated(
+        format!("{generated}\n{runtime}\n{main}"),
+        "native-task-nullable-array-owners",
+        "nullable-array-owners-ok\n",
+    );
+}
+
+const NULLABLE_ARRAY_OWNER_MAIN: &str = r#"
+static void optional_recovery(ArrayRuntime* runtime) {
+  array_idle(runtime); CHECK(!array_snapshot(runtime).resident && !array_snapshot(runtime).reserved_bytes);
+  KuTaskValueV1 next={0}; CHECK(ku_task_1_start_value(&runtime->driver,&next)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_wait_result(&next.ticket,&next.owner.lease,array_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(&next,NULL,&output)==KU_TASK_CONTROL_OK);
+  CHECK(output.result_kind==3u && output.value.null_value.ok); ku_task_outcome_drop(&output);
+  CHECK(ku_task_value_drop(&next,array_deadline())==KU_TASK_DRIVER_OK);
+  array_idle(runtime); CHECK(!array_snapshot(runtime).resident && !array_snapshot(runtime).reserved_bytes);
+}
+static void optional_cancel_case(uint32_t reason) {
+  ArrayRuntime runtime; array_init(&runtime,sizeof(KuTaskInstance_0)+4096u);
+  KuTaskValueV1 task=array_start(&runtime,true); array_idle(&runtime);
+  KuTaskInstance_0* instance=(KuTaskInstance_0*)task.owner.lease.control->context;
+  CHECK(instance && instance->timer.driver==&runtime.driver && array_snapshot(&runtime).timers==1u);
+  CHECK(instance->frame.header.initialized&(UINT64_C(1)<<@CONCAT@));
+  CHECK(instance->frame.header.initialized&(UINT64_C(1)<<@EDGE@));
+  CHECK(instance->frame.s_@CONCAT@.len==4u && !instance->frame.s_@EDGE@.is_null);
+  CHECK(instance->frame.s_@EDGE@.value.len==5u && array_calls==7u);
+  size_t live=sizeof(KuTaskInstance_0)+68u+6u*sizeof(KuString)+22u+5u;
+  CHECK(array_snapshot(&runtime).reserved_bytes==live);
+  CHECK(fixture_ledger().bytes==FIXTURE_BINDING_BYTES(&runtime.driver)+live);
+  uint64_t deadline=array_deadline();
+  CHECK(ku_task_driver_request_cancel(&task.ticket,&task.owner.lease,reason,deadline)==KU_TASK_CONTROL_OK);
+  CHECK(ku_task_driver_wait_result(&task.ticket,&task.owner.lease,deadline)==KU_TASK_DRIVER_WAIT_READY);
+  array_idle(&runtime);
+  CHECK(ku_task_control_cleanup_deadline(task.owner.lease.control)==deadline);
+  CHECK(!instance->timer.driver && !array_snapshot(&runtime).timers);
+  CHECK(!instance->frame.header.initialized && instance->values_cleaned);
+  CHECK(instance->frame.s_@EDGE@.is_null && !instance->frame.s_@EDGE@.value.ptr);
+  CHECK(!instance->frame.s_@CONCAT@.data && !instance->frame.s_@CONCAT@.len);
+  CHECK(array_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_0));
+  CHECK(fixture_ledger().bytes==FIXTURE_BINDING_BYTES(&runtime.driver)+sizeof(KuTaskInstance_0));
+  KuTaskAdapterOutcomeV1 output={0};
+  CHECK(ku_task_value_take(&task,NULL,&output)==reason && ku_task_outcome_empty(&output,1u));
+  CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK); optional_recovery(&runtime); array_finish(&runtime);
+}
+int main(void) {
+  /* Values vector, concat vector, four concat strings, then selected string. */
+  for (unsigned failure=0;failure<=7u;failure++) {
+    ArrayRuntime runtime; array_init(&runtime,sizeof(KuTaskInstance_0)+4096u);
+    array_fail_at=failure;
+    KuTaskValueV1 task=array_start(&runtime,false);
+    array_take(&runtime,&task,9,failure ? "out_of_memory" : NULL);
+    CHECK(array_calls==(failure ? failure : 7u));
+    optional_recovery(&runtime);
+    array_finish(&runtime);
+  }
+  /* Reject concat before malloc, and edge clone after all concat owners exist. */
+  for (unsigned edge=0;edge<=1u;edge++) {
+    ArrayRuntime runtime;
+    size_t bytes=sizeof(KuTaskInstance_0)+68u+2u*sizeof(KuString)
+        +(edge ? 4u*sizeof(KuString)+22u : 0u);
+    array_init(&runtime,bytes); KuTaskValueV1 task=array_start(&runtime,false);
+    array_take(&runtime,&task,0,"memory_limit");
+    CHECK(array_calls==(edge ? 6u : 1u)); optional_recovery(&runtime); array_finish(&runtime);
+  }
+  optional_cancel_case(KU_TASK_CONTROL_CANCELLED);
+  optional_cancel_case(KU_TASK_CONTROL_TIMED_OUT);
+  puts("nullable-array-owners-ok"); return 0;
+}
+"#;
+
+#[test]
 fn native_task_flat_array_results_keep_staged_owners_and_release_replaced_or_cancelled_payloads() {
     let source = r#"
 async fn Choose(value: [str], replacement: [str], mode: int): [str]! {
