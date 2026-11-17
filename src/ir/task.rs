@@ -4819,9 +4819,10 @@ pub(crate) fn compact_source_scalar_slots(
         });
     }
     if physical.len() > TaskLimits::default().max_slots {
-        return Err(invalid(
-            "more than64 physical Task slots after Copy temporary compaction",
-        ));
+        return Err(invalid(&format!(
+            "more than64 physical Task slots after Copy temporary compaction (function={}, logical={}, physical={})",
+            function.name, count, physical.len()
+        )));
     }
     for slot in &mut function.parameters {
         slot.0 = mapping[slot.0];

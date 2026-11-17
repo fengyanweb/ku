@@ -255,16 +255,30 @@ fn native_task_copy_assignment_raw_type_owned_task_and_declaration_gates_remain(
         assert!(operations[..replacement]
             .iter()
             .any(|op| matches!(op,TaskOp::Read {slot} if *slot==target)));
+        // The anonymous initializer now becomes the named owner directly;
+        // there is no separate empty header from an initial Move.
+        assert_eq!(
+            operations[..replacement]
+                .iter()
+                .filter(|op| matches!(op,
+                    TaskOp::Init { dst, .. }
+                    | TaskOp::ArrayMake { dst, .. }
+                    | TaskOp::WrapOk { dst, .. } if *dst == target))
+                .count(),
+            1,
+            "{ty}: initialize the named owner once before its self-read"
+        );
         assert_eq!(
             operations
                 .iter()
                 .filter(|op| matches!(op,TaskOp::Move {dst,..} if *dst==target))
                 .count(),
-            2
+            1,
+            "{ty}: only replacement transfers into the existing named owner"
         );
         task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
         // The lowering makes replacement explicit; raw IR must still refuse
-        // a second Owned Move if its preceding drop is removed.
+        // an Owned replacement if its preceding drop is removed.
         let mut invalid = native.tasks.clone();
         invalid.functions[native.entry.0].states[function.entry.0]
             .operations
@@ -388,9 +402,21 @@ async fn main(): null! {
         .collect();
     assert_eq!(
         body_owned.len(),
-        4,
-        "literal/Result temporaries and both bindings"
+        2,
+        "each anonymous initializer is its binding's sole owner header"
     );
+    assert_ne!(body_owned[0], body_owned[1]);
+    for expected in [IrType::Str, IrType::Result(Box::new(IrType::Int))] {
+        assert_eq!(
+            body_owned
+                .iter()
+                .filter(|slot| matches!(&main.slots[slot.0].ty,
+                    TaskSlotType::Value { ty, borrowed: false } if *ty == expected))
+                .count(),
+            1,
+            "one independently cleaned owner for {expected:?}"
+        );
+    }
     let (ready, scope_cleanup) = match body.terminator {
         TaskTerminator::ScopeDrain { ready, cleanup, .. } => (ready, cleanup),
         ref other => panic!("body must request scope drain, got {other:?}"),
@@ -482,6 +508,22 @@ async fn main(): null! {
     let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
     let frame = &plan.functions[native.entry.0];
     assert_eq!(frame.scope_exits.operations.len(), 2);
+    let literal_owner = |literal: &str| {
+        main.states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .find_map(|op| match op {
+                TaskOp::Init {
+                    dst,
+                    value: task::TaskConstant::Str(value),
+                } if value == literal => Some(*dst),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let inner_owner = literal_owner("inner");
+    let retained_owner = literal_owner("outer");
+    assert_ne!(inner_owner, retained_owner);
     for exit in &frame.scope_exits.operations {
         assert_eq!(exit.retain, Some(task::TaskScopeId(0)));
         let mut state = match main.states[exit.begin.0].terminator {
@@ -489,17 +531,21 @@ async fn main(): null! {
             ref other => panic!("dedicated Begin must jump: {other:?}"),
         };
         let mut drained = Vec::new();
-        let mut drops = 0;
+        let mut drops = Vec::new();
         for _ in 0..main.states.len() {
             assert_eq!(frame.scope_exits.state_operations[state.0], Some(exit.exit));
             if state == exit.end {
                 break;
             }
-            drops += main.states[state.0]
-                .operations
-                .iter()
-                .filter(|op| matches!(op, TaskOp::DropIfInit { .. }))
-                .count();
+            drops.extend(
+                main.states[state.0]
+                    .operations
+                    .iter()
+                    .filter_map(|op| match op {
+                        TaskOp::DropIfInit { slot } => Some(*slot),
+                        _ => None,
+                    }),
+            );
             state = match main.states[state.0].terminator {
                 TaskTerminator::ScopeDrain { scope, ready, .. } => {
                     drained.push(scope);
@@ -513,7 +559,10 @@ async fn main(): null! {
         assert_eq!(drained.len(), 2, "if arm and innermost for body");
         assert_eq!(drained[1], task::TaskScopeId(1));
         assert!(drained.iter().all(|scope| Some(*scope) != exit.retain));
-        assert_eq!(drops, 2, "inner literal and its local are dropped");
+        // The literal and named local share one owner header. Both loop
+        // exits drop it exactly once, without touching the retained outer.
+        assert_eq!(drops, vec![inner_owner]);
+        assert!(!drops.contains(&retained_owner));
         let target = match main.states[exit.end.0].terminator {
             TaskTerminator::Jump { target } => target,
             ref other => panic!("End must jump: {other:?}"),
@@ -928,7 +977,18 @@ async fn main(): null! {
             _ => None,
         })
         .collect();
-    assert_eq!(outer_values.len(), 2);
+    // The initializer is already the named owner, not an extra moved-from
+    // header. It must survive both the arm's normal drain and later use.
+    assert_eq!(outer_values.len(), 1);
+    assert_eq!(
+        main.states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .filter(|op| matches!(op, TaskOp::Print { value, .. } if *value == outer_values[0]))
+            .count(),
+        2,
+        "the same outer owner is read inside and after the arm"
+    );
     let all_owned: Vec<_> = main
         .slots
         .iter()
@@ -1765,4 +1825,293 @@ fn native_task_scalar_compaction_does_not_mask_move_or_finally_gates() {
         error.message.contains("across finally is not enabled"),
         "{error}"
     );
+}
+
+#[test]
+fn native_task_anonymous_owned_headers_forward_without_consuming_named_bindings() {
+    let source = r#"
+async fn Fresh():null! { text="a"+"b" values=["left","right"] println(text) println(values.len()) return ok(null) }
+async fn Named(value:str):null! { local=value moved=local println(moved) return ok(null) }
+async fn Nullable():int! {
+ values=["word"] head=array.first(values) length=0
+ if(head!=null) { copied=head.clone() length=head.len()+copied.len() }
+ return ok(length)
+}
+async fn main():null! {return ok(null)}
+"#;
+    let native = task_lower::lower_program(&checked(source)).unwrap();
+    let fresh = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "Fresh")
+        .unwrap();
+    assert!(
+        fresh
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .all(|operation| !matches!(operation, TaskOp::Move { .. })),
+        "anonymous string/array construction must not add empty duplicate owner headers"
+    );
+    let named = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "Named")
+        .unwrap();
+    let moves: Vec<_> = named
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter_map(|operation| match operation {
+            TaskOp::Move { dst, src } => Some((*dst, *src)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        moves.len(),
+        2,
+        "parameter and named binding transfers remain distinct"
+    );
+    assert!(moves.iter().all(|(dst, src)| dst != src));
+    assert_eq!(moves[0].1, named.parameters[0]);
+    assert_eq!(moves[1].1, moves[0].0);
+    let nullable = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "Nullable")
+        .unwrap();
+    assert!(nullable.states.iter().flat_map(|state| &state.operations).any(|operation|matches!(operation,
+        TaskOp::Move{src,..} if matches!(&nullable.slots[src.0].ty,TaskSlotType::Value{ty:IrType::Nullable(_),borrowed:false}))),
+        "nullable owners retain their original transfer/loan contract");
+    assert!(nullable
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .any(|operation| matches!(
+            operation,
+            TaskOp::Collection {
+                operation: task::TaskCollectionOperation::NullableView,
+                ..
+            }
+        )));
+    task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    let invalid=parsed("async fn Named(value:str):null! {local=value println(value) return ok(null)} async fn main():null!{return ok(null)}");
+    assert!(
+        Checker::new().check(&invalid).is_err(),
+        "owned named input is still moved"
+    );
+}
+
+#[test]
+fn native_task_forwarded_owned_arguments_are_materialized_once_across_awaits() {
+    let native = task_lower::lower_program(&checked(
+        r#"
+async fn Emit(value:str):str! {println(value) return ok(value)}
+async fn Pair(left:str,right:str):str! {return ok(left+":"+right)}
+async fn main():null! {
+ combined=(await Pair((await Emit("left"))?,(await Emit("right"))?))?
+ println(combined)
+ return ok(null)
+}
+"#,
+    ))
+    .unwrap();
+    let main = &native.tasks.functions[native.entry.0];
+    let emit = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "Emit")
+        .unwrap()
+        .id;
+    let pair = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "Pair")
+        .unwrap()
+        .id;
+    let starts: Vec<_> = main
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter_map(|operation| match operation {
+            TaskOp::Start {
+                function,
+                arguments,
+                ..
+            } => Some((*function, arguments.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts
+            .iter()
+            .filter(|(function, _)| *function == emit)
+            .count(),
+        2
+    );
+    assert_eq!(
+        starts
+            .iter()
+            .filter(|(function, _)| *function == pair)
+            .count(),
+        1
+    );
+    let pair_arguments = &starts
+        .iter()
+        .find(|(function, _)| *function == pair)
+        .unwrap()
+        .1;
+    assert_eq!(pair_arguments.len(), 2);
+    assert_ne!(pair_arguments[0], pair_arguments[1]);
+    assert_eq!(
+        main.states
+            .iter()
+            .filter(|state| matches!(state.terminator, TaskTerminator::Await { .. }))
+            .count(),
+        3
+    );
+    task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    ku::backend::c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+}
+
+#[test]
+fn native_task_installed_pg_async_fixture_keeps_original_work_within_physical_limit() {
+    let source = include_str!("fixtures/http_pg_installed_contract_async.ku");
+    let mut ast = parsed(source);
+    // The CLI resolver turns these four imports into builtin-module markers
+    // before checked lowering. Mirror that existing resolution in this IR test.
+    for name in ["pg", "fs", "http", "json"] {
+        ast.items.insert(
+            0,
+            Item::Module(ku::ast::ModuleDecl {
+                name: format!("std:{name}"),
+                span: Default::default(),
+            }),
+        );
+    }
+    Checker::new().check(&ast).unwrap();
+    let (setup, bindings) = ku::ir::lower_mixed_http_setup(&ast).unwrap();
+    let tasks = task_lower::lower_bound_service_handlers(&ast, &bindings).unwrap();
+    assert_eq!(
+        tasks.functions.len(),
+        6,
+        "every original installed route is retained"
+    );
+    let typed = tasks
+        .functions
+        .iter()
+        .find(|function| {
+            function.states.iter().any(|state| {
+                matches!(
+                    state.terminator,
+                    TaskTerminator::PgQuery { typed: Some(_), .. }
+                )
+            })
+        })
+        .unwrap();
+    assert_eq!(
+        typed
+            .states
+            .iter()
+            .filter(|state| matches!(state.terminator, TaskTerminator::PgQuery { .. }))
+            .count(),
+        3,
+        "ordinary retained result, typed query and subsequent pool reuse must all remain"
+    );
+    for function in &tasks.functions {
+        eprintln!(
+            "installed PG handler {}: {} physical slots",
+            function.name,
+            function.slots.len()
+        );
+        assert!(function.slots.len() <= TaskLimits::default().max_slots);
+    }
+    task::verify_and_plan(&tasks, TaskLimits::default()).unwrap();
+    let generated =
+        ku::backend::c::generate_mixed_http_c_source(&setup, &tasks, &Default::default()).unwrap();
+    assert!(generated.contains("DISCARD ALL"));
+    assert!(generated.contains("ku_pg_async_step"));
+}
+
+#[test]
+fn native_task_plain_catch_result_errors_deliver_into_one_existing_owner() {
+    let native = task_lower::lower_program(&checked(
+        r#"
+async fn Leaf(good:bool):str! {if(good){return ok("kept")} fail "expected"}
+async fn Inspect(good:bool):str! {
+ output="initial" i=0
+ while(i<4) {
+  try {first=(await Leaf(good))? second=(await Leaf(true))? output=first+":"+second}
+  catch(error){output="caught:"+error.code.clone()}
+  i=i+1
+ }
+ return ok(output)
+}
+async fn main():null! {return ok(null)}
+"#,
+    ))
+    .unwrap();
+    let inspect = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "Inspect")
+        .unwrap();
+    let errors: Vec<_> = inspect
+        .states
+        .iter()
+        .filter_map(|state| match state.terminator {
+            TaskTerminator::TryResult { err_result, .. } => Some(err_result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 2);
+    assert_eq!(errors[0], errors[1]);
+    assert!(
+        matches!(&inspect.slots[errors[0].0].ty,TaskSlotType::Value{ty,borrowed:false} if matches!(ty,IrType::Named(name) if name=="__ku_error_type"))
+    );
+    assert!(inspect
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .any(|operation| matches!(operation,TaskOp::Read{slot} if *slot==errors[0])));
+    assert!(
+        inspect
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .any(|operation| matches!(operation,
+        TaskOp::Move {src,dst} if *src==errors[0] && dst!=src)),
+        "named catch binding must still consume and clear the shared delivery owner"
+    );
+    let mut before_error_cleanup = 0;
+    let mut after_error_cleanup = 0;
+    for state in &inspect.states {
+        if let TaskTerminator::Await { cleanup, .. } | TaskTerminator::ScopeDrain { cleanup, .. } =
+            state.terminator
+        {
+            if matches!(state.terminator, TaskTerminator::Await { .. }) {
+                before_error_cleanup += 1;
+            } else {
+                after_error_cleanup += 1;
+            }
+            assert!(
+                inspect.states[cleanup.0].operations.iter().any(
+                    |operation| matches!(operation,TaskOp::DropIfInit{slot} if *slot==errors[0])
+                ),
+                "cancellation must retain cleanup for the shared catch owner"
+            );
+        }
+    }
+    assert!(
+        before_error_cleanup > 0 && after_error_cleanup > 0,
+        "exercise cancellation cleanup both before delivery and during error scope drain"
+    );
+    task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    ku::backend::c::generate_native_task_c_source(&native, &Default::default()).unwrap();
 }

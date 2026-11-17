@@ -2617,11 +2617,16 @@ async fn main(): null! { return ok(null) }
         TaskTerminator::Exit { value: err_result }
     );
     let success = &question.states[ok.0];
-    assert!(matches!(success.terminator, TaskTerminator::Exit { .. }));
+    let TaskTerminator::Exit { value: exit_value } = success.terminator else {
+        panic!("successful payload must retain its normal Result exit");
+    };
+    // The successful payload is already the local's sole owner. Wrapping it
+    // consumes that owner directly; a second empty initializer header is gone.
     assert!(success
         .operations
         .iter()
-        .any(|operation| matches!(operation, TaskOp::Move { src, .. } if *src == ok_value)));
+        .any(|operation| matches!(operation, TaskOp::WrapOk { dst, src }
+            if *dst == exit_value && *src == ok_value)));
 
     for (name, right_on_true) in [("ShortAnd", true), ("ShortOr", false)] {
         let function = native
@@ -3682,4 +3687,75 @@ int main(void) {
         b"late-tcp-generation-ok\n"
     };
     assert!(output.stdout.ends_with(expected));
+}
+
+#[test]
+fn native_task_direct_catch_owner_releases_success_and_partial_error_paths() {
+    let tasks = task_lower::lower_program(&checked(
+        r#"
+async fn Leaf(good:bool):str! {if(good){return ok("kept")} fail "expected"}
+async fn Inspect(good:bool):str! {
+ output="initial" i=0
+ while(i<4) {
+  try {first=(await Leaf(good))? second=(await Leaf(true))? output=first+":"+second}
+  catch(error){output="caught:"+error.code.clone()}
+  i=i+1
+ }
+ return ok(output)
+}
+async fn main():null! {
+ println((await Inspect(true))?)
+ println((await Inspect(false))?)
+ return ok(null)
+}
+"#,
+    ))
+    .unwrap();
+    let generated = c::generate_native_task_c_source(&tasks, &Default::default()).unwrap();
+    let anchor = "typedef struct KuString {";
+    assert_eq!(generated.matches(anchor).count(), 1);
+    let generated = generated
+        .replacen(anchor, &format!("{ALLOCATION_HOOK}\n{anchor}"), 1)
+        .replacen(
+            "int main(void) {",
+            "static int fixture_original_main(void) {",
+            1,
+        )
+        + r#"
+int main(void) {
+  int result=fixture_original_main();if(result)return result;
+  if(ku_perf_live_allocations || ku_perf_live_bytes || ku_perf_overflow) {
+    fprintf(stderr,"direct catch owner leaked: %zu %zu overflow=%d\n",ku_perf_live_allocations,ku_perf_live_bytes,ku_perf_overflow);
+    return 2;
+  }
+  return 0;
+}
+"#;
+    let directory = TempDir::new("native-task-direct-catch-owner");
+    let path = directory.path().join("catch.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "catch") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute the catch owner regression"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "kept:kept\ncaught:fail\n"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

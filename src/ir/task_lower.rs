@@ -759,6 +759,26 @@ impl<'a> FunctionLowerer<'a> {
                 self.span,
             ));
         }
+        // An anonymous owned result already has one initialized owner in this
+        // exact lexical scope. Forward its header to the consuming caller;
+        // introducing another Move would only add an empty logical slot.
+        // Named bindings, loans, Task/Callable identities and protected exits
+        // keep their distinct snapshot/ownership transfer below. None is the
+        // ordinary function-root scope, not permission to cross a scope edge.
+        if matches!(&ty, TaskSlotType::Value {ty,borrowed:false}
+                if !matches!(ty,IrType::Nullable(_)))
+            && owned_value(&ty)
+            && !self.stable_slots[source.0]
+            && self.slot_owners[source.0] == self.scopes.last().copied()
+            && !self.protected
+            && !self.in_finally_body
+            && self.finalies.is_empty()
+            && !self.pending_primaries.contains(&source)
+            && !self.nullable_views.contains_key(&source)
+            && !self.nullable_views.values().any(|owner| *owner == source)
+        {
+            return Ok(source);
+        }
         let destination = self.slot(ty.clone())?;
         self.emit(if copy_value(&ty) {
             TaskOp::Copy {
@@ -843,10 +863,17 @@ impl<'a> FunctionLowerer<'a> {
             self.discard_finally_primaries()?;
         }
         if let Some(handler) = self.handlers.last().copied() {
-            self.emit(TaskOp::Move {
-                dst: handler.error,
-                src: error,
-            })?;
+            if error == handler.error {
+                // A plain try/catch may receive the Result error directly in
+                // its one parent-scope delivery slot. It is already owned here;
+                // keep the same drain/jump without an invalid self-Move.
+                self.emit(TaskOp::Read { slot: error })?;
+            } else {
+                self.emit(TaskOp::Move {
+                    dst: handler.error,
+                    src: error,
+                })?;
+            }
             if self.protected {
                 self.handlers.last_mut().expect("active handler").used = true;
                 self.terminate(TaskTerminator::Jump {
@@ -1165,11 +1192,26 @@ impl<'a> FunctionLowerer<'a> {
                 let destination = self.slot(value_slot(inner.as_ref().clone()))?;
                 let catches_error = !self.handlers.is_empty();
                 let unwind_error = !self.finalies.is_empty() || self.protected;
-                let error = self.slot(value_slot(if catches_error {
-                    super::error_ir_type()
+                // Every error edge leaves this plain try body. Deliver into
+                // its existing parent-scope catch owner directly rather than
+                // allocating a terminator-owned Error header only to move it
+                // there immediately. Catch binding/drop clears this slot before
+                // re-entry; all finally/protected paths keep their old staging.
+                let direct_catch = catches_error
+                    && self.finalies.is_empty()
+                    && !self.protected
+                    && !self.in_finally_body
+                    && !self.unwinding
+                    && self.pending_primaries.is_empty();
+                let error = if direct_catch {
+                    self.handlers.last().expect("active catch owner").error
                 } else {
-                    self.function.result.clone()
-                }))?;
+                    self.slot(value_slot(if catches_error {
+                        super::error_ir_type()
+                    } else {
+                        self.function.result.clone()
+                    }))?
+                };
                 let ok = self.state(TaskTerminator::Terminate)?;
                 let err = self.state(if catches_error || unwind_error {
                     TaskTerminator::Terminate
