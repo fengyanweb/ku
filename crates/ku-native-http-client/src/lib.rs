@@ -180,6 +180,12 @@ pub unsafe extern "C" fn __ku_http_client_v1_build_id(
         || len.is_null()
         || !(data as usize).is_multiple_of(align_of::<*const u8>())
         || !(len as usize).is_multiple_of(align_of::<usize>())
+        || overlaps(
+            data as usize,
+            size_of::<*const u8>(),
+            len as usize,
+            size_of::<usize>(),
+        )
     {
         return 2;
     }
@@ -389,6 +395,21 @@ mod tests {
         assert_eq!(size_of::<Header>(), 32);
         assert_eq!(size_of::<Input>(), 96);
         assert_eq!(size_of::<Output>(), 88);
+        let mut data = ptr::null();
+        let mut len = 0;
+        assert_eq!(
+            unsafe { __ku_http_client_v1_build_id(&mut data, &mut len) },
+            0
+        );
+        assert_eq!(unsafe { slice::from_raw_parts(data, len) }, BUILD_ID);
+        let mut shared_word = 0usize;
+        let data_alias = ptr::addr_of_mut!(shared_word).cast::<*const u8>();
+        let len_alias = ptr::addr_of_mut!(shared_word);
+        assert_eq!(
+            unsafe { __ku_http_client_v1_build_id(data_alias, len_alias) },
+            2
+        );
+        assert_eq!(shared_word, 0, "rejected alias must not be written");
         let mut out = Output::empty();
         assert_eq!(
             unsafe { __ku_http_client_call_v1(ptr::null(), &mut out) },
