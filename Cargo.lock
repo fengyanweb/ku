@@ -498,6 +498,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ku-native-http-client"
+version = "0.1.0"
+dependencies = [
+ "ureq",
+ "url",
+]
+
+[[package]]
 name = "ku-native-tls"
 version = "0.1.0"
 dependencies = [

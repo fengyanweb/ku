@@ -147,8 +147,10 @@ def terminated(data, offset, what):
     return data[offset:stop]
 
 
-def validate_coff(body):
+def validate_coff(body, required_api=None, build_id=None):
     """Rust-specific COFF policy; short imports cannot define the private ABI."""
+    required_api = CALENDAR_API if required_api is None else required_api
+    build_id = BUILD_ID if build_id is None else build_id
     if len(body) < 20:
         raise ValueError('truncated COFF header')
     special = body[:4] == b'\x00\x00\xff\xff'
@@ -197,7 +199,7 @@ def validate_coff(body):
                 if item[:4] == b'\0'*4 else item[:8].split(b'\0', 1)[0])
         section = struct.unpack_from('<i' if special else '<h', item, 12)[0]
         external, aux = item[entry-2] == 2, item[entry-1]
-        if not imported and external and 0 < section <= sections and name in CALENDAR_API:
+        if not imported and external and 0 < section <= sections and name in required_api:
             if name in defined:
                 raise ValueError('duplicate defined calendar API symbol')
             defined.add(name)
@@ -212,16 +214,18 @@ def validate_coff(body):
         if length and characteristics & 0x40:
             if offset + length > len(body):
                 raise ValueError('COFF section data exceeds member bounds')
-            if not imported and BUILD_ID.encode() in body[offset:offset+length]:
+            if not imported and build_id.encode() in body[offset:offset+length]:
                 identity = True
     return True, defined, identity
 
 
-def validate_archive(path, target):
-    """Inspect every native code member, including Rust's dependency objects."""
+def validate_archive(path, target, required_api=None, build_id=None):
+    """Inspect every native code member, including Rust dependency objects."""
+    required_api = CALENDAR_API if required_api is None else required_api
+    build_id = BUILD_ID if build_id is None else build_id
     plain(path, MAX_ARCHIVE)
     data = Path(path).read_bytes()
-    if not data.startswith(b'!<arch>\n') or BUILD_ID.encode() not in data:
+    if not data.startswith(b'!<arch>\n') or build_id.encode() not in data:
         raise ValueError('calendar archive lacks its expected container/build identity')
     offset, objects, members = 8, 0, 0
     windows_definitions, windows_identity = set(), False
@@ -256,7 +260,7 @@ def validate_archive(path, target):
             valid = (len(body) >= 64 and body[:6] == b'\x7fELF\x02\x01'
                      and struct.unpack_from('<HH', body, 16) == (1, machine))
         else:
-            native, defined, identity = validate_coff(body)
+            native, defined, identity = validate_coff(body, required_api, build_id)
             if windows_definitions & defined:
                 raise ValueError('duplicate defined calendar API symbol')
             windows_definitions.update(defined)
@@ -271,7 +275,7 @@ def validate_archive(path, target):
             raise ValueError('calendar archive exceeds its native member bound')
     if offset != len(data) or objects == 0:
         raise ValueError('calendar archive has no complete native objects')
-    if target.startswith('x86_64-pc-windows-') and (windows_definitions != CALENDAR_API or not windows_identity):
+    if target.startswith('x86_64-pc-windows-') and (windows_definitions != required_api or not windows_identity):
         raise ValueError('calendar archive lacks defined ABI symbols or native object build identity')
     return objects
 
@@ -352,11 +356,11 @@ def run(command, env, timeout=900):
     return result
 
 
-def dependency_licenses(metadata):
+def dependency_licenses(metadata, crate_name="ku-native-calendar"):
     """Preserve licenses of the actual selected crate dependency closure."""
     packages = {item['id']: item for item in metadata['packages']}
     nodes = {item['id']: item for item in metadata['resolve']['nodes']}
-    roots = [key for key, item in packages.items() if item['name'] == 'ku-native-calendar']
+    roots = [key for key, item in packages.items() if item['name'] == crate_name]
     if len(roots) != 1:
         raise ValueError('metadata did not identify one native calendar crate')
     pending, seen = [roots[0]], set()
@@ -369,7 +373,7 @@ def dependency_licenses(metadata):
     chunks = []
     for key in sorted(seen, key=lambda item: (packages[item]['name'], packages[item]['version'])):
         package = packages[key]
-        if package['name'] == 'ku-native-calendar':
+        if package['name'] == crate_name:
             continue
         directory = Path(package['manifest_path']).parent
         candidates = sorted(path for path in directory.iterdir()

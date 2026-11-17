@@ -10901,7 +10901,7 @@ fn http_request_type() -> Type {
 fn http_response_type() -> Type {
     Type::Object(HashMap::from([
         ("status".to_string(), Type::Int),
-        ("headers".to_string(), Type::Object(HashMap::new())),
+        ("headers".to_string(), Type::DynamicObject),
         ("body".to_string(), Type::String),
     ]))
 }

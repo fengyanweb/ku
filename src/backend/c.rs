@@ -9,6 +9,8 @@ use output::COutput;
 mod array_optional;
 #[path = "c_calendar.rs"]
 mod calendar;
+#[path = "c_http_client.rs"]
+mod http_client;
 
 #[path = "c_int.rs"]
 mod checked_int;
@@ -51,7 +53,11 @@ mod task_root;
 fn c_object_type_name(name: &str) -> bool {
     matches!(
         name,
-        "__ku_object" | "__ku_calendar_date" | "__ku_calendar_parts"
+        "__ku_object"
+            | "__ku_calendar_date"
+            | "__ku_calendar_parts"
+            | "__ku_http_client_config"
+            | "__ku_http_headers"
     ) || crate::ir::http_constant_object_table(name).is_some()
 }
 
@@ -893,6 +899,7 @@ fn generate_c_source_with_frames_attempt(
     emit_array_map_helpers(&mut out, program)?;
     array_optional::emit_helpers(&mut out, &abi_program, !program.functions.is_empty())?;
     calendar::emit(&mut out, program);
+    http_client::emit(&mut out, program);
     emit_function_prototypes(&mut out, program)?;
     emit_closure_thunk_prototypes(&mut out, program)?;
     if program_uses_pg(program) || program_uses_mysql(program) || program_uses_redis(program) {
@@ -5473,7 +5480,11 @@ fn collect_json_writer_types(ty: &IrType, program: &IrProgram, output: &mut Vec<
             output.push(ty.clone());
             collect_json_writer_types(element, program, output);
         }
-        IrType::Named(name) if c_time_scalar_name(name) || name == "__ku_error_type" => {
+        IrType::Named(name)
+            if c_time_scalar_name(name)
+                || name == "__ku_error_type"
+                || name == "__ku_http_response" =>
+        {
             if !output.contains(ty) {
                 output.push(ty.clone());
             }
@@ -5550,7 +5561,11 @@ fn json_typed_write_call(
         IrType::Named(name) if name == "__ku_value" => Ok(format!(
             "ku_json_write_value({output}, {expression}, {depth}, {error})"
         )),
-        IrType::Named(name) if c_time_scalar_name(name) || name == "__ku_error_type" => {
+        IrType::Named(name)
+            if c_time_scalar_name(name)
+                || name == "__ku_error_type"
+                || name == "__ku_http_response" =>
+        {
             Ok(format!(
                 "ku_json_write_typed_{}({output}, {expression}, {depth}, {error})",
                 c_type_suffix(ty)?
@@ -5658,6 +5673,11 @@ fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -
                 .replace("ku_time_validate", &format!("{}_validate", c_time_prefix(name)))
                 .replace("ku_time_kind", &format!("{}_kind", c_time_prefix(name)))
             );
+        }
+        IrType::Named(name) if name == "__ku_http_response" => {
+            out.push_str("  if(!ku_json_write_byte(output,'{',error) || !ku_json_write_string(output,ku_string_static((const uint8_t*)\"body\",4),error) || !ku_json_write_byte(output,':',error) || !ku_json_write_value(output,ku_v_str(value.body),depth+1,error) || !ku_json_write_byte(output,',',error) || !ku_json_write_string(output,ku_string_static((const uint8_t*)\"headers\",7),error) || !ku_json_write_byte(output,':',error))return false;\n");
+            out.push_str("  if(value.headers) {if(!ku_json_write_value(output,ku_v_object(value.headers),depth+1,error))return false;} else {\n    if(!ku_json_write_byte(output,'{',error))return false; bool comma=false; KuString fields[2]={value.content_type,value.location}; const char* names[2]={\"content-type\",\"location\"};\n    for(size_t i=0;i<2;i++)if(fields[i].len){if(comma&&!ku_json_write_byte(output,',',error))return false;comma=true;if(!ku_json_write_string(output,ku_string_static((const uint8_t*)names[i],strlen(names[i])),error)||!ku_json_write_byte(output,':',error)||!ku_json_write_value(output,ku_v_str(fields[i]),depth+2,error))return false;}if(!ku_json_write_byte(output,'}',error))return false;\n  }\n");
+            out.push_str("  return ku_json_write_byte(output,',',error)&&ku_json_write_string(output,ku_string_static((const uint8_t*)\"status\",6),error)&&ku_json_write_byte(output,':',error)&&ku_json_write_value(output,ku_v_int(value.status),depth+1,error)&&ku_json_write_byte(output,'}',error);\n}\n");
         }
         IrType::Named(name) if name == "__ku_error_type" => {
             out.push_str(
@@ -16172,15 +16192,17 @@ fn emit_http_types(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
     // server pointer before the socket runtime completes its private layout.
     out.push_str("typedef struct KuHttpServer KuHttpServer;\n");
     out.push_str(
-        "typedef struct { int64_t status; KuString content_type; KuString body; KuString location; } KuStruct___ku_http_response;\n\
+        "typedef struct { int64_t status; KuString content_type; KuString body; KuString location; KuObject* headers; } KuStruct___ku_http_response;\n\
          static KuStruct___ku_http_response ku_move_struct___ku_http_response(KuStruct___ku_http_response* v) { KuStruct___ku_http_response r = *v; *v = (KuStruct___ku_http_response){0}; return r; }\n\
-         static KuStruct___ku_http_response ku_clone_struct___ku_http_response(KuStruct___ku_http_response v) { v.content_type = ku_string_clone(v.content_type); v.body = ku_string_clone(v.body); v.location = ku_string_clone(v.location); return v; }\n\
-         static void ku_drop_struct___ku_http_response(KuStruct___ku_http_response* v) { if (!v) return; ku_string_drop(&v->content_type); ku_string_drop(&v->body); ku_string_drop(&v->location); *v = (KuStruct___ku_http_response){0}; }\n\
          typedef struct { KuString method; KuString path; KuString body; KuObject* params; KuObject* query; KuObject* headers; } KuStruct___ku_http_request;\n\
          static KuStruct___ku_http_request ku_move_struct___ku_http_request(KuStruct___ku_http_request* v) { KuStruct___ku_http_request r = *v; *v = (KuStruct___ku_http_request){0}; return r; }\n\
          static KuStruct___ku_http_request ku_clone_struct___ku_http_request(KuStruct___ku_http_request v) { v.method = ku_string_clone(v.method); v.path = ku_string_clone(v.path); v.body = ku_string_clone(v.body); v.params = ku_object_clone(v.params); v.query = ku_object_clone(v.query); v.headers = ku_object_clone(v.headers); return v; }\n\
          static void ku_drop_struct___ku_http_request(KuStruct___ku_http_request* v) { if (!v) return; ku_string_drop(&v->method); ku_string_drop(&v->path); ku_string_drop(&v->body); ku_object_drop(v->params); ku_object_drop(v->query); ku_object_drop(v->headers); *v = (KuStruct___ku_http_request){0}; }\n\n",
     );
+    if !program.functions.is_empty() {
+        out.push_str("#define KU_HTTP_RESPONSE_SYNC 1\n");
+    }
+    out.push_str(include_str!("c_http_response_headers.c"));
     Ok(())
 }
 
@@ -16597,7 +16619,14 @@ fn emit_main_wrapper(
             "native C main wrapper does not support main parameters",
         ));
     }
-    let service = program_uses_http(program);
+    let service = [
+        "http.server",
+        "http.service",
+        "__ku_http_listen",
+        "__ku_http_bind",
+    ]
+    .iter()
+    .any(|name| program_uses_intrinsic(program, name));
     let exit = |value: &str| {
         if service {
             format!("ku_service_output_exit({value})")
@@ -17132,6 +17161,9 @@ fn c_string_method_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
 }
 
 fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String> {
+    if let Some(expression) = http_client::intrinsic_expr(name, args)? {
+        return Ok(expression);
+    }
     if let Some(expression) = calendar::intrinsic_expr(name, args)? {
         return Ok(expression);
     }

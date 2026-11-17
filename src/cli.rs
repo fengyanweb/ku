@@ -26,6 +26,8 @@ mod gnu_workspace;
 mod native_calendar;
 #[path = "cli_compression.rs"]
 mod native_compression;
+#[path = "cli_http_client.rs"]
+mod native_http_client;
 
 use crate::{
     ast::*,
@@ -2780,6 +2782,7 @@ struct CSourceFeatures {
     libmysql: bool,
     native_tls: bool,
     native_calendar: bool,
+    native_http_client: bool,
     zstd: bool,
     zlib: bool,
 }
@@ -2804,6 +2807,9 @@ impl CSourceFeatures {
             native_tls: text
                 .lines()
                 .any(|line| line == "#define KU_FEATURE_NATIVE_TLS 1"),
+            native_http_client: text
+                .lines()
+                .any(|line| line == "#define KU_FEATURE_NATIVE_HTTP_CLIENT 1"),
             native_calendar: text
                 .lines()
                 .any(|line| line == "#define KU_FEATURE_NATIVE_CALENDAR 1"),
@@ -5540,6 +5546,7 @@ fn verify_native_binary_dynamic_dependencies_file(
         && !features.libmysql
         && !features.native_tls
         && !features.native_calendar
+        && !features.native_http_client
         && !features.zstd
         && !features.zlib
     {
@@ -5576,6 +5583,13 @@ fn verify_native_binary_dynamic_dependencies_file(
             .any(|name| dynamic_dependency_is_native_calendar_library(name))
     {
         return Err("linked output records a dynamic native calendar dependency; the calendar contract requires the verified static archive".into());
+    }
+    if features.native_http_client
+        && names
+            .iter()
+            .any(|name| dynamic_dependency_is_native_http_client_library(name))
+    {
+        return Err("linked output records a dynamic native HTTP client dependency; the HTTP client contract requires the verified static archive".into());
     }
     if names
         .iter()
@@ -5699,6 +5713,25 @@ fn dynamic_dependency_is_native_calendar_library(name: &[u8]) -> bool {
             || lower
                 .windows(b"ku-native-calendar".len())
                 .any(|window| window == b"ku-native-calendar"))
+}
+
+fn dynamic_dependency_is_native_http_client_library(name: &[u8]) -> bool {
+    let name = name
+        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .unwrap_or(name);
+    let lower = name.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    let dynamic_suffix = lower.ends_with(b".dll")
+        || lower.ends_with(b".dylib")
+        || lower.ends_with(b".so")
+        || lower.windows(4).any(|window| window == b".so.");
+    dynamic_suffix
+        && (lower
+            .windows(b"ku_native_http_client".len())
+            .any(|window| window == b"ku_native_http_client")
+            || lower
+                .windows(b"ku-native-http-client".len())
+                .any(|window| window == b"ku-native-http-client"))
 }
 
 fn dynamic_dependency_is_compression_library(name: &[u8], zstd: bool, zlib: bool) -> bool {
@@ -6963,6 +6996,7 @@ fn compile_c_source_with_output(
     let needs_native_tls = features.native_tls;
     let needs_compression = features.zstd || features.zlib;
     let needs_calendar = features.native_calendar;
+    let needs_http_client = features.native_http_client;
     validate_native_tls_link_mode(needs_native_tls, static_link)?;
     let native_tls_root = needs_native_tls
         .then(|| resolve_native_tls_pack_root(env::var_os("KU_NATIVE_TLS_PACK")))
@@ -7061,7 +7095,7 @@ fn compile_c_source_with_output(
             && candidate.kind == CCompilerKind::Clang;
         let needs_native_tls_probe = needs_native_tls
             && (target.is_none() || candidate.kind == CCompilerKind::Preconfigured);
-        let needs_compression_probe = (needs_compression || needs_calendar)
+        let needs_compression_probe = (needs_compression || needs_calendar || needs_http_client)
             && (target.is_none() || candidate.kind == CCompilerKind::Preconfigured);
         let probed_compiler_target = if declared_target.is_none()
             && (needs_database_clang_probe || needs_native_tls_probe || needs_compression_probe)
@@ -7146,6 +7180,28 @@ fn compile_c_source_with_output(
                 &candidate.label,
             )
             .and_then(|selected| native_calendar::resolve(&selected, static_link));
+            match resolved {
+                Ok(pack) => Some(pack),
+                Err(error) => {
+                    if candidate.explicitly_configured {
+                        return Err(error);
+                    }
+                    compiler_failures.push(format!("{}: {error}", candidate.label));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let staged_http_client = if needs_http_client {
+            let resolved = native_compression::compiler_target(
+                native_output_target
+                    .as_ref()
+                    .expect("validated HTTP client target"),
+                effective_native_target,
+                &candidate.label,
+            )
+            .and_then(|selected| native_http_client::resolve(&selected, static_link));
             match resolved {
                 Ok(pack) => Some(pack),
                 Err(error) => {
@@ -7368,6 +7424,7 @@ fn compile_c_source_with_output(
             command.arg("-DKU_NATIVE_TLS_ENABLED=1");
         }
         let msvc_dynamic_crt = staged_calendar.as_ref().is_some_and(|pack| pack.msvc)
+            || staged_http_client.as_ref().is_some_and(|pack| pack.msvc)
             || compression_inputs.as_ref().and_then(|inputs| inputs.abi) == Some("msvc")
             || native_tls_pack
                 .as_ref()
@@ -7434,6 +7491,18 @@ fn compile_c_source_with_output(
             )?);
             for library in &calendar.libraries {
                 if calendar.msvc {
+                    command.arg("-Xlinker");
+                }
+                command.arg(library);
+            }
+        }
+        if let Some(http_client) = &staged_http_client {
+            command.arg(gnu_workspace::library_argument(
+                tool_workspace.as_mut(),
+                &http_client.archive,
+            )?);
+            for library in &http_client.libraries {
+                if http_client.msvc {
                     command.arg("-Xlinker");
                 }
                 command.arg(library);
@@ -7616,6 +7685,13 @@ fn compile_c_source_with_output(
                     )?;
                     Some(native_calendar::resolve(&selected, static_link)?)
                 } else { None };
+                let staged_msvc_http_client = if needs_http_client {
+                    let selected = native_compression::compiler_target(
+                        native_output_target.as_ref().expect("validated MSVC HTTP client target"),
+                        Some("x86_64-pc-windows-msvc"), "cl (MSVC)",
+                    )?;
+                    Some(native_http_client::resolve(&selected, static_link)?)
+                } else { None };
                 let libpq_requirement = msvc_libpq_library
                     .as_ref()
                     .map(|library| {
@@ -7651,6 +7727,7 @@ fn compile_c_source_with_output(
                         }),
                         compression: staged_msvc_compression.as_ref(),
                         calendar: staged_msvc_calendar.as_ref(),
+                        http_client: staged_msvc_http_client.as_ref(),
                     },
                     MsvcCompileOptions {
                         quiet_stdout,
@@ -8011,6 +8088,7 @@ struct MsvcDatabaseLinks<'a> {
     native_tls: Option<MsvcNativeTlsLink<'a>>,
     compression: Option<&'a native_compression::StagedCompressionInputs>,
     calendar: Option<&'a native_calendar::StagedCalendarInputs>,
+    http_client: Option<&'a native_http_client::StagedHttpClientInputs>,
 }
 
 #[derive(Clone, Copy)]
@@ -8062,6 +8140,7 @@ fn compile_with_msvc(
     if database.native_tls.is_some()
         || database.compression.is_some()
         || database.calendar.is_some()
+        || database.http_client.is_some()
     {
         // Verified native packs are built against the dynamic MSVC CRT. Make the
         // choice explicit so a project-wide default cannot silently mix CRTs.
@@ -8108,6 +8187,7 @@ fn compile_with_msvc(
         || database.native_tls.is_some()
         || database.compression.is_some()
         || database.calendar.is_some()
+        || database.http_client.is_some()
     {
         command.arg("/link");
         if let Some(library) = database.libpq {
@@ -8136,6 +8216,12 @@ fn compile_with_msvc(
         if let Some(calendar) = database.calendar {
             command.arg(strip_verbatim(calendar.archive.path()));
             for library in &calendar.libraries {
+                command.arg(library);
+            }
+        }
+        if let Some(http_client) = database.http_client {
+            command.arg(strip_verbatim(http_client.archive.path()));
+            for library in &http_client.libraries {
                 command.arg(library);
             }
         }
@@ -14590,6 +14676,59 @@ fn Zip(): null! { input=bytes.from_array([1])? gzip.compress(input,100)? return 
     }
 
     #[test]
+    fn http_client_dynamic_sidecars_are_rejected_but_unused_programs_remain_optional() {
+        let dir = TempBuildDir::create_private("http-client-loader").unwrap();
+        for (slug, data) in [
+            (
+                "x86_64-linux",
+                dependency_elf(&["libc.so.6", "libku_native_http_client.so.1"]),
+            ),
+            (
+                "x86_64-windows",
+                dependency_pe(&["KERNEL32.dll", "ku_native_http_client.dll"]),
+            ),
+            (
+                "aarch64-darwin",
+                dependency_macho(&[
+                    "/usr/lib/libSystem.B.dylib",
+                    "@rpath/libku_native_http_client.dylib",
+                ]),
+            ),
+        ] {
+            let target = resolve_build_target(Some(slug)).unwrap().unwrap();
+            let path = dir.path().join(slug);
+            fs::write(&path, data).unwrap();
+            let mut file = fs::File::open(&path).unwrap();
+            let len = file.metadata().unwrap().len();
+            let error = verify_native_binary_dynamic_dependencies_file(
+                &mut file,
+                len,
+                &target,
+                CSourceFeatures {
+                    native_http_client: true,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains("dynamic native HTTP client"), "{error}");
+            verify_native_binary_dynamic_dependencies_file(
+                &mut file,
+                len,
+                &target,
+                CSourceFeatures::default(),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert!(!dynamic_dependency_is_native_http_client_library(
+            b"libku_native_http_client.a"
+        ));
+    }
+
+    #[test]
     fn native_tls_pack_root_is_authoritative_absolute_and_has_bounded_fallback() {
         let relative = resolve_native_tls_pack_root_from(
             Some(OsString::from("relative-pack")),
@@ -14647,7 +14786,12 @@ fn Zip(): null! { input=bytes.from_array([1])? gzip.compress(input,100)? return 
         let alias = command_dir.join("ku");
         std::os::unix::fs::symlink("../SDK with spaces 中文/ku", &first).unwrap();
         std::os::unix::fs::symlink("ku-original", &alias).unwrap();
-        for namespace in ["native-calendar", "native-tls", "native-compression"] {
+        for namespace in [
+            "native-calendar",
+            "native-http",
+            "native-tls",
+            "native-compression",
+        ] {
             let expected = sdk.join(namespace).join("v1");
             fs::create_dir_all(&expected).unwrap();
             assert_eq!(

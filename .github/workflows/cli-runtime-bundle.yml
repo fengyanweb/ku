@@ -256,6 +256,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Installed SDK verification failed' }
           $installed = Get-Content -LiteralPath "$env:RUNNER_TEMP/cli-consumer-evidence.json" -Raw | ConvertFrom-Json
           if ($installed.installed_native_time_array.status -ne 'passed') { throw 'This SDK must include and actually execute the matching native calendar/array modules' }
+          if ($installed.installed_native_http_client.status -ne 'passed') { throw 'This SDK must include and actually execute the matching native HTTP/calendar client program' }
       - name: Prepare the existing PostgreSQL fixture tools on Linux
         if: runner.os == 'Linux'
         shell: bash
@@ -352,7 +353,7 @@ jobs:
           $path = Join-Path $env:RUNNER_TEMP 'cli-consumer-evidence.json'
           if (Test-Path -LiteralPath $path) {
             $evidence = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-            $native = [ordered]@{target='${{ matrix.target }}'; installed_native_tls=$evidence.installed_native_tls; installed_native_compression=$evidence.installed_native_compression; installed_native_time_array=$evidence.installed_native_time_array}
+            $native = [ordered]@{target='${{ matrix.target }}'; installed_native_tls=$evidence.installed_native_tls; installed_native_compression=$evidence.installed_native_compression; installed_native_time_array=$evidence.installed_native_time_array; installed_native_http_client=$evidence.installed_native_http_client}
             $text = ConvertTo-Json -InputObject $native -Depth 8 -Compress
             if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 32768) { throw 'Native consumer metadata exceeds summary bound' }
             Write-Output $text

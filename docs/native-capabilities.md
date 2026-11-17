@@ -64,3 +64,13 @@ ku build --backend runner --release hello.ku -o hello-runner
 递归 value 布局、object 解构、optional chaining、捕获 `for` 迭代绑定，以及尚未映射的标准库能力仍会明确拒绝。Task 参数、返回、捕获及 finally 继续受各自文档中的子集限制。遇到不支持能力或缺少依赖时应报错，不静默换成 Runner。
 
 原生 C 成为源码默认入口，不表示所有解释器功能或性能目标均已完成。能力、所有权、平台、安装与真实项目仍按各自证据验收，独立性能修改的采用条件不变。`ku run` 与直接执行 `.ku` 的既有行为不因此改变。
+
+## 同步 HTTP 客户端
+
+`http.get(url)`、`http.post(url, body)` 和 `http.request(config)` 在同步原生程序中返回 `HttpResponse!`。`HttpResponse` 可用于函数参数和返回值；`status`、`headers`、`body` 与解释器一致。结果独立持有字符串和头表，连接复用后仍有效。`clone()` 返回独立副本；读取 `response.headers` 得到独立表，修改 `response.headers[key]` 则修改该响应。JSON 和打印只暴露这三个公开字段。
+
+非 2xx 状态仍是成功结果；网络、UTF-8、响应体上限等错误通过 Result 返回。`http.request` 默认总请求期限 5000 ms、响应体上限 1,000,000 B，最大分别为 300,000 ms 和 16 MiB。已有更早的 HTTP handler 期限会限制本次调用，重定向不续期；调用返回后仍执行原有期限检查和清理。同步 DNS／网络等待不能保证任意时刻被取消。native Task（含经普通函数间接调用）继续拒绝同步 outbound HTTP；已有 Task 服务端响应子集不因此扩大为任意动态 headers。
+
+`http.client(config)` 保留现有配置对象接口，不是单独的连接池句柄；短方法复用现有懒初始化共享 agent。只有使用网络方法的程序才链接目标匹配的 `native-http/v1/<target>` 静态包。开发构建可用绝对路径 `KU_NATIVE_HTTP_CLIENT_PACK` 指定对应包；缺包、目标或源码身份不匹配会明确失败，不回退 Runner。
+
+完整回环示例：[native_http_client.ku](../examples/native_http_client.ku)。安装包验收同时链接日期和 HTTP 静态库，并在源码和 SDK 不可用时运行生成程序。各目标仍分别记录实际安装运行结果，交叉编译不等于运行通过。

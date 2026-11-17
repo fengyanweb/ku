@@ -1712,7 +1712,7 @@ impl<'a> FunctionLowerer<'a> {
                 let target = self.lower_lvalue_cached(target)?;
                 let mut left = self.lvalue_read_expr(&target);
                 if matches!(&left.kind,IrExprKind::Call {kind:IrCallKind::Intrinsic(name),..}
-                    if matches!(name.as_str(),"__ku_calendar_field_int"|"__ku_calendar_field_str"))
+                    if matches!(name.as_str(),"__ku_calendar_field_int"|"__ku_calendar_field_str"|"__ku_http_client_config_field_int"|"__ku_http_client_config_field_str"))
                 {
                     // The string getter creates an independent owner. Register
                     // it before arithmetic/store, including signal exits.
@@ -1846,7 +1846,14 @@ impl<'a> FunctionLowerer<'a> {
                 self.current.terminator = self.return_terminator(value)?;
             }
             Stmt::Print { value, .. } => {
-                let value = self.lower_expr(value)?;
+                let mut value = self.lower_expr(value)?;
+                if value.ty == IrType::Named(HTTP_RESPONSE_TYPE.into()) {
+                    value = self.emit_temp(intrinsic_expr(
+                        "__ku_http_response_public_value",
+                        vec![value],
+                        IrType::Named("__ku_value".into()),
+                    ))?;
+                }
                 emit_ir_instruction!(self, IrInst::Print(value));
             }
             Stmt::Expr { expr: value, .. } => {
@@ -2452,7 +2459,7 @@ impl<'a> FunctionLowerer<'a> {
                 },
             },
             IrLValue::Field { target, name } => self
-                .calendar_field_read(target, name)
+                .object_record_field_read(target, name)
                 .unwrap_or_else(|| IrExpr {
                     ty: self.field_type(&target.ty, name),
                     kind: IrExprKind::Field {
@@ -2651,7 +2658,14 @@ impl<'a> FunctionLowerer<'a> {
             ExprKind::Variable(_) => self.lower_expr(expr),
             ExprKind::Field { target, name } => {
                 let target = self.lower_lvalue_target_expr(target)?;
-                if let Some(read) = self.calendar_field_read(&target, name) {
+                if name == "headers" && target.ty == IrType::Named(HTTP_RESPONSE_TYPE.into()) {
+                    self.emit_temp(intrinsic_expr(
+                        "__ku_http_response_headers_prepare",
+                        vec![target.clone()],
+                        IrType::Null,
+                    ))?;
+                }
+                if let Some(read) = self.object_record_field_read(&target, name) {
                     return self.emit_temp(read);
                 }
                 let ty = self.field_type(&target.ty, name);
@@ -2694,7 +2708,14 @@ impl<'a> FunctionLowerer<'a> {
             ExprKind::Variable(_) => self.lower_expr(expr),
             ExprKind::Field { target, name } => {
                 let target = self.lower_lvalue_target_expr_cached(target)?;
-                if let Some(read) = self.calendar_field_read(&target, name) {
+                if name == "headers" && target.ty == IrType::Named(HTTP_RESPONSE_TYPE.into()) {
+                    self.emit_temp(intrinsic_expr(
+                        "__ku_http_response_headers_prepare",
+                        vec![target.clone()],
+                        IrType::Null,
+                    ))?;
+                }
+                if let Some(read) = self.object_record_field_read(&target, name) {
                     return self.emit_temp(read);
                 }
                 let ty = self.field_type(&target.ty, name);
@@ -2896,6 +2917,13 @@ impl<'a> FunctionLowerer<'a> {
                 _ => IrType::Unknown,
             };
         }
+        if struct_name == "__ku_http_client_config" {
+            return match field_name {
+                "kind" => IrType::Str,
+                "timeout_ms" | "max_body_bytes" | "max_idle_connections" => IrType::Int,
+                _ => IrType::Unknown,
+            };
+        }
         if struct_name == "__ku_calendar_date" {
             return match field_name {
                 "kind" => IrType::Str,
@@ -2919,6 +2947,7 @@ impl<'a> FunctionLowerer<'a> {
             return match field_name {
                 "status" => IrType::Int,
                 "body" => IrType::Str,
+                "headers" => IrType::Named("__ku_http_headers".into()),
                 _ => IrType::Unknown,
             };
         }
@@ -2939,14 +2968,20 @@ impl<'a> FunctionLowerer<'a> {
             .unwrap_or(IrType::Unknown)
     }
 
-    fn calendar_field_read(&self, target: &IrExpr, name: &str) -> Option<IrExpr> {
-        if !matches!(&target.ty,IrType::Named(marker) if matches!(marker.as_str(),"__ku_calendar_date"|"__ku_calendar_parts"))
+    fn object_record_field_read(&self, target: &IrExpr, name: &str) -> Option<IrExpr> {
+        if !matches!(&target.ty,IrType::Named(marker) if matches!(marker.as_str(),"__ku_calendar_date"|"__ku_calendar_parts"|"__ku_http_client_config"))
         {
             return None;
         }
         let ty = self.field_type(&target.ty, name);
         Some(intrinsic_expr(
-            if ty == IrType::Str {
+            if target.ty == IrType::Named("__ku_http_client_config".into()) {
+                if ty == IrType::Str {
+                    "__ku_http_client_config_field_str"
+                } else {
+                    "__ku_http_client_config_field_int"
+                }
+            } else if ty == IrType::Str {
                 "__ku_calendar_field_str"
             } else {
                 "__ku_calendar_field_int"
@@ -3370,7 +3405,12 @@ impl<'a> FunctionLowerer<'a> {
         let module = match &receiver.ty {
             IrType::Array(_) => "array",
             IrType::Str => "string",
-            IrType::Named(n) if n == "__ku_object" || http_constant_object_table(n).is_some() => {
+            IrType::Named(n)
+                if n == "__ku_object"
+                    || n == "__ku_http_client_config"
+                    || n == "__ku_http_headers"
+                    || http_constant_object_table(n).is_some() =>
+            {
                 "object"
             }
             IrType::Named(n) if n == "__ku_value" => "kuvalue",
@@ -3514,6 +3554,74 @@ impl<'a> FunctionLowerer<'a> {
         let value = self.nullable_read(expr, value);
         self.invalidate_nullable_call(expr);
         Ok(value)
+    }
+
+    fn lower_index_expr(
+        &mut self,
+        target: &Expr,
+        index: &Expr,
+        optional: bool,
+    ) -> KuResult<IrExpr> {
+        let target = self.lower_expr(target)?;
+        let target =
+            self.snapshot_receiver_before_effects(target, !is_pure_append_argument(index, ""))?;
+        let index = self.lower_expr(index)?;
+        // `obj[key]` on a dynamic object yields Result<KuValue>: Ok(value)
+        // when present, Err{object, missing_key} when absent. `?` unwraps
+        // it to a KuValue.
+        if !optional && target.ty == IrType::Named("__ku_http_headers".into()) {
+            return self.emit_temp(intrinsic_expr(
+                "__ku_http_headers_get",
+                vec![target, index],
+                IrType::Named("__ku_value".into()),
+            ));
+        }
+        if let IrType::Named(name) = &target.ty {
+            if name == "__ku_object"
+                || name == "__ku_http_client_config"
+                || name == "__ku_http_headers"
+                || name == "__ku_value"
+                || http_constant_object_table(name).is_some()
+            {
+                // `obj[key]?` on a KuObject or a KuValue (e.g. json.parse
+                // result) yields Result<KuValue>. The KuValue variant checks
+                // the tag is an object at runtime.
+                let intrinsic = if name == "__ku_value" {
+                    // A KuValue index dispatches by key type: an int key
+                    // reads an array element (__ku_value_index), a str key
+                    // reads an object member (__ku_value_get).
+                    if matches!(&index.ty, IrType::Int) {
+                        "__ku_value_index"
+                    } else {
+                        "__ku_value_get"
+                    }
+                } else {
+                    "__ku_object_get"
+                };
+                return self.emit_temp(IrExpr {
+                    kind: IrExprKind::Call {
+                        callee: Box::new(IrExpr {
+                            kind: IrExprKind::Local(intrinsic.to_string()),
+                            ty: IrType::Function,
+                        }),
+                        args: vec![target, index],
+                        kind: IrCallKind::Intrinsic(intrinsic.to_string()),
+                    },
+                    ty: IrType::Result(Box::new(IrType::Named("__ku_value".to_string()))),
+                });
+            }
+        }
+        let ty = match &target.ty {
+            IrType::Array(inner) => *inner.clone(),
+            _ => IrType::Unknown,
+        };
+        self.emit_temp(IrExpr {
+            kind: IrExprKind::Index {
+                target: Box::new(target),
+                index: Box::new(index),
+            },
+            ty,
+        })
     }
 
     fn lower_expr_impl(
@@ -3863,7 +3971,7 @@ impl<'a> FunctionLowerer<'a> {
                     IrCallKind::Intrinsic(name) => metadata::supports_borrowed_call(name),
                     IrCallKind::Direct(_) | IrCallKind::Indirect => true,
                 };
-                let lowered_args = self.lower_call_arguments(
+                let mut lowered_args = self.lower_call_arguments(
                     args,
                     expected_param_types.as_deref(),
                     match &bound_callee {
@@ -3924,6 +4032,19 @@ impl<'a> FunctionLowerer<'a> {
                 } else {
                     call_kind_and_type(callee, &lowered_args, self.signatures)
                 };
+                if matches!(&kind,IrCallKind::Intrinsic(name) if name=="println")
+                    && lowered_args
+                        .first()
+                        .is_some_and(|a| a.ty == IrType::Named(HTTP_RESPONSE_TYPE.into()))
+                {
+                    let value = lowered_args.remove(0);
+                    let boxed = self.emit_temp(intrinsic_expr(
+                        "__ku_http_response_public_value",
+                        vec![value],
+                        IrType::Named("__ku_value".into()),
+                    ))?;
+                    lowered_args.insert(0, boxed);
+                }
                 if matches!(&kind, IrCallKind::Intrinsic(name) if name == "http.json") {
                     // The interpreter reports invalid status/serialization as a
                     // runtime error, not a user Result. Preserve that fatal edge
@@ -4030,61 +4151,7 @@ impl<'a> FunctionLowerer<'a> {
                     ty: IrType::Array(Box::new(element)),
                 })
             }
-            ExprKind::Index { target, index } => {
-                let target = self.lower_expr(target)?;
-                let target = self.snapshot_receiver_before_effects(
-                    target,
-                    !is_pure_append_argument(index, ""),
-                )?;
-                let index = self.lower_expr(index)?;
-                // `obj[key]` on a dynamic object yields Result<KuValue>: Ok(value)
-                // when present, Err{object, missing_key} when absent. `?` unwraps
-                // it to a KuValue.
-                if let IrType::Named(name) = &target.ty {
-                    if name == "__ku_object"
-                        || name == "__ku_value"
-                        || http_constant_object_table(name).is_some()
-                    {
-                        // `obj[key]?` on a KuObject or a KuValue (e.g. json.parse
-                        // result) yields Result<KuValue>. The KuValue variant checks
-                        // the tag is an object at runtime.
-                        let intrinsic = if name == "__ku_value" {
-                            // A KuValue index dispatches by key type: an int key
-                            // reads an array element (__ku_value_index), a str key
-                            // reads an object member (__ku_value_get).
-                            if matches!(&index.ty, IrType::Int) {
-                                "__ku_value_index"
-                            } else {
-                                "__ku_value_get"
-                            }
-                        } else {
-                            "__ku_object_get"
-                        };
-                        return self.emit_temp(IrExpr {
-                            kind: IrExprKind::Call {
-                                callee: Box::new(IrExpr {
-                                    kind: IrExprKind::Local(intrinsic.to_string()),
-                                    ty: IrType::Function,
-                                }),
-                                args: vec![target, index],
-                                kind: IrCallKind::Intrinsic(intrinsic.to_string()),
-                            },
-                            ty: IrType::Result(Box::new(IrType::Named("__ku_value".to_string()))),
-                        });
-                    }
-                }
-                let ty = match &target.ty {
-                    IrType::Array(inner) => *inner.clone(),
-                    _ => IrType::Unknown,
-                };
-                self.emit_temp(IrExpr {
-                    kind: IrExprKind::Index {
-                        target: Box::new(target),
-                        index: Box::new(index),
-                    },
-                    ty,
-                })
-            }
+            ExprKind::Index { target, index } => self.lower_index_expr(target, index, false),
             ExprKind::Field { target, name } => {
                 // Constants are compiler-known only for the actual module root,
                 // never for a lexical value merely spelled `http`. Reading a
@@ -4224,8 +4291,16 @@ impl<'a> FunctionLowerer<'a> {
                         ));
                     }
                 }
+                if name == "headers" && target.ty == IrType::Named(HTTP_RESPONSE_TYPE.into()) {
+                    // A read never writes a shared/borrowed response cache.
+                    return self.emit_temp(intrinsic_expr(
+                        "__ku_http_response_headers_read",
+                        vec![target],
+                        IrType::Named("__ku_http_headers".into()),
+                    ));
+                }
                 let ty = self.field_type(&target.ty, name);
-                if let Some(read) = self.calendar_field_read(&target, name) {
+                if let Some(read) = self.object_record_field_read(&target, name) {
                     return self.emit_temp(read);
                 }
                 let field = IrExpr {
@@ -4271,7 +4346,11 @@ impl<'a> FunctionLowerer<'a> {
                 expr.span,
             )),
             ExprKind::TryUnwrap { expr } => {
-                let expr = self.lower_expr(expr)?;
+                let expr = if let ExprKind::Index { target, index } = &expr.kind {
+                    self.lower_index_expr(target, index, true)?
+                } else {
+                    self.lower_expr(expr)?
+                };
                 let ty = match &expr.ty {
                     IrType::Result(inner) => *inner.clone(),
                     _ => IrType::Unknown,
@@ -5624,12 +5703,24 @@ impl<'a> FunctionLowerer<'a> {
     }
 }
 
+fn http_response_clone_may_signal(ty: &IrType) -> bool {
+    match ty {
+        IrType::Named(name) => name == HTTP_RESPONSE_TYPE,
+        IrType::Result(inner) => http_response_clone_may_signal(inner),
+        _ => false,
+    }
+}
+
 /// Operations whose fresh native result cannot be used until the synchronous
 /// return mailbox has been consumed. This classifies only typed i64 arithmetic;
 /// float/mixed/dynamic expressions retain their separate existing semantics.
 pub(crate) fn ir_expr_needs_sync_guard(expr: &IrExpr) -> bool {
+    if matches!(&expr.kind,IrExprKind::Call{kind:IrCallKind::Intrinsic(name),args,..} if name=="__ku_clone" && args.first().is_some_and(|x| http_response_clone_may_signal(&x.ty)))
+    {
+        return true;
+    }
     if matches!(&expr.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), .. }
-        if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response"
+        if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response" | "__ku_http_response_headers_read" | "__ku_http_headers_get" | "__ku_http_response_headers_prepare" | "__ku_http_client_config_field_int" | "__ku_http_client_config_field_str" | "__ku_http_response_public_value" | "http.get" | "http.post" | "http.request" | "http.client"
             | "time.from_unix" | "time.from_millis" | "time.add" | "time.sub" | "time.diff"))
     {
         return true;
@@ -5676,7 +5767,10 @@ fn ir_expr_needs_post_call_safepoint(expr: &IrExpr) -> bool {
             ..
         } => matches!(
             name.as_str(),
-            "array.map"
+            "http.get"
+                | "http.post"
+                | "http.request"
+                | "array.map"
                 | "array.concat"
                 | "array.first"
                 | "array.last"
@@ -6180,6 +6274,10 @@ fn time_builtin_ir_type(module: &str, function: &str, args: &[IrExpr]) -> Option
 fn http_builtin_ir_type(module: &str, function: &str) -> Option<IrType> {
     match (module, function) {
         ("http", "server" | "service") => Some(IrType::Named(HTTP_SERVER_TYPE.to_string())),
+        ("http", "get" | "post" | "request") => Some(IrType::Result(Box::new(IrType::Named(
+            HTTP_RESPONSE_TYPE.into(),
+        )))),
+        ("http", "client") => Some(IrType::Named("__ku_http_client_config".into())),
         ("http", "text" | "html" | "json" | "empty" | "redirect") => {
             Some(IrType::Named(HTTP_RESPONSE_TYPE.to_string()))
         }

@@ -14,6 +14,7 @@ pub mod core;
 pub mod errors;
 pub mod fs;
 pub mod http;
+pub(crate) mod http_client_engine;
 pub mod json;
 pub(crate) mod metadata;
 pub mod object;

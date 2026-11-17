@@ -4429,7 +4429,10 @@ pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
             .iter()
             .map(|name| empty_value_expr(&IrType::Str, &format!("({place}).{name}")))
             .collect::<KuResult<Vec<_>>>()?;
-        return Ok(format!("!({place}).status && ({})", leaves.join(") && (")));
+        return Ok(format!(
+            "!({place}).status && !({place}).headers && ({})",
+            leaves.join(") && (")
+        ));
     }
     if crate::ir::task::http_request_type(ty) {
         let leaves = ["method", "path", "body"]

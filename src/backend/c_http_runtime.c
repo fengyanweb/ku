@@ -787,7 +787,7 @@ static uint32_t ku_http_result_failure(KuError* error) {
 static KuStruct___ku_http_response ku_http_response_from_result(KuResult_struct___ku_http_response r) {
   if (r.ok) { if(r.value.status==500) ku_http_failure_current.reason=KU_HTTP_ERROR_HANDLER_500; KuStruct___ku_http_response v = r.value; r.value = (KuStruct___ku_http_response){0}; return v; }
   ku_http_failure_current.reason=ku_http_result_failure(&r.error);
-  KuStruct___ku_http_response v;
+  KuStruct___ku_http_response v={0};
   v.status = 500;
   v.content_type = ku_string_static((const uint8_t*)"text/plain; charset=utf-8", 25);
   v.body = ku_string_static((const uint8_t*)"Internal Server Error", 21);
@@ -1676,8 +1676,25 @@ static void ku_http_buffer_refund(KuHttpBufferBudget* budget, size_t bytes) {
   budget->current -= bytes;
   ku_http_mutex_unlock(&budget->lock);
 }
+/* Only a returned response owner is modified; unsupported non-string headers
+ * are discarded exactly as the interpreter's value_to_http_response does. */
+static void __ku_http_headers_flatten(KuObject* map) {
+  if(!map)return;
+  for(size_t i=0;i<map->cap;i++)if(map->entries[i].used && map->entries[i].value.tag!=KU_STR)ku_value_drop(&map->entries[i].value);
+}
+static int __ku_http_response_map_bytes(KuObject* map,size_t* total) {
+  if(!map)return 1;
+  if(map->cap>SIZE_MAX/sizeof(KuEntry)||sizeof(*map)>SIZE_MAX-map->cap*sizeof(KuEntry))return 0;
+  size_t n=sizeof(*map)+map->cap*sizeof(KuEntry);
+  for(size_t i=0;i<map->cap;i++)if(map->entries[i].used) {
+    KuString fields[2]={map->entries[i].key,map->entries[i].value.tag==KU_STR?map->entries[i].value.as.s:(KuString){0}};
+    for(size_t j=0;j<2;j++)if(fields[j].storage==KU_STRING_OWNED){if(fields[j].capacity>SIZE_MAX-n)return 0;n+=fields[j].capacity;}
+  }
+  if(n>SIZE_MAX-*total)return 0;*total+=n;return 1;
+}
 static size_t ku_http_buffer_admit_response(KuHttpBufferBudget* budget, KuStruct___ku_http_response* response, KuHttpFailure* failure) {
   size_t response_charge = 0;
+  __ku_http_headers_flatten(response->headers);
   KuString response_strings[3] = { response->body, response->content_type, response->location };
   int response_fits = 1;
   for (int index=0; index<3; index++) if (response_strings[index].storage == KU_STRING_OWNED) {
@@ -1685,7 +1702,7 @@ static size_t ku_http_buffer_admit_response(KuHttpBufferBudget* budget, KuStruct
     if (bytes > SIZE_MAX - response_charge) { response_fits = 0; break; }
     response_charge += bytes;
   }
-  if (!response_fits || !ku_http_buffer_reserve(budget, response_charge)) {
+  if (!response_fits || !__ku_http_response_map_bytes(response->headers,&response_charge) || !ku_http_buffer_reserve(budget, response_charge)) {
     if (failure) { failure->reason=KU_HTTP_ERROR_PROJECTION; failure->stage=4; }
     ku_drop_struct___ku_http_response(response);
     *response = ku_http_status_response(503, "Service Unavailable");
@@ -2014,6 +2031,7 @@ typedef struct { const char* bytes; size_t length; } KuHttpPart;
 typedef struct {
   KuStruct___ku_http_response response;
   size_t charge;
+  uint8_t* header_storage; size_t header_capacity;
   /* Status is normalized to 100..599 before formatting. The longest private
      reason is 31 bytes, so the complete status line including NUL needs 47. */
   char first[64]; char last[128];
@@ -2243,6 +2261,7 @@ static void ku_http_connection_close(KuHttpConnection* connection) {
   free(connection->carry); connection->carry = NULL;
   ku_http_buffer_refund(connection->budget, connection->carry_length); connection->carry_length = 0;
   ku_http_input_drop(&connection->input);
+  free(connection->output.header_storage); connection->output.header_storage=NULL;
   ku_drop_struct___ku_http_response(&connection->output.response);
   ku_http_buffer_refund(connection->budget, connection->output.charge); connection->output.charge = 0;
   if (connection->job) ku_http_queue_cancel_job(connection->job);
@@ -2275,6 +2294,44 @@ static void ku_http_connection_close(KuHttpConnection* connection) {
   connection->reactor=reactor; connection->work_position=-1; connection->idle_position=-1;
 #endif
 }
+static uint8_t __ku_http_wire_lower(uint8_t c){return c>='A'&&c<='Z'?(uint8_t)(c+32):c;}
+static int __ku_http_wire_header_compare(const void* a,const void* b) {
+  const KuEntry* x=*(const KuEntry* const*)a;const KuEntry* y=*(const KuEntry* const*)b;
+  size_t n=x->key.len<y->key.len?x->key.len:y->key.len;
+  for(size_t i=0;i<n;i++){uint8_t l=__ku_http_wire_lower(x->key.ptr[i]),r=__ku_http_wire_lower(y->key.ptr[i]);if(l!=r)return l<r?-1:1;}
+  return x->key.len<y->key.len?-1:x->key.len!=y->key.len;
+}
+static int __ku_http_wire_managed(KuString name) {
+  static const char* fields[]={"connection","content-length","keep-alive","proxy-connection","te","trailer","transfer-encoding","upgrade"};
+  for(size_t i=0;i<sizeof(fields)/sizeof(fields[0]);i++)if(ku_http_name_eq((const char*)name.ptr,name.len,fields[i]))return 1;return 0;
+}
+/* 1 success, 0 quota/allocation failure, -1 invalid response. One owned block
+ * holds temporary sort pointers and final bytes; the old NULL path allocates 0. */
+static int __ku_http_wire_headers(KuObject* map,KuHttpBufferBudget* budget,uint8_t** storage,size_t* capacity,const char** bytes,size_t* length) {
+  *storage=NULL;*capacity=0;*bytes=NULL;*length=0;if(!map)return 1;
+  size_t count=0,wire=0;
+  for(size_t i=0;i<map->cap;i++)if(map->entries[i].used&&map->entries[i].value.tag==KU_STR) {
+    KuEntry* e=&map->entries[i];
+    if(!e->key.len||!ku_http_field_value_safe(e->value.as.s.ptr,e->value.as.s.len))return -1;
+    for(size_t j=0;j<e->key.len;j++){uint8_t c=e->key.ptr[j];if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||(c&&strchr("!#$%&'*+-.^_`|~",c))))return -1;}
+    if(__ku_http_wire_managed(e->key))continue;
+    if(e->key.len>SIZE_MAX-wire||e->value.as.s.len>SIZE_MAX-wire-e->key.len||4u>SIZE_MAX-wire-e->key.len-e->value.as.s.len)return 0;
+    wire+=e->key.len+e->value.as.s.len+4u;count++;
+  }
+  if(!count)return 1;
+  if(count>SIZE_MAX/sizeof(KuEntry*)||wire>SIZE_MAX-count*sizeof(KuEntry*))return 0;
+  size_t cap=count*sizeof(KuEntry*)+wire;
+  if(!ku_http_buffer_reserve(budget,cap))return 0;
+  uint8_t* memory=(uint8_t*)ku_object_malloc(KU_OBJECT_ALLOC_STRING_CLONE,cap);
+  if(!memory){ku_http_buffer_refund(budget,cap);return 0;}
+  KuEntry** sorted=(KuEntry**)memory;size_t at=0;
+  for(size_t i=0;i<map->cap;i++)if(map->entries[i].used&&map->entries[i].value.tag==KU_STR&&!__ku_http_wire_managed(map->entries[i].key))sorted[at++]=&map->entries[i];
+  if(count>1)qsort(sorted,count,sizeof(*sorted),__ku_http_wire_header_compare);
+  for(size_t i=1;i<count;i++)if(!__ku_http_wire_header_compare(&sorted[i-1],&sorted[i])){free(memory);ku_http_buffer_refund(budget,cap);return -1;}
+  char* dest=(char*)(memory+count*sizeof(KuEntry*));size_t offset=0;
+  for(size_t i=0;i<count;i++){KuEntry* e=sorted[i];for(size_t j=0;j<e->key.len;j++)dest[offset++]=(char)__ku_http_wire_lower(e->key.ptr[j]);memcpy(dest+offset,": ",2);offset+=2;memcpy(dest+offset,e->value.as.s.ptr,e->value.as.s.len);offset+=e->value.as.s.len;memcpy(dest+offset,"\r\n",2);offset+=2;}
+  *storage=memory;*capacity=cap;*bytes=dest;*length=wire;return 1;
+}
 static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServer* server, KuStruct___ku_http_response response, size_t response_charge, int admitted) {
   ku_http_request_cancel_pending(connection);
 #if defined(__APPLE__)
@@ -2283,12 +2340,13 @@ static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServ
   free(connection->header); connection->header = NULL;
   ku_http_buffer_refund(connection->budget, connection->capacity); connection->capacity = 0;
   ku_http_input_drop(&connection->input);
+  free(connection->output.header_storage); connection->output.header_storage=NULL;
   ku_drop_struct___ku_http_response(&connection->output.response);
   ku_http_buffer_refund(connection->budget, connection->output.charge); connection->output.charge = 0;
   memset(&connection->output, 0, sizeof(connection->output));
   if (response.status < 100 || response.status > 599 ||
-      !ku_http_field_value_safe(response.content_type.ptr, response.content_type.len) ||
-      !ku_http_field_value_safe(response.location.ptr, response.location.len)) {
+      (!response.headers && (!ku_http_field_value_safe(response.content_type.ptr, response.content_type.len) ||
+      !ku_http_field_value_safe(response.location.ptr, response.location.len)))) {
     ku_drop_struct___ku_http_response(&response);
     ku_http_buffer_refund(connection->budget, response_charge); response_charge = 0; admitted = 1;
     response = ku_http_status_response(500, "Internal Server Error");
@@ -2296,7 +2354,14 @@ static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServ
     connection->failure.stage=4;
   }
   if (!admitted) response_charge = ku_http_buffer_admit_response(connection->budget, &response, &connection->failure);
-  connection->output.charge = response_charge;
+  const char* header_bytes=NULL;size_t header_length=0;
+  int header_status=__ku_http_wire_headers(response.headers,connection->budget,&connection->output.header_storage,&connection->output.header_capacity,&header_bytes,&header_length);
+  if(header_status!=1) {
+    ku_drop_struct___ku_http_response(&response);ku_http_buffer_refund(connection->budget,response_charge);response_charge=0;
+    response=ku_http_status_response(header_status<0?500:503,header_status<0?"Internal Server Error":"Service Unavailable");
+    connection->failure.reason=header_status<0?KU_HTTP_ERROR_INVALID_RESPONSE:KU_HTTP_ERROR_PROJECTION;connection->failure.stage=4;
+  }
+  connection->output.charge = response_charge+connection->output.header_capacity;
   connection->keep_alive = connection->keep_alive && response.status >= 200 && response.status < 400;
   KuHttpOutput* output = &connection->output;
   output->response = response;
@@ -2309,12 +2374,13 @@ static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServ
     ku_http_connection_close(connection); return;
   }
   ku_http_output_part(output, output->first, (size_t)first_length);
-  if (response.content_type.len) {
+  if(response.headers)ku_http_output_part(output,header_bytes,header_length);
+  if (!response.headers && response.content_type.len) {
     ku_http_output_part(output, "content-type: ", 14);
     ku_http_output_part(output, (const char*)response.content_type.ptr, response.content_type.len);
     ku_http_output_part(output, "\r\n", 2);
   }
-  if (response.location.len) {
+  if (!response.headers && response.location.len) {
     ku_http_output_part(output, "location: ", 10);
     ku_http_output_part(output, (const char*)response.location.ptr, response.location.len);
     ku_http_output_part(output, "\r\n", 2);
@@ -2368,6 +2434,7 @@ static void ku_http_connection_next_request(KuHttpConnection* connection, KuHttp
   }
   if (connection->job) { ku_http_job_release(connection->job); connection->job = NULL; }
   ku_http_request_lease_release(connection);
+  free(connection->output.header_storage); connection->output.header_storage=NULL;
   ku_drop_struct___ku_http_response(&connection->output.response);
   ku_http_buffer_refund(connection->budget, connection->output.charge); connection->output.charge = 0;
   memset(&connection->output, 0, sizeof(connection->output));

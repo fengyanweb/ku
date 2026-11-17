@@ -10126,3 +10126,71 @@ int main(void) {
         "http-elastic-workers-full-capacity-and-retirement-ok\n"
     );
 }
+
+#[test]
+fn native_http_response_headers_are_authoritative_validated_and_sent_once() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let source = r#"
+import http from "std.http"
+fn Changed():HttpResponse {
+ r=http.text("owned 中文🙂")
+ r.headers["x-ku"]="yes"
+ r.headers["content-length"]="999"
+ return r
+}
+fn Replaced():HttpResponse {r=http.html("body");r.headers={"x-only":"yes"};return r}
+fn Bad():HttpResponse {r=http.text("bad");r.headers["x-bad"]="bad\r\nInjected: yes";return r}
+fn Duplicate():HttpResponse {r=http.text("bad");r.headers["X-Ku"]="a";r.headers["x-ku"]="b";return r}
+fn main():null! {
+ app=http.server({max_buffer_bytes:1048576})
+ app.get("/changed",Changed)
+ app.get("/replaced",Replaced)
+ app.get("/bad",Bad)
+ app.get("/duplicate",Duplicate)
+ app.get("/legacy",fn(){return http.text("legacy")})
+ app.listen("__ADDRESS__")?
+ return ok(null)
+}
+"#;
+    let Some(mut server) =
+        spawn_finite_native_server("custom-response-headers", source, &address, 5)
+    else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for path in ["changed", "replaced", "bad", "duplicate", "legacy"] {
+        let response = http_response(
+            &address,
+            &format!("GET /{path} HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"),
+            Duration::from_secs(3),
+        );
+        match path {
+            "changed" => {
+                assert_status(&response, "HTTP/1.1 200 OK");
+                assert!(response.contains("x-ku: yes\r\n"), "{response}");
+                assert!(!response.contains("999"));
+                assert_eq!(
+                    response
+                        .to_ascii_lowercase()
+                        .matches("content-length:")
+                        .count(),
+                    1
+                );
+                assert!(response.ends_with("owned 中文🙂"));
+            }
+            "replaced" => {
+                assert_status(&response, "HTTP/1.1 200 OK");
+                assert!(response.contains("x-only: yes\r\n"));
+                assert!(!response.to_ascii_lowercase().contains("content-type:"));
+            }
+            "bad" | "duplicate" => assert_status(&response, "HTTP/1.1 500 Internal Server Error"),
+            _ => {
+                assert_status(&response, "HTTP/1.1 200 OK");
+                assert!(response.contains("content-type: text/plain; charset=utf-8\r\n"));
+                assert!(response.ends_with("legacy"));
+            }
+        }
+    }
+    assert!(watchdog.wait_for_natural_exit(RUN_TIMEOUT).success());
+}

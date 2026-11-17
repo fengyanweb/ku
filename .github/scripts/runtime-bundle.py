@@ -105,6 +105,7 @@ def source_digest(repo):
     names = [Path(name) for name in ("Cargo.toml", "Cargo.lock", "build.rs", "build_support/build_identity.rs")]
     names.extend(path.relative_to(repo) for path in (repo / "src").rglob("*") if path.is_file())
     names.extend(path.relative_to(repo) for path in (repo / "crates/ku-native-calendar").rglob("*") if path.is_file())
+    names.extend(path.relative_to(repo) for path in (repo / "crates/ku-native-http-client").rglob("*") if path.is_file())
     result = hashlib.sha256()
     # Rust compares path components ordinally. WindowsPath instead folds case;
     # sorting a joined string would also misorder sibling x.rs and x/y.rs.

@@ -1,0 +1,37 @@
+import { http, json, string, time } from "std"
+
+fn Fetch(url: str): HttpResponse! {
+    return http.get(url)
+}
+fn Status(&response: HttpResponse): int {
+    return response.status
+}
+fn Keep(response: HttpResponse): HttpResponse {
+    return response
+}
+fn main(): null! {
+    date = time.datetime(2000, 2, 29, 0, 0, 0, "utc")?
+    if (time.format(date, "yyyy-MM-dd", "utc")? != "2000-02-29") fail "calendar and HTTP link"
+    config = http.client({ timeout_ms: 1000, max_body_bytes: 4096 })
+    if (config.kind != "http.client" || config.timeout_ms != 1000) fail "client config"
+    base = "http://127.0.0.1:8080"
+    first = Fetch(base + "/hello")?
+    if (Status(first) != 200 || first.body != "hello 中文🙂") fail "GET response"
+    if (first.headers["x-ku"] != "yes") fail "headers"
+    headers = first.headers
+    if (headers["x-ku"] != "yes" || headers["x-ku"]? != "yes") fail "header alias read"
+    kept = Keep(first.clone())
+    first.headers["x-local"] = "changed"
+    if (kept.headers.get_or("x-local", "missing") != "missing") fail "clone alias"
+    first.body = "local"
+    if (kept.body != "hello 中文🙂") fail "body lifetime"
+    encoded = json.encode(kept)?
+    if (!string.contains(encoded, "\"headers\"") || string.contains(encoded, "content_type")) fail "public response JSON"
+    posted = http.post(base + "/post", "payload 中文")?
+    if (posted.status != 201 || posted.body != "payload 中文") fail "POST response"
+    missing = http.request({ method: "GET", url: base + "/missing", headers: { "X-Request": "yes" }, timeout_ms: 1000, max_body_bytes: 4096 })?
+    if (missing.status != 404 || missing.body != "missing") fail "non-2xx must be Ok"
+    println(kept)
+    println("native-http-client-ok")
+    return ok(null)
+}

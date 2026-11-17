@@ -1,4 +1,8 @@
-use std::{collections::HashMap, io::Read, sync::OnceLock, time::Duration};
+use super::http_client_engine::{
+    http_request, HttpError, HttpRequest, HttpResponse, DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS,
+};
+pub use super::http_client_engine::{MAX_BODY_BYTES, MAX_TIMEOUT_MS};
+use std::collections::HashMap;
 
 use crate::{
     error::{KuError, KuResult},
@@ -10,10 +14,6 @@ use crate::{
     value::Value,
 };
 
-const DEFAULT_TIMEOUT_MS: u64 = 5_000;
-pub const MAX_TIMEOUT_MS: u64 = 300_000;
-const DEFAULT_MAX_BODY_BYTES: usize = 1_000_000;
-pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_HEADER_BYTES: i64 = 16 * 1024;
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_CONNECTIONS: i64 = 1024;
@@ -62,8 +62,6 @@ pub const MAX_REQUEST_TARGET_BYTES: usize = 8192;
 /// fixed routing scratch array; requests beyond the bound are rejected, never
 /// truncated into a shorter route.
 pub const MAX_REQUEST_PATH_SEGMENTS: usize = 64;
-
-static DEFAULT_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
     match function {
@@ -292,116 +290,6 @@ pub(crate) fn constant_code(table: &str, name: &str) -> Option<i64> {
             .find_map(|(field, code)| (*field == name).then_some(*code)),
         _ => None,
     }
-}
-
-#[derive(Debug)]
-struct HttpRequest {
-    method: String,
-    url: String,
-    headers: HashMap<String, String>,
-    body: Option<String>,
-    timeout_ms: u64,
-    max_body_bytes: usize,
-}
-
-#[derive(Debug)]
-struct HttpResponse {
-    status: i64,
-    headers: HashMap<String, String>,
-    body: String,
-}
-
-#[derive(Debug)]
-struct HttpError {
-    code: String,
-    message: String,
-}
-
-fn http_request(config: HttpRequest) -> Result<HttpResponse, HttpError> {
-    let method = config.method.to_ascii_uppercase();
-    if method != "GET" && method != "POST" {
-        return Err(http_error(
-            "invalid_method",
-            format!("http method '{method}' is not supported yet"),
-        ));
-    }
-    if config.url.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
-        return Err(http_error(
-            "invalid_url",
-            "http url must not contain whitespace or control characters",
-        ));
-    }
-    let parsed_url = url::Url::parse(&config.url)
-        .map_err(|err| http_error("invalid_url", format!("invalid http url: {err}")))?;
-    if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host().is_none() {
-        return Err(http_error(
-            "invalid_url",
-            "http url must be an absolute http:// or https:// URL",
-        ));
-    }
-
-    let mut request = default_agent()
-        .request(&method, &config.url)
-        .timeout(Duration::from_millis(config.timeout_ms));
-    for (name, value) in &config.headers {
-        request = request.set(name, value);
-    }
-    let response = match config.body {
-        Some(body) => request.send_string(&body),
-        None => request.call(),
-    };
-    let response = match response {
-        Ok(response) => response,
-        Err(ureq::Error::Status(_, response)) => response,
-        Err(ureq::Error::Transport(err)) => {
-            return Err(http_error(
-                "transport",
-                format!("http transport failed: {err}"),
-            ));
-        }
-    };
-    response_to_value(response, config.max_body_bytes)
-}
-
-fn default_agent() -> &'static ureq::Agent {
-    DEFAULT_AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_millis(DEFAULT_TIMEOUT_MS))
-            .timeout_read(Duration::from_millis(DEFAULT_TIMEOUT_MS))
-            .timeout_write(Duration::from_millis(DEFAULT_TIMEOUT_MS))
-            .build()
-    })
-}
-
-fn response_to_value(
-    response: ureq::Response,
-    max_body_bytes: usize,
-) -> Result<HttpResponse, HttpError> {
-    let status = i64::from(response.status());
-    let mut headers = HashMap::new();
-    for name in response.headers_names() {
-        if let Some(value) = response.header(&name) {
-            headers.insert(name.to_ascii_lowercase(), value.to_string());
-        }
-    }
-    let mut bytes = Vec::new();
-    let mut reader = response.into_reader().take((max_body_bytes + 1) as u64);
-    reader
-        .read_to_end(&mut bytes)
-        .map_err(|err| http_error("read_failed", format!("http response failed: {err}")))?;
-    if bytes.len() > max_body_bytes {
-        return Err(http_error(
-            "body_too_large",
-            format!("http response too large: exceeds {max_body_bytes} bytes"),
-        ));
-    }
-    let body = String::from_utf8(bytes)
-        .map_err(|err| http_error("invalid_utf8", format!("http response is not utf-8: {err}")))?;
-    Ok(HttpResponse {
-        status,
-        headers,
-        body,
-    })
 }
 
 fn request_from_value(value: &Value, span: Span) -> KuResult<HttpRequest> {
@@ -960,13 +848,6 @@ fn error_value(domain: &str, code: &str, message: &str) -> Value {
         ("code".to_string(), Value::String(code.to_string())),
         ("message".to_string(), Value::String(message.to_string())),
     ]))
-}
-
-fn http_error(code: &str, message: impl Into<String>) -> HttpError {
-    HttpError {
-        code: code.to_string(),
-        message: message.into(),
-    }
 }
 
 fn ok_value(value: Value) -> Value {

@@ -695,6 +695,100 @@ def installed_native_time_array_consumer(install, root, env, report, report_path
             cleanup.raise_if_any(primary)
 
 
+def installed_native_http_client_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False):
+    detail={'status':'running','target':target,'scope':'installed optional synchronous HTTP client; bounded loopback, moved source-free executable','checkout_hidden_during_build':checkout_hidden}
+    report['installed_native_http_client']=detail
+    if not (install/'native-http').exists():
+        detail['status']='not_in_archive';write_report(report_path,report);return
+    leaf=install/'native-http/v1'/target
+    manifest=EXPORT.NATIVE_HTTP_CLIENT.validate_pack(leaf,target)
+    detail['pack_source_sha256']=manifest['source_sha256']
+    calendar_manifest=EXPORT.NATIVE_CALENDAR.validate_pack(install/'native-calendar/v1'/target,target)
+    detail['calendar_pack_source_sha256']=calendar_manifest['source_sha256']
+    build_env=dict(env)
+    build_env.pop('KU_NATIVE_HTTP_CLIENT_PACK',None)
+    build_env.pop('KU_NATIVE_CALENDAR_PACK',None)
+    runtime_env=build_env
+    if target=='x86_64-pc-windows-gnu':
+        system_root=Path(os.environ['SystemRoot']).resolve()
+        runtime_env=dict(build_env,PATH=os.pathsep.join((str(system_root/'System32'),str(system_root))))
+    with tempfile.TemporaryDirectory(prefix='ku-installed-http-client-',dir=root) as temp:
+        temp=Path(temp);project=temp/'project outside SDK 中文';project.mkdir()
+        deployment=temp/'deployed';deployment.mkdir();unrelated=temp/'unrelated';unrelated.mkdir()
+        ku=install/('ku.exe' if os.name=='nt' else 'ku');retired=root/'installed-sdk-unavailable-for-http-client'
+        stop=threading.Event();errors=[];received=[];peer=None;retired_sdk=False;primary=None
+        with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as listener:
+            listener.bind(('127.0.0.1',0));listener.listen(4);listener.settimeout(.1)
+            address='http://127.0.0.1:'+str(listener.getsockname()[1])
+            source=(Path(__file__).resolve().parents[2]/'examples/native_http_client.ku').read_text(encoding='utf-8').replace('http://127.0.0.1:8080',address)
+            (project/'main.ku').write_text(source,encoding='utf-8');program=project/('client.exe' if os.name=='nt' else 'client')
+            def serve():
+                deadline=time.monotonic()+20
+                try:
+                    while len(received)<3 and not stop.is_set() and time.monotonic()<deadline:
+                        try:connection,_=listener.accept()
+                        except socket.timeout:continue
+                        with connection:
+                            connection.settimeout(2);data=bytearray()
+                            while b'\r\n\r\n' not in data:
+                                block=connection.recv(4096)
+                                if not block:raise RuntimeError('incomplete HTTP fixture request')
+                                data.extend(block)
+                                if len(data)>16384:raise RuntimeError('HTTP fixture header bound')
+                            head,body=bytes(data).split(b'\r\n\r\n',1);line=head.split(b'\r\n',1)[0]
+                            length=0
+                            for header in head.split(b'\r\n')[1:]:
+                                if header.lower().startswith(b'content-length:'):length=int(header.split(b':',1)[1])
+                            if not 0<=length<=4096:raise RuntimeError('HTTP fixture body bound')
+                            while len(body)<length:
+                                block=connection.recv(length-len(body))
+                                if not block:raise RuntimeError('incomplete HTTP fixture body')
+                                body+=block
+                            received.append(line.decode('ascii'))
+                            if line.startswith(b'GET /hello '):status,payload=200,'hello 中文🙂'.encode()
+                            elif line.startswith(b'POST /post '):status,payload=201,body
+                            elif line.startswith(b'GET /missing '):status,payload=404,b'missing'
+                            else:raise RuntimeError('unexpected HTTP fixture request')
+                            connection.sendall(('HTTP/1.1 '+str(status)+' Result\r\nX-Ku: yes\r\nContent-Length: '+str(len(payload))+'\r\nConnection: close\r\n\r\n').encode()+payload)
+                    if len(received)!=3 and not stop.is_set():raise RuntimeError('HTTP fixture did not finish')
+                except BaseException as e:errors.append(repr(e))
+            try:
+                entry=ku;detail['cli_entry_kind']='direct'
+                if os.name!='nt':
+                    aliases=temp/'launcher';aliases.mkdir();entry=aliases/'ku';entry.symlink_to(ku);detail['cli_entry_kind']='posix-symlink'
+                built=invoke([entry,'build','--release','--verbose','main.ku','-o',program],project,build_env)
+                detail['build_exit']=built.returncode;record_native_build_diagnostics(detail,built)
+                if built.returncode:raise RuntimeError('installed HTTP client build failed: '+(output(built)+built.stderr.decode(errors='replace'))[-4096:])
+                assert_build_backend(built,'c','release')
+                generated=reported_artifact(output(built),'native c ok: ',project,temp)
+                for feature in (b'#define KU_FEATURE_NATIVE_HTTP_CLIENT 1',b'#define KU_FEATURE_NATIVE_CALENDAR 1'):
+                    if feature not in generated.read_bytes():raise RuntimeError('combined native HTTP/calendar feature is absent: '+feature.decode())
+                detail['generated_c_sha256']=EXPORT.file_hash(generated);detail['binary_sha256']=EXPORT.file_hash(program)
+                deployed=deployment/program.name;shutil.move(str(program),str(deployed));shutil.rmtree(project)
+                if retired.exists():raise RuntimeError('HTTP client SDK quarantine exists')
+                relocate_checkout_entry(install,retired);retired_sdk=True
+                detail['source_removed_before_run']=not project.exists();detail['sdk_unavailable_during_run']=not install.exists()
+                peer=threading.Thread(target=serve,name='installed-native-http-client-peer');peer.start()
+                result=invoke([deployed],unrelated,runtime_env,seconds=15)
+                detail['run_exit']=result.returncode;detail['run_stderr_bytes']=len(result.stderr)
+                if result.returncode or output(result)!='[object]\nnative-http-client-ok\n' or result.stderr:raise RuntimeError('installed native HTTP client produced incorrect output: '+(output(result)+result.stderr.decode(errors='replace'))[-4096:])
+                peer.join(3)
+                if peer.is_alive() or errors or len(received)!=3:raise RuntimeError('HTTP fixture failed: '+repr(errors))
+                detail['requests']=received
+            except BaseException as e:primary=e
+            finally:
+                stop.set()
+                if peer:peer.join(3)
+                cleanup=OWNER.CleanupErrors()
+                if peer and peer.is_alive():cleanup.add('HTTP loopback fixture thread did not exit')
+                if retired_sdk:
+                    if retired.is_dir() and not install.exists():cleanup.attempt('restore HTTP SDK',lambda:relocate_checkout_entry(retired,install))
+                    else:cleanup.add('HTTP SDK restoration paths changed')
+                detail['installation_restored']=install.is_dir() and ku.is_file() and not retired.exists()
+                detail['status']='passed' if primary is None and not cleanup.failed else 'failed'
+                write_report(report_path,report);cleanup.raise_if_any(primary)
+
+
 def reported_artifact(text, prefix, cwd, owned_root):
     """Resolve CLI paths in its cwd and check actual directory identities.
 
@@ -1366,6 +1460,7 @@ def run(args, report):
                 installed_native_tls_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
                 installed_native_compression_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
                 installed_native_time_array_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
+                installed_native_http_client_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
             finally:
                 for old, destination in reversed(retired):
                     relocate_checkout_entry(destination, old)
@@ -1374,6 +1469,7 @@ def run(args, report):
             installed_native_tls_consumer(install, root, env, report, args.output, target)
             installed_native_compression_consumer(install, root, env, report, args.output, target)
             installed_native_time_array_consumer(install, root, env, report, args.output, target)
+            installed_native_http_client_consumer(install, root, env, report, args.output, target)
         exercise_cli_contracts()
         # Exercise the native path separately; it must not consume runner rlibs.
         success("native-doctor", ["doctor", "--backend", "c"])

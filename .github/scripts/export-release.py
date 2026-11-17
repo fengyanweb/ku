@@ -40,6 +40,11 @@ assert _CALENDAR_SPEC and _CALENDAR_SPEC.loader
 NATIVE_CALENDAR = importlib.util.module_from_spec(_CALENDAR_SPEC)
 _CALENDAR_SPEC.loader.exec_module(NATIVE_CALENDAR)
 
+_HTTP_CLIENT_SPEC = importlib.util.spec_from_file_location("ku_native_http_client_build", Path(__file__).with_name("build-native-http-client.py"))
+assert _HTTP_CLIENT_SPEC and _HTTP_CLIENT_SPEC.loader
+NATIVE_HTTP_CLIENT = importlib.util.module_from_spec(_HTTP_CLIENT_SPEC)
+_HTTP_CLIENT_SPEC.loader.exec_module(NATIVE_HTTP_CLIENT)
+
 MAX_FILES = 1000
 MAX_BYTES = 1024 * 1024 * 1024
 MAX_METADATA = 16 * 1024 * 1024
@@ -759,6 +764,24 @@ def export_release(bundle: Path, output: Path, repo: Path, version: str,
             except (ValueError, OSError, KeyError, TypeError, AttributeError) as error:
                 raise ExportError('native calendar pack validation failed: ' + str(error)) from error
             allowed |= {calendar_relative + '/' + name for name in calendar_names}
+        http_client_relative = f"native-http/v1/{target}"
+        http_client_manifest = None
+        if os.path.lexists(bundle / 'native-http'):
+            leaf = bundle / http_client_relative
+            http_client_names = ['manifest.json', 'LICENSE.ku', 'LICENSE.dependencies',
+                              'include/ku_native_http_client.h', 'lib/' + NATIVE_HTTP_CLIENT.archive_name(target)]
+            try:
+                plain(leaf, directory=True)
+                for name in http_client_names:
+                    plain(leaf / name)
+                expected_source = NATIVE_HTTP_CLIENT.source_hash()
+                http_client_manifest = NATIVE_HTTP_CLIENT.validate_pack(leaf, target, expected_source)
+                copied = NATIVE_HTTP_CLIENT.validate_pack(stage.root / http_client_relative, target, expected_source)
+                if copied != http_client_manifest:
+                    raise ValueError('http_client pack changed during export')
+            except (ValueError, OSError, KeyError, TypeError, AttributeError) as error:
+                raise ExportError('native http_client pack validation failed: ' + str(error)) from error
+            allowed |= {http_client_relative + '/' + name for name in http_client_names}
         if any(name not in allowed and not dependency_name(name, target) for name in stage.files):
             raise ExportError("bundle contains an unexpected file")
         try:
@@ -780,6 +803,14 @@ def export_release(bundle: Path, output: Path, repo: Path, version: str,
                 'source_sha256': calendar_manifest['source_sha256'],
                 'manifest': calendar_relative + '/manifest.json',
                 'materials': [calendar_relative + '/LICENSE.ku', calendar_relative + '/LICENSE.chrono'],
+            }
+        if http_client_manifest is not None:
+            attribution['native_http_client'] = {
+                'version': http_client_manifest['crate_version'],
+                'ureq_version': http_client_manifest['ureq_version'],
+                'source_sha256': http_client_manifest['source_sha256'],
+                'manifest': http_client_relative + '/manifest.json',
+                'materials': [http_client_relative + '/LICENSE.ku', http_client_relative + '/LICENSE.dependencies'],
             }
         if native_compression_root is not None:
             attribution["native_compression"] = add_native_compression(stage, native_compression_root, target)
@@ -849,6 +880,8 @@ and the operating system's local-time configuration still apply.
 中文：编译同步日期与格式化接口时，请保留 ku 旁的 native-calendar/v1/；
 链接后的程序不再需要该静态包、rustc、Ku SDK 或源码。
 """
+        if http_client_manifest is not None:
+            instructions += "\nKeep native-http/v1/ beside ku when compiling synchronous http.get/post/request. The matching static HTTP client pack is linked only when used. The resulting program needs no Ku SDK, source or Rust compiler.\n中文：同步 HTTP 客户端构建需匹配的 native-http/v1/ 静态包；生成程序运行不依赖 SDK 或 Rust。\n"
         if native_compression_root is not None:
             instructions += """
 Optional native compression packs (Zstandard 1.5.7 and zlib 1.4) are included

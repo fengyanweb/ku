@@ -141,9 +141,30 @@ fn active_strings(ty: &IrType, place: &str, body: &impl Fn(&str) -> String) -> S
     }
 }
 
+// Nonempty response headers are new synchronous storage, outside the existing
+// native Task response payload contract. Reject before dereferencing any map.
+fn response_headers_guard(ty: &IrType, place: &str, status: &str) -> String {
+    if crate::ir::task::http_response_type(ty) {
+        return format!("  if (({place}).headers) return {status};\n");
+    }
+    if let IrType::Result(inner) = ty {
+        let body = response_headers_guard(inner, &format!("({place}).value"), status);
+        if !body.is_empty() {
+            return format!("  if (({place}).ok) {{\n{body}  }}\n");
+        }
+    }
+    String::new()
+}
+
 // Charging is separate from pure leaf traversal: vector bytes are counted
 // once, while alias callbacks must never mutate any accounting variable.
 fn active_charge(ty: &IrType, place: &str, total: &str) -> String {
+    if crate::ir::task::http_response_type(ty) {
+        return response_headers_guard(ty, place, "KU_TASK_DRIVER_INVALID_ARGUMENT")
+            + &active_strings(ty, place, &|leaf| {
+                format!("  checked=ku_task_adapter_string_charge({leaf},&{total}); if (checked!=KU_TASK_DRIVER_OK) return checked;\n")
+            });
+    }
     if matches!(ty, IrType::Named(name) if name == "__ku_value") {
         return format!("  checked=ku_task_json_owned_charge({place},&{total},0u); if(checked!=KU_TASK_DRIVER_OK) return checked;\n");
     }
@@ -209,7 +230,10 @@ fn result_aliases(
             ));
         }
     }
-    Ok(active_strings(ty, place, body))
+    Ok(
+        response_headers_guard(ty, place, "KU_TASK_CONTROL_INVALID_ARGUMENT")
+            + &active_strings(ty, place, body),
+    )
 }
 
 pub(super) fn parameter_c_type(ty: &TaskSlotType) -> KuResult<String> {
@@ -319,6 +343,13 @@ fn array_input_guard(
     }
     let validate_base=format!("  checked=ku_task_adapter_buffer_excludes(base[base_count-1u],headers,{}u,extra,extra_count,driver); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  for (size_t prior=0;prior+1u<base_count;prior++) if (ku_task_adapter_buffers_overlap(base[base_count-1u],base[prior])) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n",parameters.len());
     for (index, (_, ty)) in parameters.iter().enumerate() {
+        if let TaskSlotType::Value { ty, .. } = ty {
+            code.push_str(&response_headers_guard(
+                ty,
+                &format!("(*arg_{index})"),
+                "KU_TASK_DRIVER_INVALID_ARGUMENT",
+            ));
+        }
         let register_string = |leaf: &str| {
             format!("  checked=ku_task_adapter_string_charge({leaf},&total); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  base[base_count++]=ku_task_adapter_string_buffer({leaf});\n{validate_base}")
         };

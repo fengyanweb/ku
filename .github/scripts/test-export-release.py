@@ -98,6 +98,30 @@ def calendar_pack_fixture(root, target):
     return leaf
 
 
+def http_client_pack_fixture(root, target):
+    """Object-container fixture, never a claim of executable runtime proof."""
+    builder = EXPORT.NATIVE_HTTP_CLIENT
+    leaf = root / 'native-http/v1' / target
+    (leaf/'lib').mkdir(parents=True)
+    (leaf/'include').mkdir()
+    body=bytearray(64);body[:7]=b'\x7fELF\x02\x01\x01'
+    struct.pack_into('<HH',body,16,1,62)
+    body=bytes(body)+builder.BUILD_ID.encode()
+    header=f'{"fixture.o/":<16}{0:<12}{0:<6}{0:<6}{100644:<8}{len(body):<10}`\n'.encode()
+    library=leaf/'lib'/builder.archive_name(target)
+    library.write_bytes(b'!<arch>\n'+header+body+(b'\n' if len(body)&1 else b''))
+    shutil.copyfile(builder.ROOT/'crates/ku-native-http-client/include'/builder.HEADER,leaf/'include'/builder.HEADER)
+    shutil.copyfile(builder.ROOT/'LICENSE',leaf/'LICENSE.ku')
+    (leaf/'LICENSE.dependencies').write_bytes(b'HTTP dependency license fixture\n')
+    manifest={'schema_version':1,'abi_version':1,'build_id':builder.BUILD_ID,'crate_version':'0.1.0','ureq_version':'2.12.1',
+        'rustc_version':'1.99.1','rustc_verbose':'rustc 1.99.1\nrelease: 1.99.1\n','target':target,'source_sha256':builder.source_hash(),
+        'archive':builder.record(library),'header':builder.record(leaf/'include'/builder.HEADER),
+        'native_static_libs':{'raw':'-lc -lm','tokens':['-lc','-lm']},
+        'licenses':[builder.record(leaf/'LICENSE.ku'),builder.record(leaf/'LICENSE.dependencies')]}
+    (leaf/'manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
+    return leaf
+
+
 class CalendarCoffArchiveTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='ku-calendar-coff-')
@@ -858,6 +882,35 @@ class ReleaseExportTests(unittest.TestCase):
             self.skipTest('platform cannot create a file symlink: ' + str(error))
         with self.assertRaisesRegex(EXPORT.ExportError, 'symlink/reparse'):
             self.run_export(native_compression_root=root)
+
+    def test_http_client_pack_exports_exact_payload_and_attribution(self):
+        leaf=http_client_pack_fixture(self.bundle,self.target)
+        expected=EXPORT.NATIVE_HTTP_CLIENT.validate_pack(leaf,self.target)
+        result=self.run_export()
+        manifest=json.loads(Path(result['manifest_path']).read_bytes())
+        relative=f'native-http/v1/{self.target}'
+        self.assertEqual({name for name in manifest['files'] if name.startswith('native-http/')},
+            {relative+'/'+name for name in ('manifest.json','LICENSE.ku','LICENSE.dependencies','include/ku_native_http_client.h','lib/libku_native_http_client.a')})
+        extracted=self.root/'http-extracted';extracted.mkdir()
+        EXPORT.verify_archive(Path(result['asset_path']),manifest['files'],extracted)
+        attribution=json.loads((extracted/'THIRD_PARTY.json').read_bytes())['native_http_client']
+        self.assertEqual(attribution['source_sha256'],expected['source_sha256'])
+        self.assertEqual(attribution['ureq_version'],'2.12.1')
+        self.assertIn('native-http/v1/',(extracted/'README-INSTALL.md').read_text(encoding='utf-8'))
+
+    def test_http_client_pack_rejects_nonplain_or_mismatched_inventory(self):
+        leaf=http_client_pack_fixture(self.bundle,self.target)
+        path=leaf/'manifest.json';saved=path.read_bytes()
+        for key,value in [('abi_version',True),('source_sha256','a'*64),('target','aarch64-apple-darwin'),('rustc_version','1.89.0')]:
+            data=json.loads(saved);data[key]=value;path.write_text(json.dumps(data))
+            with self.subTest(key=key),self.assertRaises(EXPORT.ExportError):self.run_export()
+            path.write_bytes(saved)
+        extra=leaf/'private-cache';extra.mkdir()
+        with self.assertRaises(EXPORT.ExportError):self.run_export()
+        extra.rmdir()
+        try:(leaf/'link').symlink_to(leaf/'include',target_is_directory=True)
+        except OSError:self.skipTest('symlink unavailable')
+        with self.assertRaises(EXPORT.ExportError):self.run_export()
 
     def test_calendar_pack_exports_exact_payload_and_attribution(self):
         leaf = calendar_pack_fixture(self.bundle, self.target)

@@ -1111,6 +1111,29 @@ function Copy-CalendarPack([string]$Source, [string]$Destination, [hashtable]$Co
     Assert-CalendarPack $Destination $Contract
 }
 
+function Get-HttpClientArchiveName([hashtable]$Contract) {
+    if ($Contract.Target -eq 'x86_64-pc-windows-msvc') { return 'ku_native_http_client.lib' }
+    return 'libku_native_http_client.a'
+}
+
+function Assert-HttpClientPack([string]$Leaf, [hashtable]$Contract) {
+    if (-not (Test-PlainDirectory $Leaf)) { throw 'http-client pack must be a plain existing directory' }
+    $httpClientBuilder = Join-Path $PSScriptRoot '../.github/scripts/build-native-http-client.py'
+    [void](Invoke-CheckedTool $script:releasePython @('-B', $httpClientBuilder, '--target', $Contract.Target, '--output', $Leaf, '--toolchain', $script:releaseToolchain, '--verify-only') $repo $script:releaseWorkRoot 'http-client-pack-verify' 30000 $script:toolWrapper)
+}
+
+function Copy-HttpClientPack([string]$Source, [string]$Destination, [hashtable]$Contract) {
+    Assert-HttpClientPack $Source $Contract
+    Ensure-PlainDirectory $Destination; Ensure-PlainDirectory (Join-Path $Destination 'include'); Ensure-PlainDirectory (Join-Path $Destination 'lib')
+    foreach ($name in @('manifest.json', 'LICENSE.ku', 'LICENSE.dependencies')) {
+        Copy-PlainFile (Join-Path $Source $name) (Join-Path $Destination $name) 1MB
+    }
+    Copy-PlainFile (Join-Path $Source 'include/ku_native_http_client.h') (Join-Path $Destination 'include/ku_native_http_client.h') 64KB
+    $archive = 'lib/' + (Get-HttpClientArchiveName $Contract)
+    Copy-PlainFile (Join-Path $Source $archive) (Join-Path $Destination $archive) 128MB
+    Assert-HttpClientPack $Destination $Contract
+}
+
 function Read-VsixEntryUtf8([object]$Entry, [long]$Limit, [string]$Label) {
     if ($Entry.Length -eq 0 -or $Entry.Length -gt $Limit) { throw "VSIX $Label has an invalid uncompressed size" }
     $stream = $Entry.Open()
@@ -1205,6 +1228,14 @@ function Assert-Bundle([string]$Bundle, [hashtable]$Contract, [string]$Version, 
         Assert-CalendarPack $calendarLeaf $Contract
         foreach ($relative in @('manifest.json', 'LICENSE.ku', 'LICENSE.chrono', 'include/ku_native_calendar.h', ('lib/' + (Get-CalendarArchiveName $Contract)))) {
             [void]$expectedFiles.Add("native-calendar/v1/$($Contract.Target)/$relative")
+        }
+    }
+    $httpClientRoot = Join-Path $Bundle 'native-http'
+    if (Test-Path -LiteralPath $httpClientRoot) {
+        $httpClientLeaf = Join-Path $httpClientRoot "v1/$($Contract.Target)"
+        Assert-HttpClientPack $httpClientLeaf $Contract
+        foreach ($relative in @('manifest.json', 'LICENSE.ku', 'LICENSE.dependencies', 'include/ku_native_http_client.h', ('lib/' + (Get-HttpClientArchiveName $Contract)))) {
+            [void]$expectedFiles.Add("native-http/v1/$($Contract.Target)/$relative")
         }
     }
     foreach ($name in $script:expectedRustDependencies.Keys) { [void]$expectedFiles.Add("deps/$name") }
@@ -1803,6 +1834,12 @@ try {
     Assert-CalendarPack $calendarPack $contract
     $calendarLinkIdentity = Get-Content -LiteralPath (Join-Path $calendarPack 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
     Write-Output "native-static-libs actual [$($contract.Target)/calendar]: $($calendarLinkIdentity.native_static_libs.raw)"
+    $httpClientPack = Join-Path $workRoot 'http-client-pack'
+    $httpClientBuilder = Join-Path $repo '.github/scripts/build-native-http-client.py'
+    [void](Invoke-CheckedTool $script:releasePython @('-B', $httpClientBuilder, '--target', $contract.Target, '--output', $httpClientPack, '--toolchain', $script:releaseToolchain, '--target-dir', $cargoTarget) $repo $workRoot 'http-client-pack-build' 900000 $wrapper)
+    Assert-HttpClientPack $httpClientPack $contract
+    $httpClientLinkIdentity = Get-Content -LiteralPath (Join-Path $httpClientPack 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    Write-Output "native-static-libs actual [$($contract.Target)/http-client]: $($httpClientLinkIdentity.native_static_libs.raw)"
 
     if (-not $ExistingVsix) {
         Copy-ExtensionSource $extensionSource $extensionWork
@@ -1821,6 +1858,7 @@ try {
     Copy-PlainFile $vsixPath (Join-Path $candidate $vsixName) 128MB
     Copy-TlsPack $tlsPack (Join-Path $candidate "native-tls/v1/$($contract.Target)") $contract $buildId
     Copy-CalendarPack $calendarPack (Join-Path $candidate "native-calendar/v1/$($contract.Target)") $contract
+    Copy-HttpClientPack $httpClientPack (Join-Path $candidate "native-http/v1/$($contract.Target)") $contract
     $rustcIdentityPath = Join-Path $workRoot 'publisher-rustc.txt'
     [IO.File]::WriteAllText($rustcIdentityPath, $rustcOutput, $utf8)
     # Query the actual same-build CLI. The source path is still present here;

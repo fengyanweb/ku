@@ -193,6 +193,11 @@ impl Verifier<'_> {
                                     | "__ku_nullable_is_null"
                                     | "__ku_calendar_field_str"
                                     | "__ku_calendar_field_int"
+                                    | "__ku_http_headers_get"
+                                    | "__ku_http_response_headers_read"
+                                    | "__ku_http_response_public_value"
+                                    | "__ku_http_client_config_field_int"
+                                    | "__ku_http_client_config_field_str"
                             )
                             || (name.starts_with("__ku_enum_payload:")
                                 && !ir_type_is_owned(&expr.ty));

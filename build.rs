@@ -80,6 +80,11 @@ fn main() {
     ];
     files(&root, &root.join("src"), &mut sources);
     files(&root, &root.join("crates/ku-native-calendar"), &mut sources);
+    files(
+        &root,
+        &root.join("crates/ku-native-http-client"),
+        &mut sources,
+    );
     sources.sort();
     let mut hash = Sha256::new();
     for name in sources {

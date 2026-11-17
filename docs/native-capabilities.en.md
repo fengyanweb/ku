@@ -64,3 +64,13 @@ Ordinary native C programs do not use `libku.rlib`. TLS packs must match the tar
 Recursive value layouts, object destructuring, optional chaining, captured `for` iteration bindings and standard-library functions without native implementations are still rejected. Task parameters, results, captures and finally blocks retain their documented subset restrictions. Unsupported features or missing dependencies must produce errors, without silently switching to the Runner.
 
 The source default does not imply that every interpreter feature or performance goal is complete. Capability, ownership, platform, installation and real-project acceptance retain their own evidence requirements, as do separate performance changes. Existing `ku run` and direct `.ku` execution behavior remains unchanged.
+
+## Synchronous HTTP client
+
+`http.get(url)`, `http.post(url, body)` and `http.request(config)` return `HttpResponse!` in synchronous native programs. Explicit `HttpResponse` parameters and returns support the same public `status`, `headers` and `body` fields as the interpreter. Results own their data independently of connection reuse. Cloning produces an independent response; reading `response.headers` yields an independent map, while `response.headers[key] = value` changes that response. Printing and JSON expose only these three public fields.
+
+Non-2xx responses remain successful results. Transport, UTF-8 and response-size failures return errors. The default total request timeout is 5000 ms and body limit is 1,000,000 B; maxima are 300,000 ms and 16 MiB. An earlier existing HTTP-handler deadline caps the call, including redirects, and normal deadline cleanup runs immediately after return. Blocking DNS/network calls cannot guarantee immediate cancellation at every point. Native Tasks, including calls through ordinary wrappers, continue to reject synchronous outbound HTTP. The existing server Task response subset does not expand to arbitrary dynamic headers.
+
+`http.client(config)` remains a configuration object, rather than a separate connection-pool handle. Shortcuts use the existing lazily initialized shared agent. Only programs using a network method link the matching `native-http/v1/<target>` static pack. Development builds can select it with an absolute `KU_NATIVE_HTTP_CLIENT_PACK` path. Missing or mismatched target/source packs fail explicitly without a Runner fallback.
+
+See [the loopback example](../examples/native_http_client.ku). The installed-SDK consumer links calendar and HTTP archives together, then runs the executable with its source and SDK unavailable. Each target still requires its own actual installed-runtime result; cross-compilation alone is not runtime acceptance.
