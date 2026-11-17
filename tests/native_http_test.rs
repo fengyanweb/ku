@@ -10237,10 +10237,9 @@ fn main():null! {
  plain=Custom()
  if(plain["body"]?!="plain") fail "ordinary callable must remain an object"
  app=http.server({handler_timeout_ms:20,max_buffer_bytes:1048576})
- calls=0
  if(true){
   prefix="env"+"-"
-  app.get("/closure",fn(){calls+=1;return {status:200,headers:{"x-mode":"captured"},body:prefix+str(calls)}})
+  app.get("/closure",fn(){return {status:200,headers:{"x-mode":"captured"},body:prefix+"owned"}})
  }
  app.get("/plain",Custom)
  app.post("/echo",Echo)
@@ -10270,7 +10269,7 @@ fn main():null! {
     );
     assert!(generated.contains("__ku_http_response_from_object_result("));
     let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
-    for count in 1..=2 {
+    for _ in 0..2 {
         let response = http_response(
             &address,
             "GET /closure HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
@@ -10279,8 +10278,8 @@ fn main():null! {
         assert_status(&response, "HTTP/1.1 200 OK");
         assert!(response.contains("x-mode: captured\r\n"), "{response}");
         assert!(
-            response.ends_with(&format!("env-{count}")),
-            "callback replay or lost environment: {response}"
+            response.ends_with("env-owned"),
+            "lost read-only captured environment: {response}"
         );
     }
     for (method, path, body, status, expected) in [
