@@ -81,7 +81,7 @@ fn run_c(label: &str, source: &str) -> Option<String> {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    Some(String::from_utf8(out.stdout).unwrap())
+    Some(String::from_utf8(out.stdout).unwrap().replace("\r\n", "\n"))
 }
 #[test]
 fn native_http_public_response_headers_alias_clone_annotations_and_json() {
@@ -259,7 +259,10 @@ fn native_http_client_calendar_real_release_loopback() {
         String::from_utf8_lossy(&result.stderr)
     );
     peer_result.unwrap();
-    assert_eq!(result.stdout, b"[object]\nnative-http-client-ok\n");
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap().replace("\r\n", "\n"),
+        "[object]\nnative-http-client-ok\n"
+    );
     assert!(result.stderr.is_empty());
 }
 
