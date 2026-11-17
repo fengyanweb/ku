@@ -798,7 +798,7 @@ static KuStruct___ku_http_response ku_http_response_from_result(KuResult_struct_
 /* Object-returning handlers retain their original callable ABI and ownership.
  * Adapt only after their one invocation, before the owner's ordinary finish
  * poll, response admission and output handoff. No environment is replaced. */
-static KuStruct___ku_http_response __ku_http_response_from_object_result(KuResult_object result) {
+static KuStruct___ku_http_response __ku_http_response_from_object_result(KuResult_struct___ku_object result) {
   if(result.ok) {
     KuStruct___ku_http_response response=__ku_http_response_from_object_owned(ku_object_move(&result.value));
     if(response.status==500)ku_http_failure_current.reason=KU_HTTP_ERROR_HANDLER_500;
@@ -1397,7 +1397,7 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
       if (route->returns_result==3 || route->returns_result==4) {
         ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
         resp=route->returns_result==4
-          ? __ku_http_response_from_object_result(((KuResult_object(*)(void*,KuStruct___ku_http_request))route->invoke)(route->env,req))
+          ? __ku_http_response_from_object_result(((KuResult_struct___ku_object(*)(void*,KuStruct___ku_http_request))route->invoke)(route->env,req))
           : __ku_http_response_from_object_owned(((KuObject*(*)(void*,KuStruct___ku_http_request))route->invoke)(route->env,req));
         handler_timed_out=__ku_sync_finish_request(&handler_signal);
       } else if (route->returns_result) {
@@ -1415,7 +1415,7 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
       if (route->returns_result==3 || route->returns_result==4) {
         ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
         resp=route->returns_result==4
-          ? __ku_http_response_from_object_result(((KuResult_object(*)(void*))route->invoke)(route->env))
+          ? __ku_http_response_from_object_result(((KuResult_struct___ku_object(*)(void*))route->invoke)(route->env))
           : __ku_http_response_from_object_owned(((KuObject*(*)(void*))route->invoke)(route->env));
         handler_timed_out=__ku_sync_finish_request(&handler_signal);
       } else if (route->returns_result) {
