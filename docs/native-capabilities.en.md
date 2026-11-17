@@ -61,6 +61,8 @@ The 0.0.20 release targets Linux x86_64 GNU, macOS Apple Silicon and Windows x86
 
 Installed-runtime validation of the current source covers Linux x86_64 GNU, macOS Apple Silicon, and both Windows x86_64 MSVC and GNU/MinGW targets. Windows GNU requires a matching MinGW-w64 toolchain. The Ku CLI links its GNU runtime statically; explicitly used third-party DLLs remain application deployment requirements. Linux ARM64 retains only the separately recorded build/link coverage.
 
+Windows GNU installation checks also cover ordinary/typed PostgreSQL parameters, Unicode, NULL, strict reset and independently owned results. Deployment requires a matching libpq import library and DLL dependencies, without relying on a development checkout or broad MSYS2 PATH. GNU/MinGW is not a current official release target.
+
 Ordinary native C programs do not use `libku.rlib`. TLS, calendar and HTTP static packs must match the target and CLI; they are linked only when the program uses the corresponding capability. Database client shared libraries and their dependencies remain deployment requirements. See [CLI/SDK](cli-runtime-bundle.en.md).
 
 Recursive value layouts, object destructuring, optional chaining, captured `for` iteration bindings and standard-library functions without native implementations are still rejected. Task parameters, results, captures and finally blocks retain their documented subset restrictions. Unsupported features or missing dependencies must produce errors, without silently switching to the Runner.

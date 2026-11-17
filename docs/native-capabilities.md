@@ -61,6 +61,8 @@ ku build --backend runner --release hello.ku -o hello-runner
 
 当前源码的安装后验证覆盖 Linux x86_64 GNU、macOS Apple Silicon，以及 Windows x86_64 的 MSVC 和 GNU／MinGW 两种目标。Windows GNU 需要匹配的 MinGW-w64 工具链；Ku CLI 静态链接其 GNU 运行库，程序显式使用的第三方 DLL 仍需按依赖部署。Linux ARM64 仍只有上述单独记录的构建／链接覆盖。
 
+Windows GNU 的安装验证还覆盖普通／typed PostgreSQL 的参数、Unicode、NULL、strict reset 和结果独立寿命。部署时需提供匹配的 libpq 导入库及 DLL 依赖，不能依赖开发机或宽泛的 MSYS2 PATH；GNU／MinGW 尚非当前正式发行目标。
+
 普通原生 C 程序不使用 `libku.rlib`。TLS、日期和 HTTP 静态包须与目标及 CLI 匹配，并仅在程序使用对应能力时参与链接；数据库客户端动态库和其依赖仍须在部署环境提供。详情见 [CLI／SDK](cli-runtime-bundle.md)。
 
 递归 value 布局、object 解构、optional chaining、捕获 `for` 迭代绑定，以及尚未映射的标准库能力仍会明确拒绝。Task 参数、返回、捕获及 finally 继续受各自文档中的子集限制。遇到不支持能力或缺少依赖时应报错，不静默换成 Runner。
