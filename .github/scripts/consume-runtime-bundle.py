@@ -640,7 +640,8 @@ def record_windows_gnu_pe_imports(detail, program, cwd, build_env, runtime_env, 
     raw = [line for line in text.splitlines() if re.match(r'^\s*DLL Name:', line)]
     data['dll_name_excerpt'] = '\n'.join(raw).encode('utf-8')[:4096].decode('utf-8', errors='ignore')
     names = list(dict.fromkeys(re.findall(r'^\s*DLL Name:\s*(\S+)\s*$', text, re.M)))
-    if result.returncode or not names or len(names) > 64:
+    data['pe_x64_verified'] = bool(re.search(r'\bfile format pei-x86-64\b', text))
+    if result.returncode or not data['pe_x64_verified'] or (not names and program.suffix.lower() != '.dll') or len(names) > 64:
         data['status'] = 'failed'
         raise RuntimeError('bounded GNU objdump did not return a valid final EXE import list')
     system32 = windows_system_root(build_env) / 'System32'
@@ -652,7 +653,9 @@ def record_windows_gnu_pe_imports(detail, program, cwd, build_env, runtime_env, 
         system = system32 / name
         row = {'name': name, 'system32': str(system.resolve()) if system.is_file() else None,
                'api_set_contract': name.lower().startswith(('api-ms-win-', 'ext-ms-win-'))}
-        if not system.is_file():
+        if row['api_set_contract']:
+            row['resolution_scope'] = 'Windows API-set contract; a PATH shim is not loader resolution evidence'
+        elif not system.is_file():
             match = next((entry / name for entry in build_paths if (entry / name).is_file()), None)
             row['build_path_first_match'] = str(match.resolve()) if match is not None else None
             row['build_path_match_sha256'] = EXPORT.file_hash(match) if match is not None else None
@@ -661,6 +664,8 @@ def record_windows_gnu_pe_imports(detail, program, cwd, build_env, runtime_env, 
         row['runtime_file_first_match'] = str(match.resolve()) if match is not None else None
         data['imports'].append(row)
     for row in data['imports']:
+        if row['api_set_contract']:
+            continue
         found = row.get('build_path_first_match')
         if not found or str(Path(found).resolve()).casefold() in seen:
             continue

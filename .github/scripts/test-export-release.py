@@ -478,7 +478,7 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         deployment = self.root / '最终 程序'
         for directory in (tools, system, deployment):
             directory.mkdir(parents=True)
-        for name in ('gcc.exe', 'objdump.exe', 'libgcc_s_test.dll', 'private-pthread-test.dll'):
+        for name in ('gcc.exe', 'objdump.exe', 'libgcc_s_test.dll', 'private-pthread-test.dll', 'api-ms-win-test-l1-1-0.dll'):
             (tools / name).write_bytes(name.encode())
         (system / 'KERNEL32.dll').write_bytes(b'system')
         program = deployment / 'modules.exe'
@@ -500,6 +500,8 @@ class RuntimeConsumerReportTests(unittest.TestCase):
             text = 'file format pei-x86-64\n DLL Name: KERNEL32.dll\n'
             if extra:
                 text += ' DLL Name: ' + extra + '\n'
+            if copied == b'final executable fixture':
+                text += ' DLL Name: api-ms-win-test-l1-1-0.dll\n'
             return subprocess.CompletedProcess(command, 0, text.encode(), b'')
 
         detail = {}
@@ -514,6 +516,8 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertIsNone(imports['imports'][1]['runtime_file_first_match'])
         self.assertEqual(imports['imports'][1]['build_path_first_match'], str(tools / 'libgcc_s_test.dll'))
         self.assertEqual(imports['dependencies'][0]['imports'][1]['build_path_first_match'], str(tools / 'private-pthread-test.dll'))
+        self.assertTrue(imports['imports'][-1]['api_set_contract'])
+        self.assertNotIn('build_path_first_match', imports['imports'][-1])
         self.assertTrue(self.consumer.pe_imports_require_non_system_libgcc(imports))
         self.assertEqual(self.consumer.OWNER.MAX_CAPTURE_BYTES, old_limit)
         self.assertEqual(runtime['PATH'], str(system))
