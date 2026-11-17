@@ -181,6 +181,7 @@ jobs:
             $env:KU_CC = 'clang -O2'
           }
           $env:KU_NATIVE_CALENDAR_PACK = Join-Path (Get-Location) 'release/${{ matrix.target }}/native-calendar/v1/${{ matrix.target }}'
+          $env:KU_NATIVE_HTTP_CLIENT_PACK = Join-Path (Get-Location) 'release/${{ matrix.target }}/native-http/v1/${{ matrix.target }}'
           $packs = Join-Path $env:KU_NATIVE_COMPRESSION_ROOT 'native-compression/v1/${{ matrix.target }}'
           $env:KU_ZSTD_LIB = Join-Path $packs 'zstd/lib'
           $env:KU_ZSTD_INCLUDE = Join-Path $packs 'zstd/include'
@@ -198,6 +199,10 @@ jobs:
           if ($LASTEXITCODE) { throw 'Native calendar module contracts failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_http_test native_calendar -- --test-threads=1
           if ($LASTEXITCODE) { throw 'Native calendar HTTP recovery failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_http_client_test -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Native HTTP client ownership/error/deadline contracts failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_run_test native_fs_base_is_executable_relative_relocatable_and_source_free -- --exact --test-threads=1
+          if ($LASTEXITCODE) { throw 'Native Unicode source/output relocation failed' }
           if (-not $IsWindows) {
             $normalCompiler = $env:KU_CC
             try {
