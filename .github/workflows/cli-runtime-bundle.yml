@@ -18,6 +18,11 @@ on:
         required: false
         default: false
         type: boolean
+      installed_pg_only:
+        description: Recheck only the GNU installed PostgreSQL contract; not full SDK acceptance
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       platform_set:
@@ -36,6 +41,11 @@ on:
         required: false
         default: false
         type: boolean
+      installed_pg_only:
+        description: Recheck only the GNU installed PostgreSQL contract; not full SDK acceptance
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -46,7 +56,7 @@ concurrency:
 
 jobs:
   candidate-release:
-    if: inputs.candidate_tag != ''
+    if: inputs.candidate_tag != '' && !inputs.installed_pg_only
     name: Create the explicit candidate draft
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -87,6 +97,18 @@ jobs:
       INSTALLER_RUN_ID: ${{ github.run_id }}
       SDK_SOURCE_COMMIT: ${{ github.sha }}
     steps:
+      - name: Validate the bounded installed-PG recheck scope
+        shell: pwsh
+        env:
+          KU_INSTALLED_PG_ONLY: ${{ inputs.installed_pg_only }}
+          KU_SELECTED_PLATFORM_SET: ${{ inputs.platform_set }}
+          KU_SELECTED_CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+        run: |
+          if ($env:KU_INSTALLED_PG_ONLY -eq 'true' -and
+              ($env:KU_SELECTED_PLATFORM_SET -ne 'windows-gnu' -or
+               -not [string]::IsNullOrEmpty($env:KU_SELECTED_CANDIDATE_TAG))) {
+            throw 'installed_pg_only requires windows-gnu and an empty candidate_tag; partial acceptance cannot upload or publish'
+          }
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -123,7 +145,7 @@ jobs:
           & $compiler --version
           & (Join-Path $bin 'g++.exe') -dumpmachine
       - name: Check the optional GNU loader probe before building its SDK
-        if: inputs.early_loader_probe && matrix.target == 'x86_64-pc-windows-gnu'
+        if: inputs.early_loader_probe && !inputs.installed_pg_only && matrix.target == 'x86_64-pc-windows-gnu'
         shell: pwsh
         run: |
           & ${{ matrix.python }} -B .github/scripts/test-export-release.py RuntimeConsumerReportTests.test_gnu_pe_imports_use_sibling_tool_and_record_non_system_dependency_chain RuntimeConsumerReportTests.test_gnu_pe_import_probe_restores_existing_capture_limit_on_failure RuntimeConsumerReportTests.test_selected_gnu_loader_tool_and_real_environment_snapshot_are_ready RuntimeConsumerReportTests.test_gnu_static_executable_keeps_an_explicit_external_dll_import RuntimeConsumerReportTests.test_native_build_diagnostics_reject_crt_warnings_on_either_stream_even_at_exit_zero
@@ -156,13 +178,13 @@ jobs:
         shell: pwsh
         run: pwsh -NoLogo -NoProfile -NonInteractive -File scripts/package-release.ps1 -Target '${{ matrix.target }}'
       - name: Probe the GNU calendar loader before full contracts
-        if: inputs.early_loader_probe && matrix.target == 'x86_64-pc-windows-gnu'
+        if: inputs.early_loader_probe && !inputs.installed_pg_only && matrix.target == 'x86_64-pc-windows-gnu'
         shell: pwsh
         run: |
           & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --native-time-array-probe-bundle 'release/${{ matrix.target }}' --repo . --output "$env:RUNNER_TEMP/gnu-loader-probe.json" --expected-sdk-commit $env:GITHUB_SHA
           if ($LASTEXITCODE) { throw 'Early GNU calendar loader probe failed; inspect the preserved bounded report' }
       - name: Summarize the optional GNU loader probe
-        if: always() && inputs.early_loader_probe && matrix.target == 'x86_64-pc-windows-gnu'
+        if: always() && inputs.early_loader_probe && !inputs.installed_pg_only && matrix.target == 'x86_64-pc-windows-gnu'
         shell: pwsh
         run: |
           $path = Join-Path $env:RUNNER_TEMP 'gnu-loader-probe.json'
@@ -172,6 +194,7 @@ jobs:
             Write-Output "GNU loader probe report: $text"
           } else { Write-Output 'GNU loader probe did not create a report; inspect the producer/probe failure above.' }
       - name: Check the CLI and manifest contracts
+        if: ${{ !inputs.installed_pg_only }}
         shell: pwsh
         run: |
           $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'cli-contract-target'
@@ -212,6 +235,7 @@ jobs:
         shell: pwsh
         run: pwsh -NoLogo -NoProfile -NonInteractive -File scripts/package-release.ps1 -Target '${{ matrix.target }}'
       - name: Verify native HTTP, loop, Unicode and codec contracts with C11 O2
+        if: ${{ !inputs.installed_pg_only }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -308,6 +332,7 @@ jobs:
           & ${{ matrix.python }} -B .github/scripts/export-release.py --bundle "release/${{ matrix.target }}" --output "$env:RUNNER_TEMP/cli-bundle-assets" --repo . --version $version --target '${{ matrix.target }}' --commit $env:GITHUB_SHA --metadata $metadataPath --rust-sysroot $sysroot.Trim() --native-compression-root $env:KU_NATIVE_COMPRESSION_ROOT
           if ($LASTEXITCODE) { throw 'Actual archive validation failed' }
       - name: Install the unlike consumer Rust toolchain
+        if: ${{ !inputs.installed_pg_only }}
         shell: pwsh
         run: |
           $consumer = if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu') { '1.96.0-x86_64-pc-windows-gnu' } else { '1.96.0' }
@@ -315,6 +340,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Consumer toolchain unavailable' }
           "KU_CONSUMER_TOOLCHAIN=$consumer" >> $env:GITHUB_ENV
       - name: Verify the source-free installer and its actual installation
+        if: ${{ !inputs.installed_pg_only }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -420,7 +446,7 @@ jobs:
             --assets (Join-Path $env:RUNNER_TEMP 'cli-bundle-assets') @pgExtra
           if ($LASTEXITCODE) { throw 'Actual installed CLI PostgreSQL acceptance failed' }
       - name: Upload only verified installation files to the explicit candidate draft
-        if: inputs.candidate_tag != ''
+        if: inputs.candidate_tag != '' && !inputs.installed_pg_only
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -435,7 +461,12 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $summaryArgs = @('-B', '.github/scripts/release-transfer.py', 'summary', '--path', (Join-Path $env:RUNNER_TEMP 'cli-consumer-evidence.json'))
+          $pgOnly = '${{ inputs.installed_pg_only }}' -eq 'true'
+          $scope = if ($pgOnly) { 'GNU installed-PG partial recheck; not full SDK acceptance' } else { 'Full selected-target SDK acceptance' }
+          Write-Output "Verification scope: $scope"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Verification scope: $scope"
+          $summaryArgs = @('-B', '.github/scripts/release-transfer.py', 'summary')
+          if (-not $pgOnly) { $summaryArgs += @('--path', (Join-Path $env:RUNNER_TEMP 'cli-consumer-evidence.json')) }
           $summaryArgs += @('--path', (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json'))
           & ${{ matrix.python }} @summaryArgs
           if ($LASTEXITCODE) { throw 'Cannot summarize installation verification' }
@@ -451,7 +482,7 @@ jobs:
           $pgPath = Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json'
           if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu' -and (Test-Path -LiteralPath $pgPath -PathType Leaf)) {
             $pg = Get-Content -LiteralPath $pgPath -Raw | ConvertFrom-Json
-            $detail = [ordered]@{ target=$pg.target; status=$pg.status; profile=$pg.profile; commit=$pg.commit; executable_sha256=$pg.executable_sha256; checkout_hidden_during_pg=$pg.checkout_hidden_during_pg; checkout_restore_confirmed=$pg.checkout_restore_confirmed; temporary_cleanup_confirmed=$pg.temporary_cleanup_confirmed; fixture_cleanup_confirmed=$pg.fixture_cleanup_confirmed; lanes=$pg.lanes; runtime_inputs=$pg.gnu_runtime_inputs; failure_kind=$pg.failure_kind; failure_diagnostics=$pg.failure_diagnostics }
+            $detail = [ordered]@{ verification_scope=$scope; target=$pg.target; status=$pg.status; profile=$pg.profile; commit=$pg.commit; executable_sha256=$pg.executable_sha256; checkout_hidden_during_pg=$pg.checkout_hidden_during_pg; checkout_restore_confirmed=$pg.checkout_restore_confirmed; temporary_cleanup_confirmed=$pg.temporary_cleanup_confirmed; fixture_cleanup_confirmed=$pg.fixture_cleanup_confirmed; lanes=$pg.lanes; runtime_inputs=$pg.gnu_runtime_inputs; failure_kind=$pg.failure_kind; failure_diagnostics=$pg.failure_diagnostics }
             $text = ConvertTo-Json -InputObject $detail -Depth 12 -Compress
             if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 65536) { throw 'GNU PG bounded metadata exceeds its output limit' }
             Write-Output "Installed GNU PG checks: $text"
