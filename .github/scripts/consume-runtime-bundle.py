@@ -20,6 +20,7 @@ import shutil
 import socket
 import ssl
 import stat
+import struct
 import sys
 import tempfile
 import threading
@@ -856,16 +857,17 @@ def installed_native_time_array_consumer(install, root, env, report, report_path
             cleanup.raise_if_any(primary)
 
 
-def installed_native_http_client_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False):
-    detail={'status':'running','target':target,'scope':'installed optional synchronous HTTP client; bounded loopback, moved source-free executable','checkout_hidden_during_build':checkout_hidden}
-    report['installed_native_http_client']=detail
+def installed_native_http_client_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False, task_client=False):
+    detail={'status':'running','target':target,'scope':'installed optional '+('Task' if task_client else 'synchronous')+' HTTP client; bounded loopback, moved source-free executable','checkout_hidden_during_build':checkout_hidden}
+    report['installed_native_task_http_client' if task_client else 'installed_native_http_client']=detail
     if not (install/'native-http').exists():
         detail['status']='not_in_archive';write_report(report_path,report);return
     leaf=install/'native-http/v1'/target
     manifest=EXPORT.NATIVE_HTTP_CLIENT.validate_pack(leaf,target)
     detail['pack_source_sha256']=manifest['source_sha256']
-    calendar_manifest=EXPORT.NATIVE_CALENDAR.validate_pack(install/'native-calendar/v1'/target,target)
-    detail['calendar_pack_source_sha256']=calendar_manifest['source_sha256']
+    if not task_client:
+        calendar_manifest=EXPORT.NATIVE_CALENDAR.validate_pack(install/'native-calendar/v1'/target,target)
+        detail['calendar_pack_source_sha256']=calendar_manifest['source_sha256']
     build_env=dict(env)
     build_env.pop('KU_NATIVE_HTTP_CLIENT_PACK',None)
     build_env.pop('KU_NATIVE_CALENDAR_PACK',None)
@@ -881,7 +883,8 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
         with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as listener:
             listener.bind(('127.0.0.1',0));listener.listen(4);listener.settimeout(.1)
             address='http://127.0.0.1:'+str(listener.getsockname()[1])
-            source=(Path(__file__).resolve().parents[2]/'examples/native_http_client.ku').read_text(encoding='utf-8').replace('http://127.0.0.1:8080',address)
+            example='native_task_http_client.ku' if task_client else 'native_http_client.ku'
+            source=(Path(__file__).resolve().parents[2]/'examples'/example).read_text(encoding='utf-8').replace('http://127.0.0.1:8080',address)
             (project/'main.ku').write_text(source,encoding='utf-8');program=project/('client.exe' if os.name=='nt' else 'client')
             def serve():
                 deadline=time.monotonic()+20
@@ -922,7 +925,7 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                 if built.returncode:raise RuntimeError('installed HTTP client build failed: '+(output(built)+built.stderr.decode(errors='replace'))[-4096:])
                 assert_build_backend(built,'c','release')
                 generated=reported_artifact(output(built),'native c ok: ',project,temp)
-                for feature in (b'#define KU_FEATURE_NATIVE_HTTP_CLIENT 1',b'#define KU_FEATURE_NATIVE_CALENDAR 1'):
+                for feature in (b'#define KU_FEATURE_NATIVE_HTTP_CLIENT 1',b'#define KU_TASK_OUTBOUND_HTTP 1' if task_client else b'#define KU_FEATURE_NATIVE_CALENDAR 1'):
                     if feature not in generated.read_bytes():raise RuntimeError('combined native HTTP/calendar feature is absent: '+feature.decode())
                 detail['generated_c_sha256']=EXPORT.file_hash(generated);detail['binary_sha256']=EXPORT.file_hash(program)
                 deployed=deployment/program.name;shutil.move(str(program),str(deployed));shutil.rmtree(project)
@@ -932,7 +935,9 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                 peer=threading.Thread(target=serve,name='installed-native-http-client-peer');peer.start()
                 result=invoke([deployed],unrelated,runtime_env,seconds=15)
                 detail['run_exit']=result.returncode;detail['run_stderr_bytes']=len(result.stderr)
-                if result.returncode or output(result)!='[object]\nnative-http-client-ok\n' or result.stderr:raise RuntimeError('installed native HTTP client produced incorrect output: '+(output(result)+result.stderr.decode(errors='replace'))[-4096:])
+                detail['process_owner_cleanup']=getattr(result,'process_owner_cleanup',None)
+                expected='native-task-http-client-ok\n' if task_client else '[object]\nnative-http-client-ok\n'
+                if result.returncode or output(result)!=expected or result.stderr:raise RuntimeError('installed native HTTP client produced incorrect output: '+(output(result)+result.stderr.decode(errors='replace'))[-4096:])
                 peer.join(3)
                 if peer.is_alive() or errors or len(received)!=3:raise RuntimeError('HTTP fixture failed: '+repr(errors))
                 detail['requests']=received
@@ -942,10 +947,207 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                 if peer:peer.join(3)
                 cleanup=OWNER.CleanupErrors()
                 if peer and peer.is_alive():cleanup.add('HTTP loopback fixture thread did not exit')
+                detail['fixture_thread_exited']=not peer or not peer.is_alive()
                 if retired_sdk:
                     if retired.is_dir() and not install.exists():cleanup.attempt('restore HTTP SDK',lambda:relocate_checkout_entry(retired,install))
                     else:cleanup.add('HTTP SDK restoration paths changed')
                 detail['installation_restored']=install.is_dir() and ku.is_file() and not retired.exists()
+                detail['status']='passed' if primary is None and not cleanup.failed else 'failed'
+                write_report(report_path,report);cleanup.raise_if_any(primary)
+
+
+def installed_native_http_relay_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False):
+    """One bounded real View -> Task outbound -> dynamic-header service.
+
+    Socket fixture threads never mutate environment or start child processes.
+    The existing owner runs and reaps the sole service process tree.
+    """
+    detail={'status':'running','target':target,'scope':'installed native HTTP end-to-end functionality, not performance',
+            'checkout_hidden_during_build':checkout_hidden}
+    report['installed_native_http_relay']=detail
+    if not (install/'native-http').exists():
+        raise RuntimeError('HTTP relay requires the matching optional HTTP pack')
+    build_env=dict(env)
+    for name in ('KU_NATIVE_HTTP_CLIENT_PACK','KU_NATIVE_CALENDAR_PACK'):
+        build_env.pop(name,None)
+    runtime_env=dict(build_env,KU_HTTP_MAX_REQUESTS='10')
+    if target=='x86_64-pc-windows-gnu':
+        system=windows_system_root(env)
+        runtime_env['PATH']=os.pathsep.join((str(system/'System32'),str(system)))
+    with tempfile.TemporaryDirectory(prefix='ku-installed-http-relay-',dir=root) as temporary:
+        temporary=Path(temporary);project=temporary/'project outside SDK 中文';project.mkdir()
+        deployed=temporary/('relay.exe' if os.name=='nt' else 'relay');unrelated=temporary/'unrelated';unrelated.mkdir()
+        ku=install/('ku.exe' if os.name=='nt' else 'ku');unavailable=root/'sdk-unavailable-for-http-relay'
+        stop=threading.Event();cancel_started=threading.Event();cancel_finished=threading.Event()
+        errors=[];received=[];responses=[];threads=[];moved=False;primary=None
+        with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as upstream, socket.socket(socket.AF_INET,socket.SOCK_STREAM) as reserve:
+            upstream.bind(('127.0.0.1',0));upstream.listen(4);upstream.settimeout(.1)
+            reserve.bind(('127.0.0.1',0));service_address=reserve.getsockname()
+            source=(Path(__file__).resolve().parents[2]/'examples/native_http_relay.ku').read_text(encoding='utf-8')
+            source=source.replace('http://127.0.0.1:8080','http://127.0.0.1:'+str(upstream.getsockname()[1]))
+            source=source.replace('127.0.0.1:8081','127.0.0.1:'+str(service_address[1]))
+            address='http://127.0.0.1:'+str(upstream.getsockname()[1])
+            extra='''import time from "std.time"
+async fn LateFetch():HttpResponse! { return http.request({url:__SLOW__,timeout_ms:5000,max_body_bytes:4096}) }
+async fn Deadline():HttpResponse! { pending=LateFetch() time.sleep(1)? return await pending }
+async fn Cancelled():HttpResponse! { r=http.get(__CANCEL__)? return ok(http.text(r.body.clone())) }
+async fn InvalidConfig():HttpResponse! {
+ try { r=http.request({url:__HELLO__,headers:{"Bad Name":"x"},timeout_ms:0})? return ok(http.text("continued")) }
+ catch(e) { return ok(http.text("caught")) }
+ return ok(http.text("continued"))
+}
+'''.replace('__SLOW__',json.dumps(address+'/slow')).replace('__CANCEL__',json.dumps(address+'/cancel')).replace('__HELLO__',json.dumps(address+'/hello'))
+            source=extra+source.replace('    app.get("/relay", Relay)','    app.get("/relay", Relay)\n    app.get("/deadline", Deadline)\n    app.get("/cancel", Cancelled)\n    app.get("/invalid-config", InvalidConfig)')
+            (project/'main.ku').write_text(source,encoding='utf-8');program=project/deployed.name
+            def upstream_peer():
+                deadline=time.monotonic()+20
+                kept=None
+                @contextmanager
+                def next_connection(index):
+                    nonlocal kept
+                    if index==1:
+                        if kept is None:raise RuntimeError('first upstream connection was not retained')
+                        connection=kept;kept=None
+                    else:
+                        while not stop.is_set() and time.monotonic()<deadline:
+                            try:connection,_=upstream.accept();break
+                            except socket.timeout:continue
+                        else:raise RuntimeError('HTTP relay upstream accept bound')
+                    try:yield connection
+                    finally:
+                        if index==0:kept=connection
+                        else:connection.close()
+                try:
+                    for index in range(6):
+                        with next_connection(index) as connection:
+                            connection.settimeout(2);request=bytearray()
+                            while b'\r\n\r\n' not in request:
+                                chunk=connection.recv(4096)
+                                if not chunk or len(request)+len(chunk)>16384:raise RuntimeError('HTTP relay request bound')
+                                request.extend(chunk)
+                            line=bytes(request).split(b'\r\n',1)[0]
+                            expected=(b'/hello',b'/hello',b'/hello',b'/slow',b'/cancel',b'/hello')[index]
+                            if not line.startswith(b'GET '+expected+b' '):raise RuntimeError('HTTP relay used another upstream path')
+                            received.append(line.decode('ascii'))
+                            if index==1:detail['upstream_connection_reused']=True
+                            payload='hello 中文🙂'.encode() if index!=1 else b'\xff'
+                            if index==4:payload=b'cancelled-old-result';cancel_started.set()
+                            connection_mode='keep-alive' if index==0 else 'close'
+                            head=('HTTP/1.1 200 OK\r\nContent-Length: '+str(len(payload))+'\r\nConnection: '+connection_mode+'\r\n\r\n').encode()
+                            if index in (2,3,4):
+                                if stop.wait({2:1.2,3:1.7,4:.2}[index]):return
+                                # This belongs to an already expired operation; it
+                                # may have been closed, and must not revive it.
+                                try:connection.sendall(head+payload)
+                                except (BrokenPipeError,ConnectionResetError,OSError):pass
+                                if index==4:cancel_finished.set()
+                            else:
+                                connection.sendall(head+payload[:1])
+                                if stop.wait(.02):return
+                                connection.sendall(payload[1:])
+                except BaseException as error:
+                    if not stop.is_set():errors.append('upstream: '+repr(error))
+                finally:
+                    if kept is not None:kept.close()
+            def request_peer():
+                deadline=time.monotonic()+18
+                try:
+                    paths=('/info','/relay','/relay','/relay','/deadline','/cancel','/invalid-config','/info','/relay','/info')
+                    for index,path in enumerate(paths):
+                        while True:
+                            try:connection=socket.create_connection(service_address,timeout=.25);break
+                            except OSError:
+                                if stop.is_set() or time.monotonic()>=deadline:raise RuntimeError('HTTP relay startup bound')
+                                stop.wait(.01)
+                        with connection:
+                            connection.settimeout(4)
+                            connection.sendall(('GET '+path+' HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n').encode())
+                            if path=='/cancel':
+                                if not cancel_started.wait(2):raise RuntimeError('outbound operation did not begin before cancellation')
+                                connection.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack('hh' if os.name=='nt' else 'ii',1,0))
+                                connection.close()
+                                if not cancel_finished.wait(2):raise RuntimeError('late cancelled upstream did not finish')
+                                responses.append({'path':path,'cancel':'reset-after-upstream-start'})
+                                continue
+                            response=bytearray()
+                            while True:
+                                chunk=connection.recv(4096)
+                                if not chunk:break
+                                response.extend(chunk)
+                                if len(response)>32768:raise RuntimeError('HTTP relay response bound')
+                            head,body=bytes(response).split(b'\r\n\r\n',1)
+                            status=int(head.split(b' ',2)[1]);headers={}
+                            for header in head.split(b'\r\n')[1:]:
+                                name,value=header.split(b':',1);headers[name.lower()]=value.strip()
+                            responses.append({'path':path,'status':status,'body_sha256':hashlib.sha256(body).hexdigest()})
+                            if path=='/info':
+                                if status!=200 or body!=b'/info':raise RuntimeError('View route or post-error recovery failed')
+                            elif index in (1,8):
+                                if status!=200 or body!='hello 中文🙂'.encode() or headers.get(b'x-ku-route')!=b'/relay' or headers.get(b'x-ku-upstream')!=b'local':raise RuntimeError('Task HTTP output/header ownership failed')
+                            elif path=='/deadline':
+                                if status!=504:raise RuntimeError('child outbound request extended the original handler deadline')
+                            elif status!=500:raise RuntimeError('HTTP Result failure did not preserve the existing 500 contract')
+                except BaseException as error:errors.append('driver: '+repr(error))
+            try:
+                built=invoke([ku,'build','--release','--verbose','main.ku','-o',program],project,build_env)
+                detail['build_exit']=built.returncode;record_native_build_diagnostics(detail,built)
+                if built.returncode:raise RuntimeError('installed HTTP relay build failed: '+(output(built)+built.stderr.decode(errors='replace'))[-4096:])
+                assert_build_backend(built,'c','release')
+                generated=reported_artifact(output(built),'native c ok: ',project,temporary)
+                code=generated.read_bytes()
+                for witness in (b'KU_FEATURE_NATIVE_HTTP_CLIENT',b'ku_task_host_http',b'ku_http_task_net_interests'):
+                    if witness not in code:raise RuntimeError('native relay execution-path witness absent: '+witness.decode())
+                detail.update(generated_c_sha256=EXPORT.file_hash(generated),binary_sha256=EXPORT.file_hash(program))
+                bad_source='''import http from "std.http"
+async fn main():null! {
+ try { r=http.request({url:"http://127.0.0.1:1/",headers:{"Bad Name":"x"},timeout_ms:0})? println("continued") }
+ catch(e) { println("caught") }
+ return ok(null)
+}
+'''
+                (project/'bad-config.ku').write_text(bad_source,encoding='utf-8')
+                bad_program=temporary/('bad-config.exe' if os.name=='nt' else 'bad-config')
+                bad_built=invoke([ku,'build','--release','--verbose','bad-config.ku','-o',bad_program],project,build_env)
+                bad_detail={};detail['config_fatal']=bad_detail;record_native_build_diagnostics(bad_detail,bad_built)
+                bad_issue=None
+                if bad_built.returncode:bad_issue=RuntimeError('installed Task config-error program did not build')
+                else:
+                    assert_build_backend(bad_built,'c','release');bad_detail['binary_sha256']=EXPORT.file_hash(bad_program)
+                shutil.move(program,deployed);shutil.rmtree(project)
+                if unavailable.exists():raise RuntimeError('HTTP relay SDK quarantine exists')
+                relocate_checkout_entry(install,unavailable);moved=True
+                detail.update(source_removed_before_run=not project.exists(),sdk_unavailable_during_run=not install.exists())
+                if bad_issue is None:
+                    bad_result=invoke([bad_program],unrelated,runtime_env,seconds=10)
+                    bad_detail.update(exit=bad_result.returncode,stdout=output(bad_result),stderr=bad_result.stderr[-4096:].decode(errors='replace'),
+                                      process_owner_cleanup=getattr(bad_result,'process_owner_cleanup',None))
+                    if bad_result.returncode==0 or bad_result.stdout or b'header' not in bad_result.stderr.lower():
+                        bad_issue=RuntimeError('HTTP config fatal was caught, continued, or reported timeout before malformed headers')
+                reserve.close()
+                for name,body in (('installed-http-relay-upstream',upstream_peer),('installed-http-relay-driver',request_peer)):
+                    peer=threading.Thread(target=body,name=name);threads.append(peer);peer.start()
+                result=invoke([deployed],unrelated,runtime_env,seconds=22)
+                detail.update(run_exit=result.returncode,process_owner_cleanup=getattr(result,'process_owner_cleanup',None),
+                              run_stdout_excerpt=output(result)[-4096:],run_stderr_excerpt=result.stderr[-4096:].decode(errors='replace'))
+                for peer in threads:peer.join(3)
+                if result.returncode or errors or len(responses)!=10 or len(received)!=6:raise RuntimeError('installed HTTP relay failed: '+repr(errors)+' '+repr(responses))
+                detail.update(responses=responses,upstream_requests=received,view_registered=True,
+                              async_outbound_result=True,dynamic_headers=True,utf8_error_recovery=True,deadline_late_result_recovery=True,
+                              inherited_deadline_before_await=True,cancelled_late_result_recovery=True,config_fatal_not_caught=bad_issue is None)
+                if bad_issue is not None:raise bad_issue
+            except BaseException as error:primary=error
+            finally:
+                stop.set()
+                cleanup=OWNER.CleanupErrors()
+                for peer in threads:
+                    peer.join(3)
+                    if peer.is_alive():cleanup.add('HTTP relay fixture did not exit: '+peer.name)
+                if moved:
+                    if unavailable.is_dir() and not install.exists():cleanup.attempt('restore relay SDK',lambda:relocate_checkout_entry(unavailable,install))
+                    else:cleanup.add('HTTP relay SDK restoration paths changed')
+                detail['installation_restored']=install.is_dir() and ku.is_file() and not unavailable.exists()
+                detail['fixture_threads_exited']=all(not peer.is_alive() for peer in threads)
+                detail.update(responses=responses,upstream_requests=received,fixture_errors=errors)
                 detail['status']='passed' if primary is None and not cleanup.failed else 'failed'
                 write_report(report_path,report);cleanup.raise_if_any(primary)
 
@@ -1709,6 +1911,8 @@ def run(args, report):
                 installed_native_compression_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
                 installed_native_time_array_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
                 installed_native_http_client_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
+                installed_native_http_client_consumer(install, root, env, report, args.output, target, checkout_hidden=True, task_client=True)
+                installed_native_http_relay_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
             finally:
                 for old, destination in reversed(retired):
                     relocate_checkout_entry(destination, old)
@@ -1718,6 +1922,8 @@ def run(args, report):
             installed_native_compression_consumer(install, root, env, report, args.output, target)
             installed_native_time_array_consumer(install, root, env, report, args.output, target)
             installed_native_http_client_consumer(install, root, env, report, args.output, target)
+            installed_native_http_client_consumer(install, root, env, report, args.output, target, task_client=True)
+            installed_native_http_relay_consumer(install, root, env, report, args.output, target)
         exercise_cli_contracts()
         # Exercise the native path separately; it must not consume runner rlibs.
         success("native-doctor", ["doctor", "--backend", "c"])

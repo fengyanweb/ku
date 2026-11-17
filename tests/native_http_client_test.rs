@@ -43,27 +43,20 @@ fn generated(source: &str) -> String {
     c::generate_c_source(&lowered).unwrap()
 }
 #[test]
-fn native_http_unknown_or_view_handler_abi_is_rejected_before_dispatch() {
-    let ast = checked(
+fn native_http_dynamic_and_view_handlers_use_their_actual_checked_abi() {
+    let c = generated(
         r#"
-fn Reply() { box={value:{status:200,headers:{},body:"raw"}}; return box["value"] }
-fn main() { app=http.server(); app.get("/",Reply) }
-"#,
-    );
-    let error = ir::lower_program(&ast).unwrap_err().to_string();
-    assert!(error.contains("native HTTP handler return type"), "{error}");
-    let ast = checked(
-        r#"
+fn Dynamic() { box={value:{status:200,headers:{},body:"raw"}}; return box["value"] }
 fn Reply(&req:HttpRequest):HttpResponse { return http.text(req.path.clone()) }
-fn main() { app=http.server(); app.get("/",Reply) }
+fn main() { app=http.server(); app.get("/dynamic",Dynamic); app.get("/",Reply) }
 "#,
     );
-    let error = ir::lower_program(&ast).unwrap_err().to_string();
-    assert!(
-        error.contains("native HTTP handler parameter ABI"),
-        "{error}"
-    );
+    assert!(c.contains("ku_http_server_add_view_route("));
+    assert!(c.contains("(KuHttpViewInvoke){.response="));
+    assert!(c.contains("__ku_http_response_from_value_result("));
+    assert!(!c.contains("View callbacks are not implemented"));
 }
+
 fn run_c(label: &str, source: &str) -> Option<String> {
     let dir = TempDir::new(label);
     let path = dir.path().join("test.c");
@@ -72,7 +65,8 @@ fn run_c(label: &str, source: &str) -> Option<String> {
     let out = run_bounded(&mut Command::new(exe), RUN_TIMEOUT, RUN_LIMITS).unwrap();
     assert!(
         out.status.success(),
-        "{}{}",
+        "status={} stdout={} stderr={}",
+        out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -117,20 +111,181 @@ fn main():null! {
     }
 }
 #[test]
-fn native_task_outbound_http_is_rejected_directly_and_through_sync_wrappers() {
-    for (label,functions,operation) in [
-        ("direct","","r=http.get(\"http://127.0.0.1:1/\")?"),
-        ("one-hop","fn Fetch():HttpResponse! {return http.get(\"http://127.0.0.1:1/\")}","r=Fetch()?"),
-        ("two-hop","fn Fetch():HttpResponse! {return http.get(\"http://127.0.0.1:1/\")} fn Next():HttpResponse! {return Fetch()}","r=Next()?")
-    ] {
-        let text=format!("import http from \"std.http\"\n{functions}\nasync fn main():null! {{{operation} return ok(null)}}");
-        let ast=checked(&text);
-        assert!(ir::task_lower::lower_program(&ast).is_err(),"{label} could block a native Task");
+fn native_task_outbound_http_uses_real_net_wait_and_sync_wrappers_remain_rejected() {
+    let source="import http from \"std.http\" async fn main():null! {r=http.get(\"http://127.0.0.1:1/\")? return ok(null)}";
+    let mut ast = checked(source);
+    // The shared synchronous helper adds std:string even when unused; it is
+    // outside the documented Task module subset and must not mask this check.
+    ast.items
+        .retain(|item| !matches!(item,ku::ast::Item::Module(m)if m.name=="std:string"));
+    let native = ir::task_lower::lower_program(&ast)
+        .unwrap_or_else(|e| panic!("direct HTTP lowering failed: {e}"));
+    assert!(native
+        .tasks
+        .functions
+        .iter()
+        .any(|f| f.states.iter().any(|s| matches!(
+            s.terminator,
+            ir::task::TaskTerminator::BlockingNet {
+                operation: ir::task::TaskNetOperation::HttpGet,
+                ..
+            }
+        ))));
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    assert!(generated.contains("#define KU_TASK_OUTBOUND_HTTP 1"));
+    assert!(generated.contains("ku_task_host_http("));
+    assert!(generated.contains("__ku_http_client_async_step_v1"));
+    let mut configured = checked(
+        r#"import http from "std.http" async fn main():null! {r=http.request({url:"http://127.0.0.1:1/",method:null,body:null,timeout_ms:null,max_body_bytes:null,headers:{"x-ok":"yes"}})? return ok(null)}"#,
+    );
+    configured
+        .items
+        .retain(|item| !matches!(item,ku::ast::Item::Module(m)if m.name=="std:string"));
+    let configured = ir::task_lower::lower_program(&configured)
+        .expect("literal null HTTP defaults must remain legal");
+    let inputs = configured
+        .tasks
+        .functions
+        .iter()
+        .flat_map(|f| &f.states)
+        .find_map(|state| match &state.terminator {
+            ir::task::TaskTerminator::BlockingNet {
+                operation: ir::task::TaskNetOperation::HttpRequest,
+                inputs,
+                ..
+            } => Some(inputs),
+            _ => None,
+        })
+        .unwrap();
+    assert!(inputs[1..5].iter().all(Option::is_none));
+    assert!(inputs[5].is_some() && inputs[6].is_some());
+    let code = c::generate_native_task_c_source(&configured, &Default::default()).unwrap();
+    let fatal = code
+        .split("if (net_status==KU_TASK_HTTP_CONFIG_ERROR)")
+        .nth(1)
+        .unwrap();
+    assert!(fatal
+        .split("if (net_status==KU_TASK_CONTROL_PENDING)")
+        .next()
+        .unwrap()
+        .contains("KU_TASK_EXIT_RUNTIME_FAILURE"));
+
+    let mut null_headers = checked(
+        r#"import http from "std.http" async fn main():null! {r=http.request({url:"http://127.0.0.1:1/",timeout_ms:0,headers:null})? return ok(null)}"#,
+    );
+    null_headers
+        .items
+        .retain(|item| !matches!(item,ku::ast::Item::Module(m)if m.name=="std:string"));
+    let null_headers = ir::task_lower::lower_program(&null_headers)
+        .expect("invalid null headers must retain checked fatal exit");
+    assert!(null_headers.tasks.functions.iter().flat_map(|f|&f.states).any(|state|matches!(&state.terminator,ir::task::TaskTerminator::BlockingNet{operation:ir::task::TaskNetOperation::HttpRequest,inputs,..}if inputs[8].is_some())));
+    for functions in ["fn Fetch():HttpResponse! {return http.get(\"http://127.0.0.1:1/\")}","fn Fetch():HttpResponse! {return http.get(\"http://127.0.0.1:1/\")} fn Next():HttpResponse! {return Fetch()}"] {
+        let operation=if functions.contains("fn Next"){"Next"}else{"Fetch"};
+        let text=format!("import http from \"std.http\"\n{functions}\nasync fn main():null! {{r={operation}()? return ok(null)}}");
+        let mut ast=checked(&text);ast.items.retain(|item|!matches!(item,ku::ast::Item::Module(m)if m.name=="std:string"));
+        assert!(ir::task_lower::lower_program(&ast).is_err(),"ordinary sync wrapper could block a native Task");
     }
 }
+
+#[test]
+fn native_task_http_value_and_client_only_c11_o2_compile_without_server() {
+    let programs = [
+        (
+            "value",
+            r#"import http from "std.http" async fn Echo(r:HttpResponse):HttpResponse! {return ok(r)} async fn main():null! {t=Echo(http.text("basic-http")) r=await t? println(r.body.clone()) return ok(null)}"#,
+        ),
+        (
+            "get",
+            r#"import http from "std.http" async fn main():null! {r=http.get("http://127.0.0.1:1/")? return ok(null)}"#,
+        ),
+        (
+            "post",
+            r#"import http from "std.http" async fn main():null! {r=http.post("http://127.0.0.1:1/","body")? return ok(null)}"#,
+        ),
+        (
+            "request",
+            r#"import http from "std.http" async fn main():null! {try {r=http.request({url:"http://127.0.0.1:1/",headers:{"bad":"line\r\n"},timeout_ms:0})?} catch(e){println("must-not-catch-fatal")} return ok(null)}"#,
+        ),
+    ];
+    for (label, source) in programs {
+        let mut ast = checked(source);
+        ast.items
+            .retain(|item| !matches!(item,ku::ast::Item::Module(m)if m.name=="std:string"));
+        let native = ir::task_lower::lower_program(&ast).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let code = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+        assert!(
+            !code.contains("#define KU_NATIVE_RUNTIME_HTTP_SOCKET"),
+            "{label} emitted a server"
+        );
+        assert!(
+            !code.contains("#define KU_SERVICE_OUTPUT_SUPPORTED"),
+            "{label} emitted a service-output worker"
+        );
+        if label == "value" {
+            if let Some(stdout) = run_c("task-http-values-no-server", &code) {
+                assert_eq!(stdout, "basic-http\n");
+            }
+            continue;
+        }
+        // Compile the real C11/O2 translation unit. Optional archive linking
+        // and execution are covered by the installed SDK consumer, separately.
+        let dir = TempDir::new("task-http-client-only-o2");
+        let input = dir.path().join("main.c");
+        let output = dir.path().join("main.o");
+        fs::write(&input, &code).unwrap();
+        let mut candidates = Vec::new();
+        if let Ok(spec) = env::var("KU_CC") {
+            if PathBuf::from(&spec).is_file() {
+                candidates.push((PathBuf::from(spec), Vec::new()));
+            } else {
+                let mut words = spec.split_whitespace();
+                if let Some(cc) = words.next() {
+                    candidates.push((
+                        PathBuf::from(cc),
+                        words.map(str::to_owned).collect::<Vec<_>>(),
+                    ));
+                }
+            }
+        }
+        candidates.extend([
+            (PathBuf::from("clang"), Vec::new()),
+            (PathBuf::from("gcc"), Vec::new()),
+            (PathBuf::from("cc"), Vec::new()),
+        ]);
+        let mut compiled = false;
+        for (cc, prefix) in candidates {
+            let mut command = Command::new(cc);
+            command
+                .args(prefix)
+                .args(["-std=c11", "-O2", "-c"])
+                .arg(&input)
+                .arg("-o")
+                .arg(&output);
+            match run_bounded(&mut command, BUILD_TIMEOUT, BUILD_LIMITS) {
+                Ok(done) => {
+                    assert!(
+                        done.status.success(),
+                        "{label}: {}",
+                        String::from_utf8_lossy(&done.stderr)
+                    );
+                    compiled = true;
+                    break;
+                }
+                Err(e) if e.kind() == harness::bounded_process::FailureKind::Spawn => continue,
+                Err(e) => panic!("{label} C compilation failed: {e}"),
+            }
+        }
+        if env::var_os("CI").is_some() {
+            assert!(compiled, "C compiler required in CI");
+        }
+    }
+}
+
 #[test]
 fn native_http_sync_client_has_immediate_deadline_guard() {
     let c=generated("import http from \"std.http\" fn main():null! { r=http.get(\"http://127.0.0.1:1/\") println(\"must be guarded\") return ok(null) }");
+    assert!(!c.contains("#define KU_NATIVE_RUNTIME_HTTP_SOCKET"));
+    assert!(!c.contains("#define KU_SERVICE_OUTPUT_SUPPORTED"));
     let root = c.rsplit_once("int main(void)").unwrap().1;
     assert!(
         !root.contains("ku_service_output_init("),
@@ -269,7 +424,7 @@ fn native_http_client_calendar_real_release_loopback() {
 }
 
 #[test]
-fn native_task_http_headers_guard_ignores_inactive_results_and_rejects_owned_map() {
+fn native_task_http_headers_guard_validates_owners_aliases_and_active_results() {
     use ir::task::*;
     let sync = ir::lower_program(&checked(
         "fn Anchor(r:HttpResponse):HttpResponse {return r} fn main() {} ",
@@ -327,19 +482,128 @@ fn native_task_http_headers_guard_ignores_inactive_results_and_rejects_owned_map
             ],
         });
     }
+    let request = ir::IrType::Named("__ku_http_request".into());
+    tasks.functions.push(TaskFunction {
+        id: TaskFunctionId(2),
+        name: "ResponseAndRequest".into(),
+        slots: vec![response.clone(), request, output.clone()]
+            .into_iter()
+            .map(|ty| TaskSlot {
+                ty: TaskSlotType::Value {
+                    ty,
+                    borrowed: false,
+                },
+            })
+            .collect(),
+        parameters: vec![SlotId(0), SlotId(1)],
+        entry: StateId(0),
+        result: output.clone(),
+        states: vec![
+            TaskState {
+                operations: vec![],
+                terminator: TaskTerminator::Suspend {
+                    resume: StateId(1),
+                    cleanup: StateId(2),
+                },
+            },
+            TaskState {
+                operations: vec![
+                    TaskOp::DropIfInit { slot: SlotId(1) },
+                    TaskOp::WrapOk {
+                        dst: SlotId(2),
+                        src: SlotId(0),
+                    },
+                ],
+                terminator: TaskTerminator::Complete { value: SlotId(2) },
+            },
+            TaskState {
+                operations: vec![
+                    TaskOp::DropIfInit { slot: SlotId(0) },
+                    TaskOp::DropIfInit { slot: SlotId(1) },
+                ],
+                terminator: TaskTerminator::Terminate,
+            },
+        ],
+    });
     let c = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
+    // This setter boundary test stubs only driver reservation, not map
+    // allocation/mutation. Full adapter admission and alias checks above stay
+    // real; the stub also proves rejected growth never requests a reservation.
+    let marker = "/* Source Task HTTP maps remain";
+    assert!(c.contains(marker));
+    let c = c.replacen(marker, &format!(r#"
+static size_t test_header_growth_calls;
+static uint32_t test_header_reconcile(void* raw) {{ return raw ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_INVALID_ARGUMENT; }}
+static uint32_t test_header_grow(const KuTaskDriverTicketV1* ticket,size_t bytes) {{
+  (void)ticket;(void)bytes;test_header_growth_calls++;return KU_TASK_DRIVER_OK;
+}}
+{marker}"#), 1);
+    let reservation =
+        "return status==KU_TASK_DRIVER_OK ? ku_task_driver_grow_charge(host->ticket,bytes):status;";
+    assert_eq!(c.matches(reservation).count(), 1);
+    let c = c.replace(
+        reservation,
+        "return status==KU_TASK_DRIVER_OK ? test_header_grow(host->ticket,bytes):status;",
+    );
     let c = c.replacen("int main(", "int ku_unused_main(", 1)
         + r#"
 int main(void) {
   size_t bytes=99;
-  KuStruct___ku_http_response input={0}; input.headers=(KuObject*)(uintptr_t)1;
-  if(ku_task_0_inputs(NULL,NULL,0,1,&input,&bytes)!=KU_TASK_DRIVER_INVALID_ARGUMENT)return 81;
-  input.headers=NULL;
-  if(ku_task_0_inputs(NULL,NULL,0,1,&input,&bytes)!=KU_TASK_DRIVER_OK || bytes)return 82;
+  KuStruct___ku_http_response input={0};
+  if(ku_task_0_inputs(NULL,NULL,0,1,&input,&bytes)!=KU_TASK_DRIVER_OK || bytes)return 81;
+  input.headers=ku_object_new(8);
+  KuString key={0},value={0};
+  if(!ku_object_string_try_concat(ku_string_static((const uint8_t*)"x-ku",4),(KuString){0},&key)
+      || !ku_object_string_try_concat(ku_string_static((const uint8_t*)"owned",5),(KuString){0},&value))return 93;
+  ku_object_set(input.headers,key,ku_v_str(value));
+  size_t expected=sizeof(KuObject)+input.headers->cap*sizeof(KuEntry)+key.capacity+value.capacity;
+  if(ku_task_0_inputs(NULL,NULL,0,1,&input,&bytes)!=KU_TASK_DRIVER_OK || bytes!=expected)return 82;
+  KuTaskAdapterBufferV1 forbidden={input.headers,sizeof(*input.headers),0};
+  if(ku_task_0_inputs(NULL,&forbidden,1,1,&input,&bytes)!=KU_TASK_DRIVER_INVALID_ARGUMENT)return 83;
+  forbidden=(KuTaskAdapterBufferV1){input.headers->entries,input.headers->cap*sizeof(KuEntry),0};
+  if(ku_task_0_inputs(NULL,&forbidden,1,1,&input,&bytes)!=KU_TASK_DRIVER_INVALID_ARGUMENT)return 84;
+  size_t original_capacity=input.headers->cap;input.headers->cap=3;
+  if(ku_task_0_inputs(NULL,NULL,0,1,&input,&bytes)!=KU_TASK_DRIVER_INVALID_ARGUMENT)return 85;
+  input.headers->cap=original_capacity;
+  input.body=key;
+  if(ku_task_0_inputs(NULL,NULL,0,1,&input,&bytes)!=KU_TASK_DRIVER_INVALID_ARGUMENT)return 86;
+  input.body=value;
+  if(ku_task_0_inputs(NULL,NULL,0,1,&input,&bytes)!=KU_TASK_DRIVER_INVALID_ARGUMENT)return 87;
+  input.body=(KuString){0};
+  KuStruct___ku_http_request request={0};request.headers=input.headers;
+  if(ku_task_2_inputs(NULL,NULL,0,1,&input,&request,&bytes)!=KU_TASK_DRIVER_INVALID_ARGUMENT)return 88;
+  request.headers=NULL;
+  if(ku_task_2_inputs(NULL,NULL,0,1,&input,&request,&bytes)!=KU_TASK_DRIVER_OK || bytes!=expected)return 89;
   KuResult_struct___ku_http_response wrapped={0};wrapped.value.headers=(KuObject*)(uintptr_t)1;
-  if(ku_task_1_inputs(NULL,NULL,0,1,&wrapped,&bytes)!=KU_TASK_DRIVER_OK || bytes)return 83;
-  wrapped.ok=true;
-  if(ku_task_1_inputs(NULL,NULL,0,1,&wrapped,&bytes)!=KU_TASK_DRIVER_INVALID_ARGUMENT)return 84;
+  if(ku_task_1_inputs(NULL,NULL,0,1,&wrapped,&bytes)!=KU_TASK_DRIVER_OK || bytes)return 90;
+  wrapped.ok=true;wrapped.value.headers=input.headers;
+  if(ku_task_1_inputs(NULL,NULL,0,1,&wrapped,&bytes)!=KU_TASK_DRIVER_OK || bytes!=expected)return 91;
+  KuTaskAdapterOutcomeV1 outcome={0};outcome.value.http_response.value.headers=input.headers;
+  if(ku_task_outcome_empty(&outcome,8u))return 92;
+  ku_drop_struct___ku_http_response(&input);
+  KuStruct___ku_http_response boundary={0};boundary.headers=ku_object_new(65536u);
+  for(size_t i=0;i<49151u;i++) {
+    char text[32];int n=snprintf(text,sizeof(text),"key%zu",i);
+    if(n<=0 || (size_t)n>=sizeof(text))return 93;
+    KuString owned_key={0};
+    if(!ku_object_string_try_concat(ku_string_static((const uint8_t*)text,(size_t)n),(KuString){0},&owned_key))return 93;
+    ku_object_set(boundary.headers,owned_key,ku_v_str(ku_string_static((const uint8_t*)"old",3)));
+  }
+  if(boundary.headers->cap!=65536u || boundary.headers->len!=49151u)return 94;
+  KuTaskDriverTicketV1 ticket={0};KuTaskControlV1 control={0};
+  KuTaskAdapterHostV1 host={0};host.ticket=&ticket;host.control=&control;
+  host.allocation_host_bytes=sizeof(host);host.allocation_host_abi=KU_TASK_ALLOCATION_HOST_ABI_VERSION;
+  host.allocation_context=&test_header_growth_calls;host.reconcile_charge=test_header_reconcile;
+  KuString new_key=ku_string_static((const uint8_t*)"x-next",6),new_value=ku_string_static((const uint8_t*)"new",3);
+  if(ku_task_host_http_header_set(&host,&boundary,new_key,new_value)!=KU_TASK_DRIVER_LIMIT
+      || test_header_growth_calls || boundary.headers->cap!=65536u || boundary.headers->len!=49151u
+      || ku_object_get(boundary.headers,new_key))return 95;
+  KuString existing=ku_string_static((const uint8_t*)"key0",4);
+  if(ku_task_host_http_header_set(&host,&boundary,existing,new_value)!=KU_TASK_DRIVER_OK
+      || test_header_growth_calls!=1u || boundary.headers->cap!=65536u || boundary.headers->len!=49151u)return 96;
+  KuValue* updated=ku_object_get(boundary.headers,existing);
+  if(!updated || updated->tag!=KU_STR || !ku_string_equal(updated->as.s,new_value))return 97;
+  ku_drop_struct___ku_http_response(&boundary);
   puts("task-http-active-payload-ok");return 0;
 }
 "#;
@@ -512,4 +776,60 @@ fn main():null! {
     if let Some(out) = run_c("http-structural-response", &c) {
         assert_eq!(out, "structural-response-ok\n");
     }
+}
+
+#[test]
+fn native_http_view_request_maps_remain_read_only_at_the_ir_boundary() {
+    use ir::{IrCallKind, IrExpr, IrExprKind, IrInst, IrType, TempId};
+    let ast = checked(
+        r#"
+fn Read(&req:HttpRequest):HttpResponse {return http.text(req.headers.host+req.params.id+req.query.q)}
+fn main() {}
+"#,
+    );
+    let valid = ir::lower_program(&ast).unwrap();
+    let actual_ir = valid.to_string();
+    assert!(actual_ir.contains("__ku_http_map_get"), "{actual_ir}");
+    assert!(actual_ir.contains("borrowed req"), "{actual_ir}");
+    ir::verify_borrow_contract(&valid).unwrap();
+    let mut invalid = valid.clone();
+    let reader = invalid
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "Read")
+        .unwrap();
+    let object = IrType::Named("__ku_object".into());
+    let response = IrType::Named("__ku_http_response".into());
+    reader.blocks[0].instructions.push(IrInst::Temp {
+        id: TempId(10000),
+        ty: response.clone(),
+        value: IrExpr {
+            ty: response,
+            kind: IrExprKind::Call {
+                callee: Box::new(IrExpr {
+                    ty: IrType::Function,
+                    kind: IrExprKind::Local("__ku_http_response_from_object_owned".into()),
+                }),
+                args: vec![IrExpr {
+                    ty: object,
+                    kind: IrExprKind::Field {
+                        target: Box::new(IrExpr {
+                            ty: IrType::Named("__ku_http_request".into()),
+                            kind: IrExprKind::BorrowedParam("req".into()),
+                        }),
+                        name: "headers".into(),
+                    },
+                }],
+                kind: IrCallKind::Intrinsic("__ku_http_response_from_object_owned".into()),
+            },
+        },
+    });
+    let error = ir::verify_borrow_contract(&invalid)
+        .expect_err("owned conversion must not consume a borrowed map");
+    assert!(
+        error
+            .to_string()
+            .contains("borrowed value passed to an owning intrinsic"),
+        "{error}"
+    );
 }

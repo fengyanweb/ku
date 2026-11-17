@@ -17,6 +17,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import select
 import shutil
 import socket
@@ -616,10 +617,82 @@ def parse_args(argv=None):
                         help="Run independent sync and/or named async HTTP -> PostgreSQL lifecycles")
     parser.add_argument("--database-owner-config", type=Path,
                         help="Private installed-archive verifier only; parent retains the direct postgres child")
+    parser.add_argument("--installed-contracts", action="store_true",
+                        help="Additional private installed-SDK ordinary/typed/reset/owned checks; never performance scoring")
     args = parser.parse_args(argv)
     if args.performance_seconds and not 3 <= args.performance_seconds <= 60:
         parser.error("performance-seconds must be 3..60")
+    if args.performance_seconds and args.installed_contracts:
+        parser.error("installed contracts cannot change a performance workload")
     return args
+
+
+def windows_pg_runtime_environment(environment, report):
+    """Only a verified private GNU DLL closure may replace the service PATH."""
+    selected = environment.get('KU_PG_PRIVATE_MANIFEST')
+    if not selected:
+        return dict(environment)
+    if sys.platform != 'win32':
+        raise ValueError('private GNU libpq runtime manifest requires Windows')
+    manifest_path = Path(selected)
+    root = Path(environment['KU_PG_LIB']).resolve(strict=True)
+    runtime = root / 'runtime'
+    if (manifest_path.is_symlink() or manifest_path.resolve(strict=True) != root / 'manifest.json'
+            or Path(environment['KU_PG_RUNTIME_DIR']).resolve(strict=True) != runtime
+            or manifest_path.stat().st_size > 1024 * 1024):
+        raise ValueError('private GNU libpq runtime paths differ from their owned root')
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if (manifest.get('format') != 'ku-private-windows-gnu-pg-v1'
+            or manifest.get('target') != 'x86_64-pc-windows-gnu'
+            or manifest.get('tool_work_removed') is not True
+            or not re.fullmatch(r'libpq-opaque-abi-ok:[1-9][0-9]*:8:8:4', manifest.get('opaque_abi', ''))):
+        raise ValueError('private GNU libpq target/ABI preparation was not confirmed')
+    inventory, import_library = manifest.get('dlls', []), manifest.get('import_library')
+    if not isinstance(inventory, list) or not 1 <= len(inventory) <= 32 or not isinstance(import_library, dict):
+        raise ValueError('private GNU DLL inventory exceeds its bound')
+    names = set()
+    for row, is_library in [(row, False) for row in inventory] + [(import_library, True)]:
+        if not isinstance(row, dict):
+            raise ValueError('private GNU inventory entry is not an object')
+        name, size, expected = row.get('name', ''), row.get('size'), row.get('sha256', '')
+        valid_name = name == 'libpq.dll.a' if is_library else bool(re.fullmatch(r'[A-Za-z0-9_+.-]+\.dll', name, re.I))
+        if not valid_name:
+            raise ValueError('private GNU library inventory has a non-plain filename')
+        path = (root if is_library else runtime) / name
+        if (path.is_symlink() or not path.is_file() or type(size) is not int or not 0 < size <= 64 * 1024 * 1024
+                or path.stat().st_size != size or not re.fullmatch(r'[0-9a-f]{64}', expected)
+                or hashlib.sha256(path.read_bytes()).hexdigest() != expected):
+            raise ValueError('private GNU libpq file identity changed before execution')
+        if not is_library:
+            if name.casefold() in names:
+                raise ValueError('private GNU DLL names collide')
+            names.add(name.casefold())
+    if ('libpq.dll' not in names or {entry.name.casefold() for entry in runtime.iterdir()} != names
+            or manifest['import_library'].get('provider_sha256') != next(row['sha256'] for row in inventory if row['name'].casefold() == 'libpq.dll')):
+        raise ValueError('private GNU import library and DLL inventory differ')
+    expected_defaults = {'PGPASSFILE': 'empty-pgpass.conf', 'PGSERVICEFILE': 'empty-pg-service.conf',
+                         'PGSYSCONFDIR': 'empty-pg-config'}
+    if (manifest.get('connection_defaults') != expected_defaults
+            or Path(manifest.get('loaded_libpq', '')).resolve() != runtime / 'libpq.dll'):
+        raise ValueError('GNU libpq ABI probe did not identify its private provider/defaults')
+    for key, name in expected_defaults.items():
+        path = root / name
+        valid = (path.is_dir() and not any(path.iterdir()) if key == 'PGSYSCONFDIR'
+                 else path.is_file() and path.stat().st_size == 0)
+        if path.is_symlink() or not valid:
+            raise ValueError('private empty libpq connection-default input changed')
+    system = next((value for key, value in environment.items() if key.upper() == 'SYSTEMROOT'), None)
+    if not system:
+        raise ValueError('private GNU runtime requires Windows SystemRoot')
+    paths = [str(runtime), str(Path(system) / 'System32'), str(Path(system))]
+    report['private_gnu_libpq'] = {'target': manifest['target'], 'provider': manifest['provider'],
+        'import_library': manifest['import_library'], 'dlls': inventory,
+        'runtime_path': paths, 'opaque_abi': manifest['opaque_abi'], 'wide_toolchain_path_in_service': False,
+        'private_empty_connection_defaults': True}
+    result = {key: value for key, value in environment.items() if not key.upper().startswith('PG')}
+    result.update(PATH=os.pathsep.join(paths), PGCLIENTENCODING='UTF8')
+    result.update({key: str(root / name) for key, name in expected_defaults.items()})
+    return result
 
 
 def installed_database_owner(args, lane, tools):
@@ -668,7 +741,8 @@ def installed_database_owner(args, lane, tools):
 
 def run_lane(args, lane, on_checkpoint=None):
     ku = args.ku.resolve()
-    filename = "http_pg_lifecycle.ku" if lane == "sync" else "http_pg_lifecycle_async.ku"
+    prefix = 'http_pg_installed_contract' if getattr(args, 'installed_contracts', False) else 'http_pg_lifecycle'
+    filename = prefix + ('' if lane == 'sync' else '_async') + '.ku'
     source = Path(__file__).resolve().parents[1] / "fixtures" / filename
     report = {"platform": os.uname().sysname if hasattr(os, "uname") else os.name,
               "lane": lane, "fixture": filename,
@@ -705,7 +779,8 @@ def run_lane(args, lane, on_checkpoint=None):
             raise
 
     progress("fixture:starting")
-    pg_config = shutil.which("pg_config") or "pg_config"
+    configured_tools = os.environ.get('KU_PG_TOOL_DIR')
+    pg_config = str(Path(configured_tools) / 'pg_config.exe') if configured_tools else shutil.which("pg_config") or "pg_config"
     tools = Path(execute([pg_config, "--bindir"]))
     suffix = ".exe" if os.name == "nt" else ""
     for name in ["initdb", "pg_ctl", "psql"]:
@@ -750,14 +825,20 @@ def run_lane(args, lane, on_checkpoint=None):
                     (private_lib / library.name).symlink_to(library.resolve())
                 environment["KU_PG_LIB"] = str(private_lib)
             environment["PGCLIENTENCODING"] = "UTF8"
-            environment["PATH"] = str(tools) + os.pathsep + environment.get("PATH", "")
+            runtime_environment = windows_pg_runtime_environment(environment, report)
+            if environment.get('KU_PG_PRIVATE_MANIFEST'):
+                tool_environment = dict(runtime_environment, PATH=str(tools) + os.pathsep + runtime_environment['PATH'])
+            else:
+                environment["PATH"] = str(tools) + os.pathsep + environment.get("PATH", "")
+                runtime_environment = environment
+                tool_environment = environment
             if external_owner is None:
                 execute([tools / "initdb", "-D", data, "-U", "ku_accept", "--auth-local=trust",
-                     "--auth-host=trust", "--encoding=UTF8", "--locale=C", "--no-instructions"])
+                     "--auth-host=trust", "--encoding=UTF8", "--locale=C", "--no-instructions"], env=tool_environment)
                 options = f"-h 127.0.0.1 -p {database_port} -c max_connections=24 -c shared_buffers=16MB"
                 if os.name != "nt":
                     options += f' -k "{root}"'
-                execute([tools / "pg_ctl", "-D", data, "-l", root / "postgres.log", "-w", "-t", "20", "start", "-o", options])
+                execute([tools / "pg_ctl", "-D", data, "-l", root / "postgres.log", "-w", "-t", "20", "start", "-o", options], env=tool_environment)
                 started = True
 
             def sql(statement, deadline=None):
@@ -769,7 +850,7 @@ def run_lane(args, lane, on_checkpoint=None):
                     budget = {"timeout_seconds": min(60, remaining), "deadline": deadline}
                 value = execute([tools / "psql", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
                             "-h", "127.0.0.1", "-p", str(database_port), "-U", "ku_accept",
-                            "-d", "postgres", "-c", statement], env=environment, **budget)
+                            "-d", "postgres", "-c", statement], env=tool_environment, **budget)
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError("database observation returned after its absolute deadline")
                 return value
@@ -810,8 +891,13 @@ def run_lane(args, lane, on_checkpoint=None):
             build_start = time.monotonic()
             execute([ku, "build", "--verbose", "--backend", "c", "--profile", args.profile, local_source, "-o", executable], cwd=root, env=environment)
             report["build_seconds"] = time.monotonic() - build_start
+            if getattr(args, 'installed_contracts', False):
+                local_source.unlink()
+                if (root / '.ku').exists():
+                    shutil.rmtree(root / '.ku', ignore_errors=False)
+                report['source_removed_before_run'] = not local_source.exists() and not (root / '.ku').exists()
             with logs.open("wb") as log:
-                service = subprocess.Popen([executable], cwd=root, env=environment, stdout=log, stderr=log)
+                service = subprocess.Popen([executable], cwd=root, env=runtime_environment, stdout=log, stderr=log)
 
             request_lock = threading.Lock()
 
@@ -952,6 +1038,11 @@ def run_lane(args, lane, on_checkpoint=None):
                 progress("http:parameters-fields-unicode-null")
                 assert json.loads(request("/read")) == expected
                 report["checks"]["parameters_fields_unicode_null"] = "passed"
+                if getattr(args, 'installed_contracts', False):
+                    typed = json.loads(request('/typed-owned'))
+                    assert typed == {'integer': 17, 'enabled': True, 'text': expected['text'],
+                                     'absent': True, 'ordinary': expected['text'], 'after': '9'}, typed
+                    report['checks']['typed_parameters_unicode_null_and_detached_results'] = 'passed'
                 progress("http:write-normal")
                 assert request("/insert/normal") == "中文🙂 payload"
                 if os.name == "nt":
@@ -1079,6 +1170,10 @@ def run_lane(args, lane, on_checkpoint=None):
             wait_service_exit(service, drain_deadline)
             assert service.returncode == 0, service.returncode
             report["checks"]["normal_drain_exit"] = service.returncode
+            if getattr(args, 'installed_contracts', False):
+                if 'installed-pg-contract-ok' not in logs.read_text(encoding='utf-8', errors='replace'):
+                    raise RuntimeError('strict-reset/owned-after-close startup contract did not complete')
+                report['checks']['strict_reset_same_backend_and_owned_after_close'] = 'passed'
             progress("http:connections-after-exit")
             check_connection_retirement(
                 "drain_connection_retirement", "database_connections_after_exit",
@@ -1116,7 +1211,7 @@ def run_lane(args, lane, on_checkpoint=None):
             raise
         finally:
             cleanup_fixture(report, args.output, service, proxy, data,
-                (None if external_owner else lambda: execute([tools / "pg_ctl", "-D", data, "-w", "-t", "15", "stop", "-m", "immediate"])), started,
+                (None if external_owner else lambda: execute([tools / "pg_ctl", "-D", data, "-w", "-t", "15", "stop", "-m", "immediate"], env=tool_environment)), started,
                 on_checkpoint=on_checkpoint)
     report["status"] = "passed"
     progress("fixture:finished")

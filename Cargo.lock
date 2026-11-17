@@ -501,6 +501,10 @@ dependencies = [
 name = "ku-native-http-client"
 version = "0.1.0"
 dependencies = [
+ "flate2",
+ "rustls",
+ "rcgen",
+ "webpki-roots 1.0.7",
  "ureq",
  "url",
 ]

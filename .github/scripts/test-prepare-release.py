@@ -64,7 +64,7 @@ class PrepareReleaseTests(unittest.TestCase):
 
     def archive(self, target, release=None, extra=None):
         asset, manifest = self.paths(target)
-        executable = "ku.exe" if target.endswith("windows-msvc") else "ku"
+        executable = "ku.exe" if "-windows-" in target else "ku"
         payloads = {"RELEASE.json": encoded(release or {"version": VERSION, "target": target, "commit": COMMIT}),
                     executable: b"fake target data, not executed\n", "deps/libprobe.rlib": b"fake library"}
         with tempfile.TemporaryDirectory(prefix='ku-runtime-identity-fixture-') as runtime_temporary:
@@ -74,8 +74,9 @@ class PrepareReleaseTests(unittest.TestCase):
                 path = runtime_root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(value)
-            compiler = 'release: 1.89.0\ncommit-hash: ' + 'b'*40 + '\ncommit-date: 2025-08-04\nhost: ' + target + '\n'
-            PREPARE.EXPORTER.RUNTIME_BUNDLE.create(runtime_root, VERSION, COMMIT, target, compiler, '1.89.0')
+            toolchain = '1.99.1' if target == 'x86_64-pc-windows-gnu' else '1.89.0'
+            compiler = 'release: ' + toolchain + '\ncommit-hash: ' + 'b'*40 + '\ncommit-date: 2025-08-04\nhost: ' + target + '\n'
+            PREPARE.EXPORTER.RUNTIME_BUNDLE.create(runtime_root, VERSION, COMMIT, target, compiler, toolchain)
             for name in ('ku-runtime.json', 'ku-runtime-deps.json', 'libku.rlib'):
                 payloads[name] = (runtime_root / name).read_bytes()
         if extra:
@@ -134,6 +135,18 @@ class PrepareReleaseTests(unittest.TestCase):
         self.assertEqual((self.repo / "docs" / f"v{VERSION}.md").read_bytes(), original)
         with self.assertRaises(PREPARE.PrepareError):
             self.prepare()
+
+    def test_gnu_source_validation_uses_exe_without_expanding_official_release_targets(self):
+        target = 'x86_64-pc-windows-gnu'
+        self.assertNotIn(target, PREPARE.TARGETS)
+        self.archive(target)
+        archive, path = self.paths(target)
+        manifest = json.loads(path.read_bytes())
+        self.assertIn('ku.exe', manifest['files'])
+        PREPARE.validate_manifest(manifest, VERSION, target, COMMIT, archive.name)
+        manifest['files']['ku'] = manifest['files'].pop('ku.exe')
+        with self.assertRaisesRegex(PREPARE.PrepareError, 'Ku executable'):
+            PREPARE.validate_manifest(manifest, VERSION, target, COMMIT, archive.name)
 
     def test_missing_archive_and_manifest_are_rejected(self):
         for index in (0, 1):

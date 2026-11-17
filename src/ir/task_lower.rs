@@ -1078,7 +1078,7 @@ impl<'a> FunctionLowerer<'a> {
                 {
                     if matches!(map.as_str(), "params" | "query" | "headers") {
                         let source = self.expression(request, depth + 2)?;
-                        if matches!(&self.function.slots[source.0].ty,TaskSlotType::Value {ty,..} if task::http_request_type(ty))
+                        if matches!(&self.function.slots[source.0].ty,TaskSlotType::Value {ty,..} if task::http_request_type(ty) || task::http_response_type(ty) && map=="headers")
                         {
                             let destination = self.slot(value_slot(IrType::Str))?;
                             let key =
@@ -1099,11 +1099,17 @@ impl<'a> FunctionLowerer<'a> {
                 if !matches!(&self.function.slots[source.0].ty,
                     TaskSlotType::Value { ty, .. }
                     if task::error_type(ty) && matches!(name.as_str(), "domain" | "code" | "message")
-                    || task::http_request_type(ty) && matches!(name.as_str(),"method"|"path"|"body"))
+                    || task::http_request_type(ty) && matches!(name.as_str(),"method"|"path"|"body")
+                    || task::http_response_type(ty) && matches!(name.as_str(),"status"|"body"))
                 {
                     return Err(unsupported("this field projection", expression.span));
                 }
-                let destination = self.slot(value_slot(IrType::Str))?;
+                let field_type = if name == "status" {
+                    IrType::Int
+                } else {
+                    IrType::Str
+                };
+                let destination = self.slot(value_slot(field_type))?;
                 self.emit(TaskOp::ErrorField {
                     dst: destination,
                     src: source,
@@ -1712,6 +1718,9 @@ impl<'a> FunctionLowerer<'a> {
             && self.local("http").is_none()
             && !self.signatures.contains_key("http")
         {
+            if matches!(name, "get" | "post" | "request") {
+                return self.outbound_http(name, args, span, depth);
+            }
             let kind = match name {
                 "text" => 0u32,
                 "html" => 1,
@@ -2101,7 +2110,7 @@ impl<'a> FunctionLowerer<'a> {
             if matches!(map.as_str(), "params" | "query" | "headers") {
                 let request = self.expression(request, depth + 2)?;
                 let key = self.expression(index, depth + 1)?;
-                if !matches!(&self.function.slots[request.0].ty,TaskSlotType::Value{ty,..} if task::http_request_type(ty))
+                if !matches!(&self.function.slots[request.0].ty,TaskSlotType::Value{ty,..} if task::http_request_type(ty) || task::http_response_type(ty) && map=="headers")
                     || self.function.slots[key.0].ty != value_slot(IrType::Str)
                 {
                     return Err(unsupported("this request map index", span));
@@ -2646,6 +2655,126 @@ impl<'a> FunctionLowerer<'a> {
         Ok(dst)
     }
 
+    fn outbound_http(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if self.in_finally_body {
+            return Err(unsupported("HTTP wait in a Task finally body", span));
+        }
+        let mut inputs = [None; 9];
+        let operation = match name {
+            "get" => task::TaskNetOperation::HttpGet,
+            "post" => task::TaskNetOperation::HttpPost,
+            _ => task::TaskNetOperation::HttpRequest,
+        };
+        if name != "request" {
+            if args.len() != if name == "post" { 2 } else { 1 } {
+                return Err(unsupported("HTTP client argument count", span));
+            }
+            for (i, arg) in args.iter().enumerate() {
+                let value = self.expression(arg, depth + 1)?;
+                if self.function.slots[value.0].ty != value_slot(IrType::Str) {
+                    return Err(unsupported("HTTP client requires str arguments", arg.span));
+                }
+                inputs[i] = Some(self.copy_or_move(value)?);
+            }
+        } else {
+            let [argument] = args else {
+                return Err(unsupported("http.request argument count", span));
+            };
+            let ExprKind::ObjectLiteral { fields } = &argument.kind else {
+                return Err(unsupported(
+                    "Task http.request requires an inline configuration",
+                    argument.span,
+                ));
+            };
+            let names = [
+                "url",
+                "body",
+                "method",
+                "timeout_ms",
+                "max_body_bytes",
+                "headers",
+            ];
+            let mut seen = 0u16;
+            for (name, value) in fields {
+                let Some(index) = names.iter().position(|n| n == name) else {
+                    return Err(unsupported("unknown HTTP request field", value.span));
+                };
+                if seen & (1 << index) != 0 {
+                    return Err(unsupported("duplicate HTTP request field", value.span));
+                }
+                seen |= 1 << index;
+                if index != 0
+                    && index != 5
+                    && matches!(&value.kind, ExprKind::Literal(Literal::Null))
+                {
+                    continue;
+                }
+                if index == 5 {
+                    if matches!(&value.kind, ExprKind::Literal(Literal::Null)) {
+                        let fault = self.slot(value_slot(IrType::Int))?;
+                        self.emit(TaskOp::Init {
+                            dst: fault,
+                            value: TaskConstant::Int(1),
+                        })?;
+                        inputs[8] = Some(fault);
+                        continue;
+                    }
+                    let ExprKind::ObjectLiteral { fields } = &value.kind else {
+                        return Err(unsupported(
+                            "Task HTTP headers require an inline string map",
+                            value.span,
+                        ));
+                    };
+                    let mut keys = Vec::new();
+                    let mut values = Vec::new();
+                    for (key, value) in fields {
+                        let k = self.slot(value_slot(IrType::Str))?;
+                        self.emit(TaskOp::Init {
+                            dst: k,
+                            value: TaskConstant::Str(key.clone()),
+                        })?;
+                        keys.push(k);
+                        let v = self.expression(value, depth + 2)?;
+                        if self.function.slots[v.0].ty != value_slot(IrType::Str) {
+                            return Err(unsupported("HTTP header values must be str", value.span));
+                        }
+                        values.push(self.copy_or_move(v)?);
+                    }
+                    for (i, elements) in [(5, keys), (6, values)] {
+                        let dst = self.slot(value_slot(IrType::Array(Box::new(IrType::Str))))?;
+                        self.emit(TaskOp::ArrayMake { dst, elements })?;
+                        inputs[i] = Some(dst);
+                    }
+                } else {
+                    let expected = if index < 3 { IrType::Str } else { IrType::Int };
+                    let v = self.expression(value, depth + 1)?;
+                    if self.function.slots[v.0].ty != value_slot(expected) {
+                        return Err(unsupported("HTTP request field type", value.span));
+                    }
+                    inputs[index] = Some(self.copy_or_move(v)?);
+                }
+            }
+            if inputs[0].is_none() {
+                return Err(unsupported("http.request missing url", argument.span));
+            }
+        }
+        let dst = self.net_terminator(
+            operation,
+            inputs,
+            IrType::Result(Box::new(IrType::Named("__ku_http_response".into()))),
+        )?;
+        for source in inputs.into_iter().flatten() {
+            self.emit(TaskOp::Drop { slot: source })?;
+        }
+        Ok(dst)
+    }
+
     fn net_terminator(
         &mut self,
         operation: task::TaskNetOperation,
@@ -3125,6 +3254,43 @@ impl<'a> FunctionLowerer<'a> {
                         // both Try routes already exit. Its validated tail is
                         // unreachable; do not invent a second native exit.
                         break;
+                    }
+                }
+                Stmt::AssignTarget {
+                    target: crate::ast::AssignTarget::Index { target, index },
+                    value,
+                    span,
+                } => {
+                    let ExprKind::Field {
+                        target: response,
+                        name,
+                    } = &target.kind
+                    else {
+                        return Err(unsupported("this Task indexed assignment", *span));
+                    };
+                    let response = self.expression(response, depth + 1)?;
+                    if name != "headers"
+                        || !matches!(&self.function.slots[response.0].ty,TaskSlotType::Value{ty,borrowed:false} if task::http_response_type(ty))
+                    {
+                        return Err(unsupported("this Task header assignment", *span));
+                    }
+                    // Receiver, key and value are evaluated once in source order.
+                    let key = self.expression(index, depth + 1)?;
+                    let data = self.expression(value, depth + 1)?;
+                    if self.function.slots[key.0].ty != value_slot(IrType::Str)
+                        || self.function.slots[data.0].ty != value_slot(IrType::Str)
+                    {
+                        return Err(unsupported("non-string Task HTTP header assignment", *span));
+                    }
+                    self.emit(TaskOp::HttpHeaderSet {
+                        response,
+                        key,
+                        value: data,
+                    })?;
+                    for (expression, slot) in [(index, key), (value, data)] {
+                        if !matches!(&expression.kind, ExprKind::Variable(_)) {
+                            self.emit(TaskOp::Drop { slot })?;
+                        }
                     }
                 }
                 Stmt::Assign { name, value, span } => {

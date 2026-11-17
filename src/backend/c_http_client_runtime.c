@@ -2,6 +2,7 @@ static KuError __ku_http_client_error(const char* code,const char* message) {
   return ku_error_make(ku_string_static((const uint8_t*)"http",4),
     ku_string_static((const uint8_t*)code,strlen(code)),ku_string_static((const uint8_t*)message,strlen(message)));
 }
+ #if defined(KU_HTTP_CLIENT_SYNC)
 static void __ku_http_client_config_error(const char* message) {
   __ku_sync_raise_http_json((const uint8_t*)message,strlen(message));
 }
@@ -49,6 +50,7 @@ static KuObject* __ku_http_client_config(KuObject* object) {
   return result;
 oom:ku_object_drop(result);__ku_http_client_config_error("http/out_of_memory: client config allocation failed");return NULL;
 }
+#endif
 #if defined(KU_FEATURE_NATIVE_HTTP_CLIENT)
 static bool __ku_http_client_copy(__ku_http_client_slice_v1 value,KuString* out) {
   *out=(KuString){0};if(value.len&&!value.data)return false;
@@ -79,6 +81,7 @@ static bool __ku_http_client_header_value(KuString s) {
 /* Prepare once before later config fields, preserving the interpreter's
  * header-before-timeout error priority. The successful caller owns this one
  * descriptor block until execute (or a later config failure) frees it. */
+ #if defined(KU_HTTP_CLIENT_SYNC)
 static int __ku_http_client_headers(KuObject* headers,__ku_http_client_header_v1** descriptors,size_t* count) {
   *descriptors=NULL;*count=0;
   if(headers&&headers->len){
@@ -99,6 +102,29 @@ static int __ku_http_client_headers(KuObject* headers,__ku_http_client_header_v1
 invalid:free(*descriptors);*descriptors=NULL;*count=0;return 0;
 oom:free(*descriptors);*descriptors=NULL;*count=0;return -1;
 }
+#endif
+static KuResult_struct___ku_http_response __ku_http_client_result(__ku_http_client_output_v1* output,uint32_t status) {
+  KuResult_struct___ku_http_response result={0};
+  if(status!=0){
+    result.error=__ku_http_client_error("transport","native HTTP client failed");
+    if(output->code.len&&!__ku_http_client_copy(output->code,&result.error.code))goto oom;
+    if(output->message.len&&!__ku_http_client_copy(output->message,&result.error.message))goto oom;
+    return result;
+  }
+  result.value.status=output->http_status;
+  if(!__ku_http_client_copy(output->body,&result.value.body)||!ku_object_try_new(output->header_count,&result.value.headers))goto oom;
+  for(size_t i=0;i<output->header_count;i++){
+    KuString key={0},value={0};
+    if(!__ku_http_client_copy(output->headers[i].name,&key)||!__ku_http_client_copy(output->headers[i].value,&value)){ku_string_drop(&key);ku_string_drop(&value);goto oom;}
+    KuValue field=ku_v_str(value);
+    if(!ku_object_try_set_owned(result.value.headers,&key,&field)){ku_string_drop(&key);ku_value_drop(&field);goto oom;}
+  }
+  result.ok=true;return result;
+oom:
+  ku_drop_struct___ku_http_response(&result.value);ku_error_drop(&result.error);result.ok=false;result.error=__ku_http_client_error("out_of_memory","HTTP input or output allocation failed");
+  return result;
+}
+ #if defined(KU_HTTP_CLIENT_SYNC)
 static KuResult_struct___ku_http_response __ku_http_client_execute(KuString method,KuString url,KuString body,bool has_body,__ku_http_client_header_v1* descriptors,size_t count,uint64_t timeout,size_t max_body) {
   KuResult_struct___ku_http_response result={0};
   __ku_http_client_output_v1 output={0};output.size=sizeof(output);
@@ -109,23 +135,7 @@ static KuResult_struct___ku_http_response __ku_http_client_execute(KuString meth
   __ku_http_client_input_v1 input={.size=sizeof(input),.flags=has_body?1u:0u,.method={method.ptr,method.len},.url={url.ptr,url.len},.body={body.ptr,body.len},.headers=descriptors,.header_count=count,.timeout_ms=timeout,.caller_budget_ms=caller_budget,.max_body_bytes=max_body};
   uint32_t status=__ku_http_client_abi_version()==1?__ku_http_client_call_v1(&input,&output):2;
   if(__ku_handler_timeout_poll())goto done;
-  if(status!=0){
-    result.error=__ku_http_client_error("transport","native HTTP client failed");
-    if(output.code.len&&!__ku_http_client_copy(output.code,&result.error.code))goto oom;
-    if(output.message.len&&!__ku_http_client_copy(output.message,&result.error.message))goto oom;
-    goto done;
-  }
-  result.value.status=output.http_status;
-  if(!__ku_http_client_copy(output.body,&result.value.body)||!ku_object_try_new(output.header_count,&result.value.headers))goto oom;
-  for(size_t i=0;i<output.header_count;i++){
-    KuString key={0},value={0};
-    if(!__ku_http_client_copy(output.headers[i].name,&key)||!__ku_http_client_copy(output.headers[i].value,&value)){ku_string_drop(&key);ku_string_drop(&value);goto oom;}
-    KuValue field=ku_v_str(value);
-    if(!ku_object_try_set_owned(result.value.headers,&key,&field)){ku_string_drop(&key);ku_value_drop(&field);goto oom;}
-  }
-  result.ok=true;goto done;
-oom:
-  ku_drop_struct___ku_http_response(&result.value);ku_error_drop(&result.error);result.ok=false;result.error=__ku_http_client_error("out_of_memory","HTTP input or output allocation failed");
+  result=__ku_http_client_result(&output,status);
 done:
   __ku_http_client_release_v1(&output);free(descriptors);return result;
 }
@@ -155,4 +165,5 @@ static KuResult_struct___ku_http_response __ku_http_client_request(KuObject* obj
   if(!__ku_http_client_integer(object,"timeout_ms",5000,300000,&timeout)||!__ku_http_client_integer(object,"max_body_bytes",1000000,16777216,&max_body)){free(descriptors);return empty;}
   return __ku_http_client_execute(method,url,body,present,descriptors,count,(uint64_t)timeout,(size_t)max_body);
 }
+#endif
 #endif

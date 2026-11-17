@@ -90,6 +90,13 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Verify the existing Python runtime
+        shell: pwsh
+        run: |
+          & ${{ matrix.python }} --version
+          if ($LASTEXITCODE) { throw 'Python version query failed' }
+          & ${{ matrix.python }} -c "import sys; assert sys.version_info >= (3, 11), 'SDK verification requires Python 3.11 or later'"
+          if ($LASTEXITCODE) { throw 'The existing runner Python cannot execute the installed-SDK verification' }
       - name: Select the existing x64 MinGW compiler for Windows GNU
         if: matrix.target == 'x86_64-pc-windows-gnu'
         shell: pwsh
@@ -174,6 +181,8 @@ jobs:
           if ($LASTEXITCODE) { throw 'Workspace check/clippy failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked -p ku-native-calendar
           if ($LASTEXITCODE) { throw 'Native calendar engine/ABI contracts failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked -p ku-native-http-client
+          if ($LASTEXITCODE) { throw 'Native HTTP async codec/TLS/ABI contracts failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN build --locked --lib --bin ku
           if ($LASTEXITCODE) { throw 'Matching source CLI/library build failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test cli_v002_test -- --test-threads=1
@@ -194,6 +203,10 @@ jobs:
           if ($LASTEXITCODE) { throw 'Optional compression pack contract tests failed' }
           & ${{ matrix.python }} -B .github/scripts/test-prepare-release.py
           if ($LASTEXITCODE) { throw 'Final release/transfer contract tests failed' }
+          & ${{ matrix.python }} -B .github/scripts/test-prepare-windows-gnu-pg.py
+          if ($LASTEXITCODE) { throw 'Private GNU libpq input/dependency contracts failed' }
+          & ${{ matrix.python }} -B tests/acceptance/test_http_pg_lifecycle.py WindowsGnuPrivateRuntimeContracts
+          if ($LASTEXITCODE) { throw 'Private GNU service PATH/provider identity contracts failed' }
       - name: Build the real isolated same-batch installer tree
         if: matrix.target != 'x86_64-pc-windows-gnu'
         shell: pwsh
@@ -237,6 +250,10 @@ jobs:
           if ($LASTEXITCODE) { throw 'Native calendar HTTP recovery failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_http_client_test -- --test-threads=1
           if ($LASTEXITCODE) { throw 'Native HTTP client ownership/error/deadline contracts failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_http_test -- native_http_view_routes_dynamic_results_and_invalid_shape_recover native_http_task_dynamic_headers_survive_await_and_transfer_once --exact --test-threads=1
+          if ($LASTEXITCODE) { throw 'Native View routes and Task dynamic headers failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_task_start_parameters_test -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Shared Task argument ownership/slot relocation failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_http_test native_http_inferred_object_handlers_preserve_callable_abi_and_owned_results -- --exact --test-threads=1
           if ($LASTEXITCODE) { throw 'Native structural HTTP handler ABI failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_http_test native_http_response_headers_are_authoritative_validated_and_sent_once -- --exact --test-threads=1
@@ -255,6 +272,10 @@ jobs:
               if ($LASTEXITCODE) { throw 'Task nullable ASan/UBSan cleanup failed' }
               cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_run_test native_calendar -- --test-threads=1
               if ($LASTEXITCODE) { throw 'Calendar ASan/UBSan cleanup failed' }
+              cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_http_client_test -- --test-threads=1
+              if ($LASTEXITCODE) { throw 'HTTP response/ABI ASan/UBSan cleanup failed' }
+              cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_http_test -- native_http_view_routes_dynamic_results_and_invalid_shape_recover native_http_task_dynamic_headers_survive_await_and_transfer_once --exact --test-threads=1
+              if ($LASTEXITCODE) { throw 'View/Task HTTP ASan/UBSan ownership failed' }
             } finally { $env:KU_CC = $normalCompiler }
           }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_compression_test native_compression_public_project_runs_outside_source_with_space_and_unicode -- --ignored --exact --test-threads=1
@@ -304,6 +325,8 @@ jobs:
           $installed = Get-Content -LiteralPath "$env:RUNNER_TEMP/cli-consumer-evidence.json" -Raw | ConvertFrom-Json
           if ($installed.installed_native_time_array.status -ne 'passed') { throw 'This SDK must include and actually execute the matching native calendar/array modules' }
           if ($installed.installed_native_http_client.status -ne 'passed') { throw 'This SDK must include and actually execute the matching native HTTP/calendar client program' }
+          if ($installed.installed_native_task_http_client.status -ne 'passed') { throw 'This SDK must execute standalone Task HTTP without a server or Runner' }
+          if ($installed.installed_native_http_relay.status -ne 'passed') { throw 'This SDK must actually execute the source-free inbound HTTP to outbound HTTP relay contract' }
       - name: Prepare the existing PostgreSQL fixture tools on Linux
         if: runner.os == 'Linux'
         shell: bash
@@ -365,17 +388,36 @@ jobs:
           & (Join-Path $runtimeDirectory 'pg_config.exe') --version
           if ($LASTEXITCODE -ne 0) { throw 'Selected pg_config failed' }
 
+      - name: Prepare private Windows GNU libpq imports and exact runtime DLLs
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:PGROOT) -or -not [IO.Path]::IsPathFullyQualified($env:PGROOT)) { throw 'Windows GNU PG verification requires the existing absolute PGROOT' }
+          $selected = (Resolve-Path -LiteralPath $env:PGROOT).Path
+          $tools = Join-Path $selected 'bin'
+          foreach ($name in @('postgres.exe', 'pg_config.exe', 'initdb.exe', 'pg_ctl.exe', 'psql.exe', 'libpq.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $tools $name) -PathType Leaf)) { throw "The selected private PG fixture provider is missing $name" }
+          }
+          $privateLib = Join-Path $env:RUNNER_TEMP ('ku-installed-pg-link-' + [Guid]::NewGuid().ToString('N'))
+          "KU_PG_LIB=$privateLib" >> $env:GITHUB_ENV
+          "KU_PG_RUNTIME_DIR=$(Join-Path $privateLib 'runtime')" >> $env:GITHUB_ENV
+          "KU_PG_PRIVATE_MANIFEST=$(Join-Path $privateLib 'manifest.json')" >> $env:GITHUB_ENV
+          "KU_PG_TOOL_DIR=$tools" >> $env:GITHUB_ENV
+          & ${{ matrix.python }} -B .github/scripts/prepare-windows-gnu-pg.py --compiler $env:KU_GNU_CC --postgres-root $selected --output $privateLib
+          if ($LASTEXITCODE) { throw 'Actual GNU libpq import-library/runtime closure preparation failed' }
       - name: Verify the same archive's installed sync and async PostgreSQL lifecycles
-        if: matrix.target != 'x86_64-pc-windows-gnu'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $pgExtra = @()
+          if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu') { $pgExtra += '--hide-checkout' }
           & ${{ matrix.python }} -B (Join-Path $env:GITHUB_WORKSPACE '.github/scripts/verify-installed-pg.py') `
             --repo $env:GITHUB_WORKSPACE --version $env:RELEASE_VERSION `
             --target '${{ matrix.target }}' --commit $env:GITHUB_SHA `
             --output (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json') `
-            --assets (Join-Path $env:RUNNER_TEMP 'cli-bundle-assets')
+            --assets (Join-Path $env:RUNNER_TEMP 'cli-bundle-assets') @pgExtra
           if ($LASTEXITCODE) { throw 'Actual installed CLI PostgreSQL acceptance failed' }
       - name: Upload only verified installation files to the explicit candidate draft
         if: inputs.candidate_tag != ''
@@ -394,17 +436,25 @@ jobs:
         shell: pwsh
         run: |
           $summaryArgs = @('-B', '.github/scripts/release-transfer.py', 'summary', '--path', (Join-Path $env:RUNNER_TEMP 'cli-consumer-evidence.json'))
-          if ('${{ matrix.target }}' -ne 'x86_64-pc-windows-gnu') { $summaryArgs += @('--path', (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json')) }
+          $summaryArgs += @('--path', (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json'))
           & ${{ matrix.python }} @summaryArgs
           if ($LASTEXITCODE) { throw 'Cannot summarize installation verification' }
           $path = Join-Path $env:RUNNER_TEMP 'cli-consumer-evidence.json'
           if (Test-Path -LiteralPath $path) {
             $evidence = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-            $native = [ordered]@{target='${{ matrix.target }}'; installed_native_tls=$evidence.installed_native_tls; installed_native_compression=$evidence.installed_native_compression; installed_native_time_array=$evidence.installed_native_time_array; installed_native_http_client=$evidence.installed_native_http_client}
+            $native = [ordered]@{target='${{ matrix.target }}'; installed_native_tls=$evidence.installed_native_tls; installed_native_compression=$evidence.installed_native_compression; installed_native_time_array=$evidence.installed_native_time_array; installed_native_http_client=$evidence.installed_native_http_client; installed_native_task_http_client=$evidence.installed_native_task_http_client; installed_native_http_relay=$evidence.installed_native_http_relay}
             $text = ConvertTo-Json -InputObject $native -Depth 8 -Compress
             if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 32768) { throw 'Native consumer metadata exceeds summary bound' }
             Write-Output $text
             Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Native installed SDK checks: $text"
+          }
+          $pgPath = Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json'
+          if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu' -and (Test-Path -LiteralPath $pgPath -PathType Leaf)) {
+            $pg = Get-Content -LiteralPath $pgPath -Raw | ConvertFrom-Json
+            $detail = [ordered]@{ target=$pg.target; status=$pg.status; profile=$pg.profile; commit=$pg.commit; executable_sha256=$pg.executable_sha256; checkout_hidden_during_pg=$pg.checkout_hidden_during_pg; checkout_restore_confirmed=$pg.checkout_restore_confirmed; temporary_cleanup_confirmed=$pg.temporary_cleanup_confirmed; fixture_cleanup_confirmed=$pg.fixture_cleanup_confirmed; lanes=$pg.lanes; runtime_inputs=$pg.gnu_runtime_inputs }
+            $text = ConvertTo-Json -InputObject $detail -Depth 12 -Compress
+            if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 65536) { throw 'GNU PG bounded metadata exceeds its output limit' }
+            Write-Output "Installed GNU PG checks: $text"
           }
       - name: Remove the owned private compression build root
         if: always()
@@ -428,5 +478,7 @@ jobs:
             if ($parent -ne $expected -or $leaf -notlike 'ku-installed-pg-link-*') {
               throw 'Refusing to clean an unowned PostgreSQL import-library path'
             }
-            Remove-Item -LiteralPath $env:KU_PG_LIB -Recurse -Force
+            if (Test-Path -LiteralPath $env:KU_PG_LIB) { Remove-Item -LiteralPath $env:KU_PG_LIB -Recurse -Force }
+            if (Test-Path -LiteralPath $env:KU_PG_LIB) { throw 'Owned PostgreSQL link/runtime root remains after cleanup' }
+            Write-Output "Owned PostgreSQL link/runtime cleanup confirmed: $env:KU_PG_LIB"
           }

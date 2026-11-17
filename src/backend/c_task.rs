@@ -266,6 +266,21 @@ pub(super) fn uses_blocking_net(tasks: &TaskProgram) -> bool {
         })
     })
 }
+pub(super) fn uses_outbound_http(tasks: &TaskProgram) -> bool {
+    tasks.functions.iter().any(|f| {
+        f.states.iter().any(|s| {
+            matches!(
+                s.terminator,
+                TaskTerminator::BlockingNet {
+                    operation: TaskNetOperation::HttpGet
+                        | TaskNetOperation::HttpPost
+                        | TaskNetOperation::HttpRequest,
+                    ..
+                }
+            )
+        })
+    })
+}
 pub(super) fn uses_postgres(tasks: &TaskProgram) -> bool {
     tasks.functions.iter().any(|function| {
         function
@@ -2877,8 +2892,45 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         TaskNetOperation::Read => 6,
                         TaskNetOperation::Write => 7,
                         TaskNetOperation::Close => 8,
+                        TaskNetOperation::HttpGet
+                        | TaskNetOperation::HttpPost
+                        | TaskNetOperation::HttpRequest => 10,
                     };
-                    if *operation == TaskNetOperation::Connect {
+                    if matches!(
+                        operation,
+                        TaskNetOperation::HttpGet
+                            | TaskNetOperation::HttpPost
+                            | TaskNetOperation::HttpRequest
+                    ) {
+                        let url =
+                            self.place(inputs[0].ok_or_else(|| unsupported("HTTP URL absent"))?);
+                        let body = inputs[1]
+                            .map(|v| self.place(v))
+                            .unwrap_or_else(|| "(KuString){0}".into());
+                        let method = inputs[2].map(|v| self.place(v)).unwrap_or_else(|| {
+                            if *operation == TaskNetOperation::HttpPost {
+                                "ku_string_static((const uint8_t*)\"POST\",4)".into()
+                            } else {
+                                "ku_string_static((const uint8_t*)\"GET\",3)".into()
+                            }
+                        });
+                        let timeout = inputs[3]
+                            .map(|v| self.place(v))
+                            .unwrap_or_else(|| "5000".into());
+                        let max = inputs[4]
+                            .map(|v| self.place(v))
+                            .unwrap_or_else(|| "1000000".into());
+                        let names = inputs[5]
+                            .map(|v| self.place(v))
+                            .unwrap_or_else(|| "(KuArray_str){0}".into());
+                        let values = inputs[6]
+                            .map(|v| self.place(v))
+                            .unwrap_or_else(|| "(KuArray_str){0}".into());
+                        let config_fault = inputs[8]
+                            .map(|v| self.place(v))
+                            .unwrap_or_else(|| "0".into());
+                        out.push_str(&format!("  uint32_t net_status=ku_task_host_http((KuTaskAdapterHostV1*)clock->host,{method},{url},{body},{},{names},{values},{timeout},{max},{config_fault},&{});\n",u32::from(inputs[1].is_some()),self.place(*dst)));
+                    } else if *operation == TaskNetOperation::Connect {
                         out.push_str("  KuValue config[9]; uint16_t present=0; memset(config,0,sizeof(config));\n");
                         for (index, input) in inputs.iter().enumerate() {
                             if let Some(input) = input {
@@ -2912,6 +2964,19 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                             };
                             out.push_str(&format!("  uint32_t net_status=ku_task_host_net_write_close((KuTaskAdapterHostV1*)clock->host,&{client},{bytes},{kind}u,&net_result);\n"));
                         }
+                    }
+                    if matches!(
+                        operation,
+                        TaskNetOperation::HttpGet
+                            | TaskNetOperation::HttpPost
+                            | TaskNetOperation::HttpRequest
+                    ) {
+                        out.push_str("  if (net_status==KU_TASK_HTTP_CONFIG_ERROR) {\n");
+                        self.emit_runtime_error(
+                            out,
+                            &format!("ku_error_move(&{}.error)", self.place(*dst)),
+                        )?;
+                        out.push_str("  }\n");
                     }
                     out.push_str("  if (net_status==KU_TASK_CONTROL_PENDING) { frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }\n  if (net_status!=KU_TASK_CONTROL_OK) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n");
                     if *operation == TaskNetOperation::Write {
@@ -3739,6 +3804,15 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 self.set_init(out, *dst, true);
             }
             TaskOp::ErrorField { dst, src, field } => {
+                if field == "status" {
+                    out.push_str(&format!(
+                        "  {}={}.status;\n",
+                        self.place(*dst),
+                        self.place(*src)
+                    ));
+                    self.set_init(out, *dst, true);
+                    return Ok(());
+                }
                 if !matches!(
                     field.as_str(),
                     "domain" | "code" | "message" | "method" | "path" | "body"
@@ -3757,10 +3831,37 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 key,
                 map,
             } => {
+                if crate::ir::task::http_response_type(self.slot_type(*request)?) {
+                    out.push_str(&format!("  {{ KuString projected={{0}}; uint32_t cloned=ku_task_host_http_header_get((KuTaskAdapterHostV1*)clock->host,&{}, {},&projected);\n",self.place(*request),self.place(*key)));
+                    out.push_str("  if(cloned==KU_TASK_HTTP_MISSING_HEADER) {\n");
+                    self.emit_runtime_error(
+                        out,
+                        &format!(
+                            "ku_error_make({},{},{})",
+                            c_static_utf8_string("object"),
+                            c_static_utf8_string("missing_key"),
+                            c_static_utf8_string("object has no requested header key")
+                        ),
+                    )?;
+                    out.push_str("  }\n");
+                    self.emit_string_allocation_check(out, "cloned")?;
+                    out.push_str(&format!("  {}=projected; }}\n", self.place(*dst)));
+                    self.set_init(out, *dst, true);
+                    return Ok(());
+                }
                 out.push_str(&format!("  {{ KuValue* field_value=ku_object_get({}.{map},{});\n  KuString field_string=field_value && field_value->tag==KU_STR ? field_value->as.s : (KuString){{0}};\n  uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,field_string,&{});\n  if(cloned==KU_TASK_DRIVER_LIMIT || cloned==KU_TASK_HOST_ALLOCATION_FAILED) {{\n",self.place(*request),self.place(*key),self.place(*dst)));
                 self.emit_runtime_error(out,"ku_error_make(ku_string_static((const uint8_t*)\"task\",4),ku_string_static((const uint8_t*)\"memory_limit\",12),ku_string_static((const uint8_t*)\"request map projection allocation rejected\",42))")?;
                 out.push_str("  }\n  if(cloned!=KU_TASK_DRIVER_OK) {frame->header.running=0;return KU_TASK_FRAME_INVALID_STATE;}\n  }\n");
                 self.set_init(out, *dst, true);
+            }
+            TaskOp::HttpHeaderSet {
+                response,
+                key,
+                value,
+            } => {
+                out.push_str(&format!("  {{ uint32_t stored=ku_task_host_http_header_set((KuTaskAdapterHostV1*)clock->host,&{},{},{});\n",self.place(*response),self.place(*key),self.place(*value)));
+                self.emit_string_allocation_check(out, "stored")?;
+                out.push_str("  }\n");
             }
             TaskOp::HttpResponse {
                 dst,

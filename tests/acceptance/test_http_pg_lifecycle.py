@@ -1,7 +1,7 @@
 """Private PostgreSQL setup, independent lanes and bounded recovery contracts."""
 import hashlib
 import json
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import os
 from pathlib import Path
@@ -1106,6 +1106,78 @@ class InstalledDatabaseOwnerContracts(unittest.TestCase):
             fixture.cleanup_fixture(report, output, None, None, self.data, None, False)
         self.assertEqual(report["cleanup_errors"], [])
         self.assertTrue(self.pid.is_file())
+
+
+class WindowsGnuPrivateRuntimeContracts(unittest.TestCase):
+    """Manifest/env data tests only; fake DLL bytes are never executed."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='ku-gnu-pg-runtime-test-')
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.link, self.system = self.root / 'private-link', self.root / 'Windows'
+        self.runtime = self.link / 'runtime'
+        self.runtime.mkdir(parents=True); (self.system / 'System32').mkdir(parents=True)
+        dll = b'owned DLL input fixture'
+        (self.runtime / 'libpq.dll').write_bytes(dll)
+        archive = b'owned GNU import archive fixture'
+        (self.link / 'libpq.dll.a').write_bytes(archive)
+        defaults = {'PGPASSFILE': 'empty-pgpass.conf', 'PGSERVICEFILE': 'empty-pg-service.conf', 'PGSYSCONFDIR': 'empty-pg-config'}
+        for key, name in defaults.items():
+            path = self.link / name
+            path.mkdir() if key == 'PGSYSCONFDIR' else path.write_bytes(b'')
+        sha = hashlib.sha256(dll).hexdigest()
+        self.manifest = {'format': 'ku-private-windows-gnu-pg-v1', 'target': 'x86_64-pc-windows-gnu',
+            'provider': 'one explicit existing PostgreSQL installation', 'tool_work_removed': True,
+            'opaque_abi': 'libpq-opaque-abi-ok:170010:8:8:4',
+            'loaded_libpq': str(self.runtime / 'libpq.dll'), 'connection_defaults': defaults,
+            'dlls': [{'name': 'libpq.dll', 'size': len(dll), 'sha256': sha}],
+            'import_library': {'name': 'libpq.dll.a', 'size': len(archive),
+                               'sha256': hashlib.sha256(archive).hexdigest(), 'provider_sha256': sha}}
+        self.path = self.link / 'manifest.json'
+        self.save()
+        self.env = {'KU_PG_LIB': str(self.link), 'KU_PG_RUNTIME_DIR': str(self.runtime),
+            'KU_PG_PRIVATE_MANIFEST': str(self.path), 'SYSTEMROOT': str(self.system),
+            'PATH': 'wide-msys-path' + os.pathsep + 'unrelated-project',
+            'PGPASSWORD': 'must-not-propagate', 'PGSERVICE': 'business-service', 'PGCLIENTENCODING': 'LATIN1'}
+
+    def save(self):
+        self.path.write_text(json.dumps(self.manifest), encoding='utf-8')
+
+    def test_runtime_path_and_connection_defaults_exclude_inherited_tools_and_credentials(self):
+        before, report = dict(self.env), {}
+        with patch.object(fixture.sys, 'platform', 'win32'):
+            result = fixture.windows_pg_runtime_environment(self.env, report)
+        self.assertEqual(result['PATH'].split(os.pathsep), [str(self.runtime), str(self.system / 'System32'), str(self.system)])
+        self.assertNotIn('PGPASSWORD', result); self.assertNotIn('PGSERVICE', result)
+        self.assertEqual(result['PGCLIENTENCODING'], 'UTF8')
+        self.assertEqual(result['PGPASSFILE'], str(self.link / 'empty-pgpass.conf'))
+        self.assertEqual(self.env, before)
+        self.assertFalse(report['private_gnu_libpq']['wide_toolchain_path_in_service'])
+
+    def test_modified_private_dll_is_rejected_before_a_service_can_start(self):
+        (self.runtime / 'libpq.dll').write_bytes(b'changed DLL')
+        with patch.object(fixture.sys, 'platform', 'win32'), self.assertRaisesRegex(ValueError, 'identity changed'):
+            fixture.windows_pg_runtime_environment(self.env, {})
+
+    def test_extra_dll_is_not_silently_adopted_from_the_private_directory(self):
+        (self.runtime / 'unexpected.dll').write_bytes(b'not inventoried')
+        with patch.object(fixture.sys, 'platform', 'win32'), self.assertRaisesRegex(ValueError, 'inventory differ'):
+            fixture.windows_pg_runtime_environment(self.env, {})
+
+    def test_import_library_must_belong_to_the_same_provider(self):
+        self.manifest['import_library']['provider_sha256'] = '0' * 64
+        self.save()
+        with patch.object(fixture.sys, 'platform', 'win32'), self.assertRaisesRegex(ValueError, 'inventory differ'):
+            fixture.windows_pg_runtime_environment(self.env, {})
+
+    def test_connection_default_directory_must_remain_empty(self):
+        (self.link / 'empty-pg-config' / 'pg_service.conf').write_bytes(b'unowned connection service')
+        with patch.object(fixture.sys, 'platform', 'win32'), self.assertRaisesRegex(ValueError, 'connection-default'):
+            fixture.windows_pg_runtime_environment(self.env, {})
+
+    def test_function_only_installed_contracts_cannot_be_used_for_performance_scoring(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            fixture.parse_args(['--ku', 'unused', '--output', 'unused.json', '--performance-seconds', '3', '--installed-contracts'])
 
 
 if __name__ == "__main__":

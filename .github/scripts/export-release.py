@@ -881,7 +881,7 @@ and the operating system's local-time configuration still apply.
 链接后的程序不再需要该静态包、rustc、Ku SDK 或源码。
 """
         if http_client_manifest is not None:
-            instructions += "\nKeep native-http/v1/ beside ku when compiling synchronous http.get/post/request. The matching static HTTP client pack is linked only when used. The resulting program needs no Ku SDK, source or Rust compiler.\n中文：同步 HTTP 客户端构建需匹配的 native-http/v1/ 静态包；生成程序运行不依赖 SDK 或 Rust。\n"
+            instructions += "\nKeep native-http/v1/ beside ku when compiling http.get/post/request in synchronous code or supported native Tasks. The matching static HTTP client pack is linked only when used. The resulting program needs no Ku SDK, source or Rust compiler.\n中文：原生 HTTP 客户端构建需匹配的 native-http/v1/ 静态包；生成程序运行不依赖 SDK 或 Rust。\n"
         if native_compression_root is not None:
             instructions += """
 Optional native compression packs (Zstandard 1.5.7 and zlib 1.4) are included

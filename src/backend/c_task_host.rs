@@ -50,6 +50,10 @@ pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
         out.push_str("#define KU_TASK_HTTP_TYPES 1\n");
     }
     out.push_str(HOST_ABI);
+    if tasks.functions.iter().any(|function|crate::ir::task::http_type(&function.result)
+        || function.slots.iter().any(|slot|matches!(&slot.ty,crate::ir::task::TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty)))) {
+        out.push_str(include_str!("c_task_http_headers.c"));
+    }
     if super::super::task::uses_blocking_io(tasks) {
         out.push_str(BLOCKING_HOST);
     }
@@ -154,7 +158,16 @@ typedef struct KuTaskAdapterHostV1 {
   void* allocation_context;
   uint32_t (*reconcile_charge)(void*);
   KuTaskBlockingTokenV1* blocking;
+#if defined(KU_TASK_OUTBOUND_HTTP)
+  uint64_t request_deadline; /* Immutable inherited HTTP D, never a slice quantum. */
+#endif
 } KuTaskAdapterHostV1;
+#if defined(KU_TASK_OUTBOUND_HTTP)
+static KU_THREAD_LOCAL uint64_t ku_task_http_entry_deadline;
+#define KU_TASK_HTTP_HOST_INIT(instance) , (instance)->request_deadline
+#else
+#define KU_TASK_HTTP_HOST_INIT(instance)
+#endif
 #define KU_TASK_ALLOCATION_HOST_ABI_VERSION 1u
 enum { KU_TASK_HOST_ALLOCATION_FAILED = 98u };
 /* Zero is a valid function ID. Initialization lives in the owner's bitmap. */
@@ -303,6 +316,7 @@ static int ku_task_outcome_empty(KuTaskAdapterOutcomeV1* output, uint32_t kind) 
     case 7: if (output->value.string_array.ok || output->value.string_array.value.data || output->value.string_array.value.len || output->value.string_array.value.capacity) return 0; error=&output->value.string_array.error; break;
 #if defined(KU_TASK_HTTP_TYPES)
     case 8: if (output->value.http_response.ok || output->value.http_response.value.status
+        || output->value.http_response.value.headers
         || !ku_task_outcome_empty_string(output->value.http_response.value.content_type)
         || !ku_task_outcome_empty_string(output->value.http_response.value.body)
         || !ku_task_outcome_empty_string(output->value.http_response.value.location)) return 0;
@@ -549,6 +563,17 @@ static uint32_t ku_task_host_net_status(uint32_t status) {
   return status==KU_TASK_DRIVER_PENDING ? KU_TASK_CONTROL_PENDING
       : status==KU_TASK_DRIVER_OK ? KU_TASK_CONTROL_OK : KU_TASK_CONTROL_INVALID_STATE;
 }
+#if defined(KU_TASK_OUTBOUND_HTTP)
+enum { KU_TASK_HTTP_CONFIG_ERROR=100u };
+static uint32_t ku_task_host_http(KuTaskAdapterHostV1* host,KuString method,KuString url,KuString body,uint32_t has_body,
+    KuArray_str names,KuArray_str values,int64_t timeout,int64_t max_body,int64_t config_fault,KuResult_struct___ku_http_response* output){
+  if(!ku_task_host_net_valid(host)||!output)return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if(ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE)return KU_TASK_CONTROL_PENDING;
+  uint32_t status=host->blocking->pool?ku_task_blocking_take(host->ticket,host->blocking,0,10u,NULL,output)
+      :ku_task_blocking_submit_http(host->ticket,host->control,host->blocking,method,url,body,has_body,names,values,timeout,max_body,config_fault,host->request_deadline,host->allocation_context,host->reconcile_charge,output);
+  return status==KU_TASK_HTTP_CONFIG_ERROR?status:ku_task_host_net_status(status);
+}
+#endif
 static uint32_t ku_task_host_net_connect(KuTaskAdapterHostV1* host,
     KuValue fields[9], uint16_t present, KuResult_net_client* output) {
   if (!ku_task_host_net_valid(host) || !fields || !output) return KU_TASK_CONTROL_INVALID_ARGUMENT;

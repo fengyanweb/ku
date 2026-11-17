@@ -1,0 +1,87 @@
+// Isolated acceptance fixture. The driver creates its own PostgreSQL cluster,
+// db.conn and http.addr in a private temporary working directory.
+import http from "std.http"
+import pg from "std.pg"
+import json from "std.json"
+import "std.fs"
+
+// Installation-only contract. The driver supplies an independent private DB.
+fn installed_pg_contract(conninfo: str): null! {
+    probe = pg.client({conninfo: conninfo, max_connections: 1, max_waiters: 1,
+        connect_timeout_ms: 2000, acquire_timeout_ms: 100, query_timeout_ms: 150})?
+    baseline = probe.query("SELECT current_setting('work_mem'), pg_backend_pid()::text", [])?
+    setting = "128kB"
+    if (baseline.value(0, 0)? == "128kB") { setting = "256kB" }
+    retained = probe.query("SELECT set_config('work_mem', $1, false), $2::text, NULL::text",
+        [setting, "中文🙂 ' \\"])?
+    typed = probe.query_one_typed("SELECT $1::int4, $2::bool, $3::text, $4::text",
+        [17, true, "中文🙂 ' \\", null], ["int4", "bool", "text", "text?"], ["int4", "bool", "text", "text?"])?
+    after = probe.query("SELECT current_setting('work_mem'), pg_backend_pid()::text", [])?
+    probe.close()
+    if (baseline.value(0, 0)? != after.value(0, 0)? || baseline.value(0, 1)? != after.value(0, 1)?) fail "strict reset/reuse"
+    if (retained.value(0, 1)? != "中文🙂 ' \\" || !retained.is_null(0, 2)?) fail "ordinary owned result after close"
+    if (typed.value_int(0, 0)? != 17 || !typed.value_bool(0, 1)? || typed.value(0, 2)? != "中文🙂 ' \\" || !typed.is_null(0, 3)?) fail "typed owned result after close"
+    println("installed-pg-contract-ok")
+    return ok(null)
+}
+
+fn main(): null! {
+    conninfo = fs.read("db.conn")?
+    installed_pg_contract(conninfo.clone())?
+    address = fs.read("http.addr")?
+    client = pg.client({conninfo: conninfo, max_connections: 4, max_waiters: 8,
+        connect_timeout_ms: 2000, acquire_timeout_ms: 100, query_timeout_ms: 150})?
+    app = http.service()
+    app.handler_timeout_ms = 2000
+    app.max_connections = 64
+    app.max_active_requests = 16
+    app.max_pending_requests = 32
+    app.get("/health", fn() { return http.text("ready") })
+    app.get("/read", fn() {
+        body = ""
+        try {
+            result = client.query("SELECT $1::text, 42::text, NULL::text", ["中文🙂 ' \\"])?
+            body = json.encode({text: result.value(0, 0)?, number: result.value(0, 1)?,
+                absent: result.is_null(0, 2)?, rows: result.rows(), cols: result.cols()})?
+        } catch(err) { body = "error:" + err.code.clone() }
+        return http.text(body)
+    })
+    app.get("/insert/{id}", fn(req) {
+        body = ""
+        try {
+            result = client.query("INSERT INTO ku_events(id, payload) VALUES($1, $2) RETURNING payload",
+                [req.params.id.clone(), "中文🙂 payload"])?
+            body = result.value(0, 0)?
+        } catch(err) { body = "error:" + err.code.clone() }
+        return http.text(body)
+    })
+    app.get("/slow", fn() {
+        body = "unexpected success"
+        try { result = client.query("SELECT pg_sleep(0.6)", [])? }
+        catch(err) { body = "error:" + err.code.clone() }
+        return http.text(body)
+    })
+    app.get("/rows", fn() {
+        body = ""
+        try {
+            result = client.query("SELECT i::text, repeat('x', 64) FROM generate_series(1, 10000) AS i", [])?
+            body = str(result.rows()) + ":" + result.value(9999, 0)?
+        } catch(err) { body = "error:" + err.code.clone() }
+        return http.text(body)
+    })
+    app.get("/typed-owned", fn() {
+        body = ""
+        try {
+            retained = client.query("SELECT $1::text", ["中文🙂 ' \\"])?
+            typed = client.query_one_typed("SELECT $1::int4, $2::bool, $3::text, $4::text",
+                [17, true, "中文🙂 ' \\", null], ["int4", "bool", "text", "text?"], ["int4", "bool", "text", "text?"])?
+            after = client.query("SELECT 9::text", [])?
+            body = json.encode({integer: typed.value_int(0, 0)?, enabled: typed.value_bool(0, 1)?,
+                text: typed.value(0, 2)?, absent: typed.is_null(0, 3)?,
+                ordinary: retained.value(0, 0)?, after: after.value(0, 0)?})?
+        } catch(err) { body = "error:" + err.code.clone() }
+        return http.text(body)
+    })
+    app.listen(address)?
+    return ok(null)
+}

@@ -99,6 +99,9 @@ pub enum TaskNetOperation {
     Read,
     Write,
     Close,
+    HttpGet,
+    HttpPost,
+    HttpRequest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,6 +341,13 @@ pub enum TaskOp {
     JsonEncodeObject {
         dst: SlotId,
         fields: Vec<(String, SlotId)>,
+    },
+    /// Mutate only an owned HTTP response's string header map. Key/value remain
+    /// independently owned operands, and allocation is hosted and prepaid.
+    HttpHeaderSet {
+        response: SlotId,
+        key: SlotId,
+        value: SlotId,
     },
     /// HTTP response construction moves an optional string payload. `kind`
     /// uses 0=text, 1=html, 2=empty, 3=redirect; status is a Copy int.
@@ -705,6 +715,7 @@ pub(crate) fn requires_string_allocation_host(operation: &TaskOp) -> bool {
         } | TaskOp::Bytes { .. }
             | TaskOp::ErrorField { .. }
             | TaskOp::HttpMapGet { .. }
+            | TaskOp::HttpHeaderSet { .. }
             | TaskOp::PgResult { .. }
             | TaskOp::JsonEncodeObject { .. }
             | TaskOp::JsonDecode { .. }
@@ -1579,14 +1590,39 @@ fn validate_shape(
                     let (source, _) = slot_type(get_slot(*src)?)?;
                     if dst == src
                         || borrowed
-                        || destination != &IrType::Str
+                        || destination
+                            != &(if http_response_type(source) && field == "status" {
+                                IrType::Int
+                            } else {
+                                IrType::Str
+                            })
                         || !(error_type(source)
                             && matches!(field.as_str(), "domain" | "code" | "message")
                             || http_request_type(source)
-                                && matches!(field.as_str(), "method" | "path" | "body"))
+                                && matches!(field.as_str(), "method" | "path" | "body")
+                            || http_response_type(source)
+                                && matches!(field.as_str(), "status" | "body"))
                     {
                         return Err(invalid(
                             "ErrorField requires an Error, owned str destination and known field",
+                        ));
+                    }
+                }
+                TaskOp::HttpHeaderSet {
+                    response,
+                    key,
+                    value,
+                } => {
+                    let (ty, borrowed) = slot_type(get_slot(*response)?)?;
+                    if borrowed
+                        || !http_response_type(ty)
+                        || response == key
+                        || response == value
+                        || slot_type(get_slot(*key)?)?.0 != &IrType::Str
+                        || slot_type(get_slot(*value)?)?.0 != &IrType::Str
+                    {
+                        return Err(invalid(
+                            "HttpHeaderSet requires an owned response and string operands",
                         ));
                     }
                 }
@@ -1630,7 +1666,9 @@ fn validate_shape(
                         || dst == key
                         || slot_type(get_slot(*dst)?)?.1
                         || slot_type(get_slot(*dst)?)?.0 != &IrType::Str
-                        || !http_request_type(slot_type(get_slot(*request)?)?.0)
+                        || !(http_request_type(slot_type(get_slot(*request)?)?.0)
+                            || http_response_type(slot_type(get_slot(*request)?)?.0)
+                                && map == "headers")
                         || slot_type(get_slot(*key)?)?.0 != &IrType::Str
                         || !matches!(map.as_str(), "params" | "query" | "headers")
                     {
@@ -1994,7 +2032,17 @@ fn validate_shape(
                     TaskNetOperation::Read => IrType::Result(Box::new(bytes.clone())),
                     TaskNetOperation::Write => IrType::Result(Box::new(IrType::Null)),
                     TaskNetOperation::Close => IrType::Null,
+                    TaskNetOperation::HttpGet
+                    | TaskNetOperation::HttpPost
+                    | TaskNetOperation::HttpRequest => {
+                        IrType::Result(Box::new(IrType::Named("__ku_http_response".into())))
+                    }
                 };
+                if matches!(operation, TaskNetOperation::HttpRequest)
+                    && inputs[5].is_some() != inputs[6].is_some()
+                {
+                    return Err(invalid("HTTP header name/value arrays must be paired"));
+                }
                 let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
                 if borrowed || destination != &destination_type {
                     return Err(invalid("BlockingNet result type mismatch"));
@@ -2006,6 +2054,26 @@ fn validate_shape(
                             6 => IrType::Bool,
                             _ => IrType::Int,
                         }),
+                        TaskNetOperation::HttpGet => {
+                            if index == 0 {
+                                Some(IrType::Str)
+                            } else {
+                                None
+                            }
+                        }
+                        TaskNetOperation::HttpPost => {
+                            if index < 2 {
+                                Some(IrType::Str)
+                            } else {
+                                None
+                            }
+                        }
+                        TaskNetOperation::HttpRequest => match index {
+                            0..=2 => Some(IrType::Str),
+                            3 | 4 | 8 => Some(IrType::Int),
+                            5 | 6 => Some(IrType::Array(Box::new(IrType::Str))),
+                            _ => None,
+                        },
                         _ if index == 0 => Some(net.clone()),
                         TaskNetOperation::Read if index == 1 => Some(IrType::Int),
                         TaskNetOperation::Write if index == 1 => Some(bytes.clone()),
@@ -2017,7 +2085,14 @@ fn validate_shape(
                             return Err(invalid("BlockingNet has an invalid input slot"));
                         }
                     } else if index == 0
-                        || (index == 1 && !matches!(operation, TaskNetOperation::Close))
+                        || (index == 1
+                            && matches!(
+                                operation,
+                                TaskNetOperation::Connect
+                                    | TaskNetOperation::Read
+                                    | TaskNetOperation::Write
+                                    | TaskNetOperation::HttpPost
+                            ))
                     {
                         return Err(invalid("BlockingNet is missing a required input"));
                     }
@@ -2434,7 +2509,8 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::StartIndirect { dst, .. }
         | TaskOp::Unary { dst, .. }
         | TaskOp::Binary { dst, .. } => Some(*dst),
-        TaskOp::ScopeEnter { .. }
+        TaskOp::HttpHeaderSet { .. }
+        | TaskOp::ScopeEnter { .. }
         | TaskOp::ScopeExitBegin { .. }
         | TaskOp::ScopeExitEnd { .. }
         | TaskOp::Read { .. }
@@ -2872,7 +2948,8 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
             state.must = (state.must & !consumed) | bit(*dst);
             state.may = (state.may & !consumed) | bit(*dst);
         }
-        TaskOp::Read { .. }
+        TaskOp::HttpHeaderSet { .. }
+        | TaskOp::Read { .. }
         | TaskOp::CheckForLimit { .. }
         | TaskOp::Print { .. }
         | TaskOp::ScopeEnter { .. }
@@ -3261,6 +3338,13 @@ fn live_states(
                             | row.map_or(0, bit)
                             | col.map_or(0, bit);
                     }
+                    TaskOp::HttpHeaderSet {
+                        response,
+                        key,
+                        value,
+                    } => {
+                        live |= bit(*response) | bit(*key) | bit(*value);
+                    }
                     TaskOp::HttpMapGet {
                         dst, request, key, ..
                     } => {
@@ -3435,6 +3519,17 @@ fn validate_ownership_and_plan(
                 let required = bit(*source) | row.map_or(0, bit) | col.map_or(0, bit);
                 if state.must & required != required {
                     return Err(invalid("PgResult reads an uninitialized operand"));
+                }
+            }
+            if let TaskOp::HttpHeaderSet {
+                response,
+                key,
+                value,
+            } = operation
+            {
+                let required = bit(*response) | bit(*key) | bit(*value);
+                if state.must & required != required {
+                    return Err(invalid("HttpHeaderSet reads an uninitialized operand"));
                 }
             }
             if let TaskOp::HttpMapGet { request, key, .. } = operation {
@@ -4400,6 +4495,15 @@ fn source_op_slots(operation: &mut TaskOp, visit: &mut impl FnMut(&mut SlotId)) 
             if let Some(slot) = col {
                 visit(slot);
             }
+        }
+        TaskOp::HttpHeaderSet {
+            response,
+            key,
+            value,
+        } => {
+            visit(response);
+            visit(key);
+            visit(value);
         }
         TaskOp::HttpResponse {
             dst, body, status, ..

@@ -184,8 +184,7 @@ impl Verifier<'_> {
                         }
                     }
                 } else if let IrCallKind::Intrinsic(name) = kind {
-                    let borrowed_read =
-                        matches!(name.as_str(), "__ku_clone" | "__ku_clone_nullable")
+                    let borrowed_read = matches!(name.as_str(), "__ku_clone" | "__ku_clone_nullable")
                             || name == "__ku_enum_tag"
                             || matches!(
                                 name.as_str(),
@@ -194,12 +193,21 @@ impl Verifier<'_> {
                                     | "__ku_calendar_field_str"
                                     | "__ku_calendar_field_int"
                                     | "__ku_http_response_from_object_view"
+                                    | "__ku_http_response_from_value_view"
                                     | "__ku_http_headers_get"
                                     | "__ku_http_response_headers_read"
                                     | "__ku_http_response_public_value"
                                     | "__ku_http_client_config_field_int"
                                     | "__ku_http_client_config_field_str"
                             )
+                            // The request StringMap dot projection is a separate
+                            // HTTP getter, not __ku_object_get: it borrows map/key
+                            // and returns a cloned owned KuString (or static "").
+                            || (name == "__ku_http_map_get"
+                                && args.len() == 2
+                                && args[0].ty == IrType::Named("__ku_object".into())
+                                && args[1].ty == IrType::Str
+                                && expr.ty == IrType::Str)
                             || (name.starts_with("__ku_enum_payload:")
                                 && !ir_type_is_owned(&expr.ty));
                     if !borrowed_read {
@@ -213,9 +221,9 @@ impl Verifier<'_> {
                                 && signature.as_ref().and_then(|s| s.arg_modes.get(i))
                                     != Some(&ParamMode::View)
                             {
-                                return Err(invalid(
-                                    "borrowed value passed to an owning intrinsic",
-                                ));
+                                return Err(invalid(&format!(
+                                    "borrowed value passed to an owning intrinsic {name} argument {i}"
+                                )));
                             }
                         }
                     }

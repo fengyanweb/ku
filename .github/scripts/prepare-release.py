@@ -182,7 +182,7 @@ def validate_manifest(manifest: dict, version: str, target: str, commit: str, as
             or check["format"] != "ku-install-check-v1" or check["version"] != version
             or check["target"] != target):
         raise PrepareError("manifest installation check identity is invalid")
-    executable = "ku.exe" if target.endswith("windows-msvc") else "ku"
+    executable = "ku.exe" if "-windows-" in target else "ku"
     if (executable not in files
             or check["executable_sha256"] != files[executable]["sha256"]):
         raise PrepareError("manifest installation check does not match its Ku executable")

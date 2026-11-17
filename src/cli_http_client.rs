@@ -24,7 +24,7 @@ fn error(message: impl Into<String>) -> KuError {
     KuError::message(message)
 }
 fn source_hash() -> String {
-    let files: [(&str, &[u8]); 5] = [
+    let files: [(&str, &[u8]); 6] = [
         (
             "crates/ku-native-http-client/Cargo.toml",
             include_bytes!("../crates/ku-native-http-client/Cargo.toml"),
@@ -36,6 +36,10 @@ fn source_hash() -> String {
         (
             "crates/ku-native-http-client/include/ku_native_http_client.h",
             include_bytes!("../crates/ku-native-http-client/include/ku_native_http_client.h"),
+        ),
+        (
+            "crates/ku-native-http-client/src/asynchronous.rs",
+            include_bytes!("../crates/ku-native-http-client/src/asynchronous.rs"),
         ),
         (
             "crates/ku-native-http-client/src/lib.rs",

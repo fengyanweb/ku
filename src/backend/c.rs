@@ -434,8 +434,11 @@ fn generate_c_source_with_frames_attempt(
         || sync::uses_checked_integer(program)
         || frames.is_some_and(|(tasks, _, _)| task::uses_checked_integer(tasks));
     sync::validate_identifiers(program, checked_integer_runtime)?;
+    let task_outbound_http = frames.is_some_and(|(tasks, _, _)| task::uses_outbound_http(tasks));
+    let task_http_values=frames.is_some_and(|(tasks,_,_)|tasks.functions.iter().any(|f|f.slots.iter().any(|s|matches!(&s.ty,crate::ir::task::TaskSlotType::Value{ty,..}if crate::ir::task::http_type(ty)))));
     let task_net = frames.is_some_and(|(tasks, _, _)| {
-        task::uses_postgres(tasks)
+        task::uses_outbound_http(tasks)
+            || task::uses_postgres(tasks)
             || tasks.functions.iter().any(|function| {
                 function.slots.iter().any(|slot| {
                     matches!(&slot.ty, crate::ir::task::TaskSlotType::Value { ty, .. }
@@ -499,7 +502,7 @@ fn generate_c_source_with_frames_attempt(
                     }
                 }
                 collect_result_type(ty, &mut frame_result_types)?;
-                if matches!(ty, IrType::Nullable(_)) {
+                if matches!(ty, IrType::Nullable(_)) || crate::ir::task::http_type(ty) {
                     abi_program.functions.push(IrFunction {
                         id: FunctionId(usize::MAX - abi_program.functions.len()),
                         name: "__ku_frame_type_only".into(),
@@ -621,7 +624,7 @@ fn generate_c_source_with_frames_attempt(
     // The pg connection poller also needs WSAPoll/poll and shutdown(2). Keep a
     // PG-only artifact lean: it does not need the HTTP/Redis resolver, atomic,
     // or thread headers unless it also uses one of those runtimes.
-    let uses_native_socket_runtime = program_uses_http(program)
+    let uses_native_socket_runtime = program_uses_http_server(program)
         || program_uses_redis(program)
         || program_uses_net(program)
         || task_net;
@@ -661,7 +664,7 @@ fn generate_c_source_with_frames_attempt(
         );
     }
     emit_fs_headers(&mut out, fs_usage);
-    service_output::emit(&mut out, program_uses_http(program));
+    service_output::emit(&mut out, program_uses_http_server(program));
     // Call-depth guard: match the interpreter's MAX_CALL_DEPTH so deep/infinite
     // recursion reports "maximum function call depth exceeded" instead of a
     // native stack-overflow crash. Counted at every function/closure-body entry
@@ -766,7 +769,7 @@ fn generate_c_source_with_frames_attempt(
     // array typedefs (a `KuArray_KuStruct_X` only needs the struct as a pointer),
     // then the struct bodies (which can embed a `KuArray_*` by value), then the
     // ownership helpers (forward-declared so struct-clone↔array-clone can recurse).
-    emit_object_type_header(&mut out, program, task_net || task_json)?;
+    emit_object_type_header(&mut out, program, task_net || task_json || task_http_values)?;
     emit_struct_forward_decls(&mut out, program);
     for inner in array_optional::nullable_elements(&abi_program) {
         let name = array_optional::nullable_type(&inner)?;
@@ -820,13 +823,13 @@ fn generate_c_source_with_frames_attempt(
     emit_object_abi(
         &mut out,
         program,
-        task_net || task_json,
+        task_net || task_json || task_http_values,
         options.object_oom_fault_injection,
     )?;
     // Object-valued typed arrays need KuObject/KuValue to be complete before
     // their typed KuArray helper bodies call ku_object_{clone,drop,move}.
     emit_late_array_typedefs(&mut out, &abi_program)?;
-    emit_http_types(&mut out, program)?;
+    emit_http_types(&mut out, &abi_program, !program.functions.is_empty())?;
     emit_closure_types(
         &mut out,
         program,
@@ -899,16 +902,16 @@ fn generate_c_source_with_frames_attempt(
     emit_array_map_helpers(&mut out, program)?;
     array_optional::emit_helpers(&mut out, &abi_program, !program.functions.is_empty())?;
     calendar::emit(&mut out, program);
-    http_client::emit(&mut out, program);
+    http_client::emit(&mut out, program, task_outbound_http);
     emit_function_prototypes(&mut out, program)?;
     emit_closure_thunk_prototypes(&mut out, program)?;
     if program_uses_pg(program) || program_uses_mysql(program) || program_uses_redis(program) {
         database_budget::emit(&mut out);
     }
-    if program_uses_http(program) || frames.is_some() {
+    if program_uses_http_server(program) || frames.is_some() {
         out.push_str(include_str!("c_runtime_config.c"));
     }
-    if program_uses_http(program) {
+    if program_uses_http_server(program) {
         if let Some((tasks, _, None)) = frames {
             out.push_str("#define KU_HTTP_HAS_TASK_RUNTIME 1\n");
             if task::uses_blocking_net(tasks) {
@@ -951,7 +954,7 @@ fn generate_c_source_with_frames_attempt(
             out.push_str("  return NULL;\n}\n");
         }
     }
-    if program_uses_http(program) {
+    if program_uses_http_server(program) {
         http_short::emit(
             &mut out,
             program,
@@ -974,9 +977,9 @@ fn generate_c_source_with_frames_attempt(
             &mut out,
             frames,
             plan,
-            entry.is_some() || program_uses_http(program),
+            entry.is_some() || program_uses_http_server(program),
         )?;
-        if program_uses_http(program) {
+        if program_uses_http_server(program) {
             task_http::emit(&mut out, frames, program)?;
         }
     }
@@ -4319,6 +4322,7 @@ fn emit_result_abi_phase(
             // The HTTP-owned adapter calls Result<Object> handlers through
             // their real ABI before converting only the successful payload.
             IrType::Named("__ku_object".to_string()),
+            IrType::Named("__ku_value".to_string()),
             IrType::Null,
         ] {
             if !result_types.contains(&inner) {
@@ -8618,6 +8622,18 @@ fn expr_uses_object(expr: &IrExpr) -> bool {
 /// additionally link `ws2_32`). The synthetic HTTP types only arise from the HTTP
 /// intrinsics, so a type scan over every temp/param/return type catches every such
 /// program.
+fn program_uses_http_server(program: &IrProgram) -> bool {
+    program_uses_native_named(program, "__ku_http_server")
+        || [
+            "http.server",
+            "http.service",
+            "__ku_http_listen",
+            "__ku_http_bind",
+        ]
+        .iter()
+        .any(|name| program_uses_intrinsic(program, name))
+}
+
 fn program_uses_http(program: &IrProgram) -> bool {
     program.functions.iter().any(|function| {
         ir_type_uses_http(&function.return_type)
@@ -16186,7 +16202,7 @@ fn inst_uses_http(inst: &IrInst) -> bool {
 /// Result ABI and value-ownership paths pick them up automatically). Emitted
 /// before the Result ABI so `KuResult_struct___ku_http_response` can embed the
 /// response struct.
-fn emit_http_types(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+fn emit_http_types(out: &mut COutput, program: &IrProgram, synchronous: bool) -> KuResult<()> {
     out.check()?;
     if !program_uses_http(program) {
         return Ok(());
@@ -16202,7 +16218,7 @@ fn emit_http_types(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
          static KuStruct___ku_http_request ku_clone_struct___ku_http_request(KuStruct___ku_http_request v) { v.method = ku_string_clone(v.method); v.path = ku_string_clone(v.path); v.body = ku_string_clone(v.body); v.params = ku_object_clone(v.params); v.query = ku_object_clone(v.query); v.headers = ku_object_clone(v.headers); return v; }\n\
          static void ku_drop_struct___ku_http_request(KuStruct___ku_http_request* v) { if (!v) return; ku_string_drop(&v->method); ku_string_drop(&v->path); ku_string_drop(&v->body); ku_object_drop(v->params); ku_object_drop(v->query); ku_object_drop(v->headers); *v = (KuStruct___ku_http_request){0}; }\n\n",
     );
-    if !program.functions.is_empty() {
+    if synchronous {
         out.push_str("#define KU_HTTP_RESPONSE_SYNC 1\n");
     }
     out.push_str(include_str!("c_http_response_headers.c"));
@@ -16219,7 +16235,9 @@ fn emit_http_runtime(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
     if !program_uses_http(program) {
         return Ok(());
     }
-    out.push_str(include_str!("c_http_runtime.c"));
+    if program_uses_http_server(program) {
+        out.push_str(include_str!("c_http_runtime.c"));
+    }
     if program_uses_intrinsic(program, "__ku_http_json_response") {
         out.push_str(
             r#"
@@ -16912,6 +16930,23 @@ fn c_http_intrinsic_expr(name: &str, args: &[IrExpr]) -> KuResult<Option<String>
         // Borrow the closure value; ku_http_server_add_route retains its own env
         // reference, and the route table releases that reference on server free.
         let handler = c_expr(handler)?;
+        if arity == "2" {
+            // C checks the real View signature at this assignment. Never cast
+            // const-request callbacks to the owned/by-value request ABI.
+            let member = match returns_result {
+                "0" => "response",
+                "1" => "result",
+                "3" => "object",
+                "4" => "object_result",
+                "5" => "value",
+                "6" => "value_result",
+                _ => return Err(unsupported("invalid native HTTP View response ABI")),
+            };
+            return Ok(Some(format!(
+                "(ku_http_server_add_view_route({}, {}, {}, (KuHttpViewInvoke){{.{member}=({handler}).invoke}}, ({handler}).env, {returns_result}), (uint8_t)0)",
+                c_expr(server)?, c_static_string(method), c_value_expr(path)?
+            )));
+        }
         return Ok(Some(format!(
             "(ku_http_server_add_route({}, {}, {}, (void*)({handler}).invoke, ({handler}).env, {arity}, {returns_result}), (uint8_t)0)",
             c_expr(server)?,

@@ -2872,13 +2872,12 @@ impl<'a> FunctionLowerer<'a> {
             } => {
                 if params.len() > 1
                     || param_modes.len() != params.len()
-                    || param_modes.iter().any(|mode| *mode != ParamMode::Owned)
                     || params
                         .first()
                         .is_some_and(|ty| *ty != IrType::Named(HTTP_REQUEST_TYPE.into()))
                 {
                     return Err(KuError::runtime(
-                        "native HTTP handler parameter ABI requires zero parameters or one owned HttpRequest; View callbacks are not implemented",
+                        "native HTTP handler parameter ABI requires zero parameters or one owned/View HttpRequest",
                         args[1].span,
                     ));
                 }
@@ -2890,18 +2889,29 @@ impl<'a> FunctionLowerer<'a> {
                     IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name=="__ku_object") => {
                         4
                     }
+                    IrType::Named(name) if name == "__ku_value" => 5,
+                    IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name=="__ku_value") => {
+                        6
+                    }
                     IrType::Named(name) if name == HTTP_RESPONSE_TYPE => 0,
                     IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name==HTTP_RESPONSE_TYPE) => {
                         1
                     }
                     _ => {
                         return Err(KuError::runtime(
-                            "native HTTP handler return type must be HttpResponse or a structural response object, optionally wrapped in Result; dynamic unknown returns cannot use the response ABI",
+                            "native HTTP handler return type must have a supported HttpResponse, object or checked dynamic-value ABI, optionally wrapped in Result",
                             args[1].span,
                         ));
                     }
                 };
-                (params.len(), abi)
+                (
+                    if param_modes.first() == Some(&ParamMode::View) {
+                        2
+                    } else {
+                        params.len()
+                    },
+                    abi,
+                )
             }
             _ => {
                 return Err(KuError::runtime(
@@ -4607,12 +4617,14 @@ impl<'a> FunctionLowerer<'a> {
         let value = self.nullable_read(expr, value);
         self.invalidate_nullable_call(expr);
         if expected == Some(&IrType::Named(HTTP_RESPONSE_TYPE.into()))
-            && matches!(&value.ty,IrType::Named(name) if name=="__ku_object")
+            && matches!(&value.ty,IrType::Named(name) if name=="__ku_object" || name=="__ku_value")
         {
-            let intrinsic = if deferred_safepoint.is_some() {
-                "__ku_http_response_from_object_view"
-            } else {
-                "__ku_http_response_from_object_owned"
+            let dynamic = value.ty == IrType::Named("__ku_value".into());
+            let intrinsic = match (dynamic, deferred_safepoint.is_some()) {
+                (false, false) => "__ku_http_response_from_object_owned",
+                (false, true) => "__ku_http_response_from_object_view",
+                (true, false) => "__ku_http_response_from_value_owned",
+                (true, true) => "__ku_http_response_from_value_view",
             };
             return self.emit_temp_for_borrow_result(
                 intrinsic_expr(
@@ -5778,7 +5790,7 @@ pub(crate) fn ir_expr_needs_sync_guard(expr: &IrExpr) -> bool {
         return true;
     }
     if matches!(&expr.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), .. }
-        if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response" | "__ku_http_response_from_object_owned" | "__ku_http_response_from_object_view" | "__ku_http_response_headers_read" | "__ku_http_headers_get" | "__ku_http_response_headers_prepare" | "__ku_http_client_config_field_int" | "__ku_http_client_config_field_str" | "__ku_http_response_public_value" | "http.get" | "http.post" | "http.request" | "http.client"
+        if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response" | "__ku_http_response_from_object_owned" | "__ku_http_response_from_object_view" | "__ku_http_response_from_value_owned" | "__ku_http_response_from_value_view" | "__ku_http_response_headers_read" | "__ku_http_headers_get" | "__ku_http_response_headers_prepare" | "__ku_http_client_config_field_int" | "__ku_http_client_config_field_str" | "__ku_http_response_public_value" | "http.get" | "http.post" | "http.request" | "http.client"
             | "time.from_unix" | "time.from_millis" | "time.add" | "time.sub" | "time.diff"))
     {
         return true;

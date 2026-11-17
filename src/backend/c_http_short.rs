@@ -1182,7 +1182,14 @@ fn task_request_fields(function: &crate::ir::task::TaskFunction) -> Option<u32> 
     for state in &function.states {
         for operation in &state.operations {
             match operation {
-                TaskOp::HttpMapGet { map, .. } => {
+                TaskOp::HttpMapGet {
+                    request: source,
+                    map,
+                    ..
+                } => {
+                    if !request(source) {
+                        continue;
+                    }
                     fields |= match map.as_str() {
                         "headers" => 1,
                         "params" => 2,
@@ -1253,6 +1260,7 @@ fn task_request_fields(function: &crate::ir::task::TaskFunction) -> Option<u32> 
                 | TaskOp::JsonValue { .. }
                 | TaskOp::JsonObject { .. }
                 | TaskOp::HttpResponse { .. }
+                | TaskOp::HttpHeaderSet { .. }
                 | TaskOp::CheckForLimit { .. }
                 | TaskOp::Print { .. } => {}
             }

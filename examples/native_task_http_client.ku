@@ -1,0 +1,21 @@
+import http from "std.http"
+
+// Use the same local /hello, /post and /missing upstream as native_http_client.ku.
+async fn main(): null! {
+    base = "http://127.0.0.1:8080"
+    first = http.get(base + "/hello")?
+    if (first.status != 200 || first.body != "hello 中文🙂") fail "GET response"
+    if (first.headers["x-ku"] != "yes") fail "GET headers"
+    posted = http.post(base + "/post", "payload 中文")?
+    if (posted.status != 201 || posted.body != "payload 中文") fail "POST response"
+    missing = http.request({
+        url: base + "/missing",
+        timeout_ms: 1000,
+        max_body_bytes: 4096,
+        headers: { "x-ku-input": first.headers["x-ku"] }
+    })?
+    if (missing.status != 404 || missing.body != "missing") fail "non-2xx result"
+    if (first.body != "hello 中文🙂" || first.headers["x-ku"] != "yes") fail "response lifetime"
+    println("native-task-http-client-ok")
+    return ok(null)
+}

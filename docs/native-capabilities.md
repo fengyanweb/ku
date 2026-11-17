@@ -24,7 +24,7 @@ ku build --backend runner --release hello.ku -o hello-runner
 | 文件与时间       | `std.fs`／`std.time` 原生实现及有界目录读取；[文件、时间与 JSON 回归](../tests/native_run_test.rs)。                                                                             |
 | JSON             | 同步 DOM／typed 接口和既有默认引擎；Task 局部 JSON 可跨 `await`，具体范围见 [Task JSON](native-task-json.md)。                                                                   |
 | Task             | 受限的源码 Task、挂起恢复、计时器、取消、期限与资源账本；[并发合同](concurrency.md)、[Task 回归](../tests/native_task_source_test.rs)。这不是完整 async／await 或完整 M:N。      |
-| HTTP             | 同步客户端、同步及受支持的具名 async handler、持久连接、有界流水线与协作式超时；[服务端回归](../tests/native_http_test.rs)、[客户端及响应回归](../tests/native_http_client_test.rs)。 |
+| HTTP             | 同步／Task 客户端、同步及受支持的具名 async handler、持久连接、有界流水线与协作式超时；[服务端回归](../tests/native_http_test.rs)、[客户端及响应回归](../tests/native_http_client_test.rs)。 |
 | 数据库           | native PostgreSQL、typed PG、Redis、MySQL client；连接池、结果独立寿命及既有清理合同见 [协议文档](protocol-foundation.md)。不自动重试业务 SQL。                                  |
 | 网络与 TLS       | owned bytes、move-only `net.client`、TLS client 和匹配目标的 TLS pack；[安装要求](cli-runtime-bundle.md)、[网络回归](../tests/native_net_test.rs)。                              |
 
@@ -67,16 +67,22 @@ ku build --backend runner --release hello.ku -o hello-runner
 
 原生 C 成为源码默认入口，不表示所有解释器功能或性能目标均已完成。能力、所有权、平台、安装与真实项目仍按各自证据验收，独立性能修改的采用条件不变。`ku run` 与直接执行 `.ku` 的既有行为不因此改变。
 
-## 同步 HTTP 客户端
+## HTTP 客户端与路由
 
 `http.get(url)`、`http.post(url, body)` 和 `http.request(config)` 在同步原生程序中返回 `HttpResponse!`。`HttpResponse` 可用于函数参数和返回值；`status`、`headers`、`body` 与解释器一致。结果独立持有字符串和头表，连接复用后仍有效。`clone()` 返回独立副本；读取 `response.headers` 得到独立表，修改 `response.headers[key]` 则修改该响应。JSON 和打印只暴露这三个公开字段。
 
 同步 HTTP 路由支持显式 `HttpResponse` 返回值，以及可静态确定为响应对象的结构化返回值；对应的 Result 返回同样适用。先写错误分支不再使成功响应的类型推导错误。处理函数仍只执行一次，Result 错误保持原有处理，响应数据按所有权规则移交或复制。
 
-路由处理函数限零参数或一个 owned `HttpRequest` 参数。无法静态确定返回形态的动态值，以及使用只读借用参数的路由注册，会在构建时明确拒绝。普通辅助函数仍可借用 `HttpRequest` 或 `HttpResponse`；这一限制针对路由注册，不扩大到普通函数调用。以上不扩大 Task outbound HTTP 或动态 headers 的范围。
+同步路由可直接注册零参数、一个 owned `HttpRequest`，或一个只读 `&req: HttpRequest` 参数的处理器。View 仅在本次同步调用期间有效；注册不会深复制整个请求，也不会转移其所有权。async 处理器仍持有 owned 请求，不能声明跨等待的 borrowed 参数。动态响应值须具有合法的 `status`、字符串头表和字符串 `body`；运行时检查通过后才移交发送路径。无法确定真实函数签名的返回方式仍在构建时明确拒绝。
 
-非 2xx 状态仍是成功结果；网络、UTF-8、响应体上限等错误通过 Result 返回。`http.request` 默认总请求期限 5000 ms、响应体上限 1,000,000 B，最大分别为 300,000 ms 和 16 MiB。已有更早的 HTTP handler 期限会限制本次调用，重定向不续期；调用返回后仍执行原有期限检查和清理。同步 DNS／网络等待不能保证任意时刻被取消。native Task（含经普通函数间接调用）继续拒绝同步 outbound HTTP；已有 Task 服务端响应子集不因此扩大为任意动态 headers。
+非 2xx 状态仍是成功结果；网络、UTF-8、响应体上限等错误通过 Result 返回。`http.request` 默认总请求期限 5000 ms、响应体上限 1,000,000 B，最大分别为 300,000 ms 和 16 MiB。已有更早的 HTTP handler 期限会限制本次调用，重定向不续期；调用返回后仍执行原有期限检查和清理。同步 DNS／网络等待不能保证任意时刻被取消。native Task 中的直接 `http.get/post/request` 使用可挂起的网络推进：DNS 使用既有有界后台机制，连接、TLS、发送和接收等待就绪事件，阶段切换不重置原期限。取消后的迟到结果只做清理，不恢复用户代码；已经开始的系统 DNS 查询须返回后才能物理退役。普通同步 wrapper 不会被悄悄放到 Task 线程中阻塞执行。
 
 `http.client(config)` 保留现有配置对象接口，不是单独的连接池句柄；短方法复用现有懒初始化共享 agent。只有使用网络方法的程序才链接目标匹配的 `native-http/v1/<target>` 静态包。开发构建可用绝对路径 `KU_NATIVE_HTTP_CLIENT_PACK` 指定对应包；缺包、目标或源码身份不匹配会明确失败，不回退 Runner。
 
 完整回环示例：[native_http_client.ku](../examples/native_http_client.ku)。运行前，请先在 `127.0.0.1:8080` 启动按示例约定提供 `/hello`、`/post` 和 `/missing` 的本地 HTTP 服务。安装包验收同时链接日期和 HTTP 静态库，并在源码和 SDK 不可用时运行生成程序。各目标仍分别记录实际安装运行结果，交叉编译不等于运行通过。
+
+Task 的 `http.request` 支持内联配置及内联字符串 header 表，字段值可以动态计算；`method/body/timeout_ms/max_body_bytes` 的 null 保留默认含义。配置对象别名不在当前 Task 聚合子集中。非法配置保持运行错误，网络、UTF-8 和正文上限等操作错误保持 Result。请求不会因网络失败而自动重试；重定向和连接复用遵守既有客户端规则。
+
+Task 可以读取响应的 `body/status`，读取或写入 `response.headers[key]`，并将 owned 响应跨等待保存或返回。动态 header 的字符串类型、名称、值、数量、字节和传输字段仍由既有 HTTP 校验约束；分配计入 Task 预算。非法响应不会使后续合法请求失效。这不扩展为任意 Task 对象、结构体或嵌套容器。
+
+Task 客户端示例：[native_task_http_client.ku](../examples/native_task_http_client.ku)。端到端服务示例：[native_http_relay.ku](../examples/native_http_relay.ku)。先在 `127.0.0.1:8080/hello` 提供本机上游，再构建并运行服务示例；`/info` 使用只读处理器，`/relay` 通过 Task 请求上游，并返回动态 header。

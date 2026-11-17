@@ -11,8 +11,8 @@ TOOLCHAIN=N.TOOLCHAIN
 TARGETS=N.TARGETS
 BUILD_ID='ku-native-http-client/0.1.0;abi=1;ureq=2.12.1;url=2.5.8;engine=shared'
 HEADER='ku_native_http_client.h'
-SOURCE_FILES=tuple(sorted(('crates/ku-native-http-client/Cargo.toml','crates/ku-native-http-client/build.rs','crates/ku-native-http-client/src/lib.rs','crates/ku-native-http-client/include/'+HEADER,'src/stdlib/http_client_engine.rs')))
-API={b'__ku_http_client_abi_version',b'__ku_http_client_v1_build_id',b'__ku_http_client_call_v1',b'__ku_http_client_release_v1'}
+SOURCE_FILES=tuple(sorted(('crates/ku-native-http-client/Cargo.toml','crates/ku-native-http-client/build.rs','crates/ku-native-http-client/src/lib.rs','crates/ku-native-http-client/src/asynchronous.rs','crates/ku-native-http-client/include/'+HEADER,'src/stdlib/http_client_engine.rs')))
+API={b'__ku_http_client_abi_version',b'__ku_http_client_v1_build_id',b'__ku_http_client_call_v1',b'__ku_http_client_release_v1',b'__ku_http_client_async_new_v1',b'__ku_http_client_async_info_v1',b'__ku_http_client_async_step_v1',b'__ku_http_client_async_take_v1',b'__ku_http_client_async_drop_v1',b'__ku_http_client_async_park_v1',b'__ku_http_client_async_reuse_v1'}
 plain,digest,record,run,native_tokens,compiler_toolchain=N.plain,N.digest,N.record,N.run,N.native_tokens,N.compiler_toolchain
 
 def archive_name(target):
@@ -26,7 +26,18 @@ def source_hash():
  return result.hexdigest()
 
 def validate_archive(path,target):return N.validate_archive(path,target,API,BUILD_ID)
-def dependency_licenses(metadata):return N.dependency_licenses(metadata,'ku-native-http-client')
+def dependency_licenses(metadata):
+ # Cargo includes test/dev nodes in workspace metadata even for a normal
+ # staticlib producer. Preserve normal/build edges and remove only dev-only
+ # edges; otherwise test certificates would be falsely attributed as product
+ # runtime dependencies and unrelated test license files would block export.
+ nodes=[]
+ for node in metadata['resolve']['nodes']:
+  deps=[edge for edge in node['deps'] if not edge.get('dep_kinds')
+        or any(kind.get('kind')!='dev' for kind in edge['dep_kinds'])]
+  nodes.append(dict(node,deps=deps,dependencies=[edge['pkg'] for edge in deps]))
+ selected=dict(metadata,resolve=dict(metadata['resolve'],nodes=nodes))
+ return N.dependency_licenses(selected,'ku-native-http-client')
 def validate_pack(leaf,target,expected_source=None):
  leaf=Path(leaf)
  if leaf.is_symlink() or not leaf.is_dir():raise ValueError('native HTTP pack root must be a plain directory')

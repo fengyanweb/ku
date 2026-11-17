@@ -114,3 +114,30 @@ static KuStruct___ku_http_response __ku_http_response_from_object_view(KuObject*
   }
   return result;
 }
+
+/* Dynamic response values are checked only at HTTP boundaries. Their ordinary
+ * callable ABI remains KuValue; invalid shapes publish the existing sync exit
+ * and retire their owned payload exactly once. */
+static KuStruct___ku_http_response __ku_http_response_from_value_owned(KuValue value) {
+  if(value.tag==KU_OBJECT) {
+    KuObject* object=value.as.o;value=ku_v_null();
+    return __ku_http_response_from_object_owned(object);
+  }
+  ku_value_drop(&value);
+  KuValue *status,*headers,*body;
+  (void)__ku_http_response_object_fields(NULL,&status,&headers,&body);
+  return (KuStruct___ku_http_response){0};
+}
+static KuStruct___ku_http_response __ku_http_response_from_value_view(KuValue value) {
+  return __ku_http_response_from_object_view(value.tag==KU_OBJECT?value.as.o:NULL);
+}
+
+/* `req.params`/`req.query`/`req.headers` `.field` read: an owned KuString copy of
+   the string value, or an empty string when the key is absent (the interpreter's
+   StringMap `.field` yields str; absent-key aborts there but is never exercised
+   by the routing tests, so native returns "" instead of crashing). */
+static KuString ku_http_map_get(KuObject* o, KuString key) {
+  KuValue* v = ku_object_get(o, key);
+  if (v && v->tag == KU_STR) return ku_string_clone(v->as.s);
+  return ku_string_static((const uint8_t*)"", 0);
+}

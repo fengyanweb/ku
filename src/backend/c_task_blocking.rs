@@ -42,6 +42,9 @@ pub(super) fn emit(
             out.push_str(NETWORK_RUNTIME);
             out.push_str(include_str!("c_task_reactor.h"));
             out.push_str(include_str!("c_task_reactor.c"));
+            out.push_str("#if defined(KU_TASK_OUTBOUND_HTTP)\n");
+            out.push_str(include_str!("c_task_http_client.c"));
+            out.push_str("#endif\n");
         }
     }
     out.check()
@@ -122,6 +125,9 @@ typedef struct KuTaskBlockingJobV1 {
 #if KU_TASK_BLOCKING_NETWORK
     KuResult_net_client net_connect_result;
     KuResult_bytes net_read_result;
+#if defined(KU_TASK_OUTBOUND_HTTP)
+    KuResult_struct___ku_http_response http_result;
+#endif
 #endif
   };
   bool exists_value;
@@ -138,6 +144,12 @@ typedef struct KuTaskBlockingJobV1 {
   size_t net_owner,net_offset,net_address_count,net_address_index;
   void* net_addresses;
   uint32_t net_plain,net_resolved;
+#if defined(KU_TASK_OUTBOUND_HTTP)
+  KuHttpClientAsyncV1* http_operation;
+  KuTaskBlockingPoolV1* http_pool;
+  KuTaskControlV1* http_control;
+  uint32_t http_interest,http_connected,http_finished;
+#endif
   uint32_t net_previous_plus_one,net_next_plus_one;
 #endif
 } KuTaskBlockingJobV1;
@@ -160,6 +172,12 @@ static void ku_task_blocking_net_config_store(KuTaskBlockingJobV1* job,size_t in
   else if(index>=1u && index<=5u)job->inputs->net_config.integers[index-1u]=value.as.i;
 }
 #endif
+#if defined(KU_TASK_OUTBOUND_HTTP)
+struct KuTaskBlockingOutputV1;
+static void ku_task_http_resolve(KuTaskBlockingJobV1*,int,struct KuTaskBlockingOutputV1*);
+static int ku_task_http_step(KuTaskBlockingPoolV1*,KuTaskBlockingJobV1*,uint32_t,int);
+static void ku_task_http_drop_operation(KuTaskBlockingJobV1*);
+#endif
 typedef struct KuTaskBlockingWorkerV1 {
   KuTaskBlockingPoolV1* pool;
   uint32_t exited, joined, closed;
@@ -175,10 +193,24 @@ typedef struct KuTaskBlockingSnapshotV1 {
   size_t workers_created, workers_exited, workers_joined;
   uint32_t closing, fault;
 } KuTaskBlockingSnapshotV1;
+#if defined(KU_TASK_OUTBOUND_HTTP)
+#define KU_TASK_HTTP_IDLE_CAPACITY 100u
+typedef struct KuTaskHttpIdleV1 {
+  KuHttpClientAsyncV1* operation;
+  KuNetClient* client;
+  KuTaskDriverV1* driver;
+  size_t owner,bytes;
+} KuTaskHttpIdleV1;
+static void ku_task_http_cache_close_locked(KuTaskBlockingPoolV1*);
+#endif
 struct KuTaskBlockingPoolV1 {
   uint32_t initialized, resources, closing, fault;
   size_t free_count,retired_slots;
   size_t output_charge_total,cancelled_running,net_wait_count,net_step_count;
+#if defined(KU_TASK_OUTBOUND_HTTP)
+  KuTaskHttpIdleV1 http_idle[KU_TASK_HTTP_IDLE_CAPACITY];
+  size_t http_idle_cursor;
+#endif
 #if KU_TASK_BLOCKING_PG
   KuAtomicRefcount pg_closing_view;
 #endif
@@ -535,6 +567,9 @@ static void ku_task_blocking_output_release(void* raw, void* pointer) {
  * payload/error at the wrong offsets; kind, not zero-filled inactive fields,
  * identifies the sole owner on every normal/error/cancel retirement path. */
 static void ku_task_blocking_net_drop_result(KuTaskBlockingJobV1* job) {
+#if defined(KU_TASK_OUTBOUND_HTTP)
+  if(job->kind==10u){ku_task_http_drop_operation(job);ku_result_drop_struct___ku_http_response(&job->http_result);return;}
+#endif
   if (job->kind==5u) ku_result_drop_net_client(&job->net_connect_result);
   else if (job->kind==6u) ku_result_drop_bytes(&job->net_read_result);
   else ku_result_drop_null(&job->result);
@@ -646,6 +681,10 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
     KuFsAllocatorV1 allocator={&allocation,ku_task_blocking_output_allocate,ku_task_blocking_output_release};
 #endif
     bool ok=false,exists_value=false;
+#if defined(KU_TASK_OUTBOUND_HTTP)
+    if(kind==10u)ku_task_http_resolve(job,cancelled,&allocation);
+    else
+#endif
 #if KU_TASK_BLOCKING_PG
     if (kind==9u) ku_task_pg_connect_run(job,cancelled);
     else
@@ -705,6 +744,9 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
     job->exists_value=exists_value;
 #if KU_TASK_BLOCKING_NETWORK
     if(ku_task_blocking_net_state_locked(pool,job,
+#if defined(KU_TASK_OUTBOUND_HTTP)
+        job->kind==10u ||
+#endif
 #if KU_TASK_BLOCKING_PG
         job->kind==9u ||
 #endif
@@ -849,6 +891,9 @@ static uint32_t ku_task_blocking_close(void* raw) {
   if (pool->initialized!=KU_TASK_DRIVER_STORAGE_LIVE) return KU_TASK_DRIVER_INVALID_STATE;
   if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
   ku_task_blocking_set_closing_locked(pool,1u); ku_task_blocking_signal(pool);
+#if defined(KU_TASK_OUTBOUND_HTTP)
+  ku_task_http_cache_close_locked(pool);
+#endif
   ku_task_blocking_unlock(pool); return KU_TASK_DRIVER_OK;
 }
 static uint32_t ku_task_blocking_ready(void* raw) {
@@ -1056,6 +1101,16 @@ static uint32_t ku_task_blocking_cancel_queued(KuTaskBlockingPoolV1* pool,KuTask
     ku_task_blocking_signal(pool);return status;
   }
 #endif
+#if defined(KU_TASK_OUTBOUND_HTTP)
+  if(job->kind==10u){
+    ku_task_http_drop_operation(job);
+    job->http_finished=1;job->http_result=(KuResult_struct___ku_http_response){false,{0},ku_task_blocking_error("cancelled","HTTP request cancelled before DNS")};
+    uint32_t state=ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_DONE);
+    if(state!=KU_TASK_DRIVER_OK)return state;
+    if(pool->finished!=UINT64_MAX)pool->finished++;
+    state=ku_task_driver_wake(&job->ticket);ku_task_blocking_signal(pool);return state;
+  }
+#endif
   ku_task_blocking_free(job->inputs->path);job->inputs->path=NULL;
   ku_task_blocking_free(job->inputs->content.ptr);job->inputs->content=(KuString){0};
   KuError error=ku_task_blocking_error("cancelled","queued operation was cancelled before execution");
@@ -1145,6 +1200,9 @@ static uint32_t ku_task_blocking_take(const KuTaskDriverTicketV1* ticket,
       else if (kind==4u) *(KuResult_array_str*)output=job->directory_result;
 #endif
 #if KU_TASK_BLOCKING_NETWORK
+#if defined(KU_TASK_OUTBOUND_HTTP)
+      else if(kind==10u) *(KuResult_struct___ku_http_response*)output=job->http_result;
+#endif
       else if (kind==5u) *(KuResult_net_client*)output=job->net_connect_result;
       else if (kind>=6u) {
         if (!owner_output && kind!=8u) { ku_task_blocking_unlock(pool); return KU_TASK_DRIVER_INVALID_ARGUMENT; }

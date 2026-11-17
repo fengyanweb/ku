@@ -7,6 +7,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     ptr, slice,
 };
+mod asynchronous;
 #[path = "../../../src/stdlib/http_client_engine.rs"]
 pub mod engine;
 #[cfg(not(panic = "unwind"))]
@@ -111,7 +112,7 @@ fn overlaps(a: usize, n: usize, b: usize, m: usize) -> bool {
         _ => true,
     }
 }
-unsafe fn execute(input: &Input, deadline: Option<std::time::Instant>) -> Result<Owner, u32> {
+unsafe fn decode_request(input: &Input) -> Result<engine::HttpRequest, u32> {
     let mut headers = HashMap::new();
     headers.try_reserve(input.header_count).map_err(|_| 1u32)?;
     let raw = if input.header_count == 0 {
@@ -138,6 +139,11 @@ unsafe fn execute(input: &Input, deadline: Option<std::time::Instant>) -> Result
         timeout_ms: input.timeout_ms,
         max_body_bytes: input.max_body_bytes,
     };
+
+    Ok(request)
+}
+unsafe fn execute(input: &Input, deadline: Option<std::time::Instant>) -> Result<Owner, u32> {
+    let request = unsafe { decode_request(input) }?;
     match engine::http_request_with_deadline(request, deadline) {
         Ok(response) => {
             let mut headers = Vec::new();
@@ -284,6 +290,9 @@ pub unsafe extern "C" fn __ku_http_client_call_v1(input: *const Input, output: *
             return 255;
         }
     };
+    unsafe { publish_owner(owned, o) }
+}
+unsafe fn publish_owner(owned: Owner, o: &mut Output) -> u32 {
     let memory = unsafe { alloc(Layout::new::<Owner>()) } as *mut Owner;
     if memory.is_null() {
         o.status = 1;

@@ -10302,3 +10302,134 @@ fn main():null! {
     }
     assert!(watchdog.wait_for_natural_exit(RUN_TIMEOUT).success());
 }
+
+#[test]
+fn native_http_view_routes_dynamic_results_and_invalid_shape_recover() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let source = r#"
+import {http,time} from "std"
+fn Borrowed(&req:HttpRequest):HttpResponse {
+ r=http.text(req.path+":"+req.body)
+ r.headers["x-view"]=req.headers.host.clone()
+ return r
+}
+fn Dynamic(&req:HttpRequest) {
+ box={value:{status:202,headers:{"x-path":req.path.clone(),"ignored":7},body:req.body.clone()}}
+ return box["value"]
+}
+fn Invalid(&req:HttpRequest) {
+ box={value:{status:200,headers:{"x-bad":req.path.clone()},body:17}}
+ return box["value"]
+}
+fn Failed(&req:HttpRequest):HttpResponse! {return err("controlled "+req.path)}
+fn Slow(&req:HttpRequest):HttpResponse {time.sleep(100);return http.text(req.path.clone())}
+fn main():null! {
+ app=http.server({handler_timeout_ms:20,max_buffer_bytes:1048576})
+ app.post("/view",Borrowed)
+ app.post("/dynamic",Dynamic)
+ app.get("/invalid",Invalid)
+ app.get("/failed",Failed)
+ app.get("/slow",Slow)
+ if(true){prefix="captured-";app.get("/closure",fn(&req:HttpRequest){return http.text(prefix+req.path)})}
+ app.get("/ok",fn(){return http.text("still-alive")})
+ app.listen("__ADDRESS__")?
+ return ok(null)
+}
+"#;
+    let Some(mut server) = spawn_native_server_profile(
+        "view-dynamic-response",
+        source,
+        &address,
+        None,
+        Some(8),
+        &[],
+        true,
+    ) else {
+        return;
+    };
+    let generated = fs::read_to_string(server.c_source()).unwrap();
+    assert!(generated.contains("(KuHttpViewInvoke){.response="));
+    assert!(generated.contains("(KuHttpViewInvoke){.value_result="));
+    // A View callback is never cast to the request-by-value ABI.
+    assert!(!generated.contains("(void*)(Reply__thunk)"));
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for (method, path, body, status, expected) in [
+        ("POST", "/view", "中文🙂", 200, "/view:中文🙂"),
+        ("POST", "/dynamic", "dynamic 中文🙂", 202, "dynamic 中文🙂"),
+        ("GET", "/invalid", "", 500, "Internal Server Error"),
+        ("GET", "/ok", "", 200, "still-alive"),
+        ("GET", "/failed", "", 500, "Internal Server Error"),
+        ("GET", "/slow", "", 504, "Gateway Timeout"),
+        ("GET", "/closure", "", 200, "captured-/closure"),
+        ("GET", "/ok", "", 200, "still-alive"),
+    ] {
+        let response=http_response(&address,&format!("{method} {path} HTTP/1.1\r\nHost: view-local\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()),Duration::from_secs(3));
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{path}: {response}"
+        );
+        assert!(response.ends_with(expected), "{path}: {response}");
+        if path == "/view" {
+            assert!(response.contains("x-view: view-local\r\n"), "{response}");
+        }
+        if path == "/dynamic" {
+            assert!(response.contains("x-path: /dynamic\r\n"), "{response}");
+            assert!(!response.contains("ignored:"), "{response}");
+        }
+    }
+    assert!(watchdog.wait_for_natural_exit(RUN_TIMEOUT).success());
+}
+
+#[test]
+fn native_http_task_dynamic_headers_survive_await_and_transfer_once() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let source = r#"
+import {http,time} from "std"
+async fn Reply(req:HttpRequest):HttpResponse! {
+ r=http.text(req.body.clone())
+ r.headers["x-ku-route"]=req.path.clone()
+ r.headers["x-ku-route"]=req.path+"-replaced"
+ body=r.body.clone()
+ status=r.status
+ marker=r.headers["x-ku-route"]
+ if(status!=200 || marker!=req.path+"-replaced" || body!=req.body) fail "response fields"
+ time.sleep(1)?
+ if(req.path=="/bad") r.headers["x-bad"]="bad\r\nInjected: yes"
+ return ok(r)
+}
+fn main():null! {
+ app=http.server({max_buffer_bytes:1048576})
+ app.post("/reply",Reply)
+ app.post("/bad",Reply)
+ app.listen("__ADDRESS__")?
+ return ok(null)
+}
+"#;
+    let Some(mut server) =
+        spawn_finite_native_server("task-response-dynamic-headers", source, &address, 3)
+    else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for (path, body, status) in [
+        ("/reply", "first 中文🙂", 200),
+        ("/bad", "invalid", 500),
+        ("/reply", "after-error", 200),
+    ] {
+        let response=http_response(&address,&format!("POST {path} HTTP/1.1\r\nHost: local\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()),Duration::from_secs(3));
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{response}"
+        );
+        if status == 200 {
+            assert!(
+                response.contains("x-ku-route: /reply-replaced\r\n"),
+                "{response}"
+            );
+            assert!(response.ends_with(body), "{response}");
+        }
+    }
+    assert!(watchdog.wait_for_natural_exit(RUN_TIMEOUT).success());
+}

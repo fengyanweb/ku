@@ -987,6 +987,25 @@ class ReleaseExportTests(unittest.TestCase):
         with self.assertRaisesRegex(EXPORT.ExportError, 'symlink/reparse'):
             self.run_export(native_compression_root=root)
 
+    def test_http_client_license_closure_excludes_only_dev_edges(self):
+        builder=EXPORT.NATIVE_HTTP_CLIENT
+        metadata={'packages':[], 'resolve':{'nodes':[
+            {'id':'http','deps':[
+                {'pkg':'normal','dep_kinds':[{'kind':None}]},
+                {'pkg':'builder','dep_kinds':[{'kind':'build'}]},
+                {'pkg':'mixed','dep_kinds':[{'kind':'dev'},{'kind':None}]},
+                {'pkg':'rcgen','dep_kinds':[{'kind':'dev'}]},
+            ],'dependencies':['normal','builder','mixed','rcgen']},
+            {'id':'rcgen','deps':[{'pkg':'yasna','dep_kinds':[{'kind':None}]}],'dependencies':['yasna']},
+        ]}}
+        original=copy.deepcopy(metadata)
+        with mock.patch.object(builder.N,'dependency_licenses',return_value=b'actual normal closure') as collector:
+            self.assertEqual(builder.dependency_licenses(metadata),b'actual normal closure')
+        selected,crate=collector.call_args.args
+        self.assertEqual(crate,'ku-native-http-client')
+        self.assertEqual(selected['resolve']['nodes'][0]['dependencies'],['normal','builder','mixed'])
+        self.assertEqual(metadata,original)
+
     def test_http_client_pack_exports_exact_payload_and_attribution(self):
         leaf=http_client_pack_fixture(self.bundle,self.target)
         expected=EXPORT.NATIVE_HTTP_CLIENT.validate_pack(leaf,self.target)
@@ -1706,6 +1725,9 @@ class InstalledPostgresDirectoryTests(unittest.TestCase):
             self.assertEqual(report["windows_pg_directory_acl_root"], str(root))
             self.assertTrue(working.is_dir())
             self.assertEqual(arguments[arguments.index("--lane") + 1], "both")
+            if report.get('target') == 'x86_64-pc-windows-gnu':
+                self.assertEqual(arguments[arguments.index('--profile') + 1], 'release')
+                self.assertIn('--installed-contracts', arguments)
             self.assertTrue(report["pg_fixture_invoked"])
             self.assertTrue(report["windows_pg_directory_acl"]["acl"]["current_user_modify_inheritable"])
             events.append("original-contained-fixture")
@@ -1756,6 +1778,38 @@ class InstalledPostgresDirectoryTests(unittest.TestCase):
         self.assertEqual(report["windows_pg_directory_acl"]["exit_code"], 1)
         self.assertTrue(report["temporary_cleanup_confirmed"])
         self.assertFalse(root.exists())
+
+    def test_windows_gnu_keeps_the_existing_owner_with_release_installed_contracts(self):
+        success = SimpleNamespace(returncode=0, stdout=json.dumps({'current_user_modify_inheritable': True,
+            'parent_sddl_before': 'parent', 'parent_sddl_after': 'parent'}), stderr='')
+        report = {'target': 'x86_64-pc-windows-gnu', 'profile': 'release'}
+        with mock.patch.object(self.gate, 'os', SimpleNamespace(name='nt')), self.gate.owned_temporary_root(report) as root:
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+            self.exercise_windows_setup(root, report, success)
+            report['fixture_cleanup_confirmed'] = True
+        self.assertTrue(report['temporary_cleanup_confirmed'])
+
+    def test_source_hiding_restores_only_its_original_checkout_after_failure(self):
+        with tempfile.TemporaryDirectory(prefix='ku-pg-hide-test-') as temporary:
+            parent = Path(temporary).resolve()
+            repo, owned = parent / 'repo', parent / 'owned'
+            repo.mkdir(); owned.mkdir()
+            (repo / 'src').mkdir(); (repo / 'src/kept.rs').write_bytes(b'original source')
+            (repo / 'Cargo.toml').write_bytes(b'original manifest')
+            (repo / 'target').mkdir()
+            report = {'commit': 'a' * 40}
+            move = SimpleNamespace(relocate_checkout_entry=lambda old, new: old.rename(new))
+            env = {'GITHUB_ACTIONS': 'true', 'GITHUB_WORKSPACE': str(repo), 'GITHUB_SHA': report['commit']}
+            with mock.patch.dict(os.environ, env), mock.patch.object(self.gate, 'load_trusted', return_value=move):
+                with self.assertRaisesRegex(RuntimeError, 'lane failed'):
+                    with self.gate.hidden_checkout(repo, owned, report):
+                        self.assertFalse((repo / 'src').exists())
+                        self.assertTrue(report['checkout_hidden_during_pg'])
+                        raise RuntimeError('lane failed')
+            self.assertEqual((repo / 'src/kept.rs').read_bytes(), b'original source')
+            self.assertEqual((repo / 'Cargo.toml').read_bytes(), b'original manifest')
+            self.assertTrue(report['checkout_restore_confirmed'])
+            self.assertEqual(list(owned.iterdir()), [])
 
     def test_existing_fixture_guard_still_refuses_other_prefix_and_nested_root(self):
         success = SimpleNamespace(returncode=0, stdout="{}", stderr="")

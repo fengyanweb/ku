@@ -35,6 +35,32 @@ uint32_t __ku_http_client_abi_version(void);
 uint32_t __ku_http_client_v1_build_id(const uint8_t**, size_t*);
 uint32_t __ku_http_client_call_v1(const KuHttpClientInputV1*, KuHttpClientOutputV1*);
 uint32_t __ku_http_client_release_v1(KuHttpClientOutputV1*);
+/* Private owner-stepped transport. Only DNS may run on the existing bounded
+ * resolver pool. Operation and callbacks are pinned by the physical job until
+ * final retirement; I/O callbacks never wait. Reserve covers live old+new buffers;
+ * refund releases an allocation only after it is freed. Drop never calls callbacks. */
+typedef struct KuHttpClientAsyncV1 KuHttpClientAsyncV1;
+typedef struct KuHttpClientAsyncIoV1 {
+  void* context;
+  intptr_t (*read)(void*,uint8_t*,size_t);
+  intptr_t (*write)(void*,const uint8_t*,size_t);
+} KuHttpClientAsyncIoV1;
+typedef struct KuHttpClientAsyncBudgetV1 {
+  void* context; uint32_t (*reserve)(void*,size_t); uint32_t (*refund)(void*,size_t);
+} KuHttpClientAsyncBudgetV1;
+typedef struct KuHttpClientAsyncInfoV1 {
+  KuHttpClientSliceV1 host; uint32_t port,tls,done;
+} KuHttpClientAsyncInfoV1;
+uint32_t __ku_http_client_async_new_v1(const KuHttpClientInputV1*,KuHttpClientAsyncBudgetV1,KuHttpClientAsyncV1**);
+uint32_t __ku_http_client_async_info_v1(KuHttpClientAsyncV1*,KuHttpClientAsyncInfoV1*);
+/* 1 read, 2 write, 4 complete, 8 redirect needing a fresh bounded DNS job. */
+uint32_t __ku_http_client_async_step_v1(KuHttpClientAsyncV1*,const KuHttpClientAsyncIoV1*,uint32_t);
+uint32_t __ku_http_client_async_take_v1(KuHttpClientAsyncV1*,KuHttpClientOutputV1*);
+uint32_t __ku_http_client_async_drop_v1(KuHttpClientAsyncV1*);
+size_t __ku_http_client_async_park_v1(KuHttpClientAsyncV1*);
+/* reuse: 2 does not consume cached; 0/255 consume it exactly once. */
+uint32_t __ku_http_client_async_reuse_v1(KuHttpClientAsyncV1*,KuHttpClientAsyncV1*);
+
 #ifdef __cplusplus
 }
 #endif

@@ -7,7 +7,7 @@ It uses only trusted checkout helpers and the existing private-PG fixture.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 import importlib.util
 import json
@@ -37,6 +37,7 @@ ARTIFACT_STORAGE_SUFFIXES = (".blob.core.windows.net", ".actions.githubuserconte
 TARGET_HOSTS = {
     "x86_64-unknown-linux-gnu": ("Linux", {"x86_64", "amd64"}),
     "x86_64-pc-windows-msvc": ("Windows", {"x86_64", "amd64"}),
+    "x86_64-pc-windows-gnu": ("Windows", {"x86_64", "amd64"}),
     "aarch64-apple-darwin": ("Darwin", {"arm64", "aarch64"}),
 }
 
@@ -233,7 +234,7 @@ def owned_temporary_root(report):
         # foreground PostgreSQL is retained by the explicit owner below.
         pg_started = report.get("pg_fixture_invoked", False)
         fixture_confirmed = report.get("fixture_cleanup_confirmed") is True
-        if pg_started and not fixture_confirmed:
+        if (pg_started and not fixture_confirmed) or report.get('checkout_restoration_failed'):
             report["cleanup_unconfirmed"] = True
             report["retained_temporary_root"] = str(root)
             try:
@@ -475,6 +476,41 @@ class PosixPrivatePostgres:
             raise
 
 
+@contextmanager
+def hidden_checkout(repo, root, report):
+    """Reuse the consumer's checked relocation only in a disposable CI tree."""
+    if (os.environ.get('GITHUB_ACTIONS') != 'true'
+            or Path(os.environ.get('GITHUB_WORKSPACE', '')).resolve() != repo
+            or os.environ.get('GITHUB_SHA') != report['commit']):
+        raise ValueError('source-hidden PG verification requires its matching disposable CI checkout')
+    consumer = load_trusted(repo / '.github/scripts/consume-runtime-bundle.py', 'installed_pg_relocator')
+    retired = []
+    report['checkout_hidden_during_pg'] = False
+    try:
+        for name in ('src', 'Cargo.toml', 'target'):
+            original, destination = repo / name, root / ('retired-checkout-' + name)
+            if original.exists():
+                consumer.relocate_checkout_entry(original, destination)
+                retired.append((original, destination))
+        report['checkout_hidden_during_pg'] = not (repo / 'src').exists() and not (repo / 'Cargo.toml').exists()
+        if not report['checkout_hidden_during_pg']:
+            raise ValueError('development source remained accessible before installed PG build')
+        yield
+    finally:
+        errors = []
+        for original, destination in reversed(retired):
+            try:
+                if original.exists() or not destination.exists():
+                    raise ValueError('source restoration paths changed')
+                consumer.relocate_checkout_entry(destination, original)
+            except BaseException as error:
+                errors.append(type(error).__name__)
+        report['checkout_restore_confirmed'] = not errors
+        if errors:
+            report['checkout_restoration_failed'] = True
+            raise ValueError('source checkout restoration is unconfirmed; retain the exact owned root')
+
+
 def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, report):
     driver = repo / "tests" / "acceptance" / "http_pg_lifecycle.py"
     executable = installed / ("ku.exe" if os.name == "nt" else "ku")
@@ -494,7 +530,9 @@ def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, repor
     working = root / "fixture-work"
     working.mkdir()
     command = [sys.executable, "-B", str(driver), "--ku", str(executable),
-               "--loops", "4", "--profile", "debug"]
+               "--loops", "4", "--profile", report.get('profile', 'debug')]
+    if report.get('target') == 'x86_64-pc-windows-gnu':
+        command.append('--installed-contracts')
     report["pg_fixture_invoked"] = True
     if os.name == "nt":
         try:
@@ -616,9 +654,12 @@ def verify(args):
     if platform.system() != system or platform.machine().lower() not in machines:
         raise ValueError("selected target does not match this physical runner")
     output = args.output.resolve()
+    profile = 'release' if args.target == 'x86_64-pc-windows-gnu' else 'debug'
+    if args.target == 'x86_64-pc-windows-gnu' and not getattr(args, 'hide_checkout', False):
+        raise ValueError('GNU PG acceptance requires --hide-checkout; source checks are not installed execution')
     report = {"format": "ku-installed-pg-check-v1", "status": "running",
               "version": args.version, "target": args.target, "commit": args.commit,
-              "database_retry": False, "loops": 4, "profile": "debug",
+              "database_retry": False, "loops": 4, "profile": profile,
               "scope": "actual installed CLI -> native sync/async PG lifecycle; not a capacity result",
               "temporary_files": "owned root; independently confirmed runtime and PG cleanup removes it even after a failed check; unconfirmed cleanup retains pid evidence"}
     save_report(output, report)
@@ -688,7 +729,8 @@ def verify(args):
             save_report(lifecycle, {"status": "running", "required_lanes": ["sync", "async"],
                                     "lanes": {}})
             save_report(output, report)
-            process = run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, report)
+            with (hidden_checkout(repo, root, report) if getattr(args, 'hide_checkout', False) else nullcontext()):
+                process = run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, report)
             if process.returncode != 0:
                 raise ValueError("installed PG lifecycle process did not succeed")
             data = prepare.json_object(prepare.read_file(lifecycle, prepare.MAX_JSON))
@@ -698,15 +740,22 @@ def verify(args):
             for lane in ("sync", "async"):
                 entry = data["lanes"][lane]
                 raw = entry.get("report", {})
-                fixture_name = "http_pg_lifecycle" + ("_async" if lane == "async" else "") + ".ku"
+                fixture_name = ("http_pg_installed_contract" if args.target == 'x86_64-pc-windows-gnu' else "http_pg_lifecycle") + ("_async" if lane == "async" else "") + ".ku"
                 fixture_sha = exporter.file_hash(repo / "tests" / "fixtures" / fixture_name)
                 if (entry.get("status") != "passed" or raw.get("status") != "passed"
                         or raw.get("cleanup_errors") != [] or raw.get("cli_sha256") != expected_cli
                         or raw.get("event_loops") != 4 or raw.get("database_retry") is not False
-                        or raw.get("parameters", {}).get("native_c_profile") != "debug"
+                        or raw.get("parameters", {}).get("native_c_profile") != profile
                         or raw.get("lane") != lane or raw.get("fixture") != fixture_name
                         or raw.get("fixture_sha256") != fixture_sha):
                     raise ValueError("PG lifecycle result, CLI identity or cleanup differs")
+                if args.target == 'x86_64-pc-windows-gnu':
+                    if (raw.get('source_removed_before_run') is not True
+                            or raw.get('private_gnu_libpq', {}).get('wide_toolchain_path_in_service') is not False
+                            or raw.get('checks', {}).get('typed_parameters_unicode_null_and_detached_results') != 'passed'
+                            or raw.get('checks', {}).get('strict_reset_same_backend_and_owned_after_close') != 'passed'):
+                        raise ValueError('GNU installed PG typed/reset/owned/runtime-path contracts did not pass')
+                    report.setdefault('gnu_runtime_inputs', {})[lane] = raw['private_gnu_libpq']
                 report.setdefault("lanes", {})[lane] = {
                     "status": "passed", "cli_sha256": raw["cli_sha256"],
                     "fixture_sha256": raw["fixture_sha256"],
@@ -745,6 +794,7 @@ def main():
     parser.add_argument("--commit", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--assets", type=Path, help="offline exact archive+manifest directory; no outer ZIP claim")
+    parser.add_argument('--hide-checkout', action='store_true', help='matching disposable CI checkout only; required for GNU')
     args = parser.parse_args()
     try:
         result = verify(args)

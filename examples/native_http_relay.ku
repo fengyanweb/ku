@@ -1,0 +1,27 @@
+import http from "std.http"
+
+// Provide /hello on the local upstream at 127.0.0.1:8080 first.
+// Build: ku build --release native_http_relay.ku -o native-http-relay
+fn Info(&req: HttpRequest): HttpResponse {
+    return http.text(req.path.clone())
+}
+
+async fn Relay(req: HttpRequest): HttpResponse! {
+    upstream = http.request({
+        url: "http://127.0.0.1:8080/hello",
+        timeout_ms: 1000,
+        max_body_bytes: 4096
+    })?
+    response = http.text(upstream.body.clone())
+    response.headers["x-ku-route"] = req.path.clone()
+    response.headers["x-ku-upstream"] = "local"
+    return ok(response)
+}
+
+fn main(): null! {
+    app = http.service({ handler_timeout_ms: 1500 })
+    app.get("/info", Info)
+    app.get("/relay", Relay)
+    app.listen("127.0.0.1:8081")?
+    return ok(null)
+}

@@ -42,27 +42,7 @@ pub fn http_request_with_deadline(
     caller_deadline: Option<Instant>,
 ) -> Result<HttpResponse, HttpError> {
     let method = config.method.to_ascii_uppercase();
-    if method != "GET" && method != "POST" {
-        return Err(http_error(
-            "invalid_method",
-            format!("http method '{method}' is not supported yet"),
-        ));
-    }
-    if config.url.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
-        return Err(http_error(
-            "invalid_url",
-            "http url must not contain whitespace or control characters",
-        ));
-    }
-    let parsed_url = url::Url::parse(&config.url)
-        .map_err(|err| http_error("invalid_url", format!("invalid http url: {err}")))?;
-    if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host().is_none() {
-        return Err(http_error(
-            "invalid_url",
-            "http url must be an absolute http:// or https:// URL",
-        ));
-    }
-
+    validate_request(&config)?;
     let mut request = default_agent().request(&method, &config.url);
     for (name, value) in &config.headers {
         request = request.set(name, value);
@@ -92,6 +72,33 @@ pub fn http_request_with_deadline(
         }
     };
     response_to_value(response, config.max_body_bytes)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn validate_request(config: &HttpRequest) -> Result<url::Url, HttpError> {
+    let method = config.method.to_ascii_uppercase();
+    if method != "GET" && method != "POST" {
+        return Err(http_error(
+            "invalid_method",
+            format!("http method '{method}' is not supported yet"),
+        ));
+    }
+    if config.url.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+        return Err(http_error(
+            "invalid_url",
+            "http url must not contain whitespace or control characters",
+        ));
+    }
+    let parsed_url = url::Url::parse(&config.url)
+        .map_err(|err| http_error("invalid_url", format!("invalid http url: {err}")))?;
+    if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host().is_none() {
+        return Err(http_error(
+            "invalid_url",
+            "http url must be an absolute http:// or https:// URL",
+        ));
+    }
+
+    Ok(parsed_url)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -1,4 +1,4 @@
-//! Optional synchronous HTTP transport. Task outbound calls stay unsupported.
+//! Optional shared HTTP client pack, with synchronous and owner-stepped Task transport.
 use super::{
     c_expr, c_place_expr, c_value_expr, output::COutput, program_uses_intrinsic, unsupported,
     IrExpr, IrProgram, KuResult,
@@ -8,11 +8,17 @@ pub(super) fn uses_runtime(p: &IrProgram) -> bool {
         .iter()
         .any(|name| program_uses_intrinsic(p, name))
 }
-pub(super) fn emit(out: &mut COutput, p: &IrProgram) {
-    if !uses_runtime(p) && !program_uses_intrinsic(p, "http.client") {
+pub(super) fn emit(out: &mut COutput, p: &IrProgram, task_http: bool) {
+    if !task_http && !uses_runtime(p) && !program_uses_intrinsic(p, "http.client") {
         return;
     }
-    if uses_runtime(p) {
+    if task_http {
+        out.push_str("#define KU_TASK_OUTBOUND_HTTP 1\n");
+    }
+    if uses_runtime(p) || program_uses_intrinsic(p, "http.client") {
+        out.push_str("#define KU_HTTP_CLIENT_SYNC 1\n");
+    }
+    if uses_runtime(p) || task_http {
         out.push_str("#define KU_FEATURE_NATIVE_HTTP_CLIENT 1\n#define KuHttpClientSliceV1 __ku_http_client_slice_v1\n#define KuHttpClientHeaderV1 __ku_http_client_header_v1\n#define KuHttpClientInputV1 __ku_http_client_input_v1\n#define KuHttpClientOutputV1 __ku_http_client_output_v1\n");
         out.push_str(include_str!(
             "../../crates/ku-native-http-client/include/ku_native_http_client.h"

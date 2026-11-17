@@ -272,7 +272,17 @@ static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len
    names belong to the route/handler, not to shared trie nodes: two methods (or
    two routes with a shared param-shaped prefix) may legitimately use different
    names for the same captured segment positions. */
-typedef struct { char* method; char** param_names; size_t nparams; void* invoke; void* env; int arity; int returns_result; } KuHttpHandler; /* 0 response, 1 Result, 2 Task, 3 object, 4 Result<object>. */
+typedef union {
+  KuStruct___ku_http_response (*response)(void*,const KuStruct___ku_http_request*);
+  KuResult_struct___ku_http_response (*result)(void*,const KuStruct___ku_http_request*);
+  KuObject* (*object)(void*,const KuStruct___ku_http_request*);
+  KuResult_struct___ku_object (*object_result)(void*,const KuStruct___ku_http_request*);
+  KuValue (*value)(void*,const KuStruct___ku_http_request*);
+  KuResult_kuvalue (*value_result)(void*,const KuStruct___ku_http_request*);
+} KuHttpViewInvoke;
+typedef struct { char* method; char** param_names; size_t nparams; union { void* invoke; KuHttpViewInvoke view; }; void* env; int arity; int returns_result; } KuHttpHandler;
+/* arity: 0 no request, 1 owned request, 2 View request; response ABI:
+ * 0 response, 1 Result, 2 Task, 3 object, 4 Result<object>, 5 value, 6 Result<value>. */
 /* Stage 8b: a routing trie node. Each node holds static children (keyed by the
    literal path segment) and at most one `{param}` child. Matching prefers a
    static child over the param child at every segment (with backtracking), which
@@ -616,7 +626,7 @@ static int ku_http_valid_route_path(const uint8_t* ptr, size_t len, size_t* segm
   if (segment_count) *segment_count = count;
   return 1;
 }
-static KuHttpServer* ku_http_server_add_route(KuHttpServer* s, KuString method, KuString path, void* invoke, void* env, int arity, int returns_result) {
+static KuHttpServer* ku_http_server_add_route_impl(KuHttpServer* s, KuString method, KuString path, void* invoke, void* env, int arity, int returns_result, KuHttpViewInvoke view) {
   if (method.len == 0 || method.len > 32) {
     fprintf(stderr, "http route method must be a valid HTTP token of at most 32 bytes\n"); exit(1);
   }
@@ -702,15 +712,22 @@ static KuHttpServer* ku_http_server_add_route(KuHttpServer* s, KuString method, 
      ku_http_node_free releases this retained ownership exactly once. */
   if (env) ((KuEnvHeader*)env)->retain(env);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
-  void* factory = ku_http_async_factory(invoke);
+  void* factory = arity==2 ? NULL : ku_http_async_factory(invoke);
   if (factory) { invoke = factory; returns_result = 2; }
 #endif
-  h->invoke = invoke; h->env = env; h->arity = arity; h->returns_result = returns_result;
+  if(arity==2) h->view=view; else h->invoke=invoke;
+  h->env = env; h->arity = arity; h->returns_result = returns_result;
   if (h->returns_result == 2) s->has_native_task_route = 1;
   else s->has_sync_route = 1;
   ku_string_drop(&method); ku_string_drop(&path);
   free(pbuf);
   return s;
+}
+static KuHttpServer* ku_http_server_add_route(KuHttpServer* s,KuString method,KuString path,void* invoke,void* env,int arity,int returns_result) {
+  return ku_http_server_add_route_impl(s,method,path,invoke,env,arity,returns_result,(KuHttpViewInvoke){0});
+}
+static KuHttpServer* ku_http_server_add_view_route(KuHttpServer* s,KuString method,KuString path,KuHttpViewInvoke invoke,void* env,int returns_result) {
+  return ku_http_server_add_route_impl(s,method,path,NULL,env,2,returns_result,invoke);
 }
 static KuHttpHandler* ku_http_node_handler(KuHttpNode* node, const char* method) {
   for (size_t i = 0; i < node->nh; i++)
@@ -808,21 +825,18 @@ static KuStruct___ku_http_response __ku_http_response_from_object_result(KuResul
   failure.error=ku_error_move(&result.error);
   return ku_http_response_from_result(failure);
 }
+static KuStruct___ku_http_response __ku_http_response_from_value_result(KuResult_kuvalue result) {
+  if(result.ok) return __ku_http_response_from_value_owned(ku_value_move(&result.value));
+  KuResult_struct___ku_http_response failure={0};
+  failure.error=ku_error_move(&result.error);
+  return ku_http_response_from_result(failure);
+}
 static int ku_http_field_value_safe(const uint8_t* ptr, size_t len) {
   for (size_t i = 0; i < len; i++) {
     uint8_t c = ptr[i];
     if (c != '\t' && (c < 0x20 || c == 0x7f)) return 0;
   }
   return 1;
-}
-/* `req.params`/`req.query`/`req.headers` `.field` read: an owned KuString copy of
-   the string value, or an empty string when the key is absent (the interpreter's
-   StringMap `.field` yields str; absent-key aborts there but is never exercised
-   by the routing tests, so native returns "" instead of crashing). */
-static KuString ku_http_map_get(KuObject* o, KuString key) {
-  KuValue* v = ku_object_get(o, key);
-  if (v && v->tag == KU_STR) return ku_string_clone(v->as.s);
-  return ku_string_static((const uint8_t*)"", 0);
 }
 /* `?k=v&k2=v2` -> KuObject{str->str}. Empty parts are skipped; a non-empty
    `=value` part keeps its empty key, and a key without `=` maps to "", matching
@@ -949,7 +963,7 @@ static unsigned long long ku_http_deadline_ms(uint32_t timeout_ms) {
  * callable fields avoids borrowing a reallocatable handler-array element.
  * No pointer below refers to the parser's header buffer or stack. */
 typedef struct KuHttpRouteToken {
-  void* invoke; void* env; char** param_names;
+  union { void* invoke; KuHttpViewInvoke view; }; void* env; char** param_names;
   uint32_t status;
   uint16_t param_count;
   uint8_t arity,returns_result,fields_mask;
@@ -1026,8 +1040,9 @@ static int ku_http_input_select(KuHttpServer* server,const KuHttpInput* input,
   if(input->route) {
     const KuHttpRouteToken* token=input->route;
     if(token->status!=200u)return (int)token->status;
-    if(token->param_count>KU_HTTP_MAX_SEGS || token->arity>1u || token->returns_result>4u)return 500;
-    selected->invoke=token->invoke;selected->env=token->env;selected->param_names=token->param_names;
+    if(token->param_count>KU_HTTP_MAX_SEGS || token->arity>2u || token->returns_result>6u || (token->arity==2u && token->returns_result==2u))return 500;
+    if(token->arity==2u)selected->view=token->view;else selected->invoke=token->invoke;
+    selected->env=token->env;selected->param_names=token->param_names;
     selected->nparams=token->param_count;selected->arity=token->arity;
     selected->returns_result=token->returns_result;*count=token->param_count;
     for(size_t p=0;p<*count;p++) {
@@ -1155,8 +1170,8 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   KuHttpHandler* selected=NULL;
   int route_status=ku_http_select_route(server,input->method,hdr+target_start,path_len,
       &selected,param_values,param_lengths,&param_count);
-  unsigned int fields_mask=selected?ku_http_handler_request_fields(selected->invoke):63u;
-  int public_headers=!server->root || (selected && selected->arity==1 && (fields_mask&1u));
+  unsigned int fields_mask=selected && selected->arity!=2 ? ku_http_handler_request_fields(selected->invoke):63u;
+  int public_headers=!server->root || (selected && selected->arity!=0 && (fields_mask&1u));
   size_t header_capacity=public_headers?ku_http_map_capacity(header_fields):0;
   size_t control_bytes=control_length<=128u?control_length:0;
   size_t rid_bytes=rid_length<48u?rid_length:48u;
@@ -1172,7 +1187,8 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   token->status=(uint32_t)route_status;token->param_count=(uint16_t)param_count;
   token->fields_mask=(uint8_t)fields_mask;
   if(selected) {
-    token->invoke=selected->invoke;token->env=selected->env;token->param_names=selected->param_names;
+    if(selected->arity==2)token->view=selected->view;else token->invoke=selected->invoke;
+    token->env=selected->env;token->param_names=selected->param_names;
     token->arity=(uint8_t)selected->arity;token->returns_result=(uint8_t)selected->returns_result;
   }
   for(size_t p=0;p<param_count;p++) {
@@ -1374,7 +1390,7 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
     int handler_timed_out = 0;
     KuSyncExitSignal handler_signal = {0};
     __ku_sync_reset();
-    if (route->arity == 1) {
+    if (route->arity != 0) {
       size_t parameter_names=0;
       for (size_t i=0;i<route->nparams;i++) parameter_names+=strlen(route->param_names[i]);
       if (!ku_http_job_projection(job,ku_http_projection_bytes(input,route->nparams,parameter_names)))
@@ -1394,7 +1410,25 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
       if(fields&32u) { req.body = ku_http_input_take_body(input); }
       if(fields&4u)req.query = ku_http_parse_query(target, path_len);
       if(fields&1u) {req.headers = input->headers; input->headers = NULL;}
-      if (route->returns_result==3 || route->returns_result==4) {
+      if(route->arity==2) {
+        ku_http_job_begin(job,(unsigned long long)server->handler_timeout_ms);
+        if(route->returns_result==0) resp=route->view.response(route->env,&req);
+        else if(route->returns_result==1) resp=ku_http_response_from_result(route->view.result(route->env,&req));
+        else if(route->returns_result==3) resp=__ku_http_response_from_object_owned(route->view.object(route->env,&req));
+        else if(route->returns_result==4) resp=__ku_http_response_from_object_result(route->view.object_result(route->env,&req));
+        else if(route->returns_result==5) resp=__ku_http_response_from_value_owned(route->view.value(route->env,&req));
+        else resp=__ku_http_response_from_value_result(route->view.value_result(route->env,&req));
+        /* The callback only borrowed this one projection. Its owner remains on
+         * this worker through return, including every failure/deadline edge. */
+        ku_drop_struct___ku_http_request(&req);
+        handler_timed_out=__ku_sync_finish_request(&handler_signal);
+      } else if(route->returns_result==5 || route->returns_result==6) {
+        ku_http_job_begin(job,(unsigned long long)server->handler_timeout_ms);
+        resp=route->returns_result==6
+          ? __ku_http_response_from_value_result(((KuResult_kuvalue(*)(void*,KuStruct___ku_http_request))route->invoke)(route->env,req))
+          : __ku_http_response_from_value_owned(((KuValue(*)(void*,KuStruct___ku_http_request))route->invoke)(route->env,req));
+        handler_timed_out=__ku_sync_finish_request(&handler_signal);
+      } else if (route->returns_result==3 || route->returns_result==4) {
         ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
         resp=route->returns_result==4
           ? __ku_http_response_from_object_result(((KuResult_struct___ku_object(*)(void*,KuStruct___ku_http_request))route->invoke)(route->env,req))
@@ -1412,7 +1446,13 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
         handler_timed_out = __ku_sync_finish_request(&handler_signal);
       }
     } else {
-      if (route->returns_result==3 || route->returns_result==4) {
+      if(route->returns_result==5 || route->returns_result==6) {
+        ku_http_job_begin(job,(unsigned long long)server->handler_timeout_ms);
+        resp=route->returns_result==6
+          ? __ku_http_response_from_value_result(((KuResult_kuvalue(*)(void*))route->invoke)(route->env))
+          : __ku_http_response_from_value_owned(((KuValue(*)(void*))route->invoke)(route->env));
+        handler_timed_out=__ku_sync_finish_request(&handler_signal);
+      } else if (route->returns_result==3 || route->returns_result==4) {
         ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
         resp=route->returns_result==4
           ? __ku_http_response_from_object_result(((KuResult_struct___ku_object(*)(void*))route->invoke)(route->env))
@@ -1434,7 +1474,7 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
       /* The execution worker owns the response until publication. A plain
          handler may complete after its original deadline; drop that response
          before selecting 504/500. Failed Result transport was dropped above. */
-      if (!route->returns_result || route->returns_result>=3) ku_drop_struct___ku_http_response(&resp);
+      if (route->arity==2 || !route->returns_result || route->returns_result>=3) ku_drop_struct___ku_http_response(&resp);
       ku_http_failure_current.reason=handler_timed_out ? KU_HTTP_ERROR_DEADLINE : KU_HTTP_ERROR_HANDLER_EXIT;
       return handler_timed_out
         ? ku_http_status_response(504, "Gateway Timeout")
@@ -2514,7 +2554,7 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
   connection->phase = KU_HTTP_IO_JOB;
   connection->deadline = 0;
   int local=ku_http_queue_is_current_owner(queue) && queue->owner_inline_remaining
-      && job->input.route && job->input.route->status==200u;
+      && job->input.route && job->input.route->status==200u && job->input.route->arity!=2u;
   int short_handler=local && ku_http_handler_is_short(job->input.route->invoke);
   const KuHttpJsonWork* json_work=local && queue->owner_inline_remaining==32u && !short_handler
       ? ku_http_handler_json_work(job->input.route->invoke):NULL;

@@ -154,6 +154,15 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                     map(request);
                     map(key);
                 }
+                TaskOp::HttpHeaderSet {
+                    response,
+                    key,
+                    value,
+                } => {
+                    map(response);
+                    map(key);
+                    map(value);
+                }
                 TaskOp::JsonDecode { dst, text } => {
                     map(dst);
                     map(text);
