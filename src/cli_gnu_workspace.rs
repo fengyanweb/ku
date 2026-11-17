@@ -30,6 +30,7 @@ pub(super) fn library_argument(
 
 pub(super) struct Workspace {
     directory: TempBuildDir,
+    temporary: TempBuildDir,
     cwd: PathBuf,
     argument_root: PathBuf,
     next_input: usize,
@@ -41,6 +42,12 @@ impl Workspace {
     }
 
     pub(super) fn create_at(cwd: &Path, temporary: &Path) -> io::Result<Self> {
+        // GCC canonicalizes its own temporary filenames before invoking as.
+        // Relative TMP under a Unicode cwd therefore becomes an unrepresentable
+        // absolute name again. Keep internal tool temporaries in a separately
+        // owned, absolute ASCII directory even when inputs use relative names.
+        let temporary_root = ascii_temp_root(temporary)?;
+        let tool_temporary = TempBuildDir::create_private_in(&temporary_root, "gnu-tmp")?;
         // Relative ASCII names work even when cwd itself contains Unicode. Rust
         // sets that original cwd with the native Unicode process API; neither
         // GCC nor ld needs to convert its absolute spelling to a narrow string.
@@ -53,6 +60,7 @@ impl Workspace {
             );
             return Ok(Self {
                 directory,
+                temporary: tool_temporary,
                 cwd: cwd.to_owned(),
                 argument_root,
                 next_input: 0,
@@ -60,11 +68,11 @@ impl Workspace {
         }
         // A read-only caller cwd can still use an ASCII temp root. A short
         // spelling is only an optional fallback, never the sole Unicode fix.
-        let temporary = ascii_temp_root(temporary)?;
-        let directory = TempBuildDir::create_private_in(&temporary, "gnu-tools")?;
+        let directory = TempBuildDir::create_private_in(&temporary_root, "gnu-tools")?;
         Ok(Self {
             argument_root: directory.path().to_owned(),
             directory,
+            temporary: tool_temporary,
             cwd: cwd.to_owned(),
             next_input: 0,
         })
@@ -72,7 +80,7 @@ impl Workspace {
 
     pub(super) fn configure(&self, command: &mut Command) {
         command.current_dir(&self.cwd);
-        let temporary = self.argument_root.join("tmp");
+        let temporary = super::strip_verbatim(self.temporary.path());
         command
             .env("TMP", &temporary)
             .env("TEMP", &temporary)
@@ -80,7 +88,6 @@ impl Workspace {
     }
 
     pub(super) fn source(&mut self, source: &Path) -> Result<PathBuf, KuError> {
-        fs::create_dir(self.directory.path().join("tmp")).map_err(error)?;
         self.copy_input(source, Path::new("source.c"), None)
     }
 
@@ -333,7 +340,12 @@ fn copy_header_tree(source: &Path, destination: &Path) -> Result<(), KuError> {
 }
 
 fn ascii_temp_root(path: &Path) -> io::Result<PathBuf> {
-    let plain = super::strip_verbatim(path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let plain = super::strip_verbatim(&path);
     if plain.to_str().is_some_and(str::is_ascii) {
         return Ok(plain);
     }
@@ -352,11 +364,11 @@ fn ascii_temp_root(path: &Path) -> io::Result<PathBuf> {
         if size > 0 && (size as usize) < result.len() {
             let short = PathBuf::from(std::ffi::OsString::from_wide(&result[..size as usize]));
             if short.to_str().is_some_and(str::is_ascii)
-                && fs::canonicalize(&short)? == fs::canonicalize(path)?
+                && fs::canonicalize(&short)? == fs::canonicalize(&path)?
             {
                 return Ok(short);
             }
         }
     }
-    Err(io::Error::other("GNU compiler needs a writable current directory or an ASCII temporary directory; configure TMP/TEMP to an existing writable ASCII directory"))
+    Err(io::Error::other("GNU assembler/linker needs an absolute ASCII temporary directory; configure TMP/TEMP to an existing writable ASCII directory (Windows short names are not assumed to exist)"))
 }

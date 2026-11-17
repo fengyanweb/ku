@@ -12986,6 +12986,10 @@ mod tests {
             assert!(matches!(key.to_str(), Some("TMP" | "TEMP" | "TMPDIR")));
             assert!(cwd.join(value.unwrap()).is_dir());
             assert!(value.unwrap().to_str().unwrap().is_ascii());
+            assert!(
+                Path::new(value.unwrap()).is_absolute(),
+                "GCC expands relative TMP beneath its Unicode cwd before invoking as"
+            );
         }
         let library = source_dir.join("原始 库.a");
         fs::write(&library, b"verified-library").unwrap();
@@ -12996,6 +13000,12 @@ mod tests {
         assert!(workspace.library(&library, [0; 32]).is_err());
         drop(workspace);
         assert!(!root.exists());
+        for (_, value) in command.get_envs() {
+            assert!(
+                !Path::new(value.unwrap()).exists(),
+                "private GNU temporary directory must be removed too"
+            );
+        }
         assert_eq!(fs::read(source).unwrap(), code);
         assert_eq!(fs::read(library).unwrap(), b"verified-library");
     }
