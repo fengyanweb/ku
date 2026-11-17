@@ -1,14 +1,12 @@
 //! Shared synchronous HTTP transport. No Ku Value, AST, interpreter or scheduler.
-use std::{
-    collections::HashMap,
-    io::Read,
-    sync::OnceLock,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, time::Instant};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{io::Read, sync::OnceLock, time::Duration};
 pub const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1_000_000;
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
 static DEFAULT_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 #[derive(Debug)]
@@ -38,6 +36,7 @@ pub fn http_request(config: HttpRequest) -> Result<HttpResponse, HttpError> {
     http_request_with_deadline(config, None)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn http_request_with_deadline(
     config: HttpRequest,
     caller_deadline: Option<Instant>,
@@ -95,6 +94,7 @@ pub fn http_request_with_deadline(
     response_to_value(response, config.max_body_bytes)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn default_agent() -> &'static ureq::Agent {
     DEFAULT_AGENT.get_or_init(|| {
         ureq::AgentBuilder::new()
@@ -105,6 +105,7 @@ fn default_agent() -> &'static ureq::Agent {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn response_to_value(
     response: ureq::Response,
     max_body_bytes: usize,
@@ -141,4 +142,17 @@ fn http_error(code: &str, message: impl Into<String>) -> HttpError {
         code: code.to_string(),
         message: message.into(),
     }
+}
+
+// Browser execution preserves its existing explicit outbound-HTTP boundary.
+// This branch deliberately has no ureq/url dependency or networking setup.
+#[cfg(target_arch = "wasm32")]
+pub fn http_request_with_deadline(
+    _config: HttpRequest,
+    _caller_deadline: Option<Instant>,
+) -> Result<HttpResponse, HttpError> {
+    Err(http_error(
+        "unsupported_in_browser",
+        "Native HTTP is unsupported_in_browser",
+    ))
 }
