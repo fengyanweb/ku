@@ -4508,7 +4508,7 @@ impl<'a> FunctionLowerer<'a> {
         &mut self,
         expr: &Expr,
         expected: Option<&IrType>,
-        deferred_safepoint: Option<&mut bool>,
+        mut deferred_safepoint: Option<&mut bool>,
     ) -> KuResult<IrExpr> {
         self.budget.borrow_mut().spend(1, expr.span)?;
         if let (ExprKind::Call { callee, args }, Some(IrType::Result(expected_inner))) =
@@ -4562,7 +4562,7 @@ impl<'a> FunctionLowerer<'a> {
             };
             return self.lower_closure_literal(params, body, expr.span, expected_params);
         }
-        let value = self.lower_expr_impl(expr, deferred_safepoint)?;
+        let value = self.lower_expr_impl(expr, deferred_safepoint.as_deref_mut())?;
         let value = self.nullable_read(expr, value);
         self.invalidate_nullable_call(expr);
         if expected == Some(&IrType::Named(HTTP_RESPONSE_TYPE.into()))
