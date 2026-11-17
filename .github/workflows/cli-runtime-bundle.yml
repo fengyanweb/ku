@@ -115,6 +115,12 @@ jobs:
           "KU_CC=$compiler" >> $env:GITHUB_ENV
           & $compiler --version
           & (Join-Path $bin 'g++.exe') -dumpmachine
+      - name: Check the optional GNU loader probe before building its SDK
+        if: inputs.early_loader_probe && matrix.target == 'x86_64-pc-windows-gnu'
+        shell: pwsh
+        run: |
+          & ${{ matrix.python }} -B .github/scripts/test-export-release.py RuntimeConsumerReportTests.test_gnu_pe_imports_use_sibling_tool_and_record_non_system_dependency_chain RuntimeConsumerReportTests.test_gnu_pe_import_probe_restores_existing_capture_limit_on_failure RuntimeConsumerReportTests.test_selected_gnu_loader_tool_and_real_environment_snapshot_are_ready RuntimeConsumerReportTests.test_native_build_diagnostics_reject_crt_warnings_on_either_stream_even_at_exit_zero
+          if ($LASTEXITCODE) { throw 'GNU loader probe preflight failed before the SDK build' }
       - name: Build the private pinned optional compression packs
         shell: pwsh
         run: |

@@ -584,6 +584,14 @@ fn main(): null! {
             cleanup.raise_if_any(primary)
 
 
+def windows_system_root(env):
+    # os.environ is case-insensitive on Windows; a plain snapshot dict is not.
+    value = next((value for key, value in env.items() if key.upper() == 'SYSTEMROOT'), None)
+    if not value:
+        raise RuntimeError('Windows loader diagnostic requires the existing SystemRoot environment')
+    return Path(value)
+
+
 def record_windows_gnu_pe_imports(detail, program, cwd, build_env, runtime_env, *, _seen=None, _depth=0, _app_dir=None):
     """Read the final EXE with the selected compiler's existing bounded tool.
 
@@ -606,14 +614,25 @@ def record_windows_gnu_pe_imports(detail, program, cwd, build_env, runtime_env, 
         raise RuntimeError('selected Windows GNU compiler has no sibling objdump.exe')
     data['tool'] = str(tool)
     original_limit = OWNER.MAX_CAPTURE_BYTES
+    inspection_directory = None
     try:
-        OWNER.MAX_CAPTURE_BYTES = min(original_limit, 256 * 1024)
-        # GNU's narrow argv has the same Unicode restriction as GCC. The
-        # fixture's final basename is ASCII; inspect that file from its actual
-        # Unicode directory without changing the application's runtime cwd.
-        result = invoke([tool, '-p', program.name], program.parent, build_env, seconds=15)
+        OWNER.MAX_CAPTURE_BYTES = min(original_limit, 2 * 1024 * 1024)
+        # Only objdump sees this same-hash ASCII copy. The real executable,
+        # its Unicode deployment path and System-only runtime stay unchanged.
+        with tempfile.TemporaryDirectory(prefix='ku-pe-imports-') as path:
+            inspection_directory = Path(path)
+            if not str(inspection_directory).isascii():
+                raise RuntimeError('GNU PE inspection requires an existing ASCII temporary root')
+            inspected = inspection_directory / ('image.dll' if program.suffix.lower() == '.dll' else 'image.exe')
+            shutil.copyfile(program, inspected)
+            data['binary_sha256'] = EXPORT.file_hash(program)
+            data['inspected_copy_sha256'] = EXPORT.file_hash(inspected)
+            if data['binary_sha256'] != data['inspected_copy_sha256']:
+                raise RuntimeError('GNU PE inspection copy identity changed')
+            result = invoke([tool, '-p', inspected.name], inspection_directory, build_env, seconds=15)
     finally:
         OWNER.MAX_CAPTURE_BYTES = original_limit
+        data['inspection_copy_removed'] = inspection_directory is not None and not inspection_directory.exists()
     data.update(exit=result.returncode, stdout_bytes=len(result.stdout),
                 stdout_sha256=hashlib.sha256(result.stdout).hexdigest(),
                 stderr_excerpt=result.stderr[:2048].decode('utf-8', errors='replace'))
@@ -624,7 +643,7 @@ def record_windows_gnu_pe_imports(detail, program, cwd, build_env, runtime_env, 
     if result.returncode or not names or len(names) > 64:
         data['status'] = 'failed'
         raise RuntimeError('bounded GNU objdump did not return a valid final EXE import list')
-    system32 = Path(build_env['SystemRoot']) / 'System32'
+    system32 = windows_system_root(build_env) / 'System32'
     build_paths = [Path(entry) for entry in build_env.get('PATH', '').split(os.pathsep) if entry]
     runtime_paths = [Path(entry) for entry in runtime_env.get('PATH', '').split(os.pathsep) if entry]
     for name in names:
@@ -1089,7 +1108,7 @@ def native_loader_leaf_probe(install, root, env, report, report_path, label, sou
     """Two fixed tiny diagnostic leaves; no load generator or product shortcut."""
     detail = {'status': 'running', 'scope': 'same SDK Release C11 O2; System-only PATH; no calendar APIs'}
     report.setdefault('loader_leaf_programs', {})[label] = detail
-    system = Path(env['SystemRoot'])
+    system = windows_system_root(env)
     runtime_env = dict(env, PATH=os.pathsep.join((str(system / 'System32'), str(system))))
     with tempfile.TemporaryDirectory(prefix='ku-loader-' + label + '-', dir=root) as path:
         directory = Path(path)
