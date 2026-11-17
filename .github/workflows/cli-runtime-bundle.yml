@@ -451,7 +451,7 @@ jobs:
           $pgPath = Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json'
           if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu' -and (Test-Path -LiteralPath $pgPath -PathType Leaf)) {
             $pg = Get-Content -LiteralPath $pgPath -Raw | ConvertFrom-Json
-            $detail = [ordered]@{ target=$pg.target; status=$pg.status; profile=$pg.profile; commit=$pg.commit; executable_sha256=$pg.executable_sha256; checkout_hidden_during_pg=$pg.checkout_hidden_during_pg; checkout_restore_confirmed=$pg.checkout_restore_confirmed; temporary_cleanup_confirmed=$pg.temporary_cleanup_confirmed; fixture_cleanup_confirmed=$pg.fixture_cleanup_confirmed; lanes=$pg.lanes; runtime_inputs=$pg.gnu_runtime_inputs }
+            $detail = [ordered]@{ target=$pg.target; status=$pg.status; profile=$pg.profile; commit=$pg.commit; executable_sha256=$pg.executable_sha256; checkout_hidden_during_pg=$pg.checkout_hidden_during_pg; checkout_restore_confirmed=$pg.checkout_restore_confirmed; temporary_cleanup_confirmed=$pg.temporary_cleanup_confirmed; fixture_cleanup_confirmed=$pg.fixture_cleanup_confirmed; lanes=$pg.lanes; runtime_inputs=$pg.gnu_runtime_inputs; failure_kind=$pg.failure_kind; failure_diagnostics=$pg.failure_diagnostics }
             $text = ConvertTo-Json -InputObject $detail -Depth 12 -Compress
             if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 65536) { throw 'GNU PG bounded metadata exceeds its output limit' }
             Write-Output "Installed GNU PG checks: $text"

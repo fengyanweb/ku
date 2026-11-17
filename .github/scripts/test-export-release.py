@@ -1811,6 +1811,78 @@ class InstalledPostgresDirectoryTests(unittest.TestCase):
             self.assertTrue(report['checkout_restore_confirmed'])
             self.assertEqual(list(owned.iterdir()), [])
 
+    def test_failed_pg_driver_exports_existing_lane_evidence_without_changing_cleanup(self):
+        with tempfile.TemporaryDirectory(prefix='ku-pg-failure-export-') as temporary:
+            lifecycle = Path(temporary) / 'lifecycle.json'
+            lifecycle.write_text(json.dumps({'status': 'failed', 'lanes': {
+                'sync': {'status': 'failed', 'report': {'failure_phase': 'http:parameters-fields-unicode-null',
+                    'failure_request': {'route': '/read', 'status': 200, 'body_prefix': 'error:query_error'},
+                    'failure': 'AssertionError: incorrect result', 'service_log_tail': 'original service stderr'}},
+                'async': {'status': 'blocked'}}}), encoding='utf-8')
+            report = {'pg_fixture_invoked': True, 'fixture_cleanup_confirmed': True,
+                      'temporary_cleanup_confirmed': True, 'status': 'failed'}
+            before = dict(report)
+            self.gate.capture_pg_failure(report, lifecycle, SystemExit('child exited 1\nstdout:\nkept\nstderr:\nfailed'))
+            detail = report.pop('failure_diagnostics')
+            self.assertEqual(report, before)
+            self.assertIn('stderr:\nfailed', detail['driver_error'])
+            self.assertEqual(detail['lanes']['sync']['failure_phase'], 'http:parameters-fields-unicode-null')
+            self.assertEqual(detail['lanes']['sync']['failure_request']['body_prefix'], 'error:query_error')
+            self.assertEqual(detail['lanes']['sync']['service_log_tail'], 'original service stderr')
+            self.assertEqual(detail['lanes']['async']['status'], 'blocked')
+
+    def test_pg_failure_export_redacts_credentials_before_truncating(self):
+        secrets = ['test-env-token-value', 'test-bearer-value', 'two words password', 'quoted-password',
+                   'test-json-token', 'github_pat_PRIVATE123', 'url-user', 'url-password', 'signed-private']
+        payload = ('Authorization: Bearer test-bearer-value\npassword=\'two words password\' '
+                   'PASSWORD="quoted-password" {"token":"test-json-token"} '
+                   'github_pat_PRIVATE123 https://url-user:url-password@example.invalid/a?sig=signed-private '
+                   'env:test-env-token-value')
+        with tempfile.TemporaryDirectory(prefix='ku-pg-failure-redact-') as temporary:
+            lifecycle = Path(temporary) / 'lifecycle.json'
+            lifecycle.write_text(json.dumps({'status': 'failed', 'lanes': {'sync': {'status': 'failed',
+                'report': {'failure': payload, 'service_log_tail': payload,
+                           'failure_request': {'route': '/read', 'body_prefix': payload}}}}}), encoding='utf-8')
+            report = {'pg_fixture_invoked': True}
+            with mock.patch.dict(os.environ, {'GH_TOKEN': secrets[0]}):
+                self.gate.capture_pg_failure(report, lifecycle, SystemExit(payload))
+            encoded = json.dumps(report['failure_diagnostics'])
+            for secret in secrets:
+                self.assertNotIn(secret, encoded)
+            self.assertIn('[redacted]', encoded)
+
+    def test_pg_failure_export_has_per_field_and_complete_utf8_byte_bounds(self):
+        with tempfile.TemporaryDirectory(prefix='ku-pg-failure-bound-') as temporary:
+            lifecycle = Path(temporary) / 'lifecycle.json'
+            large = ('中文🙂\x01\x02' * 10000)
+            lifecycle.write_text(json.dumps({'status': 'failed', 'lanes': {lane: {'status': 'failed',
+                'report': {'failure_phase': large, 'failure': large, 'service_log_tail': large,
+                           'failure_request': {'body_prefix': large}}} for lane in ('sync', 'async')}},
+                ensure_ascii=False), encoding='utf-8')
+            report = {'pg_fixture_invoked': True}
+            self.gate.capture_pg_failure(report, lifecycle, SystemExit(large))
+            detail = report['failure_diagnostics']
+            self.assertLessEqual(len(json.dumps(detail, ensure_ascii=False).encode('utf-8')), self.gate.MAX_PG_FAILURE_BYTES)
+            self.assertLessEqual(len(detail['driver_error'].encode('utf-8')), 4096)
+            for item in detail['lanes'].values():
+                self.assertLessEqual(len(item['failure_phase'].encode('utf-8')), 256)
+                self.assertLessEqual(len(item['failure'].encode('utf-8')), 2048)
+                self.assertLessEqual(len(item['service_log_tail'].encode('utf-8')), 4096)
+
+    def test_pg_failure_export_handles_missing_lifecycle_and_skips_download_errors(self):
+        with tempfile.TemporaryDirectory(prefix='ku-pg-failure-missing-') as temporary:
+            missing = Path(temporary) / 'absent.json'
+            report = {'pg_fixture_invoked': True}
+            self.gate.capture_pg_failure(report, missing, RuntimeError('child failed before receipt'))
+            self.assertEqual(report['failure_diagnostics']['lifecycle_read_error_kind'], 'FileNotFoundError')
+            self.assertIn('child failed before receipt', report['failure_diagnostics']['driver_error'])
+            class SensitiveDownloadError(Exception):
+                def __str__(self):
+                    raise AssertionError('download exception must never be serialized')
+            report = {'failure_kind': 'SensitiveDownloadError'}
+            self.gate.capture_pg_failure(report, missing, SensitiveDownloadError())
+            self.assertEqual(report, {'failure_kind': 'SensitiveDownloadError'})
+
     def test_existing_fixture_guard_still_refuses_other_prefix_and_nested_root(self):
         success = SimpleNamespace(returncode=0, stdout="{}", stderr="")
         with tempfile.TemporaryDirectory(prefix="ku-installed-pg-") as temporary:

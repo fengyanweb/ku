@@ -32,6 +32,7 @@ import zipfile
 sys.dont_write_bytecode = True
 MAX_ZIP = 1024 * 1024 * 1024
 MAX_JSON = 2 * 1024 * 1024
+MAX_PG_FAILURE_BYTES = 24 * 1024
 # Explicit supported storage domains, not a claim about all future GitHub hosts.
 ARTIFACT_STORAGE_SUFFIXES = (".blob.core.windows.net", ".actions.githubusercontent.com")
 TARGET_HOSTS = {
@@ -642,6 +643,80 @@ def save_report(output, report):
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def pg_failure_text(value, limit, *, tail=False):
+    """Redact before truncating: a clipped credential must not escape matching."""
+    text = str(value)
+    for key, secret in os.environ.items():
+        if (len(secret) >= 4 and re.search(r'(?:TOKEN|PASSWORD|PASSWD|SECRET|ACCESS_KEY|PRIVATE_KEY|API_KEY)$', key, re.I)):
+            text = text.replace(secret, '[redacted]')
+    text = re.sub(r'https?://[^\s<>\"\']+', '[url redacted]', text, flags=re.I)
+    text = re.sub(r'\bBearer\s+[A-Za-z0-9._~+/=-]+', 'Bearer [redacted]', text, flags=re.I)
+    text = re.sub(r'\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b', '[redacted]', text)
+    text = re.sub(
+        r'''(["']?(?:password|passwd|pgpassword|token|secret|api_key|authorization|cookie|set-cookie)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)''',
+        lambda match: match[1] + '[redacted]', text, flags=re.I)
+    raw = text.encode('utf-8', errors='replace')
+    if len(raw) <= limit:
+        return text
+    marker = b'[truncated]\n'
+    clipped = raw[-(limit - len(marker)):] if tail else raw[:limit - len(marker)]
+    return marker.decode() + clipped.decode('utf-8', errors='ignore')
+
+
+def capture_pg_failure(report, lifecycle, error):
+    """Export only existing private-driver evidence; never download errors."""
+    if report.get('pg_fixture_invoked') is not True:
+        return
+    detail = {'format': 'ku-installed-pg-failure-v1', 'error_kind': type(error).__name__,
+              'driver_error': pg_failure_text(error, 4096, tail=True), 'lanes': {}}
+    try:
+        if lifecycle.is_symlink():
+            raise ValueError('lifecycle must be a plain file')
+        with lifecycle.open('rb') as stream:
+            raw = stream.read(MAX_JSON + 1)
+        if len(raw) > MAX_JSON:
+            raise ValueError('lifecycle exceeds its existing JSON bound')
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(data.get('lanes'), dict):
+            raise ValueError('lifecycle has no lane object')
+        detail['lifecycle_status'] = pg_failure_text(data.get('status', ''), 128)
+        for lane in ('sync', 'async'):
+            entry = data['lanes'].get(lane)
+            if not isinstance(entry, dict):
+                continue
+            raw_report = entry.get('report', {})
+            if not isinstance(raw_report, dict):
+                raw_report = {}
+            item = {'status': pg_failure_text(entry.get('status', ''), 128)}
+            for name, limit, tail in (('failure_phase', 256, False), ('failure', 2048, True),
+                                      ('service_log_tail', 4096, True)):
+                value = raw_report.get(name, entry.get(name, ''))
+                item[name] = pg_failure_text(value, limit, tail=tail)
+            request = raw_report.get('failure_request')
+            if isinstance(request, dict):
+                item['failure_request'] = {key: pg_failure_text(value, 512) if isinstance(value, str) else value
+                    for key, value in request.items() if key in ('phase', 'route', 'method', 'status', 'body_prefix',
+                        'sequence', 'started_monotonic', 'absolute_deadline_monotonic', 'returned_monotonic', 'elapsed_ms', 'error')
+                    and (value is None or type(value) in (str, int, float, bool))}
+                encoded = json.dumps(item['failure_request'], ensure_ascii=False)
+                if len(encoded.encode('utf-8')) > 2048:
+                    item['failure_request'] = {'excerpt': pg_failure_text(encoded, 1536)}
+            detail['lanes'][lane] = item
+    except (OSError, ValueError, TypeError) as capture_error:
+        detail['lifecycle_read_error_kind'] = type(capture_error).__name__
+    # Escaped control characters can make JSON larger than the source text.
+    # Shrink only diagnostic strings; original acceptance/cleanup state is intact.
+    while len(json.dumps(detail, ensure_ascii=False).encode('utf-8')) > MAX_PG_FAILURE_BYTES:
+        detail['truncated_to_byte_bound'] = True
+        detail['driver_error'] = pg_failure_text(detail['driver_error'], max(128, len(detail['driver_error'].encode('utf-8')) // 2), tail=True)
+        for item in detail['lanes'].values():
+            for key in ('failure', 'service_log_tail'):
+                item[key] = pg_failure_text(item[key], max(128, len(item[key].encode('utf-8')) // 2), tail=True)
+            if 'failure_request' in item:
+                item['failure_request'] = {'excerpt': pg_failure_text(json.dumps(item['failure_request'], ensure_ascii=False), 768)}
+    report['failure_diagnostics'] = detail
+
+
 def verify(args):
     repo = args.repo.resolve()
     helpers = repo / ".github" / "scripts"
@@ -776,10 +851,9 @@ def verify(args):
             report["cleanup_unconfirmed"] = False
             report["status"] = "passed"
     except BaseException as error:
-        # Raw lifecycle JSON retains bounded categorical/request diagnostics.
-        # Avoid serializing download URLs or token-bearing exception strings.
         report["status"] = "failed"
         report["failure_kind"] = type(error).__name__
+        capture_pg_failure(report, output.with_name(output.stem + '.lifecycle.json'), error)
         raise
     finally:
         save_report(output, report)
