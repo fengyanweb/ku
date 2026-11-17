@@ -80,3 +80,37 @@ static KuValue __ku_http_headers_get(KuObject* headers, KuString key) {
   } else if(!ku_value_try_clone(*found,&result)) __ku_http_response_oom();
   return result;
 }
+
+/* Structural public objects meet the typed native ABI only at an existing
+ * expected-HttpResponse boundary. An owned conversion transfers leaves before
+ * retiring the outer map; a View conversion preserves the original owner. */
+static bool __ku_http_response_object_fields(KuObject* object,KuValue** status,KuValue** headers,KuValue** body) {
+  *status=object?ku_object_get(object,ku_string_static((const uint8_t*)"status",6)):NULL;
+  *headers=object?ku_object_get(object,ku_string_static((const uint8_t*)"headers",7)):NULL;
+  *body=object?ku_object_get(object,ku_string_static((const uint8_t*)"body",4)):NULL;
+  if(*status && (*status)->tag==KU_INT && *headers && (*headers)->tag==KU_OBJECT && *body && (*body)->tag==KU_STR)return true;
+#if defined(KU_HTTP_RESPONSE_SYNC)
+  static const uint8_t message[]="HttpResponse requires int status, object headers and str body";
+  __ku_sync_raise_http_json(message,sizeof(message)-1);
+#else
+  abort();
+#endif
+  return false;
+}
+static KuStruct___ku_http_response __ku_http_response_from_object_owned(KuObject* object) {
+  KuStruct___ku_http_response result={0};KuValue *status,*headers,*body;
+  if(__ku_http_response_object_fields(object,&status,&headers,&body)) {
+    result.status=status->as.i;result.headers=headers->as.o;result.body=body->as.s;
+    *headers=ku_v_null();*body=ku_v_null();
+  }
+  ku_object_drop(object);return result;
+}
+static KuStruct___ku_http_response __ku_http_response_from_object_view(KuObject* object) {
+  KuStruct___ku_http_response result={0};KuValue *status,*headers,*body;
+  if(!__ku_http_response_object_fields(object,&status,&headers,&body))return result;
+  result.status=status->as.i;
+  if(!ku_object_string_try_clone(body->as.s,&result.body) || (headers->as.o && !ku_object_try_clone(headers->as.o,&result.headers))) {
+    ku_drop_struct___ku_http_response(&result);__ku_http_response_oom();
+  }
+  return result;
+}

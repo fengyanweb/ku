@@ -457,3 +457,32 @@ int main(void) {
         assert_eq!(out, "http-request-priority-ownership-ok\n");
     }
 }
+
+#[test]
+fn native_http_structural_response_objects_convert_only_at_typed_boundaries() {
+    let c = generated(
+        r#"
+fn Make():HttpResponse {return {status:201,headers:{"x-ku":"yes"},body:"literal"}}
+fn MakeResult():HttpResponse! {return ok({status:202,headers:{"x-ku":"yes"},body:"result"})}
+fn Keep(r:HttpResponse):HttpResponse {return r}
+fn Read(&r:HttpResponse):int {return r.status}
+fn main():null! {
+ r=Make()
+ if(r.status!=201 || r.headers["x-ku"]!="yes" || r.body!="literal") fail "literal return"
+ dynamic={status:203,headers:{"x-ku":"yes"},body:"alias"}
+ if(Read(dynamic)!=203 || dynamic["body"]?!="alias") fail "View conversion consumed object"
+ moved=Keep(dynamic)
+ if(moved.status!=203 || moved.body!="alias") fail "owned conversion"
+ result=MakeResult()?
+ if(result.status!=202 || result.body!="result") fail "Result payload"
+ println("structural-response-ok")
+ return ok(null)
+}
+"#,
+    );
+    assert!(c.contains("__ku_http_response_from_object_owned("));
+    assert!(c.contains("__ku_http_response_from_object_view("));
+    if let Some(out) = run_c("http-structural-response", &c) {
+        assert_eq!(out, "structural-response-ok\n");
+    }
+}

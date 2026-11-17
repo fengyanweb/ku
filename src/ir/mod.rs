@@ -4565,6 +4565,23 @@ impl<'a> FunctionLowerer<'a> {
         let value = self.lower_expr_impl(expr, deferred_safepoint)?;
         let value = self.nullable_read(expr, value);
         self.invalidate_nullable_call(expr);
+        if expected == Some(&IrType::Named(HTTP_RESPONSE_TYPE.into()))
+            && matches!(&value.ty,IrType::Named(name) if name=="__ku_object")
+        {
+            let intrinsic = if deferred_safepoint.is_some() {
+                "__ku_http_response_from_object_view"
+            } else {
+                "__ku_http_response_from_object_owned"
+            };
+            return self.emit_temp_for_borrow_result(
+                intrinsic_expr(
+                    intrinsic,
+                    vec![value],
+                    IrType::Named(HTTP_RESPONSE_TYPE.into()),
+                ),
+                deferred_safepoint,
+            );
+        }
         Ok(nullable::coerce(value, expected))
     }
 
@@ -5720,7 +5737,7 @@ pub(crate) fn ir_expr_needs_sync_guard(expr: &IrExpr) -> bool {
         return true;
     }
     if matches!(&expr.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), .. }
-        if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response" | "__ku_http_response_headers_read" | "__ku_http_headers_get" | "__ku_http_response_headers_prepare" | "__ku_http_client_config_field_int" | "__ku_http_client_config_field_str" | "__ku_http_response_public_value" | "http.get" | "http.post" | "http.request" | "http.client"
+        if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response" | "__ku_http_response_from_object_owned" | "__ku_http_response_from_object_view" | "__ku_http_response_headers_read" | "__ku_http_headers_get" | "__ku_http_response_headers_prepare" | "__ku_http_client_config_field_int" | "__ku_http_client_config_field_str" | "__ku_http_response_public_value" | "http.get" | "http.post" | "http.request" | "http.client"
             | "time.from_unix" | "time.from_millis" | "time.add" | "time.sub" | "time.diff"))
     {
         return true;

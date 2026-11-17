@@ -1,7 +1,7 @@
 //! Optional synchronous HTTP transport. Task outbound calls stay unsupported.
 use super::{
-    c_expr, c_place_expr, output::COutput, program_uses_intrinsic, unsupported, IrExpr, IrProgram,
-    KuResult,
+    c_expr, c_place_expr, c_value_expr, output::COutput, program_uses_intrinsic, unsupported,
+    IrExpr, IrProgram, KuResult,
 };
 pub(super) fn uses_runtime(p: &IrProgram) -> bool {
     ["http.get", "http.post", "http.request"]
@@ -23,6 +23,13 @@ pub(super) fn emit(out: &mut COutput, p: &IrProgram) {
 }
 pub(super) fn intrinsic_expr(name: &str, args: &[IrExpr]) -> KuResult<Option<String>> {
     let call = match name {
+        "__ku_http_response_from_object_owned" => format!(
+            "__ku_http_response_from_object_owned({})",
+            c_value_expr(&args[0])?
+        ),
+        "__ku_http_response_from_object_view" => {
+            format!("__ku_http_response_from_object_view({})", c_expr(&args[0])?)
+        }
         "__ku_http_client_config_field_int" | "__ku_http_client_config_field_str" => {
             format!("{name}({}, {})", c_expr(&args[0])?, c_expr(&args[1])?)
         }
