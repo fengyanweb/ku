@@ -186,6 +186,8 @@ jobs:
           if ($LASTEXITCODE) { throw 'Runner manifest tests failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --lib windows_gnu_static_runtime_link_policy -- --test-threads=1
           if ($LASTEXITCODE) { throw 'Target-pinned GNU runtime argv contract failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --lib configured_c_compiler_target_probe_failure -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Explicit native compiler probe error contract failed' }
           & ${{ matrix.python }} -B .github/scripts/test-export-release.py
           if ($LASTEXITCODE) { throw 'Exporter contract tests failed' }
           & ${{ matrix.python }} -B .github/scripts/test-build-native-compression.py

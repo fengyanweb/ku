@@ -7117,19 +7117,13 @@ fn compile_c_source_with_output(
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     if candidate.explicitly_configured {
-                        return Err(KuError::message(format!(
-                            "failed to run configured C compiler '{}' target probe: {error}",
-                            candidate.label
-                        )));
+                        return Err(configured_c_compiler_target_probe_error(&candidate, &error));
                     }
                     continue;
                 }
                 Err(error) => {
                     if candidate.explicitly_configured {
-                        return Err(KuError::message(format!(
-                            "failed to determine configured C compiler '{}' target: {error}",
-                            candidate.label
-                        )));
+                        return Err(configured_c_compiler_target_probe_error(&candidate, &error));
                     }
                     compiler_failures
                         .push(format!("{} target probe failed: {error}", candidate.label));
@@ -7978,6 +7972,16 @@ fn compiler_target_matches_build(value: &str, target: &BuildTarget) -> bool {
         }
     };
     architecture_matches && operating_system_matches
+}
+
+fn configured_c_compiler_target_probe_error(
+    candidate: &CCompilerCandidate,
+    error: &io::Error,
+) -> KuError {
+    KuError::message(format!(
+        "failed to determine configured C compiler '{}' target: {error}\nhelp: set KU_CC to a working C compiler, or unset it for automatic detection",
+        candidate.label
+    ))
 }
 
 fn probe_clang_default_target(
@@ -14399,6 +14403,32 @@ fn main(): null! {
         fs::write(&source, "#define KU_FEATURE_ZLIB 1\n").unwrap();
         let features = CSourceFeatures::inspect(&source).unwrap();
         assert!(!features.zstd && features.zlib);
+    }
+
+    #[test]
+    fn configured_c_compiler_target_probe_failure_preserves_actionable_native_error() {
+        let candidate = CCompilerCandidate {
+            label: "missing compiler 中文.exe".into(),
+            program: "missing compiler 中文.exe".into(),
+            args: Vec::new(),
+            kind: CCompilerKind::Preconfigured,
+            explicitly_configured: true,
+        };
+        for (kind, reason) in [
+            (io::ErrorKind::NotFound, "compiler executable is absent"),
+            (
+                io::ErrorKind::InvalidData,
+                "compiler target output is invalid",
+            ),
+        ] {
+            let error = io::Error::new(kind, reason);
+            let diagnostic =
+                configured_c_compiler_target_probe_error(&candidate, &error).to_string();
+            assert!(diagnostic.contains("KU_CC"));
+            assert!(diagnostic.contains(&candidate.label));
+            assert!(diagnostic.contains(reason));
+            assert!(!diagnostic.contains("E0514") && !diagnostic.contains("rustc command:"));
+        }
     }
 
     #[test]
