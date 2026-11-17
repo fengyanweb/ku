@@ -584,7 +584,129 @@ fn main(): null! {
             cleanup.raise_if_any(primary)
 
 
-def installed_native_time_array_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False):
+def record_windows_gnu_pe_imports(detail, program, cwd, build_env, runtime_env, *, _seen=None, _depth=0, _app_dir=None):
+    """Read the final EXE with the selected compiler's existing bounded tool.
+
+    PATH resolutions are observations, not a replacement for Windows loader
+    rules. In particular API-set names need not be files in System32.
+    """
+    seen = set() if _seen is None else _seen
+    app_dir = program.parent if _app_dir is None else _app_dir
+    identity = str(program.resolve()).casefold()
+    if identity in seen:
+        return
+    seen.add(identity)
+    data = {'status': 'running', 'scope': 'PE imports; observed file resolution, no PATH changes',
+            'path': str(program), 'runtime_path': runtime_env.get('PATH', ''),
+            'imports': [], 'dependencies': []}
+    detail['pe_imports'] = data
+    compiler = Path(build_env['KU_GNU_CC']).resolve(strict=True)
+    tool = compiler.with_name('objdump.exe')
+    if not compiler.is_file() or not tool.is_file():
+        raise RuntimeError('selected Windows GNU compiler has no sibling objdump.exe')
+    data['tool'] = str(tool)
+    original_limit = OWNER.MAX_CAPTURE_BYTES
+    try:
+        OWNER.MAX_CAPTURE_BYTES = min(original_limit, 256 * 1024)
+        # GNU's narrow argv has the same Unicode restriction as GCC. The
+        # fixture's final basename is ASCII; inspect that file from its actual
+        # Unicode directory without changing the application's runtime cwd.
+        result = invoke([tool, '-p', program.name], program.parent, build_env, seconds=15)
+    finally:
+        OWNER.MAX_CAPTURE_BYTES = original_limit
+    data.update(exit=result.returncode, stdout_bytes=len(result.stdout),
+                stdout_sha256=hashlib.sha256(result.stdout).hexdigest(),
+                stderr_excerpt=result.stderr[:2048].decode('utf-8', errors='replace'))
+    text = result.stdout.decode('utf-8', errors='replace')
+    raw = [line for line in text.splitlines() if re.match(r'^\s*DLL Name:', line)]
+    data['dll_name_excerpt'] = '\n'.join(raw).encode('utf-8')[:4096].decode('utf-8', errors='ignore')
+    names = list(dict.fromkeys(re.findall(r'^\s*DLL Name:\s*(\S+)\s*$', text, re.M)))
+    if result.returncode or not names or len(names) > 64:
+        data['status'] = 'failed'
+        raise RuntimeError('bounded GNU objdump did not return a valid final EXE import list')
+    system32 = Path(build_env['SystemRoot']) / 'System32'
+    build_paths = [Path(entry) for entry in build_env.get('PATH', '').split(os.pathsep) if entry]
+    runtime_paths = [Path(entry) for entry in runtime_env.get('PATH', '').split(os.pathsep) if entry]
+    for name in names:
+        if Path(name).name != name or '/' in name or '\\' in name:
+            raise RuntimeError('GNU objdump returned a non-basename DLL import')
+        system = system32 / name
+        row = {'name': name, 'system32': str(system.resolve()) if system.is_file() else None,
+               'api_set_contract': name.lower().startswith(('api-ms-win-', 'ext-ms-win-'))}
+        if not system.is_file():
+            match = next((entry / name for entry in build_paths if (entry / name).is_file()), None)
+            row['build_path_first_match'] = str(match.resolve()) if match is not None else None
+            row['build_path_match_sha256'] = EXPORT.file_hash(match) if match is not None else None
+        match = next((entry / name for entry in [app_dir, cwd, *runtime_paths]
+                      if (entry / name).is_file()), None)
+        row['runtime_file_first_match'] = str(match.resolve()) if match is not None else None
+        data['imports'].append(row)
+    for row in data['imports']:
+        found = row.get('build_path_first_match')
+        if not found or str(Path(found).resolve()).casefold() in seen:
+            continue
+        if _depth >= 3 or len(seen) >= 8:
+            data['recursion_incomplete'] = True
+            continue
+        child = {}
+        record_windows_gnu_pe_imports(child, Path(found), cwd, build_env, runtime_env,
+                                     _seen=seen, _depth=_depth + 1, _app_dir=app_dir)
+        if 'pe_imports' in child:
+            data['dependencies'].append(child['pe_imports'])
+    data['status'] = 'captured'
+
+
+def pe_imports_require_non_system_libgcc(data):
+    pending, found, count = [data], False, 0
+    while pending:
+        item = pending.pop()
+        count += 1
+        if count > 8 or item.get('recursion_incomplete') or item.get('status') != 'captured':
+            return False
+        found |= any(row['name'].lower().startswith('libgcc_s') and row.get('build_path_first_match')
+                     is not None for row in item.get('imports', []))
+        pending.extend(item.get('dependencies', []))
+    return found
+
+
+def static_libgcc_loader_trial(detail, root, generated, archive, archive_sha256, tokens, env, runtime_env):
+    """One diagnostic link of the exact C/archive; never product defaults.
+
+    GCC documents -static-libgcc as selecting only the static libgcc, not
+    -static. No shared-library exception ABI or panic policy is changed here.
+    https://gcc.gnu.org/onlinedocs/gcc/Link-Options.html
+    """
+    trial = {'scope': 'conditional diagnostic only; original failure retained', 'flag': '-static-libgcc',
+             'generated_c_sha256': hashlib.sha256(generated).hexdigest(), 'archive_sha256': archive_sha256}
+    detail['static_libgcc_trial'] = trial
+    with tempfile.TemporaryDirectory(prefix='ku-static-libgcc-probe-', dir=root) as path:
+        directory = Path(path)
+        if not str(directory).isascii():
+            raise RuntimeError('conditional GNU link probe requires an existing ASCII temporary root')
+        (directory / 'source.c').write_bytes(generated)
+        shutil.copyfile(archive, directory / 'calendar.a')
+        if EXPORT.file_hash(directory / 'calendar.a') != archive_sha256:
+            raise RuntimeError('conditional GNU link probe archive identity changed')
+        temporary = directory / 'tmp'
+        temporary.mkdir()
+        selected = dict(env, TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary))
+        command = [env['KU_GNU_CC'], 'source.c', '-std=c11', '-o', 'static-libgcc.exe', '-O2',
+                   'calendar.a', *tokens, '-static-libgcc']
+        linked = invoke(command, directory, selected, seconds=30)
+        trial.update(command=command, build_exit=linked.returncode,
+                     build_stderr_excerpt=linked.stderr[:2048].decode('utf-8', errors='replace'))
+        if linked.returncode:
+            return
+        program = directory / 'static-libgcc.exe'
+        trial.update(binary_sha256=EXPORT.file_hash(program), binary_bytes=program.stat().st_size)
+        record_windows_gnu_pe_imports(trial, program, root, env, runtime_env)
+        result = invoke([program], root, runtime_env, seconds=15)
+        trial.update(run_exit=result.returncode, run_stdout=output(result)[:1024],
+                     run_stderr_excerpt=result.stderr[:1024].decode('utf-8', errors='replace'),
+                     functional_check_passed=result.returncode == 0 and output(result) == 'native-time-array-ok\n' and not result.stderr)
+
+
+def installed_native_time_array_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False, loader_probe=False):
     """Consume the target calendar pack from this final moved archive only.
 
     The source exercises the public time and nullable array contracts as the native
@@ -663,6 +785,7 @@ def installed_native_time_array_consumer(install, root, env, report, report_path
                     raise RuntimeError('installed module build is missing native implementation: ' + marker.decode())
             detail['generated_c_sha256'] = EXPORT.file_hash(emitted)
             detail['binary_sha256'] = EXPORT.file_hash(program)
+            detail['binary_bytes'] = program.stat().st_size
             deployed = deployment / program.name
             shutil.move(str(program), str(deployed))
             shutil.rmtree(project)
@@ -674,10 +797,17 @@ def installed_native_time_array_consumer(install, root, env, report, report_path
             detail['sdk_unavailable_during_run'] = not install.exists() and not ku.exists()
             if not detail['source_removed_before_run'] or not detail['sdk_unavailable_during_run']:
                 raise RuntimeError('time-array execution still has its original source or SDK')
+            if target == 'x86_64-pc-windows-gnu':
+                record_windows_gnu_pe_imports(detail, deployed, unrelated, build_env, runtime_env)
+                write_report(report_path, report)
             result = invoke([deployed], unrelated, runtime_env, seconds=15)
             detail['run_exit'] = result.returncode
             detail['run_stdout_sha256'] = hashlib.sha256(result.stdout).hexdigest()
             detail['run_stderr_sha256'] = hashlib.sha256(result.stderr).hexdigest()
+            if loader_probe and pe_imports_require_non_system_libgcc(detail.get('pe_imports', {})):
+                static_libgcc_loader_trial(detail, root, generated,
+                    retired / 'native-calendar/v1' / target / 'lib' / manifest['archive']['name'],
+                    manifest['archive']['sha256'], manifest['native_static_libs']['tokens'], build_env, runtime_env)
             if result.returncode or output(result) != 'native-time-array-ok\n' or result.stderr:
                 raise RuntimeError('moved source-free installed time-array program returned an incorrect result or exit')
             detail['binary_roundtrip'] = True
@@ -953,6 +1083,91 @@ def windows_readonly_installation(install, project, root, env, report, report_pa
         for path in created_probes:
             path.unlink(missing_ok=True)
         save()
+
+
+def native_loader_leaf_probe(install, root, env, report, report_path, label, source, expected):
+    """Two fixed tiny diagnostic leaves; no load generator or product shortcut."""
+    detail = {'status': 'running', 'scope': 'same SDK Release C11 O2; System-only PATH; no calendar APIs'}
+    report.setdefault('loader_leaf_programs', {})[label] = detail
+    system = Path(env['SystemRoot'])
+    runtime_env = dict(env, PATH=os.pathsep.join((str(system / 'System32'), str(system))))
+    with tempfile.TemporaryDirectory(prefix='ku-loader-' + label + '-', dir=root) as path:
+        directory = Path(path)
+        project = directory / 'build project 中文'
+        project.mkdir()
+        (project / 'main.ku').write_text(source, encoding='utf-8')
+        program = project / (label + '.exe')
+        unavailable = root / ('sdk-unavailable-for-' + label)
+        primary = None
+        moved = False
+        try:
+            built = invoke([install / 'ku.exe', 'build', '--backend', 'c', '--release', '--verbose',
+                            'main.ku', '-o', program], project, env)
+            detail['build_exit'] = built.returncode
+            record_native_build_diagnostics(detail, built)
+            assert_build_backend(built, 'c', 'release')
+            emitted = reported_artifact(output(built), 'native c ok: ', project, directory)
+            if b'#define KU_FEATURE_NATIVE_CALENDAR 1' in emitted.read_bytes():
+                raise RuntimeError('unused calendar feature entered a diagnostic leaf')
+            detail.update(generated_c_sha256=EXPORT.file_hash(emitted), binary_sha256=EXPORT.file_hash(program),
+                          binary_bytes=program.stat().st_size)
+            deployed = directory / (label + '.exe')
+            shutil.move(program, deployed)
+            shutil.rmtree(project)
+            relocate_checkout_entry(install, unavailable)
+            moved = True
+            detail.update(source_removed_before_run=not project.exists(), sdk_unavailable_during_run=not install.exists())
+            record_windows_gnu_pe_imports(detail, deployed, root, env, runtime_env)
+            result = invoke([deployed], root, runtime_env, seconds=15)
+            detail.update(run_exit=result.returncode, run_stdout=output(result)[:1024],
+                          run_stderr_excerpt=result.stderr[:1024].decode('utf-8', errors='replace'))
+            detail['functional_check_passed'] = result.returncode == 0 and output(result) == expected and not result.stderr
+        except BaseException as error:
+            primary = error
+        finally:
+            cleanup = OWNER.CleanupErrors()
+            if moved:
+                if unavailable.is_dir() and not install.exists():
+                    cleanup.attempt('restore loader leaf SDK', lambda: relocate_checkout_entry(unavailable, install))
+                else:
+                    cleanup.add('loader leaf SDK restoration paths changed')
+            detail['installation_restored'] = install.is_dir() and not unavailable.exists()
+            if not detail['installation_restored']:
+                cleanup.add('loader leaf SDK restoration unconfirmed')
+            detail['status'] = 'passed' if primary is None and not cleanup.failed and detail.get('functional_check_passed') else 'failed'
+            write_report(report_path, report)
+            cleanup.raise_if_any(primary)
+
+
+def run_native_time_array_probe(args, report):
+    """Diagnose only a producer's verified GNU SDK; not installation acceptance."""
+    if os.name != 'nt':
+        raise ValueError('--native-time-array-probe-bundle requires Windows GNU')
+    target = 'x86_64-pc-windows-gnu'
+    bundle = args.native_time_array_probe_bundle.resolve()
+    repo = args.repo.resolve()
+    version = json.loads((repo / 'editors/vscode-ku/package.json').read_text(encoding='utf-8'))['version']
+    manifest = EXPORT.RUNTIME_BUNDLE.verify(bundle, version, args.expected_sdk_commit, target)
+    report.update(schema='ku-native-loader-probe-v1', target=target,
+                  scope='early GNU producer copy; diagnostic only, not final archive/installation acceptance',
+                  sdk_source_commit=manifest['source_commit'], bundle_id=manifest['bundle_id'],
+                  publisher=manifest['rustc'], verification_run_id=os.environ.get('GITHUB_RUN_ID'))
+    temporary = None
+    try:
+        with tempfile.TemporaryDirectory(prefix='ku-native-loader-probe-') as path:
+            temporary = Path(path).resolve()
+            install = temporary / 'probe SDK 中文'
+            shutil.copytree(bundle, install)
+            EXPORT.RUNTIME_BUNDLE.verify(install, version, args.expected_sdk_commit, target)
+            env = dict(os.environ, RUSTUP_AUTO_INSTALL='0')
+            native_loader_leaf_probe(install, temporary, env, report, args.output, 'hello',
+                                     'fn main() { println("loader-hello-ok") }\n', 'loader-hello-ok\n')
+            native_loader_leaf_probe(install, temporary, env, report, args.output, 'scalar-time',
+                                     'import time from "std.time"\nfn main() { println(time.unix() > 0) }\n', 'true\n')
+            installed_native_time_array_consumer(install, temporary, env, report, args.output, target, loader_probe=True)
+        report['status'] = 'passed'
+    finally:
+        report['owned_probe_root_removed'] = temporary is not None and not temporary.exists()
 
 
 def run_readonly_only(args, report):
@@ -1519,8 +1734,9 @@ def run(args, report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--archive", type=Path)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--native-time-array-probe-bundle", type=Path)
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--consumer-toolchain", default="1.96.0")
@@ -1529,11 +1745,18 @@ def main():
     parser.add_argument("--installer-run")
     parser.add_argument("--expected-sdk-commit")
     args = parser.parse_args()
+    if args.native_time_array_probe_bundle:
+        if args.archive or args.manifest or args.readonly_only or args.hide_checkout or not args.expected_sdk_commit:
+            parser.error('early native probe requires --expected-sdk-commit and cannot consume an archive or other mode')
+    elif not args.archive or not args.manifest:
+        parser.error('--archive and --manifest are required outside the early native probe')
     args.output = args.output.resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     report = {"status": "running"}
     try:
-        (run_readonly_only if args.readonly_only else run)(args, report)
+        selected = (run_native_time_array_probe if args.native_time_array_probe_bundle else
+                    run_readonly_only if args.readonly_only else run)
+        selected(args, report)
     except BaseException as error:
         report.update(status="failed", failure=type(error).__name__ + ": " + str(error)[-6000:])
         raise

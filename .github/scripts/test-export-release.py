@@ -472,6 +472,58 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertTrue(ku.is_file())
         self.assertFalse(list(self.root.glob('ku-installed-time-array-*')))
 
+    def test_gnu_pe_imports_use_sibling_tool_and_record_non_system_dependency_chain(self):
+        tools = self.root / 'mingw-bin'
+        system = self.root / 'Windows' / 'System32'
+        deployment = self.root / '最终 程序'
+        for directory in (tools, system, deployment):
+            directory.mkdir(parents=True)
+        for name in ('gcc.exe', 'objdump.exe', 'libgcc_s_test.dll', 'private-pthread-test.dll'):
+            (tools / name).write_bytes(name.encode())
+        (system / 'KERNEL32.dll').write_bytes(b'system')
+        program = deployment / 'modules.exe'
+        program.write_bytes(b'final executable fixture')
+        env = {'KU_GNU_CC': str(tools / 'gcc.exe'), 'SystemRoot': str(system.parent), 'PATH': str(tools)}
+        runtime = dict(env, PATH=str(system))
+        old_limit = self.consumer.OWNER.MAX_CAPTURE_BYTES
+        calls = []
+
+        def invoke(command, cwd, selected, seconds=300):
+            calls.append(command)
+            self.assertEqual(command[:2], [tools / 'objdump.exe', '-p'])
+            self.assertEqual(selected, env)
+            self.assertEqual(seconds, 15)
+            self.assertLessEqual(self.consumer.OWNER.MAX_CAPTURE_BYTES, 256 * 1024)
+            self.assertEqual(cwd, deployment if command[-1] == 'modules.exe' else tools)
+            extra = {'modules.exe': 'libgcc_s_test.dll', 'libgcc_s_test.dll': 'private-pthread-test.dll'}.get(command[-1])
+            text = 'file format pei-x86-64\n DLL Name: KERNEL32.dll\n'
+            if extra:
+                text += ' DLL Name: ' + extra + '\n'
+            return subprocess.CompletedProcess(command, 0, text.encode(), b'')
+
+        detail = {}
+        with mock.patch.object(self.consumer, 'invoke', side_effect=invoke):
+            self.consumer.record_windows_gnu_pe_imports(detail, program, self.root, env, runtime)
+        imports = detail['pe_imports']
+        self.assertEqual(imports['status'], 'captured')
+        self.assertEqual(len(calls), 3)
+        self.assertIsNone(imports['imports'][1]['runtime_file_first_match'])
+        self.assertEqual(imports['imports'][1]['build_path_first_match'], str(tools / 'libgcc_s_test.dll'))
+        self.assertEqual(imports['dependencies'][0]['imports'][1]['build_path_first_match'], str(tools / 'private-pthread-test.dll'))
+        self.assertTrue(self.consumer.pe_imports_require_non_system_libgcc(imports))
+        self.assertEqual(self.consumer.OWNER.MAX_CAPTURE_BYTES, old_limit)
+        self.assertEqual(runtime['PATH'], str(system))
+
+    def test_gnu_pe_import_probe_restores_existing_capture_limit_on_failure(self):
+        for name in ('gcc.exe', 'objdump.exe'):
+            (self.root / name).write_bytes(b'tool fixture')
+        env = {'KU_GNU_CC': str(self.root / 'gcc.exe')}
+        old_limit = self.consumer.OWNER.MAX_CAPTURE_BYTES
+        with mock.patch.object(self.consumer, 'invoke', side_effect=RuntimeError('bounded tool failure')):
+            with self.assertRaisesRegex(RuntimeError, 'bounded tool failure'):
+                self.consumer.record_windows_gnu_pe_imports({}, self.root / 'program.exe', self.root, env, {})
+        self.assertEqual(self.consumer.OWNER.MAX_CAPTURE_BYTES, old_limit)
+
     def installed_tls_orchestration(self, failure=None):
         """Only the archive/lifetime protocol is mocked, not claimed as TLS proof.
 

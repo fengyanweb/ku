@@ -13,6 +13,11 @@ on:
         required: false
         default: ''
         type: string
+      early_loader_probe:
+        description: Diagnose the GNU producer's installed calendar loader before full contracts
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       platform_set:
@@ -26,6 +31,11 @@ on:
         required: false
         default: ''
         type: string
+      early_loader_probe:
+        description: Diagnose the GNU producer's installed calendar loader before full contracts
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -132,6 +142,22 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-gnu'
         shell: pwsh
         run: pwsh -NoLogo -NoProfile -NonInteractive -File scripts/package-release.ps1 -Target '${{ matrix.target }}'
+      - name: Probe the GNU calendar loader before full contracts
+        if: inputs.early_loader_probe && matrix.target == 'x86_64-pc-windows-gnu'
+        shell: pwsh
+        run: |
+          & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --native-time-array-probe-bundle 'release/${{ matrix.target }}' --repo . --output "$env:RUNNER_TEMP/gnu-loader-probe.json" --expected-sdk-commit $env:GITHUB_SHA
+          if ($LASTEXITCODE) { throw 'Early GNU calendar loader probe failed; inspect the preserved bounded report' }
+      - name: Summarize the optional GNU loader probe
+        if: always() && inputs.early_loader_probe && matrix.target == 'x86_64-pc-windows-gnu'
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:RUNNER_TEMP 'gnu-loader-probe.json'
+          if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $text = Get-Content -LiteralPath $path -Raw
+            if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 65536) { throw 'GNU loader probe metadata exceeds its output bound' }
+            Write-Output "GNU loader probe report: $text"
+          } else { Write-Output 'GNU loader probe did not create a report; inspect the producer/probe failure above.' }
       - name: Check the CLI and manifest contracts
         shell: pwsh
         run: |
