@@ -3693,12 +3693,15 @@ int main(void) {
 fn native_task_direct_catch_owner_releases_success_and_partial_error_paths() {
     let tasks = task_lower::lower_program(&checked(
         r#"
-async fn Leaf(good:bool):str! {if(good){return ok("kept")} fail "expected"}
+async fn Leaf(good:bool):str! {if(good){return ok("kept")} fail "expected:"+str(good)}
 async fn Inspect(good:bool):str! {
  output="initial" i=0
  while(i<4) {
   try {first=(await Leaf(good))? second=(await Leaf(true))? output=first+":"+second}
-  catch(error){output="caught:"+error.code.clone()}
+  catch(error){
+   if(error.message!="expected:false") fail "lost owned error message"
+   output="caught:"+error.code.clone()
+  }
   i=i+1
  }
  return ok(output)
