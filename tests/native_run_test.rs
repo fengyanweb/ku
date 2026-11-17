@@ -376,7 +376,11 @@ fn native_build_impl(
 }
 
 fn native_generated_c(dir: &Path, out_stem: &str) -> PathBuf {
-    let root = dir.join(".ku").join("build").join("debug").join("c");
+    native_generated_c_profile(dir, out_stem, "debug")
+}
+
+fn native_generated_c_profile(dir: &Path, out_stem: &str, profile: &str) -> PathBuf {
+    let root = dir.join(".ku").join("build").join(profile).join("c");
     let expected_name = format!("{out_stem}.c");
     let mut matches = Vec::new();
     for entry in fs::read_dir(&root)
@@ -2196,11 +2200,11 @@ fn native_import_graph_binary_runs_after_sources_removed() {
 #[test]
 fn native_fs_base_is_executable_relative_relocatable_and_source_free() {
     let container = unique_temp_dir("fs-relocatable-base");
-    let original = container.join("original-tree");
-    let source = original.join("source");
-    let bin = original.join("bin");
-    let build_cwd = container.join("build-cwd");
-    let launch_cwd = container.join("launch-cwd");
+    let original = container.join("original-tree 中文");
+    let source = original.join("source 源");
+    let bin = original.join("bin 目标");
+    let build_cwd = container.join("build-cwd 调用者");
+    let launch_cwd = container.join("launch-cwd 运行处");
     for directory in [&source, &bin, &build_cwd, &launch_cwd] {
         fs::create_dir_all(directory).expect("create relocatable fs test directory");
     }
@@ -2211,7 +2215,7 @@ fn native_fs_base_is_executable_relative_relocatable_and_source_free() {
     .expect("write imported module");
     fs::write(source.join("asset.txt"), "asset-data").expect("write source-relative asset");
     fs::write(
-        source.join("main.ku"),
+        source.join("入口 中文.ku"),
         r#"import { Label } from "./math.ku"
 import fs from "std.fs"
 
@@ -2228,14 +2232,15 @@ fn main(): null! {
     )
     .expect("write relocatable entry");
 
-    let entry = source.join("main.ku");
-    let executable = bin.join(exe_name("app"));
+    let entry = source.join("入口 中文.ku");
+    let executable = bin.join(exe_name("app 中文"));
     let mut command = Command::new(ku_binary());
     command
         .current_dir(&build_cwd)
         .arg("build")
         .arg("--backend")
         .arg("c")
+        .arg("--release")
         .arg(&entry)
         .arg("-o")
         .arg(&executable);
@@ -2252,7 +2257,7 @@ fn main(): null! {
     }
 
     // C emission remains a hard gate even when this host has no linker.
-    let c_artifact = native_generated_c(&source, "app");
+    let c_artifact = native_generated_c_profile(&source, "app 中文", "release");
     let c = fs::read_to_string(&c_artifact)
         .unwrap_or_else(|err| panic!("read generated C {}: {err}", c_artifact.display()));
     let original_text = original.to_string_lossy();
@@ -2301,13 +2306,13 @@ fn main(): null! {
         return;
     }
 
-    fs::remove_file(source.join("main.ku")).expect("remove entry source");
+    fs::remove_file(source.join("入口 中文.ku")).expect("remove entry source");
     fs::remove_file(source.join("math.ku")).expect("remove imported source");
     fs::remove_dir_all(source.join(".ku")).expect("remove generated source-side artifacts");
-    let relocated = container.join("relocated-tree");
+    let relocated = container.join("relocated-tree 中文");
     fs::rename(&original, &relocated).expect("relocate executable and source data together");
 
-    let relocated_executable = relocated.join("bin").join(exe_name("app"));
+    let relocated_executable = relocated.join("bin 目标").join(exe_name("app 中文"));
     let mut command = Command::new(&relocated_executable);
     command.current_dir(&launch_cwd);
     let run = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS).unwrap_or_else(|error| {
@@ -2322,11 +2327,11 @@ fn main(): null! {
         "import-ok\nasset-data\ntrue\n2\n"
     );
     assert_eq!(
-        fs::read_to_string(relocated.join("source").join("written.txt")).unwrap(),
+        fs::read_to_string(relocated.join("source 源").join("written.txt")).unwrap(),
         "written"
     );
     assert!(!launch_cwd.join("written.txt").exists());
-    assert!(!relocated.join("bin").join("written.txt").exists());
+    assert!(!relocated.join("bin 目标").join("written.txt").exists());
 
     fs::remove_dir_all(&container).ok();
 }

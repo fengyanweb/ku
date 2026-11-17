@@ -205,8 +205,14 @@ fn native_compression_public_project_runs_outside_source_with_space_and_unicode(
     let directory = TempDir::new("compression-public");
     let project = directory.path().join("codec 中文 project");
     fs::create_dir(&project).expect("create isolated Unicode project path");
-    fs::write(project.join("main.ku"), SOURCE).expect("write public compression example");
-    let executable = project.join(if cfg!(windows) { "codec.exe" } else { "codec" });
+    fs::write(project.join("入口 中文.ku"), SOURCE).expect("write public compression example");
+    let deployment = directory.path().join("另外的 输出目录");
+    fs::create_dir(&deployment).expect("create separate Unicode output directory");
+    let executable = deployment.join(if cfg!(windows) {
+        "程序 中文.exe"
+    } else {
+        "程序 中文"
+    });
     let mut build = Command::new(ku_binary());
     build
         .current_dir(&project)
@@ -216,7 +222,7 @@ fn native_compression_public_project_runs_outside_source_with_space_and_unicode(
             "c",
             "--release",
             "--verbose",
-            "main.ku",
+            "入口 中文.ku",
             "-o",
         ])
         .arg(&executable);
@@ -232,7 +238,7 @@ fn native_compression_public_project_runs_outside_source_with_space_and_unicode(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    fs::remove_file(project.join("main.ku")).expect("remove original source before execution");
+    fs::remove_file(project.join("入口 中文.ku")).expect("remove original source before execution");
     let mut run = Command::new(&executable);
     run.current_dir(directory.path());
     let output = run_bounded(

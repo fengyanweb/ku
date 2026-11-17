@@ -20,6 +20,8 @@ use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
 
+#[path = "cli_gnu_workspace.rs"]
+mod gnu_workspace;
 #[path = "cli_calendar.rs"]
 mod native_calendar;
 #[path = "cli_compression.rs"]
@@ -7311,14 +7313,45 @@ fn compile_c_source_with_output(
         // starts from a fresh staging path and can never touch the old output.
         let output_staging = LinkOutputStaging::create(output)?;
         let temporary_output = output_staging.path();
-        let mut command = Command::new(&candidate.program);
-        add_c_compiler_arguments(
-            &mut command,
-            &candidate.args,
-            staged_compression
-                .as_ref()
-                .map_or(&[], |inputs| inputs.include_dirs.as_slice()),
+        let mut tool_workspace = if cfg!(windows)
+            && target_is_windows
+            && (cfg!(target_env = "gnu")
+                || compiler_uses_windows_mingw_abi(&candidate)
+                || effective_native_target.is_some_and(|target| {
+                    target.contains("windows-gnu") || target.contains("mingw")
+                })) {
+            Some(gnu_workspace::Workspace::create()?)
+        } else {
+            None
+        };
+        let compiler_source = if let Some(workspace) = &mut tool_workspace {
+            workspace.source(source)?
+        } else {
+            source.to_path_buf()
+        };
+        let compiler_output = tool_workspace.as_ref().map_or_else(
+            || temporary_output.to_path_buf(),
+            |workspace| workspace.output_argument(),
         );
+        let compiler_includes = staged_compression
+            .as_ref()
+            .map_or(&[][..], |inputs| inputs.include_dirs.as_slice());
+        let compiler_includes = if let Some(workspace) = &mut tool_workspace {
+            compiler_includes
+                .iter()
+                .map(|path| workspace.include(path))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            compiler_includes.to_vec()
+        };
+        let compiler_mysql_header =
+            if let (Some(workspace), Some(header)) = (&mut tool_workspace, &libmysql_include) {
+                Some(workspace.mysql_headers(header)?)
+            } else {
+                libmysql_include.clone()
+            };
+        let mut command = Command::new(&candidate.program);
+        add_c_compiler_arguments(&mut command, &candidate.args, &compiler_includes);
         for argument in target_arguments {
             command.arg(argument);
         }
@@ -7327,8 +7360,10 @@ fn compile_c_source_with_output(
                 command.arg(format!("--target={probed_target}"));
             }
         }
-        let compiler_output = temporary_output;
-        add_gnu_c_source_and_output(&mut command, source, compiler_output);
+        add_gnu_c_source_and_output(&mut command, &compiler_source, &compiler_output);
+        if let Some(workspace) = &tool_workspace {
+            workspace.configure(&mut command);
+        }
         if needs_native_tls {
             command.arg("-DKU_NATIVE_TLS_ENABLED=1");
         }
@@ -7339,7 +7374,7 @@ fn compile_c_source_with_output(
                 .is_some_and(|pack| pack.contract.crt == "msvc-dynamic");
         add_gnu_msvc_dynamic_crt(&mut command, msvc_dynamic_crt);
         if needs_libmysql {
-            let header = libmysql_include
+            let header = compiler_mysql_header
                 .as_ref()
                 .expect("std.mysql requires an exact selected development header");
             let family = mysql_requirement
@@ -7364,24 +7399,39 @@ fn compile_c_source_with_output(
             let library = staged_libpq_library
                 .as_ref()
                 .expect("a PG compiler candidate has a private libpq link copy");
-            command.arg(strip_verbatim(library.path()));
+            command.arg(gnu_workspace::library_argument(
+                tool_workspace.as_mut(),
+                library,
+            )?);
         }
         if needs_libmysql {
             if let Some(library) = &staged_libmysql_library {
-                command.arg(strip_verbatim(library.path()));
+                command.arg(gnu_workspace::library_argument(
+                    tool_workspace.as_mut(),
+                    library,
+                )?);
             }
         }
         if let Some(pack) = &staged_native_tls_pack {
-            command.arg(strip_verbatim(pack.archive.path()));
+            command.arg(gnu_workspace::library_argument(
+                tool_workspace.as_mut(),
+                &pack.archive,
+            )?);
             add_gnu_native_tls_libraries(&mut command, pack.contract);
         }
         if let Some(compression) = &staged_compression {
             for archive in &compression.archives {
-                command.arg(strip_verbatim(archive.path()));
+                command.arg(gnu_workspace::library_argument(
+                    tool_workspace.as_mut(),
+                    archive,
+                )?);
             }
         }
         if let Some(calendar) = &staged_calendar {
-            command.arg(strip_verbatim(calendar.archive.path()));
+            command.arg(gnu_workspace::library_argument(
+                tool_workspace.as_mut(),
+                &calendar.archive,
+            )?);
             for library in &calendar.libraries {
                 if calendar.msvc {
                     command.arg("-Xlinker");
@@ -7403,8 +7453,12 @@ fn compile_c_source_with_output(
         }
         match run_build_process_bounded(&mut command, compiler_timeout) {
             Ok(status) if status.success() => {
-                let verified = match validate_link_output_candidate(
-                    temporary_output,
+                let compiler_artifact = tool_workspace.as_ref().map_or_else(
+                    || temporary_output.to_path_buf(),
+                    |workspace| workspace.output_file(),
+                );
+                let mut verified = match validate_link_output_candidate(
+                    &compiler_artifact,
                     source,
                     target,
                     &candidate.label,
@@ -7421,6 +7475,22 @@ fn compile_c_source_with_output(
                         continue;
                     }
                 };
+                if let Some(workspace) = &tool_workspace {
+                    // A different tool volume never participates in the final
+                    // rename. Unicode-capable Rust I/O copies into the original
+                    // same-volume transaction, which is checked again before
+                    // the existing destination snapshot/atomic install path.
+                    workspace.copy_output(&verified, temporary_output)?;
+                    verified = validate_link_output_candidate(
+                        temporary_output,
+                        source,
+                        target,
+                        &candidate.label,
+                        features,
+                        libpq_requirement.as_ref(),
+                        mysql_requirement.as_ref(),
+                    )?;
+                }
                 install_verified_link_output(verified, &output_staging)?;
                 return Ok(());
             }
@@ -8400,9 +8470,14 @@ impl TempBuildDir {
     }
 
     pub(crate) fn create_private(label: &str) -> io::Result<Self> {
+        Self::create_private_in(&env::temp_dir(), label)
+    }
+
+    fn create_private_in(parent: &Path, label: &str) -> io::Result<Self> {
         const MAX_ATTEMPTS: usize = 8;
         for _ in 0..MAX_ATTEMPTS {
-            let path = unique_build_tool_path(label, "dir")?;
+            let name = unique_build_tool_path(label, "dir")?;
+            let path = parent.join(name.file_name().expect("generated temporary name"));
             #[cfg(unix)]
             let builder = {
                 use std::os::unix::fs::DirBuilderExt;
@@ -12786,6 +12861,153 @@ mod tests {
         fs::create_dir(&invalid_output).expect("create invalid output directory");
         assert!(LinkOutputStaging::create(&invalid_output).is_err());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gnu_tool_workspace_preserves_unicode_cwd_and_typed_input_contents() {
+        let owner = TempBuildDir::create_private("gnu-unicode-contract").unwrap();
+        let cwd = owner.path().join("调用者 cwd");
+        let source_dir = owner.path().join("输入 source");
+        fs::create_dir(&cwd).unwrap();
+        fs::create_dir(&source_dir).unwrap();
+        let source = source_dir.join("原始 中文.c");
+        let code = b"/* original executable-relative resource locator ../source */\nint main(void){return 0;}\n";
+        fs::write(&source, code).unwrap();
+        let mut workspace = gnu_workspace::Workspace::create_at(&cwd, owner.path()).unwrap();
+        let root = workspace.output_file().parent().unwrap().to_path_buf();
+        let staged = workspace.source(&source).unwrap();
+        assert!(staged.to_str().unwrap().is_ascii() && staged.is_relative());
+        assert_eq!(fs::read(cwd.join(&staged)).unwrap(), code);
+        let mut command = Command::new("unused-compiler");
+        let original_args = [
+            "-I",
+            "相对 user headers",
+            "-include",
+            "local.h",
+            "-DNAME=用户文字",
+        ];
+        command.args(original_args);
+        workspace.configure(&mut command);
+        add_gnu_c_source_and_output(&mut command, &staged, &workspace.output_argument());
+        assert_eq!(command.get_current_dir(), Some(cwd.as_path()));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&args[..original_args.len()], original_args);
+        assert!(args[original_args.len()..].iter().all(|x| x.is_ascii()));
+        for (key, value) in command.get_envs() {
+            assert!(matches!(key.to_str(), Some("TMP" | "TEMP" | "TMPDIR")));
+            assert!(cwd.join(value.unwrap()).is_dir());
+            assert!(value.unwrap().to_str().unwrap().is_ascii());
+        }
+        let library = source_dir.join("原始 库.a");
+        fs::write(&library, b"verified-library").unwrap();
+        let checksum: [u8; 32] = Sha256::digest(b"verified-library").into();
+        let copied = workspace.library(&library, checksum).unwrap();
+        assert!(copied.to_str().unwrap().is_ascii());
+        assert_eq!(fs::read(cwd.join(copied)).unwrap(), b"verified-library");
+        assert!(workspace.library(&library, [0; 32]).is_err());
+        drop(workspace);
+        assert!(!root.exists());
+        assert_eq!(fs::read(source).unwrap(), code);
+        assert_eq!(fs::read(library).unwrap(), b"verified-library");
+    }
+
+    #[test]
+    fn gnu_tool_workspace_keeps_nested_header_layout_and_empty_headers() {
+        let owner = TempBuildDir::create_private("gnu-header-contract").unwrap();
+        let cwd = owner.path().join("调用目录");
+        let sdk = owner.path().join("SDK 中文 includes");
+        fs::create_dir(&cwd).unwrap();
+        fs::create_dir(&sdk).unwrap();
+        fs::create_dir(sdk.join("mysql")).unwrap();
+        fs::write(sdk.join("mysql/mysql.h"), b"#include \"../common.h\"\n").unwrap();
+        fs::write(sdk.join("common.h"), b"/* shared ABI definitions */\n").unwrap();
+        fs::write(sdk.join("empty.h"), b"").unwrap();
+        let selected = MysqlHeaderSelection {
+            header: sdk.join("mysql/mysql.h"),
+            include_dirs: vec![sdk.join("mysql"), sdk.clone()],
+        };
+        let mut workspace = gnu_workspace::Workspace::create_at(&cwd, owner.path()).unwrap();
+        let staged = workspace.mysql_headers(&selected).unwrap();
+        assert!(staged.header.to_str().unwrap().is_ascii());
+        assert_eq!(
+            fs::read(cwd.join(&staged.header)).unwrap(),
+            b"#include \"../common.h\"\n"
+        );
+        assert_eq!(
+            fs::read(cwd.join(&staged.include_dirs[0]).join("../common.h")).unwrap(),
+            b"/* shared ABI definitions */\n"
+        );
+        assert_eq!(
+            fs::read(cwd.join(&staged.include_dirs[1]).join("empty.h")).unwrap(),
+            b""
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&sdk, sdk.join("loop")).unwrap();
+            assert!(workspace.include(&sdk).is_err());
+        }
+    }
+
+    #[test]
+    fn gnu_tool_workspace_copies_into_original_atomic_output_transaction() {
+        let owner = TempBuildDir::create_private("gnu-install-contract").unwrap();
+        let cwd = owner.path().join("编译 cwd");
+        let output_dir = owner.path().join("其他 输出目录");
+        fs::create_dir(&cwd).unwrap();
+        fs::create_dir(&output_dir).unwrap();
+        let output = output_dir.join("结果 中文.exe");
+        fs::write(&output, b"old installed output").unwrap();
+        let workspace = gnu_workspace::Workspace::create_at(&cwd, owner.path()).unwrap();
+        let root = workspace.output_file().parent().unwrap().to_path_buf();
+        let staging = LinkOutputStaging::create(&output).unwrap();
+        assert_eq!(staging.directory.parent(), Some(output_dir.as_path()));
+        fs::write(workspace.output_file(), b"partial invalid compiler output").unwrap();
+        let target = resolve_build_target(Some("x86_64-windows"))
+            .unwrap()
+            .unwrap();
+        assert!(validate_link_output_candidate(
+            &workspace.output_file(),
+            Path::new("original.c"),
+            Some(&target),
+            "fixture",
+            CSourceFeatures::default(),
+            None,
+            None
+        )
+        .is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"old installed output");
+        let data = dependency_pe(&[]);
+        fs::write(workspace.output_file(), &data).unwrap();
+        let verified = validate_link_output_candidate(
+            &workspace.output_file(),
+            Path::new("original.c"),
+            Some(&target),
+            "fixture",
+            CSourceFeatures::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        workspace.copy_output(&verified, staging.path()).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"old installed output");
+        let copied = validate_link_output_candidate(
+            staging.path(),
+            Path::new("original.c"),
+            Some(&target),
+            "fixture",
+            CSourceFeatures::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        install_verified_link_output(copied, &staging).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), data);
+        drop(verified);
+        drop(workspace);
+        assert!(!root.exists());
     }
 
     #[test]
