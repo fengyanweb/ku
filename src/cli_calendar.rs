@@ -259,24 +259,14 @@ pub(super) fn resolve(
             "ucrt.lib",
             "legacy_stdio_definitions.lib",
         ],
+        // Reported by the locked Rust 1.99.1 GNU target for this calendar
+        // archive. This is intentionally separate from TLS and MSVC.
         "x86_64-pc-windows-gnu" => &[
-            "-ladvapi32",
-            "-lbcrypt",
             "-lkernel32",
             "-lntdll",
             "-luserenv",
             "-lws2_32",
-            "-lsynchronization",
-            "-lmsvcrt",
-            "-lgcc_eh",
-            "-l:libpthread.a",
-            "-lpthread",
-            "-lgcc",
-            "-lmingw32",
-            "-lmingwex",
-            "-lmoldname",
-            "-lmsvcrt-os",
-            "-luser32",
+            "-ldbghelp",
         ],
         _ => {
             return Err(error(
