@@ -1600,6 +1600,7 @@ fn main() {
     # Directory.Move fails atomically when another pack builder won the same
     # destination race. Move-Item could instead nest the payload.
     [System.IO.Directory]::Move($kuTlsPayload, $kuTlsDestination)
+    Write-Output "native-static-libs actual [$Target]: $kuTlsActualNativeLibs"
     Write-Output "created native TLS target pack: $kuTlsDestination"
 }
 finally {

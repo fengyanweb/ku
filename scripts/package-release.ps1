@@ -1778,6 +1778,13 @@ try {
     }
     $rustcOutput = Invoke-CheckedTool "rustc" @("+$script:publisherToolchain", "-vV") $repo $workRoot "rustc" 30000 $wrapper
     if ($rustcOutput -notmatch "(?m)^host: $([regex]::Escape($contract.Target))$") { throw "Publisher Rust host does not match release target '$($contract.Target)'" }
+    # Native pack builders deliberately remain offline. Cargo metadata also
+    # resolves the locked workspace's test/build dependencies, which a normal
+    # release build alone need not download. Prepare that target graph here,
+    # in the publisher's explicit network-enabled preparation phase.
+    $lockBeforeFetch = (Get-FileHash -LiteralPath (Join-Path $repo 'Cargo.lock') -Algorithm SHA256).Hash
+    [void](Invoke-CheckedTool 'cargo' @("+$script:publisherToolchain", 'fetch', '--locked', '--target', $contract.Target) $repo $workRoot 'locked-target-dependencies' 300000 $wrapper)
+    if ((Get-FileHash -LiteralPath (Join-Path $repo 'Cargo.lock') -Algorithm SHA256).Hash -cne $lockBeforeFetch) { throw 'Locked dependency preparation modified Cargo.lock' }
     $script:archiveVerifier = New-NativeTlsArchiveVerifier $repo $workRoot $wrapper
     Write-Host "Building Ku $version for $($contract.Target)..."
     $cargoTarget = Join-Path $workRoot "cargo"
@@ -1785,12 +1792,17 @@ try {
     if ($cargoBuild.ExitCode -ne 0) { throw "cargo failed with exit code $($cargoBuild.ExitCode):`n$($cargoBuild.Output)" }
     $procMacroArtifacts = Get-CargoProcMacroArtifacts $cargoBuild.Stdout $cargoTarget $contract
     $tlsOutputRoot = Join-Path $workRoot "tls-pack"
-    [void](Invoke-CheckedTool "pwsh" @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $builderPath, "-Target", $contract.Target, "-OutputRoot", $tlsOutputRoot) $repo $workRoot "tls-pack" 600000 $wrapper)
+    $tlsBuildOutput = Invoke-CheckedTool "pwsh" @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $builderPath, "-Target", $contract.Target, "-OutputRoot", $tlsOutputRoot) $repo $workRoot "tls-pack" 600000 $wrapper
+    $tlsNativeNotes = [regex]::Matches($tlsBuildOutput, '(?m)^native-static-libs actual \[(?<target>[^\]\r\n]+)\]: (?<libs>[^\r\n]+)\r?$')
+    if ($tlsNativeNotes.Count -ne 1 -or $tlsNativeNotes[0].Groups['target'].Value -cne $contract.Target) { throw 'Native TLS builder did not identify its actual target linker contract' }
+    Write-Output $tlsNativeNotes[0].Value.Trim()
     $tlsPack = Join-Path $tlsOutputRoot $contract.Target
     $calendarPack = Join-Path $workRoot 'calendar-pack'
     $calendarBuilder = Join-Path $repo '.github/scripts/build-native-calendar.py'
     [void](Invoke-CheckedTool $script:releasePython @('-B', $calendarBuilder, '--target', $contract.Target, '--output', $calendarPack, '--toolchain', $script:releaseToolchain, '--target-dir', $cargoTarget) $repo $workRoot 'calendar-pack-build' 900000 $wrapper)
     Assert-CalendarPack $calendarPack $contract
+    $calendarLinkIdentity = Get-Content -LiteralPath (Join-Path $calendarPack 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    Write-Output "native-static-libs actual [$($contract.Target)/calendar]: $($calendarLinkIdentity.native_static_libs.raw)"
 
     if (-not $ExistingVsix) {
         Copy-ExtensionSource $extensionSource $extensionWork
