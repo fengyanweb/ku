@@ -2856,7 +2856,23 @@ impl<'a> FunctionLowerer<'a> {
         };
         let handler = self.lower_expr_with_expected(&args[1], Some(&expected))?;
         let (arity, response_abi) = match &handler.ty {
-            IrType::Closure { params, ret, .. } => {
+            IrType::Closure {
+                params,
+                param_modes,
+                ret,
+            } => {
+                if params.len() > 1
+                    || param_modes.len() != params.len()
+                    || param_modes.iter().any(|mode| *mode != ParamMode::Owned)
+                    || params
+                        .first()
+                        .is_some_and(|ty| *ty != IrType::Named(HTTP_REQUEST_TYPE.into()))
+                {
+                    return Err(KuError::runtime(
+                        "native HTTP handler parameter ABI requires zero parameters or one owned HttpRequest; View callbacks are not implemented",
+                        args[1].span,
+                    ));
+                }
                 // Keep the callable's actual return type. Only HTTP dispatch
                 // adapts structural objects; standalone calls still return an
                 // ordinary owned object with the same inference and ABI.

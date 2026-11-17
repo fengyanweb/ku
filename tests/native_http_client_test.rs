@@ -43,7 +43,7 @@ fn generated(source: &str) -> String {
     c::generate_c_source(&lowered).unwrap()
 }
 #[test]
-fn native_http_unknown_handler_return_is_rejected_before_response_abi_cast() {
+fn native_http_unknown_or_view_handler_abi_is_rejected_before_dispatch() {
     let ast = checked(
         r#"
 fn Reply() { box={value:{status:200,headers:{},body:"raw"}}; return box["value"] }
@@ -52,6 +52,17 @@ fn main() { app=http.server(); app.get("/",Reply) }
     );
     let error = ir::lower_program(&ast).unwrap_err().to_string();
     assert!(error.contains("native HTTP handler return type"), "{error}");
+    let ast = checked(
+        r#"
+fn Reply(&req:HttpRequest):HttpResponse { return http.text(req.path.clone()) }
+fn main() { app=http.server(); app.get("/",Reply) }
+"#,
+    );
+    let error = ir::lower_program(&ast).unwrap_err().to_string();
+    assert!(
+        error.contains("native HTTP handler parameter ABI"),
+        "{error}"
+    );
 }
 fn run_c(label: &str, source: &str) -> Option<String> {
     let dir = TempDir::new(label);
