@@ -2855,9 +2855,20 @@ impl<'a> FunctionLowerer<'a> {
             ret: Box::new(IrType::Unknown),
         };
         let handler = self.lower_expr_with_expected(&args[1], Some(&expected))?;
-        let (arity, returns_result) = match &handler.ty {
+        let (arity, response_abi) = match &handler.ty {
             IrType::Closure { params, ret, .. } => {
-                (params.len(), matches!(ret.as_ref(), IrType::Result(_)))
+                // Keep the callable's actual return type. Only HTTP dispatch
+                // adapts structural objects; standalone calls still return an
+                // ordinary owned object with the same inference and ABI.
+                let abi = match ret.as_ref() {
+                    IrType::Named(name) if name == "__ku_object" => 3,
+                    IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name=="__ku_object") => {
+                        4
+                    }
+                    IrType::Result(_) => 1,
+                    _ => 0,
+                };
+                (params.len(), abi)
             }
             _ => {
                 return Err(KuError::runtime(
@@ -2873,10 +2884,7 @@ impl<'a> FunctionLowerer<'a> {
             "del" => "DELETE",
             _ => "GET",
         };
-        let intrinsic = format!(
-            "__ku_http_route:{http_method}:{arity}:{}",
-            if returns_result { 1 } else { 0 }
-        );
+        let intrinsic = format!("__ku_http_route:{http_method}:{arity}:{response_abi}");
         self.emit_temp(IrExpr {
             kind: IrExprKind::Call {
                 callee: Box::new(IrExpr {

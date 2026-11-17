@@ -4316,6 +4316,9 @@ fn emit_result_abi_phase(
     if program_uses_http(program) {
         for inner in [
             IrType::Named("__ku_http_response".to_string()),
+            // The HTTP-owned adapter calls Result<Object> handlers through
+            // their real ABI before converting only the successful payload.
+            IrType::Named("__ku_object".to_string()),
             IrType::Null,
         ] {
             if !result_types.contains(&inner) {

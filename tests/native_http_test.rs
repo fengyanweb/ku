@@ -242,6 +242,26 @@ fn spawn_native_server_settings_with_observation(
     max_requests: Option<usize>,
     settings: &[(&str, &str)],
 ) -> Option<NativeHttpServer> {
+    spawn_native_server_profile(
+        name,
+        source,
+        address,
+        observed_timeout,
+        max_requests,
+        settings,
+        false,
+    )
+}
+
+fn spawn_native_server_profile(
+    name: &str,
+    source: &str,
+    address: &str,
+    observed_timeout: Option<Duration>,
+    max_requests: Option<usize>,
+    settings: &[(&str, &str)],
+    release: bool,
+) -> Option<NativeHttpServer> {
     let dir = unique_temp_dir(name);
     let entry = "server.ku";
     fs::write(dir.join(entry), source.replace("__ADDRESS__", address)).expect("write ku source");
@@ -264,6 +284,10 @@ fn spawn_native_server_settings_with_observation(
     command
         .current_dir(&dir)
         .args(["build", "--native", entry, "-o", &out]);
+    if release {
+        command.arg("--release");
+    }
+
     let build = run_bounded(&mut command, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS)
         .unwrap_or_else(|error| panic!("native HTTP server build was not bounded: {error}"));
     let combined = format!(
@@ -10190,6 +10214,91 @@ fn main():null! {
                 assert!(response.contains("content-type: text/plain; charset=utf-8\r\n"));
                 assert!(response.ends_with("legacy"));
             }
+        }
+    }
+    assert!(watchdog.wait_for_natural_exit(RUN_TIMEOUT).success());
+}
+
+#[test]
+fn native_http_inferred_object_handlers_preserve_callable_abi_and_owned_results() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let source = r#"
+import {http,time} from "std"
+fn Custom(){return {status:201,headers:{"x-mode":"plain"},body:"plain"}}
+fn Echo(req:HttpRequest){return {status:202,headers:{"x-mode":"request"},body:req.path+":"+req.body}}
+fn Maybe(req:HttpRequest){
+ if(req.path=="/failed") return err("controlled "+req.path)
+ return ok({status:203,headers:{"x-mode":"result"},body:req.body})
+}
+fn EmptyResult(){return ok({status:204,headers:{},body:""})}
+fn Slow(){r={status:200,headers:{},body:"too late"};time.sleep(100);return r}
+fn main():null! {
+ plain=Custom()
+ if(plain["body"]?!="plain") fail "ordinary callable must remain an object"
+ app=http.server({handler_timeout_ms:20,max_buffer_bytes:1048576})
+ calls=0
+ if(true){
+  prefix="env"+"-"
+  app.get("/closure",fn(){calls+=1;return {status:200,headers:{"x-mode":"captured"},body:prefix+str(calls)}})
+ }
+ app.get("/plain",Custom)
+ app.post("/echo",Echo)
+ app.post("/result",Maybe)
+ app.post("/failed",Maybe)
+ app.get("/empty",EmptyResult)
+ app.get("/slow",Slow)
+ app.listen("__ADDRESS__")?
+ return ok(null)
+}
+"#;
+    let Some(mut server) = spawn_native_server_profile(
+        "inferred-object-handler-abi",
+        source,
+        &address,
+        None,
+        Some(8),
+        &[],
+        true,
+    ) else {
+        return;
+    };
+    let generated = fs::read_to_string(server.c_source()).unwrap();
+    assert!(
+        generated.contains("KuObject* Custom(void)"),
+        "general inference or callable ABI was changed"
+    );
+    assert!(generated.contains("__ku_http_response_from_object_result("));
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for count in 1..=2 {
+        let response = http_response(
+            &address,
+            "GET /closure HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+            Duration::from_secs(3),
+        );
+        assert_status(&response, "HTTP/1.1 200 OK");
+        assert!(response.contains("x-mode: captured\r\n"), "{response}");
+        assert!(
+            response.ends_with(&format!("env-{count}")),
+            "callback replay or lost environment: {response}"
+        );
+    }
+    for (method, path, body, status, expected) in [
+        ("GET", "/plain", "", 201, "plain"),
+        ("POST", "/echo", "hello 中文🙂", 202, "/echo:hello 中文🙂"),
+        ("POST", "/result", "result 中文🙂", 203, "result 中文🙂"),
+        ("POST", "/failed", "", 500, "Internal Server Error"),
+        ("GET", "/empty", "", 204, ""),
+        ("GET", "/slow", "", 504, "Gateway Timeout"),
+    ] {
+        let response=http_response(&address,&format!("{method} {path} HTTP/1.1\r\nHost: local\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()),Duration::from_secs(3));
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{path}: {response}"
+        );
+        assert!(response.ends_with(expected), "{path}: {response}");
+        if status == 204 {
+            assert!(response.ends_with("\r\n\r\n"));
         }
     }
     assert!(watchdog.wait_for_natural_exit(RUN_TIMEOUT).success());

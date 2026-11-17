@@ -272,7 +272,7 @@ static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len
    names belong to the route/handler, not to shared trie nodes: two methods (or
    two routes with a shared param-shaped prefix) may legitimately use different
    names for the same captured segment positions. */
-typedef struct { char* method; char** param_names; size_t nparams; void* invoke; void* env; int arity; int returns_result; } KuHttpHandler;
+typedef struct { char* method; char** param_names; size_t nparams; void* invoke; void* env; int arity; int returns_result; } KuHttpHandler; /* 0 response, 1 Result, 2 Task, 3 object, 4 Result<object>. */
 /* Stage 8b: a routing trie node. Each node holds static children (keyed by the
    literal path segment) and at most one `{param}` child. Matching prefers a
    static child over the param child at every segment (with backtracking), which
@@ -795,6 +795,19 @@ static KuStruct___ku_http_response ku_http_response_from_result(KuResult_struct_
   ku_error_drop(&r.error);
   return v;
 }
+/* Object-returning handlers retain their original callable ABI and ownership.
+ * Adapt only after their one invocation, before the owner's ordinary finish
+ * poll, response admission and output handoff. No environment is replaced. */
+static KuStruct___ku_http_response __ku_http_response_from_object_result(KuResult_object result) {
+  if(result.ok) {
+    KuStruct___ku_http_response response=__ku_http_response_from_object_owned(ku_object_move(&result.value));
+    if(response.status==500)ku_http_failure_current.reason=KU_HTTP_ERROR_HANDLER_500;
+    return response;
+  }
+  KuResult_struct___ku_http_response failure={0};
+  failure.error=ku_error_move(&result.error);
+  return ku_http_response_from_result(failure);
+}
 static int ku_http_field_value_safe(const uint8_t* ptr, size_t len) {
   for (size_t i = 0; i < len; i++) {
     uint8_t c = ptr[i];
@@ -1013,7 +1026,7 @@ static int ku_http_input_select(KuHttpServer* server,const KuHttpInput* input,
   if(input->route) {
     const KuHttpRouteToken* token=input->route;
     if(token->status!=200u)return (int)token->status;
-    if(token->param_count>KU_HTTP_MAX_SEGS || token->arity>1u || token->returns_result>2u)return 500;
+    if(token->param_count>KU_HTTP_MAX_SEGS || token->arity>1u || token->returns_result>4u)return 500;
     selected->invoke=token->invoke;selected->env=token->env;selected->param_names=token->param_names;
     selected->nparams=token->param_count;selected->arity=token->arity;
     selected->returns_result=token->returns_result;*count=token->param_count;
@@ -1381,7 +1394,13 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
       if(fields&32u) { req.body = ku_http_input_take_body(input); }
       if(fields&4u)req.query = ku_http_parse_query(target, path_len);
       if(fields&1u) {req.headers = input->headers; input->headers = NULL;}
-      if (route->returns_result) {
+      if (route->returns_result==3 || route->returns_result==4) {
+        ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
+        resp=route->returns_result==4
+          ? __ku_http_response_from_object_result(((KuResult_object(*)(void*,KuStruct___ku_http_request))route->invoke)(route->env,req))
+          : __ku_http_response_from_object_owned(((KuObject*(*)(void*,KuStruct___ku_http_request))route->invoke)(route->env,req));
+        handler_timed_out=__ku_sync_finish_request(&handler_signal);
+      } else if (route->returns_result) {
         ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
         KuResult_struct___ku_http_response rr = ((KuResult_struct___ku_http_response(*)(void*, KuStruct___ku_http_request))route->invoke)(route->env, req);
         handler_timed_out = __ku_sync_finish_request(&handler_signal);
@@ -1393,7 +1412,13 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
         handler_timed_out = __ku_sync_finish_request(&handler_signal);
       }
     } else {
-      if (route->returns_result) {
+      if (route->returns_result==3 || route->returns_result==4) {
+        ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
+        resp=route->returns_result==4
+          ? __ku_http_response_from_object_result(((KuResult_object(*)(void*))route->invoke)(route->env))
+          : __ku_http_response_from_object_owned(((KuObject*(*)(void*))route->invoke)(route->env));
+        handler_timed_out=__ku_sync_finish_request(&handler_signal);
+      } else if (route->returns_result) {
         ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
         KuResult_struct___ku_http_response rr = ((KuResult_struct___ku_http_response(*)(void*))route->invoke)(route->env);
         handler_timed_out = __ku_sync_finish_request(&handler_signal);
@@ -1409,7 +1434,7 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
       /* The execution worker owns the response until publication. A plain
          handler may complete after its original deadline; drop that response
          before selecting 504/500. Failed Result transport was dropped above. */
-      if (!route->returns_result) ku_drop_struct___ku_http_response(&resp);
+      if (!route->returns_result || route->returns_result>=3) ku_drop_struct___ku_http_response(&resp);
       ku_http_failure_current.reason=handler_timed_out ? KU_HTTP_ERROR_DEADLINE : KU_HTTP_ERROR_HANDLER_EXIT;
       return handler_timed_out
         ? ku_http_status_response(504, "Gateway Timeout")
