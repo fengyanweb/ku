@@ -526,6 +526,16 @@ fn native_task_http_headers_guard_validates_owners_aliases_and_active_results() 
         ],
     });
     let c = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
+    let hook = allocation::ALLOCATION_HOOK.replacen(
+        "  ku_perf_calls++;",
+        "  if(ku_perf_calls++ == ku_test_fail_at)return NULL;",
+        1,
+    );
+    let c = c.replacen(
+        "typedef struct KuString {",
+        &format!("static size_t ku_test_fail_at=SIZE_MAX;\n{hook}\ntypedef struct KuString {{"),
+        1,
+    );
     // This setter boundary test stubs only driver reservation, not map
     // allocation/mutation. Full adapter admission and alias checks above stay
     // real; the stub also proves rejected growth never requests a reservation.
@@ -533,9 +543,10 @@ fn native_task_http_headers_guard_validates_owners_aliases_and_active_results() 
     assert!(c.contains(marker));
     let c = c.replacen(marker, &format!(r#"
 static size_t test_header_growth_calls;
+static int test_header_reject_reservation;
 static uint32_t test_header_reconcile(void* raw) {{ return raw ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_INVALID_ARGUMENT; }}
 static uint32_t test_header_grow(const KuTaskDriverTicketV1* ticket,size_t bytes) {{
-  (void)ticket;(void)bytes;test_header_growth_calls++;return KU_TASK_DRIVER_OK;
+  (void)ticket;(void)bytes;test_header_growth_calls++;return test_header_reject_reservation ? KU_TASK_DRIVER_LIMIT : KU_TASK_DRIVER_OK;
 }}
 {marker}"#), 1);
     let reservation =
@@ -604,6 +615,78 @@ int main(void) {
   KuValue* updated=ku_object_get(boundary.headers,existing);
   if(!updated || updated->tag!=KU_STR || !ku_string_equal(updated->as.s,new_value))return 97;
   ku_drop_struct___ku_http_response(&boundary);
+  if(ku_perf_live_bytes || ku_perf_live_allocations || ku_perf_overflow)return 98;
+  /* Exercise each real allocation in three mutation shapes. Only the driver's
+   * reserve/reconcile callbacks are deterministic test doubles: all map,
+   * table, key, value and cached-default allocations/frees use the real code.
+   * Eight fixed failure positions include every current allocation site;
+   * position eight rejects the byte reservation before any allocation. */
+  for(size_t mode=0;mode<3u;mode++) {
+    size_t rejected_allocations=0,successful_updates=0;
+    for(size_t point=0;point<9u;point++) {
+      KuStruct___ku_http_response original={.status=200};
+      KuString caller_key={0},caller_value={0};
+      if(!ku_object_string_try_concat(ku_string_static((const uint8_t*)"owned-body",10),(KuString){0},&original.body)
+          || !ku_object_string_try_concat(ku_string_static((const uint8_t*)"application/test",16),(KuString){0},&original.content_type)
+          || !ku_object_string_try_concat(ku_string_static((const uint8_t*)"/owned-next",11),(KuString){0},&original.location)
+          || !ku_object_string_try_concat(ku_string_static((const uint8_t*)"target",6),(KuString){0},&caller_key)
+          || !ku_object_string_try_concat(ku_string_static((const uint8_t*)"after-owned",11),(KuString){0},&caller_value))return 101;
+      if(mode) {
+        original.headers=ku_object_new(8u);
+        size_t count=mode==1u?1u:5u;
+        for(size_t i=0;i<count;i++) {
+          char text[32];int n=mode==1u?snprintf(text,sizeof(text),"target"):snprintf(text,sizeof(text),"h%zu",i);
+          KuString entry_key={0},entry_value={0};
+          if(n<=0 || (size_t)n>=sizeof(text)
+              || !ku_object_string_try_concat(ku_string_static((const uint8_t*)text,(size_t)n),(KuString){0},&entry_key)
+              || !ku_object_string_try_concat(ku_string_static((const uint8_t*)"before-owned",12),(KuString){0},&entry_value))return 102;
+          ku_object_set(original.headers,entry_key,ku_v_str(entry_value));
+        }
+      }
+      KuObject* old_map=original.headers;KuEntry* old_table=old_map?old_map->entries:NULL;
+      KuEntry old_entries[8];if(old_map)memcpy(old_entries,old_table,sizeof(old_entries));
+      size_t old_len=old_map?old_map->len:0,old_cap=old_map?old_map->cap:0;
+      uint8_t* old_body=original.body.ptr;uint8_t* old_type=original.content_type.ptr;uint8_t* old_location=original.location.ptr;
+      uint8_t* old_caller_key=caller_key.ptr;uint8_t* old_caller_value=caller_value.ptr;
+      size_t baseline_bytes=ku_perf_live_bytes,baseline_allocations=ku_perf_live_allocations;
+      size_t calls_before=ku_perf_calls,growth_before=test_header_growth_calls;
+      test_header_reject_reservation=point==8u;
+      ku_test_fail_at=point==8u?SIZE_MAX:ku_perf_calls+point;
+      uint32_t stored=ku_task_host_http_header_set(&host,&original,caller_key,caller_value);
+      ku_test_fail_at=SIZE_MAX;test_header_reject_reservation=0;
+      if(test_header_growth_calls!=growth_before+1u || original.status!=200
+          || original.body.ptr!=old_body || original.body.len!=10u || memcmp(original.body.ptr,"owned-body",10)
+          || original.content_type.ptr!=old_type || original.content_type.len!=16u || memcmp(original.content_type.ptr,"application/test",16)
+          || original.location.ptr!=old_location || original.location.len!=11u || memcmp(original.location.ptr,"/owned-next",11)
+          || caller_key.ptr!=old_caller_key || caller_key.len!=6u || memcmp(caller_key.ptr,"target",6)
+          || caller_value.ptr!=old_caller_value || caller_value.len!=11u || memcmp(caller_value.ptr,"after-owned",11))return 103;
+      if(point==8u || stored==KU_TASK_HOST_ALLOCATION_FAILED) {
+        if(stored!=(point==8u?KU_TASK_DRIVER_LIMIT:KU_TASK_HOST_ALLOCATION_FAILED)
+            || original.headers!=old_map || (old_map && (old_map->entries!=old_table || old_map->len!=old_len
+              || old_map->cap!=old_cap || memcmp(old_table,old_entries,sizeof(old_entries))))
+            || ku_perf_live_bytes!=baseline_bytes || ku_perf_live_allocations!=baseline_allocations)return 104;
+        if(point==8u && ku_perf_calls!=calls_before)return 105;
+        if(point!=8u)rejected_allocations++;
+      } else {
+        if(stored!=KU_TASK_DRIVER_OK || !original.headers)return 106;
+        KuValue* changed=ku_object_get(original.headers,caller_key);
+        if(!changed || changed->tag!=KU_STR || changed->as.s.ptr==caller_value.ptr
+            || !ku_string_equal(changed->as.s,caller_value))return 107;
+        if(mode==0u) {
+          KuValue* content_type=ku_object_get(original.headers,ku_string_static((const uint8_t*)"content-type",12));
+          KuValue* location=ku_object_get(original.headers,ku_string_static((const uint8_t*)"location",8));
+          if(!content_type || content_type->tag!=KU_STR || !ku_string_equal(content_type->as.s,original.content_type)
+              || content_type->as.s.ptr==original.content_type.ptr || !location || location->tag!=KU_STR
+              || !ku_string_equal(location->as.s,original.location) || location->as.s.ptr==original.location.ptr)return 108;
+        } else if(original.headers!=old_map || original.headers->len!=(mode==1u?1u:6u)
+            || original.headers->cap!=(mode==1u?8u:16u))return 109;
+        successful_updates++;
+      }
+      ku_drop_struct___ku_http_response(&original);ku_string_drop(&caller_key);ku_string_drop(&caller_value);
+      if(ku_perf_live_bytes || ku_perf_live_allocations || ku_perf_overflow)return 110;
+    }
+    if(rejected_allocations<(mode==0u?6u:mode==1u?1u:3u) || !successful_updates)return 111;
+  }
   puts("task-http-active-payload-ok");return 0;
 }
 "#;
