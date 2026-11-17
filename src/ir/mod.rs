@@ -2865,8 +2865,16 @@ impl<'a> FunctionLowerer<'a> {
                     IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name=="__ku_object") => {
                         4
                     }
-                    IrType::Result(_) => 1,
-                    _ => 0,
+                    IrType::Named(name) if name == HTTP_RESPONSE_TYPE => 0,
+                    IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name==HTTP_RESPONSE_TYPE) => {
+                        1
+                    }
+                    _ => {
+                        return Err(KuError::runtime(
+                            "native HTTP handler return type must be HttpResponse or a structural response object, optionally wrapped in Result; dynamic unknown returns cannot use the response ABI",
+                            args[1].span,
+                        ));
+                    }
                 };
                 (params.len(), abi)
             }

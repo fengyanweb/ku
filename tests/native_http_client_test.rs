@@ -42,6 +42,17 @@ fn generated(source: &str) -> String {
     ir::verify_borrow_contract(&lowered).unwrap();
     c::generate_c_source(&lowered).unwrap()
 }
+#[test]
+fn native_http_unknown_handler_return_is_rejected_before_response_abi_cast() {
+    let ast = checked(
+        r#"
+fn Reply() { box={value:{status:200,headers:{},body:"raw"}}; return box["value"] }
+fn main() { app=http.server(); app.get("/",Reply) }
+"#,
+    );
+    let error = ir::lower_program(&ast).unwrap_err().to_string();
+    assert!(error.contains("native HTTP handler return type"), "{error}");
+}
 fn run_c(label: &str, source: &str) -> Option<String> {
     let dir = TempDir::new(label);
     let path = dir.path().join("test.c");
