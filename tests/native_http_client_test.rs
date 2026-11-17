@@ -260,7 +260,9 @@ fn native_http_client_calendar_real_release_loopback() {
     );
     peer_result.unwrap();
     assert_eq!(
-        String::from_utf8(result.stdout).unwrap().replace("\r\n", "\n"),
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
         "[object]\nnative-http-client-ok\n"
     );
     assert!(result.stderr.is_empty());
