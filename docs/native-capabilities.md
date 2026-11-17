@@ -24,7 +24,7 @@ ku build --backend runner --release hello.ku -o hello-runner
 | 文件与时间       | `std.fs`／`std.time` 原生实现及有界目录读取；[文件、时间与 JSON 回归](../tests/native_run_test.rs)。                                                                             |
 | JSON             | 同步 DOM／typed 接口和既有默认引擎；Task 局部 JSON 可跨 `await`，具体范围见 [Task JSON](native-task-json.md)。                                                                   |
 | Task             | 受限的源码 Task、挂起恢复、计时器、取消、期限与资源账本；[并发合同](concurrency.md)、[Task 回归](../tests/native_task_source_test.rs)。这不是完整 async／await 或完整 M:N。      |
-| HTTP             | 同步及受支持的具名 async handler、持久连接、有界流水线与协作式超时；[HTTP 回归](../tests/native_http_test.rs)。                                                                  |
+| HTTP             | 同步客户端、同步及受支持的具名 async handler、持久连接、有界流水线与协作式超时；[服务端回归](../tests/native_http_test.rs)、[客户端及响应回归](../tests/native_http_client_test.rs)。 |
 | 数据库           | native PostgreSQL、typed PG、Redis、MySQL client；连接池、结果独立寿命及既有清理合同见 [协议文档](protocol-foundation.md)。不自动重试业务 SQL。                                  |
 | 网络与 TLS       | owned bytes、move-only `net.client`、TLS client 和匹配目标的 TLS pack；[安装要求](cli-runtime-bundle.md)、[网络回归](../tests/native_net_test.rs)。                              |
 
@@ -59,7 +59,9 @@ ku build --backend runner --release hello.ku -o hello-runner
 
 0.0.20 发行目标为 Linux x86_64 GNU、macOS Apple Silicon 和 Windows x86_64 MSVC。已有 Linux ARM64 构建／链接检查另行保留，不等于已经提供该架构的发行包。每个平台均需匹配的 C 工具链、系统库及程序使用的可选依赖；跨平台生成成功不等于目标运行通过。
 
-普通原生 C 程序不使用 `libku.rlib`。TLS pack 必须与目标及 CLI 匹配；数据库客户端动态库和其依赖仍须在部署环境提供。详情见 [CLI／SDK](cli-runtime-bundle.md)。
+当前源码的安装后验证覆盖 Linux x86_64 GNU、macOS Apple Silicon，以及 Windows x86_64 的 MSVC 和 GNU／MinGW 两种目标。Windows GNU 需要匹配的 MinGW-w64 工具链；Ku CLI 静态链接其 GNU 运行库，程序显式使用的第三方 DLL 仍需按依赖部署。Linux ARM64 仍只有上述单独记录的构建／链接覆盖。
+
+普通原生 C 程序不使用 `libku.rlib`。TLS、日期和 HTTP 静态包须与目标及 CLI 匹配，并仅在程序使用对应能力时参与链接；数据库客户端动态库和其依赖仍须在部署环境提供。详情见 [CLI／SDK](cli-runtime-bundle.md)。
 
 递归 value 布局、object 解构、optional chaining、捕获 `for` 迭代绑定，以及尚未映射的标准库能力仍会明确拒绝。Task 参数、返回、捕获及 finally 继续受各自文档中的子集限制。遇到不支持能力或缺少依赖时应报错，不静默换成 Runner。
 
@@ -69,8 +71,12 @@ ku build --backend runner --release hello.ku -o hello-runner
 
 `http.get(url)`、`http.post(url, body)` 和 `http.request(config)` 在同步原生程序中返回 `HttpResponse!`。`HttpResponse` 可用于函数参数和返回值；`status`、`headers`、`body` 与解释器一致。结果独立持有字符串和头表，连接复用后仍有效。`clone()` 返回独立副本；读取 `response.headers` 得到独立表，修改 `response.headers[key]` 则修改该响应。JSON 和打印只暴露这三个公开字段。
 
+同步 HTTP 路由支持显式 `HttpResponse` 返回值，以及可静态确定为响应对象的结构化返回值；对应的 Result 返回同样适用。先写错误分支不再使成功响应的类型推导错误。处理函数仍只执行一次，Result 错误保持原有处理，响应数据按所有权规则移交或复制。
+
+路由处理函数限零参数或一个 owned `HttpRequest` 参数。无法静态确定返回形态的动态值，以及使用只读借用参数的路由注册，会在构建时明确拒绝。普通辅助函数仍可借用 `HttpRequest` 或 `HttpResponse`；这一限制针对路由注册，不扩大到普通函数调用。以上不扩大 Task outbound HTTP 或动态 headers 的范围。
+
 非 2xx 状态仍是成功结果；网络、UTF-8、响应体上限等错误通过 Result 返回。`http.request` 默认总请求期限 5000 ms、响应体上限 1,000,000 B，最大分别为 300,000 ms 和 16 MiB。已有更早的 HTTP handler 期限会限制本次调用，重定向不续期；调用返回后仍执行原有期限检查和清理。同步 DNS／网络等待不能保证任意时刻被取消。native Task（含经普通函数间接调用）继续拒绝同步 outbound HTTP；已有 Task 服务端响应子集不因此扩大为任意动态 headers。
 
 `http.client(config)` 保留现有配置对象接口，不是单独的连接池句柄；短方法复用现有懒初始化共享 agent。只有使用网络方法的程序才链接目标匹配的 `native-http/v1/<target>` 静态包。开发构建可用绝对路径 `KU_NATIVE_HTTP_CLIENT_PACK` 指定对应包；缺包、目标或源码身份不匹配会明确失败，不回退 Runner。
 
-完整回环示例：[native_http_client.ku](../examples/native_http_client.ku)。安装包验收同时链接日期和 HTTP 静态库，并在源码和 SDK 不可用时运行生成程序。各目标仍分别记录实际安装运行结果，交叉编译不等于运行通过。
+完整回环示例：[native_http_client.ku](../examples/native_http_client.ku)。运行前，请先在 `127.0.0.1:8080` 启动按示例约定提供 `/hello`、`/post` 和 `/missing` 的本地 HTTP 服务。安装包验收同时链接日期和 HTTP 静态库，并在源码和 SDK 不可用时运行生成程序。各目标仍分别记录实际安装运行结果，交叉编译不等于运行通过。
