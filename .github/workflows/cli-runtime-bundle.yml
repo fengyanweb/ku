@@ -205,6 +205,8 @@ jobs:
           if ($LASTEXITCODE) { throw 'Native structural HTTP handler ABI failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_http_test native_http_response_headers_are_authoritative_validated_and_sent_once -- --exact --test-threads=1
           if ($LASTEXITCODE) { throw 'Native response header ownership/framing failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_result_context_test -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Native Result inference/owned-error cleanup failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test native_run_test native_fs_base_is_executable_relative_relocatable_and_source_free -- --exact --test-threads=1
           if ($LASTEXITCODE) { throw 'Native Unicode source/output relocation failed' }
           if (-not $IsWindows) {
