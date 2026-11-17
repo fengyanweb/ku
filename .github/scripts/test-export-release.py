@@ -419,6 +419,13 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertTrue(detail['build_stderr_excerpt'].startswith('warning: unused local variable'))
         self.assertLessEqual(len(detail['build_stderr_excerpt'].encode('utf-8')), 4096)
 
+        detail = {}
+        commands = b'\n'.join([b'c compiler command: gcc source.c -o program.exe'] * 5)
+        self.consumer.record_native_build_diagnostics(detail, subprocess.CompletedProcess([], 0, commands, b''))
+        self.assertEqual(detail['compiler_command_count'], 5)
+        self.assertEqual(len(detail['compiler_commands']), 4)
+        self.assertTrue(detail['compiler_commands_truncated'])
+
     @unittest.skipIf(os.name == 'nt', 'POSIX launcher symlink regression')
     def test_installed_time_array_orchestration_invokes_the_sdk_through_a_real_symlink(self):
         # Exercise the consumer's entry/source/SDK lifetime protocol. Compiler

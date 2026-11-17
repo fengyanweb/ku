@@ -183,6 +183,12 @@ def native_without_rust(env, absent_home):
 
 def record_native_build_diagnostics(detail, result):
     """Preserve bounded stderr and reject known CRT/deployment mismatches."""
+    commands = [line for line in result.stdout.decode('utf-8', errors='replace').splitlines()
+                if line.startswith('c compiler command: ')]
+    detail['compiler_command_count'] = len(commands)
+    detail['compiler_commands'] = [line.encode('utf-8')[:8192].decode('utf-8', errors='ignore')
+                                   for line in commands[:4]]
+    detail['compiler_commands_truncated'] = len(commands) > 4 or any(len(line.encode('utf-8')) > 8192 for line in commands)
     detail['build_stderr_bytes'] = len(result.stderr)
     encoded = result.stderr.decode('utf-8', errors='replace').encode('utf-8')
     detail['build_stderr_excerpt'] = encoded[:4096].decode('utf-8', errors='ignore')
