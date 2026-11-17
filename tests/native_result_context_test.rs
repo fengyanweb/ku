@@ -23,6 +23,16 @@ fn Owned(label: str): str {
     return "owned-" + label
 }
 
+fn InferredInt(failed: bool) {
+    if (failed) return err("inferred-int")
+    return ok(42)
+}
+
+fn InferredText(failed: bool) {
+    if (failed) return err(Owned("inferred-error"))
+    return ok(Owned("inferred-value"))
+}
+
 fn ReturnInt(message: str): int! {
     return err(message)
 }
@@ -189,6 +199,20 @@ fn VerifyResultParameterAlias(): null! {
 }
 
 fn main(): null! {
+    if (InferredInt(false)? != 42) panic("inferred Result<int> payload")
+    if (InferredText(false)? != "owned-inferred-value") panic("inferred owned Result<str> payload")
+    try {
+        InferredInt(true)?
+        panic("inferred int error was accepted")
+    } catch(err) {
+        if (err.message != "inferred-int") panic("inferred int error changed")
+    }
+    try {
+        InferredText(true)?
+        panic("inferred owned error was accepted")
+    } catch(err) {
+        if (err.message != "owned-inferred-error") panic("inferred owned error changed")
+    }
     VerifyInt()?
     VerifyStr()?
     VerifyArray()?

@@ -567,6 +567,15 @@ fn lower_program_mode(
                     if value.ty == IrType::Unknown {
                         continue;
                     }
+                    // An untyped err() carries no success-payload evidence.
+                    // Retain it for err-only bodies, but let a later ok(value)
+                    // determine the real Result ABI before real lowering.
+                    if matches!(&value.ty, IrType::Result(inner) if **inner == IrType::Unknown) {
+                        if matches!(found, IrType::Void | IrType::Null) {
+                            found = value.ty.clone();
+                        }
+                        continue;
+                    }
                     if value.ty == IrType::Null {
                         if found == IrType::Void {
                             found = IrType::Null;
