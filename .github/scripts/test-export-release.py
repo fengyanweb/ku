@@ -544,6 +544,31 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
         self.assertIn(b'GNU objdump', result.stdout)
 
+    def test_gnu_static_executable_keeps_an_explicit_external_dll_import(self):
+        if os.name != 'nt' or not os.environ.get('KU_GNU_CC'):
+            self.skipTest('requires the already selected Windows GNU compiler; installs nothing')
+        with tempfile.TemporaryDirectory(prefix='ku-explicit-dll-', dir=self.root) as path:
+            directory = Path(path)
+            temporary = directory / 'tmp'
+            temporary.mkdir()
+            env = dict(os.environ, TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary))
+            compiler = env['KU_GNU_CC']
+            (directory / 'library.c').write_text('__declspec(dllexport) int ku_owned_value(void) { return 42; }\n', encoding='utf-8')
+            (directory / 'main.c').write_text('__declspec(dllimport) int ku_owned_value(void);\nint main(void) { return ku_owned_value() == 42 ? 0 : 9; }\n', encoding='utf-8')
+            for command in (
+                [compiler, '-O2', 'library.c', '-shared', '-o', 'owned-external.dll', '-Wl,--out-implib,owned-external.dll.a'],
+                [compiler, '-O2', '-std=c11', 'main.c', 'owned-external.dll.a', '-static', '-o', 'application.exe'],
+            ):
+                result = self.consumer.invoke(command, directory, env, seconds=30)
+                self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+            detail = {}
+            self.consumer.record_windows_gnu_pe_imports(detail, directory / 'application.exe', directory, env, env)
+            self.assertTrue(any(row['name'].lower() == 'owned-external.dll' for row in detail['pe_imports']['imports']))
+            result = self.consumer.invoke([directory / 'application.exe'], directory, env, seconds=15)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+            self.assertEqual(result.stdout, b'')
+        self.assertFalse(directory.exists())
+
     def installed_tls_orchestration(self, failure=None):
         """Only the archive/lifetime protocol is mocked, not claimed as TLS proof.
 

@@ -828,6 +828,7 @@ def installed_native_time_array_consumer(install, root, env, report, report_path
             detail['run_exit'] = result.returncode
             detail['run_stdout_sha256'] = hashlib.sha256(result.stdout).hexdigest()
             detail['run_stderr_sha256'] = hashlib.sha256(result.stderr).hexdigest()
+            write_report(report_path, report)
             if loader_probe and pe_imports_require_non_system_libgcc(detail.get('pe_imports', {})):
                 static_libgcc_loader_trial(detail, root, generated,
                     retired / 'native-calendar/v1' / target / 'lib' / manifest['archive']['name'],
@@ -1189,6 +1190,8 @@ def run_native_time_array_probe(args, report):
             native_loader_leaf_probe(install, temporary, env, report, args.output, 'scalar-time',
                                      'import time from "std.time"\nfn main() { println(time.unix() > 0) }\n', 'true\n')
             installed_native_time_array_consumer(install, temporary, env, report, args.output, target, loader_probe=True)
+            if any(leaf.get('status') != 'passed' for leaf in report['loader_leaf_programs'].values()):
+                raise RuntimeError('one or more System-only GNU loader leaves failed; all results are retained')
         report['status'] = 'passed'
     finally:
         report['owned_probe_root_removed'] = temporary is not None and not temporary.exists()

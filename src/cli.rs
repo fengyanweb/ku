@@ -7097,8 +7097,16 @@ fn compile_c_source_with_output(
             && (target.is_none() || candidate.kind == CCompilerKind::Preconfigured);
         let needs_compression_probe = (needs_compression || needs_calendar || needs_http_client)
             && (target.is_none() || candidate.kind == CCompilerKind::Preconfigured);
+        // Even Hello can inherit a POSIX MinGW runtime DLL without a native
+        // Rust pack. Determine the actual compiler ABI before
+        // choosing its default runtime link mode; executable names can lie.
+        let needs_windows_runtime_probe =
+            target_is_windows && candidate.kind != CCompilerKind::ZigCc;
         let probed_compiler_target = if declared_target.is_none()
-            && (needs_database_clang_probe || needs_native_tls_probe || needs_compression_probe)
+            && (needs_database_clang_probe
+                || needs_native_tls_probe
+                || needs_compression_probe
+                || needs_windows_runtime_probe)
         {
             match probe_clang_default_target(&candidate, link_deadline) {
                 Ok(target) => Some(target),
@@ -7443,9 +7451,12 @@ fn compile_c_source_with_output(
         if let Some(opt_level) = profile.rustc_opt_level() {
             command.arg(format!("-O{opt_level}"));
         }
-        if static_link {
-            command.arg("-static");
-        }
+        add_gnu_runtime_link_mode(
+            &mut command,
+            candidate.kind,
+            effective_native_target,
+            static_link,
+        );
         if needs_winsock {
             command.arg("-lws2_32");
         }
@@ -7794,6 +7805,28 @@ fn compile_c_source_with_output(
         "C compiler not found for native build\nhelp: {target_help}; tried {}",
         tried.join(", ")
     )))
+}
+
+fn add_gnu_runtime_link_mode(
+    command: &mut Command,
+    compiler: CCompilerKind,
+    actual_target: Option<&str>,
+    explicit_static: bool,
+) {
+    let windows_gnu = actual_target.is_some_and(|target| {
+        let target = target.to_ascii_lowercase();
+        target.ends_with("-windows-gnu")
+            || target.ends_with("-mingw32")
+            || target.ends_with("-mingw64")
+    });
+    // MinGW's ordinary C executable otherwise imports toolchain-private
+    // libwinpthread even without a Rust pack. Statically resolve its GNU
+    // runtime while retaining Windows OS imports and explicitly supplied DLL
+    // import archives. This does not change Rust panic/unwind or the C ABI.
+    // Zig owns a different runtime and must not inherit GCC's policy.
+    if explicit_static || (windows_gnu && compiler != CCompilerKind::ZigCc) {
+        command.arg("-static");
+    }
 }
 
 fn add_gnu_msvc_dynamic_crt(command: &mut Command, required: bool) {
@@ -14366,6 +14399,59 @@ fn main(): null! {
         fs::write(&source, "#define KU_FEATURE_ZLIB 1\n").unwrap();
         let features = CSourceFeatures::inspect(&source).unwrap();
         assert!(!features.zstd && features.zlib);
+    }
+
+    #[test]
+    fn windows_gnu_static_runtime_link_policy_tracks_actual_abi_and_preserves_other_targets() {
+        use std::ffi::OsStr;
+
+        for (kind, target, selected) in [
+            (
+                CCompilerKind::Preconfigured,
+                Some("x86_64-w64-mingw32"),
+                true,
+            ),
+            (
+                CCompilerKind::Preconfigured,
+                Some("x86_64-pc-windows-gnu"),
+                true,
+            ),
+            (CCompilerKind::Clang, Some("x86_64-w64-windows-gnu"), true),
+            (
+                CCompilerKind::Preconfigured,
+                Some("x86_64-pc-windows-msvc"),
+                false,
+            ),
+            (CCompilerKind::Clang, Some("x86_64-pc-windows-msvc"), false),
+            (
+                CCompilerKind::Preconfigured,
+                Some("x86_64-unknown-linux-gnu"),
+                false,
+            ),
+            (CCompilerKind::Clang, Some("aarch64-apple-darwin"), false),
+            (CCompilerKind::ZigCc, Some("x86_64-windows-gnu"), false),
+            (CCompilerKind::Preconfigured, None, false),
+        ] {
+            let mut command = Command::new("compiler-below-any-misleading-directory");
+            command.arg("-O2");
+            add_gnu_runtime_link_mode(&mut command, kind, target, false);
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                if selected {
+                    vec![OsStr::new("-O2"), OsStr::new("-static")]
+                } else {
+                    vec![OsStr::new("-O2")]
+                },
+                "{kind:?} {target:?}",
+            );
+            let mut explicit = Command::new("compiler");
+            add_gnu_runtime_link_mode(&mut explicit, kind, target, true);
+            assert_eq!(
+                explicit.get_args().collect::<Vec<_>>(),
+                [OsStr::new("-static")],
+                "an explicit --static retains its existing meaning without a duplicate flag"
+            );
+        }
     }
 
     #[test]

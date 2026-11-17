@@ -119,7 +119,7 @@ jobs:
         if: inputs.early_loader_probe && matrix.target == 'x86_64-pc-windows-gnu'
         shell: pwsh
         run: |
-          & ${{ matrix.python }} -B .github/scripts/test-export-release.py RuntimeConsumerReportTests.test_gnu_pe_imports_use_sibling_tool_and_record_non_system_dependency_chain RuntimeConsumerReportTests.test_gnu_pe_import_probe_restores_existing_capture_limit_on_failure RuntimeConsumerReportTests.test_selected_gnu_loader_tool_and_real_environment_snapshot_are_ready RuntimeConsumerReportTests.test_native_build_diagnostics_reject_crt_warnings_on_either_stream_even_at_exit_zero
+          & ${{ matrix.python }} -B .github/scripts/test-export-release.py RuntimeConsumerReportTests.test_gnu_pe_imports_use_sibling_tool_and_record_non_system_dependency_chain RuntimeConsumerReportTests.test_gnu_pe_import_probe_restores_existing_capture_limit_on_failure RuntimeConsumerReportTests.test_selected_gnu_loader_tool_and_real_environment_snapshot_are_ready RuntimeConsumerReportTests.test_gnu_static_executable_keeps_an_explicit_external_dll_import RuntimeConsumerReportTests.test_native_build_diagnostics_reject_crt_warnings_on_either_stream_even_at_exit_zero
           if ($LASTEXITCODE) { throw 'GNU loader probe preflight failed before the SDK build' }
       - name: Build the private pinned optional compression packs
         shell: pwsh
@@ -184,6 +184,8 @@ jobs:
           if ($LASTEXITCODE) { throw 'CLI contract tests failed' }
           cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --lib runner_bundle -- --test-threads=1
           if ($LASTEXITCODE) { throw 'Runner manifest tests failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --lib windows_gnu_static_runtime_link_policy -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Target-pinned GNU runtime argv contract failed' }
           & ${{ matrix.python }} -B .github/scripts/test-export-release.py
           if ($LASTEXITCODE) { throw 'Exporter contract tests failed' }
           & ${{ matrix.python }} -B .github/scripts/test-build-native-compression.py
