@@ -347,6 +347,7 @@ pub(super) fn emit_frames(
     out: &mut COutput,
     tasks: &TaskProgram,
     plan: &TaskFramePlan,
+    layouts: &crate::ir::IrLayoutTable,
     cooperative: bool,
 ) -> KuResult<()> {
     if tasks.functions.is_empty() {
@@ -364,7 +365,7 @@ pub(super) fn emit_frames(
         uses_blocking_net(tasks),
         uses_postgres(tasks),
     )?;
-    super::task_adapter::emit_host(out, tasks)?;
+    super::task_adapter::emit_host(out, tasks, layouts)?;
     let range_work = RefCell::new(super::task_range::WorkBudget::default());
     for function in &tasks.functions {
         out.check()?;
@@ -373,7 +374,7 @@ pub(super) fn emit_frames(
             .iter()
             .find(|frame| frame.function == function.id)
             .ok_or_else(|| unsupported("native task frame plan is missing a function"))?;
-        let mut emitter = FrameEmitter::new(function, frame)?;
+        let mut emitter = FrameEmitter::new(function, frame, layouts)?;
         emitter.cooperative = cooperative;
         if cooperative {
             // The existing verifier computes liveness across every CFG edge.
@@ -410,12 +411,13 @@ pub(super) fn emit_frames(
         emitter.range_work = Some(&range_work);
         emitter.emit(out)?;
     }
-    super::task_adapter::emit_adapters(out, tasks)?;
+    super::task_adapter::emit_adapters_with_layouts(out, tasks, layouts)?;
     out.check()
 }
 
 struct FrameEmitter<'a> {
     function: &'a TaskFunction,
+    layouts: &'a crate::ir::IrLayoutTable,
     persistent: HashSet<usize>,
     prefix: String,
     frame_type: String,
@@ -445,7 +447,11 @@ struct FrameEmitter<'a> {
 }
 
 impl<'a> FrameEmitter<'a> {
-    fn new(function: &'a TaskFunction, frame: &'a TaskFunctionFrame) -> KuResult<Self> {
+    fn new(
+        function: &'a TaskFunction,
+        frame: &'a TaskFunctionFrame,
+        layouts: &'a crate::ir::IrLayoutTable,
+    ) -> KuResult<Self> {
         if function.slots.len() > MAX_FRAME_SLOTS {
             return Err(unsupported("native task frame exceeds its 64-slot bitmap"));
         }
@@ -515,7 +521,9 @@ impl<'a> FrameEmitter<'a> {
                             || crate::ir::task::local_net_type(ty)
                             || crate::ir::task::local_pg_type(ty)
                             || crate::ir::task::local_json_type(ty)
-                            || crate::ir::task::http_type(ty))
+                            || crate::ir::task::http_type(ty)
+                            || crate::ir::task::record_type(ty)
+                            || crate::ir::task::nullable_record(ty))
                         && !persistent.contains(&index)
                     {
                         return Err(unsupported(
@@ -549,7 +557,9 @@ impl<'a> FrameEmitter<'a> {
                 != (task_mask != 0
                     || exit_bridge
                     || crate::ir::task::array_result(&function.result) || crate::ir::task::http_type(&function.result)
-                    || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty)))
+                    || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty)
+                            || crate::ir::task::record_type(ty)
+                            || crate::ir::task::nullable_record(ty)))
                     || function.states.iter().any(|state| {
                         matches!(
                             state.terminator,
@@ -579,6 +589,7 @@ impl<'a> FrameEmitter<'a> {
         require_result_type(&function.result)?;
         Ok(Self {
             function,
+            layouts,
             persistent,
             prefix: format!("ku_task_frame_{}", function.id.0),
             frame_type: format!("KuTaskFrame_{}", function.id.0),
@@ -743,6 +754,53 @@ impl<'a> FrameEmitter<'a> {
         }
     }
 
+    fn emit_record_field_clone(
+        &self,
+        out: &mut COutput,
+        ty: &IrType,
+        source: &str,
+        destination: &str,
+    ) -> KuResult<()> {
+        match ty {
+            IrType::Str => {
+                out.push_str(&format!("  {{ uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source},&{destination});\n"));
+                self.emit_string_allocation_check(out, "cloned")?;
+                out.push_str("  }\n");
+            }
+            IrType::Nullable(inner) if super::is_c_owned_type(inner) => {
+                out.push_str(&format!(
+                    "  {destination}.is_null={source}.is_null;\n  if (!{source}.is_null) {{\n"
+                ));
+                self.emit_record_field_clone(
+                    out,
+                    inner,
+                    &format!("{source}.value"),
+                    &format!("{destination}.value"),
+                )?;
+                out.push_str("  }\n");
+            }
+            IrType::Named(name) if crate::ir::task::record_type(ty) => {
+                let layout = self
+                    .layouts
+                    .structs
+                    .iter()
+                    .find(|layout| layout.name == *name)
+                    .ok_or_else(|| unsupported("missing Task field clone layout"))?;
+                for field in &layout.fields {
+                    let member = super::c_ident(&field.name);
+                    self.emit_record_field_clone(
+                        out,
+                        &field.ty,
+                        &format!("{source}.{member}"),
+                        &format!("{destination}.{member}"),
+                    )?;
+                }
+            }
+            _ => out.push_str(&format!("  {destination}={source};\n")),
+        }
+        out.check()
+    }
+
     fn owns_slot(&self, slot: SlotId) -> bool {
         match &self.function.slots[slot.0].ty {
             TaskSlotType::Task { .. } => true,
@@ -758,7 +816,9 @@ impl<'a> FrameEmitter<'a> {
                         || crate::ir::task::local_net_type(ty)
                         || crate::ir::task::local_pg_type(ty)
                         || crate::ir::task::local_json_type(ty)
-                        || crate::ir::task::http_type(ty))
+                        || crate::ir::task::http_type(ty)
+                        || crate::ir::task::record_type(ty)
+                        || crate::ir::task::nullable_record(ty))
             }
         }
     }
@@ -3067,6 +3127,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     let suffix = c_type_suffix(inner)?;
                     out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  KuTaskAdapterOutcomeV1 received={{0}};\n  uint32_t awaited=ku_task_host_await((KuTaskAdapterHostV1*)clock->host,&{},&received);\n  if (awaited==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (awaited!=KU_TASK_CONTROL_OK) {{ ku_task_outcome_drop(&received); frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",cleanup.0,self.place(*task)));
                     self.set_init(out, *task, false);
+                    if let Some(kind) = super::task_adapter::outcome_record_kind_symbol(inner) {
+                        out.push_str(&format!("  if (received.result_kind!={kind}) {{ ku_task_outcome_drop(&received); frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n"));
+                    }
                     out.push_str("  if (received.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE) {\n    frame->header.has_exit_deadline=received.has_cleanup_deadline;\n    frame->header.exit_deadline=received.cleanup_deadline;\n");
                     self.emit_runtime_error(
                         out,
@@ -3811,6 +3874,103 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 self.set_init(out, *src, false);
                 self.set_init(out, *dst, true);
             }
+            TaskOp::RecordMake { dst, elements } => {
+                let IrType::Named(name) = self.slot_type(*dst)? else {
+                    return Err(unsupported("Task RecordMake requires a record layout"));
+                };
+                let layout = self
+                    .layouts
+                    .structs
+                    .iter()
+                    .find(|layout| layout.name == *name)
+                    .ok_or_else(|| unsupported("missing Task record layout"))?;
+                let destination = self.place(*dst);
+                for (field, source) in layout.fields.iter().zip(elements) {
+                    let value = c_move_value(&field.ty, &self.place(*source))?;
+                    let member = super::c_ident(&field.name);
+                    out.push_str(&format!("  {destination}.{member}={value};\n"));
+                    if self.owns_slot(*source) {
+                        self.set_init(out, *source, false);
+                    }
+                }
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::RecordField {
+                dst,
+                src,
+                path,
+                take,
+            } => {
+                let mut ty = self.slot_type(*src)?;
+                let mut field = self.place(*src);
+                let mut guards = Vec::new();
+                for (member, _) in path {
+                    if let IrType::Nullable(inner) = ty {
+                        guards.push(format!("!{field}.is_null"));
+                        field.push_str(".value");
+                        ty = inner;
+                    }
+                    let IrType::Named(name) = ty else {
+                        return Err(unsupported("Task projection through a non-record field"));
+                    };
+                    let layout = self
+                        .layouts
+                        .structs
+                        .iter()
+                        .find(|layout| layout.name == *name)
+                        .ok_or_else(|| unsupported("missing Task field layout"))?;
+                    ty = &layout
+                        .fields
+                        .iter()
+                        .find(|field| field.name == *member)
+                        .ok_or_else(|| unsupported("unknown generated Task record field"))?
+                        .ty;
+                    field.push('.');
+                    field.push_str(&super::c_ident(member));
+                }
+                let destination = self.place(*dst);
+                let output_ty = self.slot_type(*dst)?;
+                let lifted = ty != output_ty;
+                if !guards.is_empty() {
+                    out.push_str(&format!(
+                        "  {destination}={};\n  if ({}) {{\n",
+                        c_zero_initializer(output_ty)?,
+                        guards.join(" && ")
+                    ));
+                }
+                let present = if lifted && ty != &IrType::Null {
+                    format!("{destination}.value")
+                } else {
+                    destination.clone()
+                };
+                if *take {
+                    out.push_str(&format!("  {present}={};\n", c_move_value(ty, &field)?));
+                } else if super::is_c_owned_type(ty) {
+                    if guards.is_empty() {
+                        out.push_str(&format!(
+                            "  {destination}={};\n",
+                            c_zero_initializer(output_ty)?
+                        ));
+                    }
+                    // A fallible field clone can leave earlier owned fields
+                    // initialized. Publish the zeroed destination to cleanup
+                    // before cloning any leaf.
+                    if lifted {
+                        out.push_str(&format!("  {destination}.is_null=false;\n"));
+                    }
+                    self.set_init(out, *dst, true);
+                    self.emit_record_field_clone(out, ty, &field, &present)?;
+                } else {
+                    out.push_str(&format!("  {present}={field};\n"));
+                }
+                if lifted && ty != &IrType::Null {
+                    out.push_str(&format!("  {destination}.is_null=false;\n"));
+                }
+                if !guards.is_empty() {
+                    out.push_str("  }\n");
+                }
+                self.set_init(out, *dst, true);
+            }
             TaskOp::ErrorField { dst, src, field } => {
                 if field == "status" {
                     out.push_str(&format!(
@@ -4449,7 +4609,7 @@ static uint32_t {prefix}_finish_finally(void* storage, size_t bytes, uint32_t ab
                frame->header.result_initialized = 0;\n\
                return KU_TASK_FRAME_OK;\n\
              }}\n",
-            empty_value_expr(&self.function.result, "(*output)")?,
+            super::task_adapter::outcome_empty_expr(self.layouts, &self.function.result, "(*output)")?,
             c_move_value(&self.function.result, "frame->result")?
         ));
         Ok(())
@@ -4491,6 +4651,8 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
         || crate::ir::task::http_type(ty)
         || crate::ir::task::local_pg_type(ty)
         || crate::ir::task::local_json_type(ty)
+        || crate::ir::task::record_type(ty)
+        || crate::ir::task::nullable_record(ty)
     {
         return Ok(());
     }
@@ -4510,7 +4672,7 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
 }
 
 fn require_result_type(ty: &IrType) -> KuResult<()> {
-    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner) || crate::ir::task::http_response_type(inner) || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
+    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner) || crate::ir::task::http_response_type(inner) || crate::ir::task::record_type(inner) || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
     {
         Ok(())
     } else {

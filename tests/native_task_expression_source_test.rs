@@ -313,6 +313,82 @@ fn lowered(source: &str) -> task_lower::NativeTaskProgram {
 }
 
 #[test]
+fn native_task_lexical_capture_follows_iteration_binding_across_await() {
+    let source = r#"
+import time from "std.time"
+struct CaptureMeta { code: int }
+struct CapturePlan { meta: CaptureMeta label: str }
+async fn Pause(): null! { time.sleep(2)? return ok(null) }
+async fn Failed(): null! { fail "one iteration" }
+async fn main(): null! {
+    index = 90
+    plan = CapturePlan { meta: CaptureMeta { code: 10 }, label: "owned" + " data" }
+    outer: fn(): int = () => index
+    pass = 0
+    while (pass < 2) {
+        pass = pass + 1
+        try {
+            for index in 2 {
+                step: fn(): int = () => index + plan.meta.code
+                index = index + 2;
+                (await Pause())?
+                if (true) {
+                    index: int = 600
+                    println(step())
+                }
+                if (pass == 1) { (await Failed())? }
+            }
+        } catch (err) { println(err.message) }
+        finally { println(outer()) }
+    }
+    return ok(null)
+}
+"#;
+    let native = lowered(source);
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    let directory = TempDir::new("task-lexical-captures");
+    let path = directory.path().join("capture.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "capture") else {
+        return;
+    };
+    let result = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "12\none iteration\n90\n12\n13\n90\n"
+    );
+}
+
+#[test]
+fn native_task_lexical_capture_rejects_escaping_function_values() {
+    let source = r#"
+async fn main(): null! {
+    value = 1
+    read: fn(): int = () => value
+    escaped = read
+    println(escaped())
+    return ok(null)
+}
+"#;
+    let ast = parsed(source);
+    Checker::new().check(&ast).expect("valid Runner closure");
+    let error = task_lower::lower_program(&ast).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Task lexical closure escaping a direct call"));
+}
+
+#[test]
 fn native_task_copy_expression_source_emits_only_the_exact_typed_operators() {
     for (expression, result, expected) in [
         ("x + y", "int", TaskBinaryOp::Add),

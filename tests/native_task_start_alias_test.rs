@@ -29,6 +29,255 @@ fn replace_once(source: String, anchor: &str, replacement: &str) -> String {
 }
 
 #[test]
+fn native_task_record_input_charges_active_owned_fields_and_rejects_aliases() {
+    let source = r#"
+struct Inner { first: str, second: str, third: str, fourth: str }
+struct Input { direct: str, nested: Inner | null }
+async fn Accept(value: Input): int! { return ok(7) }
+async fn main(): null! { return ok(null) }
+"#;
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_program()
+        .unwrap();
+    Checker::new().check(&ast).unwrap();
+    let native = task_lower::lower_program(&ast).unwrap();
+    let accept = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "Accept")
+        .unwrap()
+        .id
+        .0;
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    let mut generated = replace_once(
+        generated,
+        "int main(void) {",
+        "static int fixture_unmodified_source_main(void) {",
+    );
+    generated.push_str(&RECORD_INPUT_MAIN.replace("@ID@", &accept.to_string()));
+    let directory = TempDir::new("native-task-record-input-alias");
+    let path = directory.path().join("program.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "program") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute generated record input validation"
+        );
+        return;
+    };
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .expect("record input fixture terminates under the process watchdog");
+    assert!(
+        output.status.success(),
+        "status={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "task-record-input-ok\n"
+    );
+}
+
+const RECORD_INPUT_MAIN: &str = r#"
+#define RECORD_CHECK(x) do { if (!(x)) { fprintf(stderr,"line %d: %s\n",__LINE__,#x); return 1; } } while (0)
+int main(void) {
+  KuStruct___ku_task_record_Input input={0};
+  KuString* leaves[]={&input.direct,&input.nested.value.first,&input.nested.value.second,
+      &input.nested.value.third,&input.nested.value.fourth};
+  size_t expected=0;
+  for (size_t i=0;i<5;i++) {
+    size_t bytes=i+3u;
+    uint8_t* storage=malloc(bytes); RECORD_CHECK(storage);
+    *leaves[i]=(KuString){storage,0,bytes,KU_STRING_OWNED};
+    expected+=bytes;
+  }
+  size_t charge=0;
+  RECORD_CHECK(ku_task_@ID@_inputs(NULL,NULL,0,1,&input,&charge)==KU_TASK_DRIVER_OK);
+  RECORD_CHECK(charge==expected);
+
+  KuString separate=*leaves[4];
+  *leaves[4]=*leaves[0];
+  charge=81;
+  RECORD_CHECK(ku_task_@ID@_inputs(NULL,NULL,0,0,&input,&charge)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+  RECORD_CHECK(charge==81);
+  input.nested.is_null=true;
+  RECORD_CHECK(ku_task_@ID@_inputs(NULL,NULL,0,1,&input,&charge)==KU_TASK_DRIVER_OK);
+  RECORD_CHECK(charge==input.direct.capacity);
+  input.nested.is_null=false;
+  *leaves[4]=separate;
+
+  KuTaskAdapterBufferV1 excluded={separate.ptr,separate.capacity,0};
+  charge=81;
+  RECORD_CHECK(ku_task_@ID@_inputs(NULL,&excluded,1,1,&input,&charge)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+  RECORD_CHECK(charge==81);
+  for (size_t i=0;i<5;i++) free(leaves[i]->ptr);
+  puts("task-record-input-ok");
+  return 0;
+}
+"#;
+
+#[test]
+fn native_task_record_result_moves_after_pending_and_reclaims_failed_paths() {
+    let source = r#"
+import { time } from "std"
+struct Note { text: str, count: int | null }
+struct Transfer { body: str, note: Note | null }
+async fn Echo(value: Transfer): Transfer! {
+    time.sleep(20)?
+    return ok(value)
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_program()
+        .unwrap();
+    Checker::new().check(&ast).unwrap();
+    let native = task_lower::lower_program(&ast).unwrap();
+    let echo = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "Echo")
+        .unwrap()
+        .id
+        .0;
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    let generated = replace_once(
+        generated,
+        "typedef struct KuString {",
+        &format!("{ALLOCATION_HOOK}typedef struct KuString {{"),
+    );
+    let generated = replace_once(
+        generated,
+        "static uint64_t ku_task_driver_now_ms(void) {",
+        "static uint64_t fixture_now=1000u;\n\
+         static uint64_t ku_task_driver_now_ms(void) { return fixture_now; }\n\
+         static uint64_t fixture_original_now(void) {",
+    );
+    let mut generated = replace_once(
+        generated,
+        "int main(void) {",
+        "static int fixture_unmodified_source_main(void) {",
+    );
+    generated.push_str(&RECORD_RESULT_MAIN.replace("@ID@", &echo.to_string()));
+    let directory = TempDir::new("native-task-record-result");
+    let path = directory.path().join("program.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "program") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute generated record result transport"
+        );
+        return;
+    };
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .expect("record result fixture terminates under the process watchdog");
+    assert!(
+        output.status.success(),
+        "status={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "task-record-result-ok\n"
+    );
+}
+
+const RECORD_RESULT_MAIN: &str = r#"
+#define RECORD_CHECK(x) do { if (!(x)) { fprintf(stderr,"line %d: %s\n",__LINE__,#x); return 1; } } while (0)
+static void fixture_wake(void* context,size_t owner) { (void)context; (void)owner; }
+static int fixture_record_result(uint32_t cancellation,int limit) {
+  KuTaskDriverV1 driver={0};
+  KuTaskDriverSlotV1 slots[2]={0};
+  size_t ring[2]={0};
+  size_t fixed=ku_task_driver_fixed_storage_bytes(2u);
+  uint64_t deadline=3000u,next=UINT64_MAX;
+  fixture_now=1000u;
+  RECORD_CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,2u,ring,2u,fixed+sizeof(KuTaskInstance_@ID@)+(limit ? 0u : 1024u),
+      1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  KuStruct___ku_task_record_Transfer input={0};
+  input.body=ku_string_alloc(3u);
+  memcpy(input.body.ptr,"A\0B",3u);
+  input.note.value.text=ku_string_alloc(4u);
+  memcpy(input.note.value.text.ptr,"note",4u);
+  uint8_t* body=input.body.ptr;
+  uint8_t* note=input.note.value.text.ptr;
+  KuTaskHandle_@ID@ handle={0};
+  KuTaskAdapterOutcomeV1 outcome={0};
+  uint32_t started=ku_task_@ID@_try_start(&driver,&input,&handle);
+  if (limit) {
+    RECORD_CHECK(started==KU_TASK_DRIVER_LIMIT && input.body.ptr==body && input.note.value.text.ptr==note);
+    RECORD_CHECK(!handle.owner.lease.control && !driver.resident && !driver.reserved_bytes);
+    ku_drop_struct___ku_task_record_Transfer(&input);
+  } else {
+    RECORD_CHECK(started==KU_TASK_DRIVER_OK && !input.body.ptr && !input.note.value.text.ptr);
+    for (size_t turn=0;turn<128u && !driver.timers;turn++)
+      RECORD_CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+    RECORD_CHECK(driver.timers==1u && driver.resident==1u);
+    RECORD_CHECK(ku_task_@ID@_take(&handle,&outcome)==KU_TASK_CONTROL_PENDING);
+    RECORD_CHECK(!outcome.result_kind);
+    if (cancellation) {
+      RECORD_CHECK(ku_task_driver_request_cancel(&handle.ticket,&handle.owner.lease,cancellation,deadline)==KU_TASK_CONTROL_OK);
+    }
+    fixture_now=1100u;
+    for (size_t turn=0;turn<128u && ku_task_control_status(&handle.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+      RECORD_CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+    RECORD_CHECK(ku_task_control_status(&handle.owner.lease)==(cancellation ? cancellation : KU_TASK_CONTROL_COMPLETED));
+    if (!cancellation) {
+      /* An occupied output must reject the take and leave the payload available. */
+      outcome.value.record___ku_task_record_Transfer.ok=true;
+      RECORD_CHECK(ku_task_@ID@_take(&handle,&outcome)==KU_TASK_CONTROL_INVALID_ARGUMENT);
+      RECORD_CHECK(outcome.value.record___ku_task_record_Transfer.ok && !outcome.result_kind);
+      RECORD_CHECK(ku_task_control_atomic_load(&handle.owner.lease.control->payload)==KU_TASK_CONTROL_PAYLOAD_AVAILABLE);
+      outcome=(KuTaskAdapterOutcomeV1){0};
+      RECORD_CHECK(ku_task_@ID@_take(&handle,&outcome)==KU_TASK_CONTROL_OK);
+      RECORD_CHECK(outcome.result_kind==KU_TASK_OUTCOME_KIND___ku_task_record_Transfer);
+      KuTaskAdapterOutcomeV1 second={0};
+      RECORD_CHECK(ku_task_@ID@_take(&handle,&second)==KU_TASK_CONTROL_RESULT_TAKEN && !second.result_kind);
+    } else {
+      RECORD_CHECK(ku_task_@ID@_take(&handle,&outcome)==cancellation && !outcome.result_kind);
+    }
+    RECORD_CHECK(ku_task_@ID@_drop(&handle,deadline)==KU_TASK_DRIVER_OK);
+  }
+  RECORD_CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for (size_t turn=0;turn<128u && driver.workers_exited!=1u;turn++)
+    RECORD_CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  RECORD_CHECK(!driver.resident && !driver.running && !driver.timers && !driver.reserved_bytes && !driver.fault);
+  RECORD_CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
+  RECORD_CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  if (!limit && !cancellation) {
+    const KuStruct___ku_task_record_Transfer* moved=&outcome.value.record___ku_task_record_Transfer.value;
+    RECORD_CHECK(outcome.value.record___ku_task_record_Transfer.ok);
+    RECORD_CHECK(moved->body.ptr==body && moved->body.len==3u && !memcmp(moved->body.ptr,"A\0B",3u));
+    RECORD_CHECK(!moved->note.is_null && moved->note.value.text.ptr==note
+        && moved->note.value.text.len==4u && !memcmp(moved->note.value.text.ptr,"note",4u));
+    RECORD_CHECK(!moved->note.value.count.is_null && moved->note.value.count.value==0);
+    ku_task_outcome_drop(&outcome);
+  }
+  RECORD_CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  return 0;
+}
+int main(void) {
+  if (fixture_record_result(0u,0) || fixture_record_result(KU_TASK_CONTROL_CANCELLED,0)
+      || fixture_record_result(KU_TASK_CONTROL_TIMED_OUT,0) || fixture_record_result(0u,1)) return 1;
+  puts("task-record-result-ok");
+  return 0;
+}
+"#;
+
+#[test]
 fn native_task_start_known_alias_provenance_and_take_retry_execute_in_c() {
     let source = r#"
 async fn Parent(value: str): str! { child = Child(value) return await child }

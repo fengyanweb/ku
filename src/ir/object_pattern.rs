@@ -35,7 +35,25 @@ impl FunctionLowerer<'_> {
         value: &Expr,
         span: Span,
     ) -> KuResult<()> {
-        let value = self.lower_expr(value)?;
+        let layouts = self.layouts;
+        let value = if matches!(self.static_place_type(value), Some(IrType::Named(ref name))
+            if layouts.structs.iter().any(|layout| layout.name == *name))
+        {
+            // This is a consuming pattern, so a nested named field can move
+            // from its place instead of cloning as a value-position read.
+            self.lower_field_target(value)?
+        } else {
+            self.lower_expr(value)?
+        };
+        let named_layout = match &value.ty {
+            IrType::Named(name) if !ir_expr_is_borrowed(&value) => {
+                layouts.structs.iter().find(|layout| layout.name == *name)
+            }
+            _ => None,
+        };
+        if let Some(layout) = named_layout {
+            return self.lower_named_object_pattern(bindings, rest, value, &layout.fields);
+        }
         if !matches!(&value.ty, IrType::Named(name)
             if matches!(name.as_str(), "__ku_object" | "__ku_http_client_config" | "__ku_http_headers")
                 || http_constant_object_table(name).is_some())
@@ -105,6 +123,88 @@ impl FunctionLowerer<'_> {
         } else {
             self.emit_borrow_temporary_drop(source)
         }
+    }
+
+    fn lower_named_object_pattern(
+        &mut self,
+        bindings: &[ObjectDestructureBinding],
+        rest: Option<&ObjectDestructureRest>,
+        value: IrExpr,
+        fields: &[IrFieldLayout],
+    ) -> KuResult<()> {
+        let source = self.emit_temp(value)?;
+        let pending_start = self.pending_borrow_temporaries.len();
+        self.pending_borrow_temporaries
+            .push(PendingBorrowTemporary {
+                owner: source.clone(),
+                error_block: self.try_handlers.last().map(|handler| handler.error_block),
+            });
+        // The pattern consumes the record. Project fields from the owned
+        // temporary so the backend moves owned payloads and clears their slots.
+        let projection = |field: &IrFieldLayout| IrExpr {
+            ty: field.ty.clone(),
+            kind: IrExprKind::Field {
+                target: Box::new(source.clone()),
+                name: field.name.clone(),
+            },
+        };
+        let mut remaining = fields
+            .iter()
+            .map(|field| (field.name.as_str(), field))
+            .collect::<HashMap<_, _>>();
+        for binding in bindings {
+            let value = if let Some(field) = remaining.remove(binding.field.as_str()) {
+                projection(field)
+            } else if let Some(default) = &binding.default {
+                self.lower_expr(default)?
+            } else {
+                return Err(KuError::runtime(
+                    format!("object has no field '{}'", binding.field),
+                    binding.span,
+                ));
+            };
+            if let Some(local) = &binding.local {
+                self.store_or_define_name(
+                    local,
+                    value,
+                    binding.span,
+                    self.binding_is_boxed(local, binding.span),
+                )?;
+            } else if ir_type_is_owned(&value.ty) {
+                let temporary = self.emit_temp(value)?;
+                self.emit_borrow_temporary_drop(temporary)?;
+            } else if value.ty == IrType::Void {
+                emit_ir_instruction!(self, IrInst::Expr(value));
+            }
+        }
+        if let Some((rest, local)) =
+            rest.and_then(|rest| rest.local.as_ref().map(|name| (rest, name)))
+        {
+            let mut args = Vec::new();
+            for field in fields
+                .iter()
+                .filter(|field| remaining.contains_key(field.name.as_str()))
+            {
+                args.push(IrExpr {
+                    kind: IrExprKind::Literal(format!("{:?}", field.name)),
+                    ty: IrType::Str,
+                });
+                args.push(projection(field));
+            }
+            let rest_value = self.emit_temp(intrinsic_expr(
+                "__ku_object",
+                args,
+                IrType::Named("__ku_object".into()),
+            ))?;
+            self.store_or_define_name(
+                local,
+                rest_value,
+                rest.span,
+                self.binding_is_boxed(local, rest.span),
+            )?;
+        }
+        self.pending_borrow_temporaries.truncate(pending_start);
+        self.emit_borrow_temporary_drop(source)
     }
 
     fn object_pattern_default(

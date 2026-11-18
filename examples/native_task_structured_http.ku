@@ -1,0 +1,111 @@
+import http from "std.http"
+
+struct RequestMeta {
+    title: str
+    count: int | null
+}
+
+struct RequestPlan {
+    url: str
+    method: str
+    payload: str
+    meta: RequestMeta
+}
+
+struct Reply {
+    status: int
+    body: str
+    meta: RequestMeta | null
+    absent: int | null
+    ignored: str
+    available: bool
+}
+
+async fn PreparePlan(plan: RequestPlan): RequestPlan! {
+    println("plan-ready")
+    return ok(plan)
+}
+
+async fn ExpectedStatus(): int! {
+    println("status-ready")
+    return ok(200)
+}
+
+async fn Send(plan: RequestPlan, expected_status: int): Reply! {
+    config = {
+        url: plan.url,
+        method: plan.method,
+        body: plan.payload,
+        headers: { "x-ku-input": "structured" },
+        timeout_ms: 1000,
+        max_body_bytes: 4096
+    }
+    response = http.request(config)?
+    if (response.status == 404) fail "upstream returned 404"
+    if (response.status != expected_status) fail "unexpected upstream status"
+
+    // The metadata was not passed to HTTP. The Task still owns it after I/O.
+    return ok(Reply {
+        status: response.status,
+        body: response.body.clone(),
+        meta: plan.meta,
+        absent: null,
+        ignored: "owned" + " discard",
+        available: true
+    })
+}
+
+async fn CheckGet(base: str): null! {
+    plan = RequestPlan {
+        url: base + "/hello",
+        method: "GET",
+        payload: "",
+        meta: RequestMeta { title: "回环" + "🙂", count: 0 }
+    }
+    reply = (await Send((await PreparePlan(plan))?, (await ExpectedStatus())?))?
+    {status: code, body, meta, absent = 7, ignored: _, missing = 9, ..._} = reply
+    count = meta?.count
+    if (code != 200 || body != "hello 中文🙂") fail "wrong GET response"
+    if (count == null || count != 0 || meta?.title != "回环🙂") fail "moved metadata"
+    if (absent != null || missing != 9) fail "field presence"
+    return ok(null)
+}
+
+async fn CheckMissing(base: str): null! {
+    plan = RequestPlan {
+        url: base + "/missing",
+        method: "GET",
+        payload: "",
+        meta: RequestMeta { title: "unused", count: null }
+    }
+    try {
+        reply = (await Send(plan, 200))?
+    } catch (err) {
+        if (err.message != "upstream returned 404") fail "wrong upstream error"
+        return ok(null)
+    }
+    fail "missing upstream error"
+}
+
+async fn CheckPost(base: str): null! {
+    plan = RequestPlan {
+        url: base + "/post",
+        method: "POST",
+        payload: "payload" + " 中文",
+        meta: RequestMeta { title: "recovered", count: null }
+    }
+    reply = (await Send(plan, 201))?
+    if (reply.status != 201 || reply.body != "payload 中文") fail "POST after upstream error"
+    if (reply?.meta?.count != null) fail "null count"
+    return ok(null)
+}
+
+// Provide /hello, /missing and /post on a local upstream at 127.0.0.1:8080.
+async fn main(): null! {
+    base = "http://127.0.0.1:8080"
+    checked_get = (await CheckGet(base.clone()))?
+    checked_missing = (await CheckMissing(base.clone()))?
+    checked_post = (await CheckPost(base))?
+    println("native-task-http-client-ok")
+    return ok(null)
+}

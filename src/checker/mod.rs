@@ -1699,7 +1699,15 @@ impl Checker {
         value: &Expr,
         span: Span,
     ) -> KuResult<()> {
-        let source_type = self.check_object_destructure_source(value)?;
+        let source_type = match self.check_object_destructure_source(value)? {
+            Type::Struct(name) => {
+                let structure = self.structs.get(&name).ok_or_else(|| {
+                    KuError::runtime(format!("undefined struct '{name}'"), value.span)
+                })?;
+                Type::Object(structure.fields.clone())
+            }
+            other => other,
+        };
         let source_provenance = self.expression_closure_provenance(value);
         let mut consumed = HashSet::new();
         match source_type {

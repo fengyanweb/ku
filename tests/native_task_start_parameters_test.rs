@@ -79,7 +79,7 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                         map(other);
                     }
                 }
-                TaskOp::ArrayMake { dst, elements } => {
+                TaskOp::ArrayMake { dst, elements } | TaskOp::RecordMake { dst, elements } => {
                     map(dst);
                     for element in elements {
                         map(element);
@@ -96,6 +96,7 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 }
                 TaskOp::Init { dst, .. } | TaskOp::InitCallable { dst, .. } => map(dst),
                 TaskOp::Copy { dst, src }
+                | TaskOp::RecordField { dst, src, .. }
                 | TaskOp::CloneCallable { dst, src }
                 | TaskOp::ArrayClone { dst, src }
                 | TaskOp::ArrayLen { dst, src }

@@ -11,23 +11,54 @@
 
 use crate::error::KuResult;
 use crate::ir::task::{TaskFunction, TaskOp, TaskProgram, TaskSlotType, TaskTerminator};
-use crate::ir::IrType;
+use crate::ir::{IrLayoutTable, IrType};
 
 use super::output::COutput;
-use super::task::empty_value_expr;
 use super::{c_move_value, c_type, c_type_suffix, unsupported};
 
 #[path = "c_task_host.rs"]
 mod host;
 
-pub(super) fn emit_host(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
-    host::emit(out, tasks)
+pub(super) fn emit_host(
+    out: &mut COutput,
+    tasks: &TaskProgram,
+    layouts: &IrLayoutTable,
+) -> KuResult<()> {
+    host::emit(out, tasks, layouts)
 }
-pub(super) fn outcome_field(ty: &IrType) -> KuResult<&'static str> {
+pub(super) fn outcome_field(ty: &IrType) -> KuResult<std::borrow::Cow<'static, str>> {
     host::field(ty)
 }
 
+pub(super) fn outcome_record_kind_symbol(ty: &IrType) -> Option<String> {
+    host::record_kind_symbol(ty)
+}
+
+pub(super) fn outcome_empty_expr(
+    layouts: &IrLayoutTable,
+    ty: &IrType,
+    place: &str,
+) -> KuResult<String> {
+    host::empty_expr(layouts, ty, place)
+}
+
+#[cfg(test)]
 pub(super) fn emit_adapters(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
+    emit_adapters_with_layouts(
+        out,
+        tasks,
+        &IrLayoutTable {
+            structs: Vec::new(),
+            enums: Vec::new(),
+        },
+    )
+}
+
+pub(super) fn emit_adapters_with_layouts(
+    out: &mut COutput,
+    tasks: &TaskProgram,
+    layouts: &IrLayoutTable,
+) -> KuResult<()> {
     if tasks.functions.is_empty() {
         return Ok(());
     }
@@ -48,20 +79,25 @@ pub(super) fn emit_adapters(out: &mut COutput, tasks: &TaskProgram) -> KuResult<
     }) {
         out.push_str(FINALLY_CLOCK);
     }
+    let kinds = host::OutcomeRecords::new(tasks);
     for function in &tasks.functions {
         out.check()?;
-        emit_function(out, function)?;
+        emit_function(out, function, layouts, &kinds)?;
     }
-    emit_value_dispatch(out, tasks)?;
+    emit_value_dispatch(out, tasks, &kinds)?;
     out.check()
 }
 
-fn emit_value_dispatch(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
-    out.push_str("static uint32_t ku_task_value_check(KuTaskValueV1* value) {\n  if (!ku_task_frame_storage_valid(value,sizeof(*value),sizeof(*value),KU_TASK_FRAME_ALIGNOF(KuTaskValueV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  if (value->result_kind<1u || value->result_kind>8u) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  if (value->tag==KU_TASK_VALUE_INLINE_FAILED) return !value->owner.lease.control && !value->ticket.driver ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_INVALID_STATE;\n  if (value->tag!=KU_TASK_VALUE_LIVE) return KU_TASK_DRIVER_INVALID_STATE;\n  uint32_t checked=ku_task_control_check_lease(&value->owner.lease);\n  if (checked!=KU_TASK_CONTROL_OK) return checked;\n  KuTaskControlV1* control=value->owner.lease.control;\n  switch(value->function_id) {\n");
+fn emit_value_dispatch(
+    out: &mut COutput,
+    tasks: &TaskProgram,
+    kinds: &host::OutcomeRecords<'_>,
+) -> KuResult<()> {
+    out.push_str(&"static uint32_t ku_task_value_check(KuTaskValueV1* value) {\n  if (!ku_task_frame_storage_valid(value,sizeof(*value),sizeof(*value),KU_TASK_FRAME_ALIGNOF(KuTaskValueV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  if (value->result_kind<1u || value->result_kind>@MAX_KINDS@u) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  if (value->tag==KU_TASK_VALUE_INLINE_FAILED) return !value->owner.lease.control && !value->ticket.driver ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_INVALID_STATE;\n  if (value->tag!=KU_TASK_VALUE_LIVE) return KU_TASK_DRIVER_INVALID_STATE;\n  uint32_t checked=ku_task_control_check_lease(&value->owner.lease);\n  if (checked!=KU_TASK_CONTROL_OK) return checked;\n  KuTaskControlV1* control=value->owner.lease.control;\n  switch(value->function_id) {\n".replace("@MAX_KINDS@", &kinds.max_kind().to_string()));
     for function in &tasks.functions {
         out.check()?;
         let id = function.id.0;
-        out.push_str(&format!("  case {id}: if (value->result_kind!={}u || control->context!=(void*)control || control->operations.resume!=ku_task_{id}_resume || control->operations.take_payload!=ku_task_{id}_take_payload) return KU_TASK_DRIVER_INVALID_ARGUMENT; break;\n",host::kind(&function.result)?));
+        out.push_str(&format!("  case {id}: if (value->result_kind!={}u || control->context!=(void*)control || control->operations.resume!=ku_task_{id}_resume || control->operations.take_payload!=ku_task_{id}_take_payload) return KU_TASK_DRIVER_INVALID_ARGUMENT; break;\n",kinds.kind(&function.result)?));
     }
     out.push_str("  default: return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  }\n  checked=ku_task_driver_check_ticket(&value->ticket);\n  if (checked!=KU_TASK_DRIVER_OK) return checked;\n  KuTaskDriverV1* driver=value->ticket.driver;\n  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;\n  KuTaskDriverSlotV1* slot=ku_task_driver_find(&value->ticket);\n  checked=slot && slot->binding==control ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_STALE;\n  ku_task_driver_unlock(driver);\n  return checked;\n}\n");
     out.check()
@@ -214,9 +250,52 @@ fn active_charge(ty: &IrType, place: &str, total: &str) -> String {
     })
 }
 
+fn charge_with_layouts(
+    layouts: &IrLayoutTable,
+    ty: &IrType,
+    place: &str,
+    total: &str,
+    status: &str,
+) -> KuResult<String> {
+    let charge = |leaf: &str| {
+        format!("  {status}=ku_task_adapter_string_charge({leaf},&{total}); if ({status}!=KU_TASK_DRIVER_OK) return {status};\n")
+    };
+    if task_record_type(ty) {
+        return record_strings(layouts, ty, place, &charge);
+    }
+    if let IrType::Result(inner) = ty {
+        if task_record_type(inner) {
+            return record_result_strings(layouts, inner, place, &charge);
+        }
+    }
+    let code = active_charge(ty, place, total);
+    Ok(if status == "checked" {
+        code
+    } else {
+        code.replace("checked", status)
+    })
+}
+
+fn record_result_strings(
+    layouts: &IrLayoutTable,
+    payload: &IrType,
+    result: &str,
+    emit: &impl Fn(&str) -> String,
+) -> KuResult<String> {
+    let value = record_strings(layouts, payload, &format!("({result}).value"), emit)?;
+    let error = ["domain", "code", "message"]
+        .iter()
+        .map(|field| emit(&format!("({result}).error.{field}")))
+        .collect::<String>();
+    Ok(format!(
+        "  if (({result}).ok) {{\n{value}  }} else {{\n{error}  }}\n"
+    ))
+}
+
 // Each take stage excludes every header address known at that point before
 // reading string leaves. The first stage protects the request fields themselves.
 fn result_aliases(
+    layouts: &IrLayoutTable,
     ty: &IrType,
     place: &str,
     extra: &str,
@@ -233,8 +312,14 @@ fn result_aliases(
     }
     if let IrType::Result(inner) = ty {
         if crate::ir::task::http_response_type(inner) {
-            let payload =
-                result_aliases(inner, &format!("({place}).value"), extra, extra_count, body)?;
+            let payload = result_aliases(
+                layouts,
+                inner,
+                &format!("({place}).value"),
+                extra,
+                extra_count,
+                body,
+            )?;
             let error = ["domain", "code", "message"]
                 .iter()
                 .map(|field| body(&format!("({place}).error.{field}")))
@@ -253,6 +338,9 @@ fn result_aliases(
                 "  if (({place}).ok) {{\n    uint32_t alias_checked=ku_task_adapter_array_excludes(instance->ticket.driver,({place}).value.data,({place}).value.len,({place}).value.capacity,sizeof({c_element}),KU_TASK_FRAME_ALIGNOF({c_element}),{strings},{extra},{extra_count}u);\n    if (alias_checked!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_ARGUMENT;\n  }} else {{\n{error_checks}  }}\n",
                 strings = usize::from(element.as_ref() == &IrType::Str)
             ));
+        }
+        if task_record_type(inner) {
+            return record_result_strings(layouts, inner, place, body);
         }
     }
     Ok(active_strings(ty, place, body))
@@ -284,10 +372,102 @@ pub(super) fn parameter_move(ty: &TaskSlotType, place: &str) -> KuResult<String>
 
 fn parameter_owned(ty: &TaskSlotType) -> bool {
     match ty {
-        TaskSlotType::Value { ty, .. } => owned(ty),
+        TaskSlotType::Value { ty, .. } => owned(ty) || task_record_type(ty),
         TaskSlotType::Callable { .. } => true,
         _ => false,
     }
+}
+
+fn task_record_type(ty: &IrType) -> bool {
+    crate::ir::task::record_type(ty) || crate::ir::task::nullable_record(ty)
+}
+
+// Record fields are their actual C storage, so this emits only the active
+// string descriptors. It never follows a nullable field on the null branch.
+fn record_strings(
+    layouts: &IrLayoutTable,
+    ty: &IrType,
+    place: &str,
+    body: &impl Fn(&str) -> String,
+) -> KuResult<String> {
+    fn walk(
+        layouts: &IrLayoutTable,
+        ty: &IrType,
+        place: &str,
+        body: &impl Fn(&str) -> String,
+        depth: usize,
+        remaining: &mut usize,
+    ) -> KuResult<String> {
+        match ty {
+            IrType::Named(name) if crate::ir::task::record_type(ty) => {
+                if depth >= 8 {
+                    return Err(unsupported("native Task record exceeds 8 nested layouts"));
+                }
+                let layout = layouts
+                    .structs
+                    .iter()
+                    .find(|layout| layout.name == *name)
+                    .ok_or_else(|| {
+                        unsupported(format!("native Task record has no layout: {name}"))
+                    })?;
+                let mut code = String::new();
+                for field in &layout.fields {
+                    *remaining = remaining.checked_sub(1).ok_or_else(|| {
+                        unsupported("native Task record exceeds 64 transitive fields")
+                    })?;
+                    code.push_str(&walk(
+                        layouts,
+                        &field.ty,
+                        &format!("({place}).{}", super::c_ident(&field.name)),
+                        body,
+                        depth + 1,
+                        remaining,
+                    )?);
+                }
+                Ok(code)
+            }
+            IrType::Nullable(inner) => {
+                let code = walk(
+                    layouts,
+                    inner,
+                    &format!("({place}).value"),
+                    body,
+                    depth,
+                    remaining,
+                )?;
+                if code.is_empty() {
+                    return Ok(code);
+                }
+                Ok(format!("  if (!({place}).is_null) {{\n{code}  }}\n"))
+            }
+            IrType::Str => Ok(body(place)),
+            IrType::Int | IrType::Bool | IrType::Null => Ok(String::new()),
+            _ => Err(unsupported(format!(
+                "unsupported native Task record field type: {ty:?}"
+            ))),
+        }
+    }
+
+    walk(layouts, ty, place, body, 0, &mut 64)
+}
+
+fn parameter_record(ty: &TaskSlotType) -> Option<&IrType> {
+    match ty {
+        TaskSlotType::Value {
+            ty,
+            borrowed: false,
+        } if task_record_type(ty) => Some(ty),
+        _ => None,
+    }
+}
+
+fn record_string_capacity(layouts: &IrLayoutTable, ty: &IrType) -> KuResult<usize> {
+    let count = std::cell::Cell::new(0);
+    record_strings(layouts, ty, "", &|_| {
+        count.set(count.get() + 1);
+        String::new()
+    })?;
+    Ok(count.get())
 }
 
 fn parameter_strings(ty: &TaskSlotType, place: &str, body: &impl Fn(&str) -> String) -> String {
@@ -331,11 +511,16 @@ fn http_input_guard(
     id: &str,
     parameters: &[(usize, &TaskSlotType)],
     declarations: &str,
+    layouts: &IrLayoutTable,
 ) -> KuResult<String> {
     let count = parameters.len().max(1);
     // A Result has at most three active string fields. Each parameter can
     // additionally contribute one array vector and up to three HTTP maps.
-    let mut code=format!("static uint32_t ku_task_{id}_inputs(KuTaskDriverV1* driver,const KuTaskAdapterBufferV1* extra,size_t extra_count,int read_leaves{declarations},size_t* owned_bytes) {{\n  KuTaskAdapterBufferV1 base[{}]={{0}},headers[{count}]={{0}};\n  KuTaskAdapterStringVectorV1 vectors[{count}]={{0}}; KuObject* maps[{}]={{0}};\n  size_t base_count=0,vector_count=0,map_count=0,total=0; uint32_t checked=KU_TASK_DRIVER_OK;\n",count*4,count*3);
+    let mut range_capacity = count * 4;
+    for record in parameters.iter().filter_map(|(_, ty)| parameter_record(ty)) {
+        range_capacity += record_string_capacity(layouts, record)?.saturating_sub(4);
+    }
+    let mut code=format!("static uint32_t ku_task_{id}_inputs(KuTaskDriverV1* driver,const KuTaskAdapterBufferV1* extra,size_t extra_count,int read_leaves{declarations},size_t* owned_bytes) {{\n  KuTaskAdapterBufferV1 base[{range_capacity}]={{0}},headers[{count}]={{0}};\n  KuTaskAdapterStringVectorV1 vectors[{count}]={{0}}; KuObject* maps[{}]={{0}};\n  size_t base_count=0,vector_count=0,map_count=0,total=0; uint32_t checked=KU_TASK_DRIVER_OK;\n",count*3);
     for index in 0..parameters.len() {
         code.push_str(&format!(
             "  headers[{index}]=(KuTaskAdapterBufferV1){{arg_{index},sizeof(*arg_{index}),0}};\n"
@@ -364,7 +549,15 @@ fn http_input_guard(
                 code.push_str("  }\n");
             }
         } else {
-            code.push_str(&parameter_strings(slot,&format!("(*arg_{index})"),&|leaf|format!("  checked=ku_task_adapter_string_charge({leaf},&total); if(checked!=KU_TASK_DRIVER_OK)return checked; base[base_count++]=ku_task_adapter_string_buffer({leaf});\n")));
+            let place = format!("(*arg_{index})");
+            let add_leaf = |leaf: &str| {
+                format!("  checked=ku_task_adapter_string_charge({leaf},&total); if(checked!=KU_TASK_DRIVER_OK)return checked; base[base_count++]=ku_task_adapter_string_buffer({leaf});\n")
+            };
+            if let Some(record) = parameter_record(slot) {
+                code.push_str(&record_strings(layouts, record, &place, &add_leaf)?);
+            } else {
+                code.push_str(&parameter_strings(slot, &place, &add_leaf));
+            }
         }
         if let TaskSlotType::Value { ty, .. } = slot {
             code.push_str(&active_http_maps(ty, &format!("(*arg_{index})"), &|map| {
@@ -380,16 +573,21 @@ fn array_input_guard(
     id: &str,
     parameters: &[(usize, &TaskSlotType)],
     declarations: &str,
+    layouts: &IrLayoutTable,
 ) -> KuResult<String> {
     if parameters
         .iter()
         .any(|(_, ty)| matches!(ty,TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty)))
     {
-        return http_input_guard(id, parameters, declarations);
+        return http_input_guard(id, parameters, declarations, layouts);
     }
-    let range_capacity = parameters
-        .iter()
-        .map(|(_, ty)| match ty {
+    let mut range_capacity = 0;
+    for (_, ty) in parameters {
+        if let Some(record) = parameter_record(ty) {
+            range_capacity += record_string_capacity(layouts, record)?;
+            continue;
+        }
+        range_capacity += match ty {
             TaskSlotType::Value {
                 ty: IrType::Result(_),
                 ..
@@ -404,9 +602,9 @@ fn array_input_guard(
                 3
             }
             _ => 0,
-        })
-        .sum::<usize>()
-        .max(1);
+        };
+    }
+    let range_capacity = range_capacity.max(1);
     let vector_capacity = parameters
         .iter()
         .filter(|(_, ty)| parameter_array(ty).is_some_and(|(element, _)| element == &IrType::Str))
@@ -445,6 +643,13 @@ fn array_input_guard(
                 }
                 code.push_str("  }\n");
             }
+        } else if let Some(record) = parameter_record(ty) {
+            code.push_str(&record_strings(
+                layouts,
+                record,
+                &format!("(*arg_{index})"),
+                &register_string,
+            )?);
         } else {
             code.push_str(&parameter_strings(
                 ty,
@@ -469,13 +674,18 @@ fn array_input_guard(
     Ok(code)
 }
 
-fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
+fn emit_function(
+    out: &mut COutput,
+    function: &TaskFunction,
+    layouts: &IrLayoutTable,
+    kinds: &host::OutcomeRecords<'_>,
+) -> KuResult<()> {
     let IrType::Result(inner) = &function.result else {
         return Err(unsupported(
             "native task adapter requires a supported Result",
         ));
     };
-    if !supported_type(&function.result) {
+    if !supported_type(&function.result) && !task_record_type(inner) {
         return Err(unsupported(
             "native task adapter requires a supported Result",
         ));
@@ -489,7 +699,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             TaskSlotType::Value {
                 ty,
                 borrowed: false,
-            } if supported_type(ty) || crate::ir::task::flat_array(ty) => {}
+            } if supported_type(ty) || crate::ir::task::flat_array(ty) || task_record_type(ty) => {}
             TaskSlotType::Callable { .. } => {}
             _ => return Err(unsupported("native task adapter parameter is unsupported")),
         }
@@ -513,7 +723,8 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     });
     let dynamic_projection = blocking
         || crate::ir::task::array_result(&function.result) || crate::ir::task::http_type(&function.result)
-        || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty)))
+        || task_record_type(inner)
+        || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty) || task_record_type(ty) || matches!(ty, IrType::Result(inner) if task_record_type(inner))))
         || function.states.iter().any(|state| {
             state
                 .operations
@@ -538,22 +749,32 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
                 borrowed: false,
             } = &slot.ty
             {
-                if owned(ty) {
+                if owned(ty) || task_record_type(ty) {
                     reconcile_fields.push_str(&format!("  if (instance->frame.header.initialized & (UINT64_C(1)<<{index})) {{\n{}  }}\n",
-                        active_charge(ty,&format!("instance->frame.s_{index}"),"bytes").replace("checked","status")));
+                        charge_with_layouts(layouts, ty, &format!("instance->frame.s_{index}"),"bytes","status")?));
                 }
             }
         }
         reconcile_fields.push_str(&format!(
             "  if (instance->frame.header.result_initialized) {{\n{}  }}\n",
-            active_charge(&function.result, "instance->frame.result", "bytes")
-                .replace("checked", "status")
+            charge_with_layouts(
+                layouts,
+                &function.result,
+                "instance->frame.result",
+                "bytes",
+                "status"
+            )?
         ));
         reconcile_fields.push_str("  }\n");
         reconcile_fields.push_str(&format!(
             "  if (instance->payload_initialized) {{\n{}  }}\n",
-            active_charge(&function.result, "instance->payload", "bytes")
-                .replace("checked", "status")
+            charge_with_layouts(
+                layouts,
+                &function.result,
+                "instance->payload",
+                "bytes",
+                "status"
+            )?
         ));
     }
     let result_type = c_type(&function.result)?;
@@ -674,11 +895,17 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     }
     let has_array_parameters = parameters.iter().any(|(_, ty)| {
         parameter_array(ty).is_some()
+            || parameter_record(ty).is_some()
             || matches!(ty,TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty))
     });
     let mut hosted_runtime_inputs = String::new();
     if has_array_parameters {
-        out.push_str(&array_input_guard(&id, &parameters, &declarations)?);
+        out.push_str(&array_input_guard(
+            &id,
+            &parameters,
+            &declarations,
+            layouts,
+        )?);
         charge=format!("  size_t input_charge=0;\n  checked=ku_task_{id}_inputs(driver,(KuTaskAdapterBufferV1[]){{{{output,sizeof(*output),0}},{{source,source ? sizeof(*source) : 0,0}}}},2u,1{arguments},&input_charge);\n  if (checked!=KU_TASK_DRIVER_OK) return checked;\n  if (input_charge>SIZE_MAX-charge) return KU_TASK_DRIVER_LIMIT; charge+=input_charge;\n");
         source_buffers.clear();
         hosted_charge=format!("  checked=ku_task_{id}_inputs(NULL,(KuTaskAdapterBufferV1[]){{{{host,sizeof(*host),0}},{{output,sizeof(*output),0}},{{&source,sizeof(source),0}}}},3u,0{arguments},NULL);\n  if (checked!=KU_TASK_DRIVER_OK) return checked;\n");
@@ -690,13 +917,14 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         hosted_ticket_aliases.push_str(&format!("  checked=ku_task_{id}_inputs(NULL,{extra},5u,1{arguments},NULL); if (checked!=KU_TASK_DRIVER_OK) return checked;\n"));
         hosted_runtime_inputs=format!("  checked=ku_task_{id}_inputs(driver,{extra},5u,1{arguments},&charge); if (checked!=KU_TASK_DRIVER_OK) return checked;\n");
     }
-    let payload_aliases = result_aliases(&function.result, "instance->payload",
+    let payload_aliases = result_aliases(layouts, &function.result, "instance->payload",
         "(KuTaskAdapterBufferV1[]){{instance,sizeof(*instance),0},{request,sizeof(*request),0},{outcome,sizeof(*outcome),0},{request->parent,request->parent ? sizeof(*request->parent) : 0,0}}", 4, &|place| {
         format!(
             "  if (ku_task_adapter_string_overlaps({place}, outcome, sizeof(*outcome)) || ku_task_adapter_string_overlaps({place}, request, sizeof(*request)) || (request->parent && ku_task_adapter_string_overlaps({place},request->parent,sizeof(*request->parent)))) return KU_TASK_CONTROL_INVALID_ARGUMENT;\n"
         )
     })?;
     let request_aliases = result_aliases(
+        layouts,
         &function.result,
         "instance->payload",
         "(KuTaskAdapterBufferV1[]){{instance,sizeof(*instance),0},{request,sizeof(*request),0}}",
@@ -705,7 +933,13 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             format!("  if (ku_task_adapter_string_overlaps({place},request,sizeof(*request))) return KU_TASK_CONTROL_INVALID_ARGUMENT;\n")
         },
     )?;
-    let payload_charge = active_charge(&function.result, "instance->payload", "payload_charge");
+    let payload_charge = charge_with_layouts(
+        layouts,
+        &function.result,
+        "instance->payload",
+        "payload_charge",
+        "checked",
+    )?;
     let mut task_mask = 0u64;
     let mut task_count = 0usize;
     let mut transfers = String::new();
@@ -822,8 +1056,8 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@RESTORE@", &restore)
         .replace("@REJECTED_DROPS@", &rejected_drops)
         .replace("@PAYLOAD_CHARGE@", &payload_charge)
-        .replace("@FIELD@", host::field(&function.result)?)
-        .replace("@KIND@", &host::kind(&function.result)?.to_string())
+        .replace("@FIELD@", &host::field(&function.result)?)
+        .replace("@KIND@", &kinds.kind(&function.result)?.to_string())
         .replace("@TASK_MASK@", &task_mask.to_string())
         .replace("@TASK_COUNT@", &task_count.to_string())
         .replace("@TRANSFERS@", &transfers)
@@ -831,7 +1065,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@REQUEST_ALIASES@", &request_aliases)
         .replace(
             "@EMPTY_RESULT@",
-            &empty_value_expr(&function.result, "(*output)")?,
+            &outcome_empty_expr(layouts, &function.result, "(*output)")?,
         );
     out.push_str(&source);
     out.check()

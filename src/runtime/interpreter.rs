@@ -2310,14 +2310,17 @@ impl Interpreter {
         span: Span,
     ) -> KuResult<()> {
         source.require_owned_root(span)?;
-        let Value::Object(mut fields) = source else {
-            return Err(KuError::runtime(
-                format!(
-                    "type error: object destructuring expects object but got {}",
-                    source.type_name()
-                ),
-                span,
-            ));
+        let mut fields = match source {
+            Value::Object(fields) | Value::Struct { fields, .. } => fields,
+            other => {
+                return Err(KuError::runtime(
+                    format!(
+                        "type error: object destructuring expects object but got {}",
+                        other.type_name()
+                    ),
+                    span,
+                ))
+            }
         };
         for binding in bindings {
             let value = match fields.remove(&binding.field) {

@@ -857,9 +857,15 @@ def installed_native_time_array_consumer(install, root, env, report, report_path
             cleanup.raise_if_any(primary)
 
 
-def installed_native_http_client_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False, task_client=False):
-    detail={'status':'running','target':target,'scope':'installed optional '+('Task' if task_client else 'synchronous')+' HTTP client; bounded loopback, moved source-free executable','checkout_hidden_during_build':checkout_hidden}
-    report['installed_native_task_http_client' if task_client else 'installed_native_http_client']=detail
+def installed_native_http_client_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False, task_client=False, structured_task=False):
+    task_client = task_client or structured_task
+    example = 'native_http_client'
+    if structured_task:
+        example = 'native_task_structured_http'
+    elif task_client:
+        example = 'native_task_http_client'
+    detail={'status':'running','target':target,'scope':'installed optional '+('Task' if task_client else 'synchronous')+' HTTP client; bounded loopback, moved source-free executable','checkout_hidden_during_build':checkout_hidden,'example':example+'.ku'}
+    report['installed_'+example]=detail
     if not (install/'native-http').exists():
         detail['status']='not_in_archive';write_report(report_path,report);return
     leaf=install/'native-http/v1'/target
@@ -883,8 +889,7 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
         with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as listener:
             listener.bind(('127.0.0.1',0));listener.listen(4);listener.settimeout(.1)
             address='http://127.0.0.1:'+str(listener.getsockname()[1])
-            example='native_task_http_client.ku' if task_client else 'native_http_client.ku'
-            source=(Path(__file__).resolve().parents[2]/'examples'/example).read_text(encoding='utf-8').replace('http://127.0.0.1:8080',address)
+            source=(Path(__file__).resolve().parents[2]/'examples'/(example+'.ku')).read_text(encoding='utf-8').replace('http://127.0.0.1:8080',address)
             (project/'main.ku').write_text(source,encoding='utf-8');program=project/('client.exe' if os.name=='nt' else 'client')
             def serve():
                 deadline=time.monotonic()+20
@@ -901,8 +906,13 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                                 if len(data)>16384:raise RuntimeError('HTTP fixture header bound')
                             head,body=bytes(data).split(b'\r\n\r\n',1);line=head.split(b'\r\n',1)[0]
                             length=0
+                            structured_header = False
                             for header in head.split(b'\r\n')[1:]:
                                 if header.lower().startswith(b'content-length:'):length=int(header.split(b':',1)[1])
+                                if header.lower().startswith(b'x-ku-input:'):
+                                    structured_header = header.split(b':',1)[1].strip() == b'structured'
+                            if structured_task and not structured_header:
+                                raise RuntimeError('structured Task HTTP configuration header did not reach the server')
                             if not 0<=length<=4096:raise RuntimeError('HTTP fixture body bound')
                             while len(body)<length:
                                 block=connection.recv(length-len(body))
@@ -913,6 +923,10 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                             elif line.startswith(b'POST /post '):status,payload=201,body
                             elif line.startswith(b'GET /missing '):status,payload=404,b'missing'
                             else:raise RuntimeError('unexpected HTTP fixture request')
+                            if structured_task and line.startswith(b'GET /hello '):
+                                # The native client's first read sees a live connection with no response.
+                                if stop.wait(0.05):
+                                    return
                             connection.sendall(('HTTP/1.1 '+str(status)+' Result\r\nX-Ku: yes\r\nContent-Length: '+str(len(payload))+'\r\nConnection: close\r\n\r\n').encode()+payload)
                     if len(received)!=3 and not stop.is_set():raise RuntimeError('HTTP fixture did not finish')
                 except BaseException as e:errors.append(repr(e))
@@ -937,9 +951,13 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                 detail['run_exit']=result.returncode;detail['run_stderr_bytes']=len(result.stderr)
                 detail['process_owner_cleanup']=getattr(result,'process_owner_cleanup',None)
                 expected='native-task-http-client-ok\n' if task_client else '[object]\nnative-http-client-ok\n'
+                if structured_task:
+                    expected = 'plan-ready\nstatus-ready\n'+expected
                 if result.returncode or output(result)!=expected or result.stderr:raise RuntimeError('installed native HTTP client produced incorrect output: '+(output(result)+result.stderr.decode(errors='replace'))[-4096:])
                 peer.join(3)
                 if peer.is_alive() or errors or len(received)!=3:raise RuntimeError('HTTP fixture failed: '+repr(errors))
+                if structured_task and [line.rsplit(' ',1)[0] for line in received] != ['GET /hello', 'GET /missing', 'POST /post']:
+                    raise RuntimeError('structured Task HTTP recovery order failed: '+repr(received))
                 detail['requests']=received
             except BaseException as e:primary=e
             finally:
@@ -1912,6 +1930,7 @@ def run(args, report):
                 installed_native_time_array_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
                 installed_native_http_client_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
                 installed_native_http_client_consumer(install, root, env, report, args.output, target, checkout_hidden=True, task_client=True)
+                installed_native_http_client_consumer(install, root, env, report, args.output, target, checkout_hidden=True, structured_task=True)
                 installed_native_http_relay_consumer(install, root, env, report, args.output, target, checkout_hidden=True)
             finally:
                 for old, destination in reversed(retired):
@@ -1923,6 +1942,7 @@ def run(args, report):
             installed_native_time_array_consumer(install, root, env, report, args.output, target)
             installed_native_http_client_consumer(install, root, env, report, args.output, target)
             installed_native_http_client_consumer(install, root, env, report, args.output, target, task_client=True)
+            installed_native_http_client_consumer(install, root, env, report, args.output, target, structured_task=True)
             installed_native_http_relay_consumer(install, root, env, report, args.output, target)
         exercise_cli_contracts()
         # Exercise the native path separately; it must not consume runner rlibs.

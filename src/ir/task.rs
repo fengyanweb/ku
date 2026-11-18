@@ -167,6 +167,18 @@ pub enum TaskCollectionOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOp {
+    /// Assemble the exact generated layout in declaration order.
+    RecordMake {
+        dst: SlotId,
+        elements: Vec<SlotId>,
+    },
+    /// Read a checked field path, moving only during consuming destructure.
+    RecordField {
+        dst: SlotId,
+        src: SlotId,
+        path: Vec<(String, bool)>,
+        take: bool,
+    },
     /// Bounded synchronous collection work inside the existing Task frame.
     Collection {
         dst: SlotId,
@@ -645,6 +657,62 @@ pub(crate) fn local_json_type(ty: &IrType) -> bool {
 pub(crate) fn nullable_leaf(ty: &IrType) -> bool {
     matches!(ty, IrType::Nullable(inner) if primitive(inner))
 }
+pub(crate) fn record_type(ty: &IrType) -> bool {
+    matches!(ty, IrType::Named(name) if name.starts_with("__ku_task_record_"))
+}
+
+/// This check also bounds generated traversal of owned storage and byte ranges.
+pub(crate) fn record_layout_supported(layouts: &super::IrLayoutTable, name: &str) -> bool {
+    fn visit(
+        layouts: &super::IrLayoutTable,
+        name: &str,
+        depth: usize,
+        remaining: &mut usize,
+    ) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let Some(layout) = layouts.structs.iter().find(|layout| layout.name == name) else {
+            return false;
+        };
+        if layout.fields.len() > *remaining {
+            return false;
+        }
+        *remaining -= layout.fields.len();
+        layout.fields.iter().all(|field| match &field.ty {
+            IrType::Named(name) if record_type(&field.ty) => {
+                visit(layouts, name, depth - 1, remaining)
+            }
+            IrType::Nullable(inner) if record_type(inner) => match inner.as_ref() {
+                IrType::Named(name) => visit(layouts, name, depth - 1, remaining),
+                _ => false,
+            },
+            ty => primitive(ty) || nullable_leaf(ty),
+        })
+    }
+    visit(layouts, name, 8, &mut 64)
+}
+
+pub(crate) fn nullable_record(ty: &IrType) -> bool {
+    matches!(ty, IrType::Nullable(inner) if record_type(inner))
+}
+
+fn verify_record_reference(layouts: &super::IrLayoutTable, ty: &IrType) -> bool {
+    let ty = if let IrType::Result(inner) = ty {
+        inner
+    } else {
+        ty
+    };
+    let ty = if let IrType::Nullable(inner) = ty {
+        inner
+    } else {
+        ty
+    };
+    !record_type(ty)
+        || matches!(ty, IrType::Named(name)
+        if layouts.structs.iter().any(|layout| layout.name == *name))
+}
+
 fn parameter_type(ty: &IrType) -> bool {
     primitive(ty)
         || nullable_leaf(ty)
@@ -653,6 +721,8 @@ fn parameter_type(ty: &IrType) -> bool {
         || result_type(ty)
         || http_type(ty)
         || pg_capture_type(ty)
+        || record_type(ty)
+        || nullable_record(ty)
 }
 fn value_type(ty: &IrType) -> bool {
     parameter_type(ty)
@@ -693,7 +763,7 @@ pub(crate) fn http_type(ty: &IrType) -> bool {
 }
 
 fn result_type(ty: &IrType) -> bool {
-    matches!(ty, IrType::Result(inner) if primitive(inner) || nullable_leaf(inner) || flat_array(inner) || http_response_type(inner) || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
+    matches!(ty, IrType::Result(inner) if primitive(inner) || nullable_leaf(inner) || flat_array(inner) || http_response_type(inner) || record_type(inner) || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
 }
 
 fn copy_type(ty: &IrType) -> bool {
@@ -716,6 +786,7 @@ pub(crate) fn requires_string_allocation_host(operation: &TaskOp) -> bool {
             ..
         } | TaskOp::Bytes { .. }
             | TaskOp::ErrorField { .. }
+            | TaskOp::RecordField { take: false, .. }
             | TaskOp::HttpMapGet { .. }
             | TaskOp::HttpHeaderSet { .. }
             | TaskOp::PgResult { .. }
@@ -813,7 +884,11 @@ fn constant_type(value: &TaskConstant) -> KuResult<IrType> {
     }
 }
 
-fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
+fn preflight(
+    program: &TaskProgram,
+    limits: TaskLimits,
+    layouts: &super::IrLayoutTable,
+) -> KuResult<()> {
     let hard = TaskLimits::default();
     if limits.max_functions > hard.max_functions
         || limits.max_states > hard.max_states
@@ -865,19 +940,29 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
             "literal byte limit exceeded",
         )?;
         // Inspect the shape without recursively formatting or cloning raw types.
-        if !result_type(&function.result) || local_pg_type(&function.result) {
+        if !result_type(&function.result)
+            || local_pg_type(&function.result)
+            || !verify_record_reference(layouts, &function.result)
+        {
             return Err(invalid(
                 "function completion must be Result of a supported primitive or flat array",
             ));
         }
         for slot in &function.slots {
             let supported = match &slot.ty {
-                TaskSlotType::Value { ty, .. } => value_type(ty),
-                TaskSlotType::Task { result } => result_type(result),
+                TaskSlotType::Value { ty, .. } => {
+                    value_type(ty) && verify_record_reference(layouts, ty)
+                }
+                TaskSlotType::Task { result } => {
+                    result_type(result) && verify_record_reference(layouts, result)
+                }
                 TaskSlotType::Callable { parameters, result } => {
                     parameters.len() <= limits.max_slots
-                        && parameters.iter().all(parameter_type)
+                        && parameters
+                            .iter()
+                            .all(|ty| parameter_type(ty) && verify_record_reference(layouts, ty))
                         && result_type(result)
+                        && verify_record_reference(layouts, result)
                 }
             };
             if !supported {
@@ -924,7 +1009,9 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
                         "operation limit exceeded",
                     )?;
                 }
-                if let TaskOp::ArrayMake { elements, .. } = operation {
+                if let TaskOp::ArrayMake { elements, .. } | TaskOp::RecordMake { elements, .. } =
+                    operation
+                {
                     if elements.len() > limits.max_slots {
                         return Err(invalid("array element limit exceeded"));
                     }
@@ -1056,6 +1143,7 @@ fn validate_shape(
     program: &TaskProgram,
     functions: &HashMap<TaskFunctionId, usize>,
     budget: &mut Budget,
+    layouts: &super::IrLayoutTable,
 ) -> KuResult<SlotMasks> {
     nullable::validate_views(function, budget)?;
     let get_slot = |id: SlotId| {
@@ -1155,7 +1243,7 @@ fn validate_shape(
                             matches!(source, Some((IrType::Array(inner),false)) if flat_array(&IrType::Array(inner.clone())) && destination == &super::nullable::nullable_type(*inner.clone()) && !destination_borrowed && other.is_none())
                         }
                         TaskCollectionOperation::NullableNull => {
-                            nullable_leaf(destination)
+                            (nullable_leaf(destination) || nullable_record(destination))
                                 && !destination_borrowed
                                 && source.is_none()
                                 && other.is_none()
@@ -1180,7 +1268,7 @@ fn validate_shape(
                             matches!(source, Some((IrType::Nullable(inner),false)) if destination == inner.as_ref() && !destination_borrowed && other.is_none())
                         }
                         TaskCollectionOperation::NullableIsNull => {
-                            matches!(source, Some((source,false)) if nullable_leaf(source) && destination == &IrType::Bool && !destination_borrowed && other.is_none())
+                            matches!(source, Some((source,false)) if (nullable_leaf(source) || nullable_record(source)) && destination == &IrType::Bool && !destination_borrowed && other.is_none())
                         }
                     };
                     if !valid {
@@ -1548,7 +1636,10 @@ fn validate_shape(
                     let (source, source_borrowed) = slot_type(get_slot(*src)?)?;
                     if dst == src
                         || destination_borrowed
-                        || !(primitive(source) || flat_array(source) || http_response_type(source))
+                        || !(primitive(source)
+                            || flat_array(source)
+                            || http_response_type(source)
+                            || record_type(source))
                         || !matches!(destination, IrType::Result(inner) if inner.as_ref() == source)
                         || (source_borrowed && !copy_type(source))
                     {
@@ -1585,6 +1676,93 @@ fn validate_shape(
                             "WrapError requires distinct owned Result and Error slots",
                         ));
                     }
+                }
+                TaskOp::RecordMake { dst, elements } => {
+                    budget.spend_many(elements.len())?;
+                    let (ty, borrowed) = slot_type(get_slot(*dst)?)?;
+                    let layout = match ty {
+                        IrType::Named(name) if record_type(ty) => {
+                            layouts.structs.iter().find(|layout| layout.name == *name)
+                        }
+                        _ => None,
+                    }
+                    .ok_or_else(|| invalid("RecordMake requires a checked named layout"))?;
+                    if borrowed || elements.len() != layout.fields.len() {
+                        return Err(invalid("RecordMake layout mismatch"));
+                    }
+                    let mut moved = 0;
+                    for (field, source) in layout.fields.iter().zip(elements) {
+                        if source == dst
+                            || slot_type(get_slot(*source)?)? != (&field.ty, false)
+                            || (!copy_type(&field.ty) && moved & bit(*source) != 0)
+                        {
+                            return Err(invalid("RecordMake field type or ownership mismatch"));
+                        }
+                        if !copy_type(&field.ty) {
+                            moved |= bit(*source);
+                        }
+                    }
+                }
+                TaskOp::RecordField {
+                    dst,
+                    src,
+                    path,
+                    take,
+                } => {
+                    if src == dst || path.is_empty() || path.len() > 8 {
+                        return Err(invalid("invalid Task record field path"));
+                    }
+                    budget.spend_many(path.len())?;
+                    let (mut ty, borrowed) = slot_type(get_slot(*src)?)?;
+                    if borrowed {
+                        return Err(invalid("record field requires an owned base"));
+                    }
+                    let mut guarded = false;
+                    for (field, optional) in path {
+                        if let IrType::Nullable(inner) = ty {
+                            if !optional || *take {
+                                return Err(invalid(
+                                    "nullable Task record field requires optional projection",
+                                ));
+                            }
+                            guarded = true;
+                            ty = inner;
+                        }
+                        let IrType::Named(name) = ty else {
+                            return Err(invalid("record path crosses a non-record type"));
+                        };
+                        if !record_type(ty) {
+                            return Err(invalid("record field requires a checked record layout"));
+                        }
+                        ty = layouts
+                            .structs
+                            .iter()
+                            .find(|layout| layout.name == *name)
+                            .and_then(|layout| {
+                                layout
+                                    .fields
+                                    .iter()
+                                    .find(|candidate| candidate.name == *field)
+                            })
+                            .map(|field| &field.ty)
+                            .ok_or_else(|| invalid("unknown Task record field"))?;
+                    }
+                    let output = if guarded {
+                        super::nullable::nullable_type(ty.clone())
+                    } else {
+                        ty.clone()
+                    };
+                    if slot_type(get_slot(*dst)?)? != (&output, false)
+                        || (!take
+                            && !copy_type(ty)
+                            && ty != &IrType::Str
+                            && !matches!(ty, IrType::Nullable(inner) if inner.as_ref() == &IrType::Str)
+                            && !record_type(ty)
+                            && !nullable_record(ty))
+                    {
+                        return Err(invalid("unsupported Task record projection ownership"));
+                    }
+                    has_error_projection |= !take;
                 }
                 TaskOp::ErrorField { dst, src, field } => {
                     has_error_projection = true;
@@ -2503,6 +2681,7 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::MakeError { dst, .. }
         | TaskOp::WrapError { dst, .. }
         | TaskOp::ErrorField { dst, .. }
+        | TaskOp::RecordField { dst, .. }
         | TaskOp::HttpResponse { dst, .. }
         | TaskOp::HttpMapGet { dst, .. }
         | TaskOp::PgResult { dst, .. }
@@ -2511,6 +2690,7 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::JsonValue { dst, .. }
         | TaskOp::JsonObject { dst, .. }
         | TaskOp::ArrayMake { dst, .. }
+        | TaskOp::RecordMake { dst, .. }
         | TaskOp::Start { dst, .. }
         | TaskOp::StartIndirect { dst, .. }
         | TaskOp::Unary { dst, .. }
@@ -2892,6 +3072,7 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
         | TaskOp::Copy { dst, .. }
         | TaskOp::Unary { dst, .. }
         | TaskOp::ErrorField { dst, .. }
+        | TaskOp::RecordField { dst, .. }
         | TaskOp::HttpMapGet { dst, .. }
         | TaskOp::PgResult { dst, .. }
         | TaskOp::JsonEncodeObject { dst, .. }
@@ -2948,6 +3129,10 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
             dst,
             elements: arguments,
         }
+        | TaskOp::RecordMake {
+            dst,
+            elements: arguments,
+        }
         | TaskOp::Start { dst, arguments, .. }
         | TaskOp::StartIndirect { dst, arguments, .. } => {
             let consumed = arguments.iter().fold(0, |mask, slot| mask | bit(*slot)) & owned;
@@ -2973,6 +3158,10 @@ fn operation_work(operation: &TaskOp, budget: &mut Budget) -> KuResult<()> {
     budget.spend()?;
     match operation {
         TaskOp::ArrayMake {
+            elements: arguments,
+            ..
+        }
+        | TaskOp::RecordMake {
             elements: arguments,
             ..
         }
@@ -3312,6 +3501,7 @@ fn live_states(
                     | TaskOp::WrapError { dst, src }
                     | TaskOp::MakeError { dst, message: src }
                     | TaskOp::ErrorField { dst, src, .. }
+                    | TaskOp::RecordField { dst, src, .. }
                     | TaskOp::Unary { dst, src, .. } => live = (live & !bit(*dst)) | bit(*src),
                     TaskOp::Bytes {
                         dst, src, index, ..
@@ -3378,6 +3568,10 @@ fn live_states(
                     | TaskOp::DropIfInit { slot } => live |= bit(*slot),
                     TaskOp::Print { value, .. } => live |= bit(*value),
                     TaskOp::ArrayMake {
+                        dst,
+                        elements: arguments,
+                    }
+                    | TaskOp::RecordMake {
                         dst,
                         elements: arguments,
                     }
@@ -3482,6 +3676,7 @@ fn validate_ownership_and_plan(
                 | TaskOp::WrapError { src, .. }
                 | TaskOp::MakeError { message: src, .. }
                 | TaskOp::ErrorField { src, .. }
+                | TaskOp::RecordField { src, .. }
                 | TaskOp::JsonDecode { text: src, .. }
                 | TaskOp::JsonValue { source: src, .. }
                 | TaskOp::Unary { src, .. } => Some(*src),
@@ -3571,6 +3766,10 @@ fn validate_ownership_and_plan(
                 }
             }
             if let TaskOp::ArrayMake {
+                elements: arguments,
+                ..
+            }
+            | TaskOp::RecordMake {
                 elements: arguments,
                 ..
             }
@@ -4325,7 +4524,30 @@ fn finally_plan(
 }
 
 pub fn verify_and_plan(program: &TaskProgram, limits: TaskLimits) -> KuResult<TaskFramePlan> {
-    preflight(program, limits)?;
+    verify_and_plan_with_layouts(
+        program,
+        limits,
+        &super::IrLayoutTable {
+            structs: Vec::new(),
+            enums: Vec::new(),
+        },
+    )
+}
+
+pub(crate) fn verify_and_plan_with_layouts(
+    program: &TaskProgram,
+    limits: TaskLimits,
+    layouts: &super::IrLayoutTable,
+) -> KuResult<TaskFramePlan> {
+    if layouts.structs.len() > limits.max_functions
+        || layouts
+            .structs
+            .iter()
+            .any(|layout| !record_layout_supported(layouts, &layout.name))
+    {
+        return Err(invalid("unsupported or over-budget Task record layout"));
+    }
+    preflight(program, limits, layouts)?;
     let mut budget = Budget {
         remaining: limits.max_analysis_work,
     };
@@ -4339,7 +4561,7 @@ pub fn verify_and_plan(program: &TaskProgram, limits: TaskLimits) -> KuResult<Ta
     let masks: Vec<_> = program
         .functions
         .iter()
-        .map(|function| validate_shape(function, program, &ids, &mut budget))
+        .map(|function| validate_shape(function, program, &ids, &mut budget, layouts))
         .collect::<KuResult<_>>()?;
     let mut functions = Vec::new();
     for (function, masks) in program.functions.iter().zip(masks) {
@@ -4408,11 +4630,13 @@ fn source_op_slots(operation: &mut TaskOp, visit: &mut impl FnMut(&mut SlotId)) 
         | TaskOp::WrapOk { dst, src }
         | TaskOp::WrapError { dst, src }
         | TaskOp::ErrorField { dst, src, .. }
+        | TaskOp::RecordField { dst, src, .. }
         | TaskOp::MakeError { dst, message: src } => {
             visit(dst);
             visit(src);
         }
         TaskOp::ArrayMake { dst, elements }
+        | TaskOp::RecordMake { dst, elements }
         | TaskOp::Start {
             dst,
             arguments: elements,

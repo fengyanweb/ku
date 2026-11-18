@@ -391,6 +391,67 @@ fn main() {
 }
 
 #[test]
+fn run_supports_consuming_named_struct_patterns() {
+    let source = r#"
+struct Reply {
+    status: int
+    body: str
+    count: int | null
+    available: bool
+    note: str
+}
+
+fn MakeReply(): Reply {
+    return Reply { status: 0, body: "owned" + " body", count: null, available: false, note: "" }
+}
+
+fn main() {
+    calls = 0
+    fn Default(): int {
+        calls += 1
+        return 42
+    }
+    reply = MakeReply()
+    { status: code, body: _, count = Default(), missing = Default(), ...rest } = reply
+    if (code != 0 || count != null || missing != 42 || calls != 1) {
+        panic("named struct pattern evaluated incorrect defaults")
+    }
+    if (rest.available != false || rest.note != "") {
+        panic("named struct pattern lost remaining fields")
+    }
+}
+"#;
+    check_source("named-pattern.ku", source).expect("named struct pattern should check");
+    run_source("named-pattern.ku", source).expect("named struct pattern should run");
+
+    let use_after_destructure = r#"
+struct Reply { body: str }
+
+fn main() {
+    reply = Reply { body: "owned" + " body" }
+    { body } = reply
+    println(reply.body)
+}
+"#;
+    let err = check_source("named-pattern-move.ku", use_after_destructure)
+        .expect_err("destructuring a named struct should consume it");
+    assert!(
+        err.to_string().contains("use of moved value 'reply'"),
+        "unexpected error: {err}"
+    );
+
+    let borrow =
+        "struct Reply { body: str } fn Read(&reply: Reply) { { body } = reply } fn main() {}";
+    let err = check_source("named-pattern-borrow.ku", borrow)
+        .expect_err("destructuring cannot take ownership through a View parameter");
+    assert!(
+        err.to_string()
+            .contains("cannot move out of borrowed value"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn check_supports_union_parameter_types() {
     let source = r#"
 fn show(value: str | int): str {

@@ -1,31 +1,210 @@
 //! Fixed, generated source Task values and callback-only host operations.
 
+use std::borrow::Cow;
+
 use super::super::output::COutput;
-use super::super::unsupported;
+use super::super::{c_ident, c_type, unsupported};
 use crate::error::KuResult;
 use crate::ir::task::TaskProgram;
-use crate::ir::IrType;
+use crate::ir::{IrLayoutTable, IrType};
 
-pub(super) fn field(ty: &IrType) -> KuResult<&'static str> {
+fn record_name(ty: &IrType) -> Option<&str> {
     match ty {
-        IrType::Result(inner) => field(inner),
-        IrType::Int => Ok("integer"),
-        IrType::Bool => Ok("boolean"),
-        IrType::Null => Ok("null_value"),
-        IrType::Str => Ok("string"),
-        ty if crate::ir::task::http_response_type(ty) => Ok("http_response"),
-        IrType::Array(inner) => match inner.as_ref() {
-            IrType::Int => Ok("integer_array"),
-            IrType::Bool => Ok("boolean_array"),
-            IrType::Str => Ok("string_array"),
-            _ => Err(unsupported("unsupported Task array outcome type")),
-        },
-        _ => Err(unsupported("unsupported Task outcome type")),
+        IrType::Result(inner) => record_name(inner),
+        IrType::Named(name) if name.starts_with("__ku_task_record_") => Some(name),
+        _ => None,
     }
 }
-pub(super) fn kind(ty: &IrType) -> KuResult<u32> {
+
+fn record_field(name: &str) -> String {
+    format!("record_{}", c_ident(name))
+}
+
+pub(super) fn record_kind_symbol(ty: &IrType) -> Option<String> {
+    record_name(ty).map(|name| format!("KU_TASK_OUTCOME_KIND_{}", c_ident(name)))
+}
+
+pub(super) fn field(ty: &IrType) -> KuResult<Cow<'static, str>> {
+    if let Some(name) = record_name(ty) {
+        return Ok(Cow::Owned(record_field(name)));
+    }
+    let primitive = match ty {
+        IrType::Result(inner) => return field(inner),
+        IrType::Int => "integer",
+        IrType::Bool => "boolean",
+        IrType::Null => "null_value",
+        IrType::Str => "string",
+        ty if crate::ir::task::http_response_type(ty) => "http_response",
+        IrType::Array(inner) => match inner.as_ref() {
+            IrType::Int => "integer_array",
+            IrType::Bool => "boolean_array",
+            IrType::Str => "string_array",
+            _ => return Err(unsupported("unsupported Task array outcome type")),
+        },
+        _ => return Err(unsupported("unsupported Task outcome type")),
+    };
+    Ok(Cow::Borrowed(primitive))
+}
+
+pub(super) struct OutcomeRecords<'a> {
+    results: Vec<&'a IrType>,
+}
+
+impl<'a> OutcomeRecords<'a> {
+    pub(super) fn new(tasks: &'a TaskProgram) -> Self {
+        let mut results = Vec::new();
+        for function in &tasks.functions {
+            let result = &function.result;
+            if record_name(result).is_some() && !results.contains(&result) {
+                results.push(result);
+            }
+        }
+        Self { results }
+    }
+
+    pub(super) fn max_kind(&self) -> usize {
+        8 + self.results.len()
+    }
+
+    pub(super) fn kind(&self, ty: &IrType) -> KuResult<u32> {
+        if let Some(name) = record_name(ty) {
+            let index = self
+                .results
+                .iter()
+                .position(|result| record_name(result) == Some(name))
+                .ok_or_else(|| unsupported("Task record outcome has no registered kind"))?;
+            return u32::try_from(index + 9)
+                .map_err(|_| unsupported("too many Task record outcome kinds"));
+        }
+        primitive_kind(ty)
+    }
+
+    fn emit(&self, out: &mut COutput, layouts: &IrLayoutTable) -> KuResult<()> {
+        if self.results.is_empty() {
+            out.push_str(
+                &HOST_ABI
+                    .replace("@RECORD_OUTCOME_UNION@", "")
+                    .replace("@RECORD_OUTCOME_EMPTY@", "")
+                    .replace("@RECORD_OUTCOME_DROP@", "")
+                    .replace("@RECORD_OUTCOME_FAILURE@", "")
+                    .replace("@RECORD_OUTCOME_LAYOUT@", ""),
+            );
+            return out.check();
+        }
+        let mut members = String::new();
+        let mut empty = String::new();
+        let mut drop = String::new();
+        let mut failure = String::new();
+        out.push_str("#define KU_TASK_RECORD_OUTCOMES 1\n");
+        for result in &self.results {
+            out.check()?;
+            let IrType::Result(inner) = result else {
+                return Err(unsupported("Task record outcome must be a Result"));
+            };
+            let field = field(result)?;
+            let c_ty = c_type(result)?;
+            let suffix = super::super::c_type_suffix(inner)?;
+            let kind = self.kind(result)?;
+            let kind_symbol = record_kind_symbol(result)
+                .ok_or_else(|| unsupported("Task record outcome has no kind symbol"))?;
+            out.push_str(&format!("enum {{ {kind_symbol}={kind}u }};\n"));
+            members.push_str(&format!("          {c_ty} {field};\n"));
+            let payload_empty =
+                empty_expr(layouts, inner, &format!("output->value.{field}.value"))?;
+            empty.push_str(&format!("    case {kind_symbol}: if (output->value.{field}.ok || !({payload_empty})) return 0; error=&output->value.{field}.error; break;\n"));
+            drop.push_str(&format!(
+                "    case {kind_symbol}: ku_result_drop_{suffix}(&output->value.{field}); break;\n"
+            ));
+            failure.push_str(&format!(
+                "      case {kind_symbol}: output->value.{field}.error=error; break;\n"
+            ));
+        }
+        out.push_str(
+            &HOST_ABI
+                .replace("@RECORD_OUTCOME_UNION@", &members)
+                .replace("@RECORD_OUTCOME_EMPTY@", &empty)
+                .replace("@RECORD_OUTCOME_DROP@", &drop)
+                .replace("@RECORD_OUTCOME_FAILURE@", &failure)
+                .replace(
+                    "@RECORD_OUTCOME_LAYOUT@",
+                    " && !defined(KU_TASK_RECORD_OUTCOMES)",
+                ),
+        );
+        out.check()
+    }
+}
+
+pub(super) fn empty_expr(layouts: &IrLayoutTable, ty: &IrType, place: &str) -> KuResult<String> {
+    if record_name(ty).is_some() {
+        return record_empty_expr(layouts, ty, place, 0, &mut 64);
+    }
+    super::super::task::empty_value_expr(ty, place)
+}
+
+// Test fields rather than padding. A nullable field may use its null form or
+// the all-zero form emitted for a vacant typed output object.
+fn record_empty_expr(
+    layouts: &IrLayoutTable,
+    ty: &IrType,
+    place: &str,
+    depth: usize,
+    remaining_fields: &mut usize,
+) -> KuResult<String> {
+    if depth > 24 {
+        return Err(unsupported("Task record outcome layout is too deep"));
+    }
+    let mut child = |ty: &IrType, field: &str| {
+        record_empty_expr(
+            layouts,
+            ty,
+            &format!("({place}).{field}"),
+            depth + 1,
+            remaining_fields,
+        )
+    };
     match ty {
-        IrType::Result(inner) => kind(inner),
+        IrType::Result(inner) => {
+            let error = IrType::Named("__ku_error_type".into());
+            Ok(format!(
+                "!({place}).ok && ({}) && ({})",
+                child(inner, "value")?,
+                child(&error, "error")?
+            ))
+        }
+        IrType::Nullable(inner) => Ok(format!("({place}).is_null || ({})", child(inner, "value")?)),
+        IrType::Named(name) if record_name(ty).is_some() => {
+            let layout = layouts
+                .structs
+                .iter()
+                .find(|layout| layout.name == *name)
+                .ok_or_else(|| unsupported("Task record outcome layout is missing"))?;
+            let mut fields = Vec::new();
+            for field in &layout.fields {
+                *remaining_fields = remaining_fields.checked_sub(1).ok_or_else(|| {
+                    unsupported("Task record outcome has too many transitive fields")
+                })?;
+                let expr = record_empty_expr(
+                    layouts,
+                    &field.ty,
+                    &format!("({place}).{}", c_ident(&field.name)),
+                    depth + 1,
+                    remaining_fields,
+                )?;
+                fields.push(format!("({expr})"));
+            }
+            Ok(if fields.is_empty() {
+                "1".into()
+            } else {
+                fields.join(" && ")
+            })
+        }
+        _ => super::super::task::empty_value_expr(ty, place),
+    }
+}
+
+fn primitive_kind(ty: &IrType) -> KuResult<u32> {
+    match ty {
+        IrType::Result(inner) => primitive_kind(inner),
         IrType::Int => Ok(1),
         IrType::Bool => Ok(2),
         IrType::Null => Ok(3),
@@ -40,7 +219,11 @@ pub(super) fn kind(ty: &IrType) -> KuResult<u32> {
         _ => Err(unsupported("unsupported Task outcome type")),
     }
 }
-pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
+pub(super) fn emit(
+    out: &mut COutput,
+    tasks: &TaskProgram,
+    layouts: &IrLayoutTable,
+) -> KuResult<()> {
     out.check()?;
     if tasks.functions.iter().any(|function| function.slots.iter().any(|slot| matches!(&slot.ty,crate::ir::task::TaskSlotType::Value {ty,..} if crate::ir::task::pg_capture_type(ty)))) {
         out.push_str(PG_CAPTURE);
@@ -49,7 +232,7 @@ pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
         || function.slots.iter().any(|slot|matches!(&slot.ty,crate::ir::task::TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty)))) {
         out.push_str("#define KU_TASK_HTTP_TYPES 1\n");
     }
-    out.push_str(HOST_ABI);
+    OutcomeRecords::new(tasks).emit(out, layouts)?;
     if tasks.functions.iter().any(|function|crate::ir::task::http_type(&function.result)
         || function.slots.iter().any(|slot|matches!(&slot.ty,crate::ir::task::TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty)))) {
         out.push_str(include_str!("c_task_http_headers.c"));
@@ -114,7 +297,7 @@ typedef struct KuTaskAdapterOutcomeV1 {
 #if defined(KU_TASK_HTTP_TYPES)
           KuResult_struct___ku_http_response http_response;
 #endif
-          } value;
+@RECORD_OUTCOME_UNION@          } value;
 } KuTaskAdapterOutcomeV1;
 /* Appended kind 5--7 members must preserve the original kind 1--4 layout.
  * These compile-time assertions apply to the C target's actual ABI. */
@@ -124,7 +307,7 @@ typedef struct KuTaskAdapterOutcomeLegacyV1 {
   union { KuResult_int integer; KuResult_bool boolean;
           KuResult_null null_value; KuResult_str string; } value;
 } KuTaskAdapterOutcomeLegacyV1;
-#if !defined(KU_TASK_HTTP_TYPES)
+#if !defined(KU_TASK_HTTP_TYPES)@RECORD_OUTCOME_LAYOUT@
 typedef char KuTaskOutcomeSizeUnchangedV1[
   sizeof(KuTaskAdapterOutcomeV1)==sizeof(KuTaskAdapterOutcomeLegacyV1) ? 1 : -1];
 typedef char KuTaskOutcomeAlignmentUnchangedV1[
@@ -322,7 +505,7 @@ static int ku_task_outcome_empty(KuTaskAdapterOutcomeV1* output, uint32_t kind) 
         || !ku_task_outcome_empty_string(output->value.http_response.value.location)) return 0;
       error=&output->value.http_response.error; break;
 #endif
-    default: return 0;
+@RECORD_OUTCOME_EMPTY@    default: return 0;
   }
   return ku_task_outcome_empty_string(error->domain) && ku_task_outcome_empty_string(error->code) && ku_task_outcome_empty_string(error->message);
 }
@@ -338,7 +521,7 @@ static void ku_task_outcome_drop(KuTaskAdapterOutcomeV1* output) {
 #if defined(KU_TASK_HTTP_TYPES)
     case 8: ku_result_drop_struct___ku_http_response(&output->value.http_response); break;
 #endif
-    default: break;
+@RECORD_OUTCOME_DROP@    default: break;
   }
   *output=(KuTaskAdapterOutcomeV1){0};
 }
@@ -390,7 +573,7 @@ static uint32_t ku_task_value_take(KuTaskValueV1* value,
 #if defined(KU_TASK_HTTP_TYPES)
       case 8: output->value.http_response.error=error; break;
 #endif
-      default: return KU_TASK_DRIVER_INVALID_ARGUMENT;
+@RECORD_OUTCOME_FAILURE@      default: return KU_TASK_DRIVER_INVALID_ARGUMENT;
     }
     *value=(KuTaskValueV1){0}; return KU_TASK_DRIVER_OK;
   }

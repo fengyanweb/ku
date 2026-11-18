@@ -879,6 +879,36 @@ fn native_collection_concat_and_nullable_edges_preserve_values_and_owners() {
 }
 
 #[test]
+fn native_named_patterns_move_owned_fields_and_skip_present_defaults() {
+    let source = r#"
+struct Details { label: str }
+struct Reply { body: str, details: Details, optional: int | null, copied: int }
+struct Envelope { reply: Reply, retained: str }
+
+fn Default(): int {
+    println("default")
+    return 17
+}
+
+fn main() {
+    envelope = Envelope {
+        reply: Reply { body: "owned" + " buffer", details: Details { label: "nested" + " field" }, optional: null, copied: 0 },
+        retained: "retained" + " sibling"
+    }
+    { body: payload, details, optional = Default(), missing = Default(), ...rest } = envelope.reply
+    if (payload != "owned buffer" || details.label != "nested field") panic("owned field lost")
+    if (optional != null || missing != 17 || rest?.copied != 0) panic("pattern failed")
+    if (envelope.retained != "retained sibling") panic("pattern consumed a sibling")
+    println("named-pattern-ok")
+}
+"#;
+    let Some(stdout) = native_stdout("named-pattern", source) else {
+        return;
+    };
+    assert_eq!(stdout, "default\nnamed-pattern-ok\n");
+}
+
+#[test]
 fn native_optional_fields_evaluate_once_and_keep_null_and_zero_distinct() {
     let source = r#"
 struct Child { text: str }

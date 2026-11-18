@@ -22,11 +22,15 @@ use super::{
     },
     IrType,
 };
+mod captures;
 mod nullable;
+use captures::{LocalBinding, LocalScope};
+mod records;
 
 #[derive(Debug)]
 pub struct NativeTaskProgram {
     pub tasks: TaskProgram,
+    pub(crate) layouts: super::IrLayoutTable,
     pub entry: TaskFunctionId,
 }
 
@@ -43,13 +47,15 @@ fn object_constructor(declaration: &FnDecl) -> Option<&Expr> {
     if declaration.is_async
         || declaration.name == "main"
         || !declaration.type_params.is_empty()
-        || declaration.return_type.is_some()
         || declaration.params.len() > 64
         || declaration.params.iter().any(|parameter| {
             parameter.mode != ParamMode::Owned
-                || !parameter.ty.as_ref().and_then(primitive).is_some_and(|ty| {
-                    matches!(ty, IrType::Int | IrType::Bool | IrType::Null | IrType::Str)
-                        || task::nullable_leaf(&ty)
+                || !parameter.ty.as_ref().is_some_and(|ty| {
+                    matches!(ty, TypeName::Custom(_))
+                        || primitive(ty).is_some_and(|ty| {
+                            matches!(ty, IrType::Int | IrType::Bool | IrType::Null | IrType::Str)
+                                || task::nullable_leaf(&ty)
+                        })
                 })
         })
     {
@@ -61,8 +67,16 @@ fn object_constructor(declaration: &FnDecl) -> Option<&Expr> {
     else {
         return None;
     };
-    if !matches!(value.kind, ExprKind::ObjectLiteral { .. }) {
-        return None;
+    match (&value.kind, &declaration.return_type) {
+        (ExprKind::ObjectLiteral { .. }, None) => {}
+        (ExprKind::StructLiteral { name, .. }, None) => {
+            if name.starts_with("__ku_") {
+                return None;
+            }
+        }
+        (ExprKind::StructLiteral { name, .. }, Some(TypeName::Custom(result)))
+            if name == result => {}
+        _ => return None,
     }
     // This inspection is proportional to the admitted literal and cannot
     // recursively construct another expression stack before Task lowering.
@@ -74,8 +88,13 @@ fn object_constructor(declaration: &FnDecl) -> Option<&Expr> {
             return None;
         }
         match &value.kind {
-            ExprKind::ObjectLiteral { fields } if fields.len() <= 64 => {
+            ExprKind::ObjectLiteral { fields } | ExprKind::StructLiteral { fields, .. }
+                if fields.len() <= 64 =>
+            {
                 pending.extend(fields.iter().map(|(_, value)| value));
+            }
+            ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+                pending.push(target);
             }
             ExprKind::Literal(
                 Literal::Int(_) | Literal::Bool(_) | Literal::Null | Literal::String(_),
@@ -136,16 +155,19 @@ fn result_payload(ty: &TypeName) -> Option<IrType> {
     None
 }
 
-fn value_type(ty: &TypeName, span: Span) -> KuResult<IrType> {
-    if let Some(ty) = result_payload(ty) {
+fn value_type(ty: &TypeName, span: Span, layouts: &super::IrLayoutTable) -> KuResult<IrType> {
+    if let Some(ty) = records::payload(ty, layouts) {
         return Ok(ty);
     }
     if let TypeName::Result(inner) = ty {
-        if let Some(inner) = result_payload(inner) {
+        if let Some(inner) = records::payload(inner, layouts) {
             return Ok(IrType::Result(Box::new(inner)));
         }
     }
-    Err(unsupported("this parameter or local type", span))
+    Err(unsupported(
+        &format!("parameter or local type {ty:?}"),
+        span,
+    ))
 }
 
 fn value_slot(ty: IrType) -> TaskSlotType {
@@ -158,10 +180,10 @@ fn value_slot(ty: IrType) -> TaskSlotType {
 fn owned_value(ty: &TaskSlotType) -> bool {
     matches!(ty, TaskSlotType::Callable { .. })
         || matches!(ty, TaskSlotType::Value { ty, borrowed: false }
-        if matches!(ty, IrType::Str | IrType::Result(_)) || matches!(ty, IrType::Nullable(inner) if inner.as_ref() == &IrType::Str) || task::flat_array(ty) || task::pg_params_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty) || task::local_json_type(ty))
+        if matches!(ty, IrType::Str | IrType::Result(_)) || matches!(ty, IrType::Nullable(inner) if inner.as_ref() == &IrType::Str) || task::flat_array(ty) || task::pg_params_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty) || task::local_json_type(ty) || task::record_type(ty) || task::nullable_record(ty))
 }
 
-fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
+fn local_type(ty: &TypeName, span: Span, layouts: &super::IrLayoutTable) -> KuResult<TaskSlotType> {
     if let TypeName::Function {
         params,
         param_modes,
@@ -178,7 +200,7 @@ fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
                 span,
             ));
         }
-        let result = value_type(return_type, span)?;
+        let result = value_type(return_type, span, layouts)?;
         if !matches!(result, IrType::Result(_)) {
             return Err(unsupported(
                 "async callable signatures without a Result return",
@@ -188,12 +210,12 @@ fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
         return Ok(TaskSlotType::Callable {
             parameters: params
                 .iter()
-                .map(|ty| value_type(ty, span))
+                .map(|ty| value_type(ty, span, layouts))
                 .collect::<KuResult<_>>()?,
             result,
         });
     }
-    Ok(value_slot(value_type(ty, span)?))
+    Ok(value_slot(value_type(ty, span, layouts)?))
 }
 
 fn copy_value(ty: &TaskSlotType) -> bool {
@@ -355,6 +377,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
         names_and_literals: 0,
         expressions: 0,
     };
+    let layouts = records::layouts(program);
     let mut signatures = HashMap::new();
     let mut object_constructors = HashMap::new();
     let mut declarations = Vec::new();
@@ -472,6 +495,9 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
             _ => {}
         }
 
+        if matches!(item, Item::Struct(_)) {
+            continue;
+        }
         let Item::Function(function) = item else {
             return Err(unsupported(
                 "non-function items after import expansion",
@@ -510,10 +536,9 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
                 function.span,
             ));
         };
-        let result =
-            IrType::Result(Box::new(result_payload(inner).ok_or_else(|| {
-                unsupported("this async Result payload", function.span)
-            })?));
+        let result = IrType::Result(Box::new(records::payload(inner, &layouts).ok_or_else(
+            || unsupported(&format!("async Result payload {inner:?}"), function.span),
+        )?));
         let mut parameters = Vec::new();
         for parameter in &function.params {
             if parameter.mode != ParamMode::Owned {
@@ -526,6 +551,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
                     .as_ref()
                     .ok_or_else(|| unsupported("untyped async parameters", parameter.span))?,
                 parameter.span,
+                &layouts,
             )?;
             parameters.push(parameter_type);
         }
@@ -572,6 +598,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
                 declaration,
                 &signatures,
                 &object_constructors,
+                &layouts,
                 &mut budget,
                 std_time,
                 std_fs,
@@ -584,13 +611,18 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
         );
     }
     let tasks = TaskProgram { functions };
-    task::verify_and_plan(&tasks, limits)?;
-    Ok(NativeTaskProgram { tasks, entry })
+    task::verify_and_plan_with_layouts(&tasks, limits, &layouts)?;
+    Ok(NativeTaskProgram {
+        tasks,
+        entry,
+        layouts,
+    })
 }
 
 struct FunctionLowerer<'a> {
     signatures: &'a HashMap<String, Signature>,
     object_constructors: &'a HashMap<&'a str, (&'a FnDecl, &'a Expr)>,
+    layouts: &'a super::IrLayoutTable,
     std_time: bool,
     std_fs: bool,
     std_net: bool,
@@ -599,7 +631,7 @@ struct FunctionLowerer<'a> {
     std_json: bool,
     budget: &'a mut Budget,
     function: TaskFunction,
-    locals: Vec<HashMap<String, SlotId>>,
+    locals: Vec<LocalScope<'a>>,
     nullable_facts: HashMap<SlotId, bool>,
     nullable_views: HashMap<SlotId, SlotId>,
     // ROOT is None. Slots never change their lexical birth scope; Task moves
@@ -668,6 +700,7 @@ impl<'a> FunctionLowerer<'a> {
         declaration: &'a FnDecl,
         signatures: &'a HashMap<String, Signature>,
         object_constructors: &'a HashMap<&'a str, (&'a FnDecl, &'a Expr)>,
+        layouts: &'a super::IrLayoutTable,
         budget: &'a mut Budget,
         std_time: bool,
         std_fs: bool,
@@ -680,6 +713,7 @@ impl<'a> FunctionLowerer<'a> {
         let mut lowerer = Self {
             signatures,
             object_constructors,
+            layouts,
             std_time,
             std_fs,
             std_net,
@@ -696,7 +730,7 @@ impl<'a> FunctionLowerer<'a> {
                 states: Vec::new(),
                 result: signature.result.clone(),
             },
-            locals: vec![HashMap::new()],
+            locals: vec![LocalScope::default()],
             nullable_facts: HashMap::new(),
             nullable_views: HashMap::new(),
             slot_owners: Vec::new(),
@@ -1144,7 +1178,20 @@ impl<'a> FunctionLowerer<'a> {
             ExprKind::Index { target, index } => {
                 self.index_expression(target, index, expression.span, depth)
             }
+            ExprKind::StructLiteral { name, fields } => {
+                self.record_literal(name, fields, expression.span, depth)
+            }
+            ExprKind::OptionalField { target, name } => self
+                .record_field_expression(target, name, true, expression.span, depth)?
+                .ok_or_else(|| {
+                    unsupported("optional projection of this Task value", expression.span)
+                }),
             ExprKind::Field { target, name } => {
+                if let Some(field) =
+                    self.record_field_expression(target, name, false, expression.span, depth)?
+                {
+                    return Ok(field);
+                }
                 if let ExprKind::Field {
                     target: module,
                     name: table,
@@ -1152,7 +1199,7 @@ impl<'a> FunctionLowerer<'a> {
                 {
                     if self.std_http
                         && matches!(&module.kind, ExprKind::Variable(module) if module == "http")
-                        && self.local("http").is_none()
+                        && self.local_binding("http").is_none()
                         && !self.signatures.contains_key("http")
                         && matches!(table.as_str(), "status" | "code")
                     {
@@ -1165,7 +1212,7 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 if self.std_http
                     && matches!(&target.kind, ExprKind::Variable(module) if module == "http")
-                    && self.local("http").is_none()
+                    && self.local_binding("http").is_none()
                     && matches!(name.as_str(), "status" | "code")
                 {
                     return Err(unsupported("HTTP constant objects as Task values; read a status/code member into an int instead", expression.span));
@@ -1506,6 +1553,12 @@ impl<'a> FunctionLowerer<'a> {
     // expression frame. Even a Unary-only AST must fit the original depth gate.
     #[inline(never)]
     fn variable_expression(&mut self, name: &str, span: Span) -> KuResult<SlotId> {
+        if matches!(self.local_binding(name), Some(LocalBinding::Closure(_))) {
+            return Err(unsupported(
+                "a Task lexical closure escaping a direct call",
+                span,
+            ));
+        }
         if let Some(local) = self.local(name) {
             return self.nullable_variable_read(local);
         }
@@ -1792,7 +1845,7 @@ impl<'a> FunctionLowerer<'a> {
         if matches!(&object.kind,ExprKind::Variable(module) if module=="json")
             && matches!(name, "encode" | "stringify")
             && self.std_json
-            && self.local("json").is_none()
+            && self.local_binding("json").is_none()
             && !self.signatures.contains_key("json")
         {
             return self.json_encode_literal(args, span, depth);
@@ -1800,7 +1853,7 @@ impl<'a> FunctionLowerer<'a> {
         if matches!(&object.kind,ExprKind::Variable(module) if module=="json")
             && matches!(name, "decode" | "parse")
             && self.std_json
-            && self.local("json").is_none()
+            && self.local_binding("json").is_none()
             && !self.signatures.contains_key("json")
         {
             let [argument] = args else {
@@ -1829,7 +1882,7 @@ impl<'a> FunctionLowerer<'a> {
         }
         if matches!(&object.kind,ExprKind::Variable(module) if module=="http")
             && self.std_http
-            && self.local("http").is_none()
+            && self.local_binding("http").is_none()
             && !self.signatures.contains_key("http")
         {
             if matches!(name, "get" | "post" | "request") {
@@ -1885,7 +1938,7 @@ impl<'a> FunctionLowerer<'a> {
         if matches!(&object.kind, ExprKind::Variable(module) if module == "net")
             && name == "client"
             && self.std_net
-            && self.local("net").is_none()
+            && self.local_binding("net").is_none()
             && !self.signatures.contains_key("net")
         {
             return self.blocking_net_connect(args, span, depth);
@@ -1893,7 +1946,7 @@ impl<'a> FunctionLowerer<'a> {
         if matches!(&object.kind, ExprKind::Variable(module) if module == "bytes")
             && matches!(name, "from_str" | "from_array")
             && self.std_bytes
-            && self.local("bytes").is_none()
+            && self.local_binding("bytes").is_none()
             && !self.signatures.contains_key("bytes")
         {
             if args.len() != 1 {
@@ -1965,7 +2018,7 @@ impl<'a> FunctionLowerer<'a> {
                 "write" | "try_write" | "read" | "try_read" | "exists" | "read_dir"
             )
             && self.std_fs
-            && self.local("fs").is_none()
+            && self.local_binding("fs").is_none()
             && !self.signatures.contains_key("fs")
         {
             return if name == "exists" {
@@ -1979,7 +2032,7 @@ impl<'a> FunctionLowerer<'a> {
         if matches!(&object.kind, ExprKind::Variable(module) if module == "time")
             && name == "sleep"
             && self.std_time
-            && self.local("time").is_none()
+            && self.local_binding("time").is_none()
             && !self.signatures.contains_key("time")
         {
             if self.in_finally_body {
@@ -2427,6 +2480,10 @@ impl<'a> FunctionLowerer<'a> {
         let ExprKind::Variable(name) = &callee.kind else {
             return self.indirect_call(callee, args, span, depth);
         };
+        if let Some(LocalBinding::Closure(closure)) = self.local_binding(name) {
+            let closure = closure.clone();
+            return self.call_lexical_closure(closure, args, span, depth);
+        }
         if let Some(local) = self.local(name) {
             if matches!(
                 self.function.slots[local.0].ty,
@@ -2525,7 +2582,7 @@ impl<'a> FunctionLowerer<'a> {
         if self.in_finally_body || declaration.params.len() != args.len() {
             return Err(unsupported("this call to a Task object constructor", span));
         }
-        let mut locals = HashMap::new();
+        let mut locals = LocalScope::default();
         // Snapshot each argument before evaluating the next one, including
         // arguments with await. Do not resolve parameter names in the caller.
         for (parameter, argument) in declaration.params.iter().zip(args) {
@@ -2535,6 +2592,7 @@ impl<'a> FunctionLowerer<'a> {
                     .as_ref()
                     .expect("checked constructor parameter"),
                 parameter.span,
+                self.layouts,
             )?);
             let value = self.direct_argument_expression(argument, &expected, depth + 1)?;
             if !self.nullable_argument_matches(value, &expected) {
@@ -2560,9 +2618,11 @@ impl<'a> FunctionLowerer<'a> {
         let locals = self.locals.pop().expect("object constructor scope");
         let result = result?;
         for parameter in declaration.params.iter().rev() {
-            let slot = locals[&parameter.name];
+            let Some(LocalBinding::Slot(slot)) = locals.get(&parameter.name) else {
+                unreachable!("object constructor parameter slot");
+            };
             if owned_value(&self.function.slots[slot.0].ty) {
-                self.emit(TaskOp::DropIfInit { slot })?;
+                self.emit(TaskOp::DropIfInit { slot: *slot })?;
             }
         }
         Ok(result)
@@ -2626,8 +2686,9 @@ impl<'a> FunctionLowerer<'a> {
             && !task::nullable_leaf(ty)
             && !task::flat_array(ty)
             && !task::http_response_type(ty)
+            && !task::record_type(ty)
         {
-            return Err(unsupported("nested Result values", span));
+            return Err(unsupported(&format!("Result payload {ty}"), span));
         }
         let destination = self.slot(value_slot(IrType::Result(Box::new(ty.clone()))))?;
         self.emit(TaskOp::WrapOk {
@@ -3240,10 +3301,14 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn local(&self, name: &str) -> Option<SlotId> {
-        self.locals
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name).copied())
+        match self.local_binding(name) {
+            Some(LocalBinding::Slot(slot)) => Some(*slot),
+            Some(LocalBinding::Closure(_)) | None => None,
+        }
+    }
+
+    fn local_binding(&self, name: &str) -> Option<&LocalBinding<'a>> {
+        self.locals.iter().rev().find_map(|scope| scope.get(name))
     }
 
     // An existing flat array binding supplies the missing element type for
@@ -3284,12 +3349,15 @@ impl<'a> FunctionLowerer<'a> {
         &mut self,
         name: &str,
         annotation: Option<&TypeName>,
-        value: &Expr,
+        value: &'a Expr,
         span: Span,
         declaration: bool,
         depth: usize,
     ) -> KuResult<()> {
         if !declaration {
+            if matches!(self.local_binding(name), Some(LocalBinding::Closure(_))) {
+                return Err(unsupported("reassignment of a Task lexical closure", span));
+            }
             if let Some(destination) = self.local(name) {
                 let expected = self.function.slots[destination.0].ty.clone();
                 let copy = copy_value(&expected);
@@ -3360,6 +3428,9 @@ impl<'a> FunctionLowerer<'a> {
                 span,
             ));
         }
+        if matches!(value.kind, ExprKind::Function { .. }) {
+            return self.bind_lexical_closure(name, annotation, value);
+        }
         self.budget.text(name.len(), span)?;
         let source = if let (ExprKind::Array(elements), Some(TypeName::Array(inner))) =
             (&value.kind, annotation)
@@ -3372,12 +3443,13 @@ impl<'a> FunctionLowerer<'a> {
             self.expression(value, depth)?
         };
         let source = if let Some(annotation) = annotation {
-            self.nullable_coerce(source, &local_type(annotation, span)?)?
+            self.nullable_coerce(source, &local_type(annotation, span, self.layouts)?)?
         } else {
             source
         };
         if let Some(annotation) = annotation {
-            if !self.nullable_argument_matches(source, &local_type(annotation, span)?) {
+            if !self.nullable_argument_matches(source, &local_type(annotation, span, self.layouts)?)
+            {
                 return Err(unsupported("a mismatched local annotation", span));
             }
         }
@@ -3502,6 +3574,14 @@ impl<'a> FunctionLowerer<'a> {
                             self.emit(TaskOp::Drop { slot })?;
                         }
                     }
+                }
+                Stmt::ObjectDestructureAssign {
+                    bindings,
+                    rest,
+                    value,
+                    span,
+                } => {
+                    self.record_pattern(bindings, rest.as_ref(), value, *span, depth)?;
                 }
                 Stmt::Assign { name, value, span } => {
                     self.bind(name, None, value, *span, false, depth)?
@@ -4005,7 +4085,7 @@ impl<'a> FunctionLowerer<'a> {
         let scope = TaskScopeId(self.next_scope);
         self.next_scope += 1;
         self.scopes.push(scope);
-        self.locals.push(HashMap::new());
+        self.locals.push(LocalScope::default());
         self.emit(TaskOp::ScopeEnter {
             scope,
             tasks: Vec::new(),
@@ -4226,7 +4306,7 @@ impl<'a> FunctionLowerer<'a> {
             return Ok(self.current.take());
         }
         if self.protected {
-            self.locals.push(HashMap::new());
+            self.locals.push(LocalScope::default());
             if let Some((name, source)) = binding {
                 let destination = self.copy_or_move(source)?;
                 self.locals
@@ -4244,7 +4324,7 @@ impl<'a> FunctionLowerer<'a> {
         let scope = TaskScopeId(self.next_scope);
         self.next_scope += 1; // Bounded by generated states/operations.
         self.scopes.push(scope);
-        self.locals.push(HashMap::new());
+        self.locals.push(LocalScope::default());
         let enter_op = self.function.states[entry.0].operations.len();
         self.emit(TaskOp::ScopeEnter {
             scope,

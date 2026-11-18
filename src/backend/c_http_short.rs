@@ -1239,6 +1239,8 @@ fn task_request_fields(function: &crate::ir::task::TaskFunction) -> Option<u32> 
                 | TaskOp::InitCallable { .. }
                 | TaskOp::CloneCallable { .. }
                 | TaskOp::ArrayMake { .. }
+                | TaskOp::RecordMake { .. }
+                | TaskOp::RecordField { .. }
                 | TaskOp::ArrayClone { .. }
                 | TaskOp::Collection { .. }
                 | TaskOp::ArrayLen { .. }

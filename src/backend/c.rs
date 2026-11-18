@@ -366,7 +366,11 @@ pub fn generate_native_task_c_source(
     native: &crate::ir::task_lower::NativeTaskProgram,
     options: &CBackendOptions,
 ) -> KuResult<String> {
-    let plan = crate::ir::task::verify_and_plan(&native.tasks, Default::default())?;
+    let plan = crate::ir::task::verify_and_plan_with_layouts(
+        &native.tasks,
+        Default::default(),
+        &native.layouts,
+    )?;
     let entry = native
         .tasks
         .functions
@@ -380,10 +384,7 @@ pub fn generate_native_task_c_source(
     }
     let sync = IrProgram {
         functions: Vec::new(),
-        layouts: crate::ir::IrLayoutTable {
-            structs: Vec::new(),
-            enums: Vec::new(),
-        },
+        layouts: native.layouts.clone(),
     };
     generate_c_source_with_frames_bounded(
         &sync,
@@ -978,6 +979,7 @@ fn generate_c_source_with_frames_attempt(
             &mut out,
             frames,
             plan,
+            &program.layouts,
             entry.is_some() || program_uses_http_server(program),
         )?;
         if program_uses_http_server(program) {
@@ -18662,10 +18664,23 @@ fn emit_struct_ownership_helper(out: &mut COutput, layout: &IrStructLayout) -> K
             continue;
         }
         let f = c_ident(&field.name);
-        clone_body.push_str(&format!(
-            " value.{f} = {};",
-            c_clone_value(&field.ty, &format!("value.{f}"))?
-        ));
+        match &field.ty {
+            // The Task-only ABI emits move/drop wrappers for nullable
+            // records. Its inline field reads still use the fallible host.
+            IrType::Nullable(inner)
+                if crate::ir::task::record_type(&IrType::Named(name.clone())) =>
+            {
+                let place = format!("value.{f}.value");
+                clone_body.push_str(&format!(
+                    " if (!value.{f}.is_null) {place} = {};",
+                    c_clone_value(inner, &place)?
+                ));
+            }
+            _ => clone_body.push_str(&format!(
+                " value.{f} = {};",
+                c_clone_value(&field.ty, &format!("value.{f}"))?
+            )),
+        }
         drop_body.push_str(&format!(
             " {}",
             c_drop_value(&field.ty, &format!("value->{f}"))?
