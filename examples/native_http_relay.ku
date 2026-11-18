@@ -7,11 +7,12 @@ fn Info(&req: HttpRequest): HttpResponse {
 }
 
 async fn Relay(req: HttpRequest): HttpResponse! {
-    upstream = http.request({
+    config = {
         url: "http://127.0.0.1:8080/hello",
         timeout_ms: 1000,
         max_body_bytes: 4096
-    })?
+    }
+    upstream = http.request(config)?
     response = http.text(upstream.body.clone())
     response.headers["x-ku-route"] = req.path.clone()
     response.headers["x-ku-upstream"] = "local"

@@ -570,7 +570,68 @@ static uint32_t ku_task_host_http(KuTaskAdapterHostV1* host,KuString method,KuSt
   if(!ku_task_host_net_valid(host)||!output)return KU_TASK_CONTROL_INVALID_ARGUMENT;
   if(ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE)return KU_TASK_CONTROL_PENDING;
   uint32_t status=host->blocking->pool?ku_task_blocking_take(host->ticket,host->blocking,0,10u,NULL,output)
-      :ku_task_blocking_submit_http(host->ticket,host->control,host->blocking,method,url,body,has_body,names,values,timeout,max_body,config_fault,host->request_deadline,host->allocation_context,host->reconcile_charge,output);
+      :ku_task_blocking_submit_http(host->ticket,host->control,host->blocking,method,url,body,has_body,names,values,NULL,timeout,max_body,config_fault,host->request_deadline,host->allocation_context,host->reconcile_charge,output);
+  return status==KU_TASK_HTTP_CONFIG_ERROR?status:ku_task_host_net_status(status);
+}
+static uint32_t ku_task_http_invalid_config(KuResult_struct___ku_http_response* output,const char* message) {
+  *output=(KuResult_struct___ku_http_response){false,{0},__ku_http_client_error("invalid_config",message)};
+  return KU_TASK_HTTP_CONFIG_ERROR;
+}
+static int64_t ku_task_http_optional_int(const KuValue* value,int64_t fallback) {
+  if(!value||value->tag==KU_NULL)return fallback;
+  /* Zero is outside both allowed ranges. The submit path reports this only
+   * after the header validation, as with scalar slot inputs. */
+  return value->tag==KU_INT?value->as.i:0;
+}
+static uint32_t ku_task_host_http_object(KuTaskAdapterHostV1* host,KuValue config,KuResult_struct___ku_http_response* output) {
+  if(!ku_task_host_net_valid(host)||!output)return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if(ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE)return KU_TASK_CONTROL_PENDING;
+  if(host->blocking->pool){
+    return ku_task_host_net_status(ku_task_blocking_take(host->ticket,host->blocking,0,10u,NULL,output));
+  }
+  if(config.tag!=KU_OBJECT||!config.as.o)return ku_task_http_invalid_config(output,"http.request requires an object");
+
+  enum { URL, METHOD, BODY, HEADERS, TIMEOUT, MAX_BODY, FIELD_COUNT };
+  static const char* const names[FIELD_COUNT]={"url","method","body","headers","timeout_ms","max_body_bytes"};
+  const KuValue* fields[FIELD_COUNT]={0};
+  const KuObject* object=config.as.o;
+  for(size_t i=0;i<object->cap;i++){
+    const KuEntry* entry=&object->entries[i];
+    if(!entry->used)continue;
+    size_t index=0;
+    for(;index<FIELD_COUNT;index++){
+      if(ku_string_equal(entry->key,ku_string_static((const uint8_t*)names[index],strlen(names[index]))))break;
+    }
+    if(index==FIELD_COUNT)return ku_task_http_invalid_config(output,"unknown http config field");
+    fields[index]=&entry->value;
+  }
+  if(!fields[URL]||fields[URL]->tag!=KU_STR)return ku_task_http_invalid_config(output,"http.request missing required str url");
+  KuString url=fields[URL]->as.s;
+  KuString method=ku_string_static((const uint8_t*)"GET",3);
+  if(fields[METHOD]&&fields[METHOD]->tag!=KU_NULL){
+    if(fields[METHOD]->tag!=KU_STR)return ku_task_http_invalid_config(output,"http.request method must be str");
+    method=fields[METHOD]->as.s;
+  }
+  KuString body={0};
+  uint32_t has_body=fields[BODY]&&fields[BODY]->tag!=KU_NULL;
+  if(has_body){
+    if(fields[BODY]->tag!=KU_STR)return ku_task_http_invalid_config(output,"http.request body must be str");
+    body=fields[BODY]->as.s;
+  }
+  const KuObject* headers=NULL;
+  if(fields[HEADERS]){
+    if(fields[HEADERS]->tag!=KU_OBJECT||!fields[HEADERS]->as.o){
+      return ku_task_http_invalid_config(output,"http.request headers must be object");
+    }
+    headers=fields[HEADERS]->as.o;
+    if(headers->len>1024u)return ku_task_http_invalid_config(output,"http.request has too many headers");
+  }
+  int64_t timeout=ku_task_http_optional_int(fields[TIMEOUT],5000);
+  int64_t max_body=ku_task_http_optional_int(fields[MAX_BODY],1000000);
+  /* This call copies transport inputs into the async owner before publishing
+   * the job. Neither it nor subsequent takes retain the config/descriptor addresses. */
+  uint32_t status=ku_task_blocking_submit_http(host->ticket,host->control,host->blocking,method,url,body,has_body,
+      (KuArray_str){0},(KuArray_str){0},headers,timeout,max_body,0,host->request_deadline,host->allocation_context,host->reconcile_charge,output);
   return status==KU_TASK_HTTP_CONFIG_ERROR?status:ku_task_host_net_status(status);
 }
 #endif

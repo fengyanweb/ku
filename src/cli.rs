@@ -2710,19 +2710,21 @@ fn write_native_c_to(
 ) -> Result<PathBuf, KuError> {
     let program = parse_and_expand_with_dependency_mode(path, source, dependency_mode)?;
     let native_task_entry = ir::task_lower::has_async_entry(&program);
-    Checker::new().check(&program).map_err(|err| {
-        let id = err.diagnostic_id();
-        if matches!(
-            id,
-            DiagnosticId::HttpCapturedMutation | DiagnosticId::HttpSharedCallableReassignment
-        ) {
-            KuError::message(err.diagnostic(path, source)).with_diagnostic_id(id)
-        } else {
-            // Keep unrelated native build API errors unchanged. HTTP needs
-            // the registration/assignment diagnostic at every CLI entry.
-            err
-        }
-    })?;
+    let fields = Checker::new()
+        .check_with_native_fields(&program)
+        .map_err(|err| {
+            let id = err.diagnostic_id();
+            if matches!(
+                id,
+                DiagnosticId::HttpCapturedMutation | DiagnosticId::HttpSharedCallableReassignment
+            ) {
+                KuError::message(err.diagnostic(path, source)).with_diagnostic_id(id)
+            } else {
+                // Keep unrelated native build API errors unchanged. HTTP needs
+                // the registration/assignment diagnostic at every CLI entry.
+                err
+            }
+        })?;
     let options = backend::c::CBackendOptions {
         fs_base,
         // Test-only, generation-time opt-in. This environment is read by
@@ -2739,7 +2741,7 @@ fn write_native_c_to(
     } else {
         // Preserve each async handler's real lexical capture cells before
         // replacing its setup-side body with a fatal signature placeholder.
-        let (lowered, bindings) = ir::lower_mixed_http_setup(&program)?;
+        let (lowered, bindings) = ir::lower_mixed_http_setup_with_fields(&program, fields)?;
         let optimized = ir::optimize_program(&lowered);
         if bindings.is_empty() {
             backend::c::generate_c_source_with_options(&optimized, &options)?

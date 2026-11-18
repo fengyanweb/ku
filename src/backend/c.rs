@@ -867,6 +867,7 @@ fn generate_c_source_with_frames_attempt(
     emit_string_chars_helper(&mut out, program)?;
     emit_nullable_value_wrappers(&mut out, program, true)?;
     emit_kuvalue_array_wrappers(&mut out, program)?;
+    emit_object_pattern_array_moves(&mut out, program)?;
     emit_kuvalue_typed_array_equality_helpers(&mut out, program)?;
     emit_fs_runtime(&mut out, fs_usage, &options.fs_base);
     if frames.is_some_and(|(tasks, _, _)| task::uses_blocking_io(tasks)) {
@@ -2695,7 +2696,14 @@ fn emit_block(
         emit_for_each_cleanup(out, state)?;
     }
     for inst in &block.instructions {
-        emit_inst(out, inst, return_type, owned_locals, initial_temps)?;
+        emit_inst(
+            out,
+            inst,
+            return_type,
+            owned_locals,
+            for_each_states,
+            initial_temps,
+        )?;
     }
     if block.terminator == IrTerminator::Unreachable
         && matches!(
@@ -2713,6 +2721,7 @@ fn emit_inst(
     inst: &IrInst,
     return_type: &IrType,
     owned_locals: &[OwnedLocal],
+    for_each_states: &[ForEachState],
     initial_temps: &HashSet<usize>,
 ) -> KuResult<()> {
     out.check()?;
@@ -2726,6 +2735,25 @@ fn emit_inst(
         ty,
     }) = inst
     {
+        if name == "__ku_retire_foreach" {
+            if *ty != IrType::Void {
+                return Err(unsupported("foreach retirement must have a void result"));
+            }
+            for arg in args.iter().rev() {
+                let IrExprKind::Literal(raw) = &arg.kind else {
+                    return Err(unsupported("foreach retirement requires literal block IDs"));
+                };
+                let id = raw
+                    .parse::<usize>()
+                    .map_err(|_| unsupported("invalid foreach retirement block ID"))?;
+                let state = for_each_states
+                    .iter()
+                    .find(|state| state.block_id.0 == id)
+                    .ok_or_else(|| unsupported("foreach retirement refers to an unknown loop"))?;
+                emit_for_each_cleanup(out, state)?;
+            }
+            return Ok(());
+        }
         if name == "__ku_loop_scope_cleanup" {
             if *ty != IrType::Void {
                 return Err(unsupported("loop scope cleanup must have a void result"));
@@ -5049,6 +5077,66 @@ static bool ku_value_equal(KuValue left, KuValue right) {
 
 "#
     );
+    if program_uses_intrinsic(program, "__ku_object_take_required")
+        || program_uses_intrinsic(program, "__ku_object_pattern_convert")
+    {
+        out.push_str(
+            r#"/* The caller owns the source object and provides an empty output slot. A
+ * present null moves successfully; a missing key leaves the output untouched. */
+static bool __ku_object_take(KuObject* object, KuString key, KuValue* out) {
+  if (!object) return false;
+  ku_object_require_valid(object);
+  size_t capacity = object->cap;
+  size_t mask = capacity - 1;
+  KuEntry* entries = object->entries;
+  size_t hole = (size_t)ku_obj_hash(key) & mask;
+  for (size_t probes = 0; probes < capacity; probes++) {
+    if (!entries[hole].used) return false;
+    if (ku_string_equal(entries[hole].key, key)) {
+      *out = ku_value_move(&entries[hole].value);
+      ku_string_drop(&entries[hole].key);
+      size_t next = (hole + 1) & mask;
+      for (size_t scanned = 1; scanned < capacity; scanned++) {
+        if (!entries[next].used) {
+          entries[hole] = (KuEntry){0};
+          object->len--;
+          return true;
+        }
+        size_t home = (size_t)ku_obj_hash(entries[next].key) & mask;
+        // Move an entry back only when its search would cross the hole.
+        if (((hole - home) & mask) < ((next - home) & mask)) {
+          entries[hole] = entries[next];
+          hole = next;
+        }
+        next = (next + 1) & mask;
+      }
+      ku_object_internal_fail("object hash table retirement exhausted");
+      return false;
+    }
+    hole = (hole + 1) & mask;
+  }
+  ku_object_internal_fail("object hash table probe exhausted");
+  return false;
+}
+
+static KuValue __ku_object_take_required(KuObject* object, KuString key) {
+  KuValue value = ku_v_null();
+  if (__ku_object_take(object, key, &value)) return value;
+  __ku_sync_raise_http_json((const uint8_t*)"object has no key", sizeof("object has no key") - 1u);
+  return value;
+}
+
+static KuValue __ku_object_pattern_checked(KuValue value, uint8_t tag) {
+  if (value.tag == tag) return value;
+  ku_value_drop(&value);
+  static const uint8_t message[] = "object field does not match its checked type";
+  __ku_sync_raise_http_json(message, sizeof(message) - 1u);
+  return (KuValue){.tag=tag};
+}
+
+"#,
+        );
+    }
     Ok(())
 }
 
@@ -5300,6 +5388,39 @@ fn emit_object_result_helpers(out: &mut COutput, program: &IrProgram, force: boo
     out.check()?;
     if !force && !program_uses_object(program) {
         return Ok(());
+    }
+    if [
+        "__ku_object_optional_field",
+        "__ku_object_optional_field_view",
+        "__ku_value_optional_field",
+        "__ku_value_optional_field_view",
+    ]
+    .into_iter()
+    .any(|name| program_uses_intrinsic(program, name))
+    {
+        out.push_str(
+            r#"static KuValue __ku_object_optional_field(KuObject* object, KuString key, bool borrow) {
+  KuValue* found = ku_object_get(object, key);
+  if (!found) return ku_v_null();
+  if (borrow) return *found;
+  KuValue owned = ku_v_null();
+  if (!ku_value_try_clone(*found, &owned)) {
+    const uint8_t* message = (const uint8_t*)"object allocation failed";
+    __ku_sync_raise_http_json(message, sizeof("object allocation failed") - 1);
+  }
+  return owned;
+}
+
+static KuValue __ku_value_optional_field(KuValue value, KuString key, bool borrow) {
+  if (value.tag == KU_NULL) return ku_v_null();
+  if (value.tag == KU_OBJECT) return __ku_object_optional_field(value.as.o, key, borrow);
+  const uint8_t* message = (const uint8_t*)"type error: optional field receiver has no fields";
+  __ku_sync_raise_http_json(message, sizeof("type error: optional field receiver has no fields") - 1);
+  return ku_v_null();
+}
+
+"#,
+        );
     }
     out.push_str(
         r#"static KuResult_kuvalue ku_object_out_of_memory_result(void) {
@@ -7275,6 +7396,81 @@ fn try_emit_object_construction(out: &mut COutput, target: &str, value: &IrExpr)
 
 /// Wrap a native value into a tagged KuValue by its IR type (object fields are
 /// heterogeneous, so each is boxed into a KuValue).
+fn object_pattern_scalar_tag(ty: &IrType) -> Option<(&'static str, &'static str)> {
+    Some(match ty {
+        IrType::Int => ("KU_INT", "i"),
+        IrType::Float => ("KU_FLOAT", "f"),
+        IrType::Bool => ("KU_BOOL", "b"),
+        IrType::Str => ("KU_STR", "s"),
+        IrType::Null => ("KU_NULL", "i"),
+        IrType::Named(name) if c_object_type_name(name) => ("KU_OBJECT", "o"),
+        _ => return None,
+    })
+}
+
+fn emit_object_pattern_array_moves(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    let mut emitted = HashSet::new();
+    for function in &program.functions {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                let IrInst::Temp { value, .. } = instruction else {
+                    continue;
+                };
+                if !matches!(&value.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), .. }
+                    if name == "__ku_object_pattern_convert")
+                {
+                    continue;
+                }
+                let ty = match &value.ty {
+                    IrType::Nullable(inner) => inner.as_ref(),
+                    ty => ty,
+                };
+                let IrType::Array(element) = ty else { continue };
+                let suffix = c_type_suffix(element)?;
+                if !emitted.insert(suffix.clone()) {
+                    continue;
+                }
+                let (tag, member) = object_pattern_scalar_tag(element)
+                    .ok_or_else(|| unsupported("native object pattern array element type"))?;
+                let element_type = c_type(element)?;
+                let array = c_type(ty)?;
+                out.push_str(&format!(r#"
+static {array} __ku_object_pattern_array_{suffix}(KuValue value) {{
+  value = __ku_object_pattern_checked(value, KU_ARRAY);
+  KuValueArray* source = value.as.arr;
+  if (!source) return ({array}){{0}};
+  size_t count = source->len;
+  {element_type}* data = NULL;
+  for (size_t i = 0; i < count; ++i) {{
+    if (source->data[i].tag != {tag}) {{
+      ku_value_drop(&value);
+      static const uint8_t message[] = "object array item does not match its checked type";
+      __ku_sync_raise_http_json(message, sizeof(message) - 1u);
+      return ({array}){{0}};
+    }}
+  }}
+  if (count) {{
+    if (count <= SIZE_MAX / sizeof(*data))
+      data = ({element_type}*)ku_object_malloc(KU_OBJECT_ALLOC_VALUE_ARRAY_DATA, count * sizeof(*data));
+    if (!data) {{
+      ku_value_drop(&value);
+      static const uint8_t message[] = "out of memory moving object array field";
+      __ku_sync_raise_http_json(message, sizeof(message) - 1u);
+      return ({array}){{0}};
+    }}
+    for (size_t i = 0; i < count; ++i)
+      data[i] = ku_value_move(&source->data[i]).as.{member};
+  }}
+  ku_value_drop(&value);
+  return ({array}){{.data=data, .len=count, .capacity=count}};
+}}
+"#));
+            }
+        }
+    }
+    out.check()
+}
+
 fn ku_value_wrap(ty: &IrType, expr: &str) -> KuResult<String> {
     match ty {
         IrType::Nullable(inner) => Ok(format!("__ku_v_nullable_{}({expr})", c_type_suffix(inner)?)),
@@ -17209,6 +17405,57 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
         return Ok(expression);
     }
     match name {
+        "__ku_optional_select" => {
+            let [receiver, field] = args else {
+                return Err(unsupported(
+                    "optional field selection requires a receiver and payload",
+                ));
+            };
+            if !matches!(receiver.ty, IrType::Nullable(_)) {
+                return Err(unsupported(
+                    "optional field selection requires a nullable receiver",
+                ));
+            }
+            let present = if field.ty == *ty {
+                c_expr(field)?
+            } else if matches!(ty, IrType::Nullable(inner) if **inner == field.ty) {
+                format!("({}){{ false, {} }}", c_type(ty)?, c_expr(field)?)
+            } else {
+                return Err(unsupported("optional field payload type mismatch"));
+            };
+            return Ok(format!(
+                "(({}).is_null ? {} : {present})",
+                c_expr(receiver)?,
+                c_zero_value(ty)?,
+            ));
+        }
+        "__ku_object_optional_field"
+        | "__ku_object_optional_field_view"
+        | "__ku_value_optional_field"
+        | "__ku_value_optional_field_view" => {
+            let [receiver, key] = args else {
+                return Err(unsupported(
+                    "optional object field requires a receiver and key",
+                ));
+            };
+            let dynamic = name.starts_with("__ku_value_");
+            let correct_receiver = matches!(&receiver.ty, IrType::Named(ty)
+                if if dynamic { ty == "__ku_value" } else { c_object_type_name(ty) });
+            if !correct_receiver || key.ty != IrType::Str || !ir_type_is_ku_value(ty) {
+                return Err(unsupported("optional object field type mismatch"));
+            }
+            return Ok(format!(
+                "{}({}, {}, {})",
+                if dynamic {
+                    "__ku_value_optional_field"
+                } else {
+                    "__ku_object_optional_field"
+                },
+                c_expr(receiver)?,
+                c_expr(key)?,
+                name.ends_with("_view"),
+            ));
+        }
         "__ku_nullable_null" => return c_zero_value(ty),
         "__ku_nullable_some" => {
             let [value] = args else {
@@ -17317,6 +17564,73 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
             c_value_expr(&args[1])?,
             c_value_expr(&args[2])?
         ));
+    }
+    if matches!(name, "__ku_object_has_key" | "__ku_object_take_required") {
+        let [object, key] = args else {
+            return Err(unsupported("object pattern requires an object and key"));
+        };
+        if !matches!(&object.ty, IrType::Named(name) if c_object_type_name(name))
+            || key.ty != IrType::Str
+        {
+            return Err(unsupported("object pattern has incompatible input types"));
+        }
+        let object = c_expr(object)?;
+        let key = c_expr(key)?;
+        return Ok(if name == "__ku_object_has_key" {
+            format!("(ku_object_get({object}, {key}) != NULL)")
+        } else {
+            format!("__ku_object_take_required({object}, {key})")
+        });
+    }
+    if name == "__ku_object_pattern_box" {
+        let [value] = args else {
+            return Err(unsupported("object pattern default requires one value"));
+        };
+        return ku_value_wrap(&value.ty, &c_value_expr(value)?);
+    }
+    if name == "__ku_object_pattern_convert" {
+        let [value] = args else {
+            return Err(unsupported(
+                "object pattern conversion requires a tagged value",
+            ));
+        };
+        if !ir_type_is_ku_value(&value.ty) || crate::ir::ir_expr_is_borrowed(value) {
+            return Err(unsupported(
+                "object pattern conversion requires an owned tagged value",
+            ));
+        }
+        let inner = match ty {
+            IrType::Nullable(inner) => inner.as_ref(),
+            ty => ty,
+        };
+        let moved = c_value_expr(value)?;
+        let payload = if let IrType::Array(element) = inner {
+            format!(
+                "__ku_object_pattern_array_{}({moved})",
+                c_type_suffix(element)?
+            )
+        } else {
+            let (tag, member) = object_pattern_scalar_tag(inner).ok_or_else(|| {
+                unsupported(format!(
+                    "object pattern field conversion to {ty} is unsupported"
+                ))
+            })?;
+            format!("__ku_object_pattern_checked({moved}, {tag}).as.{member}")
+        };
+        if matches!(ty, IrType::Nullable(_)) {
+            if !matches!(value.kind, IrExprKind::Temp(_) | IrExprKind::Local(_)) {
+                return Err(unsupported(
+                    "nullable object field requires a materialized value",
+                ));
+            }
+            return Ok(format!(
+                "(({}).tag == KU_NULL ? {} : ({}){{false, {payload}}})",
+                c_expr(value)?,
+                c_zero_value(ty)?,
+                c_type(ty)?,
+            ));
+        }
+        return Ok(payload);
     }
     if name == "__ku_object_get" {
         let object = args

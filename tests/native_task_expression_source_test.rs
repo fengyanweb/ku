@@ -559,7 +559,6 @@ fn native_task_copy_expression_type_and_skipped_rhs_budget_gates_remain_strict()
         "true + false",
         "1 == true",
         "true < false",
-        "null == null",
         "\"a\" + 1",
         "ok(1) == ok(1)",
         "Child() == Child()",
@@ -577,9 +576,8 @@ fn native_task_copy_expression_type_and_skipped_rhs_budget_gates_remain_strict()
             "{expression}: {error}"
         );
     }
-    // String equality is already a supported read-only operation. Keep its
-    // positive source contract separate from genuinely invalid operand types.
-    for expression in ["\"a\" == \"b\"", "true || (\"a\" == \"a\")"] {
+    // String and null equality already have explicit supported branches.
+    for expression in ["\"a\" == \"b\"", "true || (\"a\" == \"a\")", "null == null"] {
         let source = format!("async fn main():null! {{ value={expression} return ok(null) }}");
         task_lower::lower_program(&parsed(&source)).expect("supported string comparison");
     }

@@ -988,9 +988,9 @@ def installed_native_http_relay_consumer(install, root, env, report, report_path
             source=source.replace('127.0.0.1:8081','127.0.0.1:'+str(service_address[1]))
             address='http://127.0.0.1:'+str(upstream.getsockname()[1])
             extra='''import time from "std.time"
-async fn LateFetch():HttpResponse! { return http.request({url:__SLOW__,timeout_ms:5000,max_body_bytes:4096}) }
+async fn LateFetch():HttpResponse! { config={url:__SLOW__,timeout_ms:5000,max_body_bytes:4096} return http.request(config) }
 async fn Deadline():HttpResponse! { pending=LateFetch() time.sleep(1)? return await pending }
-async fn Cancelled():HttpResponse! { r=http.get(__CANCEL__)? return ok(http.text(r.body.clone())) }
+async fn Cancelled():HttpResponse! { config={url:__CANCEL__} r=http.request(config)? return ok(http.text(r.body.clone())) }
 async fn InvalidConfig():HttpResponse! {
  try { r=http.request({url:__HELLO__,headers:{"Bad Name":"x"},timeout_ms:0})? return ok(http.text("continued")) }
  catch(e) { return ok(http.text("caught")) }

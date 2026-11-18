@@ -1023,7 +1023,7 @@ fn main() {
 }
 
 #[test]
-fn native_build_rejects_object_destructuring_until_lowered() {
+fn native_ir_lowers_object_destructuring() {
     let dir = unique_temp_path("native-object-destructure");
     fs::create_dir_all(&dir).expect("create temp dir");
     let file = dir.join("main.ku");
@@ -1039,23 +1039,18 @@ fn main() {
     )
     .expect("write source");
 
-    let err = run_cli(vec![
+    run_cli(vec![
         "ku".to_string(),
         "build".to_string(),
         "--emit-ir".to_string(),
         file.display().to_string(),
     ])
-    .expect_err("IR/native object destructuring should be rejected")
-    .to_string();
-    assert!(
-        err.contains("IR/native lowering does not support object destructuring yet"),
-        "unexpected error: {err}"
-    );
+    .expect("IR should use the owned object pattern path");
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn native_ir_rejects_closure_capture_of_for_binding_explicitly() {
+fn native_ir_boxes_a_captured_for_binding_in_the_body() {
     let tokens = Lexer::new(
         r#"
 fn main() {
@@ -1070,13 +1065,33 @@ fn main() {
     .expect("lex");
     let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
-    let err = ir::lower_program(&program)
-        .expect_err("native for-binding capture must be rejected until per-iteration cells exist")
-        .to_string();
-    assert!(
-        err.contains("closure capture of a for loop variable"),
-        "unexpected error: {err}"
-    );
+    let lowered = ir::lower_program(&program).expect("for-binding capture lowers");
+    let main = lowered
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main function exists");
+    let (yielded, body_id) = main
+        .blocks
+        .iter()
+        .find_map(|block| match &block.terminator {
+            ir::IrTerminator::ForEach {
+                name, body_block, ..
+            } => Some((name, *body_block)),
+            _ => None,
+        })
+        .expect("for terminator exists");
+    let body = main
+        .blocks
+        .iter()
+        .find(|block| block.id == body_id)
+        .expect("for body exists");
+    assert!(matches!(
+        body.instructions.first(),
+        Some(ir::IrInst::CellNew { name, init, .. })
+            if name != yielded
+                && matches!(&init.kind, ir::IrExprKind::Local(source) if source == yielded)
+    ));
 }
 
 #[test]

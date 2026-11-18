@@ -879,6 +879,77 @@ fn native_collection_concat_and_nullable_edges_preserve_values_and_owners() {
 }
 
 #[test]
+fn native_optional_fields_evaluate_once_and_keep_null_and_zero_distinct() {
+    let source = r#"
+struct Child { text: str }
+struct Parent { count: int, child: Child | null }
+
+fn receiver(present: bool): Parent | null {
+    println("receiver")
+    if (present) {
+        return Parent { count: 0, child: Child { text: "owned" + "!" } }
+    }
+    return null
+}
+
+fn check_view(&parent: Parent | null): bool {
+    return parent?.child?.text == "owned!"
+}
+
+fn main() {
+    present = receiver(true)
+    count = present?.count
+    if (count == null || count != 0) panic("zero lost its present tag")
+    if (!check_view(present)) panic("borrowed nested field")
+    text = present?.child?.text.clone()
+    present = null
+    if (text == null || text != "owned!") panic("owned projection lost its source lifetime")
+    if (receiver(false)?.child?.text != null) panic("null receiver selected a field")
+    object = { child: { count: 0 }, none: null }
+    next = object?.child?.count + 1
+    if (next != 1) panic("static object field lost its checked type")
+    if (object?.none != null || object?.missing != null) panic("missing object field")
+    println("optional-field-ok")
+}
+"#;
+    run_source("optional-field.ku", source).expect("interpreter optional-field contract");
+    let temp = TempDir::new("native-optional-field");
+    fs::write(temp.path().join("main.ku"), source).expect("write optional-field program");
+    let name = if cfg!(windows) { "app.exe" } else { "app" };
+    let mut build = Command::new(env!("CARGO_BIN_EXE_ku"));
+    build.current_dir(temp.path()).args([
+        "build",
+        "--backend",
+        "c",
+        "--release",
+        "main.ku",
+        "-o",
+        name,
+    ]);
+    let built = run_bounded(&mut build, RUN_TIMEOUT, RUN_LIMITS).expect("bounded optional build");
+    let error = String::from_utf8_lossy(&built.stderr);
+    if !built.status.success() && error.contains("C compiler not found") {
+        return;
+    }
+    assert!(
+        built.status.success(),
+        "optional field native build failed: {error}"
+    );
+    let mut run = Command::new(temp.path().join(name));
+    run.current_dir(temp.path());
+    let result = run_bounded(&mut run, RUN_TIMEOUT, RUN_LIMITS).expect("bounded optional run");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout).replace('\r', ""),
+        "receiver\nreceiver\noptional-field-ok\n"
+    );
+}
+
+#[test]
 fn native_collection_nullable_containers_print_and_encode_without_boxing_scalars() {
     let source = r#"
 import json from "std.json"

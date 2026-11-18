@@ -184,6 +184,89 @@ fn main() {{
 }
 
 #[test]
+fn native_for_capture_keeps_distinct_cells_and_retires_abandoned_iterations() {
+    let source = r#"
+fn Stop(): null! { fail "stopped" }
+fn Readers(): [fn(): str]! {
+    readers: [fn(): str] = []
+    name = "outer"
+    round = 0
+    while (round < 3) {
+        round += 1
+        try {
+            for name in ["skip", "first" + str(round), "second" + str(round), "unused"] {
+                if (name == "skip") { continue }
+                read: fn(): str = () => { return name.clone() }
+                try { Stop()? } catch(err) {
+                    if (err.message != "stopped" || read() != name) {
+                        panic("local catch lost the active iterator")
+                    }
+                }
+                readers = readers.push(read)
+                name = name + "!"
+                if (round < 3) { Stop()? }
+                if (name == "second3!") { break }
+            }
+        } catch(err) {
+            if (err.message != "stopped") { panic("wrong loop error") }
+        }
+    }
+    if (name != "outer") { panic("loop binding escaped its scope") }
+    return ok(readers)
+}
+fn AfterFinally(): int {
+    rounds = 0
+    while (rounds < 3) {
+        rounds += 1
+        try {
+            for i in 2 {
+                read: fn(): int = () => i
+                return read()
+            }
+        } finally {
+            if (rounds < 3) { continue }
+        }
+    }
+    return -1
+}
+fn main(): null! {
+    readers = Readers()?
+    if (readers.len() != 4) { panic("wrong reader count") }
+    if (readers[0]() != "first1!" || readers[1]() != "first2!"
+        || readers[2]() != "first3!" || readers[3]() != "second3!") {
+        panic("iteration cells were shared or dropped")
+    }
+    if (AfterFinally() != 0) { panic("finally left a stale iterator") }
+    println("native-for-capture-ok")
+    return ok(null)
+}
+"#;
+    run_source("native-for-capture.ku", source).expect("interpreter loop capture contract");
+    let generated = allocations(generate(source));
+    let mut generated = replace_once(
+        generated,
+        "int main(void) {",
+        "static int fixture_original_main(void) {",
+    );
+    generated.push_str(
+        r#"
+int main(void) {
+    int status = fixture_original_main();
+    if (status) return status;
+    if (ku_perf_live_allocations || ku_perf_live_bytes || ku_perf_overflow) {
+        fputs("captured loop owners retained\n", stderr);
+        return 93;
+    }
+    return 0;
+}
+"#,
+    );
+    if let Some(output) = execute("native-for-capture", generated) {
+        assert_eq!(output, "native-for-capture-ok\n");
+    }
+}
+
+#[test]
 fn native_continue_keeps_safepoints_and_finally_cannot_escape_selected_timeout() {
     let source = r#"
 fn TimedWhile():str! {
@@ -201,7 +284,12 @@ fn TimedWhile():str! {
 }
 fn TimedFor():str! {
     while(true) {
-        try { for index in 1000000000 {continue} }
+        try {
+            for index in 1000000000 {
+                read: fn(): int = () => index
+                continue
+            }
+        }
         finally {
             println("timed-for")
             try {continue} finally {println("timed-for-inner")}

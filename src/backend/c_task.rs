@@ -274,7 +274,8 @@ pub(super) fn uses_outbound_http(tasks: &TaskProgram) -> bool {
                 TaskTerminator::BlockingNet {
                     operation: TaskNetOperation::HttpGet
                         | TaskNetOperation::HttpPost
-                        | TaskNetOperation::HttpRequest,
+                        | TaskNetOperation::HttpRequest
+                        | TaskNetOperation::HttpRequestObject,
                     ..
                 }
             )
@@ -2894,9 +2895,15 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         TaskNetOperation::Close => 8,
                         TaskNetOperation::HttpGet
                         | TaskNetOperation::HttpPost
-                        | TaskNetOperation::HttpRequest => 10,
+                        | TaskNetOperation::HttpRequest
+                        | TaskNetOperation::HttpRequestObject => 10,
                     };
-                    if matches!(
+                    if *operation == TaskNetOperation::HttpRequestObject {
+                        let object = self.place(
+                            inputs[0].ok_or_else(|| unsupported("HTTP configuration absent"))?,
+                        );
+                        out.push_str(&format!("  uint32_t net_status=ku_task_host_http_object((KuTaskAdapterHostV1*)clock->host,{object},&{});\n",self.place(*dst)));
+                    } else if matches!(
                         operation,
                         TaskNetOperation::HttpGet
                             | TaskNetOperation::HttpPost
@@ -2970,6 +2977,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         TaskNetOperation::HttpGet
                             | TaskNetOperation::HttpPost
                             | TaskNetOperation::HttpRequest
+                            | TaskNetOperation::HttpRequestObject
                     ) {
                         out.push_str("  if (net_status==KU_TASK_HTTP_CONFIG_ERROR) {\n");
                         self.emit_runtime_error(
@@ -3987,6 +3995,18 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         IrType::Bool => format!("ku_v_bool({})", self.place(*slot)),
                         IrType::Null => "ku_v_null()".into(),
                         IrType::Str => format!("ku_v_str({})", self.place(*slot)),
+                        IrType::Nullable(inner) => {
+                            let wrapper = match inner.as_ref() {
+                                IrType::Int => "ku_v_int",
+                                IrType::Bool => "ku_v_bool",
+                                IrType::Str => "ku_v_str",
+                                _ => return Err(unsupported("Task object nullable field type")),
+                            };
+                            let place = self.place(*slot);
+                            format!(
+                                "(({place}).is_null ? ku_v_null() : {wrapper}(({place}).value))"
+                            )
+                        }
                         IrType::Named(name) if name == "__ku_value" => self.place(*slot),
                         _ => return Err(unsupported("Task JSON object field type")),
                     });

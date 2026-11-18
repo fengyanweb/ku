@@ -65,7 +65,7 @@ Windows GNU 的安装验证还覆盖普通／typed PostgreSQL 的参数、Unicod
 
 普通原生 C 程序不使用 `libku.rlib`。TLS、日期和 HTTP 静态包须与目标及 CLI 匹配，并仅在程序使用对应能力时参与链接；数据库客户端动态库和其依赖仍须在部署环境提供。详情见 [CLI／SDK](cli-runtime-bundle.md)。
 
-递归 value 布局、object 解构、optional chaining、捕获 `for` 迭代绑定，以及尚未映射的标准库能力仍会明确拒绝。Task 参数、返回、捕获及 finally 继续受各自文档中的子集限制。遇到不支持能力或缺少依赖时应报错，不静默换成 Runner。
+同步 native C 支持普通对象解构、`?.field` 和 `for` 迭代变量捕获。解构移交字段所有权，存在的 null 不触发默认值；可选字段保留 null，接收值只求值一次；循环捕获在每次迭代建立独立绑定。Task 的对象操作、参数、返回、捕获及 finally 仍受现有子集限制，递归布局和未知调用 ABI 会明确报错。
 
 原生 C 成为源码默认入口，不表示所有解释器功能或性能目标均已完成。能力、所有权、平台、安装与真实项目仍按各自证据验收，独立性能修改的采用条件不变。`ku run` 与直接执行 `.ku` 的既有行为不因此改变。
 
@@ -83,7 +83,7 @@ Windows GNU 的安装验证还覆盖普通／typed PostgreSQL 的参数、Unicod
 
 完整回环示例：[native_http_client.ku](../examples/native_http_client.ku)。运行前，请先在 `127.0.0.1:8080` 启动按示例约定提供 `/hello`、`/post` 和 `/missing` 的本地 HTTP 服务。安装包验收同时链接日期和 HTTP 静态库，并在源码和 SDK 不可用时运行生成程序。各目标仍分别记录实际安装运行结果，交叉编译不等于运行通过。
 
-Task 的 `http.request` 支持内联配置及内联字符串 header 表，字段值可以动态计算；`method/body/timeout_ms/max_body_bytes` 的 null 保留默认含义。配置对象别名不在当前 Task 聚合子集中。非法配置保持运行错误，网络、UTF-8 和正文上限等操作错误保持 Result。请求不会因网络失败而自动重试；重定向和连接复用遵守既有客户端规则。
+Task 的 `http.request` 支持字面量和局部配置对象，字符串 header 表也可以先绑定。字段值可以动态计算，`method/body/timeout_ms/max_body_bytes` 的 null 保留默认含义。调用只读配置，配置可重复使用。局部对象可持有受支持的 nullable 标量和嵌套对象；一般对象参数、返回和捕获仍属待补的 Task 能力。非法配置保持运行错误，网络、UTF-8 和正文上限等操作错误保持 Result。请求不会因网络失败而自动重试；重定向和连接复用遵守既有客户端规则。
 
 Task 可以读取响应的 `body/status`，读取或写入 `response.headers[key]`，并将 owned 响应跨等待保存或返回。动态 header 的字符串类型、名称、值、数量、字节和传输字段仍由既有 HTTP 校验约束；分配计入 Task 预算。非法响应不会使后续合法请求失效。这不扩展为任意 Task 对象、结构体或嵌套容器。
 

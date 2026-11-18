@@ -2112,7 +2112,7 @@ impl<'a> FunctionLowerer<'a> {
             self.budget.text(key.len(), expression.span)?;
             let source = self.expression(expression, depth + 1)?;
             if !matches!(&self.function.slots[source.0].ty,TaskSlotType::Value {ty,borrowed:false}
-                if matches!(ty,IrType::Int|IrType::Bool|IrType::Null|IrType::Str) || task::json_value_type(ty))
+                if matches!(ty,IrType::Int|IrType::Bool|IrType::Null|IrType::Str) || task::nullable_leaf(ty) || task::json_value_type(ty))
             {
                 return Err(unsupported(
                     "Task JSON field other than scalar or JSON value",
@@ -2728,11 +2728,26 @@ impl<'a> FunctionLowerer<'a> {
             let [argument] = args else {
                 return Err(unsupported("http.request argument count", span));
             };
-            let ExprKind::ObjectLiteral { fields } = &argument.kind else {
-                return Err(unsupported(
-                    "Task http.request requires an inline configuration",
-                    argument.span,
-                ));
+            let inline_fields = match &argument.kind {
+                ExprKind::ObjectLiteral { fields }
+                    if fields.iter().all(|(name, value)| {
+                        if name == "headers" {
+                            return matches!(
+                                value.kind,
+                                ExprKind::ObjectLiteral { .. } | ExprKind::Literal(Literal::Null)
+                            );
+                        }
+                        // Nullable values in named fields use the normal
+                        // tagged object representation, including null.
+                        !matches!(&value.kind, ExprKind::Variable(name)
+                            if self.local(name).is_some_and(|slot|
+                                matches!(&self.function.slots[slot.0].ty,
+                                    TaskSlotType::Value { ty: IrType::Nullable(_), .. })))
+                    }) =>
+                {
+                    fields
+                }
+                _ => return self.outbound_http_object(argument, depth),
             };
             let names = [
                 "url",
@@ -2743,7 +2758,7 @@ impl<'a> FunctionLowerer<'a> {
                 "headers",
             ];
             let mut seen = 0u16;
-            for (name, value) in fields {
+            for (name, value) in inline_fields {
                 let Some(index) = names.iter().position(|n| n == name) else {
                     return Err(unsupported("unknown HTTP request field", value.span));
                 };
@@ -2813,6 +2828,29 @@ impl<'a> FunctionLowerer<'a> {
         )?;
         for source in inputs.into_iter().flatten() {
             self.emit(TaskOp::Drop { slot: source })?;
+        }
+        Ok(dst)
+    }
+
+    fn outbound_http_object(&mut self, config: &Expr, depth: usize) -> KuResult<SlotId> {
+        let owner = self.expression(config, depth + 1)?;
+        if self.function.slots[owner.0].ty != value_slot(IrType::Named("__ku_value".into())) {
+            return Err(unsupported(
+                "this Task HTTP configuration type",
+                config.span,
+            ));
+        }
+        let mut inputs = [None; 9];
+        inputs[0] = Some(owner);
+        let dst = self.net_terminator(
+            task::TaskNetOperation::HttpRequestObject,
+            inputs,
+            IrType::Result(Box::new(IrType::Named("__ku_http_response".into()))),
+        )?;
+        // http.request reads the configuration. A binding stays owned by
+        // its frame; only a temporary is retired at this call's ready edge.
+        if !matches!(config.kind, ExprKind::Variable(_)) {
+            self.emit(TaskOp::Drop { slot: owner })?;
         }
         Ok(dst)
     }

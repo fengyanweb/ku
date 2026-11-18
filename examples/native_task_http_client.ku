@@ -8,12 +8,14 @@ async fn main(): null! {
     if (first.headers["x-ku"] != "yes") fail "GET headers"
     posted = http.post(base + "/post", "payload 中文")?
     if (posted.status != 201 || posted.body != "payload 中文") fail "POST response"
-    missing = http.request({
+    headers = { "x-ku-input": first.headers["x-ku"] }
+    config = {
         url: base + "/missing",
         timeout_ms: 1000,
         max_body_bytes: 4096,
-        headers: { "x-ku-input": first.headers["x-ku"] }
-    })?
+        headers: headers
+    }
+    missing = http.request(config)?
     if (missing.status != 404 || missing.body != "missing") fail "non-2xx result"
     if (first.body != "hello 中文🙂" || first.headers["x-ku"] != "yes") fail "response lifetime"
     println("native-task-http-client-ok")

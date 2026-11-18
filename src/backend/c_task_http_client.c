@@ -190,12 +190,25 @@ connected:
   if(!(next&3u))return ku_task_http_finish(pool,job,__ku_http_client_error("transport","HTTP operation made no bounded progress"));
   job->http_interest=next&3u;return 0;
 }
+static const char* ku_task_http_prepare_header(KuString name,KuString value,__ku_http_client_header_v1* output) {
+  if(!__ku_http_client_token(name))return "http.request header name is not a valid HTTP token";
+  if(!__ku_http_client_header_value(value))return "http.request header contains control characters";
+  static const char*const managed[]={"host","content-length","transfer-encoding","connection","proxy-connection","keep-alive","te","trailer","upgrade","expect"};
+  for(size_t i=0;i<sizeof(managed)/sizeof(managed[0]);i++){
+    if(__ku_http_client_header_eq(name,managed[i]))return "http.request header is managed by the HTTP transport";
+  }
+  *output=(__ku_http_client_header_v1){{name.ptr,name.len},{value.ptr,value.len}};
+  return NULL;
+}
 static uint32_t ku_task_blocking_submit_http(const KuTaskDriverTicketV1* ticket,KuTaskControlV1* control,KuTaskBlockingTokenV1* token,
-    KuString method,KuString url,KuString body,uint32_t has_body,KuArray_str names,KuArray_str values,int64_t timeout,int64_t max_body,int64_t config_fault,
+    KuString method,KuString url,KuString body,uint32_t has_body,KuArray_str names,KuArray_str values,const KuObject* header_map,
+    int64_t timeout,int64_t max_body,int64_t config_fault,
     uint64_t parent_deadline,void* context,uint32_t(*reconcile)(void*),KuResult_struct___ku_http_response* output){
   if(!ticket||!ticket->driver||!control||!token||token->pool||!context||!reconcile||!output||names.len!=values.len||names.len>1024u)return KU_TASK_DRIVER_INVALID_ARGUMENT;
   if(config_fault==1){*output=(KuResult_struct___ku_http_response){false,{0},__ku_http_client_error("invalid_config","http.request headers must be object")};return 100u;}
   if(config_fault)return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if(header_map&&(names.len||header_map->len>1024u||header_map->len>header_map->cap||!header_map->entries))return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  size_t header_count=header_map?header_map->len:names.len;
   const char* config_message=NULL;
   uint64_t deadline=ku_net_deadline_after_ms(timeout>=1&&timeout<=300000?(uint32_t)timeout:5000u);
   if(parent_deadline&&parent_deadline<deadline)deadline=parent_deadline;
@@ -211,21 +224,44 @@ static uint32_t ku_task_blocking_submit_http(const KuTaskDriverTicketV1* ticket,
   status=ku_task_driver_blocking_register(ticket);int registered=status==KU_TASK_DRIVER_OK;
   if(status==KU_TASK_DRIVER_OK)status=reconcile(context);
   __ku_http_client_header_v1* headers=NULL;
-  if(status==KU_TASK_DRIVER_OK&&names.len){
-    status=ku_task_http_reserve(job,names.len*sizeof(*headers));
-    if(status==KU_TASK_DRIVER_OK){headers=(__ku_http_client_header_v1*)malloc(names.len*sizeof(*headers));if(!headers)status=KU_TASK_BLOCKING_OUT_OF_MEMORY;}
-    for(size_t i=0;status==KU_TASK_DRIVER_OK&&i<names.len;i++){
-      if(!__ku_http_client_token(names.data[i])){status=100u;config_message="http.request header name is not a valid HTTP token";break;}
-      if(!__ku_http_client_header_value(values.data[i])){status=100u;config_message="http.request header contains control characters";break;}
-      static const char*const managed[]={"host","content-length","transfer-encoding","connection","proxy-connection","keep-alive","te","trailer","upgrade","expect"};
-      for(size_t n=0;n<sizeof(managed)/sizeof(managed[0]);n++)if(__ku_http_client_header_eq(names.data[i],managed[n])){status=100u;config_message="http.request header is managed by the HTTP transport";}
-      headers[i]=(__ku_http_client_header_v1){{names.data[i].ptr,names.data[i].len},{values.data[i].ptr,values.data[i].len}};
+  if(status==KU_TASK_DRIVER_OK&&header_count){
+    size_t descriptor_bytes=header_count*sizeof(*headers);
+    status=ku_task_http_reserve(job,descriptor_bytes);
+    if(status==KU_TASK_DRIVER_OK){
+      headers=(__ku_http_client_header_v1*)malloc(descriptor_bytes);
+      if(!headers)status=KU_TASK_BLOCKING_OUT_OF_MEMORY;
     }
-    if(status==KU_TASK_DRIVER_OK&&names.len>1){qsort(headers,names.len,sizeof(*headers),__ku_http_client_header_compare);for(size_t i=1;i<names.len;i++)if(!__ku_http_client_header_compare(headers+i-1,headers+i)){status=100u;config_message="duplicate http.request header";}}
+    if(status==KU_TASK_DRIVER_OK&&header_map){
+      size_t count=0;
+      for(size_t i=0;i<header_map->cap;i++){
+        const KuEntry* entry=&header_map->entries[i];
+        if(!entry->used)continue;
+        if(count==header_count){status=KU_TASK_DRIVER_INVALID_ARGUMENT;break;}
+        if(entry->value.tag!=KU_STR){config_message="http.request header must be str";break;}
+        config_message=ku_task_http_prepare_header(entry->key,entry->value.as.s,&headers[count]);
+        if(config_message)break;
+        count++;
+      }
+      if(config_message)status=100u;
+      else if(count!=header_count)status=KU_TASK_DRIVER_INVALID_ARGUMENT;
+    }else if(status==KU_TASK_DRIVER_OK){
+      for(size_t i=0;i<header_count;i++){
+        config_message=ku_task_http_prepare_header(names.data[i],values.data[i],&headers[i]);
+        if(config_message){status=100u;break;}
+      }
+    }
+    if(status==KU_TASK_DRIVER_OK&&header_count>1){
+      qsort(headers,header_count,sizeof(*headers),__ku_http_client_header_compare);
+      for(size_t i=1;i<header_count;i++){
+        if(!__ku_http_client_header_compare(headers+i-1,headers+i)){
+          status=100u;config_message="duplicate http.request header";break;
+        }
+      }
+    }
   }
   if(status==KU_TASK_DRIVER_OK&&(timeout<1||timeout>300000||max_body<1||max_body>16777216)){status=100u;config_message="http config field must be a positive int within its declared limit";}
   if(status==KU_TASK_DRIVER_OK){
-    __ku_http_client_input_v1 input={.size=sizeof(input),.flags=has_body,.method={method.ptr,method.len},.url={url.ptr,url.len},.body={body.ptr,body.len},.headers=headers,.header_count=names.len,.timeout_ms=(uint64_t)timeout,.max_body_bytes=(size_t)max_body};
+    __ku_http_client_input_v1 input={.size=sizeof(input),.flags=has_body,.method={method.ptr,method.len},.url={url.ptr,url.len},.body={body.ptr,body.len},.headers=headers,.header_count=header_count,.timeout_ms=(uint64_t)timeout,.max_body_bytes=(size_t)max_body};
     KuHttpClientAsyncBudgetV1 budget={job,ku_task_http_reserve,ku_task_http_refund};
     if(__ku_http_client_abi_version()!=1)status=KU_TASK_DRIVER_INVALID_ARGUMENT;
     else {uint32_t created=__ku_http_client_async_new_v1(&input,budget,&job->http_operation);if(created)status=created==1?KU_TASK_BLOCKING_OUT_OF_MEMORY:created==2?KU_TASK_DRIVER_INVALID_ARGUMENT:created==3?KU_TASK_DRIVER_LIMIT:KU_TASK_DRIVER_INTERNAL;}

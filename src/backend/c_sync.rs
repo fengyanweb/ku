@@ -49,10 +49,14 @@ fn validate_expr(expr: &IrExpr, allow_guarded_root: bool) -> KuResult<()> {
             "native C synchronous arithmetic/call requires a normalized immediate SyncGuard",
         ));
     }
-    // Only the one top-level instruction may own the adjacent guard. Nested
-    // work, including a call under a borrow/field/return, must be materialized.
-    for child in expr_children(expr) {
-        validate_expr(child, false)?;
+    // Optional selection emits one C conditional. Its receiver is already a
+    // materialized place; only the selected field can signal before this guard.
+    let guarded_selection = allow_guarded_root
+        && matches!(&expr.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), args, .. }
+            if name == "__ku_optional_select" && args.len() == 2);
+    for (index, child) in expr_children(expr).into_iter().enumerate() {
+        // For a Call the children are callee, receiver and selected field.
+        validate_expr(child, guarded_selection && index == 2)?;
     }
     Ok(())
 }

@@ -168,9 +168,26 @@ fn run_repeated_pending_expression(source: &str) {
             _ => None,
         })
         .collect();
-    assert_eq!(frozen_sources.len(), 1);
-    let frozen_source = frozen_sources[0];
-    assert_ne!(lhs, frozen_source);
+    let forwarded_owner = owned && !concat && frozen_sources.is_empty();
+    let frozen_source = if forwarded_owner {
+        assert_eq!(
+            parent
+                .states
+                .iter()
+                .flat_map(|s| &s.operations)
+                .filter(
+                    |op| matches!(op, TaskOp::Init { dst, value: task::TaskConstant::Str(text) }
+                    if *dst == lhs && text == "old")
+                )
+                .count(),
+            1,
+        );
+        lhs
+    } else {
+        assert_eq!(frozen_sources.len(), 1);
+        assert_ne!(lhs, frozen_sources[0]);
+        frozen_sources[0]
+    };
     let awaits: Vec<_> = parent
         .states
         .iter()
@@ -216,6 +233,12 @@ fn run_repeated_pending_expression(source: &str) {
     let source_place = scalar_place(frozen_source);
     let lhs_assignment = if concat {
         format!("  {{ uint32_t allocated=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source_place},&frame->s_{});\n",lhs.0)
+    } else if forwarded_owner {
+        drive
+            .lines()
+            .find(|line| line.starts_with(&format!("  frame->s_{} = ku_string_static(", lhs.0)))
+            .map(|line| format!("{line}\n"))
+            .expect("forwarded binding must initialize its actual frame owner")
     } else if owned {
         format!("  frame->s_{} = ku_string_move(&{source_place});\n", lhs.0)
     } else {

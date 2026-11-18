@@ -30,6 +30,8 @@ macro_rules! emit_ir_instruction {
 }
 mod monomorph;
 mod nullable;
+mod object_pattern;
+mod optional_field;
 /// Internal typed frame IR. This does not open the CLI's native async boundary.
 pub mod task;
 /// Experimental bounded source Task lowering, distinct from synchronous IR.
@@ -383,6 +385,22 @@ pub(crate) fn ir_expr_is_borrowed(expr: &IrExpr) -> bool {
             args,
             ..
         } if name == "__ku_nullable_get" => args.first().is_some_and(ir_expr_is_borrowed),
+        IrExprKind::Call {
+            kind: IrCallKind::Intrinsic(name),
+            args,
+            ..
+        } if name == "__ku_optional_select" => args.get(1).is_some_and(ir_expr_is_borrowed),
+        IrExprKind::Call {
+            kind: IrCallKind::Intrinsic(name),
+            args,
+            ..
+        } if matches!(
+            name.as_str(),
+            "__ku_object_optional_field_view" | "__ku_value_optional_field_view"
+        ) =>
+        {
+            args.first().is_some_and(ir_expr_is_borrowed)
+        }
         _ => false,
     }
 }
@@ -418,11 +436,19 @@ pub struct MixedAsyncHandler {
 }
 
 pub fn lower_mixed_http_setup(program: &Program) -> KuResult<(IrProgram, Vec<MixedAsyncHandler>)> {
+    lower_mixed_http_setup_with_fields(program, Default::default())
+}
+
+pub(crate) fn lower_mixed_http_setup_with_fields(
+    program: &Program,
+    fields: crate::checker::NativeFieldFacts,
+) -> KuResult<(IrProgram, Vec<MixedAsyncHandler>)> {
     let handlers = Rc::new(RefCell::new(Vec::new()));
     let lowered = lower_program_mode(
         program,
         Rc::new(RefCell::new(LowerBudget::new(LowerLimits::default()))),
         Some(handlers.clone()),
+        Rc::new(fields),
     )?;
     let handlers = std::mem::take(&mut *handlers.borrow_mut());
     if handlers.is_empty() {
@@ -453,13 +479,14 @@ fn lower_program_with_budget(
     program: &Program,
     budget: Rc<RefCell<LowerBudget>>,
 ) -> KuResult<IrProgram> {
-    lower_program_mode(program, budget, None)
+    lower_program_mode(program, budget, None, Default::default())
 }
 
 fn lower_program_mode(
     program: &Program,
     budget: Rc<RefCell<LowerBudget>>,
     mixed_async: Option<Rc<RefCell<Vec<MixedAsyncHandler>>>>,
+    fields: Rc<crate::checker::NativeFieldFacts>,
 ) -> KuResult<IrProgram> {
     if mixed_async.is_none() {
         crate::ast::reject_compiled_async(
@@ -537,6 +564,7 @@ fn lower_program_mode(
                 function.span,
             )?;
             probe.mixed_async = mixed_async.clone();
+            probe.native_fields = fields.clone();
             if let Some(sig) = signatures.get(&function.name) {
                 budget
                     .borrow_mut()
@@ -630,6 +658,7 @@ fn lower_program_mode(
                 function.span,
             )?;
             lower.mixed_async = mixed_async.clone();
+            lower.native_fields = fields.clone();
             for param in &params {
                 lower.locals.insert(param.name.clone(), param.ty.clone());
             }
@@ -1244,6 +1273,7 @@ struct FunctionLowerer<'a> {
     span: Span,
     signatures: &'a HashMap<String, FunctionSig>,
     layouts: &'a IrLayoutTable,
+    native_fields: Rc<crate::checker::NativeFieldFacts>,
     return_type: IrType,
     locals: HashMap<String, IrType>,
     borrowed_params: HashSet<String>,
@@ -1353,6 +1383,7 @@ impl BodyParameter for crate::ast::FunctionParam {
 struct IrTryHandler {
     error_block: BlockId,
     error_name: String,
+    loop_floor: usize,
     return_block: Option<BlockId>,
     return_name: Option<String>,
     /// The reason belongs to this pending return, never the whole frame.
@@ -1373,6 +1404,7 @@ struct IrFinallyScope {
 struct IrLoopContext {
     break_block: BlockId,
     continue_block: BlockId,
+    foreach_block: Option<BlockId>,
     handler_floor: usize,
     cleanup_floor: usize,
     owner_floor: usize,
@@ -1416,6 +1448,7 @@ impl<'a> FunctionLowerer<'a> {
             span,
             signatures,
             layouts,
+            native_fields: Default::default(),
             return_type,
             locals: HashMap::new(),
             borrowed_params: HashSet::new(),
@@ -1767,12 +1800,12 @@ impl<'a> FunctionLowerer<'a> {
                     self.store_or_define_name(name, value, *span, define_boxed)?;
                 }
             }
-            Stmt::ObjectDestructureAssign { span, .. } => {
-                return Err(KuError::runtime(
-                    "IR/native lowering does not support object destructuring yet; use interpreter mode or destructure fields explicitly",
-                    *span,
-                ));
-            }
+            Stmt::ObjectDestructureAssign {
+                bindings,
+                rest,
+                value,
+                span,
+            } => self.lower_object_pattern(bindings, rest.as_ref(), value, *span)?,
             Stmt::If {
                 condition,
                 then_branch,
@@ -1961,6 +1994,7 @@ impl<'a> FunctionLowerer<'a> {
         self.loops.push(IrLoopContext {
             break_block: after_id,
             continue_block: backedge_id,
+            foreach_block: None,
             handler_floor: self.try_handlers.len(),
             cleanup_floor: self.cleanup_attempts.len(),
             owner_floor,
@@ -2008,20 +2042,10 @@ impl<'a> FunctionLowerer<'a> {
                 ));
             }
         };
-        // A loop iterator is a fresh lexical binding on every interpreter
-        // iteration. The current native closure ABI boxes declaration sites,
-        // while `ForEach` binds its value in a terminator, so silently treating
-        // this as an ordinary local would either miss the capture or make all
-        // iterations share the wrong cell. Reject this one unsupported corner
-        // until the IR can model per-iteration cells explicitly.
-        if self.binding_is_boxed(name, span) {
-            return Err(KuError::runtime(
-                "IR/native lowering does not support closure capture of a for loop variable yet",
-                span,
-            ));
-        }
-
-        self.with_local_scope(|lower| lower.lower_for_body(name, element, iterable, body))
+        let captured_at = self.binding_is_boxed(name, span).then_some(span);
+        self.with_local_scope(|lower| {
+            lower.lower_for_body(name, element, iterable, body, captured_at)
+        })
     }
 
     fn lower_for_body(
@@ -2030,6 +2054,7 @@ impl<'a> FunctionLowerer<'a> {
         element: IrType,
         iterable: IrExpr,
         body: &[Stmt],
+        captured_at: Option<Span>,
     ) -> KuResult<()> {
         // `iterable` has already been lowered into the current block. Put the
         // actual iterator terminator in a fresh header block: the loop backedge
@@ -2042,9 +2067,13 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(iter_id, "for_iter");
-        let ir_name = self.define_local(name, element);
+        let ir_name = if captured_at.is_some() {
+            self.define_local("__ku_for_element", element.clone())
+        } else {
+            self.define_local(name, element.clone())
+        };
         self.current.terminator = IrTerminator::ForEach {
-            name: ir_name,
+            name: ir_name.clone(),
             iterable,
             body_block: body_id,
             after_block: after_id,
@@ -2055,9 +2084,24 @@ impl<'a> FunctionLowerer<'a> {
         // The iterable and hidden ForEach snapshot predate this floor. Their
         // owner survives continue; the emitter retires it at after_id.
         let owner_floor = self.scope_owners.len();
+        if let Some(span) = captured_at {
+            // Each iteration defines a fresh binding. Move the yielded payload
+            // into that iteration's cell, leaving the iterator's slot empty.
+            // Only closures that captured this cell keep it after loop cleanup.
+            self.push_cell_new(
+                name.to_string(),
+                element.clone(),
+                IrExpr {
+                    kind: IrExprKind::Local(ir_name),
+                    ty: element,
+                },
+                span,
+            )?;
+        }
         self.loops.push(IrLoopContext {
             break_block: after_id,
             continue_block: backedge_id,
+            foreach_block: Some(iter_id),
             handler_floor: self.try_handlers.len(),
             cleanup_floor: self.cleanup_attempts.len(),
             owner_floor,
@@ -2208,6 +2252,33 @@ impl<'a> FunctionLowerer<'a> {
         Ok(())
     }
 
+    fn retire_foreach_before_try_transfer(&mut self, loop_floor: usize) -> KuResult<bool> {
+        let mut crossed = self.loops[loop_floor..].iter().filter_map(|context| {
+            context
+                .foreach_block
+                .map(|block| (block, context.owner_floor))
+        });
+        let Some((first, owner_floor)) = crossed.next() else {
+            return Ok(false);
+        };
+        let blocks = std::iter::once(first)
+            .chain(crossed.map(|(block, _)| block))
+            .map(|block| IrExpr {
+                kind: IrExprKind::Literal(block.0.to_string()),
+                ty: IrType::Int,
+            })
+            .collect();
+        // This transfer bypasses the ordinary for_after block. Release body
+        // owners and retire the snapshots before the destination can re-enter
+        // these loop sites. Loops enclosing the handler remain active.
+        self.emit_loop_scope_cleanup(owner_floor)?;
+        emit_ir_instruction!(
+            self,
+            IrInst::Expr(intrinsic_expr("__ku_retire_foreach", blocks, IrType::Void))
+        );
+        Ok(true)
+    }
+
     fn lower_try(
         &mut self,
         body: &[Stmt],
@@ -2291,6 +2362,7 @@ impl<'a> FunctionLowerer<'a> {
         self.try_handlers.push(IrTryHandler {
             error_block,
             error_name: error_name.clone(),
+            loop_floor: self.loops.len(),
             return_block: finally_return_id,
             return_name: return_name.clone(),
             return_reason: return_reason.clone(),
@@ -2329,6 +2401,7 @@ impl<'a> FunctionLowerer<'a> {
                     lower.try_handlers.push(IrTryHandler {
                         error_block: finally_err_id,
                         error_name: error_name.clone(),
+                        loop_floor: lower.loops.len(),
                         return_block: finally_return_id,
                         return_name: return_name.clone(),
                         return_reason: return_reason.clone(),
@@ -4388,10 +4461,9 @@ impl<'a> FunctionLowerer<'a> {
                     self.emit_temp(field)
                 }
             }
-            ExprKind::OptionalField { .. } => Err(KuError::runtime(
-                "optional chaining is not supported by IR/native lowering yet",
-                expr.span,
-            )),
+            ExprKind::OptionalField { target, name } => {
+                self.lower_optional_field(expr, target, name)
+            }
             ExprKind::Await(_) => Err(KuError::runtime(
                 "async/await is not supported by IR/native lowering yet",
                 expr.span,
@@ -4793,6 +4865,7 @@ impl<'a> FunctionLowerer<'a> {
             span,
         )?;
         child.mixed_async = self.mixed_async.clone();
+        child.native_fields = self.native_fields.clone();
         child.captures = function_captures.iter().cloned().collect();
         child.local_names = aliases;
         for param in &ir_params {
@@ -4916,6 +4989,7 @@ impl<'a> FunctionLowerer<'a> {
             function.span,
         )?;
         child.mixed_async = self.mixed_async.clone();
+        child.native_fields = self.native_fields.clone();
         child.captures = function_captures.iter().cloned().collect();
         child.local_names = aliases.clone();
         for param in &ir_params {
@@ -5594,12 +5668,21 @@ impl<'a> FunctionLowerer<'a> {
                 emit_ir_instruction!(
                     self,
                     IrInst::Let {
-                        name: error_name,
-                        ty: error_ty,
+                        name: error_name.clone(),
+                        ty: error_ty.clone(),
                         value: error_value,
                     }
                 );
             }
+            let result = if self.retire_foreach_before_try_transfer(handler.loop_floor)? {
+                // The original Result owner may have retired with the body.
+                IrExpr {
+                    kind: IrExprKind::Local(error_name),
+                    ty: error_ty,
+                }
+            } else {
+                result
+            };
             Ok(IrTerminator::JumpErr {
                 result,
                 target: handler.error_block,
@@ -5689,6 +5772,7 @@ impl<'a> FunctionLowerer<'a> {
                 value: reason,
             }
         );
+        self.retire_foreach_before_try_transfer(handler.loop_floor)?;
         Ok(IrTerminator::Jump(return_block))
     }
 
@@ -5785,12 +5869,25 @@ fn http_response_clone_may_signal(ty: &IrType) -> bool {
 /// return mailbox has been consumed. This classifies only typed i64 arithmetic;
 /// float/mixed/dynamic expressions retain their separate existing semantics.
 pub(crate) fn ir_expr_needs_sync_guard(expr: &IrExpr) -> bool {
+    if let IrExprKind::Call {
+        kind: IrCallKind::Intrinsic(name),
+        args,
+        ..
+    } = &expr.kind
+    {
+        if name == "__ku_optional_select" {
+            return args.get(1).is_some_and(ir_expr_needs_sync_guard);
+        }
+    }
     if matches!(&expr.kind,IrExprKind::Call{kind:IrCallKind::Intrinsic(name),args,..} if name=="__ku_clone" && args.first().is_some_and(|x| http_response_clone_may_signal(&x.ty)))
     {
         return true;
     }
     if matches!(&expr.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), .. }
         if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response" | "__ku_http_response_from_object_owned" | "__ku_http_response_from_object_view" | "__ku_http_response_from_value_owned" | "__ku_http_response_from_value_view" | "__ku_http_response_headers_read" | "__ku_http_headers_get" | "__ku_http_response_headers_prepare" | "__ku_http_client_config_field_int" | "__ku_http_client_config_field_str" | "__ku_http_response_public_value" | "http.get" | "http.post" | "http.request" | "http.client"
+            | "__ku_object_take_required" | "__ku_object_pattern_convert"
+            | "__ku_object_optional_field" | "__ku_value_optional_field"
+            | "__ku_object_optional_field_view" | "__ku_value_optional_field_view"
             | "time.from_unix" | "time.from_millis" | "time.add" | "time.sub" | "time.diff"))
     {
         return true;
@@ -6427,10 +6524,9 @@ fn is_copy_ir_type(ty: &IrType) -> bool {
 /// A visible name either resolves to a binding site owned and boxable by this
 /// function body (`Some`) or to a lexical binding this scan cannot box (`None`).
 /// Body declarations and this function's parameters are `Some`; enclosing
-/// captures and catch/match bindings are `None`. A loop iterator uses a stable
-/// `Some` sentinel only so `lower_for` can reject its unsupported per-iteration
-/// capture explicitly. Non-boxable bindings still matter because they shadow an
-/// outer homonym.
+/// captures and catch/match bindings are `None`. A captured loop iterator
+/// uses its binding site to allocate a fresh cell in the loop body.
+/// Non-boxable bindings still matter because they shadow an outer homonym.
 type VisibleBoxBindings = HashMap<String, Option<BoxedBindingSite>>;
 
 /// Stage 6b: find the exact body-owned bindings captured by closures at their
@@ -6588,10 +6684,8 @@ fn collect_boxed_candidates_stmt(
         } => {
             collect_boxed_candidates_expr(iterable, visible, out)?;
             let mut scoped = visible.clone();
-            // The iterator is created by lower_for rather than a body statement,
-            // but still has a stable binding site. Recording it lets lower_for
-            // reject closure capture explicitly instead of emitting a closure
-            // that reads an unbound C local.
+            // The iterator has a stable site, but its cell is created anew in
+            // the body on each iteration.
             scoped.insert(name.clone(), Some(BoxedBindingSite::new(name, *span)));
             collect_boxed_candidates_block(body, &mut scoped, out)?;
         }

@@ -76,6 +76,22 @@ impl Verifier<'_> {
                     args,
                     ..
                 } if name == "__ku_nullable_get" && args.len() == 1 => cursor = &args[0],
+                IrExprKind::Call {
+                    kind: IrCallKind::Intrinsic(name),
+                    args,
+                    ..
+                } if name == "__ku_optional_select" && args.len() == 2 => cursor = &args[1],
+                IrExprKind::Call {
+                    kind: IrCallKind::Intrinsic(name),
+                    args,
+                    ..
+                } if matches!(
+                    name.as_str(),
+                    "__ku_object_optional_field_view" | "__ku_value_optional_field_view"
+                ) && args.len() == 2 =>
+                {
+                    cursor = &args[0]
+                }
                 _ => return false,
             }
         }
@@ -190,6 +206,9 @@ impl Verifier<'_> {
                                 name.as_str(),
                                 "__ku_nullable_get"
                                     | "__ku_nullable_is_null"
+                                    | "__ku_optional_select"
+                                    | "__ku_object_optional_field_view"
+                                    | "__ku_value_optional_field_view"
                                     | "__ku_calendar_field_str"
                                     | "__ku_calendar_field_int"
                                     | "__ku_http_response_from_object_view"

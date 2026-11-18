@@ -465,7 +465,41 @@ struct EnumType {
     variants: HashMap<String, Vec<Type>>,
 }
 
+/// Facts about field projections in the AST being checked. Identity keys
+/// are never dereferenced; copied trees fall back to checked dynamic values.
+#[derive(Default)]
+pub(crate) struct NativeFieldFacts {
+    pub(crate) destructured: HashMap<usize, TypeName>,
+    pub(crate) optional: HashMap<usize, TypeName>,
+}
+
+fn native_field_type(ty: &Type) -> Option<TypeName> {
+    Some(match ty {
+        Type::Int => TypeName::Int,
+        Type::Float => TypeName::Float,
+        Type::Bool => TypeName::Bool,
+        Type::String => TypeName::String,
+        Type::Null => TypeName::Null,
+        Type::Array(inner)
+            if matches!(
+                inner.as_ref(),
+                Type::Int | Type::Float | Type::Bool | Type::String
+            ) =>
+        {
+            TypeName::Array(Box::new(native_field_type(inner)?))
+        }
+        Type::Object(_) | Type::StringMap | Type::DynamicObject => {
+            TypeName::Custom("__ku_object".into())
+        }
+        Type::Union(parts) if parts.len() == 2 && parts.contains(&Type::Null) => {
+            TypeName::Union(parts.iter().map(native_field_type).collect::<Option<_>>()?)
+        }
+        _ => return None,
+    })
+}
+
 pub struct Checker {
+    native_field_facts: Option<NativeFieldFacts>,
     functions: HashMap<String, FunctionType>,
     structs: HashMap<String, StructType>,
     enums: HashMap<String, EnumType>,
@@ -519,6 +553,7 @@ pub struct Checker {
 impl Checker {
     pub fn new() -> Self {
         Self {
+            native_field_facts: None,
             functions: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
@@ -592,6 +627,27 @@ impl Checker {
     pub fn check(mut self, program: &Program) -> KuResult<()> {
         self.check_program(program)?;
         self.check_generic_instances()
+    }
+
+    pub(crate) fn check_with_native_fields(
+        mut self,
+        program: &Program,
+    ) -> KuResult<NativeFieldFacts> {
+        self.native_field_facts = Some(NativeFieldFacts::default());
+        self.check_program(program)?;
+        self.check_generic_instances()?;
+        Ok(self.native_field_facts.take().unwrap_or_default())
+    }
+
+    fn record_native_optional_type(&mut self, expr: &Expr, ty: &Type) {
+        if let Some(facts) = &mut self.native_field_facts {
+            let id = std::ptr::from_ref(expr) as usize;
+            if let Some(ty) = native_field_type(ty) {
+                facts.optional.insert(id, ty);
+            } else {
+                facts.optional.remove(&id);
+            }
+        }
     }
 
     fn check_program(&mut self, program: &Program) -> KuResult<()> {
@@ -1662,6 +1718,14 @@ impl Checker {
                             }
                         },
                     };
+                    if let Some(facts) = &mut self.native_field_facts {
+                        let id = std::ptr::from_ref(binding) as usize;
+                        if let Some(ty) = native_field_type(&actual) {
+                            facts.destructured.insert(id, ty);
+                        } else {
+                            facts.destructured.remove(&id);
+                        }
+                    }
                     if let Some(local) = &binding.local {
                         let provenance = if fields.contains_key(&binding.field) {
                             source_provenance.clone()
@@ -1783,6 +1847,35 @@ impl Checker {
 
     fn check_expr(&mut self, expr: &Expr) -> KuResult<Type> {
         self.check_expr_with_field_receiver(expr, None)
+    }
+
+    fn optional_field_type(&self, target: &Type, name: &str, span: Span) -> KuResult<Type> {
+        match target {
+            Type::Null => Ok(Type::Null),
+            Type::Struct(struct_name) => {
+                let structure = self.structs.get(struct_name).ok_or_else(|| {
+                    KuError::runtime(format!("undefined struct '{struct_name}'"), span)
+                })?;
+                Ok(structure.fields.get(name).cloned().unwrap_or(Type::Null))
+            }
+            Type::Object(fields) => Ok(fields.get(name).cloned().unwrap_or(Type::Null)),
+            Type::Unknown => Ok(Type::Unknown),
+            // A nullable receiver uses the same member type as its non-null
+            // value. Preserve any null already present in the field itself.
+            Type::Union(parts) if matches!(parts.as_slice(), [Type::Null, _] | [_, Type::Null]) => {
+                let inner = if parts[0] == Type::Null {
+                    &parts[1]
+                } else {
+                    &parts[0]
+                };
+                self.optional_field_type(inner, name, span)
+                    .map(nullable::make_nullable)
+            }
+            other => Err(KuError::runtime(
+                format!("type error: {} has no fields", type_name(other)),
+                span,
+            )),
+        }
     }
 
     // Method dispatch and ordinary callable-field fallback share one receiver
@@ -2293,24 +2386,15 @@ impl Checker {
                 }
                 ExprKind::OptionalField { target, name } => {
                     let target_type = self.check_expr(target)?;
-                    match target_type {
-                        Type::Null => Ok(Type::Null),
-                        Type::Struct(struct_name) => {
-                            let Some(struct_type) = self.structs.get(&struct_name) else {
-                                return Err(KuError::runtime(
-                                    format!("undefined struct '{struct_name}'"),
-                                    target.span,
-                                ));
-                            };
-                            Ok(struct_type.fields.get(name).cloned().unwrap_or(Type::Null))
-                        }
-                        Type::Object(fields) => Ok(fields.get(name).cloned().unwrap_or(Type::Null)),
-                        Type::Unknown => Ok(Type::Unknown),
-                        other => Err(KuError::runtime(
-                            format!("type error: {} has no fields", type_name(&other)),
-                            target.span,
-                        )),
+                    if let PlaceClass::Movable(mut place) = self.classify_place(target) {
+                        // `?.` skips null receivers, but it still reads the
+                        // selected place. A moved field is not a null state.
+                        place.path.push(name.clone());
+                        self.check_place_readable(&place, expr.span)?;
                     }
+                    let ty = self.optional_field_type(&target_type, name, target.span)?;
+                    self.record_native_optional_type(expr, &ty);
+                    Ok(ty)
                 }
                 ExprKind::StructLiteral { name, fields } => {
                     let Some(struct_type) = self.structs.get(name).cloned() else {

@@ -102,6 +102,8 @@ pub enum TaskNetOperation {
     HttpGet,
     HttpPost,
     HttpRequest,
+    /// A read-only frame-owned object, normalized when publishing the job.
+    HttpRequestObject,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1774,7 +1776,7 @@ fn validate_shape(
                         let (ty, borrowed) = slot_type(get_slot(*source)?)?;
                         if source == dst
                             || borrowed
-                            || !(primitive(ty) || json_value_type(ty))
+                            || !(primitive(ty) || nullable_leaf(ty) || json_value_type(ty))
                             || (!copy_type(ty) && owners & bit(*source) != 0)
                         {
                             return Err(invalid(
@@ -2034,7 +2036,8 @@ fn validate_shape(
                     TaskNetOperation::Close => IrType::Null,
                     TaskNetOperation::HttpGet
                     | TaskNetOperation::HttpPost
-                    | TaskNetOperation::HttpRequest => {
+                    | TaskNetOperation::HttpRequest
+                    | TaskNetOperation::HttpRequestObject => {
                         IrType::Result(Box::new(IrType::Named("__ku_http_response".into())))
                     }
                 };
@@ -2067,6 +2070,9 @@ fn validate_shape(
                             } else {
                                 None
                             }
+                        }
+                        TaskNetOperation::HttpRequestObject => {
+                            (index == 0).then(|| IrType::Named("__ku_value".into()))
                         }
                         TaskNetOperation::HttpRequest => match index {
                             0..=2 => Some(IrType::Str),
