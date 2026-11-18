@@ -83,7 +83,7 @@ Windows GNU 的安装验证还覆盖普通／typed PostgreSQL 的参数、Unicod
 
 完整回环示例：[native_http_client.ku](../examples/native_http_client.ku)。运行前，请先在 `127.0.0.1:8080` 启动按示例约定提供 `/hello`、`/post` 和 `/missing` 的本地 HTTP 服务。安装包验收同时链接日期和 HTTP 静态库，并在源码和 SDK 不可用时运行生成程序。各目标仍分别记录实际安装运行结果，交叉编译不等于运行通过。
 
-Task 的 `http.request` 支持字面量和局部配置对象，字符串 header 表也可以先绑定。字段值可以动态计算，`method/body/timeout_ms/max_body_bytes` 的 null 保留默认含义。调用只读配置，配置可重复使用。局部对象可持有受支持的 nullable 标量和嵌套对象；一般对象参数、返回和捕获仍属待补的 Task 能力。非法配置保持运行错误，网络、UTF-8 和正文上限等操作错误保持 Result。请求不会因网络失败而自动重试；重定向和连接复用遵守既有客户端规则。
+Task 的 `http.request` 支持字面量和局部配置对象，字符串 header 表也可以先绑定。字段值可以动态计算，`method/body/timeout_ms/max_body_bytes` 的 null 保留默认含义。调用只读配置，配置可重复使用。局部对象可持有受支持的 nullable 标量和嵌套对象。仅返回由标量参数和字面量组成的对象的简单构造函数可在 Task 中调用，实参按顺序各求值一次。任意同步函数、整个对象跨 Task 参数和结果，以及一般捕获仍不在支持范围。非法配置保持运行错误，网络、UTF-8 和正文上限等操作错误保持 Result。请求不会因网络失败而自动重试；重定向和连接复用遵守既有客户端规则。
 
 Task 可以读取响应的 `body/status`，读取或写入 `response.headers[key]`，并将 owned 响应跨等待保存或返回。动态 header 的字符串类型、名称、值、数量、字节和传输字段仍由既有 HTTP 校验约束；分配计入 Task 预算。非法响应不会使后续合法请求失效。这不扩展为任意 Task 对象、结构体或嵌套容器。
 

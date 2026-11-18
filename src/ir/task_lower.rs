@@ -37,6 +37,56 @@ struct Signature {
     result: IrType,
 }
 
+/// An object constructor can run in the caller's existing Task frame. Its
+/// body contains neither a call nor a reference to caller-local bindings.
+fn object_constructor(declaration: &FnDecl) -> Option<&Expr> {
+    if declaration.is_async
+        || declaration.name == "main"
+        || !declaration.type_params.is_empty()
+        || declaration.return_type.is_some()
+        || declaration.params.len() > 64
+        || declaration.params.iter().any(|parameter| {
+            parameter.mode != ParamMode::Owned
+                || !parameter.ty.as_ref().and_then(primitive).is_some_and(|ty| {
+                    matches!(ty, IrType::Int | IrType::Bool | IrType::Null | IrType::Str)
+                        || task::nullable_leaf(&ty)
+                })
+        })
+    {
+        return None;
+    }
+    let [Stmt::Return {
+        value: Some(value), ..
+    }] = declaration.body.as_slice()
+    else {
+        return None;
+    };
+    if !matches!(value.kind, ExprKind::ObjectLiteral { .. }) {
+        return None;
+    }
+    // This inspection is proportional to the admitted literal and cannot
+    // recursively construct another expression stack before Task lowering.
+    let mut pending = vec![value];
+    let mut visited = 0usize;
+    while let Some(value) = pending.pop() {
+        visited += 1;
+        if visited + pending.len() > 256 {
+            return None;
+        }
+        match &value.kind {
+            ExprKind::ObjectLiteral { fields } if fields.len() <= 64 => {
+                pending.extend(fields.iter().map(|(_, value)| value));
+            }
+            ExprKind::Literal(
+                Literal::Int(_) | Literal::Bool(_) | Literal::Null | Literal::String(_),
+            ) => {}
+            ExprKind::Variable(name) if declaration.params.iter().any(|p| p.name == *name) => {}
+            _ => return None,
+        }
+    }
+    Some(value)
+}
+
 fn unsupported(message: &str, span: Span) -> KuError {
     KuError::runtime(
         format!("native async subset does not support {message}"),
@@ -234,6 +284,9 @@ pub fn lower_bound_service_handlers(
                 Item::Function(function) if function.is_async && bindings.is_empty() => {
                     Some(item.clone())
                 }
+                Item::Function(function) if object_constructor(function).is_some() => {
+                    Some(item.clone())
+                }
                 Item::Module(module) if module.name.strip_prefix("std:").is_some_and(supported) => {
                     Some(item.clone())
                 }
@@ -303,6 +356,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
         expressions: 0,
     };
     let mut signatures = HashMap::new();
+    let mut object_constructors = HashMap::new();
     let mut declarations = Vec::new();
     let mut entry = None;
     let mut std_time = false;
@@ -424,6 +478,19 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
                 Span::default(),
             ));
         };
+        if let Some(body) = object_constructor(function) {
+            if signatures.contains_key(function.name.as_str())
+                || object_constructors
+                    .insert(function.name.as_str(), (function, body))
+                    .is_some()
+            {
+                return Err(unsupported(
+                    "duplicate object constructor names",
+                    function.span,
+                ));
+            }
+            continue;
+        }
         if !function.is_async || !function.type_params.is_empty() {
             return Err(unsupported(
                 "synchronous or generic functions in a native async program",
@@ -472,16 +539,17 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
             }
             entry = Some(id);
         }
-        if signatures
-            .insert(
-                function.name.clone(),
-                Signature {
-                    id,
-                    parameters,
-                    result,
-                },
-            )
-            .is_some()
+        if object_constructors.contains_key(function.name.as_str())
+            || signatures
+                .insert(
+                    function.name.clone(),
+                    Signature {
+                        id,
+                        parameters,
+                        result,
+                    },
+                )
+                .is_some()
         {
             return Err(unsupported(
                 "duplicate expanded function names",
@@ -503,6 +571,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
             FunctionLowerer::new(
                 declaration,
                 &signatures,
+                &object_constructors,
                 &mut budget,
                 std_time,
                 std_fs,
@@ -521,6 +590,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
 
 struct FunctionLowerer<'a> {
     signatures: &'a HashMap<String, Signature>,
+    object_constructors: &'a HashMap<&'a str, (&'a FnDecl, &'a Expr)>,
     std_time: bool,
     std_fs: bool,
     std_net: bool,
@@ -597,6 +667,7 @@ impl<'a> FunctionLowerer<'a> {
     fn new(
         declaration: &'a FnDecl,
         signatures: &'a HashMap<String, Signature>,
+        object_constructors: &'a HashMap<&'a str, (&'a FnDecl, &'a Expr)>,
         budget: &'a mut Budget,
         std_time: bool,
         std_fs: bool,
@@ -608,6 +679,7 @@ impl<'a> FunctionLowerer<'a> {
         let signature = &signatures[&declaration.name];
         let mut lowerer = Self {
             signatures,
+            object_constructors,
             std_time,
             std_fs,
             std_net,
@@ -2364,6 +2436,9 @@ impl<'a> FunctionLowerer<'a> {
             }
             return Err(unsupported("a call through a local value", span));
         }
+        if let Some((declaration, body)) = self.object_constructors.get(name.as_str()).copied() {
+            return self.call_object_constructor(declaration, body, args, span, depth);
+        }
         // The ordinary checker resolves declared functions before
         // builtin fallback. Native lowering must preserve that choice.
         let declared_function = self.signatures.contains_key(name);
@@ -2436,6 +2511,61 @@ impl<'a> FunctionLowerer<'a> {
             arguments,
         })?;
         Ok(destination)
+    }
+
+    #[inline(never)]
+    fn call_object_constructor(
+        &mut self,
+        declaration: &FnDecl,
+        body: &Expr,
+        args: &[Expr],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if self.in_finally_body || declaration.params.len() != args.len() {
+            return Err(unsupported("this call to a Task object constructor", span));
+        }
+        let mut locals = HashMap::new();
+        // Snapshot each argument before evaluating the next one, including
+        // arguments with await. Do not resolve parameter names in the caller.
+        for (parameter, argument) in declaration.params.iter().zip(args) {
+            let expected = value_slot(value_type(
+                parameter
+                    .ty
+                    .as_ref()
+                    .expect("checked constructor parameter"),
+                parameter.span,
+            )?);
+            let value = self.direct_argument_expression(argument, &expected, depth + 1)?;
+            if !self.nullable_argument_matches(value, &expected) {
+                return Err(unsupported(
+                    "this Task object constructor argument type",
+                    argument.span,
+                ));
+            }
+            let snapshot = self.copy_or_move(value)?;
+            self.stable_slots[snapshot.0] = true;
+            if locals.insert(parameter.name.clone(), snapshot).is_some() {
+                return Err(unsupported(
+                    "duplicate Task object constructor parameter",
+                    parameter.span,
+                ));
+            }
+        }
+        // The admitted body refers only to its own parameters and literals.
+        // The existing object operation takes field owners and cleans up on
+        // allocation refusal. Any unused owned argument still belongs here.
+        self.locals.push(locals);
+        let result = self.expression(body, depth + 1);
+        let locals = self.locals.pop().expect("object constructor scope");
+        let result = result?;
+        for parameter in declaration.params.iter().rev() {
+            let slot = locals[&parameter.name];
+            if owned_value(&self.function.slots[slot.0].ty) {
+                self.emit(TaskOp::DropIfInit { slot })?;
+            }
+        }
+        Ok(result)
     }
 
     // Existing builtin dispatch only, after normal checker/name resolution.
