@@ -380,6 +380,9 @@ mod tests {
                     other => panic!("bounded peer accept failed: {other:?}"),
                 }
             };
+            // The listener is nonblocking. The accepted peer may inherit
+            // that mode, whereas these bounded fixture reads expect blocking.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
