@@ -50,7 +50,7 @@ on:
         required: false
         default: official
         type: choice
-        options: [official, macos, windows-gnu, windows, all, non-macos]
+        options: [official, macos, linux, windows-gnu, windows, all, non-macos]
       candidate_tag:
         description: 'Optional unique ku-vVERSION-candidate-SHA12-NONCE draft; empty never uploads'
         required: false
@@ -130,7 +130,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.platform_set == 'macos' && '[{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"}]' || inputs.platform_set == 'windows-gnu' && '[{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || inputs.platform_set == 'windows' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || inputs.platform_set == 'non-macos' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || inputs.platform_set == 'all' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"},{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"}]') }}
+        include: ${{ fromJSON(inputs.platform_set == 'macos' && '[{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"}]' || inputs.platform_set == 'linux' && '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"}]' || inputs.platform_set == 'windows-gnu' && '[{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || inputs.platform_set == 'windows' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || inputs.platform_set == 'non-macos' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || inputs.platform_set == 'all' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"},{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"}]') }}
     env:
       CARGO_INCREMENTAL: '0'
       PYTHONDONTWRITEBYTECODE: '1'

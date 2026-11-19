@@ -1134,7 +1134,13 @@ def run_lane(args, lane, on_checkpoint=None):
                 provider = linker_lib.resolve(strict=True)
                 report["libpq_provider"] = {"path": str(provider),
                                             "sha256": hashlib.sha256(provider.read_bytes()).hexdigest()}
-                environment["KU_PG_LIB"] = str(runtime_dir)
+                # Bound the native linker's inspection to the selected provider
+                # even when pg_config reports a shared system library directory.
+                private_lib = root / "typed-libpq-link"
+                private_lib.mkdir()
+                (private_lib / link_name).symlink_to(provider)
+                (private_lib / versioned_name).symlink_to(provider)
+                environment["KU_PG_LIB"] = str(private_lib)
             if not environment.get("KU_PG_LIB"):
                 libdir = Path(execute([pg_config, "--libdir"]))
                 library = next((libdir / name for name in ["libpq.dylib", "libpq.so", "libpq.lib", "libpq.dll.a"]
