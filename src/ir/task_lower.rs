@@ -377,7 +377,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
         names_and_literals: 0,
         expressions: 0,
     };
-    let layouts = records::layouts(program);
+    let mut layouts = records::layouts(program);
     let mut signatures = HashMap::new();
     let mut object_constructors = HashMap::new();
     let mut declarations = Vec::new();
@@ -598,7 +598,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
                 declaration,
                 &signatures,
                 &object_constructors,
-                &layouts,
+                &mut layouts,
                 &mut budget,
                 std_time,
                 std_fs,
@@ -622,7 +622,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
 struct FunctionLowerer<'a> {
     signatures: &'a HashMap<String, Signature>,
     object_constructors: &'a HashMap<&'a str, (&'a FnDecl, &'a Expr)>,
-    layouts: &'a super::IrLayoutTable,
+    layouts: &'a mut super::IrLayoutTable,
     std_time: bool,
     std_fs: bool,
     std_net: bool,
@@ -700,7 +700,7 @@ impl<'a> FunctionLowerer<'a> {
         declaration: &'a FnDecl,
         signatures: &'a HashMap<String, Signature>,
         object_constructors: &'a HashMap<&'a str, (&'a FnDecl, &'a Expr)>,
-        layouts: &'a super::IrLayoutTable,
+        layouts: &'a mut super::IrLayoutTable,
         budget: &'a mut Budget,
         std_time: bool,
         std_fs: bool,

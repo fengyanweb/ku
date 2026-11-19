@@ -279,39 +279,63 @@ impl FunctionLowerer<'_> {
         }
         if let Some(rest) = rest {
             if let Some(local) = &rest.local {
-                let mut remaining = Vec::new();
-                for field in fields
-                    .iter()
+                let remaining = fields
+                    .into_iter()
                     .filter(|field| !selected.contains(field.name.as_str()))
-                {
-                    if !matches!(
-                        field.ty,
-                        IrType::Int | IrType::Bool | IrType::Null | IrType::Str
-                    ) && !task::nullable_leaf(&field.ty)
-                    {
-                        return Err(unsupported(
-                            &format!("Task rest field {} of type {}", field.name, field.ty),
-                            rest.span,
-                        ));
-                    }
-                    let dst = self.slot(value_slot(field.ty.clone()))?;
-                    self.emit(TaskOp::RecordField {
-                        dst,
-                        src: source,
-                        path: vec![(field.name.clone(), false)],
-                        take: true,
-                    })?;
-                    remaining.push((field.name.clone(), dst));
-                }
-                let dst = self.slot(value_slot(IrType::Named("__ku_value".into())))?;
-                self.emit(TaskOp::JsonObject {
-                    dst,
-                    fields: remaining,
-                })?;
+                    .collect::<Vec<_>>();
+                let dst = self.record_rest(source, remaining)?;
                 self.record_pattern_bind(local, dst, rest.span)?;
             }
         }
         self.emit(TaskOp::Drop { slot: source })
+    }
+
+    fn record_rest(
+        &mut self,
+        source: SlotId,
+        mut fields: Vec<super::super::IrFieldLayout>,
+    ) -> KuResult<SlotId> {
+        let nested = fields
+            .iter()
+            .any(|field| task::record_type(&field.ty) || task::nullable_record(&field.ty));
+        let mut elements = Vec::with_capacity(fields.len());
+        for field in &fields {
+            let dst = self.slot(value_slot(field.ty.clone()))?;
+            self.emit(TaskOp::RecordField {
+                dst,
+                src: source,
+                path: vec![(field.name.clone(), false)],
+                take: true,
+            })?;
+            elements.push(dst);
+        }
+        if nested {
+            // A record subset preserves the checked source's bounds. Keep the
+            // fields typed so owned payloads move into the frame's new owner.
+            // A digit after the prefix cannot start a source struct name.
+            let name = format!("__ku_task_record_{}_rest", self.layouts.structs.len());
+            for (offset, field) in fields.iter_mut().enumerate() {
+                field.offset = offset;
+            }
+            self.layouts.structs.push(super::super::IrStructLayout {
+                name: name.clone(),
+                fields,
+            });
+            let dst = self.slot(value_slot(IrType::Named(name)))?;
+            self.emit(TaskOp::RecordMake { dst, elements })?;
+            Ok(dst)
+        } else {
+            let dst = self.slot(value_slot(IrType::Named("__ku_value".into())))?;
+            self.emit(TaskOp::JsonObject {
+                dst,
+                fields: fields
+                    .into_iter()
+                    .zip(elements)
+                    .map(|(field, element)| (field.name, element))
+                    .collect(),
+            })?;
+            Ok(dst)
+        }
     }
 
     fn record_pattern_bind(&mut self, name: &str, dst: SlotId, span: Span) -> KuResult<()> {
