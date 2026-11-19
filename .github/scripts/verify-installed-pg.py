@@ -534,7 +534,7 @@ def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, repor
                "--loops", "4", "--profile", report.get('profile', 'debug')]
     lanes = ("tasks",) if report.get("tasks_example") else ("sync", "async")
     if report.get("tasks_example"):
-        command.append("--tasks-example")
+        command.extend(("--tasks-example", "--tasks-backend", report["tasks_backend"]))
     elif report.get('target') == 'x86_64-pc-windows-gnu':
         command.append('--installed-contracts')
     report["pg_fixture_invoked"] = True
@@ -684,7 +684,7 @@ def capture_pg_failure(report, lifecycle, error):
         if not isinstance(data, dict) or not isinstance(data.get('lanes'), dict):
             raise ValueError('lifecycle has no lane object')
         detail['lifecycle_status'] = pg_failure_text(data.get('status', ''), 128)
-        for lane in ('sync', 'async'):
+        for lane in ('sync', 'async', 'tasks'):
             entry = data['lanes'].get(lane)
             if not isinstance(entry, dict):
                 continue
@@ -734,6 +734,7 @@ def verify(args):
         raise ValueError("selected target does not match this physical runner")
     output = args.output.resolve()
     tasks_example = getattr(args, "tasks_example", False)
+    tasks_backend = getattr(args, "tasks_backend", None) or "native"
     lanes = ("tasks",) if tasks_example else ("sync", "async")
     profile = 'release' if tasks_example or args.target == 'x86_64-pc-windows-gnu' else 'debug'
     if args.target == 'x86_64-pc-windows-gnu' and not getattr(args, 'hide_checkout', False):
@@ -744,7 +745,8 @@ def verify(args):
               "scope": "actual installed CLI -> native sync/async PG lifecycle; not a capacity result",
               "temporary_files": "owned root; independently confirmed runtime and PG cleanup removes it even after a failed check; unconfirmed cleanup retains pid evidence"}
     if tasks_example:
-        report.update(tasks_example=True, scope="installed Ku HTTP + PG task-list example; native Release")
+        report.update(tasks_example=True, tasks_backend=tasks_backend,
+                      scope=f"installed Ku HTTP + PG task-list example; {tasks_backend} Release")
     save_report(output, report)
     try:
         with owned_temporary_root(report) as root:
@@ -832,22 +834,25 @@ def verify(args):
                 if (entry.get("status") != "passed" or raw.get("status") != "passed"
                         or raw.get("cleanup_errors") != [] or raw.get("cli_sha256") != expected_cli
                         or raw.get("event_loops") != 4 or raw.get("database_retry") is not False
-                        or raw.get("parameters", {}).get("native_c_profile") != profile
+                        or raw.get("parameters", {}).get("build_profile" if tasks_example else "native_c_profile") != profile
                         or raw.get("lane") != lane or raw.get("fixture") != fixture_name
                         or raw.get("fixture_sha256") != fixture_sha):
                     raise ValueError("PG lifecycle result, CLI identity or cleanup differs")
                 if tasks_example:
-                    for check in ("invalid_inputs_and_missing_id", "same_service_database_recovery",
-                                  "persisted_after_restart", "runner_blocked_before_writes"):
+                    for check in ("build", "startup", "invalid_inputs_and_missing_id",
+                                  "same_service_database_recovery", "persisted_after_restart",
+                                  "unauthorized_drain_rejected"):
                         if raw.get("checks", {}).get(check) != "passed":
                             raise ValueError(f"task-list installed contract unavailable: {check}")
                     if (raw.get("schema_sha256") != exporter.file_hash(repo / "examples" / "http_pg_schema.sql")
-                            or raw.get("source_removed_before_run") is not True):
+                            or raw.get("source_removed_before_run") is not True
+                            or raw.get("backend") != tasks_backend
+                            or raw["initial_service_pid"] != raw["recovery_service_pid"]):
                         raise ValueError("task-list schema or source-free run identity differs")
                     report["example_results"] = {key: raw[key] for key in (
-                        "schema_sha256", "native_executable_sha256", "created", "read_back", "runner",
+                        "backend", "fixture_sha256", "schema_sha256", "executable_sha256", "created", "read_back",
                         "invalid_responses", "database_failure", "recovered_write", "restart_read",
-                        "final_rows", "normal_exits",
+                        "initial_service_pid", "recovery_service_pid", "final_rows", "normal_exits",
                     )}
                 if args.target == 'x86_64-pc-windows-gnu' and not tasks_example:
                     if (raw.get('source_removed_before_run') is not True
@@ -896,7 +901,11 @@ def main():
     parser.add_argument('--hide-checkout', action='store_true', help='matching disposable CI checkout only; required for GNU')
     parser.add_argument("--tasks-example", action="store_true",
                         help="run only the repository's task-list example from the verified archive")
+    parser.add_argument("--tasks-backend", choices=["native", "runner"],
+                        help="build the task-list example with this backend (default: native)")
     args = parser.parse_args()
+    if args.tasks_backend is not None and not args.tasks_example:
+        parser.error("--tasks-backend requires --tasks-example")
     try:
         result = verify(args)
     except BaseException as error:

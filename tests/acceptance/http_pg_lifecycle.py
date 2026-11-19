@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real native HTTP -> PostgreSQL acceptance in a private disposable cluster.
+"""Real HTTP -> PostgreSQL acceptance in a private disposable cluster.
 
 No existing db.conn, credentials or database are read. Requires PostgreSQL server
 tools and libpq development files. Proxy faults affect only this fixture. Output
@@ -621,6 +621,8 @@ def parse_args(argv=None):
                         help="Additional private installed-SDK ordinary/typed/reset/owned checks; never performance scoring")
     parser.add_argument("--tasks-example", action="store_true",
                         help="Run only the HTTP + PG task-list example from the installed Ku")
+    parser.add_argument("--tasks-backend", choices=["native", "runner"],
+                        help="Build the task-list example with this backend (default: native)")
     args = parser.parse_args(argv)
     if args.performance_seconds and not 3 <= args.performance_seconds <= 60:
         parser.error("performance-seconds must be 3..60")
@@ -631,6 +633,9 @@ def parse_args(argv=None):
             parser.error("the task-list example is standalone functional verification")
         args.profile = "release"
         args.lane = "tasks"
+        args.tasks_backend = args.tasks_backend or "native"
+    elif args.tasks_backend is not None:
+        parser.error("--tasks-backend requires --tasks-example")
     return args
 
 
@@ -746,7 +751,7 @@ def installed_database_owner(args, lane, tools):
     return spec
 
 
-def run_tasks_example(ku, source, root, sql, execute, environment, runtime_environment,
+def run_tasks_example(ku, source, root, backend, sql, execute, environment, runtime_environment,
                       database_port, http_port, control_token, report, progress):
     """Exercise the example's actual requests against this fixture's own database."""
     schema = source.with_name("http_pg_schema.sql")
@@ -759,25 +764,27 @@ def run_tasks_example(ku, source, root, sql, execute, environment, runtime_envir
     local_source = root / source.name
     shutil.copyfile(source, local_source)
     suffix = ".exe" if os.name == "nt" else ""
-    native, runner = root / ("tasks" + suffix), root / ("tasks-runner" + suffix)
-    for binary, backend in ((native, []), (runner, ["--backend", "runner"])):
-        execute([ku, "build", "--verbose", "--release", *backend, local_source, "-o", binary],
-                cwd=root, env=environment)
+    binary = root / ("tasks-" + backend + suffix)
+    backend_args = ["--backend", "runner"] if backend == "runner" else []
+    progress("tasks:build", backend=backend)
+    execute([ku, "build", "--verbose", "--release", *backend_args, local_source, "-o", binary],
+            cwd=root, env=environment)
+    report["checks"]["build"] = "passed"
     local_source.unlink()
     if (root / ".ku").is_dir():
         shutil.rmtree(root / ".ku")
     report["source_removed_before_run"] = True
-    report["native_executable_sha256"] = hashlib.sha256(native.read_bytes()).hexdigest()
+    report["executable_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
 
     def rows():
         return json.loads(sql("SELECT coalesce(json_agg(json_build_object('id', id, "
                               "'title', title) ORDER BY id), '[]'::json) FROM ku_tasks"))
 
-    def request(method, path, expected, payload=None, deadline=None):
+    def request(method, path, expected, payload=None, deadline=None, token=None):
         connection = DeadlineHTTPConnection("127.0.0.1", http_port, deadline or time.monotonic() + 4)
         headers = {"Content-Type": "application/json"}
-        if path == "/__ku/drain":
-            headers["X-Ku-Control-Token"] = control_token
+        if token is not None:
+            headers["X-Ku-Control-Token"] = token
         try:
             connection.request(method, path, body=payload, headers=headers)
             response = connection.getresponse()
@@ -785,12 +792,12 @@ def run_tasks_example(ku, source, root, sql, execute, environment, runtime_envir
             if len(body) > 32768:
                 raise ValueError("task-list response exceeds the fixture bound")
             body = body.decode("utf-8")
+            snapshot = body.replace(control_token, "<control-token>")[:512]
+            report["last_request"] = dict(method=method, route=path, status=response.status, body_prefix=snapshot)
             try:
                 body = json.loads(body)
             except ValueError:
                 pass
-            if path != "/__ku/drain":
-                report["last_request"] = dict(method=method, path=path, status=response.status, body=body)
             if response.status != expected:
                 raise AssertionError(f"{method} {path}: expected HTTP {expected}, got {response.status}")
             if path.startswith("/tasks") and response.headers.get_content_type() != "application/json":
@@ -814,38 +821,18 @@ def run_tasks_example(ku, source, root, sql, execute, environment, runtime_envir
             raise AssertionError("GET did not return the inserted record")
         return created, actual
 
-    # Check the known Runner startup limitation on an empty database. Do not
-    # count building the binary as evidence that it performed SQL.
-    progress("tasks:runner-startup")
-    runner_log = root / "tasks-runner.log"
-    with runner_log.open("w+b") as log:
-        process = subprocess.Popen([runner], cwd=root, env=runtime_environment, stdout=log, stderr=log)
-        try:
-            exit_code = process.wait(timeout=8)
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=5)
-        log.seek(max(0, log.seek(0, os.SEEK_END) - 4096))
-        diagnostic = log.read(4096).decode("utf-8", errors="replace")
-    report["runner"] = {"exit": exit_code, "startup_diagnostic": diagnostic.strip(),
-                        "business_flow_executed": False}
-    known_boundary = (re.search(r"undefined[^\n]*\bpg\b", diagnostic, re.I)
-                      or "Could not start HTTP + PostgreSQL" in diagnostic)
-    if exit_code == 0 or not known_boundary or rows():
-        raise AssertionError("explicit Runner did not exhibit its known std.pg startup boundary")
-    report["checks"]["runner_blocked_before_writes"] = "passed"
-
+    if rows():
+        raise AssertionError("task-list example must start with an empty private table")
     original = None
     for restart in (False, True):
         progress("tasks:restart" if restart else "tasks:start")
         with (root / "http.log").open("wb") as log:
-            service = subprocess.Popen([native], cwd=root, env=runtime_environment, stdout=log, stderr=log)
+            service = subprocess.Popen([binary], cwd=root, env=runtime_environment, stdout=log, stderr=log)
         try:
             deadline = time.monotonic() + 10
             while True:
                 if service.poll() is not None:
-                    raise RuntimeError("native task-list service exited during startup")
+                    raise RuntimeError(f"{backend} task-list service exited {service.returncode} during startup")
                 try:
                     request("GET", "/tasks/10000000", 404, deadline=deadline)
                     break
@@ -857,8 +844,14 @@ def run_tasks_example(ku, source, root, sql, execute, environment, runtime_envir
                     raise AssertionError("restart lost the original PostgreSQL record")
                 report["restart_read"] = retained
             else:
-                created, original = create("整理任务🙂 ’ ' \\")
-                report.update(created=created, read_back=original, native_initial_pid=service.pid)
+                report["checks"]["startup"] = "passed"
+                request("POST", "/__ku/drain", 403)
+                request("POST", "/__ku/drain", 403, token="invalid-control-token")
+                report["checks"]["unauthorized_drain_rejected"] = "passed"
+                created, original = create("整理任务🙂")
+                report.update(created=created, read_back=original, initial_service_pid=service.pid)
+                if rows() != [original]:
+                    raise AssertionError("create did not insert exactly the acknowledged row")
                 report["invalid_responses"] = {
                     "missing_title": request("POST", "/tasks", 400, b"{}"),
                     "wrong_title_type": request("POST", "/tasks", 400, b'{"title":17}'),
@@ -867,6 +860,11 @@ def run_tasks_example(ku, source, root, sql, execute, environment, runtime_envir
                     "overflowing_id": request("GET", "/tasks/9223372036854775808", 400),
                     "absent_id": request("GET", "/tasks/10000000", 404),
                 }
+                expected_errors = {"missing_title": "invalid_title", "wrong_title_type": "invalid_title",
+                                   "embedded_nul": "invalid_title", "invalid_id": "invalid_id",
+                                   "overflowing_id": "invalid_id", "absent_id": "not_found"}
+                if report["invalid_responses"] != {key: {"error": value} for key, value in expected_errors.items()}:
+                    raise AssertionError("invalid requests did not return the expected error bodies")
                 if rows() != [original]:
                     raise AssertionError("invalid requests changed the private database")
                 report["checks"]["invalid_inputs_and_missing_id"] = "passed"
@@ -875,18 +873,20 @@ def run_tasks_example(ku, source, root, sql, execute, environment, runtime_envir
                 try:
                     failure = request("POST", "/tasks", 503, b'{"title":"do not replay"}')
                     report["database_failure"] = {"status": 503, "body": failure}
+                    if failure != {"error": "database_error"}:
+                        raise AssertionError("database failure did not return the expected error body")
                 finally:
                     sql("ALTER TABLE ku_tasks_unavailable RENAME TO ku_tasks")
                 if service.poll() is not None or rows() != [original]:
                     raise AssertionError("database failure stopped the service or produced a write")
-                _, recovered = create("数据库恢复🙂")
-                report["recovered_write"] = recovered
+                _, recovered = create("数据库恢复🙂 ’ ' \\")
+                report.update(recovered_write=recovered, recovery_service_pid=service.pid)
                 report["checks"]["same_service_database_recovery"] = "passed"
                 report["expected_rows"] = [original, recovered]
 
             began = time.monotonic()
             drain_deadline = began + 5
-            request("POST", "/__ku/drain", 200, deadline=drain_deadline)
+            request("POST", "/__ku/drain", 200, deadline=drain_deadline, token=control_token)
             wait_service_exit(service, drain_deadline)
             if service.returncode != 0:
                 raise RuntimeError("task-list service did not drain normally")
@@ -906,6 +906,7 @@ def run_tasks_example(ku, source, root, sql, execute, environment, runtime_envir
 def run_lane(args, lane, on_checkpoint=None):
     ku = args.ku.resolve()
     tasks_example = getattr(args, "tasks_example", False)
+    tasks_backend = getattr(args, "tasks_backend", None) or "native"
     prefix = 'http_pg_installed_contract' if getattr(args, 'installed_contracts', False) else 'http_pg_lifecycle'
     filename = prefix + ('' if lane == 'sync' else '_async') + '.ku'
     source = Path(__file__).resolve().parents[1] / "fixtures" / filename
@@ -932,8 +933,9 @@ def run_lane(args, lane, on_checkpoint=None):
                              "tls": "disabled only inside isolated loopback fixture"},
               "checks": {}, "status": "running"}
     if tasks_example:
+        report["backend"] = tasks_backend
         report["parameters"] = {
-            "native_c_profile": args.profile, "blocking_threads": 8,
+            "build_profile": args.profile, "blocking_threads": 8,
             "database_connections": 4, "database_waiters": 8, "database_pending_bytes": 1048576,
             "connect_timeout_ms": 5000, "acquire_timeout_ms": 5000, "query_timeout_ms": 30000,
             "database_transport": "direct loopback to private PostgreSQL",
@@ -1002,6 +1004,9 @@ def run_lane(args, lane, on_checkpoint=None):
                 else:
                     (private_lib / library.name).symlink_to(library.resolve())
                 environment["KU_PG_LIB"] = str(private_lib)
+            if tasks_example and tasks_backend == "runner" and not environment.get("KU_PG_RUNTIME_DIR"):
+                runtime_dir = tools if os.name == "nt" else Path(execute([pg_config, "--libdir"]))
+                environment["KU_PG_RUNTIME_DIR"] = str(runtime_dir.resolve(strict=True))
             environment["PGCLIENTENCODING"] = "UTF8"
             runtime_environment = windows_pg_runtime_environment(environment, report)
             if environment.get('KU_PG_PRIVATE_MANIFEST'):
@@ -1056,7 +1061,7 @@ def run_lane(args, lane, on_checkpoint=None):
 
             report["postgres_version"] = sql("SHOW server_version")
             if tasks_example:
-                run_tasks_example(ku, source, root, sql, execute, environment, runtime_environment,
+                run_tasks_example(ku, source, root, tasks_backend, sql, execute, environment, runtime_environment,
                                   database_port, http_port, control_token, report, progress)
                 report["status"] = "passed"
                 return report
@@ -1390,7 +1395,10 @@ def run_lane(args, lane, on_checkpoint=None):
                         f"{type(metrics_error).__name__}: {metrics_error}"
                         .replace(control_token, "<control-token>"))[:2048]
             if logs.is_file():
-                report["service_log_tail"] = logs.read_text(encoding="utf-8", errors="replace")[-8192:]
+                with logs.open("rb") as stream:
+                    stream.seek(max(0, stream.seek(0, os.SEEK_END) - 8192))
+                    tail = stream.read(8192).decode("utf-8", errors="replace")
+                report["service_log_tail"] = tail.replace(control_token, "<control-token>") if control_token else tail
             raise
         finally:
             cleanup_fixture(report, args.output, service, proxy, data,

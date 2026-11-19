@@ -33,6 +33,11 @@ on:
         required: false
         default: false
         type: boolean
+      installed_tasks_backend:
+        description: Backend for installed_tasks_only (native or runner)
+        required: false
+        default: native
+        type: string
   workflow_dispatch:
     inputs:
       platform_set:
@@ -66,6 +71,12 @@ on:
         required: false
         default: false
         type: boolean
+      installed_tasks_backend:
+        description: Backend for the installed task-list example
+        required: false
+        default: native
+        type: choice
+        options: [native, runner]
 
 permissions:
   contents: read
@@ -123,6 +134,7 @@ jobs:
           KU_INSTALLED_PG_ONLY: ${{ inputs.installed_pg_only }}
           KU_INSTALLED_STRUCTURED_ONLY: ${{ inputs.installed_structured_only }}
           KU_INSTALLED_TASKS_ONLY: ${{ inputs.installed_tasks_only }}
+          KU_INSTALLED_TASKS_BACKEND: ${{ inputs.installed_tasks_backend }}
           KU_SELECTED_PLATFORM_SET: ${{ inputs.platform_set }}
           KU_SELECTED_CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           KU_EARLY_LOADER_PROBE: ${{ inputs.early_loader_probe }}
@@ -141,6 +153,10 @@ jobs:
               ($env:KU_INSTALLED_PG_ONLY -eq 'true' -or $env:KU_INSTALLED_STRUCTURED_ONLY -eq 'true' -or
                $env:KU_EARLY_LOADER_PROBE -eq 'true' -or -not [string]::IsNullOrEmpty($env:KU_SELECTED_CANDIDATE_TAG))) {
             throw 'installed_tasks_only cannot run other probes or upload a candidate'
+          }
+          if ($env:KU_INSTALLED_TASKS_BACKEND -cnotin @('native', 'runner') -or
+              ($env:KU_INSTALLED_TASKS_BACKEND -eq 'runner' -and $env:KU_INSTALLED_TASKS_ONLY -ne 'true')) {
+            throw 'installed_tasks_backend must be native or select runner with installed_tasks_only'
           }
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -482,11 +498,16 @@ jobs:
         working-directory: ${{ runner.temp }}
         env:
           KU_INSTALLED_TASKS_ONLY: ${{ inputs.installed_tasks_only }}
+          KU_INSTALLED_TASKS_BACKEND: ${{ inputs.installed_tasks_backend }}
         run: |
           $ErrorActionPreference = 'Stop'
           $pgExtra = @()
-          if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu') { $pgExtra += '--hide-checkout' }
-          if ($env:KU_INSTALLED_TASKS_ONLY -eq 'true') { $pgExtra += '--tasks-example' }
+          if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu' -or $env:KU_INSTALLED_TASKS_BACKEND -eq 'runner') {
+            $pgExtra += '--hide-checkout'
+          }
+          if ($env:KU_INSTALLED_TASKS_ONLY -eq 'true') {
+            $pgExtra += @('--tasks-example', '--tasks-backend', $env:KU_INSTALLED_TASKS_BACKEND)
+          }
           & ${{ matrix.python }} -B (Join-Path $env:GITHUB_WORKSPACE '.github/scripts/verify-installed-pg.py') `
             --repo $env:GITHUB_WORKSPACE --version $env:RELEASE_VERSION `
             --target '${{ matrix.target }}' --commit $env:GITHUB_SHA `
@@ -542,7 +563,7 @@ jobs:
           $path = Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json'
           if (Test-Path -LiteralPath $path -PathType Leaf) {
             $report = Get-Content -LiteralPath $path -Raw -Encoding utf8 | ConvertFrom-Json
-            $summary = [ordered]@{ target=$report.target; commit=$report.commit; status=$report.status; temporary_cleanup_confirmed=$report.temporary_cleanup_confirmed; example_results=$report.example_results; failure_kind=$report.failure_kind }
+            $summary = [ordered]@{ target=$report.target; commit=$report.commit; tasks_backend=$report.tasks_backend; status=$report.status; checkout_hidden_during_pg=$report.checkout_hidden_during_pg; checkout_restore_confirmed=$report.checkout_restore_confirmed; temporary_cleanup_confirmed=$report.temporary_cleanup_confirmed; fixture_cleanup_confirmed=$report.fixture_cleanup_confirmed; example_results=$report.example_results; failure_kind=$report.failure_kind; failure_diagnostics=$report.failure_diagnostics }
             $text = ConvertTo-Json -InputObject $summary -Depth 10 -Compress
             if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 32768) { throw 'The task-list result exceeds the summary bound' }
             Write-Output $text
