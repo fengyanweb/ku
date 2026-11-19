@@ -1,4 +1,4 @@
-//! Direct calls of a typed lexical closure can use the Task's own bindings.
+//! Calls of a statically known lexical closure can use the Task's own bindings.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -50,6 +50,19 @@ pub(super) struct LexicalClosure<'a> {
     result: TaskSlotType,
 }
 
+fn annotation_result(annotation: Option<&TypeName>, span: Span) -> KuResult<Option<&TypeName>> {
+    match annotation {
+        None => Ok(None),
+        Some(TypeName::Function {
+            params,
+            param_modes,
+            return_type,
+            is_async: false,
+        }) if params.is_empty() && param_modes.is_empty() => Ok(Some(return_type.as_ref())),
+        _ => Err(unsupported("this Task lexical closure signature", span)),
+    }
+}
+
 impl<'a> FunctionLowerer<'a> {
     pub(super) fn bind_lexical_closure(
         &mut self,
@@ -78,16 +91,7 @@ impl<'a> FunctionLowerer<'a> {
         if !params.is_empty() {
             return Err(unsupported("parameters of a Task lexical closure", span));
         }
-        let annotated_result = match annotation {
-            None => None,
-            Some(TypeName::Function {
-                params,
-                param_modes,
-                return_type,
-                is_async: false,
-            }) if params.is_empty() && param_modes.is_empty() => Some(return_type.as_ref()),
-            _ => return Err(unsupported("this Task lexical closure signature", span)),
-        };
+        let annotated_result = annotation_result(annotation, span)?;
         let result_type = annotated_result.or(return_type.as_ref()).ok_or_else(|| {
             unsupported(
                 "a Task lexical closure without an explicit return type",
@@ -118,6 +122,35 @@ impl<'a> FunctionLowerer<'a> {
         Ok(())
     }
 
+    pub(super) fn bind_lexical_closure_alias(
+        &mut self,
+        name: &str,
+        annotation: Option<&TypeName>,
+        closure: Rc<LexicalClosure<'a>>,
+        span: Span,
+        depth: usize,
+    ) -> KuResult<()> {
+        self.budget.expression(depth, span)?;
+        if let Some(result) = annotation_result(annotation, span)? {
+            let annotated = value_slot(value_type(result, span, self.layouts)?);
+            if annotated != closure.result {
+                return Err(unsupported(
+                    "a mismatched Task lexical closure signature",
+                    span,
+                ));
+            }
+        }
+        self.budget.text(name.len(), span)?;
+        // A fresh lexical name refers to the original capture slots. It has
+        // no runtime representation and cannot outlive the enclosing scopes.
+        self.locals
+            .last_mut()
+            .expect("active closure scope")
+            .bindings
+            .insert(name.to_owned(), LocalBinding::Closure(closure));
+        Ok(())
+    }
+
     fn capture_slots(&mut self, body: &Expr) -> KuResult<LocalScope<'a>> {
         let mut captured = LocalScope::default();
         // Bounded source analysis even for an uncalled closure. Pure body
@@ -134,7 +167,9 @@ impl<'a> FunctionLowerer<'a> {
             }
             self.budget.analysis(1, expression.span)?;
             match &expression.kind {
-                ExprKind::Literal(Literal::Int(_) | Literal::Bool(_) | Literal::Null) => {}
+                ExprKind::Literal(
+                    Literal::Int(_) | Literal::Bool(_) | Literal::Null | Literal::String(_),
+                ) => {}
                 ExprKind::Variable(name) => {
                     if captured.contains_key(name) {
                         continue;

@@ -3431,6 +3431,17 @@ impl<'a> FunctionLowerer<'a> {
         if matches!(value.kind, ExprKind::Function { .. }) {
             return self.bind_lexical_closure(name, annotation, value);
         }
+        if let ExprKind::Variable(source) = &value.kind {
+            if let Some(LocalBinding::Closure(closure)) = self.local_binding(source) {
+                return self.bind_lexical_closure_alias(
+                    name,
+                    annotation,
+                    closure.clone(),
+                    value.span,
+                    depth,
+                );
+            }
+        }
         self.budget.text(name.len(), span)?;
         let source = if let (ExprKind::Array(elements), Some(TypeName::Array(inner))) =
             (&value.kind, annotation)
