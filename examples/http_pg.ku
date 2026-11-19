@@ -1,41 +1,44 @@
-// HTTP + PostgreSQL 端到端示例(native-only:ku build --native)
-//
-// 一个用纯 Ku 写、编译成 native 可执行文件的 Web 服务:
-//   浏览器 → HTTP → Ku 服务 → libpq → PostgreSQL → JSON → 前端渲染
-//
-// 准备(与 pg_demo 相同):
-//   1. 在仓库根目录放一个 db.conn 文件,内容是 libpq 连接串(已在 .gitignore)。
-//   2. 运行时需要同一 PostgreSQL 安装目录中的 libpq.dll 及其依赖 DLL 在 PATH。
-//
-// 构建运行(从仓库根目录运行,以便读到 examples/http_pg_frontend.html):
-//   ku build --native examples/http_pg.ku -o http_pg.exe
-//   ./http_pg.exe
-//   然后浏览器打开 http://127.0.0.1:8090/
-//
-// 说明:http.text 只负责响应类型，JSON 内容统一由 json.stringify 生成，不能把数据库
-// 文本直接拼进 JSON。数据库查询失败时返回固定错误 JSON；查询只读元数据。
+// HTTP + PostgreSQL 任务清单。启动和建表见 http_pg.README.md。
 
 import http from "std.http"
 import pg from "std.pg"
 import json from "std.json"
+import string from "std.string"
 import "std.fs"
 
 fn frontend_html(): str {
     body = "frontend file error"
     try {
-        body = fs.read("examples/http_pg_frontend.html")?
+        body = fs.read("http_pg_frontend.html")?
     } catch (err) {
         body = "frontend file error"
     }
     return body
 }
 
-fn main(): null! {
-    conninfo = fs.read("db.conn")?
+fn read_config(path: str, message: str): str! {
+    text = ""
+    try {
+        text = string.trim(fs.read(path)?)
+    } catch (err) {
+        fail message
+    }
+    if (text == "") fail message
+    return ok(text)
+}
+
+fn task_id(text: str): int! {
+    value = json.decode(text.clone())?
+    id = value.as_int()?
+    if (id < 1 || str(id) != text) fail "id must be a positive decimal integer"
+    return ok(id)
+}
+
+fn serve(conninfo: str, address: str): null! {
     db_client = pg.client({
         conninfo: conninfo,
-        max_connections: 16,
-        max_waiters: 256,
+        max_connections: 4,
+        max_waiters: 8,
         connect_timeout_ms: 5000,
         acquire_timeout_ms: 5000,
         query_timeout_ms: 30000
@@ -45,6 +48,47 @@ fn main(): null! {
     // 前端页面
     app.get("/", fn() {
         return http.html(frontend_html())
+    })
+
+    app.post("/tasks", fn(req: HttpRequest): HttpResponse {
+        title = ""
+        try {
+            input = json.decode(req.body.clone())?
+            title = input["title"]?.as_str()?
+            nul_value = json.decode("\"\\u0000\"")?
+            nul = nul_value.as_str()?
+            if (title.byte_len() == 0 || title.byte_len() > 800 || title.contains(nul)) {
+                return http.json(400, {error: "invalid_title"})
+            }
+        } catch (err) {
+            return http.json(400, {error: "invalid_title"})
+        }
+        try {
+            row = db_client.query(
+                "INSERT INTO ku_tasks (title) VALUES ($1) RETURNING id, title",
+                [title])?
+            return http.json(201, {id: row.value_int(0, 0)?, title: row.value(0, 1)?})
+        } catch (err) {}
+        // An unconfirmed response never triggers a second INSERT.
+        return http.json(503, {error: "database_error"})
+    })
+
+    app.get("/tasks", fn(): HttpResponse {
+        return http.json(400, {error: "invalid_id"})
+    })
+    app.get("/tasks/{id}", fn(req: HttpRequest): HttpResponse {
+        id = 0
+        try {
+            id = task_id(req.params.id.clone())?
+        } catch (err) {
+            return http.json(400, {error: "invalid_id"})
+        }
+        try {
+            row = db_client.query("SELECT id, title FROM ku_tasks WHERE id = $1::bigint", [str(id)])?
+            if (row.rows() == 0) return http.json(404, {error: "not_found"})
+            return http.json(200, {id: row.value_int(0, 0)?, title: row.value(0, 1)?})
+        } catch (err) {}
+        return http.json(503, {error: "database_error"})
     })
 
     // 所有 handler 共享线程安全的有界 client；每次查询自动借还连接。
@@ -72,8 +116,17 @@ fn main(): null! {
         return http.text(body)
     })
 
-    println("Ku HTTP+PG demo listening on http://127.0.0.1:8090")
-    println("Open http://127.0.0.1:8090/  in a browser")
-    app.listen("127.0.0.1:8090")?
+    app.listen(address)?
+    return ok(null)
+}
+
+fn main(): null! {
+    conninfo = read_config("db.conn", "Provide a non-empty db.conn beside the executable")?
+    address = read_config("http.addr", "Provide a listen address in http.addr beside the executable")?
+    try {
+        serve(conninfo, address)?
+    } catch (err) {
+        fail "Could not start HTTP + PostgreSQL; check db.conn, http.addr and libpq"
+    }
     return ok(null)
 }

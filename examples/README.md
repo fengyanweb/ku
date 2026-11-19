@@ -54,7 +54,9 @@ Redis / MySQL 的主机、端口等非机密信息直接写在示例源码顶部
 
 ### 构建运行
 
-在**仓库根目录**执行(http_pg 需要从根目录读 `examples/http_pg_frontend.html`):
+HTTP + PostgreSQL 任务清单使用默认 native 构建，支持创建和按 ID 查询。[独立启动、建表和请求命令](http_pg.README.md)
+
+其余数据库示例从仓库根目录执行：
 
 ```bash
 # PostgreSQL
@@ -69,9 +71,6 @@ ku build --native examples/redis_demo.ku -o redis_demo.exe
 ku build --native examples/mysql_demo.ku -o mysql_demo.exe
 ./mysql_demo.exe
 
-# HTTP + PostgreSQL 端到端(浏览器打开 http://127.0.0.1:8090/)
-ku build --native examples/http_pg.ku -o http_pg.exe
-./http_pg.exe
 ```
 
 ### 说明
@@ -79,5 +78,4 @@ ku build --native examples/http_pg.ku -o http_pg.exe
 - **注入安全**:`pg_demo` 使用 `PQsendQueryParams`，`mysql_demo` 使用 `MYSQL_STMT`；两者的参数都由服务端绑定，不做 SQL 字符串替换。注入 payload(如 `'; DROP TABLE users; --`)只会被当作值。
 - **池内会话隔离**：PG 每次归还前执行 `DISCARD ALL`，MySQL 使用 `mysql_reset_connection()`；reset/statement 清理失败会淘汰该连接。安全隔离会为每次 SQL 增加一次协议往返，示例不依赖跨查询 session 状态。MySQL 顶层 `CALL` 在实现有界的全结果消费前会在借连接前拒绝。
 - **禁止盲目重试**：PG/MySQL 的 `execution_unknown` 表示语句可能已执行，`execution_completed_without_result` 只用于已确认终态后本地结果无法交付；两者都不能自动重试非幂等写入。MySQL 有列 prepared result 只有读到 `MYSQL_NO_DATA` 才确认当前结果终态，`mysql_stmt_execute()==0` 本身不够。
-- **http_pg 的 JSON 输出**：`http.text` 只设置文本响应，body 必须由 `json.stringify` 生成；数据库返回文本禁止直接拼进 JSON。前端只用 `textContent` 创建数据节点，不把响应值写入 `innerHTML`。
-- 查询只读元数据(版本、库名、表数量等),不改动任何数据。
+- **http_pg 的 JSON 输出**：`/db/info` 使用 `json.stringify`，`/tasks` 使用 `http.json`。前端通过 `textContent` 显示数据库信息。

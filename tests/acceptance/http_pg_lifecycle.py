@@ -789,9 +789,12 @@ def run_tasks_example(ku, source, root, sql, execute, environment, runtime_envir
                 body = json.loads(body)
             except ValueError:
                 pass
-            report["last_request"] = dict(method=method, path=path, status=response.status, body=body)
+            if path != "/__ku/drain":
+                report["last_request"] = dict(method=method, path=path, status=response.status, body=body)
             if response.status != expected:
-                raise AssertionError(f"expected HTTP {expected}, got {report['last_request']}")
+                raise AssertionError(f"{method} {path}: expected HTTP {expected}, got {response.status}")
+            if path.startswith("/tasks") and response.headers.get_content_type() != "application/json":
+                raise AssertionError("task-list response is missing its JSON content type")
             return body
         finally:
             connection.close()
@@ -803,12 +806,13 @@ def run_tasks_example(ku, source, root, sql, execute, environment, runtime_envir
         created = request("POST", "/tasks", 201,
                           json.dumps({"title": title}, ensure_ascii=False).encode("utf-8"))
         if (not isinstance(created, dict) or type(created.get("id")) is not int
-                or created["id"] <= 0 or created.get("title", title) != title):
+                or created["id"] <= 0 or created.get("title") != title):
             raise AssertionError("create did not return a database ID")
         expected = {"id": created["id"], "title": title}
-        if read(created["id"]) != expected:
+        actual = read(created["id"])
+        if actual != expected:
             raise AssertionError("GET did not return the inserted record")
-        return created, expected
+        return created, actual
 
     # Check the known Runner startup limitation on an empty database. Do not
     # count building the binary as evidence that it performed SQL.
@@ -858,7 +862,9 @@ def run_tasks_example(ku, source, root, sql, execute, environment, runtime_envir
                 report["invalid_responses"] = {
                     "missing_title": request("POST", "/tasks", 400, b"{}"),
                     "wrong_title_type": request("POST", "/tasks", 400, b'{"title":17}'),
+                    "embedded_nul": request("POST", "/tasks", 400, b'{"title":"left\\u0000right"}'),
                     "invalid_id": request("GET", "/tasks/not-an-id", 400),
+                    "overflowing_id": request("GET", "/tasks/9223372036854775808", 400),
                     "absent_id": request("GET", "/tasks/10000000", 404),
                 }
                 if rows() != [original]:
@@ -925,6 +931,14 @@ def run_lane(args, lane, on_checkpoint=None):
                              "database_transport": "direct Ku/libpq to private PostgreSQL; no fault proxy" if args.performance_seconds else "private Python fault proxy, capacity eight connections",
                              "tls": "disabled only inside isolated loopback fixture"},
               "checks": {}, "status": "running"}
+    if tasks_example:
+        report["parameters"] = {
+            "native_c_profile": args.profile, "blocking_threads": 8,
+            "database_connections": 4, "database_waiters": 8, "database_pending_bytes": 1048576,
+            "connect_timeout_ms": 5000, "acquire_timeout_ms": 5000, "query_timeout_ms": 30000,
+            "database_transport": "direct loopback to private PostgreSQL",
+            "tls": "disabled only inside isolated loopback fixture",
+        }
     def progress(phase, **details):
         if phase.startswith(("http:", "fault:", "tasks:")):
             report["acceptance_phase"] = phase
