@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       platform_set:
-        description: Official targets, Windows GNU only, or all four
+        description: Select official targets, Windows targets, all four, or non-macOS targets
         required: false
         default: official
         type: string
@@ -30,6 +30,11 @@ on:
         type: boolean
       installed_tasks_only:
         description: Verify the installed HTTP + PostgreSQL task-list example
+        required: false
+        default: false
+        type: boolean
+      installed_typed_pg:
+        description: Verify synchronous typed PG using installed native, ku run, and Runner
         required: false
         default: false
         type: boolean
@@ -45,7 +50,7 @@ on:
         required: false
         default: official
         type: choice
-        options: [official, macos, windows-gnu, windows, all]
+        options: [official, macos, windows-gnu, windows, all, non-macos]
       candidate_tag:
         description: 'Optional unique ku-vVERSION-candidate-SHA12-NONCE draft; empty never uploads'
         required: false
@@ -68,6 +73,11 @@ on:
         type: boolean
       installed_tasks_only:
         description: Verify the installed HTTP + PostgreSQL task-list example
+        required: false
+        default: false
+        type: boolean
+      installed_typed_pg:
+        description: Verify synchronous typed PG using installed native, ku run, and Runner
         required: false
         default: false
         type: boolean
@@ -87,7 +97,7 @@ concurrency:
 
 jobs:
   candidate-release:
-    if: inputs.candidate_tag != '' && !inputs.installed_pg_only && !inputs.installed_structured_only && !inputs.installed_tasks_only
+    if: inputs.candidate_tag != '' && !inputs.installed_pg_only && !inputs.installed_structured_only && !inputs.installed_tasks_only && !inputs.installed_typed_pg
     name: Create the explicit candidate draft
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -120,7 +130,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.platform_set == 'macos' && '[{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"}]' || inputs.platform_set == 'windows-gnu' && '[{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || inputs.platform_set == 'windows' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || inputs.platform_set == 'all' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"},{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"}]') }}
+        include: ${{ fromJSON(inputs.platform_set == 'macos' && '[{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"}]' || inputs.platform_set == 'windows-gnu' && '[{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || inputs.platform_set == 'windows' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || inputs.platform_set == 'non-macos' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || inputs.platform_set == 'all' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"},{"os":"windows-2025","target":"x86_64-pc-windows-gnu","python":"python"}]' || '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"}]') }}
     env:
       CARGO_INCREMENTAL: '0'
       PYTHONDONTWRITEBYTECODE: '1'
@@ -134,6 +144,7 @@ jobs:
           KU_INSTALLED_PG_ONLY: ${{ inputs.installed_pg_only }}
           KU_INSTALLED_STRUCTURED_ONLY: ${{ inputs.installed_structured_only }}
           KU_INSTALLED_TASKS_ONLY: ${{ inputs.installed_tasks_only }}
+          KU_INSTALLED_TYPED_PG: ${{ inputs.installed_typed_pg }}
           KU_INSTALLED_TASKS_BACKEND: ${{ inputs.installed_tasks_backend }}
           KU_SELECTED_PLATFORM_SET: ${{ inputs.platform_set }}
           KU_SELECTED_CANDIDATE_TAG: ${{ inputs.candidate_tag }}
@@ -153,6 +164,11 @@ jobs:
               ($env:KU_INSTALLED_PG_ONLY -eq 'true' -or $env:KU_INSTALLED_STRUCTURED_ONLY -eq 'true' -or
                $env:KU_EARLY_LOADER_PROBE -eq 'true' -or -not [string]::IsNullOrEmpty($env:KU_SELECTED_CANDIDATE_TAG))) {
             throw 'installed_tasks_only cannot run other probes or upload a candidate'
+          }
+          if ($env:KU_INSTALLED_TYPED_PG -eq 'true' -and
+              ($env:KU_INSTALLED_PG_ONLY -eq 'true' -or $env:KU_INSTALLED_STRUCTURED_ONLY -eq 'true' -or
+               $env:KU_EARLY_LOADER_PROBE -eq 'true' -or -not [string]::IsNullOrEmpty($env:KU_SELECTED_CANDIDATE_TAG))) {
+            throw 'installed_typed_pg cannot mix with release drafts or unrelated probes'
           }
           if ($env:KU_INSTALLED_TASKS_BACKEND -cnotin @('native', 'runner') -or
               ($env:KU_INSTALLED_TASKS_BACKEND -eq 'runner' -and $env:KU_INSTALLED_TASKS_ONLY -ne 'true')) {
@@ -200,7 +216,7 @@ jobs:
           & ${{ matrix.python }} -B .github/scripts/test-export-release.py RuntimeConsumerReportTests.test_gnu_pe_imports_use_sibling_tool_and_record_non_system_dependency_chain RuntimeConsumerReportTests.test_gnu_pe_import_probe_restores_existing_capture_limit_on_failure RuntimeConsumerReportTests.test_selected_gnu_loader_tool_and_real_environment_snapshot_are_ready RuntimeConsumerReportTests.test_gnu_static_executable_keeps_an_explicit_external_dll_import RuntimeConsumerReportTests.test_native_build_diagnostics_reject_crt_warnings_on_either_stream_even_at_exit_zero
           if ($LASTEXITCODE) { throw 'GNU loader probe preflight failed before the SDK build' }
       - name: Build the private pinned optional compression packs
-        if: ${{ !inputs.installed_structured_only && !inputs.installed_tasks_only }}
+        if: ${{ !inputs.installed_structured_only && !inputs.installed_tasks_only && !inputs.installed_typed_pg }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -244,7 +260,7 @@ jobs:
             Write-Output "GNU loader probe report: $text"
           } else { Write-Output 'GNU loader probe did not create a report; inspect the producer/probe failure above.' }
       - name: Check the CLI and manifest contracts
-        if: ${{ !inputs.installed_pg_only && !inputs.installed_structured_only && !inputs.installed_tasks_only }}
+        if: ${{ !inputs.installed_pg_only && !inputs.installed_structured_only && !inputs.installed_tasks_only && !inputs.installed_typed_pg }}
         shell: pwsh
         run: |
           $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'cli-contract-target'
@@ -285,7 +301,7 @@ jobs:
         shell: pwsh
         run: pwsh -NoLogo -NoProfile -NonInteractive -File scripts/package-release.ps1 -Target '${{ matrix.target }}'
       - name: Verify native HTTP, loop, Unicode and codec contracts with C11 O2
-        if: ${{ !inputs.installed_pg_only && !inputs.installed_structured_only && !inputs.installed_tasks_only }}
+        if: ${{ !inputs.installed_pg_only && !inputs.installed_structured_only && !inputs.installed_tasks_only && !inputs.installed_typed_pg }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -384,7 +400,7 @@ jobs:
           & ${{ matrix.python }} -B .github/scripts/export-release.py --bundle "release/${{ matrix.target }}" --output "$env:RUNNER_TEMP/cli-bundle-assets" --repo . --version $version --target '${{ matrix.target }}' --commit $env:GITHUB_SHA --metadata $metadataPath --rust-sysroot $sysroot.Trim() @compression
           if ($LASTEXITCODE) { throw 'Actual archive validation failed' }
       - name: Install the unlike consumer Rust toolchain
-        if: ${{ !inputs.installed_pg_only && !inputs.installed_structured_only && !inputs.installed_tasks_only }}
+        if: ${{ !inputs.installed_pg_only && !inputs.installed_structured_only && !inputs.installed_tasks_only && !inputs.installed_typed_pg }}
         shell: pwsh
         run: |
           $consumer = if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu') { '1.96.0-x86_64-pc-windows-gnu' } else { '1.96.0' }
@@ -392,7 +408,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Consumer toolchain unavailable' }
           "KU_CONSUMER_TOOLCHAIN=$consumer" >> $env:GITHUB_ENV
       - name: Verify the source-free installer and its actual installation
-        if: ${{ !inputs.installed_pg_only && !inputs.installed_structured_only && !inputs.installed_tasks_only }}
+        if: ${{ !inputs.installed_pg_only && !inputs.installed_structured_only && !inputs.installed_tasks_only && !inputs.installed_typed_pg }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -498,15 +514,19 @@ jobs:
         working-directory: ${{ runner.temp }}
         env:
           KU_INSTALLED_TASKS_ONLY: ${{ inputs.installed_tasks_only }}
+          KU_INSTALLED_TYPED_PG: ${{ inputs.installed_typed_pg }}
           KU_INSTALLED_TASKS_BACKEND: ${{ inputs.installed_tasks_backend }}
         run: |
           $ErrorActionPreference = 'Stop'
           $pgExtra = @()
-          if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu' -or $env:KU_INSTALLED_TASKS_BACKEND -eq 'runner') {
+          if ('${{ matrix.target }}' -eq 'x86_64-pc-windows-gnu' -or $env:KU_INSTALLED_TASKS_BACKEND -eq 'runner' -or $env:KU_INSTALLED_TYPED_PG -eq 'true') {
             $pgExtra += '--hide-checkout'
           }
           if ($env:KU_INSTALLED_TASKS_ONLY -eq 'true') {
             $pgExtra += @('--tasks-example', '--tasks-backend', $env:KU_INSTALLED_TASKS_BACKEND)
+          }
+          if ($env:KU_INSTALLED_TYPED_PG -eq 'true') {
+            $pgExtra += '--typed-example'
           }
           & ${{ matrix.python }} -B (Join-Path $env:GITHUB_WORKSPACE '.github/scripts/verify-installed-pg.py') `
             --repo $env:GITHUB_WORKSPACE --version $env:RELEASE_VERSION `
@@ -515,7 +535,7 @@ jobs:
             --assets (Join-Path $env:RUNNER_TEMP 'cli-bundle-assets') @pgExtra
           if ($LASTEXITCODE) { throw 'Actual installed CLI PostgreSQL acceptance failed' }
       - name: Upload only verified installation files to the explicit candidate draft
-        if: inputs.candidate_tag != '' && !inputs.installed_pg_only && !inputs.installed_structured_only && !inputs.installed_tasks_only
+        if: inputs.candidate_tag != '' && !inputs.installed_pg_only && !inputs.installed_structured_only && !inputs.installed_tasks_only && !inputs.installed_typed_pg
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -527,7 +547,7 @@ jobs:
             --target '${{ matrix.target }}' --directory (Join-Path $env:RUNNER_TEMP 'cli-bundle-assets')
           if ($LASTEXITCODE) { throw 'Candidate draft asset transfer failed' }
       - name: Summarize bounded SDK and installed-PG verification
-        if: always() && !inputs.installed_structured_only && !inputs.installed_tasks_only
+        if: always() && !inputs.installed_structured_only && !inputs.installed_tasks_only && !inputs.installed_typed_pg
         shell: pwsh
         run: |
           $pgOnly = '${{ inputs.installed_pg_only }}' -eq 'true'
@@ -556,20 +576,20 @@ jobs:
             if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 65536) { throw 'GNU PG bounded metadata exceeds its output limit' }
             Write-Output "Installed GNU PG checks: $text"
           }
-      - name: Summarize the installed PostgreSQL task-list example
-        if: always() && inputs.installed_tasks_only
+      - name: Summarize the selected installed PostgreSQL examples
+        if: always() && (inputs.installed_tasks_only || inputs.installed_typed_pg)
         shell: pwsh
         run: |
           $path = Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json'
           if (Test-Path -LiteralPath $path -PathType Leaf) {
             $report = Get-Content -LiteralPath $path -Raw -Encoding utf8 | ConvertFrom-Json
-            $summary = [ordered]@{ target=$report.target; commit=$report.commit; tasks_backend=$report.tasks_backend; status=$report.status; checkout_hidden_during_pg=$report.checkout_hidden_during_pg; checkout_restore_confirmed=$report.checkout_restore_confirmed; temporary_cleanup_confirmed=$report.temporary_cleanup_confirmed; fixture_cleanup_confirmed=$report.fixture_cleanup_confirmed; example_results=$report.example_results; failure_kind=$report.failure_kind; failure_diagnostics=$report.failure_diagnostics }
+            $summary = [ordered]@{ target=$report.target; commit=$report.commit; tasks_backend=$report.tasks_backend; status=$report.status; checkout_hidden_during_pg=$report.checkout_hidden_during_pg; checkout_restore_confirmed=$report.checkout_restore_confirmed; temporary_cleanup_confirmed=$report.temporary_cleanup_confirmed; fixture_cleanup_confirmed=$report.fixture_cleanup_confirmed; example_results=$report.example_results; typed_results=$report.typed_results; failure_kind=$report.failure_kind; failure_diagnostics=$report.failure_diagnostics }
             $text = ConvertTo-Json -InputObject $summary -Depth 10 -Compress
-            if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 32768) { throw 'The task-list result exceeds the summary bound' }
+            if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 32768) { throw 'The installed PostgreSQL result exceeds the summary bound' }
             Write-Output $text
             Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $text
           } else {
-            Write-Output 'Installed task-list verification did not start; see the preceding build steps.'
+            Write-Output 'Installed PostgreSQL example verification did not start; see the preceding build steps.'
           }
       - name: Summarize the installed structured Task result
         if: always() && inputs.installed_structured_only

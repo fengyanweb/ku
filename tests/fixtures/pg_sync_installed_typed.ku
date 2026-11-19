@@ -1,0 +1,46 @@
+import pg from "std.pg"
+import "std.fs"
+
+fn main(): null! {
+    client = pg.client({conninfo: fs.read("db.conn")?, max_connections: 1, max_waiters: 2})?
+    row = client.query_one_typed(
+        "SELECT $1::int4 AS id, $2::bool AS enabled, $3::text AS label, $4::text AS optional_label",
+        [17, true, "中文🙂 ' \\", null],
+        ["int4", "bool", "text", "text?"],
+        ["int4", "bool", "text", "text?"]
+    )?
+    baseline = client.query("SELECT current_setting('work_mem'), pg_backend_pid()::text", [])?
+    setting = "128kB"
+    if (baseline.value(0, 0)? == "128kB") { setting = "256kB" }
+    empty = client.query_one_typed(
+        "SELECT set_config('work_mem', $1, false), $2::text",
+        [setting.clone(), ""], ["text", "text?"], ["text", "text?"]
+    )?
+    after = client.query("SELECT current_setting('work_mem'), pg_backend_pid()::text", [])?
+    if (baseline.value(0, 0)? != after.value(0, 0)? || baseline.value(0, 1)? != after.value(0, 1)?) {
+        fail "typed query must reset and return the same connection"
+    }
+    mismatch = false
+    try {
+        invalid = client.query_one_typed(
+            "INSERT INTO ku_sync_typed_probe (number) VALUES ($1::int4) RETURNING number",
+            [17], ["int4"], ["text"]
+        )?
+    } catch (err) {
+        if (err.domain != "pg" || err.code != "typed_value_error") { fail err }
+        mismatch = true
+    }
+    if (!mismatch) { fail "declared text must reject actual int4" }
+    recovered = client.query_one_typed("SELECT $1::int4 FROM pg_sleep(0.25)", [0], ["int4"], ["int4"])?
+    client.close()
+    if (row.rows() != 1 || row.cols() != 4 || row.value_int(0, 0)? != 17 || !row.value_bool(0, 1)?
+        || row.value(0, 2)? != "中文🙂 ' \\" || !row.is_null(0, 3)?) {
+        fail "typed row fields after pool close"
+    }
+    if (empty.value(0, 0)? != setting || empty.is_null(0, 1)? || empty.value(0, 1)? != ""
+        || recovered.value_int(0, 0)? != 0) {
+        fail "typed empty string and zero after pool close"
+    }
+    println("typed-pg-ok")
+    return ok(null)
+}

@@ -512,6 +512,11 @@ def hidden_checkout(repo, root, report):
             raise ValueError('source checkout restoration is unconfirmed; retain the exact owned root')
 
 
+def selected_lanes(tasks_example, typed_example):
+    return tuple(name for name, enabled in (("tasks", tasks_example), ("typed", typed_example))
+                 if enabled) or ("sync", "async")
+
+
 def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, report):
     driver = repo / "tests" / "acceptance" / "http_pg_lifecycle.py"
     executable = installed / ("ku.exe" if os.name == "nt" else "ku")
@@ -532,10 +537,12 @@ def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, repor
     working.mkdir()
     command = [sys.executable, "-B", str(driver), "--ku", str(executable),
                "--loops", "4", "--profile", report.get('profile', 'debug')]
-    lanes = ("tasks",) if report.get("tasks_example") else ("sync", "async")
+    lanes = selected_lanes(report.get("tasks_example"), report.get("typed_example"))
     if report.get("tasks_example"):
         command.extend(("--tasks-example", "--tasks-backend", report["tasks_backend"]))
-    elif report.get('target') == 'x86_64-pc-windows-gnu':
+    if report.get("typed_example"):
+        command.append("--typed-example")
+    if lanes == ("sync", "async") and report.get('target') == 'x86_64-pc-windows-gnu':
         command.append('--installed-contracts')
     report["pg_fixture_invoked"] = True
     if os.name == "nt":
@@ -582,9 +589,8 @@ def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, repor
         save_report(lane_output, {"status": "running", "lanes": {}})
         try:
             owner_config = owner.start(execution_deadline)
-            lane_args = [] if lane == "tasks" else ["--lane", lane]
             try:
-                process = exporter.run_runtime_check([*command, *lane_args,
+                process = exporter.run_runtime_check([*command, "--lane", lane,
                     "--database-owner-config", str(owner_config), "--output", str(lane_output)], repo, working,
                     timeout_seconds=min(180, execution_remaining()))
             except BaseException as failure:
@@ -734,9 +740,10 @@ def verify(args):
         raise ValueError("selected target does not match this physical runner")
     output = args.output.resolve()
     tasks_example = getattr(args, "tasks_example", False)
+    typed_example = getattr(args, "typed_example", False)
     tasks_backend = getattr(args, "tasks_backend", None) or "native"
-    lanes = ("tasks",) if tasks_example else ("sync", "async")
-    profile = 'release' if tasks_example or args.target == 'x86_64-pc-windows-gnu' else 'debug'
+    lanes = selected_lanes(tasks_example, typed_example)
+    profile = 'release' if tasks_example or typed_example or args.target == 'x86_64-pc-windows-gnu' else 'debug'
     if args.target == 'x86_64-pc-windows-gnu' and not getattr(args, 'hide_checkout', False):
         raise ValueError('GNU PG acceptance requires --hide-checkout; source checks are not installed execution')
     report = {"format": "ku-installed-pg-check-v1", "status": "running",
@@ -747,6 +754,10 @@ def verify(args):
     if tasks_example:
         report.update(tasks_example=True, tasks_backend=tasks_backend,
                       scope=f"installed Ku HTTP + PG task-list example; {tasks_backend} Release")
+    if typed_example:
+        report["typed_example"] = True
+        typed_scope = "installed synchronous typed PostgreSQL; default native, ku run and Runner Release"
+        report["scope"] = f"{report['scope']}; {typed_scope}" if tasks_example else typed_scope
     save_report(output, report)
     try:
         with owned_temporary_root(report) as root:
@@ -825,20 +836,23 @@ def verify(args):
             for lane in lanes:
                 entry = data["lanes"][lane]
                 raw = entry.get("report", {})
-                if tasks_example:
+                if lane == "tasks":
                     fixture_name = "http_pg.ku"
                     fixture_sha = exporter.file_hash(repo / "examples" / fixture_name)
+                elif lane == "typed":
+                    fixture_name = "pg_sync_installed_typed.ku"
+                    fixture_sha = exporter.file_hash(repo / "tests" / "fixtures" / fixture_name)
                 else:
                     fixture_name = ("http_pg_installed_contract" if args.target == 'x86_64-pc-windows-gnu' else "http_pg_lifecycle") + ("_async" if lane == "async" else "") + ".ku"
                     fixture_sha = exporter.file_hash(repo / "tests" / "fixtures" / fixture_name)
                 if (entry.get("status") != "passed" or raw.get("status") != "passed"
                         or raw.get("cleanup_errors") != [] or raw.get("cli_sha256") != expected_cli
                         or raw.get("event_loops") != 4 or raw.get("database_retry") is not False
-                        or raw.get("parameters", {}).get("build_profile" if tasks_example else "native_c_profile") != profile
+                        or raw.get("parameters", {}).get("build_profile" if lane in ("tasks", "typed") else "native_c_profile") != profile
                         or raw.get("lane") != lane or raw.get("fixture") != fixture_name
                         or raw.get("fixture_sha256") != fixture_sha):
                     raise ValueError("PG lifecycle result, CLI identity or cleanup differs")
-                if tasks_example:
+                if lane == "tasks":
                     for check in ("build", "startup", "invalid_inputs_and_missing_id",
                                   "same_service_database_recovery", "persisted_after_restart",
                                   "unauthorized_drain_rejected"):
@@ -854,7 +868,35 @@ def verify(args):
                         "invalid_responses", "database_failure", "recovered_write", "restart_read",
                         "initial_service_pid", "recovery_service_pid", "final_rows", "normal_exits",
                     )}
-                if args.target == 'x86_64-pc-windows-gnu' and not tasks_example:
+                    if os.name == "nt":
+                        loaded = raw.get("libpq_modules", [])
+                        if len(loaded) != 2 or any(item.get("machine") != "AMD64" for item in loaded):
+                            raise ValueError("task-list libpq.dll load/architecture was not verified")
+                        report["example_results"]["libpq_modules"] = loaded
+                if lane == "typed":
+                    for check in ("typed_values_and_detached_results",
+                                  "typed_error_recovery_without_sql_replay",
+                                  "typed_strict_reset_same_backend"):
+                        if raw.get("checks", {}).get(check) != "passed":
+                            raise ValueError(f"typed installed contract unavailable: {check}")
+                    entries = raw.get("typed_entries", {})
+                    if (set(entries) != {"ku_run", "native", "runner"}
+                            or entries["ku_run"].get("executable_sha256") != expected_cli):
+                        raise ValueError("typed execution entries or CLI identity differs")
+                    for index, name in enumerate(("ku_run", "native", "runner"), 1):
+                        result = entries[name]
+                        if (result.get("status") != "passed" or result.get("typed_output") != "typed-pg-ok"
+                                or result.get("mutation_rows") != [17] * index
+                                or result.get("remaining_database_sessions") != 0
+                                or result.get("source_removed_before_run") is not (name != "ku_run")
+                                or not prepare.SHA256.fullmatch(result.get("executable_sha256", ""))):
+                            raise ValueError(f"{name} typed execution or cleanup signature differs")
+                        if os.name == "nt" and result.get("libpq_module", {}).get("machine") != "AMD64":
+                            raise ValueError(f"{name} actual libpq.dll load was not verified")
+                    report["typed_results"] = entries
+                    if os.name != "nt":
+                        report["typed_libpq_provider"] = raw["libpq_provider"]
+                if args.target == 'x86_64-pc-windows-gnu' and lane in ("sync", "async"):
                     if (raw.get('source_removed_before_run') is not True
                             or raw.get('private_gnu_libpq', {}).get('wide_toolchain_path_in_service') is not False
                             or raw.get('checks', {}).get('typed_parameters_unicode_null_and_detached_results') != 'passed'
@@ -903,6 +945,8 @@ def main():
                         help="run only the repository's task-list example from the verified archive")
     parser.add_argument("--tasks-backend", choices=["native", "runner"],
                         help="build the task-list example with this backend (default: native)")
+    parser.add_argument("--typed-example", action="store_true",
+                        help="verify synchronous typed PG with native, ku run, and explicit Runner")
     args = parser.parse_args()
     if args.tasks_backend is not None and not args.tasks_example:
         parser.error("--tasks-backend requires --tasks-example")

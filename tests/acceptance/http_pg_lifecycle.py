@@ -282,7 +282,7 @@ class ToolTreeCleanup(Enum):
     UNCONFIRMED = "unconfirmed"
 
 
-def run(args, progress=None, timeout_seconds=60, deadline=None, **kwargs):
+def run(args, progress=None, timeout_seconds=60, deadline=None, observe_child=None, **kwargs):
     """Wait for the tool, not EOF from an intentionally backgrounded server.
 
     Windows subprocess.run kills only its direct child on timeout, then calls
@@ -329,6 +329,8 @@ def run(args, progress=None, timeout_seconds=60, deadline=None, **kwargs):
                 child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, **kwargs)
                 mark("running", pid=child.pid, timeout_seconds=timeout_seconds)
                 try:
+                    if observe_child is not None:
+                        observe_child(child, time.monotonic() + wait_budget())
                     child.wait(timeout=wait_budget())
                     wait_budget()  # Process creation and a late exit count too.
                 except (subprocess.TimeoutExpired, TimeoutError):
@@ -613,7 +615,7 @@ def parse_args(argv=None):
     parser.add_argument("--loops", type=int, default=4)
     parser.add_argument("--performance-seconds", type=int, default=0, help="Run only bounded read throughput for 3..60s; omit fault replay")
     parser.add_argument("--profile", choices=["debug", "release"], default="debug")
-    parser.add_argument("--lane", choices=["both", "sync", "async"], default="both",
+    parser.add_argument("--lane", choices=["both", "sync", "async", "tasks", "typed"], default="both",
                         help="Run independent sync and/or named async HTTP -> PostgreSQL lifecycles")
     parser.add_argument("--database-owner-config", type=Path,
                         help="Private installed-archive verifier only; parent retains the direct postgres child")
@@ -623,20 +625,83 @@ def parse_args(argv=None):
                         help="Run only the HTTP + PG task-list example from the installed Ku")
     parser.add_argument("--tasks-backend", choices=["native", "runner"],
                         help="Build the task-list example with this backend (default: native)")
+    parser.add_argument("--typed-example", action="store_true",
+                        help="Check a synchronous typed PG query with native, ku run, and explicit Runner")
     args = parser.parse_args(argv)
     if args.performance_seconds and not 3 <= args.performance_seconds <= 60:
         parser.error("performance-seconds must be 3..60")
     if args.performance_seconds and args.installed_contracts:
         parser.error("installed contracts cannot change a performance workload")
-    if args.tasks_example:
+    if args.tasks_example or args.typed_example:
         if args.performance_seconds or args.installed_contracts:
-            parser.error("the task-list example is standalone functional verification")
+            parser.error("the installed examples are standalone functional verification")
         args.profile = "release"
-        args.lane = "tasks"
+        lanes = ["tasks"] * args.tasks_example + ["typed"] * args.typed_example
+        if args.lane not in [*lanes, "both"]:
+            parser.error("requested lane does not match the selected examples")
+        args.lanes = lanes if args.lane == "both" else [args.lane]
+    elif args.lane in ("tasks", "typed"):
+        parser.error("example lanes require their corresponding example flag")
+    if args.tasks_example:
         args.tasks_backend = args.tasks_backend or "native"
     elif args.tasks_backend is not None:
         parser.error("--tasks-backend requires --tasks-example")
     return args
+
+
+def windows_loaded_libpq(process, environment, deadline):
+    """Read the actual child module path and PE machine while the test query runs."""
+    import ctypes
+    from ctypes import wintypes
+
+    class ModuleEntry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("th32ModuleID", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("GlblcntUsage", wintypes.DWORD),
+                    ("ProccntUsage", wintypes.DWORD), ("modBaseAddr", ctypes.c_void_p),
+                    ("modBaseSize", wintypes.DWORD), ("hModule", wintypes.HMODULE),
+                    ("szModule", wintypes.WCHAR * 256), ("szExePath", wintypes.WCHAR * 260)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel.CloseHandle.restype = wintypes.BOOL
+    for method in (kernel.Module32FirstW, kernel.Module32NextW):
+        method.argtypes = (wintypes.HANDLE, ctypes.POINTER(ModuleEntry))
+        method.restype = wintypes.BOOL
+    expected = Path(environment["KU_PG_RUNTIME_DIR"]) / "libpq.dll"
+    invalid_handle = ctypes.c_void_p(-1).value
+    while process.poll() is None and time.monotonic() < deadline:
+        modules = kernel.CreateToolhelp32Snapshot(0x00000008, process.pid)  # TH32CS_SNAPMODULE
+        if modules not in (None, invalid_handle):
+            try:
+                entry = ModuleEntry()
+                entry.dwSize = ctypes.sizeof(entry)
+                found = kernel.Module32FirstW(modules, ctypes.byref(entry))
+                while found:
+                    if entry.szModule.casefold() == "libpq.dll":
+                        path = Path(entry.szExePath).resolve(strict=True)
+                        if not path.samefile(expected):
+                            raise ValueError("loaded libpq.dll differs from the selected provider")
+                        with path.open("rb") as module:
+                            dos = module.read(64)
+                            if len(dos) != 64 or dos[:2] != b"MZ":
+                                raise ValueError("loaded libpq.dll lacks a DOS header")
+                            offset = struct.unpack_from("<I", dos, 60)[0]
+                            if not 64 <= offset <= 1024 * 1024:
+                                raise ValueError("loaded libpq.dll PE header offset is invalid")
+                            module.seek(offset)
+                            pe = module.read(26)
+                        if (len(pe) != 26 or pe[:4] != b"PE\x00\x00"
+                                or struct.unpack_from("<H", pe, 4)[0] != 0x8664
+                                or struct.unpack_from("<H", pe, 24)[0] != 0x20b):
+                            raise ValueError("loaded libpq.dll is not an AMD64 PE32+ DLL")
+                        return {"path": str(path), "machine": "AMD64", "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                    found = kernel.Module32NextW(modules, ctypes.byref(entry))
+            finally:
+                kernel.CloseHandle(modules)
+        time.sleep(min(0.015, max(0, deadline - time.monotonic())))
+    return None
 
 
 def windows_pg_runtime_environment(environment, report):
@@ -838,6 +903,11 @@ def run_tasks_example(ku, source, root, backend, sql, execute, environment, runt
                     break
                 except OSError:
                     time.sleep(min(0.05, deadline_remaining(deadline)))
+            if os.name == "nt":
+                loaded = windows_loaded_libpq(service, runtime_environment, deadline)
+                if loaded is None:
+                    raise RuntimeError("could not observe task-list service's loaded libpq.dll")
+                report.setdefault("libpq_modules", []).append(loaded)
             if restart:
                 retained = read(original["id"])
                 if retained != original:
@@ -903,9 +973,60 @@ def run_tasks_example(ku, source, root, backend, sql, execute, environment, runt
     report["checks"]["persisted_after_restart"] = "passed"
 
 
+def run_typed_example(ku, source, root, sql, execute, environment, runtime_environment,
+                      database_port, report, progress):
+    """Run the same native-compatible source in all three installed entry points."""
+    sql("CREATE TABLE ku_sync_typed_probe (number integer NOT NULL)")
+    (root / "db.conn").write_text(
+        f"hostaddr=127.0.0.1 port={database_port} user=ku_accept dbname=postgres "
+        "sslmode=disable application_name=ku_runtime_acceptance", encoding="utf-8")
+    local_source = root / source.name
+    shutil.copyfile(source, local_source)
+    suffix = ".exe" if os.name == "nt" else ""
+    native, runner = root / ("typed-native" + suffix), root / ("typed-runner" + suffix)
+    for backend, binary, flags in (("native", native, []), ("runner", runner, ["--backend", "runner"])):
+        progress("typed:build", entry=backend)
+        execute([ku, "build", "--verbose", "--release", *flags, local_source, "-o", binary],
+                cwd=root, env=environment)
+    cases = (("ku_run", [ku, "run", local_source]),
+             ("native", [native]), ("runner", [runner]))
+    report["typed_entries"] = {}
+    for index, (entry, command) in enumerate(cases):
+        progress("typed:execute", entry=entry)
+        if index == 1:
+            local_source.unlink()
+            if (root / ".ku").is_dir():
+                shutil.rmtree(root / ".ku")
+            report["source_removed_before_run"] = True
+        check = report["typed_entries"][entry] = {
+            "executable_sha256": hashlib.sha256(command[0].read_bytes()).hexdigest(),
+            "source_removed_before_run": not local_source.exists(),
+        }
+        def observe(process, deadline):
+            check["libpq_module"] = windows_loaded_libpq(
+                process, runtime_environment, min(deadline, time.monotonic() + 8))
+
+        output = execute(command, cwd=root, env=runtime_environment,
+                         observe_child=observe if os.name == "nt" else None)
+        if output != "typed-pg-ok":
+            raise AssertionError(f"{entry} did not finish the typed assertions")
+        if os.name == "nt" and not check.get("libpq_module"):
+            raise AssertionError(f"{entry}'s libpq.dll was not observed while running")
+        rows = json.loads(sql("SELECT coalesce(json_agg(number), '[]'::json) FROM ku_sync_typed_probe"))
+        if rows != [17] * (index + 1):
+            raise AssertionError(f"{entry} did not execute one write despite the result type mismatch")
+        began = time.monotonic()
+        observe_database_connections(sql, {}, maximum=0, began=began, deadline=began + 5)
+        check.update(status="passed", typed_output=output, mutation_rows=rows, remaining_database_sessions=0)
+    report["checks"]["typed_values_and_detached_results"] = "passed"
+    report["checks"]["typed_error_recovery_without_sql_replay"] = "passed"
+    report["checks"]["typed_strict_reset_same_backend"] = "passed"
+
+
 def run_lane(args, lane, on_checkpoint=None):
     ku = args.ku.resolve()
-    tasks_example = getattr(args, "tasks_example", False)
+    tasks_example = lane == "tasks"
+    typed_example = lane == "typed"
     tasks_backend = getattr(args, "tasks_backend", None) or "native"
     prefix = 'http_pg_installed_contract' if getattr(args, 'installed_contracts', False) else 'http_pg_lifecycle'
     filename = prefix + ('' if lane == 'sync' else '_async') + '.ku'
@@ -913,6 +1034,9 @@ def run_lane(args, lane, on_checkpoint=None):
     if tasks_example:
         filename = "http_pg.ku"
         source = Path(__file__).resolve().parents[2] / "examples" / filename
+    elif typed_example:
+        filename = "pg_sync_installed_typed.ku"
+        source = Path(__file__).resolve().parents[1] / "fixtures" / filename
     report = {"platform": os.uname().sysname if hasattr(os, "uname") else os.name,
               "lane": lane, "fixture": filename,
               "event_loops": args.loops, "database_retry": False,
@@ -941,8 +1065,12 @@ def run_lane(args, lane, on_checkpoint=None):
             "database_transport": "direct loopback to private PostgreSQL",
             "tls": "disabled only inside isolated loopback fixture",
         }
+    elif typed_example:
+        report["parameters"] = {"build_profile": args.profile,
+                                "database_transport": "direct loopback to private PostgreSQL",
+                                "tls": "disabled only inside isolated loopback fixture"}
     def progress(phase, **details):
-        if phase.startswith(("http:", "fault:", "tasks:")):
+        if phase.startswith(("http:", "fault:", "tasks:", "typed:")):
             report["acceptance_phase"] = phase
         checkpoint(report, args.output, phase, **details)
         if on_checkpoint is not None:
@@ -987,10 +1115,26 @@ def run_lane(args, lane, on_checkpoint=None):
             environment = os.environ | {"KU_EVENT_LOOPS": str(args.loops), "KU_BLOCKING_THREADS": "8",
                                         "KU_DB_MAX_CONNECTIONS": "4", "KU_DB_MAX_WAITERS": "8",
                                         "KU_DB_MAX_PENDING_BYTES": "1048576"}
-            if tasks_example:
+            if tasks_example or typed_example:
                 environment = {key: value for key, value in environment.items() if not key.upper().startswith("PG")}
             control_token = os.urandom(24).hex()
             environment["KU_SERVICE_CONTROL_TOKEN"] = control_token
+            configure_runtime = typed_example or (tasks_example and (tasks_backend == "runner" or os.name == "nt"))
+            if configure_runtime and not environment.get("KU_PG_RUNTIME_DIR"):
+                runtime_dir = tools if os.name == "nt" else Path(execute([pg_config, "--libdir"]))
+                environment["KU_PG_RUNTIME_DIR"] = str(runtime_dir.resolve(strict=True))
+            if typed_example and os.name != "nt":
+                runtime_dir = Path(environment["KU_PG_RUNTIME_DIR"])
+                link_name, versioned_name = (("libpq.dylib", "libpq.5.dylib")
+                                             if sys.platform == "darwin" else ("libpq.so", "libpq.so.5"))
+                linker_lib = runtime_dir / link_name
+                runner_lib = runtime_dir / versioned_name
+                if runner_lib.is_file() and not linker_lib.samefile(runner_lib):
+                    raise ValueError("native and Runner selected different libpq providers")
+                provider = linker_lib.resolve(strict=True)
+                report["libpq_provider"] = {"path": str(provider),
+                                            "sha256": hashlib.sha256(provider.read_bytes()).hexdigest()}
+                environment["KU_PG_LIB"] = str(runtime_dir)
             if not environment.get("KU_PG_LIB"):
                 libdir = Path(execute([pg_config, "--libdir"]))
                 library = next((libdir / name for name in ["libpq.dylib", "libpq.so", "libpq.lib", "libpq.dll.a"]
@@ -1004,9 +1148,6 @@ def run_lane(args, lane, on_checkpoint=None):
                 else:
                     (private_lib / library.name).symlink_to(library.resolve())
                 environment["KU_PG_LIB"] = str(private_lib)
-            if tasks_example and tasks_backend == "runner" and not environment.get("KU_PG_RUNTIME_DIR"):
-                runtime_dir = tools if os.name == "nt" else Path(execute([pg_config, "--libdir"]))
-                environment["KU_PG_RUNTIME_DIR"] = str(runtime_dir.resolve(strict=True))
             environment["PGCLIENTENCODING"] = "UTF8"
             runtime_environment = windows_pg_runtime_environment(environment, report)
             if environment.get('KU_PG_PRIVATE_MANIFEST'):
@@ -1063,6 +1204,11 @@ def run_lane(args, lane, on_checkpoint=None):
             if tasks_example:
                 run_tasks_example(ku, source, root, tasks_backend, sql, execute, environment, runtime_environment,
                                   database_port, http_port, control_token, report, progress)
+                report["status"] = "passed"
+                return report
+            if typed_example:
+                run_typed_example(ku, source, root, sql, execute, environment, runtime_environment,
+                                  database_port, report, progress)
                 report["status"] = "passed"
                 return report
             sql("CREATE TABLE ku_events(id text PRIMARY KEY, payload text NOT NULL)")
@@ -1430,7 +1576,7 @@ def validate_database_metrics(metrics, lane, with_faults):
 
 
 def run_lanes(args):
-    lanes = ["sync", "async"] if args.lane == "both" else [args.lane]
+    lanes = getattr(args, "lanes", None) or (["sync", "async"] if args.lane == "both" else [args.lane])
     output = args.output.resolve()
     report = {"status": "running", "required_lanes": lanes, "lanes": {},
               "database_retry": False,
