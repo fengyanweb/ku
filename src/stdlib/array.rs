@@ -9,6 +9,8 @@ use crate::{
 };
 
 pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
+    #[cfg(feature = "browser")]
+    crate::browser::preflight_args(args, span)?;
     match function {
         "len" => {
             let values = one_array("array.len", args, span)?;
@@ -35,7 +37,18 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
             let Value::Array(right) = &args[1] else {
                 return Err(expected_type("array", &args[1], span));
             };
-            let mut next = Vec::with_capacity(left.len() + right.len());
+            let length = left
+                .len()
+                .checked_add(right.len())
+                .ok_or_else(|| crate::error::KuError::runtime("array length overflow", span))?;
+            #[cfg(feature = "browser")]
+            crate::browser::allocation(
+                length
+                    .checked_mul(32)
+                    .ok_or_else(|| crate::browser::fail(span))?,
+                span,
+            )?;
+            let mut next = Vec::with_capacity(length);
             next.extend(left.iter().cloned());
             next.extend(right.iter().cloned());
             Ok(Some(Value::Array(next)))

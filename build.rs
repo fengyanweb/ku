@@ -1,3 +1,6 @@
+#[cfg(feature = "browser")]
+#[path = "src/browser/generate_import_support.rs"]
+mod browser_import_support;
 #[path = "build_support/build_identity.rs"]
 mod build_identity;
 use sha2::{Digest, Sha256};
@@ -21,6 +24,11 @@ fn files(root: &Path, dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 
 fn main() {
     let root = std::path::PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    #[cfg(feature = "browser")]
+    browser_import_support::generate(
+        &root,
+        &std::path::PathBuf::from(env::var_os("OUT_DIR").unwrap()),
+    );
     let rustc = Command::new(env::var_os("RUSTC").unwrap())
         .arg("-vV")
         .env("RUSTUP_AUTO_INSTALL", "0")

@@ -19,6 +19,10 @@ pub mod json;
 pub(crate) mod metadata;
 pub mod object;
 pub mod string;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod time;
+#[cfg(target_arch = "wasm32")]
+#[path = "../browser/time.rs"]
 pub mod time;
 
 pub fn eval_builtin(name: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
@@ -34,6 +38,12 @@ pub fn eval_dotted_builtin(
     let Some((module, function)) = dotted_name(callee) else {
         return Ok(None);
     };
+    #[cfg(feature = "browser")]
+    if crate::browser::active() && matches!(module.as_str(), "fs" | "config" | "http") {
+        return Err(crate::browser::unsupported(&module, span));
+    }
+    #[cfg(feature = "browser")]
+    crate::browser::preflight_args(args, span)?;
     match module.as_str() {
         "fs" => fs::eval(&function, args, span, base_dir),
         "lexer" | "parser" => compiler::eval(&module, &function, args, span),

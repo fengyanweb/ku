@@ -6,6 +6,8 @@ use crate::{
 };
 
 pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
+    #[cfg(feature = "browser")]
+    crate::browser::preflight_args(args, span)?;
     match function {
         "get_or" => {
             expect_arg_count("object.get_or", args.len(), 3, span)?;
