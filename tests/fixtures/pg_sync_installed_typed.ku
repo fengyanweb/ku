@@ -23,23 +23,32 @@ fn main(): null! {
     mismatch = false
     try {
         invalid = client.query_one_typed(
-            "INSERT INTO ku_sync_typed_probe (number) VALUES ($1::int4) RETURNING number",
-            [17], ["int4"], ["text"]
+            "INSERT INTO ku_sync_typed_probe (number) VALUES ($1::int4) RETURNING number, set_config('work_mem', $2, false)",
+            [17, setting.clone()], ["int4", "text"], ["text", "text"]
         )?
     } catch (err) {
         if (err.domain != "pg" || err.code != "typed_value_error") { fail err }
         mismatch = true
     }
     if (!mismatch) { fail "declared text must reject actual int4" }
-    recovered = client.query_one_typed("SELECT $1::int4 FROM pg_sleep(0.25)", [0], ["int4"], ["int4"])?
+    after_error = client.query("SELECT current_setting('work_mem'), pg_backend_pid()::text", [])?
+    if (baseline.value(0, 0)? != after_error.value(0, 0)? || baseline.value(0, 1)? != after_error.value(0, 1)?) {
+        fail "typed shape error must also reset and return the same connection"
+    }
+    recovered = client.query_one_typed(
+        "SELECT $1::int4, $2::int8, $3::bool, $4::varchar FROM pg_sleep(0.25)",
+        [0, -9223372036854775807, false, "恢复🙂"], ["int4", "int8", "bool", "varchar"],
+        ["int4", "int8", "bool", "varchar"]
+    )?
     client.close()
     if (row.rows() != 1 || row.cols() != 4 || row.value_int(0, 0)? != 17 || !row.value_bool(0, 1)?
         || row.value(0, 2)? != "中文🙂 ' \\" || !row.is_null(0, 3)?) {
         fail "typed row fields after pool close"
     }
     if (empty.value(0, 0)? != setting || empty.is_null(0, 1)? || empty.value(0, 1)? != ""
-        || recovered.value_int(0, 0)? != 0) {
-        fail "typed empty string and zero after pool close"
+        || recovered.value_int(0, 0)? != 0 || recovered.value_int(0, 1)? != -9223372036854775807
+        || recovered.value_bool(0, 2)? || recovered.value(0, 3)? != "恢复🙂") {
+        fail "typed result after pool close"
     }
     println("typed-pg-ok")
     return ok(null)

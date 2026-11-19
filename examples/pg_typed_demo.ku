@@ -1,4 +1,4 @@
-// Native C only. Build: ku build --native examples/pg_typed_demo.ku
+// Default native, ku run, or ku build --release --backend runner.
 // Read a private libpq connection string from db.conn; never commit credentials.
 import pg from "std.pg"
 import "std.fs"

@@ -1,6 +1,7 @@
 mod budget;
 mod libpq;
 mod sql;
+mod typed;
 
 use std::{
     collections::HashMap,
@@ -220,6 +221,30 @@ fn min_deadline(deadline: Instant, caller_deadline: Option<Instant>) -> Instant 
     caller_deadline.map_or(deadline, |caller| deadline.min(caller))
 }
 
+struct QueryDeadline<'a> {
+    end: Instant,
+    cancelled: &'a dyn Fn() -> bool,
+}
+
+impl QueryDeadline<'_> {
+    fn check_cancel(&self) -> PgResult<()> {
+        if (self.cancelled)() {
+            Err(CANCELLED)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check(&self) -> PgResult<()> {
+        self.check_cancel()?;
+        if Instant::now() >= self.end {
+            Err(QUERY_TIMEOUT)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl Client {
     fn open(
         config: Config,
@@ -396,31 +421,11 @@ impl Client {
         caller_deadline: Option<Instant>,
         cancelled: &dyn Fn() -> bool,
     ) -> PgResult<Rows> {
-        let deadline = min_deadline(Instant::now() + self.config.query_timeout, caller_deadline);
-        let mut check_cancel = || if cancelled() { Err(CANCELLED) } else { Ok(()) };
-        let check = || {
-            check_cancel()?;
-            if Instant::now() >= deadline {
-                return Err(QUERY_TIMEOUT);
-            }
-            Ok(())
-        };
-        check()?;
-        if sql.len() > MAX_SQL_BYTES {
-            return Err(error(
-                "query_too_large",
-                "PostgreSQL SQL text exceeds its limit",
-            ));
-        }
-        check_for_nul(sql, &check, SQL_NUL)?;
-        sql::validate(sql, &check)?;
+        let timing = self.query_deadline(caller_deadline, cancelled);
+        let check = || timing.check();
+        validate_query_sql(sql, &check)?;
         let input_bytes = pending_input_bytes(sql, params, span, &check)?;
-        let _budget = Reservation::operation(input_bytes).ok_or_else(|| {
-            error(
-                "resource_limit",
-                "database pending input byte budget exhausted or invalid",
-            )
-        })?;
+        let _budget = reserve_query_inputs(input_bytes)?;
         let sql = copy_to_cstr(sql, &check)?;
         let mut bound = Vec::new();
         bound
@@ -432,18 +437,67 @@ impl Client {
             })?));
         }
 
-        let mut lease = self.acquire(deadline, cancelled)?;
+        self.run_query(&timing, |connection| {
+            connection
+                .execute(&sql, &bound, timing.end, &mut || timing.check_cancel())
+                .map(|table| Ok(Rows(ResultData::Text(table))))
+        })
+    }
+
+    fn query_typed(
+        &self,
+        sql: &str,
+        arguments: typed::Arguments<'_>,
+        span: Span,
+        caller_deadline: Option<Instant>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> PgResult<Rows> {
+        let timing = self.query_deadline(caller_deadline, cancelled);
+        let check = || timing.check();
+        validate_query_sql(sql, &check)?;
+        let _budget = reserve_query_inputs(arguments.input_bytes(sql.len(), span, &check)?)?;
+        let sql = copy_to_cstr(sql, &check)?;
+        let (bound, columns) = arguments.bind(span, &check)?;
+        self.run_query(&timing, |connection| {
+            let result =
+                connection.execute_typed(&sql, &bound, &columns, timing.end, &mut || {
+                    timing.check_cancel()
+                })?;
+            Ok(result.map(|cells| Rows(ResultData::Typed { columns, cells })))
+        })
+    }
+
+    fn query_deadline<'a>(
+        &self,
+        caller_deadline: Option<Instant>,
+        cancelled: &'a dyn Fn() -> bool,
+    ) -> QueryDeadline<'a> {
+        QueryDeadline {
+            end: min_deadline(Instant::now() + self.config.query_timeout, caller_deadline),
+            cancelled,
+        }
+    }
+
+    fn run_query(
+        &self,
+        timing: &QueryDeadline<'_>,
+        execute: impl FnOnce(&mut Connection) -> PgResult<PgResult<Rows>>,
+    ) -> PgResult<Rows> {
+        let mut lease = self.acquire(timing.end, timing.cancelled)?;
         let connection = lease
             .connection
             .as_mut()
             .expect("PG checkout has no connection");
-        let result = connection.execute(&sql, &bound, deadline, &mut check_cancel)?;
-        // A failed cleanup cannot invalidate the independently-owned successful
-        // result. Keep the lease out of the idle pool until reset completes.
+        let result = execute(connection)?;
+        // Completed typed errors also go through strict reset. An ambiguous
+        // transport error above evicts the lease. A failed reset itself does
+        // not replace the completed query's result or error.
         if !self.pool().closed {
-            lease.reusable = connection.reset(deadline, &mut check_cancel).is_ok();
+            lease.reusable = connection
+                .reset(timing.end, &mut || timing.check_cancel())
+                .is_ok();
         }
-        Ok(Rows(result))
+        result
     }
 }
 
@@ -455,6 +509,27 @@ impl Drop for Client {
 
 const SQL_NUL: Error = error("query_error", "SQL contains a NUL byte");
 const PARAM_NUL: Error = error("query_error", "PostgreSQL parameter contains a NUL byte");
+
+fn validate_query_sql(sql: &str, check: &impl Fn() -> PgResult<()>) -> PgResult<()> {
+    check()?;
+    if sql.len() > MAX_SQL_BYTES {
+        return Err(error(
+            "query_too_large",
+            "PostgreSQL SQL text exceeds its limit",
+        ));
+    }
+    check_for_nul(sql, check, SQL_NUL)?;
+    sql::validate(sql, check)
+}
+
+fn reserve_query_inputs(bytes: usize) -> PgResult<Reservation> {
+    Reservation::operation(bytes).ok_or_else(|| {
+        error(
+            "resource_limit",
+            "database pending input byte budget exhausted or invalid",
+        )
+    })
+}
 
 fn check_for_nul(text: &str, check: &impl Fn() -> PgResult<()>, nul: Error) -> PgResult<()> {
     for chunk in text.as_bytes().chunks(INPUT_CHUNK) {
@@ -537,14 +612,22 @@ fn pending_input_bytes(
         + params.len() * (1 + size_of::<Option<CString>>() + size_of::<*const u8>()))
 }
 
-pub struct Rows(Tabular);
+enum ResultData {
+    Text(Tabular),
+    Typed {
+        columns: Vec<typed::Column>,
+        cells: Vec<typed::Cell>,
+    },
+}
+
+pub struct Rows(ResultData);
 
 impl fmt::Debug for Rows {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PgResult")
-            .field("rows", &self.0.rows)
-            .field("cols", &self.0.cols)
+            .field("rows", &self.row_count())
+            .field("cols", &self.col_count())
             .finish()
     }
 }
@@ -562,17 +645,36 @@ fn canonical_int(text: &str) -> Option<i64> {
 }
 
 impl Rows {
+    fn row_count(&self) -> usize {
+        match &self.0 {
+            ResultData::Text(table) => table.rows,
+            ResultData::Typed { .. } => 1,
+        }
+    }
+
+    fn col_count(&self) -> usize {
+        match &self.0 {
+            ResultData::Text(table) => table.cols,
+            ResultData::Typed { columns, .. } => columns.len(),
+        }
+    }
+
     fn read(&self, method: &str, row: i64, col: i64) -> PgResult<Value> {
         let bad_index = || error("value_error", "result row or column is out of bounds");
         let row = usize::try_from(row).map_err(|_| bad_index())?;
         let col = usize::try_from(col).map_err(|_| bad_index())?;
-        if row >= self.0.rows || col >= self.0.cols {
+        if row >= self.row_count() || col >= self.col_count() {
             return Err(bad_index());
         }
-        let cell = self
-            .0
+        let table = match &self.0 {
+            ResultData::Text(table) => table,
+            ResultData::Typed { columns, cells } => {
+                return read_typed_cell(method, columns[col], &cells[col]);
+            }
+        };
+        let cell = table
             .cells
-            .get(row * self.0.cols + col)
+            .get(row * table.cols + col)
             .ok_or_else(bad_index)?;
         if method == "is_null" {
             return Ok(Value::Bool(cell.is_none()));
@@ -594,12 +696,29 @@ impl Rows {
                 )
             });
         }
-        let mut text = String::new();
-        text.try_reserve_exact(value.len())
-            .map_err(|_| OUT_OF_MEMORY)?;
-        text.push_str(value);
-        Ok(Value::String(text))
+        copy_result_text(value)
     }
+}
+
+fn read_typed_cell(method: &str, column: typed::Column, cell: &typed::Cell) -> PgResult<Value> {
+    use typed::Cell;
+    match (method, cell) {
+        ("is_null", cell) => Ok(Value::Bool(matches!(cell, Cell::Null))),
+        ("value", _) if !column.is_text() => Err(typed::TYPE_ERROR),
+        (_, Cell::Null) => Err(typed::NULL_ERROR),
+        ("value", Cell::Text(value)) => copy_result_text(value),
+        ("value_int", Cell::Int(value)) => Ok(Value::Int(*value)),
+        ("value_bool", Cell::Bool(value)) => Ok(Value::Bool(*value)),
+        _ => Err(typed::TYPE_ERROR),
+    }
+}
+
+fn copy_result_text(value: &str) -> PgResult<Value> {
+    let mut text = String::new();
+    text.try_reserve_exact(value.len())
+        .map_err(|_| OUT_OF_MEMORY)?;
+    text.push_str(value);
+    Ok(Value::String(text))
 }
 
 pub(crate) fn eval(
@@ -655,13 +774,27 @@ pub(crate) fn eval_method(
             client.close();
             Value::Null
         }
-        ("pg_client", "query_one_typed", [Value::PgClient(_), _, _, _, _]) => errors::err(
-            "pg",
-            "backend_unsupported",
-            "PostgreSQL binary typed queries require the native backend",
-        ),
-        ("pg_result", "rows", [Value::PgResult(rows)]) => Value::Int(rows.0.rows as i64),
-        ("pg_result", "cols", [Value::PgResult(rows)]) => Value::Int(rows.0.cols as i64),
+        (
+            "pg_client",
+            "query_one_typed",
+            [Value::PgClient(client), Value::String(sql), Value::Array(params), Value::Array(param_types), Value::Array(result_types)],
+        ) => client
+            .query_typed(
+                sql,
+                typed::Arguments {
+                    values: params,
+                    param_types,
+                    result_types,
+                },
+                span,
+                caller_deadline,
+                cancelled,
+            )
+            .map_or_else(result_error, |rows| {
+                errors::ok(Value::PgResult(Arc::new(rows)))
+            }),
+        ("pg_result", "rows", [Value::PgResult(rows)]) => Value::Int(rows.row_count() as i64),
+        ("pg_result", "cols", [Value::PgResult(rows)]) => Value::Int(rows.col_count() as i64),
         (
             "pg_result",
             method @ ("value" | "value_int" | "value_bool" | "is_null"),

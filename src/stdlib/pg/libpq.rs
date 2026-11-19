@@ -10,6 +10,7 @@ use std::ptr::{null, null_mut, NonNull};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use super::typed::{self, Cell, Column, Param};
 use platform::{Library, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT};
 
 const CONNECTION_OK: c_int = 0;
@@ -76,6 +77,10 @@ const OUT_OF_MEMORY: Error = Error {
     kind: "out_of_memory",
     message: "could not allocate PostgreSQL operation storage",
 };
+const SESSION_STATE_ERROR: Error = Error {
+    kind: "session_state_unsupported",
+    message: "PostgreSQL statement completed or may have completed; session state is unsupported and its payload was discarded; never retry automatically",
+};
 
 #[repr(C)]
 struct PgConn {
@@ -135,6 +140,7 @@ libpq_api! {
     result_cols: c"PQnfields" => unsafe extern "C" fn(*const PgResult) -> c_int,
     result_rows: c"PQntuples" => unsafe extern "C" fn(*const PgResult) -> c_int,
     result_format: c"PQfformat" => unsafe extern "C" fn(*const PgResult, c_int) -> c_int,
+    result_oid: c"PQftype" => unsafe extern "C" fn(*const PgResult, c_int) -> u32,
     result_null: c"PQgetisnull" => unsafe extern "C" fn(*const PgResult, c_int, c_int) -> c_int,
     result_length: c"PQgetlength" => unsafe extern "C" fn(*const PgResult, c_int, c_int) -> c_int,
     result_value: c"PQgetvalue" => unsafe extern "C" fn(*const PgResult, c_int, c_int) -> *mut c_char,
@@ -224,7 +230,70 @@ impl Connection {
                 .iter()
                 .map(|value| value.as_ref().map_or(null(), |s| s.as_ptr())),
         );
-        self.query(sql, &values, deadline, check)
+        self.query(
+            sql,
+            Bindings::text(&values),
+            Rows::default(),
+            deadline,
+            check,
+        )?
+    }
+
+    pub(super) fn execute_typed(
+        &mut self,
+        sql: &CStr,
+        params: &[Param],
+        columns: &[Column],
+        deadline: Instant,
+        check: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<Result<Vec<Cell>, Error>, Error> {
+        if columns.len() > MAX_COLUMNS {
+            return Err(typed::SCHEMA_ERROR);
+        }
+        let mut values = Vec::new();
+        let mut oids = Vec::new();
+        let mut lengths = Vec::new();
+        let mut formats = Vec::new();
+        let count = params.len();
+        values.try_reserve_exact(count).map_err(|_| OUT_OF_MEMORY)?;
+        oids.try_reserve_exact(count).map_err(|_| OUT_OF_MEMORY)?;
+        lengths
+            .try_reserve_exact(count)
+            .map_err(|_| OUT_OF_MEMORY)?;
+        formats
+            .try_reserve_exact(count)
+            .map_err(|_| OUT_OF_MEMORY)?;
+        for param in params {
+            check_deadline(deadline, QUERY_TIMEOUT, check)?;
+            oids.push(param.oid);
+            formats.push(1);
+            match param.bytes() {
+                Some(bytes) => {
+                    // Binary values use explicit lengths. An empty slice's
+                    // non-null pointer denotes empty text, while null denotes NULL.
+                    values.push(bytes.as_ptr().cast::<c_char>());
+                    lengths.push(c_int::try_from(bytes.len()).map_err(|_| typed::SCHEMA_ERROR)?);
+                }
+                None => {
+                    values.push(null());
+                    lengths.push(0);
+                }
+            }
+        }
+        let bindings = Bindings {
+            values: &values,
+            oids: &oids,
+            lengths: &lengths,
+            formats: &formats,
+            result_format: 1,
+        };
+        self.query(
+            sql,
+            bindings,
+            TypedRow { columns, row: None },
+            deadline,
+            check,
+        )
     }
 
     pub(super) fn reset(
@@ -232,7 +301,13 @@ impl Connection {
         deadline: Instant,
         check: &mut impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let result = self.query(c"DISCARD ALL", &[], deadline, check)?;
+        let result = self.query(
+            c"DISCARD ALL",
+            Bindings::text(&[]),
+            Rows::default(),
+            deadline,
+            check,
+        )??;
         if result.rows == 0 && result.cols == 0 && self.reusable() {
             return Ok(());
         }
@@ -254,30 +329,38 @@ impl Connection {
         }
     }
 
-    fn query(
+    fn query<R: RowCollector>(
         &mut self,
         sql: &CStr,
-        values: &[*const c_char],
+        bindings: Bindings<'_>,
+        rows: R,
         deadline: Instant,
         check: &mut impl FnMut() -> Result<(), Error>,
-    ) -> Result<Tabular, Error> {
+    ) -> Result<Result<R::Output, Error>, Error> {
         let raw = self.raw.as_ptr();
         let api = self.api;
-        let count = c_int::try_from(values.len()).map_err(|_| QUERY_ERROR)?;
+        let count = c_int::try_from(bindings.values.len()).map_err(|_| QUERY_ERROR)?;
         check_deadline(deadline, QUERY_TIMEOUT, check)?;
         if !self.reusable() || unsafe { (api.consume_input)(raw) } == 0 || !self.reusable() {
             return Err(CONNECTION_ERROR);
         }
         check_deadline(deadline, QUERY_TIMEOUT, check)?;
 
-        // Text-format values are NUL-terminated; null pointers mean SQL NULL.
-        // There is exactly one send; a failed send can follow a partial write.
-        let values = if values.is_empty() {
-            null()
-        } else {
-            values.as_ptr()
+        // The slices and their backing values stay live through the single
+        // send. A failed send can follow a partial write.
+        let sent = unsafe {
+            (api.send_query)(
+                raw,
+                sql.as_ptr(),
+                count,
+                data_or_null(bindings.oids),
+                data_or_null(bindings.values),
+                data_or_null(bindings.lengths),
+                data_or_null(bindings.formats),
+                bindings.result_format,
+            )
         };
-        if unsafe { (api.send_query)(raw, sql.as_ptr(), count, null(), values, null(), null(), 0) } == 0
+        if sent == 0
             // This call must immediately follow the send, before any input is consumed.
             || unsafe { (api.single_row_mode)(raw) } == 0
         {
@@ -307,18 +390,19 @@ impl Connection {
                 _ => return Err(EXECUTION_UNKNOWN),
             }
         }
-        self.receive(deadline, check)
+        self.receive(rows, deadline, check)
     }
 
-    fn receive(
+    fn receive<R: RowCollector>(
         &mut self,
+        rows: R,
         deadline: Instant,
         check: &mut impl FnMut() -> Result<(), Error>,
-    ) -> Result<Tabular, Error> {
+    ) -> Result<Result<R::Output, Error>, Error> {
         let raw = self.raw.as_ptr();
         let api = self.api;
         let mut terminal = None;
-        let mut rows = Some(Rows::default());
+        let mut rows = Ok(rows);
         loop {
             let delivery_error = if terminal == Some(true) {
                 COMPLETED_WITHOUT_RESULT
@@ -344,12 +428,26 @@ impl Connection {
             let next = unsafe { (api.get_result)(raw) };
             let Some(next) = NonNull::new(next) else {
                 check_deadline(deadline, QUERY_TIMEOUT, check).map_err(|_| delivery_error)?;
-                if !self.reusable() {
+                let healthy = if R::TYPED {
+                    (unsafe { (api.status)(raw) }) == CONNECTION_OK
+                } else {
+                    self.reusable()
+                };
+                if !healthy {
                     return Err(delivery_error);
                 }
                 return match terminal {
-                    Some(true) => rows.map(|rows| rows.table).ok_or(COMPLETED_WITHOUT_RESULT),
-                    Some(false) => Err(QUERY_ERROR),
+                    Some(true) => {
+                        let result = rows.and_then(RowCollector::finish);
+                        if R::TYPED
+                            && result.is_ok()
+                            && unsafe { (api.transaction_status)(raw) } != TRANSACTION_IDLE
+                        {
+                            return Ok(Err(SESSION_STATE_ERROR));
+                        }
+                        Ok(result)
+                    }
+                    Some(false) => Ok(Err(QUERY_ERROR)),
                     None => Err(EXECUTION_UNKNOWN),
                 };
             };
@@ -363,17 +461,26 @@ impl Connection {
                     if status != RESULT_SINGLE_TUPLE {
                         terminal = Some(true);
                     }
-                    if rows
-                        .as_mut()
-                        .is_some_and(|current| !current.append(&result, status, deadline, check))
-                    {
-                        // Drain even when the result fails an ownership or size
-                        // limit. A later SQL error can supersede partial rows.
-                        rows = None;
+                    if let Ok(current) = &mut rows {
+                        match current.collect(&result, status, deadline, check) {
+                            Ok(()) => {}
+                            Err(RowFailure::Invalid(error)) => {
+                                // Remember the first error and keep draining. A
+                                // later server error supersedes partial rows.
+                                rows = Err(error);
+                            }
+                            Err(RowFailure::Interrupted) => {
+                                return Err(if terminal == Some(true) {
+                                    COMPLETED_WITHOUT_RESULT
+                                } else {
+                                    EXECUTION_UNKNOWN
+                                });
+                            }
+                        }
                     }
                 }
                 RESULT_FATAL_ERROR if result.has_sqlstate() => {
-                    rows = None;
+                    rows = Err(QUERY_ERROR);
                     terminal = Some(false);
                 }
                 RESULT_EMPTY_QUERY => terminal = Some(false),
@@ -413,6 +520,34 @@ impl Connection {
                 _ => return Err(failure),
             }
         }
+    }
+}
+
+struct Bindings<'a> {
+    values: &'a [*const c_char],
+    oids: &'a [u32],
+    lengths: &'a [c_int],
+    formats: &'a [c_int],
+    result_format: c_int,
+}
+
+impl<'a> Bindings<'a> {
+    fn text(values: &'a [*const c_char]) -> Self {
+        Self {
+            values,
+            oids: &[],
+            lengths: &[],
+            formats: &[],
+            result_format: 0,
+        }
+    }
+}
+
+fn data_or_null<T>(values: &[T]) -> *const T {
+    if values.is_empty() {
+        null()
+    } else {
+        values.as_ptr()
     }
 }
 
@@ -468,6 +603,47 @@ pub(super) struct Tabular {
 struct Rows {
     table: Tabular,
     bytes: usize,
+}
+
+enum RowFailure {
+    Invalid(Error),
+    Interrupted,
+}
+
+trait RowCollector {
+    type Output;
+    const TYPED: bool;
+
+    fn collect(
+        &mut self,
+        result: &ResultHandle,
+        status: c_int,
+        deadline: Instant,
+        check: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), RowFailure>;
+
+    fn finish(self) -> Result<Self::Output, Error>;
+}
+
+impl RowCollector for Rows {
+    type Output = Tabular;
+    const TYPED: bool = false;
+
+    fn collect(
+        &mut self,
+        result: &ResultHandle,
+        status: c_int,
+        deadline: Instant,
+        check: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), RowFailure> {
+        self.append(result, status, deadline, check)
+            .then_some(())
+            .ok_or(RowFailure::Invalid(COMPLETED_WITHOUT_RESULT))
+    }
+
+    fn finish(self) -> Result<Self::Output, Error> {
+        Ok(self.table)
+    }
 }
 
 impl Rows {
@@ -555,4 +731,136 @@ impl Rows {
         self.bytes += length;
         String::from_utf8(owned).ok().map(Some)
     }
+}
+
+struct TypedRow<'a> {
+    columns: &'a [Column],
+    row: Option<Vec<Cell>>,
+}
+
+impl RowCollector for TypedRow<'_> {
+    type Output = Vec<Cell>;
+    const TYPED: bool = true;
+
+    fn collect(
+        &mut self,
+        result: &ResultHandle,
+        status: c_int,
+        deadline: Instant,
+        check: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), RowFailure> {
+        use RowFailure::{Interrupted, Invalid};
+        let raw = result.raw.as_ptr();
+        let api = result.api;
+        let has_row = status == RESULT_SINGLE_TUPLE;
+        // Single-row mode always ends a regular query with a zero-row result.
+        // Its column types and formats are still part of the contract.
+        if unsafe { (api.result_rows)(raw) } != c_int::from(has_row)
+            || unsafe { (api.result_cols)(raw) } != self.columns.len() as c_int
+        {
+            return Err(Invalid(typed::SCHEMA_ERROR));
+        }
+        if has_row && self.row.is_some() {
+            return Err(Invalid(typed::ROWS_ERROR));
+        }
+        let mut owned = Vec::new();
+        if has_row {
+            owned
+                .try_reserve_exact(self.columns.len())
+                .map_err(|_| Interrupted)?;
+        }
+        let mut bytes = 0;
+        for (index, column) in self.columns.iter().enumerate() {
+            let col = index as c_int;
+            check_deadline(deadline, QUERY_TIMEOUT, check).map_err(|_| Interrupted)?;
+            if unsafe { (api.result_oid)(raw, col) } != column.oid {
+                return Err(Invalid(typed::OID_ERROR));
+            }
+            if unsafe { (api.result_format)(raw, col) } != 1 {
+                return Err(Invalid(typed::FORMAT_ERROR));
+            }
+            if !has_row {
+                continue;
+            }
+            if unsafe { (api.result_null)(raw, 0, col) } != 0 {
+                if !column.nullable {
+                    return Err(Invalid(typed::NULL_ERROR));
+                }
+                owned.push(Cell::Null);
+                continue;
+            }
+            let length = usize::try_from(unsafe { (api.result_length)(raw, 0, col) })
+                .map_err(|_| Invalid(typed::LENGTH_ERROR))?;
+            if length > MAX_BYTES - bytes {
+                return Err(Invalid(typed::TYPE_ERROR));
+            }
+            bytes += length;
+            let data = if length == 0 {
+                &[][..]
+            } else {
+                let data = NonNull::new(unsafe { (api.result_value)(raw, 0, col) })
+                    .ok_or(Invalid(typed::LENGTH_ERROR))?;
+                // libpq owns this validated cell until ResultHandle clears it.
+                unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), length) }
+            };
+            let cell = match column.oid {
+                typed::INT4 => Cell::Int(i64::from(i32::from_be_bytes(
+                    data.try_into().map_err(|_| Invalid(typed::LENGTH_ERROR))?,
+                ))),
+                typed::INT8 => Cell::Int(i64::from_be_bytes(
+                    data.try_into().map_err(|_| Invalid(typed::LENGTH_ERROR))?,
+                )),
+                typed::BOOL => match data {
+                    [0] => Cell::Bool(false),
+                    [1] => Cell::Bool(true),
+                    [_] => return Err(Invalid(typed::TYPE_ERROR)),
+                    _ => return Err(Invalid(typed::LENGTH_ERROR)),
+                },
+                typed::TEXT | typed::VARCHAR => Cell::Text(copy_typed_text(data, deadline, check)?),
+                _ => return Err(Invalid(typed::SCHEMA_ERROR)),
+            };
+            owned.push(cell);
+        }
+        if has_row {
+            self.row = Some(owned);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Self::Output, Error> {
+        self.row.ok_or(typed::ROWS_ERROR)
+    }
+}
+
+fn copy_typed_text(
+    mut data: &[u8],
+    deadline: Instant,
+    check: &mut impl FnMut() -> Result<(), Error>,
+) -> Result<String, RowFailure> {
+    use RowFailure::{Interrupted, Invalid};
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(data.len())
+        .map_err(|_| Interrupted)?;
+    while !data.is_empty() {
+        check_deadline(deadline, QUERY_TIMEOUT, check).map_err(|_| Interrupted)?;
+        let mut end = data.len().min(COPY_CHUNK_BYTES);
+        if end < data.len() {
+            // A UTF-8 scalar crosses at most three trailing continuation bytes.
+            while data[end] & 0xc0 == 0x80 {
+                if COPY_CHUNK_BYTES - end == 3 {
+                    return Err(Invalid(typed::TYPE_ERROR));
+                }
+                end -= 1;
+            }
+        }
+        let (chunk, rest) = data.split_at(end);
+        if chunk.contains(&0) {
+            return Err(Invalid(typed::TYPE_ERROR));
+        }
+        let chunk = std::str::from_utf8(chunk).map_err(|_| Invalid(typed::TYPE_ERROR))?;
+        owned.push_str(chunk);
+        data = rest;
+    }
+    Ok(owned)
 }

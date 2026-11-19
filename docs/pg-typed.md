@@ -1,6 +1,6 @@
 # PostgreSQL 类型化单行查询
 
-此能力位于性能开发分支，沿用 PostgreSQL 的 native C 后端范围；解释器与 LLVM 不提供数据库执行。原 `client.query(sql, [str])` 文本接口保持可用。
+同步类型化查询可通过默认 native、`ku run` 或显式 Runner 执行。普通文本查询使用 `client.query(sql, [str])`。Task 中的 PostgreSQL I/O 使用 native。
 
 ```ku
 row = client.query_one_typed(
@@ -15,7 +15,7 @@ label = row.value(0, 2)?
 absent = row.is_null(0, 3)?
 ```
 
-完整程序见 [pg_typed_demo.ku](../examples/pg_typed_demo.ku)。`db.conn` 是私有 libpq 连接配置，不应提交到仓库。查询读取参数数组；构造数组时仍遵循 Ku 原有的字符串所有权规则。混合字面量只在这个查询参数位置按上下文转为 `KuValue`，不代表普通混合数组声明已经支持。
+完整程序见 [pg_typed_demo.ku](../examples/pg_typed_demo.ku)，libpq 配置见 [HTTP + PostgreSQL 示例](../examples/http_pg.README.md)。`db.conn` 是私有连接配置，不应提交到仓库。查询读取参数数组，构造数组时仍遵循 Ku 原有的字符串所有权规则。此处的混合字面量按查询参数的上下文转为 `KuValue`。
 
 ## 声明与返回值
 
@@ -41,7 +41,7 @@ absent = row.is_null(0, 3)?
 
 无效参数、声明、数值范围、结果 OID、format、长度或 UTF-8 返回明确错误；主要代码为 `typed_value_error`，NULL 使用 `null_value`。声明或参数错误在 SQL 发出前被拒绝；结果错误发生时 SQL 可能已经执行。不要据此重放写入。
 
-结果为专有的单行 owner：数值以二进制保存，字符串存储由 Ku 持有，不引用 `PGresult`。释放原结果、重置或关闭连接后，返回行仍有效。读取整数和布尔值不构造字符串，也不经过 JSON 解析。Task 路径将实际 owner、参数副本和元数据计入现有 Task 账本；同步路径不提供这项逐 Task 计费。libpq 内部缓冲不计入 Task 账本；只有启用支持的 supervise 隔离模式或外部 cgroup／Windows Job 限制时，才受相应的进程内存限制。
+Ku 独立持有返回的单行数据。释放 libpq 结果、重置或关闭连接后，返回行仍有效。整数和布尔值从二进制结果读取。Task 路径将结果、参数副本和元数据计入 Task 账本。同步路径没有逐 Task 计费。libpq 内部缓冲受支持的 supervise 隔离模式或外部 cgroup／Windows Job 进程内存限制约束。
 
 获取连接、发送、读取和重置共用原绝对期限。每次查询独占一个 lease，收尽结果后执行同 lease 的 `DISCARD ALL`；不能清理或确认状态时驱逐连接。业务结果已独立保存后，重置失败仍按既有规则保留结果并驱逐连接。取消、断连和期限到达可能返回 `execution_unknown`；关闭连接不证明数据库操作已经回滚，不自动重试。
 

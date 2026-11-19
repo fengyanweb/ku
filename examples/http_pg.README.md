@@ -1,6 +1,6 @@
 # HTTP + PostgreSQL 任务清单
 
-需要已安装的 Ku 0.0.20、C 编译器、匹配目标的 PostgreSQL `libpq` 和 `psql`。把 `http_pg.ku`、`http_pg_schema.sql` 和本说明复制到空目录。需要原有的数据库信息页面时，再复制 `http_pg_frontend.html`。
+需要已安装的 Ku 0.0.20、匹配目标的 PostgreSQL `libpq` 和用于建表的 `psql`。默认 native 构建还需要 C 编译器。把 `http_pg.ku`、`http_pg_schema.sql` 和本说明复制到空目录。需要数据库信息页面时，再复制 `http_pg_frontend.html`。
 
 ## 启动
 
@@ -17,30 +17,34 @@ KU_PG_LIB="$(pg_config --libdir)" ku build --release http_pg.ku -o task-list && 
 
 `db.conn` 和 `http.addr` 放在可执行文件旁边。修改 `http.addr` 即可换端口。服务直接监听该地址，建表由上面的 `psql` 命令显式完成。
 
-Windows 使用 PowerShell 7 写入 UTF-8 配置。将 `KU_PG_LIB` 指向匹配目标的导入库目录，确保同一套 PostgreSQL 的运行时 DLL 可用。MSVC 使用 `libpq.lib`，MinGW GNU 使用 `libpq.dll.a`。请先把它的实际绝对目录设为 `$env:KU_PG_LIB`。
+`KU_PG_LIB` 供 native 构建定位链接库。系统已能找到匹配的链接库时可以省略。Windows 使用 PowerShell 7 写入 UTF-8 配置。MSVC 使用 `libpq.lib`，MinGW GNU 使用 `libpq.dll.a`，运行时还需提供与导入库匹配的 DLL。
 
 ```powershell
 $env:KU_TASKS_DSN = 'host=127.0.0.1 port=5432 dbname=ku_dev user=ku_dev'
 $env:KU_TASKS_DSN | Set-Content -Encoding utf8NoBOM db.conn
 '127.0.0.1:8090' | Set-Content -Encoding utf8NoBOM http.addr
 psql -X -v ON_ERROR_STOP=1 -d $env:KU_TASKS_DSN -f http_pg_schema.sql
+$env:KU_PG_LIB = '<包含匹配目标导入库的绝对目录>'
 ku build --release http_pg.ku -o task-list.exe && .\task-list.exe
 ```
 
 ### 显式 Runner
 
-在同一个目录中准备 `db.conn`、`http.addr` 并执行建表 SQL。Runner 按构建时的源码目录读取这两个配置。本示例使用同步普通查询，异步函数中的 PostgreSQL I/O 和二进制 typed 查询使用 native。macOS 或 Linux 可以用 `pg_config` 找到 libpq 动态库。
+同样准备 `db.conn`、`http.addr` 并执行建表 SQL。Runner 按构建时的源码目录读取配置。`KU_PG_RUNTIME_DIR` 供 Runner 进程和 `ku run` 在运行时加载 libpq，动态库可由系统找到时可以省略。macOS 或 Linux 可以用 `pg_config` 找到目录。
 
 ```sh
 export KU_PG_RUNTIME_DIR="$(pg_config --libdir)"
 ku build --release --backend runner http_pg.ku -o task-list-runner && ./task-list-runner
 ```
 
-Windows 在 PowerShell 将 `$env:KU_PG_RUNTIME_DIR` 设为包含 `libpq.dll` 及其依赖 DLL 的绝对目录。
+Windows 使用 PostgreSQL 动态库的实际绝对目录。
 
 ```powershell
+$env:KU_PG_RUNTIME_DIR = '<包含 libpq.dll 及其依赖的目录>'
 ku build --release --backend runner http_pg.ku -o task-list-runner.exe && .\task-list-runner.exe
 ```
+
+Runner 和 `ku run` 支持同步普通查询与 [类型化单行查询](../docs/pg-typed.md)。异步函数中的 PostgreSQL I/O 使用 native。
 
 ## 创建和查询
 
