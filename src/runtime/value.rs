@@ -63,6 +63,12 @@ pub enum Value {
     Task(TaskHandle),
     #[doc(hidden)]
     HttpListenerLease(Arc<HttpListenerLease>),
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    PgClient(Arc<crate::stdlib::pg::Client>),
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    PgResult(Arc<crate::stdlib::pg::Rows>),
     #[doc(hidden)]
     Borrowed(BorrowedValue),
     Null,
@@ -427,6 +433,10 @@ impl Value {
             Value::Function { .. } => "function",
             Value::Task(_) => "task",
             Value::HttpListenerLease(_) => "http_listener_lease",
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::PgClient(_) => "pg_client",
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::PgResult(_) => "pg_result",
             Value::Borrowed(value) => value
                 .with_read(Span::default(), |value| Ok(value.type_name()))
                 .unwrap_or("expired borrowed value"),
@@ -572,6 +582,10 @@ impl fmt::Display for Value {
             Value::Function { .. } => write!(f, "<function>"),
             Value::Task(task) => write!(f, "<task:{}>", task.id()),
             Value::HttpListenerLease(_) => write!(f, "<http-listener-lease>"),
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::PgClient(_) => write!(f, "<pg-client>"),
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::PgResult(_) => write!(f, "<pg-result>"),
             Value::Borrowed(value) => value
                 .with_read(Span::default(), |value| Ok(write!(f, "{value}")))
                 .map_err(|_| fmt::Error)?,
@@ -636,6 +650,10 @@ impl PartialEq for Value {
             (Value::HttpListenerLease(left), Value::HttpListenerLease(right)) => {
                 Arc::ptr_eq(left, right)
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            (Value::PgClient(left), Value::PgClient(right)) => Arc::ptr_eq(left, right),
+            #[cfg(not(target_arch = "wasm32"))]
+            (Value::PgResult(left), Value::PgResult(right)) => Arc::ptr_eq(left, right),
             (Value::Null, Value::Null) => true,
             _ => false,
         }

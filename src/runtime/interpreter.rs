@@ -1672,6 +1672,10 @@ impl Interpreter {
                 Value::String(_) => "string",
                 Value::Array(_) if name != "map" => "array",
                 Value::Object(_) if name == "get_or" => "object",
+                #[cfg(not(target_arch = "wasm32"))]
+                Value::PgClient(_) => "pg_client",
+                #[cfg(not(target_arch = "wasm32"))]
+                Value::PgResult(_) => "pg_result",
                 _ => "",
             })
         })?;
@@ -1718,11 +1722,41 @@ impl Interpreter {
             "array" => stdlib::array::eval(name, &values, span),
             "object" => stdlib::object::eval(name, &values, span),
             "kuvalue" => eval_kuvalue_method(name, &mut values, span),
+            #[cfg(not(target_arch = "wasm32"))]
+            "pg_client" if name == "query" || name == "query_one_typed" => {
+                self.eval_pg_io(span, move |deadline, cancelled| {
+                    stdlib::pg::eval_method(module, name, &values, span, deadline, cancelled)
+                })
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            "pg_client" | "pg_result" => {
+                stdlib::pg::eval_method(module, name, &values, span, None, &|| false)
+            }
             _ => Ok(None),
         }?;
         value
             .map(Some)
             .ok_or_else(|| KuError::runtime(format!("unknown {module} method '{name}'"), span))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn eval_pg_io(
+        &mut self,
+        span: Span,
+        run: impl FnOnce(Option<Instant>, &dyn Fn() -> bool) -> KuResult<Option<Value>>,
+    ) -> KuResult<Option<Value>> {
+        self.reject_cleanup_submission(span)?;
+        if self.async_execution {
+            return Ok(Some(stdlib::errors::err(
+                "pg",
+                "backend_unsupported",
+                "PostgreSQL I/O in an async function requires the native backend",
+            )));
+        }
+        let deadline = self.execution_deadline.as_ref().map(|state| state.deadline);
+        let value = run(deadline, &crate::runtime::task::current_task_cancelled)?;
+        self.poll_termination(span)?;
+        Ok(value)
     }
 
     fn eval_dotted_builtin(
@@ -1732,6 +1766,18 @@ impl Interpreter {
         span: Span,
     ) -> KuResult<Option<Value>> {
         if let ExprKind::Field { target, name } = &callee.kind {
+            #[cfg(not(target_arch = "wasm32"))]
+            if matches!(&target.kind, ExprKind::Variable(module) if module == "pg")
+                && name == "client"
+            {
+                #[cfg(feature = "browser")]
+                if crate::browser::active() {
+                    return Err(crate::browser::unsupported("pg", span));
+                }
+                return self.eval_pg_io(span, move |deadline, cancelled| {
+                    stdlib::pg::eval("client", args, span, deadline, cancelled)
+                });
+            }
             if matches!(&target.kind, ExprKind::Variable(module) if module == "task")
                 && self.std_modules.contains("task")
             {
@@ -2745,17 +2791,13 @@ impl Interpreter {
                     )),
                 }));
             }
-            return Ok(Some(http_error_result(
-                "listen_failed",
-                match self.run_http_listener(
+            return Ok(Some(result_from_listener_operation(
+                self.run_http_listener(
                     http_listener_value(listener_id, bound_address, target_value, compiled_router),
                     span,
-                ) {
-                    Ok(()) => "http service listen returned unexpectedly".to_string(),
-                    Err(err) if err.runtime_termination().is_some() => return Err(err),
-                    Err(err) => err.message,
-                },
-            )));
+                ),
+                "listen_failed",
+            )?));
         }
         if args.len() != 2 {
             return Err(KuError::runtime(
@@ -2832,6 +2874,9 @@ impl Interpreter {
                 .next_job(HTTP_EVENT_LOOP_SLEEP)
                 .map_err(|err| KuError::runtime(format!("http I/O reactor failed: {err}"), span))?
             else {
+                if io.is_finished() {
+                    return Ok(());
+                }
                 continue;
             };
             job.reply.handler_started();

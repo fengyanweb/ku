@@ -32,6 +32,34 @@ fn run_err(source: &str) -> String {
 }
 
 #[test]
+fn named_postgres_import_dispatches_inside_a_function_without_connecting() {
+    let source = r#"
+import {pg, string} from "std"
+
+fn open(): null! {
+    client = pg.client({conninfo: string.trim(" unused "), max_connections: 0})?
+    client.close()
+    return ok(null)
+}
+
+fn main(): null! {
+    try {
+        open()?
+    } catch (err) {
+        if (err.domain != "pg" || err.code != "invalid_config") {
+            panic("unexpected PostgreSQL error")
+        }
+        return ok(null)
+    }
+    panic("invalid pool configuration was accepted")
+    return ok(null)
+}
+"#;
+    run_source("pg-import-alias.ku", source)
+        .expect("imported pg.client should return a checked error");
+}
+
+#[test]
 fn std_string_array_json_and_time_check_and_run() {
     let source = r#"
 fn main(): null! {

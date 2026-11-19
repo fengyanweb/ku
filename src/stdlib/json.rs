@@ -403,6 +403,13 @@ fn write_json(value: &Value, output: &mut String, depth: usize, span: Span) -> K
             }
             output.push('}');
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        Value::PgClient(_) | Value::PgResult(_) => {
+            return Err(KuError::runtime(
+                format!("json.stringify does not support {}", value.type_name()),
+                span,
+            ));
+        }
         Value::Enum { .. }
         | Value::Result { .. }
         | Value::Function { .. }

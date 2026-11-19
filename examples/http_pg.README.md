@@ -27,6 +27,21 @@ psql -X -v ON_ERROR_STOP=1 -d $env:KU_TASKS_DSN -f http_pg_schema.sql
 ku build --release http_pg.ku -o task-list.exe && .\task-list.exe
 ```
 
+### 显式 Runner
+
+在同一个目录中准备 `db.conn`、`http.addr` 并执行建表 SQL。Runner 按构建时的源码目录读取这两个配置。本示例使用同步普通查询，异步函数中的 PostgreSQL I/O 和二进制 typed 查询使用 native。macOS 或 Linux 可以用 `pg_config` 找到 libpq 动态库。
+
+```sh
+export KU_PG_RUNTIME_DIR="$(pg_config --libdir)"
+ku build --release --backend runner http_pg.ku -o task-list-runner && ./task-list-runner
+```
+
+Windows 在 PowerShell 将 `$env:KU_PG_RUNTIME_DIR` 设为包含 `libpq.dll` 及其依赖 DLL 的绝对目录。
+
+```powershell
+ku build --release --backend runner http_pg.ku -o task-list-runner.exe && .\task-list-runner.exe
+```
+
 ## 创建和查询
 
 ```sh
@@ -49,4 +64,4 @@ python3 -B tests/acceptance/http_pg_lifecycle.py --tasks-example \
   --ku "$(command -v ku)" --output /tmp/ku-tasks-verification.json
 ```
 
-`std.pg` 当前由默认 native 后端提供。显式 Runner 可以构建该示例，启动时缺少 PostgreSQL 支持。
+验证显式 Runner 时，在同一条命令中加上 `--tasks-backend runner`。

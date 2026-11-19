@@ -18,6 +18,8 @@ pub(crate) mod http_client_engine;
 pub mod json;
 pub(crate) mod metadata;
 pub mod object;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod pg;
 pub mod string;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod time;
@@ -39,7 +41,7 @@ pub fn eval_dotted_builtin(
         return Ok(None);
     };
     #[cfg(feature = "browser")]
-    if crate::browser::active() && matches!(module.as_str(), "fs" | "config" | "http") {
+    if crate::browser::active() && matches!(module.as_str(), "fs" | "config" | "http" | "pg") {
         return Err(crate::browser::unsupported(&module, span));
     }
     #[cfg(feature = "browser")]

@@ -28,6 +28,67 @@ use web_time::Instant;
 
 const READ_CHUNK: usize = 8192;
 
+struct DrainControl {
+    token: String,
+    timeout: Duration,
+}
+
+impl DrainControl {
+    fn from_env() -> io::Result<Option<Self>> {
+        let Some(token) = std::env::var_os("KU_SERVICE_CONTROL_TOKEN") else {
+            return Ok(None);
+        };
+        let token = token
+            .into_string()
+            .ok()
+            .filter(|s| (1..=128).contains(&s.len()))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "service control token length must be 1..128 UTF-8 bytes",
+                )
+            })?;
+        let timeout = std::env::var("KU_HTTP_DRAIN_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|ms| (1..=300_000).contains(ms))
+            .unwrap_or(5_000);
+        Ok(Some(Self {
+            token,
+            timeout: Duration::from_millis(timeout),
+        }))
+    }
+
+    fn response(
+        &self,
+        request: &ParsedHttpRequest,
+        stream: &TcpStream,
+    ) -> Option<(HttpWireResponse, bool)> {
+        if request.path != "/__ku/drain" {
+            return None;
+        }
+        let authorized = stream.peer_addr().is_ok_and(|peer| peer.ip().is_loopback())
+            && request
+                .headers
+                .get("x-ku-control-token")
+                .is_some_and(|value| {
+                    value.len() == self.token.len()
+                        && value
+                            .bytes()
+                            .zip(self.token.bytes())
+                            .fold(0, |diff, (a, b)| diff | (a ^ b))
+                            == 0
+                });
+        Some(if !authorized {
+            (status_response(403, "Forbidden"), false)
+        } else if request.method != "POST" {
+            (status_response(404, "Not Found"), false)
+        } else {
+            (status_response(200, "Draining"), true)
+        })
+    }
+}
+
 // Requested backing capacities of transport-owned strings/bytes. Allocator
 // metadata, map buckets, Ku values retained by user code and library internals
 // are deliberately outside this counter. Control slots and the static 503
@@ -734,6 +795,7 @@ impl HttpIo {
             limits,
             TcpListener::accept,
             HttpTraceConfig::from_env(),
+            DrainControl::from_env()?,
         )
     }
 
@@ -748,7 +810,7 @@ impl HttpIo {
     where
         F: FnMut(&TcpListener) -> io::Result<(TcpStream, std::net::SocketAddr)> + Send + 'static,
     {
-        Self::start_with_accept_and_trace(listener, limits, accept, None)
+        Self::start_with_accept_and_trace(listener, limits, accept, None, None)
     }
 
     fn start_with_accept_and_trace<F>(
@@ -756,6 +818,7 @@ impl HttpIo {
         limits: HttpServerRuntimeLimits,
         accept: F,
         trace: Option<HttpTraceConfig>,
+        drain_control: Option<DrainControl>,
     ) -> io::Result<Self>
     where
         F: FnMut(&TcpListener) -> io::Result<(TcpStream, std::net::SocketAddr)> + Send + 'static,
@@ -780,6 +843,7 @@ impl HttpIo {
             Arc::clone(&budget),
         );
         reactor.trace = trace;
+        reactor.drain_control = drain_control;
         let thread = thread::Builder::new()
             .name("ku-http-io".into())
             .spawn(move || reactor.run(accept))?;
@@ -799,16 +863,16 @@ impl HttpIo {
     }
 
     pub(super) fn next_job(&mut self, timeout: Duration) -> io::Result<Option<HttpIoJob>> {
-        if self
-            .thread
-            .as_ref()
-            .is_some_and(|thread| thread.is_finished())
-        {
+        if self.thread.as_ref().is_none_or(JoinHandle::is_finished) {
             self.join()?;
-            return Err(io::Error::other("HTTP I/O reactor stopped"));
+            return Ok(None);
         }
         match self.jobs.recv_timeout(timeout) {
             Ok(mut job) => {
+                if self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
+                    self.join()?;
+                    return Ok(None);
+                }
                 if let Some(flight) = &job.flight {
                     flight.mark(Stage::Dequeued);
                 }
@@ -818,9 +882,13 @@ impl HttpIo {
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => {
                 self.join()?;
-                Err(io::Error::other("HTTP I/O reactor stopped"))
+                Ok(None)
             }
         }
+    }
+
+    pub(super) fn is_finished(&self) -> bool {
+        self.thread.is_none()
     }
 
     fn join(&mut self) -> io::Result<()> {
@@ -867,6 +935,8 @@ struct Reactor {
     trace: Option<HttpTraceConfig>,
     trace_started: Instant,
     trace_next_snapshot: Instant,
+    drain_control: Option<DrainControl>,
+    drain_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -908,6 +978,8 @@ impl Reactor {
             trace: None,
             trace_started: Instant::now(),
             trace_next_snapshot: Instant::now(),
+            drain_control: None,
+            drain_deadline: None,
         }
     }
 
@@ -978,6 +1050,17 @@ impl Reactor {
             self.promote_pending()?;
             self.advance_buffered_headers();
             self.dispatch_requests()?;
+            if let Some(deadline) = self.drain_deadline {
+                if self.connection_count.load(Ordering::Acquire) == 0 && self.rejecting.is_none() {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "HTTP drain expired",
+                    ));
+                }
+            }
             self.trace_snapshot(Instant::now());
             if let Some(rejection) = self.rejecting.as_mut() {
                 if rejection.poll() {
@@ -991,6 +1074,7 @@ impl Reactor {
             let mut interests = Vec::with_capacity(self.slots.len() + 3);
             let mut owners = Vec::with_capacity(self.slots.len() + 3);
             let mut deadline = self.trace.as_ref().map(|_| self.trace_next_snapshot);
+            tighten_deadline(&mut deadline, self.drain_deadline);
             interests.push(netpoll::Interest {
                 socket: netpoll::Socket::Stream(&self.wake.reader),
                 read: true,
@@ -999,7 +1083,7 @@ impl Reactor {
             owners.push(PollOwner::Wake);
             // Match the existing single extra rejection owner: do not accept
             // another excess socket while its drain/write is still resident.
-            if self.rejecting.is_none() {
+            if self.rejecting.is_none() && self.drain_deadline.is_none() {
                 if let Some(retry) = self
                     .accept_retry_deadline
                     .filter(|retry| Instant::now() < *retry)
@@ -1062,7 +1146,7 @@ impl Reactor {
                     PollOwner::Wake => self.wake.drain()?,
                     PollOwner::Listener => self.accept_connections(&mut accept)?,
                     PollOwner::Connection(token) => {
-                        let allow_reuse = self.pending.is_empty();
+                        let allow_reuse = self.pending.is_empty() && self.drain_deadline.is_none();
                         let Some(slot) = self.slots.get_mut(token.slot) else {
                             continue;
                         };
@@ -1093,7 +1177,7 @@ impl Reactor {
     }
 
     fn observe_completions(&mut self) {
-        let allow_reuse = self.pending.is_empty();
+        let allow_reuse = self.pending.is_empty() && self.drain_deadline.is_none();
         for (index, slot) in self.slots.iter_mut().enumerate() {
             let Some(connection) = slot.connection.as_mut() else {
                 continue;
@@ -1138,11 +1222,16 @@ impl Reactor {
 
     fn expire_connections(&mut self) {
         let now = Instant::now();
+        let draining = self.drain_deadline.is_some();
         for index in 0..self.slots.len() {
             let close = self.slots[index]
                 .connection
                 .as_mut()
-                .is_some_and(|connection| connection.expire(now, self.limits));
+                .is_some_and(|connection| {
+                    (draining && connection.reused
+                        && matches!(&connection.state, State::Header(header) if header.bytes.bytes.is_empty()))
+                        || connection.expire(now, self.limits)
+                });
             if close {
                 self.close_slot(index);
             }
@@ -1245,7 +1334,7 @@ impl Reactor {
     }
 
     fn advance_buffered_headers(&mut self) {
-        let allow_reuse = self.pending.is_empty();
+        let allow_reuse = self.pending.is_empty() && self.drain_deadline.is_none();
         for index in 0..self.slots.len() {
             let close = self.slots[index].connection.as_mut().is_some_and(|connection| {
                 matches!(&connection.state, State::Header(header) if header.scanned < header.bytes.bytes.len())
@@ -1274,6 +1363,26 @@ impl Reactor {
             };
             let request = request.take().expect("one request dispatch");
             let deadline = *deadline;
+            if let Some((response, drain_timeout)) =
+                self.drain_control.as_ref().and_then(|control| {
+                    let (response, drain) = control.response(&request, &connection.stream)?;
+                    Some((response, drain.then_some(control.timeout)))
+                })
+            {
+                connection.carry = Buffer::empty(&self.budget);
+                let writing =
+                    Writing::new(response, self.limits.write_timeout, false, &self.budget);
+                if self.drain_deadline.is_none() && writing.wire_status() == 200 {
+                    self.drain_deadline = drain_timeout.map(http_deadline);
+                }
+                connection.state = State::Write(writing);
+                continue;
+            }
+            if self.drain_deadline.is_some() {
+                connection.carry = Buffer::empty(&self.budget);
+                connection.state = State::Write(Writing::unavailable(self.limits.write_timeout));
+                continue;
+            }
             connection.keep_alive = request.keep_alive;
             connection.carry = std::mem::replace(carry, Buffer::empty(&self.budget));
             let input_charge = input_charge.take().expect("one input charge transfer");
@@ -2232,6 +2341,7 @@ mod buffer_tests {
             limits,
             TcpListener::accept,
             Some(config),
+            None,
         )
         .unwrap();
         let budget = Arc::clone(&io.budget);
