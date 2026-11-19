@@ -532,7 +532,10 @@ def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, repor
     working.mkdir()
     command = [sys.executable, "-B", str(driver), "--ku", str(executable),
                "--loops", "4", "--profile", report.get('profile', 'debug')]
-    if report.get('target') == 'x86_64-pc-windows-gnu':
+    lanes = ("tasks",) if report.get("tasks_example") else ("sync", "async")
+    if report.get("tasks_example"):
+        command.append("--tasks-example")
+    elif report.get('target') == 'x86_64-pc-windows-gnu':
         command.append('--installed-contracts')
     report["pg_fixture_invoked"] = True
     if os.name == "nt":
@@ -568,10 +571,10 @@ def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, repor
     tools = Path(tool([config, "--bindir"], min(15, execution_remaining())).stdout.decode().strip()).resolve()
     for name in ("initdb", "postgres", "pg_ctl"):
         exporter.plain(tools / name)
-    combined = {"status": "running", "required_lanes": ["sync", "async"], "lanes": {}}
+    combined = {"status": "running", "required_lanes": list(lanes), "lanes": {}}
     report["private_database_owners"] = {}
     process, first_failure = None, None
-    for lane in ("sync", "async"):
+    for lane in lanes:
         owner = PosixPrivatePostgres(root / ("private-database-" + lane), tools, lane, tool)
         report["private_database_owners"][lane] = owner.receipt
         parent_cleanup, error = False, None
@@ -579,8 +582,9 @@ def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, repor
         save_report(lane_output, {"status": "running", "lanes": {}})
         try:
             owner_config = owner.start(execution_deadline)
+            lane_args = [] if lane == "tasks" else ["--lane", lane]
             try:
-                process = exporter.run_runtime_check([*command, "--lane", lane,
+                process = exporter.run_runtime_check([*command, *lane_args,
                     "--database-owner-config", str(owner_config), "--output", str(lane_output)], repo, working,
                     timeout_seconds=min(180, execution_remaining()))
             except BaseException as failure:
@@ -625,7 +629,7 @@ def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, repor
                     with log_path.open("rb") as incoming:
                         incoming.seek(max(0, log_path.stat().st_size - 8192))
                         owner.receipt["postgres_log_tail"] = incoming.read(8192).decode("utf-8", errors="replace")
-            combined["status"] = "passed" if all(combined["lanes"].get(name, {}).get("status") == "passed" for name in ("sync", "async")) else "failed"
+            combined["status"] = "passed" if all(combined["lanes"].get(name, {}).get("status") == "passed" for name in lanes) else "failed"
             save_report(lifecycle, combined)
         if not report["fixture_cleanup_confirmed"] or isinstance(error, KeyboardInterrupt):
             raise error or ValueError("private fixture or postgres owner cleanup is unconfirmed")
@@ -729,7 +733,9 @@ def verify(args):
     if platform.system() != system or platform.machine().lower() not in machines:
         raise ValueError("selected target does not match this physical runner")
     output = args.output.resolve()
-    profile = 'release' if args.target == 'x86_64-pc-windows-gnu' else 'debug'
+    tasks_example = getattr(args, "tasks_example", False)
+    lanes = ("tasks",) if tasks_example else ("sync", "async")
+    profile = 'release' if tasks_example or args.target == 'x86_64-pc-windows-gnu' else 'debug'
     if args.target == 'x86_64-pc-windows-gnu' and not getattr(args, 'hide_checkout', False):
         raise ValueError('GNU PG acceptance requires --hide-checkout; source checks are not installed execution')
     report = {"format": "ku-installed-pg-check-v1", "status": "running",
@@ -737,6 +743,8 @@ def verify(args):
               "database_retry": False, "loops": 4, "profile": profile,
               "scope": "actual installed CLI -> native sync/async PG lifecycle; not a capacity result",
               "temporary_files": "owned root; independently confirmed runtime and PG cleanup removes it even after a failed check; unconfirmed cleanup retains pid evidence"}
+    if tasks_example:
+        report.update(tasks_example=True, scope="installed Ku HTTP + PG task-list example; native Release")
     save_report(output, report)
     try:
         with owned_temporary_root(report) as root:
@@ -801,7 +809,7 @@ def verify(args):
                 installed, repo, args.version, args.target)
             lifecycle = output.with_name(output.stem + ".lifecycle.json")
             # A zero-exit miswired driver must never reuse an earlier receipt.
-            save_report(lifecycle, {"status": "running", "required_lanes": ["sync", "async"],
+            save_report(lifecycle, {"status": "running", "required_lanes": list(lanes),
                                     "lanes": {}})
             save_report(output, report)
             with (hidden_checkout(repo, root, report) if getattr(args, 'hide_checkout', False) else nullcontext()):
@@ -809,14 +817,18 @@ def verify(args):
             if process.returncode != 0:
                 raise ValueError("installed PG lifecycle process did not succeed")
             data = prepare.json_object(prepare.read_file(lifecycle, prepare.MAX_JSON))
-            if (data.get("status") != "passed" or data.get("required_lanes") != ["sync", "async"]
-                    or set(data.get("lanes", {})) != {"sync", "async"}):
-                raise ValueError("installed PG lifecycle lanes did not both pass")
-            for lane in ("sync", "async"):
+            if (data.get("status") != "passed" or data.get("required_lanes") != list(lanes)
+                    or set(data.get("lanes", {})) != set(lanes)):
+                raise ValueError("installed PG lifecycle required lanes did not pass")
+            for lane in lanes:
                 entry = data["lanes"][lane]
                 raw = entry.get("report", {})
-                fixture_name = ("http_pg_installed_contract" if args.target == 'x86_64-pc-windows-gnu' else "http_pg_lifecycle") + ("_async" if lane == "async" else "") + ".ku"
-                fixture_sha = exporter.file_hash(repo / "tests" / "fixtures" / fixture_name)
+                if tasks_example:
+                    fixture_name = "http_pg.ku"
+                    fixture_sha = exporter.file_hash(repo / "examples" / fixture_name)
+                else:
+                    fixture_name = ("http_pg_installed_contract" if args.target == 'x86_64-pc-windows-gnu' else "http_pg_lifecycle") + ("_async" if lane == "async" else "") + ".ku"
+                    fixture_sha = exporter.file_hash(repo / "tests" / "fixtures" / fixture_name)
                 if (entry.get("status") != "passed" or raw.get("status") != "passed"
                         or raw.get("cleanup_errors") != [] or raw.get("cli_sha256") != expected_cli
                         or raw.get("event_loops") != 4 or raw.get("database_retry") is not False
@@ -824,7 +836,20 @@ def verify(args):
                         or raw.get("lane") != lane or raw.get("fixture") != fixture_name
                         or raw.get("fixture_sha256") != fixture_sha):
                     raise ValueError("PG lifecycle result, CLI identity or cleanup differs")
-                if args.target == 'x86_64-pc-windows-gnu':
+                if tasks_example:
+                    for check in ("invalid_inputs_and_missing_id", "same_service_database_recovery",
+                                  "persisted_after_restart", "runner_blocked_before_writes"):
+                        if raw.get("checks", {}).get(check) != "passed":
+                            raise ValueError(f"task-list installed contract unavailable: {check}")
+                    if (raw.get("schema_sha256") != exporter.file_hash(repo / "examples" / "http_pg_schema.sql")
+                            or raw.get("source_removed_before_run") is not True):
+                        raise ValueError("task-list schema or source-free run identity differs")
+                    report["example_results"] = {key: raw[key] for key in (
+                        "schema_sha256", "native_executable_sha256", "created", "read_back", "runner",
+                        "invalid_responses", "database_failure", "recovered_write", "restart_read",
+                        "final_rows", "normal_exits",
+                    )}
+                if args.target == 'x86_64-pc-windows-gnu' and not tasks_example:
                     if (raw.get('source_removed_before_run') is not True
                             or raw.get('private_gnu_libpq', {}).get('wide_toolchain_path_in_service') is not False
                             or raw.get('checks', {}).get('typed_parameters_unicode_null_and_detached_results') != 'passed'
@@ -869,6 +894,8 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--assets", type=Path, help="offline exact archive+manifest directory; no outer ZIP claim")
     parser.add_argument('--hide-checkout', action='store_true', help='matching disposable CI checkout only; required for GNU')
+    parser.add_argument("--tasks-example", action="store_true",
+                        help="run only the repository's task-list example from the verified archive")
     args = parser.parse_args()
     try:
         result = verify(args)
