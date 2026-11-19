@@ -9,7 +9,11 @@ mod native_harness;
 mod native_task_ledger;
 
 use ku::{
-    backend::c, checker::Checker, ir::task::TaskTerminator, ir::task_lower, lexer::Lexer,
+    backend::c,
+    checker::Checker,
+    ir::task::{TaskOp, TaskTerminator},
+    ir::task_lower,
+    lexer::Lexer,
     parser::Parser,
 };
 use native_allocation_harness::ALLOCATION_HOOK;
@@ -126,11 +130,19 @@ int main(void) {
 fn native_task_record_result_moves_after_pending_and_reclaims_failed_paths() {
     let source = r#"
 import { time } from "std"
-struct Note { text: str, count: int | null }
-struct Transfer { body: str, note: Note | null }
+struct Note { text: str, suffix: str, count: int | null }
+struct Transfer { status: int, body: str, note: Note | null, absent: int | null }
 async fn Echo(value: Transfer): Transfer! {
     time.sleep(20)?
     return ok(value)
+}
+async fn ReadRest(value: Transfer): bool! {
+    {status, missing = 9, ...rest} = value
+    read: fn(): bool = () => rest.body == "body" && rest.note?.count == 0 && rest.absent == null
+    reader = read
+    time.sleep(20)?
+    projected = rest.note
+    return ok(reader() && status == 200 && missing == 9 && projected?.count == 0)
 }
 async fn main(): null! { return ok(null) }
 "#;
@@ -147,6 +159,21 @@ async fn main(): null! { return ok(null) }
         .unwrap()
         .id
         .0;
+    let reader = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "ReadRest")
+        .unwrap();
+    let rest_slot = reader
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .find_map(|operation| match operation {
+            TaskOp::RecordMake { dst, .. } => Some(dst.0),
+            _ => None,
+        })
+        .expect("nested rest uses a typed record");
     let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
     let generated = replace_once(
         generated,
@@ -160,12 +187,34 @@ async fn main(): null! { return ok(null) }
          static uint64_t ku_task_driver_now_ms(void) { return fixture_now; }\n\
          static uint64_t fixture_original_now(void) {",
     );
+    let generated = replace_once(
+        generated,
+        "static uint32_t ku_task_host_clone_string(KuTaskAdapterHostV1* host,\n",
+        "static const uint8_t *fixture_first_clone, *fixture_failed_clone;\n\
+         static unsigned fixture_first_clones, fixture_failed_clones;\n\
+         static uint32_t ku_task_host_clone_string(KuTaskAdapterHostV1* host,\n",
+    );
+    let generated = replace_once(
+        generated,
+        "  uint8_t* bytes=(uint8_t*)malloc(capacity);\n  if (!bytes) {\n    status=host->reconcile_charge(host->allocation_context);\n    return status==KU_TASK_DRIVER_OK ? KU_TASK_HOST_ALLOCATION_FAILED : status;\n  }\n  if (source.len) memcpy(bytes,source.ptr,source.len);",
+        "  uint8_t* bytes=source.ptr && source.ptr==fixture_failed_clone\n\
+            ? (++fixture_failed_clones,(uint8_t*)NULL) : (uint8_t*)malloc(capacity);\n\
+         if (bytes && source.ptr==fixture_first_clone) ++fixture_first_clones;\n\
+         if (!bytes) {\n    status=host->reconcile_charge(host->allocation_context);\n\
+           return status==KU_TASK_DRIVER_OK ? KU_TASK_HOST_ALLOCATION_FAILED : status;\n\
+         }\n  if (source.len) memcpy(bytes,source.ptr,source.len);",
+    );
     let mut generated = replace_once(
         generated,
         "int main(void) {",
         "static int fixture_unmodified_source_main(void) {",
     );
-    generated.push_str(&RECORD_RESULT_MAIN.replace("@ID@", &echo.to_string()));
+    generated.push_str(
+        &RECORD_RESULT_MAIN
+            .replace("@ID@", &echo.to_string())
+            .replace("@READER@", &reader.id.0.to_string())
+            .replace("@REST_SLOT@", &rest_slot.to_string()),
+    );
     let directory = TempDir::new("native-task-record-result");
     let path = directory.path().join("program.c");
     fs::write(&path, generated).unwrap();
@@ -269,9 +318,92 @@ static int fixture_record_result(uint32_t cancellation,int limit) {
   RECORD_CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
   return 0;
 }
+static int fixture_nested_rest(void) {
+  KuTaskDriverV1 driver={0};
+  KuTaskDriverSlotV1 slots[2]={0};
+  size_t ring[2]={0};
+  const size_t fixed=ku_task_driver_fixed_storage_bytes(2u);
+  uint64_t next=UINT64_MAX;
+  fixture_now=1000u;
+  RECORD_CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,2u,ring,2u,fixed+sizeof(KuTaskInstance_@READER@)+1024u,
+      1u,3000u,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  size_t initial_allocations=ku_perf_live_allocations, initial_bytes=ku_perf_live_bytes;
+  /* Cancel after the rest owner is initialized, fail the second field clone
+   * after resumption, then serve a successful request on the same driver. */
+  for (unsigned mode=0;mode<3u;mode++) {
+    const uint64_t deadline=3000u;
+    KuStruct___ku_task_record_Transfer input={0};
+    input.status=200;
+    input.body=ku_string_alloc(4u);
+    memcpy(input.body.ptr,"body",4u);
+    input.note.value.text=ku_string_alloc(4u);
+    memcpy(input.note.value.text.ptr,"note",4u);
+    input.note.value.suffix=ku_string_alloc(3u);
+    memcpy(input.note.value.suffix.ptr,"end",3u);
+    input.absent.is_null=true;
+    uint8_t* body=input.body.ptr;
+    uint8_t* text=input.note.value.text.ptr;
+    uint8_t* suffix=input.note.value.suffix.ptr;
+    KuTaskHandle_@READER@ handle={0};
+    KuTaskAdapterOutcomeV1 outcome={0};
+    RECORD_CHECK(ku_task_@READER@_try_start(&driver,&input,&handle)==KU_TASK_DRIVER_OK);
+    for (unsigned turn=0;turn<128u && !driver.timers;turn++)
+      RECORD_CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+    RECORD_CHECK(driver.timers==1u && driver.resident==1u);
+    KuTaskInstance_@READER@* instance=(KuTaskInstance_@READER@*)handle.owner.lease.control->context;
+    RECORD_CHECK(instance->frame.header.initialized & (UINT64_C(1)<<@REST_SLOT@));
+    RECORD_CHECK(instance->frame.s_@REST_SLOT@.body.ptr==body);
+    RECORD_CHECK(!instance->frame.s_@REST_SLOT@.note.is_null);
+    RECORD_CHECK(instance->frame.s_@REST_SLOT@.note.value.text.ptr==text);
+    RECORD_CHECK(instance->frame.s_@REST_SLOT@.note.value.suffix.ptr==suffix);
+    RECORD_CHECK(ku_task_@READER@_take(&handle,&outcome)==KU_TASK_CONTROL_PENDING);
+    if (mode==0u)
+      RECORD_CHECK(ku_task_driver_request_cancel(&handle.ticket,&handle.owner.lease,
+          KU_TASK_CONTROL_CANCELLED,deadline)==KU_TASK_CONTROL_OK);
+    if (mode==1u) {
+      fixture_first_clone=text;
+      fixture_failed_clone=suffix;
+    }
+    fixture_now+=100u;
+    for (unsigned turn=0;turn<128u && ku_task_control_status(&handle.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+      RECORD_CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+    uint32_t taken=ku_task_@READER@_take(&handle,&outcome);
+    if (mode==0u) {
+      RECORD_CHECK(taken==KU_TASK_CONTROL_CANCELLED && !outcome.result_kind);
+    } else {
+      RECORD_CHECK(taken==KU_TASK_CONTROL_OK && outcome.result_kind==2u);
+      RECORD_CHECK(outcome.value.boolean.ok==(mode==2u));
+      if (mode==1u) {
+        RECORD_CHECK(fixture_first_clones==1u && fixture_failed_clones==1u);
+        RECORD_CHECK(ku_string_equal(outcome.value.boolean.error.code,
+            ku_string_static((const uint8_t*)"out_of_memory",13u)));
+      } else RECORD_CHECK(outcome.value.boolean.value);
+    }
+    fixture_first_clone=NULL;
+    fixture_failed_clone=NULL;
+    ku_task_outcome_drop(&outcome);
+    RECORD_CHECK(ku_task_@READER@_drop(&handle,deadline)==KU_TASK_DRIVER_OK);
+    for (unsigned turn=0;turn<128u && driver.resident;turn++)
+      RECORD_CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+    RECORD_CHECK(!driver.resident && !driver.running && !driver.timers && !driver.reserved_bytes && !driver.fault);
+    if (ku_perf_live_allocations!=initial_allocations || ku_perf_live_bytes!=initial_bytes)
+      fprintf(stderr,"nested rest mode %u allocations %zu/%zu bytes %zu/%zu\n",mode,
+          ku_perf_live_allocations,initial_allocations,ku_perf_live_bytes,initial_bytes);
+    RECORD_CHECK(ku_perf_live_allocations==initial_allocations && ku_perf_live_bytes==initial_bytes && !ku_perf_overflow);
+  }
+  RECORD_CHECK(ku_task_driver_request_close(&driver,3000u)==KU_TASK_DRIVER_OK);
+  for (unsigned turn=0;turn<128u && driver.workers_exited!=1u;turn++)
+    RECORD_CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  RECORD_CHECK(ku_task_driver_join(&driver,3000u)==KU_TASK_DRIVER_OK);
+  RECORD_CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  RECORD_CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  return 0;
+}
 int main(void) {
   if (fixture_record_result(0u,0) || fixture_record_result(KU_TASK_CONTROL_CANCELLED,0)
-      || fixture_record_result(KU_TASK_CONTROL_TIMED_OUT,0) || fixture_record_result(0u,1)) return 1;
+      || fixture_record_result(KU_TASK_CONTROL_TIMED_OUT,0) || fixture_record_result(0u,1)
+      || fixture_nested_rest()) return 1;
   puts("task-record-result-ok");
   return 0;
 }

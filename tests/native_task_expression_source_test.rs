@@ -330,11 +330,13 @@ async fn main(): null! {
         try {
             for index in 2 {
                 step: fn(): int = () => index + plan.meta.code
+                local_step: fn(): int = step
+                reader = local_step
                 index = index + 2;
                 (await Pause())?
                 if (true) {
                     index: int = 600
-                    println(step())
+                    println(reader())
                 }
                 if (pass == 1) { (await Failed())? }
             }
@@ -375,8 +377,8 @@ fn native_task_lexical_capture_rejects_escaping_function_values() {
 async fn main(): null! {
     value = 1
     read: fn(): int = () => value
-    escaped = read
-    println(escaped())
+    reader = read
+    escaped = [reader]
     return ok(null)
 }
 "#;

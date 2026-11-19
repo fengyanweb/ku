@@ -1,4 +1,5 @@
 import http from "std.http"
+import time from "std.time"
 
 struct RequestMeta {
     title: str
@@ -63,11 +64,12 @@ async fn CheckGet(base: str): null! {
         meta: RequestMeta { title: "回环" + "🙂", count: 0 }
     }
     reply = (await Send((await PreparePlan(plan))?, (await ExpectedStatus())?))?
-    {status: code, body, meta, absent = 7, ignored: _, missing = 9, ..._} = reply
-    count = meta?.count
-    if (code != 200 || body != "hello 中文🙂") fail "wrong GET response"
-    if (count == null || count != 0 || meta?.title != "回环🙂") fail "moved metadata"
-    if (absent != null || missing != 9) fail "field presence"
+    {status: code, ...rest} = reply
+    read: fn(): bool = () => rest.body == "hello 中文🙂" && rest.meta?.title == "回环🙂" && rest.meta?.count == 0 && rest.absent == null
+    reader = read
+    // The reply's remaining fields stay owned by this Task during the pause.
+    time.sleep(2)?
+    if (code != 200 || !reader()) fail "wrong GET response or metadata"
     return ok(null)
 }
 
