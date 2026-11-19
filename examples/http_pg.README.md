@@ -12,12 +12,16 @@ umask 077
 printf '%s\n' "$KU_TASKS_DSN" > db.conn
 printf '%s\n' '127.0.0.1:8090' > http.addr
 psql -X -v ON_ERROR_STOP=1 -d "$KU_TASKS_DSN" -f http_pg_schema.sql
-KU_PG_LIB="$(pg_config --libdir)" ku build --release http_pg.ku -o task-list && ./task-list
+libpq=libpq.so
+if [ "$(uname -s)" = Darwin ]; then libpq=libpq.dylib; fi
+mkdir -p .ku-pg-link
+ln -s "$(pg_config --libdir)/$libpq" ".ku-pg-link/$libpq"
+KU_PG_LIB="$PWD/.ku-pg-link" ku build --release http_pg.ku -o task-list && ./task-list
 ```
 
 `db.conn` 和 `http.addr` 放在可执行文件旁边。修改 `http.addr` 即可换端口。服务直接监听该地址，建表由上面的 `psql` 命令显式完成。
 
-`KU_PG_LIB` 供 native 构建定位链接库。系统已能找到匹配的链接库时可以省略。Windows 使用 PowerShell 7 写入 UTF-8 配置。MSVC 使用 `libpq.lib`，MinGW GNU 使用 `libpq.dll.a`，运行时还需提供与导入库匹配的 DLL。
+`KU_PG_LIB` 是 native 构建必需的链接库目录，需使用包含匹配共享库或导入库的小型绝对目录。上面的命令从 PostgreSQL 客户端开发库建立链接。Windows 使用 PowerShell 7 写入 UTF-8 配置。MSVC 使用 `libpq.lib`，MinGW GNU 使用 `libpq.dll.a`，运行时请让 Windows 找到与导入库匹配的 DLL。
 
 ```powershell
 $env:KU_TASKS_DSN = 'host=127.0.0.1 port=5432 dbname=ku_dev user=ku_dev'
@@ -68,4 +72,4 @@ python3 -B tests/acceptance/http_pg_lifecycle.py --tasks-example \
   --ku "$(command -v ku)" --output /tmp/ku-tasks-verification.json
 ```
 
-验证显式 Runner 时，在同一条命令中加上 `--tasks-backend runner`。
+验证显式 Runner 时，加上 `--tasks-backend runner`。也可以用 `--typed-example` 单独验证类型化查询的三个入口。
