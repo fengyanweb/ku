@@ -2602,10 +2602,27 @@ fn build_executable_to(
         .to_string_lossy()
         .to_string();
     let rust_source = build_runner_source(&embedded_path, source, config.dependency_mode);
-    let temp_guard = TempBuildDir::create_private("runner").map_err(|err| {
-        KuError::message(format!("failed to create private build directory: {err}"))
-    })?;
-    let temp_dir = temp_guard.path().to_path_buf();
+    let bundle =
+        crate::runner_bundle::RuntimeBundle::load(config.target.map(|target| target.rust_triple))?;
+    let windows_gnu = cfg!(windows) && bundle.target.ends_with("-windows-gnu");
+    let temp_guard = if windows_gnu {
+        gnu_workspace::create_ascii_temp("runner")?
+    } else {
+        TempBuildDir::create_private("runner").map_err(|err| {
+            KuError::message(format!("failed to create private build directory: {err}"))
+        })?
+    };
+    let temp_dir = temp_guard.path();
+    let gnu_output = if windows_gnu {
+        let absolute_output = std::path::absolute(temporary_output).map_err(|err| {
+            KuError::message(format!("failed to resolve the Runner output path: {err}"))
+        })?;
+        // Rustc forwards the output filename to MinGW's narrow-character
+        // linker. Keep Unicode paths on the Rust I/O side of the transaction.
+        (!absolute_output.to_str().is_some_and(str::is_ascii)).then(|| temp_dir.join("program.exe"))
+    } else {
+        None
+    };
     let runner = temp_dir.join("runner.rs");
     let mut runner_options = fs::OpenOptions::new();
     runner_options.create_new(true).write(true);
@@ -2630,8 +2647,6 @@ fn build_executable_to(
         })?;
     drop(runner_file);
 
-    let bundle =
-        crate::runner_bundle::RuntimeBundle::load(config.target.map(|target| target.rust_triple))?;
     let compiler = bundle.compiler()?;
     if bundle.mode == "source-development" {
         bundle.link_probe(&compiler)?;
@@ -2639,13 +2654,16 @@ fn build_executable_to(
     let prepared = bundle.prepare(&temp_dir.join("runtime"))?;
     let lib = &prepared.runtime;
     let mut command = compiler.command();
+    if windows_gnu {
+        gnu_workspace::configure_temp(&mut command, temp_dir);
+    }
     command
         .arg("--edition=2021")
         .arg(&runner)
         .arg("--extern")
         .arg(format!("ku={}", lib.display()))
         .arg("-o")
-        .arg(temporary_output);
+        .arg(gnu_output.as_deref().unwrap_or(temporary_output));
     crate::runner_bundle::add_search_paths(&mut command, &prepared);
     command.arg("--target").arg(&bundle.target);
     if let Some(opt_level) = config.profile.rustc_opt_level() {
@@ -2675,14 +2693,18 @@ fn build_executable_to(
             )));
         }
     };
-    temp_guard.cleanup();
     if !status.success() {
         return Err(KuError::message(format!(
             "ku build failed: rustc exited with {status}\nhelp: run `ku doctor --backend runner`; keep the compiler diagnostics above. If E0514 is reported, the bundle/compiler identities are still inconsistent; do not mix runtime files"
         )));
     }
+    if let Some(gnu_output) = &gnu_output {
+        let verified = validate_runner_output_candidate(gnu_output, config.target)?;
+        gnu_workspace::copy_output(&verified, temporary_output)?;
+    }
     let verified = validate_runner_output_candidate(temporary_output, config.target)?;
     install_verified_link_output(verified, &output_staging)?;
+    temp_guard.cleanup();
     Ok(output.to_path_buf())
 }
 
@@ -7551,12 +7573,12 @@ fn compile_c_source_with_output(
                         continue;
                     }
                 };
-                if let Some(workspace) = &tool_workspace {
+                if tool_workspace.is_some() {
                     // A different tool volume never participates in the final
                     // rename. Unicode-capable Rust I/O copies into the original
                     // same-volume transaction, which is checked again before
                     // the existing destination snapshot/atomic install path.
-                    workspace.copy_output(&verified, temporary_output)?;
+                    gnu_workspace::copy_output(&verified, temporary_output)?;
                     verified = validate_link_output_candidate(
                         temporary_output,
                         source,
@@ -13126,7 +13148,7 @@ mod tests {
             None,
         )
         .unwrap();
-        workspace.copy_output(&verified, staging.path()).unwrap();
+        gnu_workspace::copy_output(&verified, staging.path()).unwrap();
         assert_eq!(fs::read(&output).unwrap(), b"old installed output");
         let copied = validate_link_output_candidate(
             staging.path(),

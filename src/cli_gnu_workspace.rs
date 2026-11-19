@@ -28,6 +28,19 @@ pub(super) fn library_argument(
     }
 }
 
+pub(super) fn create_ascii_temp(label: &str) -> Result<TempBuildDir, KuError> {
+    let root = ascii_temp_root(&env::temp_dir()).map_err(error)?;
+    TempBuildDir::create_private_in(&super::strip_verbatim(&root), label).map_err(error)
+}
+
+pub(super) fn configure_temp(command: &mut Command, temporary: &Path) {
+    let temporary = super::strip_verbatim(temporary);
+    command
+        .env("TMP", &temporary)
+        .env("TEMP", &temporary)
+        .env("TMPDIR", temporary);
+}
+
 pub(super) struct Workspace {
     directory: TempBuildDir,
     temporary: TempBuildDir,
@@ -80,11 +93,7 @@ impl Workspace {
 
     pub(super) fn configure(&self, command: &mut Command) {
         command.current_dir(&self.cwd);
-        let temporary = super::strip_verbatim(self.temporary.path());
-        command
-            .env("TMP", &temporary)
-            .env("TEMP", &temporary)
-            .env("TMPDIR", temporary);
+        configure_temp(command, self.temporary.path());
     }
 
     pub(super) fn source(&mut self, source: &Path) -> Result<PathBuf, KuError> {
@@ -190,26 +199,25 @@ impl Workspace {
     pub(super) fn output_file(&self) -> PathBuf {
         self.directory.path().join("program.exe")
     }
+}
 
-    pub(super) fn copy_output(
-        &self,
-        verified: &VerifiedLinkOutput,
-        destination: &Path,
-    ) -> Result<(), KuError> {
-        verified.verify_current_path().map_err(KuError::message)?;
-        copy_open_file(
-            &verified.file,
-            &verified.identity,
-            destination,
-            MAX_NATIVE_LINK_OUTPUT_BYTES,
-        )?;
-        fs::set_permissions(
-            destination,
-            verified.file.metadata().map_err(error)?.permissions(),
-        )
-        .map_err(error)?;
-        verified.verify_current_path().map_err(KuError::message)
-    }
+pub(super) fn copy_output(
+    verified: &VerifiedLinkOutput,
+    destination: &Path,
+) -> Result<(), KuError> {
+    verified.verify_current_path().map_err(KuError::message)?;
+    copy_open_file(
+        &verified.file,
+        &verified.identity,
+        destination,
+        MAX_NATIVE_LINK_OUTPUT_BYTES,
+    )?;
+    fs::set_permissions(
+        destination,
+        verified.file.metadata().map_err(error)?.permissions(),
+    )
+    .map_err(error)?;
+    verified.verify_current_path().map_err(KuError::message)
 }
 
 fn error(error: impl std::fmt::Display) -> KuError {
