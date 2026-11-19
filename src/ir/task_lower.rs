@@ -297,6 +297,13 @@ pub fn lower_bound_service_handlers(
     program: &Program,
     bindings: &[super::MixedAsyncHandler],
 ) -> KuResult<TaskProgram> {
+    lower_bound_service_handlers_with_layouts(program, bindings).map(|native| native.tasks)
+}
+
+pub(crate) fn lower_bound_service_handlers_with_layouts(
+    program: &Program,
+    bindings: &[super::MixedAsyncHandler],
+) -> KuResult<NativeTaskProgram> {
     let supported = |name: &str| matches!(name, "time" | "fs" | "net" | "bytes" | "http" | "json");
     let mut filtered = Program {
         items: program
@@ -309,6 +316,7 @@ pub fn lower_bound_service_handlers(
                 Item::Function(function) if object_constructor(function).is_some() => {
                     Some(item.clone())
                 }
+                Item::Struct(_) => Some(item.clone()),
                 Item::Module(module) if module.name.strip_prefix("std:").is_some_and(supported) => {
                     Some(item.clone())
                 }
@@ -355,7 +363,7 @@ pub fn lower_bound_service_handlers(
         }
         filtered.items.push(Item::Function(declaration));
     }
-    lower_program_impl(&filtered, false).map(|native| native.tasks)
+    lower_program_impl(&filtered, false)
 }
 
 fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<NativeTaskProgram> {
@@ -611,6 +619,9 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
         );
     }
     let tasks = TaskProgram { functions };
+    if !require_entry {
+        records::retain_used_layouts(&mut layouts, &tasks);
+    }
     task::verify_and_plan_with_layouts(&tasks, limits, &layouts)?;
     Ok(NativeTaskProgram {
         tasks,

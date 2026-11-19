@@ -82,8 +82,8 @@ use crate::{
     error::{KuError, KuResult},
     ir::{
         FunctionId, IrBlock, IrCallKind, IrCaptureSource, IrEnumLayout, IrExpr, IrExprKind,
-        IrFieldLayout, IrFunction, IrInst, IrLValue, IrProgram, IrStructLayout, IrTerminator,
-        IrType,
+        IrFieldLayout, IrFunction, IrInst, IrLValue, IrLayoutTable, IrProgram, IrStructLayout,
+        IrTerminator, IrType,
     },
     span::Span,
 };
@@ -345,13 +345,81 @@ pub fn generate_mixed_http_c_source(
     frames: &crate::ir::task::TaskProgram,
     options: &CBackendOptions,
 ) -> KuResult<String> {
+    generate_mixed_http_with_layouts(
+        program,
+        frames,
+        &IrLayoutTable {
+            structs: Vec::new(),
+            enums: Vec::new(),
+        },
+        options,
+    )
+}
+
+pub(crate) fn generate_mixed_http_task_c_source(
+    program: &IrProgram,
+    native: &crate::ir::task_lower::NativeTaskProgram,
+    options: &CBackendOptions,
+) -> KuResult<String> {
+    generate_mixed_http_with_layouts(program, &native.tasks, &native.layouts, options)
+}
+
+fn generate_mixed_http_with_layouts(
+    program: &IrProgram,
+    frames: &crate::ir::task::TaskProgram,
+    layouts: &IrLayoutTable,
+    options: &CBackendOptions,
+) -> KuResult<String> {
     task_mixed::validate(program, frames)?;
     if !program_uses_http(program) || frames.functions.is_empty() {
         return Err(unsupported(
             "async functions outside an async entry require an HTTP service",
         ));
     }
-    let plan = crate::ir::task::verify_and_plan(frames, Default::default())?;
+    let plan = crate::ir::task::verify_and_plan_with_layouts(frames, Default::default(), layouts)?;
+    let combined;
+    let program = if layouts.structs.is_empty() {
+        program
+    } else {
+        // The synchronous setup already owns its declarations. Task records
+        // are emitted separately so their typed move/drop ABI cannot replace
+        // the setup representation, even if source names collide after C mangling.
+        let mut occupied: HashSet<_> = program
+            .layouts
+            .structs
+            .iter()
+            .map(|layout| c_struct_type(&layout.name))
+            .chain(
+                program
+                    .functions
+                    .iter()
+                    .map(|function| c_symbol(&function.name)),
+            )
+            .collect();
+        for layout in &layouts.structs {
+            if [
+                c_struct_type(&layout.name),
+                c_named_move_function(&layout.name),
+                c_named_clone_function(&layout.name),
+                c_named_drop_function(&layout.name),
+            ]
+            .into_iter()
+            .any(|symbol| !occupied.insert(symbol))
+            {
+                return Err(unsupported(format!(
+                    "mixed native HTTP Task record '{}' collides with an existing C declaration",
+                    layout.name
+                )));
+            }
+        }
+        let mut extended = program.clone();
+        extended
+            .layouts
+            .structs
+            .extend(layouts.structs.iter().cloned());
+        combined = extended;
+        &combined
+    };
     generate_c_source_with_frames_bounded(
         program,
         options,

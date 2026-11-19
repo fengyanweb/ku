@@ -2768,8 +2768,9 @@ fn write_native_c_to(
         if bindings.is_empty() {
             backend::c::generate_c_source_with_options(&optimized, &options)?
         } else {
-            let tasks = ir::task_lower::lower_bound_service_handlers(&program, &bindings)?;
-            backend::c::generate_mixed_http_c_source(&optimized, &tasks, &options)?
+            let tasks =
+                ir::task_lower::lower_bound_service_handlers_with_layouts(&program, &bindings)?;
+            backend::c::generate_mixed_http_task_c_source(&optimized, &tasks, &options)?
         }
     };
     write_text_artifact(output, c_source)

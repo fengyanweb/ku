@@ -41,6 +41,61 @@ pub(super) fn layouts(program: &Program) -> super::super::IrLayoutTable {
     layouts
 }
 
+/// The mixed service already emits its synchronous layouts. Include only the
+/// private Task layouts used by frames, signatures or their nested fields.
+pub(super) fn retain_used_layouts(layouts: &mut super::super::IrLayoutTable, tasks: &TaskProgram) {
+    fn name(mut ty: &IrType) -> Option<&str> {
+        while let IrType::Nullable(inner) | IrType::Result(inner) = ty {
+            ty = inner;
+        }
+        match ty {
+            IrType::Named(name) if task::record_type(ty) => Some(name),
+            _ => None,
+        }
+    }
+
+    let mut pending = Vec::new();
+    for function in &tasks.functions {
+        pending.extend(name(&function.result));
+        for slot in &function.slots {
+            match &slot.ty {
+                TaskSlotType::Value { ty, .. } | TaskSlotType::Task { result: ty } => {
+                    pending.extend(name(ty));
+                }
+                TaskSlotType::Callable { parameters, result } => {
+                    pending.extend(parameters.iter().filter_map(name));
+                    pending.extend(name(result));
+                }
+            }
+        }
+    }
+    if pending.is_empty() {
+        layouts.structs.clear();
+        return;
+    }
+
+    let by_name: HashMap<_, _> = layouts
+        .structs
+        .iter()
+        .map(|layout| (layout.name.as_str(), layout))
+        .collect();
+    let mut used = std::collections::HashSet::new();
+    while let Some(record) = pending.pop() {
+        if used.insert(record) {
+            if let Some(layout) = by_name.get(record) {
+                pending.extend(layout.fields.iter().filter_map(|field| name(&field.ty)));
+            }
+        }
+    }
+    let keep: Vec<_> = layouts
+        .structs
+        .iter()
+        .map(|layout| used.contains(layout.name.as_str()))
+        .collect();
+    let mut keep = keep.into_iter();
+    layouts.structs.retain(|_| keep.next().unwrap_or(false));
+}
+
 pub(super) fn payload(ty: &TypeName, layouts: &super::super::IrLayoutTable) -> Option<IrType> {
     if let TypeName::Custom(name) = ty {
         let name = record_name(name);
