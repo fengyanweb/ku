@@ -857,7 +857,11 @@ def installed_native_time_array_consumer(install, root, env, report, report_path
             cleanup.raise_if_any(primary)
 
 
-def installed_native_http_client_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False, task_client=False, structured_task=False):
+def installed_native_http_client_consumer(install, root, env, report, report_path, target, *,
+                                          checkout_hidden=False, task_client=False, structured_task=False,
+                                          backend='c'):
+    if backend != 'c' and not (backend == 'runner' and structured_task):
+        raise ValueError('only the structured Task example has a Runner comparison')
     task_client = task_client or structured_task
     example = 'native_http_client'
     if structured_task:
@@ -865,7 +869,8 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
     elif task_client:
         example = 'native_task_http_client'
     detail={'status':'running','target':target,'scope':'installed optional '+('Task' if task_client else 'synchronous')+' HTTP client; bounded loopback, moved source-free executable','checkout_hidden_during_build':checkout_hidden,'example':example+'.ku'}
-    report['installed_'+example]=detail
+    detail['backend'] = backend
+    report['installed_'+example+('_runner' if backend == 'runner' else '')]=detail
     if not (install/'native-http').exists():
         detail['status']='not_in_archive';write_report(report_path,report);return
     leaf=install/'native-http/v1'/target
@@ -878,7 +883,7 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
     build_env.pop('KU_NATIVE_HTTP_CLIENT_PACK',None)
     build_env.pop('KU_NATIVE_CALENDAR_PACK',None)
     runtime_env=build_env
-    if target=='x86_64-pc-windows-gnu':
+    if target=='x86_64-pc-windows-gnu' and backend == 'c':
         system_root=Path(os.environ['SystemRoot']).resolve()
         runtime_env=dict(build_env,PATH=os.pathsep.join((str(system_root/'System32'),str(system_root))))
     with tempfile.TemporaryDirectory(prefix='ku-installed-http-client-',dir=root) as temp:
@@ -934,14 +939,19 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                 entry=ku;detail['cli_entry_kind']='direct'
                 if os.name!='nt':
                     aliases=temp/'launcher';aliases.mkdir();entry=aliases/'ku';entry.symlink_to(ku);detail['cli_entry_kind']='posix-symlink'
-                built=invoke([entry,'build','--release','--verbose','main.ku','-o',program],project,build_env)
-                detail['build_exit']=built.returncode;record_native_build_diagnostics(detail,built)
+                selection = ['--backend', 'runner'] if backend == 'runner' else []
+                built=invoke([entry,'build','--release','--verbose',*selection,'main.ku','-o',program],project,build_env)
+                detail['build_exit']=built.returncode
+                if backend == 'c':
+                    record_native_build_diagnostics(detail,built)
                 if built.returncode:raise RuntimeError('installed HTTP client build failed: '+(output(built)+built.stderr.decode(errors='replace'))[-4096:])
-                assert_build_backend(built,'c','release')
-                generated=reported_artifact(output(built),'native c ok: ',project,temp)
-                for feature in (b'#define KU_FEATURE_NATIVE_HTTP_CLIENT 1',b'#define KU_TASK_OUTBOUND_HTTP 1' if task_client else b'#define KU_FEATURE_NATIVE_CALENDAR 1'):
-                    if feature not in generated.read_bytes():raise RuntimeError('combined native HTTP/calendar feature is absent: '+feature.decode())
-                detail['generated_c_sha256']=EXPORT.file_hash(generated);detail['binary_sha256']=EXPORT.file_hash(program)
+                assert_build_backend(built,backend,'release')
+                if backend == 'c':
+                    generated=reported_artifact(output(built),'native c ok: ',project,temp)
+                    for feature in (b'#define KU_FEATURE_NATIVE_HTTP_CLIENT 1',b'#define KU_TASK_OUTBOUND_HTTP 1' if task_client else b'#define KU_FEATURE_NATIVE_CALENDAR 1'):
+                        if feature not in generated.read_bytes():raise RuntimeError('combined native HTTP/calendar feature is absent: '+feature.decode())
+                    detail['generated_c_sha256']=EXPORT.file_hash(generated)
+                detail['binary_sha256']=EXPORT.file_hash(program)
                 deployed=deployment/program.name;shutil.move(str(program),str(deployed));shutil.rmtree(project)
                 if retired.exists():raise RuntimeError('HTTP client SDK quarantine exists')
                 relocate_checkout_entry(install,retired);retired_sdk=True
@@ -953,7 +963,10 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                 expected='native-task-http-client-ok\n' if task_client else '[object]\nnative-http-client-ok\n'
                 if structured_task:
                     expected = 'plan-ready\nstatus-ready\n'+expected
-                if result.returncode or output(result)!=expected or result.stderr:raise RuntimeError('installed native HTTP client produced incorrect output: '+(output(result)+result.stderr.decode(errors='replace'))[-4096:])
+                stdout = output(result)
+                if result.returncode or stdout!=expected or result.stderr:raise RuntimeError('installed HTTP client produced incorrect output: '+(stdout+result.stderr.decode(errors='replace'))[-4096:])
+                if structured_task:
+                    detail['run_stdout'] = stdout
                 peer.join(3)
                 if peer.is_alive() or errors or len(received)!=3:raise RuntimeError('HTTP fixture failed: '+repr(errors))
                 if structured_task and [line.rsplit(' ',1)[0] for line in received] != ['GET /hello', 'GET /missing', 'POST /post']:
@@ -972,6 +985,51 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                 detail['installation_restored']=install.is_dir() and ku.is_file() and not retired.exists()
                 detail['status']='passed' if primary is None and not cleanup.failed else 'failed'
                 write_report(report_path,report);cleanup.raise_if_any(primary)
+
+
+def run_structured_only(args, report):
+    """Check only the structured Task example from a verified installed archive."""
+    repo = args.repo.resolve()
+    if repo != Path(__file__).resolve().parents[2]:
+        raise ValueError('structured Task consumer requires its own checkout')
+    metadata = json.loads(args.manifest.read_text(encoding='utf-8'))
+    archive = args.archive.resolve()
+    if (metadata['commit'] != args.expected_sdk_commit or
+            EXPORT.file_hash(archive) != metadata['sha256'] or archive.stat().st_size != metadata['size']):
+        raise ValueError('structured Task SDK archive identity mismatch')
+    env = dict(os.environ, RUSTUP_AUTO_INSTALL='0')
+    env.pop('KU_RUNNER_RUSTC', None)
+    env.pop('RUSTUP_TOOLCHAIN', None)
+    target = metadata['target']
+    verifier = checked(['git', 'rev-parse', 'HEAD'], repo, env).strip()
+    if verifier != metadata['commit']:
+        raise ValueError('structured Task example and SDK must come from the same commit')
+    example = 'examples/native_task_structured_http.ku'
+    source = EXPORT.canonical_example((repo / example).read_bytes())
+    committed = checked(['git', 'show', f'{verifier}:{example}'], repo, env).encode('utf-8')
+    if source != committed:
+        raise ValueError('structured Task example differs from the selected commit')
+    report.update(schema='ku-structured-task-consumer-v1', target=target,
+                  sdk_source_commit=metadata['commit'], verification_code_commit=verifier,
+                  example_sha256=hashlib.sha256(source).hexdigest(),
+                  archive_sha256=metadata['sha256'], installer_run_id=args.installer_run)
+    with tempfile.TemporaryDirectory(prefix='ku-structured-task-consumer-') as temporary:
+        root = Path(temporary).resolve()
+        install = root / '安装 SDK'
+        install.mkdir()
+        EXPORT.verify_archive(archive, metadata['files'], install)
+        manifest = EXPORT.RUNTIME_BUNDLE.verify(install, metadata['version'], metadata['commit'], target)
+        report.update(bundle_id=manifest['bundle_id'], sdk_source_sha256=manifest['build_source_sha256'])
+        for backend in ('c', 'runner'):
+            installed_native_http_client_consumer(install, root, env, report, args.output, target,
+                                                  structured_task=True, backend=backend)
+        native = report['installed_native_task_structured_http']
+        runner = report['installed_native_task_structured_http_runner']
+        if any(check['status'] != 'passed' for check in (native, runner)):
+            raise RuntimeError('both installed structured Task backends must pass')
+        if any(native[key] != runner[key] for key in ('run_stdout', 'requests')):
+            raise RuntimeError('installed structured Task backends disagreed on output or request order')
+    report.update(status='passed', backend_equivalence=True, owned_temp_removed=not root.exists())
 
 
 def installed_native_http_relay_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False):
@@ -1995,19 +2053,23 @@ def main():
     parser.add_argument("--consumer-toolchain", default="1.96.0")
     parser.add_argument("--hide-checkout", action="store_true")
     parser.add_argument("--readonly-only", action="store_true")
+    parser.add_argument("--structured-only", action="store_true")
     parser.add_argument("--installer-run")
     parser.add_argument("--expected-sdk-commit")
     args = parser.parse_args()
     if args.native_time_array_probe_bundle:
-        if args.archive or args.manifest or args.readonly_only or args.hide_checkout or not args.expected_sdk_commit:
+        if args.archive or args.manifest or args.readonly_only or args.structured_only or args.hide_checkout or not args.expected_sdk_commit:
             parser.error('early native probe requires --expected-sdk-commit and cannot consume an archive or other mode')
     elif not args.archive or not args.manifest:
         parser.error('--archive and --manifest are required outside the early native probe')
+    if args.structured_only and (args.readonly_only or args.hide_checkout or not args.expected_sdk_commit):
+        parser.error('--structured-only requires --expected-sdk-commit and cannot run other verification modes')
     args.output = args.output.resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     report = {"status": "running"}
     try:
         selected = (run_native_time_array_probe if args.native_time_array_probe_bundle else
+                    run_structured_only if args.structured_only else
                     run_readonly_only if args.readonly_only else run)
         selected(args, report)
     except BaseException as error:
