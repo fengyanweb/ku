@@ -9,10 +9,10 @@ import { RejectLayout, StructLayout } from "../semantics/struct_layouts.ku"
 import { EmitNestedCLayouts, OrderCStructLayouts } from "../semantics/nested_struct_c.ku"
 import { ScalarStringHelpers } from "../semantics/scalar_int_emit.ku"
 import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
-import { LinkedNullProject, LinkedNullFunction, LinkedNullEntry, LinkedNullChild, LinkedNullNode,
+import { LinkedNullProject, LinkedNullEntry, LinkedNullChild, LinkedNullNode,
     LinkedNullParameterType, LinkedNullDependency, LinkedNullDependencyPlan, LinkedNullLayout,
     LinkedNullCType, LinkedNullPrototype, LinkedNullParameterPlan } from "../semantics/linked_null_types_c.ku"
-import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration } from "../semantics/link_plan_c.ku"
+import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration, LinkedNullFunction } from "../semantics/link_plan_c.ku"
 import { TypeNameBinding } from "../semantics/type_names.ku"
 
 struct PathLinePlan {

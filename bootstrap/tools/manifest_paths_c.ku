@@ -9,10 +9,10 @@ import { EmitNestedCLayouts, OrderCStructLayouts } from "../semantics/nested_str
 import { ScalarFunctionNode } from "../semantics/scalar_int_calls.ku"
 import { ScalarStringHelpers } from "../semantics/scalar_int_emit.ku"
 import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
-import { LinkedNullProject, LinkedNullFunction, LinkedNullEntry, LinkedNullChild, LinkedNullNode,
+import { LinkedNullProject, LinkedNullEntry, LinkedNullChild, LinkedNullNode,
     LinkedNullParameterType, LinkedNullDependency, LinkedNullDependencyPlan, LinkedNullLayout,
     LinkedNullCType, LinkedNullPrototype, LinkedNullParameterPlan } from "../semantics/linked_null_types_c.ku"
-import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration, LinkPlanType } from "../semantics/link_plan_c.ku"
+import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration, LinkPlanType, LinkedNullFunction } from "../semantics/link_plan_c.ku"
 import { TypeNameBinding } from "../semantics/type_names.ku"
 import { ManifestError, ManifestScan, ManifestChild, ManifestShape, RequireManifest,
     ReadManifestScan } from "./manifest_paths_shape.ku"
