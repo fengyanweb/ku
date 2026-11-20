@@ -1758,6 +1758,14 @@ fn ReplaceEscaped(&characters: [str], template: bool): Scanned! {
     count = decoded.byte_len()
     return ok(Scanned { text: decoded, count: count })
 }
+fn DescribeEscaped(&characters: [str], valid: bool): Scanned! {
+    escaped = characters[0].clone()
+    count = 0
+    if (!valid) {
+        fail { domain: "test", code: "escape", message: Describe("[" + escaped + "]", count) }
+    }
+    return ok(Scanned { text: escaped, count: count })
+}
 "#,
     )
     .unwrap();
@@ -1952,6 +1960,19 @@ fn ReplaceEscaped(&characters: [str], template: bool): Scanned! {
     assert!(next[0].contains("ku_projection_string_drop(&l"));
     assert!(next[1].contains("ku_projection_string_drop(&l"));
     assert!(next[2].contains(" = replaced"));
+
+    fs::write(cwd.join("function.txt"), "DescribeEscaped").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let (body, cleanup) = text.split_once("cleanup:\n").unwrap();
+    assert!(body.contains("saved_error") && body.contains(" = (KuProjectionString){0};"));
+    let compose = cleanup
+        .find("if (!ku_managed_string_append(&joined_error")
+        .unwrap();
+    let invoke = cleanup.find("result.error.message = ku_str_").unwrap();
+    assert!(compose < invoke);
+    assert!(cleanup[compose..invoke].contains("ku_projection_string_drop(&saved_error"));
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {

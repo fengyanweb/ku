@@ -1,5 +1,8 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
+import { ContainsType } from "./struct_projection_c.ku"
+import { RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { ScalarIntParameter } from "./scalar_int_emit.ku"
 import { RejectScalarInt, ScalarParameterIndex, ScalarStringLiteral } from "./scalar_int_operands.ku"
 
@@ -51,4 +54,162 @@ fn LowerNullResultExit(&nodes: [Node], &edges: [int], &parameters: [ScalarIntPar
     }
     RejectScalarInt("unsupported_null_result", "expected return with the builtin ok(null)", DeclarationSpan(value))?
     return ok("")
+}
+
+struct ManagedErrorEmission {
+    prep: GuardValue
+    declarations: str
+    after_cleanup: str
+}
+
+struct DeferredStringArgument {
+    declarations: str
+    capture: str
+    setup: str
+    value: str
+}
+
+fn deferredJoinedString(&nodes: [Node], &edges: [int], &bindings: [GuardBinding],
+                        &expression: Node, id: int, &indent: str): DeferredStringArgument! {
+    if (expression.kind != "Binary" || expression.text != "+" || expression.edge_count != 2) {
+        RejectLayout("managed_error_argument", "expected a literal prefix and suffix around one owned string", DeclarationSpan(expression))?
+    }
+    left = nodes[edges[expression.first_edge] - 1].clone()
+    suffix = nodes[edges[expression.first_edge + 1] - 1].clone()
+    if (left.kind != "Binary" || left.text != "+" || left.edge_count != 2 || suffix.kind != "String") {
+        RejectLayout("managed_error_argument", "expected a literal prefix and suffix around one owned string", DeclarationSpan(expression))?
+    }
+    prefix = nodes[edges[left.first_edge] - 1].clone()
+    value = nodes[edges[left.first_edge + 1] - 1].clone()
+    binding = GuardBindingIndex(bindings, value.text)
+    if (prefix.kind != "String" || value.kind != "Variable" || binding == 0 ||
+        bindings[binding - 1].ty.kind != "str" || bindings[binding - 1].view) {
+        RejectLayout("managed_error_argument", "expected a literal prefix and suffix around one owned string", DeclarationSpan(expression))?
+    }
+    saved = "saved_error" + str(id)
+    message = "joined_error" + str(id)
+    source = GuardBindingName(bindings[binding - 1])
+    capture = indent.clone() + saved.clone() + " = " + source.clone() + ";\n" +
+        indent.clone() + source + " = (KuProjectionString){0};\n"
+    left_value = "(KuProjectionString){(uint8_t*)" + ScalarStringLiteral(prefix)? + ", 0u, KU_PROJECTION_STRING_STATIC}"
+    right_value = "(KuProjectionString){(uint8_t*)" + ScalarStringLiteral(suffix)? + ", 0u, KU_PROJECTION_STRING_STATIC}"
+    setup = "        KuProjectionString " + message.clone() + " = " + left_value + ";\n"
+    setup += "        bool message_too_large = false;\n"
+    setup += "        if (!ku_managed_string_append(&" + message.clone() + ", " + saved.clone() + ", &message_too_large) ||\n"
+    setup += "            !ku_managed_string_append(&" + message.clone() + ", " + right_value + ", &message_too_large)) {\n"
+    setup += "            ku_projection_string_drop(&" + saved.clone() + ");\n"
+    setup += "            ku_projection_string_drop(&" + message.clone() + ");\n"
+    setup += "            fputs(message_too_large ? \"string allocation is too large\\n\" : \"out of memory\\n\", stderr);\n"
+    setup += "            exit(EXIT_FAILURE);\n        }\n"
+    setup += "        ku_projection_string_drop(&" + saved.clone() + ");\n"
+    return ok(DeferredStringArgument { declarations: "    KuProjectionString " + saved + " = {0};\n",
+        capture: capture, setup: setup, value: message })
+}
+
+fn managedErrorProvider(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &leaves: [GuardLeaf], &call: Node): GuardLeaf! {
+    if (call.edge_count > 0) {
+        target = nodes[edges[call.first_edge] - 1].clone()
+        if (target.kind == "Variable" && target.edge_count == 0 && GuardBindingIndex(bindings, target.text) == 0) {
+            for leaf in leaves.clone() {
+                if (leaf.name == target.text && leaf.result_kind == "str" && leaf.parameters.len() + 1 == call.edge_count) { return ok(leaf) }
+            }
+        }
+    }
+    RejectLayout("managed_error_provider", "expected an unshadowed, typed str message provider", DeclarationSpan(call))?
+    return ok(GuardLeaf { name: "", symbol: "", result_kind: "", parameters: [] })
+}
+
+fn deferredMessage(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
+                   &leaves: [GuardLeaf], &call: Node, id: int, &indent: str, allow_join: bool): ManagedErrorEmission! {
+    leaf = managedErrorProvider(nodes, edges, bindings, leaves, call)?
+    prep = GuardRead(GuardType { kind: "str", layout: 0 }, "", false)
+    declarations = ""
+    arguments = ""
+    composed = DeferredStringArgument { declarations: "", capture: "", setup: "", value: "" }
+    index = 0
+    while (index < leaf.parameters.len()) {
+        arg = edges[call.first_edge + index + 1]
+        kind = leaf.parameters[index].clone()
+        item = nodes[arg - 1].clone()
+        if (allow_join && index == 0 && kind == "str" && item.kind == "Binary") {
+            composed = deferredJoinedString(nodes, edges, bindings, item, id, indent)?
+            arguments = composed.value.clone()
+            index = index + 1
+            continue
+        }
+        if (composed.value != "" && (kind != "int" || (item.kind != "Int" && item.kind != "Variable"))) {
+            RejectLayout("managed_error_argument", "a joined message can defer only pure int reads", DeclarationSpan(item))?
+        }
+        if (kind != "int" && (kind != "str" || item.kind != "String")) {
+            RejectLayout("managed_error_argument", "message providers use Copy int or literal str arguments", DeclarationSpan(item))?
+        }
+        value = GuardExpression(nodes, edges, bindings, layouts, arg, 0, indent)?
+        if (value.ty.kind != kind || value.view) {
+            RejectLayout("managed_error_argument", "message argument must match its declared type", DeclarationSpan(item))?
+        }
+        rendered = value.value
+        prep.setup = prep.setup + value.setup
+        prep.uses_add = prep.uses_add || value.uses_add
+        prep.uses_sub = prep.uses_sub || value.uses_sub
+        prep.uses_eq = prep.uses_eq || value.uses_eq
+        if (kind == "int") {
+            name = "error_arg" + str(id) + "_" + str(index)
+            declarations += "    int64_t " + name.clone() + " = 0;\n"
+            prep.setup = prep.setup + indent.clone() + name.clone() + " = " + rendered + ";\n"
+            rendered = name
+        }
+        if (index > 0) { arguments += ", " }
+        arguments += rendered
+        index = index + 1
+    }
+    // Capture the last owned argument after all validation succeeds. On a
+    // joined path only this argument and Copy snapshots cross cleanup.
+    declarations += composed.declarations
+    prep.setup += composed.capture
+    prep.setup = prep.setup + indent.clone() + "record_error = " + str(id) + ";\n"
+    invoke = "result.error.message = " + leaf.symbol + "(" + arguments + ");\n"
+    begin = "    if (record_error == " + str(id) + ") "
+    finish = begin.clone() + invoke.clone()
+    if (composed.setup != "") { finish = begin + "{\n" + composed.setup + "        " + invoke + "    }\n" }
+    return ok(ManagedErrorEmission { prep: prep, declarations: declarations, after_cleanup: finish })
+}
+
+fn LowerManagedRecordError(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
+                           &leaves: [GuardLeaf], &literal: Node, id: int, &indent: str, allow_join: bool): ManagedErrorEmission! {
+    if (literal.kind != "ObjectLiteral" || literal.edge_count != 3) {
+        RejectLayout("managed_record_error", "expected Error domain, code, and message", DeclarationSpan(literal))?
+    }
+    prep = GuardRead(GuardType { kind: "str", layout: 0 }, "", false)
+    declarations = ""
+    finish = ""
+    seen: [str] = []
+    index = 0
+    while (index < literal.edge_count) {
+        field = nodes[edges[literal.first_edge + index] - 1].clone()
+        label = field.text.clone()
+        if (field.kind != "ObjectLiteralField" || field.edge_count != 1 || (label != "domain" && label != "code" && label != "message") || ContainsType(seen, label)) {
+            RejectLayout("managed_record_error_field", "expected each named Error field once", DeclarationSpan(field))?
+        }
+        child = edges[field.first_edge]
+        value = nodes[child - 1].clone()
+        if (label == "message" && value.kind == "Call") {
+            dynamic = deferredMessage(nodes, edges, bindings, layouts, leaves, value, id, indent, allow_join)?
+            prep.setup = prep.setup + dynamic.prep.setup
+            prep.uses_add = dynamic.prep.uses_add
+            prep.uses_sub = dynamic.prep.uses_sub
+            prep.uses_eq = dynamic.prep.uses_eq
+            declarations = dynamic.declarations
+            finish = dynamic.after_cleanup
+        } else {
+            if (value.kind != "String" || value.edge_count != 0) {
+                RejectLayout("managed_record_error_field", "expected a static Error field or direct message provider", DeclarationSpan(value))?
+            }
+            rendered = GuardExpression(nodes, edges, bindings, layouts, child, 0, indent)?
+            prep.setup = prep.setup + indent.clone() + "result.error." + label.clone() + " = " + rendered.value + ";\n"
+        }
+        seen = seen.push(label)
+        index = index + 1
+    }
+    prep.setup = prep.setup + indent.clone() + "goto cleanup;\n"
+    return ok(ManagedErrorEmission { prep: prep, declarations: declarations, after_cleanup: finish })
 }

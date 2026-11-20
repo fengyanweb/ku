@@ -12,8 +12,8 @@ import { RecordResultCallId } from "./call_contracts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType } from "./guarded_struct_expr.ku"
 import { AddGuardCode, EmitManagedAssignment, EmitManagedStringAppend, JoinManagedCode, ManagedBlank, ManagedCode, ManagedExpression, ManagedType } from "./managed_array_values_c.ku"
 import { HasScalarBuiltin } from "./scalar_int_operands.ku"
-import { ScalarStaticErrorFields } from "./scalar_result_null.ku"
-import { LowerManagedRecordError, ManagedDeferredMessageId } from "./guarded_string_parts.ku"
+import { LowerManagedRecordError, ScalarStaticErrorFields } from "./scalar_result_null.ku"
+import { ManagedDeferredMessageId } from "./guarded_string_parts.ku"
 
 struct ManagedBlock {
     code: ManagedCode
@@ -172,7 +172,7 @@ fn emitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
             failure = named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge] - 1].clone()
             if (root.string_locals || ManagedDeferredMessageId(named.parsed.arena.nodes, named.parsed.arena.edges, failure) != 0) {
                 lowered = LowerManagedRecordError(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts,
-                    root.leaves, failure, statement_id, indent)?
+                    root.leaves, failure, statement_id, indent, root.string_locals)?
                 code = AddGuardCode(code, lowered.prep)
                 declarations += lowered.declarations
                 error_exits += lowered.after_cleanup

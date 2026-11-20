@@ -53,65 +53,6 @@ fn LowerProjectedStringParts(&nodes: [Node], &edges: [int], &bindings: [GuardBin
     return collectProjectedParts(nodes, edges, bindings, layouts, id, 0, can_convert, [])
 }
 
-struct ManagedErrorEmission {
-    prep: GuardValue
-    declarations: str
-    after_cleanup: str
-}
-
-fn managedErrorProvider(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &leaves: [GuardLeaf], &call: Node): GuardLeaf! {
-    if (call.edge_count > 0) {
-        target = nodes[edges[call.first_edge] - 1].clone()
-        if (target.kind == "Variable" && target.edge_count == 0 && GuardBindingIndex(bindings, target.text) == 0) {
-            for leaf in leaves.clone() {
-                if (leaf.name == target.text && leaf.result_kind == "str" && leaf.parameters.len() + 1 == call.edge_count) { return ok(leaf) }
-            }
-        }
-    }
-    RejectLayout("managed_error_provider", "expected an unshadowed, typed str message provider", DeclarationSpan(call))?
-    return ok(GuardLeaf { name: "", symbol: "", result_kind: "", parameters: [] })
-}
-
-fn deferredMessage(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
-                   &leaves: [GuardLeaf], &call: Node, id: int, &indent: str): ManagedErrorEmission! {
-    leaf = managedErrorProvider(nodes, edges, bindings, leaves, call)?
-    prep = GuardRead(GuardType { kind: "str", layout: 0 }, "", false)
-    declarations = ""
-    arguments = ""
-    index = 0
-    while (index < leaf.parameters.len()) {
-        arg = edges[call.first_edge + index + 1]
-        kind = leaf.parameters[index].clone()
-        item = nodes[arg - 1].clone()
-        if (kind != "int" && (kind != "str" || item.kind != "String")) {
-            RejectLayout("managed_error_argument", "message providers use Copy int or literal str arguments", DeclarationSpan(item))?
-        }
-        value = GuardExpression(nodes, edges, bindings, layouts, arg, 0, indent)?
-        if (value.ty.kind != kind || value.view) {
-            RejectLayout("managed_error_argument", "message argument must match its declared type", DeclarationSpan(item))?
-        }
-        rendered = value.value
-        prep.setup = prep.setup + value.setup
-        prep.uses_add = prep.uses_add || value.uses_add
-        prep.uses_sub = prep.uses_sub || value.uses_sub
-        prep.uses_eq = prep.uses_eq || value.uses_eq
-        if (kind == "int") {
-            name = "error_arg" + str(id) + "_" + str(index)
-            declarations += "    int64_t " + name.clone() + " = 0;\n"
-            prep.setup = prep.setup + indent.clone() + name.clone() + " = " + rendered + ";\n"
-            rendered = name
-        }
-        if (index > 0) { arguments += ", " }
-        arguments += rendered
-        index = index + 1
-    }
-    // Only Copy snapshots and static bytes cross cleanup. The provider can
-    // fail fatally without leaving a live owner from this record frame.
-    prep.setup = prep.setup + indent.clone() + "record_error = " + str(id) + ";\n"
-    finish = "    if (record_error == " + str(id) + ") result.error.message = " + leaf.symbol + "(" + arguments + ");\n"
-    return ok(ManagedErrorEmission { prep: prep, declarations: declarations, after_cleanup: finish })
-}
-
 fn ManagedDeferredMessageId(&nodes: [Node], &edges: [int], &literal: Node): int {
     if (literal.kind != "ObjectLiteral") { return 0 }
     index = 0
@@ -202,46 +143,6 @@ fn ManagedCloneBoundString(&locals: [GuardBinding], &source: Node, &target: str,
     }
     return ok(indent.clone() + "if (!ku_result_clone_string(" + GuardBindingName(locals[binding - 1]) + ", &" + target.clone() +
         ")) { out_of_memory = true; goto cleanup; }\n")
-}
-
-fn LowerManagedRecordError(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
-                           &leaves: [GuardLeaf], &literal: Node, id: int, &indent: str): ManagedErrorEmission! {
-    if (literal.kind != "ObjectLiteral" || literal.edge_count != 3) {
-        RejectLayout("managed_record_error", "expected Error domain, code, and message", DeclarationSpan(literal))?
-    }
-    prep = GuardRead(GuardType { kind: "str", layout: 0 }, "", false)
-    declarations = ""
-    finish = ""
-    seen: [str] = []
-    index = 0
-    while (index < literal.edge_count) {
-        field = nodes[edges[literal.first_edge + index] - 1].clone()
-        label = field.text.clone()
-        if (field.kind != "ObjectLiteralField" || field.edge_count != 1 || (label != "domain" && label != "code" && label != "message") || ContainsType(seen, label)) {
-            RejectLayout("managed_record_error_field", "expected each named Error field once", DeclarationSpan(field))?
-        }
-        child = edges[field.first_edge]
-        value = nodes[child - 1].clone()
-        if (label == "message" && value.kind == "Call") {
-            dynamic = deferredMessage(nodes, edges, bindings, layouts, leaves, value, id, indent)?
-            prep.setup = prep.setup + dynamic.prep.setup
-            prep.uses_add = dynamic.prep.uses_add
-            prep.uses_sub = dynamic.prep.uses_sub
-            prep.uses_eq = dynamic.prep.uses_eq
-            declarations = dynamic.declarations
-            finish = dynamic.after_cleanup
-        } else {
-            if (value.kind != "String" || value.edge_count != 0) {
-                RejectLayout("managed_record_error_field", "expected a static Error field or direct message provider", DeclarationSpan(value))?
-            }
-            rendered = GuardExpression(nodes, edges, bindings, layouts, child, 0, indent)?
-            prep.setup = prep.setup + indent.clone() + "result.error." + label.clone() + " = " + rendered.value + ";\n"
-        }
-        seen = seen.push(label)
-        index = index + 1
-    }
-    prep.setup = prep.setup + indent.clone() + "goto cleanup;\n"
-    return ok(ManagedErrorEmission { prep: prep, declarations: declarations, after_cleanup: finish })
 }
 
 fn ManagedSourceCharactersRuntime(needs_header: bool): str {

@@ -283,6 +283,10 @@ The old destination is released after the clone succeeds. The source string
 keeps its own lifetime.
 Concatenating a literal prefix with a last-use local string uses the same
 checked temporary. A successful concatenation consumes the local suffix.
+An owned record's deferred Error message can join literal text around one
+owned string when the remaining arguments are pure integer reads. The
+epilogue keeps that string through cleanup, composes the message, and hands
+it to the typed formatter.
 
 The `linked-str` and `struct-result` modes emit `DiagnosticCanonical` and
 `ReadPrimaryAtom` from their original modules. Generated `extern` declarations
