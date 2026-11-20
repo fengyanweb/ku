@@ -4,14 +4,11 @@ import { DeclarationSpan } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { CTypeName, ContainsType, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
-import { EmitOwnedStructOperations, EmitStructArrayHeader, EmitStructArrayReadValidation, EmitTryCloneString } from "./struct_array_c.ku"
-import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
-import { StructResultHeader } from "./struct_result_c.ku"
+import { ContainsType } from "./struct_projection_c.ku"
 import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
 import { LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry, LinkedNullFunction, LinkedNullNode,
-         LinkedNullOwner, LinkedNullParameterType, LinkedNullProject, LinkedNullPrototype, LinkedNullType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullState, LowerLinkedNullRead,
+         LinkedNullOwner, LinkedNullParameterType, LinkedNullProject, LinkedNullType } from "./linked_null_types_c.ku"
+import { AddLinkedNullSlot, EmitLinkedNullSource, LinkedNullBinding, LinkedNullState, LowerLinkedNullRead,
          MoveLinkedNullSlot, NewLinkedNullState } from "./linked_null_read_c.ku"
 import { LowerLinkedNullTry, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
@@ -309,44 +306,6 @@ fn lowerLinkedBody(&project: LinkedNullProject, &function: Node, state: LinkedNu
     return ok(next)
 }
 
-fn linkedSource(&body: LinkedNullState, &symbol: str, &signature: str): str! {
-    // Keep the external prototypes independent of the selected entry's C
-    // name. The linker consumes declarations resolved from the source graph.
-    text = ProjectionHeaders(true, body.drops != "") + GuardArithmetic(body.uses_add, body.uses_sub)
-        + GuardStringEquality(body.uses_string_equal)
-    if (body.arrays.len() > 0) { text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n" }
-    if (body.uses_clone) {
-        text += "#include <stdio.h>\n#include <string.h>\n\n" + EmitTryCloneString("ku_linked_clone_string")
-    }
-    for layout in body.layouts.clone() { text += EmitLayout(layout, true, true)? }
-    for array in body.arrays.clone() {
-        element = CTypeName(array.module_index, array.declaration_node)
-        array_type = "KuArray_" + element.clone()
-        text += EmitStructArrayHeader(element, array_type) + EmitStructArrayReadValidation(element, array_type, LinkedNullArrayPrefix(array))
-    }
-    for layout in body.element_clones.clone() {
-        text += EmitOwnedStructOperations(body.layouts, layout, "ku_linked_element_" + str(layout), true)
-    }
-    text += StructResultHeader()
-    for dependency in body.links.clone() { text += LinkedNullPrototype(dependency)? }
-    text += "\nKuBootstrapResultNull " + symbol.clone() + "(" + signature.clone() + ") {\n"
-    text += "    KuBootstrapResultNull result = {0};\n"
-    clone = body.uses_clone || body.element_clones.len() > 0
-    if (clone) { text += "    bool out_of_memory = false;\n" }
-    if (body.arrays.len() > 0) { text += "    bool invalid_array = false;\n" }
-    if (body.uses_add || body.uses_sub) { text += "    bool overflow = false;\n" }
-    if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
-    text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
-    if (clone) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.arrays.len() > 0) { text += "    if (invalid_array) { fputs(\"invalid struct array ownership\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_add || body.uses_sub) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_index) {
-        text += "    if (index_failed) { fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", "
-            + "(long long)failure_index, failure_length); exit(EXIT_FAILURE); }\n"
-    }
-    return ok(text + "    return result;\n}\n")
-}
-
 fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! {
     if (supplied.len() == 0) {
         point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
@@ -359,7 +318,7 @@ fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! 
     parameters = readParameters(project, function)?
     body = lowerLinkedBody(project, function, parameters.state, parameters.body_start)?
     symbol = "ku_linked_null_" + str(id)
-    source = linkedSource(body, symbol, parameters.signature)?
+    source = EmitLinkedNullSource(body, symbol, parameters.signature)?
     plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: parameters.plan,
         result: NullLinkPlanResult(), returns_result: true }
     return ok(LinkedNullC { symbol: symbol, links: body.links, source: source, entry_plan: plan })

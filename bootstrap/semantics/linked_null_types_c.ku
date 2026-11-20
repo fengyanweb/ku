@@ -86,11 +86,24 @@ fn LinkedNullArrayPrefix(&binding: TypeNameBinding): str {
     return "ku_linked_view_" + CTypeName(binding.module_index, binding.declaration_node)
 }
 
+fn LinkedNullArrayType(&binding: TypeNameBinding): str {
+    return "KuArray_" + CTypeName(binding.module_index, binding.declaration_node)
+}
+
+fn LinkedNullArrayResultType(&binding: TypeNameBinding): str {
+    return "KuBootstrapResult_" + LinkedNullArrayType(binding)
+}
+
+fn LinkedNullOwnedArray(&binding: TypeNameBinding): bool {
+    return binding.declaration_kind == "OwnedStructArray"
+}
+
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
     if (binding.declaration_kind == "Struct") { return ok(CTypeName(binding.module_index, binding.declaration_node)) }
     if (binding.declaration_kind == "StructArray") {
-        return ok("const KuArray_" + CTypeName(binding.module_index, binding.declaration_node) + "*")
+        return ok("const " + LinkedNullArrayType(binding) + "*")
     }
+    if (LinkedNullOwnedArray(binding)) { return ok(LinkedNullArrayType(binding)) }
     if (binding.declaration_kind == "Builtin") {
         if (binding.name == "str") { return ok("KuProjectionString") }
         if (binding.name == "int") { return ok("int64_t") }
@@ -101,7 +114,7 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
 }
 
 fn LinkedNullOwner(&binding: TypeNameBinding): bool {
-    return binding.declaration_kind == "Struct" || binding.name == "str"
+    return binding.declaration_kind == "Struct" || binding.name == "str" || LinkedNullOwnedArray(binding)
 }
 
 fn LinkedNullLayout(&project: LinkedNullProject, &ty: TypeNameBinding, layouts: [StructLayout], depth: int): [StructLayout]! {
@@ -158,9 +171,19 @@ fn readLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bo
         return LinkedNullType(project, unit, id)
     }
     if (node.kind != "TypeResult" || node.edge_count != 1) {
-        RejectLayout("linked_dependency_result", "checked dependency requires an explicit null! result", DeclarationSpan(node))?
+        RejectLayout("linked_dependency_result", "checked dependency requires an explicit null! or struct array Result", DeclarationSpan(node))?
     }
-    result = LinkedNullType(project, unit, LinkedNullChild(project, unit, node, 0))?
+    payload_id = LinkedNullChild(project, unit, node, 0)
+    payload = LinkedNullNode(project, unit, payload_id)
+    if (payload.kind == "TypeArray" && payload.edge_count == 1) {
+        element = LinkedNullType(project, unit, LinkedNullChild(project, unit, payload, 0))?
+        if (element.declaration_kind != "Struct") {
+            RejectLayout("linked_dependency_result", "expected a Result of an array with bound struct elements", DeclarationSpan(payload))?
+        }
+        element.declaration_kind = "OwnedStructArray"
+        return ok(element)
+    }
+    result = LinkedNullType(project, unit, payload_id)?
     if (result.declaration_kind != "Builtin" || result.name != "null") {
         RejectLayout("linked_dependency_result", "checked dependency must return null!", result.span.clone())?
     }
@@ -192,13 +215,16 @@ fn LinkedNullDependency(&project: LinkedNullProject, from_unit: int, &target: No
         result: result, returns_result: checked })
 }
 
-fn linkedResultType(&callee: LinkedNullFunction): str! {
-    if (callee.returns_result) { return ok("KuBootstrapResultNull") }
+fn LinkedNullResultType(&callee: LinkedNullFunction): str! {
+    if (callee.returns_result) {
+        if (LinkedNullOwnedArray(callee.result)) { return ok(LinkedNullArrayResultType(callee.result)) }
+        return ok("KuBootstrapResultNull")
+    }
     return LinkedNullCType(callee.result)
 }
 
 fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
-    text = "extern " + linkedResultType(callee)? + " " + callee.symbol.clone() + "("
+    text = "extern " + LinkedNullResultType(callee)? + " " + callee.symbol.clone() + "("
     if (callee.parameters.len() == 0) { text += "void" }
     index = 0
     while (index < callee.parameters.len()) {
@@ -217,8 +243,9 @@ fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
         parameters = parameters.push(BoundLinkPlanType(ty, callee.unit, LinkedNullCType(ty)?, false))
         index = index + 1
     }
-    result = BoundLinkPlanType(callee.result, callee.unit, linkedResultType(callee)?, false)
-    if (callee.returns_result) { result = NullLinkPlanResult() }
+    result = BoundLinkPlanType(callee.result, callee.unit, LinkedNullResultType(callee)?, false)
+    if (callee.returns_result && LinkedNullOwnedArray(callee.result)) { result.kind = "StructArray" }
+    else if (callee.returns_result) { result = NullLinkPlanResult() }
     return ok(LinkPlanDeclaration { unit: callee.unit, node: callee.node, symbol: callee.symbol.clone(),
         parameters: parameters, result: result, returns_result: callee.returns_result })
 }

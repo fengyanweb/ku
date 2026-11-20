@@ -288,6 +288,14 @@ such as `RejectAt`. It evaluates bound call arguments in source order and
 transfers their owners to the declared C dependency. A returned Error owns
 its domain, code and message.
 
+`managed` emits constructors returning an owned struct array or a Result
+of that array. In the Result form, the selected function can return
+`ok(owner)` or a static Error. A `linked-null` function can bind an
+imported call with `items = Read(...) ?`, then read its length or elements.
+The caller releases initialized arrays on success and when a later Result
+fails. The link plan matches the producer and consumer by the element's
+nominal declaration.
+
 `linked-str` also emits functions such as `TokenCanonical` that consume an
 owned struct. A string field may move into the expression once. A named
 function in the same source module is linked by its declaration path and
@@ -305,7 +313,7 @@ array separately from the nominal identity of its element type.
 
 With the same manifest and selected function, append `-plan` to
 `linked-str`, `linked-null`, `struct-result`, `construct`, `project-fields`,
-`guarded` or `project-int` in `mode.txt` to emit a `ku-bootstrap-link-plan-v1`
+`guarded`, `project-int` or `managed` in `mode.txt` to emit a `ku-bootstrap-link-plan-v1`
 JSON document on stdout. The `export` record describes the selected
 function. `dependencies` lists the external project declarations used by
 the emitted C, in emitter order. The `construct`, `project-fields`,

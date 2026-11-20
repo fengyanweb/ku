@@ -3466,3 +3466,214 @@ fn bootstrap_compiles_primary_atom_with_actual_stage0_error_dependency() {
         assert!(String::from_utf8_lossy(&trap.stderr).contains("out of memory"));
     }
 }
+
+#[test]
+fn bootstrap_links_owned_array_results_and_cleans_up_checked_locals() {
+    let tmp = Temp::new();
+    let copied = tmp.0.join("source");
+    let cwd = tmp.0.join("consumer");
+    fs::create_dir(&copied).unwrap();
+    fs::create_dir(&cwd).unwrap();
+    stage_sources(&copied);
+    let suffix = std::env::consts::EXE_SUFFIX;
+    let ku = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    let semantics = copied.join("semantics");
+    let built = semantics.join(format!("ku-project{suffix}"));
+    assert_ok(&execute(
+        Command::new(&ku)
+            .args(["build", "--release", "--offline"])
+            .arg(semantics.join("projection_main.ku"))
+            .arg("-o")
+            .arg(&built),
+        &cwd,
+        180,
+    ));
+    let compiler = cwd.join(format!("ku-project{suffix}"));
+    fs::rename(built, &compiler).unwrap();
+    fs::remove_dir_all(&copied).unwrap();
+    fs::write(
+        cwd.join("types.ku"),
+        "struct Entry { value: int label: str }\n",
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("producer.ku"),
+        r#"import { Entry } from "./types.ku"
+fn Read(flag: int): [Entry]! {
+    values: [Entry] = []
+    element = Entry { value: flag, label: "owned🙂" }
+    values = values.push(element)
+    if (flag < 0) { fail { domain: "read", code: "negative", message: "denied🙂" } }
+    return ok(values)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("consumer.ku"),
+        r#"import { Read as Load } from "./producer.ku"
+fn Inspect(flag: int): null! {
+    first = Load(0)?
+    second = Load(flag)?
+    final = Load(first[0].value)?
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+
+    let emit = |manifest: &str, function: &str, mode: &str| {
+        fs::write(cwd.join("modules.txt"), manifest).unwrap();
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        fs::write(cwd.join("mode.txt"), mode).unwrap();
+        let emitted = execute(&mut Command::new(&compiler), &cwd, 30);
+        assert_ok(&emitted);
+        let c = cwd.join(format!("{function}.c"));
+        fs::write(&c, emitted.stdout).unwrap();
+        let plan = cwd.join(format!("{function}.json"));
+        fs::write(cwd.join("mode.txt"), format!("{mode}-plan")).unwrap();
+        let emitted = execute(&mut Command::new(&compiler), &cwd, 30);
+        assert_ok(&emitted);
+        fs::write(&plan, &emitted.stdout).unwrap();
+        (plan, c, String::from_utf8(emitted.stdout).unwrap())
+    };
+    let producer = emit("producer.ku\ntypes.ku\nconsumer.ku\n", "Read", "managed");
+    let consumer = emit(
+        "consumer.ku\nproducer.ku\ntypes.ku\n",
+        "Inspect",
+        "linked-null",
+    );
+    let Some(Value::Result { ok: true, value }) =
+        json::eval("decode", &[Value::String(consumer.2)], Span::default()).unwrap()
+    else {
+        panic!("expected checked array link metadata");
+    };
+    let Value::Object(plan) = *value else {
+        panic!("expected linked plan")
+    };
+    let Value::Object(export) = &plan["export"] else {
+        panic!("expected consumer export")
+    };
+    let Value::Int(node) = export["node"] else {
+        panic!("expected export node")
+    };
+    let Value::String(symbol) = &export["symbol"] else {
+        panic!("expected export symbol")
+    };
+    assert!(producer.2.contains("\"kind\":\"StructArray\""));
+    assert!(producer.2.contains("\"source_path\":\"types.ku\""));
+    assert!(producer.2.contains("\"returns_result\":true"));
+
+    let allocator = CHECKED_ARRAY_ALLOCATOR
+        .replace("static void *test_", "void *test_")
+        .replace("static void test_free", "void test_free")
+        .replace("static int outstanding", "int outstanding");
+    let allocator_source = cwd.join("ownership.c");
+    fs::write(
+        &allocator_source,
+        allocator + "\nint completed_attempts(void) { return attempts; }\n",
+    )
+    .unwrap();
+    let caller = cwd.join("caller.c");
+    fs::write(
+        &caller,
+        r#"#include <assert.h>
+extern int outstanding(void), completed_attempts(void);
+int main(void) {
+    KuBootstrapResultNull pass = __ENTRY__(1);
+    assert(pass.ok && !outstanding() && completed_attempts() == 3);
+    puts("ok");
+    KuBootstrapResultNull refused = __ENTRY__(-1);
+    assert(!refused.ok && !outstanding() && completed_attempts() == 5);
+    printf("%.*s:%.*s:%.*s\n",
+        (int)refused.error.domain.len, (char*)refused.error.domain.ptr,
+        (int)refused.error.code.len, (char*)refused.error.code.ptr,
+        (int)refused.error.message.len, (char*)refused.error.message.ptr);
+    return 0;
+}
+"#
+        .replace("__ENTRY__", symbol),
+    )
+    .unwrap();
+
+    let binary = cwd.join(format!("array-result{suffix}"));
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/tools/link_c.py");
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let cc = std::env::var("CC").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "clang".into()
+        } else {
+            "cc".into()
+        }
+    });
+    let linked = execute(
+        Command::new(python)
+            .arg("-B")
+            .arg(script)
+            .arg("--cc")
+            .arg(cc)
+            .arg("--unit")
+            .args([&producer.0, &producer.1])
+            .arg("--unit")
+            .args([&consumer.0, &consumer.1])
+            .args(["--entry", "consumer.ku", &node.to_string(), "--caller"])
+            .arg(caller)
+            .args([
+                "--cflag=-Dmalloc=test_malloc",
+                "--cflag=-Drealloc=test_realloc",
+                "--cflag=-Dfree=test_free",
+            ])
+            .arg(format!("--ldflag={}", allocator_source.display()))
+            .arg("-o")
+            .arg(&binary),
+        &cwd,
+        150,
+    );
+    assert_ok(&linked);
+    let source = cwd.join("main.ku");
+    fs::write(
+        &source,
+        r#"import { Inspect } from "./consumer.ku"
+fn main(): null! {
+    Inspect(1)?
+    println("ok")
+    try { Inspect(-1)? } catch (err) { println(err.domain + ":" + err.code + ":" + err.message) }
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let oracle = cwd.join(format!("oracle{suffix}"));
+    assert_ok(&execute(
+        Command::new(&ku)
+            .args(["build", "--release", "--offline"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&oracle),
+        &cwd,
+        100,
+    ));
+    for name in [
+        "main.ku",
+        "producer.ku",
+        "consumer.ku",
+        "types.ku",
+        "modules.txt",
+    ] {
+        fs::remove_file(cwd.join(name)).unwrap();
+    }
+    let expected = execute(&mut Command::new(oracle), &cwd, 15);
+    let actual = execute(&mut Command::new(binary), &cwd, 15);
+    assert_ok(&expected);
+    assert_ok(&actual);
+    assert_eq!(actual.stdout, expected.stdout);
+    assert!(actual.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(actual.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "ok\nread:negative:denied🙂\n"
+    );
+}

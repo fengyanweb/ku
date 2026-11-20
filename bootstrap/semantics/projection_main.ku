@@ -50,7 +50,8 @@ fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &
     }
     if (mode == "managed") {
         generated = EmitManagedArrayC(selected.named, types, imports, supplied, layouts, function)?
-        print(generated.source)
+        if (link_plan) { print(EmitLinkPlan(supplied, mode, generated.entry_plan, [])?) }
+        else { print(generated.source) }
         return ok(null)
     }
     if (mode == "guarded") {
@@ -108,6 +109,7 @@ fn main(): null! {
     else if (mode == "project-fields-plan") { mode = "project-fields" }
     else if (mode == "guarded-plan") { mode = "guarded" }
     else if (mode == "project-int-plan") { mode = "project-int" }
+    else if (mode == "managed-plan") { mode = "managed" }
     else { link_plan = false }
     if (mode == "construct" || mode == "guarded" || mode == "project-int" || mode == "managed" ||
         mode == "linked-str" || mode == "struct-result" || mode == "linked-null" || mode == "project-fields") {

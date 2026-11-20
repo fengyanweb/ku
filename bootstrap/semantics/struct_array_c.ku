@@ -44,15 +44,7 @@ fn EmitTryCloneString(&symbol: str): str {
 fn emitOwnedStructElement(&element: str, &prefix: str, &fields: [str], private_drop: bool): str {
     text = ""
     if (fields.len() != 0) { text = EmitTryCloneString(prefix.clone() + "_clone_string") }
-    if (private_drop) { text += "static " }
-    text += "void " + prefix.clone() + "_element_drop(" + element.clone() + " *value) {\n"
-    index = 0
-    while (index < fields.len()) {
-        access = "(*value)" + fields[index].clone()
-        text += "    if (" + access.clone() + ".storage == KU_PROJECTION_STRING_OWNED) free(" + access + ".ptr);\n"
-        index = index + 1
-    }
-    text += "    *value = (" + element.clone() + "){0};\n}\n\n"
+    text += emitOwnedElementDrop(element, prefix, fields, private_drop)
     text += "static bool " + prefix.clone() + "_clone_element(const " + element.clone() + " *source, " + element.clone() + " *out) {\n"
     text += "    " + element + " copy = *source;\n"
     // Establish an empty owner for every managed field before any fallible
@@ -72,6 +64,19 @@ fn emitOwnedStructElement(&element: str, &prefix: str, &fields: [str], private_d
     return text + "    *out = copy;\n    return true;\n}\n\n"
 }
 
+fn emitOwnedElementDrop(&element: str, &prefix: str, &fields: [str], private_drop: bool): str {
+    text = ""
+    if (private_drop) { text += "static " }
+    text += "void " + prefix.clone() + "_element_drop(" + element.clone() + " *value) {\n"
+    index = 0
+    while (index < fields.len()) {
+        access = "(*value)" + fields[index].clone()
+        text += "    if (" + access.clone() + ".storage == KU_PROJECTION_STRING_OWNED) free(" + access + ".ptr);\n"
+        index = index + 1
+    }
+    return text + "    *value = (" + element.clone() + "){0};\n}\n\n"
+}
+
 // The caller first validates the finite by-value layout graph. This is shared
 // by typed array storage and stand-alone scratch owners in checked calls.
 fn EmitOwnedStructOperations(&layouts: [StructLayout], root: int, &prefix: str, private_drop: bool): str {
@@ -81,6 +86,16 @@ fn EmitOwnedStructOperations(&layouts: [StructLayout], root: int, &prefix: str, 
 }
 
 fn EmitStructArrayHeader(&element: str, &array: str): str { return ProjectionArrayHeader(element, array) }
+
+fn EmitStructArrayResultHeader(&array: str): str {
+    return "typedef struct { bool ok; " + array.clone() + " value; KuBootstrapError error; } KuBootstrapResult_" + array.clone() + ";\n"
+}
+
+fn EmitOwnedStructArrayDrop(&layouts: [StructLayout], root: int, &array: str, &prefix: str): str {
+    element = CTypeName(layouts[root - 1].module_index, layouts[root - 1].node)
+    fields = collectOwnedFields(layouts, root, "", [])
+    return emitOwnedElementDrop(element, prefix, fields, true) + emitArrayDrop(array, prefix, true)
+}
 
 fn EmitStructArrayReadValidation(&element: str, &array: str, &prefix: str): str {
     text = "static size_t " + prefix.clone() + "_capacity(const " + array.clone() + " *array) {\n"
@@ -108,9 +123,7 @@ fn emitArrayBoundary(&element: str, &array: str, &prefix: str): str {
 fn emitArrayTransfer(&element: str, &array: str, &prefix: str): str {
     text = array.clone() + " " + prefix.clone() + "_move(" + array.clone() + " *array) {\n"
     text += "    " + array.clone() + " moved = *array;\n    *array = (" + array.clone() + "){0};\n    return moved;\n}\n\n"
-    text += "void " + prefix.clone() + "_drop(" + array.clone() + " *array) {\n"
-    text += "    for (size_t i = 0; i < array->len; ++i) " + prefix.clone() + "_element_drop(&array->data[i]);\n"
-    text += "    free(array->data);\n    *array = (" + array.clone() + "){0};\n}\n\n"
+    text += emitArrayDrop(array, prefix, false)
     text += "int " + prefix.clone() + "_append_move(" + array.clone() + " *array, " + element.clone() + " *value) {\n"
     text += "    if (!value || !" + prefix.clone() + "_valid(array) || " + prefix.clone() + "_contains(array, value)) return KU_STRUCT_ARRAY_INVALID;\n"
     text += "    size_t limit = SIZE_MAX / sizeof(" + element.clone() + ");\n    if (array->len == limit) return KU_STRUCT_ARRAY_CAPACITY;\n"
@@ -129,6 +142,14 @@ fn emitArrayTransfer(&element: str, &array: str, &prefix: str): str {
     text += "    int status = " + prefix.clone() + "_append_move(array, &copy);\n"
     text += "    if (status != KU_STRUCT_ARRAY_OK) " + prefix.clone() + "_element_drop(&copy);\n"
     return text + "    return status;\n}\n"
+}
+
+fn emitArrayDrop(&array: str, &prefix: str, private_drop: bool): str {
+    linkage = ""
+    if (private_drop) { linkage = "static " }
+    return linkage + "void " + prefix.clone() + "_drop(" + array.clone() + " *array) {\n"
+        + "    for (size_t i = 0; i < array->len; ++i) " + prefix.clone() + "_element_drop(&array->data[i]);\n"
+        + "    free(array->data);\n    *array = (" + array.clone() + "){0};\n}\n\n"
 }
 
 // Build standalone array operations for one bound struct layout. The private

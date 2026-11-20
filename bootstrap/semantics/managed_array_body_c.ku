@@ -10,6 +10,8 @@ import { ContainsIndex, EmitLayout } from "./struct_projection_c.ku"
 import { LowerOwnedRecordCall, OwnedRecordCall } from "./struct_result_link_c.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType } from "./guarded_struct_expr.ku"
 import { AddGuardCode, EmitManagedAssignment, EmitManagedStringAppend, JoinManagedCode, ManagedBlank, ManagedCode, ManagedExpression, ManagedType } from "./managed_array_values_c.ku"
+import { HasScalarBuiltin } from "./scalar_int_operands.ku"
+import { ScalarStaticErrorFields } from "./scalar_result_null.ku"
 
 struct ManagedBlock {
     code: ManagedCode
@@ -27,23 +29,49 @@ fn ownedDrop(&root: ManagedType, &binding: GuardBinding, &indent: str): str {
 }
 
 fn managedReturn(&nodes: [Node], &edges: [int], &locals: [GuardBinding], &root: ManagedType,
-                 &statement: Node, &indent: str): str! {
+                 &statement: Node, &indent: str, checked: bool, can_use_ok: bool): str! {
     if (statement.edge_count != 1) {
         RejectLayout("unsupported_managed_return", "expected a returned array owner", DeclarationSpan(statement))?
     }
     result = nodes[edges[statement.first_edge] - 1].clone()
+    if (checked) {
+        if (result.kind != "Call" || result.edge_count != 2 || !can_use_ok || GuardBindingIndex(locals, "ok") != 0) {
+            RejectLayout("managed_result_ok", "expected return ok with an owned array", DeclarationSpan(result))?
+        }
+        callee = nodes[edges[result.first_edge] - 1].clone()
+        if (callee.kind != "Variable" || callee.edge_count != 0 || callee.text != "ok") {
+            RejectLayout("managed_result_ok", "expected the builtin ok constructor", DeclarationSpan(callee))?
+        }
+        result = nodes[edges[result.first_edge + 1] - 1].clone()
+    }
     found = GuardBindingIndex(locals, result.text)
     if (result.kind != "Variable" || found == 0 || locals[found - 1].view ||
         locals[found - 1].ty.kind != "array" || locals[found - 1].ty.layout != root.layout) {
         RejectLayout("unsupported_managed_return", "return requires an initialized array owner of the declared type", DeclarationSpan(result))?
     }
     name = GuardBindingName(locals[found - 1])
-    return ok(indent.clone() + "result = " + root.array.prefix.clone() + "_move(&" + name + ");\n" + indent.clone() + "goto cleanup;\n")
+    prefix = "result = "
+    if (checked) { prefix = "result.value = " }
+    text = indent.clone() + prefix + root.array.prefix.clone() + "_move(&" + name + ");\n"
+    if (checked) { text += indent.clone() + "result.ok = true;\n" }
+    return ok(text + indent.clone() + "goto cleanup;\n")
 }
 
 fn EmitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
                    &supplied: [SuppliedModule], &layouts: [StructLayout], &root: ManagedType,
                    bindings: [GuardBinding], start: int, end: int, depth: int, &indent: str): ManagedBlock! {
+    return emitManagedBlock(named, types, imports, supplied, layouts, root, bindings, start, end, depth, indent, false, false)
+}
+
+fn EmitManagedResultBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
+                         &supplied: [SuppliedModule], &layouts: [StructLayout], &root: ManagedType,
+                         bindings: [GuardBinding], start: int, end: int): ManagedBlock! {
+    return emitManagedBlock(named, types, imports, supplied, layouts, root, bindings, start, end, 0, "    ", true, HasScalarBuiltin(named, "ok"))
+}
+
+fn emitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
+                    &supplied: [SuppliedModule], &layouts: [StructLayout], &root: ManagedType,
+                    bindings: [GuardBinding], start: int, end: int, depth: int, &indent: str, checked: bool, can_use_ok: bool): ManagedBlock! {
     locals = bindings
     code = ManagedBlank()
     declarations = ""
@@ -61,7 +89,12 @@ fn EmitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
             if (root.string_locals) {
                 RejectLayout("unsupported_managed_return", "result loops require one return after the managed body", DeclarationSpan(statement))?
             }
-            code.text = code.text + managedReturn(named.parsed.arena.nodes, named.parsed.arena.edges, locals, root, statement, indent)?
+            code.text = code.text + managedReturn(named.parsed.arena.nodes, named.parsed.arena.edges, locals, root, statement, indent, checked, can_use_ok)?
+            returns = true
+        } else if (checked && statement.kind == "Fail" && statement.edge_count == 1) {
+            failure = named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge] - 1].clone()
+            fields = ScalarStaticErrorFields(named.parsed.arena.nodes, named.parsed.arena.edges, failure, "KuProjectionString")?
+            code.text = code.text + indent.clone() + "result.error = (KuBootstrapError){" + fields + "};\n" + indent.clone() + "goto cleanup;\n"
             returns = true
         } else if (root.string_locals && statement.kind == "CompoundAssign" && statement.text == "+" && statement.edge_count == 2) {
             update = EmitManagedStringAppend(named, locals, layouts, root, statement, indent)?
@@ -96,8 +129,8 @@ fn EmitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
                 RejectLayout("managed_condition_type", "managed if and while require bool", DeclarationSpan(statement))?
             }
             child_start = statement.first_edge + 1
-            child = EmitManagedBlock(named, types, imports, supplied, layouts, root, locals.clone(),
-                child_start, child_start + then_count, depth + 1, inside)?
+            child = emitManagedBlock(named, types, imports, supplied, layouts, root, locals.clone(),
+                child_start, child_start + then_count, depth + 1, inside, checked, can_use_ok)?
             if (statement.kind == "While") { code.text = code.text + indent.clone() + "while (true) {\n" }
             code = AddGuardCode(code, guard)
             if (statement.kind == "While") {
@@ -110,8 +143,8 @@ fn EmitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
             declarations += child.declarations
             drops = child.drops + drops
             if (then_count < count) {
-                otherwise = EmitManagedBlock(named, types, imports, supplied, layouts, root, locals.clone(),
-                    child_start + then_count, child_start + count, depth + 1, inside)?
+                otherwise = emitManagedBlock(named, types, imports, supplied, layouts, root, locals.clone(),
+                    child_start + then_count, child_start + count, depth + 1, inside, checked, can_use_ok)?
                 code.text = code.text + " else {\n"
                 code = JoinManagedCode(code, otherwise.code)
                 code.text = code.text + indent.clone() + "}"

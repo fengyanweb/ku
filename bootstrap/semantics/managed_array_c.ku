@@ -6,15 +6,18 @@ import { TypeNameBinding } from "./type_names.ku"
 import { RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { CStructOrder, OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
-import { EmitStructArrayOperations } from "./struct_array_c.ku"
+import { EmitStructArrayOperations, EmitStructArrayResultHeader } from "./struct_array_c.ku"
 import { GuardArithmetic, GuardOwnedDrops, GuardStringEquality } from "./guarded_struct_c.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType } from "./guarded_struct_expr.ku"
 import { ManagedExplicitType, ManagedType } from "./managed_array_values_c.ku"
-import { EmitManagedBlock } from "./managed_array_body_c.ku"
+import { EmitManagedBlock, EmitManagedResultBlock, ManagedBlock } from "./managed_array_body_c.ku"
+import { StructResultHeader } from "./struct_result_c.ku"
+import { BuiltinLinkPlanType, EmptyLinkPlanDeclaration, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
 
 struct ManagedArrayC {
     symbol: str
     source: str
+    entry_plan: LinkPlanDeclaration
 }
 
 struct ManagedLayoutOutput {
@@ -119,11 +122,45 @@ fn resultEdge(&nodes: [Node], &edges: [int], &function: Node): int! {
     return ok(cursor)
 }
 
+fn managedDeclaration(&layout: StructLayout, kind: str, c_type: str, view: bool): LinkPlanType {
+    unit = layout.module_index
+    if (unit == 0) { unit = 1 }
+    return LinkPlanType { kind: kind, name: layout.name.clone(), unit: unit, node: layout.node, c_type: c_type, view: view }
+}
+
+fn managedPlan(&layouts: [StructLayout], &signature: ManagedSignature, result_layout: int, result_type: str,
+               symbol: str, node: int, checked: bool): LinkPlanDeclaration {
+    parameters: [LinkPlanType] = []
+    for binding in signature.bindings.clone() {
+        c_type = GuardCType(binding.ty, layouts)
+        if (binding.view) { c_type = "const " + c_type + "*" }
+        if (binding.ty.kind == "struct" || binding.ty.kind == "array") {
+            kind = "Struct"
+            if (binding.ty.kind == "array") { kind = "StructArray" }
+            parameters = parameters.push(managedDeclaration(layouts[binding.ty.layout - 1], kind, c_type, binding.view))
+        } else {
+            parameters = parameters.push(BuiltinLinkPlanType(binding.ty.kind, c_type, false))
+        }
+    }
+    result = managedDeclaration(layouts[result_layout - 1], "StructArray", result_type, false)
+    return LinkPlanDeclaration { unit: 1, node: node, symbol: symbol, parameters: parameters, result: result, returns_result: checked }
+}
+
+fn managedBody(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding], &supplied: [SuppliedModule],
+               &layouts: [StructLayout], &root: ManagedType, bindings: [GuardBinding], start: int, end: int, checked: bool): ManagedBlock! {
+    if (checked) { return EmitManagedResultBlock(named, types, imports, supplied, layouts, root, bindings, start, end) }
+    return EmitManagedBlock(named, types, imports, supplied, layouts, root, bindings, start, end, 0, "    ")
+}
+
 fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
                        &supplied: [SuppliedModule], &layouts: [StructLayout], function_id: int): ManagedArrayC! {
     function = named.parsed.arena.nodes[function_id - 1].clone()
     edge = resultEdge(named.parsed.arena.nodes, named.parsed.arena.edges, function)?
-    result = ManagedExplicitType(types, named.parsed.arena.nodes, named.parsed.arena.edges, layouts, named.parsed.arena.edges[edge])?
+    type_id = named.parsed.arena.edges[edge]
+    declaration = named.parsed.arena.nodes[type_id - 1].clone()
+    checked = declaration.kind == "TypeResult" && declaration.edge_count == 1
+    if (checked) { type_id = named.parsed.arena.edges[declaration.first_edge] }
+    result = ManagedExplicitType(types, named.parsed.arena.nodes, named.parsed.arena.edges, layouts, type_id)?
     if (result.kind != "array") {
         RejectLayout("unsupported_managed_signature", "expected a bound struct array result", DeclarationSpan(function))?
     }
@@ -132,24 +169,30 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     array = EmitStructArrayOperations(layouts, result.layout)
     root = ManagedType { layout: result.layout, array: array, string_locals: false, leaves: [] }
     signature = readParameters(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, root, ordered, function, edge)?
-    body = EmitManagedBlock(named, types, imports, supplied, layouts, root, signature.bindings,
-        signature.body_start, function.first_edge + function.edge_count, 0, "    ")?
+    body = managedBody(named, types, imports, supplied, layouts, root, signature.bindings.clone(),
+        signature.body_start, function.first_edge + function.edge_count, checked)?
     if (!body.returns) { RejectLayout("managed_fallthrough", "every path must return an array owner", DeclarationSpan(function))? }
     symbol = "ku_managed_" + str(function_id)
     arithmetic = body.code.uses_add || body.code.uses_sub
-    text = ProjectionHeaders(signature.layouts.strings || body.code.uses_eq, signature.drop_strings)
+    text = ProjectionHeaders(checked || signature.layouts.strings || body.code.uses_eq, signature.drop_strings)
     text += "#include <stdio.h>\n#include <stdlib.h>\n\n"
     text += GuardArithmetic(body.code.uses_add, body.code.uses_sub) + GuardStringEquality(body.code.uses_eq)
     text += signature.layouts.text + root.array.source
-    text += root.array.array_type.clone() + " " + symbol.clone() + "(" + signature.parameters + ") {\n"
-    text += "    " + root.array.array_type.clone() + " result = {0};\n"
+    result_type = root.array.array_type.clone()
+    if (checked) {
+        text += StructResultHeader() + EmitStructArrayResultHeader(root.array.array_type)
+        result_type = "KuBootstrapResult_" + result_type
+    }
+    text += result_type.clone() + " " + symbol.clone() + "(" + signature.parameters.clone() + ") {\n"
+    text += "    " + result_type.clone() + " result = {0};\n"
     text += "    int array_status = KU_STRUCT_ARRAY_OK;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n"
     if (arithmetic) { text += "    bool overflow = false;\n" }
     text += signature.unused + body.declarations + body.code.text
     text += "cleanup:\n" + body.drops + signature.drops
     if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     text += managedArrayErrors() + "    return result;\n}\n"
-    return ok(ManagedArrayC { symbol: symbol, source: text })
+    plan = managedPlan(layouts, signature, result.layout, result_type, symbol.clone(), function_id, checked)
+    return ok(ManagedArrayC { symbol: symbol, source: text, entry_plan: plan })
 }
 
 fn EmitManagedArrayC(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
@@ -164,5 +207,5 @@ fn EmitManagedArrayC(&named: NamedModule, &types: [TypeNameBinding], &imports: [
     }
     start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
     RejectLayout("unknown_managed_function", "undefined managed function '" + function_name.clone() + "'", start)?
-    return ok(ManagedArrayC { symbol: "", source: "" })
+    return ok(ManagedArrayC { symbol: "", source: "", entry_plan: EmptyLinkPlanDeclaration() })
 }

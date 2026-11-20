@@ -3,7 +3,7 @@ import { DeclarationSpan } from "./names.ku"
 import { ScalarIntParameter } from "./scalar_int_emit.ku"
 import { RejectScalarInt, ScalarParameterIndex, ScalarStringLiteral } from "./scalar_int_operands.ku"
 
-fn staticErrorResult(&nodes: [Node], &edges: [int], &object: Node): str! {
+fn ScalarStaticErrorFields(&nodes: [Node], &edges: [int], &object: Node, &string_type: str): str! {
     if (object.kind != "ObjectLiteral" || object.edge_count != 3) {
         RejectScalarInt("unsupported_static_error", "expected an Error literal with domain, code, and message", DeclarationSpan(object))?
     }
@@ -20,7 +20,7 @@ fn staticErrorResult(&nodes: [Node], &edges: [int], &object: Node): str! {
         if (value.kind != "String" || value.edge_count != 0) {
             RejectScalarInt("unsupported_static_error_field", "expected a string literal in the Error field", DeclarationSpan(value))?
         }
-        rendered = "(KuString){(uint8_t*)" + ScalarStringLiteral(value)? + ", 0u, 0u}"
+        rendered = "(" + string_type.clone() + "){(uint8_t*)" + ScalarStringLiteral(value)? + ", 0u, 0u}"
         if (field.text == "domain" && domain == "") { domain = rendered }
         else if (field.text == "code" && code == "") { code = rendered }
         else if (field.text == "message" && message == "") { message = rendered }
@@ -31,13 +31,16 @@ fn staticErrorResult(&nodes: [Node], &edges: [int], &object: Node): str! {
     }
     // Once each of the three names has been seen, the static C carrier can
     // be initialized directly. Its fields never borrow a parameter owner.
-    return ok("(KuResult_null){false, 0u, (KuError){" + domain + ", " + code + ", " + message + "}}")
+    return ok(domain + ", " + code + ", " + message)
 }
 
 fn LowerNullResultExit(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter],
                        &statement: Node, can_use_ok: bool): str! {
     value = nodes[edges[statement.first_edge] - 1].clone()
-    if (statement.kind == "Fail") { return staticErrorResult(nodes, edges, value) }
+    if (statement.kind == "Fail") {
+        fields = ScalarStaticErrorFields(nodes, edges, value, "KuString")?
+        return ok("(KuResult_null){false, 0u, (KuError){" + fields + "}}")
+    }
     if (value.kind == "Call" && value.edge_count == 2 && can_use_ok && ScalarParameterIndex(parameters, "ok") < 0) {
         target = nodes[edges[value.first_edge] - 1].clone()
         payload = nodes[edges[value.first_edge + 1] - 1].clone()
