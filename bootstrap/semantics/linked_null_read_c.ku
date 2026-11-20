@@ -7,7 +7,7 @@ import { ContainsType, CTypeName, EmitLayout, ProjectionHeaders } from "./struct
 import { BuildProjectOwningLayouts, EmitOwningLayoutDefinitions, OrderProjectOwningLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { EmitOwnedStructArrayDrop, EmitOwnedStructOperations, EmitStructArrayHeader, EmitStructArrayReadValidation,
          EmitStructArrayResultHeader, EmitStructArrayDropUsing, EmitTryCloneString } from "./struct_array_c.ku"
-import { StructResultHeader } from "./struct_result_c.ku"
+import { StructResultHeader, StructValueResultHeader } from "./struct_result_c.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullFunction,
          LinkedNullLayout, LinkedNullNode, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullProject, LinkedNullPrototype, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
@@ -128,8 +128,8 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
         carrier = ty.clone()
         carrier.declaration_kind = "StructArray"
         if (arrayPosition(next.arrays, carrier) == 0) { next.arrays = next.arrays.push(carrier) }
-    } else {
-        next.layouts = LinkedNullLayout(project, ty, next.layouts, 0)?
+    } else if (ty.declaration_kind == "Struct") {
+        next = registerOwnedElement(project, next, ty)?
     }
     kind = LinkedNullCType(ty)?
     value = LinkedNullValue { ty: ty, text: name.clone(), slot: next.slots.len() + 1, borrowed: view }
@@ -354,7 +354,17 @@ fn EmitLinkedNullSource(&body: LinkedNullState, &symbol: str, &signature: str): 
             text += EmitStructArrayDropUsing(array_type, prefix, OwningLayoutDropName(owned.module_index, owned.declaration_node), true)
         } else { text += EmitOwnedStructArrayDrop(body.layouts, layout, array_type, prefix) }
     }
-    for dependency in body.links.clone() { text += LinkedNullPrototype(dependency)? }
+    records: [str] = []
+    for dependency in body.links.clone() {
+        if (dependency.returns_result && dependency.result.declaration_kind == "Struct") {
+            kind = LinkedNullCType(dependency.result)?
+            if (!ContainsType(records, kind)) {
+                text += StructValueResultHeader(kind)
+                records = records.push(kind)
+            }
+        }
+        text += LinkedNullPrototype(dependency)?
+    }
     text += "\nKuBootstrapResultNull " + symbol.clone() + "(" + signature.clone() + ") {\n"
     text += "    KuBootstrapResultNull result = {0};\n"
     clone = body.uses_clone || body.element_clones.len() > 0

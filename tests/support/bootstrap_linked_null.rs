@@ -174,12 +174,18 @@ pub(super) fn assert_nested_array_result_cleanup(seed: &Path, cwd: &Path) {
         r#"struct Storage { labels: [str] offsets: [int] }
 struct Entry { storage: Storage }
 fn Read(flag: int): [Entry]! { return ok([]) }
+fn ReadOne(flag: int): Entry! { fail { domain: "fixture", code: "empty", message: "empty" } }
 "#,
     )
     .unwrap();
     fs::write(
         cwd.join("nested-consumer.ku"),
-        r#"import { Read as Make } from "./nested-provider.ku"
+        r#"import { Read as Make, ReadOne } from "./nested-provider.ku"
+fn InspectRecord(flag: int): null! {
+    first = ReadOne(0)?
+    second = ReadOne(flag)?
+    return ok(null)
+}
 fn Inspect(flag: int): null! {
     first = Make(0)?
     second = Make(flag)?
@@ -198,7 +204,105 @@ fn RejectClone(): null! {
         "nested-consumer.ku\nnested-provider.ku\n",
     )
     .unwrap();
-    fs::write(cwd.join("function.txt"), "Inspect").unwrap();
+    let (entry, dependency_name, carrier, code) = nested_plan(seed, cwd, "Inspect", "StructArray");
+
+    // A C ABI witness fills the declared nested carrier until managed Ku
+    // emission supports the provider's owning construction end to end.
+    let host = r#"
+__RESULT__ __DEPENDENCY__(int64_t flag) {
+    __RESULT__ result = {0};
+    if (flag < 0) return result;
+    result.value.len = 1;
+    result.value.capacity = 2;
+    result.value.data = malloc(2 * sizeof(*result.value.data));
+    memset(result.value.data + 1, 0xff, sizeof(*result.value.data));
+    result.value.data[0].f0.f0.len = 1;
+    result.value.data[0].f0.f0.capacity = 1;
+    result.value.data[0].f0.f0.data = malloc(sizeof(KuProjectionString));
+    uint8_t *owned = malloc(1);
+    *owned = 'a';
+    result.value.data[0].f0.f0.data[0] = (KuProjectionString){owned,1,1,KU_PROJECTION_STRING_OWNED};
+    result.value.data[0].f0.f1.len = 1;
+    result.value.data[0].f0.f1.capacity = 1;
+    result.value.data[0].f0.f1.data = malloc(sizeof(int64_t));
+    result.value.data[0].f0.f1.data[0] = 42;
+    result.ok = true;
+    return result;
+}
+int main(void) {
+    (void)test_realloc;
+    assert(__ENTRY__(1).ok && outstanding() == 0 && attempts == 8);
+    assert(!__ENTRY__(-1).ok && outstanding() == 0 && attempts == 12);
+    return 0;
+}
+"#
+    .replace("__ENTRY__", &entry)
+    .replace("__RESULT__", &carrier)
+    .replace("__DEPENDENCY__", &dependency_name);
+    let c = cwd.join("nested-owner.c");
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    let binary = cwd.join(format!("nested-owner{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&c, &binary, cwd);
+    fs::write(cwd.join("function.txt"), "RejectClone").unwrap();
+    let clone = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(clone.status.code(), Some(1));
+    assert!(clone.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&clone.stderr).contains("linked_nested_array_clone"));
+    assert_ok(&execute(&mut Command::new(binary), cwd, 15));
+
+    let (entry, dependency, carrier, code) = nested_plan(seed, cwd, "InspectRecord", "Struct");
+    let host = r#"
+__RESULT__ __DEPENDENCY__(int64_t flag) {
+    __RESULT__ result = {0};
+    uint8_t *text = malloc(1);
+    *text = 'x';
+    KuProjectionString owner = {text,1,1,KU_PROJECTION_STRING_OWNED};
+    if (flag < 0) {
+        result.error.message = owner;
+        return result;
+    }
+    KuGuardStringArray *labels = &result.value.f0.f0;
+    labels->data = malloc(sizeof(*labels->data));
+    labels->data[0] = owner;
+    labels->len = 1;
+    labels->capacity = 1;
+    result.ok = true;
+    return result;
+}
+int main(void) {
+    (void)test_realloc;
+    assert(__ENTRY__(1).ok && outstanding() == 0 && attempts == 4);
+    KuBootstrapResultNull failed = __ENTRY__(-1);
+    assert(!failed.ok && failed.error.message.len == 1 && *failed.error.message.ptr == 'x');
+    assert(outstanding() == 1 && attempts == 7);
+    ku_projection_string_drop(&failed.error.message);
+    assert(outstanding() == 0);
+    return 0;
+}
+"#
+    .replace("__ENTRY__", &entry)
+    .replace("__RESULT__", &carrier)
+    .replace("__DEPENDENCY__", &dependency);
+    let c = cwd.join("nested-record-owner.c");
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    let binary = cwd.join(format!(
+        "nested-record-owner{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    compile_projection(&c, &binary, cwd);
+    for name in ["nested-provider.ku", "nested-consumer.ku", "modules.txt"] {
+        fs::remove_file(cwd.join(name)).unwrap();
+    }
+    assert_ok(&execute(&mut Command::new(binary), cwd, 15));
+}
+
+fn nested_plan(
+    seed: &Path,
+    cwd: &Path,
+    function: &str,
+    kind: &str,
+) -> (String, String, String, String) {
+    fs::write(cwd.join("function.txt"), function).unwrap();
     fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
     let planned = execute(&mut Command::new(seed), cwd, 30);
     assert_ok(&planned);
@@ -234,6 +338,7 @@ fn RejectClone(): null! {
     let Value::Object(result) = &signature["result"] else {
         panic!("expected array result")
     };
+    assert_eq!(result["kind"], Value::String(kind.into()));
     let Value::String(carrier) = &result["c_type"] else {
         panic!("expected typed Result carrier")
     };
@@ -242,50 +347,10 @@ fn RejectClone(): null! {
     assert_ok(&emitted);
     let code = String::from_utf8(emitted.stdout).unwrap();
 
-    // A C ABI witness fills the declared nested carrier until managed Ku
-    // emission supports the provider's owning construction end to end.
-    let host = r#"
-__RESULT__ __DEPENDENCY__(int64_t flag) {
-    __RESULT__ result = {0};
-    if (flag < 0) return result;
-    result.value.len = 1;
-    result.value.capacity = 2;
-    result.value.data = malloc(2 * sizeof(*result.value.data));
-    memset(result.value.data + 1, 0xff, sizeof(*result.value.data));
-    result.value.data[0].f0.f0.len = 1;
-    result.value.data[0].f0.f0.capacity = 1;
-    result.value.data[0].f0.f0.data = malloc(sizeof(KuProjectionString));
-    uint8_t *owned = malloc(1);
-    *owned = 'a';
-    result.value.data[0].f0.f0.data[0] = (KuProjectionString){owned,1,1,KU_PROJECTION_STRING_OWNED};
-    result.value.data[0].f0.f1.len = 1;
-    result.value.data[0].f0.f1.capacity = 1;
-    result.value.data[0].f0.f1.data = malloc(sizeof(int64_t));
-    result.value.data[0].f0.f1.data[0] = 42;
-    result.ok = true;
-    return result;
-}
-int main(void) {
-    (void)test_realloc;
-    assert(__ENTRY__(1).ok && outstanding() == 0 && attempts == 8);
-    assert(!__ENTRY__(-1).ok && outstanding() == 0 && attempts == 12);
-    return 0;
-}
-"#
-    .replace("__ENTRY__", entry)
-    .replace("__RESULT__", carrier)
-    .replace("__DEPENDENCY__", dependency_name);
-    let c = cwd.join("nested-owner.c");
-    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
-    let binary = cwd.join(format!("nested-owner{}", std::env::consts::EXE_SUFFIX));
-    compile_projection(&c, &binary, cwd);
-    fs::write(cwd.join("function.txt"), "RejectClone").unwrap();
-    let clone = execute(&mut Command::new(seed), cwd, 30);
-    assert_eq!(clone.status.code(), Some(1));
-    assert!(clone.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&clone.stderr).contains("linked_nested_array_clone"));
-    for name in ["nested-provider.ku", "nested-consumer.ku", "modules.txt"] {
-        fs::remove_file(cwd.join(name)).unwrap();
-    }
-    assert_ok(&execute(&mut Command::new(binary), cwd, 15));
+    (
+        entry.clone(),
+        dependency_name.clone(),
+        carrier.clone(),
+        code,
+    )
 }

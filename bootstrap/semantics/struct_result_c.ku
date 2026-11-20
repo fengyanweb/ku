@@ -283,6 +283,10 @@ fn StructResultHeader(): str {
         "typedef struct { bool ok; uint8_t value; KuBootstrapError error; } KuBootstrapResultNull;\n\n"
 }
 
+fn StructValueResultHeader(&value: str): str {
+    return "typedef struct { bool ok; " + value.clone() + " value; KuBootstrapError error; } KuBootstrapResult_" + value.clone() + ";\n"
+}
+
 fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
                     &supplied: [SuppliedModule], &layouts: [StructLayout], id: int): StructResultC! {
     function = named.parsed.arena.nodes[id - 1].clone()
@@ -318,7 +322,7 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     may_allocate = order.contains_string || body.clone_layouts.len() != 0 || managed
     text = ProjectionHeaders(true, true) + "#include <stdio.h>\n\n" + GuardArithmetic(body.code.uses_add, body.code.uses_sub)
     text += GuardStringEquality(body.code.uses_eq || signature.string_array) + signature.declarations + StructResultHeader()
-    text += "typedef struct { bool ok; " + struct_type + " value; KuBootstrapError error; } " + result_type.clone() + ";\n\n"
+    text += StructValueResultHeader(struct_type) + "\n"
     if (may_allocate) { text += "#include <string.h>\n\n" }
     if (order.contains_string || managed) { text += EmitTryCloneString("ku_result_clone_string") }
     if (signature.string_array) { text += GuardStringArrayC() }
