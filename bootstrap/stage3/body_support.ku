@@ -229,7 +229,6 @@ fn CheckStrayClause(&token: Token): null! {
 fn RejectStatementLimit(token: Token): null! { RejectAt(token, "statement_limit", "stage-3 parser accepts at most 128 statements per function")? return ok(null) }
 fn RejectStatementDepth(token: Token): null! { RejectAt(token, "statement_depth_exceeded", "stage-3 statement nesting exceeds 32 levels")? return ok(null) }
 fn RejectLetStatement(token: Token): null! { RejectAt(token, "unsupported_statement", "'let' is not supported in Ku; use a typed declaration or assignment")? return ok(null) }
-fn RejectDeclarationInitializer(token: Token): null! { RejectAt(token, "unsupported_statement", "stage-3 typed declarations require an initializer")? return ok(null) }
 fn RejectTrailingDeclaration(token: Token): null! { RejectAt(token, "invalid_token_stream", "function window must contain exactly one declaration before EOF")? return ok(null) }
 
 // Finish the internal body transport in one owned transfer. Keeping this cold

@@ -27,6 +27,20 @@ const NATIVE_BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 const PROCESS_OUTPUT_LIMITS: OutputLimits = OutputLimits::new(1024 * 1024, 2 * 1024 * 1024);
 const FUNCTION_MODULE_TOKEN_LIMIT: usize = 3072;
 
+const DEFAULT_DECLARATION_SOURCE: &str = "// 前😀\r\nfn f() {\r\n    s: str\r\n}";
+const DEFAULT_DECLARATION_GOLDEN: &str = concat!(
+    "ROOT|5\n",
+    "NODE|1|TypeName|str|0|3:8@29..3:11@32|0|0\n",
+    "NODE|2|String||0|3:5@26..3:5@26|0|0\n",
+    "NODE|3|VarDecl|s|0|3:5@26..3:5@26|0|2\n",
+    "NODE|4|Function|f|0|2:1@12..4:2@35|2|1\n",
+    "NODE|5|Program||0|2:1@12..4:2@35|3|1\n",
+    "EDGE|0|1\n",
+    "EDGE|1|2\n",
+    "EDGE|2|3\n",
+    "EDGE|3|4",
+);
+
 // The installed pattern-capture example uses both a borrowed parameter
 // with an explicit union result and a zero-argument Result callback.
 const TYPED_FUNCTION_CAPTURE_SOURCE: &str = r#"
@@ -401,12 +415,16 @@ fn project_expr(source: &str, expr: &Expr, arena: &mut ProjectedArena) -> usize 
     }
     let (kind, text, int_value, children): (&str, String, i64, Vec<&Expr>) = match &expr.kind {
         ExprKind::Literal(Literal::Int(value)) => ("Int", String::new(), *value, vec![]),
-        ExprKind::Literal(Literal::Float(_)) => (
-            "Float",
-            source[expr.span.start.offset..expr.span.end.offset].to_string(),
-            0,
-            vec![],
-        ),
+        ExprKind::Literal(Literal::Float(value)) => {
+            let text = if expr.span.start == expr.span.end {
+                // An uninitialized float declaration has a synthetic value.
+                assert_eq!(*value, 0.0);
+                "0.0".to_owned()
+            } else {
+                source[expr.span.start.offset..expr.span.end.offset].to_owned()
+            };
+            ("Float", text, 0, vec![])
+        }
         ExprKind::Literal(Literal::Bool(value)) => ("Bool", value.to_string(), 0, vec![]),
         ExprKind::Literal(Literal::String(value)) => ("String", value.clone(), 0, vec![]),
         ExprKind::Literal(Literal::TemplateString(value)) => {
@@ -1436,6 +1454,10 @@ fn MainBorrow(): null! {
 
 #[test]
 fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
+    assert_eq!(
+        rust_canonical(DEFAULT_DECLARATION_SOURCE),
+        DEFAULT_DECLARATION_GOLDEN
+    );
     for (source, message) in EOF_NAME_DIAGNOSTICS {
         assert_eq!(
             rust_error_canonical(source),
@@ -1592,6 +1614,11 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         include_str!("../bootstrap/stage1/main.ku"),
         include_str!("../bootstrap/stage2/main.ku"),
         include_str!("../bootstrap/tools/declarations/main.ku"),
+        DEFAULT_DECLARATION_SOURCE,
+        "fn f() { count: int; rate: float flag: bool source: str values: [int] optional: int | null explicit: float = 2.50 return optional }",
+        "fn f() { values: [[pkg.Item | null]] result: int! callback: fn(&Node): int named: pkg.Item empty: null absent: int | bool return empty }",
+        "fn f() { count: int 41; source: str \"following\"; }",
+        "fn readProjectModule(path: str, &prefix: str): SuppliedModule! { try { source: str if (prefix == \"\") { source = fs.read(path)? } else { source = fs.read(prefix.clone() + path.clone())? } return ParseModule(source) } catch (err) { fail { domain: err.domain, code: err.code, message: err.message } } }",
         TYPED_FUNCTION_CAPTURE_SOURCE,
         "// 回调😀\r\nfn f() { if (ready) { read: fn(): int = fn(): int { return 7 }; print(read()) } next: int = 2 return next }",
         "fn Filter(rule: Rule) { {prefix, minimum=Fallback(2), missing: renamed, ...rest} = rule; read = fn(&node:Node): int { return minimum } return read }",
@@ -2513,6 +2540,18 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             "    AssertCase({}, {})?\n",
             ku_string(source),
             ku_string(&rust_canonical(source))
+        ));
+    }
+    for (source, code) in [
+        ("fn f() { source: str = }", "unexpected_eof"),
+        ("fn f() { source: = \"\" }", "unexpected_token"),
+        ("fn f() { source: str; ; }", "unexpected_eof"),
+    ] {
+        body.push_str(&format!(
+            "    ExpectError({}, {}, {})?\n",
+            ku_string(source),
+            ku_string(code),
+            ku_string(&rust_error_canonical(source)),
         ));
     }
     let malformed_callback =

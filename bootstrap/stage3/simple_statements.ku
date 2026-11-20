@@ -3,7 +3,7 @@ import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, ParseOutput } from "../stage2/ast.ku"
 import { ExpressionSpan } from "../stage2/expression_support.ku"
 import { NextBodyWork, ReadExpressionEnd, LocalAssignmentOperator, RejectLetStatement,
-         RejectDeclarationInitializer, SignatureTypeOutput } from "./body_support.ku"
+         SignatureTypeOutput } from "./body_support.ku"
 import { ReadSignatureTypePrefix } from "./signature.ku"
 import { AfterOptionalSemicolon, ObjectDestructureClose, RejectAt, RejectAtSpan, SpanFromNode, WindowKind, WindowToken } from "./support.ku"
 
@@ -98,7 +98,10 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         type_node = add_arena(type_output, WindowToken(tokens, cursor, last_index), false)?
         cursor = cursor + type_consumed
         if (WindowKind(tokens, cursor, last_index) != "Equal") {
-            RejectDeclarationInitializer(WindowToken(tokens, cursor, last_index))?
+            declared = read_node(type_node)
+            statement = defaultDeclaration(declared, type_node, statement_start, add_node)?
+            return ok(SimpleStatementRead { node: statement, cursor: AfterOptionalSemicolon(tokens, cursor, last_index),
+                                            work: parse_steps, initializer_type: 0 })
         }
         cursor = cursor + 1
         if (WindowKind(tokens, cursor, last_index) == "Fn") {
@@ -159,6 +162,28 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
     }
     if (WindowKind(tokens, cursor, last_index) == "Semicolon") { cursor = cursor + 1 }
     return ok(SimpleStatementRead { node: statement, cursor: cursor, work: parse_steps, initializer_type: 0 })
+}
+
+fn defaultDeclaration(&declared: Node, type_node: int, origin: Token,
+                      add_node: fn(str, str, int, Span, [int], Token): int!): int! {
+    // Stage0 uses a point at the binding's start for both synthesized nodes.
+    // The real declaration type keeps the span of its source tokens.
+    point = Span { line: origin.line, column: origin.column, offset: origin.offset,
+                  end_line: origin.line, end_column: origin.column, end_offset: origin.offset }
+    kind = "Null"
+    text = ""
+    if (declared.kind == "TypeName") {
+        if (declared.text == "int") { kind = "Int" }
+        else if (declared.text == "float") { kind = "Float" text = "0.0" }
+        else if (declared.text == "bool") { kind = "Bool" text = "false" }
+        else if (declared.text == "str") { kind = "String" }
+    } else if (declared.kind == "TypeArray") {
+        kind = "Array"
+    } else if (declared.kind != "TypeUnion" && declared.kind != "TypeResult" && declared.kind != "TypeFunction") {
+        RejectAtSpan(ExpressionSpan(declared), "unsupported_statement", "no stage-3 default initializer for this type")?
+    }
+    value = add_node(kind, text, 0, point.clone(), [], origin.clone())?
+    return add_node("VarDecl", origin.lexeme.clone(), 0, point, [type_node, value], origin)
 }
 
 fn expectPatternToken(&token: Token, kind: str, message: str): null! {
