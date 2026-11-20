@@ -77,9 +77,8 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
         return ok(arena_nodes.len())
     }
 
-    // This helper is deliberately self-contained. Local helpers share one
-    // captured environment, so calling another local helper from here would
-    // create a rejected local-RC ownership cycle.
+    // Reduction does not call back into the delimiter or continuation
+    // helpers. Their references to this callable stay acyclic.
     fn ReduceTop(): null! {
         if (operator_top == 0 || operators[operator_top - 1].marker != "" || value_top == 0) {
             RejectAt(tokens[cursor].clone(), "invalid_expression", "operator has no operand", stage3_domain)?
@@ -135,6 +134,188 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
     }
 
     expect_operand = true
+
+    // Reduce pending operators, then close one matching delimiter. The
+    // caller keeps ownership of the arena and both append-only stacks.
+    fn CloseDelimiter(token: Token): null! {
+        reducing = true
+        while (reducing) {
+            if (operator_top == 0 || operators[operator_top - 1].marker != "") {
+                reducing = false
+            } else {
+                ReduceTop()?
+            }
+        }
+        if (operator_top == 0) {
+            RejectAt(token.clone(), "unexpected_token", "closing delimiter has no matching opener", stage3_domain)?
+        }
+        marker = operators[operator_top - 1].clone()
+        brace_literal = IsBraceLiteralMarker(marker.marker)
+        expected_close = "RParen"
+        if (marker.marker == "array" || marker.marker == "index") { expected_close = "RBracket" }
+        if (brace_literal) { expected_close = "RBrace" }
+        if (token.kind == "RBrace" && expect_operand) {
+            if (marker.marker == "object_field") {
+                RejectAt(token.clone(), "unexpected_token", "expected expression", stage3_domain)?
+            }
+            if (marker.marker == "object" && marker.depth_active) {
+                RejectAt(token.clone(), "unexpected_token", "expected object field name", stage3_domain)?
+            }
+        }
+        if (token.kind != expected_close) {
+            RejectAt(token.clone(), "unexpected_token", "closing delimiter does not match opener", stage3_domain)?
+        }
+        if (expect_operand && (marker.depth_active || (marker.marker != "array" && marker.marker != "call" && !brace_literal))) {
+            RejectAt(token.clone(), "unexpected_token", "expected expression before closing delimiter", stage3_domain)?
+        }
+        operator_top = marker.previous
+        if (marker.depth_active) { depth = depth - 1 }
+        if (brace_literal) { brace_depth = brace_depth - 1 }
+
+        reversed: [int] = []
+        walk = value_top
+        while (walk != marker.base_value) {
+            if (walk == 0) {
+                RejectAt(token.clone(), "invalid_expression", "delimiter lost its value stack base", stage3_domain)?
+            }
+            entry = values[walk - 1].clone()
+            reversed = reversed.push(entry.node)
+            walk = entry.previous
+        }
+        count = reversed.len()
+        if ((marker.marker == "group" || marker.marker == "index") && count != 1) {
+            RejectAt(token.clone(), "invalid_expression", "delimiter requires exactly one expression", stage3_domain)?
+        }
+
+        if (marker.marker == "group") {
+            // Parentheses do not change the Rust AST node or its span.
+        } else {
+            children: [int] = []
+            start_node = 0
+            previous_value = marker.base_value
+            if (marker.marker == "call" || marker.marker == "index") {
+                target_entry = values[marker.base_value - 1].clone()
+                start_node = target_entry.node
+                previous_value = target_entry.previous
+                children = children.push(start_node)
+            }
+            reverse_index = reversed.len()
+            while (reverse_index > 0) {
+                reverse_index = reverse_index - 1
+                children = children.push(reversed[reverse_index])
+            }
+            value_top = previous_value
+            end_span = SpanFromToken(token.clone())
+            node = 0
+            if (marker.marker == "array") {
+                node = AddNode("Array", "", 0, SpanMerge(OperatorSpan(marker), end_span), children)?
+            } else if (marker.marker == "struct") {
+                node = AddNode("StructLiteral", marker.text, 0, SpanMerge(OperatorSpan(marker), end_span), children)?
+            } else if (marker.marker == "object") {
+                node = AddNode("ObjectLiteral", "", 0, SpanMerge(OperatorSpan(marker), end_span), children)?
+            } else {
+                kind = "Index"
+                if (marker.marker == "call") { kind = "Call" }
+                node = AddNode(kind, "", 0, SpanMerge(ExpressionSpan(arena_nodes[start_node - 1]), end_span), children)?
+            }
+            value_entry = ValueEntry { node: node, previous: value_top }
+            values = values.push(value_entry)
+            value_top = values.len()
+        }
+        cursor = cursor + 1
+        expect_operand = false
+        return ok(null)
+    }
+
+    // Continue an expression whose left operand is already on the value
+    // stack. Separator, postfix and binary handling share that precondition.
+    fn ContinueExpression(token: Token): null! {
+    if (token.kind == "Comma") {
+        while (operator_top != 0 && operators[operator_top - 1].marker == "") {
+            ReduceTop()?
+        }
+        if (operator_top == 0 || (operators[operator_top - 1].marker != "array" && operators[operator_top - 1].marker != "call" && !IsBraceLiteralMarker(operators[operator_top - 1].marker))) {
+            RejectAt(token.clone(), "unexpected_token", "comma is only valid in an array or call", stage3_domain)?
+        }
+        marker = operators[operator_top - 1].clone()
+        if (value_top == marker.base_value) {
+            RejectAt(token.clone(), "unexpected_token", "expected expression before comma", stage3_domain)?
+        }
+        cursor = cursor + 1
+        expect_operand = true
+    } else if (token.kind == "LParen" || token.kind == "LBracket") {
+        marker_kind = "call"
+        expected_close = "RParen"
+        if (token.kind == "LBracket") { marker_kind = "index" expected_close = "RBracket" }
+        active = tokens[cursor + 1].kind != expected_close
+        if (marker_kind == "index" && !active) {
+            RejectAt(tokens[cursor + 1].clone(), "unexpected_token", "expected expression before closing delimiter", stage3_domain)?
+        }
+        if (active) {
+            if (depth >= 32) {
+                RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested", stage3_domain)?
+            }
+            depth = depth + 1
+        }
+        operator_entry = MakeOperator(marker_kind, "", 0, false, token, operator_top, value_top, active)
+        operators = operators.push(operator_entry)
+        operator_top = operators.len()
+        cursor = cursor + 1
+        expect_operand = active
+    } else if (token.kind == "Dot" || token.kind == "QuestionDot") {
+        optional = token.kind == "QuestionDot"
+        cursor = cursor + 1
+        field = tokens[cursor].clone()
+        if (field.kind != "Ident") {
+            RejectAt(field.clone(), "unexpected_token", "expected field name after field operator", stage3_domain)?
+        }
+        target_entry = values[value_top - 1].clone()
+        value_top = target_entry.previous
+        target = arena_nodes[target_entry.node - 1].clone()
+        merged = SpanMerge(ExpressionSpan(target), SpanFromToken(field.clone()))
+        node = 0
+        if (optional && target.kind == "Index") {
+            unwrapped = AddNode("TryUnwrap", "", 0, merged.clone(), [target_entry.node])?
+            node = AddNode("Field", field.lexeme, 0, merged, [unwrapped])?
+        } else if (optional) {
+            node = AddNode("OptionalField", field.lexeme, 0, merged, [target_entry.node])?
+        } else {
+            node = AddNode("Field", field.lexeme, 0, merged, [target_entry.node])?
+        }
+        value_entry = ValueEntry { node: node, previous: value_top }
+        values = values.push(value_entry)
+        value_top = values.len()
+        cursor = cursor + 1
+    } else if (token.kind == "Question") {
+        target_entry = values[value_top - 1].clone()
+        value_top = target_entry.previous
+        target = arena_nodes[target_entry.node - 1].clone()
+        merged = SpanMerge(ExpressionSpan(target), SpanFromToken(token.clone()))
+        node = AddNode("TryUnwrap", "", 0, merged, [target_entry.node])?
+        value_entry = ValueEntry { node: node, previous: value_top }
+        values = values.push(value_entry)
+        value_top = values.len()
+        cursor = cursor + 1
+    } else {
+        binary = ReadBinaryOperator(token, stage3_domain)?
+        precedence = binary.precedence
+        reducing = true
+        while (reducing) {
+            if (operator_top == 0 || operators[operator_top - 1].marker != "" || operators[operator_top - 1].precedence < precedence) {
+                reducing = false
+            } else {
+                ReduceTop()?
+            }
+        }
+        operator_entry = MakeOperator("", binary.text, precedence, false, token, operator_top, 0, false)
+        operators = operators.push(operator_entry)
+        operator_top = operators.len()
+        cursor = cursor + 1
+        expect_operand = true
+    }
+        return ok(null)
+    }
+
     steps = 0
     parsing = true
     while (parsing) {
@@ -164,92 +345,7 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
         }
         closing = token.kind == "RParen" || token.kind == "RBracket" || (brace_depth > 0 && token.kind == "RBrace")
         if (closing) {
-            reducing = true
-            while (reducing) {
-                if (operator_top == 0 || operators[operator_top - 1].marker != "") {
-                    reducing = false
-                } else {
-                    ReduceTop()?
-                }
-            }
-            if (operator_top == 0) {
-                RejectAt(token.clone(), "unexpected_token", "closing delimiter has no matching opener", stage3_domain)?
-            }
-            marker = operators[operator_top - 1].clone()
-            brace_literal = IsBraceLiteralMarker(marker.marker)
-            expected_close = "RParen"
-            if (marker.marker == "array" || marker.marker == "index") { expected_close = "RBracket" }
-            if (brace_literal) { expected_close = "RBrace" }
-            if (token.kind == "RBrace" && expect_operand) {
-                if (marker.marker == "object_field") {
-                    RejectAt(token.clone(), "unexpected_token", "expected expression", stage3_domain)?
-                }
-                if (marker.marker == "object" && marker.depth_active) {
-                    RejectAt(token.clone(), "unexpected_token", "expected object field name", stage3_domain)?
-                }
-            }
-            if (token.kind != expected_close) {
-                RejectAt(token.clone(), "unexpected_token", "closing delimiter does not match opener", stage3_domain)?
-            }
-            if (expect_operand && (marker.depth_active || (marker.marker != "array" && marker.marker != "call" && !brace_literal))) {
-                RejectAt(token.clone(), "unexpected_token", "expected expression before closing delimiter", stage3_domain)?
-            }
-            operator_top = marker.previous
-            if (marker.depth_active) { depth = depth - 1 }
-            if (brace_literal) { brace_depth = brace_depth - 1 }
-
-            reversed: [int] = []
-            walk = value_top
-            while (walk != marker.base_value) {
-                if (walk == 0) {
-                    RejectAt(token.clone(), "invalid_expression", "delimiter lost its value stack base", stage3_domain)?
-                }
-                entry = values[walk - 1].clone()
-                reversed = reversed.push(entry.node)
-                walk = entry.previous
-            }
-            count = reversed.len()
-            if ((marker.marker == "group" || marker.marker == "index") && count != 1) {
-                RejectAt(token.clone(), "invalid_expression", "delimiter requires exactly one expression", stage3_domain)?
-            }
-
-            if (marker.marker == "group") {
-                // Parentheses do not change the Rust AST node or its span.
-            } else {
-                children: [int] = []
-                start_node = 0
-                previous_value = marker.base_value
-                if (marker.marker == "call" || marker.marker == "index") {
-                    target_entry = values[marker.base_value - 1].clone()
-                    start_node = target_entry.node
-                    previous_value = target_entry.previous
-                    children = children.push(start_node)
-                }
-                reverse_index = reversed.len()
-                while (reverse_index > 0) {
-                    reverse_index = reverse_index - 1
-                    children = children.push(reversed[reverse_index])
-                }
-                value_top = previous_value
-                end_span = SpanFromToken(token.clone())
-                node = 0
-                if (marker.marker == "array") {
-                    node = AddNode("Array", "", 0, SpanMerge(OperatorSpan(marker), end_span), children)?
-                } else if (marker.marker == "struct") {
-                    node = AddNode("StructLiteral", marker.text, 0, SpanMerge(OperatorSpan(marker), end_span), children)?
-                } else if (marker.marker == "object") {
-                    node = AddNode("ObjectLiteral", "", 0, SpanMerge(OperatorSpan(marker), end_span), children)?
-                } else {
-                    kind = "Index"
-                    if (marker.marker == "call") { kind = "Call" }
-                    node = AddNode(kind, "", 0, SpanMerge(ExpressionSpan(arena_nodes[start_node - 1]), end_span), children)?
-                }
-                value_entry = ValueEntry { node: node, previous: value_top }
-                values = values.push(value_entry)
-                value_top = values.len()
-            }
-            cursor = cursor + 1
-            expect_operand = false
+            CloseDelimiter(token)?
         } else if (token.kind == "Eof") {
             if (expect_operand) {
                 RejectAt(token.clone(), "unexpected_eof", "expected expression", stage3_domain)?
@@ -329,88 +425,8 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
                 cursor = cursor + 1
                 expect_operand = false
             }
-        } else if (token.kind == "Comma") {
-            while (operator_top != 0 && operators[operator_top - 1].marker == "") {
-                ReduceTop()?
-            }
-            if (operator_top == 0 || (operators[operator_top - 1].marker != "array" && operators[operator_top - 1].marker != "call" && !IsBraceLiteralMarker(operators[operator_top - 1].marker))) {
-                RejectAt(token.clone(), "unexpected_token", "comma is only valid in an array or call", stage3_domain)?
-            }
-            marker = operators[operator_top - 1].clone()
-            if (value_top == marker.base_value) {
-                RejectAt(token.clone(), "unexpected_token", "expected expression before comma", stage3_domain)?
-            }
-            cursor = cursor + 1
-            expect_operand = true
-        } else if (token.kind == "LParen" || token.kind == "LBracket") {
-            marker_kind = "call"
-            expected_close = "RParen"
-            if (token.kind == "LBracket") { marker_kind = "index" expected_close = "RBracket" }
-            active = tokens[cursor + 1].kind != expected_close
-            if (marker_kind == "index" && !active) {
-                RejectAt(tokens[cursor + 1].clone(), "unexpected_token", "expected expression before closing delimiter", stage3_domain)?
-            }
-            if (active) {
-                if (depth >= 32) {
-                    RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested", stage3_domain)?
-                }
-                depth = depth + 1
-            }
-            operator_entry = MakeOperator(marker_kind, "", 0, false, token, operator_top, value_top, active)
-            operators = operators.push(operator_entry)
-            operator_top = operators.len()
-            cursor = cursor + 1
-            expect_operand = active
-        } else if (token.kind == "Dot" || token.kind == "QuestionDot") {
-            optional = token.kind == "QuestionDot"
-            cursor = cursor + 1
-            field = tokens[cursor].clone()
-            if (field.kind != "Ident") {
-                RejectAt(field.clone(), "unexpected_token", "expected field name after field operator", stage3_domain)?
-            }
-            target_entry = values[value_top - 1].clone()
-            value_top = target_entry.previous
-            target = arena_nodes[target_entry.node - 1].clone()
-            merged = SpanMerge(ExpressionSpan(target), SpanFromToken(field.clone()))
-            node = 0
-            if (optional && target.kind == "Index") {
-                unwrapped = AddNode("TryUnwrap", "", 0, merged.clone(), [target_entry.node])?
-                node = AddNode("Field", field.lexeme, 0, merged, [unwrapped])?
-            } else if (optional) {
-                node = AddNode("OptionalField", field.lexeme, 0, merged, [target_entry.node])?
-            } else {
-                node = AddNode("Field", field.lexeme, 0, merged, [target_entry.node])?
-            }
-            value_entry = ValueEntry { node: node, previous: value_top }
-            values = values.push(value_entry)
-            value_top = values.len()
-            cursor = cursor + 1
-        } else if (token.kind == "Question") {
-            target_entry = values[value_top - 1].clone()
-            value_top = target_entry.previous
-            target = arena_nodes[target_entry.node - 1].clone()
-            merged = SpanMerge(ExpressionSpan(target), SpanFromToken(token.clone()))
-            node = AddNode("TryUnwrap", "", 0, merged, [target_entry.node])?
-            value_entry = ValueEntry { node: node, previous: value_top }
-            values = values.push(value_entry)
-            value_top = values.len()
-            cursor = cursor + 1
         } else {
-            binary = ReadBinaryOperator(token, stage3_domain)?
-            precedence = binary.precedence
-            reducing = true
-            while (reducing) {
-                if (operator_top == 0 || operators[operator_top - 1].marker != "" || operators[operator_top - 1].precedence < precedence) {
-                    reducing = false
-                } else {
-                    ReduceTop()?
-                }
-            }
-            operator_entry = MakeOperator("", binary.text, precedence, false, token, operator_top, 0, false)
-            operators = operators.push(operator_entry)
-            operator_top = operators.len()
-            cursor = cursor + 1
-            expect_operand = true
+            ContinueExpression(token)?
         }
     }
 

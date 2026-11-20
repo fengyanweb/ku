@@ -492,6 +492,7 @@ fn bootstrap_parser_preserves_real_failure_and_assignment_syntax() {
     }
 
     for source in [
+        include_str!("../bootstrap/stage2/parser.ku"),
         include_str!("../bootstrap/stage3/statements.ku"),
         include_str!("../bootstrap/stage3/simple_statements.ku"),
     ] {
