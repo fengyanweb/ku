@@ -1,0 +1,203 @@
+import { Token } from "../stage1/token.ku"
+import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
+import { Arena, Node, ParseOutput } from "../stage2/ast.ku"
+import { MakeExpressionNode } from "../stage2/expression_support.ku"
+import { SignatureType, ReadSignatureTypePrefix, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
+import { RejectAt, WindowKind, WindowToken } from "./support.ku"
+
+struct FunctionHeader {
+    name: str
+    arena: Arena
+    children: [int]
+    body_open: int
+    work: int
+}
+
+struct LocalFunctionScope {
+    children: [int]
+    parent_statement_count: int
+}
+
+struct LocalFunctionHeader {
+    name: str
+    output: ParseOutput
+    scope: LocalFunctionScope
+    body_open: int
+    work: int
+}
+
+// Parse one ordinary named function signature against an existing bounded
+// token window. The returned forest is consumed by the function/body reader.
+fn ReadFunctionHeader(&tokens: [Token], first: int, last_index: int, initial_work: int): FunctionHeader! {
+    arena_nodes: [Node] = []
+    arena_edges: [int] = []
+    parse_steps = initial_work
+
+    fn ChargeWork(amount: int, error_token: Token): null! {
+        parse_steps = parse_steps + amount
+        if (parse_steps > 16384) {
+            RejectAt(error_token, "work_limit", "stage-3 parser work budget exceeded")?
+        }
+        return ok(null)
+    }
+
+    fn AddNode(kind: str, text: str, int_value: int, span: Span, children: [int], error_token: Token): int! {
+        if (arena_nodes.len() >= 4096) {
+            RejectAt(error_token.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")?
+        }
+        if (children.len() > 8192 - arena_edges.len()) {
+            RejectAt(error_token.clone(), "edge_limit", "stage-3 parser accepts at most 8192 AST edges")?
+        }
+        first_edge = arena_edges.len()
+        for child in children {
+            if (child <= 0 || child > arena_nodes.len()) {
+                RejectAt(error_token.clone(), "invalid_node_id", "AST edge references an invalid NodeId")?
+            }
+            arena_edges = arena_edges.push(child)
+        }
+        node = MakeExpressionNode(kind, text, int_value, span, first_edge, arena_edges.len() - first_edge)
+        arena_nodes = arena_nodes.push(node)
+        return ok(arena_nodes.len())
+    }
+
+    fn AddParsedType(parsed: SignatureType, error_token: Token): int! {
+        parsed_root = parsed.root
+        parsed_parts = parsed.parts
+        parsed_edges = parsed.edges
+        node_base = arena_nodes.len()
+        part_index = 0
+        while (part_index < parsed_parts.len()) {
+            part = parsed_parts[part_index].clone()
+            CheckTypeArenaCapacity(arena_nodes.len(), arena_edges.len(), part.edge_count, error_token.clone())?
+            first_edge = arena_edges.len()
+            edge_index = 0
+            while (edge_index < part.edge_count) {
+                plan_edge = part.first_edge + edge_index
+                if (plan_edge < 0 || plan_edge >= parsed_edges.len()) {
+                    RejectAt(error_token.clone(), "invalid_node_id", "type plan edge lies outside its arena")?
+                }
+                child = parsed_edges[plan_edge]
+                if (child <= 0 || child > part_index) {
+                    RejectAt(error_token.clone(), "invalid_node_id", "type plan edge must reference an earlier NodeId")?
+                }
+                arena_edges = arena_edges.push(node_base + child)
+                edge_index = edge_index + 1
+            }
+            type_node = TypePartToNode(part, first_edge)
+            arena_nodes = arena_nodes.push(type_node)
+            part_index = part_index + 1
+        }
+        if (parsed_root <= 0 || parsed_root > parsed_parts.len()) {
+            RejectAt(error_token, "invalid_node_id", "type plan root is invalid")?
+        }
+        return ok(node_base + parsed_root)
+    }
+
+    function_start = WindowToken(tokens, first, last_index)
+    cursor = first + 1
+    if (WindowKind(tokens, cursor, last_index) != "Ident") {
+        RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected function name")?
+    }
+    function_name = tokens[cursor].lexeme.clone()
+    cursor = cursor + 1
+    if (WindowKind(tokens, cursor, last_index) != "LParen") {
+        RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected '(' after function name")?
+    }
+    cursor = cursor + 1
+    parameters: [int] = []
+    parameter_count = 0
+    while (WindowKind(tokens, cursor, last_index) != "RParen") {
+        ChargeWork(1, WindowToken(tokens, cursor, last_index))?
+        if (parameter_count >= 32) {
+            RejectAt(WindowToken(tokens, cursor, last_index), "parameter_limit", "stage-3 functions accept at most 32 parameters")?
+        }
+        parameter_start = WindowToken(tokens, cursor, last_index)
+        parameter_mode = 0
+        if (WindowKind(tokens, cursor, last_index) == "Ampersand") {
+            parameter_mode = 1
+            cursor = cursor + 1
+            ChargeWork(1, parameter_start.clone())?
+        }
+        parameter_token = WindowToken(tokens, cursor, last_index)
+        if (parameter_token.kind != "Ident") {
+            RejectAt(parameter_token.clone(), "unexpected_token", "expected parameter name")?
+        }
+        cursor = cursor + 1
+        parameter_children: [int] = []
+        if (WindowKind(tokens, cursor, last_index) == "Colon") {
+            type_start = cursor + 1
+            parsed_type = ReadSignatureTypePrefix(tokens, type_start, last_index)?
+            ChargeWork(parsed_type.work, WindowToken(tokens, type_start, last_index))?
+            cursor = cursor + 1 + parsed_type.consumed
+            type_node = AddParsedType(parsed_type, parameter_token.clone())?
+            parameter_children = parameter_children.push(type_node)
+        }
+        parameter_span = SpanMerge(SpanFromToken(parameter_start), SpanFromToken(parameter_token.clone()))
+        parameter = AddNode("Parameter", parameter_token.lexeme.clone(), parameter_mode, parameter_span, parameter_children, parameter_token.clone())?
+        parameters = parameters.push(parameter)
+        parameter_count = parameter_count + 1
+        if (WindowKind(tokens, cursor, last_index) == "Comma") {
+            cursor = cursor + 1
+            if (WindowKind(tokens, cursor, last_index) == "RParen") {
+                RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected parameter name")?
+            }
+        } else if (WindowKind(tokens, cursor, last_index) != "RParen") {
+            RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected ')' after parameters")?
+        }
+    }
+    cursor = cursor + 1
+    return_type = 0
+    has_return_type = false
+    if (WindowKind(tokens, cursor, last_index) == "Colon") {
+        type_start = cursor + 1
+        parsed_type = ReadSignatureTypePrefix(tokens, type_start, last_index)?
+        ChargeWork(parsed_type.work, WindowToken(tokens, type_start, last_index))?
+        has_return_type = true
+        cursor = cursor + 1 + parsed_type.consumed
+        return_type = AddParsedType(parsed_type, WindowToken(tokens, cursor - 1, last_index))?
+    }
+    if (WindowKind(tokens, cursor, last_index) != "LBrace") {
+        RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected '{'")?
+    }
+    if (has_return_type) { parameters = parameters.push(return_type) }
+    return ok(FunctionHeader {
+        name: function_name, arena: Arena { nodes: arena_nodes.clone(), edges: arena_edges.clone() },
+        children: parameters, body_open: cursor, work: parse_steps
+    })
+}
+
+// A local function header travels through the same validated arena boundary
+// as expressions. Its synthetic root is never published in the program AST.
+fn PackFunctionHeader(arena: Arena, &children: [int], span: Span, origin: Token): ParseOutput! {
+    nodes = arena.nodes
+    edges = arena.edges
+    CheckTypeArenaCapacity(nodes.len(), edges.len(), children.len(), origin)?
+    first_edge = edges.len()
+    index = 0
+    while (index < children.len()) {
+        child = children[index]
+        edges = edges.push(child)
+        index = index + 1
+    }
+    node = MakeExpressionNode("FunctionHeaderTransport", "", 0, span, first_edge, children.len())
+    nodes = nodes.push(node)
+    root = nodes.len()
+    return ok(ParseOutput { arena: Arena { nodes: nodes, edges: edges }, root: root })
+}
+
+fn ReadLocalFunctionHeader(&tokens: [Token], first: int, last: int, work: int,
+                           node_base: int, parent_statement_count: int): LocalFunctionHeader! {
+    header = ReadFunctionHeader(tokens, first, last, work)?
+    origin = WindowToken(tokens, first, last)
+    span = SpanMerge(SpanFromToken(origin.clone()), SpanFromToken(WindowToken(tokens, header.body_open, last)))
+    children = header.children
+    packed = PackFunctionHeader(header.arena, children, span, origin)?
+    relocated: [int] = []
+    for child in children {
+        next = node_base + child
+        relocated = relocated.push(next)
+    }
+    scope = LocalFunctionScope { children: relocated, parent_statement_count: parent_statement_count }
+    return ok(LocalFunctionHeader { name: header.name, output: packed, scope: scope,
+                                    body_open: header.body_open, work: header.work })
+}

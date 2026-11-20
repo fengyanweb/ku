@@ -468,6 +468,9 @@ fn bootstrap_parser_preserves_real_failure_and_assignment_syntax() {
         "fn Main() { left + right = value }",
         "fn Main() { row?.title = value }",
         "fn Main() { rows[Locate(id)] = }",
+        "fn Main() { fn () {} }",
+        "fn Main() { fn Local(&: int) {} }",
+        "fn Main() { fn Local(): int { return 0",
     ] {
         let rust = Parser::new(Lexer::new(source).lex().unwrap())
             .parse_program()
@@ -520,4 +523,46 @@ fn bootstrap_parser_preserves_real_failure_and_assignment_syntax() {
     let rejected = invoke(&else_if_chain(33));
     assert!(!rejected.status.success() && rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("statement_depth_exceeded"));
+
+    let local_chain = |depth: usize| {
+        let declarations = (0..depth)
+            .map(|index| format!("fn Local{index}() {{"))
+            .collect::<String>();
+        format!("fn Main() {{ {declarations}{} }}", "}".repeat(depth))
+    };
+    let chain = invoke(&local_chain(32));
+    assert!(
+        chain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&chain.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&chain.stdout)
+            .lines()
+            .filter(|line| line.split('|').nth(2) == Some("Function"))
+            .count(),
+        33
+    );
+    let rejected = invoke(&local_chain(33));
+    assert!(!rejected.status.success() && rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("statement_depth_exceeded"));
+
+    let statement_counts = |inside: usize, after: usize| {
+        format!(
+            "fn Main() {{ fn Local() {{ {} }} {} }}",
+            "value = 0 ".repeat(inside),
+            "value = 1 ".repeat(after),
+        )
+    };
+    let separate = invoke(&statement_counts(128, 127));
+    assert!(
+        separate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&separate.stderr)
+    );
+    for counts in [(129, 0), (1, 128)] {
+        let rejected = invoke(&statement_counts(counts.0, counts.1));
+        assert!(!rejected.status.success() && rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("statement_limit"));
+    }
 }

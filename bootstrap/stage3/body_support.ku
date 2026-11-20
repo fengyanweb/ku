@@ -37,6 +37,9 @@ fn NextBodyWork(current: int, amount: int, error_token: Token): int! {
 }
 
 fn RejectBodyEof(control_depth: int, kind: str, phase: int, error_token: Token): null! {
+    if (kind == "Function") {
+        RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after block")?
+    }
     if (control_depth > 0 && kind == "For") {
         RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after for body")?
     }
@@ -81,6 +84,10 @@ struct ControlHeader {
     expression_end: int
     body_open: int
     work: int
+}
+
+fn IsControlStatement(&kind: str): bool {
+    return kind == "If" || kind == "While" || kind == "For" || kind == "Try" || kind == "Fn"
 }
 
 fn ReadExpressionEnd(&tokens: [Token], start: int, window_end: int, context: str): int! {

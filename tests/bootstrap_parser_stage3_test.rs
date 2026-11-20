@@ -556,6 +556,7 @@ fn closing_brace(tokens: &[Token], opening: usize) -> usize {
 
 fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> usize {
     match statement {
+        Stmt::Function(function) => project_function(source, function, arena),
         Stmt::VarDecl {
             name,
             ty: Some(ty),
@@ -747,6 +748,33 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
         }
         other => panic!("stage-3 oracle received unsupported Rust statement: {other:?}"),
     }
+}
+
+fn real_local_function(source: &str, owner: &str, name: &str) -> String {
+    let tokens = Lexer::new(source)
+        .lex()
+        .expect("actual compiler source tokens");
+    let parsed = Parser::new(tokens)
+        .parse_program()
+        .expect("actual compiler source AST");
+    let function = parsed
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Function(function) if function.name == owner => Some(function),
+            _ => None,
+        })
+        .expect("real lexical owner");
+    let local = function
+        .body
+        .iter()
+        .find_map(|statement| match statement {
+            Stmt::Function(local) if local.name == name => Some(local),
+            _ => None,
+        })
+        .expect("real local declaration");
+    let declaration = &source[local.span.start.offset..local.span.end.offset];
+    format!("fn Owner() {{\n{declaration}\n}}")
 }
 
 fn project_import(source: &str, import: &ImportDecl, arena: &mut ProjectedArena) -> usize {
@@ -1329,6 +1357,7 @@ fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
 fn bootstrap_stage3_function_modules_retain_lexer_headroom() {
     let stage3 = Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/stage3");
     for name in [
+        "function_header.ku",
         "functions.ku",
         "statements.ku",
         "body_support.ku",
@@ -1392,6 +1421,16 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         .find(|line| line.starts_with("fn ReadFunction("))
         .expect("production bootstrap function reader signature");
     let compiler_declaration = format!("{compiler_signature}}}");
+    let real_charge_work = real_local_function(
+        include_str!("../bootstrap/stage3/function_header.ku"),
+        "ReadFunctionHeader",
+        "ChargeWork",
+    );
+    let real_add_node = real_local_function(
+        include_str!("../bootstrap/stage3/parser.ku"),
+        "ParseBoundedModule",
+        "AddNode",
+    );
     let cases = [
         "",
         "import \"./setup.ku\";\nfn before() {}\nimport math from \"./math.ku\"\nimport { Add, User as Person } from \"./api.ku\"\nfn main() { return Add(1, 2) }",
@@ -1428,6 +1467,10 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
 
         r#"fn main() { println(Box{first: Inner{x: 1 + 2}, other: [a(), 4]}?.other) }"#,
         r#"fn main() { value = Box{value: "中😀"} println(value) }"#,
+        &real_charge_work,
+        &real_add_node,
+        "fn outer(value: int): int { before = 1 fn read(&row: Row, transform: fn(int): int): int { fn inner(x: int): int { return x + before } return inner(transform(row.value)) }; return read(item, callback) }",
+        "// 局部😀\r\nfn main() { if (ready) { fn inside(value): int { return value + 1 } same = inside(0) } else { fn inside(value): int { return value - 1 }; same = inside(0) } after = 2 }",
         "fn main() {}",
         "fn typed(): int { return 1 }",
         "fn add(left: int, right: int): int { return left + right }\nfn echo(value): str { return \"ok\" }",
@@ -3382,6 +3425,7 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
     for name in [
         "body_support.ku",
         "enums.ku",
+        "function_header.ku",
         "functions.ku",
         "imports.ku",
         "parser.ku",

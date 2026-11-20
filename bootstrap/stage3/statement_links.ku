@@ -1,9 +1,37 @@
 import { Token } from "../stage1/token.ku"
-import { StatementLink, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength } from "./body_support.ku"
+import { Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
+import { StatementLink, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength,
+         RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectNestedRoot } from "./body_support.ku"
 
 struct AppendedStatements {
     children: [int]
     work: int
+}
+
+struct BodyAttachment {
+    arena: Arena
+    node_count: int
+    root: int
+}
+
+// For a local signature only the synthetic root is skipped; the forest of
+// parameter/type children still passes the ordinary arena validation.
+fn PrepareBodyAttachment(parsed: ParseOutput, header: bool, available_nodes: int,
+                         available_edges: int, origin: Token): BodyAttachment! {
+    validated = ValidateParseOutput(parsed)?
+    root = validated.root
+    arena = validated.arena
+    count = arena.nodes.len()
+    edge_count = arena.edges.len()
+    if (header) {
+        if (arena.nodes[root - 1].kind != "FunctionHeaderTransport") { RejectNestedRoot(origin.clone())? }
+        edge_count = arena.nodes[root - 1].first_edge
+        count = count - 1
+        root = 0
+    }
+    if (count > available_nodes) { RejectBodyNodeLimit(origin.clone())? }
+    if (edge_count > available_edges) { RejectBodyEdgeLimit(origin)? }
+    return ok(BodyAttachment { arena: arena, node_count: count, root: root })
 }
 
 // Statement links are newest-first. Validate their bounded chain before
