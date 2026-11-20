@@ -1,13 +1,11 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ManagedConsumedString } from "./call_contracts.ku"
-import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExplicitType, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 import { ScalarStringPart } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
-import { LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { ContainsType, ProjectionArrayHeader, ProjectionCloneSource, ProjectionIsStringArray } from "./struct_projection_c.ku"
-import { CheckStructArrayType } from "./struct_array_c.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { ContainsType, ProjectionArrayHeader, ProjectionCloneSource } from "./struct_projection_c.ku"
 
 fn collectProjectedParts(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
                          id: int, depth: int, can_convert: bool, collected: [ScalarStringPart]): [ScalarStringPart]! {
@@ -405,16 +403,4 @@ fn ManagedStringRuntime(): str {
         "    } else if (a < 0) {\n" +
         "        if ((b > 0 && a < INT64_MIN / b) || (b < 0 && a < INT64_MAX / b)) return false;\n" +
         "    }\n    *out = a * b;\n    return true;\n}\n\n" + ManagedStringAppendRuntime()
-}
-
-fn ManagedExplicitType(&types: [TypeNameBinding], &nodes: [Node], &edges: [int],
-                       &layouts: [StructLayout], id: int): GuardType! {
-    if (nodes[id - 1].kind == "TypeArray") {
-        if (ProjectionIsStringArray(types, nodes, edges, id)?) { return ok(GuardType { kind: "str_array", layout: 0 }) }
-        item = CheckStructArrayType(nodes, edges, types, id)?
-        index = LayoutIndex(layouts, item.module_index, item.declaration_node)
-        if (index <= 0) { RejectLayout("unknown_managed_layout", "array element has no bound layout", item.span.clone())? }
-        return ok(GuardType { kind: "array", layout: index })
-    }
-    return GuardExplicitType(types, nodes, layouts, id)
 }
