@@ -4,7 +4,7 @@ import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
-import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullDependency, ReadLinkedOwnedArray, LinkedNullFunction, LinkedNullHasResultValue, LinkedNullLiteralType,
+import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullFunction, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullExpression, LinkedNullState, LinkedNullValue, LowerLinkedNullLeaf,
          LowerLinkedNullRead, MoveLinkedNullSlot, ReadLinkedNullBinding, RequireLinkedArrayValidation } from "./linked_null_read_c.ku"
@@ -271,20 +271,31 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
         RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(statement))?
     }
     call = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
-    if (call.kind != "Call" || call.edge_count != 2) {
-        RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(call))?
+    if (call.kind != "Call" || call.edge_count < 1) {
+        RejectLayout("unsupported_linked_success", "expected return ok or a bound Result call", DeclarationSpan(call))?
     }
     callee = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
-    if (callee.kind != "Variable" || callee.edge_count != 0 || callee.text != "ok" || !unshadowedOk(project, state)) {
+    if (callee.kind == "Variable" && callee.edge_count == 0 && callee.text != "ok") {
+        target = resolveLinkedCall(project, state, call, callee, true)?
+        if (!SameLinkedType(target.result, result)) {
+            RejectLayout("linked_tail_result", "forwarded Result must match the entry's declared payload", DeclarationSpan(call))?
+        }
+        call_id = LinkedNullChild(project, 1, statement, 0)
+        arguments = lowerLinkedArguments(project, state, call, target, call_id, 0)?
+        arguments.state.code = arguments.state.code + "    result = " + target.symbol + "(" + arguments.args
+            + ");\n" + arguments.handoff + "    goto cleanup;\n"
+        return ok(arguments.state)
+    }
+    if (call.edge_count != 2 || callee.kind != "Variable" || callee.edge_count != 0 || callee.text != "ok" || !unshadowedOk(project, state)) {
         RejectLayout("unsupported_linked_success", "expected builtin ok with the declared payload", DeclarationSpan(call))?
     }
     id = LinkedNullChild(project, 1, call, 1)
     node = LinkedNullNode(project, 1, id)
     next = state
-    if (LinkedNullOwnedArray(result)) {
+    if (LinkedNullHasResultValue(result)) {
         value = LowerLinkedNullValue(project, next, id, 0)?
         if (!SameLinkedType(value.value.ty, result) || value.value.borrowed || value.value.slot == 0) {
-            RejectLayout("linked_array_return", "return requires an initialized matching array owner", DeclarationSpan(node))?
+            RejectLayout("linked_result_return", "return requires an initialized matching owner", DeclarationSpan(node))?
         }
         value.state.code = value.state.code + "    result.value = " + value.value.text.clone() + ";\n"
         owner = value.value.clone()
@@ -294,18 +305,6 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
     }
     next.code = next.code + "    result.ok = true;\n    goto cleanup;\n"
     return ok(next)
-}
-
-fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
-    ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0))?
-    value = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
-    if (value.kind != "Array" || value.edge_count != 0
-        || LinkedNullBinding(state.slots, statement.text) != 0) {
-        RejectLayout("linked_array_local", "expected a new typed array owner initialized empty", DeclarationSpan(statement))?
-    }
-    local = AddLinkedNullSlot(project, state, statement.text.clone(), "l" + str(id), ty, false)?
-    local.state.slots[local.value.slot - 1].live = true
-    return ok(local.state)
 }
 
 fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, index: int): LinkedNullState! {

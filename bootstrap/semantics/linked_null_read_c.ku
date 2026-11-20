@@ -2,14 +2,14 @@ import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { GuardArithmetic, GuardOwnedDrops, GuardStringEquality } from "./guarded_struct_c.ku"
+import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { ContainsType, CTypeName, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
 import { BuildProjectOwningLayouts, EmitOwningLayoutDefinitions, OrderProjectOwningLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { EmitOwnedStructArrayDrop, EmitOwnedStructOperations, EmitStructArrayHeader, EmitStructArrayReadValidation,
          EmitStructArrayResultHeader, EmitStructArrayDropUsing, EmitTryCloneString, EmitOwnedStructArrayAppend, StructArrayStatuses } from "./struct_array_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullFunction,
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullDropC, LinkedNullFunction,
          LinkedNullLayout, LinkedNullNode, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullProject, EmitLinkedNullPrototypes, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
 
 struct LinkedNullValue {
@@ -68,25 +68,6 @@ fn LinkedNullBinding(&slots: [LinkedNullSlot], &name: str): int {
         index = index + 1
     }
     return 0
-}
-
-fn linkedDrop(&state: LinkedNullState, &value: LinkedNullValue): str {
-    if (value.ty.name == "str" && value.ty.declaration_kind == "Builtin") {
-        return "    ku_projection_string_drop(&" + value.text.clone() + ");\n"
-    }
-    if (value.ty.declaration_kind == "Struct") {
-        unit = value.ty.module_index
-        node = value.ty.declaration_node
-        if (LayoutIndex(state.owning_layouts, unit, node) != 0) {
-            return "    " + OwningLayoutDropName(unit, node) + "(&" + value.text.clone() + ");\n"
-        }
-        layout = LayoutIndex(state.layouts, unit, node)
-        return GuardOwnedDrops(state.layouts, layout, value.text)
-    }
-    if (LinkedNullOwnedArray(value.ty)) {
-        return "    " + LinkedNullArrayPrefix(value.ty) + "_drop(&" + value.text.clone() + ");\n"
-    }
-    return ""
 }
 
 fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &element: TypeNameBinding): LinkedNullState! {
@@ -157,7 +138,7 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
     }
     next.slots = next.slots.push(LinkedNullSlot { binding: binding, value: value.clone(), live: parameter })
     if (!parameter) { next.declarations = next.declarations + "    " + kind + " " + name + " = {0};\n" }
-    if (!view) { next.drops = linkedDrop(next, value) + next.drops }
+    if (!view) { next.drops = LinkedNullDropC(next.layouts, next.owning_layouts, value.ty, value.text) + next.drops }
     return ok(LinkedNullExpression { state: next, value: value })
 }
 
@@ -189,7 +170,7 @@ fn DropLinkedNullScope(state: LinkedNullState, outer: int): LinkedNullState {
         index = index - 1
         slot = next.slots[index].clone()
         if (slot.live && LinkedNullOwner(slot.value.ty)) {
-            next.code = next.code + linkedDrop(next, slot.value)
+            next.code = next.code + LinkedNullDropC(next.layouts, next.owning_layouts, slot.value.ty, slot.value.text)
         }
         next.slots[index].binding = ""
         next.slots[index].live = false
@@ -345,7 +326,7 @@ fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpressio
     return ok(linkedValue(state, LinkedBuiltin("", at), ""))
 }
 
-fn EmitLinkedNullDeclarations(&body: LinkedNullState): str! {
+fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding): str! {
     // Keep the external prototypes independent of the selected entry's C
     // name. The linker consumes declarations resolved from the source graph.
     text = ProjectionHeaders(true, body.drops.contains("ku_projection_string_drop") || body.owning_strings) + GuardArithmetic(body.uses_add, body.uses_sub)
@@ -400,5 +381,5 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState): str! {
             seen_arrays = seen_arrays.push(array)
         }
     }
-    return ok(text + EmitLinkedNullPrototypes(body.links)?)
+    return ok(text + EmitLinkedNullPrototypes(body.links, result)?)
 }

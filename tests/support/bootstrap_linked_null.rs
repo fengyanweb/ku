@@ -181,7 +181,10 @@ fn ReadPath(path: str, &prefix: str): Entry! { fail { domain: "fixture", code: "
     .unwrap();
     fs::write(
         cwd.join("nested-consumer.ku"),
-        r#"import { Read as Make, ReadOne } from "./nested-provider.ku"
+        r#"import { Entry, Storage, Read as Make, ReadOne } from "./nested-provider.ku"
+struct Other { storage: Storage }
+fn Tail(flag: int): Entry! { return ReadOne(flag) }
+fn WrongTail(flag: int): Other! { return ReadOne(flag) }
 fn InspectRecord(flag: int): null! {
     first = ReadOne(0)?
     second = ReadOne(flag)?
@@ -264,7 +267,45 @@ int main(void) {
         code,
         ..
     } = nested_plan(seed, cwd, "InspectRecord", "Struct");
-    let host = r#"
+    let host = format!(
+        "{NESTED_RECORD_WITNESS}{}",
+        r#"
+int main(void) {
+    (void)test_realloc;
+    assert(__ENTRY__(1).ok && outstanding() == 0 && attempts == 4);
+    KuBootstrapResultNull failed = __ENTRY__(-1);
+    assert(!failed.ok && failed.error.message.len == 1 && *failed.error.message.ptr == 'x');
+    assert(outstanding() == 1 && attempts == 7);
+    ku_projection_string_drop(&failed.error.message);
+    assert(outstanding() == 0);
+    return 0;
+}
+"#
+    )
+    .replace("__ENTRY__", &entry)
+    .replace("__RESULT__", &carrier)
+    .replace("__DEPENDENCY__", &dependency);
+    let c = cwd.join("nested-record-owner.c");
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    let binary = cwd.join(format!(
+        "nested-record-owner{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    compile_projection(&c, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(binary), cwd, 15));
+    assert_tail_record_result(seed, cwd);
+    assert_nested_array_append(seed, cwd);
+    for name in [
+        "nested-provider.ku",
+        "nested-consumer.ku",
+        "nested-collector.ku",
+        "modules.txt",
+    ] {
+        fs::remove_file(cwd.join(name)).unwrap();
+    }
+}
+
+const NESTED_RECORD_WITNESS: &str = r#"
 __RESULT__ __DEPENDENCY__(int64_t flag) {
     __RESULT__ result = {0};
     uint8_t *text = malloc(1);
@@ -282,38 +323,7 @@ __RESULT__ __DEPENDENCY__(int64_t flag) {
     result.ok = true;
     return result;
 }
-int main(void) {
-    (void)test_realloc;
-    assert(__ENTRY__(1).ok && outstanding() == 0 && attempts == 4);
-    KuBootstrapResultNull failed = __ENTRY__(-1);
-    assert(!failed.ok && failed.error.message.len == 1 && *failed.error.message.ptr == 'x');
-    assert(outstanding() == 1 && attempts == 7);
-    ku_projection_string_drop(&failed.error.message);
-    assert(outstanding() == 0);
-    return 0;
-}
-"#
-    .replace("__ENTRY__", &entry)
-    .replace("__RESULT__", &carrier)
-    .replace("__DEPENDENCY__", &dependency);
-    let c = cwd.join("nested-record-owner.c");
-    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
-    let binary = cwd.join(format!(
-        "nested-record-owner{}",
-        std::env::consts::EXE_SUFFIX
-    ));
-    compile_projection(&c, &binary, cwd);
-    assert_ok(&execute(&mut Command::new(binary), cwd, 15));
-    assert_nested_array_append(seed, cwd);
-    for name in [
-        "nested-provider.ku",
-        "nested-consumer.ku",
-        "nested-collector.ku",
-        "modules.txt",
-    ] {
-        fs::remove_file(cwd.join(name)).unwrap();
-    }
-}
+"#;
 
 struct NestedPlan {
     entry: String,
@@ -385,6 +395,57 @@ fn nested_plan(seed: &Path, cwd: &Path, function: &str, kind: &str) -> NestedPla
         dependency_result: carrier.clone(),
         code,
     }
+}
+
+fn assert_tail_record_result(seed: &Path, cwd: &Path) {
+    let NestedPlan {
+        entry,
+        entry_result,
+        dependency,
+        dependency_result,
+        code,
+    } = nested_plan(seed, cwd, "Tail", "Struct");
+    assert_eq!(entry_result, dependency_result);
+    let drop = format!(
+        "ku_drop_{}",
+        entry_result.strip_prefix("KuBootstrapResult_").unwrap()
+    );
+    let host = format!(
+        "{NESTED_RECORD_WITNESS}{}",
+        r#"
+int main(void) {
+    (void)test_realloc;
+    __RESULT__ result = __ENTRY__(0);
+    assert(result.ok && outstanding() == 2 && attempts == 2);
+    assert(*result.value.f0.f0.data[0].ptr == 'x');
+    __DROP__(&result.value);
+    assert(outstanding() == 0);
+    result = __ENTRY__(-1);
+    assert(!result.ok && outstanding() == 1 && attempts == 3);
+    assert(result.error.message.len == 1 && *result.error.message.ptr == 'x');
+    ku_projection_string_drop(&result.error.message);
+    assert(outstanding() == 0);
+    return 0;
+}
+"#
+    )
+    .replace("__ENTRY__", &entry)
+    .replace("__RESULT__", &entry_result)
+    .replace("__DEPENDENCY__", &dependency)
+    .replace("__DROP__", &drop);
+    let c = cwd.join("nested-record-tail.c");
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    let exe = cwd.join(format!(
+        "nested-record-tail{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    fs::write(cwd.join("function.txt"), "WrongTail").unwrap();
+    let invalid = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(invalid.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("linked_tail_result"));
 }
 
 fn assert_nested_array_append(seed: &Path, cwd: &Path) {

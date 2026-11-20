@@ -6,7 +6,8 @@ import { ProjectBindings } from "./project_bindings.ku"
 import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { ContainsType, CTypeName } from "./struct_projection_c.ku"
-import { OrderCStructLayouts } from "./nested_struct_c.ku"
+import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
+import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
 import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
@@ -126,6 +127,37 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
     }
     RejectLayout("unsupported_linked_type", "expected a known struct, str, int or bool", binding.span.clone())?
     return ok("")
+}
+
+fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &ty: TypeNameBinding, &name: str): str {
+    if (ty.name == "str" && ty.declaration_kind == "Builtin") {
+        return "    ku_projection_string_drop(&" + name.clone() + ");\n"
+    }
+    if (ty.declaration_kind == "Struct") {
+        unit = ty.module_index
+        node = ty.declaration_node
+        if (LayoutIndex(owning_layouts, unit, node) != 0) {
+            return "    " + OwningLayoutDropName(unit, node) + "(&" + name.clone() + ");\n"
+        }
+        layout = LayoutIndex(layouts, unit, node)
+        return GuardOwnedDrops(layouts, layout, name)
+    }
+    if (LinkedNullOwnedArray(ty)) {
+        return "    " + LinkedNullArrayPrefix(ty) + "_drop(&" + name.clone() + ");\n"
+    }
+    return ""
+}
+
+// Type-only layouts may be forwarded or returned exclusively on other
+// branches. Keep their internal cleanup references valid under strict C.
+fn LinkedNullResultCleanupReference(&owning_layouts: [StructLayout], &result: TypeNameBinding): str {
+    if (LinkedNullOwnedArray(result)) {
+        return "    (void)" + LinkedNullArrayPrefix(result) + "_drop;\n"
+    }
+    if (result.declaration_kind == "Struct" && LayoutIndex(owning_layouts, result.module_index, result.declaration_node) > 0) {
+        return "    (void)" + OwningLayoutDropName(result.module_index, result.declaration_node) + ";\n"
+    }
+    return ""
 }
 
 fn LinkedNullOwner(&binding: TypeNameBinding): bool {
@@ -278,9 +310,14 @@ fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
     return ok(text + ");\n")
 }
 
-fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction]): str! {
+fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &payload: TypeNameBinding): str! {
     text = ""
     records: [str] = []
+    if (payload.declaration_kind == "Struct") {
+        root = LinkedNullCType(payload)?
+        text = StructValueResultHeader(root)
+        records = records.push(root)
+    }
     for dependency in links.clone() {
         if (dependency.returns_result && dependency.result.declaration_kind == "Struct") {
             kind = LinkedNullCType(dependency.result)?

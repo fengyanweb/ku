@@ -320,6 +320,11 @@ the call or array growth releases the initialized prefix and the current
 standalone owner. Reading a nested array field and cloning a whole record
 with those fields require separate lowering.
 
+A terminal direct call can forward a checked Result whose payload has the
+same bound type. The wrappers `ReadProjectModule` and `ReadProjectModules`
+preserve the callee's status and all owned fields. The latter links to the
+typed collector, while the former still requires the private module reader.
+
 Managed array functions can take a `str` by value and check its byte or
 Unicode scalar length before initializing a local `[str]` with `.chars()`.
 The local array owns its non-ASCII entries independently of the source.
