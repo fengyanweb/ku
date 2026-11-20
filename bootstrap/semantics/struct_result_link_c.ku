@@ -4,12 +4,16 @@ import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardExplicitType, GuardExpression } from "./guarded_struct_expr.ku"
 import { AddGuardCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
+import { ContainsIndex } from "./struct_projection_c.ku"
 
 struct StructResultLink {
     symbol: str
     prototype: str
     remaining: [GuardBinding]
     code: ManagedCode
+    declarations: str
+    drops: str
+    clone_layouts: [int]
 }
 
 fn resultFunctionNode(&named: NamedModule, &name: str): int {
@@ -48,6 +52,17 @@ fn checkNullResultCallee(&nodes: [Node], &edges: [int], &types: [TypeNameBinding
     return ok(null)
 }
 
+fn explicitCloneSource(&nodes: [Node], &edges: [int], &argument: Node): int {
+    if (argument.kind != "Call" || argument.edge_count != 1) { return 0 }
+    method = nodes[edges[argument.first_edge] - 1].clone()
+    if (method.kind != "Field" || method.text != "clone" || method.edge_count != 1) { return 0 }
+    return edges[method.first_edge]
+}
+
+fn ResultLinkClonePrefix(layout: int): str {
+    return "ku_result_link_layout_" + str(layout)
+}
+
 // Lower one direct same-module dependency as a link against its exact
 // validated declaration. No handwritten error construction substitutes for
 // a missing callee. An owner argument is made unavailable after transfer.
@@ -75,7 +90,11 @@ fn LowerStructResultLink(&named: NamedModule, &types: [TypeNameBinding], &layout
     prototype = "extern KuBootstrapResultNull " + symbol.clone() + "("
     args = ""
     transfers = ""
+    moved_scratch = ""
     code = ManagedBlank()
+    declarations = ""
+    drops = ""
+    clone_layouts: [int] = []
     available = bindings
     cursor = callee.first_edge
     end = cursor + callee.edge_count
@@ -88,8 +107,14 @@ fn LowerStructResultLink(&named: NamedModule, &types: [TypeNameBinding], &layout
         ty = GuardExplicitType(types, named.parsed.arena.nodes, layouts, named.parsed.arena.edges[parameter.first_edge])?
         arg_id = named.parsed.arena.edges[call.first_edge + index]
         arg = named.parsed.arena.nodes[arg_id - 1].clone()
-        value = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, available, layouts, arg_id, 0, "    ")?
-        if (ty.kind != value.ty.kind || ty.layout != value.ty.layout || value.view ||
+        subject = 0
+        if (ty.kind == "struct") {
+            subject = explicitCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, arg)
+        }
+        value_id = arg_id
+        if (subject != 0) { value_id = subject }
+        value = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, available, layouts, value_id, 0, "    ")?
+        if (ty.kind != value.ty.kind || ty.layout != value.ty.layout || (value.view && subject == 0) ||
             (ty.kind == "str" && arg.kind != "String")) {
             RejectLayout("struct_result_link_argument", "expected matching by-value arguments and static str", DeclarationSpan(arg))?
         }
@@ -99,8 +124,25 @@ fn LowerStructResultLink(&named: NamedModule, &types: [TypeNameBinding], &layout
         prototype += c_type.clone()
         args += sequential.clone()
         code = AddGuardCode(code, value)
-        code.text = code.text + "    " + c_type.clone() + " " + sequential + " = " + value.value + ";\n"
-        if (ty.kind == "struct") {
+        if (subject != 0) {
+            if (named.parsed.arena.nodes[subject - 1].kind != "Variable") {
+                RejectLayout("struct_result_link_owner", "explicit struct clone requires a bound value or View", DeclarationSpan(arg))?
+            }
+            prefix = ResultLinkClonePrefix(ty.layout)
+            if (!ContainsIndex(clone_layouts, ty.layout)) { clone_layouts = clone_layouts.push(ty.layout) }
+            declarations += "    " + c_type.clone() + " " + sequential.clone() + " = {0};\n"
+            drops = "    " + prefix.clone() + "_element_drop(&" + sequential.clone() + ");\n" + drops
+            reference = value.value
+            if (!value.view) { reference = "&" + reference }
+            code.text = code.text + "    if (!" + prefix + "_clone_element(" + reference + ", &" + sequential.clone() +
+                ")) { out_of_memory = true; goto cleanup; }\n"
+            // The callee will consume this clone, and no generated operation
+            // can fail between call and clearing the moved scratch slot.
+            moved_scratch += "    " + sequential + " = (" + c_type + "){0};\n"
+        } else {
+            code.text = code.text + "    " + c_type.clone() + " " + sequential + " = " + value.value + ";\n"
+        }
+        if (ty.kind == "struct" && subject == 0) {
             source = GuardBindingIndex(available, arg.text)
             if (arg.kind != "Variable" || source == 0) {
                 RejectLayout("struct_result_link_owner", "checked link needs a distinct initialized struct owner", DeclarationSpan(arg))?
@@ -120,7 +162,9 @@ fn LowerStructResultLink(&named: NamedModule, &types: [TypeNameBinding], &layout
     if (args == "") { prototype += "void" }
     outcome = "dependency" + str(statement_id)
     code.text = code.text + transfers + "    KuBootstrapResultNull " + outcome.clone() + " = " + symbol.clone() + "(" + args + ");\n"
+    code.text = code.text + moved_scratch
     code.text = code.text + "    if (!" + outcome.clone() + ".ok) {\n        result.error = " + outcome.clone() + ".error;\n"
     code.text = code.text + "        " + outcome + ".error = (KuBootstrapError){0};\n        goto cleanup;\n    }\n"
-    return ok(StructResultLink { symbol: symbol, prototype: prototype + ");\n\n", remaining: available, code: code })
+    return ok(StructResultLink { symbol: symbol, prototype: prototype + ");\n\n", remaining: available, code: code,
+        declarations: declarations, drops: drops, clone_layouts: clone_layouts })
 }

@@ -9,8 +9,8 @@ import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projectio
 import { GuardArithmetic, GuardOwnedDrops, GuardStringEquality } from "./guarded_struct_c.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression } from "./guarded_struct_expr.ku"
 import { AddGuardCode, JoinManagedCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
-import { EmitTryCloneString } from "./struct_array_c.ku"
-import { LowerStructResultLink } from "./struct_result_link_c.ku"
+import { EmitOwnedStructOperations, EmitTryCloneString } from "./struct_array_c.ku"
+import { LowerStructResultLink, ResultLinkClonePrefix } from "./struct_result_link_c.ku"
 
 struct StructResultC {
     symbol: str
@@ -31,6 +31,9 @@ struct StructResultBody {
     code: ManagedCode
     prototype: str
     dependency: str
+    declarations: str
+    drops: str
+    clone_layouts: [int]
 }
 
 fn orderResultLayout(&layouts: [StructLayout], index: int, at: Span): CStructOrder! {
@@ -196,6 +199,9 @@ fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports
     local = bindings
     prototype = ""
     dependency = ""
+    declarations = ""
+    drops = ""
+    clone_layouts: [int] = []
     cursor = start
     while (cursor < end) {
         id = named.parsed.arena.edges[cursor]
@@ -220,13 +226,17 @@ fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports
             local = link.remaining
             prototype = link.prototype
             dependency = link.symbol
+            declarations = link.declarations
+            drops = link.drops
+            clone_layouts = link.clone_layouts
             code = JoinManagedCode(code, link.code)
         } else {
             RejectLayout("unsupported_struct_result_body", "expected guarded returns or one tail checked dependency", DeclarationSpan(statement))?
         }
         cursor = cursor + 1
     }
-    return ok(StructResultBody { code: code, prototype: prototype, dependency: dependency })
+    return ok(StructResultBody { code: code, prototype: prototype, dependency: dependency,
+        declarations: declarations, drops: drops, clone_layouts: clone_layouts })
 }
 
 fn StructResultHeader(): str {
@@ -254,10 +264,15 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     struct_type = GuardCType(inner, layouts)
     result_type = "KuBootstrapResult_" + struct_type.clone()
     overflow = body.code.uses_add || body.code.uses_sub
+    may_allocate = order.contains_string || body.clone_layouts.len() != 0
     text = ProjectionHeaders(true, true) + "#include <stdio.h>\n\n" + GuardArithmetic(body.code.uses_add, body.code.uses_sub)
     text += GuardStringEquality(body.code.uses_eq) + signature.declarations + StructResultHeader()
     text += "typedef struct { bool ok; " + struct_type + " value; KuBootstrapError error; } " + result_type.clone() + ";\n\n"
-    if (order.contains_string) { text += "#include <string.h>\n\n" + EmitTryCloneString("ku_result_clone_string") }
+    if (may_allocate) { text += "#include <string.h>\n\n" }
+    if (order.contains_string) { text += EmitTryCloneString("ku_result_clone_string") }
+    for layout in body.clone_layouts {
+        text += EmitOwnedStructOperations(layouts, layout, ResultLinkClonePrefix(layout), true)
+    }
     text += result_type.clone() + " " + symbol.clone() + "_move(" + result_type.clone() + " *result) {\n"
     text += "    " + result_type.clone() + " moved = *result;\n    *result = (" + result_type.clone() + "){0};\n    return moved;\n}\n\n"
     drop = symbol.clone() + "_drop"
@@ -266,11 +281,11 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     text += "    ku_projection_string_drop(&result->error.domain);\n    ku_projection_string_drop(&result->error.code);\n"
     text += "    ku_projection_string_drop(&result->error.message);\n    *result = (" + result_type.clone() + "){0};\n}\n\n"
     text += body.prototype + result_type.clone() + " " + symbol.clone() + "(" + signature.parameters + ") {\n"
-    text += "    " + result_type + " result = {0};\n" + signature.unused
-    if (order.contains_string) { text += "    bool out_of_memory = false;\n" }
+    text += "    " + result_type + " result = {0};\n" + signature.unused + body.declarations
+    if (may_allocate) { text += "    bool out_of_memory = false;\n" }
     if (overflow) { text += "    bool overflow = false;\n" }
-    text += body.code.text + "cleanup:\n" + signature.drops
-    if (order.contains_string) {
+    text += body.code.text + "cleanup:\n" + body.drops + signature.drops
+    if (may_allocate) {
         text += "    if (out_of_memory) { " + drop.clone() + "(&result); fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n"
     }
     if (overflow) {

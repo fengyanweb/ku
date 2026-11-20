@@ -41,9 +41,10 @@ fn EmitTryCloneString(&symbol: str): str {
         "    *out = (KuProjectionString){ data, source.len, size, KU_PROJECTION_STRING_OWNED };\n    return true;\n}\n\n"
 }
 
-fn emitArrayOwnedElement(&element: str, &prefix: str, &fields: [str]): str {
+fn emitOwnedStructElement(&element: str, &prefix: str, &fields: [str], private_drop: bool): str {
     text = ""
     if (fields.len() != 0) { text = EmitTryCloneString(prefix.clone() + "_clone_string") }
+    if (private_drop) { text += "static " }
     text += "void " + prefix.clone() + "_element_drop(" + element.clone() + " *value) {\n"
     index = 0
     while (index < fields.len()) {
@@ -69,6 +70,14 @@ fn emitArrayOwnedElement(&element: str, &prefix: str, &fields: [str]): str {
         index = index + 1
     }
     return text + "    *out = copy;\n    return true;\n}\n\n"
+}
+
+// The caller first validates the finite by-value layout graph. This is shared
+// by typed array storage and stand-alone scratch owners in checked calls.
+fn EmitOwnedStructOperations(&layouts: [StructLayout], root: int, &prefix: str, private_drop: bool): str {
+    element = CTypeName(layouts[root - 1].module_index, layouts[root - 1].node)
+    owned = collectOwnedFields(layouts, root, "", [])
+    return emitOwnedStructElement(element, prefix, owned, private_drop)
 }
 
 fn emitArrayBoundary(&element: str, &array: str, &prefix: str): str {
@@ -140,7 +149,7 @@ fn EmitStructArrayOperations(&layouts: [StructLayout], root: int): StructArrayC 
     if (owned.len() != 0) { text += "#include <string.h>\n" }
     text += "\ntypedef struct { size_t len; " + element.clone() + " *data; size_t capacity; } " + array.clone() + ";\n"
     text += "enum { KU_STRUCT_ARRAY_OK, KU_STRUCT_ARRAY_INVALID, KU_STRUCT_ARRAY_BOUNDS, KU_STRUCT_ARRAY_CAPACITY, KU_STRUCT_ARRAY_OOM };\n\n"
-    text += emitArrayOwnedElement(element, prefix, owned) + emitArrayBoundary(element, array, prefix) + emitArrayTransfer(element, array, prefix)
+    text += emitOwnedStructElement(element, prefix, owned, false) + emitArrayBoundary(element, array, prefix) + emitArrayTransfer(element, array, prefix)
     return StructArrayC { element_type: element, array_type: array, prefix: prefix, source: text }
 }
 

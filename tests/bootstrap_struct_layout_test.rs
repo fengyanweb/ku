@@ -3,6 +3,9 @@
 #[path = "support/bounded_process.rs"]
 pub mod bounded_process;
 
+#[path = "support/bootstrap_binary_operator.rs"]
+mod binary_operator;
+
 #[path = "support/bootstrap_diagnostic_calls.rs"]
 mod diagnostic_calls;
 
