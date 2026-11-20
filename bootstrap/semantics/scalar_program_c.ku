@@ -144,7 +144,7 @@ fn LowerScalarProgramEntry(&nodes: [Node], &edges: [int], &declarations: [TopLev
             0, cursor, end, entry, can_print, can_use_ok)?
         return ok(ScalarIntFunction { function_node: entry, parameters: parameters, clauses: body.clauses, result_type: 4,
             uses_string_comparison: body.uses_string_comparison, uses_string_contains: body.uses_string_contains,
-            uses_string_join: false, owned_string_body: "" })
+            uses_string_join: false, uses_string_replace: false, owned_string_body: "" })
     }
     instructions: [ScalarIntInstruction] = []
     while (cursor < end - 1) {
@@ -167,7 +167,8 @@ fn LowerScalarProgramEntry(&nodes: [Node], &edges: [int], &declarations: [TopLev
     no_strings: [ScalarStringPart] = []
     clause = ScalarIntClause { control: "", condition: "", instructions: instructions, scalar_result: result, string_parts: no_strings }
     return ok(ScalarIntFunction { function_node: entry, parameters: parameters, clauses: [clause], result_type: 4,
-        uses_string_comparison: false, uses_string_contains: false, uses_string_join: false, owned_string_body: "" })
+        uses_string_comparison: false, uses_string_contains: false, uses_string_join: false, uses_string_replace: false,
+        owned_string_body: "" })
 }
 
 fn ComposeScalarProgramC(source: str, symbol: str): str {

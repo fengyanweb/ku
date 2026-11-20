@@ -39,6 +39,7 @@ struct ScalarIntFunction {
     uses_string_comparison: bool
     uses_string_contains: bool
     uses_string_join: bool
+    uses_string_replace: bool
     owned_string_body: str
 }
 
@@ -218,6 +219,10 @@ struct ScalarStringAssignment {
 }
 
 fn EmitScalarStringAssignment(&parts: [ScalarStringPart], &indent: str): ScalarStringAssignment {
+    return EmitScalarStringJoinTo(parts, indent, "result")
+}
+
+fn EmitScalarStringJoinTo(&parts: [ScalarStringPart], &indent: str, &destination: str): ScalarStringAssignment {
     count = str(parts.len())
     text = indent.clone() + "KuScalarStringPart parts[" + count.clone() + "];\n"
     uses_format = false
@@ -236,7 +241,7 @@ fn EmitScalarStringAssignment(&parts: [ScalarStringPart], &indent: str): ScalarS
         }
         index = index + 1
     }
-    text += indent.clone() + "failure = ku_scalar_string_join(parts, " + count + "u, &result);\n"
+    text += indent.clone() + "failure = ku_scalar_string_join(parts, " + count + "u, &" + destination.clone() + ");\n"
     return ScalarStringAssignment { source: text, uses_format: uses_format }
 }
 
@@ -279,7 +284,7 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         return ScalarIntBodyC { source: source, uses_add: false, uses_sub: false, uses_mul: false,
             uses_div: false, uses_rem: false, uses_string: true, uses_string_comparison: false,
             uses_string_contains: false, uses_owned_string: true, uses_string_format: false,
-            uses_string_replace: true, uses_output: false }
+            uses_string_replace: plan.uses_string_replace, uses_output: false }
     }
     uses_owned = drops != ""
     uses_cleanup = uses_owned || plan.uses_string_join

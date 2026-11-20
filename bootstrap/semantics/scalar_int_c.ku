@@ -68,17 +68,21 @@ fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLeve
             local_base, cursor, end, function_id, can_print, can_use_ok)?
         return ok(ScalarIntFunction { function_node: local_base + function_id, parameters: parameters, clauses: body.clauses,
             result_type: 4, uses_string_comparison: body.uses_string_comparison, uses_string_contains: body.uses_string_contains,
-            uses_string_join: false, owned_string_body: "" })
+            uses_string_join: false, uses_string_replace: false, owned_string_body: "" })
     }
     clauses: [ScalarIntClause] = []
     owned_body = ""
+    uses_join = false
+    uses_replace = false
     if (result_type == 2 && HasScalarOwnedStringBody(nodes, edges, cursor, end)) {
-        owned_body = LowerScalarOwnedStringBody(nodes, edges, bindings, parameters, cursor, end)?
+        lowered = LowerScalarOwnedStringBody(nodes, edges, bindings, parameters, cursor, end)?
+        uses_join = lowered.uses_join
+        uses_replace = lowered.uses_replace
+        owned_body = lowered.source
         cursor = end
     }
     uses_comparison = false
     uses_contains = false
-    uses_join = false
     while (cursor < end) {
         statement = nodes[edges[cursor] - 1].clone()
         condition = ""
@@ -128,7 +132,7 @@ fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLeve
     }
     return ok(ScalarIntFunction { function_node: local_base + function_id, parameters: parameters, clauses: clauses,
         result_type: result_type, uses_string_comparison: uses_comparison, uses_string_contains: uses_contains,
-        uses_string_join: uses_join, owned_string_body: owned_body })
+        uses_string_join: uses_join, uses_string_replace: uses_replace, owned_string_body: owned_body })
 }
 
 fn ContainsScalarIntNode(&nodes: [int], node: int): bool {

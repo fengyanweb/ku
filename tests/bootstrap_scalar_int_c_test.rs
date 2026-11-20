@@ -577,13 +577,7 @@ fn main(): null! {{
     }
 }
 
-fn assert_owned_replacement(ku: &Path, seed: &Path, cwd: &Path) {
-    let token_module = include_str!("../bootstrap/stage1/token.ku");
-    let generated = build_function(seed, cwd, token_module, "EscapeCanonical");
-    assert_success(&generated);
-    let generated = String::from_utf8(generated.stdout).expect("standalone C");
-    let (name, body) = generated.split_once('\n').expect("symbol line and C");
-    let witness = r#"
+const OWNED_STRING_WITNESS: &str = r#"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -609,6 +603,13 @@ static void watch_free(void *ptr) {
 #define malloc watch_malloc
 #define free watch_free
 "#;
+
+fn assert_owned_replacement(ku: &Path, seed: &Path, cwd: &Path) {
+    let token_module = include_str!("../bootstrap/stage1/token.ku");
+    let generated = build_function(seed, cwd, token_module, "EscapeCanonical");
+    assert_success(&generated);
+    let generated = String::from_utf8(generated.stdout).expect("standalone C");
+    let (name, body) = generated.split_once('\n').expect("symbol line and C");
     let driver = r#"
 #undef malloc
 #undef free
@@ -631,7 +632,10 @@ int main(int argc, char **argv) {
     let app = cwd.join(format!("replace{}", std::env::consts::EXE_SUFFIX));
     fs::write(
         &c_path,
-        format!("{witness}{body}{}", driver.replace("CALL", name.trim())),
+        format!(
+            "{OWNED_STRING_WITNESS}{body}{}",
+            driver.replace("CALL", name.trim())
+        ),
     )
     .expect("independent replacement C");
     fs::remove_file(cwd.join("input.ku")).expect("retire fixture source");
@@ -669,6 +673,76 @@ int main(int argc, char **argv) {
         assert!(failed.stdout.is_empty());
         assert!(String::from_utf8_lossy(&failed.stderr).contains("unsupported_replace_operand"));
     }
+}
+
+fn assert_owned_composition(ku: &Path, seed: &Path, cwd: &Path) {
+    let source = r#"
+fn Compose(name: str): str {
+    out = "[" + name
+    tail = "字" + name
+    out += tail
+    tail = "]" + name
+    return out + tail
+}
+"#;
+    let generated = build_function(seed, cwd, source, "Compose");
+    assert_success(&generated);
+    let generated = String::from_utf8(generated.stdout).expect("standalone C");
+    let (name, body) = generated.split_once('\n').expect("symbol line and C");
+    assert!(!body.contains("ku_scalar_string_replace"));
+    let driver = r#"
+#undef malloc
+#undef free
+int main(int argc, char **argv) {
+    static const uint8_t input[] = {0xf0,0x9f,0x99,0x82};
+    assert(argc == 2);
+    fail_at = (size_t)strtoul(argv[1], NULL, 10);
+    live[0] = malloc(sizeof(input));
+    assert(live[0] && atexit(verify_clean) == 0);
+    memcpy(live[0], input, sizeof(input));
+    KuBootstrapString result = CALL((KuScalarString){live[0], sizeof(input), sizeof(input), 1u});
+    assert(fail_at == 0 && calls == 5 && result.ptr == live[5] && result.storage == 1u);
+    assert(fwrite(result.ptr, 1, result.len, stdout) == result.len);
+    watch_free(result.ptr);
+    return 0;
+}
+"#;
+    let c_path = cwd.join("join.c");
+    let app = cwd.join(format!("join{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &c_path,
+        format!(
+            "{OWNED_STRING_WITNESS}{body}{}",
+            driver.replace("CALL", name.trim())
+        ),
+    )
+    .expect("independent composition C");
+    compile_c(&c_path, &app, cwd);
+    let oracle = cwd.join("join-oracle.ku");
+    fs::write(
+        &oracle,
+        format!("{source}\nfn main() {{ print(Compose(\"🙂\")) }}\n"),
+    )
+    .unwrap();
+    let expected = execute(Command::new(ku).arg("run").arg(&oracle), cwd, 10);
+    assert_success(&expected);
+    assert_eq!(expected.stdout, "[🙂字🙂]🙂".as_bytes());
+    let actual = execute(Command::new(&app).arg("0"), cwd, 10);
+    assert_success(&actual);
+    assert_eq!(actual.stdout, expected.stdout);
+    for attempt in 1..=5 {
+        let failed = execute(Command::new(&app).arg(attempt.to_string()), cwd, 10);
+        assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+        assert!(failed.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&failed.stderr).trim(),
+            "out of memory"
+        );
+    }
+    let invalid = source.replace("tail = \"]\" + name", "out = out + tail");
+    let failed = build_function(seed, cwd, &invalid, "Compose");
+    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("moved_scalar_string"));
 }
 
 fn assert_imported_calls(ku: &Path, seed: &Path, cwd: &Path) {
@@ -1039,6 +1113,7 @@ fn ku_emits_checked_c11_for_real_math_functions() {
     assert_checked_division(&ku, &seed, &cwd);
     assert_string_composition(&ku, &seed, &cwd);
     assert_owned_replacement(&ku, &seed, &cwd);
+    assert_owned_composition(&ku, &seed, &cwd);
     assert_capacity_results(&ku, &seed, &cwd);
     assert_imported_calls(&ku, &seed, &cwd);
     assert_project_executable(&ku, &seed, &cwd);
