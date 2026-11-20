@@ -183,6 +183,11 @@ this path to transfer its five string buffers into the result. C11 uses
 bounded nonrecursive layouts and static storage for string literals. The
 constructor itself allocates no heap storage.
 
+The same constructor can read matching `int` and `bool` fields from a bound
+struct parameter, including a read-only View. `MakeExpressionNode`,
+`MakeOperator` and `OperatorSpan` use this to keep absolute source coordinates.
+Moving a parameter invalidates later reads, and a View stays with its caller.
+
 For a function that reads struct fields and returns a diagnostic
 string, use the same project files with `guarded` in `mode.txt` and
 `ParseContextError` in `function.txt`. This mode supports int and bool locals,

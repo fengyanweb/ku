@@ -1349,7 +1349,85 @@ fn Make(): Outer {
     assert_guarded_context(&ku, &driver_binary, &cwd, contexts);
     assert_projected_span(&ku, &driver_binary, &cwd, span_source);
     assert_constructor_parameter_ownership(&driver_binary, &cwd);
+    assert_constructor_view(&driver_binary, &cwd);
     assert_project_link_plans(&driver_binary, &cwd);
+}
+
+fn assert_constructor_view(seed: &Path, cwd: &Path) {
+    for (file, source) in [
+        (
+            "stage2/expression_support.ku",
+            include_str!("../bootstrap/stage2/expression_support.ku"),
+        ),
+        ("stage2/ast.ku", include_str!("../bootstrap/stage2/ast.ku")),
+    ] {
+        fs::write(cwd.join(file), source).unwrap();
+    }
+    fs::write(
+        cwd.join("modules.txt"),
+        "stage2/expression_support.ku\nstage2/span.ku\nstage2/diagnostic.ku\nstage1/token.ku\nstage2/ast.ku\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("function.txt"), "OperatorSpan").unwrap();
+    let output = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains("free(") && !text.contains("malloc("));
+    let definition = text
+        .lines()
+        .find(|line| line.contains(" ku_construct_"))
+        .unwrap();
+    let (result, callable) = definition.split_once(' ').unwrap();
+    let (constructor, arguments) = callable.split_once('(').unwrap();
+    let entry = arguments
+        .strip_prefix("const ")
+        .unwrap()
+        .split_once('*')
+        .unwrap()
+        .0;
+    let driver = r#"
+#include <stdlib.h>
+int main(void) {
+    uint8_t *owner=malloc(1);
+    if(!owner) return 1;
+    *owner=73;
+    ENTRY input={.f0={owner,1,1,KU_PROJECTION_STRING_OWNED},.f4=2,.f5=3,.f6=7,.f7=4,.f8=5,.f9=9};
+    RESULT projected=CTOR(&input);
+    if (projected.f0!=2 || projected.f1!=3 || projected.f2!=7 ||
+        projected.f3!=4 || projected.f4!=5 || projected.f5!=9 ||
+        input.f0.ptr!=owner || *input.f0.ptr!=73) return 2;
+    free(input.f0.ptr);
+    return 0;
+}
+"#
+    .replace("ENTRY", entry)
+    .replace("RESULT", result)
+    .replace("CTOR", constructor);
+    let source = cwd.join("constructor-view.c");
+    fs::write(&source, format!("{text}{driver}")).unwrap();
+    let binary = cwd.join(format!("constructor-view{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&source, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(binary), cwd, 15));
+
+    for (program, expected) in [
+        (
+            "struct Data { label: str line: int }\nstruct ResultValue { data: Data line: int }\n\
+             fn Try(value: Data): ResultValue { return ResultValue { data: value, line: value.line } }\n",
+            "constructor_parameter_moved",
+        ),
+        (
+            "struct Data { label: str }\nstruct ResultValue { data: Data }\n\
+             fn Try(&value: Data): ResultValue { return ResultValue { data: value } }\n",
+            "constructor_view_escape",
+        ),
+    ] {
+        fs::write(cwd.join("bad-copy.ku"), program).unwrap();
+        fs::write(cwd.join("modules.txt"), "bad-copy.ku\n").unwrap();
+        fs::write(cwd.join("function.txt"), "Try").unwrap();
+        let output = execute(&mut Command::new(seed), cwd, 30);
+        assert!(!output.status.success() && output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
 }
 
 fn assert_project_link_plans(driver: &Path, cwd: &Path) {

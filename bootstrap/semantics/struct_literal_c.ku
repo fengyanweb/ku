@@ -8,7 +8,7 @@ import { ExplicitType, FieldIndex, LayoutIndex, RejectLayout, StructLayout } fro
 import { CTypeName, ContainsIndex, ProjectionHeaders } from "./struct_projection_c.ku"
 import { CStructOrder, EmitOrderedStructLayouts, OrderCStructLayouts } from "./nested_struct_c.ku"
 
-import { ConstructorParameter, ConstructorParameterIndex, ConstructorParameterName, ConstructorFieldMatches, ConstructorNeedsDrop, ReadConstructorParameters, DropUnusedConstructorParameters } from "./constructor_parameters.ku"
+import { ConstructorParameter, ConstructorParameterIndex, ConstructorParameterName, ConstructorFieldMatches, ConstructorNeedsDrop, ReadConstructorParameters, ReadConstructorCopyField, DropUnusedConstructorParameters } from "./constructor_parameters.ku"
 
 struct StructConstructorC {
     symbol: str
@@ -98,16 +98,23 @@ fn emitConstructorLiteral(&named: NamedModule, &layout: StructLayout, &literal: 
         if (ContainsIndex(seen, field)) {
             RejectLayout("duplicate_literal_field", "duplicate constructor field '" + item.text.clone() + "'", DeclarationSpan(item))?
         }
-        value = named.parsed.arena.nodes[named.parsed.arena.edges[item.first_edge] - 1].clone()
+        value_id = named.parsed.arena.edges[item.first_edge]
+        value = named.parsed.arena.nodes[value_id - 1].clone()
         parameter = 0
         if (value.kind == "Variable" && value.edge_count == 0) {
             parameter = ConstructorParameterIndex(parameters, value.text)
         }
         operand = ""
-        if (parameter == 0) {
+        if (value.kind == "Field") {
+            operand = ReadConstructorCopyField(named.parsed.arena.nodes, named.parsed.arena.edges, layouts, parameters,
+                bound, value_id, layout.fields[field - 1].resolved)?
+        } else if (parameter == 0) {
             operand = constructorOperand(named, value, layout.fields[field - 1].resolved, local, layouts)?
         } else {
             expected = layout.fields[field - 1].resolved.clone()
+            if (parameters[parameter - 1].view) {
+                RejectLayout("constructor_view_escape", "a View parameter cannot become an owned result field", DeclarationSpan(value))?
+            }
             if (!ConstructorFieldMatches(parameters[parameter - 1].bound, expected)) {
                 RejectLayout("constructor_parameter_type", "parameter type does not match this field", DeclarationSpan(value))?
             }

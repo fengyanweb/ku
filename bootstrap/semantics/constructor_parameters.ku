@@ -1,5 +1,6 @@
 import { Node } from "../stage2/ast.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
+import { GuardBinding, GuardExpression, GuardType } from "./guarded_struct_expr.ku"
 import { DeclarationSpan } from "./names.ku"
 import { CStructOrder, OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ContainsIndex, CTypeName, ScalarCType } from "./struct_projection_c.ku"
@@ -11,6 +12,7 @@ struct ConstructorParameter {
     bound: TypeNameBinding
     layout: int
     owned: bool
+    view: bool
 }
 
 struct ConstructorParameters {
@@ -70,20 +72,25 @@ fn ReadConstructorParameters(&nodes: [Node], &edges: [int], &bindings: [TypeName
     while (cursor < end && nodes[edges[cursor] - 1].kind == "Parameter") {
         parameter = nodes[edges[cursor] - 1].clone()
         at = DeclarationSpan(parameter)
-        if (parameter.edge_count != 1 || parameter.int_value != 0 ||
+        if (parameter.edge_count != 1 || parameter.int_value < 0 || parameter.int_value > 1 ||
             ConstructorParameterIndex(values, parameter.text) != 0) {
-            RejectLayout("unsupported_constructor_parameter", "expected a distinct, explicitly typed by-value parameter", at.clone())?
+            RejectLayout("unsupported_constructor_parameter", "expected a distinct, explicitly typed parameter", at.clone())?
         }
         binding = ExplicitType(bindings, edges[parameter.first_edge], at.clone())?
+        view = parameter.int_value == 1
+        if (view && binding.declaration_kind != "Struct") {
+            RejectLayout("unsupported_constructor_parameter", "constructor Views require a bound struct layout", at.clone())?
+        }
         layout = 0
         ctype = ""
         owned = false
         if (binding.declaration_kind == "Struct") {
             shape = OrderCStructLayouts(layouts, binding.module_index, binding.declaration_node, at)?
             layout = LayoutIndex(layouts, binding.module_index, binding.declaration_node)
-            owned = shape.contains_string
+            owned = shape.contains_string && !view
             order = mergeLayoutOrder(order, shape)
             ctype = CTypeName(binding.module_index, binding.declaration_node)
+            if (view) { ctype = "const " + ctype + "*" }
         } else if (binding.declaration_kind == "Builtin" && binding.name == "str") {
             owned = true
             order.contains_string = true
@@ -93,11 +100,37 @@ fn ReadConstructorParameters(&nodes: [Node], &edges: [int], &bindings: [TypeName
         }
         if (values.len() != 0) { signature += ", " }
         signature += ctype + " " + ConstructorParameterName(values.len() + 1)
-        values = values.push(ConstructorParameter { name: parameter.text, bound: binding, layout: layout, owned: owned })
+        values = values.push(ConstructorParameter { name: parameter.text, bound: binding, layout: layout, owned: owned, view: view })
         cursor = cursor + 1
     }
     if (signature == "") { signature = "void" }
     return ok(ConstructorParameters { values: values, order: order, next: cursor, signature: signature })
+}
+
+fn ReadConstructorCopyField(&nodes: [Node], &edges: [int], &layouts: [StructLayout],
+                            &parameters: [ConstructorParameter], &used: [int], id: int, &expected: TypeNameBinding): str! {
+    actual = nodes[id - 1].clone()
+    root = id
+    while (nodes[root - 1].kind == "Field" && nodes[root - 1].edge_count == 1) {
+        root = edges[nodes[root - 1].first_edge]
+    }
+    receiver = nodes[root - 1].clone()
+    parameter = ConstructorParameterIndex(parameters, receiver.text)
+    if (receiver.kind != "Variable" || parameter == 0 || parameters[parameter - 1].layout == 0) {
+        RejectLayout("unsupported_constructor_operand", "expected a field of a bound struct parameter", DeclarationSpan(actual))?
+    }
+    input = parameters[parameter - 1].clone()
+    if (input.owned && ContainsIndex(used, parameter)) {
+        RejectLayout("constructor_parameter_moved", "owned parameter '" + receiver.text.clone() + "' was moved by an earlier field", DeclarationSpan(receiver))?
+    }
+    binding = GuardBinding { name: input.name, ty: GuardType { kind: "struct", layout: input.layout },
+        slot: parameter - 1, parameter: true, view: input.view }
+    value = GuardExpression(nodes, edges, [binding], layouts, id, 0, "")?
+    if (expected.declaration_kind != "Builtin" || expected.name != value.ty.kind ||
+        (value.ty.kind != "int" && value.ty.kind != "bool") || value.setup != "") {
+        RejectLayout("constructor_parameter_type", "a projected value must copy a matching int or bool field", DeclarationSpan(actual))?
+    }
+    return ok(value.value)
 }
 
 fn DropUnusedConstructorParameters(&parameters: [ConstructorParameter], &layouts: [StructLayout], &used: [int]): str {
