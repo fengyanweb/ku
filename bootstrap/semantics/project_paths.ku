@@ -29,9 +29,7 @@ fn NormalizeProjectPath(parent: str, &path: str, at: Span): str! {
     }
     result = parent
     component = ""
-    // A text NUL is representable in all three execution modes.
-    decoded_zero = json.parse("\"\\u0000\"")?
-    zero = decoded_zero.as_str()?
+    zero = ProjectPathNul()?
     for character in string.chars(path.clone()) {
         if (character == "/") {
             result = AppendProjectComponent(result, component, at.clone())?
@@ -46,6 +44,12 @@ fn NormalizeProjectPath(parent: str, &path: str, at: Span): str! {
     resolved = AppendProjectComponent(result, component, at.clone())?
     if (resolved.byte_len() > 512) { RejectName("project_path", "resolved project path exceeds 512 UTF-8 bytes", at)? }
     return ok(resolved)
+}
+
+// Keep the original checked JSON conversion behind an owned str Result.
+fn ProjectPathNul(): str! {
+    decoded_zero = json.parse("\"\\u0000\"")?
+    return decoded_zero.as_str()
 }
 
 fn CheckProjectManifestPath(&path: str, at: Span): null! {
