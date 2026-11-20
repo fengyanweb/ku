@@ -7938,6 +7938,94 @@ fn native_struct_with_enum_field_topological() {
     fs::remove_dir_all(&dir).ok();
 }
 
+const FORWARD_AGGREGATE_DECLARATIONS: &str = r#"
+struct Packet { signature: Signature, state: State }
+enum State { Wrapped(payload: WireState) }
+enum WireState { Signed(signature: Signature) }
+struct Signature { label: str }
+
+fn Create(): Packet {
+    label = "Ku" + "🙂"
+    return Packet {
+        signature: Signature { label: label.clone() },
+        state: State.Wrapped(WireState.Signed(Signature { label: label }))
+    }
+}
+fn Describe(&packet: Packet): str { return packet.signature.label.clone() }
+fn Split(packet: Packet): str {
+    return match packet.state {
+        State.Wrapped(wire) => match wire { WireState.Signed(signature) => signature.label }
+    }
+}
+"#;
+
+const FORWARD_AGGREGATE_MAIN: &str = r#"
+fn main() {
+    packet = Create()
+    copied = packet.clone()
+    println(Describe(packet))
+    println(Split(copied))
+    println(Describe(packet))
+}
+"#;
+
+#[test]
+fn native_forward_aggregate_declarations_match_interpreter() {
+    struct Cleanup(PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let cleanup = Cleanup(unique_temp_dir("aggregate-declaration-order"));
+    let dir = &cleanup.0;
+    let entry = dir.join("main.ku");
+    let ku = ku_binary();
+    for imported in [false, true] {
+        let source = if imported {
+            fs::write(
+                dir.join("signature.ku"),
+                format!("module signature\n{FORWARD_AGGREGATE_DECLARATIONS}"),
+            )
+            .expect("write real imported struct/enum module");
+            format!(
+                "import {{ Create, Describe, Split }} from \"./signature.ku\"\n{FORWARD_AGGREGATE_MAIN}"
+            )
+        } else {
+            format!("{FORWARD_AGGREGATE_DECLARATIONS}{FORWARD_AGGREGATE_MAIN}")
+        };
+        fs::write(&entry, source).expect("write entry");
+        let interpreted = run_bounded(
+            Command::new(&ku).current_dir(dir).arg("run").arg(&entry),
+            RUN_TIMEOUT,
+            RUN_OUTPUT_LIMITS,
+        )
+        .expect("run interpreter");
+        assert!(
+            interpreted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&interpreted.stderr)
+        );
+        let expected = "Ku🙂\nKu🙂\nKu🙂\n";
+        assert_eq!(
+            String::from_utf8_lossy(&interpreted.stdout).replace('\r', ""),
+            expected
+        );
+        let Some(exe) = native_build(
+            dir,
+            "main.ku",
+            if imported { "imported" } else { "in_file" },
+        ) else {
+            return;
+        };
+        let (stdout, status) = run_binary(&exe);
+        assert_eq!(status, Some(0));
+        assert_eq!(stdout.replace('\r', ""), expected);
+    }
+}
+
 #[test]
 fn native_string_methods_match_interpreter() {
     // len counts Unicode scalar values (café = 4), contains/starts_with/ends_with

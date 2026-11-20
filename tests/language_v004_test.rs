@@ -264,6 +264,27 @@ fn top_level_names_and_unknown_types_are_rejected() {
 }
 
 #[test]
+fn aggregate_type_dependencies_preserve_field_diagnostics() {
+    let missing = check_err("struct Packet {\n  signature: Missing\n}\nfn main() {}");
+    assert!(missing.contains("undefined type 'Missing'"), "{missing}");
+    assert!(missing.contains("inline.ku:2:3"), "{missing}");
+    for source in [
+        "struct Node {\n  next: Node\n}\nfn main() {}",
+        "struct Node {\n  children: [Node]\n}\nfn main() {}",
+        "struct Node {\n  state: State\n}\nenum State { Linked(node: Node) }\nfn main() {}",
+    ] {
+        let error = check_err(source);
+        assert!(error.contains("recursive type declarations"), "{error}");
+        assert!(error.contains("inline.ku:2:3"), "{error}");
+    }
+    check_source(
+        "inline.ku",
+        "struct Builtins { data: KuValue, request: HttpRequest, response: HttpResponse }\nfn main() {}",
+    )
+    .expect("builtin type names remain available");
+}
+
+#[test]
 fn local_values_shadow_builtin_modules() {
     let source = r#"
 struct Reader {

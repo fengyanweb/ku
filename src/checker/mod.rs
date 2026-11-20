@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
     ast::*,
@@ -803,7 +803,7 @@ impl Checker {
             }
         }
 
-        for item in &program.items {
+        for item in aggregate_declaration_order(&program.items)? {
             match item {
                 Item::Struct(decl) => self.collect_struct(decl)?,
                 Item::Enum(decl) => self.collect_enum(decl)?,
@@ -9041,6 +9041,100 @@ fn reject_duplicate_function_value_params(params: &[FunctionParam]) -> KuResult<
         }
     }
     Ok(())
+}
+
+/// Check each nominal type's fields once its dependencies are known. The
+/// original AST and field order are also used by the interpreter and backends.
+fn aggregate_declaration_order(items: &[Item]) -> KuResult<Vec<&Item>> {
+    let declarations = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Struct(decl) => Some((decl.name.as_str(), decl.span, item)),
+            Item::Enum(decl) => Some((decl.name.as_str(), decl.span, item)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let by_name = declarations
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _, _))| (*name, index))
+        .collect::<HashMap<_, _>>();
+    let mut unresolved = vec![0usize; declarations.len()];
+    let mut dependents = vec![Vec::new(); declarations.len()];
+
+    for (index, (_, _, item)) in declarations.iter().enumerate() {
+        let mut pending: Vec<(&TypeName, Span)> = match item {
+            Item::Struct(decl) => decl
+                .fields
+                .iter()
+                .filter_map(|p| p.ty.as_ref().map(|ty| (ty, p.span)))
+                .collect(),
+            Item::Enum(decl) => decl
+                .variants
+                .iter()
+                .flat_map(|variant| &variant.fields)
+                .filter_map(|p| p.ty.as_ref().map(|ty| (ty, p.span)))
+                .collect(),
+            _ => unreachable!("only aggregate declarations were collected"),
+        };
+        while let Some((ty, span)) = pending.pop() {
+            match ty {
+                TypeName::Custom(name) => {
+                    // Other names (including built-ins) are resolved by the
+                    // normal field checker at the original field's span.
+                    if let Some(&dependency) = by_name.get(name.as_str()) {
+                        unresolved[index] += 1;
+                        dependents[dependency].push((index, span));
+                    }
+                }
+                TypeName::Array(inner) | TypeName::Result(inner) => pending.push((inner, span)),
+                TypeName::Union(arms) => pending.extend(arms.iter().map(|ty| (ty, span))),
+                TypeName::Function {
+                    params,
+                    return_type,
+                    ..
+                } => {
+                    pending.extend(params.iter().map(|ty| (ty, span)));
+                    pending.push((return_type, span));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut ready = unresolved
+        .iter()
+        .enumerate()
+        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(declarations.len());
+    // Prefer source order among ready types so independent diagnostics stay
+    // in the same order as in a dependency-first source file.
+    while let Some(index) = ready.pop_first() {
+        ordered.push(declarations[index].2);
+        for &(dependent, _) in &dependents[index] {
+            unresolved[dependent] -= 1;
+            if unresolved[dependent] == 0 {
+                ready.insert(dependent);
+            }
+        }
+    }
+    if let Some(index) = unresolved.iter().position(|count| *count != 0) {
+        let (name, declaration_span, _) = declarations[index];
+        let span = dependents
+            .iter()
+            .enumerate()
+            .filter(|(dependency, _)| unresolved[*dependency] != 0)
+            .flat_map(|(_, edges)| edges)
+            .filter_map(|(dependent, field)| (*dependent == index).then_some(*field))
+            .min_by_key(|field| field.start.offset)
+            .unwrap_or(declaration_span);
+        return Err(KuError::runtime(
+            format!("recursive type declarations are not supported: '{name}' depends on a recursive type"),
+            span,
+        ));
+    }
+    Ok(ordered)
 }
 
 fn reject_duplicate_params(function: &FnDecl) -> KuResult<()> {

@@ -1823,34 +1823,14 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
         ));
     }
 
-    for (index, layout) in program.layouts.structs.iter().enumerate() {
-        for field in &layout.fields {
-            // Only struct-typed fields are ordered among the struct list here; enum
-            // fields are ordered by `emit_layouts` across the unified struct+enum
-            // graph, so skip them (their name is not in the struct `indexes`).
-            if let IrType::Named(name) = &field.ty {
-                if enum_type_name(name).is_some() || is_runtime_object_name(name) {
-                    continue;
-                }
-                let dependency = indexes[name.as_str()];
-                if dependency >= index {
-                    return Err(unsupported(format!(
-                        "native C struct '{}.{}' must reference a struct declared earlier than '{}'; declaration-order value layouts cannot use a later struct",
-                        layout.name, field.name, layout.name
-                    )));
-                }
-            }
-        }
-    }
-
-    let enum_indexes = program
+    // The emission graph orders struct, enum and nullable layouts together.
+    let enum_names = program
         .layouts
         .enums
         .iter()
-        .enumerate()
-        .map(|(index, layout)| (layout.name.as_str(), index))
-        .collect::<HashMap<_, _>>();
-    for (index, layout) in program.layouts.enums.iter().enumerate() {
+        .map(|layout| layout.name.as_str())
+        .collect::<HashSet<_>>();
+    for layout in &program.layouts.enums {
         for variant in &layout.variants {
             for field in &variant.fields {
                 match &field.ty {
@@ -1868,22 +1848,16 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
                     }
                     IrType::Named(name) => {
                         let enum_name = enum_type_name(name).expect("checked enum marker");
-                        let Some(&dependency) = enum_indexes.get(enum_name) else {
+                        if !enum_names.contains(enum_name) {
                             return Err(unsupported(format!(
                                 "native C enum '{}.{}.{}' references unknown enum '{enum_name}'",
-                                layout.name, variant.name, field.name
-                            )));
-                        };
-                        if dependency >= index {
-                            return Err(unsupported(format!(
-                                "native C enum '{}.{}.{}' must reference an enum declared earlier; recursive enum value layouts are not supported",
                                 layout.name, variant.name, field.name
                             )));
                         }
                     }
                     other => {
                         return Err(unsupported(format!(
-                            "native C enum '{}.{}.{}' does not support payload type {other}; supported payloads are int, bool, str, structs, and earlier enums",
+                            "native C enum '{}.{}.{}' does not support payload type {other}; supported payloads are int, bool, str, structs, and enums",
                             layout.name, variant.name, field.name
                         )));
                     }
