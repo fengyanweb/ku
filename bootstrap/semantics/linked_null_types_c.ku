@@ -6,11 +6,11 @@ import { SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
 import { ResolveTypeName, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
-import { ContainsType, CTypeName } from "./struct_projection_c.ku"
+import { ContainsType, CTypeName, LinkedFsReadReference } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
-import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, LinkedFsReadReference, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]

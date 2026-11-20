@@ -4,26 +4,13 @@ import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { AppendLinkedCheckedInvocation, LinkedNullBinding, LinkedOkAvailable, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedViewPointee } from "./link_plan_c.ku"
+import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, RememberLinkedCall, LinkedNullBinding, LinkedOkAvailable, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedViewPointee } from "./link_plan_c.ku"
+import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, LinkedNullDropC, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, LowerLinkedNullLeaf,
-         LowerLinkedNullRead, ReadLinkedNullBinding, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_null_read_c.ku"
-
-struct LinkedNullArguments {
-    state: LinkedNullState
-    args: str
-    handoff: str
-}
-
-fn rememberLinkedCall(calls: [LinkedNullFunction], dependency: LinkedNullFunction): [LinkedNullFunction] {
-    result = calls
-    for old in result {
-        if (old.unit == dependency.unit && old.node == dependency.node) { return result }
-    }
-    return result.push(dependency)
-}
+import { AddLinkedNullSlot, EmitLinkedAddition, LowerLinkedNullLeaf,
+         LowerLinkedNullRead, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_null_read_c.ku"
 
 fn cloneLinkedString(&project: LinkedNullProject, source: LinkedNullExpression, id: int): LinkedNullExpression! {
     ty = source.value.ty.clone()
@@ -91,7 +78,7 @@ fn linkedViewArgument(&parameter: TypeNameBinding, &value: LinkedNullValue): str
 fn lowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &callee: LinkedNullFunction,
                          id: int, depth: int): LinkedNullArguments! {
     next = state
-    next.links = rememberLinkedCall(next.links, callee.clone())
+    next.links = RememberLinkedCall(next.links, callee.clone())
     args = ""
     handoff = ""
     loans: [LinkedNullValue] = []
@@ -145,13 +132,6 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
     output.state.code = output.state.code + "    " + output.value.text.clone() + " = " + callee.symbol + "(" + arguments.args + ");\n" + arguments.handoff
     output.state.slots[output.value.slot - 1].live = true
     return ok(output)
-}
-
-struct LinkedCheckedCall {
-    state: LinkedNullState
-    result: TypeNameBinding
-    text: str
-    id: int
 }
 
 fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap: Node, owns_value: bool, depth: int): LinkedCheckedCall! {
@@ -253,6 +233,18 @@ fn LowerLinkedNullValue(&project: LinkedNullProject, state: LinkedNullState, id:
     if (node.kind == "Call" && node.edge_count > 0) { return emitLinkedCall(project, state, node, id, depth) }
     if (node.kind == "TryUnwrap") { return emitCheckedValue(project, state, node, depth) }
     if (node.kind == "StructLiteral") { return lowerLinkedLiteral(project, state, node, id, depth) }
+    if (node.kind == "Binary" && node.text == "+" && node.edge_count == 2) {
+        left = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
+        rhs = LinkedNullChild(project, 1, node, 1)
+        if (left.value.ty.name != "str" || (left.value.borrowed && left.value.slot == 0)) {
+            right = LowerLinkedNullRead(project, left.state, rhs, depth + 1)?
+            value = right.value
+            return EmitLinkedAddition(project, right.state, left.value, value, id, at)
+        }
+        right = LowerLinkedNullValue(project, left.state, rhs, depth + 1)?
+        value = right.value
+        return EmitLinkedAddition(project, right.state, left.value, value, id, at)
+    }
     if (node.kind == "Binary" || node.kind == "Index" || node.kind == "Field") {
         return LowerLinkedNullRead(project, state, id, depth)
     }
@@ -303,20 +295,10 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
 
 fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, index: int): LinkedNullState! {
     array = state.slots[index - 1].clone()
-    call = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
-    if (!array.live || !LinkedNullOwnedArray(array.value.ty) || call.kind != "Call" || call.edge_count != 2) {
+    if (!array.live || !LinkedNullOwnedArray(array.value.ty)) {
         RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(statement))?
     }
-    method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
-    if (method.kind != "Field" || method.text != "push" || method.edge_count != 1) {
-        RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(method))?
-    }
-    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
-    if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != statement.text) {
-        RejectLayout("linked_move_append", "push must return to its array owner", DeclarationSpan(receiver))?
-    }
-    // Lowering the append value cannot move the active array that receives it.
-    id = LinkedNullChild(project, 1, call, 1)
+    id = ReadOwnedArrayPushArgument(project.supplied[0].named, statement)?
     value = LowerLinkedNullValue(project, state, id, 0)?
     if (!value.state.slots[index - 1].live || !SameLinkedType(value.value.ty, LinkedNullArrayElement(array.value.ty.clone()))
         || value.value.borrowed || value.value.slot == 0) {

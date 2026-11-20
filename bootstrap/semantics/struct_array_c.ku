@@ -342,3 +342,20 @@ fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str):
     for index in body.append_slots.clone() { append_types = append_types.push(body.slots[index - 1].value.ty.clone()) }
     return ok(text + EmitBoundArrayAppenders(append_types))
 }
+
+fn ReadOwnedArrayPushArgument(&named: NamedModule, &statement: Node): int! {
+    edges = statement.first_edge
+    call = named.parsed.arena.nodes[named.parsed.arena.edges[edges] - 1].clone()
+    if (call.kind != "Call" || call.edge_count != 2) {
+        RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(statement))?
+    }
+    method = named.parsed.arena.nodes[named.parsed.arena.edges[call.first_edge] - 1].clone()
+    if (method.kind != "Field" || method.text != "push" || method.edge_count != 1) {
+        RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(method))?
+    }
+    receiver = named.parsed.arena.nodes[named.parsed.arena.edges[method.first_edge] - 1].clone()
+    if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != statement.text) {
+        RejectLayout("linked_move_append", "push must return to its array owner", DeclarationSpan(receiver))?
+    }
+    return ok(named.parsed.arena.edges[call.first_edge + 1])
+}

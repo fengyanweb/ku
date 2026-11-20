@@ -2,13 +2,14 @@ import { LinkedMemberPath, LinkedMemberUnavailable } from "./linked_member_owner
 import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { EmitLinkedArrayBody } from "./struct_array_c.ku"
+import { Span } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
-import { LinkedCPrelude, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { ReadLinkedNullBinding, CheckLinkedAddition, LinkedCPrelude, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullDropC,
@@ -146,15 +147,6 @@ fn BindLinkedCatch(state: LinkedNullState, name: str, &binding: Node, &before: [
     return ok(next)
 }
 
-fn ReadLinkedNullBinding(state: LinkedNullState, &node: Node): LinkedNullExpression! {
-    index = LinkedNullBinding(state.slots, node.text)
-    if (index == 0 || !state.slots[index - 1].live) {
-        RejectLayout("unavailable_linked_binding", "expected an initialized, unconsumed binding", DeclarationSpan(node))?
-    }
-    value = state.slots[index - 1].value.clone()
-    return ok(LinkedNullExpression { state: state, value: value })
-}
-
 fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: int, depth: int): LinkedNullExpression! {
     node = LinkedNullNode(project, 1, id)
     if (depth >= 32) {
@@ -285,6 +277,23 @@ fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: N
     return ok(field)
 }
 
+fn EmitLinkedAddition(&project: LinkedNullProject, state: LinkedNullState, &left: LinkedNullValue,
+                      &right: LinkedNullValue, id: int, &at: Span): LinkedNullExpression! {
+    CheckLinkedAddition(state, left, right, at)?
+    if (left.ty.name == "int") {
+        scalar = state
+        out = "t" + str(id)
+        scalar.uses_add = true
+        scalar.code += EmitCheckedScalarArithmetic("add", left.text, right.text, out)
+        return ok(LinkedReadonlyExpression(scalar, LinkedBuiltin("int", at.clone()), out))
+    }
+    output = AddLinkedNullSlot(project, state, "", "t" + str(id), left.ty.clone(), false)?
+    output.state.uses_concat = true
+    output.state.code += EmitScalarStringPair(left.text, right.text, output.value.text)
+    output.state.slots[output.value.slot - 1].live = true
+    return ok(output)
+}
+
 fn readLinkedBinary(&project: LinkedNullProject, state: LinkedNullState, &node: Node, id: int, depth: int): LinkedNullExpression! {
     left = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
     op = node.text.clone()
@@ -312,19 +321,14 @@ fn readLinkedBinary(&project: LinkedNullProject, state: LinkedNullState, &node: 
         if (op == "!=") { compare = "!" + compare }
         return ok(LinkedReadonlyExpression(right.state, LinkedBuiltin("bool", DeclarationSpan(node)), compare))
     }
-    if (left.value.ty.name == "str" && op == "+") {
-        output = AddLinkedNullSlot(project, right.state, "", "t" + str(id), left.value.ty, false)?
-        output.state.uses_concat = true
-        output.state.code += EmitScalarStringPair(left.value.text, right.value.text, output.value.text)
-        output.state.slots[output.value.slot - 1].live = true
-        return ok(output)
+    if ((left.value.ty.name == "str" || left.value.ty.name == "int") && op == "+") {
+        value = right.value
+        return EmitLinkedAddition(project, right.state, left.value, value, id, DeclarationSpan(node))
     }
-    if (left.value.ty.name == "int" && (op == "+" || op == "-")) {
-        operation = "sub"
-        if (op == "+") { operation = "add" right.state.uses_add = true }
-        else { right.state.uses_sub = true }
+    if (left.value.ty.name == "int" && op == "-") {
+        right.state.uses_sub = true
         out = "t" + str(id)
-        right.state.code += EmitCheckedScalarArithmetic(operation, left.value.text, right.value.text, out)
+        right.state.code += EmitCheckedScalarArithmetic("sub", left.value.text, right.value.text, out)
         return ok(LinkedReadonlyExpression(right.state, LinkedBuiltin("int", DeclarationSpan(node)), out))
     }
     integer_comparison = left.value.ty.name == "int" && (equality || op == "<" || op == ">" || op == "<=" || op == ">=")

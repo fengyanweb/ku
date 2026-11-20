@@ -230,3 +230,18 @@ fn ProjectionHeaders(needs_string: bool, drop_strings: bool): str {
     }
     return header
 }
+
+fn LinkedFsReadReference(&symbol: str): str {
+    return "#include \"fs_read.h\"\nextern KuResult_str " + symbol.clone() + "(const KuString*);\n"
+        + "static KuProjectionString ku_linked_from_fs_string(KuString value) {\n"
+        + "    return (KuProjectionString){value.ptr,value.len,value.capacity,value.storage};\n}\n"
+        + "static KuBootstrapResult_KuProjectionString ku_linked_fs_read(const KuProjectionString* path) {\n"
+        + "    KuString input = {path->ptr,path->len,path->capacity,path->storage};\n"
+        + "    KuResult_str read = " + symbol.clone() + "(&input);\n"
+        + "    KuBootstrapResult_KuProjectionString out = {0};\n"
+        + "    out.ok = read.ok;\n"
+        + "    if (read.ok) out.value = ku_linked_from_fs_string(read.value);\n"
+        + "    else out.error = (KuBootstrapError){ku_linked_from_fs_string(read.error.domain), "
+        + "ku_linked_from_fs_string(read.error.code), ku_linked_from_fs_string(read.error.message)};\n"
+        + "    return out;\n}\n"
+}

@@ -366,6 +366,10 @@ bound str owner keeps the old owner until the selected replacement has
 succeeded. A checked failure inside either arm therefore preserves the old
 owner for the catch or common cleanup.
 
+String addition accepts checked value operands, including a cloned View
+or a bound string-returning call. Operands are evaluated in source order.
+A later call cannot consume the owner of an earlier operand.
+
 Managed array functions can take a `str` by value and check its byte or
 Unicode scalar length before initializing a local `[str]` with `.chars()`.
 The local array owns its non-ASCII entries independently of the source.

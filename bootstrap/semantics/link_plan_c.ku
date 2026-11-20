@@ -7,7 +7,7 @@ import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
 import { ContainsIndex, CTypeName, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 
 struct LinkPlanType {
     kind: str
@@ -97,6 +97,40 @@ fn NewLinkedNullState(): LinkedNullState {
 
 fn LinkedReadonlyExpression(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNullExpression {
     return LinkedNullExpression { state: state, value: LinkedNullValue { ty: ty, text: text, slot: 0, borrowed: false, member_path: "" } }
+}
+
+struct LinkedNullArguments {
+    state: LinkedNullState
+    args: str
+    handoff: str
+}
+
+fn RememberLinkedCall(calls: [LinkedNullFunction], dependency: LinkedNullFunction): [LinkedNullFunction] {
+    result = calls
+    for old in result {
+        if (old.unit == dependency.unit && old.node == dependency.node) { return result }
+    }
+    return result.push(dependency)
+}
+
+struct LinkedCheckedCall {
+    state: LinkedNullState
+    result: TypeNameBinding
+    text: str
+    id: int
+}
+
+fn CheckLinkedAddition(&state: LinkedNullState, &left: LinkedNullValue, &right: LinkedNullValue, &at: Span): null! {
+    if (left.ty.declaration_kind != "Builtin" || !SameBoundTypeIdentity(left.ty, right.ty)) {
+        RejectLayout("linked_binary_type", "addition requires matching scalar operands", at.clone())?
+    }
+    if (left.slot > 0 && !state.slots[left.slot - 1].live) {
+        RejectLayout("linked_addition_moved_operand", "right operand consumed the left operand's binding", at.clone())?
+    }
+    if (left.ty.name != "int" && left.ty.name != "str") {
+        RejectLayout("linked_binary_type", "addition requires int or str", at.clone())?
+    }
+    return ok(null)
 }
 
 fn BoundLinkPlanType(&binding: TypeNameBinding, local_unit: int, c_type: str, view: bool): LinkPlanType {
@@ -323,6 +357,15 @@ fn LinkedOkAvailable(&names: [TopLevelName], &imports: [ImportBinding], &slots: 
     return true
 }
 
+fn ReadLinkedNullBinding(state: LinkedNullState, &node: Node): LinkedNullExpression! {
+    index = LinkedNullBinding(state.slots, node.text)
+    if (index == 0 || !state.slots[index - 1].live) {
+        RejectLayout("unavailable_linked_binding", "expected an initialized, unconsumed binding", DeclarationSpan(node))?
+    }
+    value = state.slots[index - 1].value.clone()
+    return ok(LinkedNullExpression { state: state, value: value })
+}
+
 fn RestoreLinkedNullSlots(state: LinkedNullState, &outer: [LinkedNullSlot]): LinkedNullState {
     next = state
     index = 0
@@ -351,21 +394,6 @@ fn AppendLinkedCheckedInvocation(state: LinkedNullState, &carrier: str, &result:
     next = ExitLinkedFailure(next, "        ")
     next.code += "    }\n"
     return next
-}
-
-fn LinkedFsReadReference(&symbol: str): str {
-    return "#include \"fs_read.h\"\nextern KuResult_str " + symbol.clone() + "(const KuString*);\n"
-        + "static KuProjectionString ku_linked_from_fs_string(KuString value) {\n"
-        + "    return (KuProjectionString){value.ptr,value.len,value.capacity,value.storage};\n}\n"
-        + "static KuBootstrapResult_KuProjectionString ku_linked_fs_read(const KuProjectionString* path) {\n"
-        + "    KuString input = {path->ptr,path->len,path->capacity,path->storage};\n"
-        + "    KuResult_str read = " + symbol.clone() + "(&input);\n"
-        + "    KuBootstrapResult_KuProjectionString out = {0};\n"
-        + "    out.ok = read.ok;\n"
-        + "    if (read.ok) out.value = ku_linked_from_fs_string(read.value);\n"
-        + "    else out.error = (KuBootstrapError){ku_linked_from_fs_string(read.error.domain), "
-        + "ku_linked_from_fs_string(read.error.code), ku_linked_from_fs_string(read.error.message)};\n"
-        + "    return out;\n}\n"
 }
 
 fn PreserveLinkedOwners(&before: [LinkedNullSlot], &after: [LinkedNullSlot], &statement: Node): null! {

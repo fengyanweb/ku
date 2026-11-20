@@ -657,3 +657,119 @@ pub(super) fn assert_checked_string_rebind(seed: &Path, cwd: &Path) {
     assert!(wrong.stdout.is_empty());
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("unsupported_linked_else"));
 }
+
+const ADD_CALL_SOURCE: &str = r#"import { Decorate, Suffix } from "./plus-provider.ku"
+fn Compose(path: str): str! {
+    result = Decorate(path) + Suffix(1)
+    return ok(result)
+}
+fn CloneViews(&prefix: str, &path: str): str! {
+    result = prefix.clone() + path.clone()
+    return ok(result)
+}
+fn MovedOperand(path: str): str! {
+    result = path + Decorate(path)
+    return ok(result)
+}
+"#;
+
+const ADD_CALL_PROVIDER: &str = r#"
+fn Decorate(path: str): str { return path }
+fn Suffix(value: int): str { return "!" }
+"#;
+
+const ADD_CALL_HOST: &str = r#"
+static int sequence;
+KuProjectionString __DECORATE__(KuProjectionString path) {
+    assert(sequence == 0 && path.len == 4);
+    sequence = 1;
+    return path;
+}
+KuProjectionString __SUFFIX__(int64_t value) {
+    assert(sequence == 1 && value == 1);
+    sequence = 2;
+    uint8_t *text = malloc(1);
+    *text = '!';
+    return (KuProjectionString){text,1,1,KU_PROJECTION_STRING_OWNED};
+}
+int main(void) {
+    (void)test_realloc;
+    uint8_t *path = malloc(4);
+    memcpy(path,"path",4);
+    KuBootstrapResult_KuProjectionString result = __ENTRY__(
+        (KuProjectionString){path,4,4,KU_PROJECTION_STRING_OWNED});
+    assert(result.ok && sequence == 2 && outstanding() == 1);
+    assert(result.value.len == 5 && memcmp(result.value.ptr,"path!",5) == 0);
+    ku_projection_string_drop(&result.value);
+    assert(outstanding() == 0 && attempts == 3);
+    return 0;
+}
+"#;
+
+pub(super) fn assert_linked_call_addition(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("plus.ku"), ADD_CALL_SOURCE).unwrap();
+    fs::write(cwd.join("plus-provider.ku"), ADD_CALL_PROVIDER).unwrap();
+    fs::write(cwd.join("modules.txt"), "plus.ku\nplus-provider.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Compose").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+    let plan = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plan);
+    let Some(Value::Result { ok: true, value }) = json::eval(
+        "decode",
+        &[Value::String(String::from_utf8(plan.stdout).unwrap())],
+        Span::default(),
+    )
+    .unwrap() else {
+        panic!("expected call addition link plan")
+    };
+    let Value::Object(plan) = *value else {
+        panic!("expected plan object")
+    };
+    let Value::Object(export) = &plan["export"] else {
+        panic!("expected export")
+    };
+    let Value::String(entry) = &export["symbol"] else {
+        panic!("expected entry symbol")
+    };
+    let Value::Array(deps) = &plan["dependencies"] else {
+        panic!("expected dependencies")
+    };
+    let mut host = ADD_CALL_HOST.replace("__ENTRY__", entry);
+    for (name, marker) in [("Decorate", "__DECORATE__"), ("Suffix", "__SUFFIX__")] {
+        let symbol = deps
+            .iter()
+            .find_map(|dependency| match dependency {
+                Value::Object(decl) if decl["source_name"] == Value::String(name.into()) => {
+                    match &decl["symbol"] {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("expected bound operand call");
+        host = host.replace(marker, symbol);
+    }
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let source = cwd.join("call-addition.c");
+    let exe = cwd.join(format!("call-addition{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &source,
+        format!(
+            "{CHECKED_ARRAY_ALLOCATOR}{}{host}",
+            String::from_utf8(emitted.stdout).unwrap()
+        ),
+    )
+    .unwrap();
+    compile_projection(&source, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    fs::write(cwd.join("function.txt"), "CloneViews").unwrap();
+    assert_ok(&execute(&mut Command::new(seed), cwd, 30));
+    fs::write(cwd.join("function.txt"), "MovedOperand").unwrap();
+    let bad = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(bad.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("linked_addition_moved_operand"));
+}
