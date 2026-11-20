@@ -365,6 +365,10 @@ release the cloned character before returning the comparison result.
 An explicit clone of a bound local string can also feed a typed same-module
 Boolean predicate. The callee consumes the clone. The original local string
 remains available in its current scope.
+A managed string accumulator can append a literal or consume a distinct
+local string whose final use is the append. The emitter rejects later reads
+of that local and consuming a string created outside a repeating loop. The
+accumulator reuses its owned capacity and releases live owners if growth fails.
 
 `linked-str` also emits functions such as `TokenCanonical` that consume an
 owned struct. A string field may move into the expression once. A named

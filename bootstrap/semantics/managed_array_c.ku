@@ -8,7 +8,7 @@ import { CStructOrder, OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
 import { EmitStructArrayOperations, EmitStructArrayResultHeader, EmitTryCloneString } from "./struct_array_c.ku"
 import { GuardArithmetic, GuardArrayErrorC, GuardOwnedDrops, GuardStringArrayCloneC, GuardStringArrayEqualC, GuardStringEquality } from "./guarded_struct_c.ku"
-import { ManagedSourceCharactersErrors, ManagedSourceCharactersRuntime } from "./guarded_string_parts.ku"
+import { ManagedSourceCharactersErrors, ManagedSourceCharactersRuntime, ManagedStringAppendRuntime } from "./guarded_string_parts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType } from "./guarded_struct_expr.ku"
 import { ManagedExplicitType, ManagedType } from "./managed_array_values_c.ku"
 import { EmitManagedBlock, EmitManagedResultBlock, ManagedBlock } from "./managed_array_body_c.ku"
@@ -176,7 +176,8 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     // Admit the result graph before either array policy or source generation.
     ordered = orderLayout(layouts, result.layout, DeclarationSpan(function))?
     array = EmitStructArrayOperations(layouts, result.layout)
-    root = ManagedType { layout: result.layout, array: array, string_locals: false, source_strings: false, leaves: [] }
+    root = ManagedType { layout: result.layout, array: array, string_locals: false, source_strings: false,
+        function_end: function.end_offset, leaves: [] }
     signature = readParameters(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, root, ordered, function, edge)?
     root.source_strings = signature.source_strings
     leaves = OwnedScalarLeaves { bindings: [], declarations: "", plan: [] }
@@ -191,6 +192,7 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     if (!body.returns) { RejectLayout("managed_fallthrough", "every path must return an array owner", DeclarationSpan(function))? }
     symbol = "ku_managed_" + str(function_id)
     arithmetic = body.code.uses_add || body.code.uses_sub
+    append = body.code.uses_string_append
     text = ProjectionHeaders(checked || signature.layouts.strings || body.code.uses_eq || signature.source_strings, signature.drop_strings)
     text += "#include <stdio.h>\n#include <stdlib.h>\n\n"
     text += GuardArithmetic(body.code.uses_add, body.code.uses_sub) + GuardStringEquality(body.code.uses_eq)
@@ -199,6 +201,7 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
         if (body.code.uses_eq) { text += GuardStringArrayEqualC() }
     }
     if (clones) { text += EmitTryCloneString("ku_result_clone_string") }
+    if (append) { text += ManagedStringAppendRuntime() }
     text += signature.layouts.text + root.array.source
     result_type = root.array.array_type.clone()
     if (checked) {
@@ -214,13 +217,16 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
         if (body.code.uses_eq) { text += "    (void)ku_guard_string_array_equal;\n" }
     }
     if (arithmetic) { text += "    bool overflow = false;\n" }
-    if (clones) { text += "    bool out_of_memory = false;\n    (void)ku_result_clone_string;\n" }
+    if (clones || append) { text += "    bool out_of_memory = false;\n" }
+    if (clones) { text += "    (void)ku_result_clone_string;\n" }
+    if (append) { text += "    bool string_too_large = false;\n" }
     if (body.error_exits != "") { text += "    int record_error = 0;\n" }
     text += signature.unused + body.declarations + body.code.text
     text += "cleanup:\n" + body.drops + signature.drops
     if (signature.source_strings) { text += ManagedSourceCharactersErrors() + GuardArrayErrorC() }
     if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (clones) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (append) { text += "    if (string_too_large) { fputs(\"string allocation is too large\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (clones || append) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     text += managedArrayErrors() + body.error_exits + "    return result;\n}\n"
     plan = managedPlan(layouts, signature, result.layout, result_type, symbol.clone(), function_id, checked)
     return ok(ManagedArrayC { symbol: symbol, source: text, entry_plan: plan, link_plan: leaves.plan })

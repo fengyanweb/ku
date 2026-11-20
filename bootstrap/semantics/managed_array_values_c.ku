@@ -4,7 +4,7 @@ import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
 import { ContainsIndex, ProjectionCloneSource, ProjectionIsStringArray } from "./struct_projection_c.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { BindManagedLocal, CheckManagedDeclaration, IsManagedLocalArrayClone, ManagedCloneStringSetup, ManagedSourceCharsSetup, RequireNewManagedOwner } from "./guarded_string_parts.ku"
+import { BindManagedLocal, CheckManagedDeclaration, IsManagedLocalArrayClone, ManagedAppendDrop, ManagedCloneStringSetup, ManagedSourceCharsSetup, ManagedStringAppendRuntime, RequireNewManagedOwner } from "./guarded_string_parts.ku"
 import { CheckStructArrayType, StructArrayC } from "./struct_array_c.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression, GuardLeaf, GuardOwnedExpression, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 
@@ -13,6 +13,7 @@ struct ManagedCode {
     uses_add: bool
     uses_sub: bool
     uses_eq: bool
+    uses_string_append: bool
 }
 
 struct ManagedAssignment {
@@ -26,6 +27,7 @@ struct ManagedType {
     array: StructArrayC
     string_locals: bool
     source_strings: bool
+    function_end: int
     leaves: [GuardLeaf]
 }
 
@@ -41,38 +43,23 @@ fn ManagedStringRuntime(): str {
         "        if ((b > 0 && a > INT64_MAX / b) || (b < 0 && b < INT64_MIN / a)) return false;\n" +
         "    } else if (a < 0) {\n" +
         "        if ((b > 0 && a < INT64_MIN / b) || (b < 0 && a < INT64_MAX / b)) return false;\n" +
-        "    }\n    *out = a * b;\n    return true;\n}\n\n" +
-        "static bool ku_managed_string_append(KuProjectionString *left, KuProjectionString right, bool *too_large) {\n" +
-        "    if (!right.len) return true;\n" +
-        "    if (right.len > SIZE_MAX - left->len) { *too_large = true; return false; }\n" +
-        "    size_t length = left->len + right.len;\n" +
-        "    size_t capacity = left->capacity > left->len ? left->capacity : left->len;\n" +
-        "    if (left->storage != KU_PROJECTION_STRING_OWNED || length > capacity) {\n" +
-        "        if (!capacity) capacity = 8u;\n" +
-        "        while (capacity < length) capacity = capacity > SIZE_MAX / 2u ? SIZE_MAX : capacity * 2u;\n" +
-        "        uint8_t *data = left->storage == KU_PROJECTION_STRING_OWNED ? realloc(left->ptr, capacity) : malloc(capacity);\n" +
-        "        if (!data) return false;\n" +
-        "        if (left->storage != KU_PROJECTION_STRING_OWNED && left->len) memcpy(data, left->ptr, left->len);\n" +
-        "        left->ptr = data;\n        left->capacity = capacity;\n        left->storage = KU_PROJECTION_STRING_OWNED;\n" +
-        "    }\n" +
-        "    memcpy(left->ptr + left->len, right.ptr, right.len);\n" +
-        "    left->len = length;\n    return true;\n}\n\n"
+        "    }\n    *out = a * b;\n    return true;\n}\n\n" + ManagedStringAppendRuntime()
 }
 
 fn AddGuardCode(&code: ManagedCode, &setup: GuardValue): ManagedCode {
     return ManagedCode { text: code.text.clone() + setup.setup.clone(),
         uses_add: code.uses_add || setup.uses_add, uses_sub: code.uses_sub || setup.uses_sub,
-        uses_eq: code.uses_eq || setup.uses_eq }
+        uses_eq: code.uses_eq || setup.uses_eq, uses_string_append: code.uses_string_append }
 }
 
 fn JoinManagedCode(&left: ManagedCode, right: ManagedCode): ManagedCode {
     return ManagedCode { text: left.text.clone() + right.text,
         uses_add: left.uses_add || right.uses_add, uses_sub: left.uses_sub || right.uses_sub,
-        uses_eq: left.uses_eq || right.uses_eq }
+        uses_eq: left.uses_eq || right.uses_eq, uses_string_append: left.uses_string_append || right.uses_string_append }
 }
 
 fn ManagedBlank(): ManagedCode {
-    return ManagedCode { text: "", uses_add: false, uses_sub: false, uses_eq: false }
+    return ManagedCode { text: "", uses_add: false, uses_sub: false, uses_eq: false, uses_string_append: false }
 }
 
 fn ManagedExplicitType(&types: [TypeNameBinding], &nodes: [Node], &edges: [int],
@@ -232,7 +219,7 @@ fn ownedStringSetup(&named: NamedModule, &locals: [GuardBinding], &layouts: [Str
     if (node.kind == "String") {
         value = ManagedExpression(named, locals, layouts, root, node_id, indent)?
         return ok(ManagedCode { text: indent.clone() + target.clone() + " = " + value.value + ";\n",
-            uses_add: false, uses_sub: false, uses_eq: false })
+            uses_add: false, uses_sub: false, uses_eq: false, uses_string_append: false })
     }
     subject = ProjectionCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, node_id)
     if (subject == 0) {
@@ -265,6 +252,10 @@ fn EmitManagedStringAppend(&named: NamedModule, &locals: [GuardBinding], &layout
     code = AddGuardCode(ManagedBlank(), value)
     code.text = code.text + indent.clone() + "if (!ku_managed_string_append(&" + name + ", " + value.value +
         ", &string_too_large)) { out_of_memory = !string_too_large; goto cleanup; }\n"
+    if (root.source_strings) {
+        code.text += ManagedAppendDrop(named.parsed.arena.nodes, locals, id, statement, root.function_end, indent)?
+    }
+    code.uses_string_append = true
     return ok(code)
 }
 

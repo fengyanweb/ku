@@ -108,7 +108,7 @@ fn emitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
                 code.text = code.text + indent.clone() + "result.error = (KuBootstrapError){" + fields + "};\n" + indent.clone() + "goto cleanup;\n"
             }
             returns = true
-        } else if (root.string_locals && statement.kind == "CompoundAssign" && statement.text == "+" && statement.edge_count == 2) {
+        } else if ((root.string_locals || root.source_strings) && statement.kind == "CompoundAssign" && statement.text == "+" && statement.edge_count == 2) {
             update = EmitManagedStringAppend(named, locals, layouts, root, statement, indent)?
             code = JoinManagedCode(code, update)
         } else if ((statement.kind == "Assign" && statement.edge_count == 1) ||

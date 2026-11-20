@@ -264,7 +264,7 @@ fn emitOwnedResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports:
         signature.body_start, end, caller_id, record_call, layout)?
     leaves = ReadOwnedScalarLeaves(named, types, layouts, function, false)?
     root = ManagedType { layout: 0, array: StructArrayC { element_type: "", array_type: "", prefix: "", source: "" },
-        string_locals: true, source_strings: false, leaves: leaves.bindings }
+        string_locals: true, source_strings: false, function_end: function.end_offset, leaves: leaves.bindings }
     block = EmitManagedBlock(named, types, imports, supplied, layouts, root, prelude.bindings,
         prelude.next_edge, end, 0, "    ")?
     result = emitStructReturn(named, imports, supplied, block.bindings, layouts, layout,

@@ -269,6 +269,40 @@ fn CheckManagedDeclaration(&declared: GuardType, &actual: GuardType, found: int,
     return ok(null)
 }
 
+fn ManagedAppendDrop(&nodes: [Node], &locals: [GuardBinding], id: int, &statement: Node,
+                    function_end: int, &indent: str): str! {
+    operand = nodes[id - 1].clone()
+    if (operand.kind == "String") { return ok("") }
+    found = GuardBindingIndex(locals, operand.text)
+    if (operand.kind != "Variable" || found == 0 || locals[found - 1].parameter || locals[found - 1].view) {
+        RejectLayout("managed_append_move", "append requires a literal or a distinct owned local", DeclarationSpan(operand))?
+    }
+    source = locals[found - 1].clone()
+    born = nodes[source.slot - 1].offset
+    stop = function_end
+    index = 0
+    while (index < nodes.len()) {
+        if (nodes[index].kind == "While" && nodes[index].offset < statement.offset && nodes[index].end_offset >= statement.end_offset) {
+            if (born <= nodes[index].offset) {
+                RejectLayout("managed_append_move", "a loop cannot consume a string from outside its iteration", DeclarationSpan(operand))?
+            }
+            if (nodes[index].end_offset < stop) { stop = nodes[index].end_offset }
+        }
+        index = index + 1
+    }
+    // Admit this subset only when no later reference in the current scope
+    // needs the consumed value. A new iteration creates its own binding.
+    index = 0
+    while (index < nodes.len()) {
+        if (nodes[index].kind == "Variable" && nodes[index].offset >= statement.end_offset &&
+            nodes[index].end_offset <= stop && nodes[index].text == source.name) {
+            RejectLayout("managed_append_move", "append consumes the local string before this reference", DeclarationSpan(nodes[index]))?
+        }
+        index = index + 1
+    }
+    return ok(indent.clone() + "ku_projection_string_drop(&" + GuardBindingName(source) + ");\n")
+}
+
 fn ManagedSourceCharactersErrors(): str {
     return "    if (source_status != KU_SOURCE_OK) {\n" +
         "        const char *message = \"invalid string input\\n\";\n" +
@@ -276,4 +310,22 @@ fn ManagedSourceCharactersErrors(): str {
         "        if (source_status == KU_SOURCE_ARRAY_OOM) message = \"string.chars allocation failed\\n\";\n" +
         "        if (source_status == KU_SOURCE_CHAR_OOM) message = \"out of memory\\n\";\n" +
         "        fputs(message, stderr);\n        exit(EXIT_FAILURE);\n    }\n"
+}
+
+fn ManagedStringAppendRuntime(): str {
+    return "static bool ku_managed_string_append(KuProjectionString *left, KuProjectionString right, bool *too_large) {\n" +
+        "    if (!right.len) return true;\n" +
+        "    if (right.len > SIZE_MAX - left->len) { *too_large = true; return false; }\n" +
+        "    size_t length = left->len + right.len;\n" +
+        "    size_t capacity = left->capacity > left->len ? left->capacity : left->len;\n" +
+        "    if (left->storage != KU_PROJECTION_STRING_OWNED || length > capacity) {\n" +
+        "        if (!capacity) capacity = 8u;\n" +
+        "        while (capacity < length) capacity = capacity > SIZE_MAX / 2u ? SIZE_MAX : capacity * 2u;\n" +
+        "        uint8_t *data = left->storage == KU_PROJECTION_STRING_OWNED ? realloc(left->ptr, capacity) : malloc(capacity);\n" +
+        "        if (!data) return false;\n" +
+        "        if (left->storage != KU_PROJECTION_STRING_OWNED && left->len) memcpy(data, left->ptr, left->len);\n" +
+        "        left->ptr = data;\n        left->capacity = capacity;\n        left->storage = KU_PROJECTION_STRING_OWNED;\n" +
+        "    }\n" +
+        "    memcpy(left->ptr + left->len, right.ptr, right.len);\n" +
+        "    left->len = length;\n    return true;\n}\n\n"
 }

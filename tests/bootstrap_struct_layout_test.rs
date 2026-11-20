@@ -1592,6 +1592,7 @@ fn PrepareSource(source: str): [SourceLength]! {
 fn ReadLocal(source: str): [SourceLength]! {
     entries: [SourceLength] = []
     characters: [str] = source.chars()
+    combined = ""
     index = 0
     while (index < characters.len()) {
         ch = characters[index].clone()
@@ -1599,7 +1600,9 @@ fn ReadLocal(source: str): [SourceLength]! {
         if (index + 1 < characters.len()) { next = characters[index + 1].clone() }
         size = ch.byte_len() + next.byte_len()
         if (index + 1 < characters.len() && characters[index + 1].clone() == "中") { size = size + 1 }
-        item = SourceLength { value: size }
+        combined += ch
+        total = size + combined.byte_len()
+        item = SourceLength { value: total }
         entries = entries.push(item)
         index = index + 1
     }
@@ -1627,6 +1630,29 @@ fn TestLocal(source: str): [SourceLength]! {
             item = SourceLength { value: width }
             entries = entries.push(item)
         }
+    }
+    return ok(entries)
+}
+fn BadAppend(source: str): [SourceLength]! {
+    entries: [SourceLength] = []
+    characters: [str] = source.chars()
+    right = characters[0].clone()
+    left = ""
+    left += right
+    width = right.byte_len()
+    item = SourceLength { value: width }
+    entries = entries.push(item)
+    return ok(entries)
+}
+fn RepeatedAppend(source: str): [SourceLength]! {
+    entries: [SourceLength] = []
+    characters: [str] = source.chars()
+    right = characters[0].clone()
+    left = ""
+    index = 0
+    while (index < 2) {
+        left += right
+        index = index + 1
     }
     return ok(entries)
 }
@@ -1683,8 +1709,14 @@ fn TestLocal(source: str): [SourceLength]! {
         .unwrap();
     let branch = replacement[..compare].rfind("if (t").unwrap();
     assert!(replacement[branch..compare].contains("array_match"));
+    let append = replacement
+        .find("if (!ku_managed_string_append(&l")
+        .unwrap();
+    let drop = replacement[append..].lines().nth(1).unwrap();
+    assert!(drop.contains("ku_projection_string_drop(&l"));
     assert!(cleanup.contains("ku_managed_source_drop(&l"));
     assert!(cleanup.contains("array_failure.code == 2"));
+    assert!(cleanup.contains("if (string_too_large)"));
 
     fs::write(cwd.join("function.txt"), "DescribeLocal").unwrap();
     let emitted = execute(&mut Command::new(seed), cwd, 30);
@@ -1727,6 +1759,15 @@ fn TestLocal(source: str): [SourceLength]! {
     assert!(
         dependency.contains(r#""source_name":"bool","source_path":null,"node":0,"c_type":"bool"#)
     );
+
+    fs::write(cwd.join("function.txt"), "BadAppend").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert!(!rejected.status.success() && rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("managed_append_move"));
+    fs::write(cwd.join("function.txt"), "RepeatedAppend").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert!(!rejected.status.success() && rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("outside its iteration"));
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {
