@@ -1,18 +1,15 @@
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
+import { SuppliedModule } from "./imports.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { ScalarIntInstruction, ScalarIntParameter, ScalarIntClause, ScalarIntFunction, ScalarStringPart, ScalarIntegerHelpers, ScalarStringHelpers, ScalarSymbol, EmitScalarIntPlan } from "./scalar_int_emit.ku"
 import { RejectScalarInt as rejectScalarInt, ScalarParameterIndex as scalarParameterIndex,
     ScalarStringLiteral as scalarStringLiteral, ScalarStringOperand as scalarStringOperand,
     HasScalarBuiltin, LowerScalarStringParts, ScalarIntComparison } from "./scalar_int_operands.ku"
 import { LowerNullResultExit } from "./scalar_result_null.ku"
-
-struct ScalarIntCall {
-    target_node: int
-    function_node: int
-    arguments: [int]
-}
+import { ScalarType as scalarType, ScalarReturnType as scalarReturnType } from "./scalar_types.ku"
+import { ScalarIntImport, ScalarFunctionNode as scalarFunctionNode, LowerIntExpression as lowerIntExpression } from "./scalar_int_calls.ku"
 
 struct ScalarBoolC {
     source: str
@@ -25,178 +22,11 @@ struct ScalarIntC {
     source: str
 }
 
-fn scalarType(&bindings: [TypeNameBinding], use_node: int, &ty: Node): int {
-    lo = 0
-    hi = bindings.len()
-    while (lo < hi) {
-        middle = lo + (hi - lo) / 2
-        if (bindings[middle].use_node < use_node) { lo = middle + 1 }
-        else { hi = middle }
-    }
-    if (ty.kind == "TypeName" && lo < bindings.len() && bindings[lo].use_node == use_node
-        && bindings[lo].declaration_kind == "Builtin") {
-        if (bindings[lo].name == "int") { return 1 }
-        if (bindings[lo].name == "str") { return 2 }
-        if (bindings[lo].name == "bool") { return 3 }
-        if (bindings[lo].name == "null") { return 4 }
-    }
-    return 0
-}
-
-// Plain null is not a return type of this scalar emitter.
-fn scalarReturnType(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding], type_id: int): int {
-    ty = nodes[type_id - 1].clone()
-    if (ty.kind == "TypeResult" && ty.edge_count == 1) {
-        inner_id = edges[ty.first_edge]
-        if (scalarType(bindings, inner_id, nodes[inner_id - 1]) == 4) { return 4 }
-    }
-    plain = scalarType(bindings, type_id, ty)
-    if (plain < 4) { return plain }
-    return 0
-}
-
 fn requireInt(&bindings: [TypeNameBinding], use_node: int, &ty: Node): null! {
     if (scalarType(bindings, use_node, ty) != 1) {
         rejectScalarInt("unsupported_int_type", "expected a bound builtin int type", DeclarationSpan(ty))?
     }
     return ok(null)
-}
-
-fn scalarFunctionNode(&declarations: [TopLevelName], &name: str): int {
-    index = 0
-    while (index < declarations.len()) {
-        if (declarations[index].kind == "Function" && declarations[index].name == name) {
-            return declarations[index].node
-        }
-        index = index + 1
-    }
-    return 0
-}
-
-fn bindIntCall(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
-               &bindings: [TypeNameBinding], &parameters: [ScalarIntParameter], &call: Node): ScalarIntCall! {
-    if (call.edge_count == 0) {
-        rejectScalarInt("unsupported_int_callee", "expected a direct local function call", DeclarationSpan(call))?
-    }
-    target_node = edges[call.first_edge]
-    target = nodes[target_node - 1].clone()
-    if (target.kind != "Variable" || target.edge_count != 0 || scalarParameterIndex(parameters, target.text) >= 0) {
-        rejectScalarInt("unsupported_int_callee", "expected an unshadowed local function name", DeclarationSpan(target))?
-    }
-    function_node = scalarFunctionNode(declarations, target.text)
-    if (function_node == 0) {
-        rejectScalarInt("unknown_int_callee", "no local function '" + target.text.clone() + "'", DeclarationSpan(target))?
-    }
-    function = nodes[function_node - 1].clone()
-    arity = 0
-    while (arity < function.edge_count && nodes[edges[function.first_edge + arity] - 1].kind == "Parameter") {
-        parameter = nodes[edges[function.first_edge + arity] - 1].clone()
-        if (parameter.edge_count == 1) {
-            type_node = edges[parameter.first_edge]
-            if (scalarType(bindings, type_node, nodes[type_node - 1]) == 2) {
-                rejectScalarInt("unsupported_int_callee_signature", "calls in the int subset cannot transfer string parameters", DeclarationSpan(call))?
-            }
-        }
-        arity = arity + 1
-    }
-    if (call.edge_count - 1 != arity) {
-        rejectScalarInt("int_call_arity", "expected " + str(arity) + " arguments for '" + target.text + "'", DeclarationSpan(call))?
-    }
-    if (arity < function.edge_count) {
-        result_node = edges[function.first_edge + arity]
-        result_type = scalarReturnType(nodes, edges, bindings, result_node)
-        if (result_type >= 2) {
-            rejectScalarInt("unsupported_int_callee_result", "calls in an int expression must return int", DeclarationSpan(call))?
-        }
-    }
-    arguments: [int] = []
-    index = 1
-    while (index < call.edge_count) {
-        argument = edges[call.first_edge + index]
-        arguments = arguments.push(argument)
-        index = index + 1
-    }
-    return ok(ScalarIntCall { target_node: target_node, function_node: function_node, arguments: arguments })
-}
-
-fn isIntCallTarget(&calls: [ScalarIntCall], node: int): bool {
-    index = 0
-    while (index < calls.len()) {
-        if (calls[index].target_node == node) { return true }
-        index = index + 1
-    }
-    return false
-}
-
-fn lowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
-                      &bindings: [TypeNameBinding], &parameters: [ScalarIntParameter], result_node: int): [ScalarIntInstruction]! {
-    // BuildNameTable validated a contiguous post-order tree. The first child
-    // chain reaches its leftmost leaf, and every node in that range belongs
-    // to this expression. Neither a recursive stack nor a copied AST is needed.
-    cursor = result_node
-    while (nodes[cursor - 1].edge_count > 0) {
-        cursor = edges[nodes[cursor - 1].first_edge]
-    }
-    calls: [ScalarIntCall] = []
-    probe = cursor
-    while (probe <= result_node) {
-        if (nodes[probe - 1].kind == "Call") {
-            call = bindIntCall(nodes, edges, declarations, bindings, parameters, nodes[probe - 1])?
-            calls = calls.push(call)
-        }
-        probe = probe + 1
-    }
-    instructions: [ScalarIntInstruction] = []
-    call_index = 0
-    while (cursor <= result_node) {
-        node = nodes[cursor - 1].clone()
-        operation = ""
-        operand = 0
-        right_node = 0
-        arguments: [int] = []
-        if (node.kind == "Int" && node.edge_count == 0 && node.int_value >= 0) {
-            operation = "constant"
-            operand = node.int_value
-        } else if (node.kind == "Variable" && node.edge_count == 0) {
-            // The validated AST is a tree, so only the Call can consume this
-            // particular identifier. It needs no value or C temporary.
-            if (isIntCallTarget(calls, cursor)) {
-                cursor = cursor + 1
-                continue
-            }
-            operation = "parameter"
-            operand = scalarParameterIndex(parameters, node.text)
-            if (operand < 0) {
-                rejectScalarInt("undefined_int_operand", "undefined int parameter '" + node.text.clone() + "'", DeclarationSpan(node))?
-            }
-            if (parameters[operand].string_mode != 0) {
-                rejectScalarInt("unsupported_int_operand_type", "expected an int operand, found str", DeclarationSpan(node))?
-            }
-        } else if (node.kind == "Unary" && node.edge_count == 1 && node.text == "-") {
-            operation = "sub"
-            right_node = edges[node.first_edge]
-        } else if (node.kind == "Binary" && node.edge_count == 2) {
-            if (node.text == "+") { operation = "add" }
-            else if (node.text == "-") { operation = "sub" }
-            else if (node.text == "*") { operation = "mul" }
-            operand = edges[node.first_edge]
-            right_node = edges[node.first_edge + 1]
-        } else if (node.kind == "Call") {
-            call = calls[call_index].clone()
-            call_index = call_index + 1
-            operation = "call"
-            operand = call.function_node
-            arguments = call.arguments
-        }
-        if (operation == "") {
-            rejectScalarInt("unsupported_int_expression", "expected an int literal, parameter, arithmetic, or direct int call", DeclarationSpan(node))?
-        }
-        instruction = ScalarIntInstruction { operation: operation, result_node: cursor, operand: operand,
-                                            right_node: right_node, arguments: arguments }
-        instructions = instructions.push(instruction)
-        cursor = cursor + 1
-    }
-    return ok(instructions)
 }
 
 fn lowerScalarBool(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], node_id: int, depth: int): ScalarBoolC! {
@@ -255,8 +85,9 @@ fn lowerScalarBool(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParamet
     return ok(ScalarBoolC { source: "", uses_string_comparison: false, uses_string_contains: false })
 }
 
-fn lowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
-                          &bindings: [TypeNameBinding], function_id: int, can_convert: bool, can_use_ok: bool): ScalarIntFunction! {
+fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
+                          &bindings: [TypeNameBinding], &imports: [ScalarIntImport],
+                          local_base: int, function_id: int, can_convert: bool, can_use_ok: bool): ScalarIntFunction! {
     function = nodes[function_id - 1].clone()
     cursor = function.first_edge
     end = cursor + function.edge_count
@@ -336,18 +167,18 @@ fn lowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLeve
             if (has_string && (result.kind != "Int" && result.kind != "Variable")) {
                 rejectScalarInt("unsupported_string_leaf_return", "functions with str parameters return an int literal or parameter", DeclarationSpan(result))?
             }
-            instructions = lowerIntExpression(nodes, edges, declarations, bindings, parameters, result_node)?
+            instructions = lowerIntExpression(nodes, edges, declarations, bindings, parameters, imports, local_base, result_node)?
         }
         clauses = clauses.push(ScalarIntClause { condition: condition, instructions: instructions,
             scalar_result: scalar_result, string_parts: string_parts })
         cursor = cursor + 1
     }
-    return ok(ScalarIntFunction { function_node: function_id, parameters: parameters, clauses: clauses,
+    return ok(ScalarIntFunction { function_node: local_base + function_id, parameters: parameters, clauses: clauses,
         result_type: result_type, uses_string_comparison: uses_comparison, uses_string_contains: uses_contains,
         uses_string_join: uses_join })
 }
 
-fn containsIntNode(&nodes: [int], node: int): bool {
+fn ContainsScalarIntNode(&nodes: [int], node: int): bool {
     index = 0
     while (index < nodes.len()) {
         if (nodes[index] == node) { return true }
@@ -356,25 +187,32 @@ fn containsIntNode(&nodes: [int], node: int): bool {
     return false
 }
 
+fn AppendScalarIntCallees(&plan: ScalarIntFunction, previous: [int]): [int] {
+    reachable = previous
+    clause = 0
+    while (clause < plan.clauses.len()) {
+        step = 0
+        while (step < plan.clauses[clause].instructions.len()) {
+            if (plan.clauses[clause].instructions[step].operation == "call") {
+                callee = plan.clauses[clause].instructions[step].operand
+                if (!ContainsScalarIntNode(reachable, callee)) { reachable = reachable.push(callee) }
+            }
+            step = step + 1
+        }
+        clause = clause + 1
+    }
+    return reachable
+}
+
 fn planScalarIntModule(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
                        &bindings: [TypeNameBinding], entry: int, can_convert: bool, can_use_ok: bool): [ScalarIntFunction]! {
     reachable = [entry]
+    imports: [ScalarIntImport] = []
     plans: [ScalarIntFunction] = []
     index = 0
     while (index < reachable.len()) {
-        plan = lowerScalarIntFunction(nodes, edges, declarations, bindings, reachable[index], can_convert, can_use_ok)?
-        clause = 0
-        while (clause < plan.clauses.len()) {
-            step = 0
-            while (step < plan.clauses[clause].instructions.len()) {
-                if (plan.clauses[clause].instructions[step].operation == "call") {
-                    callee = plan.clauses[clause].instructions[step].operand
-                    if (!containsIntNode(reachable, callee)) { reachable = reachable.push(callee) }
-                }
-                step = step + 1
-            }
-            clause = clause + 1
-        }
+        plan = LowerScalarIntFunction(nodes, edges, declarations, bindings, imports, 0, reachable[index], can_convert, can_use_ok)?
+        reachable = AppendScalarIntCallees(plan, reachable)
         plans = plans.push(plan)
         index = index + 1
     }
@@ -386,7 +224,7 @@ fn unresolvedIntCall(&plan: ScalarIntFunction, &completed: [int]): int {
     while (clause < plan.clauses.len()) {
         index = 0
         while (index < plan.clauses[clause].instructions.len()) {
-            if (plan.clauses[clause].instructions[index].operation == "call" && !containsIntNode(completed, plan.clauses[clause].instructions[index].operand)) {
+            if (plan.clauses[clause].instructions[index].operation == "call" && !ContainsScalarIntNode(completed, plan.clauses[clause].instructions[index].operand)) {
                 return plan.clauses[clause].instructions[index].result_node
             }
             index = index + 1
@@ -396,7 +234,7 @@ fn unresolvedIntCall(&plan: ScalarIntFunction, &completed: [int]): int {
     return 0
 }
 
-fn emitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], entry: int): ScalarIntC! {
+fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [SuppliedModule], entry: int): ScalarIntC! {
     // Each round removes ready functions. If nothing is ready, following
     // unresolved edges among the remaining finite set must encounter a cycle.
     completed: [int] = []
@@ -415,11 +253,12 @@ fn emitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], entry: int):
     symbol = ""
     while (completed.len() < plans.len()) {
         blocked_at = 0
+        blocked_module = 0
         before = completed.len()
         index = 0
         while (index < plans.len()) {
             function_node = plans[index].function_node
-            if (!containsIntNode(completed, function_node)) {
+            if (!ContainsScalarIntNode(completed, function_node)) {
                 blocked = unresolvedIntCall(plans[index], completed)
                 if (blocked == 0) {
                     if (function_node == entry) {
@@ -441,13 +280,19 @@ fn emitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], entry: int):
                     completed = completed.push(function_node)
                 } else {
                     blocked_at = blocked
+                    blocked_module = (function_node - 1) / 4096
                 }
             }
             index = index + 1
         }
         if (completed.len() == before) {
-            rejectScalarInt("recursive_int_call", "recursive call graph is outside the bootstrap int subset",
-                            DeclarationSpan(nodes[blocked_at - 1]))?
+            at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+            if (supplied.len() > 0) {
+                at = DeclarationSpan(supplied[blocked_module].named.parsed.arena.nodes[blocked_at - 1])
+            } else {
+                at = DeclarationSpan(nodes[blocked_at - 1])
+            }
+            rejectScalarInt("recursive_int_call", "recursive call graph is outside the bootstrap int subset", at)?
         }
     }
     headers = ScalarIntegerHelpers(uses_add, uses_sub, uses_mul)
@@ -464,7 +309,8 @@ fn EmitScalarIntC(&named: NamedModule, &bindings: [TypeNameBinding], &function_n
     if (entry > 0) {
         plans = planScalarIntModule(named.parsed.arena.nodes, named.parsed.arena.edges,
                                     named.names.declarations, bindings, entry, HasScalarBuiltin(named, "str"), HasScalarBuiltin(named, "ok"))?
-        return emitScalarIntModule(plans, named.parsed.arena.nodes, entry)
+        supplied: [SuppliedModule] = []
+        return EmitScalarIntModule(plans, named.parsed.arena.nodes, supplied, entry)
     }
     start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
     rejectScalarInt("unknown_int_function", "undefined function '" + function_name.clone() + "'", start)?

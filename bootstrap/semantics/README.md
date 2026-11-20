@@ -132,6 +132,16 @@ and `fail` with exactly one string literal for each Error field, `domain`,
 Use `ok` to select success or error. A failed result's fields refer to static
 UTF-8 bytes and require no release.
 
+### Compile scalar calls across project modules
+
+Use `mode.txt` with `project-int`, the entry function in `function.txt` and a
+`modules.txt` manifest with the entry module first. Direct integer calls can
+use named relative imports and aliases, for example `import { Add as Plus }
+from "./math.ku"`. The selected function must meet the scalar rules above.
+The generated C contains the reachable functions with checked arguments and
+only exports the selected symbol. Missing modules, cyclic module dependencies,
+and calls through a shadowed name are diagnosed before C is emitted.
+
 ### Construct a nested struct from a project module
 
 Set `mode.txt` to `construct` and put the selected function name in

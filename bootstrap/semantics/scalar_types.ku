@@ -1,0 +1,32 @@
+import { Node } from "../stage2/ast.ku"
+import { TypeNameBinding } from "./type_names.ku"
+
+fn ScalarType(&bindings: [TypeNameBinding], use_node: int, &ty: Node): int {
+    lo = 0
+    hi = bindings.len()
+    while (lo < hi) {
+        middle = lo + (hi - lo) / 2
+        if (bindings[middle].use_node < use_node) { lo = middle + 1 }
+        else { hi = middle }
+    }
+    if (ty.kind == "TypeName" && lo < bindings.len() && bindings[lo].use_node == use_node
+        && bindings[lo].declaration_kind == "Builtin") {
+        if (bindings[lo].name == "int") { return 1 }
+        if (bindings[lo].name == "str") { return 2 }
+        if (bindings[lo].name == "bool") { return 3 }
+        if (bindings[lo].name == "null") { return 4 }
+    }
+    return 0
+}
+
+// Plain null is not a return type of this scalar emitter.
+fn ScalarReturnType(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding], type_id: int): int {
+    ty = nodes[type_id - 1].clone()
+    if (ty.kind == "TypeResult" && ty.edge_count == 1) {
+        inner_id = edges[ty.first_edge]
+        if (ScalarType(bindings, inner_id, nodes[inner_id - 1]) == 4) { return 4 }
+    }
+    plain = ScalarType(bindings, type_id, ty)
+    if (plain < 4) { return plain }
+    return 0
+}

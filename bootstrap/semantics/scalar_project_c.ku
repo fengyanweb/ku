@@ -1,0 +1,91 @@
+import { Span } from "../stage2/span.ku"
+import { BindProjectImports, SuppliedModule } from "./imports.ku"
+import { ProjectImportOrder, ProjectModuleBindings } from "./project_bindings.ku"
+import { EmitScalarIntModule, LowerScalarIntFunction, ScalarIntC, AppendScalarIntCallees } from "./scalar_int_c.ku"
+import { ScalarFunctionNode, ScalarIntCalleeSignature, ScalarIntImport } from "./scalar_int_calls.ku"
+import { ScalarIntFunction } from "./scalar_int_emit.ku"
+import { HasScalarBuiltin, RejectScalarInt } from "./scalar_int_operands.ku"
+import { BindImportedTypeNames } from "./type_names.ku"
+
+struct ScalarProjectModule {
+    imports: [ScalarIntImport]
+    has_str: bool
+    has_ok: bool
+}
+
+fn projectBindings(&supplied: [SuppliedModule]): [ProjectModuleBindings]! {
+    modules: [ProjectModuleBindings] = []
+    index = 0
+    while (index < supplied.len()) {
+        imports = BindProjectImports(supplied[index], supplied)?
+        types = BindImportedTypeNames(supplied[index].named, imports, supplied)?
+        modules = modules.push(ProjectModuleBindings { path: supplied[index].path.clone(), imports: imports, types: types })
+        index = index + 1
+    }
+    ProjectImportOrder(modules)?
+    return ok(modules)
+}
+
+fn linkedImports(&current: ProjectModuleBindings, &supplied: [SuppliedModule],
+                 &bindings: [ProjectModuleBindings]): [ScalarIntImport] {
+    calls: [ScalarIntImport] = []
+    index = 0
+    while (index < current.imports.len()) {
+        link = current.imports[index].clone()
+        if (link.module_index > 0) {
+            module_slot = link.module_index - 1
+            if (supplied[module_slot].named.parsed.arena.nodes[link.target_node - 1].kind == "Function") {
+                signature = ScalarIntCalleeSignature(supplied[module_slot].named.parsed.arena.nodes,
+                    supplied[module_slot].named.parsed.arena.edges, bindings[module_slot].types, link.target_node)
+                calls = calls.push(ScalarIntImport { local_name: link.local_name,
+                    target: module_slot * 4096 + link.target_node, signature: signature })
+            }
+        }
+        index = index + 1
+    }
+    return calls
+}
+
+fn scalarModules(&supplied: [SuppliedModule], &bindings: [ProjectModuleBindings]): [ScalarProjectModule] {
+    modules: [ScalarProjectModule] = []
+    index = 0
+    while (index < supplied.len()) {
+        calls = linkedImports(bindings[index], supplied, bindings)
+        modules = modules.push(ScalarProjectModule { imports: calls,
+            has_str: HasScalarBuiltin(supplied[index].named, "str"),
+            has_ok: HasScalarBuiltin(supplied[index].named, "ok") })
+        index = index + 1
+    }
+    return modules
+}
+
+fn EmitScalarProjectC(&supplied: [SuppliedModule], &function: str): ScalarIntC! {
+    if (supplied.len() == 0) {
+        start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+        RejectScalarInt("unknown_int_function", "a selected project module is required", start)?
+    }
+    entry = ScalarFunctionNode(supplied[0].named.names.declarations, function)
+    if (entry == 0) {
+        start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+        RejectScalarInt("unknown_int_function", "undefined function '" + function.clone() + "'", start)?
+    }
+    binding = projectBindings(supplied)?
+    modules = scalarModules(supplied, binding)
+    reachable = [entry]
+    plans: [ScalarIntFunction] = []
+    index = 0
+    while (index < reachable.len()) {
+        key = reachable[index]
+        // Every input was validated as a post-order arena of at most 4096 nodes.
+        // Keys combine the module ordinal and one-based node ID, without collisions.
+        module_slot = (key - 1) / 4096
+        base = module_slot * 4096
+        plan = LowerScalarIntFunction(supplied[module_slot].named.parsed.arena.nodes, supplied[module_slot].named.parsed.arena.edges,
+            supplied[module_slot].named.names.declarations, binding[module_slot].types, modules[module_slot].imports, base, key - base,
+            modules[module_slot].has_str, modules[module_slot].has_ok)?
+        reachable = AppendScalarIntCallees(plan, reachable)
+        plans = plans.push(plan)
+        index = index + 1
+    }
+    return EmitScalarIntModule(plans, supplied[0].named.parsed.arena.nodes, supplied, entry)
+}

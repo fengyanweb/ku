@@ -12,17 +12,29 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SEED: &str = r#"import "std.fs"
 import { ParseProgram } from "../stage3/parser.ku"
+import { Span } from "../stage2/span.ku"
 import { BuildNameTable } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
+import { ManifestPaths, ReadProjectModules } from "./project_manifest.ku"
 import { BindTypeNames } from "./type_names.ku"
-import { EmitScalarIntC } from "./scalar_int_c.ku"
+import { EmitScalarIntC, ScalarIntC } from "./scalar_int_c.ku"
+import { EmitScalarProjectC } from "./scalar_project_c.ku"
 
-fn main(): null! {
+fn Emit(&function: str): ScalarIntC! {
+    if (fs.exists("modules.txt")) {
+        at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+        paths = ManifestPaths(fs.read("modules.txt")?, at)?
+        supplied = ReadProjectModules(paths)?
+        return EmitScalarProjectC(supplied, function)
+    }
     named = BuildNameTable(ParseProgram(fs.read("input.ku")?)?)?
     supplied: [SuppliedModule] = []
     bindings = BindTypeNames(named, supplied)?
-    function = fs.read("function.txt")?
-    output = EmitScalarIntC(named, bindings, function)?
+    return EmitScalarIntC(named, bindings, function)
+}
+
+fn main(): null! {
+    output = Emit(fs.read("function.txt")?)?
     println(output.symbol)
     println(output.source)
     return ok(null)
@@ -492,6 +504,92 @@ fn main(): null! {{
     }
 }
 
+fn assert_imported_calls(ku: &Path, seed: &Path, cwd: &Path) {
+    let entry = cwd.join("entry.ku");
+    let source = r#"import { Aggregate } from "./bridge.ku"
+import { Score as Primary } from "./left.ku"
+import { Score as Secondary } from "./right.ku"
+fn TestScore(a: int): int { return Aggregate(Primary(a), Secondary(a)) }
+fn main() { println(TestScore(5)) }
+"#;
+    fs::write(&entry, source).unwrap();
+    fs::write(
+        cwd.join("bridge.ku"),
+        "import { Add as MathAdd } from \"./math.ku\"\n\
+         fn Aggregate(a: int, b: int): int { return MathAdd(a, b) }\n",
+    )
+    .unwrap();
+    // Both functions have the same local node ID but distinct module identities.
+    for (file, expression) in [("left.ku", "a + 1"), ("right.ku", "a * 2")] {
+        fs::write(
+            cwd.join(file),
+            format!("fn Score(a: int): int {{ return {expression} }}\n"),
+        )
+        .unwrap();
+    }
+    fs::write(cwd.join("math.ku"), include_str!("../examples/math.ku")).unwrap();
+    fs::write(cwd.join("function.txt"), "TestScore").unwrap();
+    let manifest = cwd.join("modules.txt");
+    let oracle = execute(Command::new(ku).arg("run").arg(&entry), cwd, 15);
+    assert_success(&oracle);
+    assert_eq!(String::from_utf8_lossy(&oracle.stdout).trim(), "16");
+    for order in [
+        "entry.ku\nright.ku\nmath.ku\nbridge.ku\nleft.ku\n",
+        "entry.ku\nleft.ku\nbridge.ku\nright.ku\nmath.ku\n",
+    ] {
+        fs::write(&manifest, order).unwrap();
+        let output = execute(&mut Command::new(seed), cwd, 20);
+        assert_success(&output);
+        let result = String::from_utf8(output.stdout).unwrap();
+        let (symbol, code) = result.split_once('\n').expect("symbol and complete C");
+        let symbol = symbol.trim();
+        assert!(symbol.starts_with("ku_int_") && !code.contains("MathAdd"));
+        assert_eq!(
+            code.lines()
+                .filter(|line| line.starts_with("static int64_t ku_int_"))
+                .count(),
+            4
+        );
+        let c = cwd.join("project.c");
+        fs::write(
+            &c,
+            format!(
+                "{code}\n#include <stdio.h>\nint main(void) {{ printf(\"%lld\\n\", (long long){symbol}(5)); return 0; }}\n"
+            ),
+        )
+        .unwrap();
+        let executable = cwd.join(format!("project{}", std::env::consts::EXE_SUFFIX));
+        compile_c(&c, &executable, cwd);
+        let observed = execute(&mut Command::new(&executable), cwd, 10);
+        assert_success(&observed);
+        assert_eq!(observed.stdout, oracle.stdout);
+    }
+
+    for (mutated, diagnostic) in [
+        (source.replace("Primary(a)", "Primary()"), "int_call_arity"),
+        (
+            source.replace("Primary(a)", "Secondary(a, a)"),
+            "int_call_arity",
+        ),
+        (
+            source.replace("TestScore(a: int)", "TestScore(Primary: int, a: int)"),
+            "unsupported_int_callee",
+        ),
+    ] {
+        fs::write(&entry, mutated).unwrap();
+        let result = execute(&mut Command::new(seed), cwd, 20);
+        assert!(!result.status.success() && result.stdout.is_empty());
+        let stderr = String::from_utf8(result.stderr).unwrap();
+        assert!(stderr.contains(diagnostic), "{stderr}");
+    }
+    fs::write(&entry, source).unwrap();
+    fs::write(&manifest, "entry.ku\nright.ku\nbridge.ku\nleft.ku\n").unwrap();
+    let failure = execute(&mut Command::new(seed), cwd, 20);
+    assert!(!failure.status.success() && failure.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("unresolved_import"));
+    fs::remove_file(manifest).unwrap();
+}
+
 #[test]
 fn ku_emits_checked_c11_for_real_math_functions() {
     let work = Temp::new();
@@ -632,6 +730,7 @@ fn ku_emits_checked_c11_for_real_math_functions() {
     assert!(!generated.contains("Irrelevant"));
     assert_string_composition(&ku, &seed, &cwd);
     assert_capacity_results(&ku, &seed, &cwd);
+    assert_imported_calls(&ku, &seed, &cwd);
 
     for (input, diagnostic) in [
         (
