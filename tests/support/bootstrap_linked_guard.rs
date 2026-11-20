@@ -952,3 +952,80 @@ pub(super) fn assert_decorated_caught_error(seed: &Path, cwd: &Path) {
     assert!(duplicate.stdout.is_empty());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("linked_error_member_moved"));
 }
+
+pub(super) fn assert_checked_str_predicate(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("predicate.ku"),
+        r#"fn Project(&path: str, mode: int): str! {
+    empty = ""
+    return ok(empty)
+}
+fn Observe(): null! { return ok(null) }
+fn Validate(&path: str, mode: int): null! {
+    if (Project(path, mode)? != path) { Observe()? }
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "predicate.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Validate\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null\n").unwrap();
+    let output = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&output);
+    let program = String::from_utf8(output.stdout).unwrap();
+    let symbol = |prefix| {
+        program
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix)?.split_once('('))
+            .map(|(name, _)| name)
+            .expect("generated typed entry or callback")
+    };
+    let caller = r#"
+static unsigned normalized, observed;
+KuBootstrapResult_KuProjectionString __PROJECT__(const KuProjectionString* original, int64_t mode) {
+    assert(original && original->len == 1u && original->ptr[0] == 'a');
+    ++normalized;
+    uint8_t* data = malloc(1u);
+    assert(data);
+    *data = mode == 0 ? 'a' : 'b';
+    KuProjectionString allocated = {data, 1u, 1u, KU_PROJECTION_STRING_OWNED};
+    if (mode == 2) {
+        return (KuBootstrapResult_KuProjectionString){.error.message = allocated};
+    }
+    return (KuBootstrapResult_KuProjectionString){.ok = true, .value = allocated};
+}
+KuBootstrapResultNull __OBSERVE__(void) {
+    assert(!outstanding());
+    ++observed;
+    return (KuBootstrapResultNull){.ok = true};
+}
+int main(void) {
+    (void)test_realloc;
+    const KuProjectionString path = {(uint8_t*)"a", 1u, 0u, KU_PROJECTION_STRING_STATIC};
+    assert(__ENTRY__(&path, 0).ok && normalized == 1u && observed == 0u && !outstanding());
+    assert(__ENTRY__(&path, 1).ok && normalized == 2u && observed == 1u && !outstanding());
+    KuBootstrapResultNull failed = __ENTRY__(&path, 2);
+    assert(!failed.ok && normalized == 3u && observed == 1u && outstanding() == 1);
+    assert(failed.error.message.len == 1u && failed.error.message.ptr[0] == 'b');
+    ku_projection_string_drop(&failed.error.message);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("__ENTRY__", symbol("KuBootstrapResultNull "))
+    .replace(
+        "__PROJECT__",
+        symbol("extern KuBootstrapResult_KuProjectionString "),
+    )
+    .replace("__OBSERVE__", symbol("extern KuBootstrapResultNull "));
+    let source = cwd.join("checked-predicate.c");
+    let executable = cwd.join(format!("checked-predicate{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &source,
+        format!("{CHECKED_ARRAY_ALLOCATOR}{program}{caller}"),
+    )
+    .unwrap();
+    compile_projection(&source, &executable, cwd);
+    assert_ok(&execute(&mut Command::new(executable), cwd, 10));
+}

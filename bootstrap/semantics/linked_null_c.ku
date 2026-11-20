@@ -10,9 +10,9 @@ import { TypeNameBinding } from "./type_names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
-import { LinkedSlotPrefix, ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullFunction, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
+import { LinkedReadonlyExpression, LinkedSlotPrefix, ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedCheckedResultPlan, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
-         LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, SameLinkedType } from "./linked_null_types_c.ku"
+         LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, LowerLinkedArrayLocal, LowerLinkedNullRead,
          RegisterLinkedNullType } from "./linked_null_read_c.ku"
 import { LowerLinkedArrayAppend, LowerLinkedSuccess,
@@ -26,6 +26,32 @@ struct LinkedNullC {
     entry_plan: LinkPlanDeclaration
 }
 
+fn lowerLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, id: int): LinkedNullExpression! {
+    node = LinkedNullNode(project, 1, id)
+    equality = node.text == "==" || node.text == "!="
+    if (node.kind != "Binary" || node.edge_count != 2 || !equality) {
+        return LowerLinkedNullRead(project, state, id, 0)
+    }
+    left_id = LinkedNullChild(project, 1, node, 0)
+    if (LinkedNullNode(project, 1, left_id).kind != "TryUnwrap") {
+        return LowerLinkedNullRead(project, state, id, 0)
+    }
+    before = state.slots.len()
+    left = LowerLinkedNullValue(project, state, left_id, 0)?
+    right = LowerLinkedNullRead(project, left.state, LinkedNullChild(project, 1, node, 1), 0)?
+    at = DeclarationSpan(node)
+    if (!LinkedStringResult(left.value.ty) || !LinkedStringResult(right.value.ty)) {
+        RejectLayout("linked_checked_comparison", "expected a checked str and a readonly str", at.clone())?
+    }
+    compare = "ku_guard_string_equal(" + left.value.text + ", " + right.value.text + ")"
+    if (node.text == "!=") { compare = "!" + compare }
+    name = "predicate" + str(id)
+    right.state.uses_string_equal = true
+    right.state.code += "    const bool " + name.clone() + " = " + compare + ";\n"
+    done = DropLinkedNullScope(right.state, before)
+    return ok(LinkedReadonlyExpression(done, LinkedBuiltin("bool", at), name))
+}
+
 fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
                     &result: TypeNameBinding, depth: int): LinkedNullRegion! {
     if (depth >= 32) {
@@ -35,7 +61,7 @@ fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statem
         RejectLayout("unsupported_linked_guard", "expected valid then and else boundaries", DeclarationSpan(statement))?
     }
     guard_id = LinkedNullChild(project, 1, statement, 0)
-    guard = LowerLinkedNullRead(project, state, guard_id, 0)?
+    guard = lowerLinkedPredicate(project, state, guard_id)?
     if (guard.value.ty.declaration_kind != "Builtin" || guard.value.ty.name != "bool") {
         RejectLayout("linked_guard_type", "expected a readonly bool condition", DeclarationSpan(statement))?
     }
