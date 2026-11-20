@@ -8,18 +8,21 @@ use ku::{span::Span, stdlib::json, value::Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct Temp(PathBuf);
 
 impl Temp {
     fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock")
             .as_nanos();
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "ku-bootstrap-layout-{}-{nonce}",
+            "ku-bootstrap-layout-{}-{nonce}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("create private layout test root");
