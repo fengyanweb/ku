@@ -205,6 +205,12 @@ identify dependencies that must be linked as C functions with the bound ABI.
 The struct Result owns one successful payload or one Error. Moving the result
 clears the source record before cleanup.
 
+Use `project-fields` to emit a bound field projection such as `SpanFromToken`
+from the project manifest. `linked-null` emits an original `null!` function
+such as `RejectAt`. It evaluates bound call arguments in source order and
+transfers their owners to the declared C dependency. A returned Error owns
+its domain, code and message.
+
 The compiler entry scans the module once and parses bounded declaration
 windows. It retains the lexer, per-function, AST and work limits. The legacy
 `ParseProgram` entry retains its 512-token whole-script limit.
