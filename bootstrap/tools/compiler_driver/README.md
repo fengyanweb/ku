@@ -1,6 +1,6 @@
 # Bootstrap compiler driver
 
-Build the driver with a current stage-0 Ku and a POSIX C11 compiler.
+Build the driver with a current stage-0 Ku and a C11 compiler.
 
 ```sh
 python3 -B bootstrap/tools/compiler_driver/build.py \
@@ -10,9 +10,19 @@ python3 -B bootstrap/tools/compiler_driver/build.py \
 The builder stages the Ku modules privately, uses existing offline native C
 emission and links the C host at O2. It publishes the requested output only
 after linking succeeds and removes the staged source and generated C.
-An interruption stops the active compiler process group before staging is
-removed. Python is a build-time dependency. The executable runs after the
-compiler source tree is removed.
+On POSIX, an interruption stops the active compiler process group before
+staging is removed. Windows uses the repository's bounded Job Object process
+owner during the build. Python and the build sources are only needed at build
+time.
+
+On Windows x64, use GCC-style `clang` with the MSVC tools and SDK available
+in a Developer PowerShell, or select an x64 MinGW GCC executable with `--cc`.
+
+```powershell
+python -B bootstrap/tools/compiler_driver/build.py `
+    --ku (Get-Command ku).Source --cc clang -o "$env:TEMP\ku-bootstrap.exe"
+& "$env:TEMP\ku-bootstrap.exe" check-project .\modules.txt
+```
 
 Run it from the directory containing your input, or pass an absolute path.
 
@@ -41,14 +51,16 @@ KU
   report the existing diagnostic on standard error. Invalid command forms
   or arguments return two. Inputs must be nonempty UTF-8 and at most 512
   bytes per argument. The host expands relative input paths against the
-  caller's directory within a 4096-byte buffer.
+  caller's directory within a 4096-byte buffer. Windows receives UTF-16
+  arguments and validates the same limit after conversion. It accepts
+  ordinary drive and UNC paths. Device and verbatim paths are rejected.
 
 The private C entry checks the exact signature of its synchronous Ku
 callee. This driver provides the command interface for the current bounded
 self-hosted compiler.
 
-The native integration test has run on macOS ARM64. The builder targets
-POSIX hosts. Windows is rejected until it has a verified UTF-16 argv adapter.
+The native integration test has run on macOS ARM64. Windows MSVC and GNU
+execution require verification on their respective Windows toolchains.
 
 ```sh
 python3 -B bootstrap/tools/compiler_driver/test_driver.py \

@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import os
 from pathlib import Path
 import re
 import shutil
@@ -10,11 +11,15 @@ import subprocess
 import sys
 import tempfile
 
-from build import executable
+from build import executable, link_c, windows_process_owner
 
 
 def execute(args, cwd, status=0):
-    result = subprocess.run(args, cwd=cwd, capture_output=True, timeout=400)
+    if os.name == "nt":
+        command = [os.fspath(argument) for argument in args]
+        result = windows_process_owner()(command, cwd, Path(command[0]).name, check=False)
+    else:
+        result = subprocess.run(args, cwd=cwd, capture_output=True, timeout=400)
     if result.returncode != status:
         raise AssertionError(
             f"{args}: expected exit {status}, got {result.returncode}\n"
@@ -52,6 +57,8 @@ def exercise_project(compiler, root, caller):
     relative = Path("..") / project.name / manifest.name
     assert execute([compiler, "check-project", relative], caller).stdout == b""
     assert execute([compiler, "check-project", manifest], caller).stdout == b""
+    if os.name == "nt":
+        assert execute([compiler, "check-project", relative.as_posix()], caller).stdout == b""
     assert b"usage:" in execute(
         [compiler, "check-project", relative, "extra"], caller, 2
     ).stderr
@@ -97,13 +104,18 @@ def exercise(ku, cc):
     with tempfile.TemporaryDirectory(prefix="ku-bootstrap-argv-test-") as temp:
         root = Path(temp)
         sources = root / "source copy"
-        tools = sources / "tools" / "compiler_driver"
+        bootstrap = sources / "bootstrap"
+        tools = bootstrap / "tools" / "compiler_driver"
         shutil.copytree(here, tools)
         for stage in ("stage1", "stage2", "stage3", "semantics"):
-            shutil.copytree(here.parents[1] / stage, sources / stage)
+            shutil.copytree(here.parents[1] / stage, bootstrap / stage)
+        if os.name == "nt":
+            owner = Path(".github/scripts/verify-native-three-os.py")
+            (sources / owner.parent).mkdir(parents=True)
+            shutil.copyfile(here.parents[2] / owner, sources / owner)
         installed = root / "installed compiler"
         installed.mkdir()
-        compiler = installed / "ku-bootstrap"
+        compiler = installed / ("ku-bootstrap.exe" if os.name == "nt" else "ku-bootstrap")
         command = [sys.executable, "-B", tools / "build.py", "--ku", ku, "--cc", cc,
                    "-o", compiler]
         execute(command, root)
@@ -122,7 +134,7 @@ def exercise(ku, cc):
         assert list(installed.iterdir()) == [compiler]
         shutil.rmtree(sources)
 
-        caller = root / "caller"
+        caller = root / "调用目录 🙂"
         caller.mkdir()
         source = caller / "含空 格🙂.ku"
         source.write_text("fn AddOne(value: int): int { return value + 1 }\n", encoding="utf-8")
@@ -148,9 +160,18 @@ def exercise(ku, cc):
         assert b"1 to 512 bytes of UTF-8" in execute(
             [compiler, "check", "x" * 513], caller, 2
         ).stderr
+        malformed = "\ud800.ku" if os.name == "nt" else b"\xff.ku"
         assert b"1 to 512 bytes of UTF-8" in execute(
-            [compiler, b"check", b"\xff.ku"], caller, 2
+            [compiler, "check", malformed], caller, 2
         ).stderr
+        assert b"1 to 512 bytes of UTF-8" in execute(
+            [compiler, "emit", source.name, "界" * 171], caller, 2
+        ).stderr
+        valid_width = execute([compiler, "emit", source.name, "界" * 170 + "ab"], caller, 1)
+        assert b"1 to 512 bytes of UTF-8" not in valid_width.stderr
+        if os.name == "nt":
+            verbatim = "\\\\?\\" + str(source)
+            assert b"UTF-8 path limit" in execute([compiler, "check", verbatim], caller, 2).stderr
         no_function = execute([compiler, "emit", source.name, "Unknown"], caller, 1)
         assert no_function.stdout == b"" and no_function.stderr
 
@@ -161,8 +182,9 @@ def exercise(ku, cc):
         derived.write_bytes(
             emitted + b"\nint main(void) { return " + symbol[1] + b"(41) == 42 ? 0 : 1; }\n"
         )
-        execute([cc, "-std=c11", "-O2", "derived.c", "-o", "derived"], caller)
-        execute([caller / "derived"], caller)
+        program = "derived.exe" if os.name == "nt" else "derived"
+        link_c(cc, "derived.c", program, caller)
+        execute([caller / program], caller)
         exercise_project(compiler, root, caller)
         print("bootstrap argv, module checks, signature and standalone C verified")
 
