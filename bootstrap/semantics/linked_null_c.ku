@@ -9,7 +9,7 @@ import { ContainsType } from "./struct_projection_c.ku"
 import { ExitLinkedFailure, FinishLinkedFunctionC, LinkedFailureTarget, LinkedNullBinding, LinkedNullFunction, LinkedNullRegion, LinkedNullState, LinkPlanDeclaration, LinkPlanType, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedCheckedResultPlan, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullParameterPlan, LinkedNullParameterType,
-         LinkedNullProject, LinkedNullResultCleanupReference, ReadLinkedResult } from "./linked_null_types_c.ku"
+         LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, BindLinkedCatch, DropLinkedNullScope, EmitLinkedNullDeclarations, LowerLinkedArrayLocal, LowerLinkedNullRead,
          MoveLinkedNullSlot, NewLinkedNullState, RegisterLinkedNullType } from "./linked_null_read_c.ku"
 import { LowerLinkedArrayAppend, LowerLinkedSuccess,
@@ -176,8 +176,15 @@ fn addLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Nod
     if (LinkedNullBinding(state.slots, statement.text) != 0) {
         RejectLayout("linked_binding_shadowed", "expected a new initialized local binding", DeclarationSpan(statement))?
     }
-    value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
+    initializer = statement.edge_count - 1
+    value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, initializer), 0)?
     ty = value.value.ty.clone()
+    if (initializer == 1) {
+        declared = LinkedNullType(project, 1, LinkedNullChild(project, 1, statement, 0))?
+        if (!SameLinkedType(declared, ty)) {
+            RejectLayout("linked_local_type", "initializer must match the declared local type", ty.span.clone())?
+        }
+    }
     slot = AddLinkedNullSlot(project, value.state, statement.text.clone(), "l" + str(id), ty, false)?
     slot.state.code = slot.state.code + "    " + slot.value.text.clone() + " = " + value.value.text.clone() + ";\n"
     slot.state.slots[slot.value.slot - 1].live = true
@@ -306,7 +313,9 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
         if (statement.kind == "Assign" && statement.edge_count == 1) {
             next = addLocal(project, next, statement, id)?
         } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {
-            next = LowerLinkedArrayLocal(project, next, statement, id)?
+            kind = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0)).kind
+            if (kind == "TypeArray") { next = LowerLinkedArrayLocal(project, next, statement, id)? }
+            else { next = addLocal(project, next, statement, id)? }
         } else if (statement.kind == "If" && statement.edge_count > 1 && statement.int_value == statement.edge_count - 1) {
             next = addGuardedRegion(project, next, statement, result, depth)?
         } else if (statement.kind == "While" && statement.edge_count >= 2 && index > start) {

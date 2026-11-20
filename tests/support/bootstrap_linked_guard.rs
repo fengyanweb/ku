@@ -260,7 +260,7 @@ int main(int argc, char **argv) {
 const TRY_SOURCE: &str = r#"import { Supply, Take, Observe } from "./try-provider.ku"
 fn Inspect(recover: bool, clone_first: bool): str! {
     try {
-        first = Supply(1)?
+        first: str = Supply(1)?
         if (clone_first) { copy = first.clone() }
         second = Supply(2)?
         Take(first)?
@@ -281,6 +281,10 @@ fn PreserveOuter(text: str): str! {
     } catch (err) {
         return ok(text)
     }
+}
+fn WrongDeclared(): null! {
+    typed: int = Supply(1)?
+    return ok(null)
 }
 fn RejectMoved(text: str): str! {
     try {
@@ -436,11 +440,16 @@ pub(super) fn assert_terminal_try_unwind(seed: &Path, cwd: &Path) {
 
     fs::write(cwd.join("function.txt"), "PreserveOuter").unwrap();
     assert_ok(&execute(&mut Command::new(seed), cwd, 30));
-    fs::write(cwd.join("function.txt"), "RejectMoved").unwrap();
-    let refused = execute(&mut Command::new(seed), cwd, 30);
-    assert_eq!(refused.status.code(), Some(1));
-    assert!(refused.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("unavailable_linked_binding"));
+    for (name, reason) in [
+        ("RejectMoved", "unavailable_linked_binding"),
+        ("WrongDeclared", "linked_local_type"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let refused = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(refused.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains(reason));
+    }
 }
 
 pub(super) fn assert_ignored_result_cleanup(seed: &Path, cwd: &Path) {
