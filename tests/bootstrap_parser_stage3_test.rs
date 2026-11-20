@@ -294,6 +294,46 @@ fn push_node(
 }
 
 fn project_expr(source: &str, expr: &Expr, arena: &mut ProjectedArena) -> usize {
+    if let ExprKind::StructLiteral { name, fields } = &expr.kind {
+        // The Rust AST keeps each value span and field name. Recover the name's
+        // location from the original token stream before projecting the pair.
+        let tokens = Lexer::new(source)
+            .lex()
+            .expect("struct literal field tokens");
+        let mut lower_bound = expr.span.start.offset;
+        let mut children = Vec::with_capacity(fields.len());
+        for (name, value) in fields {
+            let field_start = tokens
+                .windows(2)
+                .find(|pair| {
+                    pair[0].span.start.offset >= lower_bound
+                        && pair[1].span.end.offset <= value.span.start.offset
+                        && matches!(&pair[0].kind, TokenKind::Ident(field) if field == name)
+                        && pair[1].kind == TokenKind::Colon
+                })
+                .expect("struct literal field's token before its AST value")[0]
+                .span
+                .start;
+            let child = project_expr(source, value, arena);
+            children.push(push_node(
+                arena,
+                "StructLiteralField",
+                name.clone(),
+                0,
+                Span::new(field_start, value.span.end),
+                &[child],
+            ));
+            lower_bound = value.span.end.offset;
+        }
+        return push_node(
+            arena,
+            "StructLiteral",
+            name.clone(),
+            0,
+            expr.span,
+            &children,
+        );
+    }
     let (kind, text, int_value, children): (&str, String, i64, Vec<&Expr>) = match &expr.kind {
         ExprKind::Literal(Literal::Int(value)) => ("Int", String::new(), *value, vec![]),
         ExprKind::Literal(Literal::Float(_)) => (
@@ -1184,6 +1224,9 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "module App\nimport \"./types.ku\"\nstruct User { id:int }\nenum State { Ready User(value:User) }\nfn main() {}",
         STRUCT_GOLDEN_SOURCE,
         ENUM_GOLDEN_SOURCE,
+        include_str!("../bootstrap/stage2/span.ku"),
+        r#"fn main() { println(Box{first: Inner{x: 1 + 2}, other: [a(), 4]}?.other) }"#,
+        r#"fn main() { value = Box{value: "中😀"} println(value) }"#,
         "fn main() {}",
         "fn typed(): int { return 1 }",
         "fn add(left: int, right: int): int { return left + right }\nfn echo(value): str { return \"ok\" }",
@@ -1388,6 +1431,10 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let module_alias = "module App as Other";
     let double_module_semicolon = "module App;;";
     let nested_module = "fn main() { module Inner }";
+    let struct_trailing_comma = "fn main() { return Box{value: 1,} }";
+    let struct_missing_comma = "fn main() { return Box{value: 1 next: 2} }";
+    let struct_after_newline = "fn main() { return Box\n{value: 1} }";
+    let struct_empty_candidate = "fn main() { return Box{} }";
     let missing_struct_name = "struct";
     let missing_struct_open = "struct User";
     let missing_struct_field_name = "struct User { : int }";
@@ -2735,6 +2782,38 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             nested_module_message,
         ),
         (
+            struct_trailing_comma,
+            "unexpected_token",
+            diagnostic_for_kind(
+                struct_trailing_comma,
+                TokenKind::RBrace,
+                "expected expression before closing delimiter",
+            ),
+        ),
+        (
+            struct_missing_comma,
+            "trailing_token",
+            diagnostic_at(struct_missing_comma, 11, "expected end of expression"),
+        ),
+        (
+            struct_after_newline,
+            "unsupported_expression",
+            diagnostic_at(
+                struct_after_newline,
+                7,
+                "brace expressions are outside the stage-3 subset",
+            ),
+        ),
+        (
+            struct_empty_candidate,
+            "unsupported_expression",
+            diagnostic_at(
+                struct_empty_candidate,
+                7,
+                "brace expressions are outside the stage-3 subset",
+            ),
+        ),
+        (
             missing_struct_name,
             "unexpected_token",
             missing_struct_name_message,
@@ -3000,6 +3079,7 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         "diagnostic.ku",
         "ast.ku",
         "context.ku",
+        "expression_support.ku",
         "parser.ku",
     ] {
         fs::copy(

@@ -2,6 +2,7 @@ import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, SpanFromNode } from "./support.ku"
+import { IsNamedStructStart } from "../stage2/expression_support.ku"
 import { SignatureType, TypeWindowContinues, PushTypeToken, ParseTypeWindow } from "./signature.ku"
 import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, RejectBodyEof, RejectControlOpen, RejectControlClose, RejectControlBody, RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectBodyEdgeId, RejectNestedNodeId, RejectNestedRoot, RejectTypeInspection, RejectExpressionTerminator, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength, RejectElseIf, RejectElseBody, RejectStrayElse, RejectStatementLimit, RejectStatementDepth, RejectLetStatement, RejectDeclarationInitializer, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow, SignatureTypeOutput } from "./body_support.ku"
 
@@ -130,7 +131,9 @@ fn ReadFunctionBody(input_tokens: [Token], body_start: int, token_base: int, ini
         while (!boundary.complete) {
             if (probe >= tokens.len()) { RejectExpressionTerminator(last.clone())? }
             previous_can_end = probe > start && CanEndExpression(tokens[probe - 1].kind.clone())
-            boundary = PushExpressionBoundary(boundary, tokens[probe].clone(), previous_can_end)?
+            named_struct_open = probe > start && probe + 2 < tokens.len() && tokens[probe].kind == "LBrace"
+                && IsNamedStructStart(tokens[probe - 1], tokens[probe], tokens[probe + 1], tokens[probe + 2])
+            boundary = PushExpressionBoundary(boundary, tokens[probe].clone(), previous_can_end, named_struct_open)?
             if (!boundary.complete) { probe = probe + 1 }
         }
         return ok(probe)

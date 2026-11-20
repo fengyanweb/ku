@@ -1,0 +1,84 @@
+import { Token } from "../stage1/token.ku"
+import { Span, SpanFromToken } from "./span.ku"
+import { MakeDiagnostic, DiagnosticCanonical } from "./diagnostic.ku"
+import { Node } from "./ast.ku"
+
+struct OperatorEntry {
+    marker: str
+    text: str
+    precedence: int
+    unary: bool
+    line: int
+    column: int
+    offset: int
+    end_line: int
+    end_column: int
+    end_offset: int
+    previous: int
+    base_value: int
+    depth_active: bool
+}
+
+struct ValueEntry {
+    node: int
+    previous: int
+}
+
+fn MakeOperator(marker: str, text: str, precedence: int, unary: bool, token: Token, previous: int, base_value: int, depth_active: bool): OperatorEntry {
+    return OperatorEntry {
+        marker: marker,
+        text: text,
+        precedence: precedence,
+        unary: unary,
+        line: token.line,
+        column: token.column,
+        offset: token.offset,
+        end_line: token.end_line,
+        end_column: token.end_column,
+        end_offset: token.end_offset,
+        previous: previous,
+        base_value: base_value,
+        depth_active: depth_active
+    }
+}
+
+fn OperatorSpan(&entry: OperatorEntry): Span {
+    return Span {
+        line: entry.line, column: entry.column, offset: entry.offset,
+        end_line: entry.end_line, end_column: entry.end_column, end_offset: entry.end_offset
+    }
+}
+
+fn ExpressionSpan(&node: Node): Span {
+    return Span {
+        line: node.line, column: node.column, offset: node.offset,
+        end_line: node.end_line, end_column: node.end_column, end_offset: node.end_offset
+    }
+}
+
+fn MakeExpressionNode(kind: str, text: str, int_value: int, span: Span, first_edge: int, edge_count: int): Node {
+    return Node {
+        kind: kind, text: text, int_value: int_value,
+        line: span.line, column: span.column, offset: span.offset,
+        end_line: span.end_line, end_column: span.end_column, end_offset: span.end_offset,
+        first_edge: first_edge, edge_count: edge_count
+    }
+}
+
+fn IsNamedStructStart(&name: Token, &opener: Token, &field: Token, &separator: Token): bool {
+    return name.kind == "Ident" && opener.kind == "LBrace" && name.end_line == opener.line && field.kind == "Ident" && separator.kind == "Colon"
+}
+
+fn RejectAt(token: Token, code: str, message: str, stage3_domain: bool): null! {
+    domain = "bootstrap.parser"
+    if (stage3_domain) { domain = "bootstrap.parser.stage3" }
+    diagnostic = MakeDiagnostic("error", domain.clone(), code.clone(), message, "<source>", SpanFromToken(token))
+    canonical = DiagnosticCanonical(diagnostic)
+    fail { domain: domain, code: code, message: canonical }
+}
+
+fn RejectAtPoint(code: str, message: str, stage3_domain: bool): null! {
+    point = Token { kind: "Eof", lexeme: "", int_value: 0, line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    RejectAt(point, code, message, stage3_domain)?
+    return ok(null)
+}

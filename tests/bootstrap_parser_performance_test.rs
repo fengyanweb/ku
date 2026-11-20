@@ -247,6 +247,7 @@ fn copy_bootstrap_sources(directory: &std::path::Path) {
                 "diagnostic.ku",
                 "ast.ku",
                 "context.ku",
+                "expression_support.ku",
                 "parser.ku",
             ][..],
         ),

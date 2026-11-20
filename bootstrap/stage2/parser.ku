@@ -1,67 +1,14 @@
 import { Token } from "../stage1/token.ku"
 import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken, SpanMerge } from "./span.ku"
-import { MakeDiagnostic, DiagnosticCanonical } from "./diagnostic.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "./ast.ku"
 import { ParseContext, DefaultParseContext, ParseContextError, RelocateTokens } from "./context.ku"
+import { OperatorEntry, ValueEntry, MakeOperator, OperatorSpan, ExpressionSpan, MakeExpressionNode, IsNamedStructStart, RejectAt, RejectAtPoint } from "./expression_support.ku"
 
 // Stage 2B uses append-only operator/value stacks and integer links. Flat
 // binary and postfix chains are iterative; nested delimiters and unary prefixes
 // consume the explicit depth budget. Every loop either consumes a token, pops
 // an operator, or walks a value chain bounded by the 4096-token contract.
-
-struct OperatorEntry {
-    marker: str
-    text: str
-    precedence: int
-    unary: bool
-    line: int
-    column: int
-    offset: int
-    end_line: int
-    end_column: int
-    end_offset: int
-    previous: int
-    base_value: int
-    depth_active: bool
-}
-
-struct ValueEntry {
-    node: int
-    previous: int
-}
-
-fn RejectAt(token: Token, code: str, message: str, stage3_domain: bool): null! {
-    domain = "bootstrap.parser"
-    if (stage3_domain) { domain = "bootstrap.parser.stage3" }
-    diagnostic = MakeDiagnostic("error", domain.clone(), code.clone(), message, "<source>", SpanFromToken(token))
-    canonical = DiagnosticCanonical(diagnostic)
-    fail { domain: domain, code: code, message: canonical }
-}
-
-fn RejectAtPoint(code: str, message: str, stage3_domain: bool): null! {
-    point = Token { kind: "Eof", lexeme: "", int_value: 0, line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
-    RejectAt(point, code, message, stage3_domain)?
-    return ok(null)
-}
-
-fn MakeOperator(marker: str, text: str, precedence: int, unary: bool, token: Token, previous: int, base_value: int, depth_active: bool): OperatorEntry {
-    return OperatorEntry {
-        marker: marker,
-        text: text,
-        precedence: precedence,
-        unary: unary,
-        line: token.line,
-        column: token.column,
-        offset: token.offset,
-        end_line: token.end_line,
-        end_column: token.end_column,
-        end_offset: token.end_offset,
-        previous: previous,
-        base_value: base_value,
-        depth_active: depth_active
-    }
-}
 
 fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
     // Reject caller-controlled diagnostic identity before inspecting source.
@@ -95,6 +42,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
 
     cursor = 0
     depth = 1
+    struct_depth = 0
     arena_nodes: [Node] = []
     arena_edges: [int] = []
     operators: [OperatorEntry] = []
@@ -116,19 +64,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             }
             arena_edges = arena_edges.push(child)
         }
-        node = Node {
-            kind: kind,
-            text: text,
-            int_value: int_value,
-            line: span.line,
-            column: span.column,
-            offset: span.offset,
-            end_line: span.end_line,
-            end_column: span.end_column,
-            end_offset: span.end_offset,
-            first_edge: first_edge,
-            edge_count: arena_edges.len() - first_edge
-        }
+        node = MakeExpressionNode(kind, text, int_value, span, first_edge, arena_edges.len() - first_edge)
         arena_nodes = arena_nodes.push(node)
         return ok(arena_nodes.len())
     }
@@ -154,19 +90,8 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             }
             first_edge = arena_edges.len()
             arena_edges = arena_edges.push(right_entry.node)
-            unary_node = Node {
-                kind: "Unary",
-                text: operator.text,
-                int_value: 0,
-                line: operator.line,
-                column: operator.column,
-                offset: operator.offset,
-                end_line: child.end_line,
-                end_column: child.end_column,
-                end_offset: child.end_offset,
-                first_edge: first_edge,
-                edge_count: 1
-            }
+            span = SpanMerge(OperatorSpan(operator), ExpressionSpan(child))
+            unary_node = MakeExpressionNode("Unary", operator.text, 0, span, first_edge, 1)
             arena_nodes = arena_nodes.push(unary_node)
             combined = arena_nodes.len()
             combined_entry = ValueEntry { node: combined, previous: value_top }
@@ -191,19 +116,8 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
         first_edge = arena_edges.len()
         arena_edges = arena_edges.push(left_entry.node)
         arena_edges = arena_edges.push(right_entry.node)
-        binary_node = Node {
-            kind: "Binary",
-            text: operator.text,
-            int_value: 0,
-            line: left.line,
-            column: left.column,
-            offset: left.offset,
-            end_line: right.end_line,
-            end_column: right.end_column,
-            end_offset: right.end_offset,
-            first_edge: first_edge,
-            edge_count: 2
-        }
+        span = SpanMerge(ExpressionSpan(left), ExpressionSpan(right))
+        binary_node = MakeExpressionNode("Binary", operator.text, 0, span, first_edge, 2)
         arena_nodes = arena_nodes.push(binary_node)
         combined = arena_nodes.len()
         combined_entry = ValueEntry { node: combined, previous: value_top }
@@ -221,7 +135,24 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             RejectAt(tokens[cursor].clone(), "work_limit", "stage-2 parser work budget exceeded", stage3_domain)?
         }
         token = tokens[cursor].clone()
-        closing = token.kind == "RParen" || token.kind == "RBracket"
+        // A field is not an operand by itself. Once its expression has been
+        // reduced, replace that one value with an ordered named field node.
+        if (struct_depth > 0 && !expect_operand && (token.kind == "Comma" || token.kind == "RBrace")) {
+            while (operator_top != 0 && operators[operator_top - 1].marker == "") { ReduceTop()? }
+            field = operators[operator_top - 1].clone()
+            if (field.marker == "struct_field") {
+                value = values[value_top - 1].clone()
+                if (value.previous != field.base_value) {
+                    RejectAt(token.clone(), "invalid_expression", "struct field requires exactly one expression", stage3_domain)?
+                }
+                span = SpanMerge(OperatorSpan(field), ExpressionSpan(arena_nodes[value.node - 1]))
+                node = AddNode("StructLiteralField", field.text, 0, span, [value.node])?
+                values = values.push(ValueEntry { node: node, previous: value.previous })
+                value_top = values.len()
+                operator_top = field.previous
+            }
+        }
+        closing = token.kind == "RParen" || token.kind == "RBracket" || (struct_depth > 0 && token.kind == "RBrace")
         if (closing) {
             reducing = true
             while (reducing) {
@@ -237,6 +168,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             marker = operators[operator_top - 1].clone()
             expected_close = "RParen"
             if (marker.marker == "array" || marker.marker == "index") { expected_close = "RBracket" }
+            if (marker.marker == "struct") { expected_close = "RBrace" }
             if (token.kind != expected_close) {
                 RejectAt(token.clone(), "unexpected_token", "closing delimiter does not match opener", stage3_domain)?
             }
@@ -245,6 +177,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             }
             operator_top = marker.previous
             if (marker.depth_active) { depth = depth - 1 }
+            if (marker.marker == "struct") { struct_depth = struct_depth - 1 }
 
             reversed: [int] = []
             walk = value_top
@@ -282,33 +215,13 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                 end_span = SpanFromToken(token.clone())
                 node = 0
                 if (marker.marker == "array") {
-                    start_span = Span {
-                        line: marker.line,
-                        column: marker.column,
-                        offset: marker.offset,
-                        end_line: marker.end_line,
-                        end_column: marker.end_column,
-                        end_offset: marker.end_offset
-                    }
-                    node = AddNode("Array", "", 0, SpanMerge(start_span, end_span), children)?
-                } else if (marker.marker == "call") {
-                    node = AddNode("Call", "", 0, SpanMerge(Span {
-                        line: arena_nodes[start_node - 1].line,
-                        column: arena_nodes[start_node - 1].column,
-                        offset: arena_nodes[start_node - 1].offset,
-                        end_line: arena_nodes[start_node - 1].end_line,
-                        end_column: arena_nodes[start_node - 1].end_column,
-                        end_offset: arena_nodes[start_node - 1].end_offset
-                    }, end_span), children)?
+                    node = AddNode("Array", "", 0, SpanMerge(OperatorSpan(marker), end_span), children)?
+                } else if (marker.marker == "struct") {
+                    node = AddNode("StructLiteral", marker.text, 0, SpanMerge(OperatorSpan(marker), end_span), children)?
                 } else {
-                    node = AddNode("Index", "", 0, SpanMerge(Span {
-                        line: arena_nodes[start_node - 1].line,
-                        column: arena_nodes[start_node - 1].column,
-                        offset: arena_nodes[start_node - 1].offset,
-                        end_line: arena_nodes[start_node - 1].end_line,
-                        end_column: arena_nodes[start_node - 1].end_column,
-                        end_offset: arena_nodes[start_node - 1].end_offset
-                    }, end_span), children)?
+                    kind = "Index"
+                    if (marker.marker == "call") { kind = "Call" }
+                    node = AddNode(kind, "", 0, SpanMerge(ExpressionSpan(arena_nodes[start_node - 1]), end_span), children)?
                 }
                 value_entry = ValueEntry { node: node, previous: value_top }
                 values = values.push(value_entry)
@@ -327,8 +240,27 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                 RejectAt(token.clone(), "unexpected_eof", "expected closing delimiter", stage3_domain)?
             }
             parsing = false
+        } else if (expect_operand && struct_depth > 0 && operators[operator_top - 1].marker == "struct") {
+            if (token.kind != "Ident" || tokens[cursor + 1].kind != "Colon") {
+                RejectAt(token.clone(), "unexpected_token", "expected named struct field followed by ':'", stage3_domain)?
+            }
+            entry = MakeOperator("struct_field", token.lexeme.clone(), 0, false, token, operator_top, value_top, false)
+            operators = operators.push(entry)
+            operator_top = operators.len()
+            cursor = cursor + 2
         } else if (expect_operand) {
-            if (token.kind == "Bang" || token.kind == "Minus") {
+            if (token.kind == "Ident" && tokens[cursor + 1].kind == "LBrace" && cursor + 3 < tokens.len()
+                && IsNamedStructStart(token, tokens[cursor + 1], tokens[cursor + 2], tokens[cursor + 3])) {
+                if (depth >= 32) {
+                    RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested", stage3_domain)?
+                }
+                entry = MakeOperator("struct", token.lexeme.clone(), 0, false, token, operator_top, value_top, true)
+                operators = operators.push(entry)
+                operator_top = operators.len()
+                depth = depth + 1
+                struct_depth = struct_depth + 1
+                cursor = cursor + 2
+            } else if (token.kind == "Bang" || token.kind == "Minus") {
                 if (depth >= 32) {
                     RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested", stage3_domain)?
                 }
@@ -384,7 +316,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             while (operator_top != 0 && operators[operator_top - 1].marker == "") {
                 ReduceTop()?
             }
-            if (operator_top == 0 || (operators[operator_top - 1].marker != "array" && operators[operator_top - 1].marker != "call")) {
+            if (operator_top == 0 || (operators[operator_top - 1].marker != "array" && operators[operator_top - 1].marker != "call" && operators[operator_top - 1].marker != "struct")) {
                 RejectAt(token.clone(), "unexpected_token", "comma is only valid in an array or call", stage3_domain)?
             }
             marker = operators[operator_top - 1].clone()
@@ -422,10 +354,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             target_entry = values[value_top - 1].clone()
             value_top = target_entry.previous
             target = arena_nodes[target_entry.node - 1].clone()
-            merged = SpanMerge(Span {
-                line: target.line, column: target.column, offset: target.offset,
-                end_line: target.end_line, end_column: target.end_column, end_offset: target.end_offset
-            }, SpanFromToken(field.clone()))
+            merged = SpanMerge(ExpressionSpan(target), SpanFromToken(field.clone()))
             node = 0
             if (optional && target.kind == "Index") {
                 unwrapped = AddNode("TryUnwrap", "", 0, merged.clone(), [target_entry.node])?
@@ -443,10 +372,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             target_entry = values[value_top - 1].clone()
             value_top = target_entry.previous
             target = arena_nodes[target_entry.node - 1].clone()
-            merged = SpanMerge(Span {
-                line: target.line, column: target.column, offset: target.offset,
-                end_line: target.end_line, end_column: target.end_column, end_offset: target.end_offset
-            }, SpanFromToken(token.clone()))
+            merged = SpanMerge(ExpressionSpan(target), SpanFromToken(token.clone()))
             node = AddNode("TryUnwrap", "", 0, merged, [target_entry.node])?
             value_entry = ValueEntry { node: node, previous: value_top }
             values = values.push(value_entry)

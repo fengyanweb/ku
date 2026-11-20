@@ -607,6 +607,7 @@ fn main(): null! {
         "diagnostic.ku",
         "ast.ku",
         "context.ku",
+        "expression_support.ku",
         "parser.ku",
     ] {
         fs::copy(
