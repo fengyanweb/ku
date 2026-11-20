@@ -87,6 +87,15 @@ For a function with explicit `int` parameters and result, write `int` to
 from `examples/math.ku` in `function.txt`. This mode emits checked signed
 64-bit arithmetic and direct, nonrecursive calls within the input module.
 
+The same mode accepts `str` and `&str` parameters on leaf functions returning
+an `int` literal or parameter. It emits guarded returns of the form
+`if (left == right) { return value }` followed by a final return. A guard can
+compare string parameters and literals with `==` or `!=`. To try it, put the
+complete `DigitValue` definition from `bootstrap/stage1/lexer.ku` in `input.ku`
+and select `DigitValue` in `function.txt`. The emitted C compares UTF-8 bytes
+and lengths. A by-value argument transfers its owned buffer to the function.
+A `const KuScalarString*` argument borrows the caller's storage.
+
 The compiler entry scans the module once and parses bounded declaration
 windows. It retains the lexer, per-function, AST and work limits. The legacy
 `ParseProgram` entry retains its 512-token whole-script limit.

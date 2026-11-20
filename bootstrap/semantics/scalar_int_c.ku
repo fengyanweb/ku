@@ -1,3 +1,4 @@
+import { bytes } from "std"
 import { Node } from "../stage2/ast.ku"
 import { DiagnosticCanonical, MakeDiagnostic } from "../stage2/diagnostic.ku"
 import { Span } from "../stage2/span.ku"
@@ -20,10 +21,21 @@ struct ScalarIntCall {
     arguments: [int]
 }
 
+struct ScalarIntParameter {
+    name: str
+    // Zero is int, one is owned str, and two is View<str>.
+    string_mode: int
+}
+
+struct ScalarIntClause {
+    condition: str
+    instructions: [ScalarIntInstruction]
+}
+
 struct ScalarIntFunction {
     function_node: int
-    parameter_count: int
-    instructions: [ScalarIntInstruction]
+    parameters: [ScalarIntParameter]
+    clauses: [ScalarIntClause]
 }
 
 struct ScalarIntC {
@@ -36,6 +48,9 @@ struct ScalarIntBodyC {
     uses_add: bool
     uses_sub: bool
     uses_mul: bool
+    uses_string: bool
+    uses_string_comparison: bool
+    uses_owned_string: bool
 }
 
 fn rejectScalarInt(code: str, message: str, span: Span): null! {
@@ -44,7 +59,7 @@ fn rejectScalarInt(code: str, message: str, span: Span): null! {
     fail { domain: domain, code: code, message: DiagnosticCanonical(diagnostic) }
 }
 
-fn requireInt(&bindings: [TypeNameBinding], use_node: int, &ty: Node): null! {
+fn scalarType(&bindings: [TypeNameBinding], use_node: int, &ty: Node): int {
     lo = 0
     hi = bindings.len()
     while (lo < hi) {
@@ -52,17 +67,25 @@ fn requireInt(&bindings: [TypeNameBinding], use_node: int, &ty: Node): null! {
         if (bindings[middle].use_node < use_node) { lo = middle + 1 }
         else { hi = middle }
     }
-    if (ty.kind != "TypeName" || lo >= bindings.len() || bindings[lo].use_node != use_node
-        || bindings[lo].declaration_kind != "Builtin" || bindings[lo].name != "int") {
+    if (ty.kind == "TypeName" && lo < bindings.len() && bindings[lo].use_node == use_node
+        && bindings[lo].declaration_kind == "Builtin") {
+        if (bindings[lo].name == "int") { return 1 }
+        if (bindings[lo].name == "str") { return 2 }
+    }
+    return 0
+}
+
+fn requireInt(&bindings: [TypeNameBinding], use_node: int, &ty: Node): null! {
+    if (scalarType(bindings, use_node, ty) != 1) {
         rejectScalarInt("unsupported_int_type", "expected a bound builtin int type", DeclarationSpan(ty))?
     }
     return ok(null)
 }
 
-fn scalarParameterIndex(&parameters: [str], &name: str): int {
+fn scalarParameterIndex(&parameters: [ScalarIntParameter], &name: str): int {
     index = 0
     while (index < parameters.len()) {
-        if (parameters[index] == name) { return index }
+        if (parameters[index].name == name) { return index }
         index = index + 1
     }
     return -1
@@ -80,7 +103,7 @@ fn scalarFunctionNode(&declarations: [TopLevelName], &name: str): int {
 }
 
 fn bindIntCall(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
-               &parameters: [str], &call: Node): ScalarIntCall! {
+               &bindings: [TypeNameBinding], &parameters: [ScalarIntParameter], &call: Node): ScalarIntCall! {
     if (call.edge_count == 0) {
         rejectScalarInt("unsupported_int_callee", "expected a direct local function call", DeclarationSpan(call))?
     }
@@ -96,6 +119,13 @@ fn bindIntCall(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
     function = nodes[function_node - 1].clone()
     arity = 0
     while (arity < function.edge_count && nodes[edges[function.first_edge + arity] - 1].kind == "Parameter") {
+        parameter = nodes[edges[function.first_edge + arity] - 1].clone()
+        if (parameter.edge_count == 1) {
+            type_node = edges[parameter.first_edge]
+            if (scalarType(bindings, type_node, nodes[type_node - 1]) == 2) {
+                rejectScalarInt("unsupported_int_callee_signature", "calls in the int subset cannot transfer string parameters", DeclarationSpan(call))?
+            }
+        }
         arity = arity + 1
     }
     if (call.edge_count - 1 != arity) {
@@ -121,7 +151,7 @@ fn isIntCallTarget(&calls: [ScalarIntCall], node: int): bool {
 }
 
 fn lowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
-                      &parameters: [str], result_node: int): [ScalarIntInstruction]! {
+                      &bindings: [TypeNameBinding], &parameters: [ScalarIntParameter], result_node: int): [ScalarIntInstruction]! {
     // BuildNameTable validated a contiguous post-order tree. The first child
     // chain reaches its leftmost leaf, and every node in that range belongs
     // to this expression. Neither a recursive stack nor a copied AST is needed.
@@ -133,7 +163,7 @@ fn lowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelNam
     probe = cursor
     while (probe <= result_node) {
         if (nodes[probe - 1].kind == "Call") {
-            call = bindIntCall(nodes, edges, declarations, parameters, nodes[probe - 1])?
+            call = bindIntCall(nodes, edges, declarations, bindings, parameters, nodes[probe - 1])?
             calls = calls.push(call)
         }
         probe = probe + 1
@@ -160,6 +190,9 @@ fn lowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelNam
             operand = scalarParameterIndex(parameters, node.text)
             if (operand < 0) {
                 rejectScalarInt("undefined_int_operand", "undefined int parameter '" + node.text.clone() + "'", DeclarationSpan(node))?
+            }
+            if (parameters[operand].string_mode != 0) {
+                rejectScalarInt("unsupported_int_operand_type", "expected an int operand, found str", DeclarationSpan(node))?
             }
         } else if (node.kind == "Unary" && node.edge_count == 1 && node.text == "-") {
             operation = "sub"
@@ -188,36 +221,109 @@ fn lowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelNam
     return ok(instructions)
 }
 
+// Decimal source bytes never enter a C identifier or an unescaped literal.
+// Three-digit C octal escapes preserve all UTF-8 bytes and embedded zeros.
+fn scalarStringOperand(&parameters: [ScalarIntParameter], &node: Node): str! {
+    if (node.kind == "String" && node.edge_count == 0) {
+        encoded = bytes.from_str(node.text.clone())?
+        if (encoded.len() > 4095) {
+            rejectScalarInt("string_literal_limit", "standalone C string guards accept at most 4095 literal bytes", DeclarationSpan(node))?
+        }
+        literal = "(const uint8_t*)\""
+        index = 0
+        while (index < encoded.len()) {
+            byte = encoded.get(index)?
+            literal += "\\" + str(byte / 64) + str((byte / 8) % 8) + str(byte % 8)
+            index = index + 1
+        }
+        return ok(literal + "\", " + str(encoded.len()) + "u")
+    }
+    if (node.kind == "Variable" && node.edge_count == 0) {
+        index = scalarParameterIndex(parameters, node.text)
+        if (index >= 0 && parameters[index].string_mode != 0) {
+            access = "."
+            if (parameters[index].string_mode == 2) { access = "->" }
+            name = "a" + str(index)
+            return ok(name.clone() + access.clone() + "ptr, " + name + access + "len")
+        }
+    }
+    rejectScalarInt("unsupported_string_operand", "expected a bound str parameter or string literal", DeclarationSpan(node))?
+    return ok("")
+}
+
+fn scalarStringCondition(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], &node: Node): str! {
+    if (node.kind != "Binary" || node.edge_count != 2 || (node.text != "==" && node.text != "!=")) {
+        rejectScalarInt("unsupported_string_condition", "expected == or != between string operands", DeclarationSpan(node))?
+    }
+    left = scalarStringOperand(parameters, nodes[edges[node.first_edge] - 1])?
+    right = scalarStringOperand(parameters, nodes[edges[node.first_edge + 1] - 1])?
+    prefix = ""
+    if (node.text == "!=") { prefix = "!" }
+    return ok(prefix + "ku_scalar_string_equal(" + left + ", " + right + ")")
+}
+
 fn lowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
                           &bindings: [TypeNameBinding], function_id: int): ScalarIntFunction! {
     function = nodes[function_id - 1].clone()
     cursor = function.first_edge
     end = cursor + function.edge_count
-    parameters: [str] = []
+    parameters: [ScalarIntParameter] = []
+    has_string = false
     while (cursor < end && nodes[edges[cursor] - 1].kind == "Parameter") {
         parameter = nodes[edges[cursor] - 1].clone()
-        if (parameter.edge_count != 1 || parameter.int_value != 0) {
-            rejectScalarInt("unsupported_int_signature", "expected an explicitly typed owned int parameter", DeclarationSpan(parameter))?
+        if (parameter.edge_count != 1 || parameter.int_value < 0 || parameter.int_value > 1) {
+            rejectScalarInt("unsupported_int_signature", "expected an explicitly typed int, str or &str parameter", DeclarationSpan(parameter))?
         }
         if (scalarParameterIndex(parameters, parameter.text) >= 0) {
             rejectScalarInt("duplicate_int_parameter", "duplicate function parameter '" + parameter.text.clone() + "'", DeclarationSpan(parameter))?
         }
         type_id = edges[parameter.first_edge]
-        requireInt(bindings, type_id, nodes[type_id - 1])?
-        parameters = parameters.push(parameter.text)
+        string_mode = 0
+        if (scalarType(bindings, type_id, nodes[type_id - 1]) == 2) {
+            string_mode = parameter.int_value + 1
+            has_string = true
+        } else {
+            requireInt(bindings, type_id, nodes[type_id - 1])?
+            if (parameter.int_value != 0) {
+                rejectScalarInt("unsupported_int_signature", "the int subset requires by-value int parameters", DeclarationSpan(parameter))?
+            }
+        }
+        parameters = parameters.push(ScalarIntParameter { name: parameter.text, string_mode: string_mode })
         cursor = cursor + 1
     }
-    if (end - cursor != 2) {
-        rejectScalarInt("unsupported_int_body", "expected an explicit int result type and one return statement", DeclarationSpan(function))?
+    if (end - cursor < 2) {
+        rejectScalarInt("unsupported_int_body", "expected an explicit int result type and a final return", DeclarationSpan(function))?
     }
     type_id = edges[cursor]
     requireInt(bindings, type_id, nodes[type_id - 1])?
-    statement = nodes[edges[cursor + 1] - 1].clone()
-    if (statement.kind != "Return" || statement.edge_count != 1) {
-        rejectScalarInt("unsupported_int_body", "expected a return with one int expression", DeclarationSpan(statement))?
+    cursor = cursor + 1
+    clauses: [ScalarIntClause] = []
+    while (cursor < end) {
+        statement = nodes[edges[cursor] - 1].clone()
+        condition = ""
+        if (cursor < end - 1) {
+            if (statement.kind != "If" || statement.edge_count != 2 || statement.int_value != 1) {
+                rejectScalarInt("unsupported_int_body", "expected a guarded return with no else before the final return", DeclarationSpan(statement))?
+            }
+            condition = scalarStringCondition(nodes, edges, parameters, nodes[edges[statement.first_edge] - 1])?
+            return_node = edges[statement.first_edge + 1]
+            statement = nodes[return_node - 1].clone()
+        }
+        if (statement.kind != "Return" || statement.edge_count != 1) {
+            rejectScalarInt("unsupported_int_body", "expected a return with one int expression", DeclarationSpan(statement))?
+        }
+        result_node = edges[statement.first_edge]
+        // The leaf subset has no arithmetic traps or calls that could bypass
+        // the owned-parameter cleanup on the selected return.
+        result = nodes[result_node - 1].clone()
+        if (has_string && (result.kind != "Int" && result.kind != "Variable")) {
+            rejectScalarInt("unsupported_string_leaf_return", "functions with str parameters return an int literal or parameter", DeclarationSpan(result))?
+        }
+        instructions = lowerIntExpression(nodes, edges, declarations, bindings, parameters, result_node)?
+        clauses = clauses.push(ScalarIntClause { condition: condition, instructions: instructions })
+        cursor = cursor + 1
     }
-    instructions = lowerIntExpression(nodes, edges, declarations, parameters, edges[statement.first_edge])?
-    return ok(ScalarIntFunction { function_node: function_id, parameter_count: parameters.len(), instructions: instructions })
+    return ok(ScalarIntFunction { function_node: function_id, parameters: parameters, clauses: clauses })
 }
 
 fn integerHelpers(add: bool, sub: bool, mul: bool): str {
@@ -247,6 +353,26 @@ fn integerHelpers(add: bool, sub: bool, mul: bool): str {
     return text
 }
 
+fn scalarStringHelpers(carrier: bool, comparison: bool, owned: bool): str {
+    text = ""
+    if (carrier || comparison) { text += "#include <stddef.h>\n" }
+    if (comparison) { text += "#include <string.h>\n" }
+    if (owned) { text += "#include <stdlib.h>\n" }
+    if (carrier) {
+        text += "\n/* KuString layout. Owned arguments transfer their malloc-compatible backing. */\n"
+        text += "typedef struct { uint8_t* ptr; size_t len; size_t capacity; uint8_t storage; } KuScalarString;\n\n"
+    }
+    if (comparison) {
+        text += "static int ku_scalar_string_equal(const uint8_t* a, size_t n, const uint8_t* b, size_t m) {\n"
+        text += "    return n == m && (n == 0 || memcmp(a, b, n) == 0);\n}\n\n"
+    }
+    if (owned) {
+        text += "static void ku_scalar_string_drop(KuScalarString value) {\n"
+        text += "    if (value.storage == 1 && value.ptr) free(value.ptr);\n}\n\n"
+    }
+    return text
+}
+
 fn scalarSymbol(function_node: int): str {
     return "ku_int_" + str(function_node)
 }
@@ -266,46 +392,81 @@ fn emitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
     signature = "int64_t " + scalarSymbol(plan.function_node) + "("
     if (!external) { signature = "static " + signature }
     declarations = ""
-    if (plan.parameter_count == 0) { signature += "void" }
+    drops = ""
+    uses_string = false
+    if (plan.parameters.len() == 0) { signature += "void" }
     index = 0
-    while (index < plan.parameter_count) {
+    while (index < plan.parameters.len()) {
         if (index > 0) { signature += ", " }
+        mode = plan.parameters[index].string_mode
+        kind = "int64_t"
+        if (mode == 1) { kind = "KuScalarString" }
+        else if (mode == 2) { kind = "const KuScalarString*" }
+        uses_string = uses_string || mode != 0
         param = "a" + str(index)
-        signature += "int64_t " + param.clone()
+        signature += kind + " " + param.clone()
+        if (mode == 1) { drops += "    ku_scalar_string_drop(" + param.clone() + ");\n" }
         declarations += "    (void)" + param + ";\n"
         index = index + 1
     }
+    uses_owned = drops != ""
+    if (uses_owned) { declarations += "    int64_t result;\n" }
     text = signature + ") {\n" + declarations
     uses_add = false
     uses_sub = false
     uses_mul = false
-    result_node = 0
+    uses_comparison = false
     index = 0
-    while (index < plan.instructions.len()) {
-        instruction = plan.instructions[index].clone()
-        expression = ""
-        if (instruction.operation == "constant") {
-            expression = "INT64_C(" + str(instruction.operand) + ")"
-        } else if (instruction.operation == "parameter") {
-            expression = "a" + str(instruction.operand)
-        } else if (instruction.operation == "call") {
-            // Each argument already has a value. C argument evaluation order
-            // cannot reorder the Ku argument computations.
-            expression = emitIntCall(instruction)
-        } else {
-            uses_add = uses_add || instruction.operation == "add"
-            uses_sub = uses_sub || instruction.operation == "sub"
-            uses_mul = uses_mul || instruction.operation == "mul"
-            left = "INT64_C(0)"
-            if (instruction.operand != 0) { left = "t" + str(instruction.operand) }
-            expression = "ku_scalar_" + instruction.operation + "(" + left + ", t" + str(instruction.right_node) + ")"
+    while (index < plan.clauses.len()) {
+        clause = plan.clauses[index].clone()
+        guarded = clause.condition != ""
+        indent = "    "
+        if (guarded) {
+            text += "    if (" + clause.condition + ") {\n"
+            uses_comparison = true
+            indent = "        "
         }
-        result_node = instruction.result_node
-        text += "    int64_t t" + str(result_node) + " = " + expression + ";\n"
+        result_node = 0
+        step = 0
+        while (step < clause.instructions.len()) {
+            instruction = clause.instructions[step].clone()
+            expression = ""
+            if (instruction.operation == "constant") {
+                expression = "INT64_C(" + str(instruction.operand) + ")"
+            } else if (instruction.operation == "parameter") {
+                expression = "a" + str(instruction.operand)
+            } else if (instruction.operation == "call") {
+                // Evaluated arguments already have temporaries. C call
+                // argument evaluation order cannot reorder the computations.
+                expression = emitIntCall(instruction)
+            } else {
+                uses_add = uses_add || instruction.operation == "add"
+                uses_sub = uses_sub || instruction.operation == "sub"
+                uses_mul = uses_mul || instruction.operation == "mul"
+                left = "INT64_C(0)"
+                if (instruction.operand != 0) { left = "t" + str(instruction.operand) }
+                expression = "ku_scalar_" + instruction.operation + "(" + left + ", t" + str(instruction.right_node) + ")"
+            }
+            result_node = instruction.result_node
+            text += indent.clone() + "int64_t t" + str(result_node) + " = " + expression + ";\n"
+            step = step + 1
+        }
+        if (uses_owned) {
+            text += indent.clone() + "result = t" + str(result_node) + ";\n"
+            if (guarded) { text += indent + "goto cleanup;\n" }
+        } else {
+            text += indent + "return t" + str(result_node) + ";\n"
+        }
+        if (guarded) { text += "    }\n" }
         index = index + 1
     }
-    text += "    return t" + str(result_node) + ";\n}\n"
-    return ScalarIntBodyC { source: text, uses_add: uses_add, uses_sub: uses_sub, uses_mul: uses_mul }
+    if (uses_owned) {
+        if (uses_comparison) { text += "cleanup:\n" }
+        text += drops + "    return result;\n"
+    }
+    text += "}\n"
+    return ScalarIntBodyC { source: text, uses_add: uses_add, uses_sub: uses_sub, uses_mul: uses_mul,
+        uses_string: uses_string, uses_string_comparison: uses_comparison, uses_owned_string: uses_owned }
 }
 
 fn containsIntNode(&nodes: [int], node: int): bool {
@@ -324,13 +485,17 @@ fn planScalarIntModule(&nodes: [Node], &edges: [int], &declarations: [TopLevelNa
     index = 0
     while (index < reachable.len()) {
         plan = lowerScalarIntFunction(nodes, edges, declarations, bindings, reachable[index])?
-        step = 0
-        while (step < plan.instructions.len()) {
-            if (plan.instructions[step].operation == "call") {
-                callee = plan.instructions[step].operand
-                if (!containsIntNode(reachable, callee)) { reachable = reachable.push(callee) }
+        clause = 0
+        while (clause < plan.clauses.len()) {
+            step = 0
+            while (step < plan.clauses[clause].instructions.len()) {
+                if (plan.clauses[clause].instructions[step].operation == "call") {
+                    callee = plan.clauses[clause].instructions[step].operand
+                    if (!containsIntNode(reachable, callee)) { reachable = reachable.push(callee) }
+                }
+                step = step + 1
             }
-            step = step + 1
+            clause = clause + 1
         }
         plans = plans.push(plan)
         index = index + 1
@@ -339,12 +504,16 @@ fn planScalarIntModule(&nodes: [Node], &edges: [int], &declarations: [TopLevelNa
 }
 
 fn unresolvedIntCall(&plan: ScalarIntFunction, &completed: [int]): int {
-    index = 0
-    while (index < plan.instructions.len()) {
-        if (plan.instructions[index].operation == "call" && !containsIntNode(completed, plan.instructions[index].operand)) {
-            return plan.instructions[index].result_node
+    clause = 0
+    while (clause < plan.clauses.len()) {
+        index = 0
+        while (index < plan.clauses[clause].instructions.len()) {
+            if (plan.clauses[clause].instructions[index].operation == "call" && !containsIntNode(completed, plan.clauses[clause].instructions[index].operand)) {
+                return plan.clauses[clause].instructions[index].result_node
+            }
+            index = index + 1
         }
-        index = index + 1
+        clause = clause + 1
     }
     return 0
 }
@@ -356,6 +525,9 @@ fn emitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], entry: int):
     uses_add = false
     uses_sub = false
     uses_mul = false
+    uses_string = false
+    uses_string_comparison = false
+    uses_owned_string = false
     text = ""
     while (completed.len() < plans.len()) {
         blocked_at = 0
@@ -370,6 +542,9 @@ fn emitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], entry: int):
                     uses_add = uses_add || body.uses_add
                     uses_sub = uses_sub || body.uses_sub
                     uses_mul = uses_mul || body.uses_mul
+                    uses_string = uses_string || body.uses_string
+                    uses_string_comparison = uses_string_comparison || body.uses_string_comparison
+                    uses_owned_string = uses_owned_string || body.uses_owned_string
                     text += body.source
                     completed = completed.push(function_node)
                 } else {
@@ -383,7 +558,8 @@ fn emitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], entry: int):
                             DeclarationSpan(nodes[blocked_at - 1]))?
         }
     }
-    return ok(ScalarIntC { symbol: scalarSymbol(entry), source: integerHelpers(uses_add, uses_sub, uses_mul) + text })
+    return ok(ScalarIntC { symbol: scalarSymbol(entry), source: integerHelpers(uses_add, uses_sub, uses_mul)
+        + scalarStringHelpers(uses_string, uses_string_comparison, uses_owned_string) + text })
 }
 
 // The selected function is the only external symbol. Every reachable local
