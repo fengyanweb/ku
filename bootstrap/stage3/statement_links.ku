@@ -1,0 +1,35 @@
+import { Token } from "../stage1/token.ku"
+import { StatementLink, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength } from "./body_support.ku"
+
+struct AppendedStatements {
+    children: [int]
+    work: int
+}
+
+// Statement links are newest-first. Validate their bounded chain before
+// appending the referenced arena nodes in source order.
+fn AppendStatementLinks(children: [int], &links: [StatementLink], top: int, count: int,
+                        node_count: int, initial_work: int, error_token: Token): AppendedStatements! {
+    output = children
+    reversed: [int] = []
+    walk = top
+    remaining = count
+    work = initial_work
+    while (remaining > 0) {
+        work = work + 1
+        if (work > 16384) { RejectBodyWorkLimit(error_token.clone())? }
+        if (walk <= 0 || walk > links.len()) { RejectStatementLink(error_token.clone())? }
+        entry = links[walk - 1].clone()
+        if (entry.node <= 0 || entry.node > node_count) { RejectStatementNode(error_token.clone())? }
+        reversed = reversed.push(entry.node)
+        walk = entry.previous
+        remaining = remaining - 1
+    }
+    if (walk != 0) { RejectStatementLength(error_token.clone())? }
+    reverse_index = reversed.len()
+    while (reverse_index > 0) {
+        reverse_index = reverse_index - 1
+        output = output.push(reversed[reverse_index])
+    }
+    return ok(AppendedStatements { children: output, work: work })
+}

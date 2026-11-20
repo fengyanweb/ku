@@ -26,7 +26,11 @@ fn SpanFromNode(node: Node): Span {
 // Pure Stage 3 helpers live outside parser.ku so each self-hosted source file
 // remains below Stage 1's fixed per-file token ceiling.
 fn RejectAt(token: Token, code: str, message: str): null! {
-    diagnostic = MakeDiagnostic("error", "bootstrap.parser.stage3", code.clone(), message, "<source>", SpanFromToken(token))
+    return RejectAtSpan(SpanFromToken(token), code, message)
+}
+
+fn RejectAtSpan(span: Span, code: str, message: str): null! {
+    diagnostic = MakeDiagnostic("error", "bootstrap.parser.stage3", code.clone(), message, "<source>", span)
     canonical = DiagnosticCanonical(diagnostic)
     fail { domain: "bootstrap.parser.stage3", code: code, message: canonical }
 }

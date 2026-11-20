@@ -1,8 +1,10 @@
 import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
-import { SpanFromNode } from "./support.ku"
-import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, ReadControlHeader, ReadCatchBinding, ReadTypeAt, ReadExpressionEnd, LocalAssignmentOperator, RejectBodyEof, RejectControlBody, RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectBodyEdgeId, RejectNestedNodeId, RejectNestedRoot, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength, ReadElsePhase, CheckStrayClause, RejectFinally, ExpectTryToken, RejectStatementLimit, RejectStatementDepth, RejectLetStatement, RejectDeclarationInitializer, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow, SignatureTypeOutput } from "./body_support.ku"
+import { ExpressionSpan, MakeExpressionNode } from "../stage2/expression_support.ku"
+import { RejectAtSpan, SpanFromNode } from "./support.ku"
+import { AppendStatementLinks } from "./statement_links.ku"
+import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, ReadControlHeader, ReadCatchBinding, ReadTypeAt, ReadExpressionEnd, LocalAssignmentOperator, RejectBodyEof, RejectControlBody, RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectBodyEdgeId, RejectNestedNodeId, RejectNestedRoot, ReadElsePhase, CheckStrayClause, RejectFinally, ExpectTryToken, RejectStatementLimit, RejectStatementDepth, RejectLetStatement, RejectDeclarationInitializer, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow, SignatureTypeOutput } from "./body_support.ku"
 
 // Read the remainder of one bounded ordinary-function window, starting at the
 // first token after its opening brace. ValidateFunctionBodyWindow runs before
@@ -42,19 +44,7 @@ fn ReadFunctionBody(input_tokens: [Token], body_start: int, token_base: int, ini
             }
             arena_edges = arena_edges.push(child)
         }
-        node = Node {
-            kind: kind,
-            text: text,
-            int_value: int_value,
-            line: span.line,
-            column: span.column,
-            offset: span.offset,
-            end_line: span.end_line,
-            end_column: span.end_column,
-            end_offset: span.end_offset,
-            first_edge: first_edge,
-            edge_count: arena_edges.len() - first_edge
-        }
+        node = MakeExpressionNode(kind, text, int_value, span, first_edge, arena_edges.len() - first_edge)
         arena_nodes = arena_nodes.push(node)
         return ok(arena_nodes.len())
     }
@@ -85,19 +75,9 @@ fn ReadFunctionBody(input_tokens: [Token], body_start: int, token_base: int, ini
                 arena_edges = arena_edges.push(node_base + child)
                 edge_index = edge_index + 1
             }
-            relocated = Node {
-                kind: input.kind,
-                text: input.text,
-                int_value: input.int_value,
-                line: input.line,
-                column: input.column,
-                offset: input.offset,
-                end_line: input.end_line,
-                end_column: input.end_column,
-                end_offset: input.end_offset,
-                first_edge: first_edge,
-                edge_count: arena_edges.len() - first_edge
-            }
+            span = ExpressionSpan(input)
+            relocated = MakeExpressionNode(input.kind, input.text, input.int_value, span,
+                                           first_edge, arena_edges.len() - first_edge)
             arena_nodes = arena_nodes.push(relocated)
             index = index + 1
         }
@@ -107,36 +87,9 @@ fn ReadFunctionBody(input_tokens: [Token], body_start: int, token_base: int, ini
         return ok(node_base + parsed_root)
     }
     fn AppendStatementList(children: [int], top: int, count: int, error_token: Token): [int]! {
-        output: [int] = children
-        reversed: [int] = []
-        walk = top
-        remaining = count
-        while (remaining > 0) {
-            // Keep this increment inline. Calling the sibling local
-            // ChargeWork closure from this captured helper would make their
-            // environments retain each other in native lowering.
-            parse_steps = parse_steps + 1
-            if (parse_steps > 16384) {
-                RejectBodyWorkLimit(error_token.clone())?
-            }
-            if (walk <= 0 || walk > statement_links.len()) {
-                RejectStatementLink(error_token.clone())?
-            }
-            entry = statement_links[walk - 1].clone()
-            if (entry.node <= 0 || entry.node > arena_nodes.len()) {
-                RejectStatementNode(error_token.clone())?
-            }
-            reversed = reversed.push(entry.node)
-            walk = entry.previous
-            remaining = remaining - 1
-        }
-        if (walk != 0) { RejectStatementLength(error_token.clone())? }
-        reverse_index = reversed.len()
-        while (reverse_index > 0) {
-            reverse_index = reverse_index - 1
-            output = output.push(reversed[reverse_index])
-        }
-        return ok(output)
+        appended = AppendStatementLinks(children, statement_links, top, count, arena_nodes.len(), parse_steps, error_token)?
+        parse_steps = appended.work
+        return ok(appended.children)
     }
 
     fn RecordStatement(statement: int): null! {
@@ -286,7 +239,7 @@ fn ReadFunctionBody(input_tokens: [Token], body_start: int, token_base: int, ini
                         end_span = SpanFromToken(tokens[cursor].clone())
                         cursor = cursor + 1
                     } else if (requires_value || tokens[cursor].kind != "RBrace") {
-                        expression_end = ReadExpressionEnd(tokens, cursor, false)?
+                        expression_end = ReadExpressionEnd(tokens, cursor, "value")?
                         value_origin = tokens[cursor].clone()
                         value_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
                         expression = AddArena(value_parsed, value_origin)?
@@ -310,7 +263,7 @@ fn ReadFunctionBody(input_tokens: [Token], body_start: int, token_base: int, ini
                         RejectDeclarationInitializer(tokens[cursor].clone())?
                     }
                     cursor = cursor + 1
-                    expression_end = ReadExpressionEnd(tokens, cursor, false)?
+                    expression_end = ReadExpressionEnd(tokens, cursor, "value")?
                     declaration_origin = tokens[cursor].clone()
                     declaration_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
                     expression = AddArena(declaration_parsed, declaration_origin)?
@@ -325,7 +278,7 @@ fn ReadFunctionBody(input_tokens: [Token], body_start: int, token_base: int, ini
                         target = AddNode("Variable", name.clone(), 0, SpanFromToken(statement_start.clone()), [], statement_start.clone())?
                     }
                     cursor = cursor + 2
-                    expression_end = ReadExpressionEnd(tokens, cursor, false)?
+                    expression_end = ReadExpressionEnd(tokens, cursor, "value")?
                     assignment_origin = tokens[cursor].clone()
                     assignment_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
                     expression = AddArena(assignment_parsed, assignment_origin)?
@@ -339,13 +292,29 @@ fn ReadFunctionBody(input_tokens: [Token], body_start: int, token_base: int, ini
                     cursor = expression_end
                     if (tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
                 } else {
-                    expression_end = ReadExpressionEnd(tokens, cursor, false)?
+                    expression_end = ReadExpressionEnd(tokens, cursor, "assignment_target")?
                     statement_origin = tokens[cursor].clone()
                     statement_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
                     expression = AddArena(statement_parsed, statement_origin)?
                     expression_node = arena_nodes[expression - 1].clone()
-                    statement = AddNode("ExprStmt", "", 0, SpanFromNode(expression_node), [expression], statement_start.clone())?
+                    span = ExpressionSpan(expression_node)
                     cursor = expression_end
+                    kind = "ExprStmt"
+                    children: [int] = [expression]
+                    if (tokens[cursor].kind == "Equal") {
+                        if (expression_node.kind != "Field" && expression_node.kind != "Index") {
+                            RejectAtSpan(span.clone(), "invalid_assignment_target", "invalid assignment target")?
+                        }
+                        cursor = cursor + 1
+                        expression_end = ReadExpressionEnd(tokens, cursor, "value")?
+                        value = parse_expression(token_base + cursor, token_base + expression_end)?
+                        rhs = AddArena(value, tokens[cursor].clone())?
+                        span = SpanMerge(span, ExpressionSpan(arena_nodes[rhs - 1]))
+                        children = children.push(rhs)
+                        kind = "AssignTarget"
+                        cursor = expression_end
+                    }
+                    statement = AddNode(kind, "", 0, span, children, statement_start.clone())?
                     if (tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
                 }
                 RecordStatement(statement)?

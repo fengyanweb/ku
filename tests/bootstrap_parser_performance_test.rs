@@ -261,6 +261,7 @@ fn copy_bootstrap_sources(directory: &std::path::Path) {
                 "structs.ku",
                 "enums.ku",
                 "functions.ku",
+                "statement_links.ku",
                 "statements.ku",
                 "parser.ku",
             ][..],

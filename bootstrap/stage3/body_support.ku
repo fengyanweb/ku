@@ -83,7 +83,7 @@ struct ControlHeader {
     work: int
 }
 
-fn ReadExpressionEnd(&tokens: [Token], start: int, for_header: bool): int! {
+fn ReadExpressionEnd(&tokens: [Token], start: int, context: str): int! {
     probe = start
     boundary = EmptyExpressionBoundary()
     while (!boundary.complete) {
@@ -91,9 +91,13 @@ fn ReadExpressionEnd(&tokens: [Token], start: int, for_header: bool): int! {
         previous_can_end = probe > start && CanEndExpression(tokens[probe - 1].kind.clone())
         named_struct_open = probe > start && probe + 2 < tokens.len() && tokens[probe].kind == "LBrace"
             && IsNamedStructStart(tokens[probe - 1], tokens[probe], tokens[probe + 1], tokens[probe + 2])
-        if (for_header && tokens[probe].kind == "LBrace" && !named_struct_open
-            && boundary.paren_depth == 0 && boundary.bracket_depth == 0 && boundary.brace_depth == 0) {
-            return ok(probe)
+        if (boundary.paren_depth == 0 && boundary.bracket_depth == 0 && boundary.brace_depth == 0) {
+            if (context == "for_header" && tokens[probe].kind == "LBrace" && !named_struct_open) {
+                return ok(probe)
+            }
+            if (context == "assignment_target" && tokens[probe].kind == "Equal") {
+                return ok(probe)
+            }
         }
         boundary = PushExpressionBoundary(boundary, tokens[probe].clone(), previous_can_end, named_struct_open)?
         if (!boundary.complete) { probe = probe + 1 }
@@ -110,7 +114,7 @@ fn ReadControlHeader(&tokens: [Token], start: int, initial_work: int): ControlHe
         cursor = cursor + 1
         if (tokens[cursor].kind != "In") { RejectAt(tokens[cursor].clone(), "unexpected_token", "expected 'in' after loop variable")? }
         expression_start = cursor + 1
-        expression_end = ReadExpressionEnd(tokens, expression_start, true)?
+        expression_end = ReadExpressionEnd(tokens, expression_start, "for_header")?
         work = NextBodyWork(initial_work, expression_end - start, name.clone())?
         if (tokens[expression_end].kind != "LBrace") {
             RejectAt(tokens[expression_end].clone(), "unsupported_statement", "stage-3 for bodies must use braces")?

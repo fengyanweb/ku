@@ -1328,7 +1328,12 @@ fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
 #[test]
 fn bootstrap_stage3_function_modules_retain_lexer_headroom() {
     let stage3 = Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/stage3");
-    for name in ["functions.ku", "statements.ku", "body_support.ku"] {
+    for name in [
+        "functions.ku",
+        "statements.ku",
+        "body_support.ku",
+        "statement_links.ku",
+    ] {
         let path = stage3.join(name);
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
@@ -3381,6 +3386,7 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         "imports.ku",
         "parser.ku",
         "signature.ku",
+        "statement_links.ku",
         "statements.ku",
         "structs.ku",
         "support.ku",

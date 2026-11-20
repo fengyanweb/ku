@@ -4,7 +4,7 @@
 pub mod bounded_process;
 
 use bounded_process::{run_bounded, BoundedOutput, OutputLimits};
-use ku::ast::{Expr, ExprKind, Item, Literal, Stmt};
+use ku::ast::{AssignTarget, Expr, ExprKind, Item, Literal, Stmt};
 use ku::lexer::Lexer;
 use ku::parser::Parser;
 use ku::span::{Position, Span};
@@ -85,15 +85,16 @@ fn escape(text: &str) -> String {
         .replace('|', "\\p")
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Row {
     kind: String,
     text: String,
+    int_value: i64,
     span: String,
     children: Vec<String>,
 }
 
-fn actual_rows(output: &[u8]) -> Vec<Row> {
+fn actual_arena(output: &[u8]) -> (Vec<Row>, Vec<Vec<usize>>) {
     let ast = String::from_utf8_lossy(output);
     let mut nodes: Vec<Row> = Vec::new();
     let mut slices: Vec<(usize, usize)> = Vec::new();
@@ -108,6 +109,7 @@ fn actual_rows(output: &[u8]) -> Vec<Row> {
                 nodes.push(Row {
                     kind: columns[2].into(),
                     text: columns[3].into(),
+                    int_value: columns[4].parse().unwrap(),
                     span: columns[5].into(),
                     children: Vec::new(),
                 });
@@ -120,13 +122,22 @@ fn actual_rows(output: &[u8]) -> Vec<Row> {
             _ => panic!("unexpected canonical row {line}"),
         }
     }
-    for (index, (start, count)) in slices.into_iter().enumerate() {
-        nodes[index].children = edges[start..start + count]
+    let links: Vec<_> = slices
+        .into_iter()
+        .map(|(start, count)| edges[start..start + count].to_vec())
+        .collect();
+    for (index, children) in links.iter().enumerate() {
+        nodes[index].children = children
             .iter()
             .map(|child| nodes[*child].kind.clone())
             .collect();
     }
-    nodes
+    (nodes, links)
+}
+
+fn actual_rows(output: &[u8]) -> Vec<Row> {
+    actual_arena(output)
+        .0
         .into_iter()
         .filter(|row| {
             matches!(
@@ -144,12 +155,147 @@ fn kind(expr: &Expr) -> &'static str {
         ExprKind::Variable(_) => "Variable",
         ExprKind::Array(_) => "Array",
         ExprKind::Call { .. } => "Call",
+        ExprKind::Field { .. } => "Field",
+        ExprKind::Index { .. } => "Index",
         ExprKind::ObjectLiteral { .. } => "ObjectLiteral",
         _ => panic!(
             "fixture has an unexpected object field or fail operand: {:?}",
             expr.kind
         ),
     }
+}
+
+fn collect_subtree(nodes: &[Row], links: &[Vec<usize>], node: usize, result: &mut Vec<Row>) {
+    for &child in &links[node] {
+        collect_subtree(nodes, links, child, result);
+    }
+    result.push(nodes[node].clone());
+}
+
+fn actual_assignments(output: &[u8]) -> Vec<Vec<Row>> {
+    let (nodes, links) = actual_arena(output);
+    nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.kind == "AssignTarget")
+        .map(|(index, _)| {
+            let mut result = Vec::new();
+            collect_subtree(&nodes, &links, index, &mut result);
+            result
+        })
+        .collect()
+}
+
+fn project_assignment_expr(expr: &Expr, rows: &mut Vec<Row>) {
+    let mut children = Vec::new();
+    let mut add = |child: &Expr| {
+        project_assignment_expr(child, rows);
+        children.push(kind(child).into());
+    };
+    let text = match &expr.kind {
+        ExprKind::Literal(Literal::Int(_)) => "",
+        ExprKind::Variable(text) | ExprKind::Literal(Literal::String(text)) => text,
+        ExprKind::Field { target, name } => {
+            add(target);
+            name
+        }
+        ExprKind::Index { target, index } => {
+            add(target);
+            add(index);
+            ""
+        }
+        ExprKind::Call { callee, args } => {
+            add(callee);
+            for arg in args {
+                add(arg);
+            }
+            ""
+        }
+        _ => panic!("fixture uses an unprojected assignment expression"),
+    };
+    rows.push(Row {
+        kind: kind(expr).into(),
+        text: escape(text),
+        int_value: match expr.kind {
+            ExprKind::Literal(Literal::Int(value)) => value,
+            _ => 0,
+        },
+        span: canonical_span(expr.span),
+        children,
+    });
+}
+
+fn expected_assignments(source: &str) -> Vec<Vec<Row>> {
+    let tokens = Lexer::new(source).lex().expect("Stage0 tokens");
+    let program = Parser::new(tokens.clone())
+        .parse_program()
+        .expect("Stage0 syntax");
+    let mut assignments = Vec::new();
+    for item in program.items {
+        let Item::Function(function) = item else {
+            continue;
+        };
+        for statement in function.body {
+            let Stmt::AssignTarget {
+                target,
+                value,
+                span,
+            } = statement
+            else {
+                continue;
+            };
+            // Stage0 keeps the target tree but discards the combined target
+            // span. Re-read that exact window with Stage0 expression syntax.
+            let start = tokens
+                .iter()
+                .position(|token| token.span.start == span.start)
+                .unwrap();
+            let equal = tokens[start..]
+                .iter()
+                .position(|token| token.kind == TokenKind::Equal)
+                .unwrap();
+            let mut lhs_tokens = tokens[start..=start + equal].to_vec();
+            lhs_tokens.last_mut().unwrap().kind = TokenKind::Eof;
+            let lhs = Parser::new(lhs_tokens)
+                .parse_expression_only()
+                .expect("Stage0 target expression");
+            match (target, &lhs.kind) {
+                (
+                    AssignTarget::Field { target, name },
+                    ExprKind::Field {
+                        target: receiver,
+                        name: field,
+                    },
+                ) => {
+                    assert_eq!((&target, &name), (&**receiver, field));
+                }
+                (
+                    AssignTarget::Index { target, index },
+                    ExprKind::Index {
+                        target: receiver,
+                        index: key,
+                    },
+                ) => {
+                    assert_eq!((&target, &index), (&**receiver, &**key));
+                }
+                _ => panic!(
+                    "expected the Stage0 assignment target to retain its Field or Index shape"
+                ),
+            }
+            let mut rows = Vec::new();
+            project_assignment_expr(&lhs, &mut rows);
+            project_assignment_expr(&value, &mut rows);
+            rows.push(Row {
+                kind: "AssignTarget".into(),
+                text: String::new(),
+                int_value: 0,
+                span: canonical_span(span),
+                children: vec![kind(&lhs).into(), kind(&value).into()],
+            });
+            assignments.push(rows);
+        }
+    }
+    assignments
 }
 
 fn expected_expr(expr: &Expr, tokens: &[Token], rows: &mut Vec<Row>) {
@@ -168,6 +314,7 @@ fn expected_expr(expr: &Expr, tokens: &[Token], rows: &mut Vec<Row>) {
                 rows.push(Row {
                     kind: "ObjectLiteralField".into(),
                     text: escape(key),
+                    int_value: 0,
                     span: canonical_span(Span::new(start, value.span.end)),
                     children: vec![kind(value).into()],
                 });
@@ -177,6 +324,7 @@ fn expected_expr(expr: &Expr, tokens: &[Token], rows: &mut Vec<Row>) {
             rows.push(Row {
                 kind: "ObjectLiteral".into(),
                 text: String::new(),
+                int_value: 0,
                 span: canonical_span(expr.span),
                 children,
             });
@@ -198,6 +346,7 @@ fn expected_statements(statements: &[Stmt], tokens: &[Token], rows: &mut Vec<Row
                 rows.push(Row {
                     kind: "Fail".into(),
                     text: String::new(),
+                    int_value: 0,
                     span: canonical_span(*span),
                     children: vec![kind(value).into()],
                 });
@@ -235,7 +384,7 @@ fn expected_rows(source: &str) -> Vec<Row> {
 }
 
 #[test]
-fn bootstrap_parser_accepts_actual_stage3_failure_payload() {
+fn bootstrap_parser_preserves_real_failure_and_assignment_syntax() {
     let temp = Temp::new();
     let compiler = temp.0.join("compiler");
     let consumer = temp.0.join("consumer");
@@ -289,12 +438,35 @@ fn bootstrap_parser_accepts_actual_stage3_failure_payload() {
         assert_eq!(actual_rows(&output.stdout), expected);
     }
 
+    let (window_reader, _) = include_str!("../bootstrap/stage3/parser.ku")
+        .split_once("fn ParseProgram")
+        .expect("real ReadTokenWindow function");
+    let assignment = "fn Update(row, rows, id) {
+        row.title = Fetch(id); rows[id] = row.title
+        rows[Locate(id)].title = \"中文\"; rows[Locate(id)] = 0
+        unchanged = row.title == \"previous\"
+    }";
+    for source in [window_reader, assignment] {
+        let expected = expected_assignments(source);
+        assert!(!expected.is_empty());
+        let output = invoke(source);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(actual_assignments(&output.stdout), expected);
+    }
+
     for source in [
         "fn Main(): null! { fail ; }",
         "fn Main(): null! { fail { domain \"missing colon\" } }",
         "fn Main(): null! { fail { message: \"trailing\", } }",
         "fn Main(): null! { fail { message: } }",
         "fn Main(): null! { fail { 1: \"not a key\" } }",
+        "fn Main() { left + right = value }",
+        "fn Main() { row?.title = value }",
+        "fn Main() { rows[Locate(id)] = }",
     ] {
         let rust = Parser::new(Lexer::new(source).lex().unwrap())
             .parse_program()
