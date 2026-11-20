@@ -2,7 +2,7 @@ import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { ExpressionSpan, MakeExpressionNode } from "../stage2/expression_support.ku"
-import { RejectAtSpan, SpanFromNode, WindowKind, WindowToken, CheckFunctionBodySpan } from "./support.ku"
+import { RejectAtSpan, SpanFromNode, WindowKind, WindowToken, AfterOptionalSemicolon, CheckFunctionBodySpan } from "./support.ku"
 import { ReadSignatureTypePrefix } from "./signature.ku"
 import { AppendStatementLinks } from "./statement_links.ku"
 import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, ReadControlHeader, ReadCatchBinding, ReadExpressionEnd, LocalAssignmentOperator, RejectBodyEof, RejectControlBody, RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectBodyEdgeId, RejectNestedNodeId, RejectNestedRoot, ReadElsePhase, CheckStrayClause, RejectFinally, ExpectTryToken, RejectStatementLimit, RejectStatementDepth, RejectLetStatement, RejectDeclarationInitializer, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow, SignatureTypeOutput } from "./body_support.ku"
@@ -189,7 +189,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                         parse_steps = NextBodyWork(parse_steps, 1, block_end.clone())?
                     }
                 }
-                if (allow_semicolon && WindowKind(tokens, cursor, last_index) == "Semicolon") { cursor = cursor + 1 }
+                if (allow_semicolon) { cursor = AfterOptionalSemicolon(tokens, cursor, last_index) }
             }
         } else {
             CheckStrayClause(WindowToken(tokens, cursor, last_index))?
@@ -254,7 +254,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                         expression_node = arena_nodes[expression - 1].clone()
                         end_span = SpanFromNode(expression_node)
                         cursor = expression_end
-                        if (WindowKind(tokens, cursor, last_index) == "Semicolon") { cursor = cursor + 1 }
+                        cursor = AfterOptionalSemicolon(tokens, cursor, last_index)
                     }
                     statement = AddNode(kind, "", 0, SpanMerge(SpanFromToken(statement_start.clone()), end_span), children, statement_start.clone())?
                 } else if (statement_start.kind == "Ident" && WindowKind(tokens, cursor + 1, last_index) == "Colon") {
@@ -277,7 +277,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                     expression_node = arena_nodes[expression - 1].clone()
                     statement = AddNode("VarDecl", name, 0, SpanMerge(SpanFromToken(statement_start.clone()), SpanFromNode(expression_node)), [type_node, expression], statement_start.clone())?
                     cursor = expression_end
-                    if (WindowKind(tokens, cursor, last_index) == "Semicolon") { cursor = cursor + 1 }
+                    cursor = AfterOptionalSemicolon(tokens, cursor, last_index)
                 } else if (assignment_operator != "") {
                     name = statement_start.lexeme.clone()
                     target = 0
@@ -297,7 +297,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                         statement = AddNode("CompoundAssign", assignment_operator, 0, statement_span, [target, expression], statement_start.clone())?
                     }
                     cursor = expression_end
-                    if (WindowKind(tokens, cursor, last_index) == "Semicolon") { cursor = cursor + 1 }
+                    cursor = AfterOptionalSemicolon(tokens, cursor, last_index)
                 } else {
                     expression_end = ReadExpressionEnd(tokens, cursor, last_index, "assignment_target")?
                     statement_origin = WindowToken(tokens, cursor, last_index)
@@ -322,7 +322,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                         cursor = expression_end
                     }
                     statement = AddNode(kind, "", 0, span, children, statement_start.clone())?
-                    if (WindowKind(tokens, cursor, last_index) == "Semicolon") { cursor = cursor + 1 }
+                    cursor = AfterOptionalSemicolon(tokens, cursor, last_index)
                 }
                 RecordStatement(statement)?
             }

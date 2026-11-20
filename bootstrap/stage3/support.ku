@@ -28,6 +28,11 @@ fn WindowKind(&tokens: [Token], index: int, end: int): str {
     return tokens[index].kind.clone()
 }
 
+fn AfterOptionalSemicolon(&tokens: [Token], index: int, end: int): int {
+    if (WindowKind(tokens, index, end) == "Semicolon") { return index + 1 }
+    return index
+}
+
 fn SpanFromNode(node: Node): Span {
     return Span {
         line: node.line,
