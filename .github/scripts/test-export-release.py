@@ -1393,24 +1393,119 @@ class ReleaseExportTests(unittest.TestCase):
                     EXPORT.verify_default_native_installation(self.bundle, self.repo, self.target)
             self.assertEqual(invoked.call_count, 1)
 
+    def test_default_native_installation_waits_for_sharing_violation_before_source_free_run(self):
+        self.put(self.repo / "examples/hello.ku", b'fn main(){println("Hello Ku")}\n')
+        source_roots = []
+        remove_tree = shutil.rmtree
+
+        def command(executable, arguments, working):
+            if arguments:
+                source_roots.append(working)
+                Path(arguments[-1]).write_bytes(b"fixture native executable bytes")
+                return {"exit_code": 0}, "build profile: release\nc compiler command: cc argv\n"
+            self.assertFalse(source_roots[0].exists())
+            return {"exit_code": 0}, "Hello Ku\n"
+
+        def remove(path, *args, **kwargs):
+            if source_roots and path == source_roots[0] and not released:
+                released.append(path)
+                error = PermissionError(13, "directory handle is still open", str(path))
+                error.winerror = 32
+                raise error
+            return remove_tree(path, *args, **kwargs)
+
+        released = []
+        with mock.patch.object(EXPORT, "install_command", side_effect=command), \
+                mock.patch.object(EXPORT.shutil, "rmtree", side_effect=remove), \
+                mock.patch.object(EXPORT.time, "sleep") as wait:
+            result = EXPORT.verify_default_native_installation(self.bundle, self.repo, self.target)
+        self.assertEqual(released, source_roots)
+        wait.assert_called_once_with(0.02)
+        self.assertTrue(result["source_tree_removed"])
+        self.assertTrue(result["temporary_tree_removed"])
+
+    def test_native_project_removal_keeps_other_and_persistent_errors(self):
+        project = self.root / "project 中文 with spaces"
+        for code, path, attempts in ((32, project, 5), (5, project, 1), (32, project / "file", 1)):
+            error = PermissionError(13, "fixture removal failure", str(path))
+            error.winerror = code
+            with self.subTest(code=code, path=path), \
+                    mock.patch.object(EXPORT.shutil, "rmtree", side_effect=error) as remove, \
+                    mock.patch.object(EXPORT.time, "sleep") as wait, self.assertRaises(PermissionError) as raised:
+                EXPORT.remove_native_project(project)
+            self.assertIs(raised.exception, error)
+            self.assertEqual(remove.call_count, attempts)
+            self.assertEqual(wait.call_count, attempts - 1)
+
     def test_example_canonicalization_changes_only_crlf_and_requires_utf8(self):
         source = "\ufeff中文😀\r\nkeep\rcontent  \n".encode("utf-8")
         self.assertEqual(EXPORT.canonical_example(source), "\ufeff中文😀\nkeep\rcontent  \n".encode("utf-8"))
         with self.assertRaises(UnicodeDecodeError):
             EXPORT.canonical_example(b"invalid\xff\r\n")
 
-    def test_install_command_reaps_normal_and_expired_processes(self):
+    def test_install_command_keeps_receipt_and_execution_cap(self):
         receipt, output = EXPORT.install_command(Path(sys.executable), ["-c", "print('installed')"], self.root)
         self.assertEqual(receipt["exit_code"], 0)
         self.assertEqual(output, "installed\n")
-        process = mock.Mock()
-        process.poll.return_value = None
-        with mock.patch.object(EXPORT.subprocess, "Popen", return_value=process), mock.patch.object(
-                EXPORT.time, "monotonic", side_effect=(0, 31)):
+        runner = SimpleNamespace(run_bounded=mock.Mock(side_effect=SystemExit(
+            "native CI verification failed: installed Ku command exceeded 30 seconds")))
+        with mock.patch.object(EXPORT, "load_process_owner", return_value=runner):
             with self.assertRaisesRegex(EXPORT.ExportError, "exceeded 30 seconds"):
                 EXPORT.install_command(self.bundle / "ku", ["run", "hello.ku"], self.root)
-        process.kill.assert_called_once()
-        process.wait.assert_called_once_with(timeout=10)
+        self.assertEqual(runner.COMMAND_TIMEOUT_SECONDS, 30)
+        self.assertEqual(runner.MAX_CAPTURE_BYTES, 2 * 65536)
+        runner.run_bounded.assert_called_once_with([str(self.bundle / "ku"), "run", "hello.ku"],
+            self.root, "installed Ku command", check=False, stream_capture_bytes=65536)
+
+    def test_install_command_keeps_independent_stream_bounds_and_raw_hash(self):
+        python = Path(sys.executable)
+        raw = b"a" * 65534 + b"\r\n"
+        writer = ("import os\nif os.name == 'nt':\n import msvcrt\n msvcrt.setmode(1, os.O_BINARY)\n"
+                  "os.write(1, b'a'*65534 + b'\\r\\n')")
+        receipt, output = EXPORT.install_command(python, ["-c", writer], self.root)
+        self.assertEqual(receipt["stdout_bytes"], 65536)
+        self.assertEqual(receipt["stdout_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertTrue(output.endswith("\n") and "\r" not in output)
+        for stream in (1, 2):
+            with self.subTest(stream=stream), self.assertRaisesRegex(EXPORT.ExportError, "more than 65536 bytes"):
+                EXPORT.install_command(python, ["-c", f"import os; os.write({stream}, b'a'*65537)"], self.root)
+
+    def test_install_command_retires_descendant_holding_a_lock_after_root_exit(self):
+        ready = self.root / "compiler-child-ready"
+        lock = self.root / "compiler-child-lock"
+        lock.write_bytes(b"L")
+        lock_code = f"""
+import os
+lock = open({str(lock)!r}, "r+b")
+if os.name == "nt":
+    import msvcrt
+    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+else:
+    import fcntl
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+"""
+        descendant = lock_code + f"""
+from pathlib import Path
+import time
+Path({str(ready)!r}).write_text("locked", encoding="utf-8")
+time.sleep(10)
+"""
+        launcher = f"""
+from pathlib import Path
+import subprocess, sys, time
+subprocess.Popen([sys.executable, "-B", "-c", {descendant!r}])
+deadline = time.monotonic() + 5
+while not Path({str(ready)!r}).exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError("descendant did not reach held phase")
+    time.sleep(0.01)
+print("compiler root exited", flush=True)
+"""
+        python = Path(sys.executable)
+        _, output = EXPORT.install_command(python, ["-B", "-c", launcher], self.root)
+        self.assertEqual(output, "compiler root exited\n")
+        self.assertEqual(ready.read_text(encoding="utf-8"), "locked")
+        EXPORT.install_command(python, ["-B", "-c", lock_code + "lock.close()\n"], self.root)
 
     def test_windows_bundle_and_asset_names(self):
         (self.bundle / "ku").rename(self.bundle / "ku.exe")

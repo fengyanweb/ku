@@ -51,6 +51,8 @@ MAX_METADATA = 16 * 1024 * 1024
 MAX_LICENSE = 32 * 1024 * 1024
 MAX_LICENSE_TOTAL = 64 * 1024 * 1024
 MAX_TAR_TRAILER = 64 * 1024
+INSTALL_COMMAND_TIMEOUT_SECONDS = 30
+INSTALL_STREAM_CAPTURE_BYTES = 64 * 1024
 TARGETS = {
     "x86_64-pc-windows-msvc",
     "x86_64-pc-windows-gnu",
@@ -80,37 +82,33 @@ def canonical_example(source: bytes) -> bytes:
     return source.decode("utf-8").replace("\r\n", "\n").encode("utf-8")
 
 
+def load_process_owner():
+    runner_path = Path(__file__).with_name("verify-native-three-os.py")
+    spec = importlib.util.spec_from_file_location("ku_release_runtime_runner", runner_path)
+    if spec is None or spec.loader is None:
+        raise ExportError("cannot load existing native process owner")
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    return runner
+
+
 def install_command(executable: Path, arguments: list[str], working: Path) -> tuple[dict, str]:
-    """Run an installed CLI command with bounded time/output and reap it."""
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        process = subprocess.Popen([str(executable), *arguments], cwd=working,
-                                   stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
-        deadline = time.monotonic() + 30
-        try:
-            while process.poll() is None:
-                if time.monotonic() >= deadline:
-                    raise ExportError("installed Ku command exceeded 30 seconds")
-                if any(os.fstat(stream.fileno()).st_size > 65536 for stream in (stdout, stderr)):
-                    raise ExportError("installed Ku command exceeded its output limit")
-                time.sleep(0.02)
-            output = []
-            for stream in (stdout, stderr):
-                stream.seek(0)
-                value = stream.read(65537)
-                if len(value) > 65536:
-                    raise ExportError("installed Ku command exceeded its output limit")
-                output.append(value)
-            if process.returncode != 0 or output[1]:
-                raise ExportError(f"installed Ku command failed (exit {process.returncode}): "
-                                  + output[1].decode("utf-8", errors="replace")[:2048])
-            receipt = {"exit_code": process.returncode, "stdout_bytes": len(output[0]),
-                       "stdout_sha256": hashlib.sha256(output[0]).hexdigest(),
-                       "stderr_bytes": len(output[1])}
-            return receipt, output[0].decode("utf-8").replace("\r\n", "\n")
-        finally:
-            if process.poll() is None:
-                process.kill()
-            process.wait(timeout=10)
+    """Run an installed CLI command and retire its compiler process tree."""
+    runner = load_process_owner()
+    runner.COMMAND_TIMEOUT_SECONDS = INSTALL_COMMAND_TIMEOUT_SECONDS
+    runner.MAX_CAPTURE_BYTES = 2 * INSTALL_STREAM_CAPTURE_BYTES
+    try:
+        process = runner.run_bounded([str(executable), *arguments], working, "installed Ku command",
+                                     check=False, stream_capture_bytes=INSTALL_STREAM_CAPTURE_BYTES)
+    except SystemExit as error:
+        raise ExportError(str(error).removeprefix("native CI verification failed: ")) from error
+    if process.returncode != 0 or process.stderr:
+        raise ExportError(f"installed Ku command failed (exit {process.returncode}): "
+                          + process.stderr.decode("utf-8", errors="replace")[:2048])
+    receipt = {"exit_code": process.returncode, "stdout_bytes": len(process.stdout),
+               "stdout_sha256": hashlib.sha256(process.stdout).hexdigest(),
+               "stderr_bytes": len(process.stderr)}
+    return receipt, process.stdout.decode("utf-8").replace("\r\n", "\n")
 
 
 def verify_installation(installed: Path, repo: Path, version: str, target: str) -> dict:
@@ -155,6 +153,21 @@ def verify_installation(installed: Path, repo: Path, version: str, target: str) 
     return receipt
 
 
+def remove_native_project(project: Path) -> None:
+    # The command owner has drained its descendants. On Windows an unrelated
+    # reader can still briefly share the directory without permitting deletion.
+    for delay in (0.02, 0.04, 0.08, 0.16):
+        try:
+            shutil.rmtree(project)
+            return
+        except OSError as error:
+            if (getattr(error, "winerror", None) != 32 or error.filename is None
+                    or Path(error.filename) != project):
+                raise
+            time.sleep(delay)
+    shutil.rmtree(project)
+
+
 def verify_default_native_installation(installed: Path, repo: Path, target: str) -> dict:
     """Use the final archive's omitted-backend build, then remove its sources."""
     executable = installed / ("ku.exe" if "-windows-" in target else "ku")
@@ -174,8 +187,10 @@ def verify_default_native_installation(installed: Path, repo: Path, target: str)
             raise ExportError("installed omitted-backend build did not execute the Release C compiler")
         receipt["build"] = build
         receipt["binary_sha256"] = file_hash(program)
-        shutil.rmtree(project)
-        receipt["source_tree_removed"] = not project.exists()
+        remove_native_project(project)
+        if project.exists() or project.is_symlink():
+            raise ExportError("installed default native project still exists after removal")
+        receipt["source_tree_removed"] = True
         run, text = install_command(program, [], working)
         if text != "Hello Ku\n":
             raise ExportError("installed default C program returned an incorrect result")
@@ -189,12 +204,7 @@ def run_runtime_check(arguments: list[str], repo: Path, working: Path,
     """Reuse the existing suspended Windows Job/POSIX session owner and bounds."""
     if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 180:
         raise ExportError("runtime verification may only shorten the existing 180-second execution cap")
-    runner_path = Path(__file__).with_name("verify-native-three-os.py")
-    spec = importlib.util.spec_from_file_location("ku_release_runtime_runner", runner_path)
-    if spec is None or spec.loader is None:
-        raise ExportError("cannot load existing native process owner")
-    runner = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(runner)
+    runner = load_process_owner()
     runner.COMMAND_TIMEOUT_SECONDS = timeout_seconds
     runner.MAX_CAPTURE_BYTES = 1024 * 1024
     # Run the unchanged driver in this same contained Python process after

@@ -497,7 +497,8 @@ def close_finished_output_streams(
     errors.raise_if_any()
 
 
-def run_bounded(command: list[str], cwd: Path, label: str, *, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+def run_bounded(command: list[str], cwd: Path, label: str, *, check: bool = True,
+                stream_capture_bytes: int | None = None) -> subprocess.CompletedProcess[bytes]:
     creation_flags = 0
     if os.name == "nt":
         # No child/compiler code may run before the kill-on-close Job owns it.
@@ -535,6 +536,8 @@ def run_bounded(command: list[str], cwd: Path, label: str, *, check: bool = True
                 should_kill = False
                 with output_lock:
                     remaining = MAX_CAPTURE_BYTES - output_bytes
+                    if stream_capture_bytes is not None:
+                        remaining = min(remaining, stream_capture_bytes - len(output[index]))
                     if remaining > 0:
                         kept = chunk[:remaining]
                         output[index].extend(kept)
@@ -634,7 +637,9 @@ def run_bounded(command: list[str], cwd: Path, label: str, *, check: bool = True
         if reader_errors.failed:
             errors.add("output reader failed", CleanupFailure(reader_errors.summary()))
     if primary is None and overflow.is_set():
-        primary = SystemExit(f"native CI verification failed: {label} produced more than {MAX_CAPTURE_BYTES} bytes of output")
+        limit = (f"{MAX_CAPTURE_BYTES} bytes of output" if stream_capture_bytes is None else
+                 f"{stream_capture_bytes} bytes in one output stream or {MAX_CAPTURE_BYTES} bytes in total")
+        primary = SystemExit(f"native CI verification failed: {label} produced more than {limit}")
     if primary is None and return_code != 0 and check:
         stdout_text = stdout.decode("utf-8", errors="replace")
         stderr_text = stderr.decode("utf-8", errors="replace")
