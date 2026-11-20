@@ -70,6 +70,8 @@ Arguments that need inference or contextual types remain deferred.
 For explicit scalar result types and scalar unions, literal returns use the
 same check. Control blocks share the surrounding function's result type.
 Nested functions and function expressions use their own annotations.
+Relative imports can omit the `.ku` suffix. Manifest entries still name the
+normalized `.ku` files.
 
 ## Emit C for a structure projection
 

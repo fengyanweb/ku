@@ -55,6 +55,28 @@ fn CheckProjectManifestPath(&path: str, at: Span): null! {
     return ok(null)
 }
 
+fn ProjectImportFile(&requested: str): str {
+    characters = string.chars(requested.clone())
+    end = characters.len()
+    start = end
+    while (start > 0 && characters[start - 1] != "/") { start = start - 1 }
+    if (start == end ||
+        (end == start + 1 && characters[start] == ".") ||
+        (end == start + 2 && characters[start] == "." && characters[start + 1] == ".")) {
+        return requested.clone()
+    }
+    // A leading dot is part of the basename. A later dot supplies an
+    // explicit extension, including an empty or unsupported suffix.
+    cursor = start + 1
+    while (cursor < end) {
+        if (characters[cursor] == ".") { return requested.clone() }
+        cursor = cursor + 1
+    }
+    return requested.clone() + ".ku"
+}
+
 fn ResolveProjectImport(&importer: str, &requested: str, at: Span): str! {
-    return NormalizeProjectPath(ProjectParent(importer)?, requested, at)
+    if (requested.byte_len() > 512) { return NormalizeProjectPath("", requested, at) }
+    file = ProjectImportFile(requested)
+    return NormalizeProjectPath(ProjectParent(importer)?, file, at)
 }

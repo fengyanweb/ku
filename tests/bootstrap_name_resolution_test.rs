@@ -308,7 +308,7 @@ fn Ratio(value: float): float { return value }
     .unwrap();
     fs::write(&manifest, "main.ku\nparameters.ku\n").unwrap();
     let scalar_calls = r#"
-import { RequireInt as Amount, Select, Ratio } from "./parameters.ku"
+import { RequireInt as Amount, Select, Ratio } from "./parameters"
 fn Use(value: str): str { return value }
 fn NameShadow(Amount: fn(str): str): str { return Amount("local") }
 fn main() {
@@ -322,6 +322,15 @@ fn main() {
     fs::write(&main, scalar_calls).unwrap();
     assert_success(&run(Command::new(ku).arg("check").arg(&main), cwd, 20));
     assert_success(&run(&mut Command::new(executable), cwd, 20));
+    fs::write(
+        &main,
+        scalar_calls.replace("./parameters", "./parameters.json"),
+    )
+    .unwrap();
+    let rejected = run(&mut Command::new(executable), cwd, 20);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("|project_path|"));
     for (original, replacement, argument, expected) in [
         ("Amount(-7)", "Amount(\"bad\")", "\"bad\"", "int"),
         ("Select(null)", "Select(0)", "0", r"bool \p null"),
@@ -351,7 +360,7 @@ fn main() {
     }
 
     let pattern_shadow = r#"
-import { RequireInt as Amount } from "./parameters.ku"
+import { RequireInt as Amount } from "./parameters"
 struct Options { transform: fn(str): int }
 fn Count(text: str): int { return text.len() }
 fn Run(options: Options): int {
