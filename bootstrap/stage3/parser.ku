@@ -5,9 +5,9 @@ import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { ParseTokenWindow } from "../stage2/parser.ku"
 import { RejectAt, RejectAtPoint, SpanFromNode } from "./support.ku"
 import { ReadImport } from "./imports.ku"
-import { ReadModule } from "./structs.ku"
+import { DeclarationRead, ReadModule } from "./structs.ku"
 import { ReadBracedDeclaration } from "./enums.ku"
-import { ReadFunction } from "./functions.ku"
+import { ReadFunction, ReadCompilerFunction } from "./functions.ku"
 
 // Stage 3 is intentionally a strict, useful subset of the production Rust
 // parser. It accepts top-level module/struct/enum declarations and ordinary
@@ -62,6 +62,25 @@ fn ParseProgram(source: str): ParseOutput! {
 // expression window. Keep the original script entry's legacy ceilings.
 fn ParseModule(source: str): ParseOutput! {
     return ParseBoundedModule(source, true)
+}
+
+fn CopyFunctionWindow(&tokens: [Token], first: int, end: int): [Token] {
+    window: [Token] = []
+    index = first
+    while (index < end) {
+        item = tokens[index].clone()
+        window = window.push(item)
+        index = index + 1
+    }
+    closing = tokens[tokens.len() - 1].clone()
+    window = window.push(closing)
+    return window
+}
+
+fn ReadModuleFunction(&tokens: [Token], first: int, end: int, compiler_input: bool,
+                      parse_expression: fn(int, int): ParseOutput!): DeclarationRead! {
+    if (compiler_input) { return ReadCompilerFunction(tokens, first, end, parse_expression) }
+    return ReadFunction(CopyFunctionWindow(tokens, first, end), 0, parse_expression)
 }
 
 fn ParseBoundedModule(source: str, compiler_input: bool): ParseOutput! {
@@ -303,7 +322,6 @@ fn ParseBoundedModule(source: str, compiler_input: bool): ParseOutput! {
             RejectAt(tokens[cursor].clone(), "function_limit", "stage-3 parser accepts at most 64 functions")?
         }
         function_base = cursor
-        function_window: [Token] = []
         window_cursor = cursor
         function_depth = 0
         seen_body = false
@@ -313,11 +331,10 @@ fn ParseBoundedModule(source: str, compiler_input: bool): ParseOutput! {
             if (window_cursor >= tokens.len()) {
                 RejectAt(eof.clone(), "invalid_token_stream", "function inspection escaped the token stream")?
             }
-            function_token = tokens[window_cursor].clone()
-            window_is_eof = function_token.kind == "Eof"
-            window_is_lbrace = function_token.kind == "LBrace"
-            window_is_rbrace = function_token.kind == "RBrace"
-            function_window = function_window.push(function_token)
+            kind = tokens[window_cursor].kind.clone()
+            window_is_eof = kind == "Eof"
+            window_is_lbrace = kind == "LBrace"
+            window_is_rbrace = kind == "RBrace"
             window_cursor = window_cursor + 1
             if (window_is_eof) {
                 collecting_function = false
@@ -329,14 +346,19 @@ fn ParseBoundedModule(source: str, compiler_input: bool): ParseOutput! {
                 if (function_depth == 0) { collecting_function = false }
             }
         }
-        if (!window_is_eof) {
-            function_eof = eof.clone()
-            function_window = function_window.push(function_eof)
-        }
-        // Function readers keep their existing local-window bound. Only the
-        // module callback translates local offsets back to scanner positions.
+        function_end = window_cursor
+        if (window_is_eof) { function_end = function_end - 1 }
+        // The compiler reader and callback use absolute scanner indexes. The
+        // standalone reader still uses its original local 512-token contract.
         expression_base = function_base
-        function_read = ReadFunction(function_window, 0, parse_expression.clone())?
+        if (compiler_input) {
+            expression_base = 0
+            parse_steps = parse_steps + function_end - function_base
+            if (parse_steps > 16384) {
+                RejectAt(tokens[function_base].clone(), "work_limit", "stage-3 parser work budget exceeded")?
+            }
+        }
+        function_read = ReadModuleFunction(tokens, function_base, function_end, compiler_input, parse_expression.clone())?
         parse_steps = parse_steps + function_read.work
         if (parse_steps > 16384) {
             RejectAt(function_read.start.clone(), "work_limit", "stage-3 parser work budget exceeded")?

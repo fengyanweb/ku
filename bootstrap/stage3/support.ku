@@ -19,6 +19,11 @@ fn WindowToken(&tokens: [Token], index: int, end: int): Token {
     return tokens[index].clone()
 }
 
+fn WindowKind(&tokens: [Token], index: int, end: int): str {
+    if (index >= end) { return "Eof" }
+    return tokens[index].kind.clone()
+}
+
 fn SpanFromNode(node: Node): Span {
     return Span {
         line: node.line,
@@ -156,4 +161,13 @@ fn MapTokenCharacters(source: str, tokens: [Token]): SourceMap! {
         token_index = token_index + 1
     }
     return ok(SourceMap { source: source, characters: characters, starts: starts, ends: ends })
+}
+
+fn CheckFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, token_base: int, initial_work: int): null! {
+    if (tokens.len() > 4096 || body_start < 1 || body_start > last_index || last_index >= tokens.len()
+        || token_base < 0 || token_base > 4096 - tokens.len() || initial_work < 0 || initial_work > 16384
+        || tokens[tokens.len() - 1].kind != "Eof" || tokens[body_start - 1].kind != "LBrace") {
+        RejectAtPoint("invalid_token_stream", "function body interval lies outside the scanner window")?
+    }
+    return ok(null)
 }

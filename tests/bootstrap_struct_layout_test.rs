@@ -848,6 +848,27 @@ fn bootstrap_compiler_entry_reads_real_module_beyond_legacy_script_limit() {
 import { Scan } from "../stage1/lexer.ku"
 import { AstCanonical } from "../stage2/ast.ku"
 import { ParseModule, ParseProgram } from "../stage3/parser.ku"
+import { ReadCompilerFunction, ReadFunction } from "../stage3/functions.ku"
+import { ReadSignatureTypePrefix } from "../stage3/signature.ku"
+import { ParseOutput } from "../stage2/ast.ku"
+
+fn UnreachableExpression(start: int, end: int): ParseOutput! {
+    fail { domain: "bootstrap.test", code: "invalid_callback", message: "a malformed function interval reached the expression reader" }
+}
+
+fn CheckFence(source: str, boundary: int, detail: str): null! {
+    tokens = Scan(source)?
+    eof = tokens[tokens.len() - 1].clone()
+    if (tokens[boundary].kind != "Fn") { panic("fixture must place the next fn at the boundary") }
+    caught = false
+    try { ReadCompilerFunction(tokens, 0, boundary, UnreachableExpression)? } catch(err) {
+        caught = err.code == "unexpected_token" && err.message.contains(detail + "|1:" + str(eof.column) + "@" + str(eof.offset))
+    }
+    if (!caught) { panic("function interval did not see its EOF fence") }
+    following = ReadCompilerFunction(tokens, boundary, tokens.len() - 1, UnreachableExpression)?
+    if (following.consumed != 6 || following.output.root != 1) { panic("function interval changed its neighbor") }
+    return ok(null)
+}
 
 fn main(): null! {
     module_source = fs.read("large.ku")?
@@ -863,9 +884,25 @@ fn main(): null! {
         panic("module mode changes the AST of a small source file")
     }
     long_function = fs.read("oversized.ku")?
+    long_tokens = Scan(long_function.clone())?
     caught = false
-    try { ParseModule(long_function)? } catch(err) { caught = err.message.contains("function window accepts at most 512 tokens") }
-    if (!caught) { panic("function token limit changed") }
+    try { ReadFunction(long_tokens, 0, UnreachableExpression)? } catch(err) { caught = err.message.contains("function window accepts at most 512 tokens") }
+    if (!caught) { panic("public function token limit changed") }
+    long_parsed = ParseModule(long_function)?
+    if (long_parsed.root != 446) { panic("long function and following function AST changed") }
+    structs = ParseModule(fs.read("real-structs.ku")?)?
+    if (structs.root != 830 || structs.arena.edges.len() != 829) { panic("structs.ku AST changed") }
+    enums = ParseModule(fs.read("real-enums.ku")?)?
+    if (enums.root != 1002 || enums.arena.edges.len() != 1001) { panic("enums.ku AST changed") }
+    count = false
+    try { ParseModule(fs.read("over-statements.ku")?)? } catch(err) { count = err.code == "statement_limit" }
+    if (!count) { panic("compiler function statement limit changed") }
+    type_tokens = Scan(fs.read("over-type.ku")?)?
+    capped = false
+    try { ReadSignatureTypePrefix(type_tokens, 0, type_tokens.len() - 1)? } catch(err) { capped = err.message.contains("type window accepts at most 512 tokens") }
+    if (!capped) { panic("compiler type prefix limit changed") }
+    CheckFence("fn Broken(op: fn(int) fn Following() {}", 9, "expected ':' before function type return")?
+    CheckFence("fn Broken(){ if (true fn Following() {}", 8, "expected ')' after if condition")?
     println("module-window-ok")
     return ok(null)
 }
@@ -886,9 +923,32 @@ fn main(): null! {
         .expect("write smaller bootstrap module");
         fs::write(
             destination.join("oversized.ku"),
-            format!("fn Test() {{\n{}\n}}", "value = 1 + 2\n".repeat(110)),
+            format!(
+                "fn Test() {{\n{}\n}}\nfn Following(): int {{ return 7 }}",
+                "value = 1 + 2\n".repeat(110)
+            ),
         )
         .expect("write oversized function witness");
+        fs::write(
+            destination.join("real-structs.ku"),
+            include_str!("../bootstrap/stage3/structs.ku"),
+        )
+        .expect("write actual struct reader");
+        fs::write(
+            destination.join("real-enums.ku"),
+            include_str!("../bootstrap/stage3/enums.ku"),
+        )
+        .expect("write actual enum reader");
+        fs::write(
+            destination.join("over-statements.ku"),
+            format!("fn TooMany() {{\n{}\n}}", "value = 1 + 2\n".repeat(129)),
+        )
+        .expect("write compiler statement limit witness");
+        fs::write(
+            destination.join("over-type.ku"),
+            format!("A{}", ".A".repeat(256)),
+        )
+        .expect("write compiler type prefix limit witness");
     }
 
     let ku = std::env::var_os("KU_BIN")

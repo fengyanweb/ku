@@ -1,15 +1,15 @@
 import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
-import { RejectAt, RejectAtPoint, SpanFromNode } from "./support.ku"
-import { SignatureType, ReadSignatureTypeAt, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
+import { RejectAt, RejectAtPoint, SpanFromNode, WindowToken, WindowKind } from "./support.ku"
+import { SignatureType, ReadSignatureTypePrefix, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { DeclarationRead } from "./structs.ku"
-import { ReadFunctionBody } from "./statements.ku"
+import { ReadFunctionBodySpan } from "./statements.ku"
 
 // Read exactly one ordinary function followed by exactly one EOF sentinel.
 // Signature parsing stays here; statements.ku owns the bounded function-body
 // state machine and returns an internal synthetic transport tree. The original
-// token window and expression callback move into that reader exactly once.
+// token window stays owned by the reader while its body borrows that interval.
 // AttachFunctionBody validates the transport at its consumer boundary before
 // reading metadata; expression/type outputs are likewise validated by their
 // immediate consumers before relocation. Calls remain synchronous and
@@ -39,6 +39,30 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
         validation_index = validation_index + 1
     }
 
+    return ReadFunctionSpan(tokens, 0, last_index, token_base, parse_expression)
+}
+
+// Compiler entry for an interval of the Stage-1 admitted module. No token
+// slice is constructed; last_index is an exclusive boundary acting as EOF.
+fn ReadCompilerFunction(&tokens: [Token], first: int, last_index: int, parse_expression: fn(int, int): ParseOutput!): DeclarationRead! {
+    if (tokens.len() > 4096 || first < 0 || first >= last_index || last_index >= tokens.len()) {
+        RejectAtPoint("invalid_token_stream", "compiler function interval lies outside the scanner window")?
+    }
+    if (tokens[first].kind != "Fn" || tokens[tokens.len() - 1].kind != "Eof") {
+        RejectAt(tokens[first].clone(), "invalid_token_stream", "compiler function interval must start with fn in a scanner window ending at EOF")?
+    }
+    index = first
+    while (index < last_index) {
+        if (tokens[index].kind == "Eof") {
+            RejectAt(tokens[index].clone(), "invalid_token_stream", "EOF must be final in function window")?
+        }
+        index = index + 1
+    }
+    return ReadFunctionSpan(tokens, first, last_index, 0, parse_expression)
+}
+
+fn ReadFunctionSpan(&tokens: [Token], first: int, last_index: int, token_base: int, parse_expression: fn(int, int): ParseOutput!): DeclarationRead! {
+    last = WindowToken(tokens, last_index, last_index)
     arena_nodes: [Node] = []
     arena_edges: [int] = []
     parse_steps = 0
@@ -191,41 +215,41 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
         return ok(null)
     }
 
-    function_start = tokens[0].clone()
-    cursor = 1
-    if (tokens[cursor].kind != "Ident") {
-        RejectAt(tokens[cursor].clone(), "unexpected_token", "expected function name")?
+    function_start = WindowToken(tokens, first, last_index)
+    cursor = first + 1
+    if (WindowKind(tokens, cursor, last_index) != "Ident") {
+        RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected function name")?
     }
     function_name = tokens[cursor].lexeme.clone()
     cursor = cursor + 1
-    if (tokens[cursor].kind != "LParen") {
-        RejectAt(tokens[cursor].clone(), "unexpected_token", "expected '(' after function name")?
+    if (WindowKind(tokens, cursor, last_index) != "LParen") {
+        RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected '(' after function name")?
     }
     cursor = cursor + 1
     parameters: [int] = []
     parameter_count = 0
-    while (tokens[cursor].kind != "RParen") {
-        ChargeWork(1, tokens[cursor].clone())?
+    while (WindowKind(tokens, cursor, last_index) != "RParen") {
+        ChargeWork(1, WindowToken(tokens, cursor, last_index))?
         if (parameter_count >= 32) {
-            RejectAt(tokens[cursor].clone(), "parameter_limit", "stage-3 functions accept at most 32 parameters")?
+            RejectAt(WindowToken(tokens, cursor, last_index), "parameter_limit", "stage-3 functions accept at most 32 parameters")?
         }
-        parameter_start = tokens[cursor].clone()
+        parameter_start = WindowToken(tokens, cursor, last_index)
         parameter_mode = 0
-        if (tokens[cursor].kind == "Ampersand") {
+        if (WindowKind(tokens, cursor, last_index) == "Ampersand") {
             parameter_mode = 1
             cursor = cursor + 1
             ChargeWork(1, parameter_start.clone())?
         }
-        parameter_token = tokens[cursor].clone()
+        parameter_token = WindowToken(tokens, cursor, last_index)
         if (parameter_token.kind != "Ident") {
             RejectAt(parameter_token.clone(), "unexpected_token", "expected parameter name")?
         }
         cursor = cursor + 1
         parameter_children: [int] = []
-        if (tokens[cursor].kind == "Colon") {
+        if (WindowKind(tokens, cursor, last_index) == "Colon") {
             type_start = cursor + 1
-            parsed_type = ReadSignatureTypeAt(tokens, type_start)?
-            ChargeWork(parsed_type.work, tokens[type_start].clone())?
+            parsed_type = ReadSignatureTypePrefix(tokens, type_start, last_index)?
+            ChargeWork(parsed_type.work, WindowToken(tokens, type_start, last_index))?
             cursor = cursor + 1 + parsed_type.consumed
             type_node = AddParsedType(parsed_type, parameter_token.clone())?
             parameter_children = parameter_children.push(type_node)
@@ -234,31 +258,31 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
         parameter = AddNode("Parameter", parameter_token.lexeme.clone(), parameter_mode, parameter_span, parameter_children, parameter_token.clone())?
         parameters = parameters.push(parameter)
         parameter_count = parameter_count + 1
-        if (tokens[cursor].kind == "Comma") {
+        if (WindowKind(tokens, cursor, last_index) == "Comma") {
             cursor = cursor + 1
-            if (tokens[cursor].kind == "RParen") {
-                RejectAt(tokens[cursor].clone(), "unexpected_token", "expected parameter name")?
+            if (WindowKind(tokens, cursor, last_index) == "RParen") {
+                RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected parameter name")?
             }
-        } else if (tokens[cursor].kind != "RParen") {
-            RejectAt(tokens[cursor].clone(), "unexpected_token", "expected ')' after parameters")?
+        } else if (WindowKind(tokens, cursor, last_index) != "RParen") {
+            RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected ')' after parameters")?
         }
     }
     cursor = cursor + 1
     return_type = 0
     has_return_type = false
-    if (tokens[cursor].kind == "Colon") {
+    if (WindowKind(tokens, cursor, last_index) == "Colon") {
         type_start = cursor + 1
-        parsed_type = ReadSignatureTypeAt(tokens, type_start)?
-        ChargeWork(parsed_type.work, tokens[type_start].clone())?
+        parsed_type = ReadSignatureTypePrefix(tokens, type_start, last_index)?
+        ChargeWork(parsed_type.work, WindowToken(tokens, type_start, last_index))?
         has_return_type = true
         cursor = cursor + 1 + parsed_type.consumed
-        return_type = AddParsedType(parsed_type, tokens[cursor - 1].clone())?
+        return_type = AddParsedType(parsed_type, WindowToken(tokens, cursor - 1, last_index))?
     }
-    if (tokens[cursor].kind != "LBrace") {
-        RejectAt(tokens[cursor].clone(), "unexpected_token", "expected '{'")?
+    if (WindowKind(tokens, cursor, last_index) != "LBrace") {
+        RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected '{'")?
     }
     body_start = cursor + 1
-    body_output = ReadFunctionBody(tokens, body_start, token_base, parse_steps, parse_expression)?
+    body_output = ReadFunctionBodySpan(tokens, body_start, last_index, token_base, parse_steps, parse_expression)?
     AttachFunctionBody(body_output, function_start.clone())?
     parse_steps = body_work
 
@@ -270,5 +294,5 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
         arena: Arena { nodes: arena_nodes.clone(), edges: arena_edges.clone() },
         root: function
     })?
-    return ok(DeclarationRead { output: output, consumed: last_index, work: parse_steps, start: function_start })
+    return ok(DeclarationRead { output: output, consumed: last_index - first, work: parse_steps, start: function_start })
 }

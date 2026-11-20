@@ -1,9 +1,9 @@
 import { Token } from "../stage1/token.ku"
 import { Node, Arena, ParseOutput } from "../stage2/ast.ku"
 import { SpanFromToken, SpanMerge } from "../stage2/span.ku"
-import { CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, RejectAt, RejectAtPoint } from "./support.ku"
+import { CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, RejectAt, RejectAtPoint, WindowToken, WindowKind } from "./support.ku"
 import { IsNamedStructStart } from "../stage2/expression_support.ku"
-import { SignatureType, CheckTypeArenaCapacity, TypePartToNode, ReadSignatureTypeAt } from "./signature.ku"
+import { SignatureType, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 
 struct StatementLink {
     node: int
@@ -83,48 +83,48 @@ struct ControlHeader {
     work: int
 }
 
-fn ReadExpressionEnd(&tokens: [Token], start: int, context: str): int! {
+fn ReadExpressionEnd(&tokens: [Token], start: int, window_end: int, context: str): int! {
     probe = start
     boundary = EmptyExpressionBoundary()
     while (!boundary.complete) {
-        if (probe >= tokens.len()) { RejectExpressionTerminator(tokens[tokens.len() - 1].clone())? }
-        previous_can_end = probe > start && CanEndExpression(tokens[probe - 1].kind.clone())
-        named_struct_open = probe > start && probe + 2 < tokens.len() && tokens[probe].kind == "LBrace"
+        if (probe > window_end) { RejectExpressionTerminator(WindowToken(tokens, probe, window_end))? }
+        previous_can_end = probe > start && CanEndExpression(WindowKind(tokens, probe - 1, window_end))
+        named_struct_open = probe > start && probe + 2 < window_end && WindowKind(tokens, probe, window_end) == "LBrace"
             && IsNamedStructStart(tokens[probe - 1], tokens[probe], tokens[probe + 1], tokens[probe + 2])
         if (boundary.paren_depth == 0 && boundary.bracket_depth == 0 && boundary.brace_depth == 0) {
-            if (context == "for_header" && tokens[probe].kind == "LBrace" && !named_struct_open) {
+            if (context == "for_header" && WindowKind(tokens, probe, window_end) == "LBrace" && !named_struct_open) {
                 return ok(probe)
             }
-            if (context == "assignment_target" && tokens[probe].kind == "Equal") {
+            if (context == "assignment_target" && WindowKind(tokens, probe, window_end) == "Equal") {
                 return ok(probe)
             }
         }
-        boundary = PushExpressionBoundary(boundary, tokens[probe].clone(), previous_can_end, named_struct_open)?
+        boundary = PushExpressionBoundary(boundary, WindowToken(tokens, probe, window_end), previous_can_end, named_struct_open)?
         if (!boundary.complete) { probe = probe + 1 }
     }
     return ok(probe)
 }
 
-fn ReadControlHeader(&tokens: [Token], start: int, initial_work: int): ControlHeader! {
-    kind = tokens[start].kind.clone()
+fn ReadControlHeader(&tokens: [Token], start: int, window_end: int, initial_work: int): ControlHeader! {
+    kind = WindowKind(tokens, start, window_end)
     cursor = start + 1
     if (kind == "For") {
-        name = tokens[cursor].clone()
+        name = WindowToken(tokens, cursor, window_end)
         if (name.kind != "Ident") { RejectAt(name.clone(), "unexpected_token", "expected loop variable after 'for'")? }
         cursor = cursor + 1
-        if (tokens[cursor].kind != "In") { RejectAt(tokens[cursor].clone(), "unexpected_token", "expected 'in' after loop variable")? }
+        if (WindowKind(tokens, cursor, window_end) != "In") { RejectAt(WindowToken(tokens, cursor, window_end), "unexpected_token", "expected 'in' after loop variable")? }
         expression_start = cursor + 1
-        expression_end = ReadExpressionEnd(tokens, expression_start, "for_header")?
+        expression_end = ReadExpressionEnd(tokens, expression_start, window_end, "for_header")?
         work = NextBodyWork(initial_work, expression_end - start, name.clone())?
-        if (tokens[expression_end].kind != "LBrace") {
-            RejectAt(tokens[expression_end].clone(), "unsupported_statement", "stage-3 for bodies must use braces")?
+        if (WindowKind(tokens, expression_end, window_end) != "LBrace") {
+            RejectAt(WindowToken(tokens, expression_end, window_end), "unsupported_statement", "stage-3 for bodies must use braces")?
         }
         return ok(ControlHeader { binding: name.lexeme, expression_start: expression_start, expression_end: expression_end, body_open: expression_end, work: work })
     }
 
     is_while = kind == "While"
-    if (tokens[cursor].kind != "LParen") {
-        RejectControlOpen(is_while, tokens[cursor].clone())?
+    if (WindowKind(tokens, cursor, window_end) != "LParen") {
+        RejectControlOpen(is_while, WindowToken(tokens, cursor, window_end))?
     }
     cursor = cursor + 1
     condition_start = cursor
@@ -132,8 +132,8 @@ fn ReadControlHeader(&tokens: [Token], start: int, initial_work: int): ControlHe
     reading_condition = true
     work = initial_work
     while (reading_condition) {
-        work = NextBodyWork(work, 1, tokens[cursor].clone())?
-        condition_token = tokens[cursor].clone()
+        work = NextBodyWork(work, 1, WindowToken(tokens, cursor, window_end))?
+        condition_token = WindowToken(tokens, cursor, window_end)
         missing_close = condition_token.kind == "Eof" || condition_token.kind == "RBrace" || condition_token.kind == "LBrace" || condition_token.kind == "Semicolon"
         if (missing_close) {
             RejectControlClose(is_while, condition_token.clone())?
@@ -166,23 +166,18 @@ fn ExpectTryToken(&token: Token, kind: str, message: str): null! {
 
 // Each successful check consumes a non-EOF token. The terminal EOF keeps
 // the next lookup inside the window, even in a truncated catch header.
-fn ReadCatchBinding(&tokens: [Token], start: int): Token! {
-    if (start < 0 || start >= tokens.len() || tokens[tokens.len() - 1].kind != "Eof") {
+fn ReadCatchBinding(&tokens: [Token], start: int, window_end: int): Token! {
+    if (start < 0 || start > window_end || window_end >= tokens.len() || tokens[tokens.len() - 1].kind != "Eof") {
         RejectAtPoint("invalid_token_stream", "catch header must be in a token window ending at EOF")?
     }
-    RejectFinally(tokens[start])?
-    ExpectTryToken(tokens[start], "Catch", "stage-3 try requires a catch clause")?
-    ExpectTryToken(tokens[start + 1], "LParen", "expected '(' after 'catch'")?
-    binding = tokens[start + 2].clone()
+    RejectFinally(WindowToken(tokens, start, window_end))?
+    ExpectTryToken(WindowToken(tokens, start, window_end), "Catch", "stage-3 try requires a catch clause")?
+    ExpectTryToken(WindowToken(tokens, start + 1, window_end), "LParen", "expected '(' after 'catch'")?
+    binding = WindowToken(tokens, start + 2, window_end)
     ExpectTryToken(binding, "Ident", "expected catch error name")?
-    ExpectTryToken(tokens[start + 3], "RParen", "expected ')' after catch error name")?
-    ExpectTryToken(tokens[start + 4], "LBrace", "expected '{' before catch body")?
+    ExpectTryToken(WindowToken(tokens, start + 3, window_end), "RParen", "expected ')' after catch error name")?
+    ExpectTryToken(WindowToken(tokens, start + 4, window_end), "LBrace", "expected '{' before catch body")?
     return ok(binding)
-}
-
-fn ReadTypeAt(&tokens: [Token], start: int, &terminal: Token): SignatureType! {
-    if (start < 0 || start >= tokens.len()) { RejectTypeInspection(terminal.clone())? }
-    return ReadSignatureTypeAt(tokens, start)
 }
 
 fn LocalAssignmentOperator(&token: Token): str {
@@ -200,7 +195,6 @@ fn RejectBodyEdgeLimit(token: Token): null! { RejectAt(token, "edge_limit", "sta
 fn RejectBodyEdgeId(token: Token): null! { RejectAt(token, "invalid_node_id", "AST edge references an invalid NodeId")? return ok(null) }
 fn RejectNestedNodeId(token: Token): null! { RejectAt(token, "invalid_node_id", "nested AST contains an invalid NodeId")? return ok(null) }
 fn RejectNestedRoot(token: Token): null! { RejectAt(token, "invalid_node_id", "nested AST root is invalid")? return ok(null) }
-fn RejectTypeInspection(token: Token): null! { RejectAt(token, "invalid_token_stream", "type inspection escaped its bounded token window")? return ok(null) }
 fn RejectExpressionTerminator(token: Token): null! { RejectAt(token, "unexpected_eof", "expression is missing a terminator")? return ok(null) }
 fn RejectBodyWorkLimit(token: Token): null! { RejectAt(token, "work_limit", "stage-3 parser work budget exceeded")? return ok(null) }
 fn RejectStatementLink(token: Token): null! { RejectAt(token, "invalid_node_id", "statement list contains an invalid link")? return ok(null) }

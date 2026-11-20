@@ -27,7 +27,7 @@ fn native_bootstrap_parsers_close_allocations_and_scale_without_quadratic_copyin
 import { ParseOutput } from "./stage2/ast.ku"
 import { ParseContext } from "./stage2/context.ku"
 import { Span } from "./stage2/span.ku"
-import { ParseProgram } from "./stage3/parser.ku"
+import { ParseModule, ParseProgram } from "./stage3/parser.ku"
 
 fn ParseWithInvalidDomain(source: str): ParseOutput! {
     owned_domain = source.clone()
@@ -43,6 +43,7 @@ fn ParseWithInvalidDomain(source: str): ParseOutput! {
 fn main(): null! {
     expression = Parse("1")?
     program = ParseProgram("fn main() {}")?
+    compiled = ParseModule("fn main() {}")?
     return ok(null)
 }
 "#,
@@ -62,6 +63,7 @@ fn main(): null! {
         "ku_string_drop(&error->message);".to_string(),
         format!("{} {}(KuString source)", abi.result_type, abi.stage2_parse),
         format!("{} {}(KuString source)", abi.result_type, abi.stage3_parse),
+        format!("{} {}(KuString source)", abi.result_type, abi.stage3_module),
         format!(
             "{} {}(KuString source)",
             abi.result_type, abi.invalid_domain_parse
@@ -89,6 +91,7 @@ fn main(): null! {
         .replace("@KU_PARSE_RESULT_DROP@", &abi.result_drop)
         .replace("@KU_STAGE2_PARSE@", &abi.stage2_parse)
         .replace("@KU_STAGE3_PARSE@", &abi.stage3_parse)
+        .replace("@KU_STAGE3_MODULE@", &abi.stage3_module)
         .replace("@KU_INVALID_DOMAIN_PARSE@", &abi.invalid_domain_parse);
     harness.push_str(&wrapper);
     let source = directory.path().join("bootstrap-parser-performance.c");
@@ -117,6 +120,7 @@ fn main(): null! {
         "stage2-failure",
         "stage3-success",
         "stage3-module-success",
+        "stage3-compiler-function-success",
         "stage3-named-import-success",
         "stage3-function-statements-success",
         "stage3-function-statements-failure",
@@ -195,6 +199,7 @@ struct ParserNativeAbi {
     struct_drop: String,
     stage2_parse: String,
     stage3_parse: String,
+    stage3_module: String,
     invalid_domain_parse: String,
 }
 
@@ -220,6 +225,7 @@ fn parser_native_abi(generated: &str) -> ParserNativeAbi {
         result_type,
         stage2_parse: generated_function(generated, "Parse"),
         stage3_parse: generated_function(generated, "ParseProgram"),
+        stage3_module: generated_function(generated, "ParseModule"),
         invalid_domain_parse: generated_function(generated, "ParseWithInvalidDomain"),
     }
 }
@@ -859,6 +865,11 @@ int main(void) {
       ku_stage3_input(96, 0), ku_stage3_input(192, 0), 1, "", "", "") == 0);
   CHECK(ku_check_scale("stage3-module-success", @KU_STAGE3_PARSE@,
       ku_stage3_module_input(96), ku_stage3_module_input(192), 1, "", "", "") == 0);
+  /* Both fixtures place one function above the old 512-token limit. The
+     parser must borrow the interval and leave no live allocations after
+     producing the same bounded type of AST. */
+  CHECK(ku_check_scale("stage3-compiler-function-success", @KU_STAGE3_MODULE@,
+      ku_stage3_input(256, 0), ku_stage3_input(512, 0), 1, "", "", "") == 0);
   /* Full-alias lists are the longest accepted named-import shape. The 32/64
      fixtures consume 134/262 tokens including semicolon and EOF, keeping the
      larger case below the independent 266-token inspection bound. A 2.25x
