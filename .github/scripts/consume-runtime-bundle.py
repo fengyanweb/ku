@@ -987,16 +987,10 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                 write_report(report_path,report);cleanup.raise_if_any(primary)
 
 
-def installed_declaration_inventory_consumer(install, root, env, report, repo, commit, target):
-    """Build the commit's inventory tool and exercise both installed backend contracts."""
-    report['installed_declaration_inventory'] = detail = {'status': 'running', 'backends': {}}
-    directories = ('bootstrap/stage1', 'bootstrap/stage2', 'bootstrap/stage3',
-                   'bootstrap/tools/declarations')
-    project = root / 'declaration-project'
-    entry = project / 'bootstrap/tools/declarations/main.ku'
+def stage_committed_ku_sources(repo, commit, env, project, directories):
     tree = invoke(['git', 'ls-tree', '-rz', commit, '--', *directories], repo, env)
     if tree.returncode:
-        raise RuntimeError('cannot read the commit\'s declaration inventory source tree')
+        raise RuntimeError('cannot read committed Ku source tree')
     names, hashes = set(), []
     total = 0
     for record in tree.stdout.decode('utf-8').split('\0'):
@@ -1009,19 +1003,30 @@ def installed_declaration_inventory_consumer(install, root, env, report, repo, c
         relative = EXPORT.checked_relative(name)
         if (mode != '100644' or kind != 'blob' or relative.casefold() in names or
                 len(names) >= 64):
-            raise ValueError('invalid declaration inventory source: ' + relative)
+            raise ValueError('invalid committed Ku source: ' + relative)
         names.add(relative.casefold())
         blob = invoke(['git', 'cat-file', 'blob', oid], repo, env)
         if blob.returncode:
-            raise RuntimeError('cannot copy committed declaration source: ' + relative)
+            raise RuntimeError('cannot copy committed Ku source: ' + relative)
         data = EXPORT.canonical_example(blob.stdout)
         total += len(data)
         if total > 512 * 1024:
-            raise ValueError('declaration inventory source tree exceeds its fixture bound')
+            raise ValueError('committed Ku source tree exceeds its fixture bound')
         destination = project / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(data)
         hashes.append((relative, hashlib.sha256(data).hexdigest()))
+    return hashes
+
+
+def installed_declaration_inventory_consumer(install, root, env, report, repo, commit, target):
+    """Build the commit's inventory tool and exercise both installed backend contracts."""
+    report['installed_declaration_inventory'] = detail = {'status': 'running', 'backends': {}}
+    directories = ('bootstrap/stage1', 'bootstrap/stage2', 'bootstrap/stage3',
+                   'bootstrap/tools/declarations')
+    project = root / 'declaration-project'
+    entry = project / 'bootstrap/tools/declarations/main.ku'
+    hashes = stage_committed_ku_sources(repo, commit, env, project, directories)
     if not entry.is_file() or not (entry.parent / 'collect.ku').is_file():
         raise ValueError('the selected commit lacks the declaration inventory entry or helper')
     detail.update(source_files=len(hashes),
@@ -1095,6 +1100,69 @@ def installed_declaration_inventory_consumer(install, root, env, report, repo, c
     detail['status'] = 'passed'
 
 
+def installed_bootstrap_module_consumer(install, root, env, report, repo, commit, target):
+    """Build Ku's module checker and run it on its actual shared dependencies."""
+    report['installed_bootstrap_module'] = detail = {'status': 'running'}
+    compiler = root / 'bootstrap-compiler'
+    deployment = root / 'bootstrap-deployment'
+    deployment.mkdir()
+    hashes = stage_committed_ku_sources(repo, commit, env, compiler, (
+        'bootstrap/stage1', 'bootstrap/stage2', 'bootstrap/stage3', 'bootstrap/semantics',
+    ))
+    detail['compiler_source_tree_sha256'] = hashlib.sha256(EXPORT.json_bytes(sorted(hashes))).hexdigest()
+    modules = ('stage2/context.ku', 'stage2/span.ku', 'stage1/token.ku')
+    for relative in modules:
+        path = deployment / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(compiler / 'bootstrap' / relative, path)
+    detail['input_sha256'] = {relative: EXPORT.file_hash(deployment / relative) for relative in modules}
+    manifest = deployment / 'modules.txt'
+    manifest.write_bytes(('\r\n'.join(modules) + '\r\n').encode('utf-8'))
+
+    entry_directory = compiler / 'bootstrap/semantics'
+    name = 'ku-check-project' + ('.exe' if os.name == 'nt' else '')
+    program = entry_directory / name
+    ku = install / ('ku.exe' if os.name == 'nt' else 'ku')
+    built = invoke([ku, 'build', '--release', '--verbose', 'project_main.ku', '-o', program], entry_directory, env)
+    if built.returncode:
+        raise RuntimeError('installed bootstrap module compiler failed: ' +
+                           (output(built) + built.stderr.decode('utf-8', errors='replace'))[-4096:])
+    assert_build_backend(built, 'c', 'release')
+    record_native_build_diagnostics(detail, built)
+    detail['binary_sha256'] = EXPORT.file_hash(program)
+    runnable = deployment / name
+    relocate_checkout_entry(program, runnable)
+    shutil.rmtree(compiler)
+
+    run_env = env
+    if target == 'x86_64-pc-windows-gnu':
+        system = windows_system_root(env)
+        run_env = dict(env, PATH=os.pathsep.join((str(system / 'System32'), str(system))))
+    retired = root / 'installed-sdk-unavailable-for-bootstrap'
+    relocate_checkout_entry(install, retired)
+    try:
+        detail['sdk_and_compiler_source_unavailable'] = not install.exists() and not compiler.exists()
+        success = invoke([runnable], root, run_env, seconds=20)
+        detail['bound_modules'] = rows = output(success).splitlines()
+        expected_order = ['MODULE|' + module for module in reversed(modules)]
+        if (success.returncode or success.stderr or
+                [row for row in rows if row.startswith('MODULE|')] != expected_order or
+                'IMPORT|stage2/span.ku|Token|stage1/token.ku|Token|19' not in rows or
+                'IMPORT|stage2/context.ku|Token|stage1/token.ku|Token|19' not in rows or
+                'TYPE|stage2/context.ku|Span|stage2/span.ku|7|15' not in rows):
+            raise RuntimeError('relocated bootstrap module binding differed: ' +
+                               repr((output(success) + success.stderr.decode('utf-8', errors='replace'))[-4096:]))
+        manifest.write_bytes(('\n'.join(modules[:2]) + '\n').encode('utf-8'))
+        failure = invoke([runnable], root, run_env, seconds=20)
+        detail['missing_dependency'] = diagnostic = failure.stderr.decode('utf-8', errors='replace')
+        if failure.returncode != 1 or failure.stdout or '|unresolved_import|' not in diagnostic:
+            raise RuntimeError('relocated bootstrap tool lost its missing dependency diagnostic')
+    finally:
+        relocate_checkout_entry(retired, install)
+        detail['installation_restored'] = ku.is_file() and not retired.exists()
+    detail['status'] = 'passed'
+
+
 def run_structured_only(args, report):
     """Check the structured Task and declaration examples from a verified installed archive."""
     repo = args.repo.resolve()
@@ -1138,6 +1206,7 @@ def run_structured_only(args, report):
         if any(native[key] != runner[key] for key in ('run_stdout', 'requests')):
             raise RuntimeError('installed structured Task backends disagreed on output or request order')
         installed_declaration_inventory_consumer(install, root, env, report, repo, verifier, target)
+        installed_bootstrap_module_consumer(install, root, env, report, repo, verifier, target)
     report.update(status='passed', backend_equivalence=True, owned_temp_removed=not root.exists())
 
 
