@@ -1,0 +1,221 @@
+import { fs, string } from "std"
+import { Span } from "../stage2/span.ku"
+import { Arena, Node } from "../stage2/ast.ku"
+import { BindProjectImports, SuppliedModule } from "../semantics/imports.ku"
+import { DeclarationSpan, RejectName } from "../semantics/names.ku"
+import { LinkPlanDeclaration, BuiltinLinkPlanType, EmitLinkPlan } from "../semantics/link_plan_c.ku"
+import { ManifestPaths, ReadProjectModulesAt } from "../semantics/project_manifest.ku"
+import { ScalarFunctionNode } from "../semantics/scalar_int_calls.ku"
+import { ScalarStringHelpers } from "../semantics/scalar_int_emit.ku"
+import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
+
+struct CharPrefixPlan {
+    delimiter: Node
+    fallback: Node
+}
+
+struct CharPrefixC {
+    source: str
+    export: LinkPlanDeclaration
+}
+
+fn child(&arena: Arena, &node: Node, index: int): Node {
+    return arena.nodes[arena.edges[node.first_edge + index] - 1].clone()
+}
+
+fn require(valid: bool, &node: Node, message: str): null! {
+    if (!valid) {
+        RejectName("unsupported_char_prefix", message, DeclarationSpan(node))?
+    }
+    return ok(null)
+}
+
+fn shape(&node: Node, &kind: str, children: int): null! {
+    require(node.kind == kind && node.edge_count == children, node, "expected " + kind.clone() + " with "
+        + str(children) + " children in a reverse character scan")?
+    return ok(null)
+}
+
+fn variable(&node: Node, &name: str): null! {
+    require(node.kind == "Variable" && node.edge_count == 0 && node.text == name, node, "expected the same local binding")?
+    return ok(null)
+}
+
+fn integer(&node: Node, number: int): null! {
+    require(node.kind == "Int" && node.edge_count == 0 && node.int_value == number, node, "expected integer " + str(number))?
+    return ok(null)
+}
+
+fn binary(&node: Node, &operator: str): null! {
+    require(node.kind == "Binary" && node.edge_count == 2 && node.text == operator, node, "expected operator " + operator.clone())?
+    return ok(null)
+}
+
+fn method(&arena: Arena, &call: Node, &base: str, &name: str, arguments: int): null! {
+    shape(call, "Call", arguments + 1)?
+    callee = child(arena, call, 0)
+    shape(callee, "Field", 1)?
+    require(callee.text == name, callee, "expected method " + name.clone())?
+    variable(child(arena, callee, 0), base)?
+    return ok(null)
+}
+
+fn stringType(&node: Node): null! {
+    require(node.kind == "TypeName" && node.edge_count == 0 && node.text == "str", node, "expected str")?
+    return ok(null)
+}
+
+fn decrement(&arena: Arena, &node: Node, &cursor: str): null! {
+    binary(node, "-")?
+    variable(child(arena, node, 0), cursor)?
+    integer(child(arena, node, 1), 1)?
+    return ok(null)
+}
+
+fn readLoop(&arena: Arena, &loop: Node, &characters: str, &cursor: str): Node! {
+    shape(loop, "While", 2)?
+    condition = child(arena, loop, 0)
+    binary(condition, "&&")?
+    bound = child(arena, condition, 0)
+    binary(bound, ">")?
+    variable(child(arena, bound, 0), cursor)?
+    integer(child(arena, bound, 1), 0)?
+    comparison = child(arena, condition, 1)
+    binary(comparison, "!=")?
+    index = child(arena, comparison, 0)
+    shape(index, "Index", 2)?
+    variable(child(arena, index, 0), characters)?
+    decrement(arena, child(arena, index, 1), cursor)?
+    delimiter = child(arena, comparison, 1)
+    shape(delimiter, "String", 0)?
+    require(delimiter.text.len() == 1, delimiter, "expected a single Unicode scalar delimiter")?
+    step = child(arena, loop, 1)
+    shape(step, "Assign", 1)?
+    require(step.text == cursor, step, "expected the reverse scan to update its own cursor")?
+    decrement(arena, child(arena, step, 0), cursor)?
+    return ok(delimiter)
+}
+
+fn readFallback(&arena: Arena, &branch: Node, &cursor: str): Node! {
+    shape(branch, "If", 2)?
+    require(branch.int_value == 1, branch, "expected a single then-arm with no else")?
+    condition = child(arena, branch, 0)
+    binary(condition, "==")?
+    variable(child(arena, condition, 0), cursor)?
+    integer(child(arena, condition, 1), 0)?
+    returned = child(arena, branch, 1)
+    shape(returned, "Return", 1)?
+    call = child(arena, returned, 0)
+    shape(call, "Call", 2)?
+    variable(child(arena, call, 0), "ok")?
+    fallback = child(arena, call, 1)
+    shape(fallback, "String", 0)?
+    return ok(fallback)
+}
+
+fn readPlan(&arena: Arena, &entry: Node, &namespace: str): CharPrefixPlan! {
+    shape(entry, "Function", 7)?
+    parameter = child(arena, entry, 0)
+    shape(parameter, "Parameter", 1)?
+    require(parameter.int_value == 1, parameter, "expected a View str parameter")?
+    stringType(child(arena, parameter, 0))?
+    returned = child(arena, entry, 1)
+    shape(returned, "TypeResult", 1)?
+    stringType(child(arena, returned, 0))?
+
+    chars = child(arena, entry, 2)
+    shape(chars, "Assign", 1)?
+    method(arena, child(arena, chars, 0), namespace, "chars", 1)?
+    method(arena, child(arena, child(arena, chars, 0), 1), parameter.text, "clone", 0)?
+    cursor = child(arena, entry, 3)
+    shape(cursor, "Assign", 1)?
+    method(arena, child(arena, cursor, 0), chars.text, "len", 0)?
+    require(parameter.text != chars.text && parameter.text != cursor.text && chars.text != cursor.text,
+        cursor, "reverse scan requires independent bindings for the input, character array and cursor")?
+    for binding in [parameter.text.clone(), chars.text.clone(), cursor.text.clone()] {
+        require(binding != "ok" && binding != namespace, entry, "a local shadows a required builtin binding")?
+    }
+    delimiter = readLoop(arena, child(arena, entry, 4), chars.text, cursor.text)?
+    fallback = readFallback(arena, child(arena, entry, 5), cursor.text)?
+    slice_return = child(arena, entry, 6)
+    shape(slice_return, "Return", 1)?
+    slice = child(arena, slice_return, 0)
+    method(arena, slice, namespace, "slice", 3)?
+    method(arena, child(arena, slice, 1), parameter.text, "clone", 0)?
+    integer(child(arena, slice, 2), 0)?
+    decrement(arena, child(arena, slice, 3), cursor.text)?
+    return ok(CharPrefixPlan { delimiter: delimiter, fallback: fallback })
+}
+
+fn boundString(&supplied: [SuppliedModule], &entry: Node): str! {
+    namespace = ""
+    for binding in BindProjectImports(supplied[0], supplied)? {
+        require(binding.local_name != "ok", entry, "an import shadows the ok constructor")?
+        if (binding.module_index == 0 && binding.source_name == "string") { namespace = binding.local_name }
+    }
+    index = 0
+    while (index < supplied[0].named.names.declarations.len()) {
+        require(supplied[0].named.names.declarations[index].name != "ok", entry, "a declaration shadows the ok constructor")?
+        index = index + 1
+    }
+    require(namespace != "", entry, "expected a bound std.string namespace")?
+    return ok(namespace)
+}
+
+fn emitPrefix(&plan: CharPrefixPlan, &symbol: str): str! {
+    delimiter = ScalarStringLiteral(plan.delimiter)?
+    fallback = ScalarStringLiteral(plan.fallback)?
+    text = "#include <stdbool.h>\n#include <stdint.h>\n" + ScalarStringHelpers(true, false, false, false, true, false, true)
+    text += "typedef struct KuResult_str { bool ok; KuString value; KuError error; } KuResult_str;\n\n"
+    text += "KuResult_str " + symbol.clone() + "(const KuBootstrapString* input) {\n"
+    text += "    const KuScalarStringPart delimiter = {(const uint8_t*)" + delimiter + "};\n"
+    text += "    KuResult_str result = {.ok = true};\n"
+    // All matched scalar indexes only feed the single prefix slice. On a
+    // valid Ku str, stepping back over continuation bytes preserves scalar
+    // boundaries, so the temporary string array never needs to be owned.
+    text += "    size_t end = input->len;\n"
+    text += "    while (end != 0) {\n"
+    text += "        size_t start = end - 1;\n"
+    text += "        while (start != 0 && (input->ptr[start] & 0xc0u) == 0x80u) --start;\n"
+    text += "        if (end - start == delimiter.len && !memcmp(input->ptr + start, delimiter.ptr, delimiter.len)) {\n"
+    text += "            if (start != 0) {\n"
+    text += "                const KuScalarStringPart part = {input->ptr, start};\n"
+    text += "                const char* failure = ku_scalar_string_join(&part, 1u, &result.value);\n"
+    text += "                if (failure) { fputs(failure, stderr); exit(1); }\n"
+    text += "            }\n"
+    text += "            return result;\n"
+    text += "        }\n"
+    text += "        end = start;\n"
+    text += "    }\n"
+    text += "    result.value = (KuString){(uint8_t*)" + fallback + ", 0u, 0u};\n"
+    return ok(text + "    return result;\n}\n")
+}
+
+fn EmitCharPrefixC(&supplied: [SuppliedModule], &function: str): CharPrefixC! {
+    at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    if (supplied.len() == 0) { RejectName("unresolved_module", "expected a module containing the reverse character scan", at.clone())? }
+    id = ScalarFunctionNode(supplied[0].named.names.declarations, function)
+    if (id == 0) { RejectName("unknown_function", "requested reverse character scan is not a declared function", at)? }
+    entry = supplied[0].named.parsed.arena.nodes[id - 1].clone()
+    plan = readPlan(supplied[0].named.parsed.arena, entry, boundString(supplied, entry)?)?
+    symbol = "ku_char_prefix_" + str(id)
+    source = emitPrefix(plan, symbol)?
+    export = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol,
+        parameters: [BuiltinLinkPlanType("str", "const KuBootstrapString*", true)],
+        result: BuiltinLinkPlanType("str", "KuResult_str", false), returns_result: true }
+    return ok(CharPrefixC { source: source, export: export })
+}
+
+fn main(): null! {
+    at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    paths = ManifestPaths(fs.read("modules.txt")?, at)?
+    supplied = ReadProjectModulesAt(paths, "")?
+    function = string.trim(fs.read("function.txt")?)
+    compiled = EmitCharPrefixC(supplied, function)?
+    if (fs.exists("plan.txt")) {
+        print(EmitLinkPlan(supplied, "char-prefix", compiled.export, [])?)
+    } else {
+        print(compiled.source)
+    }
+    return ok(null)
+}
