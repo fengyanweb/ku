@@ -1403,7 +1403,7 @@ def run_structured_only(args, report):
             driver_test = repo / 'bootstrap/tools/compiler_driver/test_driver.py'
             result = invoke([sys.executable, '-B', driver_test, '--ku', install / 'ku', '--cc', 'clang'],
                             root, env, seconds=300)
-            if result.returncode or result.stderr or output(result) != 'bootstrap argv, diagnostics, signature and standalone C verified\n':
+            if result.returncode or result.stderr or output(result) != 'bootstrap argv, module checks, signature and standalone C verified\n':
                 raise RuntimeError('installed bootstrap command driver failed: ' +
                                    (output(result) + result.stderr.decode('utf-8', errors='replace'))[-4096:])
             report['installed_bootstrap_cli'] = {'status': 'passed', 'sha256': EXPORT.file_hash(driver_test)}
