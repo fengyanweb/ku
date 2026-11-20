@@ -1,0 +1,89 @@
+import { Node } from "../stage2/ast.ku"
+import { DiagnosticCanonical, MakeDiagnostic } from "../stage2/diagnostic.ku"
+import { Span } from "../stage2/span.ku"
+import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
+import { BindSuppliedImports, ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
+
+// Node IDs are local to the relevant AST. Module 0 denotes the source module;
+// supplied modules are one-based. Built-ins have no declaration node.
+struct TypeNameBinding {
+    use_node: int
+    name: str
+    declaration_kind: str
+    module_index: int
+    declaration_node: int
+    span: Span
+}
+
+fn IsBuiltinType(&name: str): bool {
+    return name == "int" || name == "float" || name == "bool" || name == "str" || name == "null"
+}
+
+fn ResolveTypeName(&use: Node, use_index: int, &local: [TopLevelName],
+                   &imports: [ImportBinding], &supplied: [SuppliedModule]): TypeNameBinding! {
+    at = DeclarationSpan(use)
+    name = use.text.clone()
+    if (IsBuiltinType(name)) {
+        return ok(TypeNameBinding {
+            use_node: use_index, name: name, declaration_kind: "Builtin",
+            module_index: 0, declaration_node: 0, span: at
+        })
+    }
+    index = 0
+    while (index < local.len()) {
+        declaration = local[index].clone()
+        if (declaration.name == name && (declaration.kind == "Struct" || declaration.kind == "Enum")) {
+            return ok(TypeNameBinding {
+                use_node: use_index, name: name, declaration_kind: declaration.kind,
+                module_index: 0, declaration_node: declaration.node, span: at
+            })
+        }
+        index = index + 1
+    }
+    index = 0
+    while (index < imports.len()) {
+        entry = imports[index].clone()
+        if (entry.local_name == name) {
+            target = ReadImportNode(supplied[entry.module_index - 1].named.parsed.arena.nodes,
+                                    entry.target_node, at.clone())?
+            if (target.kind == "Struct" || target.kind == "Enum") {
+                return ok(TypeNameBinding {
+                    use_node: use_index, name: name, declaration_kind: target.kind,
+                    module_index: entry.module_index, declaration_node: entry.target_node, span: at
+                })
+            }
+        }
+        index = index + 1
+    }
+    if (name == "KuValue" || name == "HttpRequest" || name == "HttpResponse") {
+        return ok(TypeNameBinding {
+            use_node: use_index, name: name, declaration_kind: "Builtin",
+            module_index: 0, declaration_node: 0, span: at
+        })
+    }
+    diagnostic = MakeDiagnostic("error", "bootstrap.semantics.types", "undefined_type",
+                                "undefined type '" + name + "'", "<source>", at)
+    fail { domain: "bootstrap.semantics.types", code: "undefined_type", message: DiagnosticCanonical(diagnostic) }
+}
+
+fn CollectTypeNames(&nodes: [Node], &local: [TopLevelName],
+                    &imports: [ImportBinding], &supplied: [SuppliedModule]): [TypeNameBinding]! {
+    bindings: [TypeNameBinding] = []
+    index = 0
+    while (index < nodes.len()) {
+        node = nodes[index].clone()
+        if (node.kind == "TypeName") {
+            binding = ResolveTypeName(node, index + 1, local, imports, supplied)?
+            bindings = bindings.push(binding)
+        }
+        index = index + 1
+    }
+    return ok(bindings)
+}
+
+// Bind explicit names on the validated Stage 3 graph. Container and union
+// shapes remain in the graph; this pass does not infer expression types.
+fn BindTypeNames(&named: NamedModule, &supplied: [SuppliedModule]): [TypeNameBinding]! {
+    imports = BindSuppliedImports(named, supplied)?
+    return CollectTypeNames(named.parsed.arena.nodes, named.names.declarations, imports, supplied)
+}
