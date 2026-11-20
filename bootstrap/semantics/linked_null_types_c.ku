@@ -1,5 +1,4 @@
-import { BoundArrayCPrefix, BoundArrayCType, BoundArrayTypePosition, EmitBoundArrayAppenders, EmitBoundArrayDeclarations,
-         EmitBoundArrayResults, EmitBoundElementClones, EmitBoundStringOperations } from "./struct_array_c.ku"
+import { BoundArrayCPrefix, BoundArrayCType, BoundArrayTypePosition } from "./struct_array_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
