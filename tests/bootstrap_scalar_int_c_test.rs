@@ -572,7 +572,9 @@ fn main() { println(TestScore(5)) }
             "call_arity",
         ),
         (
-            source.replace("TestScore(a: int)", "TestScore(Primary: int, a: int)"),
+            source
+                .replace("TestScore(a: int)", "TestScore(Primary: int, a: int)")
+                .replace("TestScore(5)", "TestScore(0, 5)"),
             "unsupported_int_callee",
         ),
     ] {
