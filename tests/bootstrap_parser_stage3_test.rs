@@ -1590,13 +1590,15 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     );
     let structured_http = include_str!("../examples/native_task_structured_http.ku");
     let structured_http_prelude = &structured_http[..structured_http
-        .find("async fn Send(")
-        .expect("start of structured HTTP service")];
+        .find("async fn CheckGet(")
+        .expect("end of the complete structured HTTP Send declaration")];
     let cases = [
         "",
         structured_http_prelude,
         "// 前😀\r\nasync fn Compute(&value: int): int! { return ok(value) }",
         "fn Outer() { async fn Inner(value: int): int! { return ok(value) } }\nasync fn Again() { fn Ordinary() {} }",
+        "fn main() { if (true) value = 1;; if (false) return; }",
+        "// 前😀\r\nfn f() { if (ready) record.Refresh() if (other) { if (ready) fail \"错😀\" } else {} }",
         "import \"./setup.ku\";\nfn before() {}\nimport math from \"./math.ku\"\nimport { Add, User as Person } from \"./api.ku\"\nfn main() { return Add(1, 2) }",
         "// 导入😀\r\nimport { Add as Plus } from \"./中😀.ku\"\r\nimport \"./tab\\tname.ku\"\r\nfn main() {}",
         "module App",
@@ -1717,7 +1719,10 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let empty_if_condition = "fn main() { if () {} }";
     let missing_if_close = "fn main() { if (true) { value = 1";
     let missing_else_close = "fn main() { if (true) {} else { value = 1";
-    let single_if_body = "fn main() { if (true) value = 1 }";
+    let inline_then_else = "fn main() { if (true) value = 1; else {} }";
+    let inline_nested = "fn main() { if (true) if (false) fail \"nested\" else {} }";
+    let inline_else_if = "fn main() { if (true) {} else if (false) fail \"nested\" }";
+    let missing_inline_body = "fn main() { if (true) else {} }";
     let single_else_body = "fn main() { if (true) {} else value = 1 }";
     let separated_else = "fn main() { if (true) {}; else {} }";
     let stray_else = "fn main() { else {} }";
@@ -1782,6 +1787,14 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         format!("fn main() {{ if (true) {{ {} }} }}", "value;".repeat(127));
     let over_aggregate_statement_limit =
         format!("fn main() {{ if (true) {{ {} }} }}", "value;".repeat(128));
+    let inline_statement_boundary = format!(
+        "fn main() {{ {} if (true) fail \"body\" }}",
+        "value;".repeat(126)
+    );
+    let over_inline_statement_limit = format!(
+        "fn main() {{ {} if (true) fail \"body\" }}",
+        "value;".repeat(127)
+    );
     let aggregate_while_statement_boundary = format!(
         "fn main() {{ while (true) {{ {} }} }}",
         "value;".repeat(127)
@@ -2619,6 +2632,10 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         ku_string(&aggregate_statement_boundary)
     ));
     body.push_str(&format!(
+        "    inline_large = ParseProgram({})?\n    if (inline_large.root != 258) {{ panic(\"stage-3 inline if statement boundary mismatch\") }}\n",
+        ku_string(&inline_statement_boundary)
+    ));
+    body.push_str(&format!(
         "    many_functions = ParseProgram({})?\n    if (many_functions.root != 65 || many_functions.arena.nodes.len() != 65 || many_functions.arena.edges.len() != 64) {{ panic(\"stage-3 function boundary mismatch\") }}\n",
         ku_string(&function_boundary)
     ));
@@ -2685,8 +2702,6 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         TokenKind::Eof,
         "expected '}' after else body",
     );
-    let single_if_body_message =
-        diagnostic_at(single_if_body, 9, "stage-3 if bodies must use braces");
     let single_else_body_message =
         diagnostic_at(single_else_body, 12, "stage-3 else bodies must use braces");
     let separated_else_message = diagnostic_at(
@@ -3064,9 +3079,41 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             missing_else_close_message,
         ),
         (
-            single_if_body,
+            inline_then_else,
             "unsupported_statement",
-            single_if_body_message,
+            diagnostic_for_kind(
+                inline_then_else,
+                TokenKind::Else,
+                "stage-3 if with else requires a braced then body",
+            ),
+        ),
+        (
+            inline_nested,
+            "unsupported_statement",
+            diagnostic_at(inline_nested, 9, "stage-3 nested if bodies must use braces"),
+        ),
+        (
+            inline_else_if,
+            "unsupported_statement",
+            diagnostic_for_kind(
+                inline_else_if,
+                TokenKind::Fail,
+                "stage-3 nested if bodies must use braces",
+            ),
+        ),
+        (
+            missing_inline_body,
+            "unexpected_token",
+            rust_error_canonical(missing_inline_body),
+        ),
+        (
+            &over_inline_statement_limit,
+            "statement_limit",
+            diagnostic_for_kind(
+                &over_inline_statement_limit,
+                TokenKind::Fail,
+                "stage-3 parser accepts at most 128 statements per function",
+            ),
         ),
         (
             single_else_body,

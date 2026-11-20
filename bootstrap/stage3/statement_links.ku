@@ -1,10 +1,11 @@
 import { Token } from "../stage1/token.ku"
-import { Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
+import { Arena, Node, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
-import { RejectAt, WindowKind, WindowToken } from "./support.ku"
+import { AfterOptionalSemicolon, RejectAt, WindowKind, WindowToken } from "./support.ku"
 import { ControlFrame, RejectFinally, StatementLink, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength,
          RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectNestedRoot, ExpectTryToken, NextBodyWork,
-         ReadControlHeader, RejectControlBody } from "./body_support.ku"
+         IsControlStatement, ReadControlHeader, RejectStatementLimit, RejectWhileBody } from "./body_support.ku"
+import { ReadSimpleBodyStatement } from "./simple_statements.ku"
 
 struct AppendedStatements {
     children: [int]
@@ -20,28 +21,66 @@ struct BodyAttachment {
 struct ControlBodyStart {
     binding: str
     condition: int
-    body_open: int
+    next: int
     work: int
+    inline_statement: int
 }
 
 fn ReadControlBodyStart(&tokens: [Token], &kind: str, start: int, last: int, token_base: int, work: int,
+                        statement_count: int, awaiting_else_if: bool,
                         parse_expression: fn(int, int): ParseOutput!,
-                        add_arena: fn(ParseOutput, Token, bool): int!): ControlBodyStart! {
+                        add_arena: fn(ParseOutput, Token, bool): int!,
+                        add_node: fn(str, str, int, Span, [int], Token): int!,
+                        read_node: fn(int): Node, read_span: fn(int): Span): ControlBodyStart! {
     if (kind == "Try") {
         body_open = start + 1
         ExpectTryToken(WindowToken(tokens, body_open, last), "LBrace", "expected '{' before try body")?
         next_work = NextBodyWork(work, 1, WindowToken(tokens, start, last))?
-        return ok(ControlBodyStart { binding: "", condition: 0, body_open: body_open, work: next_work })
+        return ok(ControlBodyStart { binding: "", condition: 0, next: body_open + 1, work: next_work, inline_statement: 0 })
     }
     header = ReadControlHeader(tokens, start, last, work)?
     origin = WindowToken(tokens, header.expression_start, last)
     parsed = parse_expression(token_base + header.expression_start, token_base + header.expression_end)?
     condition = add_arena(parsed, origin, false)?
-    if (WindowKind(tokens, header.body_open, last) != "LBrace") {
-        RejectControlBody(kind == "While", WindowToken(tokens, header.body_open, last))?
+    if (WindowKind(tokens, header.body_open, last) == "LBrace") {
+        return ok(ControlBodyStart { binding: header.binding, condition: condition,
+                                     next: header.body_open + 1, work: header.work, inline_statement: 0 })
     }
-    return ok(ControlBodyStart { binding: header.binding, condition: condition,
-                                 body_open: header.body_open, work: header.work })
+    body = WindowToken(tokens, header.body_open, last)
+    if (kind == "While") { RejectWhileBody(body.clone())? }
+    return ReadSimpleIf(tokens, start, header.body_open, last, token_base, header.work, condition,
+                        statement_count, awaiting_else_if, body, parse_expression, add_arena, add_node, read_node, read_span)
+}
+
+fn ReadSimpleIf(&tokens: [Token], start: int, body_start: int, last: int, token_base: int, work: int,
+                condition: int, statement_count: int, awaiting_else_if: bool, body: Token,
+                parse_expression: fn(int, int): ParseOutput!, add_arena: fn(ParseOutput, Token, bool): int!,
+                add_node: fn(str, str, int, Span, [int], Token): int!,
+                read_node: fn(int): Node, read_span: fn(int): Span): ControlBodyStart! {
+    if (body.kind == "Eof" || body.kind == "Else") {
+        RejectAt(body.clone(), "unexpected_token", "expected '{' or statement after 'if'")?
+    }
+    if (awaiting_else_if || IsControlStatement(body.kind)) {
+        RejectAt(body.clone(), "unsupported_statement", "stage-3 nested if bodies must use braces")?
+    }
+    if (statement_count >= 128) { RejectStatementLimit(body.clone())? }
+    body_work = NextBodyWork(work, 1, body.clone())?
+    parsed = ReadSimpleBodyStatement(tokens, body_start, last, token_base, body_work, body, true,
+                                     parse_expression, add_arena, add_node.clone(), read_node, read_span.clone())?
+    following = WindowToken(tokens, parsed.cursor, last)
+    if (parsed.initializer_type != 0) {
+        RejectAt(following.clone(), "unsupported_statement", "stage-3 inline if cannot contain a function body")?
+    }
+    // Leave dangling-else cases unsupported until both arms can close
+    // through the same control stack without changing which If owns Else.
+    if (following.kind == "Else") {
+        RejectAt(following, "unsupported_statement", "stage-3 if with else requires a braced then body")?
+    }
+    opener = WindowToken(tokens, start, last)
+    span = SpanMerge(SpanFromToken(opener.clone()), read_span(parsed.node))
+    node = add_node("If", "", 1, span, [condition, parsed.node], opener)?
+    next = AfterOptionalSemicolon(tokens, parsed.cursor, last)
+    return ok(ControlBodyStart { binding: "", condition: 0, next: next, work: parsed.work, inline_statement: node })
 }
 
 // For a local signature only the synthetic root is skipped; the forest of

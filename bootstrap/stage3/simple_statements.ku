@@ -17,7 +17,7 @@ struct SimpleStatementRead {
 // Read and append one non-control statement with the owner’s arena
 // operations. Callable handles are retained only for this call.
 fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_base: int,
-                           initial_work: int, statement_start: Token,
+                           initial_work: int, statement_start: Token, inline_if: bool,
                            parse_expression: fn(int, int): ParseOutput!,
                            add_arena: fn(ParseOutput, Token, bool): int!,
                            add_node: fn(str, str, int, Span, [int], Token): int!,
@@ -25,6 +25,9 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
     cursor = first
     parse_steps = initial_work
     statement = 0
+    value_context = "value"
+    target_context = "assignment_target"
+    if (inline_if) { value_context = "inline_if_value" target_context = "inline_if_target" }
     if (statement_start.kind == "LBrace") {
         closing = ObjectDestructureClose(tokens, first, last_index)
         if (closing != 0) {
@@ -46,7 +49,7 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
     } else if (statement_start.kind == "Print") {
         cursor = cursor + 1
         wrapped = WindowKind(tokens, cursor, last_index) == "LParen"
-        context = "value"
+        context = value_context
         if (wrapped) { cursor = cursor + 1 context = "print_argument" }
         origin = WindowToken(tokens, cursor, last_index)
         if (wrapped && origin.kind == "Ampersand") {
@@ -78,7 +81,7 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         if (!requires_value && WindowKind(tokens, cursor, last_index) == "Semicolon") {
             end_span = SpanFromToken(WindowToken(tokens, cursor, last_index))
         } else if (requires_value || WindowKind(tokens, cursor, last_index) != "RBrace") {
-            expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
+            expression_end = ReadExpressionEnd(tokens, cursor, last_index, value_context)?
             value_origin = WindowToken(tokens, cursor, last_index)
             value_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
             expression = add_arena(value_parsed, value_origin, false)?
@@ -109,7 +112,7 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
             // type is already attached, and the cursor stays on the Fn.
             return ok(SimpleStatementRead { node: 0, cursor: cursor, work: parse_steps, initializer_type: type_node })
         }
-        expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
+        expression_end = ReadExpressionEnd(tokens, cursor, last_index, value_context)?
         declaration_origin = WindowToken(tokens, cursor, last_index)
         declaration_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
         expression = add_arena(declaration_parsed, declaration_origin, false)?
@@ -123,7 +126,7 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
             target = add_node("Variable", name.clone(), 0, SpanFromToken(statement_start.clone()), [], statement_start.clone())?
         }
         cursor = cursor + 2
-        expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
+        expression_end = ReadExpressionEnd(tokens, cursor, last_index, value_context)?
         assignment_origin = WindowToken(tokens, cursor, last_index)
         assignment_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
         expression = add_arena(assignment_parsed, assignment_origin, false)?
@@ -136,7 +139,7 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         }
         cursor = expression_end
     } else {
-        expression_end = ReadExpressionEnd(tokens, cursor, last_index, "assignment_target")?
+        expression_end = ReadExpressionEnd(tokens, cursor, last_index, target_context)?
         statement_origin = WindowToken(tokens, cursor, last_index)
         statement_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
         expression = add_arena(statement_parsed, statement_origin, false)?
@@ -150,7 +153,7 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
                 RejectAtSpan(span.clone(), "invalid_assignment_target", "invalid assignment target")?
             }
             cursor = cursor + 1
-            expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
+            expression_end = ReadExpressionEnd(tokens, cursor, last_index, value_context)?
             value = parse_expression(token_base + cursor, token_base + expression_end)?
             rhs = add_arena(value, WindowToken(tokens, cursor, last_index), false)?
             span = SpanMerge(span, read_span(rhs))

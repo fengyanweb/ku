@@ -108,7 +108,9 @@ fn EndsAtExpressionSeparator(&tokens: [Token], cursor: int, window_end: int, &co
                            previous_can_end: bool, named_struct_open: bool): bool {
     if (context == "print_argument") { return kind == "RParen" || kind == "Comma" }
     if (context == "destructure_default") { return kind == "Comma" || kind == "RBrace" }
-    return (context == "value" || context == "assignment_target") && previous_can_end &&
+    inline_if = context == "inline_if_value" || context == "inline_if_target"
+    if (inline_if && kind == "Else") { return true }
+    return (context == "value" || context == "assignment_target" || inline_if) && previous_can_end &&
         kind == "LBrace" && !named_struct_open && ObjectDestructureClose(tokens, cursor, window_end) != 0
 }
 
