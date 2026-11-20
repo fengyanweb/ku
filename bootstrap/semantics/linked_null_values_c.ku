@@ -3,7 +3,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { AppendLinkedCheckedInvocation, LinkedNullBinding, LinkedOkAvailable, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { AppendLinkedCheckedInvocation, LinkedNullBinding, LinkedOkAvailable, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedViewPointee } from "./link_plan_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, LinkedNullDropC, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
@@ -72,6 +72,10 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
 fn linkedViewArgument(&parameter: TypeNameBinding, &value: LinkedNullValue): str! {
     if (parameter.declaration_kind == "StringView" && value.ty.declaration_kind == "Builtin" && value.ty.name == "str"
         && (!value.borrowed || value.slot > 0)) {
+        return ok("&(" + value.text.clone() + ")")
+    }
+    if (parameter.declaration_kind == "StructView" && (!value.borrowed || value.slot > 0)
+        && SameLinkedType(LinkedViewPointee(parameter.clone()), value.ty)) {
         return ok("&(" + value.text.clone() + ")")
     }
     if (SameLinkedType(parameter, value.ty)) { return ok(value.text.clone()) }

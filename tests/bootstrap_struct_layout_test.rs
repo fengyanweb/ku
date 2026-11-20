@@ -15,6 +15,9 @@ mod linked_guard;
 #[path = "support/bootstrap_linked_null.rs"]
 mod linked_null;
 
+#[path = "support/bootstrap_struct_view.rs"]
+mod struct_view;
+
 #[path = "support/bootstrap_token_window.rs"]
 mod token_window;
 
@@ -4098,4 +4101,5 @@ int main(int argc, char **argv) {
     linked_guard::assert_terminal_try_unwind(&compiler, &cwd);
     linked_guard::assert_ignored_result_cleanup(&compiler, &cwd);
     linked_guard::assert_checked_string_rebind(&compiler, &cwd);
+    struct_view::assert_named_struct_view(&compiler, &cwd);
 }

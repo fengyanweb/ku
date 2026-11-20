@@ -5,7 +5,7 @@ import { GuardBoundType, GuardCType, GuardType } from "./guarded_struct_expr.ku"
 import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
-import { ExplicitType, RejectLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
+import { ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
 import { ContainsIndex, CTypeName, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 
@@ -68,6 +68,7 @@ struct LinkedNullState {
     append_slots: [int]
     uses_str_array: bool
     uses_str_view: bool
+    uses_struct_view: bool
     element_clones: [int]
     uses_index: bool
     uses_add: bool
@@ -86,8 +87,12 @@ fn NewLinkedNullState(): LinkedNullState {
     return LinkedNullState { layouts: [], owning_layouts: [], owning_strings: false,
         slots: [], links: [], declarations: "", code: "", drops: "", catch_slot: 0,
         catch_edges: false, catch_moved: [], uses_clone: false,
-        arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false,
+        arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,
         element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false, uses_print: false, uses_concat: false }
+}
+
+fn LinkedReadonlyExpression(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNullExpression {
+    return LinkedNullExpression { state: state, value: LinkedNullValue { ty: ty, text: text, slot: 0, borrowed: false } }
 }
 
 fn BoundLinkPlanType(&binding: TypeNameBinding, local_unit: int, c_type: str, view: bool): LinkPlanType {
@@ -238,6 +243,31 @@ fn LinkedNullOwnedArray(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "OwnedStructArray"
 }
 
+fn LinkedNullReadableArray(&type: TypeNameBinding): bool {
+    return type.declaration_kind == "StructArray" || type.declaration_kind == "BuiltinArray" || LinkedNullOwnedArray(type)
+}
+
+fn LinkedNullArrayHeader(&type: TypeNameBinding, &value: str): str {
+    if (LinkedNullOwnedArray(type)) { return "(&" + value.clone() + ")" }
+    return value.clone()
+}
+
+fn LinkedViewPointee(binding: TypeNameBinding): TypeNameBinding {
+    result = binding
+    if (result.declaration_kind == "StringView") { result.declaration_kind = "Builtin" }
+    if (result.declaration_kind == "StructView") { result.declaration_kind = "Struct" }
+    return result
+}
+
+fn LinkedRecordFields(&layouts: [StructLayout], &managed: [StructLayout], &type: TypeNameBinding): [StructFieldLayout]! {
+    layout = LayoutIndex(layouts, type.module_index, type.declaration_node)
+    if (layout > 0) { return ok(layouts[layout - 1].fields.clone()) }
+    layout = LayoutIndex(managed, type.module_index, type.declaration_node)
+    if (layout > 0) { return ok(managed[layout - 1].fields.clone()) }
+    RejectLayout("linked_field_layout", "readonly field requires a bound struct layout", type.span.clone())?
+    return ok([])
+}
+
 fn LinkedNullOwner(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Struct" || binding.declaration_kind == "CaughtError"
         || (binding.declaration_kind == "Builtin" && binding.name == "str")
@@ -371,7 +401,7 @@ fn ReadLinkedCatchParts(&named: NamedModule, &node: Node): LinkedCatchParts! {
 
 fn LinkedCPrelude(&body: LinkedNullState, guards: str, clone: str): str {
     text = ProjectionHeaders(true, body.drops.contains("ku_projection_string_drop") || body.owning_strings) + guards
-    if (body.arrays.len() > 0 || body.uses_str_array || body.uses_str_view || body.uses_print) {
+    if (body.arrays.len() > 0 || body.uses_str_array || body.uses_str_view || body.uses_struct_view || body.uses_print) {
         text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
     }
     if (body.uses_clone) {
@@ -393,6 +423,7 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
     if (array_checks) { text += "    bool invalid_array = false;\n" }
     if (body.uses_print) { text += "    bool output_failed = false;\n" }
     if (body.uses_str_view) { text += "    bool invalid_str = false;\n" }
+    if (body.uses_struct_view) { text += "    bool invalid_struct_view = false;\n" }
     if (body.uses_add || body.uses_sub) { text += "    bool overflow = false;\n" }
     if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
     if (body.uses_concat) { text += "    const char* string_failure = NULL;\n" }
@@ -412,6 +443,7 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
             + "        fputs(message, stderr); exit(EXIT_FAILURE);\n    }\n"
     }
     if (body.uses_str_view) { text += "    if (invalid_str) { fputs(\"invalid str view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_struct_view) { text += "    if (invalid_struct_view) { fputs(\"invalid struct view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_concat) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_add || body.uses_sub) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_index) {

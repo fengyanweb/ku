@@ -53,6 +53,8 @@ fn readParameters(&project: LinkedNullProject, &function: Node): LinkedNullParam
         if (ty.declaration_kind == "StringView") {
             validation += "    if (!" + name.clone() + " || (" + name.clone() + "->len && !" + name.clone()
                 + "->ptr)) { invalid_str = true; goto cleanup; }\n"
+        } else if (ty.declaration_kind == "StructView") {
+            validation += "    if (!" + name.clone() + ") { invalid_struct_view = true; goto cleanup; }\n"
         } else if (view) {
             validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(" + name.clone() + ") || (uintmax_t)"
                 + name.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"

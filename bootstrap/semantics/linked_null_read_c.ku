@@ -7,12 +7,12 @@ import { ContainsIndex, ContainsType, CTypeName, EmitLayout } from "./struct_pro
 import { BuildProjectOwningLayouts, EmitOwningLayoutDefinitions, OrderProjectOwningLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { EmitLinkedStringArrayPrelude, EmitOwnedStructArrayDrop, EmitOwnedStructOperations, EmitStructArrayHeader, EmitStructArrayReadValidation,
          EmitStructArrayResultHeader, EmitStructArrayDropUsing, EmitTryCloneString, EmitOwnedStructArrayAppend, StructArrayStatuses } from "./struct_array_c.ku"
-import { LinkedCPrelude, LinkedNullBinding, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { LinkedCPrelude, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { EmitProjectionStringJoinHelpers, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullDropC,
-         LinkedNullLayout, LinkedNullNode, LinkedNullProject, EmitLinkedNullPrototypes, LinkedNullView, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullDropC,
+         LinkedNullLayout, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, EmitLinkedNullPrototypes, LinkedNullView, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &element: TypeNameBinding): LinkedNullState! {
     next = state
@@ -43,6 +43,7 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
     next = state
     if (ty.declaration_kind == "BuiltinArray") { next.uses_str_array = true }
     if (ty.declaration_kind == "StringView") { next.uses_str_view = true }
+    if (ty.declaration_kind == "StructView") { next.uses_struct_view = true }
     if (ty.declaration_kind == "StructArray" || LinkedNullOwnedArray(ty)) {
         element = LinkedNullArrayElement(ty.clone())
         if (LinkedNullOwnedArray(ty)) { next = registerOwnedElement(project, next, element)? }
@@ -53,8 +54,8 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
         carrier = ty.clone()
         carrier.declaration_kind = "StructArray"
         if (LinkedNullArrayPosition(next.arrays, carrier) == 0) { next.arrays = next.arrays.push(carrier) }
-    } else if (ty.declaration_kind == "Struct") {
-        next = registerOwnedElement(project, next, ty)?
+    } else if (ty.declaration_kind == "Struct" || ty.declaration_kind == "StructView") {
+        next = registerOwnedElement(project, next, LinkedViewPointee(ty))?
     }
     return ok(next)
 }
@@ -76,9 +77,10 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
     if (ty.declaration_kind == "StructArray") { next = RequireLinkedArrayValidation(next, ty.clone()) }
     kind = LinkedNullCType(ty)?
     value = LinkedNullValue { ty: ty, text: name.clone(), slot: next.slots.len() + 1, borrowed: view }
-    if (value.ty.declaration_kind == "StringView") {
-        value.ty.declaration_kind = "Builtin"
+    if (value.ty.declaration_kind == "StringView" || value.ty.declaration_kind == "StructView") {
+        value.ty = LinkedViewPointee(value.ty)
         value.text = "(*" + name.clone() + ")"
+        next.code += LinkedNullResultCleanupReference(next.owning_layouts, value.ty)
     }
     next.slots = next.slots.push(LinkedNullSlot { binding: binding, value: value.clone(), live: parameter })
     if (!parameter) { next.declarations = next.declarations + "    " + kind + " " + name + " = {0};\n" }
@@ -153,10 +155,6 @@ fn BindLinkedCatch(state: LinkedNullState, name: str, &binding: Node, &before: [
     return ok(next)
 }
 
-fn linkedValue(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNullExpression {
-    return LinkedNullExpression { state: state, value: LinkedNullValue { ty: ty, text: text, slot: 0, borrowed: false } }
-}
-
 fn ReadLinkedNullBinding(state: LinkedNullState, &node: Node): LinkedNullExpression! {
     index = LinkedNullBinding(state.slots, node.text)
     if (index == 0 || !state.slots[index - 1].live) {
@@ -188,7 +186,7 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
                 RejectLayout("linked_array_length", "len requires a struct array", DeclarationSpan(node))?
             }
             header = LinkedNullArrayHeader(value.value.ty, value.value.text)
-            return ok(linkedValue(value.state, LinkedBuiltin("int", DeclarationSpan(node)),
+            return ok(LinkedReadonlyExpression(value.state, LinkedBuiltin("int", DeclarationSpan(node)),
                 "(int64_t)" + header + "->len"))
         }
     }
@@ -197,7 +195,7 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
         return LowerLinkedNullLeaf(state, node)
     }
     RejectLayout("unsupported_linked_read", "expected a readonly scalar expression or array view", DeclarationSpan(node))?
-    return ok(linkedValue(state, LinkedBuiltin("", DeclarationSpan(node)), ""))
+    return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", DeclarationSpan(node)), ""))
 }
 
 fn readLinkedIndex(&project: LinkedNullProject, state: LinkedNullState, &node: Node, id: int, depth: int): LinkedNullExpression! {
@@ -213,7 +211,7 @@ fn readLinkedIndex(&project: LinkedNullProject, state: LinkedNullState, &node: N
     index.state.code = index.state.code + "    int64_t " + offset.clone() + " = " + index.value.text + ";\n"
         + "    if (" + offset.clone() + " < 0 || (uint64_t)" + offset.clone() + " >= " + header.clone() + "->len) {\n"
         + "        index_failed = true; failure_index = " + offset.clone() + "; failure_length = " + header.clone() + "->len; goto cleanup;\n    }\n"
-    item = linkedValue(index.state, LinkedNullArrayElement(array.value.ty), header + "->data[" + offset + "]")
+    item = LinkedReadonlyExpression(index.state, LinkedNullArrayElement(array.value.ty), header + "->data[" + offset + "]")
     if (item.value.ty.declaration_kind == "Builtin") {
         item.state.code += "    if (" + item.value.text.clone() + ".len && !" + item.value.text.clone()
             + ".ptr) { invalid_array = true; goto cleanup; }\n"
@@ -228,16 +226,16 @@ fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: N
     if (ty.declaration_kind != "Struct") {
         RejectLayout("linked_field_type", "expected a readonly struct field receiver", DeclarationSpan(node))?
     }
-    layout = LayoutIndex(receiver.state.layouts, ty.module_index, ty.declaration_node)
-    ordinal = FieldIndex(receiver.state.layouts[layout - 1].fields, node.text)
+    fields = LinkedRecordFields(receiver.state.layouts, receiver.state.owning_layouts, ty)?
+    ordinal = FieldIndex(fields, node.text)
     if (ordinal == 0) {
         RejectLayout("linked_unknown_field", "unknown field '" + node.text.clone() + "'", DeclarationSpan(node))?
     }
-    field_type = receiver.state.layouts[layout - 1].fields[ordinal - 1].resolved.clone()
+    field_type = fields[ordinal - 1].resolved.clone()
     if (field_type.declaration_kind == "StructArray" || field_type.declaration_kind == "BuiltinArray") {
         RejectLayout("linked_nested_array_projection", "a nested owning array field does not yet support projection", DeclarationSpan(node))?
     }
-    field = linkedValue(receiver.state, field_type, receiver.value.text + ".f" + str(ordinal - 1))
+    field = LinkedReadonlyExpression(receiver.state, field_type, receiver.value.text + ".f" + str(ordinal - 1))
     field.value.borrowed = LinkedNullOwner(field.value.ty)
     return ok(field)
 }
@@ -260,14 +258,14 @@ fn readLinkedBinary(&project: LinkedNullProject, state: LinkedNullState, &node: 
     }
     if (logical && left.value.ty.name == "bool") {
         right.state.code += "    " + result.clone() + " = " + right.value.text + ";\n    }\n"
-        return ok(linkedValue(right.state, LinkedBuiltin("bool", DeclarationSpan(node)), result))
+        return ok(LinkedReadonlyExpression(right.state, LinkedBuiltin("bool", DeclarationSpan(node)), result))
     }
     equality = op == "==" || op == "!="
     if (left.value.ty.name == "str" && equality) {
         right.state.uses_string_equal = true
         compare = "ku_guard_string_equal(" + left.value.text + ", " + right.value.text + ")"
         if (op == "!=") { compare = "!" + compare }
-        return ok(linkedValue(right.state, LinkedBuiltin("bool", DeclarationSpan(node)), compare))
+        return ok(LinkedReadonlyExpression(right.state, LinkedBuiltin("bool", DeclarationSpan(node)), compare))
     }
     if (left.value.ty.name == "str" && op == "+") {
         output = AddLinkedNullSlot(project, right.state, "", "t" + str(id), left.value.ty, false)?
@@ -284,15 +282,15 @@ fn readLinkedBinary(&project: LinkedNullProject, state: LinkedNullState, &node: 
         right.state.code = right.state.code + "    int64_t " + out.clone() + ";\n"
             + "    if (!ku_guard_try_" + operation + "(" + left.value.text + ", " + right.value.text + ", &"
             + out.clone() + ")) { overflow = true; goto cleanup; }\n"
-        return ok(linkedValue(right.state, LinkedBuiltin("int", DeclarationSpan(node)), out))
+        return ok(LinkedReadonlyExpression(right.state, LinkedBuiltin("int", DeclarationSpan(node)), out))
     }
     integer_comparison = left.value.ty.name == "int" && (equality || op == "<" || op == ">" || op == "<=" || op == ">=")
     if (integer_comparison || (left.value.ty.name == "bool" && equality)) {
-        return ok(linkedValue(right.state, LinkedBuiltin("bool", DeclarationSpan(node)),
+        return ok(LinkedReadonlyExpression(right.state, LinkedBuiltin("bool", DeclarationSpan(node)),
             "(" + left.value.text + " " + op + " " + right.value.text + ")"))
     }
     RejectLayout("linked_binary_type", "unsupported readonly scalar operation", DeclarationSpan(node))?
-    return ok(linkedValue(right.state, LinkedBuiltin("", DeclarationSpan(node)), ""))
+    return ok(LinkedReadonlyExpression(right.state, LinkedBuiltin("", DeclarationSpan(node)), ""))
 }
 
 fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpression! {
@@ -300,16 +298,16 @@ fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpressio
     if (node.kind == "Variable" && node.edge_count == 0) { return ReadLinkedNullBinding(state, node) }
     if (node.kind == "String" && node.edge_count == 0) {
         value = "(KuProjectionString){(uint8_t*)" + ScalarStringLiteral(node)? + ", 0u, KU_PROJECTION_STRING_STATIC}"
-        return ok(linkedValue(state, LinkedBuiltin("str", at), value))
+        return ok(LinkedReadonlyExpression(state, LinkedBuiltin("str", at), value))
     }
     if (node.kind == "Bool" && node.edge_count == 0 && (node.text == "true" || node.text == "false")) {
-        return ok(linkedValue(state, LinkedBuiltin("bool", at), node.text.clone()))
+        return ok(LinkedReadonlyExpression(state, LinkedBuiltin("bool", at), node.text.clone()))
     }
     if (node.kind == "Int" && node.edge_count == 0 && node.int_value >= 0) {
-        return ok(linkedValue(state, LinkedBuiltin("int", at), "INT64_C(" + str(node.int_value) + ")"))
+        return ok(LinkedReadonlyExpression(state, LinkedBuiltin("int", at), "INT64_C(" + str(node.int_value) + ")"))
     }
     RejectLayout("unsupported_linked_operand", "expected a bound value, literal or checked direct call", at.clone())?
-    return ok(linkedValue(state, LinkedBuiltin("", at), ""))
+    return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", at), ""))
 }
 
 fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding): str! {

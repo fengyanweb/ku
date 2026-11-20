@@ -9,7 +9,7 @@ import { ContainsType, CTypeName } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
-import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, LinkedFsReadReference, LinkedNullBinding, LinkedNullFunction, LinkedNullSlot, LinkedNullOwnedArray, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, LinkedFsReadReference, LinkedNullBinding, LinkedNullFunction, LinkedNullSlot, LinkedNullOwnedArray, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -98,8 +98,12 @@ fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view
             ty.declaration_kind = "StringView"
             return ok(ty)
         }
+        if (ty.declaration_kind == "Struct") {
+            ty.declaration_kind = "StructView"
+            return ok(ty)
+        }
     }
-    RejectLayout("linked_entry_view", "expected a borrowed str or readonly array of strings or bound structs", DeclarationSpan(node))?
+    RejectLayout("linked_entry_view", "expected a readonly str, named struct or supported array", DeclarationSpan(node))?
     return ok(LinkedBuiltin("", DeclarationSpan(node)))
 }
 
@@ -119,15 +123,6 @@ fn LinkedNullArrayType(&binding: TypeNameBinding): str {
     return "KuArray_" + CTypeName(binding.module_index, binding.declaration_node)
 }
 
-fn LinkedNullReadableArray(&type: TypeNameBinding): bool {
-    return type.declaration_kind == "StructArray" || type.declaration_kind == "BuiltinArray" || LinkedNullOwnedArray(type)
-}
-
-fn LinkedNullArrayHeader(&type: TypeNameBinding, &value: str): str {
-    if (LinkedNullOwnedArray(type)) { return "(&" + value.clone() + ")" }
-    return value.clone()
-}
-
 fn LinkedStringResult(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Builtin" && binding.name == "str"
 }
@@ -141,6 +136,9 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
     if (binding.declaration_kind == "BuiltinArray") { return ok("const KuGuardStringArray*") }
     if (binding.declaration_kind == "StringView") { return ok("const KuProjectionString*") }
     if (binding.declaration_kind == "Struct") { return ok(CTypeName(binding.module_index, binding.declaration_node)) }
+    if (binding.declaration_kind == "StructView") {
+        return ok("const " + CTypeName(binding.module_index, binding.declaration_node) + "*")
+    }
     if (binding.declaration_kind == "StructArray") {
         return ok("const " + LinkedNullArrayType(binding) + "*")
     }
@@ -192,6 +190,7 @@ fn LinkedNullResultCleanupReference(&owning_layouts: [StructLayout], &result: Ty
 
 fn LinkedNullView(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "StructArray" || binding.declaration_kind == "BuiltinArray" || binding.declaration_kind == "StringView"
+        || binding.declaration_kind == "StructView"
 }
 
 fn LinkedNullParameterPlan(&binding: TypeNameBinding, unit: int): LinkPlanType! {
@@ -199,7 +198,8 @@ fn LinkedNullParameterPlan(&binding: TypeNameBinding, unit: int): LinkPlanType! 
     if (binding.declaration_kind == "StringView") {
         return ok(BuiltinLinkPlanType("str", LinkedNullCType(binding)?, true))
     }
-    return ok(BoundLinkPlanType(binding, unit, LinkedNullCType(binding)?, LinkedNullView(binding)))
+    type = LinkedViewPointee(binding.clone())
+    return ok(BoundLinkPlanType(type, unit, LinkedNullCType(binding)?, LinkedNullView(binding)))
 }
 
 fn LinkedNullLayout(&project: LinkedNullProject, &ty: TypeNameBinding, layouts: [StructLayout], depth: int): [StructLayout]! {
