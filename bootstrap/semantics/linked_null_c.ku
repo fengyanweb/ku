@@ -1,3 +1,4 @@
+import { ReadLinkedNullParameters } from "./linked_parameters_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
 import { MoveLinkedNullSlot } from "./linked_member_ownership.ku"
@@ -9,10 +10,9 @@ import { TypeNameBinding } from "./type_names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
-import { ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullFunction, LinkedNullRegion, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NewLinkedNullState, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
+import { ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullFunction, LinkedNullRegion, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedCheckedResultPlan, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
-         LinkedNullNode, LinkedNullParameterPlan, LinkedNullParameterType,
-         LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
+         LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, BindLinkedCatch, DropLinkedNullScope, EmitLinkedNullDeclarations, LowerLinkedArrayLocal, LowerLinkedNullRead,
          RegisterLinkedNullType } from "./linked_null_read_c.ku"
 import { LowerLinkedArrayAppend, LowerLinkedSuccess,
@@ -24,57 +24,6 @@ struct LinkedNullC {
     links: [LinkedNullFunction]
     source: str
     entry_plan: LinkPlanDeclaration
-}
-
-struct LinkedNullParameters {
-    state: LinkedNullState
-    signature: str
-    body_start: int
-    plan: [LinkPlanType]
-    result: TypeNameBinding
-}
-
-fn readParameters(&project: LinkedNullProject, &function: Node): LinkedNullParameters! {
-    state = NewLinkedNullState()
-    signature = ""
-    plan: [LinkPlanType] = []
-    index = 0
-    validation = ""
-    while (index < function.edge_count) {
-        node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
-        if (node.kind != "Parameter") { break }
-        if (node.edge_count != 1 || node.int_value < 0 || node.int_value > 1 || LinkedNullBinding(state.slots, node.text) != 0) {
-            RejectLayout("linked_entry_parameter", "expected distinct explicitly typed parameters", DeclarationSpan(node))?
-        }
-        view = node.int_value == 1
-        ty = LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, node, 0), view)?
-        name = "a" + str(index)
-        if (index != 0) { signature += ", " }
-        c_type = LinkedNullCType(ty)?
-        signature += c_type.clone() + " " + name.clone()
-        plan = plan.push(LinkedNullParameterPlan(ty, 1)?)
-        if (ty.declaration_kind == "StringView") {
-            validation += "    if (!" + name.clone() + " || (" + name.clone() + "->len && !" + name.clone()
-                + "->ptr)) { invalid_str = true; goto cleanup; }\n"
-        } else if (ty.declaration_kind == "StructView") {
-            validation += "    if (!" + name.clone() + ") { invalid_struct_view = true; goto cleanup; }\n"
-        } else if (view) {
-            validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(" + name.clone() + ") || (uintmax_t)"
-                + name.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
-        }
-        slot = AddLinkedNullSlot(project, state, node.text, name.clone(), ty, true)?
-        state = slot.state
-        state.code = state.code + "    (void)" + name + ";\n"
-        index = index + 1
-    }
-    if (index >= function.edge_count - 1) {
-        RejectLayout("linked_null_signature", "entry requires a declared null! result and a body", DeclarationSpan(function))?
-    }
-    result = ReadLinkedResult(project, 1, LinkedNullChild(project, 1, function, index), true)?
-    if (index == 0) { signature = "void" }
-    state.code = state.code + validation
-    state = RegisterLinkedNullType(project, state, result.clone())?
-    return ok(LinkedNullParameters { state: state, signature: signature, body_start: index + 1, plan: plan, result: result })
 }
 
 fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
@@ -362,7 +311,7 @@ fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! 
     project = LinkedNullProject { supplied: supplied.clone(), binding: bound }
     id = LinkedNullEntry(project, entry_name)?
     function = LinkedNullNode(project, 1, id)
-    parameters = readParameters(project, function)?
+    parameters = ReadLinkedNullParameters(project, function)?
     result = parameters.result.clone()
     region = lowerLinkedRegion(project, function, parameters.state, parameters.body_start, result, 0)?
     if (!region.terminal) {

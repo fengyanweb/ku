@@ -1,0 +1,59 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan } from "./names.ku"
+import { TypeNameBinding } from "./type_names.ku"
+import { RejectLayout } from "./struct_layouts.ku"
+import { LinkedNullBinding, LinkedNullState, LinkPlanType, NewLinkedNullState } from "./link_plan_c.ku"
+import { LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullParameterPlan,
+         LinkedNullParameterType, LinkedNullProject, ReadLinkedResult } from "./linked_null_types_c.ku"
+import { AddLinkedNullSlot, RegisterLinkedNullType } from "./linked_null_read_c.ku"
+
+struct LinkedNullParameters {
+    state: LinkedNullState
+    signature: str
+    body_start: int
+    plan: [LinkPlanType]
+    result: TypeNameBinding
+}
+
+fn ReadLinkedNullParameters(&project: LinkedNullProject, &function: Node): LinkedNullParameters! {
+    state = NewLinkedNullState()
+    signature = ""
+    plan: [LinkPlanType] = []
+    index = 0
+    validation = ""
+    while (index < function.edge_count) {
+        node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
+        if (node.kind != "Parameter") { break }
+        if (node.edge_count != 1 || node.int_value < 0 || node.int_value > 1 || LinkedNullBinding(state.slots, node.text) != 0) {
+            RejectLayout("linked_entry_parameter", "expected distinct explicitly typed parameters", DeclarationSpan(node))?
+        }
+        view = node.int_value == 1
+        ty = LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, node, 0), view)?
+        name = "a" + str(index)
+        if (index != 0) { signature += ", " }
+        c_type = LinkedNullCType(ty)?
+        signature += c_type.clone() + " " + name.clone()
+        plan = plan.push(LinkedNullParameterPlan(ty, 1)?)
+        if (ty.declaration_kind == "StringView") {
+            validation += "    if (!" + name.clone() + " || (" + name.clone() + "->len && !" + name.clone()
+                + "->ptr)) { invalid_str = true; goto cleanup; }\n"
+        } else if (ty.declaration_kind == "StructView") {
+            validation += "    if (!" + name.clone() + ") { invalid_struct_view = true; goto cleanup; }\n"
+        } else if (view) {
+            validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(" + name.clone() + ") || (uintmax_t)"
+                + name.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
+        }
+        slot = AddLinkedNullSlot(project, state, node.text, name.clone(), ty, true)?
+        state = slot.state
+        state.code = state.code + "    (void)" + name + ";\n"
+        index = index + 1
+    }
+    if (index >= function.edge_count - 1) {
+        RejectLayout("linked_null_signature", "entry requires a declared null! result and a body", DeclarationSpan(function))?
+    }
+    result = ReadLinkedResult(project, 1, LinkedNullChild(project, 1, function, index), true)?
+    if (index == 0) { signature = "void" }
+    state.code = state.code + validation
+    state = RegisterLinkedNullType(project, state, result.clone())?
+    return ok(LinkedNullParameters { state: state, signature: signature, body_start: index + 1, plan: plan, result: result })
+}
