@@ -3875,19 +3875,31 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 self.set_init(out, *dst, true);
             }
             TaskOp::RecordMake { dst, elements } => {
-                let IrType::Named(name) = self.slot_type(*dst)? else {
-                    return Err(unsupported("Task RecordMake requires a record layout"));
+                let ty = self.slot_type(*dst)?;
+                let layout = if crate::ir::task::error_type(ty) {
+                    None
+                } else {
+                    let IrType::Named(name) = ty else {
+                        return Err(unsupported("Task RecordMake requires a record layout"));
+                    };
+                    Some(
+                        self.layouts
+                            .structs
+                            .iter()
+                            .find(|layout| layout.name == *name)
+                            .ok_or_else(|| unsupported("missing Task record layout"))?,
+                    )
                 };
-                let layout = self
-                    .layouts
-                    .structs
-                    .iter()
-                    .find(|layout| layout.name == *name)
-                    .ok_or_else(|| unsupported("missing Task record layout"))?;
                 let destination = self.place(*dst);
-                for (field, source) in layout.fields.iter().zip(elements) {
-                    let value = c_move_value(&field.ty, &self.place(*source))?;
-                    let member = super::c_ident(&field.name);
+                for (index, source) in elements.iter().enumerate() {
+                    let (member, ty) = match layout {
+                        Some(layout) => {
+                            let field = &layout.fields[index];
+                            (super::c_ident(&field.name), &field.ty)
+                        }
+                        None => (crate::ir::ERROR_FIELDS[index].to_owned(), &IrType::Str),
+                    };
+                    let value = c_move_value(ty, &self.place(*source))?;
                     out.push_str(&format!("  {destination}.{member}={value};\n"));
                     if self.owns_slot(*source) {
                         self.set_init(out, *source, false);

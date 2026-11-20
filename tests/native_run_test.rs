@@ -659,6 +659,122 @@ fn run_binary_with_object_oom(
 }
 
 #[test]
+fn native_task_inline_error_passes_through_imported_callable() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    let directory = Cleanup(unique_temp_dir("task-inline-error"));
+    let dir = &directory.0;
+    fs::write(
+        dir.join("helpers.ku"),
+        r#"
+import time from "std.time"
+
+async fn Field(marker: int, value: str): str! {
+    time.sleep(2)?
+    println(marker)
+    return ok(value + "!")
+}
+async fn Stop(): str! {
+    time.sleep(2)?
+    println(5)
+    fail "prefix stops here"
+}
+async fn Input(mode: int): [str]! {
+    if (mode == 0) {
+        fail {
+            message: (await Field(1, "no input"))?,
+            domain: (await Field(2, "spec"))?,
+            code: (await Field(3, "rejected"))?
+        }
+    }
+    if (mode == 1) {
+        fail {
+            message: (await Field(4, "drop this"))?,
+            domain: (await Stop())?,
+            code: (await Field(6, "unreachable"))?
+        }
+    }
+    return ok(["愿🙂"])
+}
+async fn Echo(values: [str]!): [str]! { return values }
+async fn Apply(callback: async fn([str]!): [str]!, mode: int): [str]! {
+    return await callback(await Input(mode))
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("main.ku"),
+        r#"
+import { Echo, Apply } from "./helpers"
+async fn main(): null! {
+    try { (await Apply(Echo, 0))? } catch(error) {
+        println(error.domain)
+        println(error.code)
+        println(error.message)
+    }
+    try { (await Apply(Echo, 1))? } catch(error) { println(error.message) }
+    result = (await Apply(Echo, 2))?
+    for item in result { println(item) }
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let expected = "1\n2\n3\nspec!\nrejected!\nno input!\n4\n5\nprefix stops here\n愿🙂\n";
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(dir).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS).unwrap();
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout).replace('\r', ""),
+        expected
+    );
+
+    let executable = exe_name("inline-error");
+    let mut build = Command::new(ku_binary());
+    build
+        .current_dir(dir)
+        .args(["build", "--release", "main.ku", "-o", &executable]);
+    let built = run_bounded(&mut build, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS).unwrap();
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    if !built.status.success() && diagnostics.contains("C compiler not found") {
+        assert!(env::var_os("GITHUB_ACTIONS").is_none(), "{diagnostics}");
+        return;
+    }
+    assert!(built.status.success(), "{diagnostics}");
+    let generated =
+        fs::read_to_string(native_generated_c_profile(dir, "inline-error", "release")).unwrap();
+    for field in ["domain", "code", "message"] {
+        assert!(generated.contains(&format!(".{field}=ku_string_move(")));
+    }
+    let mut run = Command::new(dir.join(executable));
+    run.current_dir(dir);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        expected
+    );
+}
+
+#[test]
 fn native_dynamic_http_server_config_rejects_unknown_fields() {
     let dir = unique_temp_dir("http-dynamic-config");
     fs::write(

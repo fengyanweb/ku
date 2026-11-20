@@ -2851,45 +2851,32 @@ impl<'a> FunctionLowerer<'a> {
     /// direct/try lowering tells its backend that this is `fail`, not `err`.
     /// An existing Error keeps its original domain and code.
     fn lower_error_expr(&mut self, value: &Expr) -> KuResult<IrExpr> {
-        if let ExprKind::ObjectLiteral { fields } = &value.kind {
-            let mut domain = None;
-            let mut code = None;
-            let mut message = None;
-            for (index, (name, _)) in fields.iter().enumerate() {
-                match name.as_str() {
-                    "domain" => domain = Some(index),
-                    "code" => code = Some(index),
-                    "message" => message = Some(index),
-                    _ => {}
-                }
+        if let Some(InlineErrorFields {
+            fields,
+            layout_order: [domain, code, message],
+        }) = inline_error_fields(value)
+        {
+            // Freeze fields in source order before rearranging the Error ABI.
+            let mut values = Vec::with_capacity(fields.len());
+            for (_, value) in fields {
+                let value = self.lower_expr(value)?;
+                values.push(self.emit_temp(value)?);
             }
-            if let (Some(domain), Some(code), Some(message)) = (domain, code, message) {
-                if fields.len() == 3 {
-                    // Object fields evaluate in source order. Freeze each value
-                    // before later callbacks, then arrange the already-owned
-                    // temps for the fixed domain/code/message ABI.
-                    let mut values = Vec::with_capacity(fields.len());
-                    for (_, value) in fields {
-                        let value = self.lower_expr(value)?;
-                        values.push(self.emit_temp(value)?);
-                    }
-                    return Ok(IrExpr {
-                        kind: IrExprKind::Call {
-                            callee: Box::new(IrExpr {
-                                kind: IrExprKind::Local("__ku_error_make".to_string()),
-                                ty: IrType::Function,
-                            }),
-                            args: vec![
-                                values[domain].clone(),
-                                values[code].clone(),
-                                values[message].clone(),
-                            ],
-                            kind: IrCallKind::Intrinsic("__ku_error_make".to_string()),
-                        },
-                        ty: error_ir_type(),
-                    });
-                }
-            }
+            return Ok(IrExpr {
+                kind: IrExprKind::Call {
+                    callee: Box::new(IrExpr {
+                        kind: IrExprKind::Local("__ku_error_make".to_string()),
+                        ty: IrType::Function,
+                    }),
+                    args: vec![
+                        values[domain].clone(),
+                        values[code].clone(),
+                        values[message].clone(),
+                    ],
+                    kind: IrCallKind::Intrinsic("__ku_error_make".to_string()),
+                },
+                ty: error_ir_type(),
+            });
         }
         self.lower_expr(value)
     }
@@ -6374,6 +6361,31 @@ fn zero_expr(ty: IrType) -> IrExpr {
         kind: IrExprKind::Literal("<native-zero>".to_string()),
         ty,
     }
+}
+
+pub(crate) const ERROR_FIELDS: [&str; 3] = ["domain", "code", "message"];
+
+struct InlineErrorFields<'a> {
+    fields: &'a [(String, Expr)],
+    layout_order: [usize; 3],
+}
+
+fn inline_error_fields(value: &Expr) -> Option<InlineErrorFields<'_>> {
+    let ExprKind::ObjectLiteral { fields } = &value.kind else {
+        return None;
+    };
+    if fields.len() != ERROR_FIELDS.len() {
+        return None;
+    }
+    let mut indices = [None; ERROR_FIELDS.len()];
+    for (index, (name, _)) in fields.iter().enumerate() {
+        let offset = ERROR_FIELDS.iter().position(|field| *field == name)?;
+        indices[offset] = Some(index);
+    }
+    Some(InlineErrorFields {
+        fields,
+        layout_order: [indices[0]?, indices[1]?, indices[2]?],
+    })
 }
 
 fn error_ir_type() -> IrType {

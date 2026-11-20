@@ -973,6 +973,54 @@ impl<'a> FunctionLowerer<'a> {
         Ok(())
     }
 
+    fn fail_payload(&mut self, value: &Expr, span: Span, depth: usize) -> KuResult<SlotId> {
+        if let Some(super::InlineErrorFields {
+            fields,
+            layout_order,
+        }) = super::inline_error_fields(value)
+        {
+            self.budget.expression(depth, value.span)?;
+            self.budget.analysis(fields.len(), value.span)?;
+            let string = value_slot(IrType::Str);
+            let mut sources = Vec::with_capacity(fields.len());
+            for (name, expression) in fields {
+                self.budget.text(name.len(), expression.span)?;
+                let source = self.expression(expression, depth + 1)?;
+                let source = self.copy_or_move(source)?;
+                if self.function.slots[source.0].ty != string {
+                    return Err(unsupported(
+                        &format!("non-str Error field {name}"),
+                        expression.span,
+                    ));
+                }
+                sources.push(source);
+            }
+            let dst = self.slot(value_slot(super::error_ir_type()))?;
+            let elements = layout_order.map(|index| sources[index]).into();
+            self.emit(TaskOp::RecordMake { dst, elements })?;
+            return Ok(dst);
+        }
+
+        let mut source = self.expression(value, depth)?;
+        if self.nullable_views.contains_key(&source) {
+            source = self.copy_or_move(source)?;
+        }
+        if self.function.slots[source.0].ty == value_slot(IrType::Str) {
+            let dst = self.slot(value_slot(super::error_ir_type()))?;
+            self.emit(TaskOp::MakeError {
+                dst,
+                message: source,
+            })?;
+            Ok(dst)
+        } else if matches!(&self.function.slots[source.0].ty,
+            TaskSlotType::Value { ty, .. } if task::error_type(ty))
+        {
+            Ok(source)
+        } else {
+            Err(unsupported("fail of a value other than str or Error", span))
+        }
+    }
+
     fn raise_error(&mut self, error: SlotId) -> KuResult<()> {
         let leaves_finally =
             self.in_finally_body && self.handlers.len() <= self.finally_body_handler_depth;
@@ -3638,27 +3686,7 @@ impl<'a> FunctionLowerer<'a> {
                             continue;
                         }
                     }
-                    let mut source = self.expression(value, depth)?;
-                    if self.nullable_views.contains_key(&source) {
-                        source = self.copy_or_move(source)?;
-                    }
-                    let error = if self.function.slots[source.0].ty == value_slot(IrType::Str) {
-                        let error = self.slot(value_slot(super::error_ir_type()))?;
-                        self.emit(TaskOp::MakeError {
-                            dst: error,
-                            message: source,
-                        })?;
-                        error
-                    } else if matches!(&self.function.slots[source.0].ty,
-                        TaskSlotType::Value { ty, .. } if task::error_type(ty))
-                    {
-                        source
-                    } else {
-                        return Err(unsupported(
-                            "fail of a value other than str or Error",
-                            *span,
-                        ));
-                    };
+                    let error = self.fail_payload(value, *span, depth)?;
                     self.raise_error(error)?;
                 }
                 Stmt::Print { value, .. } => {

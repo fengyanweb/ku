@@ -1681,24 +1681,34 @@ fn validate_shape(
                     budget.spend_many(elements.len())?;
                     let (ty, borrowed) = slot_type(get_slot(*dst)?)?;
                     let layout = match ty {
-                        IrType::Named(name) if record_type(ty) => {
-                            layouts.structs.iter().find(|layout| layout.name == *name)
-                        }
-                        _ => None,
-                    }
-                    .ok_or_else(|| invalid("RecordMake requires a checked named layout"))?;
-                    if borrowed || elements.len() != layout.fields.len() {
+                        _ if error_type(ty) => None,
+                        IrType::Named(name) if record_type(ty) => Some(
+                            layouts
+                                .structs
+                                .iter()
+                                .find(|layout| layout.name == *name)
+                                .ok_or_else(|| {
+                                    invalid("RecordMake requires a checked named layout")
+                                })?,
+                        ),
+                        _ => return Err(invalid("RecordMake requires a checked named layout")),
+                    };
+                    let len =
+                        layout.map_or(super::ERROR_FIELDS.len(), |layout| layout.fields.len());
+                    if borrowed || elements.len() != len {
                         return Err(invalid("RecordMake layout mismatch"));
                     }
                     let mut moved = 0;
-                    for (field, source) in layout.fields.iter().zip(elements) {
+                    for (index, source) in elements.iter().enumerate() {
+                        let expected =
+                            layout.map_or(&IrType::Str, |layout| &layout.fields[index].ty);
                         if source == dst
-                            || slot_type(get_slot(*source)?)? != (&field.ty, false)
-                            || (!copy_type(&field.ty) && moved & bit(*source) != 0)
+                            || slot_type(get_slot(*source)?)? != (expected, false)
+                            || (!copy_type(expected) && moved & bit(*source) != 0)
                         {
                             return Err(invalid("RecordMake field type or ownership mismatch"));
                         }
-                        if !copy_type(&field.ty) {
+                        if !copy_type(expected) {
                             moved |= bit(*source);
                         }
                     }
