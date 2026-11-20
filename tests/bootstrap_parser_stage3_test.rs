@@ -3895,8 +3895,17 @@ fn ExpectBodyCallbackOutputError(tokens: [Token], body_start: int): null! {
     assert!(native_c.contains("int main("));
     assert!(!native_c.contains("const SOURCE"));
     assert!(!native_c.contains("run_source"));
+    let uses_scanner_window = native_c.lines().any(|line| {
+        line.contains("_ParseTokenWindow(") && line.contains("&window") && line.contains(", true)")
+    });
+    let slices_source = native_c.lines().any(|line| {
+        line.contains("ku_string_slice(")
+            && !line
+                .trim_start()
+                .starts_with("static KuResult_str ku_string_slice(")
+    });
     assert!(
-        native_c.contains("_ParseTokenWindow(") && !native_c.contains("ku_string_slice("),
+        uses_scanner_window && !slices_source,
         "Stage 3 must parse bounded windows of the original tokens"
     );
 
