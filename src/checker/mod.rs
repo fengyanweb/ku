@@ -443,6 +443,86 @@ struct FunctionValueBodyRef<'a> {
     body_id: Option<FunctionBodyId>,
 }
 
+#[derive(Debug, Default)]
+struct AnonymousReturnEvidence {
+    payload: Option<Type>,
+    has_null: bool,
+    unsupported: bool,
+    reachable_catches: HashSet<usize>,
+}
+
+impl AnonymousReturnEvidence {
+    fn observe(&mut self, ty: &Type) {
+        let payload = match ty {
+            Type::Null | Type::Void => {
+                self.has_null = true;
+                return;
+            }
+            Type::Union(parts) => match parts.as_slice() {
+                [Type::Null, payload] | [payload, Type::Null] => payload,
+                _ => {
+                    self.unsupported = true;
+                    return;
+                }
+            },
+            ty => ty,
+        };
+        if !matches!(payload, Type::Int | Type::Float | Type::Bool | Type::String)
+            || self
+                .payload
+                .as_ref()
+                .is_some_and(|previous| previous != payload)
+        {
+            self.unsupported = true;
+        } else if self.payload.is_none() {
+            self.payload = Some(payload.clone());
+        }
+    }
+
+    fn nullable_type(self, falls_through: bool) -> Option<Type> {
+        if self.unsupported || !(self.has_null || falls_through) {
+            return None;
+        }
+        self.payload
+            .map(|payload| Type::Union(vec![payload, Type::Null]))
+    }
+
+    fn stmt_falls_through(&self, stmt: &Stmt) -> bool {
+        let block_falls_through =
+            |body: &[Stmt]| body.iter().all(|stmt| self.stmt_falls_through(stmt));
+        match stmt {
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => block_falls_through(then_branch) || block_falls_through(else_branch),
+            Stmt::Try {
+                body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                block_falls_through(finally_body)
+                    && (block_falls_through(body)
+                        || (self
+                            .reachable_catches
+                            .contains(&(stmt as *const Stmt as usize))
+                            && block_falls_through(catch_body)))
+            }
+            // The native IR considers both exits of a loop condition before
+            // optimization.
+            Stmt::While { .. } => true,
+            _ => !stmt_stops_fallthrough(stmt),
+        }
+    }
+}
+
+fn has_scalar_nullable_payload(ty: &Type) -> bool {
+    matches!(ty, Type::Union(parts) if matches!(parts.as_slice(),
+        [Type::Null, Type::Int | Type::Float | Type::Bool | Type::String]
+        | [Type::Int | Type::Float | Type::Bool | Type::String, Type::Null]))
+}
+
 #[derive(Debug, Clone)]
 struct FunctionType {
     type_params: Vec<String>,
@@ -525,6 +605,9 @@ pub struct Checker {
     readonly_capture: Option<ReadonlyCapture>,
     std_modules: HashSet<String>,
     function_value_inference_stack: Vec<FunctionBodyId>,
+    /// Inference for one unannotated anonymous function. Sibling and nested
+    /// function bodies must not contribute returns to it.
+    anonymous_return_evidence: Option<AnonymousReturnEvidence>,
     /// Bodies currently re-audited below an outer read-only execution boundary.
     /// This guard is independent from return inference because annotated direct
     /// and mutually recursive FunctionValues must terminate too.
@@ -570,6 +653,7 @@ impl Checker {
             readonly_capture: None,
             std_modules: HashSet::new(),
             function_value_inference_stack: Vec::new(),
+            anonymous_return_evidence: None,
             readonly_function_body_stack: Vec::new(),
             next_function_body_id: 1,
             next_binding_id: 1,
@@ -1521,6 +1605,16 @@ impl Checker {
                     // snapshots. In particular, do not merge the raw throw state
                     // into finally after a catch has re-initialized a value.
                     let catch_reachable = !body_throws.is_empty();
+                    let dead_catch_evidence = if catch_reachable {
+                        if let Some(evidence) = &mut self.anonymous_return_evidence {
+                            evidence
+                                .reachable_catches
+                                .insert(stmt as *const Stmt as usize);
+                        }
+                        None
+                    } else {
+                        self.anonymous_return_evidence.take()
+                    };
                     self.scopes = if catch_reachable {
                         merge_moved_scope_paths(before.clone(), &body_throws)
                     } else {
@@ -1547,6 +1641,9 @@ impl Checker {
                         Ok(())
                     })();
                     self.pop_scope();
+                    if let Some(evidence) = dead_catch_evidence {
+                        self.anonymous_return_evidence = Some(evidence);
+                    }
                     let catch_end = self.scopes.clone();
                     if let Err(error) = catch_result {
                         self.try_exit_collectors.pop();
@@ -1666,6 +1763,7 @@ impl Checker {
                 if !type_matches(&self.current_return, &actual) {
                     return Err(type_error(*span, &self.current_return, &actual));
                 }
+                self.observe_anonymous_return(&actual);
                 self.capture_try_exit(TryExitKind::Return);
                 Ok(())
             }
@@ -2698,13 +2796,16 @@ impl Checker {
         let captured_names = checker_closure_capture_names(params, body, &visible_names);
         self.reject_borrowed_captures(&captured_names, span)?;
         self.record_function_body_outer_bindings(body_id, &captured_names);
-        let inferred = self.check_function_value_body(
-            &resolved_params,
-            own_return.as_deref(),
-            body,
-            Some(body_id),
+        let inferred = self.check_function_value_body_impl(
+            FunctionValueBodyRef {
+                params: &resolved_params,
+                return_type: own_return.as_deref(),
+                body,
+                body_id: Some(body_id),
+            },
             &arg_types,
             span,
+            own_return.is_none(),
         );
         self.async_depth = saved_async_depth;
         let inferred = inferred?;
@@ -5051,6 +5152,32 @@ impl Checker {
         arg_types: &[Type],
         span: Span,
     ) -> KuResult<Type> {
+        self.check_function_value_body_impl(
+            FunctionValueBodyRef {
+                params,
+                return_type,
+                body,
+                body_id,
+            },
+            arg_types,
+            span,
+            false,
+        )
+    }
+
+    fn check_function_value_body_impl(
+        &mut self,
+        function: FunctionValueBodyRef<'_>,
+        arg_types: &[Type],
+        span: Span,
+        infer_anonymous_nullable: bool,
+    ) -> KuResult<Type> {
+        let FunctionValueBodyRef {
+            params,
+            return_type,
+            body,
+            body_id,
+        } = function;
         let guard_inference = return_type.is_none();
         if guard_inference {
             let Some(body_id) = body_id else {
@@ -5096,6 +5223,10 @@ impl Checker {
             self.function_value_inference_stack.push(body_id);
         }
         let saved_return = self.current_return.clone();
+        let saved_anonymous_return = std::mem::replace(
+            &mut self.anonymous_return_evidence,
+            infer_anonymous_nullable.then(AnonymousReturnEvidence::default),
+        );
         let saved_loop_depth = self.loop_depth;
         let saved_recoverable_depth = self.recoverable_depth;
         // A closure executes later; its return/fail/? edges do not enter a try
@@ -5123,9 +5254,15 @@ impl Checker {
             }
 
             let mut inferred_return = Type::Null;
+            let mut reachable = true;
             for stmt in body {
-                if let Some(return_type) = self.check_stmt_and_infer_return(stmt)? {
+                if let Some(return_type) =
+                    self.check_stmt_and_infer_return_on_path(stmt, reachable)?
+                {
                     inferred_return = merge_return_types(&inferred_return, &return_type, span)?;
+                }
+                if let Some(evidence) = &self.anonymous_return_evidence {
+                    reachable &= evidence.stmt_falls_through(stmt);
                 }
             }
             if let Some(expected) = return_type {
@@ -5139,7 +5276,16 @@ impl Checker {
                     return Err(type_error(span, expected, &inferred_return));
                 }
             }
-            Ok(inferred_return)
+            Ok(self
+                .anonymous_return_evidence
+                .take()
+                .and_then(|evidence| evidence.nullable_type(reachable))
+                .or_else(|| {
+                    return_type
+                        .filter(|ty| has_scalar_nullable_payload(ty))
+                        .cloned()
+                })
+                .unwrap_or(inferred_return))
         })();
 
         // Every enclosing binding this closure reads is boxed into a shared cell
@@ -5193,6 +5339,7 @@ impl Checker {
             self.pop_scope();
         }
         self.current_return = saved_return;
+        self.anonymous_return_evidence = saved_anonymous_return;
         self.loop_depth = saved_loop_depth;
         self.recoverable_depth = saved_recoverable_depth;
         self.try_exit_collectors = saved_try_exit_collectors;
@@ -5286,6 +5433,7 @@ impl Checker {
         self.push_scope();
         self.readonly_capture = Some(effective_capture);
         let saved_return = self.current_return.clone();
+        let saved_anonymous_return = self.anonymous_return_evidence.take();
         let saved_loop_depth = self.loop_depth;
         let saved_recoverable_depth = self.recoverable_depth;
         // Handler/async bodies are separate executions too; do not report their
@@ -5331,10 +5479,15 @@ impl Checker {
                     return Err(type_error(span, expected, &inferred_return));
                 }
             }
-            Ok(inferred_return)
+            Ok(function
+                .return_type
+                .filter(|ty| has_scalar_nullable_payload(ty))
+                .cloned()
+                .unwrap_or(inferred_return))
         })();
 
         self.current_return = saved_return;
+        self.anonymous_return_evidence = saved_anonymous_return;
         self.loop_depth = saved_loop_depth;
         self.recoverable_depth = saved_recoverable_depth;
         self.try_exit_collectors = saved_try_exit_collectors;
@@ -5500,6 +5653,7 @@ impl Checker {
                 if !type_matches(&self.current_return, &actual) {
                     return Err(type_error(*span, &self.current_return, &actual));
                 }
+                self.observe_anonymous_return(&actual);
                 self.capture_try_exit(TryExitKind::Return);
                 Ok(Some(actual))
             }
@@ -5580,16 +5734,44 @@ impl Checker {
     fn check_block_and_infer_return(&mut self, body: &[Stmt]) -> KuResult<Option<Type>> {
         self.push_scope();
         let mut inferred = None;
+        let mut reachable = true;
         for stmt in body {
-            if let Some(return_type) = self.check_stmt_and_infer_return(stmt)? {
+            if let Some(return_type) = self.check_stmt_and_infer_return_on_path(stmt, reachable)? {
                 inferred = Some(match inferred {
                     Some(existing) => merge_return_types(&existing, &return_type, stmt_span(stmt))?,
                     None => return_type,
                 });
             }
+            if let Some(evidence) = &self.anonymous_return_evidence {
+                reachable &= evidence.stmt_falls_through(stmt);
+            }
         }
         self.pop_scope();
         Ok(inferred)
+    }
+
+    fn observe_anonymous_return(&mut self, actual: &Type) {
+        if self.loop_analysis_depth == 0 {
+            if let Some(evidence) = &mut self.anonymous_return_evidence {
+                evidence.observe(actual);
+            }
+        }
+    }
+
+    fn check_stmt_and_infer_return_on_path(
+        &mut self,
+        stmt: &Stmt,
+        reachable: bool,
+    ) -> KuResult<Option<Type>> {
+        if reachable {
+            return self.check_stmt_and_infer_return(stmt);
+        }
+        // Keep diagnostics for dead statements from the existing checker. Only
+        // their contribution to the anonymous callable's ABI is suppressed.
+        let saved = self.anonymous_return_evidence.take();
+        let result = self.check_stmt_and_infer_return(stmt);
+        self.anonymous_return_evidence = saved;
+        result
     }
 
     fn expect_condition(&mut self, expr: &Expr, span: Span) -> KuResult<()> {

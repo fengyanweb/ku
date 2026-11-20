@@ -917,11 +917,18 @@ fn fold_binary(left: &IrExpr, op: BinaryOp, right: &IrExpr) -> Option<IrExpr> {
 }
 
 fn remove_unreachable_blocks(function: &mut IrFunction) {
-    let Some(entry) = function.blocks.first().map(|block| block.id) else {
-        return;
+    let reachable = reachable_block_ids(&function.blocks);
+    function
+        .blocks
+        .retain(|block| reachable.contains(&block.id));
+}
+
+fn reachable_block_ids(blocks: &[IrBlock]) -> HashSet<BlockId> {
+    let Some(entry) = blocks.first().map(|block| block.id) else {
+        return HashSet::new();
     };
     let mut index_by_id = HashMap::new();
-    for (index, block) in function.blocks.iter().enumerate() {
+    for (index, block) in blocks.iter().enumerate() {
         index_by_id.insert(block.id, index);
     }
     let mut stack = vec![entry];
@@ -934,15 +941,13 @@ fn remove_unreachable_blocks(function: &mut IrFunction) {
             continue;
         };
         for target in terminator_successors(
-            &function.blocks[index].terminator,
-            function.blocks.get(index + 1).map(|block| block.id),
+            &blocks[index].terminator,
+            blocks.get(index + 1).map(|block| block.id),
         ) {
             stack.push(target);
         }
     }
-    function
-        .blocks
-        .retain(|block| reachable.contains(&block.id));
+    reachable
 }
 
 fn terminator_successors(terminator: &IrTerminator, next: Option<BlockId>) -> Vec<BlockId> {
@@ -1275,6 +1280,7 @@ struct FunctionLowerer<'a> {
     layouts: &'a IrLayoutTable,
     native_fields: Rc<crate::checker::NativeFieldFacts>,
     return_type: IrType,
+    inferred_closure_returns: Option<Vec<(BlockId, IrType)>>,
     locals: HashMap<String, IrType>,
     borrowed_params: HashSet<String>,
     /// Source spellings resolve to unique C/IR names while a lexical binding is
@@ -1450,6 +1456,7 @@ impl<'a> FunctionLowerer<'a> {
             layouts,
             native_fields: Default::default(),
             return_type,
+            inferred_closure_returns: None,
             locals: HashMap::new(),
             borrowed_params: HashSet::new(),
             local_names: HashMap::new(),
@@ -1882,6 +1889,14 @@ impl<'a> FunctionLowerer<'a> {
                     .as_ref()
                     .map(|value| self.lower_expr_with_expected(value, Some(&expected)))
                     .transpose()?;
+                if let Some(returns) = &mut self.inferred_closure_returns {
+                    returns.push((
+                        self.current.id,
+                        value
+                            .as_ref()
+                            .map_or(IrType::Null, |value| value.ty.clone()),
+                    ));
+                }
                 let value = value.or_else(|| {
                     matches!(expected, IrType::Nullable(_)).then(|| zero_expr(expected))
                 });
@@ -4867,41 +4882,71 @@ impl<'a> FunctionLowerer<'a> {
             .map(|(name, ty, _)| (name.clone(), ty.clone()))
             .collect::<Vec<_>>();
 
-        let declared_return = declared_return.map(|ty| lower_type(ty, self.layouts));
-        let mut child = FunctionLowerer::new(
-            self.signatures,
-            self.layouts,
-            declared_return.clone().unwrap_or(IrType::Unknown),
-            self.next_function_id.clone(),
-            self.lifted_functions.clone(),
-            self.budget.clone(),
-            span,
-        )?;
-        child.mixed_async = self.mixed_async.clone();
-        child.native_fields = self.native_fields.clone();
-        child.captures = function_captures.iter().cloned().collect();
-        child.local_names = aliases;
-        for param in &ir_params {
-            child.locals.insert(param.name.clone(), param.ty.clone());
-        }
-        child.lower_block_body("entry", body, params)?;
+        let lower_body = |return_type, observe_returns| {
+            let mut child = FunctionLowerer::new(
+                self.signatures,
+                self.layouts,
+                return_type,
+                self.next_function_id.clone(),
+                self.lifted_functions.clone(),
+                self.budget.clone(),
+                span,
+            )?;
+            child.inferred_closure_returns = observe_returns;
+            child.mixed_async = self.mixed_async.clone();
+            child.native_fields = self.native_fields.clone();
+            child.captures = function_captures.iter().cloned().collect();
+            child.local_names = aliases.clone();
+            for param in &ir_params {
+                child.locals.insert(param.name.clone(), param.ty.clone());
+            }
+            child.lower_block_body("entry", body, params)?;
+            Ok::<_, KuError>(child)
+        };
 
-        let return_type = declared_return.unwrap_or_else(|| {
-            // With no declaration, synthetic timeout returns cannot determine
-            // the ABI ahead of a concrete source return.
-            let inferred = child
-                .blocks
-                .iter()
-                .find_map(|block| match &block.terminator {
-                    IrTerminator::Return(Some(value)) if value.ty != IrType::Unknown => {
-                        Some(value.ty.clone())
-                    }
-                    _ => None,
-                })
-                .unwrap_or(IrType::Null);
-            resolve_closure_safepoint_return_type(&mut child.blocks, &inferred);
-            inferred
-        });
+        let declared_return = declared_return.map(|ty| lower_type(ty, self.layouts));
+        let saved_id = self.next_function_id.get();
+        let saved_lifted = self.lifted_functions.borrow().len();
+        let saved_handlers = self
+            .mixed_async
+            .as_ref()
+            .map(|handlers| handlers.borrow().len());
+        let mut child = lower_body(
+            declared_return.clone().unwrap_or(IrType::Unknown),
+            declared_return.is_none().then(Vec::new),
+        )?;
+
+        let return_type = if let Some(declared) = declared_return {
+            declared
+        } else {
+            let reachable = reachable_block_ids(&child.blocks);
+            if let Some(nullable_return) = inferred_nullable_closure_return(&child, &reachable) {
+                // Choose the concrete type before lowering owned pending returns
+                // through finally. Discard provisional nested bodies but retain
+                // their charges against the original lowering budget.
+                self.next_function_id.set(saved_id);
+                self.lifted_functions.borrow_mut().truncate(saved_lifted);
+                if let (Some(handlers), Some(len)) = (&self.mixed_async, saved_handlers) {
+                    handlers.borrow_mut().truncate(len);
+                }
+                child = lower_body(nullable_return.clone(), None)?;
+                nullable_return
+            } else {
+                let inferred = child
+                    .blocks
+                    .iter()
+                    .filter(|block| reachable.contains(&block.id))
+                    .find_map(|block| match &block.terminator {
+                        IrTerminator::Return(Some(value)) if value.ty != IrType::Unknown => {
+                            Some(value.ty.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(IrType::Null);
+                resolve_closure_safepoint_return_type(&mut child.blocks, &inferred);
+                inferred
+            }
+        };
 
         let cid = FunctionId(self.next_function_id.get());
         self.next_function_id.set(cid.0 + 1);
@@ -5975,6 +6020,44 @@ fn ir_expr_needs_post_call_safepoint(expr: &IrExpr) -> bool {
                 | "deflate.decompress"
         ),
         _ => false,
+    }
+}
+
+fn inferred_nullable_closure_return(
+    lowered: &FunctionLowerer<'_>,
+    reachable: &HashSet<BlockId>,
+) -> Option<IrType> {
+    let returns = lowered.inferred_closure_returns.as_ref()?;
+    if returns.is_empty() {
+        return None;
+    }
+    let mut has_null = lowered.blocks.last().is_some_and(|block| {
+        block.terminator == IrTerminator::Next && reachable.contains(&block.id)
+    });
+    let mut payload = None;
+    for (block, ty) in returns {
+        if !reachable.contains(block) {
+            continue;
+        }
+        if matches!(ty, IrType::Null | IrType::Void) {
+            has_null = true;
+            continue;
+        }
+        let ty = match ty {
+            IrType::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        if !matches!(ty, IrType::Int | IrType::Float | IrType::Bool | IrType::Str)
+            || payload.is_some_and(|previous| previous != ty)
+        {
+            return None;
+        }
+        payload = Some(ty);
+    }
+    if has_null {
+        payload.cloned().map(nullable::nullable_type)
+    } else {
+        None
     }
 }
 

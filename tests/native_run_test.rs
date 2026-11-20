@@ -9280,14 +9280,14 @@ fn native_closure_returned_from_parameter_is_ref_counted() {
     fs::remove_dir_all(&dir).ok();
 }
 
-fn assert_annotated_callback_across_modules(source: &str, expected: &str) {
+fn assert_native_callback_matches_interpreter(source: &str, expected: &str) {
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    let cleanup = Cleanup(unique_temp_dir("annotated-callback"));
+    let cleanup = Cleanup(unique_temp_dir("callback-return"));
     let dir = &cleanup.0;
     let entry = dir.join("main.ku");
     fs::write(&entry, source).unwrap();
@@ -9295,7 +9295,11 @@ fn assert_annotated_callback_across_modules(source: &str, expected: &str) {
     fs::write(
         dir.join("declaration.ku"),
         r#"
+import fs from "std.fs"
+fn ReadPrefix(): str! { return fs.read("prefix.txt") }
 fn Score(rule: fn(&str): int | null, &line: str): int | null { return rule(line) }
+fn StrictScore(rule: fn(&str): int, &line: str): int { return rule(line) }
+fn Empty(rule: fn(): null): null { return rule() }
 fn Validate(rule: fn(&str): bool!, &line: str): bool! { return rule(line) }
 "#,
     )
@@ -9341,7 +9345,7 @@ fn Validate(rule: fn(&str): bool!, &line: str): bool! { return rule(line) }
 
 #[test]
 fn native_closure_annotated_nullable_return_keeps_null_distinct_from_zero() {
-    assert_annotated_callback_across_modules(
+    assert_native_callback_matches_interpreter(
         r#"import fs from "std.fs"
 import { Score } from "./declaration.ku"
 
@@ -9366,7 +9370,7 @@ fn main(): null! {
 
 #[test]
 fn native_closure_annotated_result_can_fail_without_a_success_return() {
-    assert_annotated_callback_across_modules(
+    assert_native_callback_matches_interpreter(
         r#"import fs from "std.fs"
 import { Validate } from "./declaration.ku"
 
@@ -9389,6 +9393,105 @@ fn main(): null! {
 }
 "#,
         "scan\nbad-declaration\nfn broken\nclosed\n",
+    );
+}
+
+#[test]
+fn native_closure_inferred_nullable_return_preserves_both_branch_orders() {
+    assert_native_callback_matches_interpreter(
+        r#"import { ReadPrefix, Score, StrictScore, Empty } from "./declaration.ku"
+
+fn main(): null! {
+    prefix = ReadPrefix()?
+    null_first = fn(&line: str) {
+        if (!line.starts_with(prefix)) { return null }
+        return line.len() - prefix.len()
+    }
+    value_first = fn(&line: str) {
+        if (line.starts_with(prefix)) { return line.len() - prefix.len() }
+        return null
+    }
+    partial = fn(&line: str) {
+        if (line.starts_with(prefix)) { return line.len() - prefix.len() }
+    }
+    empty = fn() { return null }
+    outer = fn(&line: str) {
+        inner = fn() { return null }
+        try {
+            inner()
+        } catch (err) {
+            return null
+        }
+        return line.len()
+    }
+    println(null_first("fn "))
+    println(null_first("struct Value"))
+    println(null_first("fn Parse"))
+    println(value_first("fn "))
+    println(value_first("struct Value"))
+    println(value_first("fn Parse"))
+    println(Score(partial.clone(), "fn "))
+    println(Score(partial, "struct Value"))
+    println(Empty(empty))
+    println(StrictScore(outer, "fn "))
+    return ok(null)
+}
+"#,
+        "0\nnull\n5\n0\nnull\n5\n0\nnull\nnull\n3\n",
+    );
+}
+
+#[test]
+fn native_closure_inferred_nullable_return_does_not_satisfy_plain_callback() {
+    let error = ku::cli::check_source(
+        "nullable-callback.ku",
+        r#"
+fn Apply(rule: fn(&str): int, &line: str): int { return rule(line) }
+fn main() {
+    prefix = "fn "
+    score = fn(&line: str) {
+        if (!line.starts_with(prefix)) { return null }
+        return line.len()
+    }
+    println(Apply(score, "struct Value"))
+}
+"#,
+    )
+    .expect_err("a possibly null callback does not have the nonnullable return ABI");
+    let diagnostic = error.to_string();
+    assert!(
+        diagnostic.contains("expected fn(&str): int"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("got fn(&str): int | null"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn native_closure_inferred_nullable_owned_return_survives_finally() {
+    assert_native_callback_matches_interpreter(
+        r#"import { ReadPrefix } from "./declaration.ku"
+
+fn main(): null! {
+    prefix = ReadPrefix()?
+    select = fn(&line: str) {
+        try {
+            if (!line.starts_with(prefix)) { return null }
+            return line + " selected"
+        } finally {
+            println("closed")
+        }
+    }
+    present = select("fn Keep")
+    absent = select("struct Decl")
+    println(present)
+    println(absent)
+    return ok(null)
+}
+"#,
+        "closed\nclosed\nfn Keep selected\nnull\n",
     );
 }
 
