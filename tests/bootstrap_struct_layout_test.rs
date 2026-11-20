@@ -140,7 +140,7 @@ fn Inspect(): Facts! {
     token = BuildNameTable(ParseProgram(fs.read("supplier.ku")?)?)?
     supplied: [SuppliedModule] = [SuppliedModule { path: "../stage1/token.ku", named: token }]
     bindings = BindTypeNames(named, supplied)?
-    layouts = BuildStructLayouts(named, bindings)?
+    layouts = BuildStructLayouts(named, bindings, supplied)?
     function = fs.read("function.txt")?
     plan = BindStructReturn(named, bindings, layouts, function)?
     index = 0
@@ -192,6 +192,22 @@ const SPAN_PLAN: &str = concat!(
     "PROJECT|4|1|4\n",
     "PROJECT|5|1|5\n",
 );
+const SPAN_TOKEN_PLAN: &str = concat!(
+    "FUNCTION|SpanFromToken|Span\n",
+    "FIELD|0|line|int\n",
+    "FIELD|1|column|int\n",
+    "FIELD|2|offset|int\n",
+    "FIELD|3|end_line|int\n",
+    "FIELD|4|end_column|int\n",
+    "FIELD|5|end_offset|int\n",
+    "PARAM|token|0\n",
+    "PROJECT|0|0|3\n",
+    "PROJECT|1|0|4\n",
+    "PROJECT|2|0|5\n",
+    "PROJECT|3|0|6\n",
+    "PROJECT|4|0|7\n",
+    "PROJECT|5|0|8\n",
+);
 const FLIPPED_PLAN: &str = concat!(
     "FUNCTION|Flip|Pair\n",
     "FIELD|0|x|int\n",
@@ -229,6 +245,7 @@ fn bootstrap_checks_and_lowers_real_struct_projection_returns() {
     let flipped = "struct Pair { x: int flag: bool }\nfn Flip(&right: Pair, left: Pair): Pair { return Pair { flag: left.flag, x: right.x } }\nfn main() {}";
     let accepts = [
         ("SpanMerge", span.as_str(), SPAN_PLAN),
+        ("SpanFromToken", span.as_str(), SPAN_TOKEN_PLAN),
         ("Flip", flipped, FLIPPED_PLAN),
     ];
     let rejects = [
@@ -279,15 +296,26 @@ fn bootstrap_checks_and_lowers_real_struct_projection_returns() {
             format!("error|bootstrap.semantics.structs|{code}|<source>|{detail}"),
         ));
     }
-    // Use the declared parameter rather than the last lexical occurrence.
-    let signature = span.find("token: Token").expect("real Token parameter");
-    let span_of_token = format!(
+    let transfer = "struct Row { text: str }\nfn Transfer(row: Row): Row { return Row { text: row.text } }\nfn main() {}";
+    position_check(&compiler, transfer, "Transfer");
+    assert_ok(&execute(
+        Command::new(&ku)
+            .arg("check")
+            .arg(compiler.join("input.ku")),
+        &cwd,
+        20,
+    ));
+    let declaration = transfer.find("fn Transfer").expect("Transfer declaration");
+    let declaration_end = transfer
+        .find("\nfn main")
+        .expect("end of Transfer declaration");
+    let span_of_transfer = format!(
         "{}..{}",
-        coordinates(&span, signature),
-        coordinates(&span, signature + "token".len())
+        coordinates(transfer, declaration),
+        coordinates(transfer, declaration_end)
     );
-    diagnostics.push((span.as_str(), "SpanFromToken", format!(
-        "error|bootstrap.semantics.structs|unsupported_aggregate_layout|<source>|projection returns require local structs containing Copy scalar fields|{span_of_token}"
+    diagnostics.push((transfer, "Transfer", format!(
+        "error|bootstrap.semantics.structs|unsupported_aggregate_layout|<source>|projection returns require local structs containing Copy scalar fields|{span_of_transfer}"
     )));
 
     for (function, source, expected) in accepts {
@@ -355,7 +383,7 @@ fn main(): null! {
     token = BuildNameTable(ParseProgram(fs.read("supplier.ku")?)?)?
     supplied: [SuppliedModule] = [SuppliedModule { path: "../stage1/token.ku", named: token }]
     bindings = BindTypeNames(named, supplied)?
-    layouts = BuildStructLayouts(named, bindings)?
+    layouts = BuildStructLayouts(named, bindings, supplied)?
     function = fs.read("function.txt")?
     plan = BindStructReturn(named, bindings, layouts, function)?
     println(str(plan.result_layout) + "|" + str(plan.function_node))
@@ -564,6 +592,237 @@ fn main(): null {{
         compile_projection(&c_source, &app_binary, &app);
         fs::remove_file(c_source).expect("remove C source before run");
         let result = execute(&mut Command::new(app_binary), &app, 20);
+        assert_ok(&result);
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout).replace("\r\n", "\n"),
+            expected
+        );
+    }
+}
+
+const TRACK_STRING_STORAGE: &str = r#"#include <assert.h>
+#include <stddef.h>
+#include <stdlib.h>
+
+static void *owned[2];
+static unsigned allocations;
+static unsigned drops;
+static void *probe_alloc(size_t size) {
+    void *ptr = malloc(size);
+    assert(ptr && allocations < 2);
+    owned[allocations++] = ptr;
+    return ptr;
+}
+
+static void probe_free(void *ptr) {
+    unsigned i;
+    for (i = 0; i < 2; ++i) {
+        if (owned[i] && owned[i] == ptr) {
+            owned[i] = NULL;
+            ++drops;
+            free(ptr);
+            return;
+        }
+    }
+    abort();
+}
+
+#define free probe_free
+"#;
+
+fn ownership_driver(owned_input: bool, result_type: &str, symbol: &str) -> String {
+    let mut driver = r#"
+#undef free
+#include <inttypes.h>
+#include <stdio.h>
+
+static KuProjectionString owned_string(uint8_t byte) {
+    uint8_t *ptr = probe_alloc(1);
+    ptr[0] = byte;
+    return (KuProjectionString){ ptr, 1, 1, KU_PROJECTION_STRING_OWNED };
+}
+
+int main(void) {
+    static uint8_t permanent[] = { 's' };
+    KuStruct_m1_19 token = {
+        owned_string('k'), owned_string('l'), 0, 1, 2, 3, 4, 5, 6
+    };
+"#
+    .to_string();
+    if owned_input {
+        driver.push_str(&format!(
+            r#"    {result_type} value = {symbol}(token);
+    assert(allocations == 2 && drops == 2);
+    assert(owned[0] == NULL && owned[1] == NULL);
+
+    KuProjectionString literal = {{ permanent, 1, 0, KU_PROJECTION_STRING_STATIC }};
+    KuStruct_m1_19 static_token = {{ literal, literal, 0, 1, 2, 3, 4, 5, 6 }};
+    {result_type} copy = {symbol}(static_token);
+    assert(copy.f0 == 1 && copy.f5 == 6 && permanent[0] == 's');
+    assert(drops == 2);
+"#
+        ));
+    } else {
+        // No generated drop helper is linked for View-only inputs. The
+        // caller still owns its exact buffers and releases them itself.
+        driver.push_str(&format!(
+            r#"    uint8_t *kind = token.f0.ptr;
+    uint8_t *lexeme = token.f1.ptr;
+    {result_type} value = {symbol}(&token);
+    assert(allocations == 2 && drops == 0 && permanent[0] == 's');
+    assert(token.f0.ptr == kind && token.f1.ptr == lexeme);
+    assert(kind[0] == 'k' && lexeme[0] == 'l');
+    probe_free(kind);
+    probe_free(lexeme);
+    assert(drops == 2 && owned[0] == NULL && owned[1] == NULL);
+"#
+        ));
+    }
+    driver.push_str(
+        r#"    printf("%" PRId64 "\n%" PRId64 "\n%" PRId64 "\n%" PRId64 "\n%" PRId64 "\n%" PRId64 "\n",
+        value.f0, value.f1, value.f2, value.f3, value.f4, value.f5);
+    return 0;
+}
+"#,
+    );
+    driver
+}
+
+#[test]
+fn bootstrap_projection_drops_owned_token_strings_and_preserves_views() {
+    let work = Temp::new();
+    let source = work.0.join("compiler");
+    let cwd = work.0.join("invocation");
+    let relocated = work.0.join("relocated");
+    for directory in [&source, &cwd, &relocated] {
+        fs::create_dir(directory).expect("create isolated consumer directory");
+    }
+    stage_sources(&source);
+    let compiler = source.join("semantics");
+    let entry = compiler.join("project.ku");
+    let ku = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    fs::write(&entry, C_EMITTER).expect("write actual Ku compiler entry");
+
+    let span = include_str!("../bootstrap/stage2/span.ku");
+    let view = span.replace(
+        "SpanFromToken(token: Token)",
+        "SpanFromToken(&token: Token)",
+    );
+    assert_ne!(span, view);
+    let token = include_str!("../bootstrap/stage1/token.ku");
+    let materialize = |directory: &Path, input: &str| {
+        fs::write(directory.join("input.ku"), input).expect("write SpanFromToken subject");
+        fs::write(directory.join("function.txt"), "SpanFromToken")
+            .expect("choose runtime function");
+        fs::write(directory.join("supplier.ku"), token)
+            .expect("write explicitly supplied Token module");
+    };
+
+    let oracle = source.join("token_entry.ku");
+    fs::write(
+        &oracle,
+        r#"import { Token } from "./stage1/token.ku"
+import { SpanFromToken } from "./stage2/span.ku"
+fn main(): null! {
+    token = Token { kind: "k".clone(), lexeme: "l".clone(), int_value: 0,
+        line: 1, column: 2, offset: 3, end_line: 4, end_column: 5, end_offset: 6 }
+    coordinates = SpanFromToken(token)
+    println(coordinates.line)
+    println(coordinates.column)
+    println(coordinates.offset)
+    println(coordinates.end_line)
+    println(coordinates.end_column)
+    println(coordinates.end_offset)
+    return ok(null)
+}
+"#,
+    )
+    .expect("write Stage0 oracle using actual Token");
+    let expected = "1\n2\n3\n4\n5\n6\n";
+    let mut reference_fragments = Vec::new();
+    for (owned, input) in [(true, span), (false, view.as_str())] {
+        if !owned {
+            fs::write(source.join("stage2/span.ku"), &view).expect("use View form in oracle");
+        }
+        let baseline = execute(Command::new(&ku).arg("run").arg(&oracle), &cwd, 20);
+        assert_ok(&baseline);
+        assert_eq!(
+            String::from_utf8_lossy(&baseline.stdout).replace("\r\n", "\n"),
+            expected
+        );
+        materialize(&compiler, input);
+        let emitted = execute(Command::new(&ku).arg("run").arg(&entry), &cwd, 20);
+        assert_ok(&emitted);
+        reference_fragments.push(
+            String::from_utf8(emitted.stdout)
+                .expect("generated C")
+                .replace("\r\n", "\n"),
+        );
+    }
+    // Only the input subject uses the View variation. Restore the seed's own
+    // compiler-source module before building it.
+    fs::write(source.join("stage2/span.ku"), span).expect("restore seed's exact Span module");
+    let seed = compiler.join(format!("ku-project-c{}", std::env::consts::EXE_SUFFIX));
+    let build = execute(
+        Command::new(&ku)
+            .args(["build", "--release"])
+            .arg(&entry)
+            .arg("-o")
+            .arg(&seed),
+        &cwd,
+        120,
+    );
+    assert_ok(&build);
+    let stage1 = relocated.join(seed.file_name().expect("seed executable name"));
+    fs::rename(seed, &stage1).expect("relocate native Ku compiler seed");
+    fs::remove_dir_all(&source).expect("remove seed source, oracle programs and staging");
+
+    for ((owned, input), reference) in [(true, span), (false, view.as_str())]
+        .into_iter()
+        .zip(reference_fragments)
+    {
+        materialize(&relocated, input);
+        let generated = execute(&mut Command::new(&stage1), &cwd, 20);
+        assert_ok(&generated);
+        let output = String::from_utf8(generated.stdout)
+            .expect("C fragment")
+            .replace("\r\n", "\n");
+        assert_eq!(output, reference);
+        let (ids, c) = output.split_once('\n').expect("layout metadata and C");
+        let (layout, function_id) = ids.split_once('|').expect("numeric identity components");
+        let layout: u32 = layout.parse().expect("numeric result layout");
+        let function_id: u32 = function_id.parse().expect("numeric function ID");
+        assert_eq!(
+            c.matches("ku_projection_string_drop(&a0.").count(),
+            if owned { 2 } else { 0 }
+        );
+        if owned {
+            assert!(c.contains("ku_projection_string_drop(&a0.f0);"));
+            assert!(c.contains("ku_projection_string_drop(&a0.f1);"));
+            assert!(
+                c.find("result.f5 =").unwrap()
+                    < c.find("ku_projection_string_drop(&a0.f0);").unwrap()
+            );
+        } else {
+            assert!(c.contains("const KuStruct_m1_19 *a0") && !c.contains("free("));
+        }
+        let mode = if owned { "owned" } else { "view" };
+        let application = work.0.join(mode);
+        fs::create_dir(&application).expect("fresh C consumer directory");
+        let c_source = application.join("projection.c");
+        let binary = application.join(format!("projection{}", std::env::consts::EXE_SUFFIX));
+        let driver = ownership_driver(
+            owned,
+            &format!("KuStruct_{layout}"),
+            &format!("ku_project_{function_id}"),
+        );
+        fs::write(&c_source, format!("{TRACK_STRING_STORAGE}{c}\n{driver}"))
+            .expect("write generated C and owning bridge");
+        compile_projection(&c_source, &binary, &application);
+        fs::remove_file(c_source).expect("remove native consumer source before run");
+        let result = execute(&mut Command::new(binary), &application, 20);
         assert_ok(&result);
         assert_eq!(
             String::from_utf8_lossy(&result.stdout).replace("\r\n", "\n"),

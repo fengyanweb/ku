@@ -2,7 +2,8 @@ import { Node } from "../stage2/ast.ku"
 import { DiagnosticCanonical, MakeDiagnostic } from "../stage2/diagnostic.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { SuppliedModule } from "./imports.ku"
+import { IsBuiltinType, TypeNameBinding } from "./type_names.ku"
 
 struct StructFieldLayout {
     name: str
@@ -13,6 +14,7 @@ struct StructFieldLayout {
 
 struct StructLayout {
     name: str
+    module_index: int
     node: int
     fields: [StructFieldLayout]
 }
@@ -20,6 +22,7 @@ struct StructLayout {
 struct StructParameter {
     name: str
     mode: int
+    layout_module: int
     layout_node: int
 }
 
@@ -70,17 +73,26 @@ fn FieldIndex(&fields: [StructFieldLayout], &name: str): int {
     return 0
 }
 
-fn LayoutIndex(&layouts: [StructLayout], node: int): int {
+fn LayoutIndex(&layouts: [StructLayout], module_index: int, node: int): int {
     index = 0
     while (index < layouts.len()) {
-        if (layouts[index].node == node) { return index + 1 }
+        if (layouts[index].module_index == module_index && layouts[index].node == node) { return index + 1 }
         index = index + 1
     }
     return 0
 }
 
+fn ImportedFieldType(&node: Node, use_node: int): TypeNameBinding! {
+    at = DeclarationSpan(node)
+    if (node.kind != "TypeName" || !IsBuiltinType(node.text)) {
+        RejectLayout("unsupported_layout_type", "imported struct fields require explicit builtin scalar or str types", at.clone())?
+    }
+    return ok(TypeNameBinding { use_node: use_node, name: node.text.clone(), declaration_kind: "Builtin",
+                                module_index: 0, declaration_node: 0, span: at })
+}
+
 fn CollectFields(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
-                 &decl: Node): [StructFieldLayout]! {
+                 &decl: Node, imported: bool): [StructFieldLayout]! {
     fields: [StructFieldLayout] = []
     index = 0
     while (index < decl.edge_count) {
@@ -92,9 +104,14 @@ fn CollectFields(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
         if (FieldIndex(fields, field.text) != 0) {
             RejectLayout("duplicate_layout_field", "duplicate struct field '" + field.text.clone() + "'", DeclarationSpan(field))?
         }
-        resolved = ExplicitType(bindings, edges[field.first_edge], DeclarationSpan(field))?
-        entry = StructFieldLayout { name: field.text, ordinal: index, node: id, resolved: resolved }
-        fields = fields.push(entry)
+        type_id = edges[field.first_edge]
+        if (imported) {
+            resolved = ImportedFieldType(nodes[type_id - 1], type_id)?
+            fields = fields.push(StructFieldLayout { name: field.text, ordinal: index, node: id, resolved: resolved })
+        } else {
+            resolved = ExplicitType(bindings, type_id, DeclarationSpan(field))?
+            fields = fields.push(StructFieldLayout { name: field.text, ordinal: index, node: id, resolved: resolved })
+        }
         index = index + 1
     }
     return ok(fields)
@@ -108,8 +125,8 @@ fn CollectLayouts(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
         name = names[index].clone()
         if (name.kind == "Struct") {
             decl = nodes[name.node - 1].clone()
-            fields = CollectFields(nodes, edges, bindings, decl)?
-            layout = StructLayout { name: name.name, node: name.node, fields: fields }
+            fields = CollectFields(nodes, edges, bindings, decl, false)?
+            layout = StructLayout { name: name.name, module_index: 0, node: name.node, fields: fields }
             layouts = layouts.push(layout)
         }
         index = index + 1
@@ -117,17 +134,48 @@ fn CollectLayouts(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
     return ok(layouts)
 }
 
-// Accept the validated named graph and the bindings produced for that graph.
-fn BuildStructLayouts(&named: NamedModule, &bindings: [TypeNameBinding]): [StructLayout]! {
-    return CollectLayouts(named.parsed.arena.nodes, named.parsed.arena.edges,
-                          bindings, named.names.declarations)
+fn ImportedLayout(&named: NamedModule, module_index: int, node: int, at: Span): StructLayout! {
+    count = named.parsed.arena.nodes.len()
+    if (node <= 0 || node > count) {
+        RejectLayout("invalid_layout_binding", "imported layout refers to an invalid declaration", at.clone())?
+    }
+    declaration = named.parsed.arena.nodes[node - 1].clone()
+    if (declaration.kind != "Struct") {
+        RejectLayout("invalid_layout_binding", "imported layout does not refer to a struct", at)?
+    }
+    no_local_bindings: [TypeNameBinding] = []
+    fields = CollectFields(named.parsed.arena.nodes, named.parsed.arena.edges, no_local_bindings, declaration, true)?
+    return ok(StructLayout { name: declaration.text, module_index: module_index, node: node, fields: fields })
 }
 
-fn TrivialFields(&fields: [StructFieldLayout]): bool {
+// Build layouts from the validated current graph and explicitly resolved
+// imports. Imported dependency fields are limited to builtin scalar/str.
+fn BuildStructLayouts(&named: NamedModule, &bindings: [TypeNameBinding], &supplied: [SuppliedModule]): [StructLayout]! {
+    layouts = CollectLayouts(named.parsed.arena.nodes, named.parsed.arena.edges,
+                             bindings, named.names.declarations)?
+    index = 0
+    while (index < bindings.len()) {
+        binding = bindings[index].clone()
+        module_index = binding.module_index
+        node = binding.declaration_node
+        if (binding.declaration_kind == "Struct" && module_index > 0 && LayoutIndex(layouts, module_index, node) == 0) {
+            if (module_index > supplied.len()) {
+                RejectLayout("invalid_layout_binding", "missing supplied module for imported layout", binding.span.clone())?
+            }
+            layout = ImportedLayout(supplied[module_index - 1].named, module_index, node, binding.span)?
+            layouts = layouts.push(layout)
+        }
+        index = index + 1
+    }
+    return ok(layouts)
+}
+
+fn ProjectionFieldsFit(&fields: [StructFieldLayout], input: bool): bool {
     index = 0
     while (index < fields.len()) {
         leaf = fields[index].resolved.clone()
-        if (leaf.declaration_kind != "Builtin" || !(leaf.name == "int" || leaf.name == "float" || leaf.name == "bool" || leaf.name == "null")) {
+        copy = leaf.name == "int" || leaf.name == "float" || leaf.name == "bool" || leaf.name == "null"
+        if (leaf.declaration_kind != "Builtin" || !(copy || (input && leaf.name == "str"))) {
             return false
         }
         index = index + 1
@@ -135,10 +183,13 @@ fn TrivialFields(&fields: [StructFieldLayout]): bool {
     return true
 }
 
-fn TrivialLayout(&layouts: [StructLayout], &binding: TypeNameBinding, at: Span): int! {
-    index = LayoutIndex(layouts, binding.declaration_node)
-    if (binding.declaration_kind != "Struct" || binding.module_index != 0 || index == 0
-        || !TrivialFields(layouts[index - 1].fields)) {
+fn CheckedLayout(&layouts: [StructLayout], &binding: TypeNameBinding, input: bool, at: Span): int! {
+    index = LayoutIndex(layouts, binding.module_index, binding.declaration_node)
+    if (binding.declaration_kind != "Struct" || index == 0 || (!input && binding.module_index != 0)
+        || !ProjectionFieldsFit(layouts[index - 1].fields, input)) {
+        if (input) {
+            RejectLayout("unsupported_aggregate_layout", "projection inputs require structs containing Copy scalar or str fields", at.clone())?
+        }
         RejectLayout("unsupported_aggregate_layout", "projection returns require local structs containing Copy scalar fields", at)?
     }
     return ok(index)
@@ -172,7 +223,8 @@ fn ProjectionOperand(&nodes: [Node], &edges: [int], &layouts: [StructLayout],
     if (receiver.kind != "Variable" || parameter == 0) {
         RejectLayout("unsupported_projection", "expected a struct parameter as the field receiver", DeclarationSpan(receiver))?
     }
-    layout = LayoutIndex(layouts, parameters[parameter - 1].layout_node)
+    source = parameters[parameter - 1].clone()
+    layout = LayoutIndex(layouts, source.layout_module, source.layout_node)
     input_field = FieldIndex(layouts[layout - 1].fields, value.text)
     if (input_field == 0) {
         RejectLayout("unknown_projection_field", "struct '" + layouts[layout - 1].name.clone() + "' has no field '" + value.text.clone() + "'", at.clone())?
@@ -244,8 +296,9 @@ fn ProjectionPlan(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
             RejectLayout("duplicate_projection_parameter", "duplicate function parameter '" + parameter.text.clone() + "'", position.clone())?
         }
         resolved = ExplicitType(bindings, edges[parameter.first_edge], position.clone())?
-        layout = TrivialLayout(layouts, resolved, position)?
-        entry = StructParameter { name: parameter.text, mode: parameter.int_value, layout_node: layouts[layout - 1].node }
+        layout = CheckedLayout(layouts, resolved, true, position)?
+        entry = StructParameter { name: parameter.text, mode: parameter.int_value,
+                                  layout_module: layouts[layout - 1].module_index, layout_node: layouts[layout - 1].node }
         parameters = parameters.push(entry)
         cursor = cursor + 1
     }
@@ -253,7 +306,7 @@ fn ProjectionPlan(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
         RejectLayout("unsupported_projection_body", "expected an explicit result type and a single return statement", at.clone())?
     }
     result = ExplicitType(bindings, edges[cursor], at.clone())?
-    layout = TrivialLayout(layouts, result, at.clone())?
+    layout = CheckedLayout(layouts, result, false, at.clone())?
     statement = nodes[edges[cursor + 1] - 1].clone()
     if (statement.kind != "Return" || statement.edge_count != 1) {
         RejectLayout("unsupported_projection_body", "expected a return of a struct literal", DeclarationSpan(statement))?

@@ -19,8 +19,22 @@ fn ScalarCType(&ty: TypeNameBinding): str! {
     return ok("")
 }
 
-fn CTypeName(node: int): str {
-    return "KuStruct_" + str(node)
+fn CTypeName(module_index: int, node: int): str {
+    if (module_index == 0) { return "KuStruct_" + str(node) }
+    return "KuStruct_m" + str(module_index) + "_" + str(node)
+}
+
+fn ContainsType(&names: [str], &name: str): bool {
+    index = 0
+    while (index < names.len()) {
+        if (names[index] == name) { return true }
+        index = index + 1
+    }
+    return false
+}
+
+fn StringField(&field: TypeNameBinding): bool {
+    return field.declaration_kind == "Builtin" && field.name == "str"
 }
 
 fn ContainsIndex(&ids: [int], id: int): bool {
@@ -32,58 +46,73 @@ fn ContainsIndex(&ids: [int], id: int): bool {
     return false
 }
 
-fn EmitLayout(&layout: StructLayout): str! {
+fn EmitLayout(&layout: StructLayout, allow_string: bool): str! {
     text = "typedef struct {\n"
     count = layout.fields.len()
     if (count == 0) { text += "    unsigned char empty;\n" }
     index = 0
     while (index < count) {
-        kind = ScalarCType(layout.fields[index].resolved)?
+        kind = "KuProjectionString"
+        if (!(allow_string && StringField(layout.fields[index].resolved))) {
+            kind = ScalarCType(layout.fields[index].resolved)?
+        }
         text += "    " + kind + " f" + str(index) + ";\n"
         index = index + 1
     }
-    text += "} " + CTypeName(layout.node) + ";\n\n"
+    text += "} " + CTypeName(layout.module_index, layout.node) + ";\n\n"
     return ok(text)
 }
 
-fn FindLayout(&layouts: [StructLayout], node: int): StructLayout! {
-    index = LayoutIndex(layouts, node)
-    if (index == 0 || node <= 0) { InvalidPlan("unknown struct layout ID")? }
+fn FindLayout(&layouts: [StructLayout], module_index: int, node: int): StructLayout! {
+    index = LayoutIndex(layouts, module_index, node)
+    if (index == 0 || module_index < 0 || node <= 0) { InvalidPlan("unknown struct layout ID")? }
     return ok(layouts[index - 1].clone())
 }
 
 // Emits one checked function as standalone C11. Only numeric arena IDs and
 // ordinals enter identifiers. A View parameter is a pointer to const storage;
-// owned scalar structs are ordinary C values and hold no cleanup resources.
+// owned inputs are C values. Supported string carriers in owned inputs are
+// released after the Copy projections. No owned output or transfer is emitted.
 fn EmitStructProjectionC(&layouts: [StructLayout], &plan: StructReturnPlan): str! {
     if (plan.function_node <= 0) { InvalidPlan("expected a positive function ID")? }
-    result = FindLayout(layouts, plan.result_layout)?
-    text = "#include <stdbool.h>\n#include <stdint.h>\n\n"
-    text += EmitLayout(result)?
-    emitted: [int] = [result.node]
-    signature = CTypeName(result.node) + " ku_project_" + str(plan.function_node) + "("
+    result = FindLayout(layouts, 0, plan.result_layout)?
+    text = EmitLayout(result, false)?
+    emitted: [str] = [CTypeName(0, result.node)]
+    signature = CTypeName(0, result.node) + " ku_project_" + str(plan.function_node) + "("
     parameters_count = plan.parameters.len()
     if (parameters_count == 0) { signature += "void" }
+    drops = ""
+    needs_string = false
     index = 0
     while (index < parameters_count) {
         parameter = plan.parameters[index].clone()
-        input = FindLayout(layouts, parameter.layout_node)?
-        if (!ContainsIndex(emitted, input.node)) {
-            text += EmitLayout(input)?
-            id = input.node
-            emitted = emitted.push(id)
+        input = FindLayout(layouts, parameter.layout_module, parameter.layout_node)?
+        type_name = CTypeName(parameter.layout_module, parameter.layout_node)
+        if (!ContainsType(emitted, type_name)) {
+            text += EmitLayout(input, true)?
+            emitted = emitted.push(type_name.clone())
         }
         if (index > 0) { signature += ", " }
         if (parameter.mode == 0) {
-            signature += CTypeName(parameter.layout_node) + " a" + str(index)
+            signature += type_name + " a" + str(index)
         } else if (parameter.mode == 1) {
-            signature += "const " + CTypeName(parameter.layout_node) + " *a" + str(index)
+            signature += "const " + type_name + " *a" + str(index)
         } else {
             InvalidPlan("expected an owned or View parameter")?
         }
+        field = 0
+        while (field < input.fields.len()) {
+            if (StringField(input.fields[field].resolved)) {
+                needs_string = true
+                if (parameter.mode == 0) {
+                    drops += "    ku_projection_string_drop(&a" + str(index) + ".f" + str(field) + ");\n"
+                }
+            }
+            field = field + 1
+        }
         index = index + 1
     }
-    text += signature + ") {\n    " + CTypeName(result.node) + " result;\n"
+    text += signature + ") {\n    " + CTypeName(0, result.node) + " result;\n"
     field_count = result.fields.len()
     if (field_count != plan.projections.len()) { InvalidPlan("expected exactly one projection for each result field")? }
     seen: [int] = []
@@ -98,7 +127,7 @@ fn EmitStructProjectionC(&layouts: [StructLayout], &plan: StructReturnPlan): str
             InvalidPlan("projection refers to an unknown parameter")?
         }
         parameter = plan.parameters[projection.parameter].clone()
-        input = FindLayout(layouts, parameter.layout_node)?
+        input = FindLayout(layouts, parameter.layout_module, parameter.layout_node)?
         if (projection.input_field < 0 || projection.input_field >= input.fields.len()) {
             InvalidPlan("projection refers to an unknown input field")?
         }
@@ -114,6 +143,22 @@ fn EmitStructProjectionC(&layouts: [StructLayout], &plan: StructReturnPlan): str
         index = index + 1
     }
     if (field_count == 0) { text += "    result.empty = 0;\n" }
-    text += "    return result;\n}\n"
-    return ok(text)
+    text += drops + "    return result;\n}\n"
+    header = "#include <stdbool.h>\n#include <stdint.h>\n\n"
+    if (needs_string) {
+        // Private emitted ABI. The carrier and storage tags match Stage0
+        // KuString. A caller moves malloc-compatible OWNED fields into an
+        // owned argument and retains all fields when passing a View.
+        header += "#include <stddef.h>\n"
+        if (drops != "") { header += "#include <stdlib.h>\n" }
+        header += "/* KuString-compatible carrier: STATIC is borrowed storage; OWNED uses free. */\n"
+        header += "typedef struct { uint8_t *ptr; size_t len; size_t capacity; uint8_t storage; } KuProjectionString;\n"
+        header += "enum { KU_PROJECTION_STRING_STATIC = 0, KU_PROJECTION_STRING_OWNED = 1 };\n\n"
+        if (drops != "") {
+            header += "static void ku_projection_string_drop(KuProjectionString *value) {\n"
+            header += "    if (value->storage == KU_PROJECTION_STRING_OWNED && value->ptr) free(value->ptr);\n"
+            header += "    *value = (KuProjectionString){0};\n}\n\n"
+        }
+    }
+    return ok(header + text)
 }
