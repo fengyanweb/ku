@@ -1566,3 +1566,316 @@ int main(int argc, char **argv) {
     .expect("write standalone View consumer");
     path
 }
+
+const ARRAY_OWNER_EMITTER: &str = r#"import "std.fs"
+import { BindProjectImports } from "./imports.ku"
+import { BindImportedTypeNames } from "./type_names.ku"
+import { BuildStructLayouts } from "./struct_layouts.ku"
+import { ReadProjectModules } from "./project_manifest.ku"
+import { EmitReturnedStructArrayC } from "./struct_array_c.ku"
+
+fn main(): null! {
+    supplied = ReadProjectModules(["stage2/context.ku", "stage2/span.ku", "stage1/token.ku"])?
+    imports = BindProjectImports(supplied[0], supplied)?
+    bound = BindImportedTypeNames(supplied[0].named, imports, supplied)?
+    layouts = BuildStructLayouts(supplied[0].named, bound, supplied)?
+    c = EmitReturnedStructArrayC(supplied[0].named, bound, layouts, fs.read("target.txt")?)?
+    println(c.element_type + "|" + c.array_type + "|" + c.prefix)
+    print(c.source)
+    return ok(null)
+}
+"#;
+
+const CHECKED_ARRAY_ALLOCATOR: &str = r#"
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static void *live[16];
+static int attempts;
+static int fail_after = -1;
+static int slot_for(void *pointer) {
+    for (int i = 0; i < 16; ++i) if (live[i] == pointer) return i;
+    abort();
+}
+static int inject_failure(void) {
+    ++attempts;
+    if (fail_after == 0) return 1;
+    if (fail_after > 0) --fail_after;
+    return 0;
+}
+static void *test_malloc(size_t size) {
+    if (inject_failure()) return NULL;
+    size_t slot = (size_t)slot_for(NULL);
+    void *result = malloc(size);
+    assert(result);
+    live[slot] = result;
+    return result;
+}
+static void *test_realloc(void *pointer, size_t size) {
+    if (inject_failure()) return NULL;
+    size_t slot = (size_t)slot_for(pointer);
+    void *result = realloc(pointer, size);
+    assert(result);
+    live[slot] = result;
+    return result;
+}
+static void test_free(void *pointer) {
+    if (!pointer) return;
+    live[slot_for(pointer)] = NULL;
+    free(pointer);
+}
+static int outstanding(void) {
+    int count = 0;
+    for (int i = 0; i < 16; ++i) count += live[i] != NULL;
+    return count;
+}
+#define malloc test_malloc
+#define realloc test_realloc
+#define free test_free
+"#;
+
+const TOKEN_OWNER_DRIVER: &str = r#"
+typedef struct { size_t len; __ELEMENT__ *data; size_t capacity; } Stage0ArrayHeader;
+_Static_assert(sizeof(__ARRAY__) == sizeof(Stage0ArrayHeader), "Stage0 array ABI size");
+_Static_assert(offsetof(__ARRAY__, data) == offsetof(Stage0ArrayHeader, data), "Stage0 array data");
+_Static_assert(offsetof(__ARRAY__, capacity) == offsetof(Stage0ArrayHeader, capacity), "Stage0 array capacity");
+
+static KuProjectionString string_owner(const uint8_t *text, size_t len) {
+    uint8_t *buf = malloc(len ? len : 1);
+    if (len) memcpy(buf, text, len);
+    return (KuProjectionString){ buf, len, len ? len : 1, KU_PROJECTION_STRING_OWNED };
+}
+static void print_token(const __ELEMENT__ *value) {
+    printf("%.*s|%.*s|%lld|%lld|%lld|%lld|%lld|%lld|%lld\n",
+        (int)value->f0.len, (char*)value->f0.ptr, (int)value->f1.len, (char*)value->f1.ptr,
+        (long long)value->f2, (long long)value->f3, (long long)value->f4, (long long)value->f5,
+        (long long)value->f6, (long long)value->f7, (long long)value->f8);
+}
+int main(void) {
+    static uint8_t spelling[] = {0xe4,0xbb,0xbb,0xe5,0x8a,0xa1,0xf0,0x9f,0x99,0x82};
+    __ARRAY__ tokens = {0};
+    __ELEMENT__ owner = {
+        string_owner((const uint8_t*)"String", 6), string_owner(spelling, sizeof(spelling)),
+        0, 1, 8, 7, 1, 13, 19
+    };
+    // Receive the legacy representation whose storage has exactly len slots.
+    tokens.data = malloc(sizeof(*tokens.data));
+    tokens.len = 1;
+    tokens.data[0] = owner;
+    owner = (__ELEMENT__){0};
+    assert(outstanding() == 3 && !tokens.capacity);
+
+    __ELEMENT__ clone = {0};
+    fail_after = 1;
+    assert(__PREFIX___clone_at(&tokens, 0, &clone) == KU_STRUCT_ARRAY_OOM);
+    fail_after = -1;
+    assert(outstanding() == 3 && !clone.f0.ptr && !clone.f1.ptr);
+    assert(__PREFIX___clone_at(&tokens, -1, &clone) == KU_STRUCT_ARRAY_BOUNDS);
+    assert(__PREFIX___clone_at(&tokens, INT64_MAX, &clone) == KU_STRUCT_ARRAY_BOUNDS);
+    assert(__PREFIX___clone_at(&tokens, 0, &tokens.data[0]) == KU_STRUCT_ARRAY_INVALID);
+    assert(__PREFIX___append_move(&tokens, &tokens.data[0]) == KU_STRUCT_ARRAY_INVALID);
+
+    assert(__PREFIX___clone_at(&tokens, 0, &clone) == KU_STRUCT_ARRAY_OK);
+    uint8_t *cloned_body = clone.f1.ptr;
+    assert(outstanding() == 5 && cloned_body != tokens.data[0].f1.ptr);
+    __ELEMENT__ *old_storage = tokens.data;
+    fail_after = 0;
+    assert(__PREFIX___append_move(&tokens, &clone) == KU_STRUCT_ARRAY_OOM);
+    fail_after = -1;
+    assert(tokens.data == old_storage && tokens.len == 1 && !tokens.capacity);
+    assert(clone.f1.ptr == cloned_body && outstanding() == 5);
+    assert(__PREFIX___append_move(&tokens, &clone) == KU_STRUCT_ARRAY_OK);
+    assert(tokens.len == 2 && tokens.capacity == 2 && tokens.data[1].f1.ptr == cloned_body);
+    assert(!clone.f0.ptr && !clone.f1.ptr && outstanding() == 5);
+
+    // The parser's existing 4096-entry boundary fits without narrowing the
+    // language's array type or cloning any earlier owner during growth.
+    KuProjectionString state = { spelling, sizeof(spelling), 0, KU_PROJECTION_STRING_STATIC };
+    int before = attempts;
+    for (size_t i = tokens.len; i < 4096; ++i) {
+        __ELEMENT__ item = {0};
+        item.f0 = state;
+        assert(__PREFIX___append_move(&tokens, &item) == KU_STRUCT_ARRAY_OK && !item.f0.ptr);
+    }
+    assert(attempts - before == 11 && outstanding() == 5);
+    assert(tokens.len == 4096 && tokens.capacity == 4096 && tokens.data[1].f1.ptr == cloned_body);
+    before = attempts;
+    assert(__PREFIX___clone_at(&tokens, 4095, &clone) == KU_STRUCT_ARRAY_OK);
+    assert(clone.f0.ptr == spelling && attempts == before);
+    __PREFIX___element_drop(&clone);
+
+    old_storage = tokens.data;
+    __ARRAY__ moved = __PREFIX___move(&tokens);
+    assert(!tokens.data && !tokens.len && !tokens.capacity && moved.data == old_storage);
+    assert(attempts == before);
+    print_token(&moved.data[1]);
+    __PREFIX___drop(&tokens);
+    __PREFIX___drop(&moved);
+    __PREFIX___drop(&moved);
+    assert(outstanding() == 0);
+    return 0;
+}
+"#;
+
+const NESTED_OWNER_DRIVER: &str = r#"
+int main(void) {
+    __ARRAY__ values = { 1, malloc(sizeof(__ELEMENT__)), 1 };
+    uint8_t *body = malloc(3);
+    memcpy(body, "yes", 3);
+    values.data[0] = (__ELEMENT__){0};
+    values.data[0].f0.f0 = (KuProjectionString){ body, 3, 3, KU_PROJECTION_STRING_OWNED };
+    values.data[0].f0.f1 = 11;
+    __ELEMENT__ *initial = values.data;
+    fail_after = 1;
+    assert(__PREFIX___append_clone(&values, &values.data[0]) == KU_STRUCT_ARRAY_OOM);
+    fail_after = -1;
+    assert(values.data == initial && values.len == 1 && values.capacity == 1);
+    assert(values.data[0].f0.f0.ptr == body && outstanding() == 2);
+    assert(__PREFIX___append_clone(&values, &values.data[0]) == KU_STRUCT_ARRAY_OK);
+    assert(values.len == 2 && values.capacity == 2 && outstanding() == 3);
+    assert(values.data[0].f0.f0.ptr == body && values.data[1].f0.f0.ptr != body);
+    assert(memcmp(values.data[1].f0.f0.ptr, "yes", 3) == 0 && values.data[1].f0.f1 == 11);
+    __PREFIX___drop(&values);
+    assert(outstanding() == 0);
+    return 0;
+}
+"#;
+
+fn write_array_owner_source(output: BoundedOutput, path: &Path, driver: &str) {
+    assert_ok(&output);
+    let generated = String::from_utf8(output.stdout).unwrap();
+    let (names, body) = generated
+        .split_once('\n')
+        .expect("type names then generated C");
+    let names: Vec<_> = names.trim_end().split('|').collect();
+    let [element, array, prefix] = names.as_slice() else {
+        panic!("generated array names")
+    };
+    let driver = driver
+        .replace("__ELEMENT__", element)
+        .replace("__ARRAY__", array)
+        .replace("__PREFIX__", prefix);
+    fs::write(path, format!("{CHECKED_ARRAY_ALLOCATOR}{body}{driver}")).unwrap();
+}
+
+#[test]
+fn bootstrap_emits_owned_array_operations_for_relocate_tokens_type() {
+    let work = Temp::new();
+    let source = work.0.join("compiler");
+    let project = work.0.join("project");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&project).unwrap();
+    stage_sources(&source);
+    let ku = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    let exe = format!("array-emitter{}", std::env::consts::EXE_SUFFIX);
+    let entry = source.join("semantics/array-emitter.ku");
+    let built = source.join("semantics").join(&exe);
+    let installed = project.join(exe);
+    fs::write(&entry, ARRAY_OWNER_EMITTER).unwrap();
+    assert_ok(&execute(
+        Command::new(&ku)
+            .args(["build", "--release"])
+            .arg(entry)
+            .arg("-o")
+            .arg(&built),
+        &project,
+        150,
+    ));
+    fs::rename(built, &installed).unwrap();
+    fs::remove_dir_all(&source).unwrap();
+
+    for (path, contents) in [
+        (
+            "stage1/token.ku",
+            include_str!("../bootstrap/stage1/token.ku"),
+        ),
+        (
+            "stage1/lexer.ku",
+            include_str!("../bootstrap/stage1/lexer.ku"),
+        ),
+        (
+            "stage2/context.ku",
+            include_str!("../bootstrap/stage2/context.ku"),
+        ),
+        (
+            "stage2/span.ku",
+            include_str!("../bootstrap/stage2/span.ku"),
+        ),
+    ] {
+        let path = project.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    let stage0 = project.join("reference.ku");
+    fs::write(
+        &stage0,
+        r#"import { Scan } from "./stage1/lexer.ku"
+import { Token, TokenCanonical } from "./stage1/token.ku"
+fn main(): null! {
+    tokens = Scan("plan = \"任务🙂\"")?
+    token = tokens[2].clone()
+    result: [Token] = []
+    result = result.push(token)
+    println(TokenCanonical(result[0].clone()))
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let reference = execute(Command::new(&ku).arg("run").arg(stage0), &project, 20);
+    assert_ok(&reference);
+    let expected = String::from_utf8(reference.stdout)
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert_eq!(expected, "String|任务🙂|0|1|8|7|1|13|19\n");
+
+    let select = project.join("target.txt");
+    fs::write(&select, "RelocateTokens").unwrap();
+    let path = project.join("array_owner.c");
+    write_array_owner_source(
+        execute(&mut Command::new(&installed), &project, 30),
+        &path,
+        TOKEN_OWNER_DRIVER,
+    );
+    fs::write(
+        project.join("stage2/context.ku"),
+        r#"
+struct Item { label: str count: int }
+struct Outer { item: Item }
+fn Select(values: [Outer]): [Outer] { return values }
+fn Primitive(values: [int]): [int] { return values }
+"#,
+    )
+    .unwrap();
+    fs::write(&select, "Select").unwrap();
+    let nested = project.join("nested_owner.c");
+    write_array_owner_source(
+        execute(&mut Command::new(&installed), &project, 30),
+        &nested,
+        NESTED_OWNER_DRIVER,
+    );
+    fs::write(&select, "Primitive").unwrap();
+    let unsupported = execute(&mut Command::new(&installed), &project, 15);
+    assert!(!unsupported.status.success() && unsupported.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("unsupported_struct_array_type"));
+    for family in ["stage1", "stage2"] {
+        fs::remove_dir_all(project.join(family)).unwrap();
+    }
+    fs::remove_file(project.join("reference.ku")).unwrap();
+    let binary = project.join(format!("array-owner{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&path, &binary, &project);
+    let run = execute(&mut Command::new(binary), &project, 15);
+    assert_ok(&run);
+    assert_eq!(
+        String::from_utf8(run.stdout).unwrap().replace("\r\n", "\n"),
+        expected
+    );
+    let binary = project.join(format!("nested-owner{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&nested, &binary, &project);
+    assert_ok(&execute(&mut Command::new(binary), &project, 15));
+}

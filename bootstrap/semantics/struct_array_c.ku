@@ -1,0 +1,172 @@
+import { Node } from "../stage2/ast.ku"
+import { Span } from "../stage2/span.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
+import { OrderCStructLayouts, EmitNestedCLayouts } from "./nested_struct_c.ku"
+import { CTypeName } from "./struct_projection_c.ku"
+import { ExplicitType, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { TypeNameBinding } from "./type_names.ku"
+
+struct StructArrayC {
+    element_type: str
+    array_type: str
+    prefix: str
+    source: str
+}
+
+fn collectOwnedFields(&layouts: [StructLayout], index: int, &prefix: str, paths: [str]): [str] {
+    owned = paths
+    field_index = 0
+    while (field_index < layouts[index - 1].fields.len()) {
+        field = layouts[index - 1].fields[field_index].resolved.clone()
+        path = prefix.clone() + ".f" + str(field_index)
+        if (field.declaration_kind == "Builtin" && field.name == "str") {
+            owned = owned.push(path)
+        } else if (field.declaration_kind == "Struct") {
+            child = LayoutIndex(layouts, field.module_index, field.declaration_node)
+            // The checked layout order establishes an acyclic, eight-level
+            // bound before walking this graph.
+            owned = collectOwnedFields(layouts, child, path, owned)
+        }
+        field_index = field_index + 1
+    }
+    return owned
+}
+
+fn emitArrayOwnedElement(&element: str, &prefix: str, &fields: [str]): str {
+    text = ""
+    if (fields.len() != 0) {
+        text += "static bool " + prefix.clone() + "_clone_string(KuProjectionString source, KuProjectionString *out) {\n"
+        text += "    if (source.storage == KU_PROJECTION_STRING_STATIC) { *out = source; return true; }\n"
+        text += "    if (!source.ptr) return true;\n"
+        text += "    size_t size = source.len ? source.len : 1;\n    uint8_t *data = malloc(size);\n    if (!data) return false;\n"
+        text += "    if (source.len) memcpy(data, source.ptr, source.len);\n"
+        text += "    *out = (KuProjectionString){ data, source.len, size, KU_PROJECTION_STRING_OWNED };\n    return true;\n}\n\n"
+    }
+    text += "void " + prefix.clone() + "_element_drop(" + element.clone() + " *value) {\n"
+    index = 0
+    while (index < fields.len()) {
+        access = "(*value)" + fields[index].clone()
+        text += "    if (" + access.clone() + ".storage == KU_PROJECTION_STRING_OWNED) free(" + access + ".ptr);\n"
+        index = index + 1
+    }
+    text += "    *value = (" + element.clone() + "){0};\n}\n\n"
+    text += "static bool " + prefix.clone() + "_clone_element(const " + element.clone() + " *source, " + element.clone() + " *out) {\n"
+    text += "    " + element + " copy = *source;\n"
+    // Establish an empty owner for every managed field before any fallible
+    // allocation. An error may then unwind just the initialized fields.
+    index = 0
+    while (index < fields.len()) {
+        text += "    copy" + fields[index].clone() + " = (KuProjectionString){0};\n"
+        index = index + 1
+    }
+    index = 0
+    while (index < fields.len()) {
+        field = fields[index].clone()
+        text += "    if (!" + prefix.clone() + "_clone_string((*source)" + field.clone() + ", &copy" + field + ")) {\n"
+        text += "        " + prefix.clone() + "_element_drop(&copy);\n        return false;\n    }\n"
+        index = index + 1
+    }
+    return text + "    *out = copy;\n    return true;\n}\n\n"
+}
+
+fn emitArrayBoundary(&element: str, &array: str, &prefix: str): str {
+    text = "static size_t " + prefix.clone() + "_capacity(const " + array.clone() + " *array) {\n"
+    // Stage0 still accepts a zero explicit capacity for legacy len-slot
+    // initializers. Every newly produced header writes its full capacity.
+    text += "    return array->capacity ? array->capacity : array->len;\n}\n\n"
+    text += "static bool " + prefix.clone() + "_valid(const " + array.clone() + " *array) {\n"
+    text += "    if (!array) return false;\n    size_t capacity = " + prefix.clone() + "_capacity(array);\n"
+    text += "    return array->len <= capacity && capacity <= SIZE_MAX / sizeof(" + element.clone() + ") && (array->data || !capacity);\n}\n\n"
+    text += "static bool " + prefix.clone() + "_contains(const " + array.clone() + " *array, const " + element.clone() + " *value) {\n"
+    text += "    uintptr_t slot = (uintptr_t)value, base = (uintptr_t)array->data;\n"
+    text += "    return array->data && slot >= base && slot - base < " + prefix.clone() + "_capacity(array) * sizeof(" + element.clone() + ");\n}\n\n"
+    text += "int " + prefix.clone() + "_clone_at(const " + array + " *array, int64_t index, " + element + " *out) {\n"
+    text += "    if (!out || !" + prefix.clone() + "_valid(array) || " + prefix.clone() + "_contains(array, out)) return KU_STRUCT_ARRAY_INVALID;\n"
+    text += "    if (index < 0 || (uint64_t)index >= array->len) return KU_STRUCT_ARRAY_BOUNDS;\n"
+    text += "    return " + prefix.clone() + "_clone_element(&array->data[index], out) ? KU_STRUCT_ARRAY_OK : KU_STRUCT_ARRAY_OOM;\n}\n\n"
+    return text
+}
+
+fn emitArrayTransfer(&element: str, &array: str, &prefix: str): str {
+    text = array.clone() + " " + prefix.clone() + "_move(" + array.clone() + " *array) {\n"
+    text += "    " + array.clone() + " moved = *array;\n    *array = (" + array.clone() + "){0};\n    return moved;\n}\n\n"
+    text += "void " + prefix.clone() + "_drop(" + array.clone() + " *array) {\n"
+    text += "    for (size_t i = 0; i < array->len; ++i) " + prefix.clone() + "_element_drop(&array->data[i]);\n"
+    text += "    free(array->data);\n    *array = (" + array.clone() + "){0};\n}\n\n"
+    text += "int " + prefix.clone() + "_append_move(" + array.clone() + " *array, " + element.clone() + " *value) {\n"
+    text += "    if (!value || !" + prefix.clone() + "_valid(array) || " + prefix.clone() + "_contains(array, value)) return KU_STRUCT_ARRAY_INVALID;\n"
+    text += "    size_t limit = SIZE_MAX / sizeof(" + element.clone() + ");\n    if (array->len == limit) return KU_STRUCT_ARRAY_CAPACITY;\n"
+    text += "    size_t capacity = " + prefix.clone() + "_capacity(array);\n"
+    text += "    if (array->len == capacity) {\n"
+    text += "        size_t next = capacity ? (capacity > limit / 2 ? limit : capacity * 2) : (limit < 8 ? limit : 8);\n"
+    text += "        " + element.clone() + " *data = realloc(array->data, next * sizeof(" + element.clone() + "));\n"
+    text += "        if (!data) return KU_STRUCT_ARRAY_OOM;\n        array->data = data;\n        capacity = next;\n    }\n"
+    text += "    array->data[array->len++] = *value;\n    array->capacity = capacity;\n    *value = (" + element.clone() + "){0};\n    return KU_STRUCT_ARRAY_OK;\n}\n\n"
+    text += "int " + prefix.clone() + "_append_clone(" + array.clone() + " *array, const " + element.clone() + " *value) {\n"
+    text += "    if (!value || !" + prefix.clone() + "_valid(array)) return KU_STRUCT_ARRAY_INVALID;\n"
+    // Clone before grow, so a well-typed borrowed source may be an element
+    // of this same array without leaving a pointer into reallocated storage.
+    text += "    " + element + " copy = {0};\n"
+    text += "    if (!" + prefix.clone() + "_clone_element(value, &copy)) return KU_STRUCT_ARRAY_OOM;\n"
+    text += "    int status = " + prefix.clone() + "_append_move(array, &copy);\n"
+    text += "    if (status != KU_STRUCT_ARRAY_OK) " + prefix.clone() + "_element_drop(&copy);\n"
+    return text + "    return status;\n}\n"
+}
+
+// Build standalone array operations for one bound struct layout. The private
+// ABI matches Stage0's header/member order. clone_at initializes an empty
+// destination only on success. append_move consumes a separate element
+// owner only on success. The enclosing lowered function owns unwinding.
+fn EmitStructArrayC(&layouts: [StructLayout], module_index: int, declaration: int, at: Span): StructArrayC! {
+    order = OrderCStructLayouts(layouts, module_index, declaration, at)?
+    root = LayoutIndex(layouts, module_index, declaration)
+    element = CTypeName(module_index, declaration)
+    array = "KuArray_" + element.clone()
+    prefix = "ku_owned_array_" + element.clone()
+    owned = collectOwnedFields(layouts, root, "", [])
+    text = EmitNestedCLayouts(layouts, order)? + "#include <stddef.h>\n#include <stdlib.h>\n"
+    if (owned.len() != 0) { text += "#include <string.h>\n" }
+    text += "\ntypedef struct { size_t len; " + element.clone() + " *data; size_t capacity; } " + array.clone() + ";\n"
+    text += "enum { KU_STRUCT_ARRAY_OK, KU_STRUCT_ARRAY_INVALID, KU_STRUCT_ARRAY_BOUNDS, KU_STRUCT_ARRAY_CAPACITY, KU_STRUCT_ARRAY_OOM };\n\n"
+    text += emitArrayOwnedElement(element, prefix, owned) + emitArrayBoundary(element, array, prefix) + emitArrayTransfer(element, array, prefix)
+    return ok(StructArrayC { element_type: element, array_type: array, prefix: prefix, source: text })
+}
+
+fn checkStructArrayType(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding], id: int): TypeNameBinding! {
+    ty = nodes[id - 1].clone()
+    if (ty.kind != "TypeArray" || ty.edge_count != 1) {
+        RejectLayout("unsupported_struct_array_type", "expected a declared array of known structs", DeclarationSpan(ty))?
+    }
+    element = ExplicitType(bindings, edges[ty.first_edge], DeclarationSpan(ty))?
+    if (element.declaration_kind != "Struct") {
+        RejectLayout("unsupported_struct_array_type", "expected a bound struct element type", element.span.clone())?
+    }
+    return ok(element)
+}
+
+// Select support routines from a function's real typed result, independent
+// of its body lowering. Array identity is the bound element, not its spelling.
+fn EmitReturnedStructArrayC(&named: NamedModule, &bindings: [TypeNameBinding], &layouts: [StructLayout],
+                            &function_name: str): StructArrayC! {
+    index = 0
+    while (index < named.names.declarations.len()) {
+        entry = named.names.declarations[index].clone()
+        if (entry.kind == "Function" && entry.name == function_name) {
+            function = named.parsed.arena.nodes[entry.node - 1].clone()
+            cursor = function.first_edge
+            end = cursor + function.edge_count
+            while (cursor < end && named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].kind == "Parameter") {
+                cursor = cursor + 1
+            }
+            if (cursor >= end) {
+                RejectLayout("unsupported_struct_array_type", "expected an explicit struct array result", entry.span.clone())?
+            }
+            element = checkStructArrayType(named.parsed.arena.nodes, named.parsed.arena.edges, bindings, named.parsed.arena.edges[cursor])?
+            return EmitStructArrayC(layouts, element.module_index, element.declaration_node, element.span)
+        }
+        index = index + 1
+    }
+    start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    RejectLayout("unknown_struct_array_function", "undefined function '" + function_name.clone() + "'", start)?
+    return ok(StructArrayC { element_type: "", array_type: "", prefix: "", source: "" })
+}
