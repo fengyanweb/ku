@@ -1,11 +1,14 @@
 import { json } from "std"
+import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
+import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
+import { EmitTryCloneString } from "./struct_array_c.ku"
 import { GuardBoundType, GuardCType, GuardType } from "./guarded_struct_expr.ku"
 import { SuppliedModule } from "./imports.ku"
-import { DeclarationSpan } from "./names.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ExplicitType, RejectLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
-import { CTypeName, ScalarCType } from "./struct_projection_c.ku"
+import { ContainsIndex, CTypeName, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 
 struct LinkPlanType {
@@ -24,6 +27,61 @@ struct LinkPlanDeclaration {
     parameters: [LinkPlanType]
     result: LinkPlanType
     returns_result: bool
+}
+
+struct LinkedNullFunction {
+    unit: int
+    node: int
+    symbol: str
+    parameters: [TypeNameBinding]
+    result: TypeNameBinding
+    returns_result: bool
+}
+
+struct LinkedNullValue {
+    ty: TypeNameBinding
+    text: str
+    slot: int
+    borrowed: bool
+}
+
+struct LinkedNullSlot {
+    binding: str
+    value: LinkedNullValue
+    live: bool
+}
+
+struct LinkedNullState {
+    layouts: [StructLayout]
+    owning_layouts: [StructLayout]
+    owning_strings: bool
+    slots: [LinkedNullSlot]
+    links: [LinkedNullFunction]
+    declarations: str
+    code: str
+    drops: str
+    catch_slot: int
+    catch_edges: bool
+    catch_moved: [int]
+    uses_clone: bool
+    arrays: [TypeNameBinding]
+    validated_arrays: [TypeNameBinding]
+    owned_arrays: [TypeNameBinding]
+    append_slots: [int]
+    uses_str_array: bool
+    uses_str_view: bool
+    element_clones: [int]
+    uses_index: bool
+    uses_add: bool
+    uses_sub: bool
+    uses_string_equal: bool
+    uses_print: bool
+    uses_concat: bool
+}
+
+struct LinkedNullExpression {
+    state: LinkedNullState
+    value: LinkedNullValue
 }
 
 fn BoundLinkPlanType(&binding: TypeNameBinding, local_unit: int, c_type: str, view: bool): LinkPlanType {
@@ -168,4 +226,153 @@ fn NamedProjectionLinkPlan(&selected: SuppliedModule, &types: [TypeNameBinding],
     result = ExplicitType(types, selected.named.parsed.arena.edges[cursor], DeclarationSpan(declaration))?
     return ok(LinkPlanDeclaration { unit: 1, node: node, symbol: symbol.clone(), parameters: parameters,
         result: namedProjectionType(result, layouts, guarded, false)?, returns_result: false })
+}
+
+fn LinkedNullOwnedArray(&binding: TypeNameBinding): bool {
+    return binding.declaration_kind == "OwnedStructArray"
+}
+
+fn LinkedNullOwner(&binding: TypeNameBinding): bool {
+    return binding.declaration_kind == "Struct" || binding.declaration_kind == "CaughtError"
+        || (binding.declaration_kind == "Builtin" && binding.name == "str")
+        || LinkedNullOwnedArray(binding)
+}
+
+fn LinkedFailureTarget(&state: LinkedNullState): str {
+    if (state.catch_slot == 0) { return "result.error" }
+    return state.slots[state.catch_slot - 1].value.text.clone()
+}
+
+fn ExitLinkedFailure(state: LinkedNullState, &indent: str): LinkedNullState {
+    next = state
+    label = "cleanup"
+    if (next.catch_slot > 0) {
+        label = LinkedFailureTarget(next) + "_handler"
+        next.catch_edges = true
+        index = 0
+        while (index < next.catch_slot - 1) {
+            if (!next.slots[index].live && LinkedNullOwner(next.slots[index].value.ty)
+                && !ContainsIndex(next.catch_moved, index)) {
+                next.catch_moved = next.catch_moved.push(index)
+            }
+            index = index + 1
+        }
+    }
+    next.code += indent.clone() + "goto " + label + ";\n"
+    return next
+}
+
+fn LinkedNullBinding(&slots: [LinkedNullSlot], &name: str): int {
+    if (name == "") { return 0 }
+    index = 0
+    while (index < slots.len()) {
+        if (slots[index].binding == name) { return index + 1 }
+        index = index + 1
+    }
+    return 0
+}
+
+fn RestoreLinkedNullSlots(state: LinkedNullState, &outer: [LinkedNullSlot]): LinkedNullState {
+    next = state
+    index = 0
+    while (index < next.slots.len()) {
+        if (index < outer.len()) { next.slots[index].live = outer[index].live }
+        else {
+            next.slots[index].binding = ""
+            next.slots[index].live = false
+        }
+        index = index + 1
+    }
+    return next
+}
+
+fn PreserveLinkedOwners(&before: [LinkedNullSlot], &after: [LinkedNullSlot], &statement: Node): null! {
+    index = 0
+    while (index < before.len()) {
+        if (LinkedNullOwner(before[index].value.ty) && before[index].live != after[index].live) {
+            RejectLayout("linked_control_move", "conditional code cannot consume an outer owner", DeclarationSpan(statement))?
+        }
+        index = index + 1
+    }
+    return ok(null)
+}
+
+struct LinkedNullRegion {
+    state: LinkedNullState
+    terminal: bool
+}
+
+struct LinkedCatchParts {
+    protected: Node
+    binding: Node
+    recovery: Node
+}
+
+fn ReadLinkedCatchParts(&named: NamedModule, &node: Node): LinkedCatchParts! {
+    edge = node.first_edge
+    protected = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
+    handler = named.parsed.arena.nodes[named.parsed.arena.edges[edge + 1] - 1].clone()
+    if (protected.kind != "TryBody" || handler.kind != "Catch" || handler.edge_count != 2) {
+        RejectLayout("unsupported_linked_catch", "expected a protected body and named catch", DeclarationSpan(node))?
+    }
+    edge = handler.first_edge
+    binding = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
+    recovery = named.parsed.arena.nodes[named.parsed.arena.edges[edge + 1] - 1].clone()
+    if (binding.kind != "CatchBinding" || binding.text == "" || binding.edge_count != 0 || recovery.kind != "CatchBody") {
+        RejectLayout("unsupported_linked_catch", "expected a named catch and handler body", DeclarationSpan(handler))?
+    }
+    return ok(LinkedCatchParts { protected: protected, binding: binding, recovery: recovery })
+}
+
+fn LinkedCPrelude(&body: LinkedNullState): str {
+    text = ProjectionHeaders(true, body.drops.contains("ku_projection_string_drop") || body.owning_strings) + GuardArithmetic(body.uses_add, body.uses_sub)
+        + GuardStringEquality(body.uses_string_equal)
+    if (body.arrays.len() > 0 || body.uses_str_array || body.uses_str_view || body.uses_print) {
+        text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
+    }
+    if (body.uses_clone) {
+        text += "#include <stdio.h>\n#include <string.h>\n\n" + EmitTryCloneString("ku_linked_clone_string")
+    }
+    return text
+}
+
+fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &signature: str,
+                         &result_type: str, &payload_cleanup: str): str {
+    text = header
+    array_checks = body.validated_arrays.len() > 0 || body.uses_str_array
+    text += "\n" + result_type.clone() + " " + symbol.clone() + "(" + signature.clone() + ") {\n"
+    text += "    " + result_type.clone() + " result = {0};\n"
+    text += payload_cleanup.clone()
+    if (body.append_slots.len() > 0) { text += "    int append_status = KU_STRUCT_ARRAY_OK;\n" }
+    clone = body.uses_clone || body.element_clones.len() > 0
+    if (clone) { text += "    bool out_of_memory = false;\n" }
+    if (array_checks) { text += "    bool invalid_array = false;\n" }
+    if (body.uses_print) { text += "    bool output_failed = false;\n" }
+    if (body.uses_str_view) { text += "    bool invalid_str = false;\n" }
+    if (body.uses_add || body.uses_sub) { text += "    bool overflow = false;\n" }
+    if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
+    if (body.uses_concat) { text += "    const char* string_failure = NULL;\n" }
+    text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
+    if (body.uses_print) { text += "    if (output_failed) { fputs(\"output write failed\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (clone) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (array_checks) {
+        message = "invalid struct array ownership"
+        if (body.uses_str_array) { message = "invalid array view" }
+        text += "    if (invalid_array) { fputs(\"" + message + "\\n\", stderr); exit(EXIT_FAILURE); }\n"
+    }
+    if (body.append_slots.len() > 0) {
+        text += "    if (append_status != KU_STRUCT_ARRAY_OK) {\n"
+            + "        const char *message = \"invalid struct array ownership\\n\";\n"
+            + "        if (append_status == KU_STRUCT_ARRAY_CAPACITY) message = \"array allocation is too large\\n\";\n"
+            + "        if (append_status == KU_STRUCT_ARRAY_OOM) message = \"array allocation failed\\n\";\n"
+            + "        fputs(message, stderr); exit(EXIT_FAILURE);\n    }\n"
+    }
+    if (body.uses_str_view) { text += "    if (invalid_str) { fputs(\"invalid str view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_concat) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_add || body.uses_sub) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_index) {
+        text += "    if (index_failed) { fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", "
+            + "(long long)failure_index, failure_length); exit(EXIT_FAILURE); }\n"
+    }
+    return text + "    return result;\n}\n"
 }

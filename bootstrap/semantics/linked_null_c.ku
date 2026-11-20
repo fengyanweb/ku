@@ -6,12 +6,12 @@ import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { ContainsType } from "./struct_projection_c.ku"
-import { LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
-import { LinkedCheckedResultCType, LinkedCheckedResultPlan, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
-         LinkedNullFunction, LinkedNullNode, LinkedNullOwner, LinkedNullParameterPlan, LinkedNullParameterType,
-         LinkedNullProject, LinkedNullResultCleanupReference, ReadLinkedOwnedArray, ReadLinkedResult } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, DropLinkedNullScope, EmitLinkedNullDeclarations, LinkedNullBinding, LinkedNullSlot, LinkedNullState, LowerLinkedNullRead,
-         MoveLinkedNullSlot, NewLinkedNullState, RegisterLinkedNullType, RestoreLinkedNullSlots } from "./linked_null_read_c.ku"
+import { ExitLinkedFailure, FinishLinkedFunctionC, LinkedFailureTarget, LinkedNullBinding, LinkedNullFunction, LinkedNullRegion, LinkedNullState, LinkPlanDeclaration, LinkPlanType, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
+import { LinkedBuiltin, LinkedCheckedResultCType, LinkedCheckedResultPlan, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
+         LinkedNullNode, LinkedNullParameterPlan, LinkedNullParameterType,
+         LinkedNullProject, LinkedNullResultCleanupReference, ReadLinkedResult } from "./linked_null_types_c.ku"
+import { AddLinkedNullSlot, BindLinkedCatch, DropLinkedNullScope, EmitLinkedNullDeclarations, LowerLinkedArrayLocal, LowerLinkedNullRead,
+         MoveLinkedNullSlot, NewLinkedNullState, RegisterLinkedNullType } from "./linked_null_read_c.ku"
 import { LowerLinkedArrayAppend, LowerLinkedSuccess,
          LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
@@ -72,22 +72,6 @@ fn readParameters(&project: LinkedNullProject, &function: Node): LinkedNullParam
     return ok(LinkedNullParameters { state: state, signature: signature, body_start: index + 1, plan: plan, result: result })
 }
 
-fn preserveLinkedOwners(&before: [LinkedNullSlot], &after: [LinkedNullSlot], &statement: Node): null! {
-    index = 0
-    while (index < before.len()) {
-        if (LinkedNullOwner(before[index].value.ty) && before[index].live != after[index].live) {
-            RejectLayout("linked_control_move", "conditional code cannot consume an outer owner", DeclarationSpan(statement))?
-        }
-        index = index + 1
-    }
-    return ok(null)
-}
-
-struct LinkedNullRegion {
-    state: LinkedNullState
-    terminal: bool
-}
-
 fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
                     &result: TypeNameBinding, depth: int): LinkedNullState! {
     if (depth >= 32) {
@@ -109,7 +93,7 @@ fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statem
         // arm can reach the following statements with these outer owners.
         taken.state = RestoreLinkedNullSlots(taken.state, outer)
     } else {
-        preserveLinkedOwners(outer, taken.state.slots, statement)?
+        PreserveLinkedOwners(outer, taken.state.slots, statement)?
         taken.state = DropLinkedNullScope(taken.state, outer.len())
     }
     taken.state.code += "    }\n"
@@ -181,7 +165,7 @@ fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statemen
         }
         index = index + 1
     }
-    preserveLinkedOwners(outer, next.slots, statement)?
+    PreserveLinkedOwners(outer, next.slots, statement)?
     next = DropLinkedNullScope(next, locals)
     advanced = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, step, 0), 0)?
     advanced.state.code = advanced.state.code + "    " + advanced.state.slots[cursor - 1].value.text.clone() + " = " + advanced.value.text + ";\n    }\n"
@@ -236,6 +220,17 @@ fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &stat
         RejectLayout("unsupported_linked_terminal", "expected a final Error fail or return ok(null)", DeclarationSpan(statement))?
     }
     literal = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+    target = LinkedFailureTarget(state)
+    if (literal.kind == "Variable" && literal.edge_count == 0) {
+        error = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
+        if (error.value.ty.declaration_kind != "CaughtError") {
+            RejectLayout("unsupported_linked_error", "expected a caught Error owner", DeclarationSpan(literal))?
+        }
+        error.state.code += "    " + target + " = " + error.value.text.clone() + ";\n"
+        owner = error.value.clone()
+        moved = MoveLinkedNullSlot(error.state, owner)?
+        return ok(ExitLinkedFailure(moved, "    "))
+    }
     if (literal.kind != "ObjectLiteral" || literal.edge_count != 3) {
         RejectLayout("unsupported_linked_error", "expected Error domain, code and message", DeclarationSpan(literal))?
     }
@@ -258,26 +253,36 @@ fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &stat
         if (value.value.ty.declaration_kind != "Builtin" || value.value.ty.name != "str") {
             RejectLayout("unsupported_linked_error_field", "error fields require str", DeclarationSpan(node))?
         }
-        value.state.code = value.state.code + "    result.error." + label.clone() + " = " + value.value.text.clone() + ";\n"
+        value.state.code = value.state.code + "    " + target.clone() + "." + label.clone() + " = " + value.value.text.clone() + ";\n"
         owner = value.value.clone()
         next = MoveLinkedNullSlot(value.state, owner)?
         seen = seen.push(label)
         index = index + 1
     }
-    next.code = next.code + "    goto cleanup;\n"
-    return ok(next)
+    return ok(ExitLinkedFailure(next, "    "))
 }
 
-fn lowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
-    ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0))?
-    value = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
-    if (value.kind != "Array" || value.edge_count != 0
-        || LinkedNullBinding(state.slots, statement.text) != 0) {
-        RejectLayout("linked_array_local", "expected a new typed array owner initialized empty", DeclarationSpan(statement))?
+fn lowerLinkedCatch(&project: LinkedNullProject, state: LinkedNullState, &node: Node, id: int,
+                    &result: TypeNameBinding, depth: int): LinkedNullRegion! {
+    if (state.catch_slot != 0 || node.edge_count != 2 || depth >= 8) {
+        RejectLayout("unsupported_linked_catch", "expected one terminal try with a named catch", DeclarationSpan(node))?
     }
-    local = AddLinkedNullSlot(project, state, statement.text.clone(), "l" + str(id), ty, false)?
-    local.state.slots[local.value.slot - 1].live = true
-    return ok(local.state)
+    clauses = ReadLinkedCatchParts(project.supplied[0].named, node)?
+    outer = state.slots.clone()
+    ty = LinkedBuiltin("Error", DeclarationSpan(clauses.binding))
+    ty.declaration_kind = "CaughtError"
+    slot = AddLinkedNullSlot(project, state, "", "caught" + str(id), ty, false)?
+    slot.state.catch_slot = slot.value.slot
+    body = lowerLinkedRegion(project, clauses.protected, slot.state, 0, result, depth + 1)?
+    if (!body.terminal) {
+        RejectLayout("unsupported_linked_catch", "the protected body must return or fail", DeclarationSpan(clauses.protected))?
+    }
+    resumed = BindLinkedCatch(body.state, clauses.binding.text.clone(), clauses.binding, outer)?
+    handled = lowerLinkedRegion(project, clauses.recovery, resumed, 0, result, depth + 1)?
+    if (!handled.terminal) {
+        RejectLayout("unsupported_linked_catch", "the handler must return or fail", DeclarationSpan(clauses.recovery))?
+    }
+    return ok(handled)
 }
 
 fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNullState, start: int,
@@ -295,10 +300,13 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             else { next = lowerLinkedFailure(project, next, statement)? }
             return ok(LinkedNullRegion { state: next, terminal: true })
         }
+        if (statement.kind == "Try" && index == region.edge_count - 1) {
+            return lowerLinkedCatch(project, next, statement, id, result, depth)
+        }
         if (statement.kind == "Assign" && statement.edge_count == 1) {
             next = addLocal(project, next, statement, id)?
         } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {
-            next = lowerLinkedArrayLocal(project, next, statement, id)?
+            next = LowerLinkedArrayLocal(project, next, statement, id)?
         } else if (statement.kind == "If" && statement.edge_count > 1 && statement.int_value == statement.edge_count - 1) {
             next = addGuardedRegion(project, next, statement, result, depth)?
         } else if (statement.kind == "While" && statement.edge_count >= 2 && index > start) {
@@ -315,44 +323,10 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
 }
 
 fn emitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &payload: TypeNameBinding): str! {
-    text = EmitLinkedNullDeclarations(body, payload)?
-    result_type = LinkedCheckedResultCType(payload)?
-    array_checks = body.validated_arrays.len() > 0 || body.uses_str_array
-    text += "\n" + result_type.clone() + " " + symbol.clone() + "(" + signature.clone() + ") {\n"
-    text += "    " + result_type.clone() + " result = {0};\n"
-    text += LinkedNullResultCleanupReference(body.owning_layouts, payload)
-    if (body.append_slots.len() > 0) { text += "    int append_status = KU_STRUCT_ARRAY_OK;\n" }
-    clone = body.uses_clone || body.element_clones.len() > 0
-    if (clone) { text += "    bool out_of_memory = false;\n" }
-    if (array_checks) { text += "    bool invalid_array = false;\n" }
-    if (body.uses_print) { text += "    bool output_failed = false;\n" }
-    if (body.uses_str_view) { text += "    bool invalid_str = false;\n" }
-    if (body.uses_add || body.uses_sub) { text += "    bool overflow = false;\n" }
-    if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
-    if (body.uses_concat) { text += "    const char* string_failure = NULL;\n" }
-    text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
-    if (body.uses_print) { text += "    if (output_failed) { fputs(\"output write failed\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (clone) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (array_checks) {
-        message = "invalid struct array ownership"
-        if (body.uses_str_array) { message = "invalid array view" }
-        text += "    if (invalid_array) { fputs(\"" + message + "\\n\", stderr); exit(EXIT_FAILURE); }\n"
-    }
-    if (body.append_slots.len() > 0) {
-        text += "    if (append_status != KU_STRUCT_ARRAY_OK) {\n"
-            + "        const char *message = \"invalid struct array ownership\\n\";\n"
-            + "        if (append_status == KU_STRUCT_ARRAY_CAPACITY) message = \"array allocation is too large\\n\";\n"
-            + "        if (append_status == KU_STRUCT_ARRAY_OOM) message = \"array allocation failed\\n\";\n"
-            + "        fputs(message, stderr); exit(EXIT_FAILURE);\n    }\n"
-    }
-    if (body.uses_str_view) { text += "    if (invalid_str) { fputs(\"invalid str view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_concat) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_add || body.uses_sub) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_index) {
-        text += "    if (index_failed) { fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", "
-            + "(long long)failure_index, failure_length); exit(EXIT_FAILURE); }\n"
-    }
-    return ok(text + "    return result;\n}\n")
+    header = EmitLinkedNullDeclarations(body, payload)?
+    result = LinkedCheckedResultCType(payload)?
+    keep = LinkedNullResultCleanupReference(body.owning_layouts, payload)
+    return ok(FinishLinkedFunctionC(header, body, symbol, signature, result, keep))
 }
 
 fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! {

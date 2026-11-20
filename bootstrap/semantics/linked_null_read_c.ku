@@ -2,75 +2,23 @@ import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
-import { ContainsType, CTypeName, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
+import { ContainsIndex, ContainsType, CTypeName, EmitLayout } from "./struct_projection_c.ku"
 import { BuildProjectOwningLayouts, EmitOwningLayoutDefinitions, OrderProjectOwningLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { EmitLinkedStringArrayPrelude, EmitOwnedStructArrayDrop, EmitOwnedStructOperations, EmitStructArrayHeader, EmitStructArrayReadValidation,
-         EmitStructArrayResultHeader, EmitStructArrayDropUsing, EmitTryCloneString, EmitOwnedStructArrayAppend, StructArrayStatuses } from "./struct_array_c.ku"
+         EmitStructArrayResultHeader, EmitStructArrayDropUsing, EmitOwnedStructArrayAppend, StructArrayStatuses } from "./struct_array_c.ku"
+import { LinkedCPrelude, LinkedNullBinding, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { EmitProjectionStringJoinHelpers, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullDropC, LinkedNullFunction,
-         LinkedNullLayout, LinkedNullNode, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullProject, EmitLinkedNullPrototypes, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
-
-struct LinkedNullValue {
-    ty: TypeNameBinding
-    text: str
-    slot: int
-    borrowed: bool
-}
-
-struct LinkedNullSlot {
-    binding: str
-    value: LinkedNullValue
-    live: bool
-}
-
-struct LinkedNullState {
-    layouts: [StructLayout]
-    owning_layouts: [StructLayout]
-    owning_strings: bool
-    slots: [LinkedNullSlot]
-    links: [LinkedNullFunction]
-    declarations: str
-    code: str
-    drops: str
-    uses_clone: bool
-    arrays: [TypeNameBinding]
-    validated_arrays: [TypeNameBinding]
-    owned_arrays: [TypeNameBinding]
-    append_slots: [int]
-    uses_str_array: bool
-    uses_str_view: bool
-    element_clones: [int]
-    uses_index: bool
-    uses_add: bool
-    uses_sub: bool
-    uses_string_equal: bool
-    uses_print: bool
-    uses_concat: bool
-}
-
-struct LinkedNullExpression {
-    state: LinkedNullState
-    value: LinkedNullValue
-}
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullDropC,
+         LinkedNullLayout, LinkedNullNode, LinkedNullProject, EmitLinkedNullPrototypes, LinkedNullView, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn NewLinkedNullState(): LinkedNullState {
     return LinkedNullState { layouts: [], owning_layouts: [], owning_strings: false,
-        slots: [], links: [], declarations: "", code: "", drops: "", uses_clone: false,
+        slots: [], links: [], declarations: "", code: "", drops: "", catch_slot: 0,
+        catch_edges: false, catch_moved: [], uses_clone: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false,
         element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false, uses_print: false, uses_concat: false }
-}
-
-fn LinkedNullBinding(&slots: [LinkedNullSlot], &name: str): int {
-    if (name == "") { return 0 }
-    index = 0
-    while (index < slots.len()) {
-        if (slots[index].binding == name) { return index + 1 }
-        index = index + 1
-    }
-    return 0
 }
 
 fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &element: TypeNameBinding): LinkedNullState! {
@@ -145,6 +93,18 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
     return ok(LinkedNullExpression { state: next, value: value })
 }
 
+fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
+    ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0))?
+    value = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
+    if (value.kind != "Array" || value.edge_count != 0
+        || LinkedNullBinding(state.slots, statement.text) != 0) {
+        RejectLayout("linked_array_local", "expected a new typed array owner initialized empty", DeclarationSpan(statement))?
+    }
+    local = AddLinkedNullSlot(project, state, statement.text.clone(), "l" + str(id), ty, false)?
+    local.state.slots[local.value.slot - 1].live = true
+    return ok(local.state)
+}
+
 fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNullState! {
     if (value.borrowed) {
         RejectLayout("linked_view_escape", "readonly values cannot be moved or stored without an explicit clone", value.ty.span.clone())?
@@ -157,13 +117,13 @@ fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNu
     return ok(next)
 }
 
-fn DropLinkedNullScope(state: LinkedNullState, outer: int): LinkedNullState {
+fn dropLinkedScope(state: LinkedNullState, outer: int, unwind: bool): LinkedNullState {
     next = state
     index = next.slots.len()
     while (index > outer) {
         index = index - 1
         slot = next.slots[index].clone()
-        if (slot.live && LinkedNullOwner(slot.value.ty)) {
+        if ((slot.live || unwind) && !slot.value.borrowed && LinkedNullOwner(slot.value.ty)) {
             next.code = next.code + LinkedNullDropC(next.layouts, next.owning_layouts, slot.value.ty, slot.value.text)
         }
         next.slots[index].binding = ""
@@ -172,18 +132,31 @@ fn DropLinkedNullScope(state: LinkedNullState, outer: int): LinkedNullState {
     return next
 }
 
-fn RestoreLinkedNullSlots(state: LinkedNullState, &outer: [LinkedNullSlot]): LinkedNullState {
+fn DropLinkedNullScope(state: LinkedNullState, outer: int): LinkedNullState {
+    return dropLinkedScope(state, outer, false)
+}
+
+fn BindLinkedCatch(state: LinkedNullState, name: str, &binding: Node, &before: [LinkedNullSlot]): LinkedNullState! {
+    if (!state.catch_edges || LinkedNullBinding(before, name) != 0) {
+        RejectLayout("linked_catch_shape", "catch requires a reachable error edge and a distinct Error binding", DeclarationSpan(binding))?
+    }
     next = state
+    slot = next.catch_slot
+    next.code += next.slots[slot - 1].value.text.clone() + "_handler:\n"
+    // Every slot starts zero. A later syntactic move need not have
+    // happened at the point of the failure, so unwind its owner as well.
+    next = dropLinkedScope(next, slot, true)
     index = 0
-    while (index < next.slots.len()) {
-        if (index < outer.len()) { next.slots[index].live = outer[index].live }
-        else {
-            next.slots[index].binding = ""
-            next.slots[index].live = false
-        }
+    while (index < before.len()) {
+        next.slots[index].live = before[index].live && !ContainsIndex(next.catch_moved, index)
         index = index + 1
     }
-    return next
+    next.slots[slot - 1].binding = name
+    next.slots[slot - 1].live = true
+    next.catch_slot = 0
+    next.catch_edges = false
+    next.catch_moved = []
+    return ok(next)
 }
 
 fn linkedValue(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNullExpression {
@@ -348,14 +321,7 @@ fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpressio
 fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding): str! {
     // Keep the external prototypes independent of the selected entry's C
     // name. The linker consumes declarations resolved from the source graph.
-    text = ProjectionHeaders(true, body.drops.contains("ku_projection_string_drop") || body.owning_strings) + GuardArithmetic(body.uses_add, body.uses_sub)
-        + GuardStringEquality(body.uses_string_equal)
-    if (body.arrays.len() > 0 || body.uses_str_array || body.uses_str_view) {
-        text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
-    }
-    if (body.uses_clone) {
-        text += "#include <stdio.h>\n#include <string.h>\n\n" + EmitTryCloneString("ku_linked_clone_string")
-    }
+    text = LinkedCPrelude(body)
     if (body.uses_concat) { text += EmitProjectionStringJoinHelpers() }
     definitions = EmitOwningLayoutDefinitions(body.owning_layouts, 0, 0)?
     text += definitions.source

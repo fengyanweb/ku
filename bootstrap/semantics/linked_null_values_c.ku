@@ -3,10 +3,11 @@ import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
+import { ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
-import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullFunction, LinkedNullHasResultValue, LinkedNullLiteralType,
-         LinkedNullNode, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullExpression, LinkedNullState, LinkedNullValue, LowerLinkedNullLeaf,
+import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullHasResultValue, LinkedNullLiteralType,
+         LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
+import { AddLinkedNullSlot, LowerLinkedNullLeaf,
          LowerLinkedNullRead, MoveLinkedNullSlot, ReadLinkedNullBinding, RequireLinkedArrayValidation } from "./linked_null_read_c.ku"
 
 struct LinkedNullArguments {
@@ -180,12 +181,13 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
     }
     arguments = lowerLinkedArguments(project, state, call, callee, id, depth)?
     result = "dependency" + str(id)
-    // The callee owns the arguments at this point. An error skips subsequent
-    // statements and transfers its strings before the caller's cleanup.
+    failure = LinkedFailureTarget(arguments.state)
     arguments.state.code = arguments.state.code + "    " + LinkedNullResultType(callee)? + " " + result.clone() + " = " + LinkedNullCallSymbol(callee)
         + "(" + arguments.args + ");\n" + arguments.handoff
-        + "    if (!" + result.clone() + ".ok) {\n        result.error = " + result.clone() + ".error;\n"
-        + "        " + result.clone() + ".error = (KuBootstrapError){0};\n        goto cleanup;\n    }\n"
+        + "    if (!" + result.clone() + ".ok) {\n        " + failure + " = " + result.clone() + ".error;\n"
+        + "        " + result.clone() + ".error = (KuBootstrapError){0};\n"
+    arguments.state = ExitLinkedFailure(arguments.state, "        ")
+    arguments.state.code += "    }\n"
     return ok(LinkedCheckedCall { state: arguments.state, result: callee.result, text: result, id: id })
 }
 

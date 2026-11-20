@@ -343,6 +343,13 @@ checked `fs.read` requires the bound standard namespace and the existing
 and converts the carrier fields without copying the file contents. The
 caller retains its path, and the original error fields are transferred.
 
+A terminal `try` can route a checked failure to a named `catch`. The
+protected scope unwinds its initialized owners before the handler runs,
+including values whose moves occur after the failing call. The handler
+may return a replacement or transfer the intact Error with `fail err`.
+Fatal allocation and bounds exits use the common cleanup. A binding
+that was consumed on any caught edge is unavailable in the handler.
+
 Managed array functions can take a `str` by value and check its byte or
 Unicode scalar length before initializing a local `[str]` with `.chars()`.
 The local array owns its non-ASCII entries independently of the source.

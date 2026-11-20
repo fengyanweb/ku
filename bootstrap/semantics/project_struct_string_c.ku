@@ -15,7 +15,8 @@ import { HasScalarBuiltin, ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { BindStructStringCall, ReadStructStringFold, StructStringDependency, StructStringFold } from "./struct_string_calls.ku"
 import { TypeNameBinding } from "./type_names.ku"
 
-import { DropLinkedNullScope, LinkedNullBinding, LinkedNullState } from "./linked_null_read_c.ku"
+import { DropLinkedNullScope } from "./linked_null_read_c.ku"
+import { LinkedNullBinding, LinkedNullState } from "./link_plan_c.ku"
 import { LinkedNullChild, LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
 import { LowerLinkedNullTry, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 fn linkedOutputBuiltin(&project: LinkedNullProject, &state: LinkedNullState, &target: Node): bool {
