@@ -5,12 +5,12 @@ import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_la
 import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { ContainsType, CTypeName, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
 import { BuildProjectOwningLayouts, EmitOwningLayoutDefinitions, OrderProjectOwningLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
-import { EmitOwnedStructArrayDrop, EmitOwnedStructOperations, EmitStructArrayHeader, EmitStructArrayReadValidation,
+import { EmitLinkedStringArrayPrelude, EmitOwnedStructArrayDrop, EmitOwnedStructOperations, EmitStructArrayHeader, EmitStructArrayReadValidation,
          EmitStructArrayResultHeader, EmitStructArrayDropUsing, EmitTryCloneString, EmitOwnedStructArrayAppend, StructArrayStatuses } from "./struct_array_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
-import { EmitScalarStringPair, ScalarStringJoinHelpers } from "./scalar_int_emit.ku"
+import { EmitProjectionStringJoinHelpers, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullDropC, LinkedNullFunction,
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullDropC, LinkedNullFunction,
          LinkedNullLayout, LinkedNullNode, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullProject, EmitLinkedNullPrototypes, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
 
 struct LinkedNullValue {
@@ -150,7 +150,7 @@ fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNu
         RejectLayout("linked_view_escape", "readonly values cannot be moved or stored without an explicit clone", value.ty.span.clone())?
     }
     next = state
-    if (value.slot > 0 && LinkedNullOwner(value.ty)) {
+    if (value.slot > 0 && LinkedNullDropC(next.layouts, next.owning_layouts, value.ty, value.text) != "") {
         next.code = next.code + "    " + value.text.clone() + " = (" + LinkedNullCType(value.ty)? + "){0};\n"
         next.slots[value.slot - 1].live = false
     }
@@ -190,15 +190,6 @@ fn linkedValue(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNu
     return LinkedNullExpression { state: state, value: LinkedNullValue { ty: ty, text: text, slot: 0, borrowed: false } }
 }
 
-fn readableArray(&value: LinkedNullValue): bool {
-    return value.ty.declaration_kind == "StructArray" || value.ty.declaration_kind == "BuiltinArray" || LinkedNullOwnedArray(value.ty)
-}
-
-fn arrayHeader(&value: LinkedNullValue): str {
-    if (LinkedNullOwnedArray(value.ty)) { return "(&" + value.text.clone() + ")" }
-    return value.text.clone()
-}
-
 fn ReadLinkedNullBinding(state: LinkedNullState, &node: Node): LinkedNullExpression! {
     index = LinkedNullBinding(state.slots, node.text)
     if (index == 0 || !state.slots[index - 1].live) {
@@ -226,10 +217,10 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
         target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
         if (target.kind == "Field" && target.edge_count == 1 && target.text == "len") {
             value = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, target, 0), depth + 1)?
-            if (!readableArray(value.value)) {
+            if (!LinkedNullReadableArray(value.value.ty)) {
                 RejectLayout("linked_array_length", "len requires a struct array", DeclarationSpan(node))?
             }
-            header = arrayHeader(value.value)
+            header = LinkedNullArrayHeader(value.value.ty, value.value.text)
             return ok(linkedValue(value.state, LinkedBuiltin("int", DeclarationSpan(node)),
                 "(int64_t)" + header + "->len"))
         }
@@ -245,12 +236,12 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
 fn readLinkedIndex(&project: LinkedNullProject, state: LinkedNullState, &node: Node, id: int, depth: int): LinkedNullExpression! {
     array = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
     index = LowerLinkedNullRead(project, array.state, LinkedNullChild(project, 1, node, 1), depth + 1)?
-    if (!readableArray(array.value) || index.value.ty.name != "int" ||
+    if (!LinkedNullReadableArray(array.value.ty) || index.value.ty.name != "int" ||
         index.value.ty.declaration_kind != "Builtin") {
         RejectLayout("linked_index_type", "expected a readonly struct array and int index", DeclarationSpan(node))?
     }
     offset = "i" + str(id)
-    header = arrayHeader(array.value)
+    header = LinkedNullArrayHeader(array.value.ty, array.value.text)
     index.state.uses_index = true
     index.state.code = index.state.code + "    int64_t " + offset.clone() + " = " + index.value.text + ";\n"
         + "    if (" + offset.clone() + " < 0 || (uint64_t)" + offset.clone() + " >= " + header.clone() + "->len) {\n"
@@ -365,10 +356,7 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
     if (body.uses_clone) {
         text += "#include <stdio.h>\n#include <string.h>\n\n" + EmitTryCloneString("ku_linked_clone_string")
     }
-    if (body.uses_concat) {
-        text += "#include <stdio.h>\n#include <string.h>\n\n"
-            + "typedef KuProjectionString KuBootstrapString;\n" + ScalarStringJoinHelpers(false)
-    }
+    if (body.uses_concat) { text += EmitProjectionStringJoinHelpers() }
     definitions = EmitOwningLayoutDefinitions(body.owning_layouts, 0, 0)?
     text += definitions.source
     for layout in body.layouts.clone() {
@@ -385,10 +373,7 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
         }
     }
     if (body.uses_str_array) {
-        if (!ContainsType(definitions.array_types, "KuGuardStringArray")) {
-            text += EmitStructArrayHeader("KuProjectionString", "KuGuardStringArray")
-        }
-        text += EmitStructArrayReadValidation("KuProjectionString", "KuGuardStringArray", "ku_linked_view_str_array")
+        text += EmitLinkedStringArrayPrelude(!ContainsType(definitions.array_types, "KuGuardStringArray"))
     }
     for layout in body.element_clones.clone() {
         text += EmitOwnedStructOperations(body.layouts, layout, "ku_linked_element_" + str(layout), true)

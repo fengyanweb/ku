@@ -179,6 +179,11 @@ fn ScalarStringJoinHelpers(format: bool): str {
     return text + "    return NULL;\n}\n\n"
 }
 
+fn EmitProjectionStringJoinHelpers(): str {
+    return "#include <stdio.h>\n#include <string.h>\n\n"
+        + "typedef KuProjectionString KuBootstrapString;\n" + ScalarStringJoinHelpers(false)
+}
+
 // A checked binary join reads both operands once, after Ku's ordered
 // lowering has evaluated them. Their source owners remain with the caller.
 fn EmitScalarStringPair(&left: str, &right: str, &result: str): str {

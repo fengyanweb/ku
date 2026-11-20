@@ -132,6 +132,15 @@ fn LinkedNullOwnedArray(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "OwnedStructArray"
 }
 
+fn LinkedNullReadableArray(&type: TypeNameBinding): bool {
+    return type.declaration_kind == "StructArray" || type.declaration_kind == "BuiltinArray" || LinkedNullOwnedArray(type)
+}
+
+fn LinkedNullArrayHeader(&type: TypeNameBinding, &value: str): str {
+    if (LinkedNullOwnedArray(type)) { return "(&" + value.clone() + ")" }
+    return value.clone()
+}
+
 fn LinkedStringResult(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Builtin" && binding.name == "str"
 }

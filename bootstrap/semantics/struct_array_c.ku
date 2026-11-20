@@ -97,6 +97,12 @@ fn EmitOwnedStructArrayDrop(&layouts: [StructLayout], root: int, &array: str, &p
     return emitOwnedElementDrop(element, prefix, fields, true) + EmitStructArrayDropUsing(array, prefix, prefix.clone() + "_element_drop", true)
 }
 
+fn EmitLinkedStringArrayPrelude(needs_header: bool): str {
+    source = ""
+    if (needs_header) { source += EmitStructArrayHeader("KuProjectionString", "KuGuardStringArray") }
+    return source + EmitStructArrayReadValidation("KuProjectionString", "KuGuardStringArray", "ku_linked_view_str_array")
+}
+
 fn EmitStructArrayReadValidation(&element: str, &array: str, &prefix: str): str {
     text = "static size_t " + prefix.clone() + "_capacity(const " + array.clone() + " *array) {\n"
     // Stage0 still accepts a zero explicit capacity for legacy len-slot
