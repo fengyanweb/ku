@@ -232,7 +232,7 @@ fn ProjectionHeaders(needs_string: bool, drop_strings: bool): str {
 }
 
 fn LinkedFsReadReference(&symbol: str): str {
-    return "#include \"fs_read.h\"\nextern KuResult_str " + symbol.clone() + "(const KuString*);\n"
+    return "#define KU_BOOTSTRAP_FS_NO_COMPAT_STRING\n#include \"fs_read.h\"\n#undef KU_BOOTSTRAP_FS_NO_COMPAT_STRING\nextern KuResult_str " + symbol.clone() + "(const KuString*);\n"
         + "static KuProjectionString ku_linked_from_fs_string(KuString value) {\n"
         + "    return (KuProjectionString){value.ptr,value.len,value.capacity,value.storage};\n}\n"
         + "static KuBootstrapResult_KuProjectionString ku_linked_fs_read(const KuProjectionString* path) {\n"

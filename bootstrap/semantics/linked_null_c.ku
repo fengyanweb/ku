@@ -8,8 +8,7 @@ import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
-import { RejectLayout } from "./struct_layouts.ku"
-import { ContainsType } from "./struct_projection_c.ku"
+import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
 import { ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullFunction, LinkedNullRegion, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NewLinkedNullState, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedCheckedResultPlan, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullParameterPlan, LinkedNullParameterType,
@@ -228,7 +227,8 @@ fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &stat
     if (statement.kind != "Fail" || statement.edge_count != 1) {
         RejectLayout("unsupported_linked_terminal", "expected a final Error fail or return ok(null)", DeclarationSpan(statement))?
     }
-    literal = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+    id = LinkedNullChild(project, 1, statement, 0)
+    literal = LinkedNullNode(project, 1, id)
     target = LinkedFailureTarget(state)
     if (literal.kind == "Variable" && literal.edge_count == 0) {
         error = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
@@ -240,33 +240,40 @@ fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &stat
         moved = MoveLinkedNullSlot(error.state, owner)?
         return ok(ExitLinkedFailure(moved, "    "))
     }
-    if (literal.kind != "ObjectLiteral" || literal.edge_count != 3) {
-        RejectLayout("unsupported_linked_error", "expected Error domain, code and message", DeclarationSpan(literal))?
-    }
+    plan = ReadLinkedErrorInitializer(project.supplied[0].named, literal)?
     next = state
-    seen: [str] = []
-    index = 0
-    while (index < literal.edge_count) {
-        field = LinkedNullNode(project, 1, LinkedNullChild(project, 1, literal, index))
-        label = field.text.clone()
-        if (field.kind != "ObjectLiteralField" || field.edge_count != 1 || (label != "domain" && label != "code" && label != "message")
-            || ContainsType(seen, label)) {
-            RejectLayout("invalid_linked_error_field", "expected each named Error field once", DeclarationSpan(field))?
-        }
-        item = LinkedNullChild(project, 1, field, 0)
-        node = LinkedNullNode(project, 1, item)
-        if ((node.kind != "Variable" && node.kind != "String") || node.edge_count != 0) {
-            RejectLayout("unsupported_linked_error_field", "error fields require initialized str bindings or literals", DeclarationSpan(node))?
-        }
-        value = LowerLinkedNullValue(project, next.clone(), item, 0)?
+    destination = target.clone()
+    if (plan.scratch) {
+        ty = LinkedBuiltin("Error", DeclarationSpan(literal))
+        ty.declaration_kind = "CaughtError"
+        scratch = AddLinkedNullSlot(project, next, "", "error" + str(id), ty, false)?
+        next = scratch.state
+        destination = scratch.value.text
+    }
+    for field in plan.fields {
+        value = LowerLinkedNullValue(project, next, field.expression, 0)?
         if (value.value.ty.declaration_kind != "Builtin" || value.value.ty.name != "str") {
-            RejectLayout("unsupported_linked_error_field", "error fields require str", DeclarationSpan(node))?
+            RejectLayout("unsupported_linked_error_field", "error fields require str", value.value.ty.span.clone())?
         }
-        value.state.code = value.state.code + "    " + target.clone() + "." + label.clone() + " = " + value.value.text.clone() + ";\n"
-        owner = value.value.clone()
-        next = MoveLinkedNullSlot(value.state, owner)?
-        seen = seen.push(label)
-        index = index + 1
+        value.state.code += "    " + destination.clone() + "." + field.name + " = " + value.value.text.clone() + ";\n"
+        owner = value.value
+        if (owner.borrowed) {
+            if (owner.slot == 0 || value.state.catch_slot != 0
+                || value.state.slots[owner.slot - 1].value.ty.declaration_kind != "CaughtError") {
+                RejectLayout("linked_error_field_owner", "error fields require an owned str or a terminal caught field", owner.ty.span.clone())?
+            }
+            value.state.code += "    " + owner.text.clone() + " = (KuProjectionString){0};\n"
+            value.state.moved_error_fields = value.state.moved_error_fields.push(owner.text)
+            next = value.state
+        } else {
+            next = MoveLinkedNullSlot(value.state, owner)?
+        }
+    }
+    if (plan.scratch) {
+        next.code += "    " + target + " = " + destination.clone() + ";\n"
+            + "    " + destination + " = (KuBootstrapError){0};\n"
+        cleared: [str] = []
+        next.moved_error_fields = cleared
     }
     return ok(ExitLinkedFailure(next, "    "))
 }

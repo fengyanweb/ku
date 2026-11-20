@@ -359,6 +359,10 @@ including values whose moves occur after the failing call. The handler
 may return a replacement or transfer the intact Error with `fail err`.
 Fatal allocation and bounds exits use the common cleanup. A binding
 that was consumed on any caught edge is unavailable in the handler.
+A terminal fail can move caught Error fields into a new Error. Its
+other string operands can read still-live caught fields. The scratch
+Error owns each completed field during message construction, so a
+fatal allocation failure also releases the partially constructed Error.
 
 An explicitly typed local uses the existing ownership path once its
 initializer matches the declared type. A conditional replacement of one

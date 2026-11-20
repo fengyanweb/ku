@@ -4243,4 +4243,5 @@ int main(int argc, char **argv) {
     struct_view::assert_named_struct_view(&compiler, &cwd);
     member_move::assert_owned_member_transfer(&compiler, &cwd);
     linked_guard::assert_linked_call_addition(&compiler, &cwd);
+    linked_guard::assert_decorated_caught_error(&compiler, &cwd);
 }

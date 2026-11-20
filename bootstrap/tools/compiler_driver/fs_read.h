@@ -12,7 +12,9 @@ typedef struct KuString {
     size_t capacity;
     uint8_t storage;
 } KuString;
+#ifndef KU_BOOTSTRAP_FS_NO_COMPAT_STRING
 typedef KuString KuBootstrapString;
+#endif
 
 enum { KU_STRING_STATIC = 0, KU_STRING_OWNED = 1 };
 

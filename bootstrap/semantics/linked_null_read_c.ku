@@ -6,10 +6,10 @@ import { Span } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
-import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
-import { ReadLinkedNullBinding, CheckLinkedAddition, LinkedCPrelude, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { LinkedErrorField, ReadLinkedNullBinding, CheckLinkedAddition, LinkedCPrelude, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullDropC,
@@ -238,6 +238,11 @@ fn readLinkedIndex(&project: LinkedNullProject, state: LinkedNullState, &node: N
 fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: Node, depth: int): LinkedNullExpression! {
     receiver = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
     ty = receiver.value.ty.clone()
+    if (ty.declaration_kind == "CaughtError") {
+        at = DeclarationSpan(node)
+        member = ReadLinkedErrorMember(receiver.value.text, node.text, receiver.state.moved_error_fields, at.clone())?
+        return ok(LinkedErrorField(receiver, member, at))
+    }
     if (ty.declaration_kind != "Struct") {
         RejectLayout("linked_field_type", "expected a readonly struct field receiver", DeclarationSpan(node))?
     }

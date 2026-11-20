@@ -773,3 +773,159 @@ pub(super) fn assert_linked_call_addition(seed: &Path, cwd: &Path) {
     assert!(bad.stdout.is_empty());
     assert!(String::from_utf8_lossy(&bad.stderr).contains("linked_addition_moved_operand"));
 }
+
+const DECORATED_CATCH_SOURCE: &str = r#"import { Supply, Decorate } from "./decorated-provider.ku"
+fn Finish(path: str): str! {
+    try {
+        ready = Supply()?
+        return ok(ready)
+    } catch (err) {
+        fail { domain: err.domain, code: err.code, message: Decorate(path) + ": " + err.message }
+    }
+}
+fn Duplicate(): null! {
+    try {
+        ready = Supply()?
+        return ok(null)
+    } catch (err) {
+        fail { domain: err.domain, code: err.code, message: "bad " + err.domain }
+    }
+}
+"#;
+
+const DECORATED_CATCH_PROVIDER: &str = r#"
+fn Supply(): str! { return ok("success") }
+fn Decorate(path: str): str { return path }
+"#;
+
+const DECORATED_CATCH_HOST: &str = r#"
+static bool succeeds;
+static uint8_t *domain, *error_code;
+static KuProjectionString owned(const char *string, size_t len) {
+    uint8_t *data = malloc(len);
+    assert(data);
+    memcpy(data,string,len);
+    return (KuProjectionString){data,len,len,KU_PROJECTION_STRING_OWNED};
+}
+KuBootstrapResult_KuProjectionString __SUPPLY__(void) {
+    KuBootstrapResult_KuProjectionString out = {0};
+    if (succeeds) {
+        out.ok = true;
+        out.value = owned("success",7);
+    } else {
+        out.error.domain = owned("parse",5);
+        out.error.code = owned("invalid",7);
+        out.error.message = owned("structure",9);
+        domain = out.error.domain.ptr;
+        error_code = out.error.code.ptr;
+    }
+    return out;
+}
+KuProjectionString __DECORATE__(KuProjectionString path) {
+    assert(path.len == 4 && memcmp(path.ptr,"file",4) == 0);
+    return path;
+}
+static void verify_partial_oom(void) {
+    if (outstanding() || attempts != 6) _Exit(81);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    (void)test_realloc;
+    if (argc == 2) {
+        KuProjectionString path = owned("file",4);
+        fail_after = 4;
+        assert(atexit(verify_partial_oom) == 0);
+        (void)__ENTRY__(path);
+        return 82;
+    }
+    KuBootstrapResult_KuProjectionString result = __ENTRY__(owned("file",4));
+    assert(!result.ok && !result.value.ptr && attempts == 6 && outstanding() == 3);
+    assert(result.error.domain.ptr == domain && result.error.domain.len == 5);
+    assert(result.error.code.ptr == error_code && result.error.code.len == 7);
+    assert(result.error.message.len == 15 && memcmp(result.error.message.ptr,"file: structure",15) == 0);
+    ku_projection_string_drop(&result.error.domain);
+    ku_projection_string_drop(&result.error.code);
+    ku_projection_string_drop(&result.error.message);
+    assert(!outstanding());
+    succeeds = true;
+    result = __ENTRY__(owned("file",4));
+    assert(result.ok && result.value.len == 7 && outstanding() == 1);
+    ku_projection_string_drop(&result.value);
+    assert(!outstanding());
+    return 0;
+}
+"#;
+
+pub(super) fn assert_decorated_caught_error(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("decorated.ku"), DECORATED_CATCH_SOURCE).unwrap();
+    fs::write(cwd.join("decorated-provider.ku"), DECORATED_CATCH_PROVIDER).unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "decorated.ku\ndecorated-provider.ku\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("function.txt"), "Finish").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+    let metadata = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&metadata);
+    let Some(Value::Result { ok: true, value }) = json::eval(
+        "decode",
+        &[Value::String(String::from_utf8(metadata.stdout).unwrap())],
+        Span::default(),
+    )
+    .unwrap() else {
+        panic!("expected caught Error link plan")
+    };
+    let Value::Object(plan) = *value else {
+        panic!("expected plan object")
+    };
+    let Value::Object(export) = &plan["export"] else {
+        panic!("expected export")
+    };
+    let Value::String(entry) = &export["symbol"] else {
+        panic!("expected entry symbol")
+    };
+    let Value::Array(deps) = &plan["dependencies"] else {
+        panic!("expected dependencies")
+    };
+    let markers = [("Supply", "__SUPPLY__"), ("Decorate", "__DECORATE__")];
+    let mut host = DECORATED_CATCH_HOST.replace("__ENTRY__", entry);
+    for (name, marker) in markers {
+        let symbol = deps
+            .iter()
+            .find_map(|dependency| match dependency {
+                Value::Object(decl) if decl["source_name"] == Value::String(name.into()) => {
+                    match &decl["symbol"] {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("expected bound dependency");
+        host = host.replace(marker, symbol);
+    }
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let code = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&code);
+    let source = cwd.join("decorated-error.c");
+    let exe = cwd.join(format!("decorated-error{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &source,
+        format!(
+            "{CHECKED_ARRAY_ALLOCATOR}{}{host}",
+            String::from_utf8(code.stdout).unwrap()
+        ),
+    )
+    .unwrap();
+    compile_projection(&source, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    let oom = execute(Command::new(exe).arg("oom"), cwd, 15);
+    assert_eq!(oom.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&oom.stderr).trim(), "out of memory");
+    fs::write(cwd.join("function.txt"), "Duplicate").unwrap();
+    let duplicate = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(duplicate.status.code(), Some(1));
+    assert!(duplicate.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("linked_error_member_moved"));
+}

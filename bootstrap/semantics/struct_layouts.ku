@@ -372,3 +372,57 @@ fn BindStructReturn(&named: NamedModule, &bindings: [TypeNameBinding], &layouts:
     RejectLayout("unknown_projection_function", "undefined function '" + function_name.clone() + "'", start)?
     return ok(StructReturnPlan { function_name: "", function_node: 0, result_layout: 0, parameters: [], projections: [] })
 }
+
+struct LinkedErrorInitializerField {
+    name: str
+    expression: int
+}
+
+struct LinkedErrorInitializer {
+    fields: [LinkedErrorInitializerField]
+    scratch: bool
+}
+
+fn isLinkedErrorMember(&name: str): bool {
+    return name == "domain" || name == "code" || name == "message"
+}
+
+fn ReadLinkedErrorMember(&owner: str, &name: str, &moved: [str], at: Span): str! {
+    if (!isLinkedErrorMember(name)) {
+        RejectLayout("linked_error_member", "expected a caught Error field", at.clone())?
+    }
+    member = owner.clone() + "." + name.clone()
+    index = 0
+    while (index < moved.len()) {
+        if (moved[index] == member) {
+            RejectLayout("linked_error_member_moved", "caught Error field already moved", at.clone())?
+        }
+        index = index + 1
+    }
+    return ok(member)
+}
+
+fn ReadLinkedErrorInitializer(&named: NamedModule, &literal: Node): LinkedErrorInitializer! {
+    if (literal.kind != "ObjectLiteral" || literal.edge_count != 3) {
+        RejectLayout("unsupported_linked_error", "expected Error domain, code and message", DeclarationSpan(literal))?
+    }
+    fields: [LinkedErrorInitializerField] = []
+    scratch = false
+    index = 0
+    while (index < literal.edge_count) {
+        field = named.parsed.arena.nodes[named.parsed.arena.edges[literal.first_edge + index] - 1].clone()
+        repeat = false
+        for existing in fields {
+            if (existing.name == field.text) { repeat = true }
+        }
+        if (field.kind != "ObjectLiteralField" || field.edge_count != 1 || !isLinkedErrorMember(field.text) || repeat) {
+            RejectLayout("invalid_linked_error_field", "expected each named Error field once", DeclarationSpan(field))?
+        }
+        expression = named.parsed.arena.edges[field.first_edge]
+        operand = named.parsed.arena.nodes[expression - 1].clone()
+        scratch = scratch || operand.edge_count != 0 || (operand.kind != "Variable" && operand.kind != "String")
+        fields = fields.push(LinkedErrorInitializerField { name: field.text, expression: expression })
+        index = index + 1
+    }
+    return ok(LinkedErrorInitializer { fields: fields, scratch: scratch })
+}
