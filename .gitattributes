@@ -1,1 +1,2 @@
 /.github/fixtures/native-three-os/fs-relative/src/asset.txt text eol=lf
+/src/backend/c_fs_*.c text eol=lf

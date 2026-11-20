@@ -132,6 +132,89 @@ class LinkTests(unittest.TestCase):
         cc.assert_not_called()
         self.assertEqual(self.output.read_bytes(), old)
 
+    def test_fs_read_provider_links_and_preserves_bytes_and_errors(self):
+        tools = Path(__file__).resolve().parent
+        driver = tools / "compiler_driver"
+        backend = tools.parents[1] / "src" / "backend"
+        path_type = dict(builtin("str", "const KuBootstrapString*"), passing="view")
+        result_type = builtin("str", "KuResult_str")
+        provider = declaration("std/fs.ku", 1, "KuBootstrapFsRead", [path_type])
+        provider["signature"].update(result=result_type, returns_result=True)
+        dependency = dict(provider, symbol="read_builtin")
+        consumer = declaration("manifest.ku", 1, "read_manifest", [path_type])
+        consumer["signature"].update(result=result_type, returns_result=True)
+
+        units = self.unit("consumer", plan(consumer, [dependency]), """
+#include "fs_read.h"
+extern KuResult_str read_builtin(const KuString*);
+KuResult_str read_manifest(const KuString* path) { return read_builtin(path); }
+""")
+        units += self.unit("provider", plan(provider),
+                           (driver / "fs_read.c").read_text(encoding="ascii"), receipt=True)
+
+        filename = "条目🙂.txt"
+        content = "清单🙂".encode("utf-8") + b"\0\r\n"
+        (self.root / filename).write_bytes(content)
+        (self.root / "empty").write_bytes(b"")
+        (self.root / "plain").write_bytes(b"not truncated")
+        (self.root / "not-utf8").write_bytes(b"\xed\xa0\x80")
+        (self.root / "exact-limit").write_bytes(b"x" * 1_000_000)
+        (self.root / "over-limit").write_bytes(b"x" * 1_000_001)
+
+        def c_bytes(value):
+            return '"' + "".join(f"\\{byte:03o}" for byte in value) + '"'
+
+        self.caller.write_text(r"""
+#include <stdlib.h>
+#include <string.h>
+static KuString view(const char* bytes, size_t len) {
+    return (KuString){(uint8_t*)bytes, len, 0, KU_STRING_STATIC};
+}
+static bool equal(KuString actual, const char* text) {
+    size_t len = strlen(text);
+    return actual.storage == KU_STRING_STATIC && actual.len == len &&
+           !memcmp(actual.ptr, text, len);
+}
+static int fail(KuString path, const char* code) {
+    KuResult_str out = read_manifest(&path);
+    return out.ok || out.value.ptr || out.value.len || out.value.capacity ||
+           !equal(out.error.domain, "fs") || !equal(out.error.code, code) ||
+           !out.error.message.len;
+}
+int main(void) {
+    static const char name[] = __NAME__;
+    static const char expected[] = __CONTENT__;
+    KuString path = view(name, sizeof(name) - 1u);
+    KuResult_str out = read_manifest(&path);
+    if (!out.ok || out.value.storage != KU_STRING_OWNED ||
+        out.value.len != sizeof(expected) - 1u ||
+        memcmp(out.value.ptr, expected, sizeof(expected) - 1u)) return 1;
+    free(out.value.ptr);
+    path = view("empty", 5u);
+    out = read_manifest(&path);
+    if (!out.ok || out.value.len) return 2;
+    if (out.value.storage == KU_STRING_OWNED) free(out.value.ptr);
+    path = view("exact-limit", 11u);
+    out = read_manifest(&path);
+    if (!out.ok || out.value.len != 1000000u ||
+        out.value.storage != KU_STRING_OWNED || out.value.ptr[999999] != 'x') return 3;
+    free(out.value.ptr);
+    return fail(view("not-utf8", 8u), "read_failed") ||
+           fail(view("plain\0ignored", 13u), "read_failed") ||
+           fail(view("\377", 1u), "read_failed") ||
+           fail(view("missing", 7u), "read_failed") ||
+           fail(view("over-limit", 10u), "file_too_large");
+}
+""".replace("__NAME__", c_bytes(filename.encode("utf-8")))
+   .replace("__CONTENT__", c_bytes(content)), encoding="ascii")
+        cc = os.environ.get("CC", "cc")
+        include = "/I" if Path(cc).stem.lower() in {"cl", "clang-cl"} else "-I"
+        self.assertEqual(link_c.main([
+            *units, "--entry", "manifest.ku", "1", "--caller", str(self.caller),
+            "-o", str(self.output), f"--cflag={include}{driver}", f"--cflag={include}{backend}",
+        ]), 0)
+        subprocess.run([self.output], cwd=self.root, check=True, timeout=5)
+
     def test_missing_and_duplicate_providers_are_rejected_before_compiling(self):
         self.assert_preflight_error([*self.entry_args, *self.left_args], "missing provider for tools/右.ku#17")
         self.assert_preflight_error([*self.entry_args, *self.left_args, *self.right_args, *self.left_args],
