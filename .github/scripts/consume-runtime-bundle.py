@@ -1277,6 +1277,33 @@ async fn main(): null! {
         install, root / 'task-error-project', env, target, files, '1\n2\n3\ntrue\nno input!\n过🙂\nupstream\n7\n')
 
 
+def installed_task_optional_consumer(install, root, env, report, target):
+    """Exercise optional owned Task results from a relocated multi-file program."""
+    files = {
+        'helper.ku': """struct Reply { detail: Detail }
+struct Detail { body: str title: str | null }
+async fn Fetch(): Reply! {
+    return ok(Reply { detail: Detail { body: "Ku" + "🙂", title: "owned" + " title" } })
+}
+""",
+        'main.ku': """import time from "std.time"
+import { Fetch } from "./helper.ku"
+async fn main(): null! {
+    named = (await Fetch())?
+    println(named?.detail?.unknown)
+    println(((await Fetch())?)?.detail?.unknown)
+    println(((await Fetch())?)?.detail?.title == null)
+    println(((await Fetch())?)?.detail?.title != null)
+    time.sleep(2)?
+    println(named.detail.body)
+    return ok(null)
+}
+""",
+    }
+    report['installed_task_optional'] = validate_installed_relative_program(
+        install, root / 'task-optional-project', env, target, files, 'null\nnull\nfalse\ntrue\nKu🙂\n')
+
+
 def run_structured_only(args, report):
     """Check the structured Task and declaration examples from a verified installed archive."""
     repo = args.repo.resolve()
@@ -1323,6 +1350,7 @@ def run_structured_only(args, report):
         installed_bootstrap_module_consumer(install, root, env, report, repo, verifier, target)
         installed_forward_layout_consumer(install, root, env, report, target)
         installed_task_error_consumer(install, root, env, report, target)
+        installed_task_optional_consumer(install, root, env, report, target)
     report.update(status='passed', backend_equivalence=True, owned_temp_removed=not root.exists())
 
 
