@@ -1186,7 +1186,8 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
     detail['status'] = 'passed'
 
 
-def validate_installed_relative_program(install, project, env, target, files, expected):
+def validate_installed_relative_program(install, project, env, target, files, expected, *,
+                                        native_only_diagnostic=None):
     project.mkdir()
     for name, contents in files.items():
         (project / name).write_text(contents, encoding='utf-8')
@@ -1218,6 +1219,13 @@ def validate_installed_relative_program(install, project, env, target, files, ex
                 (project / name).unlink()
         result = invoke(command, cwd, selected_env, seconds=20)
         observed = output(result)
+        if native_only_diagnostic is not None and mode != 'c':
+            diagnostic = result.stderr.decode('utf-8', errors='replace')
+            if result.returncode != 1 or observed or native_only_diagnostic not in diagnostic:
+                raise RuntimeError(project.name + ' installed diagnostic differed: ' +
+                                   repr((observed + diagnostic)[-4096:]))
+            outputs[mode] = {'exit_code': result.returncode, 'diagnostic': native_only_diagnostic}
+            continue
         if result.returncode or result.stderr or observed != expected:
             raise RuntimeError(project.name + ' installed execution differed: ' +
                                repr((observed + result.stderr.decode('utf-8', errors='replace'))[-4096:]))
@@ -1238,6 +1246,19 @@ def installed_forward_layout_consumer(install, root, env, report, target):
     }
     report['installed_forward_layout'] = validate_installed_relative_program(
         install, root / 'forward-layout-project', env, target, files, 'Ku🙂\n')
+
+
+def installed_native_only_bytes_consumer(install, root, env, report, target):
+    """An installed interpreter or Runner explains the native-only bytes call."""
+    files = {
+        'helper.ku': 'import { bytes } from "std"\n'
+                     'fn Encoded(text: str): int! { return ok(bytes.from_str(text)?.len()) }\n',
+        'main.ku': 'import { Encoded as Count } from "./helper.ku"\n'
+                   'fn main(): null! { println(Count("中文🙂")?) return ok(null) }\n',
+    }
+    report['installed_native_only_bytes'] = validate_installed_relative_program(
+        install, root / 'native-only-bytes-project', env, target, files, '10\n',
+        native_only_diagnostic='std.bytes currently requires native C; use ku build --backend c')
 
 
 def installed_task_error_consumer(install, root, env, report, target):
@@ -1412,6 +1433,7 @@ def run_structured_only(args, report):
                                (output(result) + result.stderr.decode('utf-8', errors='replace'))[-4096:])
         report['installed_bootstrap_cli'] = {'status': 'passed', 'sha256': EXPORT.file_hash(driver_test)}
         installed_forward_layout_consumer(install, root, env, report, target)
+        installed_native_only_bytes_consumer(install, root, env, report, target)
         installed_task_error_consumer(install, root, env, report, target)
         installed_task_optional_consumer(install, root, env, report, target)
         installed_pattern_capture_consumer(install, root, env, report, target)
