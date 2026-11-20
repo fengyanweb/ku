@@ -12,6 +12,9 @@ mod diagnostic_calls;
 #[path = "support/bootstrap_linked_null.rs"]
 mod linked_null;
 
+#[path = "support/bootstrap_token_window.rs"]
+mod token_window;
+
 use bounded_process::{run_bounded, BoundedOutput, OutputLimits};
 use ku::{span::Span, stdlib::json, value::Value};
 use std::fs;
@@ -1356,6 +1359,7 @@ fn Make(): Outer {
     assert_guarded_predicate(&driver_binary, &cwd);
     assert_project_link_plans(&driver_binary, &cwd);
     linked_null::assert_checked_owned_call(&driver_binary, &cwd);
+    token_window::assert_readonly_preflight(&driver_binary, &cwd);
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {

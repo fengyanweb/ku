@@ -28,9 +28,8 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
     return ParseTokenWindow(RelocateTokens(tokens, context), stage3_domain)
 }
 
-// Parse a bounded window whose tokens already carry absolute positions.
-// The caller supplies exactly one terminal EOF, with the desired error span.
-fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
+// Validate the token window before the parser creates any arena state.
+fn ValidateTokenWindow(&tokens: [Token], stage3_domain: bool): null! {
     if (tokens.len() == 0) {
         RejectAtPoint("invalid_token_stream", "token stream must end in exactly one EOF", stage3_domain)?
     }
@@ -47,7 +46,13 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
     if (tokens[tokens.len() - 1].kind != "Eof") {
         RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "token stream is missing EOF", stage3_domain)?
     }
+    return ok(null)
+}
 
+// Parse a bounded window whose tokens already carry absolute positions.
+// The caller supplies exactly one terminal EOF, with the desired error span.
+fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
+    ValidateTokenWindow(tokens, stage3_domain)?
     cursor = 0
     depth = 1
     brace_depth = 0

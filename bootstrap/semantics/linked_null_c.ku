@@ -4,14 +4,16 @@ import { DeclarationSpan } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { ContainsType, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
-import { EmitTryCloneString } from "./struct_array_c.ku"
+import { CTypeName, ContainsType, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
+import { EmitOwnedStructOperations, EmitStructArrayHeader, EmitStructArrayReadValidation, EmitTryCloneString } from "./struct_array_c.ku"
+import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
-import { LinkedNullCType, LinkedNullChild, LinkedNullEntry, LinkedNullFunction, LinkedNullNode,
-         LinkedNullProject, LinkedNullPrototype, LinkedNullType, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullState, LowerLinkedNullValue,
-         LowerLinkedNullTry, MoveLinkedNullSlot, NewLinkedNullState } from "./linked_null_values_c.ku"
+import { LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry, LinkedNullFunction, LinkedNullNode,
+         LinkedNullOwner, LinkedNullParameterType, LinkedNullProject, LinkedNullPrototype, LinkedNullType } from "./linked_null_types_c.ku"
+import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullState, LowerLinkedNullRead,
+         MoveLinkedNullSlot, NewLinkedNullState } from "./linked_null_read_c.ku"
+import { LowerLinkedNullTry, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
 struct LinkedNullC {
     symbol: str
@@ -32,18 +34,24 @@ fn readParameters(&project: LinkedNullProject, &function: Node): LinkedNullParam
     signature = ""
     plan: [LinkPlanType] = []
     index = 0
+    validation = ""
     while (index < function.edge_count) {
         node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
         if (node.kind != "Parameter") { break }
-        if (node.edge_count != 1 || node.int_value != 0 || LinkedNullBinding(state.slots, node.text) != 0) {
-            RejectLayout("linked_entry_parameter", "expected distinct explicitly typed by-value parameters", DeclarationSpan(node))?
+        if (node.edge_count != 1 || node.int_value < 0 || node.int_value > 1 || LinkedNullBinding(state.slots, node.text) != 0) {
+            RejectLayout("linked_entry_parameter", "expected distinct explicitly typed parameters", DeclarationSpan(node))?
         }
-        ty = LinkedNullType(project, 1, LinkedNullChild(project, 1, node, 0))?
+        view = node.int_value == 1
+        ty = LinkedNullParameterType(project, LinkedNullChild(project, 1, node, 0), view)?
         name = "a" + str(index)
         if (index != 0) { signature += ", " }
         c_type = LinkedNullCType(ty)?
         signature += c_type.clone() + " " + name.clone()
-        plan = plan.push(BoundLinkPlanType(ty, 1, c_type, false))
+        plan = plan.push(BoundLinkPlanType(ty, 1, c_type, view))
+        if (view) {
+            validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(" + name.clone() + ") || (uintmax_t)"
+                + name.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
+        }
         slot = AddLinkedNullSlot(project, state, node.text, name.clone(), ty, true)?
         state = slot.state
         state.code = state.code + "    (void)" + name + ";\n"
@@ -61,7 +69,106 @@ fn readParameters(&project: LinkedNullProject, &function: Node): LinkedNullParam
         RejectLayout("linked_null_signature", "expected a null! result", inner.span)?
     }
     if (index == 0) { signature = "void" }
+    state.code = state.code + validation
     return ok(LinkedNullParameters { state: state, signature: signature, body_start: index + 1, plan: plan })
+}
+
+fn preserveLinkedOwners(&before: LinkedNullState, &after: LinkedNullState, &statement: Node): null! {
+    index = 0
+    while (index < before.slots.len()) {
+        if (LinkedNullOwner(before.slots[index].value.ty) && before.slots[index].live != after.slots[index].live) {
+            RejectLayout("linked_control_move", "conditional code cannot consume an outer owner", DeclarationSpan(statement))?
+        }
+        index = index + 1
+    }
+    return ok(null)
+}
+
+fn addGuardedCall(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    body = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
+    if (body.kind == "Assign") { return addGuardedAssignment(project, state, statement) }
+    if (body.kind != "ExprStmt" || body.edge_count != 1) {
+        RejectLayout("unsupported_linked_guard", "expected one checked call in the guard", DeclarationSpan(body))?
+    }
+    guard = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
+    if (guard.value.ty.declaration_kind != "Builtin" || guard.value.ty.name != "bool") {
+        RejectLayout("linked_guard_type", "expected a readonly bool condition", DeclarationSpan(statement))?
+    }
+    guard.state.code = guard.state.code + "    if (" + guard.value.text + ") {\n"
+    taken = LowerLinkedNullTry(project, guard.state.clone(), body)?
+    preserveLinkedOwners(guard.state, taken, body)?
+    taken.code = taken.code + "    }\n"
+    return ok(taken)
+}
+
+fn isReadonlyArrayLimit(&project: LinkedNullProject, &state: LinkedNullState, node_id: int): bool {
+    node = LinkedNullNode(project, 1, node_id)
+    if (node.kind == "Binary" && node.text == "-" && node.edge_count == 2) {
+        amount = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 1))
+        if (amount.kind != "Int" || amount.edge_count != 0 || amount.int_value < 0) { return false }
+        node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
+    }
+    if (node.kind != "Call" || node.edge_count != 1) { return false }
+    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
+    if (target.kind != "Field" || target.edge_count != 1 || target.text != "len") { return false }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+    if (receiver.kind != "Variable" || receiver.edge_count != 0) { return false }
+    slot = LinkedNullBinding(state.slots, receiver.text)
+    return slot > 0 && state.slots[slot - 1].value.ty.declaration_kind == "StructArray"
+}
+
+fn countedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &initial: Node, &step: Node): int! {
+    guard = LinkedNullNode(project, 1, LinkedNullChild(project, 1, loop, 0))
+    if (guard.kind != "Binary" || guard.edge_count != 2 || guard.text != "<" ||
+        !isReadonlyArrayLimit(project, state, LinkedNullChild(project, 1, guard, 1))) {
+        RejectLayout("unsupported_linked_loop", "counted while requires a readonly array length bound", DeclarationSpan(guard))?
+    }
+    left = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
+    slot = LinkedNullBinding(state.slots, left.text)
+    if (left.kind != "Variable" || left.edge_count != 0 || slot == 0 || state.slots[slot - 1].value.ty.name != "int" ||
+        initial.kind != "Assign" || initial.edge_count != 1 || initial.text != left.text ||
+        step.kind != "Assign" || step.edge_count != 1 || step.text != left.text) {
+        RejectLayout("unsupported_linked_loop", "counted while requires one distinct int cursor", DeclarationSpan(loop))?
+    }
+    zero = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 0))
+    rhs = LinkedNullNode(project, 1, LinkedNullChild(project, 1, step, 0))
+    if (zero.kind != "Int" || zero.edge_count != 0 || zero.int_value != 0 || rhs.kind != "Binary" || rhs.edge_count != 2 || rhs.text != "+") {
+        RejectLayout("unsupported_linked_loop", "counted while requires initialization to zero and a unit increment", DeclarationSpan(loop))?
+    }
+    cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, rhs, 0))
+    one = LinkedNullNode(project, 1, LinkedNullChild(project, 1, rhs, 1))
+    if (cursor.kind != "Variable" || cursor.edge_count != 0 || cursor.text != left.text ||
+        one.kind != "Int" || one.edge_count != 0 || one.int_value != 1) {
+        RejectLayout("unsupported_linked_loop", "counted while must advance the cursor by one", DeclarationSpan(step))?
+    }
+    return ok(slot)
+}
+
+fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, &initial: Node): LinkedNullState! {
+    step = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, statement.edge_count - 1))
+    cursor = countedIndex(project, state, statement, initial, step)?
+    next = state
+    next.code = next.code + "    while (true) {\n"
+    guard = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, statement, 0), 0)?
+    guard.state.code = guard.state.code + "    if (!(" + guard.value.text + ")) break;\n"
+    next = guard.state
+    index = 1
+    while (index < statement.edge_count - 1) {
+        item = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, index))
+        if (item.kind == "If" && item.edge_count == 2 && item.int_value == 1) {
+            body = LinkedNullNode(project, 1, LinkedNullChild(project, 1, item, 1))
+            if (body.kind != "ExprStmt") {
+                RejectLayout("unsupported_linked_loop_body", "counted while may only guard checked calls", DeclarationSpan(body))?
+            }
+            next = addGuardedCall(project, next, item)?
+        } else {
+            RejectLayout("unsupported_linked_loop_body", "counted while may only guard checked calls", DeclarationSpan(item))?
+        }
+        index = index + 1
+    }
+    advanced = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, step, 0), 0)?
+    advanced.state.code = advanced.state.code + "    " + advanced.state.slots[cursor - 1].value.text.clone() + " = " + advanced.value.text + ";\n    }\n"
+    return ok(advanced.state)
 }
 
 fn addLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
@@ -187,11 +294,14 @@ fn lowerLinkedBody(&project: LinkedNullProject, &function: Node, state: LinkedNu
         if (statement.kind == "Assign" && statement.edge_count == 1) {
             next = addLocal(project, next, statement, id)?
         } else if (statement.kind == "If" && statement.edge_count == 2 && statement.int_value == 1) {
-            next = addGuardedAssignment(project, next, statement)?
+            next = addGuardedCall(project, next, statement)?
+        } else if (statement.kind == "While" && statement.edge_count >= 2 && index > start) {
+            initial = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index - 1))
+            next = addCountedLoop(project, next, statement, initial)?
         } else if (statement.kind == "ExprStmt" && statement.edge_count == 1) {
             next = LowerLinkedNullTry(project, next, statement)?
         } else {
-            RejectLayout("unsupported_linked_statement", "expected a fresh local, guarded string assignment or checked call", DeclarationSpan(statement))?
+            RejectLayout("unsupported_linked_statement", "expected a fresh local, guarded statement, counted while or checked call", DeclarationSpan(statement))?
         }
         index = index + 1
     }
@@ -202,18 +312,38 @@ fn lowerLinkedBody(&project: LinkedNullProject, &function: Node, state: LinkedNu
 fn linkedSource(&body: LinkedNullState, &symbol: str, &signature: str): str! {
     // Keep the external prototypes independent of the selected entry's C
     // name. The linker consumes declarations resolved from the source graph.
-    text = ProjectionHeaders(true, true)
+    text = ProjectionHeaders(true, body.drops != "") + GuardArithmetic(body.uses_add, body.uses_sub)
+        + GuardStringEquality(body.uses_string_equal)
+    if (body.arrays.len() > 0) { text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n" }
     if (body.uses_clone) {
         text += "#include <stdio.h>\n#include <string.h>\n\n" + EmitTryCloneString("ku_linked_clone_string")
     }
     for layout in body.layouts.clone() { text += EmitLayout(layout, true, true)? }
+    for array in body.arrays.clone() {
+        element = CTypeName(array.module_index, array.declaration_node)
+        array_type = "KuArray_" + element.clone()
+        text += EmitStructArrayHeader(element, array_type) + EmitStructArrayReadValidation(element, array_type, LinkedNullArrayPrefix(array))
+    }
+    for layout in body.element_clones.clone() {
+        text += EmitOwnedStructOperations(body.layouts, layout, "ku_linked_element_" + str(layout), true)
+    }
     text += StructResultHeader()
     for dependency in body.links.clone() { text += LinkedNullPrototype(dependency)? }
     text += "\nKuBootstrapResultNull " + symbol.clone() + "(" + signature.clone() + ") {\n"
     text += "    KuBootstrapResultNull result = {0};\n"
-    if (body.uses_clone) { text += "    bool out_of_memory = false;\n" }
+    clone = body.uses_clone || body.element_clones.len() > 0
+    if (clone) { text += "    bool out_of_memory = false;\n" }
+    if (body.arrays.len() > 0) { text += "    bool invalid_array = false;\n" }
+    if (body.uses_add || body.uses_sub) { text += "    bool overflow = false;\n" }
+    if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
     text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
-    if (body.uses_clone) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (clone) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.arrays.len() > 0) { text += "    if (invalid_array) { fputs(\"invalid struct array ownership\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_add || body.uses_sub) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_index) {
+        text += "    if (index_failed) { fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", "
+            + "(long long)failure_index, failure_length); exit(EXIT_FAILURE); }\n"
+    }
     return ok(text + "    return result;\n}\n")
 }
 

@@ -1,103 +1,17 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
-import { TypeNameBinding } from "./type_names.ku"
-import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
-import { ScalarStringLiteral } from "./scalar_int_operands.ku"
-import { LinkedBuiltin, LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullFunction, LinkedNullLayout, LinkedNullLiteralType,
+import { LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullFunction, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullOwner, LinkedNullProject, SameLinkedType } from "./linked_null_types_c.ku"
-
-struct LinkedNullValue {
-    ty: TypeNameBinding
-    text: str
-    slot: int
-}
-
-struct LinkedNullSlot {
-    binding: str
-    value: LinkedNullValue
-    live: bool
-}
-
-struct LinkedNullState {
-    layouts: [StructLayout]
-    slots: [LinkedNullSlot]
-    links: [LinkedNullFunction]
-    declarations: str
-    code: str
-    drops: str
-    uses_clone: bool
-}
-
-struct LinkedNullExpression {
-    state: LinkedNullState
-    value: LinkedNullValue
-}
+import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullExpression, LinkedNullState, LowerLinkedNullLeaf,
+         LowerLinkedNullRead, MoveLinkedNullSlot, ReadLinkedNullBinding } from "./linked_null_read_c.ku"
 
 struct LinkedNullArguments {
     state: LinkedNullState
     args: str
     handoff: str
-}
-
-fn NewLinkedNullState(): LinkedNullState {
-    return LinkedNullState { layouts: [], slots: [], links: [], declarations: "", code: "", drops: "", uses_clone: false }
-}
-
-fn LinkedNullBinding(&slots: [LinkedNullSlot], &name: str): int {
-    if (name == "") { return 0 }
-    index = 0
-    while (index < slots.len()) {
-        if (slots[index].binding == name) { return index + 1 }
-        index = index + 1
-    }
-    return 0
-}
-
-fn linkedDrop(&layouts: [StructLayout], &value: LinkedNullValue): str {
-    if (value.ty.name == "str" && value.ty.declaration_kind == "Builtin") {
-        return "    ku_projection_string_drop(&" + value.text.clone() + ");\n"
-    }
-    if (value.ty.declaration_kind == "Struct") {
-        layout = LayoutIndex(layouts, value.ty.module_index, value.ty.declaration_node)
-        return GuardOwnedDrops(layouts, layout, value.text)
-    }
-    return ""
-}
-
-fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, binding: str,
-                     name: str, ty: TypeNameBinding, parameter: bool): LinkedNullExpression! {
-    next = state
-    next.layouts = LinkedNullLayout(project, ty, next.layouts, 0)?
-    kind = LinkedNullCType(ty)?
-    value = LinkedNullValue { ty: ty, text: name.clone(), slot: next.slots.len() + 1 }
-    next.slots = next.slots.push(LinkedNullSlot { binding: binding, value: value.clone(), live: parameter })
-    if (!parameter) { next.declarations = next.declarations + "    " + kind + " " + name + " = {0};\n" }
-    next.drops = linkedDrop(next.layouts, value) + next.drops
-    return ok(LinkedNullExpression { state: next, value: value })
-}
-
-fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNullState! {
-    next = state
-    if (value.slot > 0 && LinkedNullOwner(value.ty)) {
-        next.code = next.code + "    " + value.text.clone() + " = (" + LinkedNullCType(value.ty)? + "){0};\n"
-        next.slots[value.slot - 1].live = false
-    }
-    return ok(next)
-}
-
-fn linkedValue(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNullExpression {
-    return LinkedNullExpression { state: state, value: LinkedNullValue { ty: ty, text: text, slot: 0 } }
-}
-
-fn linkedRead(state: LinkedNullState, &node: Node): LinkedNullExpression! {
-    index = LinkedNullBinding(state.slots, node.text)
-    if (index == 0 || !state.slots[index - 1].live) {
-        RejectLayout("unavailable_linked_binding", "expected an initialized, unconsumed binding", DeclarationSpan(node))?
-    }
-    value = state.slots[index - 1].value.clone()
-    return ok(LinkedNullExpression { state: state, value: value })
 }
 
 fn rememberLinkedCall(calls: [LinkedNullFunction], dependency: LinkedNullFunction): [LinkedNullFunction] {
@@ -108,12 +22,30 @@ fn rememberLinkedCall(calls: [LinkedNullFunction], dependency: LinkedNullFunctio
     return result.push(dependency)
 }
 
-fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int): LinkedNullExpression! {
-    subject = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int, depth: int): LinkedNullExpression! {
+    subject_id = LinkedNullChild(project, 1, target, 0)
+    subject = LinkedNullNode(project, 1, subject_id)
+    if (subject.kind == "Index") {
+        source = LowerLinkedNullRead(project, state, subject_id, depth + 1)?
+        ty = source.value.ty.clone()
+        layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
+        output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
+        if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
+            output.state.code = output.state.code + "    " + output.value.text.clone() + " = " + source.value.text + ";\n"
+        } else {
+            if (!ContainsIndex(output.state.element_clones, layout)) {
+                output.state.element_clones = output.state.element_clones.push(layout)
+            }
+            output.state.code = output.state.code + "    if (!ku_linked_element_" + str(layout) + "_clone_element(&"
+                + source.value.text + ", &" + output.value.text.clone() + ")) { out_of_memory = true; goto cleanup; }\n"
+        }
+        output.state.slots[output.value.slot - 1].live = true
+        return ok(output)
+    }
     if (subject.kind != "Variable" || subject.edge_count != 0) {
         RejectLayout("unsupported_linked_clone", "expected a bound str variable for clone", DeclarationSpan(subject))?
     }
-    source = linkedRead(state, subject)?
+    source = ReadLinkedNullBinding(state, subject)?
     if (source.value.ty.declaration_kind != "Builtin" || source.value.ty.name != "str") {
         RejectLayout("unsupported_linked_clone", "only str.clone is in this checked subset", DeclarationSpan(subject))?
     }
@@ -168,7 +100,10 @@ fn lowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
 fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: Node, id: int, depth: int): LinkedNullExpression! {
     target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
     if (target.kind == "Field" && target.text == "clone" && target.edge_count == 1 && call.edge_count == 1) {
-        return emitLinkedClone(project, state, target, id)
+        return emitLinkedClone(project, state, target, id, depth)
+    }
+    if (target.kind == "Field" && target.text == "len" && target.edge_count == 1 && call.edge_count == 1) {
+        return LowerLinkedNullRead(project, state, id, depth)
     }
     callee = resolveLinkedCall(project, state, call, target, false)?
     arguments = lowerLinkedArguments(project, state, call, callee, id, depth)?
@@ -239,19 +174,10 @@ fn LowerLinkedNullValue(&project: LinkedNullProject, state: LinkedNullState, id:
     if (depth >= 32) {
         RejectLayout("linked_expression_depth", "linked null! expressions allow at most 32 levels", at.clone())?
     }
-    if (node.kind == "Variable" && node.edge_count == 0) { return linkedRead(state, node) }
-    if (node.kind == "String" && node.edge_count == 0) {
-        value = "(KuProjectionString){(uint8_t*)" + ScalarStringLiteral(node)? + ", 0u, KU_PROJECTION_STRING_STATIC}"
-        return ok(linkedValue(state, LinkedBuiltin("str", at), value))
-    }
-    if (node.kind == "Bool" && node.edge_count == 0 && (node.text == "true" || node.text == "false")) {
-        return ok(linkedValue(state, LinkedBuiltin("bool", at), node.text))
-    }
-    if (node.kind == "Int" && node.edge_count == 0 && node.int_value >= 0) {
-        return ok(linkedValue(state, LinkedBuiltin("int", at), "INT64_C(" + str(node.int_value) + ")"))
-    }
     if (node.kind == "Call" && node.edge_count > 0) { return emitLinkedCall(project, state, node, id, depth) }
     if (node.kind == "StructLiteral") { return lowerLinkedLiteral(project, state, node, id, depth) }
-    RejectLayout("unsupported_linked_operand", "expected a bound value, literal or checked direct call", at.clone())?
-    return ok(linkedValue(state, LinkedBuiltin("", at), ""))
+    if (node.kind == "Binary" || node.kind == "Index" || node.kind == "Field") {
+        return LowerLinkedNullRead(project, state, id, depth)
+    }
+    return LowerLinkedNullLeaf(state, node)
 }

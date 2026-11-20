@@ -29,7 +29,7 @@ fn LinkedBuiltin(name: str, at: Span): TypeNameBinding {
 
 fn SameLinkedType(&a: TypeNameBinding, &b: TypeNameBinding): bool {
     return a.declaration_kind == b.declaration_kind && a.module_index == b.module_index
-        && a.declaration_node == b.declaration_node && (a.declaration_kind == "Struct" || a.name == b.name)
+        && a.declaration_node == b.declaration_node && (a.declaration_kind != "Builtin" || a.name == b.name)
 }
 
 fn LinkedNullNode(&project: LinkedNullProject, unit: int, node: int): Node {
@@ -62,8 +62,35 @@ fn LinkedNullLiteralType(&project: LinkedNullProject, unit: int, &literal: Node,
     return ok(absoluteType(binding, unit))
 }
 
+fn LinkedNullParameterType(&project: LinkedNullProject, id: int, view: bool): TypeNameBinding! {
+    if (!view) { return LinkedNullType(project, 1, id) }
+    node = LinkedNullNode(project, 1, id)
+    if (node.kind != "TypeArray" || node.edge_count != 1) {
+        RejectLayout("linked_entry_view", "expected a readonly array of bound structs", DeclarationSpan(node))?
+    }
+    ty = LinkedNullType(project, 1, LinkedNullChild(project, 1, node, 0))?
+    if (ty.declaration_kind != "Struct") {
+        RejectLayout("linked_entry_view", "expected a readonly array of bound structs", ty.span.clone())?
+    }
+    ty.declaration_kind = "StructArray"
+    return ok(ty)
+}
+
+fn LinkedNullArrayElement(binding: TypeNameBinding): TypeNameBinding {
+    result = binding
+    result.declaration_kind = "Struct"
+    return result
+}
+
+fn LinkedNullArrayPrefix(&binding: TypeNameBinding): str {
+    return "ku_linked_view_" + CTypeName(binding.module_index, binding.declaration_node)
+}
+
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
     if (binding.declaration_kind == "Struct") { return ok(CTypeName(binding.module_index, binding.declaration_node)) }
+    if (binding.declaration_kind == "StructArray") {
+        return ok("const KuArray_" + CTypeName(binding.module_index, binding.declaration_node) + "*")
+    }
     if (binding.declaration_kind == "Builtin") {
         if (binding.name == "str") { return ok("KuProjectionString") }
         if (binding.name == "int") { return ok("int64_t") }
