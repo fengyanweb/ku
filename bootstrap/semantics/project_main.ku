@@ -1,7 +1,7 @@
 import "std.fs"
 import { EscapeCanonical } from "../stage1/token.ku"
 import { Span } from "../stage2/span.ku"
-import { BindProjectImports, ImportBinding } from "./imports.ku"
+import { BindProjectImports, ImportBinding, SuppliedModule } from "./imports.ku"
 import { RejectName } from "./names.ku"
 import { ManifestPaths, ReadProjectModules } from "./project_manifest.ku"
 import { BindImportedTypeNames, TypeNameBinding } from "./type_names.ku"
