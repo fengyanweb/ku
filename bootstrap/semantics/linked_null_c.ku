@@ -13,7 +13,7 @@ import { LinkedBuiltin, LinkedCheckedResultCType, LinkedCheckedResultPlan, Linke
 import { AddLinkedNullSlot, BindLinkedCatch, DropLinkedNullScope, EmitLinkedNullDeclarations, LowerLinkedArrayLocal, LowerLinkedNullRead,
          MoveLinkedNullSlot, RegisterLinkedNullType } from "./linked_null_read_c.ku"
 import { LowerLinkedArrayAppend, LowerLinkedSuccess,
-         LowerLinkedNullValue } from "./linked_null_values_c.ku"
+         LowerLinkedNullValue, LowerLinkedStringRebind } from "./linked_null_values_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
 
 struct LinkedNullC {
@@ -78,8 +78,11 @@ fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statem
         RejectLayout("linked_control_depth", "linked control flow allows at most 32 levels", DeclarationSpan(statement))?
     }
     body = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
-    if (statement.edge_count == 2 && body.kind == "Assign" && LinkedNullBinding(state.slots, body.text) != 0) {
-        return addGuardedAssignment(project, state, statement)
+    if (statement.int_value == 1 && statement.edge_count <= 3 && body.kind == "Assign" && LinkedNullBinding(state.slots, body.text) != 0) {
+        return addGuardedAssignment(project, state, statement, body)
+    }
+    if (statement.int_value != statement.edge_count - 1) {
+        RejectLayout("unsupported_linked_else", "linked else arms must replace the same existing str owner", DeclarationSpan(statement))?
     }
     guard = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
     if (guard.value.ty.declaration_kind != "Builtin" || guard.value.ty.name != "bool") {
@@ -191,35 +194,28 @@ fn addLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Nod
     return MoveLinkedNullSlot(slot.state, value.value)
 }
 
-fn addGuardedAssignment(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
-    guard_id = LinkedNullChild(project, 1, statement, 0)
-    guard_node = LinkedNullNode(project, 1, guard_id)
-    if (guard_node.kind != "Variable" || guard_node.edge_count != 0) {
-        RejectLayout("unsupported_linked_guard", "expected a bool binding in the guard", DeclarationSpan(guard_node))?
+fn addGuardedAssignment(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, &branch: Node): LinkedNullState! {
+    guard = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
+    if (guard.value.ty.declaration_kind != "Builtin" || guard.value.ty.name != "bool" || branch.edge_count != 1) {
+        RejectLayout("unsupported_linked_guard", "expected a bool guard and a single replacement", DeclarationSpan(statement))?
     }
-    guard = LowerLinkedNullValue(project, state, guard_id, 0)?
-    if (guard.value.ty.declaration_kind != "Builtin" || guard.value.ty.name != "bool") {
-        RejectLayout("unsupported_linked_guard", "expected a bool binding in the guard", DeclarationSpan(guard_node))?
+    outer = guard.state.slots.clone()
+    guard.state.code += "    if (" + guard.value.text + ") {\n"
+    taken = LowerLinkedStringRebind(project, guard.state, branch)?
+    PreserveLinkedOwners(outer, taken.slots, branch)?
+    taken = DropLinkedNullScope(taken, outer.len())
+    if (statement.edge_count == 3) {
+        other = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 2))
+        if (other.kind != "Assign" || other.edge_count != 1 || other.text != branch.text) {
+            RejectLayout("unsupported_linked_else", "both arms must replace the same existing str owner", DeclarationSpan(other))?
+        }
+        taken.code += "    } else {\n"
+        taken = LowerLinkedStringRebind(project, taken, other)?
+        PreserveLinkedOwners(outer, taken.slots, other)?
+        taken = DropLinkedNullScope(taken, outer.len())
     }
-    branch = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
-    if (branch.kind != "Assign" || branch.edge_count != 1) {
-        RejectLayout("unsupported_linked_guard", "expected a single assignment in the guard", DeclarationSpan(branch))?
-    }
-    slot = LinkedNullBinding(guard.state.slots, branch.text)
-    if (slot == 0 || !guard.state.slots[slot - 1].live || guard.state.slots[slot - 1].value.ty.name != "str"
-        || guard.state.slots[slot - 1].value.ty.declaration_kind != "Builtin") {
-        RejectLayout("unsupported_linked_guard", "expected an initialized str target in the guard", DeclarationSpan(branch))?
-    }
-    rhs = LinkedNullChild(project, 1, branch, 0)
-    literal = LinkedNullNode(project, 1, rhs)
-    if (literal.kind != "String" || literal.edge_count != 0) {
-        RejectLayout("unsupported_linked_guard", "guarded str assignment requires a static literal", DeclarationSpan(literal))?
-    }
-    target = guard.state.slots[slot - 1].value.text.clone()
-    value = LowerLinkedNullValue(project, guard.state, rhs, 0)?
-    value.state.code = value.state.code + "    if (" + guard.value.text + ") {\n        ku_projection_string_drop(&" + target.clone() + ");\n"
-        + "        " + target + " = " + value.value.text + ";\n    }\n"
-    return ok(value.state)
+    taken.code += "    }\n"
+    return ok(taken)
 }
 
 fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
@@ -316,7 +312,7 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             kind = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0)).kind
             if (kind == "TypeArray") { next = LowerLinkedArrayLocal(project, next, statement, id)? }
             else { next = addLocal(project, next, statement, id)? }
-        } else if (statement.kind == "If" && statement.edge_count > 1 && statement.int_value == statement.edge_count - 1) {
+        } else if (statement.kind == "If" && statement.edge_count > 1) {
             next = addGuardedRegion(project, next, statement, result, depth)?
         } else if (statement.kind == "While" && statement.edge_count >= 2 && index > start) {
             initial = LinkedNullNode(project, 1, LinkedNullChild(project, 1, region, index - 1))

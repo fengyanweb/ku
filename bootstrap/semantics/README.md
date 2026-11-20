@@ -352,6 +352,12 @@ may return a replacement or transfer the intact Error with `fail err`.
 Fatal allocation and bounds exits use the common cleanup. A binding
 that was consumed on any caught edge is unavailable in the handler.
 
+An explicitly typed local uses the existing ownership path once its
+initializer matches the declared type. A conditional replacement of one
+bound str owner keeps the old owner until the selected replacement has
+succeeded. A checked failure inside either arm therefore preserves the old
+owner for the catch or common cleanup.
+
 Managed array functions can take a `str` by value and check its byte or
 Unicode scalar length before initializing a local `[str]` with `.chars()`.
 The local array owns its non-ASCII entries independently of the source.

@@ -3,9 +3,9 @@ import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { AppendLinkedCheckedInvocation, LinkedNullBinding, LinkedOkAvailable, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
-import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullDropC, LinkedNullHasResultValue, LinkedNullLiteralType,
+import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, LinkedNullDropC, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, LowerLinkedNullLeaf,
          LowerLinkedNullRead, MoveLinkedNullSlot, ReadLinkedNullBinding, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_null_read_c.ku"
@@ -67,22 +67,6 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     }
     output.state.slots[output.value.slot - 1].live = true
     return ok(output)
-}
-
-fn resolveLinkedCall(&project: LinkedNullProject, &state: LinkedNullState, &call: Node, &target: Node, checked: bool): LinkedNullFunction! {
-    name = target.text.clone()
-    if (target.kind == "Field" && target.edge_count == 1) {
-        receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
-        name = receiver.text.clone()
-    }
-    if (LinkedNullBinding(state.slots, name) != 0) {
-        RejectLayout("shadowed_linked_dependency", "direct dependency name is shadowed by a local", DeclarationSpan(target))?
-    }
-    callee = LinkedNullDependency(project, 1, target, checked)?
-    if (callee.parameters.len() != call.edge_count - 1) {
-        RejectLayout("linked_dependency_arity", "argument count differs from the bound function declaration", DeclarationSpan(call))?
-    }
-    return ok(callee)
 }
 
 fn linkedViewArgument(&parameter: TypeNameBinding, &value: LinkedNullValue): str! {
@@ -150,7 +134,7 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
     if (target.kind == "Field" && target.text == "len" && target.edge_count == 1 && call.edge_count == 1) {
         return LowerLinkedNullRead(project, state, id, depth)
     }
-    callee = resolveLinkedCall(project, state, call, target, false)?
+    callee = ResolveLinkedCall(project, state.slots, call, target, false)?
     arguments = lowerLinkedArguments(project, state, call, callee, id, depth)?
     output = AddLinkedNullSlot(project, arguments.state, "", "t" + str(id), callee.result, false)?
     output.state.code = output.state.code + "    " + output.value.text.clone() + " = " + callee.symbol + "(" + arguments.args + ");\n" + arguments.handoff
@@ -175,20 +159,18 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
         RejectLayout("unsupported_linked_try", "expected a direct checked dependency call", DeclarationSpan(call))?
     }
     target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
-    callee = resolveLinkedCall(project, state, call, target, true)?
+    callee = ResolveLinkedCall(project, state.slots, call, target, true)?
     if (owns_value && !LinkedNullHasResultValue(callee.result)) {
         RejectLayout("linked_dependency_result", "expected an owning Result for a value", DeclarationSpan(unwrap))?
     }
     arguments = lowerLinkedArguments(project, state, call, callee, id, depth)?
     result = "dependency" + str(id)
-    failure = LinkedFailureTarget(arguments.state)
-    arguments.state.code = arguments.state.code + "    " + LinkedNullResultType(callee)? + " " + result.clone() + " = " + LinkedNullCallSymbol(callee)
-        + "(" + arguments.args + ");\n" + arguments.handoff
-        + "    if (!" + result.clone() + ".ok) {\n        " + failure + " = " + result.clone() + ".error;\n"
-        + "        " + result.clone() + ".error = (KuBootstrapError){0};\n"
-    arguments.state = ExitLinkedFailure(arguments.state, "        ")
-    arguments.state.code += "    }\n"
-    return ok(LinkedCheckedCall { state: arguments.state, result: callee.result, text: result, id: id })
+    carrier = LinkedNullResultType(callee)?
+    symbol = LinkedNullCallSymbol(callee)
+    args = arguments.args
+    handoff = arguments.handoff
+    next = AppendLinkedCheckedInvocation(arguments.state, carrier, result, symbol, args, handoff)
+    return ok(LinkedCheckedCall { state: next, result: callee.result, text: result, id: id })
 }
 
 fn validateLinkedPayload(state: LinkedNullState, &result: TypeNameBinding, &payload: str): LinkedNullState {
@@ -272,17 +254,6 @@ fn LowerLinkedNullValue(&project: LinkedNullProject, state: LinkedNullState, id:
     return LowerLinkedNullLeaf(state, node)
 }
 
-fn unshadowedOk(&project: LinkedNullProject, &state: LinkedNullState): bool {
-    if (LinkedNullBinding(state.slots, "ok") != 0) { return false }
-    for name in project.supplied[0].named.names.declarations.clone() {
-        if (name.name == "ok") { return false }
-    }
-    for binding in project.binding.modules[0].imports.clone() {
-        if (binding.local_name == "ok") { return false }
-    }
-    return true
-}
-
 fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, &result: TypeNameBinding): LinkedNullState! {
     if (statement.edge_count != 1) {
         RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(statement))?
@@ -294,7 +265,7 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
     callee = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
     if ((callee.kind == "Variable" && callee.edge_count == 0 && callee.text != "ok")
         || (callee.kind == "Field" && callee.edge_count == 1)) {
-        target = resolveLinkedCall(project, state, call, callee, true)?
+        target = ResolveLinkedCall(project, state.slots, call, callee, true)?
         if (!SameLinkedType(target.result, result)) {
             RejectLayout("linked_tail_result", "forwarded Result must match the entry's declared payload", DeclarationSpan(call))?
         }
@@ -304,7 +275,7 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
             + ");\n" + arguments.handoff + "    goto cleanup;\n"
         return ok(arguments.state)
     }
-    if (call.edge_count != 2 || callee.kind != "Variable" || callee.edge_count != 0 || callee.text != "ok" || !unshadowedOk(project, state)) {
+    if (call.edge_count != 2 || callee.kind != "Variable" || callee.edge_count != 0 || callee.text != "ok" || !LinkedOkAvailable(project.supplied[0].named.names.declarations, project.binding.modules[0].imports, state.slots)) {
         RejectLayout("unsupported_linked_success", "expected builtin ok with the declared payload", DeclarationSpan(call))?
     }
     id = LinkedNullChild(project, 1, call, 1)
@@ -355,4 +326,22 @@ fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &
     // original slot still owns its complete element for the cleanup label.
     value.state.slots[value.value.slot - 1].live = false
     return ok(value.state)
+}
+
+fn LowerLinkedStringRebind(&project: LinkedNullProject, state: LinkedNullState, &assignment: Node): LinkedNullState! {
+    index = LinkedNullBinding(state.slots, assignment.text)
+    if (index == 0 || !state.slots[index - 1].live) {
+        RejectLayout("linked_rebind_target", "expected an initialized local str owner", DeclarationSpan(assignment))?
+    }
+    target = state.slots[index - 1].value.clone()
+    value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, assignment, 0), 0)?
+    if (target.borrowed || target.ty.name != "str" || target.ty.declaration_kind != "Builtin"
+        || !SameLinkedType(target.ty, value.value.ty) || value.value.borrowed
+        || value.value.slot == index || !value.state.slots[index - 1].live) {
+        RejectLayout("linked_rebind_type", "replacement requires a separate str owner of the declared type", DeclarationSpan(assignment))?
+    }
+    value.state.code += "    ku_projection_string_drop(&" + target.text.clone() + ");\n"
+        + "    " + target.text + " = " + value.value.text.clone() + ";\n"
+    moved = value.value.clone()
+    return MoveLinkedNullSlot(value.state, moved)
 }

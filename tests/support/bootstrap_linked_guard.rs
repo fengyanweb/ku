@@ -537,3 +537,123 @@ int main(void) {
     compile_projection(&source, &program, cwd);
     assert_ok(&execute(&mut Command::new(&program), cwd, 15));
 }
+
+const REBIND_SOURCE: &str = r#"import { Supply } from "./try-provider.ku"
+fn Replace(first: bool): str! {
+    owner: str = Supply(1)?
+    try {
+        if (first) { owner = Supply(2)? }
+        else { owner = Supply(3)? }
+        return ok(owner)
+    } catch (err) {
+        return ok(owner)
+    }
+}
+fn WrongElse(first: bool): str! {
+    left = Supply(1)?
+    right = Supply(1)?
+    if (first) { left = Supply(2)? }
+    else { right = Supply(3)? }
+    return ok(left)
+}
+"#;
+
+const REBIND_HOST: &str = r#"
+static int refused, selected;
+static uint8_t *original;
+static uintptr_t original_address;
+KuBootstrapResult_KuProjectionString __SUPPLY__(int64_t stage) {
+    KuBootstrapResult_KuProjectionString result = {0};
+    if (stage != 1) {
+        assert(outstanding() == 1 && *original == 1);
+        selected = (int)stage;
+    }
+    uint8_t *data = malloc(1);
+    *data = (uint8_t)stage;
+    KuProjectionString text = {data,1,1,KU_PROJECTION_STRING_OWNED};
+    if (stage == refused) {
+        result.error.message = text;
+        return result;
+    }
+    if (stage == 1) { original = data; original_address = (uintptr_t)data; }
+    result.ok = true;
+    result.value = text;
+    return result;
+}
+int main(void) {
+    (void)test_realloc;
+    for (int i = 2; i <= 3; ++i) {
+        refused = 0;
+        KuBootstrapResult_KuProjectionString result = __ENTRY__(i == 2);
+        assert(result.ok && selected == i && (uintptr_t)result.value.ptr != original_address);
+        assert(outstanding() == 1 && *result.value.ptr == i);
+        ku_projection_string_drop(&result.value);
+        assert(!outstanding());
+
+        refused = i;
+        result = __ENTRY__(i == 2);
+        assert(result.ok && selected == i && result.value.ptr == original);
+        assert(outstanding() == 1 && *result.value.ptr == 1 && !result.error.message.ptr);
+        ku_projection_string_drop(&result.value);
+        assert(!outstanding());
+    }
+    return 0;
+}
+"#;
+
+pub(super) fn assert_checked_string_rebind(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("rebind.ku"), REBIND_SOURCE).unwrap();
+    fs::write(cwd.join("try-provider.ku"), TRY_PROVIDER).unwrap();
+    fs::write(cwd.join("modules.txt"), "rebind.ku\ntry-provider.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Replace").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+    let planned = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&planned);
+    let Some(Value::Result { ok: true, value }) = json::eval(
+        "decode",
+        &[Value::String(String::from_utf8(planned.stdout).unwrap())],
+        Span::default(),
+    )
+    .unwrap() else {
+        panic!("expected a typed checked replacement plan")
+    };
+    let Value::Object(plan) = *value else {
+        panic!("expected plan object")
+    };
+    let Value::Object(export) = &plan["export"] else {
+        panic!("expected export")
+    };
+    let Value::Array(deps) = &plan["dependencies"] else {
+        panic!("expected dependencies")
+    };
+    let [Value::Object(supply)] = deps.as_slice() else {
+        panic!("expected one supplier")
+    };
+    let (Value::String(entry), Value::String(provider)) = (&export["symbol"], &supply["symbol"])
+    else {
+        panic!("expected the bound symbols")
+    };
+    let host = REBIND_HOST
+        .replace("__ENTRY__", entry)
+        .replace("__SUPPLY__", provider);
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let source = cwd.join("rebind-owner.c");
+    let exe = cwd.join(format!("rebind-owner{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &source,
+        format!(
+            "{CHECKED_ARRAY_ALLOCATOR}{}{host}",
+            String::from_utf8(emitted.stdout).unwrap()
+        ),
+    )
+    .unwrap();
+    compile_projection(&source, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    fs::write(cwd.join("function.txt"), "WrongElse").unwrap();
+    let wrong = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(wrong.status.code(), Some(1));
+    assert!(wrong.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("unsupported_linked_else"));
+}

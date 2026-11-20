@@ -2,8 +2,8 @@ import { json } from "std"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { GuardBoundType, GuardCType, GuardType } from "./guarded_struct_expr.ku"
-import { SuppliedModule } from "./imports.ku"
-import { DeclarationSpan, NamedModule } from "./names.ku"
+import { ImportBinding, SuppliedModule } from "./imports.ku"
+import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ExplicitType, RejectLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
 import { ContainsIndex, CTypeName, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
@@ -278,6 +278,17 @@ fn LinkedNullBinding(&slots: [LinkedNullSlot], &name: str): int {
     return 0
 }
 
+fn LinkedOkAvailable(&names: [TopLevelName], &imports: [ImportBinding], &slots: [LinkedNullSlot]): bool {
+    if (LinkedNullBinding(slots, "ok") != 0) { return false }
+    for name in names.clone() {
+        if (name.name == "ok") { return false }
+    }
+    for binding in imports.clone() {
+        if (binding.local_name == "ok") { return false }
+    }
+    return true
+}
+
 fn RestoreLinkedNullSlots(state: LinkedNullState, &outer: [LinkedNullSlot]): LinkedNullState {
     next = state
     index = 0
@@ -290,6 +301,34 @@ fn RestoreLinkedNullSlots(state: LinkedNullState, &outer: [LinkedNullSlot]): Lin
         index = index + 1
     }
     return next
+}
+
+fn AppendLinkedCheckedInvocation(state: LinkedNullState, &carrier: str, &result: str, &symbol: str,
+                                 &args: str, &handoff: str): LinkedNullState {
+    next = state
+    failure = LinkedFailureTarget(next)
+    next.code = next.code + "    " + carrier.clone() + " " + result.clone() + " = " + symbol.clone()
+        + "(" + args.clone() + ");\n" + handoff.clone()
+        + "    if (!" + result.clone() + ".ok) {\n        " + failure + " = " + result.clone() + ".error;\n"
+        + "        " + result.clone() + ".error = (KuBootstrapError){0};\n"
+    next = ExitLinkedFailure(next, "        ")
+    next.code += "    }\n"
+    return next
+}
+
+fn LinkedFsReadReference(&symbol: str): str {
+    return "#include \"fs_read.h\"\nextern KuResult_str " + symbol.clone() + "(const KuString*);\n"
+        + "static KuProjectionString ku_linked_from_fs_string(KuString value) {\n"
+        + "    return (KuProjectionString){value.ptr,value.len,value.capacity,value.storage};\n}\n"
+        + "static KuBootstrapResult_KuProjectionString ku_linked_fs_read(const KuProjectionString* path) {\n"
+        + "    KuString input = {path->ptr,path->len,path->capacity,path->storage};\n"
+        + "    KuResult_str read = " + symbol.clone() + "(&input);\n"
+        + "    KuBootstrapResult_KuProjectionString out = {0};\n"
+        + "    out.ok = read.ok;\n"
+        + "    if (read.ok) out.value = ku_linked_from_fs_string(read.value);\n"
+        + "    else out.error = (KuBootstrapError){ku_linked_from_fs_string(read.error.domain), "
+        + "ku_linked_from_fs_string(read.error.code), ku_linked_from_fs_string(read.error.message)};\n"
+        + "    return out;\n}\n"
 }
 
 fn PreserveLinkedOwners(&before: [LinkedNullSlot], &after: [LinkedNullSlot], &statement: Node): null! {
