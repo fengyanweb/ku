@@ -18,6 +18,11 @@ appear in source order and include their arena node ID and source span. The
 pass checks reserved compiler names in declarations and signature bindings.
 Errors include the source position.
 
+`type_names.ku` binds explicit type-name nodes to built-ins, local declarations
+and named imports. Its result keeps both the original use node and the target
+module and declaration node. The type syntax remains in the original AST for
+subsequent layout and expression checks.
+
 Import entries remain in the validated graph. The pass reports their count and
 retains their node IDs for later resolution. It does not open import files or
 resolve exports, references, types or function bodies.

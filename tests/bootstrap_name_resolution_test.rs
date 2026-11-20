@@ -299,6 +299,7 @@ import { Node, ParseOutput } from "../stage2/ast.ku"
 import { ParseProgram } from "../stage3/parser.ku"
 import { BindSuppliedImports, ImportBinding, SuppliedModule } from "./imports.ku"
 import { BuildNameTable } from "./names.ku"
+import { BindTypeNames } from "./type_names.ku"
 
 fn NodeAt(&graph: ParseOutput, id: int): Node {
     return graph.arena.nodes[id - 1].clone()
@@ -309,6 +310,7 @@ fn Witness(): ImportBinding! {
     named = BuildNameTable(ParseProgram(fs.read("supplier.ku")?)?)?
     path = fs.read("path.txt")?
     supplied: [SuppliedModule] = [SuppliedModule { path: path, named: named }]
+    type_uses = BindTypeNames(importer, supplied)?
     bindings = BindSuppliedImports(importer, supplied)?
     if (bindings.len() != 1) { panic("expected one binding") }
     binding = bindings[0].clone()
@@ -316,6 +318,19 @@ fn Witness(): ImportBinding! {
     target = NodeAt(supplied[binding.module_index - 1].named.parsed, binding.target_node)
     if (request.kind != "ImportName" || request.text != binding.source_name || target.kind != "Struct"
         || target.text != binding.source_name) { panic("import IDs lost their graph identity") }
+    imported = 0
+    for reference in type_uses {
+        original = NodeAt(importer.parsed, reference.use_node)
+        if (original.kind != "TypeName" || original.text != reference.name) { panic("lost type syntax identity") }
+        if (reference.module_index == 1) {
+            if (reference.name != binding.local_name || reference.declaration_kind != "Struct" || reference.declaration_node != binding.target_node) { panic("wrong imported type identity") }
+            imported = imported + 1
+        } else if (reference.declaration_node > 0) {
+            local = NodeAt(importer.parsed, reference.declaration_node)
+            if (local.kind != reference.declaration_kind || local.text != reference.name) { panic("wrong local type identity") }
+        } else if (reference.declaration_kind != "Builtin") { panic("unexpected type namespace") }
+    }
+    if (type_uses.len() != 13 || imported != 1) { panic("unexpected span.ku type references") }
     return ok(binding)
 }
 
@@ -388,6 +403,12 @@ fn bootstrap_binds_named_relative_imports_against_explicit_modules() {
         assert_success(&ran);
         assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), expected);
     }
+    let unknown_type = "fn main(): Missing { return null }";
+    install_case(&compiler, unknown_type, token, relative_path);
+    let rejected = run(Command::new(&ku).arg("run").arg(&entry), &cwd, 20);
+    let unknown_diagnostic = "error|bootstrap.semantics.types|undefined_type|<source>|undefined type 'Missing'|1:12@11..1:19@18";
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains(unknown_diagnostic));
 
     let errors = [
         (
@@ -488,6 +509,13 @@ fn bootstrap_binds_named_relative_imports_against_explicit_modules() {
         assert_success(&ran);
         assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), expected);
     }
+    install_case(&relocated, unknown_type, token, relative_path);
+    let rejected = run(&mut Command::new(&native), &cwd, 20);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&rejected.stderr).trim_end(),
+        unknown_diagnostic
+    );
     for (code, input, supplied, path, detail) in errors {
         install_case(&relocated, input, supplied, path);
         let ran = run(&mut Command::new(&native), &cwd, 20);
