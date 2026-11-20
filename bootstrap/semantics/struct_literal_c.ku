@@ -2,7 +2,7 @@ import "std.bytes"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
-import { BindSuppliedImports, ImportBinding, SuppliedModule } from "./imports.ku"
+import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
 import { ExplicitType, FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { CTypeName, ContainsIndex } from "./struct_projection_c.ku"
@@ -130,8 +130,8 @@ fn resolveConstructorLiteral(&named: NamedModule, &imports: [ImportBinding], &su
     return ResolveTypeName(literal, literal_id, named.names.declarations, imports, supplied)
 }
 
-fn emitConstructor(&named: NamedModule, &bindings: [TypeNameBinding], &supplied: [SuppliedModule],
-                   &layouts: [StructLayout], function_id: int): StructConstructorC! {
+fn emitConstructor(&named: NamedModule, &bindings: [TypeNameBinding], &imports: [ImportBinding],
+                   &supplied: [SuppliedModule], &layouts: [StructLayout], function_id: int): StructConstructorC! {
     function = named.parsed.arena.nodes[function_id - 1].clone()
     at = DeclarationSpan(function)
     if (function.kind != "Function" || function.edge_count < 2 || function.edge_count > 3 ||
@@ -144,7 +144,6 @@ fn emitConstructor(&named: NamedModule, &bindings: [TypeNameBinding], &supplied:
     }
     order = OrderCStructLayouts(layouts, return_type.module_index, return_type.declaration_node, at)?
     root = LayoutIndex(layouts, return_type.module_index, return_type.declaration_node)
-    imports = BindSuppliedImports(named, supplied)?
     local = ConstructorLocal { name: "", layout: 0 }
     body = ""
     if (function.edge_count == 3) {
@@ -178,13 +177,13 @@ fn emitConstructor(&named: NamedModule, &bindings: [TypeNameBinding], &supplied:
 
 // This constructor subset does not infer types or copy owned fields. All
 // assignments retain source order and use only validated concrete layouts.
-fn EmitStructConstructorC(&named: NamedModule, &bindings: [TypeNameBinding], &supplied: [SuppliedModule],
-                          &layouts: [StructLayout], &function_name: str): StructConstructorC! {
+fn EmitStructConstructorC(&named: NamedModule, &bindings: [TypeNameBinding], &imports: [ImportBinding],
+                          &supplied: [SuppliedModule], &layouts: [StructLayout], &function_name: str): StructConstructorC! {
     index = 0
     while (index < named.names.declarations.len()) {
         item = named.names.declarations[index].clone()
         if (item.kind == "Function" && item.name == function_name) {
-            return emitConstructor(named, bindings, supplied, layouts, item.node)
+            return emitConstructor(named, bindings, imports, supplied, layouts, item.node)
         }
         index = index + 1
     }

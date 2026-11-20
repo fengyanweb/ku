@@ -992,7 +992,6 @@ import { BindTypeNames } from "./type_names.ku"
 import { BuildStructLayouts } from "./struct_layouts.ku"
 import { CTypeName } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, EmitNestedCLayouts } from "./nested_struct_c.ku"
-import { EmitStructConstructorC } from "./struct_literal_c.ku"
 
 fn main(): null! {
     named = BuildNameTable(ParseModule(fs.read("input.ku")?)?)?
@@ -1005,12 +1004,6 @@ fn main(): null! {
     bindings = BindTypeNames(named, supplied)?
     layouts = BuildStructLayouts(named, bindings, supplied)?
     root = fs.read("type.txt")?
-    if (root == "") {
-        constructor = EmitStructConstructorC(named, bindings, supplied, layouts, fs.read("function.txt")?)?
-        println(constructor.symbol)
-        println(constructor.text)
-        return ok(null)
-    }
     index = 0
     while (index < named.names.declarations.len()) {
         item = named.names.declarations[index].clone()
@@ -1055,6 +1048,20 @@ fn native_seed_emits_nested_c_for_real_parse_context() {
     );
     assert_ok(&build);
     fs::rename(built, &seed).expect("relocate installed-build native layout compiler");
+    let driver_name = format!("ku-project{}", std::env::consts::EXE_SUFFIX);
+    let driver_built = compiler.join(&driver_name);
+    let driver_binary = cwd.join(driver_name);
+    let build = execute(
+        Command::new(&ku)
+            .args(["build", "--release"])
+            .arg(compiler.join("projection_main.ku"))
+            .arg("-o")
+            .arg(&driver_built),
+        &cwd,
+        150,
+    );
+    assert_ok(&build);
+    fs::rename(driver_built, &driver_binary).expect("relocate the built project CLI");
     fs::remove_dir_all(copied).expect("retire compiler design sources before emission");
 
     let span_source = include_str!("../bootstrap/stage2/span.ku");
@@ -1210,23 +1217,41 @@ fn main() {
     );
     fs::remove_dir_all(oracle).expect("remove oracle sources before emitted C build");
 
+    for directory in ["stage1", "stage2"] {
+        fs::create_dir(cwd.join(directory)).expect("create manifest source directory");
+    }
+    let target = cwd.join("stage2/context.ku");
+    fs::write(&target, contexts).expect("use original unmodified context module");
+    fs::write(cwd.join("stage2/span.ku"), span_source).expect("use original span module");
+    fs::write(cwd.join("stage1/token.ku"), token_source).expect("use original token module");
+    fs::write(cwd.join("mode.txt"), "construct\n").expect("select constructor mode");
     fs::write(cwd.join("function.txt"), "DefaultParseContext").expect("select real constructor");
-    let emitted = run(contexts, "");
+    let manifest = cwd.join("modules.txt");
+    fs::write(
+        &manifest,
+        "stage2/context.ku\r\nstage2/span.ku\r\nstage1/token.ku\r\n",
+    )
+    .expect("use project-relative paths in manifest order");
+    for flat_fixture in ["input.ku", "span.ku", "token.ku", "type.txt"] {
+        fs::remove_file(cwd.join(flat_fixture)).expect("leave only manifest input for the CLI");
+    }
+    let emitted = execute(&mut Command::new(&driver_binary), &cwd, 30);
     assert_ok(&emitted);
-    let emitted = String::from_utf8(emitted.stdout).expect("C text");
-    let (symbol, c) = emitted
-        .split_once('\n')
-        .expect("numeric constructor symbol and C");
-    let symbol = symbol.trim();
+    let c = String::from_utf8(emitted.stdout).expect("C text");
+    let (result_type, declaration) = c
+        .lines()
+        .find_map(|line| {
+            let parts = line.split_once(' ')?;
+            parts.1.starts_with("ku_construct_").then_some(parts)
+        })
+        .expect("typed standalone constructor definition");
+    let symbol = declaration
+        .strip_suffix("(void) {")
+        .expect("parameterless constructor");
     assert!(symbol
         .strip_prefix("ku_construct_")
         .is_some_and(|id| { !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) }));
     assert!(!c.contains("malloc(") && !c.contains("free(") && !c.contains("clone"));
-    let result_type = c
-        .lines()
-        .find_map(|line| line.split_once(&format!(" {symbol}(void)")))
-        .map(|(ty, _)| ty)
-        .expect("typed standalone constructor definition");
     let driver = r#"
 #include <stdio.h>
 #include <inttypes.h>
@@ -1254,16 +1279,10 @@ int main(void) {
         ),
     )
     .expect("write C constructor and independent harness");
-    for file in [
-        "input.ku",
-        "span.ku",
-        "token.ku",
-        "type.txt",
-        "function.txt",
-    ] {
-        fs::remove_file(cwd.join(file)).expect("remove Ku input before building constructor C");
-    }
     let app = cwd.join(format!("create-app{}", std::env::consts::EXE_SUFFIX));
+    fs::rename(cwd.join("stage1"), cwd.join("private-stage1")).expect("hide supplied token source");
+    fs::rename(cwd.join("stage2"), cwd.join("private-stage2"))
+        .expect("hide supplied stage2 sources");
     compile_projection(&c_path, &app, &cwd);
     let observed = execute(&mut Command::new(app), &cwd, 10);
     assert_ok(&observed);
@@ -1274,8 +1293,27 @@ int main(void) {
         expected
     );
 
+    fs::rename(cwd.join("private-stage1"), cwd.join("stage1"))
+        .expect("restore token source for error cases");
+    fs::rename(cwd.join("private-stage2"), cwd.join("stage2"))
+        .expect("restore stage2 sources for error cases");
+    for (paths, code) in [
+        (
+            "stage2/span.ku\nstage2/context.ku\nstage1/token.ku\n",
+            "unknown_constructor_function",
+        ),
+        ("stage2/context.ku\nstage2/context.ku\n", "ambiguous_module"),
+        ("stage2/context.ku\nstage1/token.ku\n", "unresolved_import"),
+    ] {
+        fs::write(&manifest, paths).expect("write manifest error case");
+        let rejected = execute(&mut Command::new(&driver_binary), &cwd, 30);
+        assert!(!rejected.status.success() && rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(code));
+    }
     fs::write(cwd.join("function.txt"), "Make").expect("select rejection case");
-    let rejected = run(
+    fs::write(&manifest, "stage2/context.ku").expect("select single module for rejection case");
+    fs::write(
+        target,
         r#"
 struct Owned { text: str }
 struct Outer { value: Owned }
@@ -1284,8 +1322,9 @@ fn Make(): Outer {
     return Outer { value: item.clone() }
 }
 "#,
-        "",
-    );
+    )
+    .expect("write owned local rejection case");
+    let rejected = execute(&mut Command::new(&driver_binary), &cwd, 30);
     assert!(!rejected.status.success() && rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("noncopy_constructor_local"));
 }

@@ -1,28 +1,15 @@
-import { fs, string } from "std"
+import "std.fs"
 import { EscapeCanonical } from "../stage1/token.ku"
 import { Span } from "../stage2/span.ku"
-import { ParseModule } from "../stage3/parser.ku"
-import { BindProjectImports, ImportBinding, SuppliedModule } from "./imports.ku"
-import { BuildNameTable, RejectName } from "./names.ku"
-import { CheckProjectManifestPath } from "./project_paths.ku"
+import { BindProjectImports, ImportBinding } from "./imports.ku"
+import { RejectName } from "./names.ku"
+import { ManifestPaths, ReadProjectModules } from "./project_manifest.ku"
 import { BindImportedTypeNames, TypeNameBinding } from "./type_names.ku"
 
 struct ProjectModuleBindings {
     path: str
     imports: [ImportBinding]
     types: [TypeNameBinding]
-}
-
-fn ReadProjectModule(path: str): SuppliedModule! {
-    try {
-        named = BuildNameTable(ParseModule(fs.read(path)?)?)?
-        return ok(SuppliedModule { path: path, named: named })
-    } catch (err) {
-        fail {
-            domain: err.domain, code: err.code,
-            message: EscapeCanonical(path) + ": " + err.message
-        }
-    }
 }
 
 fn ResolveProjectModule(&entry: SuppliedModule, &supplied: [SuppliedModule]): ProjectModuleBindings! {
@@ -36,36 +23,6 @@ fn ResolveProjectModule(&entry: SuppliedModule, &supplied: [SuppliedModule]): Pr
             message: EscapeCanonical(entry.path.clone()) + ": " + err.message
         }
     }
-}
-
-fn ManifestPaths(manifest: str, at: Span): [str]! {
-    if (manifest.byte_len() > 32768) {
-        RejectName("project_limit", "the module manifest exceeds 32768 UTF-8 bytes", at.clone())?
-    }
-    paths: [str] = []
-    line = ""
-    for character in string.chars(manifest + "\n") {
-        if (character != "\n") {
-            line = line + character
-            if (line.byte_len() > 513) {
-                RejectName("project_path", "manifest lines must fit a 512-byte path", at.clone())?
-            }
-        } else {
-            // Join compatible LF/CRLF input while retaining spaces in filenames.
-            if (line.ends_with("\r")) { line = string.slice(line.clone(), 0, line.len() - 1)? }
-            if (line != "") {
-                CheckProjectManifestPath(line, at.clone())?
-                if (paths.len() == 64) { RejectName("project_limit", "the module manifest accepts at most 64 modules", at.clone())? }
-                for existing in paths {
-                    if (existing == line) { RejectName("ambiguous_module", "duplicate project module '" + line.clone() + "'", at.clone())? }
-                }
-                paths = paths.push(line)
-            }
-            line = ""
-        }
-    }
-    if (paths.len() == 0) { RejectName("project_path", "modules.txt must list at least one project source", at)? }
-    return ok(paths)
 }
 
 fn ProjectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
@@ -108,11 +65,7 @@ fn ProjectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
 fn main(): null! {
     at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
     paths = ManifestPaths(fs.read("modules.txt")?, at)?
-    supplied: [SuppliedModule] = []
-    for path in paths {
-        entry = ReadProjectModule(path)?
-        supplied = supplied.push(entry)
-    }
+    supplied = ReadProjectModules(paths)?
     modules: [ProjectModuleBindings] = []
     for entry in supplied {
         resolved = ResolveProjectModule(entry, supplied)?

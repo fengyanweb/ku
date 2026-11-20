@@ -1,0 +1,61 @@
+import { fs, string } from "std"
+import { EscapeCanonical } from "../stage1/token.ku"
+import { Span } from "../stage2/span.ku"
+import { ParseModule } from "../stage3/parser.ku"
+import { SuppliedModule } from "./imports.ku"
+import { BuildNameTable, RejectName } from "./names.ku"
+import { CheckProjectManifestPath } from "./project_paths.ku"
+
+fn ManifestPaths(manifest: str, at: Span): [str]! {
+    if (manifest.byte_len() > 32768) {
+        RejectName("project_limit", "the module manifest exceeds 32768 UTF-8 bytes", at.clone())?
+    }
+    paths: [str] = []
+    line = ""
+    for character in string.chars(manifest + "\n") {
+        if (character != "\n") {
+            line = line + character
+            if (line.byte_len() > 513) {
+                RejectName("project_path", "manifest lines must fit a 512-byte path", at.clone())?
+            }
+        } else {
+            // Join compatible LF/CRLF input while retaining spaces in filenames.
+            if (line.ends_with("\r")) { line = string.slice(line.clone(), 0, line.len() - 1)? }
+            if (line != "") {
+                CheckProjectManifestPath(line, at.clone())?
+                if (paths.len() == 64) { RejectName("project_limit", "the module manifest accepts at most 64 modules", at.clone())? }
+                for existing in paths {
+                    if (existing == line) { RejectName("ambiguous_module", "duplicate project module '" + line.clone() + "'", at.clone())? }
+                }
+                paths = paths.push(line)
+            }
+            line = ""
+        }
+    }
+    if (paths.len() == 0) { RejectName("project_path", "modules.txt must list at least one project source", at)? }
+    return ok(paths)
+}
+
+fn ReadProjectModule(path: str): SuppliedModule! {
+    try {
+        named = BuildNameTable(ParseModule(fs.read(path)?)?)?
+        return ok(SuppliedModule { path: path, named: named })
+    } catch (err) {
+        fail {
+            domain: err.domain, code: err.code,
+            message: EscapeCanonical(path) + ": " + err.message
+        }
+    }
+}
+
+fn ReadProjectModules(&paths: [str]): [SuppliedModule]! {
+    supplied: [SuppliedModule] = []
+    index = 0
+    while (index < paths.len()) {
+        path = paths[index].clone()
+        entry = ReadProjectModule(path)?
+        supplied = supplied.push(entry)
+        index = index + 1
+    }
+    return ok(supplied)
+}

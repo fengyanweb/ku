@@ -1,14 +1,16 @@
 import { fs, string } from "std"
+import { Span } from "../stage2/span.ku"
 import { ParseModule } from "../stage3/parser.ku"
-import { SuppliedModule } from "./imports.ku"
+import { BindProjectImports, SuppliedModule } from "./imports.ku"
 import { BuildNameTable } from "./names.ku"
+import { ManifestPaths, ReadProjectModules } from "./project_manifest.ku"
 import { EmitScalarIntC } from "./scalar_int_c.ku"
 import { BindStructReturn, BuildStructLayouts } from "./struct_layouts.ku"
+import { EmitStructConstructorC } from "./struct_literal_c.ku"
 import { EmitStructProjectionC } from "./struct_projection_c.ku"
-import { BindTypeNames } from "./type_names.ku"
+import { BindImportedTypeNames, BindTypeNames } from "./type_names.ku"
 
-fn main(): null! {
-    input = BuildNameTable(ParseModule(fs.read("input.ku")?)?)?
+fn selectedFunction(): str! {
     function = string.trim(fs.read("function.txt")?)
     if (function.len() == 0) {
         fail {
@@ -17,6 +19,31 @@ fn main(): null! {
             message: "function.txt must name a function"
         }
     }
+    return ok(function)
+}
+
+fn emitProjectConstructor(&selected: SuppliedModule, &supplied: [SuppliedModule], &function: str): null! {
+    imports = BindProjectImports(selected, supplied)?
+    types = BindImportedTypeNames(selected.named, imports, supplied)?
+    layouts = BuildStructLayouts(selected.named, types, supplied)?
+    generated = EmitStructConstructorC(selected.named, types, imports, supplied, layouts, function)?
+    print(generated.text)
+    return ok(null)
+}
+
+fn main(): null! {
+    mode = "projection"
+    if (fs.exists("mode.txt")) { mode = string.trim(fs.read("mode.txt")?) }
+    if (mode == "construct") {
+        function = selectedFunction()?
+        at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+        paths = ManifestPaths(fs.read("modules.txt")?, at)?
+        supplied = ReadProjectModules(paths)?
+        return emitProjectConstructor(supplied[0], supplied, function)
+    }
+
+    input = BuildNameTable(ParseModule(fs.read("input.ku")?)?)?
+    function = selectedFunction()?
 
     supplied: [SuppliedModule] = []
     if (fs.exists("supplier.ku")) {
@@ -25,16 +52,13 @@ fn main(): null! {
         supplied = supplied.push(SuppliedModule { path: path, named: library })
     }
     bindings = BindTypeNames(input, supplied)?
-    if (fs.exists("mode.txt")) {
-        mode = string.trim(fs.read("mode.txt")?)
-        if (mode == "int") {
-            generated = EmitScalarIntC(input, bindings, function)?
-            print(generated.source)
-            return ok(null)
-        }
-        if (mode != "projection") {
-            fail { domain: "bootstrap.projection", code: "invalid_mode", message: "mode.txt must contain projection or int" }
-        }
+    if (mode == "int") {
+        generated = EmitScalarIntC(input, bindings, function)?
+        print(generated.source)
+        return ok(null)
+    }
+    if (mode != "projection") {
+        fail { domain: "bootstrap.projection", code: "invalid_mode", message: "mode.txt must contain projection, int or construct" }
     }
     layouts = BuildStructLayouts(input, bindings, supplied)?
     plan = BindStructReturn(input, bindings, layouts, function)?

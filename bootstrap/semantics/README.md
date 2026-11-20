@@ -124,6 +124,41 @@ as present. The emitter bounds boolean expression nesting at 32 levels.
 Try the complete `IsDigit`, `IsIdentifierStart` and
 `IsIdentifierContinue` definitions in `bootstrap/stage1/lexer.ku`.
 
+### Construct a nested struct from a project module
+
+Set `mode.txt` to `construct` and put the selected function name in
+`function.txt`. List project-relative source paths in `modules.txt`, with
+the module that defines the function first. Keep the source files in their
+original relative locations. The tool resolves the selected module's
+named imports using those paths.
+
+From the repository root, build the real `DefaultParseContext` constructor
+in a separate directory:
+
+```sh
+project=$(mktemp -d)
+compiler=$(mktemp -d)
+cp -R bootstrap/. "$compiler/"
+mkdir "$project/stage1" "$project/stage2"
+cp bootstrap/stage1/token.ku "$project/stage1/"
+cp bootstrap/stage2/context.ku bootstrap/stage2/span.ku "$project/stage2/"
+ku build --release "$compiler/semantics/projection_main.ku" -o "$compiler/semantics/ku-project"
+mv "$compiler/semantics/ku-project" "$project/ku-project"
+(
+    cd "$project"
+    printf 'construct\n' > mode.txt
+    printf 'DefaultParseContext\n' > function.txt
+    printf 'stage2/context.ku\nstage2/span.ku\nstage1/token.ku\n' > modules.txt
+    ./ku-project > context.c
+    cc -std=c11 -O2 -c context.c -o context.o
+)
+```
+
+This mode accepts a parameterless function returning a named struct literal,
+optionally after one Copy struct local initialized by a literal. The emitted
+C11 uses by-value fields for bounded, nonrecursive structs and static storage
+for string literals. The constructor itself allocates no heap storage.
+
 The compiler entry scans the module once and parses bounded declaration
 windows. It retains the lexer, per-function, AST and work limits. The legacy
 `ParseProgram` entry retains its 512-token whole-script limit.
