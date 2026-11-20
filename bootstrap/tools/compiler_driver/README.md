@@ -47,6 +47,10 @@ KU
 - `emit` selects one supported integer function and writes its C11 source
   to standard output. The leading C comment names the generated symbol
   for a caller. Link that source with a C caller or harness.
+- `emit-project modules.txt Function` selects a function from the first
+  listed module. The emitted C includes its supported reachable callees
+  from the project. It uses the same manifest and import resolution as
+  `check-project`.
 - Success returns zero. File, checker and emitter errors return one and
   report the existing diagnostic on standard error. Invalid command forms
   or arguments return two. Inputs must be nonempty UTF-8 and at most 512

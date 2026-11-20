@@ -29,7 +29,20 @@ def execute(args, cwd, status=0):
     return result
 
 
-def exercise_project(compiler, root, caller):
+def exercise_emitted(cc, emitted, caller, stem, arguments, result):
+    symbol = re.match(rb"/\* ([A-Za-z_][0-9A-Za-z_]*) \*/\n", emitted)
+    assert symbol, emitted[:200]
+    source = caller / (stem + ".c")
+    invocation = symbol[1] + arguments
+    source.write_bytes(
+        emitted + b"\nint main(void) { return " + invocation + b" != " + result + b"; }\n"
+    )
+    program = stem + (".exe" if os.name == "nt" else "")
+    link_c(cc, source.name, program, caller)
+    execute([caller / program], caller)
+
+
+def exercise_project(compiler, cc, root, caller):
     project = root / "项目 清单🙂"
     src, lib = project / "src", project / "lib"
     src.mkdir(parents=True)
@@ -97,6 +110,13 @@ def exercise_project(compiler, root, caller):
     project_error(b"exceeds 32768 UTF-8 bytes")
     manifest.write_bytes(listed)
     assert execute([compiler, "check-project", relative], caller).stdout == b""
+    emitted = execute([compiler, "emit-project", relative, "Answer"], caller).stdout
+    exercise_emitted(cc, emitted, caller, "project-derived", b"()", b"42")
+    missing = execute([compiler, "emit-project", relative, "Unknown"], caller, 1)
+    assert not missing.stdout and b"unknown_int_function" in missing.stderr, missing.stderr
+    manifest.write_bytes(b"src/main.ku\n")
+    unresolved = execute([compiler, "emit-project", relative, "Answer"], caller, 1)
+    assert not unresolved.stdout and b"unresolved_import" in unresolved.stderr, unresolved.stderr
 
 
 def exercise(ku, cc):
@@ -176,16 +196,8 @@ def exercise(ku, cc):
         assert no_function.stdout == b"" and no_function.stderr
 
         emitted = execute([compiler, "emit", source.name, "AddOne"], caller).stdout
-        symbol = re.match(rb"/\* ([A-Za-z_][0-9A-Za-z_]*) \*/\n", emitted)
-        assert symbol, emitted[:200]
-        derived = caller / "derived.c"
-        derived.write_bytes(
-            emitted + b"\nint main(void) { return " + symbol[1] + b"(41) == 42 ? 0 : 1; }\n"
-        )
-        program = "derived.exe" if os.name == "nt" else "derived"
-        link_c(cc, "derived.c", program, caller)
-        execute([caller / program], caller)
-        exercise_project(compiler, root, caller)
+        exercise_emitted(cc, emitted, caller, "derived", b"(41)", b"42")
+        exercise_project(compiler, cc, root, caller)
         print("bootstrap argv, module checks, signature and standalone C verified")
 
 
