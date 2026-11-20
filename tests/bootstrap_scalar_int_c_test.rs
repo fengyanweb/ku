@@ -199,7 +199,7 @@ fn compare_function(
             format!("{declarations}\nfn main() {{ println({name}({oracle_args})) }}\n"),
         )
         .expect("write interpreter oracle");
-        let expected_output = execute(&mut Command::new(ku).arg("run").arg(&oracle), cwd, 10);
+        let expected_output = execute(Command::new(ku).arg("run").arg(&oracle), cwd, 10);
         fs::remove_file(&oracle).expect("remove oracle before running independent executable");
         let actual = execute(
             Command::new(&app).args(args.iter().map(i64::to_string)),
@@ -314,11 +314,7 @@ int main(int argc, char **argv) {
         ),
     )
     .expect("At interpreter oracle");
-    let expected = execute(
-        &mut Command::new(ku).arg("run").arg(&expected_source),
-        cwd,
-        10,
-    );
+    let expected = execute(Command::new(ku).arg("run").arg(&expected_source), cwd, 10);
     assert_success(&expected);
     fs::remove_file(&expected_source).expect("source-free standalone At");
     let actual = execute(Command::new(&app).arg("success"), cwd, 10);
