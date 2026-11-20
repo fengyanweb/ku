@@ -2,7 +2,7 @@ import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, ParseOutput } from "../stage2/ast.ku"
 import { ExpressionSpan } from "../stage2/expression_support.ku"
-import { NextBodyWork, ReadExpressionEnd, LocalAssignmentOperator, RejectLetStatement,
+import { NextBodyWork, ReadExpressionEnd, AssignmentOperator, RejectLetStatement,
          SignatureTypeOutput } from "./body_support.ku"
 import { ReadTypedInitializer } from "./function_header.ku"
 import { ReadSignatureTypePrefix } from "./signature.ku"
@@ -38,7 +38,7 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         }
     }
     assignment_operator = ""
-    if (statement_start.kind == "Ident") { assignment_operator = LocalAssignmentOperator(WindowToken(tokens, cursor + 1, last_index)) }
+    if (statement_start.kind == "Ident") { assignment_operator = AssignmentOperator(WindowKind(tokens, cursor + 1, last_index)) }
     if (statement_start.kind == "Let") {
         RejectLetStatement(statement_start)?
     } else if (statement_start.kind == "Break" || statement_start.kind == "Continue") {
@@ -148,7 +148,8 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         cursor = expression_end
         kind = "ExprStmt"
         children: [int] = [expression]
-        if (WindowKind(tokens, cursor, last_index) == "Equal") {
+        assignment_operator = AssignmentOperator(WindowKind(tokens, cursor, last_index))
+        if (assignment_operator != "") {
             if (expression_node.kind != "Field" && expression_node.kind != "Index") {
                 RejectAtSpan(span.clone(), "invalid_assignment_target", "invalid assignment target")?
             }
@@ -158,10 +159,11 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
             rhs = add_arena(value, WindowToken(tokens, cursor, last_index), false)?
             span = SpanMerge(span, read_span(rhs))
             children = children.push(rhs)
-            kind = "AssignTarget"
+            kind = "CompoundAssign"
+            if (assignment_operator == "=") { kind = "AssignTarget" assignment_operator = "" }
             cursor = expression_end
         }
-        statement = add_node(kind, "", 0, span, children, statement_start.clone())?
+        statement = add_node(kind, assignment_operator, 0, span, children, statement_start.clone())?
     }
     if (WindowKind(tokens, cursor, last_index) == "Semicolon") { cursor = cursor + 1 }
     return ok(SimpleStatementRead { node: statement, cursor: cursor, work: parse_steps, initializer_type: 0 })

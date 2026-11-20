@@ -654,6 +654,61 @@ fn closing_brace(tokens: &[Token], opening: usize) -> usize {
     panic!("Rust accepted a block without its closing brace");
 }
 
+fn project_assignment_target(
+    source: &str,
+    target: &AssignTarget,
+    span: Span,
+    arena: &mut ProjectedArena,
+) -> usize {
+    let tokens = Lexer::new(source).lex().expect("assignment tokens");
+    match target {
+        AssignTarget::Variable(name) => {
+            let token = tokens
+                .iter()
+                .find(|token| token.span.start == span.start)
+                .expect("assignment variable");
+            push_node(arena, "Variable", name.clone(), 0, token.span, &[])
+        }
+        AssignTarget::Field { target, name } => {
+            let field = tokens
+                .iter()
+                .find(|token| {
+                    token.span.start.offset >= target.span.end.offset
+                        && matches!(&token.kind, TokenKind::Ident(field) if field == name)
+                })
+                .expect("assignment terminal field");
+            let receiver = project_expr(source, target, arena);
+            push_node(
+                arena,
+                "Field",
+                name.clone(),
+                0,
+                target.span.merge(field.span),
+                &[receiver],
+            )
+        }
+        AssignTarget::Index { target, index } => {
+            let closing = tokens
+                .iter()
+                .find(|token| {
+                    token.span.start.offset >= index.span.end.offset
+                        && token.kind == TokenKind::RBracket
+                })
+                .expect("assignment closing bracket");
+            let receiver = project_expr(source, target, arena);
+            let index = project_expr(source, index, arena);
+            push_node(
+                arena,
+                "Index",
+                String::new(),
+                0,
+                target.span.merge(closing.span),
+                &[receiver, index],
+            )
+        }
+    }
+}
+
 fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> usize {
     match statement {
         Stmt::Function(function) => project_function(source, function, arena),
@@ -679,6 +734,22 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
         Stmt::Assign { name, value, span } => {
             let value = project_expr(source, value, arena);
             push_node(arena, "Assign", name.clone(), 0, *span, &[value])
+        }
+        Stmt::AssignTarget {
+            target,
+            value,
+            span,
+        } => {
+            let target = project_assignment_target(source, target, *span, arena);
+            let value = project_expr(source, value, arena);
+            push_node(
+                arena,
+                "AssignTarget",
+                String::new(),
+                0,
+                *span,
+                &[target, value],
+            )
         }
         Stmt::ObjectDestructureAssign {
             bindings,
@@ -730,19 +801,12 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
             )
         }
         Stmt::CompoundAssign {
-            target: AssignTarget::Variable(name),
+            target,
             op,
             value,
             span,
         } => {
-            let tokens = Lexer::new(source)
-                .lex()
-                .expect("compound assignment tokens");
-            let target = tokens
-                .iter()
-                .find(|token| token.span.start == span.start)
-                .expect("compound assignment target token");
-            let target = push_node(arena, "Variable", name.clone(), 0, target.span, &[]);
+            let target = project_assignment_target(source, target, *span, arena);
             let value = project_expr(source, value, arena);
             let operator = match op {
                 BinaryOp::Add => "+",
@@ -1658,6 +1722,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "// 捕获😀\r\nfn outer(prefix: int) { read = fn(&value: int): int { if (ready) { return prefix } return value }; after = read }",
         "// 异常😀\r\nfn main() { before = 0 try { if (check) { try {} catch(inner) {} } next = 1 } catch(outer) { one = outer.code try { recover()? } catch(recovery) {} two = outer.message } after = 2 }",
         "fn sum() { count = 0 for n in [1,2] { if (n > 1) { count += n } } count %= 5 return count }",
+        "// 字段🙂\r\nfn f() { item.state.code += Build(1); item.cells[next(2)] -= 3; if (ready) row.x *= 4; row.y = 5; row.z /= 2; row.items[0] %= 3 }",
         "// 跳转😀\r\nfn f() { for value in [1,2] { try { if (value == 1) { continue; } break } catch(err) { break; } } while (ready) { continue } }",
         // Loop placement is a checker decision in Rust; the parser retains
         // the same leaves even without a target or in a nested function.
@@ -1901,7 +1966,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let for_unbraced = "fn f() { for x in xs println(x) }";
     let for_else = "fn f() { for x in xs {} else {} }";
     let for_missing_close = "fn f() { for x in xs { a += 1";
-    let compound_field = "fn f() { row.x += 1 }";
+    let invalid_compound_target = "fn f() { 0 += 1 }";
 
     let struct_trailing_comma = "fn main() { return Box{value: 1,} }";
     let struct_missing_comma = "fn main() { return Box{value: 1 next: 2} }";
@@ -3393,12 +3458,12 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             ),
         ),
         (
-            compound_field,
-            "trailing_token",
+            invalid_compound_target,
+            "invalid_assignment_target",
             diagnostic_for_kind(
-                compound_field,
-                TokenKind::PlusEqual,
-                "expected end of expression",
+                invalid_compound_target,
+                TokenKind::Int(0),
+                "invalid assignment target",
             ),
         ),
         (
