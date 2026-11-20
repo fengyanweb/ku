@@ -25,7 +25,15 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
     }
     context_error = ParseContextError(source_characters, source_bytes, tokens[tokens.len() - 1].clone(), context.clone())
     if (context_error != "") { RejectAt(tokens[0].clone(), "invalid_parse_context", context_error, stage3_domain)? }
-    tokens = RelocateTokens(tokens, context)
+    return ParseTokenWindow(RelocateTokens(tokens, context), stage3_domain)
+}
+
+// Parse a bounded window whose tokens already carry absolute positions.
+// The caller supplies exactly one terminal EOF, with the desired error span.
+fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
+    if (tokens.len() == 0) {
+        RejectAtPoint("invalid_token_stream", "token stream must end in exactly one EOF", stage3_domain)?
+    }
     if (tokens.len() > 4096) {
         RejectAt(tokens[0].clone(), "invalid_token_stream", "stage-2 parser accepts at most 4096 tokens", stage3_domain)?
     }

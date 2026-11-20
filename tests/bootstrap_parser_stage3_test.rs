@@ -3739,8 +3739,8 @@ fn ExpectBodyCallbackOutputError(tokens: [Token], body_start: int): null! {
     assert!(!native_c.contains("const SOURCE"));
     assert!(!native_c.contains("run_source"));
     assert!(
-        native_c.contains("ku_string_slice("),
-        "Stage 3 expression extraction must retain the bounded slice path"
+        native_c.contains("_ParseTokenWindow(") && !native_c.contains("ku_string_slice("),
+        "Stage 3 must parse bounded windows of the original tokens"
     );
 
     let native_name = if cfg!(windows) {

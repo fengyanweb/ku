@@ -2,7 +2,8 @@ import { Token } from "../stage1/token.ku"
 import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
-import { RejectAt, RejectAtPoint, ParseExpressionAt, MapTokenCharacters, SpanFromNode } from "./support.ku"
+import { ParseTokenWindow } from "../stage2/parser.ku"
+import { RejectAt, RejectAtPoint, SpanFromNode } from "./support.ku"
 import { ReadImport } from "./imports.ku"
 import { ReadModule } from "./structs.ku"
 import { ReadBracedDeclaration } from "./enums.ku"
@@ -19,14 +20,40 @@ import { ReadFunction } from "./functions.ku"
 // existing optional semicolon is also accepted. Unsupported production syntax
 // is rejected explicitly rather than guessed at or given a second interpretation.
 //
-// The complete module is scanned once. Token byte offsets are mapped to
-// Unicode-scalar slice indexes in one monotonic pass. Stage 2 then re-scans
-// each bounded, already lexically-valid expression window with a structured
-// origin/boundary context, so it relocates both AST and parser-error spans
-// before returning them to this module's fixed NodeId/edge arenas.
+// Stage 2 consumes bounded windows of the original tokens. Their absolute
+// source positions also locate expression errors without a second lexer pass.
+
+fn ReadTokenWindow(&tokens: [Token], start: int, end: int, source_length: int,
+                   work_remaining: int): [Token]! {
+    if (tokens.len() == 0) {
+        RejectAtPoint("invalid_token_stream", "token stream must contain exactly one final EOF")?
+    }
+    if (start > end || start < 0 || end > tokens.len() - 1) {
+        diagnostic_index = tokens.len() - 1
+        if (start >= 0 && start < tokens.len()) { diagnostic_index = start }
+        RejectAt(tokens[diagnostic_index].clone(), "invalid_expression_range", "statement expression token range is invalid")?
+    }
+    if (source_length > work_remaining) {
+        RejectAt(tokens[start].clone(), "work_limit", "stage-3 expression slicing budget exceeded")?
+    }
+    window: [Token] = []
+    index = start
+    while (index < end) {
+        token = tokens[index].clone()
+        window = window.push(token)
+        index = index + 1
+    }
+    boundary = tokens[end].clone()
+    boundary.kind = "Eof"
+    boundary.lexeme = ""
+    boundary.int_value = 0
+    window = window.push(boundary)
+    return ok(window)
+}
 
 fn ParseProgram(source: str): ParseOutput! {
-    tokens = Scan(source.clone())?
+    source_length = source.len()
+    tokens = Scan(source)?
     if (tokens.len() == 0) {
         RejectAtPoint("invalid_token_stream", "token stream must contain exactly one final EOF")?
     }
@@ -47,14 +74,6 @@ fn ParseProgram(source: str): ParseOutput! {
     if (eof.kind != "Eof") {
         RejectAt(eof.clone(), "invalid_token_stream", "token stream is missing EOF")?
     }
-
-    // The source moves through the mapper and back. Give the mapper one token
-    // copy; the separate callback snapshot below keeps the scanner unshared.
-    mapped = MapTokenCharacters(source, tokens.clone())?
-    token_char_starts: [int] = mapped.starts
-    token_char_ends: [int] = mapped.ends
-    source_chars: [str] = mapped.characters
-    expression_source_text: str = mapped.source
 
     arena_nodes: [Node] = []
     arena_edges: [int] = []
@@ -150,26 +169,12 @@ fn ParseProgram(source: str): ParseOutput! {
     // the outer scanner's tokens binding is not retained by this closure.
     expression_tokens = tokens.clone()
     fn ParseExpressionWindow(start: int, end: int): ParseOutput! {
-        if (start > end || start < 0 || end > expression_tokens.len() - 1) {
-            diagnostic_index = expression_tokens.len() - 1
-            if (start >= 0 && start < expression_tokens.len()) { diagnostic_index = start }
-            RejectAt(expression_tokens[diagnostic_index].clone(), "invalid_expression_range", "statement expression token range is invalid")?
-        }
-        origin = expression_tokens[start].clone()
-        boundary = expression_tokens[end].clone()
-        // string.slice may scan the complete source. Keep an explicit aggregate
-        // budget so comment-heavy modules cannot multiply that scan by every
-        // statement. This also avoids interpreter per-character concatenation.
-        source_length = source_chars.len()
-        if (source_length > 131072 - slice_work) {
-            RejectAt(origin.clone(), "work_limit", "stage-3 expression slicing budget exceeded")?
-        }
+        // Keep the existing source-work admission boundary while the scanner's
+        // per-file limits are unchanged. Borrow the scanner array once so a
+        // captured field read cannot clone it for each appended expression token.
+        window = ReadTokenWindow(expression_tokens, start, end, source_length, 131072 - slice_work)?
         slice_work = slice_work + source_length
-        slice_end = token_char_starts[start]
-        if (end > start) { slice_end = token_char_ends[end - 1] }
-        expression_source = expression_source_text.slice(token_char_starts[start], slice_end)?
-        parsed = ParseExpressionAt(expression_source, origin.clone(), boundary)?
-        return ok(parsed)
+        return ParseTokenWindow(window, true)
     }
     parse_expression: fn(int, int): ParseOutput! = ParseExpressionWindow
 
