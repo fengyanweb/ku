@@ -155,7 +155,8 @@ fn BindLinkedCatch(state: LinkedNullState, name: str, &binding: Node, &before: [
     next.slots[slot - 1].live = true
     next.catch_slot = 0
     next.catch_edges = false
-    next.catch_moved = []
+    cleared: [int] = []
+    next.catch_moved = cleared
     return ok(next)
 }
 
