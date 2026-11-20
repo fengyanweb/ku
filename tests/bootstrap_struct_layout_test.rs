@@ -33,6 +33,27 @@ impl Drop for Temp {
     }
 }
 
+fn stage_sources(source: &Path) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for stage in ["stage1", "stage2", "stage3", "semantics"] {
+        let target = source.join(stage);
+        fs::create_dir(&target).expect("create copied compiler stage");
+        for entry in
+            fs::read_dir(root.join("bootstrap").join(stage)).expect("read compiler sources")
+        {
+            let entry = entry.expect("stage source");
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "ku")
+            {
+                fs::copy(entry.path(), target.join(entry.file_name()))
+                    .expect("copy hostable Ku compiler module");
+            }
+        }
+    }
+}
+
 fn execute(command: &mut Command, cwd: &Path, limit: u64) -> BoundedOutput {
     command.current_dir(cwd);
     run_bounded(
@@ -190,24 +211,7 @@ fn bootstrap_checks_and_lowers_real_struct_projection_returns() {
     for directory in [&source, &cwd, &relocated] {
         fs::create_dir(directory).expect("create isolated consumer directory");
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for stage in ["stage1", "stage2", "stage3", "semantics"] {
-        let target = source.join(stage);
-        fs::create_dir(&target).expect("create copied compiler stage");
-        for entry in
-            fs::read_dir(root.join("bootstrap").join(stage)).expect("read compiler sources")
-        {
-            let entry = entry.expect("stage source");
-            if entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "ku")
-            {
-                fs::copy(entry.path(), target.join(entry.file_name()))
-                    .expect("copy hostable Ku compiler module");
-            }
-        }
-    }
+    stage_sources(&source);
     let compiler = source.join("semantics");
     let entry = compiler.join("inspect_layout.ku");
     let ku = std::env::var_os("KU_BIN")
@@ -335,5 +339,235 @@ fn bootstrap_checks_and_lowers_real_struct_projection_returns() {
         assert_eq!(ran.status.code(), Some(1));
         assert!(ran.stdout.is_empty());
         assert_eq!(String::from_utf8_lossy(&ran.stderr).trim_end(), expected);
+    }
+}
+
+const C_EMITTER: &str = r#"import "std.fs"
+import { ParseProgram } from "../stage3/parser.ku"
+import { BuildNameTable } from "./names.ku"
+import { SuppliedModule } from "./imports.ku"
+import { BindTypeNames } from "./type_names.ku"
+import { BuildStructLayouts, BindStructReturn } from "./struct_layouts.ku"
+import { EmitStructProjectionC } from "./struct_projection_c.ku"
+
+fn main(): null! {
+    named = BuildNameTable(ParseProgram(fs.read("input.ku")?)?)?
+    token = BuildNameTable(ParseProgram(fs.read("supplier.ku")?)?)?
+    supplied: [SuppliedModule] = [SuppliedModule { path: "../stage1/token.ku", named: token }]
+    bindings = BindTypeNames(named, supplied)?
+    layouts = BuildStructLayouts(named, bindings)?
+    function = fs.read("function.txt")?
+    plan = BindStructReturn(named, bindings, layouts, function)?
+    println(str(plan.result_layout) + "|" + str(plan.function_node))
+    println(EmitStructProjectionC(layouts, plan)?)
+    return ok(null)
+}
+"#;
+
+fn compile_projection(source: &Path, output: &Path, cwd: &Path) {
+    let selected = std::env::var("KU_CC").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "clang".into()
+        } else {
+            "cc".into()
+        }
+    });
+    let tokens: Vec<&str> = if Path::new(&selected).is_file() {
+        vec![selected.as_str()]
+    } else {
+        selected.split_whitespace().collect()
+    };
+    let (program, arguments) = tokens
+        .split_first()
+        .expect("a C compiler for standalone projection");
+    let mut compile = Command::new(program);
+    compile.args(arguments);
+    let stem = Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    if stem.eq_ignore_ascii_case("cl") || stem.eq_ignore_ascii_case("clang-cl") {
+        compile
+            .args(["/nologo", "/std:c11", "/O2", "/WX"])
+            .arg(source)
+            .arg(format!("/Fe{}", output.display()))
+            .arg(format!("/Fo{}", output.with_extension("obj").display()));
+    } else {
+        compile
+            .args([
+                "-std=c11",
+                "-pedantic-errors",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-O2",
+            ])
+            .arg(source)
+            .arg("-o")
+            .arg(output);
+    }
+    assert_ok(&execute(&mut compile, cwd, 30));
+}
+
+#[test]
+fn ku_compiler_emits_standalone_c_for_real_scalar_projection() {
+    let work = Temp::new();
+    let source = work.0.join("compiler");
+    let cwd = work.0.join("invocation");
+    let relocated = work.0.join("relocated");
+    for directory in [&source, &cwd, &relocated] {
+        fs::create_dir(directory).expect("create isolated consumer directory");
+    }
+    stage_sources(&source);
+    let compiler = source.join("semantics");
+    let entry = compiler.join("project.ku");
+    let ku = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    fs::write(&entry, C_EMITTER).expect("write actual Ku emitter entry");
+
+    let token = include_str!("../bootstrap/stage1/token.ku");
+    let span = include_str!("../bootstrap/stage2/span.ku");
+    let flip = "struct Pair { x: int flag: bool }\nfn Flip(&right: Pair, left: Pair): Pair { return Pair { flag: left.flag, x: right.x } }\n";
+    let oracle_entry = source.join("span_entry.ku");
+    fs::write(
+        &oracle_entry,
+        r#"import { Span, SpanMerge } from "./stage2/span.ku"
+fn main(): null {
+    left = Span { line: 1, column: 2, offset: 3, end_line: 4, end_column: 5, end_offset: 6 }
+    right = Span { line: 7, column: 8, offset: 9, end_line: 10, end_column: 11, end_offset: 12 }
+    result = SpanMerge(left, right)
+    println(result.line)
+    println(result.column)
+    println(result.offset)
+    println(result.end_line)
+    println(result.end_column)
+    println(result.end_offset)
+    return null
+}
+"#,
+    )
+    .expect("write ore source that imports real SpanMerge");
+    let oracle = execute(Command::new(&ku).arg("run").arg(&oracle_entry), &cwd, 20);
+    assert_ok(&oracle);
+    assert_eq!(
+        String::from_utf8_lossy(&oracle.stdout).replace("\r\n", "\n"),
+        "1\n2\n3\n10\n11\n12\n"
+    );
+    let flip_entry = format!(
+        r#"{flip}
+fn main(): null {{
+    right = Pair {{ x: -5000000003, flag: false }}
+    left = Pair {{ x: 42, flag: true }}
+    result = Flip(right, left)
+    println(result.x)
+    println(result.flag)
+    println(right.x)
+    return null
+}}
+"#
+    );
+    fs::write(&oracle_entry, flip_entry).expect("write oracle for borrowed scalar aggregate");
+    let oracle = execute(Command::new(&ku).arg("run").arg(&oracle_entry), &cwd, 20);
+    assert_ok(&oracle);
+    assert_eq!(
+        String::from_utf8_lossy(&oracle.stdout).replace("\r\n", "\n"),
+        "-5000000003\ntrue\n-5000000003\n"
+    );
+
+    let cases = [
+        (
+            "SpanMerge",
+            span,
+            "1\n2\n3\n10\n11\n12\n",
+            r#"    RESULT left = { 1, 2, 3, 4, 5, 6 };
+    RESULT right = { 7, 8, 9, 10, 11, 12 };
+    RESULT value = PROJECT(left, right);
+    printf("%" PRId64 "\n%" PRId64 "\n%" PRId64 "\n%" PRId64 "\n%" PRId64 "\n%" PRId64 "\n",
+           value.f0, value.f1, value.f2, value.f3, value.f4, value.f5);
+"#,
+        ),
+        (
+            "Flip",
+            flip,
+            "-5000000003\ntrue\n-5000000003\n",
+            r#"    RESULT right = { -INT64_C(5000000003), false };
+    RESULT left = { INT64_C(42), true };
+    RESULT value = PROJECT(&right, left);
+    printf("%" PRId64 "\n%s\n%" PRId64 "\n",
+           value.f0, value.f1 ? "true" : "false", right.f0);
+"#,
+        ),
+    ];
+    let materialize = |directory: &Path, function: &str, input: &str| {
+        fs::write(directory.join("input.ku"), input).expect("write subject");
+        fs::write(directory.join("function.txt"), function).expect("choose function");
+        fs::write(directory.join("supplier.ku"), token).expect("write explicitly supplied module");
+    };
+
+    let mut expected_c = Vec::new();
+    for (function, input, _, _) in cases {
+        materialize(&compiler, function, input);
+        let interpreted = execute(Command::new(&ku).arg("run").arg(&entry), &cwd, 20);
+        assert_ok(&interpreted);
+        expected_c.push(
+            String::from_utf8(interpreted.stdout)
+                .expect("C fragment")
+                .replace("\r\n", "\n"),
+        );
+    }
+    let seed = compiler.join(format!("ku-project-c{}", std::env::consts::EXE_SUFFIX));
+    let build = execute(
+        Command::new(&ku)
+            .args(["build", "--release"])
+            .arg(&entry)
+            .arg("-o")
+            .arg(&seed),
+        &cwd,
+        120,
+    );
+    assert_ok(&build);
+    let stage1 = relocated.join(seed.file_name().expect("seed executable name"));
+    fs::rename(seed, &stage1).expect("relocate native Ku compiler seed");
+    fs::remove_dir_all(&source).expect("remove seed source, oracle programs and staging");
+
+    for ((function, input, expected, driver), reference) in cases.into_iter().zip(expected_c) {
+        materialize(&relocated, function, input);
+        let compiled = execute(&mut Command::new(&stage1), &cwd, 20);
+        assert_ok(&compiled);
+        let output = String::from_utf8(compiled.stdout)
+            .expect("native seed output")
+            .replace("\r\n", "\n");
+        assert_eq!(output, reference, "emitter output differs: {function}");
+        let (ids, c) = output
+            .split_once('\n')
+            .expect("metadata line followed by C");
+        let (layout, function_id) = ids.split_once('|').expect("layout and function IDs");
+        let layout: u32 = layout.parse().expect("numeric layout ID");
+        let function_id: u32 = function_id.parse().expect("numeric function ID");
+        assert!(layout > 0 && function_id > 0);
+        assert!(!c.contains(function) && !c.contains("run_source"));
+        assert!(!c.contains("KuString") && c.contains("int64_t f0;"));
+        if function == "Flip" {
+            assert!(c.contains("const KuStruct_"));
+            assert!(c.find("result.f1 =").unwrap() < c.find("result.f0 =").unwrap());
+        }
+        let harness = driver
+            .replace("RESULT", &format!("KuStruct_{layout}"))
+            .replace("PROJECT", &format!("ku_project_{function_id}"));
+        let app = work.0.join(format!("app_{function}"));
+        fs::create_dir(&app).expect("create fresh C consumer directory");
+        let c_source = app.join("projection.c");
+        let app_binary = app.join(format!("projection{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&c_source, format!("{c}\n#include <inttypes.h>\n#include <stdio.h>\nint main(void) {{\n{harness}    return 0;\n}}\n"))
+            .expect("write generated C plus scalar calling harness");
+        compile_projection(&c_source, &app_binary, &app);
+        fs::remove_file(c_source).expect("remove C source before run");
+        let result = execute(&mut Command::new(app_binary), &app, 20);
+        assert_ok(&result);
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout).replace("\r\n", "\n"),
+            expected
+        );
     }
 }

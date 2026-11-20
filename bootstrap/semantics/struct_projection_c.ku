@@ -1,0 +1,119 @@
+import { Span } from "../stage2/span.ku"
+import { TypeNameBinding } from "./type_names.ku"
+import { LayoutIndex, RejectLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
+
+fn InvalidPlan(message: str): null! {
+    point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    RejectLayout("invalid_projection_plan", message, point)?
+    return ok(null)
+}
+
+fn ScalarCType(&ty: TypeNameBinding): str! {
+    if (ty.declaration_kind == "Builtin") {
+        if (ty.name == "int") { return ok("int64_t") }
+        if (ty.name == "float") { return ok("double") }
+        if (ty.name == "bool") { return ok("bool") }
+        if (ty.name == "null") { return ok("uint8_t") }
+    }
+    InvalidPlan("C projection fields must be Copy scalars")?
+    return ok("")
+}
+
+fn CTypeName(node: int): str {
+    return "KuStruct_" + str(node)
+}
+
+fn ContainsIndex(&ids: [int], id: int): bool {
+    index = 0
+    while (index < ids.len()) {
+        if (ids[index] == id) { return true }
+        index = index + 1
+    }
+    return false
+}
+
+fn EmitLayout(&layout: StructLayout): str! {
+    text = "typedef struct {\n"
+    count = layout.fields.len()
+    if (count == 0) { text += "    unsigned char empty;\n" }
+    index = 0
+    while (index < count) {
+        kind = ScalarCType(layout.fields[index].resolved)?
+        text += "    " + kind + " f" + str(index) + ";\n"
+        index = index + 1
+    }
+    text += "} " + CTypeName(layout.node) + ";\n\n"
+    return ok(text)
+}
+
+fn FindLayout(&layouts: [StructLayout], node: int): StructLayout! {
+    index = LayoutIndex(layouts, node)
+    if (index == 0 || node <= 0) { InvalidPlan("unknown struct layout ID")? }
+    return ok(layouts[index - 1].clone())
+}
+
+// Emits one checked function as standalone C11. Only numeric arena IDs and
+// ordinals enter identifiers. A View parameter is a pointer to const storage;
+// owned scalar structs are ordinary C values and hold no cleanup resources.
+fn EmitStructProjectionC(&layouts: [StructLayout], &plan: StructReturnPlan): str! {
+    if (plan.function_node <= 0) { InvalidPlan("expected a positive function ID")? }
+    result = FindLayout(layouts, plan.result_layout)?
+    text = "#include <stdbool.h>\n#include <stdint.h>\n\n"
+    text += EmitLayout(result)?
+    emitted: [int] = [result.node]
+    signature = CTypeName(result.node) + " ku_project_" + str(plan.function_node) + "("
+    parameters_count = plan.parameters.len()
+    if (parameters_count == 0) { signature += "void" }
+    index = 0
+    while (index < parameters_count) {
+        parameter = plan.parameters[index].clone()
+        input = FindLayout(layouts, parameter.layout_node)?
+        if (!ContainsIndex(emitted, input.node)) {
+            text += EmitLayout(input)?
+            id = input.node
+            emitted = emitted.push(id)
+        }
+        if (index > 0) { signature += ", " }
+        if (parameter.mode == 0) {
+            signature += CTypeName(parameter.layout_node) + " a" + str(index)
+        } else if (parameter.mode == 1) {
+            signature += "const " + CTypeName(parameter.layout_node) + " *a" + str(index)
+        } else {
+            InvalidPlan("expected an owned or View parameter")?
+        }
+        index = index + 1
+    }
+    text += signature + ") {\n    " + CTypeName(result.node) + " result;\n"
+    field_count = result.fields.len()
+    if (field_count != plan.projections.len()) { InvalidPlan("expected exactly one projection for each result field")? }
+    seen: [int] = []
+    index = 0
+    while (index < plan.projections.len()) {
+        projection = plan.projections[index].clone()
+        if (projection.output_field < 0 || projection.output_field >= field_count
+            || ContainsIndex(seen, projection.output_field)) {
+            InvalidPlan("each output field must appear once")?
+        }
+        if (projection.parameter < 0 || projection.parameter >= parameters_count) {
+            InvalidPlan("projection refers to an unknown parameter")?
+        }
+        parameter = plan.parameters[projection.parameter].clone()
+        input = FindLayout(layouts, parameter.layout_node)?
+        if (projection.input_field < 0 || projection.input_field >= input.fields.len()) {
+            InvalidPlan("projection refers to an unknown input field")?
+        }
+        actual = ScalarCType(input.fields[projection.input_field].resolved)?
+        expected = ScalarCType(result.fields[projection.output_field].resolved)?
+        if (actual != expected) { InvalidPlan("projection changes field type")? }
+        access = "."
+        if (parameter.mode == 1) { access = "->" }
+        text += "    result.f" + str(projection.output_field) + " = a" + str(projection.parameter)
+            + access + "f" + str(projection.input_field) + ";\n"
+        field = projection.output_field
+        seen = seen.push(field)
+        index = index + 1
+    }
+    if (field_count == 0) { text += "    result.empty = 0;\n" }
+    text += "    return result;\n}\n"
+    return ok(text)
+}
