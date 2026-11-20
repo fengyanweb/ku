@@ -549,12 +549,28 @@ fn Replace(first: bool): str! {
         return ok(owner)
     }
 }
+fn Consume(value: str): null! { return ok(null) }
+fn Keep(value: str): str! { return ok(value) }
 fn WrongElse(first: bool): str! {
     left = Supply(1)?
     right = Supply(1)?
-    if (first) { left = Supply(2)? }
+    if (first) { Consume(left)? }
     else { right = Supply(3)? }
-    return ok(left)
+    return ok(right)
+}
+struct Bundle { left: str right: str }
+fn WrongMembers(bundle: Bundle, first: bool): null! {
+    if (first) { Consume(bundle.left)? }
+    else { Consume(bundle.right)? }
+    return ok(null)
+}
+fn CatchMoved(owner: str): str! {
+    try {
+        owner = Keep(owner)?
+        return ok(owner)
+    } catch (err) {
+        return ok(owner)
+    }
 }
 "#;
 
@@ -651,11 +667,18 @@ pub(super) fn assert_checked_string_rebind(seed: &Path, cwd: &Path) {
     .unwrap();
     compile_projection(&source, &exe, cwd);
     assert_ok(&execute(&mut Command::new(exe), cwd, 15));
-    fs::write(cwd.join("function.txt"), "WrongElse").unwrap();
-    let wrong = execute(&mut Command::new(seed), cwd, 30);
-    assert_eq!(wrong.status.code(), Some(1));
-    assert!(wrong.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&wrong.stderr).contains("unsupported_linked_else"));
+    for name in ["WrongElse", "WrongMembers"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let wrong = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(wrong.status.code(), Some(1));
+        assert!(wrong.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&wrong.stderr).contains("linked_control_move"));
+    }
+    fs::write(cwd.join("function.txt"), "CatchMoved").unwrap();
+    let moved = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(moved.status.code(), Some(1));
+    assert!(moved.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&moved.stderr).contains("unavailable_linked_binding"));
 }
 
 const ADD_CALL_SOURCE: &str = r#"import { Decorate, Suffix } from "./plus-provider.ku"

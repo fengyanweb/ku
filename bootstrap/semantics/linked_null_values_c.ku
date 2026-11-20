@@ -317,18 +317,19 @@ fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &
 
 fn LowerLinkedStringRebind(&project: LinkedNullProject, state: LinkedNullState, &assignment: Node): LinkedNullState! {
     index = LinkedNullBinding(state.slots, assignment.text)
-    if (index == 0 || !state.slots[index - 1].live) {
-        RejectLayout("linked_rebind_target", "expected an initialized local str owner", DeclarationSpan(assignment))?
+    if (index == 0) {
+        RejectLayout("linked_rebind_target", "expected a declared local str owner", DeclarationSpan(assignment))?
     }
     target = state.slots[index - 1].value.clone()
     value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, assignment, 0), 0)?
     if (target.borrowed || target.ty.name != "str" || target.ty.declaration_kind != "Builtin"
         || !SameLinkedType(target.ty, value.value.ty) || value.value.borrowed
-        || value.value.slot == index || !value.state.slots[index - 1].live) {
+        || value.value.slot == index) {
         RejectLayout("linked_rebind_type", "replacement requires a separate str owner of the declared type", DeclarationSpan(assignment))?
     }
     value.state.code += "    ku_projection_string_drop(&" + target.text.clone() + ");\n"
         + "    " + target.text + " = " + value.value.text.clone() + ";\n"
+    value.state.slots[index - 1].live = true
     moved = value.value.clone()
     return MoveLinkedNullSlot(value.state, moved)
 }

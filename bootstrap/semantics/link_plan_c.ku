@@ -6,7 +6,7 @@ import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
-import { ContainsIndex, CTypeName, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
+import { ContainsIndex, ContainsType, CTypeName, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 
 struct LinkPlanType {
@@ -423,11 +423,30 @@ fn AppendLinkedCheckedInvocation(state: LinkedNullState, &carrier: str, &result:
     return next
 }
 
+fn LinkedSlotPrefix(&slots: [LinkedNullSlot], length: int): [LinkedNullSlot] {
+    result: [LinkedNullSlot] = []
+    index = 0
+    while (index < length) {
+        result = result.push(slots[index].clone())
+        index = index + 1
+    }
+    return result
+}
+
+fn linkedSlotOwnershipMatches(&before: LinkedNullSlot, &after: LinkedNullSlot): bool {
+    if (before.live != after.live || before.moved_members.len() != after.moved_members.len()) { return false }
+    index = 0
+    while (index < before.moved_members.len()) {
+        if (!ContainsType(after.moved_members, before.moved_members[index])) { return false }
+        index = index + 1
+    }
+    return true
+}
+
 fn PreserveLinkedOwners(&before: [LinkedNullSlot], &after: [LinkedNullSlot], &statement: Node): null! {
     index = 0
     while (index < before.len()) {
-        if (LinkedNullOwner(before[index].value.ty)
-            && (before[index].live != after[index].live || before[index].moved_members.len() != after[index].moved_members.len())) {
+        if (LinkedNullOwner(before[index].value.ty) && !linkedSlotOwnershipMatches(before[index], after[index])) {
             RejectLayout("linked_control_move", "conditional code cannot consume an outer owner", DeclarationSpan(statement))?
         }
         index = index + 1
