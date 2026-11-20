@@ -7,7 +7,7 @@ import { RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { CStructOrder, OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
 import { EmitStructArrayOperations, EmitStructArrayResultHeader } from "./struct_array_c.ku"
-import { GuardArithmetic, GuardOwnedDrops, GuardStringEquality } from "./guarded_struct_c.ku"
+import { GuardArithmetic, GuardArrayErrorC, GuardOwnedDrops, GuardStringArrayCloneC, GuardStringEquality } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors, ManagedSourceCharactersRuntime } from "./guarded_string_parts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType } from "./guarded_struct_expr.ku"
 import { ManagedExplicitType, ManagedType } from "./managed_array_values_c.ku"
@@ -174,8 +174,9 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     // Admit the result graph before either array policy or source generation.
     ordered = orderLayout(layouts, result.layout, DeclarationSpan(function))?
     array = EmitStructArrayOperations(layouts, result.layout)
-    root = ManagedType { layout: result.layout, array: array, string_locals: false, leaves: [] }
+    root = ManagedType { layout: result.layout, array: array, string_locals: false, source_strings: false, leaves: [] }
     signature = readParameters(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, root, ordered, function, edge)?
+    root.source_strings = signature.source_strings
     body = managedBody(named, types, imports, supplied, layouts, root, signature.bindings.clone(),
         signature.body_start, function.first_edge + function.edge_count, checked)?
     if (!body.returns) { RejectLayout("managed_fallthrough", "every path must return an array owner", DeclarationSpan(function))? }
@@ -184,7 +185,7 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     text = ProjectionHeaders(checked || signature.layouts.strings || body.code.uses_eq || signature.source_strings, signature.drop_strings)
     text += "#include <stdio.h>\n#include <stdlib.h>\n\n"
     text += GuardArithmetic(body.code.uses_add, body.code.uses_sub) + GuardStringEquality(body.code.uses_eq)
-    if (signature.source_strings) { text += ManagedSourceCharactersRuntime() }
+    if (signature.source_strings) { text += ManagedSourceCharactersRuntime() + GuardStringArrayCloneC() }
     text += signature.layouts.text + root.array.source
     result_type = root.array.array_type.clone()
     if (checked) {
@@ -195,12 +196,13 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     text += "    " + result_type.clone() + " result = {0};\n"
     text += "    int array_status = KU_STRUCT_ARRAY_OK;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n"
     if (signature.source_strings) {
-        text += "    int source_status = KU_SOURCE_OK;\n    (void)ku_managed_source_chars;\n    (void)ku_managed_source_drop;\n"
+        text += "    int source_status = KU_SOURCE_OK;\n    KuGuardArrayFailure array_failure = {0};\n"
+        text += "    (void)ku_managed_source_chars;\n    (void)ku_managed_source_drop;\n    (void)ku_guard_string_array_clone_at;\n"
     }
     if (arithmetic) { text += "    bool overflow = false;\n" }
     text += signature.unused + body.declarations + body.code.text
     text += "cleanup:\n" + body.drops + signature.drops
-    if (signature.source_strings) { text += ManagedSourceCharactersErrors() }
+    if (signature.source_strings) { text += ManagedSourceCharactersErrors() + GuardArrayErrorC() }
     if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     text += managedArrayErrors() + "    return result;\n}\n"
     plan = managedPlan(layouts, signature, result.layout, result_type, symbol.clone(), function_id, checked)

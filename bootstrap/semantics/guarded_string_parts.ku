@@ -4,7 +4,7 @@ import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, Gua
 import { ScalarStringPart } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { ContainsType, ProjectionArrayHeader } from "./struct_projection_c.ku"
+import { ContainsType, ProjectionArrayHeader, ProjectionCloneSource } from "./struct_projection_c.ku"
 
 fn collectProjectedParts(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
                          id: int, depth: int, can_convert: bool, collected: [ScalarStringPart]): [ScalarStringPart]! {
@@ -198,6 +198,39 @@ fn ManagedSourceCharsSetup(&locals: [GuardBinding], &receiver: Node, &target: st
 fn RequireNewManagedOwner(found: int, &statement: Node): null! {
     if (found != 0) {
         RejectLayout("unsupported_managed_reassignment", "owner initialization requires a fresh local scope", DeclarationSpan(statement))?
+    }
+    return ok(null)
+}
+
+fn IsManagedLocalArrayClone(&nodes: [Node], &edges: [int], &locals: [GuardBinding], id: int): bool {
+    subject = ProjectionCloneSource(nodes, edges, id)
+    if (subject == 0) { return false }
+    item = nodes[subject - 1].clone()
+    if (item.kind != "Index" || item.edge_count != 2) { return false }
+    array = nodes[edges[item.first_edge] - 1].clone()
+    if (array.kind != "Variable") { return false }
+    found = GuardBindingIndex(locals, array.text)
+    return found != 0 && locals[found - 1].ty.kind == "str_array" && !locals[found - 1].parameter
+}
+
+fn ManagedCloneStringSetup(&base: GuardValue, &index: GuardValue, &at: Node,
+                           &target: str, &indent: str): str! {
+    if (base.ty.kind != "str_array" || base.setup != "" || index.ty.kind != "int") {
+        RejectLayout("managed_string_index", "expected a declared [str] and a checked int index", DeclarationSpan(at))?
+    }
+    reference = ""
+    if (!base.view) { reference = "&" }
+    return ok(indent.clone() + "if (!ku_guard_string_array_clone_at(" + reference + base.value.clone() + ", " +
+        index.value.clone() + ", &" + target.clone() + ", &array_failure)) goto cleanup;\n")
+}
+
+fn BindManagedLocal(&statement: Node, statement_id: int, ty: GuardType): GuardBinding {
+    return GuardBinding { name: statement.text.clone(), ty: ty, slot: statement_id, parameter: false, view: false }
+}
+
+fn CheckManagedDeclaration(&declared: GuardType, &actual: GuardType, found: int, &statement: Node): null! {
+    if (statement.kind == "VarDecl" && (found != 0 || declared.kind != actual.kind || declared.layout != actual.layout)) {
+        RejectLayout("managed_local_type", "typed local requires a fresh slot and matching initializer", DeclarationSpan(statement))?
     }
     return ok(null)
 }

@@ -325,6 +325,9 @@ Unicode scalar length before initializing a local `[str]` with `.chars()`.
 The local array owns its non-ASCII entries independently of the source.
 Cleanup releases all initialized entries if construction fails. The stage-1
 lexer uses this sequence to apply its input limits before allocating characters.
+The managed body can clone an indexed local character into a fresh string or
+replace a live string after the checked clone succeeds. Each loop iteration
+releases its local string owners before advancing to the next iteration.
 
 `linked-str` also emits functions such as `TokenCanonical` that consume an
 owned struct. A string field may move into the expression once. A named

@@ -270,9 +270,8 @@ fn GuardStringEquality(needed: bool): str {
     return "#include <string.h>\n\nstatic bool ku_guard_string_equal(KuProjectionString a, KuProjectionString b) {\n    return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0);\n}\n\n"
 }
 
-fn GuardStringArrayC(): str {
-    text = "#include <stdio.h>\n\ntypedef struct { size_t len; KuProjectionString *data; size_t capacity; } KuGuardStringArray;\n"
-    text += "typedef struct { int code; int64_t index; size_t length; } KuGuardArrayFailure;\n\n"
+fn GuardStringArrayCloneC(): str {
+    text = "typedef struct { int code; int64_t index; size_t length; } KuGuardArrayFailure;\n\n"
     text += EmitTryCloneString("ku_guard_clone_string")
     text += "static bool ku_guard_string_array_clone_at(const KuGuardStringArray *array, int64_t index, KuProjectionString *item, KuGuardArrayFailure *failure) {\n"
     text += "    if (!array) { failure->code = 1; return false; }\n"
@@ -281,6 +280,12 @@ fn GuardStringArrayC(): str {
     text += "    if (index < 0 || (uint64_t)index >= array->len) { *failure = (KuGuardArrayFailure){2, index, array->len}; return false; }\n"
     text += "    if (!ku_guard_clone_string(array->data[index], item)) { failure->code = 3; return false; }\n"
     text += "    return true;\n}\n\n"
+    return text
+}
+
+fn GuardStringArrayC(): str {
+    text = "#include <stdio.h>\n\ntypedef struct { size_t len; KuProjectionString *data; size_t capacity; } KuGuardStringArray;\n"
+    text += GuardStringArrayCloneC()
     text += "static bool ku_guard_string_array_equal(const KuGuardStringArray *array, int64_t index, KuProjectionString literal, bool *out, KuGuardArrayFailure *failure) {\n"
     text += "    KuProjectionString item = {0};\n"
     text += "    if (!ku_guard_string_array_clone_at(array, index, &item, failure)) return false;\n"

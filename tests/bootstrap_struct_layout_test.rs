@@ -1585,6 +1585,21 @@ fn PrepareSource(source: str): [SourceLength]! {
     entries = entries.push(item)
     return ok(entries)
 }
+fn ReadLocal(source: str): [SourceLength]! {
+    entries: [SourceLength] = []
+    characters: [str] = source.chars()
+    index = 0
+    while (index < characters.len()) {
+        ch = characters[index].clone()
+        next = ""
+        if (index + 1 < characters.len()) { next = characters[index + 1].clone() }
+        size = ch.byte_len() + next.byte_len()
+        item = SourceLength { value: size }
+        entries = entries.push(item)
+        index = index + 1
+    }
+    return ok(entries)
+}
 "#,
     )
     .unwrap();
@@ -1613,6 +1628,27 @@ fn PrepareSource(source: str): [SourceLength]! {
     assert!(plan.contains(
         r#""kind":"Builtin","source_name":"str","source_path":null,"node":0,"c_type":"KuProjectionString","passing":"value""#
     ));
+
+    fs::write(cwd.join("function.txt"), "ReadLocal").unwrap();
+    fs::write(cwd.join("mode.txt"), "managed").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let body = text.split_once("(KuProjectionString a0) {").unwrap().1;
+    let (iteration, cleanup) = body.split_once("cleanup:\n").unwrap();
+    assert_eq!(
+        iteration
+            .matches("if (!ku_guard_string_array_clone_at(&l")
+            .count(),
+        2
+    );
+    let (lookup, replacement) = iteration.split_once("&replaced").unwrap();
+    assert!(lookup.contains("while (true)") && lookup.contains("KuProjectionString replaced"));
+    let drop = replacement.find("ku_projection_string_drop(&l").unwrap();
+    assert!(drop < replacement.find(" = replaced").unwrap());
+    assert!(replacement.matches("ku_projection_string_drop(&l").count() >= 3);
+    assert!(cleanup.contains("ku_managed_source_drop(&l"));
+    assert!(cleanup.contains("array_failure.code == 2"));
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {
