@@ -475,6 +475,7 @@ fn project_expr(source: &str, expr: &Expr, arena: &mut ProjectedArena) -> usize 
             ("OptionalField", name.clone(), 0, vec![target])
         }
         ExprKind::TryUnwrap { expr } => ("TryUnwrap", String::new(), 0, vec![expr]),
+        ExprKind::Await(expr) => ("Await", String::new(), 0, vec![expr]),
         other => panic!("stage-3 oracle received unsupported Rust expression: {other:?}"),
     };
     let child_ids = children
@@ -1592,9 +1593,17 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let structured_http_prelude = &structured_http[..structured_http
         .find("async fn CheckGet(")
         .expect("end of the complete structured HTTP Send declaration")];
+    let check_missing_start = structured_http
+        .find("async fn CheckMissing(")
+        .expect("structured HTTP error-handling Task");
+    let check_missing_end = structured_http
+        .find("async fn CheckPost(")
+        .expect("end of the structured HTTP error-handling Task");
     let cases = [
         "",
         structured_http_prelude,
+        &structured_http[check_missing_start..check_missing_end],
+        "async fn Work() { local = 1 await operation() return local }",
         "// 前😀\r\nasync fn Compute(&value: int): int! { return ok(value) }",
         "fn Outer() { async fn Inner(value: int): int! { return ok(value) } }\nasync fn Again() { fn Ordinary() {} }",
         "fn main() { if (true) value = 1;; if (false) return; }",

@@ -159,6 +159,7 @@ fn project_expr(
             ("OptionalField", name.clone(), 0, vec![target])
         }
         ExprKind::TryUnwrap { expr } => ("TryUnwrap", String::new(), 0, vec![expr]),
+        ExprKind::Await(expr) => ("Await", String::new(), 0, vec![expr]),
         other => panic!("stage-2 oracle received unsupported Rust AST: {other:?}"),
     };
     let child_ids = children
@@ -298,6 +299,11 @@ fn cli_worker_preserves_normal_error_exit_and_stderr() {
 
 #[test]
 fn bootstrap_parser_stage2_matches_rust_and_has_stable_diagnostics() {
+    let nested_await = include_str!("../examples/native_task_structured_http.ku")
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("reply = "))
+        .find(|expression| expression.starts_with("(await Send((await PreparePlan("))
+        .expect("existing structured HTTP nested await expression");
     let mut cases = vec![
         "42".to_string(),
         "1.250".to_string(),
@@ -321,6 +327,9 @@ fn bootstrap_parser_stage2_matches_rust_and_has_stable_diagnostics() {
         "user.items[0]?.name?".to_string(),
         "apply([true, null], -value).field?".to_string(),
         "(1 + 2) * 3".to_string(),
+        "await (user.get()?).value + 2".to_string(),
+        "!(await ready(client.items[1]))?".to_string(),
+        nested_await.to_string(),
     ];
     cases.push(format!("{}1{}", "(".repeat(30), ")".repeat(30)));
     let long_flat = (0..256).map(|_| "1").collect::<Vec<_>>().join(" + ");
@@ -582,6 +591,16 @@ fn main(): null! {
         "    ExpectError(\"\", \"unexpected_eof\", {})?\n    ExpectError(\"1 +\", \"unexpected_eof\", {})?\n    ExpectError(\"()\", \"unexpected_token\", \"expected expression before closing delimiter|1:2@1..1:3@2\")?\n    ExpectError(\"a.\", \"unexpected_token\", \"expected field name after field operator|1:3@2..1:3@2\")?\n    ExpectError(\"a)\", \"unexpected_token\", \"closing delimiter has no matching opener|1:2@1..1:3@2\")?\n    ExpectError(\"[1)\", \"unexpected_token\", \"closing delimiter does not match opener|1:3@2..1:4@3\")?\n    ExpectError(\"a[]\", \"unexpected_token\", \"expected expression before closing delimiter|1:3@2..1:4@3\")?\n    ExpectError(\"f(1,)\", \"unexpected_token\", \"expected expression before closing delimiter|1:5@4..1:6@5\")?\n",
         ku_string(&rust_error_canonical("")),
         ku_string(&rust_error_canonical("1 +"))
+    ));
+    for source in ["await work()?", "await (work()?)"] {
+        body.push_str(&format!(
+            "    ExpectError({}, \"unsupported_expression\", \"stage-2 await with a postfix '?' operand requires parentheses around await|1:1@0..1:6@5\")?\n",
+            ku_string(source)
+        ));
+    }
+    body.push_str(&format!(
+        "    ExpectError({}, \"depth_exceeded\", \"maximum parse depth exceeded; expression is too deeply nested|1:187@186..1:192@191\")?\n",
+        ku_string(&format!("{}operation()", "await ".repeat(32)))
     ));
     body.push_str(&format!(
         "    ExpectError({}, \"depth_exceeded\", \"maximum parse depth exceeded; expression is too deeply nested|1:32@31..1:33@32\")?\n    return ok(null)\n}}\n",

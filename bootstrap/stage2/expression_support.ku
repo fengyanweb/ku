@@ -1,5 +1,5 @@
 import { Token } from "../stage1/token.ku"
-import { Span, SpanFromToken } from "./span.ku"
+import { Span, SpanFromToken, SpanMerge } from "./span.ku"
 import { MakeDiagnostic, DiagnosticCanonical } from "./diagnostic.ku"
 import { Node } from "./ast.ku"
 
@@ -63,6 +63,22 @@ fn MakeExpressionNode(kind: str, text: str, int_value: int, span: Span, first_ed
         end_line: span.end_line, end_column: span.end_column, end_offset: span.end_offset,
         first_edge: first_edge, edge_count: edge_count
     }
+}
+
+fn MakeUnaryNode(operator: OperatorEntry, &operand: Node, first_edge: int, stage3_domain: bool): Node! {
+    if (operator.text == "await" && operand.kind == "TryUnwrap") {
+        // Stage0 lifts Await under trailing TryUnwrap nodes. Until the
+        // parser can insert that node in post-order, reject this tree.
+        prefix = Token { kind: "Await", lexeme: "await", int_value: 0, line: operator.line,
+                         column: operator.column, offset: operator.offset, end_line: operator.end_line,
+                         end_column: operator.end_column, end_offset: operator.end_offset }
+        RejectAt(prefix, "unsupported_expression", "stage-2 await with a postfix '?' operand requires parentheses around await", stage3_domain)?
+    }
+    span = SpanMerge(OperatorSpan(operator), ExpressionSpan(operand))
+    if (operator.text == "await") {
+        return ok(MakeExpressionNode("Await", "", 0, span, first_edge, 1))
+    }
+    return ok(MakeExpressionNode("Unary", operator.text, 0, span, first_edge, 1))
 }
 
 fn IsNamedStructStart(&name: Token, &opener: Token, &field: Token, &separator: Token): bool {

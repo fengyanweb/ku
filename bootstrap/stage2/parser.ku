@@ -3,7 +3,7 @@ import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken, SpanMerge } from "./span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "./ast.ku"
 import { ParseContext, DefaultParseContext, ParseContextError, RelocateTokens } from "./context.ku"
-import { OperatorEntry, ValueEntry, MakeOperator, OperatorSpan, ExpressionSpan, MakeExpressionNode, IsNamedStructStart, IsBraceLiteralMarker, ReadBinaryOperator, ReadPrimaryAtom, RejectAt, RejectAtPoint } from "./expression_support.ku"
+import { OperatorEntry, ValueEntry, MakeOperator, OperatorSpan, ExpressionSpan, MakeExpressionNode, MakeUnaryNode, IsNamedStructStart, IsBraceLiteralMarker, ReadBinaryOperator, ReadPrimaryAtom, RejectAt, RejectAtPoint } from "./expression_support.ku"
 
 // Stage 2B uses append-only operator/value stacks and integer links. Flat
 // binary and postfix chains are iterative; nested delimiters and unary prefixes
@@ -101,9 +101,8 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
                 RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges", stage3_domain)?
             }
             first_edge = arena_edges.len()
+            unary_node = MakeUnaryNode(operator, child, first_edge, stage3_domain)?
             arena_edges = arena_edges.push(right_entry.node)
-            span = SpanMerge(OperatorSpan(operator), ExpressionSpan(child))
-            unary_node = MakeExpressionNode("Unary", operator.text, 0, span, first_edge, 1)
             arena_nodes = arena_nodes.push(unary_node)
             combined = arena_nodes.len()
             combined_entry = ValueEntry { node: combined, previous: value_top }
@@ -391,7 +390,7 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
                 depth = depth + 1
                 brace_depth = brace_depth + 1
                 cursor = cursor + 2
-            } else if (token.kind == "Bang" || token.kind == "Minus") {
+            } else if (token.kind == "Bang" || token.kind == "Minus" || token.kind == "Await") {
                 if (depth >= 32) {
                     RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested", stage3_domain)?
                 }
