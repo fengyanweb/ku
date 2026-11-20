@@ -5,18 +5,13 @@ import { SuppliedModule } from "./imports.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { ScalarIntInstruction, ScalarIntParameter, ScalarIntClause, ScalarIntFunction, ScalarStringPart, ScalarIntegerHelpers, ScalarStringHelpers, ScalarSymbol, EmitScalarIntPlan } from "./scalar_int_emit.ku"
 import { RejectScalarInt as rejectScalarInt, ScalarParameterIndex as scalarParameterIndex,
-    ScalarStringLiteral as scalarStringLiteral, ScalarStringOperand as scalarStringOperand,
-    HasScalarBuiltin, LowerScalarStringParts, ScalarIntComparison } from "./scalar_int_operands.ku"
+    ScalarStringLiteral as scalarStringLiteral,
+    HasScalarBuiltin, LowerScalarBool, LowerScalarStringParts } from "./scalar_int_operands.ku"
 import { LowerNullResultExit } from "./scalar_result_null.ku"
+import { HasScalarControlBody, LowerScalarControlBody } from "./scalar_program_c.ku"
 import { ScalarType as scalarType, ScalarReturnType as scalarReturnType } from "./scalar_types.ku"
 import { ScalarIntImport, ScalarFunctionNode as scalarFunctionNode, LowerIntExpression as lowerIntExpression } from "./scalar_int_calls.ku"
 import { HasScalarOwnedStringBody, LowerScalarOwnedStringBody, ScalarStringReplaceHelpers } from "./scalar_string_replace.ku"
-
-struct ScalarBoolC {
-    source: str
-    uses_string_comparison: bool
-    uses_string_contains: bool
-}
 
 struct ScalarIntC {
     symbol: str
@@ -30,65 +25,10 @@ fn requireInt(&bindings: [TypeNameBinding], use_node: int, &ty: Node): null! {
     return ok(null)
 }
 
-fn lowerScalarBool(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], node_id: int, depth: int): ScalarBoolC! {
-    node = nodes[node_id - 1].clone()
-    // The parser bounds parentheses and prefix chains. Binary chains can
-    // be deeper without parentheses, so bound this emitter's descent too.
-    if (depth >= 32) {
-        rejectScalarInt("bool_depth_limit", "standalone C boolean expressions accept at most 32 levels", DeclarationSpan(node))?
-    }
-    if (node.kind == "Bool" && node.edge_count == 0) {
-        literal = "0"
-        if (node.text == "true") { literal = "1" }
-        return ok(ScalarBoolC { source: literal, uses_string_comparison: false, uses_string_contains: false })
-    }
-    if (node.kind == "Unary" && node.edge_count == 1 && node.text == "!") {
-        child = lowerScalarBool(nodes, edges, parameters, edges[node.first_edge], depth + 1)?
-        return ok(ScalarBoolC { source: "(!" + child.source + ")", uses_string_comparison: child.uses_string_comparison,
-            uses_string_contains: child.uses_string_contains })
-    }
-    if (node.kind == "Binary" && node.edge_count == 2) {
-        left_id = edges[node.first_edge]
-        right_id = edges[node.first_edge + 1]
-        if (node.text == "&&" || node.text == "||") {
-            left = lowerScalarBool(nodes, edges, parameters, left_id, depth + 1)?
-            right = lowerScalarBool(nodes, edges, parameters, right_id, depth + 1)?
-            // Keep evaluation of the right operand inside C's short circuit.
-            return ok(ScalarBoolC { source: "(" + left.source + " " + node.text + " " + right.source + ")",
-                uses_string_comparison: left.uses_string_comparison || right.uses_string_comparison,
-                uses_string_contains: left.uses_string_contains || right.uses_string_contains })
-        }
-        comparison = ScalarIntComparison(nodes, edges, parameters, node)?
-        if (comparison != "") {
-            return ok(ScalarBoolC { source: comparison, uses_string_comparison: false, uses_string_contains: false })
-        }
-        if (node.text == "==" || node.text == "!=") {
-            left = scalarStringOperand(parameters, nodes[left_id - 1])?
-            right = scalarStringOperand(parameters, nodes[right_id - 1])?
-            prefix = ""
-            if (node.text == "!=") { prefix = "!" }
-            return ok(ScalarBoolC { source: prefix + "ku_scalar_string_equal(" + left + ", " + right + ")",
-                uses_string_comparison: true, uses_string_contains: false })
-        }
-    }
-    if (node.kind == "Call" && node.edge_count == 2) {
-        target = nodes[edges[node.first_edge] - 1].clone()
-        if (target.kind == "Field" && target.edge_count == 1 && target.text == "contains") {
-            // Both operands are checked string literals or pure parameter
-            // reads, so C's argument order cannot reorder effects.
-            hay = scalarStringOperand(parameters, nodes[edges[target.first_edge] - 1])?
-            needle = scalarStringOperand(parameters, nodes[edges[node.first_edge + 1] - 1])?
-            return ok(ScalarBoolC { source: "ku_scalar_string_contains(" + hay + ", " + needle + ")",
-                uses_string_comparison: false, uses_string_contains: true })
-        }
-    }
-    rejectScalarInt("unsupported_bool_expression", "expected a bool literal, logical operator, string comparison, or str.contains call", DeclarationSpan(node))?
-    return ok(ScalarBoolC { source: "", uses_string_comparison: false, uses_string_contains: false })
-}
-
 fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
                           &bindings: [TypeNameBinding], &imports: [ScalarIntImport],
-                          local_base: int, function_id: int, can_convert: bool, can_use_ok: bool): ScalarIntFunction! {
+                          local_base: int, function_id: int, can_convert: bool, can_use_ok: bool,
+                          can_print: bool): ScalarIntFunction! {
     function = nodes[function_id - 1].clone()
     cursor = function.first_edge
     end = cursor + function.edge_count
@@ -123,6 +63,13 @@ fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLeve
     result_type = scalarReturnType(nodes, edges, bindings, type_id)
     if (result_type == 0) { requireInt(bindings, type_id, nodes[type_id - 1])? }
     cursor = cursor + 1
+    if (result_type == 4 && HasScalarControlBody(nodes, edges, cursor, end, false)) {
+        body = LowerScalarControlBody(nodes, edges, declarations, bindings, imports, parameters,
+            local_base, cursor, end, function_id, can_print, can_use_ok)?
+        return ok(ScalarIntFunction { function_node: local_base + function_id, parameters: parameters, clauses: body.clauses,
+            result_type: 4, uses_string_comparison: body.uses_string_comparison, uses_string_contains: body.uses_string_contains,
+            uses_string_join: false, owned_string_body: "" })
+    }
     clauses: [ScalarIntClause] = []
     owned_body = ""
     if (result_type == 2 && HasScalarOwnedStringBody(nodes, edges, cursor, end)) {
@@ -139,7 +86,7 @@ fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLeve
             if (statement.kind != "If" || statement.edge_count != 2 || statement.int_value != 1) {
                 rejectScalarInt("unsupported_int_body", "expected a guarded return with no else before the final return", DeclarationSpan(statement))?
             }
-            guard = lowerScalarBool(nodes, edges, parameters, edges[statement.first_edge], 0)?
+            guard = LowerScalarBool(nodes, edges, parameters, edges[statement.first_edge], 0)?
             condition = guard.source
             uses_comparison = uses_comparison || guard.uses_string_comparison
             uses_contains = uses_contains || guard.uses_string_contains
@@ -164,7 +111,7 @@ fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLeve
                 uses_join = true
             }
         } else if (result_type == 3) {
-            boolean = lowerScalarBool(nodes, edges, parameters, result_node, 0)?
+            boolean = LowerScalarBool(nodes, edges, parameters, result_node, 0)?
             scalar_result = boolean.source
             uses_comparison = uses_comparison || boolean.uses_string_comparison
             uses_contains = uses_contains || boolean.uses_string_contains
@@ -175,7 +122,7 @@ fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLeve
             }
             instructions = lowerIntExpression(nodes, edges, declarations, bindings, parameters, imports, local_base, result_node)?
         }
-        clauses = clauses.push(ScalarIntClause { condition: condition, instructions: instructions,
+        clauses = clauses.push(ScalarIntClause { control: "", condition: condition, instructions: instructions,
             scalar_result: scalar_result, string_parts: string_parts })
         cursor = cursor + 1
     }
@@ -211,13 +158,14 @@ fn AppendScalarIntCallees(&plan: ScalarIntFunction, previous: [int]): [int] {
 }
 
 fn planScalarIntModule(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
-                       &bindings: [TypeNameBinding], entry: int, can_convert: bool, can_use_ok: bool): [ScalarIntFunction]! {
+                       &bindings: [TypeNameBinding], entry: int, can_convert: bool, can_use_ok: bool,
+                       can_print: bool): [ScalarIntFunction]! {
     reachable = [entry]
     imports: [ScalarIntImport] = []
     plans: [ScalarIntFunction] = []
     index = 0
     while (index < reachable.len()) {
-        plan = LowerScalarIntFunction(nodes, edges, declarations, bindings, imports, 0, reachable[index], can_convert, can_use_ok)?
+        plan = LowerScalarIntFunction(nodes, edges, declarations, bindings, imports, 0, reachable[index], can_convert, can_use_ok, can_print)?
         reachable = AppendScalarIntCallees(plan, reachable)
         plans = plans.push(plan)
         index = index + 1
@@ -256,6 +204,7 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
     uses_string_join = false
     uses_string_format = false
     uses_string_replace = false
+    uses_output = false
     returns_bool = false
     returns_null_result = false
     text = ""
@@ -288,6 +237,7 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
                     uses_string_join = uses_string_join || plans[index].uses_string_join
                     uses_string_format = uses_string_format || body.uses_string_format
                     uses_string_replace = uses_string_replace || body.uses_string_replace
+                    uses_output = uses_output || body.uses_output
                     text += body.source
                     completed = completed.push(function_node)
                 } else {
@@ -308,6 +258,7 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
         }
     }
     headers = ScalarIntegerHelpers(uses_add, uses_sub, uses_mul, uses_div, uses_rem)
+    if (uses_output) { headers += "#include <stdio.h>\n" }
     if (returns_bool || uses_string_contains || returns_null_result) { headers += "#include <stdbool.h>\n" }
     headers += ScalarStringHelpers(uses_string, uses_string_comparison, uses_string_contains,
         uses_owned_string, uses_string_join, uses_string_format, returns_null_result)
@@ -321,7 +272,8 @@ fn EmitScalarIntC(&named: NamedModule, &bindings: [TypeNameBinding], &function_n
     entry = scalarFunctionNode(named.names.declarations, function_name)
     if (entry > 0) {
         plans = planScalarIntModule(named.parsed.arena.nodes, named.parsed.arena.edges,
-                                    named.names.declarations, bindings, entry, HasScalarBuiltin(named, "str"), HasScalarBuiltin(named, "ok"))?
+                                    named.names.declarations, bindings, entry, HasScalarBuiltin(named, "str"),
+                                    HasScalarBuiltin(named, "ok"), HasScalarBuiltin(named, "println"))?
         supplied: [SuppliedModule] = []
         return EmitScalarIntModule(plans, named.parsed.arena.nodes, supplied, entry)
     }

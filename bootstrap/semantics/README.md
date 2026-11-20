@@ -77,9 +77,13 @@ normalized `.ku` files.
 
 `EmitScalarProjectProgramC` binds and checks the supplied project modules.
 The first module defines `fn main(): null!`. The entry can print integer
-expressions with the builtin `println` and end with `return ok(null)` or an
-`Error` literal in `fail`. Integer expressions use the existing checked
-scalar functions, including relative imports with aliases.
+expressions with the builtin `println` and use nested `if` or `else`
+branches. Every path must reach `return ok(null)` or an `Error` literal in
+`fail`. Integer expressions use the existing checked scalar functions,
+including relative imports with aliases. Conditions support boolean literals,
+logical operators, and the scalar comparison subset.
+An exported `null!` function can use the same statement forms with integer
+parameters or borrowed strings.
 
 ```ku
 import { Increment as Answer } from "./numbers.ku"

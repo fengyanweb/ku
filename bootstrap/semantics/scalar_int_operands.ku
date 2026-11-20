@@ -124,6 +124,68 @@ fn ScalarIntComparison(&nodes: [Node], &edges: [int], &parameters: [ScalarIntPar
     return ok("")
 }
 
+struct ScalarBoolC {
+    source: str
+    uses_string_comparison: bool
+    uses_string_contains: bool
+}
+
+fn LowerScalarBool(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], node_id: int, depth: int): ScalarBoolC! {
+    node = nodes[node_id - 1].clone()
+    // The parser bounds parentheses and prefix chains. Binary chains can
+    // be deeper without parentheses, so bound this emitter's descent too.
+    if (depth >= 32) {
+        RejectScalarInt("bool_depth_limit", "standalone C boolean expressions accept at most 32 levels", DeclarationSpan(node))?
+    }
+    if (node.kind == "Bool" && node.edge_count == 0) {
+        literal = "0"
+        if (node.text == "true") { literal = "1" }
+        return ok(ScalarBoolC { source: literal, uses_string_comparison: false, uses_string_contains: false })
+    }
+    if (node.kind == "Unary" && node.edge_count == 1 && node.text == "!") {
+        child = LowerScalarBool(nodes, edges, parameters, edges[node.first_edge], depth + 1)?
+        return ok(ScalarBoolC { source: "(!" + child.source + ")", uses_string_comparison: child.uses_string_comparison,
+            uses_string_contains: child.uses_string_contains })
+    }
+    if (node.kind == "Binary" && node.edge_count == 2) {
+        left_id = edges[node.first_edge]
+        right_id = edges[node.first_edge + 1]
+        if (node.text == "&&" || node.text == "||") {
+            left = LowerScalarBool(nodes, edges, parameters, left_id, depth + 1)?
+            right = LowerScalarBool(nodes, edges, parameters, right_id, depth + 1)?
+            // Keep evaluation of the right operand inside C's short circuit.
+            return ok(ScalarBoolC { source: "(" + left.source + " " + node.text + " " + right.source + ")",
+                uses_string_comparison: left.uses_string_comparison || right.uses_string_comparison,
+                uses_string_contains: left.uses_string_contains || right.uses_string_contains })
+        }
+        comparison = ScalarIntComparison(nodes, edges, parameters, node)?
+        if (comparison != "") {
+            return ok(ScalarBoolC { source: comparison, uses_string_comparison: false, uses_string_contains: false })
+        }
+        if (node.text == "==" || node.text == "!=") {
+            left = ScalarStringOperand(parameters, nodes[left_id - 1])?
+            right = ScalarStringOperand(parameters, nodes[right_id - 1])?
+            prefix = ""
+            if (node.text == "!=") { prefix = "!" }
+            return ok(ScalarBoolC { source: prefix + "ku_scalar_string_equal(" + left + ", " + right + ")",
+                uses_string_comparison: true, uses_string_contains: false })
+        }
+    }
+    if (node.kind == "Call" && node.edge_count == 2) {
+        target = nodes[edges[node.first_edge] - 1].clone()
+        if (target.kind == "Field" && target.edge_count == 1 && target.text == "contains") {
+            // Both operands are checked string literals or pure parameter
+            // reads, so C's argument order cannot reorder effects.
+            hay = ScalarStringOperand(parameters, nodes[edges[target.first_edge] - 1])?
+            needle = ScalarStringOperand(parameters, nodes[edges[node.first_edge + 1] - 1])?
+            return ok(ScalarBoolC { source: "ku_scalar_string_contains(" + hay + ", " + needle + ")",
+                uses_string_comparison: false, uses_string_contains: true })
+        }
+    }
+    RejectScalarInt("unsupported_bool_expression", "expected a bool literal, logical operator, string comparison, or str.contains call", DeclarationSpan(node))?
+    return ok(ScalarBoolC { source: "", uses_string_comparison: false, uses_string_contains: false })
+}
+
 fn collectStringParts(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], can_convert: bool,
                       node_id: int, depth: int, parts: [ScalarStringPart]): [ScalarStringPart]! {
     node = nodes[node_id - 1].clone()

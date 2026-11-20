@@ -74,7 +74,8 @@ fn lowerProjectFunction(&unit: SuppliedModule, &binding: ProjectModuleBindings, 
             HasScalarBuiltin(unit.named, "println"), info.has_ok)
     }
     return LowerScalarIntFunction(unit.named.parsed.arena.nodes, unit.named.parsed.arena.edges,
-        unit.named.names.declarations, binding.types, info.imports, base, function, info.has_str, info.has_ok)
+        unit.named.names.declarations, binding.types, info.imports, base, function, info.has_str, info.has_ok,
+        HasScalarBuiltin(unit.named, "println"))
 }
 
 fn scalarProjectPlans(&supplied: [SuppliedModule], &function: str, program: bool): [ScalarIntFunction]! {

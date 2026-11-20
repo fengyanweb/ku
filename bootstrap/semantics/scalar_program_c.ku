@@ -3,7 +3,7 @@ import { DeclarationSpan, TopLevelName } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { LowerIntExpression, ScalarIntImport } from "./scalar_int_calls.ku"
 import { ScalarIntClause, ScalarIntFunction, ScalarIntInstruction, ScalarIntParameter, ScalarStringPart } from "./scalar_int_emit.ku"
-import { RejectScalarInt } from "./scalar_int_operands.ku"
+import { LowerScalarBool, RejectScalarInt } from "./scalar_int_operands.ku"
 import { LowerNullResultExit } from "./scalar_result_null.ku"
 import { ScalarReturnType } from "./scalar_types.ku"
 
@@ -17,8 +17,115 @@ fn programOutputArgument(&nodes: [Node], &edges: [int], &statement: Node, builti
             }
         }
     }
-    RejectScalarInt("unsupported_program_statement", "expected the builtin println with one int argument", DeclarationSpan(statement))?
+    RejectScalarInt("unsupported_program_statement", "expected a scalar println, if, return or fail, found " + statement.kind.clone(), DeclarationSpan(statement))?
     return ok(0)
+}
+
+struct ScalarControlBody {
+    clauses: [ScalarIntClause]
+    uses_string_comparison: bool
+    uses_string_contains: bool
+    exits: bool
+}
+
+// Keep the legacy representation for a sequence of single guarded exits.
+fn HasScalarControlBody(&nodes: [Node], &edges: [int], start: int, end: int, program: bool): bool {
+    cursor = start
+    while (cursor < end) {
+        statement = nodes[edges[cursor] - 1].clone()
+        if (statement.kind == "If") {
+            if (program || cursor == end - 1 || statement.edge_count != 2 || statement.int_value != 1) { return true }
+            branch = nodes[edges[statement.first_edge + 1] - 1].clone()
+            if (branch.kind != "Return" && branch.kind != "Fail") { return true }
+        } else if (!program && statement.kind == "ExprStmt" && cursor < end - 1) {
+            return true
+        }
+        cursor = cursor + 1
+    }
+    return false
+}
+
+fn controlMarker(control: str, condition: str, result: str): ScalarIntClause {
+    no_instructions: [ScalarIntInstruction] = []
+    no_strings: [ScalarStringPart] = []
+    return ScalarIntClause { control: control, condition: condition, instructions: no_instructions,
+        scalar_result: result, string_parts: no_strings }
+}
+
+fn lowerControlBlock(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
+                     &bindings: [TypeNameBinding], &imports: [ScalarIntImport], &parameters: [ScalarIntParameter],
+                     base: int, start: int, end: int, depth: int, can_print: bool, can_use_ok: bool,
+                     previous: ScalarControlBody): ScalarControlBody! {
+    state = previous
+    exits = false
+    cursor = start
+    while (cursor < end) {
+        statement_id = edges[cursor]
+        statement = nodes[statement_id - 1].clone()
+        if (statement.kind == "If") {
+            if (depth >= 32) {
+                RejectScalarInt("program_depth_limit", "standalone C conditionals accept at most 32 levels", DeclarationSpan(statement))?
+            }
+            if (statement.edge_count == 0 || statement.int_value < 0 || statement.int_value >= statement.edge_count) {
+                RejectScalarInt("invalid_program_if", "invalid conditional statement edges", DeclarationSpan(statement))?
+            }
+            guard = LowerScalarBool(nodes, edges, parameters, edges[statement.first_edge], 0)?
+            state.uses_string_comparison = state.uses_string_comparison || guard.uses_string_comparison
+            state.uses_string_contains = state.uses_string_contains || guard.uses_string_contains
+            state.clauses = state.clauses.push(controlMarker("if", guard.source, ""))
+            middle = statement.first_edge + 1 + statement.int_value
+            last = statement.first_edge + statement.edge_count
+            state = lowerControlBlock(nodes, edges, declarations, bindings, imports, parameters,
+                base, statement.first_edge + 1, middle, depth + 1, can_print, can_use_ok, state)?
+            then_exits = state.exits
+            if (middle < last) {
+                state.clauses = state.clauses.push(controlMarker("else", "", ""))
+                state = lowerControlBlock(nodes, edges, declarations, bindings, imports, parameters,
+                    base, middle, last, depth + 1, can_print, can_use_ok, state)?
+                exits = exits || (then_exits && state.exits)
+            }
+            state.clauses = state.clauses.push(controlMarker("end", "", ""))
+        } else if (statement.kind == "Return" || statement.kind == "Fail") {
+            if (statement.edge_count != 1) {
+                RejectScalarInt("unsupported_program_exit", "expected return ok(null) or static fail", DeclarationSpan(statement))?
+            }
+            result = LowerNullResultExit(nodes, edges, parameters, statement, can_use_ok)?
+            state.clauses = state.clauses.push(controlMarker("return", "", result))
+            exits = true
+        } else {
+            argument = programOutputArgument(nodes, edges, statement, can_print)?
+            instructions = LowerIntExpression(nodes, edges, declarations, bindings, parameters, imports, base, argument)?
+            no_arguments: [int] = []
+            instructions = instructions.push(ScalarIntInstruction { operation: "println", result_node: statement_id,
+                operand: argument, right_node: 0, arguments: no_arguments })
+            no_strings: [ScalarStringPart] = []
+            state.clauses = state.clauses.push(ScalarIntClause { control: "output", condition: "", instructions: instructions,
+                scalar_result: "", string_parts: no_strings })
+        }
+        cursor = cursor + 1
+    }
+    state.exits = exits
+    return ok(state)
+}
+
+fn LowerScalarControlBody(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
+                          &bindings: [TypeNameBinding], &imports: [ScalarIntImport], &parameters: [ScalarIntParameter],
+                          base: int, start: int, end: int, function_id: int, can_print: bool, can_use_ok: bool): ScalarControlBody! {
+    index = 0
+    while (index < parameters.len()) {
+        if (parameters[index].string_mode == 1) {
+            RejectScalarInt("unsupported_program_owner", "scalar conditional bodies require an int or borrowed str parameter", DeclarationSpan(nodes[function_id - 1]))?
+        }
+        index = index + 1
+    }
+    empty: [ScalarIntClause] = []
+    state = ScalarControlBody { clauses: empty, uses_string_comparison: false, uses_string_contains: false, exits: false }
+    body = lowerControlBlock(nodes, edges, declarations, bindings, imports, parameters,
+        base, start, end, 0, can_print, can_use_ok, state)?
+    if (!body.exits) {
+        RejectScalarInt("unsupported_program_exit", "a scalar conditional body can reach its end without returning a null Result", DeclarationSpan(nodes[function_id - 1]))?
+    }
+    return ok(body)
 }
 
 fn LowerScalarProgramEntry(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
@@ -32,6 +139,13 @@ fn LowerScalarProgramEntry(&nodes: [Node], &edges: [int], &declarations: [TopLev
     }
     cursor = cursor + 1
     parameters: [ScalarIntParameter] = []
+    if (HasScalarControlBody(nodes, edges, cursor, end, true)) {
+        body = LowerScalarControlBody(nodes, edges, declarations, bindings, imports, parameters,
+            0, cursor, end, entry, can_print, can_use_ok)?
+        return ok(ScalarIntFunction { function_node: entry, parameters: parameters, clauses: body.clauses, result_type: 4,
+            uses_string_comparison: body.uses_string_comparison, uses_string_contains: body.uses_string_contains,
+            uses_string_join: false, owned_string_body: "" })
+    }
     instructions: [ScalarIntInstruction] = []
     while (cursor < end - 1) {
         statement_id = edges[cursor]
@@ -51,7 +165,7 @@ fn LowerScalarProgramEntry(&nodes: [Node], &edges: [int], &declarations: [TopLev
     }
     result = LowerNullResultExit(nodes, edges, parameters, statement, can_use_ok)?
     no_strings: [ScalarStringPart] = []
-    clause = ScalarIntClause { condition: "", instructions: instructions, scalar_result: result, string_parts: no_strings }
+    clause = ScalarIntClause { control: "", condition: "", instructions: instructions, scalar_result: result, string_parts: no_strings }
     return ok(ScalarIntFunction { function_node: entry, parameters: parameters, clauses: [clause], result_type: 4,
         uses_string_comparison: false, uses_string_contains: false, uses_string_join: false, owned_string_body: "" })
 }

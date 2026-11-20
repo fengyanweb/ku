@@ -768,19 +768,50 @@ fn assert_project_executable(ku: &Path, seed: &Path, cwd: &Path) {
     let body = "fn main(): null! { println(Answer(41));";
     let helper = "fn Increment(value: int): int { return value + 1 }\n";
     fs::write(&symbol, "").unwrap();
-    for (name, exit, status, stderr) in [
-        ("success", "return ok(null)", 0, ""),
+    for (name, exit, status, stdout, stderr) in [
+        ("success", "return ok(null)", 0, "42\n", ""),
         (
             "failure",
             "fail { domain: \"demo\", code: \"stopped\", message: \"停止🙂\0末\" }",
             1,
+            "42\n",
             "停止🙂\0末\n",
         ),
         (
             "overflow",
             "println(Answer(9223372036854775807)); return ok(null)",
             1,
+            "42\n",
             "integer overflow\n",
+        ),
+        (
+            "branches-rejoin",
+            r#"if (40 < 41 && !false) {
+                println(Answer(9))
+                println(Answer(19))
+            } else {
+                fail { domain: "flow", code: "wrong", message: "unreachable" }
+            }
+            println(90)
+            return ok(null)"#,
+            0,
+            "42\n10\n20\n90\n",
+            "",
+        ),
+        (
+            "branches-exit",
+            r#"if (false) {
+                println(Answer(9223372036854775807))
+                return ok(null)
+            } else if (true) {
+                println(Answer(-2))
+                fail { domain: "flow", code: "expected", message: "chosen🙂" }
+            } else {
+                return ok(null)
+            }"#,
+            1,
+            "42\n-1\n",
+            "chosen🙂\n",
         ),
     ] {
         fs::write(&main, format!("{import}{body} {exit} }}\n")).unwrap();
@@ -816,7 +847,10 @@ fn assert_project_executable(ku: &Path, seed: &Path, cwd: &Path) {
         assert_eq!(actual.status.code(), native.status.code(), "{native:?}");
         assert_eq!(actual.stdout, native.stdout);
         assert_eq!(actual.stderr, native.stderr);
-        assert_eq!(String::from_utf8_lossy(&actual.stdout).trim_end(), "42");
+        assert_eq!(
+            String::from_utf8_lossy(&actual.stdout).replace("\r\n", "\n"),
+            stdout
+        );
         assert_eq!(
             String::from_utf8_lossy(&actual.stderr).replace("\r\n", "\n"),
             stderr
@@ -841,6 +875,14 @@ fn assert_project_executable(ku: &Path, seed: &Path, cwd: &Path) {
         (
             "fn main(): null! { println(Answer(41)) }",
             "unsupported_program_exit",
+        ),
+        (
+            "fn main(): null! { if (false) { return ok(null) } else { println(Answer(41)) } }",
+            "unsupported_program_exit",
+        ),
+        (
+            "fn main(): null! { if (\"str\") { return ok(null) } return ok(null) }",
+            "unsupported_bool_expression",
         ),
     ] {
         fs::write(&main, format!("{import}{source}\n")).unwrap();

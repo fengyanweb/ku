@@ -23,6 +23,7 @@ struct ScalarStringPart {
 }
 
 struct ScalarIntClause {
+    control: str
     condition: str
     instructions: [ScalarIntInstruction]
     scalar_result: str
@@ -54,6 +55,7 @@ struct ScalarIntBodyC {
     uses_owned_string: bool
     uses_string_format: bool
     uses_string_replace: bool
+    uses_output: bool
 }
 
 fn ScalarIntegerHelpers(add: bool, sub: bool, mul: bool, div: bool, rem: bool): str {
@@ -243,7 +245,8 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         source += "    if (failure) { fputs(failure, stderr); exit(EXIT_FAILURE); }\n    return result;\n}\n"
         return ScalarIntBodyC { source: source, uses_add: false, uses_sub: false, uses_mul: false,
             uses_div: false, uses_rem: false, uses_string: true, uses_string_comparison: false,
-            uses_string_contains: false, uses_owned_string: true, uses_string_format: false, uses_string_replace: true }
+            uses_string_contains: false, uses_owned_string: true, uses_string_format: false,
+            uses_string_replace: true, uses_output: false }
     }
     uses_owned = drops != ""
     uses_cleanup = uses_owned || plan.uses_string_join
@@ -259,11 +262,33 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
     uses_div = false
     uses_rem = false
     uses_format = false
+    uses_output = false
+    depth = 0
     index = 0
     while (index < plan.clauses.len()) {
         clause = plan.clauses[index].clone()
-        guarded = clause.condition != ""
+        index = index + 1
+        control = clause.control.clone()
+        if (control == "else" || control == "end") { depth = depth - 1 }
         indent = "    "
+        padding = depth
+        while (padding > 0) {
+            indent += "    "
+            padding = padding - 1
+        }
+        if (control == "if") {
+            text += indent + "if (" + clause.condition + ") {\n"
+            depth = depth + 1
+            continue
+        } else if (control == "else") {
+            text += indent + "} else {\n"
+            depth = depth + 1
+            continue
+        } else if (control == "end") {
+            text += indent + "}\n"
+            continue
+        }
+        guarded = clause.condition != ""
         if (guarded) {
             text += "    if (" + clause.condition + ") {\n"
             indent = "        "
@@ -301,6 +326,10 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
             text += indent.clone() + "int64_t t" + str(result_node) + " = " + expression + ";\n"
             step = step + 1
         }
+        if (control == "output") {
+            uses_output = true
+            continue
+        }
         result = clause.scalar_result
         if (plan.result_type == 1) { result = "t" + str(result_node) }
         if (clause.string_parts.len() != 0) {
@@ -315,7 +344,6 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
             text += indent + "return " + result + ";\n"
         }
         if (guarded) { text += "    }\n" }
-        index = index + 1
     }
     if (uses_cleanup) {
         if (plan.clauses.len() > 1) { text += "cleanup:\n" }
@@ -332,5 +360,5 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         uses_div: uses_div, uses_rem: uses_rem,
         uses_string: uses_string, uses_string_comparison: plan.uses_string_comparison,
         uses_string_contains: plan.uses_string_contains, uses_owned_string: uses_owned,
-        uses_string_format: uses_format, uses_string_replace: false }
+        uses_string_format: uses_format, uses_string_replace: false, uses_output: uses_output }
 }
