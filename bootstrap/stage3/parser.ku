@@ -3,7 +3,7 @@ import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { ParseTokenWindow } from "../stage2/parser.ku"
-import { RejectAt, RejectAtPoint, SpanFromNode } from "./support.ku"
+import { RejectAt, RejectAtPoint, SpanFromNode, WindowToken } from "./support.ku"
 import { ReadImport } from "./imports.ku"
 import { DeclarationRead, ReadModule } from "./structs.ku"
 import { ReadBracedDeclaration } from "./enums.ku"
@@ -46,10 +46,7 @@ fn ReadTokenWindow(&tokens: [Token], start: int, end: int, work_cost: int,
         window = window.push(token)
         index = index + 1
     }
-    boundary = tokens[end].clone()
-    boundary.kind = "Eof"
-    boundary.lexeme = ""
-    boundary.int_value = 0
+    boundary = WindowToken(tokens, end, end)
     window = window.push(boundary)
     return ok(window)
 }

@@ -858,11 +858,12 @@ fn UnreachableExpression(start: int, end: int): ParseOutput! {
 
 fn CheckFence(source: str, boundary: int, detail: str): null! {
     tokens = Scan(source)?
-    eof = tokens[tokens.len() - 1].clone()
-    if (tokens[boundary].kind != "Fn") { panic("fixture must place the next fn at the boundary") }
+    next_function = tokens[boundary].clone()
+    if (next_function.kind != "Fn") { panic("fixture must place the next fn at the boundary") }
     caught = false
     try { ReadCompilerFunction(tokens, 0, boundary, UnreachableExpression)? } catch(err) {
-        caught = err.code == "unexpected_token" && err.message.contains(detail + "|1:" + str(eof.column) + "@" + str(eof.offset))
+        position = str(next_function.line) + ":" + str(next_function.column) + "@" + str(next_function.offset)
+        caught = err.code == "unexpected_token" && err.message.contains(detail + "|" + position + "..")
     }
     if (!caught) { panic("function interval did not see its EOF fence") }
     following = ReadCompilerFunction(tokens, boundary, tokens.len() - 1, UnreachableExpression)?
@@ -901,7 +902,7 @@ fn main(): null! {
     capped = false
     try { ReadSignatureTypePrefix(type_tokens, 0, type_tokens.len() - 1)? } catch(err) { capped = err.message.contains("type window accepts at most 512 tokens") }
     if (!capped) { panic("compiler type prefix limit changed") }
-    CheckFence("fn Broken(op: fn(int) fn Following() {}", 9, "expected ':' before function type return")?
+    CheckFence("fn Broken(op: fn(int)\nfn Following() {}", 9, "expected ':' before function type return")?
     CheckFence("fn Broken(){ if (true fn Following() {}", 8, "expected ')' after if condition")?
     println("module-window-ok")
     return ok(null)
