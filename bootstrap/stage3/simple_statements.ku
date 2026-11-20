@@ -28,6 +28,12 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
     if (statement_start.kind == "Ident") { assignment_operator = LocalAssignmentOperator(WindowToken(tokens, cursor + 1, last_index)) }
     if (statement_start.kind == "Let") {
         RejectLetStatement(statement_start)?
+    } else if (statement_start.kind == "Break" || statement_start.kind == "Continue") {
+        // Like Stage0, record only the keyword span. The checker validates
+        // whether the current function has an enclosing loop.
+        kind = statement_start.kind.clone()
+        statement = add_node(kind, "", 0, SpanFromToken(statement_start.clone()), [], statement_start)?
+        cursor = cursor + 1
     } else if (statement_start.kind == "Return" || statement_start.kind == "Fail") {
         kind = statement_start.kind.clone()
         requires_value = kind == "Fail"

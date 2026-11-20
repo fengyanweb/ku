@@ -677,6 +677,8 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
             );
             push_node(arena, "While", String::new(), 0, *span, &children)
         }
+        Stmt::Break { span } => push_node(arena, "Break", String::new(), 0, *span, &[]),
+        Stmt::Continue { span } => push_node(arena, "Continue", String::new(), 0, *span, &[]),
         Stmt::Try {
             body,
             catch_name: Some(catch_name),
@@ -1464,6 +1466,11 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         include_str!("../bootstrap/stage2/main.ku"),
         "// 异常😀\r\nfn main() { before = 0 try { if (check) { try {} catch(inner) {} } next = 1 } catch(outer) { one = outer.code try { recover()? } catch(recovery) {} two = outer.message } after = 2 }",
         "fn sum() { count = 0 for n in [1,2] { if (n > 1) { count += n } } count %= 5 return count }",
+        "// 跳转😀\r\nfn f() { for value in [1,2] { try { if (value == 1) { continue; } break } catch(err) { break; } } while (ready) { continue } }",
+        // Loop placement is a checker decision in Rust; the parser retains
+        // the same leaves even without a target or in a nested function.
+        "fn f() { break; continue }",
+        "fn f() { while (ready) { fn g() { break; continue } break; } }",
         "fn mixed() { while (ready) { for next in Source{elements: [1,2]}.elements { acc -= next acc *= 2 acc /= 3 } } }",
 
         r#"fn main() { println(Box{first: Inner{x: 1 + 2}, other: [a(), 4]}?.other) }"#,
