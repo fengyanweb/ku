@@ -1,0 +1,189 @@
+import { Node } from "../stage2/ast.ku"
+import { Span } from "../stage2/span.ku"
+import { DeclarationSpan } from "./names.ku"
+import { SuppliedModule } from "./imports.ku"
+import { BindProjectModules, ProjectBindings } from "./project_bindings.ku"
+import { GuardBinding, GuardBindingIndex, GuardCType, GuardExplicitType, GuardExpression } from "./guarded_struct_expr.ku"
+import { GuardOwnedDrops } from "./guarded_struct_c.ku"
+import { EmitOrderedStructLayouts, OrderCStructLayouts } from "./nested_struct_c.ku"
+import { ProjectionHeaders } from "./struct_projection_c.ku"
+import { BuildStructLayouts, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { ScalarStringJoinHelpers } from "./scalar_int_emit.ku"
+import { ScalarStringLiteral } from "./scalar_int_operands.ku"
+import { BindStructStringCall, StructStringDependency } from "./struct_string_calls.ku"
+
+struct ProjectStructStringC {
+    symbol: str
+    dependencies: [StructStringDependency]
+    source: str
+}
+
+struct StructStringFlow {
+    source: str
+    slots: [int]
+    dependencies: [StructStringDependency]
+    moved_fields: [str]
+    result: str
+    leaves: int
+    uses_join: bool
+}
+
+fn hasMovedField(&moved: [str], &field: str): bool {
+    index = 0
+    while (index < moved.len()) {
+        if (moved[index] == field) { return true }
+        index = index + 1
+    }
+    return false
+}
+
+fn addStringDependency(dependencies: [StructStringDependency], dependency: StructStringDependency): [StructStringDependency] {
+    index = 0
+    while (index < dependencies.len()) {
+        if (dependencies[index].module_index == dependency.module_index && dependencies[index].declaration == dependency.declaration) {
+            return dependencies
+        }
+        index = index + 1
+    }
+    return dependencies.push(dependency)
+}
+
+fn structStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, &layouts: [StructLayout],
+                    &bindings: [GuardBinding], &call: Node, &output: str, flow: StructStringFlow): StructStringFlow! {
+    current = flow
+    target = supplied[0].named.parsed.arena.nodes[supplied[0].named.parsed.arena.edges[call.first_edge] - 1].clone()
+    if (GuardBindingIndex(bindings, target.text) != 0) {
+        RejectLayout("shadowed_struct_string_call", "a local binding shadows the imported string function", DeclarationSpan(target))?
+    }
+    arg_id = supplied[0].named.parsed.arena.edges[call.first_edge + 1]
+    argument = supplied[0].named.parsed.arena.nodes[arg_id - 1].clone()
+    value = GuardExpression(supplied[0].named.parsed.arena.nodes, supplied[0].named.parsed.arena.edges,
+        bindings, layouts, arg_id, 0, "    ")?
+    dependency = BindStructStringCall(supplied, project, layouts, target, argument, value)?
+    argument_c = value.value.clone()
+    if (value.ty.kind == "str") {
+        if (hasMovedField(current.moved_fields, argument_c)) {
+            RejectLayout("reused_struct_string_owner", "owned field was already consumed by a direct call", DeclarationSpan(argument))?
+        }
+        // This position is solely a by-value field use in an owned parameter.
+        // Clear its old owner before the call. Repeated reads are rejected.
+        held = "arg_" + output.clone()
+        current.source = current.source + "    KuProjectionString " + held.clone() + " = " + argument_c.clone() + ";\n"
+        current.source = current.source + "    " + argument_c.clone() + " = (KuProjectionString){0};\n"
+        current.moved_fields = current.moved_fields.push(argument_c)
+        argument_c = held
+    }
+    current.source = current.source + "    " + output.clone() + " = " + dependency.symbol.clone() + "(" + argument_c + ");\n"
+    current.dependencies = addStringDependency(current.dependencies, dependency)
+    return ok(current)
+}
+
+fn lowerStructString(&supplied: [SuppliedModule], &project: ProjectBindings, &layouts: [StructLayout],
+                     &bindings: [GuardBinding], id: int, depth: int, flow: StructStringFlow): StructStringFlow! {
+    if (depth >= 32) {
+        RejectLayout("struct_string_depth", "imported string expressions accept at most 32 levels",
+            DeclarationSpan(supplied[0].named.parsed.arena.nodes[id - 1]))?
+    }
+    node = supplied[0].named.parsed.arena.nodes[id - 1].clone()
+    current = flow
+    output = "s" + str(id)
+    if (node.kind == "Binary" && node.text == "+" && node.edge_count == 2) {
+        lhs = supplied[0].named.parsed.arena.edges[node.first_edge]
+        rhs = supplied[0].named.parsed.arena.edges[node.first_edge + 1]
+        current = lowerStructString(supplied, project, layouts, bindings, lhs, depth + 1, current)?
+        left = current.result.clone()
+        current = lowerStructString(supplied, project, layouts, bindings, rhs, depth + 1, current)?
+        right = current.result.clone()
+        // Match the source tree's left/right evaluation and concatenation
+        // boundaries. A join failure cannot run subsequent direct calls.
+        current.source = current.source + "    {\n        KuScalarStringPart pair[2] = {{" + left.clone() + ".ptr, " + left.clone() + ".len}, {" +
+            right.clone() + ".ptr, " + right.clone() + ".len}};\n        failure = ku_scalar_string_join(pair, 2u, &" + output.clone() + ");\n"
+        current.source = current.source + "        if (failure) goto cleanup;\n    }\n"
+        current.source = current.source + "    ku_projection_string_drop(&" + right + ");\n    ku_projection_string_drop(&" + left + ");\n"
+        current.uses_join = true
+    } else {
+        if (current.leaves == 64) {
+            RejectLayout("struct_string_parts", "imported string expressions accept at most 64 parts", DeclarationSpan(node))?
+        }
+        if (node.kind == "String" && node.edge_count == 0) {
+            literal = ScalarStringLiteral(node)?
+            current.source = current.source + "    " + output.clone() + " = (KuProjectionString){ (uint8_t*)" + literal +
+                ", 0u, KU_PROJECTION_STRING_STATIC };\n"
+        } else if (node.kind == "Call" && node.edge_count == 2) {
+            current = structStringCall(supplied, project, layouts, bindings, node, output, current)?
+        } else {
+            RejectLayout("unsupported_struct_string_part", "expected a string literal or a typed direct import call", DeclarationSpan(node))?
+        }
+        current.leaves = current.leaves + 1
+    }
+    current.slots = current.slots.push(id)
+    current.result = output
+    return ok(current)
+}
+
+fn emitProjectStringFunction(&supplied: [SuppliedModule], &project: ProjectBindings, &layouts: [StructLayout],
+                             function_id: int): ProjectStructStringC! {
+    fn_node = supplied[0].named.parsed.arena.nodes[function_id - 1].clone()
+    if (fn_node.edge_count != 3) {
+        RejectLayout("struct_string_signature", "expected one owned struct parameter and one str return", DeclarationSpan(fn_node))?
+    }
+    param = supplied[0].named.parsed.arena.nodes[supplied[0].named.parsed.arena.edges[fn_node.first_edge] - 1].clone()
+    if (param.kind != "Parameter" || param.edge_count != 1 || param.int_value != 0) {
+        RejectLayout("struct_string_signature", "expected one typed by-value struct parameter", DeclarationSpan(param))?
+    }
+    input = GuardExplicitType(project.modules[0].types, supplied[0].named.parsed.arena.nodes, layouts,
+        supplied[0].named.parsed.arena.edges[param.first_edge])?
+    result = GuardExplicitType(project.modules[0].types, supplied[0].named.parsed.arena.nodes, layouts,
+        supplied[0].named.parsed.arena.edges[fn_node.first_edge + 1])?
+    returned = supplied[0].named.parsed.arena.nodes[supplied[0].named.parsed.arena.edges[fn_node.first_edge + 2] - 1].clone()
+    if (input.kind != "struct" || result.kind != "str" || returned.kind != "Return" || returned.edge_count != 1) {
+        RejectLayout("struct_string_signature", "expected one owned struct parameter and one str return", DeclarationSpan(fn_node))?
+    }
+    order = OrderCStructLayouts(layouts, layouts[input.layout - 1].module_index, layouts[input.layout - 1].node, DeclarationSpan(param))?
+    binding = GuardBinding { name: param.text, ty: input, slot: 0, parameter: true, view: false }
+    initial = StructStringFlow { source: "", slots: [], dependencies: [], moved_fields: [], result: "", leaves: 0, uses_join: false }
+    lowered = lowerStructString(supplied, project, layouts, [binding.clone()], supplied[0].named.parsed.arena.edges[returned.first_edge], 0, initial)?
+    symbol = "ku_struct_string_" + str(function_id)
+    text = ProjectionHeaders(true, true) + "#include <stdio.h>\n\n" + EmitOrderedStructLayouts(layouts, order)?
+    if (lowered.uses_join) {
+        text += "#include <string.h>\n\ntypedef KuProjectionString KuBootstrapString;\n"
+        text += ScalarStringJoinHelpers(false)
+    }
+    for dependency in lowered.dependencies {
+        text += "extern KuProjectionString " + dependency.symbol + "(" + dependency.parameter + ");\n"
+    }
+    text += "\nKuProjectionString " + symbol.clone() + "(" + GuardCType(binding.ty, layouts) + " a0) {\n"
+    text += "    KuProjectionString result = {0};\n"
+    if (lowered.uses_join) { text += "    const char* failure = NULL;\n" }
+    drops = GuardOwnedDrops(layouts, binding.ty.layout, "a0")
+    if (drops == "") { text += "    (void)a0;\n" }
+    for slot in lowered.slots {
+        temporary = "s" + str(slot)
+        text += "    KuProjectionString " + temporary.clone() + " = {0};\n"
+        drops = "    ku_projection_string_drop(&" + temporary + ");\n" + drops
+    }
+    text += lowered.source + "    result = " + lowered.result.clone() + ";\n    " + lowered.result + " = (KuProjectionString){0};\n"
+    // The common cleanup label is only needed when an operation can fail.
+    if (lowered.uses_join) { text += "cleanup:\n" }
+    text += drops
+    if (lowered.uses_join) { text += "    if (failure) { fputs(failure, stderr); exit(EXIT_FAILURE); }\n" }
+    text += "    return result;\n}\n"
+    return ok(ProjectStructStringC { symbol: symbol, dependencies: lowered.dependencies, source: text })
+}
+
+fn EmitProjectStructStringC(&supplied: [SuppliedModule], &function: str): ProjectStructStringC! {
+    start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    if (supplied.len() == 0) { RejectLayout("unknown_struct_string_function", "expected a supplied project module", start.clone())? }
+    index = 0
+    while (index < supplied[0].named.names.declarations.len()) {
+        entry = supplied[0].named.names.declarations[index].clone()
+        if (entry.kind == "Function" && entry.name == function) {
+            project = BindProjectModules(supplied)?
+            layouts = BuildStructLayouts(supplied[0].named, project.modules[0].types, supplied)?
+            return emitProjectStringFunction(supplied, project, layouts, entry.node)
+        }
+        index = index + 1
+    }
+    RejectLayout("unknown_struct_string_function", "undefined struct-to-string function '" + function.clone() + "'", start)?
+    return ok(ProjectStructStringC { symbol: "", dependencies: [], source: "" })
+}

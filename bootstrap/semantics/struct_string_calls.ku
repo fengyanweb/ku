@@ -1,0 +1,76 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan } from "./names.ku"
+import { SuppliedModule } from "./imports.ku"
+import { ProjectBindings } from "./project_bindings.ku"
+import { GuardCType, GuardValue } from "./guarded_struct_expr.ku"
+import { OrderCStructLayouts } from "./nested_struct_c.ku"
+import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
+
+struct StructStringDependency {
+    symbol: str
+    module_index: int
+    declaration: int
+    source_name: str
+    parameter: str
+}
+
+fn importedFunctionIndex(&project: ProjectBindings, &name: str): int {
+    index = 0
+    while (index < project.modules[0].imports.len()) {
+        if (project.modules[0].imports[index].local_name == name) { return index + 1 }
+        index = index + 1
+    }
+    return 0
+}
+
+// Both the declaration and the type identities are resolved in the callee's
+// own module. A same-spelling local struct is not interchangeable with it.
+fn BindStructStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, &layouts: [StructLayout],
+                        &target: Node, &argument: Node, &value: GuardValue): StructStringDependency! {
+    index = importedFunctionIndex(project, target.text)
+    if (target.kind != "Variable" || target.edge_count != 0 || index == 0) {
+        RejectLayout("unsupported_struct_string_call", "expected a named imported string function", DeclarationSpan(target))?
+    }
+    link = project.modules[0].imports[index - 1].clone()
+    if (link.module_index <= 0) {
+        RejectLayout("unsupported_struct_string_call", "expected an explicit project module dependency", DeclarationSpan(target))?
+    }
+    module_slot = link.module_index - 1
+    function = supplied[module_slot].named.parsed.arena.nodes[link.target_node - 1].clone()
+    if (function.kind != "Function" || function.edge_count < 3) {
+        RejectLayout("struct_string_link_signature", "expected one typed argument and a str result", DeclarationSpan(target))?
+    }
+    parameter = supplied[module_slot].named.parsed.arena.nodes[supplied[module_slot].named.parsed.arena.edges[function.first_edge] - 1].clone()
+    result_id = supplied[module_slot].named.parsed.arena.edges[function.first_edge + 1]
+    returned = supplied[module_slot].named.parsed.arena.nodes[result_id - 1].clone()
+    if (parameter.kind != "Parameter" || parameter.edge_count != 1 || parameter.int_value != 0 || returned.kind != "TypeName") {
+        RejectLayout("struct_string_link_signature", "expected exactly one typed by-value argument and a str result", DeclarationSpan(target))?
+    }
+    type_id = supplied[module_slot].named.parsed.arena.edges[parameter.first_edge]
+    declared = ExplicitType(project.modules[module_slot].types, type_id, DeclarationSpan(parameter))?
+    result = ExplicitType(project.modules[module_slot].types, result_id, DeclarationSpan(returned))?
+    if (result.declaration_kind != "Builtin" || result.name != "str" || value.setup != "" || value.view || argument.kind != "Field") {
+        RejectLayout("struct_string_link_argument", "expected a str return and one checked projected value", DeclarationSpan(argument))?
+    }
+    if (declared.declaration_kind == "Builtin" && declared.name == "str" && value.ty.kind == "str") {
+        return ok(StructStringDependency { symbol: "ku_struct_string_link_m" + str(link.module_index) + "_" + str(link.target_node),
+            module_index: link.module_index, declaration: link.target_node, source_name: link.source_name, parameter: "KuProjectionString" })
+    }
+    if (declared.declaration_kind == "Struct" && value.ty.kind == "struct") {
+        layout = layouts[value.ty.layout - 1].clone()
+        expected_module = declared.module_index
+        if (expected_module == 0) { expected_module = link.module_index }
+        actual_module = layout.module_index
+        if (actual_module == 0) { actual_module = 1 }
+        if (expected_module == actual_module && declared.declaration_node == layout.node) {
+            order = OrderCStructLayouts(layouts, layout.module_index, layout.node, DeclarationSpan(argument))?
+            if (!order.contains_string) {
+                return ok(StructStringDependency { symbol: "ku_struct_string_link_m" + str(link.module_index) + "_" + str(link.target_node),
+                    module_index: link.module_index, declaration: link.target_node, source_name: link.source_name,
+                    parameter: GuardCType(value.ty, layouts) })
+            }
+        }
+    }
+    RejectLayout("struct_string_link_argument", "projected argument must match an owned str or the same Copy struct type", DeclarationSpan(argument))?
+    return ok(StructStringDependency { symbol: "", module_index: 0, declaration: 0, source_name: "", parameter: "" })
+}

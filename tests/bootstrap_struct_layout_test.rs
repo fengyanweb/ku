@@ -3,6 +3,9 @@
 #[path = "support/bounded_process.rs"]
 pub mod bounded_process;
 
+#[path = "support/bootstrap_diagnostic_calls.rs"]
+mod diagnostic_calls;
+
 use bounded_process::{run_bounded, BoundedOutput, OutputLimits};
 use ku::{span::Span, stdlib::json, value::Value};
 use std::fs;
