@@ -61,3 +61,12 @@ owned input struct releases its owned string fields after the scalar reads. A
 View parameter retains the caller's storage. The current subset returns one
 local struct of scalar projections. General function bodies and returning
 owned fields remain outside this tool's supported scope.
+
+For a function with explicit `int` parameters and result, write `int` to
+`mode.txt` and put the module in `input.ku`. Select a function such as `Twice`
+from `examples/math.ku` in `function.txt`. This mode emits checked signed
+64-bit arithmetic and direct, nonrecursive calls within the input module.
+
+The compiler entry scans the module once and parses bounded declaration
+windows. It retains the lexer, per-function, AST and work limits. The legacy
+`ParseProgram` entry retains its 512-token whole-script limit.

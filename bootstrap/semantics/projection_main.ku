@@ -1,13 +1,14 @@
 import { fs, string } from "std"
-import { ParseProgram } from "../stage3/parser.ku"
+import { ParseModule } from "../stage3/parser.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BuildNameTable } from "./names.ku"
+import { EmitScalarIntC } from "./scalar_int_c.ku"
 import { BindStructReturn, BuildStructLayouts } from "./struct_layouts.ku"
 import { EmitStructProjectionC } from "./struct_projection_c.ku"
 import { BindTypeNames } from "./type_names.ku"
 
 fn main(): null! {
-    input = BuildNameTable(ParseProgram(fs.read("input.ku")?)?)?
+    input = BuildNameTable(ParseModule(fs.read("input.ku")?)?)?
     function = string.trim(fs.read("function.txt")?)
     if (function.len() == 0) {
         fail {
@@ -20,10 +21,21 @@ fn main(): null! {
     supplied: [SuppliedModule] = []
     if (fs.exists("supplier.ku")) {
         path = string.trim(fs.read("supplier_path.txt")?)
-        library = BuildNameTable(ParseProgram(fs.read("supplier.ku")?)?)?
+        library = BuildNameTable(ParseModule(fs.read("supplier.ku")?)?)?
         supplied = supplied.push(SuppliedModule { path: path, named: library })
     }
     bindings = BindTypeNames(input, supplied)?
+    if (fs.exists("mode.txt")) {
+        mode = string.trim(fs.read("mode.txt")?)
+        if (mode == "int") {
+            generated = EmitScalarIntC(input, bindings, function)?
+            print(generated.source)
+            return ok(null)
+        }
+        if (mode != "projection") {
+            fail { domain: "bootstrap.projection", code: "invalid_mode", message: "mode.txt must contain projection or int" }
+        }
+    }
     layouts = BuildStructLayouts(input, bindings, supplied)?
     plan = BindStructReturn(input, bindings, layouts, function)?
     c = EmitStructProjectionC(layouts, plan)?

@@ -23,8 +23,8 @@ import { ReadFunction } from "./functions.ku"
 // Stage 2 consumes bounded windows of the original tokens. Their absolute
 // source positions also locate expression errors without a second lexer pass.
 
-fn ReadTokenWindow(&tokens: [Token], start: int, end: int, source_length: int,
-                   work_remaining: int): [Token]! {
+fn ReadTokenWindow(&tokens: [Token], start: int, end: int, work_cost: int,
+                   work_remaining: int, compiler_input: bool): [Token]! {
     if (tokens.len() == 0) {
         RejectAtPoint("invalid_token_stream", "token stream must contain exactly one final EOF")?
     }
@@ -33,7 +33,10 @@ fn ReadTokenWindow(&tokens: [Token], start: int, end: int, source_length: int,
         if (start >= 0 && start < tokens.len()) { diagnostic_index = start }
         RejectAt(tokens[diagnostic_index].clone(), "invalid_expression_range", "statement expression token range is invalid")?
     }
-    if (source_length > work_remaining) {
+    if (work_cost > work_remaining) {
+        if (compiler_input) {
+            RejectAt(tokens[start].clone(), "work_limit", "stage-3 token window work budget exceeded")?
+        }
         RejectAt(tokens[start].clone(), "work_limit", "stage-3 expression slicing budget exceeded")?
     }
     window: [Token] = []
@@ -52,15 +55,22 @@ fn ReadTokenWindow(&tokens: [Token], start: int, end: int, source_length: int,
 }
 
 fn ParseProgram(source: str): ParseOutput! {
+    return ParseBoundedModule(source, false)
+}
+
+// Compiler input uses the scanner's file ceiling and charges each actual
+// expression window. Keep the original script entry's legacy ceilings.
+fn ParseModule(source: str): ParseOutput! {
+    return ParseBoundedModule(source, true)
+}
+
+fn ParseBoundedModule(source: str, compiler_input: bool): ParseOutput! {
     source_length = source.len()
     tokens = Scan(source)?
     if (tokens.len() == 0) {
         RejectAtPoint("invalid_token_stream", "token stream must contain exactly one final EOF")?
     }
-    // Stage 3 still stores token-to-character indexes in captured bounded
-    // arrays. Keep this first module slice below Stage 2's expression-only
-    // ceiling until Ku has an in-place arena builder.
-    if (tokens.len() > 512) {
+    if (!compiler_input && tokens.len() > 512) {
         RejectAt(tokens[0].clone(), "invalid_token_stream", "stage-3 parser accepts at most 512 tokens")?
     }
     token_index = 0
@@ -82,7 +92,8 @@ fn ParseProgram(source: str): ParseOutput! {
     import_count = 0
     function_count = 0
     parse_steps = 0
-    slice_work = 0
+    expression_work = 0
+    expression_base = 0
 
     fn AddNode(kind: str, text: str, int_value: int, span: Span, children: [int], error_token: Token): int! {
         if (arena_nodes.len() >= 4096) {
@@ -165,15 +176,21 @@ fn ParseProgram(source: str): ParseOutput! {
     }
     append_arena: fn(ParseOutput, Token): int! = AddArena
 
-    // After the 512-token/EOF preflight, keep one callback-owned snapshot so
+    // After token/EOF preflight, keep one callback-owned snapshot so
     // the outer scanner's tokens binding is not retained by this closure.
     expression_tokens = tokens.clone()
     fn ParseExpressionWindow(start: int, end: int): ParseOutput! {
-        // Keep the existing source-work admission boundary while the scanner's
-        // per-file limits are unchanged. Borrow the scanner array once so a
+        cost = source_length
+        limit = 131072
+        if (compiler_input) {
+            cost = end - start + 1
+            limit = 16384
+        }
+        // Borrow the scanner array once so a
         // captured field read cannot clone it for each appended expression token.
-        window = ReadTokenWindow(expression_tokens, start, end, source_length, 131072 - slice_work)?
-        slice_work = slice_work + source_length
+        window = ReadTokenWindow(expression_tokens, expression_base + start, expression_base + end,
+                                 cost, limit - expression_work, compiler_input)?
+        expression_work = expression_work + cost
         return ParseTokenWindow(window, true)
     }
     parse_expression: fn(int, int): ParseOutput! = ParseExpressionWindow
@@ -316,7 +333,10 @@ fn ParseProgram(source: str): ParseOutput! {
             function_eof = eof.clone()
             function_window = function_window.push(function_eof)
         }
-        function_read = ReadFunction(function_window, function_base, parse_expression.clone())?
+        // Function readers keep their existing local-window bound. Only the
+        // module callback translates local offsets back to scanner positions.
+        expression_base = function_base
+        function_read = ReadFunction(function_window, 0, parse_expression.clone())?
         parse_steps = parse_steps + function_read.work
         if (parse_steps > 16384) {
             RejectAt(function_read.start.clone(), "work_limit", "stage-3 parser work budget exceeded")?

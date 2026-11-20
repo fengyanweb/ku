@@ -830,3 +830,92 @@ fn main(): null! {
         );
     }
 }
+
+#[test]
+fn bootstrap_compiler_entry_reads_real_module_beyond_legacy_script_limit() {
+    let work = Temp::new();
+    let source = work.0.join("compiler");
+    let relocated = work.0.join("relocated");
+    for directory in [&source, &relocated] {
+        fs::create_dir(directory).expect("create isolated compiler consumer");
+    }
+    stage_sources(&source);
+    let compiler = source.join("semantics");
+    let entry = compiler.join("module-window.ku");
+    fs::write(
+        &entry,
+        r#"import "std.fs"
+import { Scan } from "../stage1/lexer.ku"
+import { AstCanonical } from "../stage2/ast.ku"
+import { ParseModule, ParseProgram } from "../stage3/parser.ku"
+
+fn main(): null! {
+    module_source = fs.read("large.ku")?
+    tokens = Scan(module_source.clone())?
+    if (tokens.len() <= 512) { panic("fixture must exceed the script token limit") }
+    caught = false
+    try { ParseProgram(module_source.clone())? } catch(err) { caught = err.code == "invalid_token_stream" }
+    if (!caught) { panic("script token limit changed") }
+    parsed = ParseModule(module_source)?
+    if (parsed.root != 454) { panic("context.ku AST changed") }
+    small = fs.read("small.ku")?
+    if (AstCanonical(ParseProgram(small.clone())?) != AstCanonical(ParseModule(small)?)) {
+        panic("module mode changes the AST of a small source file")
+    }
+    long_function = fs.read("oversized.ku")?
+    caught = false
+    try { ParseModule(long_function)? } catch(err) { caught = err.message.contains("function window accepts at most 512 tokens") }
+    if (!caught) { panic("function token limit changed") }
+    println("module-window-ok")
+    return ok(null)
+}
+"#,
+    )
+    .expect("write compiler module-window witness");
+
+    for destination in [&compiler, &relocated] {
+        fs::write(
+            destination.join("large.ku"),
+            include_str!("../bootstrap/stage2/context.ku"),
+        )
+        .expect("write actual bootstrap module");
+        fs::write(
+            destination.join("small.ku"),
+            include_str!("../bootstrap/stage2/span.ku"),
+        )
+        .expect("write smaller bootstrap module");
+        fs::write(
+            destination.join("oversized.ku"),
+            format!("fn Test() {{\n{}\n}}", "value = 1 + 2\n".repeat(110)),
+        )
+        .expect("write oversized function witness");
+    }
+
+    let ku = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    let interpreted = execute(Command::new(&ku).arg("run").arg(&entry), &work.0, 30);
+    assert_ok(&interpreted);
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout).trim(),
+        "module-window-ok"
+    );
+
+    let executable = compiler.join(format!("module-window{}", std::env::consts::EXE_SUFFIX));
+    let built = execute(
+        Command::new(&ku)
+            .args(["build", "--release"])
+            .arg(&entry)
+            .arg("-o")
+            .arg(&executable),
+        &work.0,
+        120,
+    );
+    assert_ok(&built);
+    let native = relocated.join(executable.file_name().expect("native file name"));
+    fs::rename(executable, &native).expect("relocate module-window seed");
+    fs::remove_dir_all(source).expect("remove moved seed's source and build directory");
+    let output = execute(&mut Command::new(native), &work.0, 30);
+    assert_ok(&output);
+    assert_eq!(output.stdout, interpreted.stdout);
+}
