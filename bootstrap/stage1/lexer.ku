@@ -101,6 +101,198 @@ fn CheckStringCapacity(character_count: int): null! {
     return ok(null)
 }
 
+struct ScannedLiteral {
+    kind: str
+    lexeme: str
+    int_value: int
+    next_index: int
+    line: int
+    column: int
+    offset: int
+}
+
+fn ScanNumber(&characters: [str], length: int, start_index: int, start_line: int, start_column: int, start_offset: int): ScannedLiteral! {
+    index = start_index
+    line = start_line
+    column = start_column
+    offset = start_offset
+    lexeme = ""
+    int_value = 0
+    kind = ""
+    // An overflowing integer prefix can still be a valid decimal
+    // float. Defer its integer diagnostic until the whole token kind
+    // is known, preserving the float spelling instead of rounding it.
+    overflow = false
+    scanning = true
+    while (scanning && index < length) {
+        current = characters[index].clone()
+        if (IsDigit(current.clone())) {
+            if (!overflow) {
+                digit = DigitValue(current.clone())
+                if (int_value > 922337203685477580 || (int_value == 922337203685477580 && digit > 7)) {
+                    overflow = true
+                } else {
+                    int_value = int_value * 10 + digit
+                }
+            }
+            lexeme += current
+            index = index + 1
+            column = column + 1
+            offset = offset + 1
+        } else {
+            scanning = false
+        }
+    }
+    is_float = false
+    if (index + 1 < length) {
+        if (characters[index].clone() == "." && IsDigit(characters[index + 1].clone())) {
+            is_float = true
+        }
+    }
+    if (is_float) {
+        kind = "Float"
+        int_value = 0
+        lexeme += "."
+        index = index + 1
+        column = column + 1
+        offset = offset + 1
+        scanning = true
+        while (scanning && index < length) {
+            current = characters[index].clone()
+            if (IsDigit(current.clone())) {
+                lexeme += current
+                index = index + 1
+                column = column + 1
+                offset = offset + 1
+            } else {
+                scanning = false
+            }
+        }
+    } else {
+        if (overflow) {
+            fail {
+                domain: "bootstrap.lexer",
+                code: "integer_overflow",
+                message: At("invalid int literal", start_line, start_column, start_offset)
+            }
+        }
+        kind = "Int"
+    }
+    return ok(ScannedLiteral {
+        kind: kind, lexeme: lexeme, int_value: int_value,
+        next_index: index, line: line, column: column, offset: offset
+    })
+}
+
+fn ScanQuoted(&characters: [str], quote: str, length: int, start_index: int, start_line: int, start_column: int, start_offset: int): ScannedLiteral! {
+    index = start_index
+    line = start_line
+    column = start_column
+    offset = start_offset
+    lexeme = ""
+    template = quote == "`"
+    kind = "String"
+    if (template) { kind = "TemplateString" }
+    index = index + 1
+    column = column + 1
+    offset = offset + 1
+    string_length = 0
+    closed = false
+    while (!closed && index < length) {
+        current = characters[index].clone()
+        if (current == quote) {
+            index = index + 1
+            column = column + 1
+            offset = offset + 1
+            closed = true
+        } else if (current == "\\") {
+            index = index + 1
+            column = column + 1
+            offset = offset + 1
+            if (index >= length) {
+                if (template) {
+                    fail {
+                        domain: "bootstrap.lexer",
+                        code: "unterminated_template_escape",
+                        message: At("unterminated template string escape", start_line, start_column, start_offset)
+                    }
+                }
+                fail {
+                    domain: "bootstrap.lexer",
+                    code: "unterminated_escape",
+                    message: At("unterminated string escape", start_line, start_column, start_offset)
+                }
+            }
+            escaped = characters[index].clone()
+            // Unknown ordinary escapes point after the consumed
+            // character, including a literal newline or UTF-8 scalar.
+            offset = offset + escaped.byte_len()
+            index = index + 1
+            if (escaped == "\n") {
+                line = line + 1
+                column = 1
+            } else {
+                column = column + 1
+            }
+            decoded = ""
+            if (escaped == "n") {
+                decoded = "\n"
+            } else if (escaped == "r") {
+                decoded = "\r"
+            } else if (escaped == "t") {
+                decoded = "\t"
+            } else if (escaped == quote) {
+                decoded = quote.clone()
+            } else if (escaped == "\\") {
+                decoded = "\\"
+            } else if (template) {
+                // Braces and unknown escapes retain their backslash;
+                // template interpolation is the parser's job.
+                decoded = "\\" + escaped
+            } else {
+                fail {
+                    domain: "bootstrap.lexer",
+                    code: "unknown_escape",
+                    message: At("unknown string escape '\\" + escaped + "'", line, column, offset)
+                }
+            }
+            string_length = string_length + decoded.len()
+            CheckStringCapacity(string_length)?
+            lexeme += decoded
+        } else {
+            offset = offset + current.byte_len()
+            if (current == "\n") {
+                line = line + 1
+                column = 1
+            } else {
+                column = column + 1
+            }
+            index = index + 1
+            string_length = string_length + 1
+            CheckStringCapacity(string_length)?
+            lexeme += current
+        }
+    }
+    if (!closed) {
+        if (template) {
+            fail {
+                domain: "bootstrap.lexer",
+                code: "unterminated_template",
+                message: At("unterminated template string", start_line, start_column, start_offset)
+            }
+        }
+        fail {
+            domain: "bootstrap.lexer",
+            code: "unterminated_string",
+            message: At("unterminated string", start_line, start_column, start_offset)
+        }
+    }
+    return ok(ScannedLiteral {
+        kind: kind, lexeme: lexeme, int_value: 0,
+        next_index: index, line: line, column: column, offset: offset
+    })
+}
+
 fn Scan(source: str): [Token]! {
     tokens: [Token] = []
     // The byte guard rejects certainly over-limit inputs without a full
@@ -215,164 +407,22 @@ fn Scan(source: str): [Token]! {
                 }
                 kind = KeywordKind(lexeme.clone())
             } else if (IsDigit(ch.clone())) {
-                // An overflowing integer prefix can still be a valid decimal
-                // float. Defer its integer diagnostic until the whole token kind
-                // is known, preserving the float spelling instead of rounding it.
-                overflow = false
-                scanning = true
-                while (scanning && index < length) {
-                    current = characters[index].clone()
-                    if (IsDigit(current.clone())) {
-                        if (!overflow) {
-                            digit = DigitValue(current.clone())
-                            if (int_value > 922337203685477580 || (int_value == 922337203685477580 && digit > 7)) {
-                                overflow = true
-                            } else {
-                                int_value = int_value * 10 + digit
-                            }
-                        }
-                        lexeme += current
-                        index = index + 1
-                        column = column + 1
-                        offset = offset + 1
-                    } else {
-                        scanning = false
-                    }
-                }
-                is_float = false
-                if (index + 1 < length) {
-                    if (characters[index].clone() == "." && IsDigit(characters[index + 1].clone())) {
-                        is_float = true
-                    }
-                }
-                if (is_float) {
-                    kind = "Float"
-                    int_value = 0
-                    lexeme += "."
-                    index = index + 1
-                    column = column + 1
-                    offset = offset + 1
-                    scanning = true
-                    while (scanning && index < length) {
-                        current = characters[index].clone()
-                        if (IsDigit(current.clone())) {
-                            lexeme += current
-                            index = index + 1
-                            column = column + 1
-                            offset = offset + 1
-                        } else {
-                            scanning = false
-                        }
-                    }
-                } else {
-                    if (overflow) {
-                        fail {
-                            domain: "bootstrap.lexer",
-                            code: "integer_overflow",
-                            message: At("invalid int literal", start_line, start_column, start_offset)
-                        }
-                    }
-                    kind = "Int"
-                }
+                literal = ScanNumber(characters, length, index, line, column, offset)?
+                kind = literal.kind
+                lexeme = literal.lexeme
+                int_value = literal.int_value
+                index = literal.next_index
+                line = literal.line
+                column = literal.column
+                offset = literal.offset
             } else if (ch == "\"" || ch == "'" || ch == "`") {
-                quote = ch.clone()
-                template = quote == "`"
-                kind = "String"
-                if (template) { kind = "TemplateString" }
-                index = index + 1
-                column = column + 1
-                offset = offset + 1
-                string_length = 0
-                closed = false
-                while (!closed && index < length) {
-                    current = characters[index].clone()
-                    if (current == quote) {
-                        index = index + 1
-                        column = column + 1
-                        offset = offset + 1
-                        closed = true
-                    } else if (current == "\\") {
-                        index = index + 1
-                        column = column + 1
-                        offset = offset + 1
-                        if (index >= length) {
-                            if (template) {
-                                fail {
-                                    domain: "bootstrap.lexer",
-                                    code: "unterminated_template_escape",
-                                    message: At("unterminated template string escape", start_line, start_column, start_offset)
-                                }
-                            }
-                            fail {
-                                domain: "bootstrap.lexer",
-                                code: "unterminated_escape",
-                                message: At("unterminated string escape", start_line, start_column, start_offset)
-                            }
-                        }
-                        escaped = characters[index].clone()
-                        // Unknown ordinary escapes point after the consumed
-                        // character, including a literal newline or UTF-8 scalar.
-                        offset = offset + escaped.byte_len()
-                        index = index + 1
-                        if (escaped == "\n") {
-                            line = line + 1
-                            column = 1
-                        } else {
-                            column = column + 1
-                        }
-                        decoded = ""
-                        if (escaped == "n") {
-                            decoded = "\n"
-                        } else if (escaped == "r") {
-                            decoded = "\r"
-                        } else if (escaped == "t") {
-                            decoded = "\t"
-                        } else if (escaped == quote) {
-                            decoded = quote.clone()
-                        } else if (escaped == "\\") {
-                            decoded = "\\"
-                        } else if (template) {
-                            // Braces and unknown escapes retain their backslash;
-                            // template interpolation is the parser's job.
-                            decoded = "\\" + escaped
-                        } else {
-                            fail {
-                                domain: "bootstrap.lexer",
-                                code: "unknown_escape",
-                                message: At("unknown string escape '\\" + escaped + "'", line, column, offset)
-                            }
-                        }
-                        string_length = string_length + decoded.len()
-                        CheckStringCapacity(string_length)?
-                        lexeme += decoded
-                    } else {
-                        offset = offset + current.byte_len()
-                        if (current == "\n") {
-                            line = line + 1
-                            column = 1
-                        } else {
-                            column = column + 1
-                        }
-                        index = index + 1
-                        string_length = string_length + 1
-                        CheckStringCapacity(string_length)?
-                        lexeme += current
-                    }
-                }
-                if (!closed) {
-                    if (template) {
-                        fail {
-                            domain: "bootstrap.lexer",
-                            code: "unterminated_template",
-                            message: At("unterminated template string", start_line, start_column, start_offset)
-                        }
-                    }
-                    fail {
-                        domain: "bootstrap.lexer",
-                        code: "unterminated_string",
-                        message: At("unterminated string", start_line, start_column, start_offset)
-                    }
-                }
+                literal = ScanQuoted(characters, ch, length, index, line, column, offset)?
+                kind = literal.kind
+                lexeme = literal.lexeme
+                index = literal.next_index
+                line = literal.line
+                column = literal.column
+                offset = literal.offset
             } else {
                 lexeme = ch.clone()
                 width = 1
