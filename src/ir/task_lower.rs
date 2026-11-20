@@ -1297,10 +1297,20 @@ impl<'a> FunctionLowerer<'a> {
                             self.emit(TaskOp::Drop { slot: key })?;
                             return Ok(destination);
                         }
+                        if let Some(field) =
+                            self.temporary_record_projection(source, &[map, name], expression.span)?
+                        {
+                            return Ok(field);
+                        }
                         return Err(unsupported("this request map projection", expression.span));
                     }
                 }
                 let source = self.expression(target, depth + 1)?;
+                if let Some(field) =
+                    self.temporary_record_projection(source, &[name], expression.span)?
+                {
+                    return Ok(field);
+                }
                 if !matches!(&self.function.slots[source.0].ty,
                     TaskSlotType::Value { ty, .. }
                     if task::error_type(ty) && matches!(name.as_str(), "domain" | "code" | "message")

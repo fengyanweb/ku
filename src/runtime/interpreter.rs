@@ -1295,6 +1295,9 @@ impl Interpreter {
             {
                 self.tick(expr.span)?;
                 let target = self.eval_borrow_argument(target, env, depth, leases)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 return field_value(&target, name, expr.span);
             }
             ExprKind::Index { target, index } => {

@@ -202,8 +202,47 @@ impl FunctionLowerer<'_> {
             _ if optional => self.expression(base, depth + path.len())?,
             _ => return Ok(None),
         };
-        self.budget.analysis(path.len(), span)?;
         path.reverse();
+        self.record_field_slot(
+            source,
+            path,
+            span,
+            false,
+            !matches!(base.kind, ExprKind::Variable(_)),
+        )
+    }
+
+    pub(super) fn temporary_record_projection(
+        &mut self,
+        source: SlotId,
+        fields: &[&str],
+        span: Span,
+    ) -> KuResult<Option<SlotId>> {
+        if self.stable_slots[source.0]
+            || self.slot_owners[source.0] != self.scopes.last().copied()
+            || !matches!(&self.function.slots[source.0].ty, TaskSlotType::Value { ty, borrowed: false }
+                if task::record_type(ty))
+        {
+            return Ok(None);
+        }
+        // The current expression owns this anonymous record. Move the selected
+        // field before dropping the rest; named owners keep their existing read.
+        let path = fields
+            .iter()
+            .map(|field| (field.to_string(), false))
+            .collect();
+        self.record_field_slot(source, path, span, true, true)
+    }
+
+    fn record_field_slot(
+        &mut self,
+        source: SlotId,
+        path: Vec<(String, bool)>,
+        span: Span,
+        take: bool,
+        drop_source: bool,
+    ) -> KuResult<Option<SlotId>> {
+        self.budget.analysis(path.len(), span)?;
         let mut ty = match &self.function.slots[source.0].ty {
             TaskSlotType::Value { ty, .. } => ty.clone(),
             _ => return Ok(None),
@@ -253,9 +292,9 @@ impl FunctionLowerer<'_> {
             dst,
             src: source,
             path,
-            take: false,
+            take,
         })?;
-        if !matches!(base.kind, ExprKind::Variable(_)) {
+        if drop_source {
             self.emit(TaskOp::Drop { slot: source })?;
         }
         Ok(Some(dst))
