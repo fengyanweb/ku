@@ -2424,6 +2424,121 @@ fn native_import_graph_binary_runs_after_sources_removed() {
 }
 
 #[test]
+fn native_main_name_distinguishes_local_storage_from_the_entry_function() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    let directory = Cleanup(unique_temp_dir("imported-local-main"));
+    let dir = &directory.0;
+    let imported = dir.join("report.ku");
+    let entry = dir.join("main.ku");
+    fs::write(
+        &imported,
+        r#"struct Report { amount: int label: str }
+fn Read(&main: Report): int { return main.amount }
+fn Forward(&main: Report): int { return Read(main) }
+fn Take(main: Report): Report { return main }
+fn Calculate(): int {
+    main = Report { amount: 40, label: "re" + "port" }
+    main.amount = 41
+    read = Forward(main)
+    moved = Take(main)
+    return read + moved.amount - 40
+}
+fn Capture(): str {
+    main = "old" + "🙂"
+    read: fn(): str = fn(): str { return main.clone() }
+    main = "captured" + "🙂"
+    return read()
+}
+fn ResultValue(): str! {
+    main = ok("Re" + "sult")
+    value = main?
+    return ok(value)
+}
+fn ErrorSource(): null! { fail { domain: "test", code: "reraised", message: "owner" + "🙂" } }
+fn Reraise(): null! {
+    try { ErrorSource()? } catch (main) { fail main }
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &entry,
+        r#"import { Calculate, Capture, ResultValue, Reraise } from "./report.ku"
+fn DirectEntry(): null! { return main() }
+fn EntryValue(): fn(): null! { return main }
+fn main(): null! {
+    println(Calculate())
+    println(Capture())
+    println(ResultValue()?)
+    try { Reraise()? } catch (failure) { println(failure.message) }
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+
+    let expected = "42\ncaptured🙂\nResult\nowner🙂\n";
+    let interpreter = run_bounded(
+        Command::new(ku_binary())
+            .current_dir(dir)
+            .args(["run", "--offline", "main.ku"]),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(interpreter.status.success(), "{interpreter:?}");
+    assert!(interpreter.stderr.is_empty(), "{interpreter:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&interpreter.stdout).replace('\r', ""),
+        expected
+    );
+
+    let executable = dir.join(exe_name("app"));
+    let build = run_bounded(
+        Command::new(ku_binary())
+            .current_dir(dir)
+            .args(["build", "--release", "--offline", "main.ku", "-o"])
+            .arg(&executable),
+        BUILD_TIMEOUT,
+        BUILD_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    if !build.status.success()
+        && String::from_utf8_lossy(&build.stderr).contains("C compiler not found")
+    {
+        eprintln!("skip: no C compiler available for native e2e test");
+        return;
+    }
+    assert!(build.status.success(), "{build:?}");
+    let c = fs::read_to_string(native_generated_c_profile(dir, "app", "release")).unwrap();
+    let direct = c.split_once("DirectEntry(void) {").unwrap().1;
+    assert!(direct.split_once("\n}\n").unwrap().0.contains("ku_main()"));
+    assert!(c.contains("ku_main__thunk"));
+    fs::remove_file(&imported).unwrap();
+    fs::remove_file(&entry).unwrap();
+
+    let native = run_bounded(
+        Command::new(executable).current_dir(dir),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(native.status.success(), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout).replace('\r', ""),
+        expected
+    );
+}
+
+#[test]
 fn native_fs_base_is_executable_relative_relocatable_and_source_free() {
     let container = unique_temp_dir("fs-relocatable-base");
     let original = container.join("original-tree 中文");

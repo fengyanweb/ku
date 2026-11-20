@@ -3462,12 +3462,15 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                 Ok(value.clone())
             }
         }
-        IrExprKind::Local(name) => Ok(c_symbol(name)),
-        IrExprKind::BorrowedParam(name) => Ok(if is_c_owned_type(&expr.ty) {
-            format!("(*{})", c_symbol(name))
-        } else {
-            c_symbol(name)
-        }),
+        IrExprKind::Local(name) => Ok(c_ident(name)),
+        IrExprKind::BorrowedParam(name) => {
+            let ident = c_ident(name);
+            Ok(if is_c_owned_type(&expr.ty) {
+                format!("(*{ident})")
+            } else {
+                ident
+            })
+        }
         IrExprKind::Borrow(value) => c_expr(value),
         IrExprKind::Temp(id) | IrExprKind::BorrowedTemp(id) => Ok(format!("t{}", id.0)),
         IrExprKind::StructLiteral { name, fields } => {
@@ -3621,7 +3624,12 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                     "native C prototype only supports direct function calls",
                 ));
             }
-            let callee = c_expr(callee)?;
+            // Direct lowering carries the resolved function name in a Local
+            // placeholder. Only a function symbol needs the entry-point rename.
+            let IrExprKind::Local(name) = &callee.kind else {
+                return Err(unsupported("native C direct call requires a function name"));
+            };
+            let callee = c_symbol(name);
             let args = args
                 .iter()
                 .map(c_arg_value_expr)
@@ -3719,7 +3727,7 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                 let cells = captures
                     .iter()
                     .map(|(name, _, source)| match source {
-                        IrCaptureSource::Local => c_symbol(name),
+                        IrCaptureSource::Local => c_ident(name),
                         IrCaptureSource::EnclosingEnvironment => {
                             format!("__e->{}", c_ident(name))
                         }
@@ -3757,7 +3765,7 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
 /// left to clear.
 fn c_move_place(expr: &IrExpr) -> KuResult<Option<String>> {
     match &expr.kind {
-        IrExprKind::Local(name) => Ok(Some(c_symbol(name))),
+        IrExprKind::Local(name) => Ok(Some(c_ident(name))),
         IrExprKind::Temp(id) => Ok(Some(format!("t{}", id.0))),
         IrExprKind::Field { target, name } => {
             let IrType::Named(type_name) = &target.ty else {
@@ -3925,7 +3933,7 @@ fn c_arg_value_expr(expr: &IrExpr) -> KuResult<String> {
             return c_expr(value);
         }
         return match &value.kind {
-            IrExprKind::BorrowedParam(name) => Ok(c_symbol(name)),
+            IrExprKind::BorrowedParam(name) => Ok(c_ident(name)),
             _ if c_borrow_is_addressable(value) => Ok(format!("&({})", c_expr(value)?)),
             // A lookup returns a shallow header. Its C11 compound-literal slot
             // remains valid throughout this synchronous call, without ownership.
@@ -3986,7 +3994,7 @@ fn c_clone_expr(expr: &IrExpr) -> KuResult<String> {
 
 fn c_addressable_expr(expr: &IrExpr) -> KuResult<String> {
     match &expr.kind {
-        IrExprKind::Local(name) => Ok(c_symbol(name)),
+        IrExprKind::Local(name) => Ok(c_ident(name)),
         IrExprKind::Temp(id) => Ok(format!("t{}", id.0)),
         IrExprKind::Call {
             kind: IrCallKind::Intrinsic(name),
@@ -4003,7 +4011,7 @@ fn c_error_expr(value: &IrExpr, default_code: &str) -> KuResult<String> {
     if value.ty == IrType::Named("__ku_error_type".to_string()) {
         // Move an existing Error value (its KuStrings are owned).
         match &value.kind {
-            IrExprKind::Local(name) => Ok(format!("ku_error_move(&{})", c_symbol(name))),
+            IrExprKind::Local(name) => Ok(format!("ku_error_move(&{})", c_ident(name))),
             IrExprKind::Temp(id) => Ok(format!("ku_error_move(&t{})", id.0)),
             // A freshly-built error (e.g. `__ku_error_make(...)`) — already an rvalue.
             _ => c_expr(value),
@@ -4123,7 +4131,7 @@ fn c_lvalue(target: &IrLValue) -> KuResult<String> {
 /// and nested indexed assignments update their owning container.
 fn c_place_expr(expr: &IrExpr) -> KuResult<String> {
     match &expr.kind {
-        IrExprKind::Local(name) => Ok(c_symbol(name)),
+        IrExprKind::Local(name) => Ok(c_ident(name)),
         IrExprKind::Temp(id) => Ok(format!("t{}", id.0)),
         IrExprKind::CellLoad(cell) => Ok(format!("({})->value", c_expr(cell)?)),
         IrExprKind::Field { target, name } => {
