@@ -216,11 +216,13 @@ such as `RejectAt`. It evaluates bound call arguments in source order and
 transfers their owners to the declared C dependency. A returned Error owns
 its domain, code and message.
 
-With the same manifest and selected function, set `mode.txt` to
-`linked-str-plan`, `linked-null-plan` or `struct-result-plan` to emit a
-`ku-bootstrap-link-plan-v1` JSON document on stdout. The `export` record
-describes the selected function. `dependencies` lists the declarations
-used by the emitted C, in the order retained by the emitter. Each record
+With the same manifest and selected function, append `-plan` to
+`linked-str`, `linked-null`, `struct-result`, `construct`, `project-fields`,
+`guarded` or `project-int` in `mode.txt` to emit a `ku-bootstrap-link-plan-v1`
+JSON document on stdout. The `export` record describes the selected
+function. `dependencies` lists the external project declarations used by
+the emitted C, in emitter order. The `construct`, `project-fields`,
+`guarded` and `project-int` plans have an empty `dependencies` list. Each record
 contains its normalized `source_path`, declared AST `node`, source name,
 C symbol, and the checked parameter and result signature. A struct type
 uses its own declaration path and node. Builtin types use a null path and

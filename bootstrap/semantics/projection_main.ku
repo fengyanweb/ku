@@ -5,13 +5,13 @@ import { EmitGuardedStructC } from "./guarded_struct_c.ku"
 import { BindProjectImports, SuppliedModule } from "./imports.ku"
 import { EmitLinkedNullC } from "./linked_null_c.ku"
 import { LinkedNullDependencyPlan } from "./linked_null_types_c.ku"
-import { EmitLinkPlan, LinkPlanDeclaration } from "./link_plan_c.ku"
+import { EmitLinkPlan, LinkPlanDeclaration, NamedProjectionLinkPlan, StructProjectionLinkPlan } from "./link_plan_c.ku"
 import { EmitManagedArrayC } from "./managed_array_c.ku"
 import { BuildNameTable } from "./names.ku"
 import { ManifestPaths, ReadProjectModules } from "./project_manifest.ku"
 import { EmitProjectStructStringC } from "./project_struct_string_c.ku"
 import { EmitScalarIntC } from "./scalar_int_c.ku"
-import { EmitScalarProjectC } from "./scalar_project_c.ku"
+import { EmitScalarProjectC, EmitScalarProjectLinkPlan } from "./scalar_project_c.ku"
 import { BindStructReturn, BuildStructLayouts } from "./struct_layouts.ku"
 import { EmitStructConstructorC } from "./struct_literal_c.ku"
 import { EmitStructProjectionC } from "./struct_projection_c.ku"
@@ -37,7 +37,9 @@ fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &
     layouts = BuildStructLayouts(selected.named, types, supplied)?
     if (mode == "project-fields") {
         plan = BindStructReturn(selected.named, types, layouts, function)?
-        print(EmitStructProjectionC(layouts, plan)?)
+        source = EmitStructProjectionC(layouts, plan)?
+        if (link_plan) { print(EmitLinkPlan(supplied, mode, StructProjectionLinkPlan(plan), [])?) }
+        else { print(source) }
         return ok(null)
     }
     if (mode == "struct-result") {
@@ -53,11 +55,17 @@ fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &
     }
     if (mode == "guarded") {
         generated = EmitGuardedStructC(selected.named, types, layouts, function)?
-        print(generated.source)
+        if (link_plan) {
+            export = NamedProjectionLinkPlan(selected, types, layouts, function, generated.symbol, true)?
+            print(EmitLinkPlan(supplied, mode, export, [])?)
+        } else { print(generated.source) }
         return ok(null)
     }
     generated = EmitStructConstructorC(selected.named, types, imports, supplied, layouts, function)?
-    print(generated.text)
+    if (link_plan) {
+        export = NamedProjectionLinkPlan(selected, types, layouts, function, generated.symbol, false)?
+        print(EmitLinkPlan(supplied, mode, export, [])?)
+    } else { print(generated.text) }
     return ok(null)
 }
 
@@ -96,6 +104,10 @@ fn main(): null! {
     if (mode == "linked-null-plan") { mode = "linked-null" }
     else if (mode == "linked-str-plan") { mode = "linked-str" }
     else if (mode == "struct-result-plan") { mode = "struct-result" }
+    else if (mode == "construct-plan") { mode = "construct" }
+    else if (mode == "project-fields-plan") { mode = "project-fields" }
+    else if (mode == "guarded-plan") { mode = "guarded" }
+    else if (mode == "project-int-plan") { mode = "project-int" }
     else { link_plan = false }
     if (mode == "construct" || mode == "guarded" || mode == "project-int" || mode == "managed" ||
         mode == "linked-str" || mode == "struct-result" || mode == "linked-null" || mode == "project-fields") {
@@ -110,8 +122,11 @@ fn main(): null! {
             return emitLinkedString(supplied, function, link_plan)
         }
         if (mode == "project-int") {
-            generated = EmitScalarProjectC(supplied, function)?
-            print(generated.source)
+            if (link_plan) { print(EmitScalarProjectLinkPlan(supplied, function)?) }
+            else {
+                generated = EmitScalarProjectC(supplied, function)?
+                print(generated.source)
+            }
             return ok(null)
         }
         return emitProjectFunction(supplied[0], supplied, function, mode, link_plan)
@@ -133,7 +148,7 @@ fn main(): null! {
         return ok(null)
     }
     if (mode != "projection") {
-        fail { domain: "bootstrap.projection", code: "invalid_mode", message: "mode.txt must contain projection, int, project-int, project-fields, construct, guarded, managed, linked-str, linked-null, struct-result or one of their linked plan modes" }
+        fail { domain: "bootstrap.projection", code: "invalid_mode", message: "mode.txt must contain projection, int, project-int, project-fields, construct, guarded, managed, linked-str, linked-null, struct-result or a supported -plan mode" }
     }
     layouts = BuildStructLayouts(input, bindings, supplied)?
     plan = BindStructReturn(input, bindings, layouts, function)?

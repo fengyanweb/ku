@@ -1,5 +1,10 @@
 import { json } from "std"
+import { GuardBoundType, GuardCType } from "./guarded_struct_expr.ku"
 import { SuppliedModule } from "./imports.ku"
+import { DeclarationSpan } from "./names.ku"
+import { ScalarFunctionNode } from "./scalar_int_calls.ku"
+import { ExplicitType, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
+import { CTypeName, ScalarCType } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 
 struct LinkPlanType {
@@ -27,8 +32,12 @@ fn BoundLinkPlanType(&binding: TypeNameBinding, local_unit: int, c_type: str, vi
         unit: unit, node: binding.declaration_node, c_type: c_type, view: view }
 }
 
+fn BuiltinLinkPlanType(name: str, c_type: str, view: bool): LinkPlanType {
+    return LinkPlanType { kind: "Builtin", name: name, unit: 0, node: 0, c_type: c_type, view: view }
+}
+
 fn NullLinkPlanResult(): LinkPlanType {
-    return LinkPlanType { kind: "Builtin", name: "null", unit: 0, node: 0, c_type: "KuBootstrapResultNull", view: false }
+    return BuiltinLinkPlanType("null", "KuBootstrapResultNull", false)
 }
 
 fn EmptyLinkPlanDeclaration(): LinkPlanDeclaration {
@@ -77,4 +86,59 @@ fn EmitLinkPlan(&supplied: [SuppliedModule], &mode: str, &entry: LinkPlanDeclara
         index = index + 1
     }
     return ok(text + "]}\n")
+}
+
+fn projectedStructType(module_index: int, node: int, view: bool): LinkPlanType {
+    unit = module_index
+    if (unit == 0) { unit = 1 }
+    c_type = CTypeName(module_index, node)
+    if (view) { c_type = "const " + c_type + "*" }
+    return LinkPlanType { kind: "Struct", name: "", unit: unit, node: node, c_type: c_type, view: view }
+}
+
+fn StructProjectionLinkPlan(&plan: StructReturnPlan): LinkPlanDeclaration {
+    parameters: [LinkPlanType] = []
+    index = 0
+    while (index < plan.parameters.len()) {
+        parameter = plan.parameters[index].clone()
+        parameters = parameters.push(projectedStructType(parameter.layout_module, parameter.layout_node,
+            parameter.mode == 1))
+        index = index + 1
+    }
+    return LinkPlanDeclaration { unit: 1, node: plan.function_node, symbol: "ku_project_" + str(plan.function_node),
+        parameters: parameters, result: projectedStructType(0, plan.result_layout, false), returns_result: false }
+}
+
+fn namedProjectionType(&bound: TypeNameBinding, &layouts: [StructLayout], guarded: bool, view: bool): LinkPlanType! {
+    c_type = ""
+    if (guarded) {
+        c_type = GuardCType(GuardBoundType(bound, layouts)?, layouts)
+    } else if (bound.declaration_kind == "Struct") {
+        c_type = CTypeName(bound.module_index, bound.declaration_node)
+    } else if (bound.name == "str") {
+        c_type = "KuProjectionString"
+    } else {
+        c_type = ScalarCType(bound)?
+    }
+    if (view) { c_type = "const " + c_type + "*" }
+    return ok(BoundLinkPlanType(bound, 1, c_type, view))
+}
+
+// The constructor and guarded emitters have accepted this exact function
+// before we read its explicitly typed signature from the same bound module.
+fn NamedProjectionLinkPlan(&selected: SuppliedModule, &types: [TypeNameBinding], &layouts: [StructLayout],
+                           &function: str, &symbol: str, guarded: bool): LinkPlanDeclaration! {
+    node = ScalarFunctionNode(selected.named.names.declarations, function)
+    declaration = selected.named.parsed.arena.nodes[node - 1].clone()
+    cursor = declaration.first_edge
+    parameters: [LinkPlanType] = []
+    while (selected.named.parsed.arena.nodes[selected.named.parsed.arena.edges[cursor] - 1].kind == "Parameter") {
+        parameter = selected.named.parsed.arena.nodes[selected.named.parsed.arena.edges[cursor] - 1].clone()
+        bound = ExplicitType(types, selected.named.parsed.arena.edges[parameter.first_edge], DeclarationSpan(parameter))?
+        parameters = parameters.push(namedProjectionType(bound, layouts, guarded, parameter.int_value == 1)?)
+        cursor = cursor + 1
+    }
+    result = ExplicitType(types, selected.named.parsed.arena.edges[cursor], DeclarationSpan(declaration))?
+    return ok(LinkPlanDeclaration { unit: 1, node: node, symbol: symbol.clone(), parameters: parameters,
+        result: namedProjectionType(result, layouts, guarded, false)?, returns_result: false })
 }

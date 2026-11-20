@@ -205,11 +205,21 @@ fn EmitScalarStringAssignment(&parts: [ScalarStringPart], &indent: str): ScalarS
     return ScalarStringAssignment { source: text, uses_format: uses_format }
 }
 
+fn ScalarResultCType(result_type: int): str {
+    if (result_type == 2) { return "KuBootstrapString" }
+    if (result_type == 3) { return "bool" }
+    if (result_type == 4) { return "KuResult_null" }
+    return "int64_t"
+}
+
+fn ScalarParameterCType(string_mode: int): str {
+    if (string_mode == 1) { return "KuScalarString" }
+    if (string_mode == 2) { return "const KuScalarString*" }
+    return "int64_t"
+}
+
 fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
-    result_type = "int64_t"
-    if (plan.result_type == 2) { result_type = "KuBootstrapString" }
-    else if (plan.result_type == 3) { result_type = "bool" }
-    else if (plan.result_type == 4) { result_type = "KuResult_null" }
+    result_type = ScalarResultCType(plan.result_type)
     signature = result_type.clone() + " " + ScalarSymbol(plan.function_node, plan.result_type) + "("
     if (!external) { signature = "static " + signature }
     declarations = ""
@@ -220,9 +230,7 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
     while (index < plan.parameters.len()) {
         if (index > 0) { signature += ", " }
         mode = plan.parameters[index].string_mode
-        kind = "int64_t"
-        if (mode == 1) { kind = "KuScalarString" }
-        else if (mode == 2) { kind = "const KuScalarString*" }
+        kind = ScalarParameterCType(mode)
         uses_string = uses_string || mode != 0
         param = "a" + str(index)
         signature += kind + " " + param.clone()

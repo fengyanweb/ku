@@ -252,7 +252,7 @@ fn compare_function(
 
 fn assert_checked_division(ku: &Path, seed: &Path, cwd: &Path) {
     let (_, project_emitter) = include_str!("../bootstrap/semantics/scalar_project_c.ku")
-        .split_once("fn EmitScalarProjectC(")
+        .split_once("fn scalarProjectPlans(")
         .expect("the project emitter");
     let (_, module_slot) = project_emitter
         .split_once("module_slot = ")

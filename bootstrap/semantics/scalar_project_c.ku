@@ -1,9 +1,10 @@
 import { Span } from "../stage2/span.ku"
 import { SuppliedModule } from "./imports.ku"
+import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
 import { BindProjectModules, ProjectModuleBindings } from "./project_bindings.ku"
 import { EmitScalarIntModule, LowerScalarIntFunction, ScalarIntC, AppendScalarIntCallees } from "./scalar_int_c.ku"
 import { ScalarFunctionNode, ScalarIntCalleeSignature, ScalarIntImport } from "./scalar_int_calls.ku"
-import { ScalarIntFunction } from "./scalar_int_emit.ku"
+import { ScalarIntFunction, ScalarParameterCType, ScalarResultCType } from "./scalar_int_emit.ku"
 import { HasScalarBuiltin, RejectScalarInt } from "./scalar_int_operands.ku"
 
 struct ScalarProjectModule {
@@ -45,7 +46,26 @@ fn scalarModules(&supplied: [SuppliedModule], &bindings: [ProjectModuleBindings]
     return modules
 }
 
-fn EmitScalarProjectC(&supplied: [SuppliedModule], &function: str): ScalarIntC! {
+fn scalarProjectLinkPlan(&plan: ScalarIntFunction, symbol: str): LinkPlanDeclaration {
+    parameters: [LinkPlanType] = []
+    index = 0
+    while (index < plan.parameters.len()) {
+        mode = plan.parameters[index].string_mode
+        name = "int"
+        if (mode != 0) { name = "str" }
+        parameters = parameters.push(BuiltinLinkPlanType(name, ScalarParameterCType(mode), mode == 2))
+        index = index + 1
+    }
+    name = "int"
+    if (plan.result_type == 2) { name = "str" }
+    else if (plan.result_type == 3) { name = "bool" }
+    else if (plan.result_type == 4) { name = "null" }
+    result = BuiltinLinkPlanType(name, ScalarResultCType(plan.result_type), false)
+    return LinkPlanDeclaration { unit: 1, node: plan.function_node, symbol: symbol, parameters: parameters,
+        result: result, returns_result: plan.result_type == 4 }
+}
+
+fn scalarProjectPlans(&supplied: [SuppliedModule], &function: str): [ScalarIntFunction]! {
     if (supplied.len() == 0) {
         start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
         RejectScalarInt("unknown_int_function", "a selected project module is required", start)?
@@ -74,5 +94,18 @@ fn EmitScalarProjectC(&supplied: [SuppliedModule], &function: str): ScalarIntC! 
         plans = plans.push(plan)
         index = index + 1
     }
-    return EmitScalarIntModule(plans, supplied[0].named.parsed.arena.nodes, supplied, entry)
+    return ok(plans)
+}
+
+fn EmitScalarProjectC(&supplied: [SuppliedModule], &function: str): ScalarIntC! {
+    plans = scalarProjectPlans(supplied, function)?
+    return EmitScalarIntModule(plans, supplied[0].named.parsed.arena.nodes, supplied, plans[0].function_node)
+}
+
+fn EmitScalarProjectLinkPlan(&supplied: [SuppliedModule], &function: str): str! {
+    plans = scalarProjectPlans(supplied, function)?
+    generated = EmitScalarIntModule(plans, supplied[0].named.parsed.arena.nodes, supplied, plans[0].function_node)?
+    // Callees are validated and emitted as internal definitions in this C unit.
+    export = scalarProjectLinkPlan(plans[0], generated.symbol)
+    return EmitLinkPlan(supplied, "project-int", export, [])
 }

@@ -1500,6 +1500,136 @@ fn assert_project_link_plans(driver: &Path, cwd: &Path) {
         assert_eq!(c, emitter(mode, name));
     }
 
+    fs::write(
+        cwd.join("provider.ku"),
+        "fn Size(&text: str): int { return 4 }\nfn Complete(): null! { return ok(null) }\n",
+    )
+    .unwrap();
+    for (mode, name, manifest, expected_params, result_name, result_path, wrapper) in [
+        (
+            "construct",
+            "MakeDiagnostic",
+            "stage2/diagnostic.ku\nstage2/span.ku\nstage1/token.ku\n",
+            &[
+                ("str", "", "value"),
+                ("str", "", "value"),
+                ("str", "", "value"),
+                ("str", "", "value"),
+                ("str", "", "value"),
+                ("Span", "stage2/span.ku", "value"),
+            ][..],
+            "Diagnostic",
+            "stage2/diagnostic.ku",
+            false,
+        ),
+        (
+            "project-fields",
+            "SpanFromToken",
+            "stage2/span.ku\nstage1/token.ku\n",
+            &[("Token", "stage1/token.ku", "value")][..],
+            "Span",
+            "stage2/span.ku",
+            false,
+        ),
+        (
+            "guarded",
+            "SpanCanonical",
+            "stage2/span.ku\nstage1/token.ku\n",
+            &[("Span", "stage2/span.ku", "value")][..],
+            "str",
+            "",
+            false,
+        ),
+        (
+            "project-int",
+            "EscapeCanonical",
+            "stage1/token.ku\n",
+            &[("str", "", "value")][..],
+            "str",
+            "",
+            false,
+        ),
+        (
+            "project-int",
+            "Size",
+            "provider.ku\n",
+            &[("str", "", "view")][..],
+            "int",
+            "",
+            false,
+        ),
+        (
+            "project-int",
+            "Complete",
+            "provider.ku\n",
+            &[][..],
+            "null",
+            "",
+            true,
+        ),
+    ] {
+        fs::write(cwd.join("modules.txt"), manifest).unwrap();
+        let plan = decode(emitter(&format!("{mode}-plan"), name));
+        let c = emitter(mode, name);
+        assert_eq!(plan["mode"], Value::String(mode.into()));
+        assert_eq!(plan["dependencies"], Value::Array(vec![]));
+        let Value::Object(export) = &plan["export"] else {
+            panic!("expected an export")
+        };
+        assert_eq!(export["source_name"], Value::String(name.into()));
+        assert_eq!(
+            export["source_path"],
+            Value::String(manifest.lines().next().unwrap().into())
+        );
+        let Value::String(symbol) = &export["symbol"] else {
+            panic!("expected a symbol")
+        };
+        let Value::Object(signature) = &export["signature"] else {
+            panic!("expected a signature")
+        };
+        assert_eq!(signature["returns_result"], Value::Bool(wrapper));
+        let Value::Array(parameters) = &signature["parameters"] else {
+            panic!("expected parameters")
+        };
+        assert_eq!(parameters.len(), expected_params.len());
+        let c_type = |record: &Value, name: &str, path: &str, passing: &str| {
+            let Value::Object(ty) = record else {
+                panic!("expected a type")
+            };
+            assert_eq!(ty["source_name"], Value::String(name.into()));
+            assert_eq!(ty["passing"], Value::String(passing.into()));
+            if path.is_empty() {
+                assert_eq!(ty["kind"], Value::String("Builtin".into()));
+                assert_eq!(ty["source_path"], Value::Null);
+            } else {
+                assert_eq!(ty["kind"], Value::String("Struct".into()));
+                assert_eq!(ty["source_path"], Value::String(path.into()));
+            }
+            let Value::String(c_type) = &ty["c_type"] else {
+                panic!("expected a C type")
+            };
+            c_type.clone()
+        };
+        let result = c_type(&signature["result"], result_name, result_path, "value");
+        let mut params = parameters
+            .iter()
+            .zip(expected_params)
+            .enumerate()
+            .map(|(index, (entry, (name, path, passing)))| {
+                format!("{} a{index}", c_type(entry, name, path, passing))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if params.is_empty() {
+            params = "void".into();
+        }
+        assert!(
+            c.replace(" *a", "* a")
+                .contains(&format!("{result} {symbol}({params}) {{")),
+            "incorrect C signature for {name}"
+        );
+    }
+
     for directory in ["left", "right"] {
         fs::create_dir(cwd.join(directory)).unwrap();
         fs::write(
