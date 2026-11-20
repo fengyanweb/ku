@@ -1,0 +1,194 @@
+import "std.bytes"
+import { Node } from "../stage2/ast.ku"
+import { Span } from "../stage2/span.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
+import { BindSuppliedImports, ImportBinding, SuppliedModule } from "./imports.ku"
+import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
+import { ExplicitType, FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { CTypeName, ContainsIndex } from "./struct_projection_c.ku"
+import { CStructOrder, EmitNestedCLayouts, OrderCStructLayouts } from "./nested_struct_c.ku"
+
+struct StructConstructorC {
+    symbol: str
+    text: str
+}
+
+struct ConstructorLocal {
+    name: str
+    layout: int
+}
+
+fn sameCLayout(&expected: StructLayout, &found: TypeNameBinding): bool {
+    return found.declaration_kind == "Struct" && expected.module_index == found.module_index &&
+           expected.node == found.declaration_node
+}
+
+fn staticCString(&value: Node): str! {
+    bytes_value = bytes.from_str(value.text.clone())?
+    if (bytes_value.len() > 4095) {
+        RejectLayout("string_literal_limit", "standalone C accepts at most 4095 bytes in a string literal", DeclarationSpan(value))?
+    }
+    // Fixed-width octal preserves UTF-8, embedded NUL and C metacharacters.
+    quoted = "\""
+    index = 0
+    while (index < bytes_value.len()) {
+        byte = bytes_value.get(index)?
+        quoted += "\\" + str(byte / 64) + str((byte / 8) % 8) + str(byte % 8)
+        index = index + 1
+    }
+    return ok("(KuProjectionString){(uint8_t*)" + quoted + "\", " + str(bytes_value.len()) + "u, 0u, KU_PROJECTION_STRING_STATIC}")
+}
+
+fn usesCopyLocal(&nodes: [Node], &edges: [int], &value: Node, &name: str): bool {
+    if (value.kind == "Variable" && value.edge_count == 0) { return value.text == name }
+    if (value.kind == "Call" && value.edge_count == 1) {
+        target = nodes[edges[value.first_edge] - 1].clone()
+        if (target.kind == "Field" && target.text == "clone" && target.edge_count == 1) {
+            local = nodes[edges[target.first_edge] - 1].clone()
+            return local.kind == "Variable" && local.text == name && local.edge_count == 0
+        }
+    }
+    return false
+}
+
+fn constructorOperand(&named: NamedModule, &value: Node, &field: TypeNameBinding,
+                      &local: ConstructorLocal, &layouts: [StructLayout]): str! {
+    if (field.declaration_kind == "Builtin" && value.edge_count == 0) {
+        if (field.name == "int" && value.kind == "Int" && value.int_value >= 0) {
+            return ok("INT64_C(" + str(value.int_value) + ")")
+        }
+        if (field.name == "bool" && value.kind == "Bool" && (value.text == "true" || value.text == "false")) {
+            return ok(value.text.clone())
+        }
+        if (field.name == "null" && value.kind == "Null") { return ok("0") }
+        if (field.name == "str" && value.kind == "String") { return staticCString(value) }
+    }
+    if (local.layout != 0 && sameCLayout(layouts[local.layout - 1], field) &&
+        usesCopyLocal(named.parsed.arena.nodes, named.parsed.arena.edges, value, local.name)) {
+        return ok("local")
+    }
+    RejectLayout("unsupported_constructor_operand", "expected a matching scalar literal, static string, or Copy struct local", DeclarationSpan(value))?
+    return ok("")
+}
+
+fn emitConstructorLiteral(&named: NamedModule, &layout: StructLayout, &literal: Node, &destination: str,
+                          &local: ConstructorLocal, &layouts: [StructLayout]): str! {
+    text = "    " + CTypeName(layout.module_index, layout.node) + " " + destination.clone()
+    if (layout.fields.len() == 0) { text += " = {0}" }
+    text += ";\n"
+    seen: [int] = []
+    index = 0
+    while (index < literal.edge_count) {
+        item = named.parsed.arena.nodes[named.parsed.arena.edges[literal.first_edge + index] - 1].clone()
+        if (item.kind != "StructLiteralField" || item.edge_count != 1) {
+            RejectLayout("unsupported_constructor_body", "expected a struct literal field", DeclarationSpan(item))?
+        }
+        field = FieldIndex(layout.fields, item.text)
+        if (field == 0) {
+            RejectLayout("unknown_literal_field", "unknown constructor field '" + item.text.clone() + "'", DeclarationSpan(item))?
+        }
+        if (ContainsIndex(seen, field)) {
+            RejectLayout("duplicate_literal_field", "duplicate constructor field '" + item.text.clone() + "'", DeclarationSpan(item))?
+        }
+        value = named.parsed.arena.nodes[named.parsed.arena.edges[item.first_edge] - 1].clone()
+        operand = constructorOperand(named, value, layout.fields[field - 1].resolved, local, layouts)?
+        text += "    " + destination.clone() + ".f" + str(field - 1) + " = " + operand + ";\n"
+        seen = seen.push(field)
+        index = index + 1
+    }
+    index = 0
+    while (index < layout.fields.len()) {
+        if (!ContainsIndex(seen, index + 1)) {
+            RejectLayout("missing_literal_field", "missing constructor field '" + layout.fields[index].name.clone() + "'", DeclarationSpan(literal))?
+        }
+        index = index + 1
+    }
+    return ok(text)
+}
+
+fn layoutForConstructorLocal(&order: CStructOrder, index: int, at: Span): null! {
+    cursor = 0
+    while (cursor < order.entries.len()) {
+        if (order.entries[cursor].layout_index == index) {
+            if (order.entries[cursor].contains_string) {
+                RejectLayout("noncopy_constructor_local", "constructor local must be a Copy layout", at.clone())?
+            }
+            return ok(null)
+        }
+        cursor = cursor + 1
+    }
+    RejectLayout("unsupported_constructor_local", "constructor local must use a dependency of the result layout", at)?
+    return ok(null)
+}
+
+fn resolveConstructorLiteral(&named: NamedModule, &imports: [ImportBinding], &supplied: [SuppliedModule],
+                             literal_id: int): TypeNameBinding! {
+    literal = named.parsed.arena.nodes[literal_id - 1].clone()
+    if (literal.kind != "StructLiteral") {
+        RejectLayout("unsupported_constructor_body", "expected a named struct literal", DeclarationSpan(literal))?
+    }
+    return ResolveTypeName(literal, literal_id, named.names.declarations, imports, supplied)
+}
+
+fn emitConstructor(&named: NamedModule, &bindings: [TypeNameBinding], &supplied: [SuppliedModule],
+                   &layouts: [StructLayout], function_id: int): StructConstructorC! {
+    function = named.parsed.arena.nodes[function_id - 1].clone()
+    at = DeclarationSpan(function)
+    if (function.kind != "Function" || function.edge_count < 2 || function.edge_count > 3 ||
+        named.parsed.arena.nodes[named.parsed.arena.edges[function.first_edge] - 1].kind != "TypeName") {
+        RejectLayout("unsupported_constructor_signature", "expected a parameterless function with an explicit struct return type", at.clone())?
+    }
+    return_type = ExplicitType(bindings, named.parsed.arena.edges[function.first_edge], at.clone())?
+    if (return_type.declaration_kind != "Struct") {
+        RejectLayout("unsupported_constructor_signature", "expected a struct return type", return_type.span.clone())?
+    }
+    order = OrderCStructLayouts(layouts, return_type.module_index, return_type.declaration_node, at)?
+    root = LayoutIndex(layouts, return_type.module_index, return_type.declaration_node)
+    imports = BindSuppliedImports(named, supplied)?
+    local = ConstructorLocal { name: "", layout: 0 }
+    body = ""
+    if (function.edge_count == 3) {
+        statement = named.parsed.arena.nodes[named.parsed.arena.edges[function.first_edge + 1] - 1].clone()
+        if (statement.kind != "Assign" || statement.edge_count != 1) {
+            RejectLayout("unsupported_constructor_body", "expected a single local struct initializer before return", DeclarationSpan(statement))?
+        }
+        initializer = named.parsed.arena.edges[statement.first_edge]
+        resolved = resolveConstructorLiteral(named, imports, supplied, initializer)?
+        index = LayoutIndex(layouts, resolved.module_index, resolved.declaration_node)
+        layoutForConstructorLocal(order, index, DeclarationSpan(statement))?
+        body = emitConstructorLiteral(named, layouts[index - 1], named.parsed.arena.nodes[initializer - 1], "local", local, layouts)?
+        body += "    (void)local;\n"
+        local = ConstructorLocal { name: statement.text, layout: index }
+    }
+    returned = named.parsed.arena.nodes[named.parsed.arena.edges[function.first_edge + function.edge_count - 1] - 1].clone()
+    if (returned.kind != "Return" || returned.edge_count != 1) {
+        RejectLayout("unsupported_constructor_body", "expected one return of a struct literal", DeclarationSpan(returned))?
+    }
+    literal = named.parsed.arena.edges[returned.first_edge]
+    actual = resolveConstructorLiteral(named, imports, supplied, literal)?
+    if (!sameCLayout(layouts[root - 1], actual)) {
+        RejectLayout("constructor_type_mismatch", "returned struct literal must match the result layout", actual.span)?
+    }
+    body += emitConstructorLiteral(named, layouts[root - 1], named.parsed.arena.nodes[literal - 1], "result", local, layouts)?
+    symbol = "ku_construct_" + str(function_id)
+    declaration = CTypeName(return_type.module_index, return_type.declaration_node) + " " + symbol.clone() + "(void) {\n"
+    text = EmitNestedCLayouts(layouts, order)? + declaration + body + "    return result;\n}\n"
+    return ok(StructConstructorC { symbol: symbol, text: text })
+}
+
+// This constructor subset does not infer types or copy owned fields. All
+// assignments retain source order and use only validated concrete layouts.
+fn EmitStructConstructorC(&named: NamedModule, &bindings: [TypeNameBinding], &supplied: [SuppliedModule],
+                          &layouts: [StructLayout], &function_name: str): StructConstructorC! {
+    index = 0
+    while (index < named.names.declarations.len()) {
+        item = named.names.declarations[index].clone()
+        if (item.kind == "Function" && item.name == function_name) {
+            return emitConstructor(named, bindings, supplied, layouts, item.node)
+        }
+        index = index + 1
+    }
+    start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    RejectLayout("unknown_constructor_function", "undefined constructor '" + function_name.clone() + "'", start)?
+    return ok(StructConstructorC { symbol: "", text: "" })
+}

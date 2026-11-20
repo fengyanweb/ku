@@ -992,6 +992,7 @@ import { BindTypeNames } from "./type_names.ku"
 import { BuildStructLayouts } from "./struct_layouts.ku"
 import { CTypeName } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, EmitNestedCLayouts } from "./nested_struct_c.ku"
+import { EmitStructConstructorC } from "./struct_literal_c.ku"
 
 fn main(): null! {
     named = BuildNameTable(ParseModule(fs.read("input.ku")?)?)?
@@ -1004,6 +1005,12 @@ fn main(): null! {
     bindings = BindTypeNames(named, supplied)?
     layouts = BuildStructLayouts(named, bindings, supplied)?
     root = fs.read("type.txt")?
+    if (root == "") {
+        constructor = EmitStructConstructorC(named, bindings, supplied, layouts, fs.read("function.txt")?)?
+        println(constructor.symbol)
+        println(constructor.text)
+        return ok(null)
+    }
     index = 0
     while (index < named.names.declarations.len()) {
         item = named.names.declarations[index].clone()
@@ -1176,4 +1183,109 @@ int main(void) {
         );
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(code));
     }
+
+    let oracle = cwd.join("oracle");
+    fs::create_dir_all(oracle.join("stage1")).expect("create original token source directory");
+    fs::create_dir_all(oracle.join("stage2")).expect("create original context source directory");
+    fs::write(oracle.join("stage1/token.ku"), token_source).expect("write real oracle Token");
+    fs::write(oracle.join("stage2/span.ku"), span_source).expect("write real oracle Span");
+    let original = oracle.join("stage2/context.ku");
+    fs::write(&original, format!("{contexts}{}", r#"
+fn main() {
+    value = DefaultParseContext()
+    println(value.diagnostic_domain)
+    println(str(value.origin.line) + " " + str(value.origin.column) + " " + str(value.origin.offset) + " " + str(value.origin.end_line) + " " + str(value.origin.end_column) + " " + str(value.origin.end_offset))
+    println(str(value.boundary.line) + " " + str(value.boundary.column) + " " + str(value.boundary.offset) + " " + str(value.boundary.end_line) + " " + str(value.boundary.end_column) + " " + str(value.boundary.end_offset))
+    println(value.has_boundary)
+}
+"#)).expect("write real context with observation entry");
+    let expected = execute(Command::new(&ku).arg("run").arg(original), &cwd, 30);
+    assert_ok(&expected);
+    let expected = String::from_utf8(expected.stdout)
+        .expect("Ku oracle output")
+        .replace("\r\n", "\n");
+    assert_eq!(
+        expected.trim(),
+        "bootstrap.parser\n1 1 0 1 1 0\n1 1 0 1 1 0\nfalse"
+    );
+    fs::remove_dir_all(oracle).expect("remove oracle sources before emitted C build");
+
+    fs::write(cwd.join("function.txt"), "DefaultParseContext").expect("select real constructor");
+    let emitted = run(contexts, "");
+    assert_ok(&emitted);
+    let emitted = String::from_utf8(emitted.stdout).expect("C text");
+    let (symbol, c) = emitted
+        .split_once('\n')
+        .expect("numeric constructor symbol and C");
+    let symbol = symbol.trim();
+    assert!(symbol
+        .strip_prefix("ku_construct_")
+        .is_some_and(|id| { !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) }));
+    assert!(!c.contains("malloc(") && !c.contains("free(") && !c.contains("clone"));
+    let result_type = c
+        .lines()
+        .find_map(|line| line.split_once(&format!(" {symbol}(void)")))
+        .map(|(ty, _)| ty)
+        .expect("typed standalone constructor definition");
+    let driver = r#"
+#include <stdio.h>
+#include <inttypes.h>
+int main(void) {
+    RESULT value = CONSTRUCTOR();
+    if (value.f0.storage != KU_PROJECTION_STRING_STATIC || value.f0.capacity != 0) return 1;
+    printf("%.*s\n", (int)value.f0.len, (const char*)value.f0.ptr);
+    printf("%" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 "\n",
+           value.f1.f0, value.f1.f1, value.f1.f2, value.f1.f3, value.f1.f4, value.f1.f5);
+    printf("%" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 "\n",
+           value.f2.f0, value.f2.f1, value.f2.f2, value.f2.f3, value.f2.f4, value.f2.f5);
+    puts(value.f3 ? "true" : "false");
+    value.f1.f0 = 77;
+    return value.f2.f0 != 1;
+}
+"#;
+    let c_path = cwd.join("create.c");
+    fs::write(
+        &c_path,
+        format!(
+            "{c}{}",
+            driver
+                .replace("RESULT", result_type)
+                .replace("CONSTRUCTOR", symbol)
+        ),
+    )
+    .expect("write C constructor and independent harness");
+    for file in [
+        "input.ku",
+        "span.ku",
+        "token.ku",
+        "type.txt",
+        "function.txt",
+    ] {
+        fs::remove_file(cwd.join(file)).expect("remove Ku input before building constructor C");
+    }
+    let app = cwd.join(format!("create-app{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&c_path, &app, &cwd);
+    let observed = execute(&mut Command::new(app), &cwd, 10);
+    assert_ok(&observed);
+    assert_eq!(
+        String::from_utf8(observed.stdout)
+            .expect("C output")
+            .replace("\r\n", "\n"),
+        expected
+    );
+
+    fs::write(cwd.join("function.txt"), "Make").expect("select rejection case");
+    let rejected = run(
+        r#"
+struct Owned { text: str }
+struct Outer { value: Owned }
+fn Make(): Outer {
+    item = Owned { text: "alive" }
+    return Outer { value: item.clone() }
+}
+"#,
+        "",
+    );
+    assert!(!rejected.status.success() && rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("noncopy_constructor_local"));
 }
