@@ -341,6 +341,22 @@ fn project_expr(source: &str, expr: &Expr, arena: &mut ProjectedArena) -> usize 
         body,
     } = &expr.kind
     {
+        if source[expr.span.start.offset..].starts_with('(') {
+            assert!(params.is_empty() && return_type.is_none());
+            assert!(matches!(
+                body.as_slice(),
+                [Stmt::Return { value: Some(_), .. }]
+            ));
+            let returned = project_stmt(source, &body[0], arena);
+            return push_node(
+                arena,
+                "FunctionExpr",
+                String::new(),
+                0,
+                expr.span,
+                &[returned],
+            );
+        }
         let function = FnDecl {
             name: String::new(),
             is_async: false,
@@ -1590,19 +1606,9 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "AddNode",
     );
     let structured_http = include_str!("../examples/native_task_structured_http.ku");
-    let structured_http_prelude = &structured_http[..structured_http
-        .find("async fn CheckGet(")
-        .expect("end of the complete structured HTTP Send declaration")];
-    let check_missing_start = structured_http
-        .find("async fn CheckMissing(")
-        .expect("structured HTTP error-handling Task");
-    let check_missing_end = structured_http
-        .find("async fn CheckPost(")
-        .expect("end of the structured HTTP error-handling Task");
     let cases = [
         "",
-        structured_http_prelude,
-        &structured_http[check_missing_start..check_missing_end],
+        "// 前😀\r\nfn Read() { name = \"读\"\n reader: fn(): str = () => (name + \"😀\"); return reader }",
         "async fn Work() { local = 1 await operation() return local }",
         "// 前😀\r\nasync fn Compute(&value: int): int! { return ok(value) }",
         "fn Outer() { async fn Inner(value: int): int! { return ok(value) } }\nasync fn Again() { fn Ordinary() {} }",
@@ -1722,6 +1728,8 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     );
     let broken_expression = "fn main(){ value = 1 + ; }";
     let empty_rhs_expression = "fn main(){ value = ; }";
+    let missing_arrow_expression = "fn main() { read: fn(): int = () => ; }";
+    let block_arrow_initializer = "fn main() { read: fn(): int = () => { return 1 } }";
     let unicode_broken_expression = UNICODE_CRLF_ERROR_SOURCE;
     let missing_if_lparen = "fn main() { if true {} }";
     let missing_if_rparen = "fn main() { if (true {} }";
@@ -2336,7 +2344,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let direct_body_while_source =
         "fn f() { before; while (looping) { if (ready) { inner; } } after; }";
 
-    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { Node, Arena, AstCanonical, ParseOutput } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ReadFunction } from \"./functions.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
+    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { Node, Arena, AstCanonical, ParseOutput } from \"../stage2/ast.ku\"\nimport { ParseModule, ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ReadFunction } from \"./functions.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
@@ -2500,6 +2508,11 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         "    mixed_callable = ParseTypeWindow(Scan(\"fn(&[pkg.Item!] | null, [int]): str!\")?)?\n    if (mixed_callable.consumed != 19 || mixed_callable.work != 52 || mixed_callable.root != 12) { panic(\"callable type planning cursor, work or root changed\") }\n",
     );
     body.push_str("    return ok(null)\n}\n\nfn MainGrammar(): null! {\n");
+    body.push_str(&format!(
+        "    structured_http = AstCanonical(ParseModule({})?)\n    if (structured_http != {}) {{ panic(\"stage-3 structured HTTP module differs from Stage0\") }}\n",
+        ku_string(structured_http),
+        ku_string(&rust_canonical(structured_http)),
+    ));
     for source in accepted {
         body.push_str(&format!(
             "    AssertCase({}, {})?\n",
@@ -3114,6 +3127,20 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             missing_inline_body,
             "unexpected_token",
             rust_error_canonical(missing_inline_body),
+        ),
+        (
+            missing_arrow_expression,
+            "unexpected_eof",
+            rust_error_canonical(missing_arrow_expression),
+        ),
+        (
+            block_arrow_initializer,
+            "unsupported_expression",
+            diagnostic_at(
+                block_arrow_initializer,
+                16,
+                "stage-3 arrow initializer requires an expression body",
+            ),
         ),
         (
             &over_inline_statement_limit,

@@ -4,6 +4,7 @@ import { Node, ParseOutput } from "../stage2/ast.ku"
 import { ExpressionSpan } from "../stage2/expression_support.ku"
 import { NextBodyWork, ReadExpressionEnd, LocalAssignmentOperator, RejectLetStatement,
          SignatureTypeOutput } from "./body_support.ku"
+import { ReadTypedInitializer } from "./function_header.ku"
 import { ReadSignatureTypePrefix } from "./signature.ku"
 import { AfterOptionalSemicolon, ObjectDestructureClose, RejectAt, RejectAtSpan, SpanFromNode, WindowKind, WindowToken } from "./support.ku"
 
@@ -112,13 +113,12 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
             // type is already attached, and the cursor stays on the Fn.
             return ok(SimpleStatementRead { node: 0, cursor: cursor, work: parse_steps, initializer_type: type_node })
         }
-        expression_end = ReadExpressionEnd(tokens, cursor, last_index, value_context)?
-        declaration_origin = WindowToken(tokens, cursor, last_index)
-        declaration_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
-        expression = add_arena(declaration_parsed, declaration_origin, false)?
-        expression_node = read_node(expression)
-        statement = add_node("VarDecl", name, 0, SpanMerge(SpanFromToken(statement_start.clone()), SpanFromNode(expression_node)), [type_node, expression], statement_start.clone())?
-        cursor = expression_end
+        initialized = ReadTypedInitializer(tokens, cursor, last_index, token_base, parse_steps, value_context,
+                                           parse_expression, add_arena, add_node.clone(), read_span.clone())?
+        span = SpanMerge(SpanFromToken(statement_start.clone()), read_span(initialized.expression))
+        statement = add_node("VarDecl", name, 0, span, [type_node, initialized.expression], statement_start.clone())?
+        cursor = initialized.cursor
+        parse_steps = initialized.work
     } else if (assignment_operator != "") {
         name = statement_start.lexeme.clone()
         target = 0

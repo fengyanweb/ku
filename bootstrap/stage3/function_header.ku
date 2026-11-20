@@ -2,6 +2,7 @@ import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Arena, Node, ParseOutput } from "../stage2/ast.ku"
 import { MakeExpressionNode } from "../stage2/expression_support.ku"
+import { NextBodyWork, ReadExpressionEnd } from "./body_support.ku"
 import { SignatureType, ReadSignatureTypePrefix, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { RejectAt, WindowKind, WindowToken } from "./support.ku"
 
@@ -26,6 +27,43 @@ struct LocalFunctionHeader {
     scope: LocalFunctionScope
     body_open: int
     work: int
+}
+
+struct TypedInitializerRead {
+    expression: int
+    cursor: int
+    work: int
+}
+
+fn ReadTypedInitializer(&tokens: [Token], first: int, last: int, token_base: int, initial_work: int,
+                        &context: str, parse_expression: fn(int, int): ParseOutput!,
+                        add_arena: fn(ParseOutput, Token, bool): int!,
+                        add_node: fn(str, str, int, Span, [int], Token): int!,
+                        read_span: fn(int): Span): TypedInitializerRead! {
+    arrow = WindowKind(tokens, first, last) == "LParen" && WindowKind(tokens, first + 1, last) == "RParen"
+        && WindowKind(tokens, first + 2, last) == "Arrow"
+    start = first
+    work = initial_work
+    if (arrow) {
+        start = first + 3
+        work = NextBodyWork(work, 3, WindowToken(tokens, first, last))?
+        if (WindowKind(tokens, start, last) == "LBrace") {
+            RejectAt(WindowToken(tokens, start, last), "unsupported_expression", "stage-3 arrow initializer requires an expression body")?
+        }
+    }
+    end = ReadExpressionEnd(tokens, start, last, context)?
+    origin = WindowToken(tokens, start, last)
+    parsed = parse_expression(token_base + start, token_base + end)?
+    expression = add_arena(parsed, origin.clone(), false)?
+    if (arrow) {
+        // Stage0 represents an expression body as one implicit Return.
+        body_span = read_span(expression)
+        returned = add_node("Return", "", 0, body_span.clone(), [expression], origin)?
+        opener = WindowToken(tokens, first, last)
+        function_span = SpanMerge(SpanFromToken(opener.clone()), body_span)
+        expression = add_node("FunctionExpr", "", 0, function_span, [returned], opener)?
+    }
+    return ok(TypedInitializerRead { expression: expression, cursor: end, work: work })
 }
 
 // Parse one ordinary named function signature against an existing bounded
