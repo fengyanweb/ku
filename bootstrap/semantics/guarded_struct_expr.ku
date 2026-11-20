@@ -172,21 +172,23 @@ fn guardStringArrayCompare(&nodes: [Node], &edges: [int], &bindings: [GuardBindi
     if (indexed.kind != "Index" || indexed.edge_count != 2) { return ok(emptyGuardValue()) }
     // Count the clone call, its member and the indexed expression as well.
     array = GuardExpression(nodes, edges, bindings, layouts, edges[indexed.first_edge], depth + 4, indent)?
-    if (array.ty.kind != "str_array" || !array.view || array.setup != "") {
-        RejectLayout("guarded_string_array", "indexed string comparisons require a declared View [str]", DeclarationSpan(indexed))?
+    if (array.ty.kind != "str_array" || array.setup != "") {
+        RejectLayout("guarded_string_array", "indexed string comparisons require a bound [str]", DeclarationSpan(indexed))?
     }
     index = GuardExpression(nodes, edges, bindings, layouts, edges[indexed.first_edge + 1], depth + 4, indent)?
     if (index.ty.kind != "int") {
         RejectLayout("guarded_string_array_index", "the string array index must be an int", DeclarationSpan(indexed))?
     }
     out = "array_match" + str(id)
+    reference = ""
+    if (!array.view) { reference = "&" }
     setup = index.setup + indent.clone() + "bool " + out.clone() + ";\n"
-    setup += indent.clone() + "if (!ku_guard_string_array_equal(" + array.value + ", " + index.value +
+    setup += indent.clone() + "if (!ku_guard_string_array_equal(" + reference + array.value + ", " + index.value +
         ", (KuProjectionString){(uint8_t*)" + ScalarStringLiteral(literal)? + ", 0u, KU_PROJECTION_STRING_STATIC}, &" +
         out.clone() + ", &array_failure)) goto cleanup;\n"
     if (node.text == "!=") { out = "(!" + out + ")" }
     return ok(GuardValue { ty: GuardType { kind: "bool", layout: 0 }, setup: setup, value: out, view: false,
-        uses_add: index.uses_add, uses_sub: index.uses_sub, uses_eq: index.uses_eq })
+        uses_add: index.uses_add, uses_sub: index.uses_sub, uses_eq: index.uses_eq || !array.view })
 }
 
 fn cloneLeafString(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],

@@ -333,6 +333,8 @@ lexer uses this sequence to apply its input limits before allocating characters.
 The managed body can clone an indexed local character into a fresh string or
 replace a live string after the checked clone succeeds. Each loop iteration
 releases its local string owners before advancing to the next iteration.
+Comparisons of an indexed clone with a literal use the same bound check and
+release the cloned character before returning the comparison result.
 
 `linked-str` also emits functions such as `TokenCanonical` that consume an
 owned struct. A string field may move into the expression once. A named

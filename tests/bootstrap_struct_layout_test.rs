@@ -1594,6 +1594,7 @@ fn ReadLocal(source: str): [SourceLength]! {
         next = ""
         if (index + 1 < characters.len()) { next = characters[index + 1].clone() }
         size = ch.byte_len() + next.byte_len()
+        if (index + 1 < characters.len() && characters[index + 1].clone() == "中") { size = size + 1 }
         item = SourceLength { value: size }
         entries = entries.push(item)
         index = index + 1
@@ -1647,6 +1648,11 @@ fn ReadLocal(source: str): [SourceLength]! {
     let drop = replacement.find("ku_projection_string_drop(&l").unwrap();
     assert!(drop < replacement.find(" = replaced").unwrap());
     assert!(replacement.matches("ku_projection_string_drop(&l").count() >= 3);
+    let compare = replacement
+        .find("if (!ku_guard_string_array_equal(&l")
+        .unwrap();
+    let branch = replacement[..compare].rfind("if (t").unwrap();
+    assert!(replacement[branch..compare].contains("array_match"));
     assert!(cleanup.contains("ku_managed_source_drop(&l"));
     assert!(cleanup.contains("array_failure.code == 2"));
 }

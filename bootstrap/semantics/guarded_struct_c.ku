@@ -283,14 +283,17 @@ fn GuardStringArrayCloneC(): str {
     return text
 }
 
-fn GuardStringArrayC(): str {
-    text = "#include <stdio.h>\n\ntypedef struct { size_t len; KuProjectionString *data; size_t capacity; } KuGuardStringArray;\n"
-    text += GuardStringArrayCloneC()
-    text += "static bool ku_guard_string_array_equal(const KuGuardStringArray *array, int64_t index, KuProjectionString literal, bool *out, KuGuardArrayFailure *failure) {\n"
+fn GuardStringArrayEqualC(): str {
+    text = "static bool ku_guard_string_array_equal(const KuGuardStringArray *array, int64_t index, KuProjectionString literal, bool *out, KuGuardArrayFailure *failure) {\n"
     text += "    KuProjectionString item = {0};\n"
     text += "    if (!ku_guard_string_array_clone_at(array, index, &item, failure)) return false;\n"
     text += "    *out = ku_guard_string_equal(item, literal);\n    ku_projection_string_drop(&item);\n    return true;\n}\n\n"
     return text
+}
+
+fn GuardStringArrayC(): str {
+    header = "#include <stdio.h>\n\ntypedef struct { size_t len; KuProjectionString *data; size_t capacity; } KuGuardStringArray;\n"
+    return header + GuardStringArrayCloneC() + GuardStringArrayEqualC()
 }
 
 fn GuardArrayErrorC(): str {

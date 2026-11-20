@@ -7,7 +7,7 @@ import { RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { CStructOrder, OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
 import { EmitStructArrayOperations, EmitStructArrayResultHeader } from "./struct_array_c.ku"
-import { GuardArithmetic, GuardArrayErrorC, GuardOwnedDrops, GuardStringArrayCloneC, GuardStringEquality } from "./guarded_struct_c.ku"
+import { GuardArithmetic, GuardArrayErrorC, GuardOwnedDrops, GuardStringArrayCloneC, GuardStringArrayEqualC, GuardStringEquality } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors, ManagedSourceCharactersRuntime } from "./guarded_string_parts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType } from "./guarded_struct_expr.ku"
 import { ManagedExplicitType, ManagedType } from "./managed_array_values_c.ku"
@@ -185,7 +185,10 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     text = ProjectionHeaders(checked || signature.layouts.strings || body.code.uses_eq || signature.source_strings, signature.drop_strings)
     text += "#include <stdio.h>\n#include <stdlib.h>\n\n"
     text += GuardArithmetic(body.code.uses_add, body.code.uses_sub) + GuardStringEquality(body.code.uses_eq)
-    if (signature.source_strings) { text += ManagedSourceCharactersRuntime() + GuardStringArrayCloneC() }
+    if (signature.source_strings) {
+        text += ManagedSourceCharactersRuntime() + GuardStringArrayCloneC()
+        if (body.code.uses_eq) { text += GuardStringArrayEqualC() }
+    }
     text += signature.layouts.text + root.array.source
     result_type = root.array.array_type.clone()
     if (checked) {
@@ -198,6 +201,7 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     if (signature.source_strings) {
         text += "    int source_status = KU_SOURCE_OK;\n    KuGuardArrayFailure array_failure = {0};\n"
         text += "    (void)ku_managed_source_chars;\n    (void)ku_managed_source_drop;\n    (void)ku_guard_string_array_clone_at;\n"
+        if (body.code.uses_eq) { text += "    (void)ku_guard_string_array_equal;\n" }
     }
     if (arithmetic) { text += "    bool overflow = false;\n" }
     text += signature.unused + body.declarations + body.code.text
