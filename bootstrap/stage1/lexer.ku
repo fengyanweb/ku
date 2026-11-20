@@ -293,6 +293,91 @@ fn ScanQuoted(&characters: [str], quote: str, length: int, start_index: int, sta
     })
 }
 
+fn ScanPunctuation(&characters: [str], ch: str, next: str, length: int,
+                   start_index: int, start_line: int, start_column: int, start_offset: int): ScannedLiteral! {
+    kind = ""
+    index = start_index
+    column = start_column
+    offset = start_offset
+    lexeme = ch.clone()
+    width = 1
+    pair = ch.clone() + next.clone()
+    if (pair == "..") {
+        third_dot = false
+        if (index + 2 < length) {
+            third_dot = characters[index + 2].clone() == "."
+        }
+        if (!third_dot) {
+            fail {
+                domain: "bootstrap.lexer",
+                code: "invalid_ellipsis",
+                message: At("expected third '.' for '...'", start_line, start_column, start_offset)
+            }
+        }
+        kind = "Ellipsis"
+        lexeme = "..."
+        width = 3
+    } else {
+        if (pair == "++") { kind = "PlusPlus" }
+        if (pair == "+=") { kind = "PlusEqual" }
+        if (pair == "--") { kind = "MinusMinus" }
+        if (pair == "-=") { kind = "MinusEqual" }
+        if (pair == "=>") { kind = "Arrow" }
+        if (pair == "*=") { kind = "StarEqual" }
+        if (pair == "/=") { kind = "SlashEqual" }
+        if (pair == "%=") { kind = "PercentEqual" }
+        if (pair == "!=") { kind = "BangEqual" }
+        if (pair == "?.") { kind = "QuestionDot" }
+        if (pair == "==") { kind = "EqualEqual" }
+        if (pair == "<=") { kind = "LessEqual" }
+        if (pair == ">=") { kind = "GreaterEqual" }
+        if (pair == "&&") { kind = "AndAnd" }
+        if (pair == "||") { kind = "OrOr" }
+        if (kind != "") {
+            lexeme = pair
+            width = 2
+        }
+    }
+    if (kind == "") {
+        if (ch == "+") { kind = "Plus" }
+        if (ch == "-") { kind = "Minus" }
+        if (ch == "*") { kind = "Star" }
+        if (ch == "/") { kind = "Slash" }
+        if (ch == "%") { kind = "Percent" }
+        if (ch == "!") { kind = "Bang" }
+        if (ch == "?") { kind = "Question" }
+        if (ch == "=") { kind = "Equal" }
+        if (ch == "<") { kind = "Less" }
+        if (ch == ">") { kind = "Greater" }
+        if (ch == "&") { kind = "Ampersand" }
+        if (ch == "|") { kind = "Pipe" }
+        if (ch == ".") { kind = "Dot" }
+        if (ch == "(") { kind = "LParen" }
+        if (ch == ")") { kind = "RParen" }
+        if (ch == "{") { kind = "LBrace" }
+        if (ch == "}") { kind = "RBrace" }
+        if (ch == "[") { kind = "LBracket" }
+        if (ch == "]") { kind = "RBracket" }
+        if (ch == ",") { kind = "Comma" }
+        if (ch == ":") { kind = "Colon" }
+        if (ch == ";") { kind = "Semicolon" }
+    }
+    if (kind == "") {
+        fail {
+            domain: "bootstrap.lexer",
+            code: "invalid_character",
+            message: At("unexpected character '" + ch + "'", start_line, start_column, start_offset)
+        }
+    }
+    index = index + width
+    column = column + width
+    offset = offset + width
+    return ok(ScannedLiteral {
+        kind: kind, lexeme: lexeme, int_value: 0,
+        next_index: index, line: start_line, column: column, offset: offset
+    })
+}
+
 fn Scan(source: str): [Token]! {
     tokens: [Token] = []
     // The byte guard rejects certainly over-limit inputs without a full
@@ -424,79 +509,12 @@ fn Scan(source: str): [Token]! {
                 column = literal.column
                 offset = literal.offset
             } else {
-                lexeme = ch.clone()
-                width = 1
-                pair = ch.clone() + next.clone()
-                if (pair == "..") {
-                    third_dot = false
-                    if (index + 2 < length) {
-                        third_dot = characters[index + 2].clone() == "."
-                    }
-                    if (!third_dot) {
-                        fail {
-                            domain: "bootstrap.lexer",
-                            code: "invalid_ellipsis",
-                            message: At("expected third '.' for '...'", start_line, start_column, start_offset)
-                        }
-                    }
-                    kind = "Ellipsis"
-                    lexeme = "..."
-                    width = 3
-                } else {
-                    if (pair == "++") { kind = "PlusPlus" }
-                    if (pair == "+=") { kind = "PlusEqual" }
-                    if (pair == "--") { kind = "MinusMinus" }
-                    if (pair == "-=") { kind = "MinusEqual" }
-                    if (pair == "=>") { kind = "Arrow" }
-                    if (pair == "*=") { kind = "StarEqual" }
-                    if (pair == "/=") { kind = "SlashEqual" }
-                    if (pair == "%=") { kind = "PercentEqual" }
-                    if (pair == "!=") { kind = "BangEqual" }
-                    if (pair == "?.") { kind = "QuestionDot" }
-                    if (pair == "==") { kind = "EqualEqual" }
-                    if (pair == "<=") { kind = "LessEqual" }
-                    if (pair == ">=") { kind = "GreaterEqual" }
-                    if (pair == "&&") { kind = "AndAnd" }
-                    if (pair == "||") { kind = "OrOr" }
-                    if (kind != "") {
-                        lexeme = pair
-                        width = 2
-                    }
-                }
-                if (kind == "") {
-                    if (ch == "+") { kind = "Plus" }
-                    if (ch == "-") { kind = "Minus" }
-                    if (ch == "*") { kind = "Star" }
-                    if (ch == "/") { kind = "Slash" }
-                    if (ch == "%") { kind = "Percent" }
-                    if (ch == "!") { kind = "Bang" }
-                    if (ch == "?") { kind = "Question" }
-                    if (ch == "=") { kind = "Equal" }
-                    if (ch == "<") { kind = "Less" }
-                    if (ch == ">") { kind = "Greater" }
-                    if (ch == "&") { kind = "Ampersand" }
-                    if (ch == "|") { kind = "Pipe" }
-                    if (ch == ".") { kind = "Dot" }
-                    if (ch == "(") { kind = "LParen" }
-                    if (ch == ")") { kind = "RParen" }
-                    if (ch == "{") { kind = "LBrace" }
-                    if (ch == "}") { kind = "RBrace" }
-                    if (ch == "[") { kind = "LBracket" }
-                    if (ch == "]") { kind = "RBracket" }
-                    if (ch == ",") { kind = "Comma" }
-                    if (ch == ":") { kind = "Colon" }
-                    if (ch == ";") { kind = "Semicolon" }
-                }
-                if (kind == "") {
-                    fail {
-                        domain: "bootstrap.lexer",
-                        code: "invalid_character",
-                        message: At("unexpected character '" + ch + "'", start_line, start_column, start_offset)
-                    }
-                }
-                index = index + width
-                column = column + width
-                offset = offset + width
+                literal = ScanPunctuation(characters, ch, next, length, index, line, column, offset)?
+                kind = literal.kind
+                lexeme = literal.lexeme
+                index = literal.next_index
+                column = literal.column
+                offset = literal.offset
             }
             token = Token {
                 kind: kind, lexeme: lexeme, int_value: int_value,
