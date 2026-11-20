@@ -1399,6 +1399,14 @@ def run_structured_only(args, report):
             raise RuntimeError('installed structured Task backends disagreed on output or request order')
         installed_declaration_inventory_consumer(install, root, env, report, repo, verifier, target)
         installed_bootstrap_module_consumer(install, root, env, report, repo, verifier, target)
+        if '-windows-' not in target:
+            driver_test = repo / 'bootstrap/tools/compiler_driver/test_driver.py'
+            result = invoke([sys.executable, '-B', driver_test, '--ku', install / 'ku', '--cc', 'clang'],
+                            root, env, seconds=300)
+            if result.returncode or result.stderr or output(result) != 'bootstrap argv, diagnostics, signature and standalone C verified\n':
+                raise RuntimeError('installed bootstrap command driver failed: ' +
+                                   (output(result) + result.stderr.decode('utf-8', errors='replace'))[-4096:])
+            report['installed_bootstrap_cli'] = {'status': 'passed', 'sha256': EXPORT.file_hash(driver_test)}
         installed_forward_layout_consumer(install, root, env, report, target)
         installed_task_error_consumer(install, root, env, report, target)
         installed_task_optional_consumer(install, root, env, report, target)
