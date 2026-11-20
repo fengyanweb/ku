@@ -9,6 +9,9 @@ mod binary_operator;
 #[path = "support/bootstrap_diagnostic_calls.rs"]
 mod diagnostic_calls;
 
+#[path = "support/bootstrap_linked_guard.rs"]
+mod linked_guard;
+
 #[path = "support/bootstrap_linked_null.rs"]
 mod linked_null;
 
@@ -3980,4 +3983,5 @@ int main(int argc, char **argv) {
     linked_null::assert_nested_array_result_cleanup(&compiler, &cwd);
     linked_null::assert_short_circuit_reads(&compiler, &cwd);
     linked_null::assert_linked_fs_read(&compiler, &cwd);
+    linked_guard::assert_terminal_branch_ownership(&compiler, &cwd);
 }

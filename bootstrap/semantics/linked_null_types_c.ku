@@ -59,6 +59,21 @@ fn absoluteType(binding: TypeNameBinding, unit: int): TypeNameBinding {
     return resolved
 }
 
+fn LinkedNullArrayLimitName(&project: LinkedNullProject, node_id: int): str {
+    node = LinkedNullNode(project, 1, node_id)
+    if (node.kind == "Binary" && node.text == "-" && node.edge_count == 2) {
+        amount = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 1))
+        if (amount.kind != "Int" || amount.edge_count != 0 || amount.int_value < 0) { return "" }
+        node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
+    }
+    if (node.kind != "Call" || node.edge_count != 1) { return "" }
+    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
+    if (target.kind != "Field" || target.edge_count != 1 || target.text != "len") { return "" }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+    if (receiver.kind != "Variable" || receiver.edge_count != 0) { return "" }
+    return receiver.text
+}
+
 fn LinkedNullType(&project: LinkedNullProject, unit: int, node: int): TypeNameBinding! {
     resolved = ExplicitType(project.binding.modules[unit - 1].types, node, DeclarationSpan(LinkedNullNode(project, unit, node)))?
     return ok(absoluteType(resolved, unit))

@@ -310,6 +310,11 @@ imported call with `items = Read(...) ?`, then read its length or elements.
 The caller releases initialized arrays on success and when a later Result
 fails. The link plan matches the producer and consumer by the element's
 nominal declaration.
+Linked checked bodies can use nested readonly guards with local bindings.
+Fallthrough releases a branch's local owners at the closing brace. An early
+return or failure transfers its selected Result through the same cleanup as
+the final return. Only the untaken path can reach the following statements.
+
 The linked path also moves an owned record out of a checked dependency.
 It uses the project's nominal layout and destructor for nested fields. A
 bounded array-returning entry can build an explicit empty array, visit a

@@ -169,6 +169,20 @@ fn DropLinkedNullScope(state: LinkedNullState, outer: int): LinkedNullState {
     return next
 }
 
+fn RestoreLinkedNullSlots(state: LinkedNullState, &outer: [LinkedNullSlot]): LinkedNullState {
+    next = state
+    index = 0
+    while (index < next.slots.len()) {
+        if (index < outer.len()) { next.slots[index].live = outer[index].live }
+        else {
+            next.slots[index].binding = ""
+            next.slots[index].live = false
+        }
+        index = index + 1
+    }
+    return next
+}
+
 fn linkedValue(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNullExpression {
     return LinkedNullExpression { state: state, value: LinkedNullValue { ty: ty, text: text, slot: 0, borrowed: false } }
 }
