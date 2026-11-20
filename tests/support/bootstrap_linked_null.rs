@@ -175,6 +175,7 @@ pub(super) fn assert_nested_array_result_cleanup(seed: &Path, cwd: &Path) {
 struct Entry { storage: Storage }
 fn Read(flag: int): [Entry]! { return ok([]) }
 fn ReadOne(flag: int): Entry! { fail { domain: "fixture", code: "empty", message: "empty" } }
+fn ReadPath(path: str, &prefix: str): Entry! { fail { domain: "fixture", code: "empty", message: path } }
 "#,
     )
     .unwrap();
@@ -204,7 +205,13 @@ fn RejectClone(): null! {
         "nested-consumer.ku\nnested-provider.ku\n",
     )
     .unwrap();
-    let (entry, dependency_name, carrier, code) = nested_plan(seed, cwd, "Inspect", "StructArray");
+    let NestedPlan {
+        entry,
+        dependency: dependency_name,
+        dependency_result: carrier,
+        code,
+        ..
+    } = nested_plan(seed, cwd, "Inspect", "StructArray");
 
     // A C ABI witness fills the declared nested carrier until managed Ku
     // emission supports the provider's owning construction end to end.
@@ -250,7 +257,13 @@ int main(void) {
     assert!(String::from_utf8_lossy(&clone.stderr).contains("linked_nested_array_clone"));
     assert_ok(&execute(&mut Command::new(binary), cwd, 15));
 
-    let (entry, dependency, carrier, code) = nested_plan(seed, cwd, "InspectRecord", "Struct");
+    let NestedPlan {
+        entry,
+        dependency,
+        dependency_result: carrier,
+        code,
+        ..
+    } = nested_plan(seed, cwd, "InspectRecord", "Struct");
     let host = r#"
 __RESULT__ __DEPENDENCY__(int64_t flag) {
     __RESULT__ result = {0};
@@ -290,18 +303,27 @@ int main(void) {
         std::env::consts::EXE_SUFFIX
     ));
     compile_projection(&c, &binary, cwd);
-    for name in ["nested-provider.ku", "nested-consumer.ku", "modules.txt"] {
+    assert_ok(&execute(&mut Command::new(binary), cwd, 15));
+    assert_nested_array_append(seed, cwd);
+    for name in [
+        "nested-provider.ku",
+        "nested-consumer.ku",
+        "nested-collector.ku",
+        "modules.txt",
+    ] {
         fs::remove_file(cwd.join(name)).unwrap();
     }
-    assert_ok(&execute(&mut Command::new(binary), cwd, 15));
 }
 
-fn nested_plan(
-    seed: &Path,
-    cwd: &Path,
-    function: &str,
-    kind: &str,
-) -> (String, String, String, String) {
+struct NestedPlan {
+    entry: String,
+    entry_result: String,
+    dependency: String,
+    dependency_result: String,
+    code: String,
+}
+
+fn nested_plan(seed: &Path, cwd: &Path, function: &str, kind: &str) -> NestedPlan {
     fs::write(cwd.join("function.txt"), function).unwrap();
     fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
     let planned = execute(&mut Command::new(seed), cwd, 30);
@@ -322,6 +344,15 @@ fn nested_plan(
     };
     let Value::String(entry) = &export["symbol"] else {
         panic!("expected entry symbol")
+    };
+    let Value::Object(entry_signature) = &export["signature"] else {
+        panic!("expected entry signature")
+    };
+    let Value::Object(entry_result) = &entry_signature["result"] else {
+        panic!("expected entry result")
+    };
+    let Value::String(entry_carrier) = &entry_result["c_type"] else {
+        panic!("expected entry type")
     };
     let Value::Array(dependencies) = &plan["dependencies"] else {
         panic!("expected dependencies")
@@ -347,10 +378,124 @@ fn nested_plan(
     assert_ok(&emitted);
     let code = String::from_utf8(emitted.stdout).unwrap();
 
-    (
-        entry.clone(),
-        dependency_name.clone(),
-        carrier.clone(),
+    NestedPlan {
+        entry: entry.clone(),
+        entry_result: entry_carrier.clone(),
+        dependency: dependency_name.clone(),
+        dependency_result: carrier.clone(),
         code,
+    }
+}
+
+fn assert_nested_array_append(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("nested-collector.ku"),
+        r#"import { Entry, ReadPath } from "./nested-provider.ku"
+fn Collect(&paths: [str], &prefix: str): [Entry]! {
+    supplied: [Entry] = []
+    index = 0
+    while (index < paths.len()) {
+        path = paths[index].clone()
+        entry = ReadPath(path, prefix)?
+        supplied = supplied.push(entry)
+        index = index + 1
+    }
+    return ok(supplied)
+}
+"#,
     )
+    .unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "nested-collector.ku\nnested-provider.ku\n",
+    )
+    .unwrap();
+    let NestedPlan {
+        entry,
+        entry_result,
+        dependency,
+        dependency_result: carrier,
+        code,
+    } = nested_plan(seed, cwd, "Collect", "Struct");
+    let drop = entry_result
+        .strip_prefix("KuBootstrapResult_KuArray_")
+        .unwrap();
+    let drop = format!("ku_linked_view_{drop}_drop");
+    assert!(code.contains("_append_move(&") && !code.contains("_append_clone"));
+    let host = r#"
+static unsigned called;
+__RESULT__ __DEPENDENCY__(KuProjectionString path, const KuProjectionString *prefix) {
+    __RESULT__ result = {0};
+    ++called;
+    assert(prefix->len == 2 && memcmp(prefix->ptr, "./", 2) == 0);
+    assert(path.len == 1);
+    if (*path.ptr == '!') {
+        result.error.message = path;
+        return result;
+    }
+    KuGuardStringArray *labels = &result.value.f0.f0;
+    labels->data = malloc(sizeof(*labels->data));
+    assert(labels->data);
+    labels->data[0] = path;
+    labels->len = 1;
+    labels->capacity = 1;
+    result.ok = true;
+    return result;
+}
+static void after_growth_failure(void) {
+    if (outstanding() || called != 9 || attempts != 11) _Exit(82);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    static uint8_t names[] = "ABCDEFGHIJKL";
+    static uint8_t prefix[] = "./";
+    KuProjectionString path_values[12];
+    for (size_t i = 0; i < 12; ++i) {
+        path_values[i] = (KuProjectionString){&names[i], 1, 0, KU_PROJECTION_STRING_STATIC};
+    }
+    KuGuardStringArray paths = {12, path_values, 12};
+    KuProjectionString base = {prefix, 2, 0, KU_PROJECTION_STRING_STATIC};
+    if (argc == 2) {
+        assert(atexit(after_growth_failure) == 0);
+        fail_after = 10;
+        (void)__ENTRY__(&paths, &base);
+        return 83;
+    }
+    __ENTRY_RESULT__ recovered = __ENTRY__(&paths, &base);
+    assert(recovered.ok && recovered.value.len == 12 && called == 12);
+    assert(outstanding() == 13 && attempts == 14);
+    for (size_t i = 0; i < 12; ++i) {
+        assert(recovered.value.data[i].f0.f0.data[0].ptr == &names[i]);
+    }
+    __DROP__(&recovered.value);
+    assert(!outstanding() && paths.data == path_values && paths.len == 12);
+    names[2] = '!';
+    __ENTRY_RESULT__ failed = __ENTRY__(&paths, &base);
+    assert(!failed.ok && failed.error.message.ptr == &names[2] && called == 15);
+    assert(!outstanding());
+    paths.len = 0;
+    recovered = __ENTRY__(&paths, &base);
+    assert(recovered.ok && !recovered.value.len && !recovered.value.data && called == 15);
+    return 0;
+}
+"#
+    .replace("__ENTRY__", &entry)
+    .replace("__ENTRY_RESULT__", &entry_result)
+    .replace("__RESULT__", &carrier)
+    .replace("__DEPENDENCY__", &dependency)
+    .replace("__DROP__", &drop);
+    let c = cwd.join("nested-record-append.c");
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    let exe = cwd.join(format!(
+        "nested-record-append{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    let exhausted = execute(Command::new(&exe).arg("grow"), cwd, 15);
+    assert_eq!(exhausted.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&exhausted.stderr).trim(),
+        "array allocation failed"
+    );
 }

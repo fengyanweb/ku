@@ -4,10 +4,10 @@ import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
-import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullFunction, LinkedNullHasResultValue, LinkedNullLiteralType,
+import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullDependency, ReadLinkedOwnedArray, LinkedNullFunction, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullExpression, LinkedNullState, LinkedNullValue, LowerLinkedNullLeaf,
-         LowerLinkedNullRead, MoveLinkedNullSlot, ReadLinkedNullBinding } from "./linked_null_read_c.ku"
+         LowerLinkedNullRead, MoveLinkedNullSlot, ReadLinkedNullBinding, RequireLinkedArrayValidation } from "./linked_null_read_c.ku"
 
 struct LinkedNullArguments {
     state: LinkedNullState
@@ -196,6 +196,8 @@ fn emitCheckedValue(&project: LinkedNullProject, state: LinkedNullState, &unwrap
     slot = AddLinkedNullSlot(project, call.state, "", "t" + str(call.id), call.result, false)?
     payload = call.text + ".value"
     if (LinkedNullOwnedArray(slot.value.ty)) {
+        ty = slot.value.ty.clone()
+        slot.state = RequireLinkedArrayValidation(slot.state, ty)
         prefix = LinkedNullArrayPrefix(slot.value.ty)
         slot.state.code = slot.state.code + "    if (!" + prefix + "_valid(&" + payload.clone() + ") || (uintmax_t)"
             + payload.clone() + ".len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
@@ -251,4 +253,89 @@ fn LowerLinkedNullValue(&project: LinkedNullProject, state: LinkedNullState, id:
         return LowerLinkedNullRead(project, state, id, depth)
     }
     return LowerLinkedNullLeaf(state, node)
+}
+
+fn unshadowedOk(&project: LinkedNullProject, &state: LinkedNullState): bool {
+    if (LinkedNullBinding(state.slots, "ok") != 0) { return false }
+    for name in project.supplied[0].named.names.declarations.clone() {
+        if (name.name == "ok") { return false }
+    }
+    for binding in project.binding.modules[0].imports.clone() {
+        if (binding.local_name == "ok") { return false }
+    }
+    return true
+}
+
+fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, &result: TypeNameBinding): LinkedNullState! {
+    if (statement.edge_count != 1) {
+        RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(statement))?
+    }
+    call = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+    if (call.kind != "Call" || call.edge_count != 2) {
+        RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(call))?
+    }
+    callee = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (callee.kind != "Variable" || callee.edge_count != 0 || callee.text != "ok" || !unshadowedOk(project, state)) {
+        RejectLayout("unsupported_linked_success", "expected builtin ok with the declared payload", DeclarationSpan(call))?
+    }
+    id = LinkedNullChild(project, 1, call, 1)
+    node = LinkedNullNode(project, 1, id)
+    next = state
+    if (LinkedNullOwnedArray(result)) {
+        value = LowerLinkedNullValue(project, next, id, 0)?
+        if (!SameLinkedType(value.value.ty, result) || value.value.borrowed || value.value.slot == 0) {
+            RejectLayout("linked_array_return", "return requires an initialized matching array owner", DeclarationSpan(node))?
+        }
+        value.state.code = value.state.code + "    result.value = " + value.value.text.clone() + ";\n"
+        owner = value.value.clone()
+        next = MoveLinkedNullSlot(value.state, owner)?
+    } else if (node.kind != "Null" || node.edge_count != 0) {
+        RejectLayout("unsupported_linked_success", "expected builtin ok with literal null", DeclarationSpan(call))?
+    }
+    next.code = next.code + "    result.ok = true;\n    goto cleanup;\n"
+    return ok(next)
+}
+
+fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
+    ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0))?
+    value = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
+    if (value.kind != "Array" || value.edge_count != 0
+        || LinkedNullBinding(state.slots, statement.text) != 0) {
+        RejectLayout("linked_array_local", "expected a new typed array owner initialized empty", DeclarationSpan(statement))?
+    }
+    local = AddLinkedNullSlot(project, state, statement.text.clone(), "l" + str(id), ty, false)?
+    local.state.slots[local.value.slot - 1].live = true
+    return ok(local.state)
+}
+
+fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, index: int): LinkedNullState! {
+    array = state.slots[index - 1].clone()
+    call = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+    if (!array.live || !LinkedNullOwnedArray(array.value.ty) || call.kind != "Call" || call.edge_count != 2) {
+        RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(statement))?
+    }
+    method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (method.kind != "Field" || method.text != "push" || method.edge_count != 1) {
+        RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(method))?
+    }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
+    if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != statement.text) {
+        RejectLayout("linked_move_append", "push must return to its array owner", DeclarationSpan(receiver))?
+    }
+    // Lowering the append value cannot move the active array that receives it.
+    id = LinkedNullChild(project, 1, call, 1)
+    value = LowerLinkedNullValue(project, state, id, 0)?
+    if (!value.state.slots[index - 1].live || !SameLinkedType(value.value.ty, LinkedNullArrayElement(array.value.ty.clone()))
+        || value.value.borrowed || value.value.slot == 0) {
+        RejectLayout("linked_move_append", "push requires one independent owned element of the declared type", value.value.ty.span.clone())?
+    }
+    if (!ContainsIndex(value.state.append_slots, index)) { value.state.append_slots = value.state.append_slots.push(index) }
+    value.state = RequireLinkedArrayValidation(value.state, array.value.ty.clone())
+    prefix = LinkedNullArrayPrefix(array.value.ty)
+    value.state.code = value.state.code + "    append_status = " + prefix + "_append_move(&" + array.value.text
+        + ", &" + value.value.text.clone() + ");\n    if (append_status != KU_STRUCT_ARRAY_OK) goto cleanup;\n"
+    // The C helper zeros this slot only after transfer. On failure, the
+    // original slot still owns its complete element for the cleanup label.
+    value.state.slots[value.value.slot - 1].live = false
+    return ok(value.state)
 }

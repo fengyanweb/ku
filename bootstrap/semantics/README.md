@@ -310,9 +310,15 @@ imported call with `items = Read(...) ?`, then read its length or elements.
 The caller releases initialized arrays on success and when a later Result
 fails. The link plan matches the producer and consumer by the element's
 nominal declaration.
-The linked consumer uses the project's owning layout and destructor for
-elements with nested arrays. Reading a nested array field and cloning a
-whole element with those fields require separate lowering.
+The linked path also moves an owned record out of a checked dependency.
+It uses the project's nominal layout and destructor for nested fields. A
+bounded array-returning entry can build an explicit empty array, visit a
+readonly view from index zero, and move fresh records into the array. The
+actual `ReadProjectModulesAt` uses this form. Its translation unit calls the
+private `readProjectModule` through a typed dependency. A failure during
+the call or array growth releases the initialized prefix and the current
+standalone owner. Reading a nested array field and cloning a whole record
+with those fields require separate lowering.
 
 Managed array functions can take a `str` by value and check its byte or
 Unicode scalar length before initializing a local `[str]` with `.chars()`.

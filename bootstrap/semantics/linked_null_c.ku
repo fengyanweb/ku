@@ -1,16 +1,19 @@
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
+import { TypeNameBinding } from "./type_names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { ContainsType } from "./struct_projection_c.ku"
-import { LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
-import { LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry, LinkedNullFunction, LinkedNullNode,
-         LinkedNullOwner, LinkedNullParameterPlan, LinkedNullParameterType, LinkedNullProject, LinkedNullType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, EmitLinkedNullSource, LinkedNullBinding, LinkedNullState, LowerLinkedNullRead,
-         MoveLinkedNullSlot, NewLinkedNullState } from "./linked_null_read_c.ku"
-import { LowerLinkedNullTry, LowerLinkedNullValue } from "./linked_null_values_c.ku"
+import { LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
+import { LinkedCheckedResultCType, LinkedCheckedResultPlan, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
+         LinkedNullFunction, LinkedNullNode, LinkedNullOwner, LinkedNullOwnedArray, LinkedNullParameterPlan, LinkedNullParameterType,
+         LinkedNullProject, ReadLinkedResult } from "./linked_null_types_c.ku"
+import { AddLinkedNullSlot, DropLinkedNullScope, EmitLinkedNullDeclarations, LinkedNullBinding, LinkedNullSlot, LinkedNullState, LowerLinkedNullRead,
+         MoveLinkedNullSlot, NewLinkedNullState, RegisterLinkedNullType } from "./linked_null_read_c.ku"
+import { LowerLinkedArrayAppend, LowerLinkedArrayLocal, LowerLinkedSuccess,
+         LowerLinkedNullTry, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
 struct LinkedNullC {
     symbol: str
@@ -24,6 +27,7 @@ struct LinkedNullParameters {
     signature: str
     body_start: int
     plan: [LinkPlanType]
+    result: TypeNameBinding
 }
 
 fn readParameters(&project: LinkedNullProject, &function: Node): LinkedNullParameters! {
@@ -60,23 +64,20 @@ fn readParameters(&project: LinkedNullProject, &function: Node): LinkedNullParam
     if (index >= function.edge_count - 1) {
         RejectLayout("linked_null_signature", "entry requires a declared null! result and a body", DeclarationSpan(function))?
     }
-    result = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
-    if (result.kind != "TypeResult" || result.edge_count != 1) {
-        RejectLayout("linked_null_signature", "expected an explicitly declared null! result", DeclarationSpan(result))?
-    }
-    inner = LinkedNullType(project, 1, LinkedNullChild(project, 1, result, 0))?
-    if (inner.declaration_kind != "Builtin" || inner.name != "null") {
-        RejectLayout("linked_null_signature", "expected a null! result", inner.span)?
+    result = ReadLinkedResult(project, 1, LinkedNullChild(project, 1, function, index), true)?
+    if (result.declaration_kind != "Builtin" && !LinkedNullOwnedArray(result)) {
+        RejectLayout("linked_entry_result", "expected a null! or owning struct array Result at this entry", result.span.clone())?
     }
     if (index == 0) { signature = "void" }
     state.code = state.code + validation
-    return ok(LinkedNullParameters { state: state, signature: signature, body_start: index + 1, plan: plan })
+    state = RegisterLinkedNullType(project, state, result.clone())?
+    return ok(LinkedNullParameters { state: state, signature: signature, body_start: index + 1, plan: plan, result: result })
 }
 
-fn preserveLinkedOwners(&before: LinkedNullState, &after: LinkedNullState, &statement: Node): null! {
+fn preserveLinkedOwners(&before: [LinkedNullSlot], &after: [LinkedNullSlot], &statement: Node): null! {
     index = 0
-    while (index < before.slots.len()) {
-        if (LinkedNullOwner(before.slots[index].value.ty) && before.slots[index].live != after.slots[index].live) {
+    while (index < before.len()) {
+        if (LinkedNullOwner(before[index].value.ty) && before[index].live != after[index].live) {
             RejectLayout("linked_control_move", "conditional code cannot consume an outer owner", DeclarationSpan(statement))?
         }
         index = index + 1
@@ -96,7 +97,7 @@ fn addGuardedCall(&project: LinkedNullProject, state: LinkedNullState, &statemen
     }
     guard.state.code = guard.state.code + "    if (" + guard.value.text + ") {\n"
     taken = LowerLinkedNullTry(project, guard.state.clone(), body)?
-    preserveLinkedOwners(guard.state, taken, body)?
+    preserveLinkedOwners(guard.state.slots, taken.slots, body)?
     taken.code = taken.code + "    }\n"
     return ok(taken)
 }
@@ -114,7 +115,9 @@ fn isReadonlyArrayLimit(&project: LinkedNullProject, &state: LinkedNullState, no
     receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
     if (receiver.kind != "Variable" || receiver.edge_count != 0) { return false }
     slot = LinkedNullBinding(state.slots, receiver.text)
-    return slot > 0 && state.slots[slot - 1].value.ty.declaration_kind == "StructArray"
+    if (slot == 0) { return false }
+    kind = state.slots[slot - 1].value.ty.declaration_kind.clone()
+    return kind == "StructArray" || kind == "BuiltinArray"
 }
 
 fn countedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &initial: Node, &step: Node): int! {
@@ -147,25 +150,34 @@ fn countedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Nod
 fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, &initial: Node): LinkedNullState! {
     step = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, statement.edge_count - 1))
     cursor = countedIndex(project, state, statement, initial, step)?
+    outer = state.slots.clone()
     next = state
     next.code = next.code + "    while (true) {\n"
     guard = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, statement, 0), 0)?
     guard.state.code = guard.state.code + "    if (!(" + guard.value.text + ")) break;\n"
     next = guard.state
+    locals = next.slots.len()
     index = 1
     while (index < statement.edge_count - 1) {
-        item = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, index))
+        id = LinkedNullChild(project, 1, statement, index)
+        item = LinkedNullNode(project, 1, id)
         if (item.kind == "If" && item.edge_count == 2 && item.int_value == 1) {
             body = LinkedNullNode(project, 1, LinkedNullChild(project, 1, item, 1))
             if (body.kind != "ExprStmt") {
-                RejectLayout("unsupported_linked_loop_body", "counted while may only guard checked calls", DeclarationSpan(body))?
+                RejectLayout("unsupported_linked_loop_body", "expected a guard of a checked call", DeclarationSpan(body))?
             }
             next = addGuardedCall(project, next, item)?
+        } else if (item.kind == "Assign" && item.edge_count == 1) {
+            found = LinkedNullBinding(next.slots, item.text)
+            if (found == 0) { next = addLocal(project, next, item, id)? }
+            else { next = LowerLinkedArrayAppend(project, next, item, found)? }
         } else {
-            RejectLayout("unsupported_linked_loop_body", "counted while may only guard checked calls", DeclarationSpan(item))?
+            RejectLayout("unsupported_linked_loop_body", "expected a guard, fresh local or move append", DeclarationSpan(item))?
         }
         index = index + 1
     }
+    preserveLinkedOwners(outer, next.slots, statement)?
+    next = DropLinkedNullScope(next, locals)
     advanced = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, step, 0), 0)?
     advanced.state.code = advanced.state.code + "    " + advanced.state.slots[cursor - 1].value.text.clone() + " = " + advanced.value.text + ";\n    }\n"
     return ok(advanced.state)
@@ -251,48 +263,20 @@ fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &stat
     return ok(next)
 }
 
-fn unshadowedOk(&project: LinkedNullProject, &state: LinkedNullState): bool {
-    if (LinkedNullBinding(state.slots, "ok") != 0) { return false }
-    for name in project.supplied[0].named.names.declarations.clone() {
-        if (name.name == "ok") { return false }
-    }
-    for binding in project.binding.modules[0].imports.clone() {
-        if (binding.local_name == "ok") { return false }
-    }
-    return true
-}
-
-fn lowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
-    if (statement.edge_count != 1) {
-        RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(statement))?
-    }
-    call = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
-    if (call.kind != "Call" || call.edge_count != 2) {
-        RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(call))?
-    }
-    callee = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
-    value = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 1))
-    if (callee.kind != "Variable" || callee.edge_count != 0 || callee.text != "ok"
-        || value.kind != "Null" || value.edge_count != 0 || !unshadowedOk(project, state)) {
-        RejectLayout("unsupported_linked_success", "expected builtin ok with literal null", DeclarationSpan(call))?
-    }
-    next = state
-    next.code = next.code + "    result.ok = true;\n    goto cleanup;\n"
-    return ok(next)
-}
-
-fn lowerLinkedBody(&project: LinkedNullProject, &function: Node, state: LinkedNullState, start: int): LinkedNullState! {
+fn lowerLinkedBody(&project: LinkedNullProject, &function: Node, state: LinkedNullState, start: int, &result: TypeNameBinding): LinkedNullState! {
     next = state
     index = start
     while (index < function.edge_count) {
         id = LinkedNullChild(project, 1, function, index)
         statement = LinkedNullNode(project, 1, id)
         if (index == function.edge_count - 1) {
-            if (statement.kind == "Return") { return lowerLinkedSuccess(project, next, statement) }
+            if (statement.kind == "Return") { return LowerLinkedSuccess(project, next, statement, result) }
             return lowerLinkedFailure(project, next, statement)
         }
         if (statement.kind == "Assign" && statement.edge_count == 1) {
             next = addLocal(project, next, statement, id)?
+        } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {
+            next = LowerLinkedArrayLocal(project, next, statement, id)?
         } else if (statement.kind == "If" && statement.edge_count == 2 && statement.int_value == 1) {
             next = addGuardedCall(project, next, statement)?
         } else if (statement.kind == "While" && statement.edge_count >= 2 && index > start) {
@@ -309,6 +293,46 @@ fn lowerLinkedBody(&project: LinkedNullProject, &function: Node, state: LinkedNu
     return ok(next)
 }
 
+fn emitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &payload: TypeNameBinding): str! {
+    text = EmitLinkedNullDeclarations(body)?
+    result_type = LinkedCheckedResultCType(payload)?
+    array_checks = body.validated_arrays.len() > 0 || body.uses_str_array
+    text += "\n" + result_type.clone() + " " + symbol.clone() + "(" + signature.clone() + ") {\n"
+    text += "    " + result_type.clone() + " result = {0};\n"
+    if (LinkedNullOwnedArray(payload)) {
+        // An error-only body still declares the complete typed carrier.
+        text += "    (void)" + LinkedNullArrayPrefix(payload) + "_drop;\n"
+    }
+    if (body.append_slots.len() > 0) { text += "    int append_status = KU_STRUCT_ARRAY_OK;\n" }
+    clone = body.uses_clone || body.element_clones.len() > 0
+    if (clone) { text += "    bool out_of_memory = false;\n" }
+    if (array_checks) { text += "    bool invalid_array = false;\n" }
+    if (body.uses_str_view) { text += "    bool invalid_str = false;\n" }
+    if (body.uses_add || body.uses_sub) { text += "    bool overflow = false;\n" }
+    if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
+    text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
+    if (clone) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (array_checks) {
+        message = "invalid struct array ownership"
+        if (body.uses_str_array) { message = "invalid array view" }
+        text += "    if (invalid_array) { fputs(\"" + message + "\\n\", stderr); exit(EXIT_FAILURE); }\n"
+    }
+    if (body.append_slots.len() > 0) {
+        text += "    if (append_status != KU_STRUCT_ARRAY_OK) {\n"
+            + "        const char *message = \"invalid struct array ownership\\n\";\n"
+            + "        if (append_status == KU_STRUCT_ARRAY_CAPACITY) message = \"array allocation is too large\\n\";\n"
+            + "        if (append_status == KU_STRUCT_ARRAY_OOM) message = \"array allocation failed\\n\";\n"
+            + "        fputs(message, stderr); exit(EXIT_FAILURE);\n    }\n"
+    }
+    if (body.uses_str_view) { text += "    if (invalid_str) { fputs(\"invalid str view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_add || body.uses_sub) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_index) {
+        text += "    if (index_failed) { fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", "
+            + "(long long)failure_index, failure_length); exit(EXIT_FAILURE); }\n"
+    }
+    return ok(text + "    return result;\n}\n")
+}
+
 fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! {
     if (supplied.len() == 0) {
         point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
@@ -319,10 +343,11 @@ fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! 
     id = LinkedNullEntry(project, entry_name)?
     function = LinkedNullNode(project, 1, id)
     parameters = readParameters(project, function)?
-    body = lowerLinkedBody(project, function, parameters.state, parameters.body_start)?
+    result = parameters.result.clone()
+    body = lowerLinkedBody(project, function, parameters.state, parameters.body_start, result)?
     symbol = "ku_linked_null_" + str(id)
-    source = EmitLinkedNullSource(body, symbol, parameters.signature)?
+    source = emitLinkedFunction(body, symbol, parameters.signature, result)?
     plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: parameters.plan,
-        result: NullLinkPlanResult(), returns_result: true }
+        result: LinkedCheckedResultPlan(result, 1)?, returns_result: true }
     return ok(LinkedNullC { symbol: symbol, links: body.links, source: source, entry_plan: plan })
 }

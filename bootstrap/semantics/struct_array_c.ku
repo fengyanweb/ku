@@ -108,11 +108,15 @@ fn EmitStructArrayReadValidation(&element: str, &array: str, &prefix: str): str 
     return text
 }
 
+fn emitArrayContains(&element: str, &array: str, &prefix: str): str {
+    text = "static bool " + prefix.clone() + "_contains(const " + array.clone() + " *array, const " + element.clone() + " *value) {\n"
+    text += "    uintptr_t slot = (uintptr_t)value, base = (uintptr_t)array->data;\n"
+    return text + "    return array->data && slot >= base && slot - base < " + prefix.clone() + "_capacity(array) * sizeof(" + element.clone() + ");\n}\n\n"
+}
+
 fn emitArrayBoundary(&element: str, &array: str, &prefix: str): str {
     text = EmitStructArrayReadValidation(element, array, prefix)
-    text += "static bool " + prefix.clone() + "_contains(const " + array.clone() + " *array, const " + element.clone() + " *value) {\n"
-    text += "    uintptr_t slot = (uintptr_t)value, base = (uintptr_t)array->data;\n"
-    text += "    return array->data && slot >= base && slot - base < " + prefix.clone() + "_capacity(array) * sizeof(" + element.clone() + ");\n}\n\n"
+    text += emitArrayContains(element, array, prefix)
     text += "int " + prefix.clone() + "_clone_at(const " + array + " *array, int64_t index, " + element + " *out) {\n"
     text += "    if (!out || !" + prefix.clone() + "_valid(array) || " + prefix.clone() + "_contains(array, out)) return KU_STRUCT_ARRAY_INVALID;\n"
     text += "    if (index < 0 || (uint64_t)index >= array->len) return KU_STRUCT_ARRAY_BOUNDS;\n"
@@ -120,10 +124,9 @@ fn emitArrayBoundary(&element: str, &array: str, &prefix: str): str {
     return text
 }
 
-fn emitArrayTransfer(&element: str, &array: str, &prefix: str): str {
-    text = array.clone() + " " + prefix.clone() + "_move(" + array.clone() + " *array) {\n"
-    text += "    " + array.clone() + " moved = *array;\n    *array = (" + array.clone() + "){0};\n    return moved;\n}\n\n"
-    text += EmitStructArrayDropUsing(array, prefix, prefix.clone() + "_element_drop", false)
+fn emitArrayAppend(&element: str, &array: str, &prefix: str, private_append: bool): str {
+    text = ""
+    if (private_append) { text = "static " }
     text += "int " + prefix.clone() + "_append_move(" + array.clone() + " *array, " + element.clone() + " *value) {\n"
     text += "    if (!value || !" + prefix.clone() + "_valid(array) || " + prefix.clone() + "_contains(array, value)) return KU_STRUCT_ARRAY_INVALID;\n"
     text += "    size_t limit = SIZE_MAX / sizeof(" + element.clone() + ");\n    if (array->len == limit) return KU_STRUCT_ARRAY_CAPACITY;\n"
@@ -133,6 +136,22 @@ fn emitArrayTransfer(&element: str, &array: str, &prefix: str): str {
     text += "        " + element.clone() + " *data = realloc(array->data, next * sizeof(" + element.clone() + "));\n"
     text += "        if (!data) return KU_STRUCT_ARRAY_OOM;\n        array->data = data;\n        capacity = next;\n    }\n"
     text += "    array->data[array->len++] = *value;\n    array->capacity = capacity;\n    *value = (" + element.clone() + "){0};\n    return KU_STRUCT_ARRAY_OK;\n}\n\n"
+    return text
+}
+
+fn EmitOwnedStructArrayAppend(&element: str, &array: str, &prefix: str): str {
+    return emitArrayContains(element, array, prefix) + emitArrayAppend(element, array, prefix, true)
+}
+
+fn StructArrayStatuses(): str {
+    return "enum { KU_STRUCT_ARRAY_OK, KU_STRUCT_ARRAY_INVALID, KU_STRUCT_ARRAY_BOUNDS, KU_STRUCT_ARRAY_CAPACITY, KU_STRUCT_ARRAY_OOM };\n\n"
+}
+
+fn emitArrayTransfer(&element: str, &array: str, &prefix: str): str {
+    text = array.clone() + " " + prefix.clone() + "_move(" + array.clone() + " *array) {\n"
+    text += "    " + array.clone() + " moved = *array;\n    *array = (" + array.clone() + "){0};\n    return moved;\n}\n\n"
+    text += EmitStructArrayDropUsing(array, prefix, prefix.clone() + "_element_drop", false)
+    text += emitArrayAppend(element, array, prefix, false)
     text += "int " + prefix.clone() + "_append_clone(" + array.clone() + " *array, const " + element.clone() + " *value) {\n"
     text += "    if (!value || !" + prefix.clone() + "_valid(array)) return KU_STRUCT_ARRAY_INVALID;\n"
     // Clone before grow, so a well-typed borrowed source may be an element
@@ -176,7 +195,7 @@ fn EmitStructArrayOperations(&layouts: [StructLayout], root: int): StructArrayC 
     text = "#include <stddef.h>\n#include <stdlib.h>\n"
     if (owned.len() != 0) { text += "#include <string.h>\n" }
     text += EmitStructArrayHeader(element, array)
-    text += "enum { KU_STRUCT_ARRAY_OK, KU_STRUCT_ARRAY_INVALID, KU_STRUCT_ARRAY_BOUNDS, KU_STRUCT_ARRAY_CAPACITY, KU_STRUCT_ARRAY_OOM };\n\n"
+    text += StructArrayStatuses()
     text += emitOwnedStructElement(element, prefix, owned, false) + emitArrayBoundary(element, array, prefix) + emitArrayTransfer(element, array, prefix)
     return StructArrayC { element_type: element, array_type: array, prefix: prefix, source: text }
 }
