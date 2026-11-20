@@ -1,7 +1,7 @@
 import { Node } from "../stage2/ast.ku"
 import { DiagnosticCanonical, MakeDiagnostic } from "../stage2/diagnostic.ku"
 import { Span } from "../stage2/span.ku"
-import { DeclarationSpan, NamedModule } from "./names.ku"
+import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 
 // Each instruction defines one int64 value identified by its expression node.
@@ -11,6 +11,13 @@ struct ScalarIntInstruction {
     result_node: int
     operand: int
     right_node: int
+    arguments: [int]
+}
+
+struct ScalarIntCall {
+    target_node: int
+    function_node: int
+    arguments: [int]
 }
 
 struct ScalarIntFunction {
@@ -22,6 +29,13 @@ struct ScalarIntFunction {
 struct ScalarIntC {
     symbol: str
     source: str
+}
+
+struct ScalarIntBodyC {
+    source: str
+    uses_add: bool
+    uses_sub: bool
+    uses_mul: bool
 }
 
 fn rejectScalarInt(code: str, message: str, span: Span): null! {
@@ -54,7 +68,60 @@ fn scalarParameterIndex(&parameters: [str], &name: str): int {
     return -1
 }
 
-fn lowerIntExpression(&nodes: [Node], &edges: [int], &parameters: [str], result_node: int): [ScalarIntInstruction]! {
+fn scalarFunctionNode(&declarations: [TopLevelName], &name: str): int {
+    index = 0
+    while (index < declarations.len()) {
+        if (declarations[index].kind == "Function" && declarations[index].name == name) {
+            return declarations[index].node
+        }
+        index = index + 1
+    }
+    return 0
+}
+
+fn bindIntCall(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
+               &parameters: [str], &call: Node): ScalarIntCall! {
+    if (call.edge_count == 0) {
+        rejectScalarInt("unsupported_int_callee", "expected a direct local function call", DeclarationSpan(call))?
+    }
+    target_node = edges[call.first_edge]
+    target = nodes[target_node - 1].clone()
+    if (target.kind != "Variable" || target.edge_count != 0 || scalarParameterIndex(parameters, target.text) >= 0) {
+        rejectScalarInt("unsupported_int_callee", "expected an unshadowed local function name", DeclarationSpan(target))?
+    }
+    function_node = scalarFunctionNode(declarations, target.text)
+    if (function_node == 0) {
+        rejectScalarInt("unknown_int_callee", "no local function '" + target.text.clone() + "'", DeclarationSpan(target))?
+    }
+    function = nodes[function_node - 1].clone()
+    arity = 0
+    while (arity < function.edge_count && nodes[edges[function.first_edge + arity] - 1].kind == "Parameter") {
+        arity = arity + 1
+    }
+    if (call.edge_count - 1 != arity) {
+        rejectScalarInt("int_call_arity", "expected " + str(arity) + " arguments for '" + target.text + "'", DeclarationSpan(call))?
+    }
+    arguments: [int] = []
+    index = 1
+    while (index < call.edge_count) {
+        argument = edges[call.first_edge + index]
+        arguments = arguments.push(argument)
+        index = index + 1
+    }
+    return ok(ScalarIntCall { target_node: target_node, function_node: function_node, arguments: arguments })
+}
+
+fn isIntCallTarget(&calls: [ScalarIntCall], node: int): bool {
+    index = 0
+    while (index < calls.len()) {
+        if (calls[index].target_node == node) { return true }
+        index = index + 1
+    }
+    return false
+}
+
+fn lowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
+                      &parameters: [str], result_node: int): [ScalarIntInstruction]! {
     // BuildNameTable validated a contiguous post-order tree. The first child
     // chain reaches its leftmost leaf, and every node in that range belongs
     // to this expression. Neither a recursive stack nor a copied AST is needed.
@@ -62,16 +129,33 @@ fn lowerIntExpression(&nodes: [Node], &edges: [int], &parameters: [str], result_
     while (nodes[cursor - 1].edge_count > 0) {
         cursor = edges[nodes[cursor - 1].first_edge]
     }
+    calls: [ScalarIntCall] = []
+    probe = cursor
+    while (probe <= result_node) {
+        if (nodes[probe - 1].kind == "Call") {
+            call = bindIntCall(nodes, edges, declarations, parameters, nodes[probe - 1])?
+            calls = calls.push(call)
+        }
+        probe = probe + 1
+    }
     instructions: [ScalarIntInstruction] = []
+    call_index = 0
     while (cursor <= result_node) {
         node = nodes[cursor - 1].clone()
         operation = ""
         operand = 0
         right_node = 0
+        arguments: [int] = []
         if (node.kind == "Int" && node.edge_count == 0 && node.int_value >= 0) {
             operation = "constant"
             operand = node.int_value
         } else if (node.kind == "Variable" && node.edge_count == 0) {
+            // The validated AST is a tree, so only the Call can consume this
+            // particular identifier. It needs no value or C temporary.
+            if (isIntCallTarget(calls, cursor)) {
+                cursor = cursor + 1
+                continue
+            }
             operation = "parameter"
             operand = scalarParameterIndex(parameters, node.text)
             if (operand < 0) {
@@ -86,19 +170,26 @@ fn lowerIntExpression(&nodes: [Node], &edges: [int], &parameters: [str], result_
             else if (node.text == "*") { operation = "mul" }
             operand = edges[node.first_edge]
             right_node = edges[node.first_edge + 1]
+        } else if (node.kind == "Call") {
+            call = calls[call_index].clone()
+            call_index = call_index + 1
+            operation = "call"
+            operand = call.function_node
+            arguments = call.arguments
         }
         if (operation == "") {
-            rejectScalarInt("unsupported_int_expression", "expected an int literal, parameter, unary -, or binary +, -, *", DeclarationSpan(node))?
+            rejectScalarInt("unsupported_int_expression", "expected an int literal, parameter, arithmetic, or direct int call", DeclarationSpan(node))?
         }
-        instruction = ScalarIntInstruction { operation: operation, result_node: cursor, operand: operand, right_node: right_node }
+        instruction = ScalarIntInstruction { operation: operation, result_node: cursor, operand: operand,
+                                            right_node: right_node, arguments: arguments }
         instructions = instructions.push(instruction)
         cursor = cursor + 1
     }
     return ok(instructions)
 }
 
-fn lowerScalarIntFunction(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
-                          function_id: int): ScalarIntFunction! {
+fn lowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
+                          &bindings: [TypeNameBinding], function_id: int): ScalarIntFunction! {
     function = nodes[function_id - 1].clone()
     cursor = function.first_edge
     end = cursor + function.edge_count
@@ -125,7 +216,7 @@ fn lowerScalarIntFunction(&nodes: [Node], &edges: [int], &bindings: [TypeNameBin
     if (statement.kind != "Return" || statement.edge_count != 1) {
         rejectScalarInt("unsupported_int_body", "expected a return with one int expression", DeclarationSpan(statement))?
     }
-    instructions = lowerIntExpression(nodes, edges, parameters, edges[statement.first_edge])?
+    instructions = lowerIntExpression(nodes, edges, declarations, parameters, edges[statement.first_edge])?
     return ok(ScalarIntFunction { function_node: function_id, parameter_count: parameters.len(), instructions: instructions })
 }
 
@@ -156,9 +247,24 @@ fn integerHelpers(add: bool, sub: bool, mul: bool): str {
     return text
 }
 
-fn emitScalarIntPlan(&plan: ScalarIntFunction): ScalarIntC {
-    symbol = "ku_int_" + str(plan.function_node)
-    signature = "int64_t " + symbol.clone() + "("
+fn scalarSymbol(function_node: int): str {
+    return "ku_int_" + str(function_node)
+}
+
+fn emitIntCall(&call: ScalarIntInstruction): str {
+    text = scalarSymbol(call.operand) + "("
+    index = 0
+    while (index < call.arguments.len()) {
+        if (index > 0) { text += ", " }
+        text += "t" + str(call.arguments[index])
+        index = index + 1
+    }
+    return text + ")"
+}
+
+fn emitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
+    signature = "int64_t " + scalarSymbol(plan.function_node) + "("
+    if (!external) { signature = "static " + signature }
     declarations = ""
     if (plan.parameter_count == 0) { signature += "void" }
     index = 0
@@ -182,6 +288,10 @@ fn emitScalarIntPlan(&plan: ScalarIntFunction): ScalarIntC {
             expression = "INT64_C(" + str(instruction.operand) + ")"
         } else if (instruction.operation == "parameter") {
             expression = "a" + str(instruction.operand)
+        } else if (instruction.operation == "call") {
+            // Each argument already has a value. C argument evaluation order
+            // cannot reorder the Ku argument computations.
+            expression = emitIntCall(instruction)
         } else {
             uses_add = uses_add || instruction.operation == "add"
             uses_sub = uses_sub || instruction.operation == "sub"
@@ -195,20 +305,95 @@ fn emitScalarIntPlan(&plan: ScalarIntFunction): ScalarIntC {
         index = index + 1
     }
     text += "    return t" + str(result_node) + ";\n}\n"
-    return ScalarIntC { symbol: symbol, source: integerHelpers(uses_add, uses_sub, uses_mul) + text }
+    return ScalarIntBodyC { source: text, uses_add: uses_add, uses_sub: uses_sub, uses_mul: uses_mul }
 }
 
-// Emits standalone C11 for one selected function with Copy int parameters and
-// a single checked int expression. The private symbol contains only an arena ID.
-fn EmitScalarIntC(&named: NamedModule, &bindings: [TypeNameBinding], &function_name: str): ScalarIntC! {
+fn containsIntNode(&nodes: [int], node: int): bool {
     index = 0
-    while (index < named.names.declarations.len()) {
-        declaration = named.names.declarations[index].clone()
-        if (declaration.kind == "Function" && declaration.name == function_name) {
-            plan = lowerScalarIntFunction(named.parsed.arena.nodes, named.parsed.arena.edges, bindings, declaration.node)?
-            return ok(emitScalarIntPlan(plan))
+    while (index < nodes.len()) {
+        if (nodes[index] == node) { return true }
+        index = index + 1
+    }
+    return false
+}
+
+fn planScalarIntModule(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
+                       &bindings: [TypeNameBinding], entry: int): [ScalarIntFunction]! {
+    reachable = [entry]
+    plans: [ScalarIntFunction] = []
+    index = 0
+    while (index < reachable.len()) {
+        plan = lowerScalarIntFunction(nodes, edges, declarations, bindings, reachable[index])?
+        step = 0
+        while (step < plan.instructions.len()) {
+            if (plan.instructions[step].operation == "call") {
+                callee = plan.instructions[step].operand
+                if (!containsIntNode(reachable, callee)) { reachable = reachable.push(callee) }
+            }
+            step = step + 1
+        }
+        plans = plans.push(plan)
+        index = index + 1
+    }
+    return ok(plans)
+}
+
+fn unresolvedIntCall(&plan: ScalarIntFunction, &completed: [int]): int {
+    index = 0
+    while (index < plan.instructions.len()) {
+        if (plan.instructions[index].operation == "call" && !containsIntNode(completed, plan.instructions[index].operand)) {
+            return plan.instructions[index].result_node
         }
         index = index + 1
+    }
+    return 0
+}
+
+fn emitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], entry: int): ScalarIntC! {
+    // Each round removes ready functions. If nothing is ready, following
+    // unresolved edges among the remaining finite set must encounter a cycle.
+    completed: [int] = []
+    uses_add = false
+    uses_sub = false
+    uses_mul = false
+    text = ""
+    while (completed.len() < plans.len()) {
+        blocked_at = 0
+        before = completed.len()
+        index = 0
+        while (index < plans.len()) {
+            function_node = plans[index].function_node
+            if (!containsIntNode(completed, function_node)) {
+                blocked = unresolvedIntCall(plans[index], completed)
+                if (blocked == 0) {
+                    body = emitScalarIntPlan(plans[index], function_node == entry)
+                    uses_add = uses_add || body.uses_add
+                    uses_sub = uses_sub || body.uses_sub
+                    uses_mul = uses_mul || body.uses_mul
+                    text += body.source
+                    completed = completed.push(function_node)
+                } else {
+                    blocked_at = blocked
+                }
+            }
+            index = index + 1
+        }
+        if (completed.len() == before) {
+            rejectScalarInt("recursive_int_call", "recursive call graph is outside the bootstrap int subset",
+                            DeclarationSpan(nodes[blocked_at - 1]))?
+        }
+    }
+    return ok(ScalarIntC { symbol: scalarSymbol(entry), source: integerHelpers(uses_add, uses_sub, uses_mul) + text })
+}
+
+// The selected function is the only external symbol. Every reachable local
+// callee must also be a checked int function; there is no dynamic dispatch.
+fn EmitScalarIntC(&named: NamedModule, &bindings: [TypeNameBinding], &function_name: str): ScalarIntC! {
+    entry = scalarFunctionNode(named.names.declarations, function_name)
+    if (entry > 0) {
+        plans = planScalarIntModule(named.parsed.arena.nodes, named.parsed.arena.edges,
+                                    named.names.declarations, bindings, entry)?
+        return emitScalarIntModule(plans, named.parsed.arena.nodes, entry)
     }
     start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
     rejectScalarInt("unknown_int_function", "undefined function '" + function_name.clone() + "'", start)?

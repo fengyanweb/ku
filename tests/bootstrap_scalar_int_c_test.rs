@@ -140,7 +140,14 @@ fn build_function(ku_seed: &Path, cwd: &Path, source: &str, name: &str) -> Bound
 
 type Case = (&'static [i64], Option<i64>);
 
-fn compare_function(ku: &Path, seed: &Path, cwd: &Path, source: &str, name: &str, cases: &[Case]) {
+fn compare_function(
+    ku: &Path,
+    seed: &Path,
+    cwd: &Path,
+    source: &str,
+    name: &str,
+    cases: &[Case],
+) -> String {
     let generated = build_function(seed, cwd, source, name);
     assert_success(&generated);
     let generated = String::from_utf8(generated.stdout).expect("UTF-8 C program");
@@ -226,6 +233,7 @@ fn compare_function(ku: &Path, seed: &Path, cwd: &Path, source: &str, name: &str
             }
         }
     }
+    generated
 }
 
 #[test]
@@ -335,6 +343,38 @@ fn ku_emits_checked_c11_for_real_math_functions() {
     );
     compare_function(&ku, &seed, &cwd, varied, "Limit", &[(&[], Some(i64::MAX))]);
 
+    // The declaration order is deliberately different from the call order.
+    // Two branches share Twice, and Shifted also calls a zero-argument helper.
+    let composed = format!(
+        "fn Composed(a: int, b: int): int {{ return Add(Shifted(a), hidden(b)) - Twice(b) }}\n\
+         fn Irrelevant(a: int): int {{ return a / 2 }}\n\
+         fn Shifted(a: int): int {{ return Twice(a) + Scale() }}\n\
+         fn Scale(): int {{ return 5 }}\n{math}"
+    );
+    let generated = compare_function(
+        &ku,
+        &seed,
+        &cwd,
+        &composed,
+        "Composed",
+        &[
+            (&[3, 4], Some(6)),
+            (&[-3, -4], Some(2)),
+            (&[i64::MAX, 0], None),
+            (&[0, i64::MIN], None),
+            (&[0, i64::MAX], None),
+        ],
+    );
+    assert_eq!(
+        generated
+            .lines()
+            .filter(|line| line.starts_with("static int64_t ku_int_"))
+            .count(),
+        5,
+        "only reachable local helpers, each emitted once"
+    );
+    assert!(!generated.contains("Irrelevant"));
+
     for (input, diagnostic) in [
         (
             "fn Example(a: float): int { return 1 }",
@@ -351,6 +391,39 @@ fn ku_emits_checked_c11_for_real_math_functions() {
         (
             "fn Example(a: int): int { return a / 2 }",
             "unsupported_int_expression",
+        ),
+        (
+            "fn Example(a: int): int { return Missing(a) }",
+            "unknown_int_callee",
+        ),
+        (
+            "fn Example(a: int): int { return Example(a) }",
+            "recursive_int_call",
+        ),
+        (
+            "fn Other(a: int): int { return Example(a) }\n\
+             fn Example(a: int): int { return Other(a) }",
+            "recursive_int_call",
+        ),
+        (
+            "fn Example(Helper: int): int { return Helper(1) }\n\
+             fn Helper(a: int): int { return a }",
+            "unsupported_int_callee",
+        ),
+        (
+            "fn Helper(a: int): int { return a }\n\
+             fn Example(): int { return Helper() }",
+            "int_call_arity",
+        ),
+        (
+            "fn Helper(a: float): int { return 1 }\n\
+             fn Example(a: int): int { return Helper(a) }",
+            "unsupported_int_type",
+        ),
+        (
+            "fn Helper(a: int): int { return a }\n\
+             fn Example(): int { return Helper }",
+            "undefined_int_operand",
         ),
     ] {
         let rejected = build_function(&seed, &cwd, input, "Example");
