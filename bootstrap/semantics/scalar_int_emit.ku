@@ -110,7 +110,7 @@ fn ScalarStringHelpers(carrier: bool, comparison: bool, contains: bool, owned: b
         text += "static void ku_scalar_string_drop(KuScalarString value) {\n"
         text += "    if (value.storage == 1 && value.ptr) free(value.ptr);\n}\n\n"
     }
-    if (join) { text += scalarStringJoinHelpers(format) }
+    if (join) { text += ScalarStringJoinHelpers(format) }
     return text
 }
 
@@ -132,7 +132,7 @@ fn emitIntCall(&call: ScalarIntInstruction): str {
     return text + ")"
 }
 
-fn scalarStringJoinHelpers(format: bool): str {
+fn ScalarStringJoinHelpers(format: bool): str {
     text = "typedef struct { const uint8_t* ptr; size_t len; } KuScalarStringPart;\n\n"
     if (format) {
         text += "static KuScalarStringPart ku_scalar_string_int(int64_t value, uint8_t digits[20]) {\n"
@@ -163,7 +163,7 @@ struct ScalarStringAssignment {
     uses_format: bool
 }
 
-fn scalarStringAssignment(&parts: [ScalarStringPart], &indent: str): ScalarStringAssignment {
+fn EmitScalarStringAssignment(&parts: [ScalarStringPart], &indent: str): ScalarStringAssignment {
     count = str(parts.len())
     text = indent.clone() + "KuScalarStringPart parts[" + count.clone() + "];\n"
     uses_format = false
@@ -260,7 +260,7 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         result = clause.scalar_result
         if (plan.result_type == 1) { result = "t" + str(result_node) }
         if (clause.string_parts.len() != 0) {
-            assignment = scalarStringAssignment(clause.string_parts, indent)
+            assignment = EmitScalarStringAssignment(clause.string_parts, indent)
             text += assignment.source
             uses_format = uses_format || assignment.uses_format
             if (guarded) { text += indent + "goto cleanup;\n" }

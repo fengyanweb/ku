@@ -1,7 +1,9 @@
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
-import { ScalarStringLiteral } from "./scalar_int_operands.ku"
+import { ScalarStringLiteral, HasScalarBuiltin } from "./scalar_int_operands.ku"
+import { EmitScalarStringAssignment, ScalarStringJoinHelpers } from "./scalar_int_emit.ku"
+import { LowerProjectedStringParts } from "./guarded_string_parts.ku"
 import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
 import { LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { OrderCStructLayouts } from "./nested_struct_c.ku"
@@ -25,6 +27,8 @@ struct GuardBlock {
     source: str
     uses_add: bool
     uses_sub: bool
+    uses_join: bool
+    uses_format: bool
     returns: bool
 }
 
@@ -94,28 +98,39 @@ fn readGuardSignature(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
     }
     result = GuardExplicitType(types, nodes, layouts, edges[cursor])?
     if (result.kind != "str") {
-        RejectLayout("unsupported_guarded_signature", "guarded C currently returns static str literals", DeclarationSpan(nodes[edges[cursor] - 1]))?
+        RejectLayout("unsupported_guarded_signature", "guarded C requires a str result", DeclarationSpan(nodes[edges[cursor] - 1]))?
     }
     if (bindings.len() == 0) { declaration += "void" }
     return ok(GuardSignature { bindings: bindings, declaration: declaration + ") {\n", definitions: definitions,
         drops: drops, body_start: cursor + 1 })
 }
 
-fn guardStringReturn(&nodes: [Node], &edges: [int], &statement: Node, &indent: str): str! {
-    if (statement.edge_count != 1 || nodes[edges[statement.first_edge] - 1].kind != "String") {
-        RejectLayout("unsupported_guarded_return", "expected a static str literal return", DeclarationSpan(statement))?
+fn guardStringReturn(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
+                     &statement: Node, &indent: str, can_convert: bool): GuardBlock! {
+    if (statement.edge_count != 1) {
+        RejectLayout("unsupported_guarded_return", "expected a string result", DeclarationSpan(statement))?
     }
-    literal = ScalarStringLiteral(nodes[edges[statement.first_edge] - 1])?
-    return ok(indent.clone() + "result = (KuProjectionString){ (uint8_t*)" + literal + ", 0u, KU_PROJECTION_STRING_STATIC };\n" +
-        indent.clone() + "goto cleanup;\n")
+    id = edges[statement.first_edge]
+    if (nodes[id - 1].kind == "String") {
+        literal = ScalarStringLiteral(nodes[id - 1])?
+        return ok(GuardBlock { source: indent.clone() + "result = (KuProjectionString){ (uint8_t*)" + literal + ", 0u, KU_PROJECTION_STRING_STATIC };\n" +
+            indent.clone() + "goto cleanup;\n", uses_add: false, uses_sub: false,
+            uses_join: false, uses_format: false, returns: true })
+    }
+    parts = LowerProjectedStringParts(nodes, edges, bindings, layouts, id, can_convert)?
+    assignment = EmitScalarStringAssignment(parts, indent)
+    return ok(GuardBlock { source: assignment.source + indent.clone() + "goto cleanup;\n", uses_add: false, uses_sub: false,
+        uses_join: true, uses_format: assignment.uses_format, returns: true })
 }
 
 fn emitGuardBlock(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &layouts: [StructLayout],
-                  bindings: [GuardBinding], start: int, end: int, depth: int, &indent: str): GuardBlock! {
+                  bindings: [GuardBinding], start: int, end: int, depth: int, &indent: str, can_convert: bool): GuardBlock! {
     locals = bindings
     source = ""
     uses_add = false
     uses_sub = false
+    uses_join = false
+    uses_format = false
     returns = false
     cursor = start
     while (cursor < end) {
@@ -125,7 +140,10 @@ fn emitGuardBlock(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &lay
             RejectLayout("unreachable_guarded_statement", "a prior statement always returns", DeclarationSpan(statement))?
         }
         if (statement.kind == "Return") {
-            source += guardStringReturn(nodes, edges, statement, indent)?
+            result = guardStringReturn(nodes, edges, locals, layouts, statement, indent, can_convert)?
+            source += result.source
+            uses_join = uses_join || result.uses_join
+            uses_format = uses_format || result.uses_format
             returns = true
         } else if ((statement.kind == "Assign" && statement.edge_count == 1) ||
                    (statement.kind == "VarDecl" && statement.edge_count == 2)) {
@@ -169,24 +187,29 @@ fn emitGuardBlock(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &lay
             start_else = start_then + statement.int_value
             stop = statement.first_edge + statement.edge_count
             inside = indent.clone() + "    "
-            yes = emitGuardBlock(nodes, edges, types, layouts, locals.clone(), start_then, start_else, depth + 1, inside)?
+            yes = emitGuardBlock(nodes, edges, types, layouts, locals.clone(), start_then, start_else, depth + 1, inside, can_convert)?
             uses_add = uses_add || condition.uses_add || yes.uses_add
             uses_sub = uses_sub || condition.uses_sub || yes.uses_sub
+            uses_join = uses_join || yes.uses_join
+            uses_format = uses_format || yes.uses_format
             source += condition.setup + indent.clone() + "if ((bool)" + condition.value + ") {\n" + yes.source + indent.clone() + "}"
             if (start_else < stop) {
-                no = emitGuardBlock(nodes, edges, types, layouts, locals.clone(), start_else, stop, depth + 1, inside)?
+                no = emitGuardBlock(nodes, edges, types, layouts, locals.clone(), start_else, stop, depth + 1, inside, can_convert)?
                 uses_add = uses_add || no.uses_add
                 uses_sub = uses_sub || no.uses_sub
+                uses_join = uses_join || no.uses_join
+                uses_format = uses_format || no.uses_format
                 returns = yes.returns && no.returns
                 source += " else {\n" + no.source + indent.clone() + "}"
             }
             source += "\n"
         } else {
-            RejectLayout("unsupported_guarded_statement", "expected a scalar binding, if, or static str return", DeclarationSpan(statement))?
+            RejectLayout("unsupported_guarded_statement", "expected a scalar binding, if, or str return", DeclarationSpan(statement))?
         }
         cursor = cursor + 1
     }
-    return ok(GuardBlock { source: source, uses_add: uses_add, uses_sub: uses_sub, returns: returns })
+    return ok(GuardBlock { source: source, uses_add: uses_add, uses_sub: uses_sub,
+        uses_join: uses_join, uses_format: uses_format, returns: returns })
 }
 
 fn guardArithmetic(add: bool, sub: bool): str {
@@ -206,7 +229,7 @@ fn guardArithmetic(add: bool, sub: bool): str {
 }
 
 fn emitGuardedStructFunction(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
-                             &layouts: [StructLayout], function_id: int): GuardedStructC! {
+                             &layouts: [StructLayout], function_id: int, can_convert: bool): GuardedStructC! {
     function = nodes[function_id - 1].clone()
     symbol = "ku_guarded_" + str(function_id)
     signature = readGuardSignature(nodes, edges, types, layouts, function, symbol)?
@@ -215,28 +238,34 @@ fn emitGuardedStructFunction(&nodes: [Node], &edges: [int], &types: [TypeNameBin
         arguments += "    (void)" + GuardBindingName(binding) + ";\n"
     }
     body = emitGuardBlock(nodes, edges, types, layouts, signature.bindings, signature.body_start,
-        function.first_edge + function.edge_count, 0, "    ")?
+        function.first_edge + function.edge_count, 0, "    ", can_convert)?
     if (!body.returns) {
-        RejectLayout("guarded_fallthrough", "every guarded C path must return a static string", DeclarationSpan(function))?
+        RejectLayout("guarded_fallthrough", "every guarded C path must return a string", DeclarationSpan(function))?
     }
     arithmetic = body.uses_add || body.uses_sub
     text = ProjectionHeaders(true, signature.drops != "") + guardArithmetic(body.uses_add, body.uses_sub)
+    if (body.uses_join) {
+        text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\ntypedef KuProjectionString KuBootstrapString;\n"
+        text += ScalarStringJoinHelpers(body.uses_format)
+    }
     text += signature.definitions + signature.declaration + "    KuProjectionString result = {0};\n" + arguments
     if (arithmetic) { text += "    bool overflow = false;\n" }
+    if (body.uses_join) { text += "    const char *failure = NULL;\n" }
     text += body.source + "cleanup:\n" + signature.drops
+    if (body.uses_join) { text += "    if (failure) { fputs(failure, stderr); exit(EXIT_FAILURE); }\n" }
     if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     text += "    return result;\n}\n"
     return ok(GuardedStructC { symbol: symbol, source: text })
 }
 
 // Lower a function whose only managed inputs are finite struct ownership
-// trees and whose result borrows static bytes. No interpreter fallback.
+// trees and whose result is a static or newly owned string.
 fn EmitGuardedStructC(&named: NamedModule, &types: [TypeNameBinding], &layouts: [StructLayout], &function_name: str): GuardedStructC! {
     index = 0
     while (index < named.names.declarations.len()) {
         item = named.names.declarations[index].clone()
         if (item.kind == "Function" && item.name == function_name) {
-            return emitGuardedStructFunction(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, item.node)
+            return emitGuardedStructFunction(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, item.node, HasScalarBuiltin(named, "str"))
         }
         index = index + 1
     }

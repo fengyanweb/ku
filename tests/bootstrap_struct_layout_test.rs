@@ -1328,6 +1328,72 @@ fn Make(): Outer {
     assert!(!rejected.status.success() && rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("noncopy_constructor_local"));
     assert_guarded_context(&ku, &driver_binary, &cwd, contexts);
+    assert_projected_span(&ku, &driver_binary, &cwd, span_source);
+}
+
+fn assert_projected_span(ku: &Path, seed: &Path, cwd: &Path, source: &str) {
+    fs::create_dir_all(cwd.join("stage1")).unwrap();
+    fs::create_dir_all(cwd.join("stage2")).unwrap();
+    fs::write(
+        cwd.join("stage1/token.ku"),
+        include_str!("../bootstrap/stage1/token.ku"),
+    )
+    .unwrap();
+    let span = cwd.join("stage2/span.ku");
+    fs::write(
+        &span,
+        format!(
+            "{source}{}",
+            r#"
+fn main() {
+    span = Span { line: 7, column: 4, offset: -9223372036854775807 - 1,
+                  end_line: 8, end_column: 1, end_offset: 9223372036854775807 }
+    println(SpanCanonical(span))
+}
+"#
+        ),
+    )
+    .unwrap();
+    let oracle = execute(Command::new(ku).arg("run").arg(&span), cwd, 30);
+    assert_ok(&oracle);
+    assert_eq!(
+        String::from_utf8_lossy(&oracle.stdout).trim(),
+        "7:4@-9223372036854775808..8:1@9223372036854775807"
+    );
+    fs::write(&span, source).unwrap();
+    fs::write(cwd.join("mode.txt"), "guarded").unwrap();
+    fs::write(cwd.join("function.txt"), "SpanCanonical").unwrap();
+    fs::write(cwd.join("modules.txt"), "stage2/span.ku\nstage1/token.ku\n").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let declaration = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuProjectionString ku_guarded_"))
+        .expect("standalone C signature");
+    let (id, args) = declaration.split_once('(').unwrap();
+    let (span_type, _) = args.split_once(' ').unwrap();
+    assert_eq!(code.matches("data = malloc(").count(), 1);
+    let driver = r#"
+int main(void) {
+    SPAN input = { .f0 = 7, .f1 = 4, .f2 = INT64_MIN,
+                   .f3 = 8, .f4 = 1, .f5 = INT64_MAX };
+    KuProjectionString output = FUNCTION(input);
+    if (output.storage != KU_PROJECTION_STRING_OWNED) return 2;
+    printf("%.*s\n", (int)output.len, (const char*)output.ptr);
+    free(output.ptr);
+    return 0;
+}
+"#
+    .replace("SPAN", span_type)
+    .replace("FUNCTION", &format!("ku_guarded_{id}"));
+    let c = cwd.join("projected-span.c");
+    fs::write(&c, format!("{code}{driver}")).unwrap();
+    let exe = cwd.join(format!("projected-span{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&c, &exe, cwd);
+    let observed = execute(&mut Command::new(exe), cwd, 15);
+    assert_ok(&observed);
+    assert_eq!(observed.stdout, oracle.stdout);
 }
 
 fn assert_guarded_context(ku: &Path, seed: &Path, cwd: &Path, context: &str) {

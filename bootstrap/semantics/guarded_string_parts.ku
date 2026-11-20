@@ -1,0 +1,52 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan } from "./names.ku"
+import { GuardBinding, GuardBindingIndex, GuardExpression } from "./guarded_struct_expr.ku"
+import { ScalarStringPart } from "./scalar_int_emit.ku"
+import { ScalarStringLiteral } from "./scalar_int_operands.ku"
+import { RejectLayout, StructLayout } from "./struct_layouts.ku"
+
+fn collectProjectedParts(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
+                         id: int, depth: int, can_convert: bool, collected: [ScalarStringPart]): [ScalarStringPart]! {
+    node = nodes[id - 1].clone()
+    parts = collected
+    if (depth >= 32 || parts.len() >= 64) {
+        RejectLayout("guarded_string_limit", "guarded string composition supports up to 32 expression levels and 64 parts", DeclarationSpan(node))?
+    }
+    if (node.kind == "Binary" && node.text == "+" && node.edge_count == 2) {
+        parts = collectProjectedParts(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, can_convert, parts)?
+        return collectProjectedParts(nodes, edges, bindings, layouts, edges[node.first_edge + 1], depth + 1, can_convert, parts)
+    }
+    part = ""
+    integer = false
+    if (node.kind == "String" && node.edge_count == 0) {
+        part = "(const uint8_t*)" + ScalarStringLiteral(node)?
+    } else if (node.kind == "Field" && node.edge_count == 1) {
+        field = GuardExpression(nodes, edges, bindings, layouts, id, 0, "")?
+        if (field.ty.kind == "str" && field.setup == "") {
+            part = field.value.clone() + ".ptr, " + field.value + ".len"
+        }
+    } else if (node.kind == "Call" && node.edge_count == 2 && can_convert && GuardBindingIndex(bindings, "str") == 0) {
+        target = nodes[edges[node.first_edge] - 1].clone()
+        if (target.kind == "Variable" && target.text == "str" && target.edge_count == 0) {
+            value = GuardExpression(nodes, edges, bindings, layouts, edges[node.first_edge + 1], 0, "")?
+            if (value.ty.kind == "int" && value.setup == "") {
+                part = value.value
+                integer = true
+            }
+        }
+    }
+    if (part == "") {
+        RejectLayout("unsupported_guarded_string_part", "expected a literal, string field, or direct str conversion of a Copy int", DeclarationSpan(node))?
+    }
+    parts = parts.push(ScalarStringPart { source: part, integer: integer })
+    return ok(parts)
+}
+
+fn LowerProjectedStringParts(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
+                             id: int, can_convert: bool): [ScalarStringPart]! {
+    node = nodes[id - 1].clone()
+    if (node.kind != "Binary" || node.text != "+" || node.edge_count != 2) {
+        RejectLayout("unsupported_guarded_return", "expected a str literal or concatenation of checked fields", DeclarationSpan(node))?
+    }
+    return collectProjectedParts(nodes, edges, bindings, layouts, id, 0, can_convert, [])
+}
