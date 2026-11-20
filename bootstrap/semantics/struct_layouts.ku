@@ -1,0 +1,289 @@
+import { Node } from "../stage2/ast.ku"
+import { DiagnosticCanonical, MakeDiagnostic } from "../stage2/diagnostic.ku"
+import { Span } from "../stage2/span.ku"
+import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
+import { TypeNameBinding } from "./type_names.ku"
+
+struct StructFieldLayout {
+    name: str
+    ordinal: int
+    node: int
+    resolved: TypeNameBinding
+}
+
+struct StructLayout {
+    name: str
+    node: int
+    fields: [StructFieldLayout]
+}
+
+struct StructParameter {
+    name: str
+    mode: int
+    layout_node: int
+}
+
+// The output ordinal is independent of the position in projections. That
+// array records source evaluation order; the field ordinals describe layout.
+struct StructProjection {
+    output_field: int
+    parameter: int
+    input_field: int
+    value_node: int
+}
+
+struct StructReturnPlan {
+    function_name: str
+    function_node: int
+    result_layout: int
+    parameters: [StructParameter]
+    projections: [StructProjection]
+}
+
+fn RejectLayout(code: str, message: str, span: Span): null! {
+    domain = "bootstrap.semantics.structs"
+    diagnostic = MakeDiagnostic("error", domain.clone(), code.clone(), message, "<source>", span)
+    fail { domain: domain, code: code, message: DiagnosticCanonical(diagnostic) }
+}
+
+fn ExplicitType(&bindings: [TypeNameBinding], use_node: int, at: Span): TypeNameBinding! {
+    lo = 0
+    hi = bindings.len()
+    // BindTypeNames produces ascending AST IDs.
+    while (lo < hi) {
+        middle = lo + (hi - lo) / 2
+        if (bindings[middle].use_node < use_node) { lo = middle + 1 }
+        else { hi = middle }
+    }
+    if (lo >= bindings.len() || bindings[lo].use_node != use_node) {
+        RejectLayout("unsupported_layout_type", "expected a bound explicit TypeName", at)?
+    }
+    return ok(bindings[lo].clone())
+}
+
+fn FieldIndex(&fields: [StructFieldLayout], &name: str): int {
+    index = 0
+    while (index < fields.len()) {
+        if (fields[index].name == name) { return index + 1 }
+        index = index + 1
+    }
+    return 0
+}
+
+fn LayoutIndex(&layouts: [StructLayout], node: int): int {
+    index = 0
+    while (index < layouts.len()) {
+        if (layouts[index].node == node) { return index + 1 }
+        index = index + 1
+    }
+    return 0
+}
+
+fn CollectFields(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
+                 &decl: Node): [StructFieldLayout]! {
+    fields: [StructFieldLayout] = []
+    index = 0
+    while (index < decl.edge_count) {
+        id = edges[decl.first_edge + index]
+        field = nodes[id - 1].clone()
+        if (field.kind != "StructField" || field.edge_count != 1) {
+            RejectLayout("unsupported_layout_type", "struct fields must have an explicit type", DeclarationSpan(field))?
+        }
+        if (FieldIndex(fields, field.text) != 0) {
+            RejectLayout("duplicate_layout_field", "duplicate struct field '" + field.text.clone() + "'", DeclarationSpan(field))?
+        }
+        resolved = ExplicitType(bindings, edges[field.first_edge], DeclarationSpan(field))?
+        entry = StructFieldLayout { name: field.text, ordinal: index, node: id, resolved: resolved }
+        fields = fields.push(entry)
+        index = index + 1
+    }
+    return ok(fields)
+}
+
+fn CollectLayouts(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
+                  &names: [TopLevelName]): [StructLayout]! {
+    layouts: [StructLayout] = []
+    index = 0
+    while (index < names.len()) {
+        name = names[index].clone()
+        if (name.kind == "Struct") {
+            decl = nodes[name.node - 1].clone()
+            fields = CollectFields(nodes, edges, bindings, decl)?
+            layout = StructLayout { name: name.name, node: name.node, fields: fields }
+            layouts = layouts.push(layout)
+        }
+        index = index + 1
+    }
+    return ok(layouts)
+}
+
+// Accept the validated named graph and the bindings produced for that graph.
+fn BuildStructLayouts(&named: NamedModule, &bindings: [TypeNameBinding]): [StructLayout]! {
+    return CollectLayouts(named.parsed.arena.nodes, named.parsed.arena.edges,
+                          bindings, named.names.declarations)
+}
+
+fn TrivialFields(&fields: [StructFieldLayout]): bool {
+    index = 0
+    while (index < fields.len()) {
+        leaf = fields[index].resolved.clone()
+        if (leaf.declaration_kind != "Builtin" || !(leaf.name == "int" || leaf.name == "float" || leaf.name == "bool" || leaf.name == "null")) {
+            return false
+        }
+        index = index + 1
+    }
+    return true
+}
+
+fn TrivialLayout(&layouts: [StructLayout], &binding: TypeNameBinding, at: Span): int! {
+    index = LayoutIndex(layouts, binding.declaration_node)
+    if (binding.declaration_kind != "Struct" || binding.module_index != 0 || index == 0
+        || !TrivialFields(layouts[index - 1].fields)) {
+        RejectLayout("unsupported_aggregate_layout", "projection returns require local structs containing Copy scalar fields", at)?
+    }
+    return ok(index)
+}
+
+fn ParameterIndex(&parameters: [StructParameter], &name: str): int {
+    index = 0
+    while (index < parameters.len()) {
+        if (parameters[index].name == name) { return index + 1 }
+        index = index + 1
+    }
+    return 0
+}
+
+fn CheckProjectionType(&expected: TypeNameBinding, &actual: TypeNameBinding, at: Span): null! {
+    if (expected.name != actual.name) {
+        RejectLayout("projection_type_mismatch", "type error: expected " + expected.name.clone() + " but got " + actual.name.clone(), at)?
+    }
+    return ok(null)
+}
+
+fn ProjectionOperand(&nodes: [Node], &edges: [int], &layouts: [StructLayout],
+                     &parameters: [StructParameter], &expected: StructFieldLayout, value_id: int): StructProjection! {
+    value = nodes[value_id - 1].clone()
+    at = DeclarationSpan(value)
+    if (value.kind != "Field" || value.edge_count != 1) {
+        RejectLayout("unsupported_projection", "expected a field read from a parameter", at.clone())?
+    }
+    receiver = nodes[edges[value.first_edge] - 1].clone()
+    parameter = ParameterIndex(parameters, receiver.text)
+    if (receiver.kind != "Variable" || parameter == 0) {
+        RejectLayout("unsupported_projection", "expected a struct parameter as the field receiver", DeclarationSpan(receiver))?
+    }
+    layout = LayoutIndex(layouts, parameters[parameter - 1].layout_node)
+    input_field = FieldIndex(layouts[layout - 1].fields, value.text)
+    if (input_field == 0) {
+        RejectLayout("unknown_projection_field", "struct '" + layouts[layout - 1].name.clone() + "' has no field '" + value.text.clone() + "'", at.clone())?
+    }
+    field = layouts[layout - 1].fields[input_field - 1].clone()
+    CheckProjectionType(expected.resolved, field.resolved, at)?
+    return ok(StructProjection { output_field: expected.ordinal, parameter: parameter - 1, input_field: field.ordinal, value_node: value_id })
+}
+
+fn ProjectFields(&nodes: [Node], &edges: [int], &layouts: [StructLayout],
+                 &parameters: [StructParameter], &expected: StructLayout, &literal: Node): [StructProjection]! {
+    projected: [StructProjection] = []
+    seen: [int] = []
+    index = 0
+    while (index < literal.edge_count) {
+        item = nodes[edges[literal.first_edge + index] - 1].clone()
+        if (item.kind != "StructLiteralField" || item.edge_count != 1) {
+            RejectLayout("unsupported_projection", "expected a struct literal field", DeclarationSpan(item))?
+        }
+        value_id = edges[item.first_edge]
+        at = DeclarationSpan(nodes[value_id - 1])
+        field = FieldIndex(expected.fields, item.text)
+        if (field == 0) {
+            RejectLayout("unknown_literal_field", "struct '" + expected.name.clone() + "' has no field '" + item.text.clone() + "'", at.clone())?
+        }
+        previous = 0
+        while (previous < seen.len()) {
+            if (seen[previous] == field) {
+                RejectLayout("duplicate_literal_field", "duplicate field '" + item.text.clone() + "' in struct literal", at.clone())?
+            }
+            previous = previous + 1
+        }
+        projection = ProjectionOperand(nodes, edges, layouts, parameters, expected.fields[field - 1], value_id)?
+        projected = projected.push(projection)
+        seen = seen.push(field)
+        index = index + 1
+    }
+    index = 0
+    while (index < expected.fields.len()) {
+        previous = 0
+        present = false
+        while (previous < seen.len()) {
+            if (seen[previous] == index + 1) { present = true }
+            previous = previous + 1
+        }
+        if (!present) {
+            name = expected.fields[index].name.clone()
+            RejectLayout("missing_literal_field", "missing field '" + name + "' in struct literal '" + expected.name.clone() + "'", DeclarationSpan(literal))?
+        }
+        index = index + 1
+    }
+    return ok(projected)
+}
+
+fn ProjectionPlan(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
+                  &layouts: [StructLayout], function_id: int): StructReturnPlan! {
+    function = nodes[function_id - 1].clone()
+    at = DeclarationSpan(function)
+    parameters: [StructParameter] = []
+    cursor = function.first_edge
+    end = cursor + function.edge_count
+    while (cursor < end && nodes[edges[cursor] - 1].kind == "Parameter") {
+        parameter = nodes[edges[cursor] - 1].clone()
+        position = DeclarationSpan(parameter)
+        if (parameter.edge_count != 1) {
+            RejectLayout("unsupported_projection_signature", "struct projection parameters need explicit types", position.clone())?
+        }
+        if (ParameterIndex(parameters, parameter.text) != 0) {
+            RejectLayout("duplicate_projection_parameter", "duplicate function parameter '" + parameter.text.clone() + "'", position.clone())?
+        }
+        resolved = ExplicitType(bindings, edges[parameter.first_edge], position.clone())?
+        layout = TrivialLayout(layouts, resolved, position)?
+        entry = StructParameter { name: parameter.text, mode: parameter.int_value, layout_node: layouts[layout - 1].node }
+        parameters = parameters.push(entry)
+        cursor = cursor + 1
+    }
+    if (end - cursor != 2) {
+        RejectLayout("unsupported_projection_body", "expected an explicit result type and a single return statement", at.clone())?
+    }
+    result = ExplicitType(bindings, edges[cursor], at.clone())?
+    layout = TrivialLayout(layouts, result, at.clone())?
+    statement = nodes[edges[cursor + 1] - 1].clone()
+    if (statement.kind != "Return" || statement.edge_count != 1) {
+        RejectLayout("unsupported_projection_body", "expected a return of a struct literal", DeclarationSpan(statement))?
+    }
+    literal = nodes[edges[statement.first_edge] - 1].clone()
+    expected = layouts[layout - 1].clone()
+    if (literal.kind != "StructLiteral" || literal.text != expected.name) {
+        RejectLayout("unsupported_projection_body", "returned literal must match the declared local struct", DeclarationSpan(literal))?
+    }
+    projections = ProjectFields(nodes, edges, layouts, parameters, expected, literal)?
+    return ok(StructReturnPlan { function_name: function.text, function_node: function_id,
+                                result_layout: expected.node, parameters: parameters, projections: projections })
+}
+
+// The caller selects a function. No parser, interpreter or runtime fallback
+// is used when its shape is outside this projection-return subset.
+fn BindStructReturn(&named: NamedModule, &bindings: [TypeNameBinding], &layouts: [StructLayout],
+                    &function_name: str): StructReturnPlan! {
+    count = named.names.declarations.len()
+    index = 0
+    while (index < count) {
+        declaration = named.names.declarations[index].clone()
+        if (declaration.kind == "Function" && declaration.name == function_name) {
+            function_id = declaration.node
+            return ProjectionPlan(named.parsed.arena.nodes, named.parsed.arena.edges,
+                                  bindings, layouts, function_id)
+        }
+        index = index + 1
+    }
+    start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    RejectLayout("unknown_projection_function", "undefined function '" + function_name.clone() + "'", start)?
+    return ok(StructReturnPlan { function_name: "", function_node: 0, result_layout: 0, parameters: [], projections: [] })
+}
