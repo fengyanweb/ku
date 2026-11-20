@@ -1,0 +1,164 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan } from "./names.ku"
+import { TypeNameBinding } from "./type_names.ku"
+import { ScalarIntParameter } from "./scalar_int_emit.ku"
+import { RejectScalarInt, ScalarParameterIndex, ScalarStringLiteral } from "./scalar_int_operands.ku"
+import { ScalarType } from "./scalar_types.ku"
+
+fn isReplace(&nodes: [Node], &edges: [int], &value: Node): bool {
+    if (value.kind != "Call" || value.edge_count == 0) { return false }
+    callee = nodes[edges[value.first_edge] - 1].clone()
+    return callee.kind == "Field" && callee.text == "replace" && callee.edge_count == 1
+}
+
+fn HasScalarOwnedStringBody(&nodes: [Node], &edges: [int], start: int, end: int): bool {
+    first = nodes[edges[start] - 1].clone()
+    if (first.kind == "Assign" || first.kind == "VarDecl") { return true }
+    return start + 1 == end && first.kind == "Return" && first.edge_count == 1
+        && isReplace(nodes, edges, nodes[edges[first.first_edge] - 1])
+}
+
+fn localIndex(&locals: [str], &name: str): int {
+    index = 0
+    while (index < locals.len()) {
+        if (locals[index] == name) { return index }
+        index = index + 1
+    }
+    return -1
+}
+
+fn stringOperand(&parameters: [ScalarIntParameter], &locals: [str], &node: Node): str! {
+    if (node.kind == "String" && node.edge_count == 0) {
+        return ok("(KuScalarString){(uint8_t*)" + ScalarStringLiteral(node)? + ", 0u, 0u}")
+    }
+    if (node.kind == "Variable" && node.edge_count == 0) {
+        local = localIndex(locals, node.text)
+        if (local >= 0) { return ok("s" + str(local)) }
+        parameter = ScalarParameterIndex(parameters, node.text)
+        if (parameter >= 0 && parameters[parameter].string_mode == 1) {
+            return ok("a" + str(parameter))
+        }
+    }
+    RejectScalarInt("unsupported_replace_operand", "expected an initialized str local, owned str parameter or str literal", DeclarationSpan(node))?
+    return ok("")
+}
+
+fn emitReplace(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], &locals: [str],
+               &call: Node, &target: str): str! {
+    if (!isReplace(nodes, edges, call) || call.edge_count != 3) {
+        RejectScalarInt("unsupported_replace_call", "expected str.replace with two str arguments", DeclarationSpan(call))?
+    }
+    callee = nodes[edges[call.first_edge] - 1].clone()
+    receiver = stringOperand(parameters, locals, nodes[edges[callee.first_edge] - 1])?
+    needle = stringOperand(parameters, locals, nodes[edges[call.first_edge + 1] - 1])?
+    replacement = stringOperand(parameters, locals, nodes[edges[call.first_edge + 2] - 1])?
+    // All operands are read-only references or literals. Nothing is freed
+    // before the new owner is complete, even when all inputs name the target.
+    return ok("    {\n        KuScalarString next;\n        failure = ku_scalar_string_replace("
+        + receiver + ", " + needle + ", " + replacement + ", &next);\n        if (failure) goto cleanup;\n"
+        + "        ku_scalar_string_drop(" + target.clone() + ");\n        " + target.clone() + " = next;\n    }\n")
+}
+
+fn ownedResult(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], &locals: [str], &value: Node): str! {
+    if (isReplace(nodes, edges, value)) { return emitReplace(nodes, edges, parameters, locals, value, "result") }
+    if (value.kind == "Variable" && value.edge_count == 0) {
+        owner = ""
+        local = localIndex(locals, value.text)
+        if (local >= 0) { owner = "s" + str(local) }
+        else {
+            parameter = ScalarParameterIndex(parameters, value.text)
+            if (parameter >= 0 && parameters[parameter].string_mode == 1) { owner = "a" + str(parameter) }
+        }
+        if (owner != "") {
+            return ok("    result = " + owner.clone() + ";\n    " + owner + " = (KuScalarString){0};\n")
+        }
+    }
+    RejectScalarInt("unsupported_replace_return", "expected an owned str or a str.replace result", DeclarationSpan(value))?
+    return ok("")
+}
+
+fn LowerScalarOwnedStringBody(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
+                             &parameters: [ScalarIntParameter], start: int, end: int): str! {
+    locals: [str] = []
+    declarations = "    KuBootstrapString result = {0};\n    const char* failure = NULL;\n"
+    code = ""
+    drops = ""
+    cursor = start
+    while (cursor < end - 1) {
+        statement = nodes[edges[cursor] - 1].clone()
+        explicit = statement.kind == "VarDecl" && statement.edge_count == 2
+        if (!explicit && (statement.kind != "Assign" || statement.edge_count != 1)) {
+            RejectScalarInt("unsupported_replace_statement", "expected a straight-line owned str assignment", DeclarationSpan(statement))?
+        }
+        local = localIndex(locals, statement.text)
+        if (ScalarParameterIndex(parameters, statement.text) >= 0 || (explicit && local >= 0)) {
+            RejectScalarInt("unsupported_replace_binding", "expected a distinct str local", DeclarationSpan(statement))?
+        }
+        if (explicit) {
+            type_id = edges[statement.first_edge]
+            if (ScalarType(types, type_id, nodes[type_id - 1]) != 2) {
+                RejectScalarInt("unsupported_replace_binding", "explicit replacement locals require builtin str", DeclarationSpan(statement))?
+            }
+        }
+        fresh = local < 0
+        if (fresh) { local = locals.len() }
+        target = "s" + str(local)
+        value = nodes[edges[statement.first_edge + statement.edge_count - 1] - 1].clone()
+        code += emitReplace(nodes, edges, parameters, locals, value, target)?
+        if (fresh) {
+            // The new name is not visible while lowering its initializer.
+            locals = locals.push(statement.text)
+            declarations += "    KuScalarString " + target.clone() + " = {0};\n"
+            drops = "    ku_scalar_string_drop(" + target + ");\n" + drops
+        }
+        cursor = cursor + 1
+    }
+    final = nodes[edges[cursor] - 1].clone()
+    if (final.kind != "Return" || final.edge_count != 1) {
+        RejectScalarInt("unsupported_replace_return", "expected a final owned str return", DeclarationSpan(final))?
+    }
+    code += ownedResult(nodes, edges, parameters, locals, nodes[edges[final.first_edge] - 1])?
+    return ok(declarations + code + "cleanup:\n" + drops)
+}
+
+// Match Stage0's byte lengths and ownership. The helper publishes its output
+// only on success so an allocation failure can unwind generated locals.
+fn ScalarStringReplaceHelpers(): str {
+    text = "#include <stdio.h>\n#include <string.h>\n\n"
+    text += "static size_t ku_scalar_replace_chunk(KuScalarString s, size_t at) {\n"
+    text += "    size_t next = at + 1;\n    while (next < s.len && (s.ptr[next] & 0xc0u) == 0x80u) ++next;\n"
+    text += "    return next;\n}\n\n"
+    text += "static int ku_scalar_replace_find(KuScalarString s, KuScalarString from, size_t i, size_t* at) {\n"
+    text += "    if (from.len > s.len - i) return 0;\n    size_t last = s.len - from.len;\n"
+    text += "    for (;; ++i) {\n        if (memcmp(s.ptr + i, from.ptr, from.len) == 0) { *at = i; return 1; }\n"
+    text += "        if (i == last) return 0;\n    }\n}\n\n"
+    text += "static const char* ku_scalar_replace_empty(KuScalarString s, KuScalarString to, KuScalarString* out) {\n"
+    text += "    size_t chunks = 0;\n    for (size_t i = 0; i < s.len; i = ku_scalar_replace_chunk(s, i)) ++chunks;\n"
+    text += "    if (chunks == SIZE_MAX || (to.len && chunks + 1 > (SIZE_MAX - s.len) / to.len))\n"
+    text += "        return \"string replacement is too large\\n\";\n"
+    text += "    size_t len = s.len + to.len * (chunks + 1);\n"
+    text += "    if (len == 0) { *out = (KuScalarString){0}; return NULL; }\n"
+    text += "    uint8_t* data = malloc(len);\n    if (!data) return \"out of memory\\n\";\n"
+    text += "    size_t used = 0;\n    if (to.len) { memcpy(data, to.ptr, to.len); used += to.len; }\n"
+    text += "    for (size_t i = 0; i < s.len;) {\n        size_t next = ku_scalar_replace_chunk(s, i);\n"
+    text += "        memcpy(data + used, s.ptr + i, next - i); used += next - i;\n"
+    text += "        if (to.len) { memcpy(data + used, to.ptr, to.len); used += to.len; }\n        i = next;\n    }\n"
+    text += "    *out = (KuScalarString){data, len, len, 1u};\n    return NULL;\n}\n\n"
+    text += "static const char* ku_scalar_string_replace(KuScalarString s, KuScalarString from, KuScalarString to, KuScalarString* out) {\n"
+    text += "    if (from.len == 0) return ku_scalar_replace_empty(s, to, out);\n"
+    text += "    size_t count = 0, at, i = 0;\n"
+    text += "    while (ku_scalar_replace_find(s, from, i, &at)) { ++count; i = at + from.len; }\n"
+    text += "    if (count == 0 && (s.storage == 0 || !s.ptr)) { *out = s.storage == 0 ? s : (KuScalarString){0}; return NULL; }\n"
+    text += "    size_t kept = s.len - count * from.len;\n"
+    text += "    if (to.len && count > (SIZE_MAX - kept) / to.len) return \"string replacement is too large\\n\";\n"
+    text += "    size_t len = kept + count * to.len;\n"
+    text += "    if (len == 0 && count != 0) { *out = (KuScalarString){0}; return NULL; }\n"
+    text += "    size_t capacity = len ? len : 1u;\n"
+    text += "    uint8_t* data = malloc(capacity);\n    if (!data) return \"out of memory\\n\";\n"
+    text += "    size_t used = 0;\n    i = 0;\n"
+    text += "    while (ku_scalar_replace_find(s, from, i, &at)) {\n"
+    text += "        if (at > i) { memcpy(data + used, s.ptr + i, at - i); used += at - i; }\n"
+    text += "        if (to.len) { memcpy(data + used, to.ptr, to.len); used += to.len; }\n        i = at + from.len;\n    }\n"
+    text += "    if (s.len > i) memcpy(data + used, s.ptr + i, s.len - i);\n"
+    return text + "    *out = (KuScalarString){data, len, capacity, 1u};\n    return NULL;\n}\n\n"
+}

@@ -573,6 +573,100 @@ fn main(): null! {{
     }
 }
 
+fn assert_owned_replacement(ku: &Path, seed: &Path, cwd: &Path) {
+    let token_module = include_str!("../bootstrap/stage1/token.ku");
+    let generated = build_function(seed, cwd, token_module, "EscapeCanonical");
+    assert_success(&generated);
+    let generated = String::from_utf8(generated.stdout).expect("standalone C");
+    let (name, body) = generated.split_once('\n').expect("symbol line and C");
+    let witness = r#"
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+static void *live[6];
+static size_t calls, fail_at;
+static void verify_clean(void) {
+    for (size_t i = 0; i < 6; ++i) assert(live[i] == NULL);
+}
+static void *watch_malloc(size_t size) {
+    ++calls;
+    if (calls == fail_at) return NULL;
+    assert(calls <= 5);
+    live[calls] = malloc(size);
+    assert(live[calls]);
+    return live[calls];
+}
+static void watch_free(void *ptr) {
+    for (size_t i = 0; i < 6; ++i) {
+        if (live[i] == ptr) { live[i] = NULL; free(ptr); return; }
+    }
+    assert(0 && "owner already dropped or unrecognized");
+}
+#define malloc watch_malloc
+#define free watch_free
+"#;
+    let driver = r#"
+#undef malloc
+#undef free
+int main(int argc, char **argv) {
+    static const uint8_t input[] = {'\\','\r','\n','\t','|',0,0xe4,0xb8,0xad,0xf0,0x9f,0x99,0x82};
+    assert(argc == 2);
+    fail_at = (size_t)strtoul(argv[1], NULL, 10);
+    live[0] = malloc(sizeof(input));
+    assert(live[0] && atexit(verify_clean) == 0);
+    memcpy(live[0], input, sizeof(input));
+    KuScalarString value = { live[0], sizeof(input), sizeof(input), 1u };
+    KuBootstrapString result = CALL(value);
+    assert(fail_at == 0 && calls == 5 && result.ptr == live[5] && result.storage == 1u);
+    assert(fwrite(result.ptr, 1, result.len, stdout) == result.len);
+    watch_free(result.ptr);
+    return 0;
+}
+"#;
+    let c_path = cwd.join("replace.c");
+    let app = cwd.join(format!("replace{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &c_path,
+        format!("{witness}{body}{}", driver.replace("CALL", name.trim())),
+    )
+    .expect("independent replacement C");
+    fs::remove_file(cwd.join("input.ku")).expect("retire fixture source");
+    compile_c(&c_path, &app, cwd);
+    let oracle = cwd.join("escape-oracle.ku");
+    fs::write(
+        &oracle,
+        format!(
+            "{token_module}\nfn main() {{ print(EscapeCanonical(\"\\\\\\r\\n\\t|\0中🙂\")) }}\n"
+        ),
+    )
+    .expect("unchanged interpreter leaf");
+    let expected = execute(Command::new(ku).arg("run").arg(&oracle), cwd, 10);
+    fs::remove_file(&oracle).expect("no Ku source needed by emitted program");
+    assert_success(&expected);
+    let actual = execute(Command::new(&app).arg("0"), cwd, 10);
+    assert_success(&actual);
+    assert_eq!(actual.stdout, expected.stdout);
+    for attempt in 1..=5 {
+        let failed = execute(Command::new(&app).arg(attempt.to_string()), cwd, 10);
+        assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+        assert!(failed.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&failed.stderr).trim(),
+            "out of memory"
+        );
+    }
+    for source in [
+        r#"fn Invalid(&text: str): str { return text.replace("x", "y") }"#,
+        r#"fn Invalid(text: str): str { output = output.replace("x", "y")
+           return output }"#,
+    ] {
+        let failed = build_function(seed, cwd, source, "Invalid");
+        assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+        assert!(failed.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("unsupported_replace_operand"));
+    }
+}
+
 fn assert_imported_calls(ku: &Path, seed: &Path, cwd: &Path) {
     let entry = cwd.join("entry.ku");
     let source = r#"import { Aggregate } from "./bridge.ku"
@@ -802,6 +896,7 @@ fn ku_emits_checked_c11_for_real_math_functions() {
     assert!(!generated.contains("ku_scalar_check_divisor"));
     assert_checked_division(&ku, &seed, &cwd);
     assert_string_composition(&ku, &seed, &cwd);
+    assert_owned_replacement(&ku, &seed, &cwd);
     assert_capacity_results(&ku, &seed, &cwd);
     assert_imported_calls(&ku, &seed, &cwd);
 

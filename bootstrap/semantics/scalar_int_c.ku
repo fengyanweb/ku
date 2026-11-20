@@ -10,6 +10,7 @@ import { RejectScalarInt as rejectScalarInt, ScalarParameterIndex as scalarParam
 import { LowerNullResultExit } from "./scalar_result_null.ku"
 import { ScalarType as scalarType, ScalarReturnType as scalarReturnType } from "./scalar_types.ku"
 import { ScalarIntImport, ScalarFunctionNode as scalarFunctionNode, LowerIntExpression as lowerIntExpression } from "./scalar_int_calls.ku"
+import { HasScalarOwnedStringBody, LowerScalarOwnedStringBody, ScalarStringReplaceHelpers } from "./scalar_string_replace.ku"
 
 struct ScalarBoolC {
     source: str
@@ -123,6 +124,11 @@ fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLeve
     if (result_type == 0) { requireInt(bindings, type_id, nodes[type_id - 1])? }
     cursor = cursor + 1
     clauses: [ScalarIntClause] = []
+    owned_body = ""
+    if (result_type == 2 && HasScalarOwnedStringBody(nodes, edges, cursor, end)) {
+        owned_body = LowerScalarOwnedStringBody(nodes, edges, bindings, parameters, cursor, end)?
+        cursor = end
+    }
     uses_comparison = false
     uses_contains = false
     uses_join = false
@@ -175,7 +181,7 @@ fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLeve
     }
     return ok(ScalarIntFunction { function_node: local_base + function_id, parameters: parameters, clauses: clauses,
         result_type: result_type, uses_string_comparison: uses_comparison, uses_string_contains: uses_contains,
-        uses_string_join: uses_join })
+        uses_string_join: uses_join, owned_string_body: owned_body })
 }
 
 fn ContainsScalarIntNode(&nodes: [int], node: int): bool {
@@ -249,6 +255,7 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
     uses_owned_string = false
     uses_string_join = false
     uses_string_format = false
+    uses_string_replace = false
     returns_bool = false
     returns_null_result = false
     text = ""
@@ -280,6 +287,7 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
                     uses_owned_string = uses_owned_string || body.uses_owned_string
                     uses_string_join = uses_string_join || plans[index].uses_string_join
                     uses_string_format = uses_string_format || body.uses_string_format
+                    uses_string_replace = uses_string_replace || body.uses_string_replace
                     text += body.source
                     completed = completed.push(function_node)
                 } else {
@@ -301,9 +309,10 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
     }
     headers = ScalarIntegerHelpers(uses_add, uses_sub, uses_mul, uses_div, uses_rem)
     if (returns_bool || uses_string_contains || returns_null_result) { headers += "#include <stdbool.h>\n" }
-    return ok(ScalarIntC { symbol: symbol, source: headers
-        + ScalarStringHelpers(uses_string, uses_string_comparison, uses_string_contains,
-            uses_owned_string, uses_string_join, uses_string_format, returns_null_result) + text })
+    headers += ScalarStringHelpers(uses_string, uses_string_comparison, uses_string_contains,
+        uses_owned_string, uses_string_join, uses_string_format, returns_null_result)
+    if (uses_string_replace) { headers += ScalarStringReplaceHelpers() }
+    return ok(ScalarIntC { symbol: symbol, source: headers + text })
 }
 
 // The selected function is the only external symbol. Every reachable local

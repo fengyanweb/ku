@@ -38,6 +38,7 @@ struct ScalarIntFunction {
     uses_string_comparison: bool
     uses_string_contains: bool
     uses_string_join: bool
+    owned_string_body: str
 }
 
 struct ScalarIntBodyC {
@@ -52,6 +53,7 @@ struct ScalarIntBodyC {
     uses_string_contains: bool
     uses_owned_string: bool
     uses_string_format: bool
+    uses_string_replace: bool
 }
 
 fn ScalarIntegerHelpers(add: bool, sub: bool, mul: bool, div: bool, rem: bool): str {
@@ -228,6 +230,13 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         declarations += "    (void)" + param + ";\n"
         index = index + 1
     }
+    if (plan.owned_string_body != "") {
+        source = signature + ") {\n" + declarations + plan.owned_string_body.clone() + drops
+        source += "    if (failure) { fputs(failure, stderr); exit(EXIT_FAILURE); }\n    return result;\n}\n"
+        return ScalarIntBodyC { source: source, uses_add: false, uses_sub: false, uses_mul: false,
+            uses_div: false, uses_rem: false, uses_string: true, uses_string_comparison: false,
+            uses_string_contains: false, uses_owned_string: true, uses_string_format: false, uses_string_replace: true }
+    }
     uses_owned = drops != ""
     uses_cleanup = uses_owned || plan.uses_string_join
     if (plan.uses_string_join) {
@@ -309,5 +318,5 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         uses_div: uses_div, uses_rem: uses_rem,
         uses_string: uses_string, uses_string_comparison: plan.uses_string_comparison,
         uses_string_contains: plan.uses_string_contains, uses_owned_string: uses_owned,
-        uses_string_format: uses_format }
+        uses_string_format: uses_format, uses_string_replace: false }
 }
