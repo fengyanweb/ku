@@ -1010,7 +1010,9 @@ def stage_committed_ku_sources(repo, commit, env, project, directories):
             raise RuntimeError('cannot copy committed Ku source: ' + relative)
         data = EXPORT.canonical_example(blob.stdout)
         total += len(data)
-        if total > 512 * 1024:
+        # Bound the whole copied checkout fixture independently of the
+        # compiler's per-source and 64-module limits.
+        if total > 1024 * 1024:
             raise ValueError('committed Ku source tree exceeds its fixture bound')
         destination = project / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1304,6 +1306,50 @@ async fn main(): null! {
         install, root / 'task-optional-project', env, target, files, 'null\nnull\nfalse\ntrue\nKu🙂\n')
 
 
+def installed_pattern_capture_consumer(install, root, env, report, target):
+    """Capture imported defaults and a dynamic rest in relocated native closures."""
+    files = {
+        'data.ku': """struct Rule { prefix: str minimum: int | null }
+fn Make(minimum: int | null): Rule { return Rule { prefix: "Ke" + "ep", minimum: minimum } }
+""",
+        'filter.ku': """import { Rule } from "./data.ku"
+fn Default(value: int): int { println(value) return value }
+fn Select(rule: Rule): fn(str): int | null {
+    {prefix, minimum = Default(70), missing: fallback = Default(2)} = rule
+    read: fn(str): int | null = fn(name: str): int | null {
+        if (!name.starts_with(prefix)) { return null }
+        if (minimum == null) { return fallback }
+        return minimum
+    }
+    return read
+}
+fn Label(): fn(): str! {
+    options = {prefix: "old", label: "tail" + "🙂"}
+    {prefix, ...rest} = options
+    read: fn(): str! = fn(): str! { return ok(prefix + ":" + rest["label"]?.as_str()?) }
+    prefix = "new"
+    return read
+}
+""",
+        'main.ku': """import { Make } from "./data.ku"
+import { Select, Label } from "./filter.ku"
+fn Apply(handler: fn(str): int | null): int | null { return handler("KeepEntry") }
+fn main(): null! {
+    filter = Select(Make(null))
+    println(Apply(filter.clone()))
+    println(filter("DropEntry"))
+    zero = Select(Make(0))
+    println(Apply(zero))
+    label = Label()
+    println(label()?)
+    return ok(null)
+}
+""",
+    }
+    report['installed_pattern_capture'] = validate_installed_relative_program(
+        install, root / 'pattern-capture-project', env, target, files, '2\n2\nnull\n2\n0\nnew:tail🙂\n')
+
+
 def run_structured_only(args, report):
     """Check the structured Task and declaration examples from a verified installed archive."""
     repo = args.repo.resolve()
@@ -1351,6 +1397,7 @@ def run_structured_only(args, report):
         installed_forward_layout_consumer(install, root, env, report, target)
         installed_task_error_consumer(install, root, env, report, target)
         installed_task_optional_consumer(install, root, env, report, target)
+        installed_pattern_capture_consumer(install, root, env, report, target)
     report.update(status='passed', backend_equivalence=True, owned_temp_removed=not root.exists())
 
 
