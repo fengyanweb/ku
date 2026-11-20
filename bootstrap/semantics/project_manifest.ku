@@ -6,6 +6,14 @@ import { SuppliedModule } from "./imports.ku"
 import { BuildNameTable, RejectName } from "./names.ku"
 import { CheckProjectManifestPath } from "./project_paths.ku"
 
+fn PrepareManifestPath(raw: str, at: Span): str! {
+    line = raw
+    // Remove exactly one line-ending CR before checking the path.
+    if (line.ends_with("\r")) { line = string.slice(line.clone(), 0, line.len() - 1)? }
+    if (line != "") { CheckProjectManifestPath(line, at)? }
+    return ok(line)
+}
+
 fn ManifestPaths(manifest: str, at: Span): [str]! {
     if (manifest.byte_len() > 32768) {
         RejectName("project_limit", "the module manifest exceeds 32768 UTF-8 bytes", at.clone())?
@@ -20,9 +28,8 @@ fn ManifestPaths(manifest: str, at: Span): [str]! {
             }
         } else {
             // Join compatible LF/CRLF input while retaining spaces in filenames.
-            if (line.ends_with("\r")) { line = string.slice(line.clone(), 0, line.len() - 1)? }
+            line = PrepareManifestPath(line, at.clone())?
             if (line != "") {
-                CheckProjectManifestPath(line, at.clone())?
                 if (paths.len() == 64) { RejectName("project_limit", "the module manifest accepts at most 64 modules", at.clone())? }
                 for existing in paths {
                     if (existing == line) { RejectName("ambiguous_module", "duplicate project module '" + line.clone() + "'", at.clone())? }

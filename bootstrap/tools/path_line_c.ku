@@ -1,0 +1,217 @@
+import { fs, string } from "std"
+import { Node } from "../stage2/ast.ku"
+import { Span } from "../stage2/span.ku"
+import { SuppliedModule } from "../semantics/imports.ku"
+import { DeclarationSpan } from "../semantics/names.ku"
+import { BindProjectModules } from "../semantics/project_bindings.ku"
+import { ManifestPaths, ReadProjectModulesAt } from "../semantics/project_manifest.ku"
+import { RejectLayout, StructLayout } from "../semantics/struct_layouts.ku"
+import { EmitNestedCLayouts, OrderCStructLayouts } from "../semantics/nested_struct_c.ku"
+import { ScalarStringHelpers } from "../semantics/scalar_int_emit.ku"
+import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
+import { LinkedNullProject, LinkedNullFunction, LinkedNullEntry, LinkedNullChild, LinkedNullNode,
+    LinkedNullParameterType, LinkedNullDependency, LinkedNullDependencyPlan, LinkedNullLayout,
+    LinkedNullCType, LinkedNullPrototype, LinkedNullParameterPlan } from "../semantics/linked_null_types_c.ku"
+import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration } from "../semantics/link_plan_c.ku"
+import { TypeNameBinding } from "../semantics/type_names.ku"
+
+struct PathLinePlan {
+    suffix: Node
+    validator: LinkedNullFunction
+}
+
+struct PathLineC {
+    source: str
+    export: LinkPlanDeclaration
+    validator: LinkPlanDeclaration
+}
+
+fn child(&project: LinkedNullProject, &parent: Node, index: int): Node {
+    return LinkedNullNode(project, 1, LinkedNullChild(project, 1, parent, index))
+}
+
+fn require(valid: bool, &node: Node, reason: str): null! {
+    if (!valid) { RejectLayout("unsupported_path_line", reason, DeclarationSpan(node))? }
+    return ok(null)
+}
+
+fn shape(&node: Node, &kind: str, arity: int): null! {
+    require(node.kind == kind && node.edge_count == arity, node, "expected " + kind.clone() + " with " + str(arity) + " children")?
+    return ok(null)
+}
+
+fn variable(&node: Node, &name: str): null! {
+    require(node.kind == "Variable" && node.edge_count == 0 && node.text == name, node, "expected the same checked local binding")?
+    return ok(null)
+}
+
+fn method(&project: LinkedNullProject, &call: Node, &base: str, &name: str, count: int): null! {
+    shape(call, "Call", count + 1)?
+    callee = child(project, call, 0)
+    shape(callee, "Field", 1)?
+    require(callee.text == name, callee, "expected method " + name.clone())?
+    variable(child(project, callee, 0), base)?
+    return ok(null)
+}
+
+fn requireNamespace(&project: LinkedNullProject, &line: str, &context: str, &entry: Node): null! {
+    require(line != context && line != "string" && context != "string" && line != "ok" && context != "ok",
+        entry, "parameters must leave string and ok unshadowed")?
+    string_bound = false
+    for binding in project.binding[0].imports.clone() {
+        require(binding.local_name != "ok", entry, "an import shadows the ok constructor")?
+        if (binding.local_name == "string" && binding.source_name == "string" && binding.module_index == 0) { string_bound = true }
+    }
+    for decl in project.supplied[0].named.names.declarations.clone() {
+        require(decl.name != "ok", entry, "a declaration shadows the ok constructor")?
+    }
+    require(string_bound, entry, "expected a bound std.string namespace")?
+    return ok(null)
+}
+
+fn readTrim(&project: LinkedNullProject, &branch: Node, &line: str): Node! {
+    shape(branch, "If", 2)?
+    require(branch.int_value == 1, branch, "expected one trim statement and no else")?
+    condition = child(project, branch, 0)
+    method(project, condition, line, "ends_with", 1)?
+    suffix = child(project, condition, 1)
+    shape(suffix, "String", 0)?
+    require(suffix.text.len() == 1, suffix, "expected one Unicode scalar suffix")?
+    assign = child(project, branch, 1)
+    shape(assign, "Assign", 1)?
+    require(assign.text == line, assign, "slice must replace the original line owner")?
+    checked = child(project, assign, 0)
+    shape(checked, "TryUnwrap", 1)?
+    slice = child(project, checked, 0)
+    method(project, slice, "string", "slice", 3)?
+    method(project, child(project, slice, 1), line, "clone", 0)?
+    start = child(project, slice, 2)
+    require(start.kind == "Int" && start.edge_count == 0 && start.int_value == 0, start, "slice must start at zero")?
+    end = child(project, slice, 3)
+    require(end.kind == "Binary" && end.edge_count == 2 && end.text == "-", end, "expected one trailing scalar removed")?
+    method(project, child(project, end, 0), line, "len", 0)?
+    one = child(project, end, 1)
+    require(one.kind == "Int" && one.edge_count == 0 && one.int_value == 1, one, "expected one trailing scalar removed")?
+    return ok(suffix)
+}
+
+fn readGuard(&project: LinkedNullProject, &branch: Node, &line: str, &context: str, &record: TypeNameBinding): LinkedNullFunction! {
+    shape(branch, "If", 2)?
+    require(branch.int_value == 1, branch, "expected one checked call and no else")?
+    condition = child(project, branch, 0)
+    require(condition.kind == "Binary" && condition.edge_count == 2 && condition.text == "!=", condition, "expected the nonempty-line guard")?
+    variable(child(project, condition, 0), line)?
+    empty = child(project, condition, 1)
+    require(empty.kind == "String" && empty.edge_count == 0 && empty.text == "", empty, "expected the empty string comparator")?
+    statement = child(project, branch, 1)
+    shape(statement, "ExprStmt", 1)?
+    checked = child(project, statement, 0)
+    shape(checked, "TryUnwrap", 1)?
+    call = child(project, checked, 0)
+    shape(call, "Call", 3)?
+    target = child(project, call, 0)
+    require(target.text != line && target.text != context, target, "the checked call cannot target a parameter")?
+    variable(child(project, call, 1), line)?
+    variable(child(project, call, 2), context)?
+    validator = LinkedNullDependency(project, 1, target, true)?
+    require(validator.parameters.len() == 2 && validator.result.declaration_kind == "Builtin"
+        && validator.result.name == "null", target, "validator must accept View str and the same context and return null!")?
+    require(validator.parameters[0].declaration_kind == "StringView" && validator.parameters[1].declaration_kind == "Struct"
+        && validator.parameters[1].module_index == record.module_index && validator.parameters[1].declaration_node == record.declaration_node,
+        target, "validator arguments must match the View string and original context")?
+    return ok(validator)
+}
+
+fn readPlan(&project: LinkedNullProject, &entry: Node, &raw: str, &context: str, &record: TypeNameBinding): PathLinePlan! {
+    assigned = child(project, entry, 3)
+    shape(assigned, "Assign", 1)?
+    variable(child(project, assigned, 0), raw)?
+    require(assigned.text != raw && assigned.text != context && raw != "ok" && raw != "string",
+        assigned, "expected a distinct owner for the consumed line parameter")?
+    line = assigned.text
+    requireNamespace(project, line, context, entry)?
+    suffix = readTrim(project, child(project, entry, 4), line)?
+    validator = readGuard(project, child(project, entry, 5), line, context, record)?
+    terminal = child(project, entry, 6)
+    shape(terminal, "Return", 1)?
+    success = child(project, terminal, 0)
+    shape(success, "Call", 2)?
+    variable(child(project, success, 0), "ok")?
+    variable(child(project, success, 1), line)?
+    return ok(PathLinePlan { suffix: suffix, validator: validator })
+}
+
+fn emitLine(&plan: PathLinePlan, &symbol: str, &context_type: str, layouts: str): str! {
+    suffix = ScalarStringLiteral(plan.suffix)?
+    text = "#include <stdbool.h>\n#include <stdint.h>\n" + ScalarStringHelpers(true, true, false, true, true, false, true)
+    text += "typedef KuString KuProjectionString;\ntypedef KuResult_null KuBootstrapResultNull;\n"
+    text += "typedef struct KuResult_str { bool ok; KuString value; KuError error; } KuResult_str;\n\n"
+    text += layouts + LinkedNullPrototype(plan.validator)?
+    text += "KuResult_str " + symbol.clone() + "(KuProjectionString line, " + context_type.clone() + " at) {\n"
+    text += "    const KuScalarStringPart suffix = {(const uint8_t*)" + suffix + "};\n"
+    text += "    if (line.len >= suffix.len && ku_scalar_string_equal(line.ptr + line.len - suffix.len, suffix.len, suffix.ptr, suffix.len)) {\n"
+    text += "        KuProjectionString trimmed = {0};\n"
+    text += "        const KuScalarStringPart head = {line.ptr, line.len - suffix.len};\n"
+    text += "        if (head.len) {\n"
+    text += "            const char* failure = ku_scalar_string_join(&head, 1u, &trimmed);\n"
+    text += "            if (failure) { ku_scalar_string_drop(line); fputs(failure, stderr); exit(1); }\n"
+    text += "        }\n"
+    text += "        ku_scalar_string_drop(line);\n"
+    text += "        line = trimmed;\n"
+    text += "    }\n"
+    text += "    if (line.len) {\n"
+    text += "        KuBootstrapResultNull checked = " + plan.validator.symbol.clone() + "(&line, at);\n"
+    text += "        if (!checked.ok) {\n"
+    text += "            ku_scalar_string_drop(line);\n"
+    text += "            return (KuResult_str){false, {0}, checked.error};\n"
+    text += "        }\n"
+    text += "    }\n"
+    return ok(text + "    return (KuResult_str){true, line, {0}};\n}\n")
+}
+
+fn EmitPathLineC(&supplied: [SuppliedModule], &name: str): PathLineC! {
+    bound = BindProjectModules(supplied)?
+    project = LinkedNullProject { supplied: supplied.clone(), binding: bound.modules }
+    id = LinkedNullEntry(project, name)?
+    entry = LinkedNullNode(project, 1, id)
+    shape(entry, "Function", 7)?
+    line = child(project, entry, 0)
+    context = child(project, entry, 1)
+    shape(line, "Parameter", 1)?
+    shape(context, "Parameter", 1)?
+    require(line.int_value == 0 && context.int_value == 0, entry, "expected owned str and Copy context parameters")?
+    line_type = LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, line, 0), false)?
+    record = LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, context, 0), false)?
+    require(line_type.declaration_kind == "Builtin" && line_type.name == "str" && record.declaration_kind == "Struct",
+        entry, "expected a str and the bound context struct")?
+    result = child(project, entry, 2)
+    shape(result, "TypeResult", 1)?
+    inner = child(project, result, 0)
+    require(inner.kind == "TypeName" && inner.edge_count == 0 && inner.text == "str", inner, "expected a str! result")?
+
+    empty: [StructLayout] = []
+    layouts = LinkedNullLayout(project, record, empty, 0)?
+    order = OrderCStructLayouts(layouts, record.module_index, record.declaration_node, record.span.clone())?
+    require(!order.contains_string, context, "the validation context must be Copy")?
+    plan = readPlan(project, entry, line.text, context.text, record)?
+    symbol = "ku_path_line_" + str(id)
+    emitted = emitLine(plan, symbol, LinkedNullCType(record)?, EmitNestedCLayouts(layouts, order)?)?
+    export = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol,
+        parameters: [LinkedNullParameterPlan(line_type, 1)?, LinkedNullParameterPlan(record, 1)?],
+        result: BuiltinLinkPlanType("str", "KuResult_str", false), returns_result: true }
+    return ok(PathLineC { source: emitted, export: export, validator: LinkedNullDependencyPlan(plan.validator)? })
+}
+
+fn main(): null! {
+    at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    paths = ManifestPaths(fs.read("modules.txt")?, at)?
+    supplied = ReadProjectModulesAt(paths, "")?
+    function = string.trim(fs.read("function.txt")?)
+    compiled = EmitPathLineC(supplied, function)?
+    if (fs.exists("plan.txt")) {
+        export = compiled.export
+        validator = compiled.validator
+        print(EmitLinkPlan(supplied, "path-line", export, [validator])?)
+    } else { print(compiled.source) }
+    return ok(null)
+}
