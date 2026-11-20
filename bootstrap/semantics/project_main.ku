@@ -1,6 +1,7 @@
 import "std.fs"
 import { EscapeCanonical } from "../stage1/token.ku"
 import { Span } from "../stage2/span.ku"
+import { CheckDirectCallArities } from "./call_contracts.ku"
 import { BindProjectImports, SuppliedModule } from "./imports.ku"
 import { ManifestPaths, ReadProjectModules } from "./project_manifest.ku"
 import { BindImportedTypeNames } from "./type_names.ku"
@@ -10,6 +11,7 @@ fn ResolveProjectModule(&entry: SuppliedModule, &supplied: [SuppliedModule]): Pr
     try {
         imports = BindProjectImports(entry, supplied)?
         types = BindImportedTypeNames(entry.named, imports, supplied)?
+        CheckDirectCallArities(entry.named, imports, supplied)?
         return ok(ProjectModuleBindings { path: entry.path.clone(), imports: imports, types: types })
     } catch (err) {
         fail {

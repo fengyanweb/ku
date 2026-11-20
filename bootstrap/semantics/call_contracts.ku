@@ -1,0 +1,125 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan, NamedModule, RejectName } from "./names.ku"
+import { ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
+
+struct DirectSignature {
+    name: str
+    arity: int
+}
+
+fn parameterCount(&nodes: [Node], &edges: [int], &function: Node): int {
+    count = 0
+    while (count < function.edge_count && nodes[edges[function.first_edge + count] - 1].kind == "Parameter") {
+        count = count + 1
+    }
+    return count
+}
+
+fn directSignatures(&named: NamedModule, &imports: [ImportBinding], &supplied: [SuppliedModule]): [DirectSignature]! {
+    signatures: [DirectSignature] = []
+    index = 0
+    while (index < named.names.declarations.len()) {
+        if (named.names.declarations[index].kind == "Function") {
+            id = named.names.declarations[index].node
+            arity = parameterCount(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.nodes[id - 1])
+            signatures = signatures.push(DirectSignature { name: named.names.declarations[index].name.clone(), arity: arity })
+        }
+        index = index + 1
+    }
+    index = 0
+    while (index < imports.len()) {
+        module_index = imports[index].module_index
+        if (module_index > 0) {
+            source = ReadImportNode(supplied[module_index - 1].named.parsed.arena.nodes,
+                                    imports[index].target_node, imports[index].span.clone())?
+            if (source.kind == "Function") {
+                arity = parameterCount(supplied[module_index - 1].named.parsed.arena.nodes,
+                                       supplied[module_index - 1].named.parsed.arena.edges, source)
+                signatures = signatures.push(DirectSignature { name: imports[index].local_name.clone(), arity: arity })
+            }
+        }
+        index = index + 1
+    }
+    return ok(signatures)
+}
+
+fn expectedArity(&signatures: [DirectSignature], &name: str): int {
+    index = 0
+    while (index < signatures.len()) {
+        if (signatures[index].name == name) { return signatures[index].arity }
+        index = index + 1
+    }
+    return -1
+}
+
+fn containsShadow(&shadowed: [str], &name: str): bool {
+    index = 0
+    while (index < shadowed.len()) {
+        if (shadowed[index] == name) { return true }
+        index = index + 1
+    }
+    return false
+}
+
+fn couldBindLocal(&kind: str): bool {
+    return kind == "Parameter" || kind == "VarDecl" || kind == "Assign"
+        || kind == "For" || kind == "CatchBinding" || kind == "Function"
+}
+
+fn firstSubtreeNode(&nodes: [Node], &edges: [int], root: int): int {
+    // The accepted arena uses contiguous post-order subtrees. Follow strictly
+    // decreasing IDs to the leftmost node instead of copying a function AST.
+    node = root
+    while (nodes[node - 1].edge_count > 0) {
+        node = edges[nodes[node - 1].first_edge]
+    }
+    return node
+}
+
+fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignature], function: int): null! {
+    start = firstSubtreeNode(nodes, edges, function)
+    // This pass proves direct targets. Defer potentially shadowed names,
+    // including local functions/captures, to a later lexical binding pass.
+    shadowed: [str] = []
+    index = start
+    while (index < function) {
+        if (couldBindLocal(nodes[index - 1].kind) && expectedArity(signatures, nodes[index - 1].text) >= 0
+            && !containsShadow(shadowed, nodes[index - 1].text)) {
+            shadowed = shadowed.push(nodes[index - 1].text.clone())
+        }
+        index = index + 1
+    }
+
+    index = start
+    while (index < function) {
+        if (nodes[index - 1].kind == "Call" && nodes[index - 1].edge_count > 0) {
+            target = edges[nodes[index - 1].first_edge]
+            if (nodes[target - 1].kind == "Variable" && !containsShadow(shadowed, nodes[target - 1].text)) {
+                arity = expectedArity(signatures, nodes[target - 1].text)
+                count = nodes[index - 1].edge_count - 1
+                if (arity >= 0 && count != arity) {
+                    RejectName("call_arity", "function '" + nodes[target - 1].text.clone() + "' expects "
+                               + str(arity) + " arguments but got " + str(count), DeclarationSpan(nodes[index - 1]))?
+                }
+            }
+        }
+        index = index + 1
+    }
+    return ok(null)
+}
+
+// Use the arenas and import identities from the declaration/explicit type pass.
+// Leave the project's AST IDs and successful output unchanged.
+fn CheckDirectCallArities(&named: NamedModule, &imports: [ImportBinding], &supplied: [SuppliedModule]): null! {
+    signatures = directSignatures(named, imports, supplied)?
+    if (signatures.len() == 0) { return ok(null) }
+    index = 0
+    while (index < named.names.declarations.len()) {
+        if (named.names.declarations[index].kind == "Function") {
+            function = named.names.declarations[index].node
+            checkFunctionCalls(named.parsed.arena.nodes, named.parsed.arena.edges, signatures, function)?
+        }
+        index = index + 1
+    }
+    return ok(null)
+}

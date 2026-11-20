@@ -58,6 +58,19 @@ fn bootstrap_checks_diamond_modules_from_a_relocated_installation() {
     let built = compiler.join("semantics").join(&file);
     let executable = project.join(&file);
     let ku = Path::new(env!("CARGO_BIN_EXE_ku"));
+    let source_dir = entry.parent().unwrap();
+    fs::write(source_dir.join("modules.txt"), "call-witness.ku\n").unwrap();
+    fs::write(
+        source_dir.join("call-witness.ku"),
+        "fn Value(x: int): int { return x }\nfn main() { println(Value(1)) }\n",
+    )
+    .unwrap();
+    let interpreted = run(Command::new(ku).arg("run").arg(&entry), &cwd, 20);
+    assert_success(&interpreted);
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout).trim(),
+        "MODULE|call-witness.ku"
+    );
     assert_success(&run(
         Command::new(ku)
             .args(["build", "--release"])
@@ -202,6 +215,87 @@ fn main() {}
             assert!(stderr.starts_with("stage2/context.ku: "), "{stderr}");
         }
     }
+
+    assert_direct_call_contracts(ku, &executable, &project, &cwd);
+}
+
+fn assert_direct_call_contracts(ku: &Path, executable: &Path, project: &Path, cwd: &Path) {
+    let manifest = project.join("modules.txt");
+    let diagnostic = project.join("stage2/diagnostic.ku");
+    let main = project.join("main.ku");
+    let pristine = include_str!("../bootstrap/stage2/diagnostic.ku");
+    let imported = pristine
+        .replace("Span, SpanCanonical", "Span, SpanCanonical as RenderSpan")
+        .replace(
+            "SpanCanonical(diagnostic.span)",
+            "RenderSpan(diagnostic.span)",
+        );
+    assert_ne!(imported, pristine);
+    fs::write(&diagnostic, &imported).expect("real alias fixture");
+    fs::write(
+        &manifest,
+        "stage2/diagnostic.ku\nstage2/span.ku\nstage1/token.ku\n",
+    )
+    .unwrap();
+    fs::write(&main, "import { DiagnosticCanonical as _DiagnosticCanonical } from \"./stage2/diagnostic.ku\"\nfn main() {}\n").unwrap();
+    assert_success(&run(Command::new(ku).arg("check").arg(&main), cwd, 20));
+    let accepted = run(&mut Command::new(executable), cwd, 20);
+    assert_success(&accepted);
+    assert!(String::from_utf8_lossy(&accepted.stdout)
+        .contains("IMPORT|stage2/diagnostic.ku|RenderSpan|stage2/span.ku|SpanCanonical|"));
+
+    let wrong = imported.replace(
+        "RenderSpan(diagnostic.span)",
+        "RenderSpan(diagnostic.span, 0)",
+    );
+    assert_ne!(wrong, imported);
+    fs::write(&diagnostic, wrong).expect("introduce wrong arity in the real module");
+    let rust = run(Command::new(ku).arg("check").arg(&main), cwd, 20);
+    assert_eq!(rust.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rust.stderr).contains("expects 1 arguments but got 2"));
+    let rejected = run(&mut Command::new(executable), cwd, 20);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    let stale = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stale.starts_with("stage2/diagnostic.ku: "), "{stale}");
+    assert!(
+        stale.contains(
+            "|call_arity|<source>|function 'RenderSpan' expects 1 arguments but got 2|28:"
+        ),
+        "{stale}"
+    );
+
+    const LOCAL_SHADOWS: &str = r#"
+fn One(a: int): int { return a }
+fn Two(a: int, b: int): int { return a + b }
+fn Parameter(One: fn(int, int): int): int { return One(1, 2) }
+fn Binding(): int {
+    One = Two
+    return One(2, 3)
+}
+fn Nested(): int {
+    fn One(a: int, b: int): int { return a - b }
+    return One(8, 1)
+}
+fn main() { println(Parameter(Two) + Binding() + Nested() + One(6)) }
+"#;
+    fs::write(&main, LOCAL_SHADOWS).expect("write same-spelled local callable cases");
+    fs::write(&manifest, "main.ku\n").unwrap();
+    assert_success(&run(Command::new(ku).arg("check").arg(&main), cwd, 20));
+    assert_success(&run(&mut Command::new(executable), cwd, 20));
+
+    fs::write(&main, LOCAL_SHADOWS.replace("One(6)", "One()")).unwrap();
+    let rust = run(Command::new(ku).arg("check").arg(&main), cwd, 20);
+    assert_eq!(rust.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rust.stderr).contains("expects 1 arguments but got 0"));
+    let rejected = run(&mut Command::new(executable), cwd, 20);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    let message = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        message.contains("|call_arity|<source>|function 'One' expects 1 arguments but got 0|"),
+        "{message}"
+    );
 }
 
 impl Drop for Temp {

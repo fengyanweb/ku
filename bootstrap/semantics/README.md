@@ -59,8 +59,11 @@ resolves named relative imports against that set. It binds standard library
 namespaces from `import { fs, string } from "std"`, `import "std.fs"` or
 `import fs from "std.fs"`. A `STD` row gives the importing path, namespace,
 import node and request node. These namespaces have no file dependency and
-cannot be used as type names. This entry handles declaration and explicit type
-names. Expression type checking and C generation are separate.
+cannot be used as type names. The tool also checks argument counts for direct
+calls to local and named-import functions, including import aliases. Names
+that could be shadowed by a local binding and calls through a value are left
+to lexical binding and expression type checking. A call-count error carries
+the source path and the full call span.
 
 ## Emit C for a structure projection
 
