@@ -11,6 +11,7 @@ the current phase, so the existing CI artifact retains either lane's failure.
 
 import argparse
 import concurrent.futures
+from contextlib import contextmanager
 from enum import Enum
 import hashlib
 import http.client
@@ -615,7 +616,7 @@ def parse_args(argv=None):
     parser.add_argument("--loops", type=int, default=4)
     parser.add_argument("--performance-seconds", type=int, default=0, help="Run only bounded read throughput for 3..60s; omit fault replay")
     parser.add_argument("--profile", choices=["debug", "release"], default="debug")
-    parser.add_argument("--lane", choices=["both", "sync", "async", "tasks", "typed"], default="both",
+    parser.add_argument("--lane", choices=["both", "sync", "async", "tasks", "typed", "async-example"], default="both",
                         help="Run independent sync and/or named async HTTP -> PostgreSQL lifecycles")
     parser.add_argument("--database-owner-config", type=Path,
                         help="Private installed-archive verifier only; parent retains the direct postgres child")
@@ -627,20 +628,22 @@ def parse_args(argv=None):
                         help="Build the task-list example with this backend (default: native)")
     parser.add_argument("--typed-example", action="store_true",
                         help="Check a synchronous typed PG query with native, ku run, and explicit Runner")
+    parser.add_argument("--async-example", action="store_true",
+                        help="Check asynchronous PG wait, cancellation and recovery with all three entry points")
     args = parser.parse_args(argv)
     if args.performance_seconds and not 3 <= args.performance_seconds <= 60:
         parser.error("performance-seconds must be 3..60")
     if args.performance_seconds and args.installed_contracts:
         parser.error("installed contracts cannot change a performance workload")
-    if args.tasks_example or args.typed_example:
+    if args.tasks_example or args.typed_example or args.async_example:
         if args.performance_seconds or args.installed_contracts:
             parser.error("the installed examples are standalone functional verification")
         args.profile = "release"
-        lanes = ["tasks"] * args.tasks_example + ["typed"] * args.typed_example
+        lanes = ["tasks"] * args.tasks_example + ["typed"] * args.typed_example + ["async-example"] * args.async_example
         if args.lane not in [*lanes, "both"]:
             parser.error("requested lane does not match the selected examples")
         args.lanes = lanes if args.lane == "both" else [args.lane]
-    elif args.lane in ("tasks", "typed"):
+    elif args.lane in ("tasks", "typed", "async-example"):
         parser.error("example lanes require their corresponding example flag")
     if args.tasks_example:
         args.tasks_backend = args.tasks_backend or "native"
@@ -1023,10 +1026,251 @@ def run_typed_example(ku, source, root, sql, execute, environment, runtime_envir
     report["checks"]["typed_strict_reset_same_backend"] = "passed"
 
 
+ASYNC_PG_WAIT_SQL = (
+    "SELECT json_build_object('pid', pid, 'state', state, 'wait', wait_event_type, "
+    "'event', wait_event, 'blockers', pg_blocking_pids(pid), "
+    "'attempt', (SELECT last_value FROM ku_async_pg_attempt)) "
+    "FROM pg_stat_activity WHERE application_name = 'ku_runtime_acceptance' "
+    "AND wait_event_type = 'Lock' AND query LIKE 'WITH attempt AS MATERIALIZED%'"
+)
+ASYNC_PG_LOCK_OWNER_SQL = (
+    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
+    "AND classid = 197208 AND objid = 2 AND objsubid = 2"
+)
+ASYNC_PG_HANDLER_TIMEOUT_SECONDS = 3
+
+
+def observe_until(sql, statement, predicate, deadline):
+    """Read the state itself before advancing. Poll cadence is not a witness."""
+    while True:
+        deadline_remaining(deadline)
+        observation = sql(statement, deadline=deadline)
+        if predicate(observation):
+            return observation
+        time.sleep(min(0.025, deadline_remaining(deadline)))
+
+
+@contextmanager
+def async_pg_lock(psql, cwd, sql, environment):
+    """An independent psql owns the transaction and releases it in all paths."""
+    with (cwd / "async-pg-lock.log").open("wb") as log:
+        process = subprocess.Popen(psql, cwd=cwd, env=environment, stdin=subprocess.PIPE,
+                                   stdout=log, stderr=log, text=True)
+        try:
+            process.stdin.write("BEGIN;\nSELECT pg_advisory_xact_lock(197208, 2);\n")
+            process.stdin.flush()
+            holder = observe_until(sql, ASYNC_PG_LOCK_OWNER_SQL, str.isdecimal, time.monotonic() + 5)
+            yield int(holder)
+        finally:
+            try:
+                if process.poll() is None:
+                    process.stdin.write("ROLLBACK;\n\\q\n")
+                    process.stdin.flush()
+            finally:
+                process.stdin.close()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+
+
+def async_pg_response(connection):
+    response = connection.getresponse()
+    data = response.read(32769)
+    if len(data) > 32768:
+        raise ValueError("async PG example response exceeds the fixture bound")
+    return response.status, data.decode("utf-8")
+
+
+def run_async_pg_example(ku, source, root, sql, execute, psql, environment, runtime_environment, tool_environment,
+                         database_port, http_port, control_token, report, progress):
+    """Exercise a real pool-one async query without guessing when PostgreSQL is waiting."""
+    sql("CREATE SEQUENCE ku_async_pg_attempt")
+    (root / "db.conn").write_text(
+        f"hostaddr=127.0.0.1 port={database_port} user=ku_accept dbname=postgres "
+        "sslmode=disable application_name=ku_runtime_acceptance", encoding="utf-8")
+    (root / "http.addr").write_text(f"127.0.0.1:{http_port}", encoding="utf-8")
+    local_source = root / source.name
+    shutil.copyfile(source, local_source)
+    suffix = ".exe" if os.name == "nt" else ""
+    native, runner = root / ("async-native" + suffix), root / ("async-runner" + suffix)
+    for entry, binary, flags in (("native", native, []), ("runner", runner, ["--backend", "runner"])):
+        progress("async-example:build", entry=entry)
+        execute([ku, "build", "--verbose", "--release", *flags, local_source, "-o", binary],
+                cwd=root, env=environment)
+
+    def request(path, expected=200, *, method="GET", deadline=None, control=False):
+        connection = DeadlineHTTPConnection("127.0.0.1", http_port, deadline or time.monotonic() + 4)
+        try:
+            headers = {"X-Ku-Control-Token": control_token} if control else {}
+            connection.request(method, path, headers=headers)
+            status, body = async_pg_response(connection)
+            report["last_request"] = {"route": path, "method": method, "status": status,
+                                      "body_prefix": body.replace(control_token, "<control-token>")[:512]}
+            if status != expected:
+                raise AssertionError(f"{path} returned HTTP {status}, expected {expected}")
+            return body
+        finally:
+            connection.close()
+
+    def record(scenario, name):
+        scenario["event_order"].append(name)
+        scenario["event_monotonic"][name] = time.monotonic()
+
+    cases = (("ku_run", [ku, "run", local_source]), ("native", [native]), ("runner", [runner]))
+    report["async_entries"] = {}
+    failures = []
+    for index, (entry, command) in enumerate(cases):
+        progress("async-example:start", entry=entry)
+        if index == 1:
+            local_source.unlink()
+            if (root / ".ku").is_dir():
+                shutil.rmtree(root / ".ku")
+            report["source_removed_before_run"] = True
+        current = report["async_entries"][entry] = {
+            "executable_sha256": hashlib.sha256(command[0].read_bytes()).hexdigest(),
+            "source_removed_before_run": not local_source.exists(),
+            "scenarios": {},
+        }
+        sql("ALTER SEQUENCE ku_async_pg_attempt RESTART WITH 1")
+        logs = root / f"async-{entry}.log"
+        with logs.open("wb") as log:
+            service = subprocess.Popen(command, cwd=root, env=runtime_environment, stdout=log, stderr=log)
+        try:
+            ready_deadline = time.monotonic() + 10
+            while True:
+                if service.poll() is not None:
+                    raise RuntimeError(f"{entry} service exited {service.returncode} during startup")
+                try:
+                    if request("/light", deadline=ready_deadline) != "light-ready":
+                        raise AssertionError("lightweight route returned an unexpected response")
+                    break
+                except OSError:
+                    time.sleep(min(0.025, deadline_remaining(ready_deadline)))
+            if os.name == "nt":
+                current["libpq_module"] = windows_loaded_libpq(service, runtime_environment, ready_deadline)
+                if not current["libpq_module"]:
+                    raise AssertionError("could not identify the actual loaded libpq.dll")
+            baseline = json.loads(request("/probe"))
+            expected_pid = baseline["pid"]
+            for ordinal, phase in enumerate(("normal", "cancel", "deadline"), 1):
+                progress("async-example:waiting", entry=entry, scenario=phase)
+                scenario = current["scenarios"][phase] = {
+                    "event_order": [], "event_monotonic": {},
+                }
+                connection = DeadlineHTTPConnection("127.0.0.1", http_port, time.monotonic() + 10)
+                try:
+                    with async_pg_lock(psql, root, sql, tool_environment) as holder:
+                        record(scenario, "lock_acquired")
+                        launched = time.monotonic()
+                        expiry = launched + ASYNC_PG_HANDLER_TIMEOUT_SECONDS
+                        connection.request("GET", f"/wait/{phase}")
+                        witness = observe_until(sql, ASYNC_PG_WAIT_SQL, bool, expiry)
+                        wait = json.loads(witness)
+                        if (wait["blockers"] != [holder] or wait["pid"] != expected_pid
+                                or wait["attempt"] != ordinal or wait["state"] != "active"):
+                            raise AssertionError(f"{phase} lock witness is inconsistent: {wait}")
+                        scenario["postgres_wait"] = wait
+                        scenario["holder_pid"] = holder
+                        record(scenario, "postgres_wait")
+                        if request("/light", deadline=expiry) != "light-ready":
+                            raise AssertionError("lightweight request failed during confirmed PG wait")
+                        record(scenario, "lightweight_completed")
+                        if sql(ASYNC_PG_LOCK_OWNER_SQL, deadline=expiry) != str(holder):
+                            raise AssertionError("lightweight request finished after the control lock released")
+                        if entry == "native":
+                            metrics = json.loads(request("/__ku/metrics", deadline=expiry, control=True))
+                            net_wait = metrics["task_blocking"]["net_wait"]
+                            if net_wait < 1:
+                                raise AssertionError("native Task network wait was not observed")
+                            scenario["native_task_net_wait"] = net_wait
+                        if phase == "cancel":
+                            linger = struct.pack("HH" if os.name == "nt" else "ii", 1, 0)
+                            connection.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
+                            connection.close()
+                            record(scenario, "client_reset")
+                        if phase == "deadline":
+                            status, body = async_pg_response(connection)
+                            scenario["response"] = {"status": status, "body_prefix": body[:512]}
+                            if status != 504:
+                                raise AssertionError(f"waiting request returned {status}, expected handler expiry")
+                            record(scenario, "deadline_elapsed")
+                        if phase != "normal":
+                            # The old transaction is still locked. A successor on
+                            # the same lease is valid only after retiring its old
+                            # result. The cancel path has to beat the original D.
+                            recovery_deadline = expiry if phase == "cancel" else time.monotonic() + 5
+                            next_request = json.loads(request("/probe", deadline=recovery_deadline))
+                            scenario["successor"] = next_request
+                            expected_pid = next_request["pid"]
+                            if next_request["setting"] != baseline["setting"]:
+                                raise AssertionError("successor got a modified session")
+                            scenario["disposition"] = ("reused_after_cleanup" if expected_pid == wait["pid"]
+                                                       else "evicted_then_reconnected")
+                            if sql(ASYNC_PG_LOCK_OWNER_SQL, deadline=recovery_deadline) != str(holder):
+                                raise AssertionError("successor completed after the control lock released")
+                            record(scenario, "recovery_completed")
+                    record(scenario, "released")
+                    if phase == "normal":
+                        status, body = async_pg_response(connection)
+                        result = json.loads(body)
+                        if (status != 200 or result["label"] != "normal" or result["pid"] != expected_pid
+                                or result["attempt"] != ordinal or result["setting"] == baseline["setting"]):
+                            raise AssertionError(f"normal unlock did not deliver the expected row: {status}, {body}")
+                        scenario["response"] = result
+                        record(scenario, "normal_result")
+                        if json.loads(request("/probe")) != baseline:
+                            raise AssertionError("successful query did not reset and return the same connection")
+                finally:
+                    connection.close()
+            typed = json.loads(request("/typed"))
+            if typed != {"integer": 17, "text": "中文🙂", "pid": expected_pid, "absent": True}:
+                raise AssertionError(f"typed successor did not preserve its declared type and NULL: {typed}")
+            current["typed_successor"] = typed
+            attempts = sql("SELECT last_value FROM ku_async_pg_attempt")
+            if attempts != "3":
+                raise AssertionError(f"expected three submitted lock queries without replay, observed {attempts}")
+            current["query_submissions"] = int(attempts)
+            began = time.monotonic()
+            drain_deadline = began + 5
+            request("/__ku/drain", method="POST", deadline=drain_deadline, control=True)
+            wait_service_exit(service, drain_deadline)
+            if service.returncode != 0:
+                raise AssertionError("async service did not exit normally")
+            deliveries = [line for line in logs.read_text(encoding="utf-8").splitlines()
+                          if line.startswith("pg-delivered:")]
+            if deliveries != ["pg-delivered:normal"]:
+                raise AssertionError(f"handler resumed with a late result, or delivered twice: {deliveries}")
+            current["deliveries"] = deliveries
+            observe_database_connections(sql, {}, maximum=0, began=began, deadline=drain_deadline)
+            current.update(status="passed", remaining_database_sessions=0)
+        except Exception as error:
+            current.update(status="failed", failure=str(error)[:512],
+                           last_request=dict(report.get("last_request", {})))
+            with logs.open("rb") as log:
+                log.seek(max(0, log.seek(0, os.SEEK_END) - 2048))
+                current["service_log_tail"] = log.read(2048).decode("utf-8", errors="replace").replace(
+                    control_token, "<control-token>")
+            failures.append(entry)
+        finally:
+            if service.poll() is None:
+                service.kill()
+                service.wait(timeout=5)
+            # A failed entry still cannot leave a live session for the next.
+            began = time.monotonic()
+            observe_database_connections(sql, {}, maximum=0, began=began, deadline=began + 5)
+            progress("async-example:finished", entry=entry, status=current.get("status"))
+    if failures:
+        raise AssertionError(f"async PG acceptance failed for {', '.join(failures)}")
+    report["checks"]["async_pg_ordered_wait_cancel_deadline_recovery"] = "passed"
+
+
 def run_lane(args, lane, on_checkpoint=None):
     ku = args.ku.resolve()
     tasks_example = lane == "tasks"
     typed_example = lane == "typed"
+    async_example = lane == "async-example"
     tasks_backend = getattr(args, "tasks_backend", None) or "native"
     prefix = 'http_pg_installed_contract' if getattr(args, 'installed_contracts', False) else 'http_pg_lifecycle'
     filename = prefix + ('' if lane == 'sync' else '_async') + '.ku'
@@ -1036,6 +1280,9 @@ def run_lane(args, lane, on_checkpoint=None):
         source = Path(__file__).resolve().parents[2] / "examples" / filename
     elif typed_example:
         filename = "pg_sync_installed_typed.ku"
+        source = Path(__file__).resolve().parents[1] / "fixtures" / filename
+    elif async_example:
+        filename = "pg_async_installed_wait.ku"
         source = Path(__file__).resolve().parents[1] / "fixtures" / filename
     report = {"platform": os.uname().sysname if hasattr(os, "uname") else os.name,
               "lane": lane, "fixture": filename,
@@ -1069,8 +1316,15 @@ def run_lane(args, lane, on_checkpoint=None):
         report["parameters"] = {"build_profile": args.profile,
                                 "database_transport": "direct loopback to private PostgreSQL",
                                 "tls": "disabled only inside isolated loopback fixture"}
+    elif async_example:
+        report["parameters"] = {
+            "build_profile": args.profile, "database_connections": 1, "database_waiters": 1,
+            "handler_timeout_ms": 1000 * ASYNC_PG_HANDLER_TIMEOUT_SECONDS,
+            "database_transport": "direct loopback to private PostgreSQL",
+            "tls": "disabled only inside isolated loopback fixture",
+        }
     def progress(phase, **details):
-        if phase.startswith(("http:", "fault:", "tasks:", "typed:")):
+        if phase.startswith(("http:", "fault:", "tasks:", "typed:", "async-example:")):
             report["acceptance_phase"] = phase
         checkpoint(report, args.output, phase, **details)
         if on_checkpoint is not None:
@@ -1115,15 +1369,15 @@ def run_lane(args, lane, on_checkpoint=None):
             environment = os.environ | {"KU_EVENT_LOOPS": str(args.loops), "KU_BLOCKING_THREADS": "8",
                                         "KU_DB_MAX_CONNECTIONS": "4", "KU_DB_MAX_WAITERS": "8",
                                         "KU_DB_MAX_PENDING_BYTES": "1048576"}
-            if tasks_example or typed_example:
+            if tasks_example or typed_example or async_example:
                 environment = {key: value for key, value in environment.items() if not key.upper().startswith("PG")}
             control_token = os.urandom(24).hex()
             environment["KU_SERVICE_CONTROL_TOKEN"] = control_token
-            configure_runtime = typed_example or (tasks_example and (tasks_backend == "runner" or os.name == "nt"))
+            configure_runtime = typed_example or async_example or (tasks_example and (tasks_backend == "runner" or os.name == "nt"))
             if configure_runtime and not environment.get("KU_PG_RUNTIME_DIR"):
                 runtime_dir = tools if os.name == "nt" else Path(execute([pg_config, "--libdir"]))
                 environment["KU_PG_RUNTIME_DIR"] = str(runtime_dir.resolve(strict=True))
-            if typed_example and os.name != "nt":
+            if (typed_example or async_example) and os.name != "nt":
                 runtime_dir = Path(environment["KU_PG_RUNTIME_DIR"])
                 link_name, versioned_name = (("libpq.dylib", "libpq.5.dylib")
                                              if sys.platform == "darwin" else ("libpq.so", "libpq.so.5"))
@@ -1136,7 +1390,7 @@ def run_lane(args, lane, on_checkpoint=None):
                                             "sha256": hashlib.sha256(provider.read_bytes()).hexdigest()}
                 # Bound the native linker's inspection to the selected provider
                 # even when pg_config reports a shared system library directory.
-                private_lib = root / "typed-libpq-link"
+                private_lib = root / "example-libpq-link"
                 private_lib.mkdir()
                 (private_lib / link_name).symlink_to(provider)
                 (private_lib / versioned_name).symlink_to(provider)
@@ -1171,6 +1425,9 @@ def run_lane(args, lane, on_checkpoint=None):
                 execute([tools / "pg_ctl", "-D", data, "-l", root / "postgres.log", "-w", "-t", "20", "start", "-o", options], env=tool_environment)
                 started = True
 
+            psql = [tools / ("psql" + suffix), "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+                    "-h", "127.0.0.1", "-p", str(database_port), "-U", "ku_accept", "-d", "postgres"]
+
             def sql(statement, deadline=None):
                 budget = {}
                 if deadline is not None:
@@ -1178,9 +1435,7 @@ def run_lane(args, lane, on_checkpoint=None):
                     if remaining <= 0:
                         raise TimeoutError("database observation deadline expired before psql launch")
                     budget = {"timeout_seconds": min(60, remaining), "deadline": deadline}
-                value = execute([tools / "psql", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
-                            "-h", "127.0.0.1", "-p", str(database_port), "-U", "ku_accept",
-                            "-d", "postgres", "-c", statement], env=tool_environment, **budget)
+                value = execute([*psql, "-c", statement], env=tool_environment, **budget)
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError("database observation returned after its absolute deadline")
                 return value
@@ -1215,6 +1470,11 @@ def run_lane(args, lane, on_checkpoint=None):
             if typed_example:
                 run_typed_example(ku, source, root, sql, execute, environment, runtime_environment,
                                   database_port, report, progress)
+                report["status"] = "passed"
+                return report
+            if async_example:
+                run_async_pg_example(ku, source, root, sql, execute, psql, environment, runtime_environment,
+                                     tool_environment, database_port, http_port, control_token, report, progress)
                 report["status"] = "passed"
                 return report
             sql("CREATE TABLE ku_events(id text PRIMARY KEY, payload text NOT NULL)")

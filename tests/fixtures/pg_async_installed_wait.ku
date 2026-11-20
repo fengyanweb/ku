@@ -1,0 +1,44 @@
+import { http, pg, json, fs } from "std"
+
+fn main(): null! {
+    conninfo = fs.read("db.conn")?
+    address = fs.read("http.addr")?
+    client = pg.client({conninfo: conninfo, max_connections: 1, max_waiters: 1,
+        connect_timeout_ms: 2000, acquire_timeout_ms: 1000, query_timeout_ms: 5000})?
+
+    async fn waiting(req: HttpRequest): HttpResponse! {
+        label = req.params.label.clone()
+        result = client.query(
+            "WITH attempt AS MATERIALIZED (SELECT nextval('ku_async_pg_attempt') AS serial) SELECT $1::text, pg_backend_pid()::text, serial::text, pg_advisory_xact_lock(197208, 1 + sign(serial)::int)::text, set_config('work_mem', CASE WHEN current_setting('work_mem') = '128kB' THEN '256kB' ELSE '128kB' END, false) FROM attempt",
+            [label.clone()])?
+        body = json.encode({label: result.value(0, 0)?, pid: result.value_int(0, 1)?,
+            attempt: result.value_int(0, 2)?, setting: result.value(0, 4)?})?
+        println("pg-delivered:" + label)
+        return ok(http.text(body))
+    }
+    async fn probe(): HttpResponse! {
+        result = client.query("SELECT pg_backend_pid()::text, current_setting('work_mem')", [])?
+        body = json.encode({pid: result.value_int(0, 0)?, setting: result.value(0, 1)?})?
+        return ok(http.text(body))
+    }
+    async fn typed(): HttpResponse! {
+        result = client.query_one_typed("SELECT $1::int4, $2::text, pg_backend_pid()::int4, $3::text",
+            [17, "中文🙂", null], ["int4", "text", "text?"], ["int4", "text", "int4", "text?"])?
+        body = json.encode({integer: result.value_int(0, 0)?, text: result.value(0, 1)?,
+            pid: result.value_int(0, 2)?, absent: result.is_null(0, 3)?})?
+        return ok(http.text(body))
+    }
+    fn light(): HttpResponse { return http.text("light-ready") }
+
+    app = http.service()
+    app.handler_timeout_ms = 3000
+    app.max_connections = 16
+    app.max_active_requests = 8
+    app.max_pending_requests = 8
+    app.get("/light", light)
+    app.get("/wait/{label}", waiting)
+    app.get("/probe", probe)
+    app.get("/typed", typed)
+    app.listen(address)?
+    return ok(null)
+}
