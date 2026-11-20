@@ -349,6 +349,21 @@ fn main() {
             .trim_end()
             .ends_with(&format!("@{}", position + argument.len())));
     }
+
+    let pattern_shadow = r#"
+import { RequireInt as Amount } from "./parameters.ku"
+struct Options { transform: fn(str): int }
+fn Count(text: str): int { return text.len() }
+fn Run(options: Options): int {
+    {transform: Amount} = options
+    return Amount("local")
+}
+fn main() { println(Run(Options { transform: Count })) }
+"#;
+    fs::write(&main, pattern_shadow)
+        .expect("object pattern binds a local callable over the import");
+    assert_success(&run(Command::new(ku).arg("check").arg(&main), cwd, 20));
+    assert_success(&run(&mut Command::new(executable), cwd, 20));
 }
 
 impl Drop for Temp {

@@ -101,6 +101,7 @@ fn containsName(&names: [str], &name: str): bool {
 fn couldBindLocal(&kind: str): bool {
     return kind == "Parameter" || kind == "VarDecl" || kind == "Assign"
         || kind == "For" || kind == "CatchBinding" || kind == "Function"
+        || kind == "ObjectDestructureLocal" || kind == "ObjectDestructureRest"
 }
 
 fn firstSubtreeNode(&nodes: [Node], &edges: [int], root: int): int {
