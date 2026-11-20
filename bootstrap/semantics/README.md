@@ -196,6 +196,12 @@ owners and array return. The no-relocation branch returns the original array
 storage. Relocation produces independent token owners, and bounds, arithmetic
 and allocation failures release all live storage before reporting the error.
 
+The `linked-str` and `struct-result` modes emit `DiagnosticCanonical` and
+`ReadPrimaryAtom` from their original modules. Generated `extern` declarations
+identify dependencies that must be linked as C functions with the bound ABI.
+The struct Result owns one successful payload or one Error. Moving the result
+clears the source record before cleanup.
+
 The compiler entry scans the module once and parses bounded declaration
 windows. It retains the lexer, per-function, AST and work limits. The legacy
 `ParseProgram` entry retains its 512-token whole-script limit.
