@@ -293,3 +293,209 @@ fn bootstrap_name_table_matches_stage0_and_keeps_graph_ownership() {
         "name-owner-ok"
     );
 }
+
+const IMPORT_BINDING: &str = r#"import "std.fs"
+import { Node, ParseOutput } from "../stage2/ast.ku"
+import { ParseProgram } from "../stage3/parser.ku"
+import { BindSuppliedImports, ImportBinding, SuppliedModule } from "./imports.ku"
+import { BuildNameTable } from "./names.ku"
+
+fn NodeAt(&graph: ParseOutput, id: int): Node {
+    return graph.arena.nodes[id - 1].clone()
+}
+
+fn Witness(): ImportBinding! {
+    importer = BuildNameTable(ParseProgram(fs.read("input.ku")?)?)?
+    named = BuildNameTable(ParseProgram(fs.read("supplier.ku")?)?)?
+    path = fs.read("path.txt")?
+    supplied: [SuppliedModule] = [SuppliedModule { path: path, named: named }]
+    bindings = BindSuppliedImports(importer, supplied)?
+    if (bindings.len() != 1) { panic("expected one binding") }
+    binding = bindings[0].clone()
+    request = NodeAt(importer.parsed, binding.request_node)
+    target = NodeAt(supplied[binding.module_index - 1].named.parsed, binding.target_node)
+    if (request.kind != "ImportName" || request.text != binding.source_name || target.kind != "Struct"
+        || target.text != binding.source_name) { panic("import IDs lost their graph identity") }
+    return ok(binding)
+}
+
+fn main(): null! {
+    binding = Witness()?
+    println(binding.path + "|" + binding.source_name + "|" + binding.local_name + "|"
+        + str(binding.module_index) + "|" + str(binding.request_node) + "|" + str(binding.target_node))
+    return ok(null)
+}
+"#;
+
+#[test]
+fn bootstrap_binds_named_relative_imports_against_explicit_modules() {
+    let temporary = Temp::new();
+    let cwd = temporary.0.join("invocation");
+    let source = temporary.0.join("compiler");
+    let relocated = temporary.0.join("relocated");
+    let oracle = temporary.0.join("oracle");
+    let oracle_input = oracle.join("semantics");
+    for directory in [
+        &cwd,
+        &source,
+        &relocated,
+        &oracle_input,
+        &oracle.join("stage1"),
+    ] {
+        fs::create_dir_all(directory).expect("create private fixture directory");
+    }
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for stage in ["stage1", "stage2", "stage3", "semantics"] {
+        let target = source.join(stage);
+        fs::create_dir(&target).expect("create copied compiler stage");
+        for entry in fs::read_dir(repo.join("bootstrap").join(stage)).expect("read compiler stage")
+        {
+            let entry = entry.expect("read compiler stage file");
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "ku")
+            {
+                fs::copy(entry.path(), target.join(entry.file_name()))
+                    .expect("copy Ku stage source");
+            }
+        }
+    }
+    let compiler = source.join("semantics");
+    let entry = compiler.join("binding.ku");
+    fs::write(&entry, IMPORT_BINDING).expect("write named binding witness");
+    let ku = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    let span = include_str!("../bootstrap/stage2/span.ku");
+    let alias = span
+        .replace("import { Token }", "import { Token as InputToken }")
+        .replace("token: Token", "token: InputToken");
+    let token = include_str!("../bootstrap/stage1/token.ku");
+    let relative_path = "../stage1/token.ku";
+    let install_case = |directory: &Path, input: &str, supplied: &str, path: &str| {
+        fs::write(directory.join("input.ku"), input).expect("write isolated importer");
+        fs::write(directory.join("supplier.ku"), supplied).expect("write isolated supplied module");
+        fs::write(directory.join("path.txt"), path).expect("write explicit import mapping");
+    };
+    let successes = [
+        (span, "../stage1/token.ku|Token|Token|1|1|19"),
+        (&alias, "../stage1/token.ku|Token|InputToken|1|2|19"),
+    ];
+    for (input, expected) in successes {
+        install_case(&compiler, input, token, relative_path);
+        let ran = run(Command::new(&ku).arg("run").arg(&entry), &cwd, 20);
+        assert_success(&ran);
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), expected);
+    }
+
+    let errors = [
+        (
+            "unresolved_import",
+            "import { Token } from \"../stage1/token.ku\"\nfn main() {}",
+            token,
+            "./other.ku",
+            "no module is supplied for '../stage1/token.ku'|1:1@0..1:43@42",
+        ),
+        (
+            "missing_export",
+            "import { Token } from \"../stage1/token.ku\"\nfn main() { Token() }",
+            "module Token\nfn main() {}",
+            relative_path,
+            "'Token' is not exported by '../stage1/token.ku'|1:10@9..1:15@14",
+        ),
+        (
+            "missing_export",
+            "import { hidden } from \"../stage1/token.ku\"\nfn main() { hidden() }",
+            "fn hidden() {}",
+            relative_path,
+            "'hidden' is not exported by '../stage1/token.ku'|1:10@9..1:16@15",
+        ),
+        (
+            "duplicate_import_name",
+            "import { One as A, Two as B, Two as A } from \"../stage1/token.ku\"\nfn main() { A() B() }",
+            "fn One() {}\nfn Two() {}",
+            relative_path,
+            "duplicate import name 'Two'|1:30@29..1:33@32",
+        ),
+        (
+            "duplicate_import_alias",
+            "import { One as A, Two as A } from \"../stage1/token.ku\"\nfn main() { A() }",
+            "fn One() {}\nfn Two() {}",
+            relative_path,
+            "duplicate import alias 'A'|1:20@19..1:23@22",
+        ),
+        (
+            "import_name_conflict",
+            "import { One as A } from \"../stage1/token.ku\"\nfn A() {}\nfn main() { A() }",
+            "fn One() {}",
+            relative_path,
+            "imported name 'A' conflicts with another top-level name|1:10@9..1:13@12",
+        ),
+        (
+            "unsupported_import_kind",
+            "import \"../stage1/token.ku\"\nfn main() {}",
+            token,
+            relative_path,
+            "supplied module binding accepts only named relative imports|1:1@0..1:28@27",
+        ),
+    ];
+    for (code, input, supplied, path, detail) in errors {
+        install_case(&compiler, input, supplied, path);
+        let ran = run(Command::new(&ku).arg("run").arg(&entry), &cwd, 20);
+        assert_eq!(ran.status.code(), Some(1));
+        let want = format!("error|bootstrap.semantics.names|{code}|<source>|{detail}");
+        let diagnostic = String::from_utf8_lossy(&ran.stderr);
+        assert!(
+            diagnostic.contains(&want),
+            "{want} missing from {diagnostic}"
+        );
+
+        if matches!(
+            code,
+            "duplicate_import_name" | "duplicate_import_alias" | "import_name_conflict"
+        ) {
+            let path = oracle_input.join("input.ku");
+            fs::write(&path, input).expect("write Stage0 oracle importer");
+            fs::write(oracle.join("stage1/token.ku"), supplied)
+                .expect("write Stage0 oracle dependency");
+            let stage0 = run(
+                Command::new(&ku).args(["check", "--json"]).arg(path),
+                &cwd,
+                20,
+            );
+            assert_eq!(stage0_detail(input, &stage0, false), detail);
+        }
+    }
+
+    let executable = compiler.join(format!("ku-bind{}", std::env::consts::EXE_SUFFIX));
+    let built = run(
+        Command::new(&ku)
+            .args(["build", "--release"])
+            .arg(&entry)
+            .arg("-o")
+            .arg(&executable),
+        &cwd,
+        120,
+    );
+    assert_success(&built);
+    let native = relocated.join(executable.file_name().expect("native name"));
+    fs::rename(&executable, &native).expect("relocate named binding tool");
+    fs::remove_dir_all(&source).expect("remove copied source tree and staging");
+    for (input, expected) in successes {
+        install_case(&relocated, input, token, relative_path);
+        let ran = run(&mut Command::new(&native), &cwd, 20);
+        assert_success(&ran);
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), expected);
+    }
+    for (code, input, supplied, path, detail) in errors {
+        install_case(&relocated, input, supplied, path);
+        let ran = run(&mut Command::new(&native), &cwd, 20);
+        assert_eq!(ran.status.code(), Some(1));
+        assert!(ran.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&ran.stderr).trim_end(),
+            format!("error|bootstrap.semantics.names|{code}|<source>|{detail}")
+        );
+    }
+}

@@ -21,3 +21,14 @@ Errors include the source position.
 Import entries remain in the validated graph. The pass reports their count and
 retains their node IDs for later resolution. It does not open import files or
 resolve exports, references, types or function bodies.
+
+`imports.ku` also exposes `BindSuppliedImports`. Callers pass previously
+parsed modules under the exact relative paths used by named imports. For
+example, supply the name table for `stage1/token.ku` under
+`../stage1/token.ku` to bind the `Token` import of `stage2/span.ku`.
+Each resulting binding identifies the requesting node and the exported
+declaration's node in the supplied module. An absent module and a missing or
+private export produce different positioned errors.
+
+This pass takes explicit module inputs. It leaves glob, namespace, standard
+library and package imports to a later stage.

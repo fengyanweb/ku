@@ -1,0 +1,181 @@
+import "std.string"
+import { Node } from "../stage2/ast.ku"
+import { Span } from "../stage2/span.ku"
+import { DeclarationSpan, NamedModule, RejectName, TopLevelName } from "./names.ku"
+
+struct SuppliedModule {
+    path: str
+    named: NamedModule
+}
+
+// All IDs and the supplied module index are one-based. Requests and targets
+// refer to the importer's and the supplied module's separate retained arenas.
+struct ImportBinding {
+    local_name: str
+    source_name: str
+    path: str
+    import_node: int
+    request_node: int
+    module_index: int
+    target_node: int
+    span: Span
+}
+
+fn ReadImportNode(&nodes: [Node], node: int, at: Span): Node! {
+    if (node <= 0 || node > nodes.len()) {
+        RejectName("invalid_module_tree", "import table references an invalid AST node", at)?
+    }
+    return ok(nodes[node - 1].clone())
+}
+
+fn CheckImportEdges(&node: Node, edge_count: int, at: Span): null! {
+    if (node.first_edge < 0 || node.first_edge > edge_count || node.edge_count < 0 || node.edge_count > edge_count - node.first_edge) {
+        RejectName("invalid_module_tree", "import AST references an invalid edge range", at)?
+    }
+    return ok(null)
+}
+
+fn FindModule(&supplied: [SuppliedModule], &path: str, at: Span): int! {
+    found = 0
+    index = 0
+    while (index < supplied.len()) {
+        if (supplied[index].path == path) {
+            if (found != 0) {
+                RejectName("ambiguous_module", "more than one module is supplied for '" + path.clone() + "'", at.clone())?
+            }
+            found = index + 1
+        }
+        index = index + 1
+    }
+    if (found == 0) {
+        RejectName("unresolved_import", "no module is supplied for '" + path.clone() + "'", at)?
+    }
+    return ok(found)
+}
+
+fn FindExport(&declarations: [TopLevelName], &request: str, at: Span): int! {
+    if (declarations.len() > 255) {
+        RejectName("item_limit", "supplied module accepts at most 255 declarations", at)?
+    }
+    if (request.byte_len() == 0 || !("ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(string.slice(request.clone(), 0, 1)?))) {
+        return ok(0)
+    }
+    index = 0
+    while (index < declarations.len()) {
+        entry = declarations[index].clone()
+        if (entry.name == request && (entry.kind == "Function" || entry.kind == "Struct" || entry.kind == "Enum")) {
+            return ok(entry.node)
+        }
+        index = index + 1
+    }
+    return ok(0)
+}
+
+fn ResolveSuppliedExport(&supplied: NamedModule, &request: str, at: Span): int! {
+    node = FindExport(supplied.names.declarations, request, at.clone())?
+    if (node == 0) { return ok(0) }
+    target = ReadImportNode(supplied.parsed.arena.nodes, node, at.clone())?
+    if (target.text != request || (target.kind != "Function" && target.kind != "Struct" && target.kind != "Enum")) {
+        RejectName("invalid_module_tree", "supplied export does not match its declaration", at)?
+    }
+    return ok(node)
+}
+
+fn CheckImportName(&local_names: [TopLevelName], &bindings: [ImportBinding], current_import: int,
+                   &request: str, &local: str, at: Span): null! {
+    index = 0
+    conflict = false
+    duplicate_alias = false
+    while (index < bindings.len()) {
+        binding = bindings[index].clone()
+        if (binding.import_node == current_import && binding.source_name == request) {
+            RejectName("duplicate_import_name", "duplicate import name '" + request.clone() + "'", at.clone())?
+        }
+        if (binding.local_name == local) {
+            if (binding.import_node == current_import) { duplicate_alias = true }
+            conflict = true
+        }
+        index = index + 1
+    }
+    if (duplicate_alias) {
+        RejectName("duplicate_import_alias", "duplicate import alias '" + local.clone() + "'", at.clone())?
+    }
+    index = 0
+    while (index < local_names.len()) {
+        if (local_names[index].name == local) { conflict = true }
+        index = index + 1
+    }
+    if (conflict) {
+        RejectName("import_name_conflict", "imported name '" + local.clone() + "' conflicts with another top-level name", at)?
+    }
+    return ok(null)
+}
+
+fn CollectImportBindings(&nodes: [Node], &edges: [int], &imports: [int], &local_names: [TopLevelName],
+                         &supplied: [SuppliedModule]): [ImportBinding]! {
+    start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    if (imports.len() > 64 || supplied.len() > 64 || local_names.len() > 255) {
+        RejectName("import_limit", "supplied import pass exceeded the module count limit", start.clone())?
+    }
+    bindings: [ImportBinding] = []
+    group_index = 0
+    while (group_index < imports.len()) {
+        import_id = imports[group_index]
+        group = ReadImportNode(nodes, import_id, start.clone())?
+        group_span = DeclarationSpan(group)
+        CheckImportEdges(group, edges.len(), group_span.clone())?
+        if (group.kind != "Import") {
+            RejectName("invalid_module_tree", "import table must identify an Import AST node", group_span.clone())?
+        }
+        if (group.edge_count == 0 || !(group.text.starts_with("./") || group.text.starts_with("../"))) {
+            RejectName("unsupported_import_kind", "supplied module binding accepts only named relative imports", group_span.clone())?
+        }
+        first = ReadImportNode(nodes, edges[group.first_edge], group_span.clone())?
+        if (first.kind != "ImportName") {
+            RejectName("unsupported_import_kind", "supplied module binding accepts only named relative imports", group_span.clone())?
+        }
+        module_index = FindModule(supplied, group.text, group_span.clone())?
+        index = 0
+        while (index < group.edge_count) {
+            request_node = edges[group.first_edge + index]
+            request = ReadImportNode(nodes, request_node, group_span.clone())?
+            at = DeclarationSpan(request)
+            CheckImportEdges(request, edges.len(), at.clone())?
+            if (request.kind != "ImportName" || request.edge_count > 1) {
+                RejectName("invalid_module_tree", "expected a named import with at most one alias", at.clone())?
+            }
+            local = request.text.clone()
+            if (request.edge_count == 1) {
+                alias = ReadImportNode(nodes, edges[request.first_edge], at.clone())?
+                if (alias.kind != "ImportAlias" || alias.edge_count != 0) {
+                    RejectName("invalid_module_tree", "expected an import alias leaf", at.clone())?
+                }
+                local = alias.text
+            }
+            if (bindings.len() >= 255) {
+                RejectName("import_limit", "supplied import pass accepts at most 255 imported bindings", at.clone())?
+            }
+            CheckImportName(local_names, bindings, import_id, request.text, local, at.clone())?
+            target_node = ResolveSuppliedExport(supplied[module_index - 1].named, request.text, at.clone())?
+            if (target_node == 0) {
+                RejectName("missing_export", "'" + request.text.clone() + "' is not exported by '" + group.text.clone() + "'", at.clone())?
+            }
+            binding = ImportBinding {
+                local_name: local, source_name: request.text, path: group.text.clone(),
+                import_node: import_id, request_node: request_node, module_index: module_index,
+                target_node: target_node, span: at
+            }
+            bindings = bindings.push(binding)
+            index = index + 1
+        }
+        group_index = group_index + 1
+    }
+    return ok(bindings)
+}
+
+// The caller supplies an ordered table of already parsed modules under the
+// exact import spellings it supports. No filesystem or recursive graph walk.
+fn BindSuppliedImports(&importer: NamedModule, &supplied: [SuppliedModule]): [ImportBinding]! {
+    return CollectImportBindings(importer.parsed.arena.nodes, importer.parsed.arena.edges,
+                                 importer.names.imports, importer.names.declarations, supplied)
+}
