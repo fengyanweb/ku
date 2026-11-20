@@ -198,6 +198,11 @@ allocates the joined output once. An owned struct argument releases its
 strings on return, allocation failure or arithmetic failure. A View argument
 leaves its storage with the caller.
 
+The same mode supports a `bool` result for predicates such as the original
+`IsNamedStructStart`. It reads the four Token Views in source order and
+preserves short-circuit conditions. The generated predicate does no allocation
+or ownership transfer.
+
 For the original `RelocateTokens` in `stage2/context.ku`, select `managed` and
 keep the same project manifest. The emitter handles the loop, per-iteration
 owners and array return. The no-relocation branch returns the original array

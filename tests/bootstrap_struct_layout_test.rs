@@ -1350,7 +1350,53 @@ fn Make(): Outer {
     assert_projected_span(&ku, &driver_binary, &cwd, span_source);
     assert_constructor_parameter_ownership(&driver_binary, &cwd);
     assert_constructor_view(&driver_binary, &cwd);
+    assert_guarded_predicate(&driver_binary, &cwd);
     assert_project_link_plans(&driver_binary, &cwd);
+}
+
+fn assert_guarded_predicate(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("mode.txt"), "guarded").unwrap();
+    fs::write(cwd.join("function.txt"), "IsNamedStructStart").unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "stage2/expression_support.ku\nstage2/span.ku\nstage2/diagnostic.ku\nstage1/token.ku\nstage2/ast.ku\n",
+    )
+    .unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    assert!(!text.contains("malloc(") && !text.contains("free("));
+    let signature = text
+        .lines()
+        .find_map(|line| line.strip_prefix("bool ku_guarded_"))
+        .unwrap();
+    let (id, arguments) = signature.split_once('(').unwrap();
+    let token = arguments
+        .strip_prefix("const ")
+        .unwrap()
+        .split_once('*')
+        .unwrap()
+        .0;
+    let driver = r#"
+#define TEXT(s) ((KuProjectionString){(uint8_t*)(s),sizeof(s)-1,0,KU_PROJECTION_STRING_STATIC})
+int main(void) {
+    TOKEN name={.f0=TEXT("Ident"),.f3=7,.f6=7}, opener={.f0=TEXT("LBrace"),.f3=7,.f6=7};
+    TOKEN field={.f0=TEXT("Ident"),.f3=7,.f6=7}, sep={.f0=TEXT("Colon"),.f3=7,.f6=7};
+    if (!PREDICATE(&name,&opener,&field,&sep)) return 1;
+    opener.f3=8;
+    if (PREDICATE(&name,&opener,&field,&sep)) return 2;
+    opener.f3=7;
+    sep.f0=TEXT("Comma");
+    return PREDICATE(&name,&opener,&field,&sep);
+}
+"#
+    .replace("TOKEN", token)
+    .replace("PREDICATE", &format!("ku_guarded_{id}"));
+    let c = cwd.join("guarded-predicate.c");
+    fs::write(&c, format!("{text}{driver}")).unwrap();
+    let exe = cwd.join(format!("guarded-predicate{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 15));
 }
 
 fn assert_constructor_view(seed: &Path, cwd: &Path) {
