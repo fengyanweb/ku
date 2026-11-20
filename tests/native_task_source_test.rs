@@ -523,18 +523,22 @@ fn native_task_optional_absence_releases_awaited_records_before_timer() {
         r#"
 import time from "std.time"
 struct Reply { detail: Detail }
-struct Detail { body: str }
+struct Detail { body: str title: str | null }
 async fn Check(): bool! {
     named = (await Fetch())?
     println(named?.detail?.unknown)
     println(((await Fetch())?)?.detail?.unknown)
     println(((await Fetch())?)?.unknown)
     println(null?.unknown)
+    equal = ((await Fetch())?)?.detail?.title == null
+    different = ((await Fetch())?)?.detail?.title != null
+    kept: str | null = "kept"
+    present = kept != null
     time.sleep(2)?
-    return ok(named.detail.body == "owned text")
+    return ok(!equal && different && present && kept == "kept" && named.detail.body == "owned text")
 }
 async fn Fetch(): Reply! {
-    return ok(Reply { detail: Detail { body: "owned" + " text" } })
+    return ok(Reply { detail: Detail { body: "owned" + " text", title: "kept" + " title" } })
 }
 async fn main(): null! { return ok(null) }
 "#,
@@ -601,8 +605,11 @@ static int fixture_case(bool cancel) {
   KuString named=instance->frame.s_@NAMED@.detail.body;
   CHECK(named.storage==KU_STRING_OWNED && named.len==10u);
   CHECK(!memcmp(named.ptr,"owned text",10u));
-  CHECK(driver.reserved_bytes==sizeof(*instance)+named.capacity);
-  CHECK(ku_perf_live_allocations==driver_allocations+2u);
+  KuString title=instance->frame.s_@NAMED@.detail.title.value;
+  CHECK(title.storage==KU_STRING_OWNED && title.len==10u);
+  CHECK(!memcmp(title.ptr,"kept title",10u));
+  CHECK(driver.reserved_bytes==sizeof(*instance)+named.capacity+title.capacity);
+  CHECK(ku_perf_live_allocations==driver_allocations+3u);
   CHECK(ku_perf_live_bytes==driver_bytes+driver.reserved_bytes);
 
   if(cancel)

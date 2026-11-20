@@ -204,6 +204,12 @@ impl FunctionLowerer<'_> {
             other: None,
             operation: TaskCollectionOperation::NullableIsNull,
         })?;
+        if !matches!(tested.kind, ExprKind::Variable(_))
+            && !self.stable_slots[source.0]
+            && owned_value(&self.function.slots[source.0].ty)
+        {
+            self.emit(TaskOp::Drop { slot: source })?;
+        }
         if op == BinaryOp::Equal {
             return Ok(Some(dst));
         }
