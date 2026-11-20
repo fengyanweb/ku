@@ -4,7 +4,7 @@ import { Node, ParseOutput } from "../stage2/ast.ku"
 import { ExpressionSpan, MakeExpressionNode } from "../stage2/expression_support.ku"
 import { WindowKind, WindowToken, AfterOptionalSemicolon, CheckFunctionBodySpan } from "./support.ku"
 import { CheckTypeArenaCapacity } from "./signature.ku"
-import { AppendStatementLinks, BuildCatchClause, PrepareBodyAttachment } from "./statement_links.ku"
+import { AppendStatementLinks, BuildCatchClause, BuildControlStatement, FunctionEofKind, LocalFunctionNodeKind, PrepareBodyAttachment } from "./statement_links.ku"
 import { LocalFunctionScope, ReadLocalFunctionHeader } from "./function_header.ku"
 import { ReadSimpleBodyStatement } from "./simple_statements.ku"
 import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, ReadControlHeader, IsControlStatement, ReadCatchBinding, RejectBodyEof, RejectControlBody, RejectBodyEdgeId, RejectNestedNodeId, ReadElsePhase, CheckStrayClause, ExpectTryToken, RejectStatementLimit, RejectStatementDepth, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow } from "./body_support.ku"
@@ -120,7 +120,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
     while (reading_body) {
         token = WindowToken(tokens, cursor, last_index)
         parse_steps = NextBodyWork(parse_steps, 1, token.clone())?
-        if (token.kind == "Eof") { RejectBodyEof(control_depth, current.kind.clone(), current.phase, token.clone())? }
+        if (token.kind == "Eof") { RejectBodyEof(control_depth, FunctionEofKind(current.kind), current.phase, token.clone())? }
         if (token.kind == "RBrace") {
             block_end = token
             cursor = cursor + 1
@@ -149,7 +149,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                     control_start = WindowToken(tokens, current.start, last_index)
                     control_children: [int] = [current.condition]
                     control_value = 0
-                    if (current.kind == "Function") {
+                    if (current.kind == "Function" || current.kind == "FunctionExpr") {
                         scope = local_headers[current.condition - 1].clone()
                         control_children = scope.children
                         statement_count = scope.parent_statement_count
@@ -164,7 +164,8 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                             control_children = AppendStatementList(control_children, current.else_top, current.else_count, control_start.clone())?
                         }
                     }
-                    statement = AddNode(current.kind.clone(), current.binding.clone(), control_value, SpanMerge(SpanFromToken(control_start.clone()), SpanFromToken(block_end.clone())), control_children, control_start)?
+                    statement = BuildControlStatement(tokens, cursor, last_index, current, control_value,
+                                                      control_children, control_start, block_end, AddNode.clone())?
                     control_depth = control_depth - 1
                     if (control_depth > 0) {
                         // Every nested open appends exactly one parent frame.
@@ -191,14 +192,16 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
             statement_start = token
             statement_count = statement_count + 1
             control_kind = statement_start.kind.clone()
-            if (IsControlStatement(control_kind)) {
+            if (IsControlStatement(control_kind) || (control_kind == "Ident"
+                && WindowKind(tokens, cursor + 1, last_index) == "Equal"
+                && WindowKind(tokens, cursor + 2, last_index) == "Fn")) {
                 if (control_depth >= 32) {
                     RejectStatementDepth(statement_start.clone())?
                 }
                 condition = 0
                 binding = ""
-                if (control_kind == "Fn") {
-                    local = ReadLocalFunctionHeader(tokens, cursor, last_index, parse_steps, arena_nodes.len(), statement_count)?
+                if (control_kind == "Fn" || control_kind == "Ident") {
+                    local = ReadLocalFunctionHeader(tokens, cursor, last_index, parse_steps, arena_nodes.len(), statement_count, control_kind == "Ident")?
                     AddArena(local.output, statement_start.clone(), true)?
                     local_headers = local_headers.push(local.scope)
                     statement_count = 0
@@ -206,7 +209,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                     binding = local.name
                     cursor = local.body_open
                     parse_steps = local.work
-                    control_kind = "Function"
+                    control_kind = LocalFunctionNodeKind(control_kind)
                 } else if (control_kind == "Try") {
                     cursor = cursor + 1
                     ExpectTryToken(WindowToken(tokens, cursor, last_index), "LBrace", "expected '{' before try body")?

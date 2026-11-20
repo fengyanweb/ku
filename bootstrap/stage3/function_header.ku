@@ -29,6 +29,10 @@ struct LocalFunctionHeader {
 // Parse one ordinary named function signature against an existing bounded
 // token window. The returned forest is consumed by the function/body reader.
 fn ReadFunctionHeader(&tokens: [Token], first: int, last_index: int, initial_work: int): FunctionHeader! {
+    return ReadFunctionHeaderMode(tokens, first, last_index, initial_work, false)
+}
+
+fn ReadFunctionHeaderMode(&tokens: [Token], first: int, last_index: int, initial_work: int, anonymous: bool): FunctionHeader! {
     arena_nodes: [Node] = []
     arena_edges: [int] = []
     parse_steps = initial_work
@@ -95,13 +99,22 @@ fn ReadFunctionHeader(&tokens: [Token], first: int, last_index: int, initial_wor
 
     function_start = WindowToken(tokens, first, last_index)
     cursor = first + 1
-    if (WindowKind(tokens, cursor, last_index) != "Ident") {
-        RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected function name")?
+    function_name = ""
+    open_error = "expected '(' after 'fn'"
+    parameter_error = "expected anonymous function parameter"
+    close_error = "expected ')' after anonymous function parameters"
+    if (!anonymous) {
+        if (WindowKind(tokens, cursor, last_index) != "Ident") {
+            RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected function name")?
+        }
+        function_name = tokens[cursor].lexeme.clone()
+        cursor = cursor + 1
+        open_error = "expected '(' after function name"
+        parameter_error = "expected parameter name"
+        close_error = "expected ')' after parameters"
     }
-    function_name = tokens[cursor].lexeme.clone()
-    cursor = cursor + 1
     if (WindowKind(tokens, cursor, last_index) != "LParen") {
-        RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected '(' after function name")?
+        RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", open_error)?
     }
     cursor = cursor + 1
     parameters: [int] = []
@@ -120,7 +133,7 @@ fn ReadFunctionHeader(&tokens: [Token], first: int, last_index: int, initial_wor
         }
         parameter_token = WindowToken(tokens, cursor, last_index)
         if (parameter_token.kind != "Ident") {
-            RejectAt(parameter_token.clone(), "unexpected_token", "expected parameter name")?
+            RejectAt(parameter_token.clone(), "unexpected_token", parameter_error.clone())?
         }
         cursor = cursor + 1
         parameter_children: [int] = []
@@ -139,10 +152,10 @@ fn ReadFunctionHeader(&tokens: [Token], first: int, last_index: int, initial_wor
         if (WindowKind(tokens, cursor, last_index) == "Comma") {
             cursor = cursor + 1
             if (WindowKind(tokens, cursor, last_index) == "RParen") {
-                RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected parameter name")?
+                RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", parameter_error.clone())?
             }
         } else if (WindowKind(tokens, cursor, last_index) != "RParen") {
-            RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected ')' after parameters")?
+            RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", close_error.clone())?
         }
     }
     cursor = cursor + 1
@@ -186,9 +199,11 @@ fn PackFunctionHeader(arena: Arena, &children: [int], span: Span, origin: Token)
 }
 
 fn ReadLocalFunctionHeader(&tokens: [Token], first: int, last: int, work: int,
-                           node_base: int, parent_statement_count: int): LocalFunctionHeader! {
-    header = ReadFunctionHeader(tokens, first, last, work)?
-    origin = WindowToken(tokens, first, last)
+                           node_base: int, parent_statement_count: int, anonymous_assignment: bool): LocalFunctionHeader! {
+    header_start = first
+    if (anonymous_assignment) { header_start = first + 2 }
+    header = ReadFunctionHeaderMode(tokens, header_start, last, work, anonymous_assignment)?
+    origin = WindowToken(tokens, header_start, last)
     span = SpanMerge(SpanFromToken(origin.clone()), SpanFromToken(WindowToken(tokens, header.body_open, last)))
     children = header.children
     packed = PackFunctionHeader(header.arena, children, span, origin)?
@@ -198,6 +213,11 @@ fn ReadLocalFunctionHeader(&tokens: [Token], first: int, last: int, work: int,
         relocated = relocated.push(next)
     }
     scope = LocalFunctionScope { children: relocated, parent_statement_count: parent_statement_count }
-    return ok(LocalFunctionHeader { name: header.name, output: packed, scope: scope,
+    name = header.name
+    if (anonymous_assignment) {
+        target = WindowToken(tokens, first, last)
+        name = target.lexeme
+    }
+    return ok(LocalFunctionHeader { name: name, output: packed, scope: scope,
                                     body_open: header.body_open, work: header.work })
 }

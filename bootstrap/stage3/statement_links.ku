@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
-import { WindowToken } from "./support.ku"
+import { RejectAt, WindowToken } from "./support.ku"
 import { ControlFrame, RejectFinally, StatementLink, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength,
          RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectNestedRoot } from "./body_support.ku"
 
@@ -78,4 +78,38 @@ fn BuildCatchClause(&tokens: [Token], next: int, last: int, &frame: ControlFrame
     catch_body = add_node("CatchBody", "", 0, body_span, children, catch_open)?
     clause_span = SpanMerge(SpanFromToken(catch_start.clone()), end_span)
     return add_node("Catch", "", 0, clause_span, [frame.catch_binding, catch_body], catch_start)
+}
+
+
+// Match the named function body diagnostic for an incomplete anonymous body.
+fn FunctionEofKind(&kind: str): str {
+    if (kind == "FunctionExpr") { return "Function" }
+    return kind.clone()
+}
+
+fn LocalFunctionNodeKind(&start_kind: str): str {
+    if (start_kind == "Ident") { return "FunctionExpr" }
+    return "Function"
+}
+
+fn BuildControlStatement(&tokens: [Token], next: int, last: int, &frame: ControlFrame, value: int,
+                         children: [int], start: Token, &closing: Token,
+                         add_node: fn(str, str, int, Span, [int], Token): int!): int! {
+    end_span = SpanFromToken(closing.clone())
+    statement_span = SpanMerge(SpanFromToken(start.clone()), end_span.clone())
+    if (frame.kind != "FunctionExpr") {
+        return add_node(frame.kind.clone(), frame.binding.clone(), value, statement_span, children, start)
+    }
+
+    // Only complete ordinary assignment RHS values use this path. A group,
+    // index or unary minus can otherwise look like a second statement.
+    following = WindowToken(tokens, next, last)
+    if (following.kind == "LParen" || following.kind == "LBracket" || following.kind == "Minus"
+        || following.kind == "Dot" || following.kind == "Question") {
+        RejectAt(following, "unsupported_expression", "stage-3 anonymous function assignments require a complete right-hand side")?
+    }
+    opener = WindowToken(tokens, frame.start + 2, last)
+    span = SpanMerge(SpanFromToken(opener.clone()), end_span)
+    expression = add_node("FunctionExpr", "", 0, span, children, opener)?
+    return add_node("Assign", frame.binding.clone(), 0, statement_span, [expression], start)
 }

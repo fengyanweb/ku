@@ -10,7 +10,7 @@ pub mod bounded_process;
 use bounded_process::{run_bounded, OutputLimits};
 use ku::ast::{
     AssignTarget, BinaryOp, EnumDecl, Expr, ExprKind, FnDecl, ImportDecl, ImportKind, Item,
-    Literal, ModuleDecl, ParamMode, Stmt, StructDecl, TypeName, UnaryOp,
+    Literal, ModuleDecl, Param, ParamMode, Stmt, StructDecl, TypeName, UnaryOp,
 };
 use ku::lexer::Lexer;
 use ku::parser::Parser;
@@ -294,6 +294,31 @@ fn push_node(
 }
 
 fn project_expr(source: &str, expr: &Expr, arena: &mut ProjectedArena) -> usize {
+    if let ExprKind::Function {
+        params,
+        return_type,
+        body,
+    } = &expr.kind
+    {
+        let function = FnDecl {
+            name: String::new(),
+            is_async: false,
+            type_params: Vec::new(),
+            params: params
+                .iter()
+                .map(|param| Param {
+                    mode: param.mode,
+                    name: param.name.clone(),
+                    ty: param.ty.clone(),
+                    span: param.span,
+                })
+                .collect(),
+            return_type: return_type.clone(),
+            body: body.clone(),
+            span: expr.span,
+        };
+        return project_function(source, &function, arena);
+    }
     let literal = match &expr.kind {
         ExprKind::StructLiteral { name, fields } => {
             Some(("StructLiteral", "StructLiteralField", name.as_str(), fields))
@@ -643,6 +668,10 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
             let expr = project_expr(source, expr, arena);
             push_node(arena, "ExprStmt", String::new(), 0, *span, &[expr])
         }
+        Stmt::Fail { value, span } => {
+            let value = project_expr(source, value, arena);
+            push_node(arena, "Fail", String::new(), 0, *span, &[value])
+        }
         Stmt::Print { value, span } => {
             let value = project_expr(source, value, arena);
             push_node(arena, "Print", String::new(), 0, *span, &[value])
@@ -890,8 +919,13 @@ fn project_function(source: &str, function: &FnDecl, arena: &mut ProjectedArena)
         })
         .expect("function start token");
     cursor += 1;
-    assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
-    cursor += 1;
+    let kind = if function.name.is_empty() {
+        "FunctionExpr"
+    } else {
+        assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
+        cursor += 1;
+        "Function"
+    };
     assert!(matches!(tokens[cursor].kind, TokenKind::LParen));
     cursor += 1;
 
@@ -939,7 +973,7 @@ fn project_function(source: &str, function: &FnDecl, arena: &mut ProjectedArena)
     );
     push_node(
         arena,
-        "Function",
+        kind,
         function.name.clone(),
         0,
         function.span,
@@ -1443,7 +1477,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let compiler_declaration = format!("{compiler_signature}}}");
     let real_charge_work = real_local_function(
         include_str!("../bootstrap/stage3/function_header.ku"),
-        "ReadFunctionHeader",
+        "ReadFunctionHeaderMode",
         "ChargeWork",
     );
     let real_add_node = real_local_function(
@@ -1481,6 +1515,8 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         include_str!("../bootstrap/stage1/token.ku"),
         include_str!("../bootstrap/stage1/main.ku"),
         include_str!("../bootstrap/stage2/main.ku"),
+        include_str!("../bootstrap/tools/declarations/main.ku"),
+        "// 捕获😀\r\nfn outer(prefix: int) { read = fn(&value: int): int { if (ready) { return prefix } return value }; after = read }",
         "// 异常😀\r\nfn main() { before = 0 try { if (check) { try {} catch(inner) {} } next = 1 } catch(outer) { one = outer.code try { recover()? } catch(recovery) {} two = outer.message } after = 2 }",
         "fn sum() { count = 0 for n in [1,2] { if (n > 1) { count += n } } count %= 5 return count }",
         "// 跳转😀\r\nfn f() { for value in [1,2] { try { if (value == 1) { continue; } break } catch(err) { break; } } while (ready) { continue } }",
