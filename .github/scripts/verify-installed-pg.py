@@ -512,7 +512,9 @@ def hidden_checkout(repo, root, report):
             raise ValueError('source checkout restoration is unconfirmed; retain the exact owned root')
 
 
-def selected_lanes(tasks_example, typed_example):
+def selected_lanes(tasks_example, typed_example, async_example=False):
+    if async_example:
+        return ("async-example",)
     return tuple(name for name, enabled in (("tasks", tasks_example), ("typed", typed_example))
                  if enabled) or ("sync", "async")
 
@@ -537,11 +539,14 @@ def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, repor
     working.mkdir()
     command = [sys.executable, "-B", str(driver), "--ku", str(executable),
                "--loops", "4", "--profile", report.get('profile', 'debug')]
-    lanes = selected_lanes(report.get("tasks_example"), report.get("typed_example"))
+    lanes = selected_lanes(report.get("tasks_example"), report.get("typed_example"),
+                           report.get("async_example"))
     if report.get("tasks_example"):
         command.extend(("--tasks-example", "--tasks-backend", report["tasks_backend"]))
     if report.get("typed_example"):
         command.append("--typed-example")
+    if report.get("async_example"):
+        command.append("--async-example")
     if lanes == ("sync", "async") and report.get('target') == 'x86_64-pc-windows-gnu':
         command.append('--installed-contracts')
     report["pg_fixture_invoked"] = True
@@ -560,7 +565,7 @@ def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, repor
         return process
     execution_deadline = time.monotonic() + 180
     report["fixture_execution_budget_seconds"] = 180
-    report["fixture_execution_budget_scope"] = "one absolute budget across tools/startup and both independent lanes; mandatory reclamation has a separate bounded cleanup phase"
+    report["fixture_execution_budget_scope"] = "one absolute budget across tools, startup and selected lanes; mandatory reclamation has a separate bounded cleanup phase"
     def execution_remaining():
         value = execution_deadline - time.monotonic()
         if value <= 0:
@@ -690,7 +695,7 @@ def capture_pg_failure(report, lifecycle, error):
         if not isinstance(data, dict) or not isinstance(data.get('lanes'), dict):
             raise ValueError('lifecycle has no lane object')
         detail['lifecycle_status'] = pg_failure_text(data.get('status', ''), 128)
-        for lane in ('sync', 'async', 'tasks'):
+        for lane in ('sync', 'async', 'tasks', 'typed', 'async-example'):
             entry = data['lanes'].get(lane)
             if not isinstance(entry, dict):
                 continue
@@ -711,6 +716,13 @@ def capture_pg_failure(report, lifecycle, error):
                 encoded = json.dumps(item['failure_request'], ensure_ascii=False)
                 if len(encoded.encode('utf-8')) > 2048:
                     item['failure_request'] = {'excerpt': pg_failure_text(encoded, 1536)}
+            if lane == 'async-example' and isinstance(raw_report.get('async_entries'), dict):
+                item['async_entries'] = {
+                    name: {field: pg_failure_text(evidence.get(field, ''), limit, tail=True)
+                           for field, limit in (('status', 32), ('failure', 256), ('service_log_tail', 512))}
+                    for name, evidence in raw_report['async_entries'].items()
+                    if name in ('ku_run', 'native', 'runner') and isinstance(evidence, dict)
+                }
             detail['lanes'][lane] = item
     except (OSError, ValueError, TypeError) as capture_error:
         detail['lifecycle_read_error_kind'] = type(capture_error).__name__
@@ -741,9 +753,12 @@ def verify(args):
     output = args.output.resolve()
     tasks_example = getattr(args, "tasks_example", False)
     typed_example = getattr(args, "typed_example", False)
+    async_example = getattr(args, "async_example", False)
     tasks_backend = getattr(args, "tasks_backend", None) or "native"
-    lanes = selected_lanes(tasks_example, typed_example)
-    profile = 'release' if tasks_example or typed_example or args.target == 'x86_64-pc-windows-gnu' else 'debug'
+    if async_example and (tasks_example or typed_example):
+        raise ValueError("the async PG example requires a separate fixture run")
+    lanes = selected_lanes(tasks_example, typed_example, async_example)
+    profile = 'release' if tasks_example or typed_example or async_example or args.target == 'x86_64-pc-windows-gnu' else 'debug'
     if args.target == 'x86_64-pc-windows-gnu' and not getattr(args, 'hide_checkout', False):
         raise ValueError('GNU PG acceptance requires --hide-checkout; source checks are not installed execution')
     report = {"format": "ku-installed-pg-check-v1", "status": "running",
@@ -758,6 +773,9 @@ def verify(args):
         report["typed_example"] = True
         typed_scope = "installed synchronous typed PostgreSQL; default native, ku run and Runner Release"
         report["scope"] = f"{report['scope']}; {typed_scope}" if tasks_example else typed_scope
+    if async_example:
+        report.update(async_example=True,
+                      scope="installed HTTP Task PostgreSQL wait, cancellation and recovery; native, ku run and Runner Release")
     save_report(output, report)
     try:
         with owned_temporary_root(report) as root:
@@ -842,13 +860,16 @@ def verify(args):
                 elif lane == "typed":
                     fixture_name = "pg_sync_installed_typed.ku"
                     fixture_sha = exporter.file_hash(repo / "tests" / "fixtures" / fixture_name)
+                elif lane == "async-example":
+                    fixture_name = "pg_async_installed_wait.ku"
+                    fixture_sha = exporter.file_hash(repo / "tests" / "fixtures" / fixture_name)
                 else:
                     fixture_name = ("http_pg_installed_contract" if args.target == 'x86_64-pc-windows-gnu' else "http_pg_lifecycle") + ("_async" if lane == "async" else "") + ".ku"
                     fixture_sha = exporter.file_hash(repo / "tests" / "fixtures" / fixture_name)
                 if (entry.get("status") != "passed" or raw.get("status") != "passed"
                         or raw.get("cleanup_errors") != [] or raw.get("cli_sha256") != expected_cli
                         or raw.get("event_loops") != 4 or raw.get("database_retry") is not False
-                        or raw.get("parameters", {}).get("build_profile" if lane in ("tasks", "typed") else "native_c_profile") != profile
+                        or raw.get("parameters", {}).get("build_profile" if lane in ("tasks", "typed", "async-example") else "native_c_profile") != profile
                         or raw.get("lane") != lane or raw.get("fixture") != fixture_name
                         or raw.get("fixture_sha256") != fixture_sha):
                     raise ValueError("PG lifecycle result, CLI identity or cleanup differs")
@@ -896,6 +917,53 @@ def verify(args):
                     report["typed_results"] = entries
                     if os.name != "nt":
                         report["typed_libpq_provider"] = raw["libpq_provider"]
+                if lane == "async-example":
+                    if raw.get("checks", {}).get("async_pg_ordered_wait_cancel_deadline_recovery") != "passed":
+                        raise ValueError("asynchronous PostgreSQL lifecycle check is missing")
+                    entries = raw.get("async_entries", {})
+                    if (set(entries) != {"ku_run", "native", "runner"}
+                            or entries["ku_run"].get("executable_sha256") != expected_cli):
+                        raise ValueError("async PG execution entries or CLI identity differs")
+                    required_order = ("lock_acquired", "postgres_wait", "lightweight_completed", "released")
+                    for name, result in entries.items():
+                        if (result.get("status") != "passed"
+                                or result.get("remaining_database_sessions") != 0
+                                or result.get("source_removed_before_run") is not (name != "ku_run")
+                                or result.get("query_submissions") != 3
+                                or result.get("deliveries") != ["pg-delivered:normal"]
+                                or not prepare.SHA256.fullmatch(result.get("executable_sha256", ""))):
+                            raise ValueError(f"{name} async PG execution or cleanup signature differs")
+                        typed = result.get("typed_successor", {})
+                        if (typed.get("integer") != 17 or typed.get("text") != "中文🙂"
+                                or typed.get("absent") is not True):
+                            raise ValueError(f"{name} typed PG successor did not preserve its declared fields")
+                        scenarios = result.get("scenarios", {})
+                        if set(scenarios) != {"normal", "cancel", "deadline"}:
+                            raise ValueError(f"{name} required async PG scenarios are missing")
+                        for phase, trace in scenarios.items():
+                            events = trace.get("event_order", [])
+                            if tuple(event for event in events if event in required_order) != required_order:
+                                raise ValueError(f"{name} {phase} did not finish the lightweight request before unlocking")
+                            if name == "native" and trace.get("native_task_net_wait", 0) < 1:
+                                raise ValueError(f"{name} {phase} has no Task network wait witness")
+                            if phase == "normal":
+                                completion_order = ("released", "normal_result")
+                            else:
+                                failure = "client_reset" if phase == "cancel" else "deadline_elapsed"
+                                completion_order = (failure, "recovery_completed", "released")
+                                if trace.get("disposition") not in ("reused_after_cleanup", "evicted_then_reconnected"):
+                                    raise ValueError(f"{name} {phase} has no verified connection disposition")
+                            if tuple(event for event in events if event in completion_order) != completion_order:
+                                raise ValueError(f"{name} {phase} has no verified completion order")
+                        if os.name == "nt":
+                            module = result.get("libpq_module", {})
+                            if (module.get("machine") != "AMD64"
+                                    or not prepare.SHA256.fullmatch(module.get("sha256", ""))
+                                    or Path(module.get("path", "")).name.casefold() != "libpq.dll"):
+                                raise ValueError(f"{name} actual libpq.dll load was not verified")
+                    report["async_results"] = entries
+                    if os.name != "nt":
+                        report["async_libpq_provider"] = raw["libpq_provider"]
                 if args.target == 'x86_64-pc-windows-gnu' and lane in ("sync", "async"):
                     if (raw.get('source_removed_before_run') is not True
                             or raw.get('private_gnu_libpq', {}).get('wide_toolchain_path_in_service') is not False
@@ -947,6 +1015,8 @@ def main():
                         help="build the task-list example with this backend (default: native)")
     parser.add_argument("--typed-example", action="store_true",
                         help="verify synchronous typed PG with native, ku run, and explicit Runner")
+    parser.add_argument("--async-example", action="store_true",
+                        help="verify HTTP Task PG waiting, cancellation, and recovery with all three installed entries")
     args = parser.parse_args()
     if args.tasks_backend is not None and not args.tasks_example:
         parser.error("--tasks-backend requires --tasks-example")
