@@ -444,20 +444,52 @@ fn bootstrap_parser_preserves_real_failure_and_assignment_syntax() {
         );
     }
 
+    let parser_module = include_str!("../bootstrap/stage3/parser.ku");
     let assignment = "fn Update(row, rows, id) {
         row.title = Fetch(id); rows[id] = row.title
         rows[Locate(id)].title = \"中文\"; rows[Locate(id)] = 0
         unchanged = row.title == \"previous\"
     }";
-    let expected = expected_assignments(assignment);
-    assert!(!expected.is_empty());
-    let output = invoke(assignment);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(actual_assignments(&output.stdout), expected);
+    for source in [parser_module, assignment] {
+        let expected = expected_assignments(source);
+        let output = invoke(source);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(actual_assignments(&output.stdout), expected);
+        if source == parser_module {
+            let rust = Parser::new(Lexer::new(source).lex().unwrap())
+                .parse_program()
+                .expect("Stage0 parses the complete compiler module");
+            let expected: Vec<_> = rust
+                .items
+                .into_iter()
+                .filter_map(|item| {
+                    let Item::Function(function) = item else {
+                        return None;
+                    };
+                    Some((function.name, canonical_span(function.span)))
+                })
+                .collect();
+            assert!(expected
+                .iter()
+                .any(|(name, _)| name == "ParseBoundedModule"));
+            let (nodes, links) = actual_arena(&output.stdout);
+            let functions: Vec<_> = links
+                .last()
+                .expect("program root")
+                .iter()
+                .map(|index| &nodes[*index])
+                .filter(|node| node.kind == "Function")
+                .map(|node| (node.text.clone(), node.span.clone()))
+                .collect();
+            assert_eq!(functions, expected);
+        } else {
+            assert!(!expected.is_empty());
+        }
+    }
 
     for source in [
         "fn Main(): null! { fail ; }",

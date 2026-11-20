@@ -17,6 +17,42 @@ struct ImportRead {
     work: int
 }
 
+// Collect a declaration from the admitted module without copying its token
+// stream. The extra token after the path is the parser's semicolon lookahead.
+fn ReadModuleImport(&tokens: [Token], first: int, &eof: Token): ImportRead! {
+    import_window: [Token] = []
+    window_cursor = first
+    collecting_import = true
+    after_path = false
+    window_is_eof = false
+    while (collecting_import) {
+        if (window_cursor >= tokens.len()) {
+            RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "import inspection escaped the token stream")?
+        }
+        // 265 source tokens cover the complete 65-name all-alias
+        // boundary; one appended EOF sentinel keeps every lookahead
+        // safe while the 64-name grammar limit remains authoritative.
+        if (import_window.len() >= 265) {
+            RejectAt(tokens[window_cursor].clone(), "work_limit", "stage-3 import inspection budget exceeded")?
+        }
+        window_token = tokens[window_cursor].clone()
+        window_is_eof = window_token.kind == "Eof"
+        window_is_string = window_token.kind == "String"
+        import_window = import_window.push(window_token)
+        window_cursor = window_cursor + 1
+        if (after_path || window_is_eof) {
+            collecting_import = false
+        } else if (window_is_string) {
+            after_path = true
+        }
+    }
+    if (!window_is_eof) {
+        import_eof = eof.clone()
+        import_window = import_window.push(import_eof)
+    }
+    return ReadImport(import_window)
+}
+
 // The caller supplies one bounded import window ending at EOF or one token
 // after the first string. Every accepted grammar path therefore has the path
 // token and optional semicolon lookahead without copying the complete module.

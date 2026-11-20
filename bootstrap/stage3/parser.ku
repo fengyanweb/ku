@@ -4,10 +4,10 @@ import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { ParseTokenWindow } from "../stage2/parser.ku"
 import { RejectAt, RejectAtPoint, SpanFromNode, WindowToken } from "./support.ku"
-import { ReadImport } from "./imports.ku"
+import { ReadModuleImport } from "./imports.ku"
 import { DeclarationRead, ReadModule } from "./structs.ku"
 import { ReadBracedDeclaration } from "./enums.ku"
-import { ReadFunction, ReadCompilerFunction } from "./functions.ku"
+import { ModuleFunctionEnd, ReadFunction, ReadCompilerFunction } from "./functions.ku"
 
 // Stage 3 is intentionally a strict, useful subset of the production Rust
 // parser. It accepts top-level module/struct/enum declarations and ordinary
@@ -220,37 +220,7 @@ fn ParseBoundedModule(source: str, compiler_input: bool): ParseOutput! {
             if (import_count >= 64) {
                 RejectAt(tokens[cursor].clone(), "import_limit", "stage-3 parser accepts at most 64 imports")?
             }
-            import_window: [Token] = []
-            window_cursor = cursor
-            collecting_import = true
-            after_path = false
-            window_is_eof = false
-            while (collecting_import) {
-                if (window_cursor >= tokens.len()) {
-                    RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "import inspection escaped the token stream")?
-                }
-                // 265 source tokens cover the complete 65-name all-alias
-                // boundary; one appended EOF sentinel keeps every lookahead
-                // safe while the 64-name grammar limit remains authoritative.
-                if (import_window.len() >= 265) {
-                    RejectAt(tokens[window_cursor].clone(), "work_limit", "stage-3 import inspection budget exceeded")?
-                }
-                window_token = tokens[window_cursor].clone()
-                window_is_eof = window_token.kind == "Eof"
-                window_is_string = window_token.kind == "String"
-                import_window = import_window.push(window_token)
-                window_cursor = window_cursor + 1
-                if (after_path || window_is_eof) {
-                    collecting_import = false
-                } else if (window_is_string) {
-                    after_path = true
-                }
-            }
-            if (!window_is_eof) {
-                import_eof = eof.clone()
-                import_window = import_window.push(import_eof)
-            }
-            parsed = ReadImport(import_window)?
+            parsed = ReadModuleImport(tokens, cursor, eof)?
             parse_steps = parse_steps + parsed.work
             if (parse_steps > 16384) {
                 RejectAt(parsed.start.clone(), "work_limit", "stage-3 parser work budget exceeded")?
@@ -319,32 +289,7 @@ fn ParseBoundedModule(source: str, compiler_input: bool): ParseOutput! {
             RejectAt(tokens[cursor].clone(), "function_limit", "stage-3 parser accepts at most 64 functions")?
         }
         function_base = cursor
-        window_cursor = cursor
-        function_depth = 0
-        seen_body = false
-        collecting_function = true
-        window_is_eof = false
-        while (collecting_function) {
-            if (window_cursor >= tokens.len()) {
-                RejectAt(eof.clone(), "invalid_token_stream", "function inspection escaped the token stream")?
-            }
-            kind = tokens[window_cursor].kind.clone()
-            window_is_eof = kind == "Eof"
-            window_is_lbrace = kind == "LBrace"
-            window_is_rbrace = kind == "RBrace"
-            window_cursor = window_cursor + 1
-            if (window_is_eof) {
-                collecting_function = false
-            } else if (window_is_lbrace) {
-                seen_body = true
-                function_depth = function_depth + 1
-            } else if (seen_body && window_is_rbrace) {
-                function_depth = function_depth - 1
-                if (function_depth == 0) { collecting_function = false }
-            }
-        }
-        function_end = window_cursor
-        if (window_is_eof) { function_end = function_end - 1 }
+        function_end = ModuleFunctionEnd(tokens, function_base, eof)?
         // The compiler reader and callback use absolute scanner indexes. The
         // standalone reader still uses its original local 512-token contract.
         expression_base = function_base
