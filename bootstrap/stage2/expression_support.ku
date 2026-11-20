@@ -73,6 +73,48 @@ fn IsBraceLiteralMarker(&marker: str): bool {
     return marker == "struct" || marker == "object"
 }
 
+struct BinaryOperator {
+    precedence: int
+    text: str
+}
+
+fn ReadBinaryOperator(&token: Token, stage3_domain: bool): BinaryOperator! {
+    if (token.kind == "OrOr") { return ok(BinaryOperator { precedence: 1, text: "||" }) }
+    if (token.kind == "AndAnd") { return ok(BinaryOperator { precedence: 2, text: "&&" }) }
+    if (token.kind == "BangEqual") { return ok(BinaryOperator { precedence: 3, text: "!=" }) }
+    if (token.kind == "EqualEqual") { return ok(BinaryOperator { precedence: 3, text: "==" }) }
+    if (token.kind == "Less") { return ok(BinaryOperator { precedence: 4, text: "<" }) }
+    if (token.kind == "LessEqual") { return ok(BinaryOperator { precedence: 4, text: "<=" }) }
+    if (token.kind == "Greater") { return ok(BinaryOperator { precedence: 4, text: ">" }) }
+    if (token.kind == "GreaterEqual") { return ok(BinaryOperator { precedence: 4, text: ">=" }) }
+    if (token.kind == "Minus") { return ok(BinaryOperator { precedence: 5, text: "-" }) }
+    if (token.kind == "Plus") { return ok(BinaryOperator { precedence: 5, text: "+" }) }
+    if (token.kind == "Slash") { return ok(BinaryOperator { precedence: 6, text: "/" }) }
+    if (token.kind == "Star") { return ok(BinaryOperator { precedence: 6, text: "*" }) }
+    if (token.kind == "Percent") { return ok(BinaryOperator { precedence: 6, text: "%" }) }
+    RejectAt(token.clone(), "trailing_token", "expected end of expression", stage3_domain)?
+    return ok(BinaryOperator { precedence: 0, text: "" })
+}
+
+struct PrimaryAtom {
+    kind: str
+    text: str
+    int_value: int
+}
+
+fn ReadPrimaryAtom(token: Token, stage3_domain: bool): PrimaryAtom! {
+    if (token.kind == "Int") { return ok(PrimaryAtom { kind: "Int", text: "", int_value: token.int_value }) }
+    if (token.kind == "Float" || token.kind == "String" || token.kind == "TemplateString") {
+        return ok(PrimaryAtom { kind: token.kind, text: token.lexeme, int_value: 0 })
+    }
+    if (token.kind == "True") { return ok(PrimaryAtom { kind: "Bool", text: "true", int_value: 0 }) }
+    if (token.kind == "False") { return ok(PrimaryAtom { kind: "Bool", text: "false", int_value: 0 }) }
+    if (token.kind == "Null") { return ok(PrimaryAtom { kind: "Null", text: "", int_value: 0 }) }
+    if (token.kind == "Ident") { return ok(PrimaryAtom { kind: "Variable", text: token.lexeme, int_value: 0 }) }
+    RejectAt(token, "unsupported_expression", "expression form is outside the stage-2 bootstrap subset", stage3_domain)?
+    return ok(PrimaryAtom { kind: "", text: "", int_value: 0 })
+}
+
 fn RejectAt(token: Token, code: str, message: str, stage3_domain: bool): null! {
     domain = "bootstrap.parser"
     if (stage3_domain) { domain = "bootstrap.parser.stage3" }

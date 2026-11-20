@@ -3,7 +3,7 @@ import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken, SpanMerge } from "./span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "./ast.ku"
 import { ParseContext, DefaultParseContext, ParseContextError, RelocateTokens } from "./context.ku"
-import { OperatorEntry, ValueEntry, MakeOperator, OperatorSpan, ExpressionSpan, MakeExpressionNode, IsNamedStructStart, IsBraceLiteralMarker, RejectAt, RejectAtPoint } from "./expression_support.ku"
+import { OperatorEntry, ValueEntry, MakeOperator, OperatorSpan, ExpressionSpan, MakeExpressionNode, IsNamedStructStart, IsBraceLiteralMarker, ReadBinaryOperator, ReadPrimaryAtom, RejectAt, RejectAtPoint } from "./expression_support.ku"
 
 // Stage 2B uses append-only operator/value stacks and integer links. Flat
 // binary and postfix chains are iterative; nested delimiters and unary prefixes
@@ -321,26 +321,8 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
                 cursor = cursor + 1
             } else {
                 span = SpanFromToken(token.clone())
-                node = 0
-                if (token.kind == "Int") {
-                    node = AddNode("Int", "", token.int_value, span, [])?
-                } else if (token.kind == "Float") {
-                    node = AddNode("Float", token.lexeme, 0, span, [])?
-                } else if (token.kind == "String") {
-                    node = AddNode("String", token.lexeme, 0, span, [])?
-                } else if (token.kind == "TemplateString") {
-                    node = AddNode("TemplateString", token.lexeme, 0, span, [])?
-                } else if (token.kind == "True") {
-                    node = AddNode("Bool", "true", 0, span, [])?
-                } else if (token.kind == "False") {
-                    node = AddNode("Bool", "false", 0, span, [])?
-                } else if (token.kind == "Null") {
-                    node = AddNode("Null", "", 0, span, [])?
-                } else if (token.kind == "Ident") {
-                    node = AddNode("Variable", token.lexeme, 0, span, [])?
-                } else {
-                    RejectAt(token.clone(), "unsupported_expression", "expression form is outside the stage-2 bootstrap subset", stage3_domain)?
-                }
+                atom = ReadPrimaryAtom(token, stage3_domain)?
+                node = AddNode(atom.kind, atom.text, atom.int_value, span, [])?
                 value_entry = ValueEntry { node: node, previous: value_top }
                 values = values.push(value_entry)
                 value_top = values.len()
@@ -414,24 +396,8 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
             value_top = values.len()
             cursor = cursor + 1
         } else {
-            precedence = 0
-            text = ""
-            if (token.kind == "OrOr") { precedence = 1 text = "||" }
-            if (token.kind == "AndAnd") { precedence = 2 text = "&&" }
-            if (token.kind == "BangEqual") { precedence = 3 text = "!=" }
-            if (token.kind == "EqualEqual") { precedence = 3 text = "==" }
-            if (token.kind == "Less") { precedence = 4 text = "<" }
-            if (token.kind == "LessEqual") { precedence = 4 text = "<=" }
-            if (token.kind == "Greater") { precedence = 4 text = ">" }
-            if (token.kind == "GreaterEqual") { precedence = 4 text = ">=" }
-            if (token.kind == "Minus") { precedence = 5 text = "-" }
-            if (token.kind == "Plus") { precedence = 5 text = "+" }
-            if (token.kind == "Slash") { precedence = 6 text = "/" }
-            if (token.kind == "Star") { precedence = 6 text = "*" }
-            if (token.kind == "Percent") { precedence = 6 text = "%" }
-            if (precedence == 0) {
-                RejectAt(token.clone(), "trailing_token", "expected end of expression", stage3_domain)?
-            }
+            binary = ReadBinaryOperator(token, stage3_domain)?
+            precedence = binary.precedence
             reducing = true
             while (reducing) {
                 if (operator_top == 0 || operators[operator_top - 1].marker != "" || operators[operator_top - 1].precedence < precedence) {
@@ -440,7 +406,7 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
                     ReduceTop()?
                 }
             }
-            operator_entry = MakeOperator("", text, precedence, false, token, operator_top, 0, false)
+            operator_entry = MakeOperator("", binary.text, precedence, false, token, operator_top, 0, false)
             operators = operators.push(operator_entry)
             operator_top = operators.len()
             cursor = cursor + 1
