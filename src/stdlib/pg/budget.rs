@@ -14,6 +14,12 @@ static USED: Mutex<Budget> = Mutex::new(Budget {
 });
 static LIMITS: OnceLock<Option<Budget>> = OnceLock::new();
 
+#[cfg(test)]
+pub(super) fn test_usage() -> (usize, usize, usize) {
+    let used = USED.lock().unwrap_or_else(|error| error.into_inner());
+    (used.connections, used.waiters, used.pending)
+}
+
 fn limit(name: &str, fallback: usize, max: usize) -> Option<usize> {
     let Some(value) = std::env::var_os(name) else {
         return Some(fallback);

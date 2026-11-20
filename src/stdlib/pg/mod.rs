@@ -1,6 +1,8 @@
 mod budget;
 mod libpq;
 mod sql;
+#[cfg(test)]
+mod tests;
 mod typed;
 
 use std::{
@@ -223,6 +225,7 @@ fn min_deadline(deadline: Instant, caller_deadline: Option<Instant>) -> Instant 
 
 struct QueryDeadline<'a> {
     end: Instant,
+    acquire_end: Option<Instant>,
     cancelled: &'a dyn Fn() -> bool,
 }
 
@@ -238,6 +241,7 @@ pub(crate) struct PreparedQuery {
     sql: CString,
     parameters: QueryParameters,
     deadline: Instant,
+    acquire_deadline: Option<Instant>,
     _budget: Reservation,
 }
 
@@ -245,6 +249,7 @@ impl PreparedQuery {
     pub(crate) fn execute(self, cancelled: &dyn Fn() -> bool) -> Value {
         let timing = QueryDeadline {
             end: self.deadline,
+            acquire_end: self.acquire_deadline,
             cancelled,
         };
         let result = timing.check().and_then(|()| {
@@ -351,12 +356,7 @@ impl Client {
         pool.release_if_closed();
     }
 
-    fn acquire(
-        &self,
-        query_deadline: Instant,
-        cancelled: &dyn Fn() -> bool,
-    ) -> PgResult<Lease<'_>> {
-        let deadline = query_deadline.min(Instant::now() + self.config.acquire_timeout);
+    fn acquire(&self, deadline: Instant, cancelled: &dyn Fn() -> bool) -> PgResult<Lease<'_>> {
         let mut pool = self.pool();
         let mut waiting = false;
         let acquired = loop {
@@ -389,6 +389,8 @@ impl Client {
                 }
                 waiting = true;
                 pool.waiting += 1;
+                #[cfg(test)]
+                tests::observe_waiter_registration();
             }
             let mut wake_at = deadline.min(now + WAIT_CHECK);
             if can_connect && now < pool.reconnect_at {
@@ -464,9 +466,10 @@ impl Client {
         params: &[Value],
         span: Span,
         caller_deadline: Option<Instant>,
+        asynchronous: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> PgResult<PreparedQuery> {
-        let timing = self.query_deadline(caller_deadline, cancelled);
+        let timing = self.query_deadline(caller_deadline, asynchronous, cancelled);
         let check = || timing.check();
         validate_query_sql(sql, &check)?;
         let input_bytes = pending_input_bytes(sql, params, span, &check)?;
@@ -487,6 +490,7 @@ impl Client {
             sql,
             parameters: QueryParameters::Text(bound),
             deadline: timing.end,
+            acquire_deadline: timing.acquire_end,
             _budget: budget,
         })
     }
@@ -497,9 +501,10 @@ impl Client {
         arguments: typed::Arguments<'_>,
         span: Span,
         caller_deadline: Option<Instant>,
+        asynchronous: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> PgResult<PreparedQuery> {
-        let timing = self.query_deadline(caller_deadline, cancelled);
+        let timing = self.query_deadline(caller_deadline, asynchronous, cancelled);
         let check = || timing.check();
         validate_query_sql(sql, &check)?;
         let budget = reserve_query_inputs(arguments.input_bytes(sql.len(), span, &check)?)?;
@@ -510,6 +515,7 @@ impl Client {
             sql,
             parameters: QueryParameters::Typed(bound, columns),
             deadline: timing.end,
+            acquire_deadline: timing.acquire_end,
             _budget: budget,
         })
     }
@@ -517,10 +523,16 @@ impl Client {
     fn query_deadline<'a>(
         &self,
         caller_deadline: Option<Instant>,
+        asynchronous: bool,
         cancelled: &'a dyn Fn() -> bool,
     ) -> QueryDeadline<'a> {
+        let started = Instant::now();
+        let end = min_deadline(started + self.config.query_timeout, caller_deadline);
         QueryDeadline {
-            end: min_deadline(Instant::now() + self.config.query_timeout, caller_deadline),
+            end,
+            // The bounded worker queue is part of an asynchronous acquisition.
+            // A synchronous call begins its acquire budget at checkout.
+            acquire_end: asynchronous.then(|| end.min(started + self.config.acquire_timeout)),
             cancelled,
         }
     }
@@ -530,7 +542,10 @@ impl Client {
         timing: &QueryDeadline<'_>,
         execute: impl FnOnce(&mut Connection) -> PgResult<PgResult<Rows>>,
     ) -> PgResult<Rows> {
-        let mut lease = self.acquire(timing.end, timing.cancelled)?;
+        let acquire_deadline = timing
+            .acquire_end
+            .unwrap_or_else(|| timing.end.min(Instant::now() + self.config.acquire_timeout));
+        let mut lease = self.acquire(acquire_deadline, timing.cancelled)?;
         let connection = lease
             .connection
             .as_mut()
@@ -796,6 +811,7 @@ pub(crate) fn prepare_query(
     values: &[Value],
     span: Span,
     caller_deadline: Option<Instant>,
+    asynchronous: bool,
     cancelled: &dyn Fn() -> bool,
 ) -> KuResult<Result<PreparedQuery, Value>> {
     let result = match (function, values) {
@@ -807,7 +823,14 @@ pub(crate) fn prepare_query(
                 let Value::Array(params) = params else {
                     return Err(expected_type("[str]", params, span));
                 };
-                Ok(client.prepare_query(sql, params, span, caller_deadline, cancelled))
+                Ok(client.prepare_query(
+                    sql,
+                    params,
+                    span,
+                    caller_deadline,
+                    asynchronous,
+                    cancelled,
+                ))
             })
         })?,
         (
@@ -822,6 +845,7 @@ pub(crate) fn prepare_query(
             },
             span,
             caller_deadline,
+            asynchronous,
             cancelled,
         ),
         _ => {

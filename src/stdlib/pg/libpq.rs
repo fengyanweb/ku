@@ -348,6 +348,8 @@ impl Connection {
 
         // The slices and their backing values stay live through the single
         // send. A failed send can follow a partial write.
+        #[cfg(test)]
+        super::tests::observe_send(sql);
         let sent = unsafe {
             (api.send_query)(
                 raw,

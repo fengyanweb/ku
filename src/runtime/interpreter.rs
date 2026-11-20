@@ -1815,9 +1815,17 @@ impl Interpreter {
             .execution_deadline
             .as_ref()
             .and_then(|state| state.peer_cancel.clone());
-        let prepared = stdlib::pg::prepare_query(method, values, span, deadline, &|| {
-            current_task_cancelled() || peer.as_ref().is_some_and(|peer| peer.context().is_some())
-        })?;
+        let prepared = stdlib::pg::prepare_query(
+            method,
+            values,
+            span,
+            deadline,
+            self.async_execution,
+            &|| {
+                current_task_cancelled()
+                    || peer.as_ref().is_some_and(|peer| peer.context().is_some())
+            },
+        )?;
         let query = match prepared {
             Ok(query) => query,
             Err(error) => {
