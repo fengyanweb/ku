@@ -35,7 +35,7 @@ fn InvalidateLoan(packet: Packet): null! {
     )
     .unwrap();
     fs::write(cwd.join("function.txt"), "MoveMembers").unwrap();
-    let emit = |mode| {
+    let emit = |mode: &str| {
         fs::write(cwd.join("mode.txt"), mode).unwrap();
         execute(&mut Command::new(seed), cwd, 30)
     };
