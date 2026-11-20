@@ -1,0 +1,31 @@
+import { fs, string } from "std"
+import { Node } from "../../stage2/ast.ku"
+import { ParseProgram } from "../../stage3/parser.ku"
+import { Collect } from "./collect.ku"
+
+fn Select(prefix: str): fn(&Node): bool! {
+    if (prefix.len() == 0) {
+        return fn(&node: Node): bool! {
+            fail {
+                domain: "inventory",
+                code: "empty_prefix",
+                message: "prefix.txt is empty while filtering line " + str(node.line)
+            }
+        }
+    }
+    read = fn(&node: Node): bool! {
+        return ok(node.kind == "Function" && node.text.starts_with(prefix))
+    }
+    reader = read
+    return reader
+}
+
+fn main(): null! {
+    filter = Select(string.trim(fs.read("prefix.txt")?))
+    source = fs.read("source.ku")?
+    declarations = Collect(ParseProgram(source)?, filter)?
+    for declaration in declarations {
+        println(declaration)
+    }
+    return ok(null)
+}

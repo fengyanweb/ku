@@ -1,0 +1,18 @@
+import { Node, ParseOutput } from "../../stage2/ast.ku"
+
+fn Collect(output: ParseOutput, include: fn(&Node): bool!): [str]! {
+    arena = output.arena
+    nodes = arena.nodes
+    edges = arena.edges
+    module_node = nodes[output.root - 1].clone()
+    inventory: [str] = []
+    index = 0
+    while (index < module_node.edge_count) {
+        node = nodes[edges[module_node.first_edge + index] - 1].clone()
+        if (include(node)?) {
+            inventory = inventory.push(str(node.line) + ":" + str(node.column) + " " + node.text)
+        }
+        index = index + 1
+    }
+    return ok(inventory)
+}

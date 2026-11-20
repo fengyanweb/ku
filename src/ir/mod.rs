@@ -4541,9 +4541,9 @@ impl<'a> FunctionLowerer<'a> {
             ExprKind::Match { value, arms } => self.lower_match(value, arms, expr.span),
             ExprKind::Function {
                 params,
-                return_type: _,
+                return_type,
                 body,
-            } => self.lower_closure_literal(params, body, expr.span, None),
+            } => self.lower_closure_literal(params, return_type.as_ref(), body, expr.span, None),
         }
     }
 
@@ -4678,12 +4678,23 @@ impl<'a> FunctionLowerer<'a> {
                 ty: IrType::Array(expected_element.clone()),
             });
         }
-        if let ExprKind::Function { params, body, .. } = &expr.kind {
+        if let ExprKind::Function {
+            params,
+            return_type,
+            body,
+        } = &expr.kind
+        {
             let expected_params = match expected {
                 Some(IrType::Closure { params, .. }) => Some(params.as_slice()),
                 _ => None,
             };
-            return self.lower_closure_literal(params, body, expr.span, expected_params);
+            return self.lower_closure_literal(
+                params,
+                return_type.as_ref(),
+                body,
+                expr.span,
+                expected_params,
+            );
         }
         let value = self.lower_expr_impl(expr, deferred_safepoint.as_deref_mut())?;
         let value = self.nullable_read(expr, value);
@@ -4801,7 +4812,7 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     /// Lower a closure literal into a lifted, globally-unique IrFunction plus a
-    /// `MakeClosure` value (Stage 6a: no captures, env is NULL). An unannotated
+    /// `MakeClosure` value. An unannotated
     /// parameter is filled from `expected` — the parameter types of the expected
     /// function type supplied by context — matching the checker's rules; with no
     /// annotation and no expected type it is an error (the checker rejects this
@@ -4809,6 +4820,7 @@ impl<'a> FunctionLowerer<'a> {
     fn lower_closure_literal(
         &mut self,
         params: &[crate::ast::FunctionParam],
+        declared_return: Option<&TypeName>,
         body: &[Stmt],
         span: Span,
         expected: Option<&[IrType]>,
@@ -4855,10 +4867,11 @@ impl<'a> FunctionLowerer<'a> {
             .map(|(name, ty, _)| (name.clone(), ty.clone()))
             .collect::<Vec<_>>();
 
+        let declared_return = declared_return.map(|ty| lower_type(ty, self.layouts));
         let mut child = FunctionLowerer::new(
             self.signatures,
             self.layouts,
-            IrType::Unknown,
+            declared_return.clone().unwrap_or(IrType::Unknown),
             self.next_function_id.clone(),
             self.lifted_functions.clone(),
             self.budget.clone(),
@@ -4873,21 +4886,22 @@ impl<'a> FunctionLowerer<'a> {
         }
         child.lower_block_body("entry", body, params)?;
 
-        // Recover the real return type from a source return. Cooperative timeout
-        // blocks are lowered while this child still has an Unknown seed, so their
-        // synthetic zero returns must not win inference over the closure body's
-        // concrete return.
-        let return_type = child
-            .blocks
-            .iter()
-            .find_map(|block| match &block.terminator {
-                IrTerminator::Return(Some(value)) if value.ty != IrType::Unknown => {
-                    Some(value.ty.clone())
-                }
-                _ => None,
-            })
-            .unwrap_or(IrType::Null);
-        resolve_closure_safepoint_return_type(&mut child.blocks, &return_type);
+        let return_type = declared_return.unwrap_or_else(|| {
+            // With no declaration, synthetic timeout returns cannot determine
+            // the ABI ahead of a concrete source return.
+            let inferred = child
+                .blocks
+                .iter()
+                .find_map(|block| match &block.terminator {
+                    IrTerminator::Return(Some(value)) if value.ty != IrType::Unknown => {
+                        Some(value.ty.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(IrType::Null);
+            resolve_closure_safepoint_return_type(&mut child.blocks, &inferred);
+            inferred
+        });
 
         let cid = FunctionId(self.next_function_id.get());
         self.next_function_id.set(cid.0 + 1);
@@ -4956,8 +4970,7 @@ impl<'a> FunctionLowerer<'a> {
             .iter()
             .map(|param| param.ty.clone())
             .collect::<Vec<_>>();
-        // A declared return type is authoritative (and available up front, unlike
-        // a closure literal's recovered type); default to Null when omitted.
+        // A named function without a return declaration defaults to Null.
         let return_type = function
             .return_type
             .as_ref()
@@ -5965,7 +5978,7 @@ fn ir_expr_needs_post_call_safepoint(expr: &IrExpr) -> bool {
     }
 }
 
-/// Closure bodies are initially lowered with an Unknown return seed so their
+/// Unannotated closure bodies are lowered with an Unknown return seed so their
 /// source returns can drive inference. Timeout/signal cleanup paths created during
 /// that pass therefore contain Unknown-typed zero payloads (and a try/finally
 /// return slot may be Unknown too). Once inference succeeds, make only those

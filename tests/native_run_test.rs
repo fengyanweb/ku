@@ -9280,6 +9280,118 @@ fn native_closure_returned_from_parameter_is_ref_counted() {
     fs::remove_dir_all(&dir).ok();
 }
 
+fn assert_annotated_callback_across_modules(source: &str, expected: &str) {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("annotated-callback"));
+    let dir = &cleanup.0;
+    let entry = dir.join("main.ku");
+    fs::write(&entry, source).unwrap();
+    fs::write(dir.join("prefix.txt"), "fn ").unwrap();
+    fs::write(
+        dir.join("declaration.ku"),
+        r#"
+fn Score(rule: fn(&str): int | null, &line: str): int | null { return rule(line) }
+fn Validate(rule: fn(&str): bool!, &line: str): bool! { return rule(line) }
+"#,
+    )
+    .unwrap();
+
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(dir).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS).unwrap();
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout).replace('\r', ""),
+        expected
+    );
+
+    let executable = dir.join(exe_name("callback"));
+    let mut build = Command::new(ku_binary());
+    build
+        .current_dir(dir)
+        .args(["build", "--release", "main.ku", "-o"])
+        .arg(&executable);
+    let built = run_bounded(&mut build, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS).unwrap();
+    let diagnostic = String::from_utf8_lossy(&built.stderr);
+    if !built.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    }
+    assert!(built.status.success(), "{diagnostic}");
+
+    fs::remove_file(entry).unwrap();
+    fs::remove_file(dir.join("declaration.ku")).unwrap();
+    let (stdout, status) = run_binary(&executable);
+    assert_eq!(status, Some(0));
+    assert_eq!(stdout.replace('\r', ""), expected);
+}
+
+#[test]
+fn native_closure_annotated_nullable_return_keeps_null_distinct_from_zero() {
+    assert_annotated_callback_across_modules(
+        r#"import fs from "std.fs"
+import { Score } from "./declaration.ku"
+
+fn MakeScorer(prefix: str): fn(&str): int | null {
+    return fn(&line: str): int | null {
+        if (!line.starts_with(prefix)) { return null }
+        return line.len() - prefix.len()
+    }
+}
+
+fn main(): null! {
+    scorer = MakeScorer(fs.read("prefix.txt")?)
+    println(Score(scorer.clone(), "fn "))
+    println(Score(scorer.clone(), "struct Value"))
+    println(Score(scorer, "fn Parse"))
+    return ok(null)
+}
+"#,
+        "0\nnull\n5\n",
+    );
+}
+
+#[test]
+fn native_closure_annotated_result_can_fail_without_a_success_return() {
+    assert_annotated_callback_across_modules(
+        r#"import fs from "std.fs"
+import { Validate } from "./declaration.ku"
+
+fn main(): null! {
+    prefix = fs.read("prefix.txt")?
+    reject = fn(&line: str): bool! {
+        fail {domain: "scan", code: "bad-declaration", message: prefix + line}
+    }
+    try {
+        Validate(reject, "broken")?
+        panic("callback unexpectedly returned success")
+    } catch (err) {
+        println(err.domain)
+        println(err.code)
+        println(err.message)
+    } finally {
+        println("closed")
+    }
+    return ok(null)
+}
+"#,
+        "scan\nbad-declaration\nfn broken\nclosed\n",
+    );
+}
+
 #[test]
 fn native_local_named_function_self_recursion() {
     // Stage 6f: a local named function `fn fact(...)` defined inside `main` is
