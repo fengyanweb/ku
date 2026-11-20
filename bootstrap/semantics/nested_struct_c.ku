@@ -228,6 +228,10 @@ fn BuildProjectOwningLayouts(&supplied: [SuppliedModule], &project: ProjectBindi
     return collectProjectLayout(supplied, project, unit, declaration, at, layouts, 0)
 }
 
+fn OrderProjectOwningLayouts(&layouts: [StructLayout], unit: int, declaration: int, at: Span): CStructOrder! {
+    return orderCLayouts(layouts, unit, declaration, at, true)
+}
+
 fn OwningLayoutDropName(module_index: int, declaration: int): str {
     return "ku_drop_" + CTypeName(module_index, declaration)
 }
@@ -261,16 +265,17 @@ fn emitOwningLayoutDrop(&layout: StructLayout, public: bool): str {
     return text + "    *value = (" + type_name + "){0};\n}\n\n"
 }
 
-// Every complete field and live array element owns its storage. Zeroed fields
-// and array headers are safe after an interrupted construction. Array len
-// identifies the initialized prefix; capacity can include unused elements.
-fn EmitProjectOwningLayoutsC(&layouts: [StructLayout], unit: int, declaration: int, at: Span): str! {
-    order = orderCLayouts(layouts, unit, declaration, at, true)?
-    text = ProjectionHeaders(order.contains_string, order.contains_string)
-    if (!order.contains_string) { text += "#include <stddef.h>\n#include <stdlib.h>\n" }
+struct OwningLayoutDefinitions {
+    source: str
+    array_types: [str]
+}
+
+// Emit validated layouts in dependency order. Hosted call sites leave the
+// individual member drops private inside their translation unit.
+fn EmitOwningLayoutDefinitions(&ordered: [StructLayout], unit: int, declaration: int): OwningLayoutDefinitions! {
+    text = ""
     arrays: [str] = []
-    for entry in order.entries {
-        layout = layouts[entry.layout_index - 1].clone()
+    for layout in ordered.clone() {
         for member in layout.fields {
             field = member.resolved
             array = ""
@@ -295,5 +300,18 @@ fn EmitProjectOwningLayoutsC(&layouts: [StructLayout], unit: int, declaration: i
         text += EmitOwningLayout(layout)?
         text += emitOwningLayoutDrop(layout, layout.module_index == unit && layout.node == declaration)
     }
-    return ok(text)
+    return ok(OwningLayoutDefinitions { source: text, array_types: arrays })
+}
+
+// Every complete field and live array element owns its storage. Zeroed fields
+// and array headers are safe after an interrupted construction. Array len
+// identifies the initialized prefix; capacity can include unused elements.
+fn EmitProjectOwningLayoutsC(&layouts: [StructLayout], unit: int, declaration: int, at: Span): str! {
+    order = OrderProjectOwningLayouts(layouts, unit, declaration, at)?
+    text = ProjectionHeaders(order.contains_string, order.contains_string)
+    if (!order.contains_string) { text += "#include <stddef.h>\n#include <stdlib.h>\n" }
+    ordered: [StructLayout] = []
+    for entry in order.entries { ordered = ordered.push(layouts[entry.layout_index - 1].clone()) }
+    definitions = EmitOwningLayoutDefinitions(ordered, unit, declaration)?
+    return ok(text + definitions.source)
 }

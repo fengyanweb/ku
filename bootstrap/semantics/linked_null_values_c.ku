@@ -42,6 +42,9 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
             return cloneLinkedString(project, source, id)
         }
         ty = source.value.ty.clone()
+        if (LayoutIndex(source.state.owning_layouts, ty.module_index, ty.declaration_node) != 0) {
+            RejectLayout("linked_nested_array_clone", "an element with nested owning arrays does not yet support clone", ty.span.clone())?
+        }
         layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
         output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
         if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {

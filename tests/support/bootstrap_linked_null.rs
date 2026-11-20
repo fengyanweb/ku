@@ -167,3 +167,125 @@ pub(super) fn assert_checked_owned_call(seed: &Path, cwd: &Path) {
         assert!(error.contains(diagnostic), "{diagnostic}, got {error}");
     }
 }
+
+pub(super) fn assert_nested_array_result_cleanup(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("nested-provider.ku"),
+        r#"struct Storage { labels: [str] offsets: [int] }
+struct Entry { storage: Storage }
+fn Read(flag: int): [Entry]! { return ok([]) }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("nested-consumer.ku"),
+        r#"import { Read as Make } from "./nested-provider.ku"
+fn Inspect(flag: int): null! {
+    first = Make(0)?
+    second = Make(flag)?
+    return ok(null)
+}
+fn RejectClone(): null! {
+    entries = Make(0)?
+    entry = entries[0].clone()
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "nested-consumer.ku\nnested-provider.ku\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("function.txt"), "Inspect").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+    let planned = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&planned);
+    let Some(Value::Result { ok: true, value }) = json::eval(
+        "decode",
+        &[Value::String(String::from_utf8(planned.stdout).unwrap())],
+        Span::default(),
+    )
+    .unwrap() else {
+        panic!("expected nested array link plan")
+    };
+    let Value::Object(plan) = *value else {
+        panic!("expected plan object")
+    };
+    let Value::Object(export) = &plan["export"] else {
+        panic!("expected export")
+    };
+    let Value::String(entry) = &export["symbol"] else {
+        panic!("expected entry symbol")
+    };
+    let Value::Array(dependencies) = &plan["dependencies"] else {
+        panic!("expected dependencies")
+    };
+    let [Value::Object(dependency)] = dependencies.as_slice() else {
+        panic!("expected one real declaration")
+    };
+    let Value::String(dependency_name) = &dependency["symbol"] else {
+        panic!("expected dependency symbol")
+    };
+    let Value::Object(signature) = &dependency["signature"] else {
+        panic!("expected typed dependency")
+    };
+    let Value::Object(result) = &signature["result"] else {
+        panic!("expected array result")
+    };
+    let Value::String(carrier) = &result["c_type"] else {
+        panic!("expected typed Result carrier")
+    };
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+
+    // A C ABI witness fills the declared nested carrier until managed Ku
+    // emission supports the provider's owning construction end to end.
+    let host = r#"
+__RESULT__ __DEPENDENCY__(int64_t flag) {
+    __RESULT__ result = {0};
+    if (flag < 0) return result;
+    result.value.len = 1;
+    result.value.capacity = 2;
+    result.value.data = malloc(2 * sizeof(*result.value.data));
+    memset(result.value.data + 1, 0xff, sizeof(*result.value.data));
+    result.value.data[0].f0.f0.len = 1;
+    result.value.data[0].f0.f0.capacity = 1;
+    result.value.data[0].f0.f0.data = malloc(sizeof(KuProjectionString));
+    uint8_t *owned = malloc(1);
+    *owned = 'a';
+    result.value.data[0].f0.f0.data[0] = (KuProjectionString){owned,1,1,KU_PROJECTION_STRING_OWNED};
+    result.value.data[0].f0.f1.len = 1;
+    result.value.data[0].f0.f1.capacity = 1;
+    result.value.data[0].f0.f1.data = malloc(sizeof(int64_t));
+    result.value.data[0].f0.f1.data[0] = 42;
+    result.ok = true;
+    return result;
+}
+int main(void) {
+    (void)test_realloc;
+    assert(__ENTRY__(1).ok && outstanding() == 0 && attempts == 8);
+    assert(!__ENTRY__(-1).ok && outstanding() == 0 && attempts == 12);
+    return 0;
+}
+"#
+    .replace("__ENTRY__", entry)
+    .replace("__RESULT__", carrier)
+    .replace("__DEPENDENCY__", dependency_name);
+    let c = cwd.join("nested-owner.c");
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    let binary = cwd.join(format!("nested-owner{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&c, &binary, cwd);
+    fs::write(cwd.join("function.txt"), "RejectClone").unwrap();
+    let clone = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(clone.status.code(), Some(1));
+    assert!(clone.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&clone.stderr).contains("linked_nested_array_clone"));
+    for name in ["nested-provider.ku", "nested-consumer.ku", "modules.txt"] {
+        fs::remove_file(cwd.join(name)).unwrap();
+    }
+    assert_ok(&execute(&mut Command::new(binary), cwd, 15));
+}

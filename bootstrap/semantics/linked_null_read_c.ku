@@ -3,9 +3,10 @@ import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { GuardArithmetic, GuardOwnedDrops, GuardStringEquality } from "./guarded_struct_c.ku"
-import { CTypeName, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
+import { ContainsType, CTypeName, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
+import { BuildProjectOwningLayouts, EmitOwningLayoutDefinitions, OrderProjectOwningLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { EmitOwnedStructArrayDrop, EmitOwnedStructOperations, EmitStructArrayHeader, EmitStructArrayReadValidation,
-         EmitStructArrayResultHeader, EmitTryCloneString } from "./struct_array_c.ku"
+         EmitStructArrayResultHeader, EmitStructArrayDropUsing, EmitTryCloneString } from "./struct_array_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullFunction,
@@ -26,6 +27,8 @@ struct LinkedNullSlot {
 
 struct LinkedNullState {
     layouts: [StructLayout]
+    owning_layouts: [StructLayout]
+    owning_strings: bool
     slots: [LinkedNullSlot]
     links: [LinkedNullFunction]
     declarations: str
@@ -49,7 +52,8 @@ struct LinkedNullExpression {
 }
 
 fn NewLinkedNullState(): LinkedNullState {
-    return LinkedNullState { layouts: [], slots: [], links: [], declarations: "", code: "", drops: "", uses_clone: false,
+    return LinkedNullState { layouts: [], owning_layouts: [], owning_strings: false,
+        slots: [], links: [], declarations: "", code: "", drops: "", uses_clone: false,
         arrays: [], owned_arrays: [], uses_str_array: false, uses_str_view: false,
         element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false }
 }
@@ -64,18 +68,48 @@ fn LinkedNullBinding(&slots: [LinkedNullSlot], &name: str): int {
     return 0
 }
 
-fn linkedDrop(&layouts: [StructLayout], &value: LinkedNullValue): str {
+fn linkedDrop(&state: LinkedNullState, &value: LinkedNullValue): str {
     if (value.ty.name == "str" && value.ty.declaration_kind == "Builtin") {
         return "    ku_projection_string_drop(&" + value.text.clone() + ");\n"
     }
     if (value.ty.declaration_kind == "Struct") {
-        layout = LayoutIndex(layouts, value.ty.module_index, value.ty.declaration_node)
-        return GuardOwnedDrops(layouts, layout, value.text)
+        unit = value.ty.module_index
+        node = value.ty.declaration_node
+        if (LayoutIndex(state.owning_layouts, unit, node) != 0) {
+            return "    " + OwningLayoutDropName(unit, node) + "(&" + value.text.clone() + ");\n"
+        }
+        layout = LayoutIndex(state.layouts, unit, node)
+        return GuardOwnedDrops(state.layouts, layout, value.text)
     }
     if (LinkedNullOwnedArray(value.ty)) {
         return "    " + LinkedNullArrayPrefix(value.ty) + "_drop(&" + value.text.clone() + ");\n"
     }
     return ""
+}
+
+fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &element: TypeNameBinding): LinkedNullState! {
+    next = state
+    try {
+        next.layouts = LinkedNullLayout(project, element, next.layouts.clone(), 0)?
+        return ok(next)
+    } catch (err) {
+        if (err.code != "unsupported_layout_type") { fail err }
+    }
+    unit = element.module_index
+    node = element.declaration_node
+    layout = BuildProjectOwningLayouts(project.supplied, project.binding, unit, node, element.span.clone())?
+    order = OrderProjectOwningLayouts(layout, unit, node, element.span.clone())?
+    next.owning_strings = next.owning_strings || order.contains_string
+    for entry in order.entries {
+        item = layout[entry.layout_index - 1].clone()
+        if (LayoutIndex(next.owning_layouts, item.module_index, item.node) == 0) {
+            next.owning_layouts = next.owning_layouts.push(item.clone())
+        }
+        if (LayoutIndex(next.layouts, item.module_index, item.node) == 0) {
+            next.layouts = next.layouts.push(item)
+        }
+    }
+    return ok(next)
 }
 
 fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, binding: str,
@@ -86,7 +120,8 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
     if (ty.declaration_kind == "StringView") { next.uses_str_view = true }
     if (ty.declaration_kind == "StructArray" || LinkedNullOwnedArray(ty)) {
         element = LinkedNullArrayElement(ty.clone())
-        next.layouts = LinkedNullLayout(project, element, next.layouts, 0)?
+        if (LinkedNullOwnedArray(ty)) { next = registerOwnedElement(project, next, element)? }
+        else { next.layouts = LinkedNullLayout(project, element, next.layouts, 0)? }
         if (LinkedNullOwnedArray(ty) && arrayPosition(next.owned_arrays, ty) == 0) {
             next.owned_arrays = next.owned_arrays.push(ty.clone())
         }
@@ -104,7 +139,7 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
     }
     next.slots = next.slots.push(LinkedNullSlot { binding: binding, value: value.clone(), live: parameter })
     if (!parameter) { next.declarations = next.declarations + "    " + kind + " " + name + " = {0};\n" }
-    if (!view) { next.drops = linkedDrop(next.layouts, value) + next.drops }
+    if (!view) { next.drops = linkedDrop(next, value) + next.drops }
     return ok(LinkedNullExpression { state: next, value: value })
 }
 
@@ -219,6 +254,9 @@ fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: N
         RejectLayout("linked_unknown_field", "unknown field '" + node.text.clone() + "'", DeclarationSpan(node))?
     }
     field_type = receiver.state.layouts[layout - 1].fields[ordinal - 1].resolved.clone()
+    if (field_type.declaration_kind == "StructArray" || field_type.declaration_kind == "BuiltinArray") {
+        RejectLayout("linked_nested_array_projection", "a nested owning array field does not yet support projection", DeclarationSpan(node))?
+    }
     field = linkedValue(receiver.state, field_type, receiver.value.text + ".f" + str(ordinal - 1))
     field.value.borrowed = LinkedNullOwner(field.value.ty)
     return ok(field)
@@ -277,21 +315,30 @@ fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpressio
 fn EmitLinkedNullSource(&body: LinkedNullState, &symbol: str, &signature: str): str! {
     // Keep the external prototypes independent of the selected entry's C
     // name. The linker consumes declarations resolved from the source graph.
-    text = ProjectionHeaders(true, body.drops.contains("ku_projection_string_drop")) + GuardArithmetic(body.uses_add, body.uses_sub)
+    text = ProjectionHeaders(true, body.drops.contains("ku_projection_string_drop") || body.owning_strings) + GuardArithmetic(body.uses_add, body.uses_sub)
         + GuardStringEquality(body.uses_string_equal)
     array_checks = body.arrays.len() > 0 || body.uses_str_array
     if (array_checks || body.uses_str_view) { text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n" }
     if (body.uses_clone) {
         text += "#include <stdio.h>\n#include <string.h>\n\n" + EmitTryCloneString("ku_linked_clone_string")
     }
-    for layout in body.layouts.clone() { text += EmitLayout(layout, true, true)? }
+    definitions = EmitOwningLayoutDefinitions(body.owning_layouts, 0, 0)?
+    text += definitions.source
+    for layout in body.layouts.clone() {
+        if (LayoutIndex(body.owning_layouts, layout.module_index, layout.node) == 0) {
+            text += EmitLayout(layout, true, true)?
+        }
+    }
     for array in body.arrays.clone() {
         element = CTypeName(array.module_index, array.declaration_node)
         array_type = "KuArray_" + element.clone()
-        text += EmitStructArrayHeader(element, array_type) + EmitStructArrayReadValidation(element, array_type, LinkedNullArrayPrefix(array))
+        if (!ContainsType(definitions.array_types, array_type)) { text += EmitStructArrayHeader(element, array_type) }
+        text += EmitStructArrayReadValidation(element, array_type, LinkedNullArrayPrefix(array))
     }
     if (body.uses_str_array) {
-        text += EmitStructArrayHeader("KuProjectionString", "KuGuardStringArray")
+        if (!ContainsType(definitions.array_types, "KuGuardStringArray")) {
+            text += EmitStructArrayHeader("KuProjectionString", "KuGuardStringArray")
+        }
         text += EmitStructArrayReadValidation("KuProjectionString", "KuGuardStringArray", "ku_linked_view_str_array")
     }
     for layout in body.element_clones.clone() {
@@ -302,7 +349,10 @@ fn EmitLinkedNullSource(&body: LinkedNullState, &symbol: str, &signature: str): 
         array_type = LinkedNullArrayType(owned)
         layout = LayoutIndex(body.layouts, owned.module_index, owned.declaration_node)
         text += EmitStructArrayResultHeader(array_type)
-        text += EmitOwnedStructArrayDrop(body.layouts, layout, array_type, LinkedNullArrayPrefix(owned))
+        prefix = LinkedNullArrayPrefix(owned)
+        if (LayoutIndex(body.owning_layouts, owned.module_index, owned.declaration_node) != 0) {
+            text += EmitStructArrayDropUsing(array_type, prefix, OwningLayoutDropName(owned.module_index, owned.declaration_node), true)
+        } else { text += EmitOwnedStructArrayDrop(body.layouts, layout, array_type, prefix) }
     }
     for dependency in body.links.clone() { text += LinkedNullPrototype(dependency)? }
     text += "\nKuBootstrapResultNull " + symbol.clone() + "(" + signature.clone() + ") {\n"

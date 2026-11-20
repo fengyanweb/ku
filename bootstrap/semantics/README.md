@@ -310,6 +310,9 @@ imported call with `items = Read(...) ?`, then read its length or elements.
 The caller releases initialized arrays on success and when a later Result
 fails. The link plan matches the producer and consumer by the element's
 nominal declaration.
+The linked consumer uses the project's owning layout and destructor for
+elements with nested arrays. Reading a nested array field and cloning a
+whole element with those fields require separate lowering.
 
 `linked-str` also emits functions such as `TokenCanonical` that consume an
 owned struct. A string field may move into the expression once. A named

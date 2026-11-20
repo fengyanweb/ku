@@ -256,7 +256,7 @@ fn unshadowedOk(&project: LinkedNullProject, &state: LinkedNullState): bool {
     for name in project.supplied[0].named.names.declarations.clone() {
         if (name.name == "ok") { return false }
     }
-    for binding in project.binding[0].imports.clone() {
+    for binding in project.binding.modules[0].imports.clone() {
         if (binding.local_name == "ok") { return false }
     }
     return true
@@ -315,7 +315,7 @@ fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! 
         RejectLayout("missing_linked_entry_module", "a selected source module is required", point)?
     }
     bound = BindProjectModules(supplied)?
-    project = LinkedNullProject { supplied: supplied.clone(), binding: bound.modules }
+    project = LinkedNullProject { supplied: supplied.clone(), binding: bound }
     id = LinkedNullEntry(project, entry_name)?
     function = LinkedNullNode(project, 1, id)
     parameters = readParameters(project, function)?

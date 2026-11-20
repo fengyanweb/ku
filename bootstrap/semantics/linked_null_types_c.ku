@@ -2,7 +2,7 @@ import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
-import { ProjectModuleBindings } from "./project_bindings.ku"
+import { ProjectBindings } from "./project_bindings.ku"
 import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { CTypeName } from "./struct_projection_c.ku"
@@ -11,7 +11,7 @@ import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanTy
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
-    binding: [ProjectModuleBindings]
+    binding: ProjectBindings
 }
 
 struct LinkedNullFunction {
@@ -49,13 +49,13 @@ fn absoluteType(binding: TypeNameBinding, unit: int): TypeNameBinding {
 }
 
 fn LinkedNullType(&project: LinkedNullProject, unit: int, node: int): TypeNameBinding! {
-    resolved = ExplicitType(project.binding[unit - 1].types, node, DeclarationSpan(LinkedNullNode(project, unit, node)))?
+    resolved = ExplicitType(project.binding.modules[unit - 1].types, node, DeclarationSpan(LinkedNullNode(project, unit, node)))?
     return ok(absoluteType(resolved, unit))
 }
 
 fn LinkedNullLiteralType(&project: LinkedNullProject, unit: int, &literal: Node, id: int): TypeNameBinding! {
     binding = ResolveTypeName(literal, id, project.supplied[unit - 1].named.names.declarations,
-                              project.binding[unit - 1].imports, project.supplied)?
+                              project.binding.modules[unit - 1].imports, project.supplied)?
     if (binding.declaration_kind != "Struct") {
         RejectLayout("linked_literal_type", "expected the declaration of a concrete struct", DeclarationSpan(literal))?
     }
@@ -156,7 +156,7 @@ fn LinkedNullLayout(&project: LinkedNullProject, &ty: TypeNameBinding, layouts: 
     }
     named = project.supplied[unit - 1].named.clone()
     declaration = LinkedNullNode(project, unit, ty.declaration_node)
-    fields = CollectFields(named.parsed.arena.nodes, named.parsed.arena.edges, project.binding[unit - 1].types, declaration, false)?
+    fields = CollectFields(named.parsed.arena.nodes, named.parsed.arena.edges, project.binding.modules[unit - 1].types, declaration, false)?
     relocated: [StructFieldLayout] = []
     ordered = layouts
     for field in fields {
@@ -181,7 +181,7 @@ fn linkedDirectFunction(&project: LinkedNullProject, unit: int, &target: Node): 
     if (target.kind == "Variable" && target.edge_count == 0) {
         local = localFunction(project, unit, target.text)
         if (local > 0) { return ok([unit, local]) }
-        for binding in project.binding[unit - 1].imports.clone() {
+        for binding in project.binding.modules[unit - 1].imports.clone() {
             if (binding.local_name == target.text && binding.module_index > 0) {
                 item = LinkedNullNode(project, binding.module_index, binding.target_node)
                 if (item.kind == "Function") { return ok([binding.module_index, binding.target_node]) }

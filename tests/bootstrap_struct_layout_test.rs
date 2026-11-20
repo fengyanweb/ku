@@ -3879,7 +3879,7 @@ int main(int argc, char **argv) {
 
     fs::write(cwd.join("function.txt"), "Invalid").unwrap();
     fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
-    let mixed_modes = execute(&mut Command::new(compiler), &cwd, 30);
+    let mixed_modes = execute(&mut Command::new(&compiler), &cwd, 30);
     assert_eq!(mixed_modes.status.code(), Some(1));
     assert!(mixed_modes.stdout.is_empty());
     assert!(String::from_utf8_lossy(&mixed_modes.stderr).contains("linked_view_move"));
@@ -3890,4 +3890,5 @@ int main(int argc, char **argv) {
     let bounds = execute(Command::new(executable).arg("empty"), &cwd, 15);
     assert_eq!(bounds.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&bounds.stderr).contains("index 0 out of bounds for length 0"));
+    linked_null::assert_nested_array_result_cleanup(&compiler, &cwd);
 }

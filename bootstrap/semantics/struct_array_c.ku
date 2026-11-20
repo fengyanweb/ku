@@ -94,7 +94,7 @@ fn EmitStructArrayResultHeader(&array: str): str {
 fn EmitOwnedStructArrayDrop(&layouts: [StructLayout], root: int, &array: str, &prefix: str): str {
     element = CTypeName(layouts[root - 1].module_index, layouts[root - 1].node)
     fields = collectOwnedFields(layouts, root, "", [])
-    return emitOwnedElementDrop(element, prefix, fields, true) + emitArrayDrop(array, prefix, true)
+    return emitOwnedElementDrop(element, prefix, fields, true) + EmitStructArrayDropUsing(array, prefix, prefix.clone() + "_element_drop", true)
 }
 
 fn EmitStructArrayReadValidation(&element: str, &array: str, &prefix: str): str {
@@ -123,7 +123,7 @@ fn emitArrayBoundary(&element: str, &array: str, &prefix: str): str {
 fn emitArrayTransfer(&element: str, &array: str, &prefix: str): str {
     text = array.clone() + " " + prefix.clone() + "_move(" + array.clone() + " *array) {\n"
     text += "    " + array.clone() + " moved = *array;\n    *array = (" + array.clone() + "){0};\n    return moved;\n}\n\n"
-    text += emitArrayDrop(array, prefix, false)
+    text += EmitStructArrayDropUsing(array, prefix, prefix.clone() + "_element_drop", false)
     text += "int " + prefix.clone() + "_append_move(" + array.clone() + " *array, " + element.clone() + " *value) {\n"
     text += "    if (!value || !" + prefix.clone() + "_valid(array) || " + prefix.clone() + "_contains(array, value)) return KU_STRUCT_ARRAY_INVALID;\n"
     text += "    size_t limit = SIZE_MAX / sizeof(" + element.clone() + ");\n    if (array->len == limit) return KU_STRUCT_ARRAY_CAPACITY;\n"
@@ -144,11 +144,11 @@ fn emitArrayTransfer(&element: str, &array: str, &prefix: str): str {
     return text + "    return status;\n}\n"
 }
 
-fn emitArrayDrop(&array: str, &prefix: str, private_drop: bool): str {
+fn EmitStructArrayDropUsing(&array: str, &prefix: str, &element_drop: str, private_drop: bool): str {
     linkage = ""
     if (private_drop) { linkage = "static " }
     return linkage + "void " + prefix.clone() + "_drop(" + array.clone() + " *array) {\n"
-        + "    for (size_t i = 0; i < array->len; ++i) " + prefix.clone() + "_element_drop(&array->data[i]);\n"
+        + "    for (size_t i = 0; i < array->len; ++i) " + element_drop.clone() + "(&array->data[i]);\n"
         + "    free(array->data);\n    *array = (" + array.clone() + "){0};\n}\n\n"
 }
 
