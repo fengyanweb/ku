@@ -1,19 +1,15 @@
 import { LinkedMemberPath, LinkedMemberUnavailable } from "./linked_member_ownership.ku"
-import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
-import { StructResultHeader } from "./struct_result_c.ku"
-import { EmitLinkedArrayBody } from "./struct_array_c.ku"
 import { Span } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { ContainsIndex } from "./struct_projection_c.ku"
 import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
-import { RegisterLinkedIntArray, LinkedErrorField, ReadLinkedNullBinding, CheckLinkedAddition, LinkedCPrelude, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { RegisterLinkedIntArray, LinkedErrorField, ReadLinkedNullBinding, CheckLinkedAddition, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullDropC,
-         LinkedNullLayout, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedStringResult, EmitLinkedNullPrototypes, LinkedNullView, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
+         LinkedNullLayout, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedStringResult, LinkedNullView, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &element: TypeNameBinding): LinkedNullState! {
     next = state
@@ -105,49 +101,6 @@ fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &s
     local = AddLinkedNullSlot(project, state, statement.text.clone(), "l" + str(id), ty, false)?
     local.state.slots[local.value.slot - 1].live = true
     return ok(local.state)
-}
-
-fn dropLinkedScope(state: LinkedNullState, outer: int, unwind: bool): LinkedNullState {
-    next = state
-    index = next.slots.len()
-    while (index > outer) {
-        index = index - 1
-        slot = next.slots[index].clone()
-        if ((slot.live || unwind) && !slot.value.borrowed && LinkedNullOwner(slot.value.ty)) {
-            next.code = next.code + LinkedNullDropC(next.layouts, next.owning_layouts, slot.value.ty, slot.value.text)
-        }
-        next.slots[index].binding = ""
-        next.slots[index].live = false
-    }
-    return next
-}
-
-fn DropLinkedNullScope(state: LinkedNullState, outer: int): LinkedNullState {
-    return dropLinkedScope(state, outer, false)
-}
-
-fn BindLinkedCatch(state: LinkedNullState, name: str, &binding: Node, &before: [LinkedNullSlot]): LinkedNullState! {
-    if (!state.catch_edges || LinkedNullBinding(before, name) != 0) {
-        RejectLayout("linked_catch_shape", "catch requires a reachable error edge and a distinct Error binding", DeclarationSpan(binding))?
-    }
-    next = state
-    slot = next.catch_slot
-    next.code += next.slots[slot - 1].value.text.clone() + "_handler:\n"
-    // Every slot starts zero. A later syntactic move need not have
-    // happened at the point of the failure, so unwind its owner as well.
-    next = dropLinkedScope(next, slot, true)
-    index = 0
-    while (index < before.len()) {
-        next.slots[index].live = before[index].live && !ContainsIndex(next.catch_moved, index)
-        index = index + 1
-    }
-    next.slots[slot - 1].binding = name
-    next.slots[slot - 1].live = true
-    next.catch_slot = 0
-    next.catch_edges = false
-    cleared: [int] = []
-    next.catch_moved = cleared
-    return ok(next)
 }
 
 fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: int, depth: int): LinkedNullExpression! {
@@ -352,10 +305,4 @@ fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpressio
     if (value.kind != "") { return ok(LinkedReadonlyExpression(state, LinkedBuiltin(value.kind, at), value.text)) }
     RejectLayout("unsupported_linked_operand", "expected a bound value, literal or checked direct call", at.clone())?
     return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", at), ""))
-}
-
-fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding): str! {
-    header = LinkedCPrelude(body, GuardArithmetic(body.uses_add, body.uses_sub) + GuardStringEquality(body.uses_string_equal))
-    declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
-    return ok(declarations + EmitLinkedNullPrototypes(body.links, result)?)
 }

@@ -4,7 +4,8 @@ import { RejectLayout } from "./struct_layouts.ku"
 import { LinkedNullBinding, LinkedNullRegion, LinkedNullSlot, LinkedNullState,
     PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedStringResult } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, DropLinkedNullScope } from "./linked_null_read_c.ku"
+import { AddLinkedNullSlot } from "./linked_null_read_c.ku"
+import { DropLinkedNullScope } from "./linked_member_ownership.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
 struct LinkedCharacterLoop {

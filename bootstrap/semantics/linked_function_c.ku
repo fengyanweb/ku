@@ -1,4 +1,9 @@
-import { LinkedNullState } from "./link_plan_c.ku"
+import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
+import { StructResultHeader } from "./struct_result_c.ku"
+import { EmitLinkedArrayBody } from "./struct_array_c.ku"
+import { TypeNameBinding } from "./type_names.ku"
+import { EmitLinkedNullPrototypes } from "./linked_null_types_c.ku"
+import { LinkedCPrelude, LinkedNullState } from "./link_plan_c.ku"
 
 fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &signature: str,
                          &result_type: str, &payload_cleanup: str, char_errors: str): str {
@@ -43,4 +48,10 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
             + "(long long)failure_index, failure_length); exit(EXIT_FAILURE); }\n"
     }
     return text + "    return result;\n}\n"
+}
+
+fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding): str! {
+    header = LinkedCPrelude(body, GuardArithmetic(body.uses_add, body.uses_sub) + GuardStringEquality(body.uses_string_equal))
+    declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
+    return ok(declarations + EmitLinkedNullPrototypes(body.links, result)?)
 }

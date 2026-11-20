@@ -1,6 +1,9 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan } from "./names.ku"
+import { ContainsIndex } from "./struct_projection_c.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { LinkedNullCType, LinkedNullDropC } from "./linked_null_types_c.ku"
-import { LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { LinkedNullBinding, LinkedNullSlot, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 
 fn LinkedMemberPath(&receiver: LinkedNullValue, ordinal: int): str {
     if (receiver.slot == 0 || (receiver.borrowed && receiver.member_path == "")) { return "" }
@@ -43,5 +46,48 @@ fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNu
         next.code = next.code + "    " + value.text.clone() + " = (" + LinkedNullCType(value.ty)? + "){0};\n"
         next = RecordLinkedMemberMove(next, value)
     }
+    return ok(next)
+}
+
+fn dropLinkedScope(state: LinkedNullState, outer: int, unwind: bool): LinkedNullState {
+    next = state
+    index = next.slots.len()
+    while (index > outer) {
+        index = index - 1
+        slot = next.slots[index].clone()
+        if ((slot.live || unwind) && !slot.value.borrowed && LinkedNullOwner(slot.value.ty)) {
+            next.code = next.code + LinkedNullDropC(next.layouts, next.owning_layouts, slot.value.ty, slot.value.text)
+        }
+        next.slots[index].binding = ""
+        next.slots[index].live = false
+    }
+    return next
+}
+
+fn DropLinkedNullScope(state: LinkedNullState, outer: int): LinkedNullState {
+    return dropLinkedScope(state, outer, false)
+}
+
+fn BindLinkedCatch(state: LinkedNullState, name: str, &binding: Node, &before: [LinkedNullSlot]): LinkedNullState! {
+    if (!state.catch_edges || LinkedNullBinding(before, name) != 0) {
+        RejectLayout("linked_catch_shape", "catch requires a reachable error edge and a distinct Error binding", DeclarationSpan(binding))?
+    }
+    next = state
+    slot = next.catch_slot
+    next.code += next.slots[slot - 1].value.text.clone() + "_handler:\n"
+    // Every slot starts zero. A later syntactic move need not have
+    // happened at the point of the failure, so unwind its owner as well.
+    next = dropLinkedScope(next, slot, true)
+    index = 0
+    while (index < before.len()) {
+        next.slots[index].live = before[index].live && !ContainsIndex(next.catch_moved, index)
+        index = index + 1
+    }
+    next.slots[slot - 1].binding = name
+    next.slots[slot - 1].live = true
+    next.catch_slot = 0
+    next.catch_edges = false
+    cleared: [int] = []
+    next.catch_moved = cleared
     return ok(next)
 }
