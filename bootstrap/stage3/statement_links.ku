@@ -4,7 +4,7 @@ import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { AfterOptionalSemicolon, RejectAt, WindowKind, WindowToken } from "./support.ku"
 import { ControlFrame, RejectFinally, StatementLink, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength,
          RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectNestedRoot, ExpectTryToken, NextBodyWork,
-         IsControlStatement, ReadControlHeader, RejectStatementLimit, RejectWhileBody } from "./body_support.ku"
+         IsControlStatement, ReadExpressionEnd, RejectStatementLimit, RejectWhileBody } from "./body_support.ku"
 import { ReadSimpleBodyStatement } from "./simple_statements.ku"
 
 struct AppendedStatements {
@@ -24,6 +24,73 @@ struct ControlBodyStart {
     next: int
     work: int
     inline_statement: int
+}
+
+fn RejectControlOpen(is_while: bool, error_token: Token): null! {
+    if (!is_while) { RejectAt(error_token.clone(), "unexpected_token", "expected '(' after 'if'")? }
+    RejectAt(error_token, "unexpected_token", "expected '(' after 'while'")?
+    return ok(null)
+}
+
+fn RejectControlClose(is_while: bool, error_token: Token): null! {
+    if (!is_while) { RejectAt(error_token.clone(), "unexpected_token", "expected ')' after if condition")? }
+    RejectAt(error_token, "unexpected_token", "expected ')' after while condition")?
+    return ok(null)
+}
+
+struct ControlHeader {
+    binding: str
+    expression_start: int
+    expression_end: int
+    body_open: int
+    work: int
+}
+
+fn ReadControlHeader(&tokens: [Token], start: int, window_end: int, initial_work: int): ControlHeader! {
+    kind = WindowKind(tokens, start, window_end)
+    cursor = start + 1
+    if (kind == "For") {
+        name = WindowToken(tokens, cursor, window_end)
+        if (name.kind != "Ident") { RejectAt(name.clone(), "unexpected_token", "expected loop variable after 'for'")? }
+        cursor = cursor + 1
+        if (WindowKind(tokens, cursor, window_end) != "In") { RejectAt(WindowToken(tokens, cursor, window_end), "unexpected_token", "expected 'in' after loop variable")? }
+        expression_start = cursor + 1
+        expression_end = ReadExpressionEnd(tokens, expression_start, window_end, "for_header")?
+        work = NextBodyWork(initial_work, expression_end - start, name.clone())?
+        if (WindowKind(tokens, expression_end, window_end) != "LBrace") {
+            RejectAt(WindowToken(tokens, expression_end, window_end), "unsupported_statement", "stage-3 for bodies must use braces")?
+        }
+        return ok(ControlHeader { binding: name.lexeme, expression_start: expression_start, expression_end: expression_end, body_open: expression_end, work: work })
+    }
+
+    is_while = kind == "While"
+    if (WindowKind(tokens, cursor, window_end) != "LParen") {
+        RejectControlOpen(is_while, WindowToken(tokens, cursor, window_end))?
+    }
+    cursor = cursor + 1
+    condition_start = cursor
+    condition_depth = 0
+    reading_condition = true
+    work = initial_work
+    while (reading_condition) {
+        work = NextBodyWork(work, 1, WindowToken(tokens, cursor, window_end))?
+        condition_token = WindowToken(tokens, cursor, window_end)
+        missing_close = condition_token.kind == "Eof" || condition_token.kind == "RBrace" || condition_token.kind == "LBrace" || condition_token.kind == "Semicolon"
+        if (missing_close) {
+            RejectControlClose(is_while, condition_token.clone())?
+        }
+        if (condition_token.kind == "RParen") {
+            if (condition_depth == 0) { reading_condition = false }
+            else {
+                condition_depth = condition_depth - 1
+                cursor = cursor + 1
+            }
+        } else {
+            if (condition_token.kind == "LParen") { condition_depth = condition_depth + 1 }
+            cursor = cursor + 1
+        }
+    }
+    return ok(ControlHeader { binding: "", expression_start: condition_start, expression_end: cursor, body_open: cursor + 1, work: work })
 }
 
 fn ReadControlBodyStart(&tokens: [Token], &kind: str, start: int, last: int, token_base: int, work: int,
