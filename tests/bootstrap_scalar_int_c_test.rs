@@ -470,7 +470,7 @@ fn main(): null! {{
                 ),
             )
             .expect("Stage0 interpreter capacity oracle");
-            let interpreted = execute(&mut Command::new(ku).arg("run").arg(&oracle), cwd, 10);
+            let interpreted = execute(Command::new(ku).arg("run").arg(&oracle), cwd, 10);
             assert_success(&interpreted);
             fs::remove_file(&oracle).expect("no Ku source during the independent C run");
             let actual = execute(Command::new(&app).arg(value.to_string()), cwd, 10);
