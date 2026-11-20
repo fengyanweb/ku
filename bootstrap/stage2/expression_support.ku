@@ -69,6 +69,10 @@ fn IsNamedStructStart(&name: Token, &opener: Token, &field: Token, &separator: T
     return name.kind == "Ident" && opener.kind == "LBrace" && name.end_line == opener.line && field.kind == "Ident" && separator.kind == "Colon"
 }
 
+fn IsBraceLiteralMarker(&marker: str): bool {
+    return marker == "struct" || marker == "object"
+}
+
 fn RejectAt(token: Token, code: str, message: str, stage3_domain: bool): null! {
     domain = "bootstrap.parser"
     if (stage3_domain) { domain = "bootstrap.parser.stage3" }

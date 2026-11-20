@@ -77,7 +77,9 @@ fn PushExpressionBoundary(state: ExpressionBoundary, token: Token, previous_can_
         if (token.kind == "LBracket") { bracket_depth = bracket_depth + 1 }
         else if (token.kind == "RBracket" && bracket_depth > 0) { bracket_depth = bracket_depth - 1 }
         if (token.kind == "LBrace") {
-            if (!named_struct_open) { RejectAt(token.clone(), "unsupported_expression", "brace expressions are outside the stage-3 subset")? }
+            // An operand can start with an anonymous object. A brace after
+            // a complete value still needs the named-struct lookahead.
+            if (!named_struct_open && previous_can_end) { RejectAt(token.clone(), "unsupported_expression", "brace expressions are outside the stage-3 subset")? }
             brace_depth = brace_depth + 1
         } else if (token.kind == "RBrace" && brace_depth > 0) { brace_depth = brace_depth - 1 }
     }

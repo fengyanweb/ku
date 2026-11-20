@@ -3,7 +3,7 @@ import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken, SpanMerge } from "./span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "./ast.ku"
 import { ParseContext, DefaultParseContext, ParseContextError, RelocateTokens } from "./context.ku"
-import { OperatorEntry, ValueEntry, MakeOperator, OperatorSpan, ExpressionSpan, MakeExpressionNode, IsNamedStructStart, RejectAt, RejectAtPoint } from "./expression_support.ku"
+import { OperatorEntry, ValueEntry, MakeOperator, OperatorSpan, ExpressionSpan, MakeExpressionNode, IsNamedStructStart, IsBraceLiteralMarker, RejectAt, RejectAtPoint } from "./expression_support.ku"
 
 // Stage 2B uses append-only operator/value stacks and integer links. Flat
 // binary and postfix chains are iterative; nested delimiters and unary prefixes
@@ -50,7 +50,7 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
 
     cursor = 0
     depth = 1
-    struct_depth = 0
+    brace_depth = 0
     arena_nodes: [Node] = []
     arena_edges: [int] = []
     operators: [OperatorEntry] = []
@@ -145,22 +145,24 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
         token = tokens[cursor].clone()
         // A field is not an operand by itself. Once its expression has been
         // reduced, replace that one value with an ordered named field node.
-        if (struct_depth > 0 && !expect_operand && (token.kind == "Comma" || token.kind == "RBrace")) {
+        if (brace_depth > 0 && !expect_operand && (token.kind == "Comma" || token.kind == "RBrace")) {
             while (operator_top != 0 && operators[operator_top - 1].marker == "") { ReduceTop()? }
             field = operators[operator_top - 1].clone()
-            if (field.marker == "struct_field") {
+            if (field.marker == "struct_field" || field.marker == "object_field") {
                 value = values[value_top - 1].clone()
                 if (value.previous != field.base_value) {
-                    RejectAt(token.clone(), "invalid_expression", "struct field requires exactly one expression", stage3_domain)?
+                    RejectAt(token.clone(), "invalid_expression", "literal field requires exactly one expression", stage3_domain)?
                 }
                 span = SpanMerge(OperatorSpan(field), ExpressionSpan(arena_nodes[value.node - 1]))
-                node = AddNode("StructLiteralField", field.text, 0, span, [value.node])?
+                field_kind = "StructLiteralField"
+                if (field.marker == "object_field") { field_kind = "ObjectLiteralField" }
+                node = AddNode(field_kind, field.text, 0, span, [value.node])?
                 values = values.push(ValueEntry { node: node, previous: value.previous })
                 value_top = values.len()
                 operator_top = field.previous
             }
         }
-        closing = token.kind == "RParen" || token.kind == "RBracket" || (struct_depth > 0 && token.kind == "RBrace")
+        closing = token.kind == "RParen" || token.kind == "RBracket" || (brace_depth > 0 && token.kind == "RBrace")
         if (closing) {
             reducing = true
             while (reducing) {
@@ -174,18 +176,27 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
                 RejectAt(token.clone(), "unexpected_token", "closing delimiter has no matching opener", stage3_domain)?
             }
             marker = operators[operator_top - 1].clone()
+            brace_literal = IsBraceLiteralMarker(marker.marker)
             expected_close = "RParen"
             if (marker.marker == "array" || marker.marker == "index") { expected_close = "RBracket" }
-            if (marker.marker == "struct") { expected_close = "RBrace" }
+            if (brace_literal) { expected_close = "RBrace" }
+            if (token.kind == "RBrace" && expect_operand) {
+                if (marker.marker == "object_field") {
+                    RejectAt(token.clone(), "unexpected_token", "expected expression", stage3_domain)?
+                }
+                if (marker.marker == "object" && marker.depth_active) {
+                    RejectAt(token.clone(), "unexpected_token", "expected object field name", stage3_domain)?
+                }
+            }
             if (token.kind != expected_close) {
                 RejectAt(token.clone(), "unexpected_token", "closing delimiter does not match opener", stage3_domain)?
             }
-            if (expect_operand && (marker.depth_active || (marker.marker != "array" && marker.marker != "call"))) {
+            if (expect_operand && (marker.depth_active || (marker.marker != "array" && marker.marker != "call" && !brace_literal))) {
                 RejectAt(token.clone(), "unexpected_token", "expected expression before closing delimiter", stage3_domain)?
             }
             operator_top = marker.previous
             if (marker.depth_active) { depth = depth - 1 }
-            if (marker.marker == "struct") { struct_depth = struct_depth - 1 }
+            if (brace_literal) { brace_depth = brace_depth - 1 }
 
             reversed: [int] = []
             walk = value_top
@@ -226,6 +237,8 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
                     node = AddNode("Array", "", 0, SpanMerge(OperatorSpan(marker), end_span), children)?
                 } else if (marker.marker == "struct") {
                     node = AddNode("StructLiteral", marker.text, 0, SpanMerge(OperatorSpan(marker), end_span), children)?
+                } else if (marker.marker == "object") {
+                    node = AddNode("ObjectLiteral", "", 0, SpanMerge(OperatorSpan(marker), end_span), children)?
                 } else {
                     kind = "Index"
                     if (marker.marker == "call") { kind = "Call" }
@@ -248,11 +261,20 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
                 RejectAt(token.clone(), "unexpected_eof", "expected closing delimiter", stage3_domain)?
             }
             parsing = false
-        } else if (expect_operand && struct_depth > 0 && operators[operator_top - 1].marker == "struct") {
-            if (token.kind != "Ident" || tokens[cursor + 1].kind != "Colon") {
+        } else if (expect_operand && brace_depth > 0 && IsBraceLiteralMarker(operators[operator_top - 1].marker)) {
+            field_marker = "struct_field"
+            if (operators[operator_top - 1].marker == "object") {
+                field_marker = "object_field"
+                if (token.kind != "Ident" && token.kind != "String") {
+                    RejectAt(token.clone(), "unexpected_token", "expected object field name", stage3_domain)?
+                }
+                if (tokens[cursor + 1].kind != "Colon") {
+                    RejectAt(tokens[cursor + 1].clone(), "unexpected_token", "expected ':' after object field", stage3_domain)?
+                }
+            } else if (token.kind != "Ident" || tokens[cursor + 1].kind != "Colon") {
                 RejectAt(token.clone(), "unexpected_token", "expected named struct field followed by ':'", stage3_domain)?
             }
-            entry = MakeOperator("struct_field", token.lexeme.clone(), 0, false, token, operator_top, value_top, false)
+            entry = MakeOperator(field_marker, token.lexeme.clone(), 0, false, token, operator_top, value_top, false)
             operators = operators.push(entry)
             operator_top = operators.len()
             cursor = cursor + 2
@@ -266,7 +288,7 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
                 operators = operators.push(entry)
                 operator_top = operators.len()
                 depth = depth + 1
-                struct_depth = struct_depth + 1
+                brace_depth = brace_depth + 1
                 cursor = cursor + 2
             } else if (token.kind == "Bang" || token.kind == "Minus") {
                 if (depth >= 32) {
@@ -277,10 +299,15 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
                 operators = operators.push(operator_entry)
                 operator_top = operators.len()
                 cursor = cursor + 1
-            } else if (token.kind == "LParen" || token.kind == "LBracket") {
+            } else if (token.kind == "LParen" || token.kind == "LBracket" || token.kind == "LBrace") {
                 marker_kind = "group"
                 expected_close = "RParen"
                 if (token.kind == "LBracket") { marker_kind = "array" expected_close = "RBracket" }
+                if (token.kind == "LBrace") {
+                    marker_kind = "object"
+                    expected_close = "RBrace"
+                    brace_depth = brace_depth + 1
+                }
                 active = tokens[cursor + 1].kind != expected_close
                 if (active) {
                     if (depth >= 32) {
@@ -324,7 +351,7 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
             while (operator_top != 0 && operators[operator_top - 1].marker == "") {
                 ReduceTop()?
             }
-            if (operator_top == 0 || (operators[operator_top - 1].marker != "array" && operators[operator_top - 1].marker != "call" && operators[operator_top - 1].marker != "struct")) {
+            if (operator_top == 0 || (operators[operator_top - 1].marker != "array" && operators[operator_top - 1].marker != "call" && !IsBraceLiteralMarker(operators[operator_top - 1].marker))) {
                 RejectAt(token.clone(), "unexpected_token", "comma is only valid in an array or call", stage3_domain)?
             }
             marker = operators[operator_top - 1].clone()
