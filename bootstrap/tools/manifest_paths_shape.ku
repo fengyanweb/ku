@@ -1,0 +1,282 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan } from "../semantics/names.ku"
+import { RejectLayout } from "../semantics/struct_layouts.ku"
+import { LinkedNullProject, LinkedNullChild, LinkedNullNode } from "../semantics/linked_null_types_c.ku"
+
+struct ManifestError {
+    target: Node
+    code: Node
+    message: Node
+    suffix: Node
+    duplicate: bool
+}
+
+struct ManifestLimit {
+    limit: int
+    error: ManifestError
+}
+
+struct ManifestScan {
+    file: ManifestLimit
+    line: ManifestLimit
+    count: ManifestLimit
+    duplicate: ManifestError
+    empty: ManifestError
+    prepare: Node
+}
+
+struct ManifestLocals {
+    input: str
+    at: str
+    paths: str
+    line: str
+    character: str
+    existing: str
+}
+
+fn ManifestChild(&project: LinkedNullProject, &node: Node, which: int): Node {
+    return LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, which))
+}
+
+fn RequireManifest(valid: bool, &node: Node, message: str): null! {
+    if (!valid) { RejectLayout("unsupported_manifest_scan", message, DeclarationSpan(node))? }
+    return ok(null)
+}
+
+fn ManifestShape(&node: Node, &kind: str, children: int): null! {
+    RequireManifest(node.kind == kind && node.edge_count == children, node,
+        "expected " + kind.clone() + " with " + str(children) + " children")?
+    return ok(null)
+}
+
+fn variable(&node: Node, &name: str): null! {
+    ManifestShape(node, "Variable", 0)?
+    RequireManifest(node.text == name, node, "expected the same local binding")?
+    return ok(null)
+}
+
+fn binary(&node: Node, &op: str): null! {
+    ManifestShape(node, "Binary", 2)?
+    RequireManifest(node.text == op, node, "expected operator " + op.clone())?
+    return ok(null)
+}
+
+fn literal(&node: Node, &text: str): null! {
+    ManifestShape(node, "String", 0)?
+    RequireManifest(node.text == text, node, "unexpected string literal in scanner")?
+    return ok(null)
+}
+
+fn method(&project: LinkedNullProject, &call: Node, &base: str, &name: str, arguments: int): null! {
+    ManifestShape(call, "Call", arguments + 1)?
+    callee = ManifestChild(project, call, 0)
+    ManifestShape(callee, "Field", 1)?
+    RequireManifest(callee.text == name, callee, "expected method " + name.clone())?
+    variable(ManifestChild(project, callee, 0), base)?
+    return ok(null)
+}
+
+fn checked(&project: LinkedNullProject, &node: Node): Node! {
+    ManifestShape(node, "TryUnwrap", 1)?
+    return ok(ManifestChild(project, node, 0))
+}
+
+fn ownAssignment(&node: Node, &name: str): null! {
+    ManifestShape(node, "Assign", 1)?
+    RequireManifest(node.text == name, node, "expected assignment to the same local owner")?
+    return ok(null)
+}
+
+fn oneBranch(&node: Node): null! {
+    ManifestShape(node, "If", 2)?
+    RequireManifest(node.int_value == 1, node, "expected a single statement and no else")?
+    return ok(null)
+}
+
+fn errorCall(&project: LinkedNullProject, &node: Node, &locals: ManifestLocals,
+             cloned: bool, duplicate: bool): ManifestError! {
+    ManifestShape(node, "ExprStmt", 1)?
+    call = checked(project, ManifestChild(project, node, 0))?
+    ManifestShape(call, "Call", 4)?
+    target = ManifestChild(project, call, 0)
+    ManifestShape(target, "Variable", 0)?
+    code = ManifestChild(project, call, 1)
+    ManifestShape(code, "String", 0)?
+    expression = ManifestChild(project, call, 2)
+    message = expression.clone()
+    suffix = expression.clone()
+    if (duplicate) {
+        binary(expression, "+")?
+        left = ManifestChild(project, expression, 0)
+        binary(left, "+")?
+        message = ManifestChild(project, left, 0)
+        method(project, ManifestChild(project, left, 1), locals.line, "clone", 0)?
+        suffix = ManifestChild(project, expression, 1)
+        ManifestShape(suffix, "String", 0)?
+    }
+    ManifestShape(message, "String", 0)?
+    context = ManifestChild(project, call, 3)
+    if (cloned) { method(project, context, locals.at, "clone", 0)? }
+    else { variable(context, locals.at)? }
+    return ok(ManifestError { target: target, code: code, message: message, suffix: suffix, duplicate: duplicate })
+}
+
+fn readLimit(&project: LinkedNullProject, &branch: Node, &locals: ManifestLocals, &base: str, &length: str,
+             &comparison: str, minimum: int, maximum: int, cloned: bool): ManifestLimit! {
+    oneBranch(branch)?
+    condition = ManifestChild(project, branch, 0)
+    binary(condition, comparison)?
+    method(project, ManifestChild(project, condition, 0), base, length, 0)?
+    limit = ManifestChild(project, condition, 1)
+    ManifestShape(limit, "Int", 0)?
+    RequireManifest(limit.int_value >= minimum && limit.int_value <= maximum, limit, "limit is outside the bounded scanner shape")?
+    error = errorCall(project, ManifestChild(project, branch, 1), locals, cloned, false)?
+    return ok(ManifestLimit { limit: limit.int_value, error: error })
+}
+
+fn readDuplicate(&project: LinkedNullProject, &loop: Node, &locals: ManifestLocals): ManifestError! {
+    ManifestShape(loop, "For", 2)?
+    variable(ManifestChild(project, loop, 0), locals.paths)?
+    branch = ManifestChild(project, loop, 1)
+    oneBranch(branch)?
+    equality = ManifestChild(project, branch, 0)
+    binary(equality, "==")?
+    variable(ManifestChild(project, equality, 0), locals.existing)?
+    variable(ManifestChild(project, equality, 1), locals.line)?
+    return errorCall(project, ManifestChild(project, branch, 1), locals, true, true)
+}
+
+fn readInput(&project: LinkedNullProject, &loop: Node, &locals: ManifestLocals): null! {
+    collection = ManifestChild(project, loop, 0)
+    method(project, collection, "string", "chars", 1)?
+    source = ManifestChild(project, collection, 1)
+    binary(source, "+")?
+    variable(ManifestChild(project, source, 0), locals.input)?
+    literal(ManifestChild(project, source, 1), "\n")?
+    return ok(null)
+}
+
+fn readAppend(&project: LinkedNullProject, &statement: Node, &locals: ManifestLocals): null! {
+    ownAssignment(statement, locals.paths)?
+    append = ManifestChild(project, statement, 0)
+    method(project, append, locals.paths, "push", 1)?
+    variable(ManifestChild(project, append, 1), locals.line)?
+    return ok(null)
+}
+
+fn readPrepare(&project: LinkedNullProject, &statement: Node, &locals: ManifestLocals): Node! {
+    ownAssignment(statement, locals.line)?
+    call = checked(project, ManifestChild(project, statement, 0))?
+    ManifestShape(call, "Call", 3)?
+    target = ManifestChild(project, call, 0)
+    ManifestShape(target, "Variable", 0)?
+    variable(ManifestChild(project, call, 1), locals.line)?
+    method(project, ManifestChild(project, call, 2), locals.at, "clone", 0)?
+    return ok(target)
+}
+
+fn requireNamespaces(&project: LinkedNullProject, &names: [str], &root: Node): null! {
+    index = 0
+    while (index < names.len()) {
+        RequireManifest(names[index] != "ok" && names[index] != "string", root, "local shadows a required builtin")?
+        prior = 0
+        while (prior < index) {
+            RequireManifest(names[index] != names[prior], root, "the scanner must have distinct local bindings")?
+            prior = prior + 1
+        }
+        index = index + 1
+    }
+    standard = false
+    for binding in project.binding.modules[0].imports.clone() {
+        RequireManifest(binding.local_name != "ok", root, "import shadows the ok constructor")?
+        if (binding.local_name == "string" && binding.source_name == "string" && binding.module_index == 0) { standard = true }
+    }
+    for declaration in project.supplied[0].named.names.declarations.clone() {
+        RequireManifest(declaration.name != "ok", root, "declaration shadows the ok constructor")?
+    }
+    RequireManifest(standard, root, "expected bound std.string")?
+    return ok(null)
+}
+
+fn requireUnshadowed(&node: Node, &names: [str]): null! {
+    index = 0
+    while (index < names.len()) {
+        RequireManifest(node.text != names[index], node, "a local shadows the checked dependency")?
+        index = index + 1
+    }
+    return ok(null)
+}
+
+fn checkReturn(&project: LinkedNullProject, &node: Node, &paths: str): null! {
+    ManifestShape(node, "Return", 1)?
+    call = ManifestChild(project, node, 0)
+    ManifestShape(call, "Call", 2)?
+    variable(ManifestChild(project, call, 0), "ok")?
+    variable(ManifestChild(project, call, 1), paths)?
+    return ok(null)
+}
+
+fn ReadManifestScan(&project: LinkedNullProject, &entry: Node, &input: str, &at: str): ManifestScan! {
+    declaration = ManifestChild(project, entry, 4)
+    ManifestShape(declaration, "VarDecl", 2)?
+    array = ManifestChild(project, declaration, 0)
+    ManifestShape(array, "TypeArray", 1)?
+    element = ManifestChild(project, array, 0)
+    ManifestShape(element, "TypeName", 0)?
+    RequireManifest(element.text == "str", element, "expected owned string array")?
+    ManifestShape(ManifestChild(project, declaration, 1), "Array", 0)?
+    initial = ManifestChild(project, entry, 5)
+    ManifestShape(initial, "Assign", 1)?
+    literal(ManifestChild(project, initial, 0), "")?
+
+    loop = ManifestChild(project, entry, 6)
+    ManifestShape(loop, "For", 2)?
+    arms = ManifestChild(project, loop, 1)
+    ManifestShape(arms, "If", 6)?
+    RequireManifest(arms.int_value == 2, arms, "expected two scanning and three line flush statements")?
+    accepting = ManifestChild(project, arms, 4)
+    ManifestShape(accepting, "If", 4)?
+    RequireManifest(accepting.int_value == 3, accepting, "expected limit, duplicate check and append with no else")?
+    duplicate_loop = ManifestChild(project, accepting, 2)
+    ManifestShape(duplicate_loop, "For", 2)?
+    local = ManifestLocals { input: input.clone(), at: at.clone(), paths: declaration.text, line: initial.text,
+        character: loop.text.clone(), existing: duplicate_loop.text.clone() }
+    names = [local.input.clone(), local.at.clone(), local.paths.clone(), local.line.clone(),
+        local.character.clone(), local.existing.clone()]
+    requireNamespaces(project, names, entry)?
+
+    readInput(project, loop, local)?
+    separator = ManifestChild(project, arms, 0)
+    binary(separator, "!=")?
+    variable(ManifestChild(project, separator, 0), local.character)?
+    literal(ManifestChild(project, separator, 1), "\n")?
+    accumulation = ManifestChild(project, arms, 1)
+    ownAssignment(accumulation, local.line)?
+    join = ManifestChild(project, accumulation, 0)
+    binary(join, "+")?
+    variable(ManifestChild(project, join, 0), local.line)?
+    variable(ManifestChild(project, join, 1), local.character)?
+    prepared = readPrepare(project, ManifestChild(project, arms, 3), local)?
+    flush = ManifestChild(project, arms, 5)
+    ownAssignment(flush, local.line)?
+    literal(ManifestChild(project, flush, 0), "")?
+    present = ManifestChild(project, accepting, 0)
+    binary(present, "!=")?
+    variable(ManifestChild(project, present, 0), local.line)?
+    literal(ManifestChild(project, present, 1), "")?
+
+    file = readLimit(project, ManifestChild(project, entry, 3), local, local.input, "byte_len", ">", 1, 32768, true)?
+    line = readLimit(project, ManifestChild(project, arms, 2), local, local.line, "byte_len", ">", 1, 513, true)?
+    count = readLimit(project, ManifestChild(project, accepting, 1), local, local.paths, "len", "==", 1, 64, true)?
+    duplicate = readDuplicate(project, duplicate_loop, local)?
+    readAppend(project, ManifestChild(project, accepting, 3), local)?
+    empty = readLimit(project, ManifestChild(project, entry, 7), local, local.paths, "len", "==", 0, 0, false)?
+    checkReturn(project, ManifestChild(project, entry, 8), local.paths)?
+    requireUnshadowed(prepared, names)?
+    requireUnshadowed(file.error.target, names)?
+    for target in [line.error.target.clone(), count.error.target.clone(), duplicate.target.clone(), empty.error.target.clone()] {
+        RequireManifest(target.text == file.error.target.text, target, "all diagnostic calls must address the same dependency")?
+    }
+    return ok(ManifestScan { file: file, line: line, count: count, duplicate: duplicate,
+                             empty: empty.error, prepare: prepared })
+}

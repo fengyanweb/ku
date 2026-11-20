@@ -1,0 +1,208 @@
+import { fs, string } from "std"
+import { Node } from "../stage2/ast.ku"
+import { Span } from "../stage2/span.ku"
+import { SuppliedModule } from "../semantics/imports.ku"
+import { BindProjectModules } from "../semantics/project_bindings.ku"
+import { ManifestPaths, ReadProjectModulesAt } from "../semantics/project_manifest.ku"
+import { StructLayout } from "../semantics/struct_layouts.ku"
+import { EmitNestedCLayouts, OrderCStructLayouts } from "../semantics/nested_struct_c.ku"
+import { ScalarFunctionNode } from "../semantics/scalar_int_calls.ku"
+import { ScalarStringHelpers } from "../semantics/scalar_int_emit.ku"
+import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
+import { LinkedNullProject, LinkedNullFunction, LinkedNullEntry, LinkedNullChild, LinkedNullNode,
+    LinkedNullParameterType, LinkedNullDependency, LinkedNullDependencyPlan, LinkedNullLayout,
+    LinkedNullCType, LinkedNullPrototype, LinkedNullParameterPlan } from "../semantics/linked_null_types_c.ku"
+import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration, LinkPlanType } from "../semantics/link_plan_c.ku"
+import { TypeNameBinding } from "../semantics/type_names.ku"
+import { ManifestError, ManifestScan, ManifestChild, ManifestShape, RequireManifest,
+    ReadManifestScan } from "./manifest_paths_shape.ku"
+
+struct ManifestPathsC {
+    source: str
+    export: LinkPlanDeclaration
+    dependencies: [LinkPlanDeclaration]
+}
+
+fn ownedString(&type: TypeNameBinding): bool {
+    return type.declaration_kind == "Builtin" && type.name == "str"
+}
+
+fn sameContext(&type: TypeNameBinding, &context: TypeNameBinding): bool {
+    return type.declaration_kind == "Struct" && type.module_index == context.module_index &&
+        type.declaration_node == context.declaration_node
+}
+
+fn ownedParameter(&project: LinkedNullProject, &entry: Node, index: int): TypeNameBinding! {
+    parameter = ManifestChild(project, entry, index)
+    ManifestShape(parameter, "Parameter", 1)?
+    RequireManifest(parameter.int_value == 0, parameter, "expected an owned parameter")?
+    return LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, parameter, 0), false)
+}
+
+fn prepareDependency(&project: LinkedNullProject, &target: Node, &context: TypeNameBinding): LinkPlanDeclaration! {
+    id = ScalarFunctionNode(project.supplied[0].named.names.declarations, target.text)
+    RequireManifest(id > 0, target, "expected a declared local line preparer")?
+    entry = LinkedNullNode(project, 1, id)
+    RequireManifest(entry.kind == "Function" && entry.edge_count >= 4, entry, "expected a synchronous str! line preparer")?
+    path = ownedParameter(project, entry, 0)?
+    record = ownedParameter(project, entry, 1)?
+    RequireManifest(ownedString(path) && sameContext(record, context), target, "line preparer must use the original owned string and Copy context")?
+    result = ManifestChild(project, entry, 2)
+    ManifestShape(result, "TypeResult", 1)?
+    inner = ManifestChild(project, result, 0)
+    ManifestShape(inner, "TypeName", 0)?
+    RequireManifest(inner.text == "str", inner, "expected an owned str payload")?
+    return ok(LinkPlanDeclaration { unit: 1, node: id, symbol: "ku_manifest_prepare_" + str(id),
+        parameters: [LinkedNullParameterPlan(path, 1)?, LinkedNullParameterPlan(record, 1)?],
+        result: BuiltinLinkPlanType("str", "KuResult_str", false), returns_result: true })
+}
+
+fn rejectDependency(&project: LinkedNullProject, &target: Node, &context: TypeNameBinding): LinkedNullFunction! {
+    callee = LinkedNullDependency(project, 1, target, true)?
+    RequireManifest(callee.parameters.len() == 3 && callee.result.declaration_kind == "Builtin" &&
+        callee.result.name == "null", target, "expected diagnostic constructor with null! result")?
+    RequireManifest(ownedString(callee.parameters[0]) && ownedString(callee.parameters[1]) &&
+        sameContext(callee.parameters[2], context), target, "diagnostic arguments need owned strings and the same Copy context")?
+    entry = LinkedNullNode(project, callee.unit, callee.node)
+    RequireManifest(entry.edge_count >= 5, entry, "diagnostic function requires an unconditional fail")?
+    index = 4
+    while (index < entry.edge_count - 1) {
+        statement = LinkedNullNode(project, callee.unit, LinkedNullChild(project, callee.unit, entry, index))
+        RequireManifest(statement.kind == "Assign" || statement.kind == "VarDecl", statement,
+            "diagnostic function cannot branch or return before failing")?
+        index = index + 1
+    }
+    terminal = LinkedNullNode(project, callee.unit, LinkedNullChild(project, callee.unit, entry, index))
+    ManifestShape(terminal, "Fail", 1)?
+    return ok(callee)
+}
+
+fn emitFailure(&failure: ManifestError, &reject: str, &indent: str): str! {
+    code = ScalarStringLiteral(failure.code)?
+    message = ScalarStringLiteral(failure.message)?
+    text = ""
+    argument = "(KuString){(uint8_t*)" + message.clone() + ", 0u, 0u}"
+    if (failure.duplicate) {
+        tail = ScalarStringLiteral(failure.suffix)?
+        text += indent.clone() + "const KuScalarStringPart parts[3] = {{(const uint8_t*)" + message +
+            "},{line.ptr,line.len},{(const uint8_t*)" + tail + "}};\n"
+        text += indent.clone() + "KuProjectionString message = {0};\n"
+        text += indent.clone() + "fatal = ku_scalar_string_join(parts, 3u, &message);\n"
+        text += indent.clone() + "if (fatal) goto failure;\n"
+        argument = "message"
+    }
+    text += indent.clone() + "checked = " + reject.clone() + "((KuString){(uint8_t*)" + code +
+        ", 0u, 0u}, " + argument + ", at);\n"
+    text += indent.clone() + "if (checked.ok) fatal = \"bootstrap diagnostic unexpectedly succeeded\\n\";\n"
+    text += indent.clone() + "else output.error = checked.error;\n"
+    return ok(text + indent.clone() + "goto failure;\n")
+}
+
+fn emitManifest(&scan: ManifestScan, &symbol: str, &record: str, layouts: str,
+                &prepare: LinkPlanDeclaration, &reject: LinkedNullFunction): str! {
+    code = "#include <stdbool.h>\n#include <stdint.h>\n" + ScalarStringHelpers(true, true, false, true, true, false, true)
+    code += "typedef KuString KuProjectionString;\ntypedef KuError KuBootstrapError;\ntypedef KuResult_null KuBootstrapResultNull;\n"
+    code += "typedef struct KuResult_str { bool ok; KuString value; KuError error; } KuResult_str;\n"
+    code += "typedef struct { size_t len; KuProjectionString* data; size_t capacity; } KuGuardStringArray;\n"
+    code += "typedef struct { bool ok; KuGuardStringArray value; KuBootstrapError error; } KuBootstrapResultStringArray;\n\n"
+    code += layouts + LinkedNullPrototype(reject)?
+    code += "extern KuResult_str " + prepare.symbol.clone() + "(KuProjectionString, " + record.clone() + ");\n\n"
+    code += "KuBootstrapResultStringArray " + symbol.clone() + "(KuProjectionString manifest, " + record.clone() + " at) {\n"
+    code += "    KuBootstrapResultStringArray output = {0};\n"
+    code += "    KuProjectionString line = {0};\n    KuBootstrapResultNull checked = {0};\n    const char* fatal = NULL;\n"
+    code += "    if (manifest.len > " + str(scan.file.limit) + "u) {\n"
+    code += emitFailure(scan.file.error, reject.symbol, "        ")?
+    code += "    }\n"
+    // LF cannot be a UTF-8 continuation byte. Scanner checks happen before
+    // the checked line call, and an empty final segment is still processed.
+    code += "    size_t begin = 0;\n    for (;;) {\n"
+    code += "        size_t end = begin;\n        while (end < manifest.len && manifest.ptr[end] != 0x0au) ++end;\n"
+    code += "        size_t bytes = end - begin;\n"
+    code += "        if (bytes > " + str(scan.line.limit) + "u) {\n"
+    code += emitFailure(scan.line.error, reject.symbol, "            ")?
+    code += "        }\n"
+    code += "        KuProjectionString raw = {0};\n"
+    code += "        if (bytes) {\n"
+    code += "            const KuScalarStringPart part = {manifest.ptr + begin, bytes};\n"
+    code += "            fatal = ku_scalar_string_join(&part, 1u, &raw);\n"
+    code += "            if (fatal) goto failure;\n        }\n"
+    code += "        KuResult_str prepared = " + prepare.symbol.clone() + "(raw, at);\n"
+    code += "        if (!prepared.ok) { output.error = prepared.error; goto failure; }\n"
+    code += "        line = prepared.value;\n"
+    code += "        if (line.len) {\n"
+    code += "            if (output.value.len == " + str(scan.count.limit) + "u) {\n"
+    code += emitFailure(scan.count.error, reject.symbol, "                ")?
+    code += "            }\n"
+    code += "            for (size_t i = 0; i < output.value.len; ++i) {\n"
+    code += "                KuProjectionString existing = output.value.data[i];\n"
+    code += "                if (ku_scalar_string_equal(existing.ptr, existing.len, line.ptr, line.len)) {\n"
+    code += emitFailure(scan.duplicate, reject.symbol, "                    ")?
+    code += "                }\n            }\n"
+    code += "            if (output.value.len == output.value.capacity) {\n"
+    code += "                size_t capacity = output.value.capacity ? 2u * output.value.capacity : 4u;\n"
+    code += "                if (capacity > " + str(scan.count.limit) + "u) capacity = " + str(scan.count.limit) + "u;\n"
+    code += "                KuProjectionString* next = realloc(output.value.data, capacity * sizeof(*next));\n"
+    code += "                if (!next) { fatal = \"array allocation failed\\n\"; goto failure; }\n"
+    code += "                output.value.data = next;\n                output.value.capacity = capacity;\n"
+    code += "            }\n"
+    code += "            output.value.data[output.value.len++] = line;\n"
+    code += "        } else { ku_scalar_string_drop(line); }\n        line = (KuProjectionString){0};\n"
+    code += "        if (end == manifest.len) break;\n        begin = end + 1u;\n    }\n"
+    code += "    if (!output.value.len) {\n"
+    code += emitFailure(scan.empty, reject.symbol, "        ")?
+    code += "    }\n"
+    code += "    ku_scalar_string_drop(manifest);\n    output.ok = true;\n    return output;\n"
+    code += "failure:\n    ku_scalar_string_drop(line);\n"
+    code += "    for (size_t i = 0; i < output.value.len; ++i) ku_scalar_string_drop(output.value.data[i]);\n"
+    code += "    free(output.value.data);\n    output.value = (KuGuardStringArray){0};\n    ku_scalar_string_drop(manifest);\n"
+    return ok(code + "    if (fatal) { fputs(fatal, stderr); exit(1); }\n    return output;\n}\n")
+}
+
+fn EmitManifestPathsC(&supplied: [SuppliedModule], &name: str): ManifestPathsC! {
+    bound = BindProjectModules(supplied)?
+    project = LinkedNullProject { supplied: supplied.clone(), binding: bound }
+    id = LinkedNullEntry(project, name)?
+    entry = LinkedNullNode(project, 1, id)
+    ManifestShape(entry, "Function", 9)?
+    input = ownedParameter(project, entry, 0)?
+    context = ownedParameter(project, entry, 1)?
+    RequireManifest(ownedString(input) && context.declaration_kind == "Struct", entry, "expected str and Copy context")?
+    result = ManifestChild(project, entry, 2)
+    ManifestShape(result, "TypeResult", 1)?
+    payload = ManifestChild(project, result, 0)
+    ManifestShape(payload, "TypeArray", 1)?
+    inner = ManifestChild(project, payload, 0)
+    ManifestShape(inner, "TypeName", 0)?
+    RequireManifest(inner.text == "str", inner, "expected an owned [str]! result")?
+
+    layouts: [StructLayout] = []
+    needed = LinkedNullLayout(project, context, layouts, 0)?
+    order = OrderCStructLayouts(needed, context.module_index, context.declaration_node, context.span.clone())?
+    RequireManifest(!order.contains_string, entry, "context must be Copy")?
+    input_node = ManifestChild(project, entry, 0)
+    at_node = ManifestChild(project, entry, 1)
+    scan = ReadManifestScan(project, entry, input_node.text, at_node.text)?
+    prepare = prepareDependency(project, scan.prepare, context)?
+    reject = rejectDependency(project, scan.file.error.target, context)?
+    symbol = "ku_manifest_paths_" + str(id)
+    source = emitManifest(scan, symbol, LinkedNullCType(context)?, EmitNestedCLayouts(needed, order)?, prepare, reject)?
+    result_type = LinkPlanType { kind: "BuiltinArray", name: "str", unit: 0, node: 0,
+        c_type: "KuBootstrapResultStringArray", view: false }
+    export = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol,
+        parameters: [LinkedNullParameterPlan(input, 1)?, LinkedNullParameterPlan(context, 1)?],
+        result: result_type, returns_result: true }
+    return ok(ManifestPathsC { source: source, export: export, dependencies: [prepare, LinkedNullDependencyPlan(reject)?] })
+}
+
+fn main(): null! {
+    at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    supplied = ReadProjectModulesAt(ManifestPaths(fs.read("modules.txt")?, at)?, "")?
+    function = string.trim(fs.read("function.txt")?)
+    compiled = EmitManifestPathsC(supplied, function)?
+    if (fs.exists("plan.txt")) {
+        export = compiled.export
+        links = compiled.dependencies
+        print(EmitLinkPlan(supplied, "manifest-paths", export, links)?)
+    } else { print(compiled.source) }
+    return ok(null)
+}
