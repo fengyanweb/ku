@@ -46,6 +46,7 @@ struct LinkedNullState {
     uses_add: bool
     uses_sub: bool
     uses_string_equal: bool
+    uses_print: bool
 }
 
 struct LinkedNullExpression {
@@ -57,7 +58,7 @@ fn NewLinkedNullState(): LinkedNullState {
     return LinkedNullState { layouts: [], owning_layouts: [], owning_strings: false,
         slots: [], links: [], declarations: "", code: "", drops: "", uses_clone: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false,
-        element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false }
+        element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false, uses_print: false }
 }
 
 fn LinkedNullBinding(&slots: [LinkedNullSlot], &name: str): int {

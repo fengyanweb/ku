@@ -134,3 +134,125 @@ int main(int argc, char **argv) {
         "out of memory"
     );
 }
+
+pub(super) fn assert_checked_output_ownership(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("output-source.ku"),
+        r#"import { Load } from "./output-dependency.ku"
+fn Publish(&prefix: str, fail_read: bool): null! {
+    print(prefix)
+    println(Load(fail_read)?)
+    print(prefix)
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("output-dependency.ku"),
+        "fn Load(fail_read: bool): str! { return ok(\"payload\") }\n",
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "output-source.ku\noutput-dependency.ku\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("function.txt"), "Publish").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let generated = String::from_utf8(emitted.stdout).unwrap();
+    let entry = generated
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResultNull ku_linked_null_"))
+        .and_then(|line| line.split_once('('))
+        .map(|(number, _)| format!("ku_linked_null_{number}"))
+        .unwrap();
+    let load = generated
+        .lines()
+        .find_map(|line| line.strip_prefix("extern KuBootstrapResult_KuProjectionString "))
+        .and_then(|line| line.split_once('('))
+        .map(|(name, _)| name)
+        .unwrap();
+    let limited_write = r#"
+static int fail_output;
+static size_t output_bytes;
+static size_t limited_write(const void *ptr, size_t size, size_t count, FILE *stream) {
+    assert(size == 1 && count && stream == stdout);
+    if (fail_output && output_bytes == 4) return 0;
+    if (count > 2) count = 2;
+    size_t written = fwrite(ptr, 1, count, stream);
+    output_bytes += written;
+    return written;
+}
+#define fwrite limited_write
+"#;
+    let host = r#"
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+static int calls;
+static KuProjectionString prefix;
+KuBootstrapResult_KuProjectionString __LOAD__(bool reject) {
+    static const uint8_t spelling[] = {'x',0,0xe7,0xba,0xb8};
+    uint8_t *owned = malloc(sizeof(spelling));
+    memcpy(owned, spelling, sizeof(spelling));
+    KuProjectionString data = {owned,sizeof(spelling),sizeof(spelling),KU_PROJECTION_STRING_OWNED};
+    ++calls;
+    if (reject) return (KuBootstrapResult_KuProjectionString){.error = {.message = data}};
+    return (KuBootstrapResult_KuProjectionString){.ok = true, .value = data};
+}
+static void output_failure_cleanup(void) {
+    if (outstanding() != 1 || calls != 1 || output_bytes != 4) _Exit(91);
+    ku_projection_string_drop(&prefix);
+}
+int main(int argc, char **argv) {
+    (void)test_realloc;
+    (void)argv;
+#ifdef _WIN32
+    assert(_setmode(_fileno(stdout), _O_BINARY) != -1);
+#endif
+    uint8_t *bytes = malloc(2);
+    memcpy(bytes, "H:", 2);
+    prefix = (KuProjectionString){bytes,2,2,KU_PROJECTION_STRING_OWNED};
+    fail_output = argc == 3;
+    if (fail_output) assert(atexit(output_failure_cleanup) == 0);
+    KuBootstrapResultNull result = __ENTRY__(&prefix, argc == 2);
+    assert(calls == 1 && prefix.ptr == bytes && prefix.len == 2);
+    if (argc == 2) {
+        assert(!result.ok && result.error.message.len == 5 && outstanding() == 2);
+        ku_projection_string_drop(&result.error.message);
+    } else {
+        assert(result.ok && outstanding() == 1);
+    }
+    ku_projection_string_drop(&prefix);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("__ENTRY__", &entry)
+    .replace("__LOAD__", load);
+    let source = cwd.join("stdout-owner.c");
+    let program = cwd.join(format!("stdout-owner{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &source,
+        format!("{CHECKED_ARRAY_ALLOCATOR}{limited_write}{generated}{host}"),
+    )
+    .unwrap();
+    compile_projection(&source, &program, cwd);
+    let success = execute(&mut Command::new(&program), cwd, 15);
+    assert_ok(&success);
+    assert_eq!(success.stdout, "H:x\0纸\nH:".as_bytes());
+    let failed_read = execute(Command::new(&program).arg("read-error"), cwd, 15);
+    assert_ok(&failed_read);
+    assert_eq!(failed_read.stdout, b"H:");
+    let failed_output = execute(Command::new(&program).args(["output", "failed"]), cwd, 15);
+    assert_eq!(failed_output.status.code(), Some(1));
+    assert_eq!(failed_output.stdout, b"H:x\0");
+    assert_eq!(
+        String::from_utf8_lossy(&failed_output.stderr).trim(),
+        "output write failed"
+    );
+}

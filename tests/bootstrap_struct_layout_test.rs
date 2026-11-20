@@ -4052,4 +4052,5 @@ int main(int argc, char **argv) {
     linked_null::assert_short_circuit_reads(&compiler, &cwd);
     linked_null::assert_linked_fs_read(&compiler, &cwd);
     linked_guard::assert_terminal_branch_ownership(&compiler, &cwd);
+    linked_guard::assert_checked_output_ownership(&compiler, &cwd);
 }

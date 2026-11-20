@@ -13,7 +13,8 @@ import { LinkedCheckedResultCType, LinkedCheckedResultPlan, LinkedNullArrayLimit
 import { AddLinkedNullSlot, DropLinkedNullScope, EmitLinkedNullDeclarations, LinkedNullBinding, LinkedNullSlot, LinkedNullState, LowerLinkedNullRead,
          MoveLinkedNullSlot, NewLinkedNullState, RegisterLinkedNullType, RestoreLinkedNullSlots } from "./linked_null_read_c.ku"
 import { LowerLinkedArrayAppend, LowerLinkedSuccess,
-         LowerLinkedNullTry, LowerLinkedNullValue } from "./linked_null_values_c.ku"
+         LowerLinkedNullValue } from "./linked_null_values_c.ku"
+import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
 
 struct LinkedNullC {
     symbol: str
@@ -303,8 +304,8 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
         } else if (statement.kind == "While" && statement.edge_count >= 2 && index > start) {
             initial = LinkedNullNode(project, 1, LinkedNullChild(project, 1, region, index - 1))
             next = addCountedLoop(project, next, statement, initial, result, depth)?
-        } else if (statement.kind == "ExprStmt" && statement.edge_count == 1) {
-            next = LowerLinkedNullTry(project, next, statement)?
+        } else if ((statement.kind == "ExprStmt" || statement.kind == "Print") && statement.edge_count == 1) {
+            next = LowerLinkedStatementCall(project, next, statement)?
         } else {
             RejectLayout("unsupported_linked_statement", "expected a fresh local, guarded statement, counted while or checked call", DeclarationSpan(statement))?
         }
@@ -324,10 +325,12 @@ fn emitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &pa
     clone = body.uses_clone || body.element_clones.len() > 0
     if (clone) { text += "    bool out_of_memory = false;\n" }
     if (array_checks) { text += "    bool invalid_array = false;\n" }
+    if (body.uses_print) { text += "    bool output_failed = false;\n" }
     if (body.uses_str_view) { text += "    bool invalid_str = false;\n" }
     if (body.uses_add || body.uses_sub) { text += "    bool overflow = false;\n" }
     if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
     text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
+    if (body.uses_print) { text += "    if (output_failed) { fputs(\"output write failed\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (clone) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (array_checks) {
         message = "invalid struct array ownership"

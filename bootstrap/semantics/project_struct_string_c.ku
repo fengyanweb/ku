@@ -15,6 +15,60 @@ import { HasScalarBuiltin, ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { BindStructStringCall, ReadStructStringFold, StructStringDependency, StructStringFold } from "./struct_string_calls.ku"
 import { TypeNameBinding } from "./type_names.ku"
 
+import { DropLinkedNullScope, LinkedNullBinding, LinkedNullState } from "./linked_null_read_c.ku"
+import { LinkedNullChild, LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
+import { LowerLinkedNullTry, LowerLinkedNullValue } from "./linked_null_values_c.ku"
+fn linkedOutputBuiltin(&project: LinkedNullProject, &state: LinkedNullState, &target: Node): bool {
+    if (target.kind != "Variable" || target.edge_count != 0 ||
+        target.text != "println" ||
+        LinkedNullBinding(state.slots, target.text) != 0) { return false }
+    for declaration in project.supplied[0].named.names.declarations.clone() {
+        if (declaration.name == target.text) { return false }
+    }
+    for binding in project.binding.modules[0].imports.clone() {
+        if (binding.local_name == target.text) { return false }
+    }
+    return true
+}
+
+fn emitLinkedOutput(&text: str, newline: bool): str {
+    code = "    {\n        KuProjectionString written_text = " + text.clone() + ";\n"
+        + "        size_t offset = 0;\n        while (offset < written_text.len) {\n"
+        + "            size_t count = fwrite(written_text.ptr + offset, 1, written_text.len - offset, stdout);\n"
+        + "            if (!count) { output_failed = true; goto cleanup; }\n"
+        + "            offset += count;\n        }\n"
+    if (newline) { code += "        if (fputc('\\n', stdout) == EOF) { output_failed = true; goto cleanup; }\n" }
+    return code + "        (void)fflush(stdout);\n    }\n"
+}
+
+fn lowerLinkedOutputValue(&project: LinkedNullProject, state: LinkedNullState, id: int,
+                          newline: bool): LinkedNullState! {
+    scope = state.slots.len()
+    value = LowerLinkedNullValue(project, state, id, 0)?
+    if (value.value.ty.declaration_kind != "Builtin" || value.value.ty.name != "str") {
+        node = LinkedNullNode(project, 1, id)
+        RejectLayout("linked_output_type", "expected a str argument for linked output", DeclarationSpan(node))?
+    }
+    value.state.uses_print = true
+    value.state.code += emitLinkedOutput(value.value.text, newline)
+    return ok(DropLinkedNullScope(value.state, scope))
+}
+
+fn LowerLinkedStatementCall(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    id = LinkedNullChild(project, 1, statement, 0)
+    // Stage3 represents the print keyword separately from a println call.
+    if (statement.kind == "Print") { return lowerLinkedOutputValue(project, state, id, false) }
+    call = LinkedNullNode(project, 1, id)
+    if (call.kind == "Call" && call.edge_count == 2) {
+        target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+        if (linkedOutputBuiltin(project, state, target)) {
+            argument = LinkedNullChild(project, 1, call, 1)
+            return lowerLinkedOutputValue(project, state, argument, true)
+        }
+    }
+    return LowerLinkedNullTry(project, state, statement)
+}
+
 struct ProjectStructStringC {
     symbol: str
     dependencies: [StructStringDependency]

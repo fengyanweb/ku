@@ -319,6 +319,8 @@ Linked checked bodies can use nested readonly guards with local bindings.
 Fallthrough releases a branch's local owners at the closing brace. An early
 return or failure transfers its selected Result through the same cleanup as
 the final return. Only the untaken path can reach the following statements.
+Linked `print` and `println` can read a checked string expression once;
+its temporary is released after the write without consuming a named owner.
 
 The linked path also moves an owned record out of a checked dependency.
 It uses the project's nominal layout and destructor for nested fields. A
