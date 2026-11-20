@@ -167,6 +167,8 @@ fn LowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelNam
             if (node.text == "+") { operation = "add" }
             else if (node.text == "-") { operation = "sub" }
             else if (node.text == "*") { operation = "mul" }
+            else if (node.text == "/") { operation = "div" }
+            else if (node.text == "%") { operation = "rem" }
             operand = edges[node.first_edge]
             right_node = edges[node.first_edge + 1]
         } else if (node.kind == "Call") {

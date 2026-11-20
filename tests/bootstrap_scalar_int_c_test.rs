@@ -150,7 +150,9 @@ fn build_function(ku_seed: &Path, cwd: &Path, source: &str, name: &str) -> Bound
     execute(&mut Command::new(ku_seed), cwd, 15)
 }
 
-type Case = (&'static [i64], Option<i64>);
+type Case = (&'static [i64], Result<i64, &'static str>);
+const OVERFLOW: Result<i64, &str> = Err("integer overflow");
+const ZERO_DIVISOR: Result<i64, &str> = Err("division by zero");
 
 fn compare_function(
     ku: &Path,
@@ -219,7 +221,7 @@ fn compare_function(
             10,
         );
         match expected {
-            Some(value) => {
+            Ok(value) => {
                 assert_success(&expected_output);
                 assert_success(&actual);
                 assert_eq!(
@@ -232,12 +234,12 @@ fn compare_function(
                     "{name}{args:?}"
                 );
             }
-            None => {
+            Err(diagnostic) => {
                 for failure in [&expected_output, &actual] {
-                    assert!(!failure.status.success(), "{name}{args:?}");
+                    assert_eq!(failure.status.code(), Some(1), "{name}{args:?}");
                     assert!(failure.stdout.is_empty(), "{name}{args:?}");
                     assert!(
-                        String::from_utf8_lossy(&failure.stderr).contains("integer overflow"),
+                        String::from_utf8_lossy(&failure.stderr).contains(diagnostic),
                         "{name}{args:?}: {}",
                         String::from_utf8_lossy(&failure.stderr)
                     );
@@ -246,6 +248,73 @@ fn compare_function(
         }
     }
     generated
+}
+
+fn assert_checked_division(ku: &Path, seed: &Path, cwd: &Path) {
+    let (_, project_emitter) = include_str!("../bootstrap/semantics/scalar_project_c.ku")
+        .split_once("fn EmitScalarProjectC(")
+        .expect("the project emitter");
+    let (_, module_slot) = project_emitter
+        .split_once("module_slot = ")
+        .expect("the compiler's module slot expression");
+    let module_slot = module_slot.lines().next().unwrap();
+    let source = format!("fn ModuleSlot(key: int): int {{ return {module_slot} }}");
+    let division = compare_function(
+        ku,
+        seed,
+        cwd,
+        &source,
+        "ModuleSlot",
+        &[
+            (&[1], Ok(0)),
+            (&[4096], Ok(0)),
+            (&[4097], Ok(1)),
+            (&[8193], Ok(2)),
+            (&[0], Ok(0)),
+            (&[i64::MIN], OVERFLOW),
+        ],
+    );
+    assert!(division.contains("static int64_t ku_scalar_div("));
+    assert!(!division.contains("static int64_t ku_scalar_rem("));
+
+    let source = r#"fn Div(a: int, b: int): int { return a / b }
+fn Rem(a: int, b: int): int { return a % b }
+fn Both(a: int, b: int): int { return Div(a, b) + Rem(a - 1, b) }"#;
+    for (name, expected, min_expected) in [("Div", -2, i64::MIN / 2), ("Rem", -1, 0)] {
+        let generated = compare_function(
+            ku,
+            seed,
+            cwd,
+            source,
+            name,
+            &[
+                (&[-7, 3], Ok(expected)),
+                (&[i64::MIN, 2], Ok(min_expected)),
+                (&[1, 0], ZERO_DIVISOR),
+                (&[i64::MIN, -1], OVERFLOW),
+            ],
+        );
+        if name == "Rem" {
+            assert!(generated.contains("static int64_t ku_scalar_rem("));
+            assert!(!generated.contains("static int64_t ku_scalar_div("));
+        }
+    }
+    let both = compare_function(
+        ku,
+        seed,
+        cwd,
+        source,
+        "Both",
+        &[
+            (&[-7, 3], Ok(-4)),
+            // The left call traps before evaluating the overflowing right argument.
+            (&[i64::MIN, 0], ZERO_DIVISOR),
+        ],
+    );
+    assert_eq!(
+        both.matches("static void ku_scalar_check_divisor(").count(),
+        1
+    );
 }
 
 const ALLOCATOR_WATCH: &str = r#"
@@ -625,11 +694,11 @@ fn ku_emits_checked_c11_for_real_math_functions() {
         math,
         "Add",
         &[
-            (&[1, 2], Some(3)),
-            (&[i64::MAX, 0], Some(i64::MAX)),
-            (&[i64::MIN, i64::MAX], Some(-1)),
-            (&[i64::MAX, 1], None),
-            (&[i64::MIN, -1], None),
+            (&[1, 2], Ok(3)),
+            (&[i64::MAX, 0], Ok(i64::MAX)),
+            (&[i64::MIN, i64::MAX], Ok(-1)),
+            (&[i64::MAX, 1], OVERFLOW),
+            (&[i64::MIN, -1], OVERFLOW),
         ],
     );
     compare_function(
@@ -639,11 +708,11 @@ fn ku_emits_checked_c11_for_real_math_functions() {
         math,
         "Twice",
         &[
-            (&[7], Some(14)),
-            (&[i64::MIN / 2], Some(i64::MIN)),
-            (&[i64::MAX / 2], Some(i64::MAX - 1)),
-            (&[i64::MIN / 2 - 1], None),
-            (&[i64::MAX / 2 + 1], None),
+            (&[7], Ok(14)),
+            (&[i64::MIN / 2], Ok(i64::MIN)),
+            (&[i64::MAX / 2], Ok(i64::MAX - 1)),
+            (&[i64::MIN / 2 - 1], OVERFLOW),
+            (&[i64::MAX / 2 + 1], OVERFLOW),
         ],
     );
     compare_function(
@@ -653,9 +722,9 @@ fn ku_emits_checked_c11_for_real_math_functions() {
         math,
         "hidden",
         &[
-            (&[0], Some(-1)),
-            (&[i64::MIN + 1], Some(i64::MIN)),
-            (&[i64::MIN], None),
+            (&[0], Ok(-1)),
+            (&[i64::MIN + 1], Ok(i64::MIN)),
+            (&[i64::MIN], OVERFLOW),
         ],
     );
     let varied = "fn Combine(a: int, b: int, c: int): int { return (a + b) * (c - 2) }\n\
@@ -669,10 +738,10 @@ fn ku_emits_checked_c11_for_real_math_functions() {
         varied,
         "Combine",
         &[
-            (&[4, 5, 9], Some(63)),
-            (&[-8, 2, 5], Some(-18)),
-            (&[i64::MAX, 1, 2], None),
-            (&[0, 0, i64::MIN], None),
+            (&[4, 5, 9], Ok(63)),
+            (&[-8, 2, 5], Ok(-18)),
+            (&[i64::MAX, 1, 2], OVERFLOW),
+            (&[0, 0, i64::MIN], OVERFLOW),
         ],
     );
     compare_function(
@@ -682,11 +751,11 @@ fn ku_emits_checked_c11_for_real_math_functions() {
         varied,
         "Product",
         &[
-            (&[i64::MIN, 0], Some(0)),
-            (&[-2, -3], Some(6)),
-            (&[i64::MAX, -1], Some(-i64::MAX)),
-            (&[-1, i64::MIN], None),
-            (&[i64::MIN, -1], None),
+            (&[i64::MIN, 0], Ok(0)),
+            (&[-2, -3], Ok(6)),
+            (&[i64::MAX, -1], Ok(-i64::MAX)),
+            (&[-1, i64::MIN], OVERFLOW),
+            (&[i64::MIN, -1], OVERFLOW),
         ],
     );
     compare_function(
@@ -695,9 +764,9 @@ fn ku_emits_checked_c11_for_real_math_functions() {
         &cwd,
         varied,
         "Negate",
-        &[(&[0], Some(0)), (&[i64::MIN], None)],
+        &[(&[0], Ok(0)), (&[i64::MIN], OVERFLOW)],
     );
-    compare_function(&ku, &seed, &cwd, varied, "Limit", &[(&[], Some(i64::MAX))]);
+    compare_function(&ku, &seed, &cwd, varied, "Limit", &[(&[], Ok(i64::MAX))]);
 
     // The declaration order is deliberately different from the call order.
     // Two branches share Twice, and Shifted also calls a zero-argument helper.
@@ -714,11 +783,11 @@ fn ku_emits_checked_c11_for_real_math_functions() {
         &composed,
         "Composed",
         &[
-            (&[3, 4], Some(6)),
-            (&[-3, -4], Some(2)),
-            (&[i64::MAX, 0], None),
-            (&[0, i64::MIN], None),
-            (&[0, i64::MAX], None),
+            (&[3, 4], Ok(6)),
+            (&[-3, -4], Ok(2)),
+            (&[i64::MAX, 0], OVERFLOW),
+            (&[0, i64::MIN], OVERFLOW),
+            (&[0, i64::MAX], OVERFLOW),
         ],
     );
     assert_eq!(
@@ -730,6 +799,8 @@ fn ku_emits_checked_c11_for_real_math_functions() {
         "only reachable local helpers, each emitted once"
     );
     assert!(!generated.contains("Irrelevant"));
+    assert!(!generated.contains("ku_scalar_check_divisor"));
+    assert_checked_division(&ku, &seed, &cwd);
     assert_string_composition(&ku, &seed, &cwd);
     assert_capacity_results(&ku, &seed, &cwd);
     assert_imported_calls(&ku, &seed, &cwd);
@@ -780,7 +851,7 @@ fn ku_emits_checked_c11_for_real_math_functions() {
             "undefined_int_operand",
         ),
         (
-            "fn Example(a: int): int { return a / 2 }",
+            "fn Example(a: int): int { return a / 2.0 }",
             "unsupported_int_expression",
         ),
         (

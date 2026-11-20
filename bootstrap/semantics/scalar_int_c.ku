@@ -241,6 +241,8 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
     uses_add = false
     uses_sub = false
     uses_mul = false
+    uses_div = false
+    uses_rem = false
     uses_string = false
     uses_string_comparison = false
     uses_string_contains = false
@@ -270,6 +272,8 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
                     uses_add = uses_add || body.uses_add
                     uses_sub = uses_sub || body.uses_sub
                     uses_mul = uses_mul || body.uses_mul
+                    uses_div = uses_div || body.uses_div
+                    uses_rem = uses_rem || body.uses_rem
                     uses_string = uses_string || body.uses_string
                     uses_string_comparison = uses_string_comparison || body.uses_string_comparison
                     uses_string_contains = uses_string_contains || body.uses_string_contains
@@ -295,7 +299,7 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
             rejectScalarInt("recursive_int_call", "recursive call graph is outside the bootstrap int subset", at)?
         }
     }
-    headers = ScalarIntegerHelpers(uses_add, uses_sub, uses_mul)
+    headers = ScalarIntegerHelpers(uses_add, uses_sub, uses_mul, uses_div, uses_rem)
     if (returns_bool || uses_string_contains || returns_null_result) { headers += "#include <stdbool.h>\n" }
     return ok(ScalarIntC { symbol: symbol, source: headers
         + ScalarStringHelpers(uses_string, uses_string_comparison, uses_string_contains,
