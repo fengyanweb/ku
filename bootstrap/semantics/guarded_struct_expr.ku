@@ -46,6 +46,7 @@ fn GuardBindingName(&binding: GuardBinding): str {
 fn GuardCType(&ty: GuardType, &layouts: [StructLayout]): str {
     if (ty.kind == "bool") { return "bool" }
     if (ty.kind == "str") { return "KuProjectionString" }
+    if (ty.kind == "str_array") { return "KuGuardStringArray" }
     if (ty.kind == "struct" || ty.kind == "array") {
         layout = CTypeName(layouts[ty.layout - 1].module_index, layouts[ty.layout - 1].node)
         if (ty.kind == "array") { return "KuArray_" + layout }
@@ -141,6 +142,49 @@ fn guardBoolean(&left: GuardValue, &right: GuardValue, &node: Node, id: int, &in
         uses_eq: left.uses_eq || right.uses_eq })
 }
 
+fn guardClonedIndex(&nodes: [Node], &edges: [int], id: int): int {
+    call = nodes[id - 1].clone()
+    if (call.kind != "Call" || call.edge_count != 1) { return 0 }
+    member = nodes[edges[call.first_edge] - 1].clone()
+    if (member.kind != "Field" || member.text != "clone" || member.edge_count != 1) { return 0 }
+    indexed = edges[member.first_edge]
+    if (nodes[indexed - 1].kind != "Index" || nodes[indexed - 1].edge_count != 2) { return 0 }
+    return indexed
+}
+
+fn guardStringArrayCompare(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
+                          &node: Node, id: int, depth: int, &indent: str): GuardValue! {
+    left = edges[node.first_edge]
+    right = edges[node.first_edge + 1]
+    indexed_id = guardClonedIndex(nodes, edges, left)
+    literal = nodes[right - 1].clone()
+    if (indexed_id == 0) {
+        indexed_id = guardClonedIndex(nodes, edges, right)
+        literal = nodes[left - 1].clone()
+    }
+    if (indexed_id == 0 || literal.kind != "String" || literal.edge_count != 0) {
+        return ok(GuardRead(GuardType { kind: "", layout: 0 }, "", false))
+    }
+    indexed = nodes[indexed_id - 1].clone()
+    // Count the clone call, its member and the indexed expression as well.
+    array = GuardExpression(nodes, edges, bindings, layouts, edges[indexed.first_edge], depth + 4, indent)?
+    if (array.ty.kind != "str_array" || !array.view || array.setup != "") {
+        RejectLayout("guarded_string_array", "indexed string comparisons require a declared View [str]", DeclarationSpan(indexed))?
+    }
+    index = GuardExpression(nodes, edges, bindings, layouts, edges[indexed.first_edge + 1], depth + 4, indent)?
+    if (index.ty.kind != "int") {
+        RejectLayout("guarded_string_array_index", "the string array index must be an int", DeclarationSpan(indexed))?
+    }
+    out = "array_match" + str(id)
+    setup = index.setup + indent.clone() + "bool " + out.clone() + ";\n"
+    setup += indent.clone() + "if (!ku_guard_string_array_equal(" + array.value + ", " + index.value +
+        ", (KuProjectionString){(uint8_t*)" + ScalarStringLiteral(literal)? + ", 0u, KU_PROJECTION_STRING_STATIC}, &" +
+        out.clone() + ", &array_failure)) goto cleanup;\n"
+    if (node.text == "!=") { out = "(!" + out + ")" }
+    return ok(GuardValue { ty: GuardType { kind: "bool", layout: 0 }, setup: setup, value: out, view: false,
+        uses_add: index.uses_add, uses_sub: index.uses_sub, uses_eq: index.uses_eq })
+}
+
 fn GuardExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
                    id: int, depth: int, &indent: str): GuardValue! {
     node = nodes[id - 1].clone()
@@ -191,6 +235,10 @@ fn GuardExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &la
         }
     }
     if (node.kind == "Binary" && node.edge_count == 2) {
+        if (node.text == "==" || node.text == "!=") {
+            comparison = guardStringArrayCompare(nodes, edges, bindings, layouts, node, id, depth, indent)?
+            if (comparison.ty.kind == "bool") { return ok(comparison) }
+        }
         left = GuardExpression(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, indent)?
         right_indent = indent.clone()
         if (node.text == "&&" || node.text == "||") { right_indent += "    " }

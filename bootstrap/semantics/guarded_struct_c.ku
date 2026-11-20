@@ -5,10 +5,11 @@ import { ScalarStringLiteral, HasScalarBuiltin } from "./scalar_int_operands.ku"
 import { EmitScalarStringAssignment, ScalarStringJoinHelpers } from "./scalar_int_emit.ku"
 import { LowerProjectedStringParts } from "./guarded_string_parts.ku"
 import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
-import { LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { ExplicitType, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { OrderCStructLayouts } from "./nested_struct_c.ku"
+import { EmitTryCloneString } from "./struct_array_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
-import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardExplicitType, GuardExpression } from "./guarded_struct_expr.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardExplicitType, GuardExpression, GuardType } from "./guarded_struct_expr.ku"
 
 struct GuardedStructC {
     symbol: str
@@ -22,6 +23,7 @@ struct GuardSignature {
     drops: str
     body_start: int
     result_kind: str
+    string_array: bool
 }
 
 struct GuardBlock {
@@ -53,6 +55,20 @@ fn GuardOwnedDrops(&layouts: [StructLayout], index: int, &base: str): str {
     return drops
 }
 
+fn guardParameterType(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
+                      &layouts: [StructLayout], id: int, view: bool): GuardType! {
+    node = nodes[id - 1].clone()
+    if (node.kind != "TypeArray") { return GuardExplicitType(types, nodes, layouts, id) }
+    if (!view || node.edge_count != 1) {
+        RejectLayout("unsupported_guarded_signature", "guarded array parameters require View [str]", DeclarationSpan(node))?
+    }
+    item = ExplicitType(types, edges[node.first_edge], DeclarationSpan(node))?
+    if (item.declaration_kind != "Builtin" || item.name != "str") {
+        RejectLayout("unsupported_guarded_signature", "guarded array parameters require View [str]", item.span.clone())?
+    }
+    return ok(GuardType { kind: "str_array", layout: 0 })
+}
+
 fn readGuardSignature(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
                       &layouts: [StructLayout], &function: Node, &symbol: str): GuardSignature! {
     bindings: [GuardBinding] = []
@@ -60,6 +76,7 @@ fn readGuardSignature(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
     declaration = symbol.clone() + "("
     definitions = ""
     drops = ""
+    string_array = false
     cursor = function.first_edge
     end = cursor + function.edge_count
     while (cursor < end && nodes[edges[cursor] - 1].kind == "Parameter") {
@@ -69,11 +86,12 @@ fn readGuardSignature(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
             GuardBindingIndex(bindings, parameter.text) != 0) {
             RejectLayout("unsupported_guarded_signature", "expected a distinct, explicitly typed scalar or struct parameter", at.clone())?
         }
-        ty = GuardExplicitType(types, nodes, layouts, edges[parameter.first_edge])?
         view = parameter.int_value == 1
-        if (ty.kind == "str" || (view && ty.kind != "struct")) {
-            RejectLayout("unsupported_guarded_signature", "guarded C accepts value scalars and value or View structs", at.clone())?
+        ty = guardParameterType(nodes, edges, types, layouts, edges[parameter.first_edge], view)?
+        if (ty.kind == "str" || (view && ty.kind != "struct" && ty.kind != "str_array")) {
+            RejectLayout("unsupported_guarded_signature", "guarded C accepts value scalars, value or View structs, and View [str]", at.clone())?
         }
+        string_array = string_array || ty.kind == "str_array"
         binding = GuardBinding { name: parameter.text, ty: ty, slot: bindings.len(), parameter: true, view: view }
         name = GuardBindingName(binding)
         c_type = GuardCType(binding.ty, layouts)
@@ -105,7 +123,7 @@ fn readGuardSignature(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
     if (bindings.len() == 0) { declaration += "void" }
     result_type = GuardCType(result, layouts)
     return ok(GuardSignature { bindings: bindings, declaration: result_type + " " + declaration + ") {\n", definitions: definitions,
-        drops: drops, body_start: cursor + 1, result_kind: result.kind })
+        drops: drops, body_start: cursor + 1, result_kind: result.kind, string_array: string_array })
 }
 
 fn guardReturn(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
@@ -252,6 +270,30 @@ fn GuardStringEquality(needed: bool): str {
     return "#include <string.h>\n\nstatic bool ku_guard_string_equal(KuProjectionString a, KuProjectionString b) {\n    return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0);\n}\n\n"
 }
 
+fn guardStringArrayC(): str {
+    text = "#include <stdio.h>\n\ntypedef struct { size_t len; KuProjectionString *data; size_t capacity; } KuGuardStringArray;\n"
+    text += "typedef struct { int code; int64_t index; size_t length; } KuGuardArrayFailure;\n\n"
+    text += EmitTryCloneString("ku_guard_clone_string")
+    text += "static bool ku_guard_string_array_equal(const KuGuardStringArray *array, int64_t index, KuProjectionString literal, bool *out, KuGuardArrayFailure *failure) {\n"
+    text += "    if (!array) { failure->code = 1; return false; }\n"
+    text += "    size_t capacity = array->capacity ? array->capacity : array->len;\n"
+    text += "    if (array->len > capacity || capacity > SIZE_MAX / sizeof(*array->data) || (capacity && !array->data)) { failure->code = 1; return false; }\n"
+    text += "    if (index < 0 || (uint64_t)index >= array->len) { *failure = (KuGuardArrayFailure){2, index, array->len}; return false; }\n"
+    text += "    KuProjectionString item = {0};\n"
+    text += "    if (!ku_guard_clone_string(array->data[index], &item)) { failure->code = 3; return false; }\n"
+    text += "    *out = ku_guard_string_equal(item, literal);\n    ku_projection_string_drop(&item);\n    return true;\n}\n\n"
+    return text
+}
+
+fn guardArrayErrorC(): str {
+    return "    if (array_failure.code == 2) {\n"
+        + "        fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", (long long)array_failure.index, array_failure.length);\n"
+        + "        exit(EXIT_FAILURE);\n    }\n"
+        + "    if (array_failure.code) {\n"
+        + "        fputs(array_failure.code == 3 ? \"out of memory\\n\" : \"invalid string array ownership\\n\", stderr);\n"
+        + "        exit(EXIT_FAILURE);\n    }\n"
+}
+
 fn emitGuardedStructFunction(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
                              &layouts: [StructLayout], function_id: int, can_convert: bool): GuardedStructC! {
     function = nodes[function_id - 1].clone()
@@ -268,7 +310,9 @@ fn emitGuardedStructFunction(&nodes: [Node], &edges: [int], &types: [TypeNameBin
         RejectLayout("guarded_fallthrough", "every guarded C path must return its declared result", DeclarationSpan(function))?
     }
     arithmetic = body.uses_add || body.uses_sub
-    text = ProjectionHeaders(true, signature.drops != "") + GuardArithmetic(body.uses_add, body.uses_sub) + GuardStringEquality(body.uses_eq)
+    text = ProjectionHeaders(true, signature.drops != "" || signature.string_array)
+        + GuardArithmetic(body.uses_add, body.uses_sub) + GuardStringEquality(body.uses_eq || signature.string_array)
+    if (signature.string_array) { text += guardStringArrayC() }
     if (body.uses_join) {
         text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\ntypedef KuProjectionString KuBootstrapString;\n"
         text += ScalarStringJoinHelpers(body.uses_format)
@@ -279,9 +323,13 @@ fn emitGuardedStructFunction(&nodes: [Node], &edges: [int], &types: [TypeNameBin
     text += arguments
     if (arithmetic) { text += "    bool overflow = false;\n" }
     if (body.uses_join) { text += "    const char *failure = NULL;\n" }
+    if (signature.string_array) {
+        text += "    KuGuardArrayFailure array_failure = {0};\n    (void)ku_guard_string_array_equal;\n"
+    }
     text += body.source + "cleanup:\n" + signature.drops
     if (body.uses_join) { text += "    if (failure) { fputs(failure, stderr); exit(EXIT_FAILURE); }\n" }
     if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (signature.string_array) { text += guardArrayErrorC() }
     text += "    return result;\n}\n"
     return ok(GuardedStructC { symbol: symbol, source: text })
 }

@@ -3,7 +3,7 @@ import { GuardBoundType, GuardCType } from "./guarded_struct_expr.ku"
 import { SuppliedModule } from "./imports.ku"
 import { DeclarationSpan } from "./names.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
-import { ExplicitType, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
+import { ExplicitType, RejectLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
 import { CTypeName, ScalarCType } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 
@@ -134,7 +134,11 @@ fn NamedProjectionLinkPlan(&selected: SuppliedModule, &types: [TypeNameBinding],
     parameters: [LinkPlanType] = []
     while (selected.named.parsed.arena.nodes[selected.named.parsed.arena.edges[cursor] - 1].kind == "Parameter") {
         parameter = selected.named.parsed.arena.nodes[selected.named.parsed.arena.edges[cursor] - 1].clone()
-        bound = ExplicitType(types, selected.named.parsed.arena.edges[parameter.first_edge], DeclarationSpan(parameter))?
+        type_id = selected.named.parsed.arena.edges[parameter.first_edge]
+        if (guarded && selected.named.parsed.arena.nodes[type_id - 1].kind == "TypeArray") {
+            RejectLayout("unsupported_guarded_link_array", "View [str] is available in guarded C emission; link plans do not yet describe it", DeclarationSpan(parameter))?
+        }
+        bound = ExplicitType(types, type_id, DeclarationSpan(parameter))?
         parameters = parameters.push(namedProjectionType(bound, layouts, guarded, parameter.int_value == 1)?)
         cursor = cursor + 1
     }

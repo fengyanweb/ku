@@ -111,6 +111,13 @@ struct ScannedLiteral {
     offset: int
 }
 
+fn HasFractionPoint(&characters: [str], index: int, length: int): bool {
+    if (index + 1 < length) {
+        return characters[index].clone() == "."
+    }
+    return false
+}
+
 fn ScanNumber(&characters: [str], length: int, start_index: int, start_line: int, start_column: int, start_offset: int): ScannedLiteral! {
     index = start_index
     line = start_line
@@ -143,12 +150,7 @@ fn ScanNumber(&characters: [str], length: int, start_index: int, start_line: int
             scanning = false
         }
     }
-    is_float = false
-    if (index + 1 < length) {
-        if (characters[index].clone() == "." && IsDigit(characters[index + 1].clone())) {
-            is_float = true
-        }
-    }
+    is_float = HasFractionPoint(characters, index, length) && IsDigit(characters[index + 1].clone())
     if (is_float) {
         kind = "Float"
         int_value = 0

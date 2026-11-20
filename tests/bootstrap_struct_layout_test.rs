@@ -1357,6 +1357,7 @@ fn Make(): Outer {
     assert_constructor_parameter_ownership(&driver_binary, &cwd);
     assert_constructor_view(&driver_binary, &cwd);
     assert_guarded_predicate(&driver_binary, &cwd);
+    assert_guarded_string_array(&driver_binary, &cwd);
     assert_project_link_plans(&driver_binary, &cwd);
     linked_null::assert_checked_owned_call(&driver_binary, &cwd);
     token_window::assert_readonly_preflight(&driver_binary, &cwd);
@@ -1405,6 +1406,69 @@ int main(void) {
     let exe = cwd.join(format!("guarded-predicate{}", std::env::consts::EXE_SUFFIX));
     compile_projection(&c, &exe, cwd);
     assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+}
+
+fn assert_guarded_string_array(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("stage1/lexer.ku"),
+        include_str!("../bootstrap/stage1/lexer.ku"),
+    )
+    .unwrap();
+    fs::write(cwd.join("mode.txt"), "guarded").unwrap();
+    fs::write(cwd.join("function.txt"), "HasFractionPoint").unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "stage1/lexer.ku\nstage1/token.ku\n",
+    )
+    .unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let symbol = text
+        .lines()
+        .find_map(|line| line.strip_prefix("bool ku_guarded_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let driver = r#"
+int main(int argc, char **argv) {
+    (void)argv;
+    uint8_t dot[] = {'.'};
+    KuProjectionString item = {dot, 1u, 0u, KU_PROJECTION_STRING_STATIC};
+    const KuGuardStringArray value = {1u, &item, 1u};
+    if (argc == 2) return PREDICATE(&value, -1, 1);
+    if (argc == 3) return PREDICATE(&value, INT64_MAX, INT64_MAX);
+    uint8_t *owner = malloc(1);
+    if (!owner) return 1;
+    owner[0] = '.';
+    item = (KuProjectionString){owner, 1u, 1u, KU_PROJECTION_STRING_OWNED};
+    bool success = PREDICATE(&value, 0, 2) && !PREDICATE(&value, 1, 2);
+    success = success && value.data == &item && item.ptr == owner && owner[0] == '.';
+    free(owner);
+    return success ? 0 : 1;
+}
+"#
+    .replace("PREDICATE", &format!("ku_guarded_{symbol}"));
+    let c = cwd.join("guarded-string-array.c");
+    fs::write(&c, format!("{text}{driver}")).unwrap();
+    let exe = cwd.join(format!(
+        "guarded-string-array{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    for (args, wanted) in [
+        (
+            &["bound"][..],
+            "array/index_out_of_bounds: index -1 out of bounds for length 1",
+        ),
+        (&["overflow", "case"][..], "integer overflow"),
+    ] {
+        let run = execute(Command::new(&exe).args(args), cwd, 15);
+        assert_eq!(run.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&run.stderr).contains(wanted));
+    }
 }
 
 fn assert_constructor_view(seed: &Path, cwd: &Path) {

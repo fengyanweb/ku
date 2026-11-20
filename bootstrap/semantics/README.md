@@ -206,6 +206,13 @@ The same mode supports a `bool` result for predicates such as the original
 preserves short-circuit conditions. The generated predicate does no allocation
 or ownership transfer.
 
+`HasFractionPoint`, called by the numeric lexer, uses `guarded` with a
+`View [str]` parameter. This subset compares a cloned indexed string with
+a literal. The array remains owned by the caller. The emitted predicate
+preserves checked arithmetic, array bounds and the clone's failure point.
+Use ordinary C emission for this signature. Link plans for a string array
+are unavailable.
+
 For the original `RelocateTokens` in `stage2/context.ku`, select `managed` and
 keep the same project manifest. The emitter handles the loop, per-iteration
 owners and array return. The no-relocation branch returns the original array
