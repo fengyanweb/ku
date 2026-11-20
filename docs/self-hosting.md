@@ -1,5 +1,15 @@
 # Ku 自举状态
 
+## 当前开发树
+
+Ku 编写的前端已能读取完整的 `stage1/lexer.ku`、`stage2/parser.ku`、`stage3/parser.ku` 和 `stage3/statements.ku`。编译器的模块入口使用原词法器的文件上限，直接借用扫描位置划分函数。旧 `ParseProgram` 的整文件 512 令牌限制与每函数 128 条语句限制继续生效。
+
+- [模块检查工具](../bootstrap/semantics/README.md) 可检查一组实际源码的相对导入、标准库命名空间和显式类型，报告依赖顺序，并在移除编译器源码后运行。
+- 同一自举目录的 C11 生成器已覆盖受检整数函数、标量结构投影以及真实词法函数。它用实际类型和生命周期决定字符串所有权，原生生成物可独立编译运行。
+- 完整自举仍需表达式类型与所有权、完整 IR 和 C 后端，以及 stage1 自编译出 stage2、stage2 再生成 stage3 的产物和行为对照。
+
+## 0.0.17 基线记录
+
 发布基线：Ku 0.0.17 已实现有界 Lexer，并推进到 Parser 子集，但还不能自举完整工具链。
 
 本轮参数模式增量：Stage 3 的命名函数参数现在识别既有 `&name: T`（以及原有可省略类型的参数槽位），不新增调用语法。`Parameter.int_value` 固定为 owned `0` / borrowed `1`，参数 span 从 `&` 或名字起点覆盖到名字末尾，类型继续使用独立 child；不改变 arena 布局。`ValidateParseOutput` 拒绝其他模式值并返回 `bootstrap.ast/invalid_parameter_mode`。Rust projector、Unicode/CRLF 静态 golden、32/33 参数及直接 helper 畸形窗口都同步覆盖；借用参数使用独立解释器批次并进入同一删源码 native suite，16/32 参数的成功与缺失 body close 路径检查分配增长和逐轮 zero-live。本轮新增门槛的实际通过状态以对应提交回归为准，不能沿用 0.0.17 结果。
