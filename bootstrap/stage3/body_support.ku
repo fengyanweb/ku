@@ -92,6 +92,7 @@ fn IsControlStatement(&kind: str): bool {
 
 fn ReadExpressionEnd(&tokens: [Token], start: int, window_end: int, context: str): int! {
     probe = start
+    print_argument = context == "print_argument"
     boundary = EmptyExpressionBoundary()
     while (!boundary.complete) {
         if (probe > window_end) { RejectExpressionTerminator(WindowToken(tokens, probe, window_end))? }
@@ -104,6 +105,10 @@ fn ReadExpressionEnd(&tokens: [Token], start: int, window_end: int, context: str
             }
             if (context == "assignment_target" && WindowKind(tokens, probe, window_end) == "Equal") {
                 return ok(probe)
+            }
+            if (print_argument) {
+                kind = WindowKind(tokens, probe, window_end)
+                if (kind == "RParen" || kind == "Comma") { return ok(probe) }
             }
         }
         boundary = PushExpressionBoundary(boundary, WindowToken(tokens, probe, window_end), previous_can_end, named_struct_open)?

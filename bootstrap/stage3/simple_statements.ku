@@ -5,7 +5,7 @@ import { ExpressionSpan } from "../stage2/expression_support.ku"
 import { NextBodyWork, ReadExpressionEnd, LocalAssignmentOperator, RejectLetStatement,
          RejectDeclarationInitializer, SignatureTypeOutput } from "./body_support.ku"
 import { ReadSignatureTypePrefix } from "./signature.ku"
-import { RejectAtSpan, SpanFromNode, WindowKind, WindowToken } from "./support.ku"
+import { RejectAt, RejectAtSpan, SpanFromNode, WindowKind, WindowToken } from "./support.ku"
 
 struct SimpleStatementRead {
     node: int
@@ -34,6 +34,32 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         kind = statement_start.kind.clone()
         statement = add_node(kind, "", 0, SpanFromToken(statement_start.clone()), [], statement_start)?
         cursor = cursor + 1
+    } else if (statement_start.kind == "Print") {
+        cursor = cursor + 1
+        wrapped = WindowKind(tokens, cursor, last_index) == "LParen"
+        context = "value"
+        if (wrapped) { cursor = cursor + 1 context = "print_argument" }
+        origin = WindowToken(tokens, cursor, last_index)
+        if (wrapped && origin.kind == "Ampersand") {
+            RejectAt(origin.clone(), "unexpected_token", "'&' is not written at the call site")?
+        }
+        expression_end = ReadExpressionEnd(tokens, cursor, last_index, context)?
+        if (expression_end == cursor) {
+            RejectAt(origin.clone(), "unexpected_token", "expected expression")?
+        }
+        parsed = parse_expression(token_base + cursor, token_base + expression_end)?
+        cursor = expression_end
+        if (wrapped) {
+            closing = WindowToken(tokens, cursor, last_index)
+            if (closing.kind != "RParen") {
+                RejectAt(closing, "unexpected_token", "expected ')' after print argument")?
+            }
+            parse_steps = NextBodyWork(parse_steps, 2, statement_start.clone())?
+            cursor = cursor + 1
+        }
+        expression = add_arena(parsed, origin, false)?
+        span = SpanMerge(SpanFromToken(statement_start.clone()), read_span(expression))
+        statement = add_node("Print", "", 0, span, [expression], statement_start)?
     } else if (statement_start.kind == "Return" || statement_start.kind == "Fail") {
         kind = statement_start.kind.clone()
         requires_value = kind == "Fail"

@@ -630,6 +630,10 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
             let expr = project_expr(source, expr, arena);
             push_node(arena, "ExprStmt", String::new(), 0, *span, &[expr])
         }
+        Stmt::Print { value, span } => {
+            let value = project_expr(source, value, arena);
+            push_node(arena, "Print", String::new(), 0, *span, &[value])
+        }
         Stmt::Return { value, span } => {
             let children = value
                 .as_ref()
@@ -1470,6 +1474,8 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         // Loop placement is a checker decision in Rust; the parser retains
         // the same leaves even without a target or in a nested function.
         "fn f() { break; continue }",
+        "// 输出😀\r\nfn f() { print \"中😀\"; print((call(1, 2))) println(\"x\") }",
+        "fn f() { print 1 + 2 print({value: [1,2]}) println(g()) }",
         "fn f() { while (ready) { fn g() { break; continue } break; } }",
         "fn mixed() { while (ready) { for next in Source{elements: [1,2]}.elements { acc -= next acc *= 2 acc /= 3 } } }",
 
@@ -3024,6 +3030,26 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             nested_module,
             "unsupported_expression",
             nested_module_message,
+        ),
+        (
+            "fn f() { print() }",
+            "unexpected_token",
+            rust_error_canonical("fn f() { print() }"),
+        ),
+        (
+            "fn f() { print(a, b) }",
+            "unexpected_token",
+            rust_error_canonical("fn f() { print(a, b) }"),
+        ),
+        (
+            "fn f() { print(a; }",
+            "unexpected_token",
+            rust_error_canonical("fn f() { print(a; }"),
+        ),
+        (
+            "fn f() { print(&a) }",
+            "unexpected_token",
+            rust_error_canonical("fn f() { print(&a) }"),
         ),
         (
             for_missing_name,
