@@ -41,12 +41,14 @@ struct LinkedNullValue {
     text: str
     slot: int
     borrowed: bool
+    member_path: str
 }
 
 struct LinkedNullSlot {
     binding: str
     value: LinkedNullValue
     live: bool
+    moved_members: [str]
 }
 
 struct LinkedNullState {
@@ -94,7 +96,7 @@ fn NewLinkedNullState(): LinkedNullState {
 }
 
 fn LinkedReadonlyExpression(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNullExpression {
-    return LinkedNullExpression { state: state, value: LinkedNullValue { ty: ty, text: text, slot: 0, borrowed: false } }
+    return LinkedNullExpression { state: state, value: LinkedNullValue { ty: ty, text: text, slot: 0, borrowed: false, member_path: "" } }
 }
 
 fn BoundLinkPlanType(&binding: TypeNameBinding, local_unit: int, c_type: str, view: bool): LinkPlanType {
@@ -289,7 +291,7 @@ fn ExitLinkedFailure(state: LinkedNullState, &indent: str): LinkedNullState {
         next.catch_edges = true
         index = 0
         while (index < next.catch_slot - 1) {
-            if (!next.slots[index].live && LinkedNullOwner(next.slots[index].value.ty)
+            if ((!next.slots[index].live || next.slots[index].moved_members.len() > 0) && LinkedNullOwner(next.slots[index].value.ty)
                 && !ContainsIndex(next.catch_moved, index)) {
                 next.catch_moved = next.catch_moved.push(index)
             }
@@ -325,7 +327,10 @@ fn RestoreLinkedNullSlots(state: LinkedNullState, &outer: [LinkedNullSlot]): Lin
     next = state
     index = 0
     while (index < next.slots.len()) {
-        if (index < outer.len()) { next.slots[index].live = outer[index].live }
+        if (index < outer.len()) {
+            next.slots[index].live = outer[index].live
+            next.slots[index].moved_members = outer[index].moved_members.clone()
+        }
         else {
             next.slots[index].binding = ""
             next.slots[index].live = false
@@ -366,7 +371,8 @@ fn LinkedFsReadReference(&symbol: str): str {
 fn PreserveLinkedOwners(&before: [LinkedNullSlot], &after: [LinkedNullSlot], &statement: Node): null! {
     index = 0
     while (index < before.len()) {
-        if (LinkedNullOwner(before[index].value.ty) && before[index].live != after[index].live) {
+        if (LinkedNullOwner(before[index].value.ty)
+            && (before[index].live != after[index].live || before[index].moved_members.len() != after[index].moved_members.len())) {
             RejectLayout("linked_control_move", "conditional code cannot consume an outer owner", DeclarationSpan(statement))?
         }
         index = index + 1
@@ -407,49 +413,4 @@ fn LinkedCPrelude(&body: LinkedNullState, guards: str): str {
         text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
     }
     return text
-}
-
-fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &signature: str,
-                         &result_type: str, &payload_cleanup: str, char_errors: str): str {
-    text = header
-    array_checks = body.validated_arrays.len() > 0 || body.uses_str_array
-    text += "\n" + result_type.clone() + " " + symbol.clone() + "(" + signature.clone() + ") {\n"
-    text += "    " + result_type.clone() + " result = {0};\n"
-    text += payload_cleanup.clone()
-    if (body.append_slots.len() > 0) { text += "    int append_status = KU_STRUCT_ARRAY_OK;\n" }
-    clone = body.uses_clone || body.element_clones.len() > 0
-    if (clone) { text += "    bool out_of_memory = false;\n" }
-    if (array_checks) { text += "    bool invalid_array = false;\n" }
-    if (body.uses_print) { text += "    bool output_failed = false;\n" }
-    if (body.uses_str_view) { text += "    bool invalid_str = false;\n" }
-    if (body.uses_struct_view) { text += "    bool invalid_struct_view = false;\n" }
-    if (body.uses_add || body.uses_sub) { text += "    bool overflow = false;\n" }
-    if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
-    if (body.uses_concat) { text += "    const char* string_failure = NULL;\n" }
-    if (body.uses_chars) { text += "    int source_status = KU_SOURCE_OK;\n" }
-    text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
-    if (body.uses_print) { text += "    if (output_failed) { fputs(\"output write failed\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (clone) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (array_checks) {
-        message = "invalid struct array ownership"
-        if (body.uses_str_array) { message = "invalid array view" }
-        text += "    if (invalid_array) { fputs(\"" + message + "\\n\", stderr); exit(EXIT_FAILURE); }\n"
-    }
-    if (body.append_slots.len() > 0) {
-        text += "    if (append_status != KU_STRUCT_ARRAY_OK) {\n"
-            + "        const char *message = \"invalid struct array ownership\\n\";\n"
-            + "        if (append_status == KU_STRUCT_ARRAY_CAPACITY) message = \"array allocation is too large\\n\";\n"
-            + "        if (append_status == KU_STRUCT_ARRAY_OOM) message = \"array allocation failed\\n\";\n"
-            + "        fputs(message, stderr); exit(EXIT_FAILURE);\n    }\n"
-    }
-    if (body.uses_str_view) { text += "    if (invalid_str) { fputs(\"invalid str view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_struct_view) { text += "    if (invalid_struct_view) { fputs(\"invalid struct view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_concat) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_chars) { text += char_errors }
-    if (body.uses_add || body.uses_sub) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_index) {
-        text += "    if (index_failed) { fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", "
-            + "(long long)failure_index, failure_length); exit(EXIT_FAILURE); }\n"
-    }
-    return text + "    return result;\n}\n"
 }

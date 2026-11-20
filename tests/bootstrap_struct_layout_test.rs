@@ -18,6 +18,9 @@ mod linked_chars;
 #[path = "support/bootstrap_linked_null.rs"]
 mod linked_null;
 
+#[path = "support/bootstrap_member_move.rs"]
+mod member_move;
+
 #[path = "support/bootstrap_struct_view.rs"]
 mod struct_view;
 
@@ -4238,4 +4241,5 @@ int main(int argc, char **argv) {
     linked_guard::assert_ignored_result_cleanup(&compiler, &cwd);
     linked_guard::assert_checked_string_rebind(&compiler, &cwd);
     struct_view::assert_named_struct_view(&compiler, &cwd);
+    member_move::assert_owned_member_transfer(&compiler, &cwd);
 }

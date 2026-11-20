@@ -328,6 +328,9 @@ reads and View-to-View calls keep the original parent owner live.
 A View of a record array can also describe elements with nested owned arrays.
 A nested record-array field can be passed as a View. The call tracks the
 parent owner so a later argument cannot move it before using the View.
+Owned fields move individually into by-value arguments. A field moved by a
+later argument cannot invalidate an earlier View, and field moves leave the
+unmoved siblings under their original cleanup.
 
 The linked path also moves an owned record out of a checked dependency.
 It uses the project's nominal layout and destructor for nested fields. A

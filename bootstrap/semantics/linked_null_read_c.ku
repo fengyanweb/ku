@@ -1,3 +1,4 @@
+import { LinkedMemberPath, LinkedMemberUnavailable } from "./linked_member_ownership.ku"
 import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { EmitLinkedArrayBody } from "./struct_array_c.ku"
@@ -78,13 +79,13 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
         next.code += LinkedNullResultCleanupReference(next.owning_layouts, element)
     }
     kind = LinkedNullCType(ty)?
-    value = LinkedNullValue { ty: ty, text: name.clone(), slot: next.slots.len() + 1, borrowed: view }
+    value = LinkedNullValue { ty: ty, text: name.clone(), slot: next.slots.len() + 1, borrowed: view, member_path: "" }
     if (value.ty.declaration_kind == "StringView" || value.ty.declaration_kind == "StructView") {
         value.ty = LinkedViewPointee(value.ty)
         value.text = "(*" + name.clone() + ")"
         next.code += LinkedNullResultCleanupReference(next.owning_layouts, value.ty)
     }
-    next.slots = next.slots.push(LinkedNullSlot { binding: binding, value: value.clone(), live: parameter })
+    next.slots = next.slots.push(LinkedNullSlot { binding: binding, value: value.clone(), live: parameter, moved_members: [] })
     if (!parameter) { next.declarations = next.declarations + "    " + kind + " " + name + " = {0};\n" }
     if (!view) { next.drops = LinkedNullDropC(next.layouts, next.owning_layouts, value.ty, value.text) + next.drops }
     return ok(LinkedNullExpression { state: next, value: value })
@@ -100,18 +101,6 @@ fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &s
     local = AddLinkedNullSlot(project, state, statement.text.clone(), "l" + str(id), ty, false)?
     local.state.slots[local.value.slot - 1].live = true
     return ok(local.state)
-}
-
-fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNullState! {
-    if (value.borrowed) {
-        RejectLayout("linked_view_escape", "readonly values cannot be moved or stored without an explicit clone", value.ty.span.clone())?
-    }
-    next = state
-    if (value.slot > 0 && LinkedNullDropC(next.layouts, next.owning_layouts, value.ty, value.text) != "") {
-        next.code = next.code + "    " + value.text.clone() + " = (" + LinkedNullCType(value.ty)? + "){0};\n"
-        next.slots[value.slot - 1].live = false
-    }
-    return ok(next)
 }
 
 fn dropLinkedScope(state: LinkedNullState, outer: int, unwind: bool): LinkedNullState {
@@ -269,6 +258,10 @@ fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: N
     member = receiver.value.text + ".f" + str(ordinal - 1)
     field = LinkedReadonlyExpression(receiver.state, field_type, member)
     field.value.slot = receiver.value.slot
+    field.value.member_path = LinkedMemberPath(receiver.value, ordinal)
+    if (LinkedMemberUnavailable(field.state, field.value, false)) {
+        RejectLayout("linked_moved_member", "cannot read a field already moved from its parent", DeclarationSpan(node))?
+    }
     if (field.value.ty.declaration_kind == "StructArray" ||
         (field.value.ty.declaration_kind == "BuiltinArray" && field.value.ty.name == "str")) {
         ty = field.value.ty.clone()

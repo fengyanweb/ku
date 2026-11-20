@@ -1,3 +1,4 @@
+import { LinkedMemberUnavailable, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { Node } from "../stage2/ast.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -8,7 +9,7 @@ import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, LinkedNullDropC, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, LowerLinkedNullLeaf,
-         LowerLinkedNullRead, MoveLinkedNullSlot, ReadLinkedNullBinding, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_null_read_c.ku"
+         LowerLinkedNullRead, ReadLinkedNullBinding, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_null_read_c.ku"
 
 struct LinkedNullArguments {
     state: LinkedNullState
@@ -93,14 +94,14 @@ fn lowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
     next.links = rememberLinkedCall(next.links, callee.clone())
     args = ""
     handoff = ""
-    loans: [int] = []
+    loans: [LinkedNullValue] = []
     index = 0
     while (index < callee.parameters.len()) {
         argument = LowerLinkedNullValue(project, next.clone(), LinkedNullChild(project, 1, call, index + 1), depth + 1)?
         if (args != "") { args += ", " }
         if (LinkedNullView(callee.parameters[index])) {
             args += linkedViewArgument(callee.parameters[index], argument.value)?
-            if (argument.value.slot > 0) { loans = loans.push(argument.value.slot) }
+            if (argument.value.slot > 0) { loans = loans.push(argument.value.clone()) }
             next = argument.state
             index = index + 1
             continue
@@ -123,7 +124,7 @@ fn lowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
     // Evaluating a later argument may move an earlier lent binding. The
     // final direct call cannot outlive a moved source, including nested calls.
     for loan in loans {
-        if (!next.slots[loan - 1].live) {
+        if (LinkedMemberUnavailable(next, loan, true)) {
             RejectLayout("linked_view_move", "a later argument consumes an earlier View source", DeclarationSpan(call))?
         }
     }

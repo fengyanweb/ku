@@ -1,5 +1,7 @@
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
+import { MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { FinishLinkedFunctionC } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -8,12 +10,12 @@ import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { ContainsType } from "./struct_projection_c.ku"
-import { ExitLinkedFailure, FinishLinkedFunctionC, LinkedFailureTarget, LinkedNullBinding, LinkedNullFunction, LinkedNullRegion, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NewLinkedNullState, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
+import { ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullFunction, LinkedNullRegion, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NewLinkedNullState, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedCheckedResultPlan, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullParameterPlan, LinkedNullParameterType,
          LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, BindLinkedCatch, DropLinkedNullScope, EmitLinkedNullDeclarations, LowerLinkedArrayLocal, LowerLinkedNullRead,
-         MoveLinkedNullSlot, RegisterLinkedNullType } from "./linked_null_read_c.ku"
+         RegisterLinkedNullType } from "./linked_null_read_c.ku"
 import { LowerLinkedArrayAppend, LowerLinkedSuccess,
          LowerLinkedNullValue, LowerLinkedStringRebind } from "./linked_null_values_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
