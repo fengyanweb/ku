@@ -1,0 +1,26 @@
+import "std.fs"
+import { ParseModule } from "../../stage3/parser.ku"
+import { CheckDirectCallContracts } from "../../semantics/call_contracts.ku"
+import { ImportBinding, SuppliedModule } from "../../semantics/imports.ku"
+import { BuildNameTable } from "../../semantics/names.ku"
+import { EmitScalarIntC } from "../../semantics/scalar_int_c.ku"
+import { BindTypeNames } from "../../semantics/type_names.ku"
+
+fn BootstrapEntry(&command: str, &path: str, &symbol: str): null! {
+    input = BuildNameTable(ParseModule(fs.read(path.clone())?)?)?
+    supplied: [SuppliedModule] = []
+    imports: [ImportBinding] = []
+    types = BindTypeNames(input, supplied)?
+    CheckDirectCallContracts(input, imports, supplied)?
+    if (command == "check") { return ok(null) }
+    if (command == "emit") {
+        generated = EmitScalarIntC(input, types, symbol)?
+        println("/* " + generated.symbol + " */")
+        print(generated.source)
+        return ok(null)
+    }
+    fail { domain: "bootstrap.cli", code: "command", message: "unknown compiler command" }
+}
+
+// The stage-0 checker still requires the ordinary zero-argument entry.
+fn main(): null! { return ok(null) }
