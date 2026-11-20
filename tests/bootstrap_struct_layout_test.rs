@@ -411,6 +411,158 @@ fn compile_projection(source: &Path, output: &Path, cwd: &Path) {
     compile_projection_product(source, output, cwd, true, false);
 }
 
+#[test]
+fn bootstrap_emits_owning_layout_for_real_supplied_module() {
+    let tmp = Temp::new();
+    let copied = tmp.0.join("compiler");
+    let cwd = tmp.0.join("application");
+    fs::create_dir(&copied).unwrap();
+    fs::create_dir(&cwd).unwrap();
+    stage_sources(&copied);
+    for file in [
+        "semantics/imports.ku",
+        "semantics/names.ku",
+        "semantics/project_paths.ku",
+        "stage2/ast.ku",
+        "stage2/diagnostic.ku",
+        "stage2/span.ku",
+        "stage1/token.ku",
+    ] {
+        let output = cwd.join(file);
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        fs::copy(copied.join(file), output).unwrap();
+    }
+    let entry = copied.join("semantics/emit_owning.ku");
+    fs::write(
+        &entry,
+        r#"import "std.fs"
+import { ReadProjectModules } from "./project_manifest.ku"
+import { BindProjectModules } from "./project_bindings.ku"
+import { BuildProjectOwningLayouts, EmitProjectOwningLayoutsC, OwningLayoutDropName } from "./nested_struct_c.ku"
+import { CTypeName } from "./struct_projection_c.ku"
+fn main(): null! {
+    subject = fs.read("subject.txt")?
+    supplied = ReadProjectModules([subject, "semantics/names.ku", "semantics/project_paths.ku",
+        "stage2/ast.ku", "stage2/diagnostic.ku", "stage2/span.ku", "stage1/token.ku"])?
+    project = BindProjectModules(supplied)?
+    for item in supplied[0].named.names.declarations {
+        if (item.kind == "Struct") {
+            layouts = BuildProjectOwningLayouts(supplied, project, 1, item.node, item.span.clone())?
+            emitted = EmitProjectOwningLayoutsC(layouts, 1, item.node, item.span)?
+            println(CTypeName(1, item.node) + "|" + OwningLayoutDropName(1, item.node))
+            print(emitted)
+            return ok(null)
+        }
+    }
+    fail { domain: "test", code: "empty", message: "no owning layout" }
+}
+"#,
+    )
+    .unwrap();
+    let ku = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    let name = format!("emit-owning{}", std::env::consts::EXE_SUFFIX);
+    let built = copied.join("semantics").join(&name);
+    assert_ok(&execute(
+        Command::new(ku)
+            .args(["build", "--release"])
+            .arg(&entry)
+            .arg("-o")
+            .arg(&built),
+        &cwd,
+        180,
+    ));
+    let seed = cwd.join(name);
+    fs::rename(built, &seed).unwrap();
+    fs::remove_dir_all(copied).unwrap();
+
+    fs::write(cwd.join("subject.txt"), "semantics/imports.ku").unwrap();
+    let output = execute(&mut Command::new(&seed), &cwd, 30);
+    assert_ok(&output);
+    let emitted = String::from_utf8(output.stdout).unwrap();
+    let (symbols, text) = emitted.split_once('\n').unwrap();
+    let (ty, drop) = symbols.trim().split_once('|').unwrap();
+    assert_eq!(text.matches("} KuArrayInt;").count(), 1);
+    assert_eq!(text.matches(".len; i != 0; --i").count(), 2);
+    let caller = r#"
+static KuProjectionString string_owner(void) {
+    uint8_t *bytes = malloc(1);
+    if (!bytes) return (KuProjectionString){0};
+    *bytes = UINT8_C(42);
+    return (KuProjectionString){bytes, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+static void partial_project(RESULT *project) {
+    project->f0 = string_owner();
+    if (!project->f0.ptr) return;
+    project->f1.f0.f0.f0.data = malloc(4 * sizeof *project->f1.f0.f0.f0.data);
+    if (!project->f1.f0.f0.f0.data) return;
+    memset(project->f1.f0.f0.f0.data, 0xff, 4 * sizeof *project->f1.f0.f0.f0.data);
+    project->f1.f0.f0.f0.capacity = 4;
+    memset(&project->f1.f0.f0.f0.data[0], 0, sizeof *project->f1.f0.f0.f0.data);
+    project->f1.f0.f0.f0.len = 1;
+    project->f1.f0.f0.f0.data[0].f0 = string_owner();
+    if (!project->f1.f0.f0.f0.data[0].f0.ptr) return;
+    project->f1.f0.f0.f1.data = malloc(sizeof *project->f1.f0.f0.f1.data);
+    if (!project->f1.f0.f0.f1.data) return;
+    project->f1.f0.f0.f1.data[0] = INT64_C(42);
+    project->f1.f0.f0.f1.len = project->f1.f0.f0.f1.capacity = 1;
+    project->f1.f1.f0.data = malloc(sizeof *project->f1.f1.f0.data);
+    if (!project->f1.f1.f0.data) return;
+    memset(project->f1.f1.f0.data, 0, sizeof *project->f1.f1.f0.data);
+    project->f1.f1.f0.len = project->f1.f1.f0.capacity = 1;
+    project->f1.f1.f0.data[0].f1 = string_owner();
+}
+int main(void) {
+    (void)test_realloc;
+    for (int limit = 0; limit <= 6; ++limit) {
+        RESULT owner = {0};
+        fail_after = limit;
+        partial_project(&owner);
+        assert(outstanding() == limit);
+        DROP(&owner);
+        assert(outstanding() == 0);
+        assert(!owner.f0.ptr && !owner.f1.f0.f0.f0.data && !owner.f1.f1.f0.data);
+        DROP(&owner);
+    }
+    puts("partial and complete Project owners released");
+    return 0;
+}
+"#;
+    let path = cwd.join("owning.c");
+    fs::write(
+        &path,
+        format!(
+            "{CHECKED_ARRAY_ALLOCATOR}{text}{}",
+            caller.replace("RESULT", ty).replace("DROP", drop)
+        ),
+    )
+    .unwrap();
+    let binary = cwd.join(format!("owning{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&path, &binary, &cwd);
+    let result = execute(&mut Command::new(binary), &cwd, 10);
+    assert_ok(&result);
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout).trim(),
+        "partial and complete Project owners released"
+    );
+
+    for (source, diagnostic) in [
+        ("struct Loop { children: [Loop] }", "recursive_owned_layout"),
+        (
+            "struct Shallow { flags: [bool] }",
+            "unsupported_layout_type",
+        ),
+    ] {
+        fs::write(cwd.join("subject.txt"), "rejected.ku").unwrap();
+        fs::write(cwd.join("rejected.ku"), source).unwrap();
+        let result = execute(&mut Command::new(&seed), &cwd, 30);
+        assert_eq!(result.status.code(), Some(1));
+        assert!(result.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&result.stderr).contains(diagnostic));
+    }
+}
+
 fn compile_projection_product(
     source: &Path,
     output: &Path,

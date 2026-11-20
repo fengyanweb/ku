@@ -2,7 +2,7 @@ import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { OrderCStructLayouts, EmitNestedCLayouts } from "./nested_struct_c.ku"
-import { CTypeName } from "./struct_projection_c.ku"
+import { CTypeName, ProjectionArrayHeader } from "./struct_projection_c.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 
@@ -80,9 +80,7 @@ fn EmitOwnedStructOperations(&layouts: [StructLayout], root: int, &prefix: str, 
     return emitOwnedStructElement(element, prefix, owned, private_drop)
 }
 
-fn EmitStructArrayHeader(&element: str, &array: str): str {
-    return "\ntypedef struct { size_t len; " + element.clone() + " *data; size_t capacity; } " + array.clone() + ";\n"
-}
+fn EmitStructArrayHeader(&element: str, &array: str): str { return ProjectionArrayHeader(element, array) }
 
 fn EmitStructArrayReadValidation(&element: str, &array: str, &prefix: str): str {
     text = "static size_t " + prefix.clone() + "_capacity(const " + array.clone() + " *array) {\n"

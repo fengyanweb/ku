@@ -91,8 +91,27 @@ fn ImportedFieldType(&node: Node, use_node: int): TypeNameBinding! {
                                 module_index: 0, declaration_node: 0, span: at })
 }
 
-fn CollectFields(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
-                 &decl: Node, imported: bool): [StructFieldLayout]! {
+fn owningFieldType(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding], id: int): TypeNameBinding! {
+    at = DeclarationSpan(nodes[id - 1])
+    if (nodes[id - 1].kind != "TypeArray") { return ExplicitType(bindings, id, at) }
+    if (nodes[id - 1].edge_count != 1) {
+        RejectLayout("unsupported_layout_type", "an array field must declare one element type", at.clone())?
+    }
+    element = ExplicitType(bindings, edges[nodes[id - 1].first_edge], at.clone())?
+    if (element.declaration_kind == "Struct") {
+        element.declaration_kind = "StructArray"
+    } else if (element.declaration_kind == "Builtin" && element.name == "int") {
+        element.declaration_kind = "BuiltinArray"
+    } else {
+        RejectLayout("unsupported_layout_type", "owning C layout supports [int] or an array of bound structs", at.clone())?
+    }
+    element.use_node = id
+    element.span = at
+    return ok(element)
+}
+
+fn collectFields(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
+                 &decl: Node, imported: bool, owning: bool): [StructFieldLayout]! {
     fields: [StructFieldLayout] = []
     index = 0
     while (index < decl.edge_count) {
@@ -108,6 +127,9 @@ fn CollectFields(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
         if (imported) {
             resolved = ImportedFieldType(nodes[type_id - 1], type_id)?
             fields = fields.push(StructFieldLayout { name: field.text, ordinal: index, node: id, resolved: resolved })
+        } else if (owning) {
+            resolved = owningFieldType(nodes, edges, bindings, type_id)?
+            fields = fields.push(StructFieldLayout { name: field.text, ordinal: index, node: id, resolved: resolved })
         } else {
             resolved = ExplicitType(bindings, type_id, DeclarationSpan(field))?
             fields = fields.push(StructFieldLayout { name: field.text, ordinal: index, node: id, resolved: resolved })
@@ -115,6 +137,16 @@ fn CollectFields(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
         index = index + 1
     }
     return ok(fields)
+}
+
+fn CollectFields(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
+                 &decl: Node, imported: bool): [StructFieldLayout]! {
+    return collectFields(nodes, edges, bindings, decl, imported, false)
+}
+
+fn CollectOwningFields(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
+                       &decl: Node): [StructFieldLayout]! {
+    return collectFields(nodes, edges, bindings, decl, false, true)
 }
 
 fn CollectLayouts(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],

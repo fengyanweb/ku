@@ -46,7 +46,15 @@ fn ContainsIndex(&ids: [int], id: int): bool {
     return false
 }
 
-fn EmitLayout(&layout: StructLayout, allow_string: bool, allow_nested: bool): str! {
+fn StructArrayTypeName(&field: TypeNameBinding): str {
+    return "KuArray_" + CTypeName(field.module_index, field.declaration_node)
+}
+
+fn ProjectionArrayHeader(&element: str, &array: str): str {
+    return "\ntypedef struct { size_t len; " + element.clone() + " *data; size_t capacity; } " + array.clone() + ";\n"
+}
+
+fn emitLayout(&layout: StructLayout, allow_string: bool, allow_nested: bool, arrays: bool): str! {
     text = "typedef struct {\n"
     count = layout.fields.len()
     if (count == 0) { text += "    unsigned char empty;\n" }
@@ -56,6 +64,10 @@ fn EmitLayout(&layout: StructLayout, allow_string: bool, allow_nested: bool): st
         kind = "KuProjectionString"
         if (allow_nested && field.declaration_kind == "Struct") {
             kind = CTypeName(field.module_index, field.declaration_node)
+        } else if (arrays && field.declaration_kind == "StructArray") {
+            kind = StructArrayTypeName(field)
+        } else if (arrays && field.declaration_kind == "BuiltinArray" && field.name == "int") {
+            kind = "KuArrayInt"
         } else if (!(allow_string && StringField(field))) {
             kind = ScalarCType(field)?
         }
@@ -64,6 +76,14 @@ fn EmitLayout(&layout: StructLayout, allow_string: bool, allow_nested: bool): st
     }
     text += "} " + CTypeName(layout.module_index, layout.node) + ";\n\n"
     return ok(text)
+}
+
+fn EmitLayout(&layout: StructLayout, allow_string: bool, allow_nested: bool): str! {
+    return emitLayout(layout, allow_string, allow_nested, false)
+}
+
+fn EmitOwningLayout(&layout: StructLayout): str! {
+    return emitLayout(layout, true, true, true)
 }
 
 fn FindLayout(&layouts: [StructLayout], module_index: int, node: int): StructLayout! {

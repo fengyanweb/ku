@@ -224,6 +224,15 @@ struct parameter, including a read-only View. `MakeExpressionNode`,
 `MakeOperator` and `OperatorSpan` use this to keep absolute source coordinates.
 Moving a parameter invalidates later reads, and a View stays with its caller.
 
+`BuildProjectOwningLayouts` follows the actual module and declaration IDs of
+owning fields. `EmitProjectOwningLayoutsC` emits C definitions and a drop function
+for a complete owner or a partially initialized owner whose fields start at
+zero. In addition to the scalar and by-value struct fields, this path covers
+`[int]` and arrays of bound structs. Arrays use the existing typed C carrier
+and drop only the initialized prefix. The real `SuppliedModule` layout includes
+both the AST arenas and declaration tables. Recursive ownership graphs are
+rejected at the recursive field.
+
 For a function that reads struct fields and returns a diagnostic
 string, use the same project files with `guarded` in `mode.txt` and
 `ParseContextError` in `function.txt`. This mode supports int and bool locals,
