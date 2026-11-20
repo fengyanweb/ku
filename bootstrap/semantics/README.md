@@ -325,6 +325,7 @@ A checked call used as a statement drops its success payload before the next
 statement and transfers the original Error if the call fails.
 A named struct View uses a const pointer to the bound declaration. Field
 reads and View-to-View calls keep the original parent owner live.
+A View of a record array can also describe elements with nested owned arrays.
 
 The linked path also moves an owned record out of a checked dependency.
 It uses the project's nominal layout and destructor for nested fields. A

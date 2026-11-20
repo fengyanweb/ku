@@ -45,8 +45,7 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
     if (ty.declaration_kind == "StructView") { next.uses_struct_view = true }
     if (ty.declaration_kind == "StructArray" || LinkedNullOwnedArray(ty)) {
         element = LinkedNullArrayElement(ty.clone())
-        if (LinkedNullOwnedArray(ty)) { next = registerOwnedElement(project, next, element)? }
-        else { next.layouts = LinkedNullLayout(project, element, next.layouts, 0)? }
+        next = registerOwnedElement(project, next, element)?
         if (LinkedNullOwnedArray(ty) && LinkedNullArrayPosition(next.owned_arrays, ty) == 0) {
             next.owned_arrays = next.owned_arrays.push(ty.clone())
         }
@@ -73,7 +72,11 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
                      name: str, ty: TypeNameBinding, parameter: bool): LinkedNullExpression! {
     next = RegisterLinkedNullType(project, state, ty.clone())?
     view = LinkedNullView(ty)
-    if (ty.declaration_kind == "StructArray") { next = RequireLinkedArrayValidation(next, ty.clone()) }
+    if (ty.declaration_kind == "StructArray") {
+        next = RequireLinkedArrayValidation(next, ty.clone())
+        element = LinkedNullArrayElement(ty.clone())
+        next.code += LinkedNullResultCleanupReference(next.owning_layouts, element)
+    }
     kind = LinkedNullCType(ty)?
     value = LinkedNullValue { ty: ty, text: name.clone(), slot: next.slots.len() + 1, borrowed: view }
     if (value.ty.declaration_kind == "StringView" || value.ty.declaration_kind == "StructView") {

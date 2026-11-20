@@ -25,6 +25,10 @@ fn Wrong(&item: Envelope): null! {
     Own(item)?
     return ok(null)
 }
+fn InspectArray(&items: [Envelope]): null! {
+    See(items[0].item.count)?
+    return ok(null)
+}
 "#,
     )
     .unwrap();
@@ -157,6 +161,62 @@ int main(int argc, char **argv) {
         String::from_utf8_lossy(&invalid.stderr).trim(),
         "invalid struct view"
     );
+    fs::write(cwd.join("function.txt"), "InspectArray").unwrap();
+    let array_c = output("linked-null");
+    assert_ok(&array_c);
+    let array_program = String::from_utf8(array_c.stdout).unwrap();
+    let signature = array_program
+        .lines()
+        .find(|line| line.starts_with("KuBootstrapResultNull ku_linked_null_"))
+        .expect("checked array entry");
+    let (_, after_result) = signature.split_once(' ').unwrap();
+    let (array_entry, formal) = after_result.split_once("(const ").unwrap();
+    let (array_type, _) = formal.split_once('*').unwrap();
+    let witness = r#"
+static int seen;
+KuBootstrapResultNull __SEE__(int64_t value) {
+    assert(value == 42);
+    ++seen;
+    return (KuBootstrapResultNull){.ok = true};
+}
+int main(void) {
+    (void)test_realloc;
+    __PACKET__ element = {0};
+    int64_t *offsets = malloc(sizeof(*offsets));
+    offsets[0] = 19;
+    uint8_t *text = malloc(3);
+    memcpy(text, "abc", 3);
+    element.f0.f0 = (KuProjectionString){text,3,3,KU_PROJECTION_STRING_OWNED};
+    element.f0.f1 = 42;
+    element.f1.data = offsets;
+    element.f1.len = 1;
+    element.f1.capacity = 1;
+    __ARRAY__ collection = {1,&element,1};
+    assert(__ENTRY__(&collection).ok && seen == 1);
+    assert(outstanding() == 2 && offsets[0] == 19 && memcmp(text, "abc", 3) == 0);
+    free(offsets);
+    free(text);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("__SEE__", &symbol("See"))
+    .replace("__PACKET__", packet)
+    .replace("__ARRAY__", array_type)
+    .replace("__ENTRY__", array_entry);
+    let c = cwd.join("nested-record-array-view.c");
+    let app = cwd.join(format!(
+        "nested-record-array-view{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(
+        &c,
+        format!("{CHECKED_ARRAY_ALLOCATOR}{array_program}{witness}"),
+    )
+    .unwrap();
+    compile_projection(&c, &app, cwd);
+    assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+
     fs::write(cwd.join("function.txt"), "Wrong").unwrap();
     let rejected = output("linked-null");
     assert_eq!(rejected.status.code(), Some(1));
