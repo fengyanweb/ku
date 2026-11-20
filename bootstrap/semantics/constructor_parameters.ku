@@ -1,0 +1,129 @@
+import { Node } from "../stage2/ast.ku"
+import { GuardOwnedDrops } from "./guarded_struct_c.ku"
+import { DeclarationSpan } from "./names.ku"
+import { CStructOrder, OrderCStructLayouts } from "./nested_struct_c.ku"
+import { ContainsIndex, CTypeName, ScalarCType } from "./struct_projection_c.ku"
+import { ExplicitType, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { TypeNameBinding } from "./type_names.ku"
+
+struct ConstructorParameter {
+    name: str
+    bound: TypeNameBinding
+    layout: int
+    owned: bool
+}
+
+struct ConstructorParameters {
+    values: [ConstructorParameter]
+    order: CStructOrder
+    next: int
+    signature: str
+}
+
+fn ConstructorParameterIndex(&values: [ConstructorParameter], &name: str): int {
+    index = 0
+    while (index < values.len()) {
+        if (values[index].name == name) { return index + 1 }
+        index = index + 1
+    }
+    return 0
+}
+
+fn ConstructorParameterName(index: int): str { return "a" + str(index - 1) }
+
+fn ConstructorFieldMatches(&declared: TypeNameBinding, &field: TypeNameBinding): bool {
+    if (declared.declaration_kind == "Builtin") {
+        return field.declaration_kind == "Builtin" && declared.name == field.name
+    }
+    return declared.declaration_kind == "Struct" && field.declaration_kind == "Struct" &&
+        declared.module_index == field.module_index && declared.declaration_node == field.declaration_node
+}
+
+fn mergeLayoutOrder(old: CStructOrder, &addition: CStructOrder): CStructOrder {
+    order = old
+    indexes: [int] = []
+    index = 0
+    while (index < order.entries.len()) {
+        indexes = indexes.push(order.entries[index].layout_index)
+        index = index + 1
+    }
+    index = 0
+    while (index < addition.entries.len()) {
+        entry = addition.entries[index].clone()
+        if (!ContainsIndex(indexes, entry.layout_index)) {
+            indexes = indexes.push(entry.layout_index)
+            order.entries = order.entries.push(entry)
+        }
+        index = index + 1
+    }
+    order.contains_string = order.contains_string || addition.contains_string
+    return order
+}
+
+fn ReadConstructorParameters(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
+                             &layouts: [StructLayout], &function: Node, result_order: CStructOrder): ConstructorParameters! {
+    values: [ConstructorParameter] = []
+    order = result_order
+    cursor = function.first_edge
+    end = cursor + function.edge_count
+    signature = ""
+    while (cursor < end && nodes[edges[cursor] - 1].kind == "Parameter") {
+        parameter = nodes[edges[cursor] - 1].clone()
+        at = DeclarationSpan(parameter)
+        if (parameter.edge_count != 1 || parameter.int_value != 0 ||
+            ConstructorParameterIndex(values, parameter.text) != 0) {
+            RejectLayout("unsupported_constructor_parameter", "expected a distinct, explicitly typed by-value parameter", at.clone())?
+        }
+        binding = ExplicitType(bindings, edges[parameter.first_edge], at.clone())?
+        layout = 0
+        ctype = ""
+        owned = false
+        if (binding.declaration_kind == "Struct") {
+            shape = OrderCStructLayouts(layouts, binding.module_index, binding.declaration_node, at)?
+            layout = LayoutIndex(layouts, binding.module_index, binding.declaration_node)
+            owned = shape.contains_string
+            order = mergeLayoutOrder(order, shape)
+            ctype = CTypeName(binding.module_index, binding.declaration_node)
+        } else if (binding.declaration_kind == "Builtin" && binding.name == "str") {
+            owned = true
+            order.contains_string = true
+            ctype = "KuProjectionString"
+        } else {
+            ctype = ScalarCType(binding)?
+        }
+        if (values.len() != 0) { signature += ", " }
+        signature += ctype + " " + ConstructorParameterName(values.len() + 1)
+        values = values.push(ConstructorParameter { name: parameter.text, bound: binding, layout: layout, owned: owned })
+        cursor = cursor + 1
+    }
+    if (signature == "") { signature = "void" }
+    return ok(ConstructorParameters { values: values, order: order, next: cursor, signature: signature })
+}
+
+fn DropUnusedConstructorParameters(&parameters: [ConstructorParameter], &layouts: [StructLayout], &used: [int]): str {
+    text = ""
+    index = 0
+    while (index < parameters.len()) {
+        if (!ContainsIndex(used, index + 1)) {
+            argument = ConstructorParameterName(index + 1)
+            if (!parameters[index].owned) {
+                text += "    (void)" + argument + ";\n"
+            } else if (parameters[index].layout == 0) {
+                text += "    ku_projection_string_drop(&" + argument + ");\n"
+            } else {
+                text += GuardOwnedDrops(layouts, parameters[index].layout, argument)
+            }
+        }
+        index = index + 1
+    }
+    return text
+}
+
+fn ConstructorNeedsDrop(&parameters: [ConstructorParameter], &used: [int]): bool {
+    index = 0
+    while (index < parameters.len()) {
+        if (parameters[index].owned && !ContainsIndex(used, index + 1)) { return true }
+        index = index + 1
+    }
+    return false
+}

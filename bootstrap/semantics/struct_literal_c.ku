@@ -5,8 +5,10 @@ import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
 import { ExplicitType, FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { CTypeName, ContainsIndex } from "./struct_projection_c.ku"
-import { CStructOrder, EmitNestedCLayouts, OrderCStructLayouts } from "./nested_struct_c.ku"
+import { CTypeName, ContainsIndex, ProjectionHeaders } from "./struct_projection_c.ku"
+import { CStructOrder, EmitOrderedStructLayouts, OrderCStructLayouts } from "./nested_struct_c.ku"
+
+import { ConstructorParameter, ConstructorParameterIndex, ConstructorParameterName, ConstructorFieldMatches, ConstructorNeedsDrop, ReadConstructorParameters, DropUnusedConstructorParameters } from "./constructor_parameters.ku"
 
 struct StructConstructorC {
     symbol: str
@@ -16,6 +18,11 @@ struct StructConstructorC {
 struct ConstructorLocal {
     name: str
     layout: int
+}
+
+struct ConstructorLiteralC {
+    text: str
+    used: [int]
 }
 
 fn sameCLayout(&expected: StructLayout, &found: TypeNameBinding): bool {
@@ -72,7 +79,8 @@ fn constructorOperand(&named: NamedModule, &value: Node, &field: TypeNameBinding
 }
 
 fn emitConstructorLiteral(&named: NamedModule, &layout: StructLayout, &literal: Node, &destination: str,
-                          &local: ConstructorLocal, &layouts: [StructLayout]): str! {
+                          &local: ConstructorLocal, &layouts: [StructLayout], &parameters: [ConstructorParameter], used: [int]): ConstructorLiteralC! {
+    bound = used
     text = "    " + CTypeName(layout.module_index, layout.node) + " " + destination.clone()
     if (layout.fields.len() == 0) { text += " = {0}" }
     text += ";\n"
@@ -91,7 +99,25 @@ fn emitConstructorLiteral(&named: NamedModule, &layout: StructLayout, &literal: 
             RejectLayout("duplicate_literal_field", "duplicate constructor field '" + item.text.clone() + "'", DeclarationSpan(item))?
         }
         value = named.parsed.arena.nodes[named.parsed.arena.edges[item.first_edge] - 1].clone()
-        operand = constructorOperand(named, value, layout.fields[field - 1].resolved, local, layouts)?
+        parameter = 0
+        if (value.kind == "Variable" && value.edge_count == 0) {
+            parameter = ConstructorParameterIndex(parameters, value.text)
+        }
+        operand = ""
+        if (parameter == 0) {
+            operand = constructorOperand(named, value, layout.fields[field - 1].resolved, local, layouts)?
+        } else {
+            expected = layout.fields[field - 1].resolved.clone()
+            if (!ConstructorFieldMatches(parameters[parameter - 1].bound, expected)) {
+                RejectLayout("constructor_parameter_type", "parameter type does not match this field", DeclarationSpan(value))?
+            }
+            already_bound = ContainsIndex(bound, parameter)
+            if (already_bound && parameters[parameter - 1].owned) {
+                RejectLayout("constructor_parameter_moved", "owned parameter '" + value.text.clone() + "' was moved by an earlier field", DeclarationSpan(value))?
+            }
+            if (!already_bound) { bound = bound.push(parameter) }
+            operand = ConstructorParameterName(parameter)
+        }
         text += "    " + destination.clone() + ".f" + str(field - 1) + " = " + operand + ";\n"
         seen = seen.push(field)
         index = index + 1
@@ -103,7 +129,7 @@ fn emitConstructorLiteral(&named: NamedModule, &layout: StructLayout, &literal: 
         }
         index = index + 1
     }
-    return ok(text)
+    return ok(ConstructorLiteralC { text: text, used: bound })
 }
 
 fn layoutForConstructorLocal(&order: CStructOrder, index: int, at: Span): null! {
@@ -134,28 +160,39 @@ fn emitConstructor(&named: NamedModule, &bindings: [TypeNameBinding], &imports: 
                    &supplied: [SuppliedModule], &layouts: [StructLayout], function_id: int): StructConstructorC! {
     function = named.parsed.arena.nodes[function_id - 1].clone()
     at = DeclarationSpan(function)
-    if (function.kind != "Function" || function.edge_count < 2 || function.edge_count > 3 ||
-        named.parsed.arena.nodes[named.parsed.arena.edges[function.first_edge] - 1].kind != "TypeName") {
-        RejectLayout("unsupported_constructor_signature", "expected a parameterless function with an explicit struct return type", at.clone())?
+    end = function.first_edge + function.edge_count
+    cursor = function.first_edge
+    while (cursor < end && named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].kind == "Parameter") {
+        cursor = cursor + 1
     }
-    return_type = ExplicitType(bindings, named.parsed.arena.edges[function.first_edge], at.clone())?
+    if (function.kind != "Function" || end - cursor < 2 || end - cursor > 3 ||
+        named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].kind != "TypeName") {
+        RejectLayout("unsupported_constructor_signature", "expected an explicit struct result and a single struct literal return", at.clone())?
+    }
+    return_type = ExplicitType(bindings, named.parsed.arena.edges[cursor], at.clone())?
     if (return_type.declaration_kind != "Struct") {
         RejectLayout("unsupported_constructor_signature", "expected a struct return type", return_type.span.clone())?
     }
     order = OrderCStructLayouts(layouts, return_type.module_index, return_type.declaration_node, at)?
+    inputs = ReadConstructorParameters(named.parsed.arena.nodes, named.parsed.arena.edges, bindings, layouts, function, order)?
     root = LayoutIndex(layouts, return_type.module_index, return_type.declaration_node)
     local = ConstructorLocal { name: "", layout: 0 }
     body = ""
-    if (function.edge_count == 3) {
-        statement = named.parsed.arena.nodes[named.parsed.arena.edges[function.first_edge + 1] - 1].clone()
-        if (statement.kind != "Assign" || statement.edge_count != 1) {
+    used: [int] = []
+    if (end - inputs.next == 3) {
+        statement = named.parsed.arena.nodes[named.parsed.arena.edges[inputs.next + 1] - 1].clone()
+        if (statement.kind != "Assign" || statement.edge_count != 1 ||
+            ConstructorParameterIndex(inputs.values, statement.text) != 0) {
             RejectLayout("unsupported_constructor_body", "expected a single local struct initializer before return", DeclarationSpan(statement))?
         }
         initializer = named.parsed.arena.edges[statement.first_edge]
         resolved = resolveConstructorLiteral(named, imports, supplied, initializer)?
         index = LayoutIndex(layouts, resolved.module_index, resolved.declaration_node)
-        layoutForConstructorLocal(order, index, DeclarationSpan(statement))?
-        body = emitConstructorLiteral(named, layouts[index - 1], named.parsed.arena.nodes[initializer - 1], "local", local, layouts)?
+        layoutForConstructorLocal(inputs.order, index, DeclarationSpan(statement))?
+        prepared = emitConstructorLiteral(named, layouts[index - 1], named.parsed.arena.nodes[initializer - 1], "local",
+            local, layouts, inputs.values, used)?
+        body = prepared.text
+        used = prepared.used
         body += "    (void)local;\n"
         local = ConstructorLocal { name: statement.text, layout: index }
     }
@@ -168,10 +205,14 @@ fn emitConstructor(&named: NamedModule, &bindings: [TypeNameBinding], &imports: 
     if (!sameCLayout(layouts[root - 1], actual)) {
         RejectLayout("constructor_type_mismatch", "returned struct literal must match the result layout", actual.span)?
     }
-    body += emitConstructorLiteral(named, layouts[root - 1], named.parsed.arena.nodes[literal - 1], "result", local, layouts)?
+    assembled = emitConstructorLiteral(named, layouts[root - 1], named.parsed.arena.nodes[literal - 1],
+        "result", local, layouts, inputs.values, used)?
+    body += assembled.text
+    body += DropUnusedConstructorParameters(inputs.values, layouts, assembled.used)
     symbol = "ku_construct_" + str(function_id)
-    declaration = CTypeName(return_type.module_index, return_type.declaration_node) + " " + symbol.clone() + "(void) {\n"
-    text = EmitNestedCLayouts(layouts, order)? + declaration + body + "    return result;\n}\n"
+    declaration = CTypeName(return_type.module_index, return_type.declaration_node) + " " + symbol.clone() + "(" + inputs.signature + ") {\n"
+    header = ProjectionHeaders(inputs.order.contains_string, ConstructorNeedsDrop(inputs.values, assembled.used))
+    text = header + EmitOrderedStructLayouts(layouts, inputs.order)? + declaration + body + "    return result;\n}\n"
     return ok(StructConstructorC { symbol: symbol, text: text })
 }
 

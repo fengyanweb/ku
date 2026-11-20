@@ -1345,6 +1345,127 @@ fn Make(): Outer {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("noncopy_constructor_local"));
     assert_guarded_context(&ku, &driver_binary, &cwd, contexts);
     assert_projected_span(&ku, &driver_binary, &cwd, span_source);
+    assert_constructor_parameter_ownership(&driver_binary, &cwd);
+}
+
+fn assert_constructor_parameter_ownership(seed: &Path, cwd: &Path) {
+    let diagnostic = cwd.join("stage2/diagnostic.ku");
+    fs::write(
+        &diagnostic,
+        include_str!("../bootstrap/stage2/diagnostic.ku"),
+    )
+    .unwrap();
+    fs::write(cwd.join("mode.txt"), "construct").unwrap();
+    fs::write(cwd.join("function.txt"), "MakeDiagnostic").unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "stage2/diagnostic.ku\nstage2/span.ku\nstage1/token.ku\n",
+    )
+    .unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    assert!(!code.contains("malloc(") && !code.contains("free("));
+    let signature = code
+        .lines()
+        .find(|line| line.contains(" ku_construct_") && line.ends_with(" {"))
+        .unwrap();
+    let (result, call) = signature.split_once(' ').unwrap();
+    let (symbol, formals) = call.split_once('(').unwrap();
+    let position = formals
+        .rsplit(", ")
+        .next()
+        .unwrap()
+        .strip_suffix(" a5) {")
+        .unwrap();
+    let driver = r#"
+#include <stdlib.h>
+int main(void) {
+    KuProjectionString args[5];
+    for (size_t i = 0; i < 5; ++i) {
+        uint8_t *memory = malloc(1);
+        if (!memory) return 1;
+        *memory = (uint8_t)i;
+        args[i] = (KuProjectionString){memory, 1, 1, KU_PROJECTION_STRING_OWNED};
+    }
+    DIAGNOSTIC value = FUNCTION(args[0], args[1], args[2], args[3], args[4], (POSITION){.f0=7});
+    if (value.f0.ptr != args[0].ptr || value.f1.ptr != args[1].ptr ||
+        value.f2.ptr != args[2].ptr || value.f3.ptr != args[3].ptr ||
+        value.f4.ptr != args[4].ptr || value.f5.f0 != 7) return 2;
+    free(value.f0.ptr); free(value.f1.ptr); free(value.f2.ptr);
+    free(value.f3.ptr); free(value.f4.ptr);
+    return 0;
+}
+"#
+    .replace("DIAGNOSTIC", result)
+    .replace("FUNCTION", symbol)
+    .replace("POSITION", position);
+    let source = cwd.join("construct-owners.c");
+    fs::write(&source, format!("{code}{driver}")).unwrap();
+    let binary = cwd.join(format!("construct-owners{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&source, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(binary), cwd, 15));
+
+    fs::write(
+        cwd.join("bad-owner.ku"),
+        "struct Pair { a: str b: str }\nfn Reuse(value: str): Pair { return Pair { a: value, b: value } }\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "bad-owner.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Reuse").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert!(!rejected.status.success() && rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("constructor_parameter_moved"));
+
+    fs::write(
+        cwd.join("bad-owner.ku"),
+        "struct Spare { label: str }\nstruct Output { item: str }\n\
+         fn Select(spare: Spare, keep: str): Output { return Output { item: keep } }\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("function.txt"), "Select").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let signature = code
+        .lines()
+        .find(|line| line.contains(" ku_construct_"))
+        .unwrap();
+    let (result, declaration) = signature.split_once(' ').unwrap();
+    let (symbol, arguments) = declaration.split_once('(').unwrap();
+    let (spare, _) = arguments.split_once(' ').unwrap();
+    let shim = r#"
+#include <stdlib.h>
+#include <assert.h>
+static void *unused;
+static unsigned retired;
+static void observe_free(void *memory) {
+    assert(memory == unused);
+    ++retired;
+    free(memory);
+}
+#define free observe_free
+"#;
+    let driver = r#"
+#undef free
+int main(void) {
+    unused=malloc(1);
+    uint8_t *kept=malloc(1);
+    assert(unused && kept);
+    SPARE spare={.f0=(KuProjectionString){unused, 1, 1, KU_PROJECTION_STRING_OWNED}};
+    OUTPUT value=FUNCTION(spare, (KuProjectionString){kept, 1, 1, KU_PROJECTION_STRING_OWNED});
+    assert(retired==1 && value.f0.ptr==kept);
+    free(value.f0.ptr);
+    return 0;
+}
+"#
+    .replace("SPARE", spare)
+    .replace("OUTPUT", result)
+    .replace("FUNCTION", symbol);
+    fs::write(&source, format!("{shim}{code}{driver}")).unwrap();
+    let binary = cwd.join(format!("unused-owner{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&source, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(binary), cwd, 15));
 }
 
 fn assert_projected_span(ku: &Path, seed: &Path, cwd: &Path, source: &str) {

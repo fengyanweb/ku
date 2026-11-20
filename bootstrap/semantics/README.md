@@ -175,10 +175,13 @@ mv "$compiler/semantics/ku-project" "$project/ku-project"
 )
 ```
 
-This mode accepts a parameterless function returning a named struct literal,
-optionally after one Copy struct local initialized by a literal. The emitted
-C11 uses by-value fields for bounded, nonrecursive structs and static storage
-for string literals. The constructor itself allocates no heap storage.
+This mode accepts a function returning a named struct literal, optionally
+after one Copy struct local initialized by a literal. Explicit by-value
+parameters can initialize matching fields. An owned parameter transfers once;
+unused owned parameters are released before returning. `MakeDiagnostic` uses
+this path to transfer its five string buffers into the result. C11 uses
+bounded nonrecursive layouts and static storage for string literals. The
+constructor itself allocates no heap storage.
 
 For a function that reads struct fields and returns a diagnostic
 string, use the same project files with `guarded` in `mode.txt` and
