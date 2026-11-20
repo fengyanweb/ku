@@ -156,7 +156,11 @@ fn OrderCStructLayouts(&layouts: [StructLayout], module_index: int, node: int, a
 }
 
 fn EmitNestedCLayouts(&layouts: [StructLayout], &order: CStructOrder): str! {
-    text = ProjectionHeaders(order.contains_string, false)
+    return ok(ProjectionHeaders(order.contains_string, false) + EmitOrderedStructLayouts(layouts, order)?)
+}
+
+fn EmitOrderedStructLayouts(&layouts: [StructLayout], &order: CStructOrder): str! {
+    text = ""
     index = 0
     while (index < order.entries.len()) {
         layout_index = order.entries[index].layout_index

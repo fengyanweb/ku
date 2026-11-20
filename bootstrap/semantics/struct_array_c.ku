@@ -120,19 +120,29 @@ fn emitArrayTransfer(&element: str, &array: str, &prefix: str): str {
 fn EmitStructArrayC(&layouts: [StructLayout], module_index: int, declaration: int, at: Span): StructArrayC! {
     order = OrderCStructLayouts(layouts, module_index, declaration, at)?
     root = LayoutIndex(layouts, module_index, declaration)
+    ops = EmitStructArrayOperations(layouts, root)
+    ops.source = EmitNestedCLayouts(layouts, order)? + ops.source
+    return ok(ops)
+}
+
+// Emit operations after the caller has validated and declared the layouts.
+// These parts can be shared in the same translation unit with other roots.
+fn EmitStructArrayOperations(&layouts: [StructLayout], root: int): StructArrayC {
+    module_index = layouts[root - 1].module_index
+    declaration = layouts[root - 1].node
     element = CTypeName(module_index, declaration)
     array = "KuArray_" + element.clone()
     prefix = "ku_owned_array_" + element.clone()
     owned = collectOwnedFields(layouts, root, "", [])
-    text = EmitNestedCLayouts(layouts, order)? + "#include <stddef.h>\n#include <stdlib.h>\n"
+    text = "#include <stddef.h>\n#include <stdlib.h>\n"
     if (owned.len() != 0) { text += "#include <string.h>\n" }
     text += "\ntypedef struct { size_t len; " + element.clone() + " *data; size_t capacity; } " + array.clone() + ";\n"
     text += "enum { KU_STRUCT_ARRAY_OK, KU_STRUCT_ARRAY_INVALID, KU_STRUCT_ARRAY_BOUNDS, KU_STRUCT_ARRAY_CAPACITY, KU_STRUCT_ARRAY_OOM };\n\n"
     text += emitArrayOwnedElement(element, prefix, owned) + emitArrayBoundary(element, array, prefix) + emitArrayTransfer(element, array, prefix)
-    return ok(StructArrayC { element_type: element, array_type: array, prefix: prefix, source: text })
+    return StructArrayC { element_type: element, array_type: array, prefix: prefix, source: text }
 }
 
-fn checkStructArrayType(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding], id: int): TypeNameBinding! {
+fn CheckStructArrayType(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding], id: int): TypeNameBinding! {
     ty = nodes[id - 1].clone()
     if (ty.kind != "TypeArray" || ty.edge_count != 1) {
         RejectLayout("unsupported_struct_array_type", "expected a declared array of known structs", DeclarationSpan(ty))?
@@ -161,7 +171,7 @@ fn EmitReturnedStructArrayC(&named: NamedModule, &bindings: [TypeNameBinding], &
             if (cursor >= end) {
                 RejectLayout("unsupported_struct_array_type", "expected an explicit struct array result", entry.span.clone())?
             }
-            element = checkStructArrayType(named.parsed.arena.nodes, named.parsed.arena.edges, bindings, named.parsed.arena.edges[cursor])?
+            element = CheckStructArrayType(named.parsed.arena.nodes, named.parsed.arena.edges, bindings, named.parsed.arena.edges[cursor])?
             return EmitStructArrayC(layouts, element.module_index, element.declaration_node, element.span)
         }
         index = index + 1

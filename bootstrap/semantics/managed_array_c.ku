@@ -1,0 +1,168 @@
+import { Node } from "../stage2/ast.ku"
+import { Span } from "../stage2/span.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
+import { ImportBinding, SuppliedModule } from "./imports.ku"
+import { TypeNameBinding } from "./type_names.ku"
+import { RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { CStructOrder, OrderCStructLayouts } from "./nested_struct_c.ku"
+import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
+import { EmitStructArrayOperations } from "./struct_array_c.ku"
+import { GuardArithmetic, GuardOwnedDrops, GuardStringEquality } from "./guarded_struct_c.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType } from "./guarded_struct_expr.ku"
+import { ManagedExplicitType, ManagedType } from "./managed_array_values_c.ku"
+import { EmitManagedBlock } from "./managed_array_body_c.ku"
+
+struct ManagedArrayC {
+    symbol: str
+    source: str
+}
+
+struct ManagedLayoutOutput {
+    text: str
+    declared: [int]
+    strings: bool
+}
+
+struct ManagedSignature {
+    bindings: [GuardBinding]
+    layouts: ManagedLayoutOutput
+    parameters: str
+    unused: str
+    drops: str
+    drop_strings: bool
+    body_start: int
+}
+
+fn appendLayouts(&layouts: [StructLayout], &order: CStructOrder, output: ManagedLayoutOutput): ManagedLayoutOutput! {
+    next = output
+    cursor = 0
+    while (cursor < order.entries.len()) {
+        index = order.entries[cursor].layout_index
+        if (!ContainsIndex(next.declared, index)) {
+            next.text = next.text + EmitLayout(layouts[index - 1], true, true)?
+            next.declared = next.declared.push(index)
+        }
+        cursor = cursor + 1
+    }
+    next.strings = next.strings || order.contains_string
+    return ok(next)
+}
+
+fn orderLayout(&layouts: [StructLayout], index: int, at: Span): CStructOrder! {
+    return OrderCStructLayouts(layouts, layouts[index - 1].module_index, layouts[index - 1].node, at)
+}
+
+fn readParameters(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &layouts: [StructLayout],
+                  &root: ManagedType, &ordered: CStructOrder, &function: Node, result_edge: int): ManagedSignature! {
+    bindings: [GuardBinding] = []
+    declarations = appendLayouts(layouts, ordered, ManagedLayoutOutput { text: "", declared: [], strings: false })?
+    parameters = ""
+    unused = ""
+    drops = ""
+    drop_strings = false
+    cursor = function.first_edge
+    while (cursor < result_edge) {
+        parameter = nodes[edges[cursor] - 1].clone()
+        at = DeclarationSpan(parameter)
+        if (parameter.edge_count != 1 || parameter.int_value < 0 || parameter.int_value > 1 ||
+            GuardBindingIndex(bindings, parameter.text) != 0) {
+            RejectLayout("unsupported_managed_signature", "expected a distinct typed value or View parameter", at.clone())?
+        }
+        ty = ManagedExplicitType(types, nodes, edges, layouts, edges[parameter.first_edge])?
+        view = parameter.int_value == 1
+        if (ty.kind == "str" || (view && ty.kind != "array" && ty.kind != "struct") ||
+            (ty.kind == "array" && ty.layout != root.layout)) {
+            RejectLayout("unsupported_managed_signature", "expected Copy scalars, known structs or matching arrays", at.clone())?
+        }
+        binding = GuardBinding { name: parameter.text, ty: ty, slot: bindings.len(), parameter: true, view: view }
+        name = GuardBindingName(binding)
+        c_type = GuardCType(binding.ty, layouts)
+        if (view) { c_type = "const " + c_type + "*" }
+        if (bindings.len() > 0) { parameters += ", " }
+        parameters += c_type + " " + name.clone()
+        unused += "    (void)" + name.clone() + ";\n"
+        if (binding.ty.kind == "struct") {
+            dependencies = orderLayout(layouts, binding.ty.layout, at)?
+            declarations = appendLayouts(layouts, dependencies, declarations)?
+            if (!view && dependencies.contains_string) {
+                drop_strings = true
+                drops = GuardOwnedDrops(layouts, binding.ty.layout, name.clone()) + drops
+            }
+        }
+        if (binding.ty.kind == "array" && !view) { drops = "    " + root.array.prefix.clone() + "_drop(&" + name + ");\n" + drops }
+        bindings = bindings.push(binding)
+        cursor = cursor + 1
+    }
+    if (parameters == "") { parameters = "void" }
+    return ok(ManagedSignature { bindings: bindings, layouts: declarations, parameters: parameters,
+        unused: unused, drops: drops, drop_strings: drop_strings, body_start: result_edge + 1 })
+}
+
+fn managedArrayErrors(): str {
+    return "    if (array_status == KU_STRUCT_ARRAY_BOUNDS) {\n" +
+        "        fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", (long long)failure_index, failure_length);\n" +
+        "        exit(EXIT_FAILURE);\n    }\n" +
+        "    if (array_status) {\n" +
+        "        const char *message = \"invalid struct array ownership\\n\";\n" +
+        "        if (array_status == KU_STRUCT_ARRAY_CAPACITY) message = \"array allocation is too large\\n\";\n" +
+        "        if (array_status == KU_STRUCT_ARRAY_OOM) message = \"array allocation failed\\n\";\n" +
+        "        fputs(message, stderr);\n        exit(EXIT_FAILURE);\n    }\n"
+}
+
+fn resultEdge(&nodes: [Node], &edges: [int], &function: Node): int! {
+    cursor = function.first_edge
+    end = cursor + function.edge_count
+    while (cursor < end && nodes[edges[cursor] - 1].kind == "Parameter") { cursor = cursor + 1 }
+    if (cursor >= end - 1) {
+        RejectLayout("unsupported_managed_signature", "expected an explicit struct array result and a body", DeclarationSpan(function))?
+    }
+    return ok(cursor)
+}
+
+fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
+                       &supplied: [SuppliedModule], &layouts: [StructLayout], function_id: int): ManagedArrayC! {
+    function = named.parsed.arena.nodes[function_id - 1].clone()
+    edge = resultEdge(named.parsed.arena.nodes, named.parsed.arena.edges, function)?
+    result = ManagedExplicitType(types, named.parsed.arena.nodes, named.parsed.arena.edges, layouts, named.parsed.arena.edges[edge])?
+    if (result.kind != "array") {
+        RejectLayout("unsupported_managed_signature", "expected a bound struct array result", DeclarationSpan(function))?
+    }
+    // Admit the result graph before either array policy or source generation.
+    ordered = orderLayout(layouts, result.layout, DeclarationSpan(function))?
+    array = EmitStructArrayOperations(layouts, result.layout)
+    root = ManagedType { layout: result.layout, array: array }
+    signature = readParameters(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, root, ordered, function, edge)?
+    body = EmitManagedBlock(named, types, imports, supplied, layouts, root, signature.bindings,
+        signature.body_start, function.first_edge + function.edge_count, 0, "    ")?
+    if (!body.returns) { RejectLayout("managed_fallthrough", "every path must return an array owner", DeclarationSpan(function))? }
+    symbol = "ku_managed_" + str(function_id)
+    arithmetic = body.code.uses_add || body.code.uses_sub
+    text = ProjectionHeaders(signature.layouts.strings || body.code.uses_eq, signature.drop_strings)
+    text += "#include <stdio.h>\n#include <stdlib.h>\n\n"
+    text += GuardArithmetic(body.code.uses_add, body.code.uses_sub) + GuardStringEquality(body.code.uses_eq)
+    text += signature.layouts.text + root.array.source
+    text += root.array.array_type.clone() + " " + symbol.clone() + "(" + signature.parameters + ") {\n"
+    text += "    " + root.array.array_type.clone() + " result = {0};\n"
+    text += "    int array_status = KU_STRUCT_ARRAY_OK;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n"
+    if (arithmetic) { text += "    bool overflow = false;\n" }
+    text += signature.unused + body.declarations + body.code.text
+    text += "cleanup:\n" + body.drops + signature.drops
+    if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    text += managedArrayErrors() + "    return result;\n}\n"
+    return ok(ManagedArrayC { symbol: symbol, source: text })
+}
+
+fn EmitManagedArrayC(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
+                    &supplied: [SuppliedModule], &layouts: [StructLayout], &function_name: str): ManagedArrayC! {
+    index = 0
+    while (index < named.names.declarations.len()) {
+        item = named.names.declarations[index].clone()
+        if (item.kind == "Function" && item.name == function_name) {
+            return emitManagedFunction(named, types, imports, supplied, layouts, item.node)
+        }
+        index = index + 1
+    }
+    start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    RejectLayout("unknown_managed_function", "undefined managed function '" + function_name.clone() + "'", start)?
+    return ok(ManagedArrayC { symbol: "", source: "" })
+}

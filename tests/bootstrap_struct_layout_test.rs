@@ -1659,11 +1659,11 @@ const CHECKED_ARRAY_ALLOCATOR: &str = r#"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-static void *live[16];
+static void *live[96];
 static int attempts;
 static int fail_after = -1;
 static int slot_for(void *pointer) {
-    for (int i = 0; i < 16; ++i) if (live[i] == pointer) return i;
+    for (int i = 0; i < 96; ++i) if (live[i] == pointer) return i;
     abort();
 }
 static int inject_failure(void) {
@@ -1695,7 +1695,7 @@ static void test_free(void *pointer) {
 }
 static int outstanding(void) {
     int count = 0;
-    for (int i = 0; i < 16; ++i) count += live[i] != NULL;
+    for (int i = 0; i < 96; ++i) count += live[i] != NULL;
     return count;
 }
 #define malloc test_malloc
@@ -1944,4 +1944,331 @@ fn Primitive(values: [int]): [int] { return values }
     let binary = project.join(format!("nested-owner{}", std::env::consts::EXE_SUFFIX));
     compile_projection(&nested, &binary, &project);
     assert_ok(&execute(&mut Command::new(binary), &project, 15));
+}
+
+const RELOCATE_EMITTER: &str = r#"import "std.fs"
+import { BindProjectImports } from "./imports.ku"
+import { BindImportedTypeNames } from "./type_names.ku"
+import { BuildStructLayouts } from "./struct_layouts.ku"
+import { ReadProjectModules } from "./project_manifest.ku"
+import { EmitManagedArrayC } from "./managed_array_c.ku"
+fn main(): null! {
+    supplied = ReadProjectModules(["stage2/context.ku", "stage2/span.ku", "stage1/token.ku"])?
+    imports = BindProjectImports(supplied[0], supplied)?
+    bound = BindImportedTypeNames(supplied[0].named, imports, supplied)?
+    layouts = BuildStructLayouts(supplied[0].named, bound, supplied)?
+    c = EmitManagedArrayC(supplied[0].named, bound, imports, supplied, layouts, fs.read("target.txt")?)?
+    print(c.source)
+    return ok(null)
+}
+"#;
+
+const RELOCATE_ORACLE: &str = r#"import { Scan } from "./stage1/lexer.ku"
+import { Canonical, Token } from "./stage1/token.ku"
+import { DefaultParseContext, RelocateTokens } from "./stage2/context.ku"
+fn main(): null! {
+    tokens = Scan("plan = \"任务🙂\"\ntrue")?
+    println("INPUT\n" + Canonical(tokens.clone()))
+    println("UNCHANGED\n" + Canonical(RelocateTokens(tokens.clone(), DefaultParseContext())))
+    context = DefaultParseContext()
+    context.origin.line = 4
+    context.origin.column = 9
+    context.origin.offset = 80
+    println("SHIFT\n" + Canonical(RelocateTokens(tokens.clone(), context.clone())))
+    context.has_boundary = true
+    context.boundary.line = 9
+    context.boundary.column = 12
+    context.boundary.offset = 500
+    context.boundary.end_line = 10
+    context.boundary.end_column = 4
+    context.boundary.end_offset = 510
+    println("BOUNDARY\n" + Canonical(RelocateTokens(tokens, context.clone())))
+    empty: [Token] = []
+    println("EMPTY\n" + Canonical(RelocateTokens(empty, context)))
+    return ok(null)
+}
+"#;
+
+const RELOCATE_CONSUMER: &str = r#"
+static KuProjectionString make_owned(const char *text) {
+    size_t len = strlen(text);
+    uint8_t *ptr = malloc(len ? len : 1);
+    if (len) memcpy(ptr, text, len);
+    return (KuProjectionString){ ptr, len, len ? len : 1, KU_PROJECTION_STRING_OWNED };
+}
+static __ARRAY__ make_input(void) {
+    __ARRAY__ array = { __COUNT__, malloc(__COUNT__ * sizeof(__TOKEN__)), __COUNT__ };
+__INPUT__
+    return array;
+}
+static __CONTEXT__ context_for(int variant) {
+    __CONTEXT__ context = {0};
+    context.f0 = make_owned("bootstrap.parser");
+    context.f1.f0 = variant ? 4 : 1;
+    context.f1.f1 = variant ? 9 : 1;
+    context.f1.f2 = variant ? 80 : 0;
+    context.f1.f3 = 1;
+    context.f1.f4 = 1;
+    context.f2.f0 = 1;
+    context.f2.f1 = 1;
+    context.f2.f3 = 1;
+    context.f2.f4 = 1;
+    if (variant >= 2) {
+        context.f3 = true;
+        context.f2.f0 = 9;
+        context.f2.f1 = 12;
+        context.f2.f2 = 500;
+        context.f2.f3 = 10;
+        context.f2.f4 = 4;
+        context.f2.f5 = 510;
+    }
+    return context;
+}
+static void canonical(const char *label, __ARRAY__ *result) {
+    puts(label);
+    for (size_t i = 0; i < result->len; ++i) {
+        __TOKEN__ *t = &result->data[i];
+        printf("%.*s|%.*s|%lld|%lld|%lld|%lld|%lld|%lld|%lld\n",
+            (int)t->f0.len, (char*)t->f0.ptr, (int)t->f1.len, (char*)t->f1.ptr,
+            (long long)t->f2, (long long)t->f3, (long long)t->f4, (long long)t->f5,
+            (long long)t->f6, (long long)t->f7, (long long)t->f8);
+    }
+    if (!result->len) puts("");
+}
+static void check_clean(void) {
+    if (outstanding() != 0) _Exit(97);
+}
+int main(int argc, char **argv) {
+    assert(atexit(check_clean) == 0);
+    if (argc == 2) {
+        __ARRAY__ input = make_input();
+        __CONTEXT__ context = context_for(2);
+        if (strcmp(argv[1], "overflow") == 0) context.f1.f2 = INT64_MAX;
+        else fail_after = atoi(argv[1]);
+        (void)__ENTRY__(input, context);
+        return 98;
+    }
+    const char *labels[] = {"UNCHANGED", "SHIFT", "BOUNDARY", "EMPTY"};
+    for (int mode = 0; mode < 4; ++mode) {
+        __ARRAY__ input = {0};
+        if (mode != 3) input = make_input();
+        __TOKEN__ *origin = input.data;
+        __CONTEXT__ context = context_for(mode);
+        int initial_attempts = attempts;
+        __ARRAY__ result = __ENTRY__(input, context);
+        if (mode == 0) assert(origin == result.data && attempts == initial_attempts);
+        if (mode == 2) fprintf(stderr, "%d\n", attempts - initial_attempts);
+        canonical(labels[mode], &result);
+        __PREFIX___drop(&result);
+        assert(!outstanding());
+    }
+    return 0;
+}
+"#;
+
+fn c_token_bytes(value: &str) -> String {
+    let escaped: String = value.bytes().map(|byte| format!("\\{byte:03o}")).collect();
+    format!("make_owned(\"{escaped}\")")
+}
+
+#[test]
+fn bootstrap_compiles_unmodified_relocate_tokens_with_owned_cleanup() {
+    let work = Temp::new();
+    let compiler = work.0.join("compiler");
+    let project = work.0.join("project");
+    fs::create_dir(&compiler).unwrap();
+    fs::create_dir(&project).unwrap();
+    stage_sources(&compiler);
+    let ku = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    let exe = format!("relocate-emitter{}", std::env::consts::EXE_SUFFIX);
+    let entry = compiler.join("semantics/relocate-emitter.ku");
+    let built = compiler.join("semantics").join(&exe);
+    let emitter = project.join(exe);
+    fs::write(&entry, RELOCATE_EMITTER).unwrap();
+    assert_ok(&execute(
+        Command::new(&ku)
+            .args(["build", "--release"])
+            .arg(&entry)
+            .arg("-o")
+            .arg(&built),
+        &project,
+        150,
+    ));
+    fs::rename(built, &emitter).unwrap();
+    for stage in ["stage1", "stage2"] {
+        fs::rename(compiler.join(stage), project.join(stage)).unwrap();
+    }
+    fs::remove_dir_all(&compiler).unwrap();
+
+    let oracle = project.join("oracle.ku");
+    let expected_exe = project.join(format!("reference{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&oracle, RELOCATE_ORACLE).unwrap();
+    let result = execute(
+        Command::new(&ku)
+            .args(["build", "--release"])
+            .arg(oracle)
+            .arg("-o")
+            .arg(&expected_exe),
+        &project,
+        90,
+    );
+    assert_ok(&result);
+    let observed = execute(&mut Command::new(expected_exe), &project, 20);
+    assert_ok(&observed);
+    let expected = String::from_utf8(observed.stdout)
+        .unwrap()
+        .replace("\r\n", "\n");
+    let (input, other) = expected
+        .strip_prefix("INPUT\n")
+        .unwrap()
+        .split_once("UNCHANGED\n")
+        .unwrap();
+    let expected = format!("UNCHANGED\n{other}");
+    let mut initializer = String::new();
+    let mut count = 0;
+    for line in input.lines() {
+        let fields: Vec<_> = line.split('|').collect();
+        let [kind, lexeme, rest @ ..] = fields.as_slice() else {
+            panic!("canonical input token")
+        };
+        assert_eq!(rest.len(), 7);
+        let values: Vec<_> = rest
+            .iter()
+            .map(|item| item.parse::<i64>().expect("token integer").to_string())
+            .collect();
+        initializer.push_str(&format!(
+            "    array.data[{count}] = (__TOKEN__){{ {}, {}, {} }};\n",
+            c_token_bytes(kind),
+            c_token_bytes(lexeme),
+            values.join(", ")
+        ));
+        count += 1;
+    }
+    assert_eq!(count, 5);
+    assert!(expected.contains("String|任务🙂") && expected.contains("Eof||0|9|12|500|10|4|510"));
+
+    fs::write(project.join("target.txt"), "RelocateTokens").unwrap();
+    let emitted = execute(&mut Command::new(&emitter), &project, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let signature = code
+        .lines()
+        .find(|line| line.contains(" ku_managed_"))
+        .unwrap();
+    let (array, function) = signature.split_once(' ').unwrap();
+    let (symbol, signature) = function.split_once('(').unwrap();
+    let (_, context) = signature.split_once(", ").unwrap();
+    let context = context.strip_suffix(" a1) {").unwrap();
+    let token = array.strip_prefix("KuArray_").unwrap();
+    let prefix = format!("ku_owned_array_{token}");
+    let driver = RELOCATE_CONSUMER
+        .replace("__INPUT__", &initializer)
+        .replace("__COUNT__", &count.to_string())
+        .replace("__ARRAY__", array)
+        .replace("__TOKEN__", token)
+        .replace("__CONTEXT__", context)
+        .replace("__ENTRY__", symbol)
+        .replace("__PREFIX__", &prefix);
+    let executable = project.join(format!("relocated{}", std::env::consts::EXE_SUFFIX));
+    let source = project.join("relocated.c");
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{driver}")).unwrap();
+    let bounds = write_managed_bounds_case(&project, &emitter);
+    for stage in ["stage1", "stage2"] {
+        fs::remove_dir_all(project.join(stage)).unwrap();
+    }
+    fs::remove_file(project.join("oracle.ku")).unwrap();
+    compile_projection(&source, &executable, &project);
+    let result = execute(&mut Command::new(&executable), &project, 20);
+    assert_ok(&result);
+    assert_eq!(
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        expected
+    );
+    let allocation_count: usize = String::from_utf8(result.stderr)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(allocation_count > 10 && allocation_count <= 64);
+    for fail_after in 0..allocation_count {
+        let trap = execute(
+            Command::new(&executable).arg(fail_after.to_string()),
+            &project,
+            5,
+        );
+        assert_eq!(
+            trap.status.code(),
+            Some(1),
+            "injected allocation failure {fail_after}: {}",
+            String::from_utf8_lossy(&trap.stderr)
+        );
+        assert!(String::from_utf8_lossy(&trap.stderr).contains("array allocation failed"));
+    }
+    let overflow = execute(Command::new(executable).arg("overflow"), &project, 5);
+    assert_eq!(overflow.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&overflow.stderr).contains("integer overflow"));
+    let bounds_exe = project.join(format!("bounds{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&bounds, &bounds_exe, &project);
+    assert_ok(&execute(&mut Command::new(&bounds_exe), &project, 10));
+    let trap = execute(Command::new(&bounds_exe).arg("-1"), &project, 5);
+    assert_eq!(trap.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&trap.stderr).trim_end(),
+        "array/index_out_of_bounds: index -1 out of bounds for length 1"
+    );
+}
+
+fn write_managed_bounds_case(project: &Path, emitter: &Path) -> PathBuf {
+    fs::write(
+        project.join("stage2/context.ku"),
+        r#"
+struct Entry { text: str score: int }
+fn Take(source: [Entry], idx: int): [Entry] {
+    item = source[idx].clone()
+    result: [Entry] = []
+    result = result.push(item)
+    return result
+}
+"#,
+    )
+    .unwrap();
+    fs::write(project.join("target.txt"), "Take").unwrap();
+    let result = execute(&mut Command::new(emitter), project, 25);
+    assert_ok(&result);
+    let code = String::from_utf8(result.stdout).unwrap();
+    let signature = code
+        .lines()
+        .find(|line| line.contains(" ku_managed_"))
+        .unwrap();
+    let (array, function) = signature.split_once(' ').unwrap();
+    let (symbol, _) = function.split_once('(').unwrap();
+    let item = array.strip_prefix("KuArray_").unwrap();
+    let driver = r#"
+static void check_clean(void) {
+    if (outstanding()) _Exit(97);
+}
+int main(int argc, char **argv) {
+    assert(atexit(check_clean) == 0);
+    __ARRAY__ input = { 1, malloc(sizeof(__ITEM__)), 1 };
+    uint8_t *bytes = malloc(1);
+    bytes[0] = 'x';
+    input.data[0] = (__ITEM__){ { bytes, 1, 1, KU_PROJECTION_STRING_OWNED }, 42 };
+    __ARRAY__ output = __ENTRY__(input, argc == 1 ? 0 : atoi(argv[1]));
+    assert(output.len == 1 && output.data[0].f1 == 42 && output.data[0].f0.ptr[0] == 'x');
+    __PREFIX___drop(&output);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("__ARRAY__", array)
+    .replace("__ITEM__", item)
+    .replace("__ENTRY__", symbol)
+    .replace("__PREFIX__", &format!("ku_owned_array_{item}"));
+    let path = project.join("managed_bounds.c");
+    fs::write(&path, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{driver}")).unwrap();
+    path
 }

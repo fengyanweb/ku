@@ -1,5 +1,6 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
+import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { CTypeName } from "./struct_projection_c.ku"
 import { ExplicitType, FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
@@ -25,6 +26,7 @@ struct GuardValue {
     view: bool
     uses_add: bool
     uses_sub: bool
+    uses_eq: bool
 }
 
 fn GuardBindingIndex(&bindings: [GuardBinding], &name: str): int {
@@ -44,8 +46,10 @@ fn GuardBindingName(&binding: GuardBinding): str {
 fn GuardCType(&ty: GuardType, &layouts: [StructLayout]): str {
     if (ty.kind == "bool") { return "bool" }
     if (ty.kind == "str") { return "KuProjectionString" }
-    if (ty.kind == "struct") {
-        return CTypeName(layouts[ty.layout - 1].module_index, layouts[ty.layout - 1].node)
+    if (ty.kind == "struct" || ty.kind == "array") {
+        layout = CTypeName(layouts[ty.layout - 1].module_index, layouts[ty.layout - 1].node)
+        if (ty.kind == "array") { return "KuArray_" + layout }
+        return layout
     }
     return "int64_t"
 }
@@ -69,7 +73,7 @@ fn GuardExplicitType(&types: [TypeNameBinding], &nodes: [Node], &layouts: [Struc
 }
 
 fn GuardRead(ty: GuardType, value: str, view: bool): GuardValue {
-    return GuardValue { ty: ty, setup: "", value: value, view: view, uses_add: false, uses_sub: false }
+    return GuardValue { ty: ty, setup: "", value: value, view: view, uses_add: false, uses_sub: false, uses_eq: false }
 }
 
 fn guardField(&layouts: [StructLayout], &base: GuardValue, &node: Node): GuardValue! {
@@ -97,12 +101,21 @@ fn guardInteger(&left: GuardValue, &right: GuardValue, &node: Node, id: int, &in
     setup = left.setup.clone() + right.setup.clone() + indent.clone() + "int64_t " + output.clone() + ";\n"
     setup += indent.clone() + "if (!ku_guard_try_" + operation + "(" + left.value.clone() + ", " + right.value.clone() + ", &" + output.clone() + ")) { overflow = true; goto cleanup; }\n"
     return ok(GuardValue { ty: GuardType { kind: "int", layout: 0 }, setup: setup, value: output, view: false,
-        uses_add: left.uses_add || right.uses_add || add, uses_sub: left.uses_sub || right.uses_sub || !add })
+        uses_add: left.uses_add || right.uses_add || add, uses_sub: left.uses_sub || right.uses_sub || !add,
+        uses_eq: left.uses_eq || right.uses_eq })
 }
 
 fn guardBoolean(&left: GuardValue, &right: GuardValue, &node: Node, id: int, &indent: str): GuardValue! {
     logical = node.text == "&&" || node.text == "||"
     equality = node.text == "==" || node.text == "!="
+    if (equality && left.ty.kind == "str" && right.ty.kind == "str") {
+        prefix = ""
+        if (node.text == "!=") { prefix = "!" }
+        value = prefix + "ku_guard_string_equal(" + left.value.clone() + ", " + right.value.clone() + ")"
+        return ok(GuardValue { ty: GuardType { kind: "bool", layout: 0 }, setup: left.setup.clone() + right.setup.clone(),
+            value: value, view: false, uses_add: left.uses_add || right.uses_add,
+            uses_sub: left.uses_sub || right.uses_sub, uses_eq: true })
+    }
     if (logical) {
         if (left.ty.kind != "bool" || right.ty.kind != "bool") {
             RejectLayout("guarded_operand_type", "short circuit requires bool operands", DeclarationSpan(node))?
@@ -124,7 +137,8 @@ fn guardBoolean(&left: GuardValue, &right: GuardValue, &node: Node, id: int, &in
         setup += right.setup.clone()
     }
     return ok(GuardValue { ty: GuardType { kind: "bool", layout: 0 }, setup: setup, value: value, view: false,
-        uses_add: left.uses_add || right.uses_add, uses_sub: left.uses_sub || right.uses_sub })
+        uses_add: left.uses_add || right.uses_add, uses_sub: left.uses_sub || right.uses_sub,
+        uses_eq: left.uses_eq || right.uses_eq })
 }
 
 fn GuardExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
@@ -139,6 +153,10 @@ fn GuardExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &la
     if (node.kind == "Bool" && node.edge_count == 0 && (node.text == "true" || node.text == "false")) {
         return ok(GuardRead(GuardType { kind: "bool", layout: 0 }, node.text, false))
     }
+    if (node.kind == "String" && node.edge_count == 0) {
+        value = "((KuProjectionString){ (uint8_t*)" + ScalarStringLiteral(node)? + ", 0u, KU_PROJECTION_STRING_STATIC })"
+        return ok(GuardRead(GuardType { kind: "str", layout: 0 }, value, false))
+    }
     if (node.kind == "Variable" && node.edge_count == 0) {
         found = GuardBindingIndex(bindings, node.text)
         if (found == 0) {
@@ -149,6 +167,17 @@ fn GuardExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &la
     if (node.kind == "Field" && node.edge_count == 1) {
         base = GuardExpression(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, indent)?
         return guardField(layouts, base, node)
+    }
+    if (node.kind == "Call" && node.edge_count == 1) {
+        method = nodes[edges[node.first_edge] - 1].clone()
+        if (method.kind == "Field" && method.text == "len" && method.edge_count == 1) {
+            receiver = GuardExpression(nodes, edges, bindings, layouts, edges[method.first_edge], depth + 1, indent)?
+            if (receiver.ty.kind == "array") {
+                access = ".len"
+                if (receiver.view) { access = "->len" }
+                return ok(GuardRead(GuardType { kind: "int", layout: 0 }, "((int64_t)" + receiver.value + access + ")", false))
+            }
+        }
     }
     if (node.kind == "Unary" && node.edge_count == 1) {
         operand = GuardExpression(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, indent)?

@@ -29,10 +29,11 @@ struct GuardBlock {
     uses_sub: bool
     uses_join: bool
     uses_format: bool
+    uses_eq: bool
     returns: bool
 }
 
-fn guardOwnedDrops(&layouts: [StructLayout], index: int, &base: str): str {
+fn GuardOwnedDrops(&layouts: [StructLayout], index: int, &base: str): str {
     drops = ""
     cursor = 0
     while (cursor < layouts[index - 1].fields.len()) {
@@ -44,7 +45,7 @@ fn guardOwnedDrops(&layouts: [StructLayout], index: int, &base: str): str {
             child = LayoutIndex(layouts, field.module_index, field.declaration_node)
             // The ordered layout has already validated this acyclic graph
             // (at most eight levels). Each path is one owned field instance.
-            drops += guardOwnedDrops(layouts, child, name)
+            drops += GuardOwnedDrops(layouts, child, name)
         }
         cursor = cursor + 1
     }
@@ -88,7 +89,7 @@ fn readGuardSignature(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
                     emitted = emitted.push(index)
                 }
             }
-            if (!view) { drops += guardOwnedDrops(layouts, binding.ty.layout, name) }
+            if (!view) { drops += GuardOwnedDrops(layouts, binding.ty.layout, name) }
         }
         bindings = bindings.push(binding)
         cursor = cursor + 1
@@ -114,12 +115,12 @@ fn guardStringReturn(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &
     if (nodes[id - 1].kind == "String") {
         literal = ScalarStringLiteral(nodes[id - 1])?
         return ok(GuardBlock { source: indent.clone() + "result = (KuProjectionString){ (uint8_t*)" + literal + ", 0u, KU_PROJECTION_STRING_STATIC };\n" +
-            indent.clone() + "goto cleanup;\n", uses_add: false, uses_sub: false,
+            indent.clone() + "goto cleanup;\n", uses_add: false, uses_sub: false, uses_eq: false,
             uses_join: false, uses_format: false, returns: true })
     }
     parts = LowerProjectedStringParts(nodes, edges, bindings, layouts, id, can_convert)?
     assignment = EmitScalarStringAssignment(parts, indent)
-    return ok(GuardBlock { source: assignment.source + indent.clone() + "goto cleanup;\n", uses_add: false, uses_sub: false,
+    return ok(GuardBlock { source: assignment.source + indent.clone() + "goto cleanup;\n", uses_add: false, uses_sub: false, uses_eq: false,
         uses_join: true, uses_format: assignment.uses_format, returns: true })
 }
 
@@ -131,6 +132,7 @@ fn emitGuardBlock(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &lay
     uses_sub = false
     uses_join = false
     uses_format = false
+    uses_eq = false
     returns = false
     cursor = start
     while (cursor < end) {
@@ -162,6 +164,7 @@ fn emitGuardBlock(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &lay
             source += value.setup
             uses_add = uses_add || value.uses_add
             uses_sub = uses_sub || value.uses_sub
+            uses_eq = uses_eq || value.uses_eq
             if (found == 0) {
                 local = GuardBinding { name: statement.text, ty: value.ty, slot: statement_id, parameter: false, view: false }
                 name = GuardBindingName(local)
@@ -192,6 +195,7 @@ fn emitGuardBlock(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &lay
             uses_sub = uses_sub || condition.uses_sub || yes.uses_sub
             uses_join = uses_join || yes.uses_join
             uses_format = uses_format || yes.uses_format
+            uses_eq = uses_eq || condition.uses_eq || yes.uses_eq
             source += condition.setup + indent.clone() + "if ((bool)" + condition.value + ") {\n" + yes.source + indent.clone() + "}"
             if (start_else < stop) {
                 no = emitGuardBlock(nodes, edges, types, layouts, locals.clone(), start_else, stop, depth + 1, inside, can_convert)?
@@ -199,6 +203,7 @@ fn emitGuardBlock(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &lay
                 uses_sub = uses_sub || no.uses_sub
                 uses_join = uses_join || no.uses_join
                 uses_format = uses_format || no.uses_format
+                uses_eq = uses_eq || no.uses_eq
                 returns = yes.returns && no.returns
                 source += " else {\n" + no.source + indent.clone() + "}"
             }
@@ -208,11 +213,11 @@ fn emitGuardBlock(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &lay
         }
         cursor = cursor + 1
     }
-    return ok(GuardBlock { source: source, uses_add: uses_add, uses_sub: uses_sub,
+    return ok(GuardBlock { source: source, uses_add: uses_add, uses_sub: uses_sub, uses_eq: uses_eq,
         uses_join: uses_join, uses_format: uses_format, returns: returns })
 }
 
-fn guardArithmetic(add: bool, sub: bool): str {
+fn GuardArithmetic(add: bool, sub: bool): str {
     text = ""
     if (add || sub) { text = "#include <stdio.h>\n#include <stdlib.h>\n\n" }
     if (add) {
@@ -226,6 +231,11 @@ fn guardArithmetic(add: bool, sub: bool): str {
         text += "    *out = a - b;\n    return true;\n}\n\n"
     }
     return text
+}
+
+fn GuardStringEquality(needed: bool): str {
+    if (!needed) { return "" }
+    return "#include <string.h>\n\nstatic bool ku_guard_string_equal(KuProjectionString a, KuProjectionString b) {\n    return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0);\n}\n\n"
 }
 
 fn emitGuardedStructFunction(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
@@ -243,7 +253,7 @@ fn emitGuardedStructFunction(&nodes: [Node], &edges: [int], &types: [TypeNameBin
         RejectLayout("guarded_fallthrough", "every guarded C path must return a string", DeclarationSpan(function))?
     }
     arithmetic = body.uses_add || body.uses_sub
-    text = ProjectionHeaders(true, signature.drops != "") + guardArithmetic(body.uses_add, body.uses_sub)
+    text = ProjectionHeaders(true, signature.drops != "") + GuardArithmetic(body.uses_add, body.uses_sub) + GuardStringEquality(body.uses_eq)
     if (body.uses_join) {
         text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\ntypedef KuProjectionString KuBootstrapString;\n"
         text += ScalarStringJoinHelpers(body.uses_format)

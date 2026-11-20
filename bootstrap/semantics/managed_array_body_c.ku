@@ -1,0 +1,118 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
+import { ImportBinding, SuppliedModule } from "./imports.ku"
+import { TypeNameBinding } from "./type_names.ku"
+import { RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardExpression } from "./guarded_struct_expr.ku"
+import { AddGuardCode, EmitManagedAssignment, JoinManagedCode, ManagedBlank, ManagedCode, ManagedType } from "./managed_array_values_c.ku"
+
+struct ManagedBlock {
+    code: ManagedCode
+    declarations: str
+    drops: str
+    returns: bool
+}
+
+fn ownedDrop(&root: ManagedType, &binding: GuardBinding, &indent: str): str {
+    operation = "_element_drop(&"
+    if (binding.ty.kind == "array") { operation = "_drop(&" }
+    return indent.clone() + root.array.prefix.clone() + operation + GuardBindingName(binding) + ");\n"
+}
+
+fn managedReturn(&nodes: [Node], &edges: [int], &locals: [GuardBinding], &root: ManagedType,
+                 &statement: Node, &indent: str): str! {
+    if (statement.edge_count != 1) {
+        RejectLayout("unsupported_managed_return", "expected a returned array owner", DeclarationSpan(statement))?
+    }
+    result = nodes[edges[statement.first_edge] - 1].clone()
+    found = GuardBindingIndex(locals, result.text)
+    if (result.kind != "Variable" || found == 0 || locals[found - 1].view ||
+        locals[found - 1].ty.kind != "array" || locals[found - 1].ty.layout != root.layout) {
+        RejectLayout("unsupported_managed_return", "return requires an initialized array owner of the declared type", DeclarationSpan(result))?
+    }
+    name = GuardBindingName(locals[found - 1])
+    return ok(indent.clone() + "result = " + root.array.prefix.clone() + "_move(&" + name + ");\n" + indent.clone() + "goto cleanup;\n")
+}
+
+fn EmitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
+                   &supplied: [SuppliedModule], &layouts: [StructLayout], &root: ManagedType,
+                   bindings: [GuardBinding], start: int, end: int, depth: int, &indent: str): ManagedBlock! {
+    locals = bindings
+    code = ManagedBlank()
+    declarations = ""
+    drops = ""
+    scope_drops = ""
+    returns = false
+    cursor = start
+    while (cursor < end) {
+        statement_id = named.parsed.arena.edges[cursor]
+        statement = named.parsed.arena.nodes[statement_id - 1].clone()
+        if (returns) {
+            RejectLayout("unreachable_managed_statement", "a prior managed statement always returns", DeclarationSpan(statement))?
+        }
+        if (statement.kind == "Return") {
+            code.text = code.text + managedReturn(named.parsed.arena.nodes, named.parsed.arena.edges, locals, root, statement, indent)?
+            returns = true
+        } else if ((statement.kind == "Assign" && statement.edge_count == 1) ||
+                   (statement.kind == "VarDecl" && statement.edge_count == 2)) {
+            assignment = EmitManagedAssignment(named, types, imports, supplied, layouts, root, locals, statement_id, indent)?
+            code = JoinManagedCode(code, assignment.code)
+            if (assignment.introduces) {
+                binding = assignment.binding
+                if (binding.ty.kind == "struct" || binding.ty.kind == "array") {
+                    // Predeclare only managed owners. Any goto cleanup can
+                    // then safely drop zero, partial, complete or moved slots.
+                    declarations += "    " + GuardCType(binding.ty, layouts) + " " + GuardBindingName(binding) + " = {0};\n"
+                    drops = ownedDrop(root, binding, "    ") + drops
+                    scope_drops = ownedDrop(root, binding, indent) + scope_drops
+                }
+                locals = locals.push(binding)
+            }
+        } else if ((statement.kind == "If" || statement.kind == "While") && statement.edge_count >= 1) {
+            count = statement.edge_count - 1
+            then_count = count
+            if (statement.kind == "If") { then_count = statement.int_value }
+            if (depth >= 32 || then_count < 0 || then_count > count) {
+                RejectLayout("managed_block_limit", "managed C accepts at most 32 validated control levels", DeclarationSpan(statement))?
+            }
+            inside = indent.clone() + "    "
+            guard_indent = indent.clone()
+            if (statement.kind == "While") { guard_indent = inside.clone() }
+            guard = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts,
+                named.parsed.arena.edges[statement.first_edge], 0, guard_indent)?
+            if (guard.ty.kind != "bool") {
+                RejectLayout("managed_condition_type", "managed if and while require bool", DeclarationSpan(statement))?
+            }
+            child_start = statement.first_edge + 1
+            child = EmitManagedBlock(named, types, imports, supplied, layouts, root, locals.clone(),
+                child_start, child_start + then_count, depth + 1, inside)?
+            if (statement.kind == "While") { code.text = code.text + indent.clone() + "while (true) {\n" }
+            code = AddGuardCode(code, guard)
+            if (statement.kind == "While") {
+                code.text = code.text + inside.clone() + "if (!(bool)" + guard.value + ") break;\n"
+            } else {
+                code.text = code.text + indent.clone() + "if ((bool)" + guard.value + ") {\n"
+            }
+            code = JoinManagedCode(code, child.code)
+            code.text = code.text + indent.clone() + "}"
+            declarations += child.declarations
+            drops = child.drops + drops
+            if (then_count < count) {
+                otherwise = EmitManagedBlock(named, types, imports, supplied, layouts, root, locals.clone(),
+                    child_start + then_count, child_start + count, depth + 1, inside)?
+                code.text = code.text + " else {\n"
+                code = JoinManagedCode(code, otherwise.code)
+                code.text = code.text + indent.clone() + "}"
+                declarations += otherwise.declarations
+                drops = otherwise.drops + drops
+                returns = child.returns && otherwise.returns
+            }
+            code.text = code.text + "\n"
+        } else {
+            RejectLayout("unsupported_managed_statement", "expected an owner local, Copy local, if, while or return", DeclarationSpan(statement))?
+        }
+        cursor = cursor + 1
+    }
+    if (!returns) { code.text = code.text + scope_drops }
+    return ok(ManagedBlock { code: code, declarations: declarations, drops: drops, returns: returns })
+}

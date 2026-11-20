@@ -1,0 +1,238 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
+import { ImportBinding, SuppliedModule } from "./imports.ku"
+import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
+import { ContainsIndex } from "./struct_projection_c.ku"
+import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { CheckStructArrayType, StructArrayC } from "./struct_array_c.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression, GuardType, GuardValue } from "./guarded_struct_expr.ku"
+
+struct ManagedCode {
+    text: str
+    uses_add: bool
+    uses_sub: bool
+    uses_eq: bool
+}
+
+struct ManagedAssignment {
+    code: ManagedCode
+    binding: GuardBinding
+    introduces: bool
+}
+
+struct ManagedType {
+    layout: int
+    array: StructArrayC
+}
+
+fn AddGuardCode(&code: ManagedCode, &setup: GuardValue): ManagedCode {
+    return ManagedCode { text: code.text.clone() + setup.setup.clone(),
+        uses_add: code.uses_add || setup.uses_add, uses_sub: code.uses_sub || setup.uses_sub,
+        uses_eq: code.uses_eq || setup.uses_eq }
+}
+
+fn JoinManagedCode(&left: ManagedCode, right: ManagedCode): ManagedCode {
+    return ManagedCode { text: left.text.clone() + right.text,
+        uses_add: left.uses_add || right.uses_add, uses_sub: left.uses_sub || right.uses_sub,
+        uses_eq: left.uses_eq || right.uses_eq }
+}
+
+fn ManagedBlank(): ManagedCode {
+    return ManagedCode { text: "", uses_add: false, uses_sub: false, uses_eq: false }
+}
+
+fn ManagedExplicitType(&types: [TypeNameBinding], &nodes: [Node], &edges: [int],
+                       &layouts: [StructLayout], id: int): GuardType! {
+    if (nodes[id - 1].kind == "TypeArray") {
+        item = CheckStructArrayType(nodes, edges, types, id)?
+        index = LayoutIndex(layouts, item.module_index, item.declaration_node)
+        if (index <= 0) { RejectLayout("unknown_managed_layout", "array element has no bound layout", item.span.clone())? }
+        return ok(GuardType { kind: "array", layout: index })
+    }
+    return GuardExplicitType(types, nodes, layouts, id)
+}
+
+fn isMethod(&nodes: [Node], &edges: [int], &value: Node, &name: str, arity: int): bool {
+    if (value.kind != "Call" || value.edge_count != arity + 1) { return false }
+    method = nodes[edges[value.first_edge] - 1].clone()
+    return method.kind == "Field" && method.text == name && method.edge_count == 1
+}
+
+fn methodReceiver(&nodes: [Node], &edges: [int], &call: Node): int {
+    return edges[nodes[edges[call.first_edge] - 1].first_edge]
+}
+
+fn requireNewOwner(found: int, &statement: Node): null! {
+    if (found != 0) {
+        RejectLayout("unsupported_managed_reassignment", "owner initialization requires a fresh local scope", DeclarationSpan(statement))?
+    }
+    return ok(null)
+}
+
+fn localBinding(&statement: Node, statement_id: int, ty: GuardType): GuardBinding {
+    return GuardBinding { name: statement.text.clone(), ty: ty, slot: statement_id, parameter: false, view: false }
+}
+
+fn cloneArrayElement(&nodes: [Node], &edges: [int], &locals: [GuardBinding], &layouts: [StructLayout],
+                     &root: ManagedType, &call: Node, &binding: GuardBinding, &indent: str): ManagedCode! {
+    indexed = nodes[methodReceiver(nodes, edges, call) - 1].clone()
+    if (indexed.kind != "Index" || indexed.edge_count != 2) {
+        RejectLayout("unsupported_managed_clone", "expected a checked array index followed by clone", DeclarationSpan(call))?
+    }
+    base = GuardExpression(nodes, edges, locals, layouts, edges[indexed.first_edge], 0, indent)?
+    index = GuardExpression(nodes, edges, locals, layouts, edges[indexed.first_edge + 1], 0, indent)?
+    if (base.ty.kind != "array" || base.ty.layout != root.layout || index.ty.kind != "int") {
+        RejectLayout("managed_index_type", "expected the bound array type and an int index", DeclarationSpan(indexed))?
+    }
+    prefix = "&"
+    if (base.view) { prefix = "" }
+    code = AddGuardCode(ManagedBlank(), index)
+    selected = "i" + str(binding.slot)
+    access = ".len"
+    if (base.view) { access = "->len" }
+    code.text = code.text + indent.clone() + "int64_t " + selected.clone() + " = " + index.value + ";\n"
+    code.text = code.text + indent.clone() + "array_status = " + root.array.prefix.clone() + "_clone_at(" + prefix + base.value + ", " +
+        selected.clone() + ", &" + GuardBindingName(binding) + ");\n"
+    code.text = code.text + indent.clone() + "if (array_status == KU_STRUCT_ARRAY_BOUNDS) { failure_index = " + selected +
+        "; failure_length = " + base.value.clone() + access + "; }\n" + indent.clone() + "if (array_status) goto cleanup;\n"
+    return ok(code)
+}
+
+fn appendToOwner(&nodes: [Node], &edges: [int], &locals: [GuardBinding], &layouts: [StructLayout],
+                 &root: ManagedType, &call: Node, &binding: GuardBinding, &indent: str): ManagedCode! {
+    receiver = nodes[methodReceiver(nodes, edges, call) - 1].clone()
+    if (binding.ty.kind != "array" || binding.ty.layout != root.layout || binding.parameter || binding.view ||
+        receiver.kind != "Variable" || receiver.text != binding.name) {
+        RejectLayout("unsupported_managed_append", "append requires assigning to the same owning local array", DeclarationSpan(call))?
+    }
+    item = GuardExpression(nodes, edges, locals, layouts, edges[call.first_edge + 1], 0, indent)?
+    if (item.ty.kind != "struct" || item.ty.layout != root.layout) {
+        RejectLayout("managed_append_type", "append requires an element of the bound array type", DeclarationSpan(call))?
+    }
+    prefix = "&"
+    if (item.view) { prefix = "" }
+    // Named push arguments are kept alive and copied by the language. The
+    // helper clones before growing so a borrowed element may alias storage.
+    code = AddGuardCode(ManagedBlank(), item)
+    code.text = code.text + indent.clone() + "array_status = " + root.array.prefix.clone() + "_append_clone(&" + GuardBindingName(binding) + ", " +
+        prefix + item.value + ");\n" + indent.clone() + "if (array_status) goto cleanup;\n"
+    return ok(code)
+}
+
+fn constructorFields(&nodes: [Node], &edges: [int], &locals: [GuardBinding], &layouts: [StructLayout],
+                     &root: ManagedType, &literal: Node, &binding: GuardBinding, &indent: str): ManagedCode! {
+    code = ManagedBlank()
+    seen: [int] = []
+    index = 0
+    while (index < literal.edge_count) {
+        item = nodes[edges[literal.first_edge + index] - 1].clone()
+        field = FieldIndex(layouts[root.layout - 1].fields, item.text)
+        if (item.kind != "StructLiteralField" || item.edge_count != 1 || field == 0 || ContainsIndex(seen, field)) {
+            RejectLayout("managed_literal_field", "expected each bound element field once", DeclarationSpan(item))?
+        }
+        expected = GuardBoundType(layouts[root.layout - 1].fields[field - 1].resolved, layouts)?
+        value = GuardExpression(nodes, edges, locals, layouts, edges[item.first_edge], 0, indent)?
+        if (expected.kind != value.ty.kind || (expected.kind != "int" && expected.kind != "bool" && expected.kind != "str")) {
+            RejectLayout("managed_literal_type", "element literals require matching scalar or str fields", DeclarationSpan(item))?
+        }
+        code = AddGuardCode(code, value)
+        target = GuardBindingName(binding) + ".f" + str(field - 1)
+        if (expected.kind == "str") {
+            code.text = code.text + indent.clone() + "if (!" + root.array.prefix.clone() + "_clone_string(" + value.value + ", &" + target +
+                ")) { array_status = KU_STRUCT_ARRAY_OOM; goto cleanup; }\n"
+        } else {
+            code.text = code.text + indent.clone() + target + " = " + value.value + ";\n"
+        }
+        index = index + 1
+        seen = seen.push(field)
+    }
+    if (seen.len() != layouts[root.layout - 1].fields.len()) {
+        RejectLayout("managed_literal_field", "element literal must initialize every field", DeclarationSpan(literal))?
+    }
+    return ok(code)
+}
+
+fn validateDeclaration(&declared: GuardType, &actual: GuardType, found: int, &statement: Node): null! {
+    if (statement.kind == "VarDecl" &&
+        (found != 0 || declared.kind != actual.kind || declared.layout != actual.layout)) {
+        RejectLayout("managed_local_type", "typed local requires a fresh slot and matching initializer", DeclarationSpan(statement))?
+    }
+    return ok(null)
+}
+
+fn managedInitializer(&named: NamedModule, &imports: [ImportBinding], &supplied: [SuppliedModule],
+                      &locals: [GuardBinding], &layouts: [StructLayout], &root: ManagedType,
+                      &statement: Node, statement_id: int, &node: Node, node_id: int, &declared: GuardType,
+                      found: int, &indent: str): ManagedAssignment! {
+    requireNewOwner(found, statement)?
+    if (node.kind == "Array") {
+        if (node.edge_count != 0 || declared.kind != "array" || declared.layout != root.layout) {
+            RejectLayout("unsupported_managed_array_literal", "expected a typed empty array of the bound element", DeclarationSpan(node))?
+        }
+        return ok(ManagedAssignment { code: ManagedBlank(), binding: localBinding(statement, statement_id, declared.clone()), introduces: true })
+    }
+    ty = GuardType { kind: "struct", layout: root.layout }
+    validateDeclaration(declared, ty, found, statement)?
+    binding = localBinding(statement, statement_id, ty)
+    if (node.kind == "StructLiteral") {
+        actual = ResolveTypeName(node, node_id, named.names.declarations, imports, supplied)?
+        if (actual.declaration_kind != "Struct" || LayoutIndex(layouts, actual.module_index, actual.declaration_node) != root.layout) {
+            RejectLayout("managed_literal_type", "expected a literal of the bound element type", DeclarationSpan(node))?
+        }
+        fields = constructorFields(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts, root, node, binding, indent)?
+        return ok(ManagedAssignment { code: fields, binding: binding, introduces: true })
+    }
+    code = cloneArrayElement(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts, root, node, binding, indent)?
+    return ok(ManagedAssignment { code: code, binding: binding, introduces: true })
+}
+
+fn copyAssignment(&nodes: [Node], &edges: [int], &locals: [GuardBinding], &layouts: [StructLayout],
+                  &statement: Node, statement_id: int, node_id: int, &declared: GuardType, found: int,
+                  &indent: str): ManagedAssignment! {
+    value = GuardExpression(nodes, edges, locals, layouts, node_id, 0, indent)?
+    if (value.ty.kind != "int" && value.ty.kind != "bool") {
+        RejectLayout("unsupported_managed_local", "expected a Copy scalar or a supported owner initialization", DeclarationSpan(statement))?
+    }
+    validateDeclaration(declared, value.ty, found, statement)?
+    code = AddGuardCode(ManagedBlank(), value)
+    if (found == 0) {
+        binding = localBinding(statement, statement_id, value.ty)
+        name = GuardBindingName(binding)
+        code.text = code.text + indent.clone() + GuardCType(binding.ty, layouts) + " " + name.clone() + " = " + value.value + ";\n" +
+            indent.clone() + "(void)" + name + ";\n"
+        return ok(ManagedAssignment { code: code, binding: binding, introduces: true })
+    }
+    binding = locals[found - 1].clone()
+    if (binding.parameter || binding.ty.kind != value.ty.kind) {
+        RejectLayout("managed_local_type", "assignment must retain the initialized local type", DeclarationSpan(statement))?
+    }
+    code.text = code.text + indent.clone() + GuardBindingName(binding) + " = " + value.value + ";\n"
+    return ok(ManagedAssignment { code: code, binding: binding, introduces: false })
+}
+
+fn EmitManagedAssignment(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
+                         &supplied: [SuppliedModule], &layouts: [StructLayout], &root: ManagedType,
+                         &locals: [GuardBinding], statement_id: int, &indent: str): ManagedAssignment! {
+    statement = named.parsed.arena.nodes[statement_id - 1].clone()
+    declared = GuardType { kind: "", layout: 0 }
+    found = GuardBindingIndex(locals, statement.text)
+    if (statement.kind == "VarDecl") {
+        declared = ManagedExplicitType(types, named.parsed.arena.nodes, named.parsed.arena.edges, layouts,
+            named.parsed.arena.edges[statement.first_edge])?
+    }
+    node_id = named.parsed.arena.edges[statement.first_edge + statement.edge_count - 1]
+    node = named.parsed.arena.nodes[node_id - 1].clone()
+    if (node.kind == "Array" || node.kind == "StructLiteral" ||
+        isMethod(named.parsed.arena.nodes, named.parsed.arena.edges, node, "clone", 0)) {
+        return managedInitializer(named, imports, supplied, locals, layouts, root, statement, statement_id, node, node_id, declared, found, indent)
+    }
+    if (isMethod(named.parsed.arena.nodes, named.parsed.arena.edges, node, "push", 1)) {
+        if (found == 0 || statement.kind != "Assign") {
+            RejectLayout("unsupported_managed_append", "append requires an existing owning local", DeclarationSpan(node))?
+        }
+        binding = locals[found - 1].clone()
+        code = appendToOwner(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts, root, node, binding, indent)?
+        return ok(ManagedAssignment { code: code, binding: binding, introduces: false })
+    }
+    return copyAssignment(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts, statement, statement_id, node_id, declared, found, indent)
+}
