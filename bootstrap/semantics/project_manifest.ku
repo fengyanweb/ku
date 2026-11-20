@@ -40,7 +40,7 @@ fn ManifestPaths(manifest: str, at: Span): [str]! {
 // supplies the directory prefix, including its final slash, separately.
 fn readProjectModule(path: str, &prefix: str): SuppliedModule! {
     try {
-        source: str
+        source: str = ""
         if (prefix == "") { source = fs.read(path)? }
         else { source = fs.read(prefix.clone() + path.clone())? }
         named = BuildNameTable(ParseModule(source)?)?
