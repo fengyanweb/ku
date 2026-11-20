@@ -321,6 +321,8 @@ return or failure transfers its selected Result through the same cleanup as
 the final return. Only the untaken path can reach the following statements.
 Linked `print` and `println` can read a checked string expression once;
 its temporary is released after the write without consuming a named owner.
+A checked call used as a statement drops its success payload before the next
+statement and transfers the original Error if the call fails.
 
 The linked path also moves an owned record out of a checked dependency.
 It uses the project's nominal layout and destructor for nested fields. A

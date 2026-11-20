@@ -442,3 +442,89 @@ pub(super) fn assert_terminal_try_unwind(seed: &Path, cwd: &Path) {
     assert!(refused.stdout.is_empty());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("unavailable_linked_binding"));
 }
+
+pub(super) fn assert_ignored_result_cleanup(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("ignored-source.ku"),
+        r#"import { Open, Observe } from "./ignored-dependency.ku"
+fn Use(failed: bool): null! {
+    Open(failed)?
+    Observe()?
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("ignored-dependency.ku"),
+        r#"struct Item { label: str }
+struct Packet { item: Item }
+fn Open(failed: bool): Packet! { return ok(Packet { item: Item { label: "payload" } }) }
+fn Observe(): null! { return ok(null) }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "ignored-source.ku\nignored-dependency.ku\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("function.txt"), "Use").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let generated = String::from_utf8(emitted.stdout).unwrap();
+    let declaration = |prefix: &str| {
+        let line = generated
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .expect("generated declaration");
+        let (function, _) = line.split_once('(').expect("function parameters");
+        function.rsplit_once(' ').unwrap()
+    };
+    let (_, entry) = declaration("KuBootstrapResultNull ku_linked_null_");
+    let (open_result, open) = declaration("extern KuBootstrapResult_KuStruct_");
+    let (_, observe) = declaration("extern KuBootstrapResultNull ku_value_dependency_");
+    let host = r#"
+static int opens, checks;
+__RESULT__ __OPEN__(bool bad) {
+    uint8_t *bytes = malloc(7);
+    memcpy(bytes, "payload", 7);
+    KuProjectionString owned = { bytes,7,7,KU_PROJECTION_STRING_OWNED };
+    ++opens;
+    if (bad) return (__RESULT__){.error = {.message = owned}};
+    __RESULT__ result = {.ok = true};
+    result.value.f0.f0 = owned;
+    return result;
+}
+KuBootstrapResultNull __OBSERVE__(void) {
+    assert(outstanding() == 0);
+    ++checks;
+    return (KuBootstrapResultNull){.ok = true};
+}
+int main(void) {
+    (void)test_realloc;
+    assert(__ENTRY__(false).ok);
+    assert(opens == 1 && checks == 1 && outstanding() == 0);
+    KuBootstrapResultNull errored = __ENTRY__(true);
+    assert(!errored.ok && opens == 2 && checks == 1 && outstanding() == 1);
+    assert(memcmp(errored.error.message.ptr,"payload",7) == 0);
+    ku_projection_string_drop(&errored.error.message);
+    assert(outstanding() == 0);
+    return 0;
+}
+"#
+    .replace("__ENTRY__", entry)
+    .replace("__OPEN__", open)
+    .replace("__RESULT__", open_result.trim_start_matches("extern "))
+    .replace("__OBSERVE__", observe);
+    let source = cwd.join("ignored-result.c");
+    let program = cwd.join(format!("ignored-result{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &source,
+        format!("{CHECKED_ARRAY_ALLOCATOR}{generated}{host}"),
+    )
+    .unwrap();
+    compile_projection(&source, &program, cwd);
+    assert_ok(&execute(&mut Command::new(&program), cwd, 15));
+}

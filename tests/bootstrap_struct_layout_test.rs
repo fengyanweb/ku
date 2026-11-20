@@ -4055,4 +4055,5 @@ int main(int argc, char **argv) {
     linked_guard::assert_terminal_branch_ownership(&compiler, &cwd);
     linked_guard::assert_checked_output_ownership(&compiler, &cwd);
     linked_guard::assert_terminal_try_unwind(&compiler, &cwd);
+    linked_guard::assert_ignored_result_cleanup(&compiler, &cwd);
 }
