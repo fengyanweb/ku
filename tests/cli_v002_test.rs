@@ -71,6 +71,57 @@ fn run_ku(args: &[&str]) -> RunResult {
     run_with_timeout(&bin, args, Duration::from_secs(2))
 }
 
+#[test]
+fn doctor_build_identity_uses_only_the_actual_executable() {
+    use ku::{span::Span, stdlib::json, value::Value};
+
+    let root = unique_temp_dir("doctor-identity");
+    fs::create_dir(&root).unwrap();
+    let binary = root.join(format!("ku{}", env::consts::EXE_SUFFIX));
+    fs::copy(ku_binary(), &binary).unwrap();
+    let mut command = Command::new(&binary);
+    command
+        .current_dir(&root)
+        .env("KU_RUNNER_RUSTC", root.join("missing-rustc"))
+        .env("KU_CC", root.join("missing-cc"))
+        .args(["doctor", "--build-identity"]);
+    let output = run_bounded(
+        &mut command,
+        Duration::from_secs(8),
+        SHORT_PROCESS_OUTPUT_LIMITS,
+    );
+    fs::remove_dir_all(root).unwrap();
+    let output = output.expect("bounded CLI identity");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let json = Value::String(String::from_utf8(output.stdout).unwrap());
+    let Some(Value::Result { ok: true, value }) =
+        json::eval("decode", &[json], Span::default()).unwrap()
+    else {
+        panic!("expected CLI identity JSON");
+    };
+    let Value::Object(fields) = *value else {
+        panic!("expected a CLI identity record");
+    };
+    assert_eq!(fields.len(), 7);
+    assert_eq!(fields["schema"], Value::String("ku-doctor-v1".into()));
+    assert_eq!(
+        fields["ku_version"],
+        Value::String(env!("CARGO_PKG_VERSION").into())
+    );
+    for field in ["build_source_sha256", "build_identity_sha256"] {
+        assert!(
+            matches!(&fields[field], Value::String(hash) if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        );
+    }
+    let conflicting = run_ku(&["doctor", "--build-identity", "--backend", "c"]);
+    assert_eq!(conflicting.code, Some(1));
+    assert!(conflicting.stdout.is_empty());
+    assert!(conflicting
+        .stderr
+        .contains("does not take additional options"));
+}
+
 fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }

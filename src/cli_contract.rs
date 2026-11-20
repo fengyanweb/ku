@@ -199,10 +199,10 @@ pub const COMMANDS: &[CommandContract] = &[
         value_options: &[], flags: DEPENDENCY_FLAGS, maximum_paths: 1,
     },
     CommandContract {
-        name: "doctor", usage: "ku doctor [--json] [--backend runner|c]\n  ku doctor --install-runner-toolchain",
+        name: "doctor", usage: "ku doctor [--json] [--backend runner|c]\n  ku doctor --build-identity\n  ku doctor --install-runner-toolchain",
         description: "Diagnose the current Ku installation and available build tools.",
-        notes: "Default diagnostics are read-only; optional unrequested backends may warn. --backend runner or --backend c requires that backend to be ready. --json emits a stable JSON object only. --install-runner-toolchain explicitly installs this bundle's required Rust toolchain without changing global defaults or project overrides. KU_RUNNER_RUSTC is an explicit absolute compiler path: it has priority and a mismatched compiler is rejected rather than ignored. Help never probes or installs tools and cannot be combined with --json.",
-        value_options: &["--backend"], flags: &["--json", "--install-runner-toolchain"], maximum_paths: 0,
+        notes: "Default diagnostics are read-only; optional unrequested backends may warn. --backend runner or --backend c requires that backend to be ready. --json emits a stable JSON object only. --build-identity reports the CLI's compiled-in identity as JSON without loading a runtime bundle or probing build tools. --install-runner-toolchain explicitly installs this bundle's required Rust toolchain without changing global defaults or project overrides. KU_RUNNER_RUSTC is an explicit absolute compiler path: it has priority and a mismatched compiler is rejected rather than ignored. Help never probes or installs tools and cannot be combined with --json.",
+        value_options: &["--backend"], flags: &["--json", "--build-identity", "--install-runner-toolchain"], maximum_paths: 0,
     },
     CommandContract {
         name: "version", usage: "ku version", description: "Print Ku version.",

@@ -1863,7 +1863,7 @@ try {
     [IO.File]::WriteAllText($rustcIdentityPath, $rustcOutput, $utf8)
     # Query the actual same-build CLI. The source path is still present here;
     # metadata creation never substitutes the currently installed daily CLI.
-    $cliIdentity = Invoke-BoundedTool (Join-Path $targetRelease $contract.Executable) @('doctor', '--json') $repo $workRoot 'publisher-cli-identity' 30000 $wrapper
+    $cliIdentity = Invoke-BoundedTool (Join-Path $targetRelease $contract.Executable) @('doctor', '--build-identity') $repo $workRoot 'publisher-cli-identity' 30000 $wrapper
     if ($cliIdentity.ExitCode -ne 0) { throw "Cannot read the actual CLI build identity: $($cliIdentity.Output)" }
     $buildIdentityPath = Join-Path $workRoot 'publisher-build-identity.json'
     [IO.File]::WriteAllText($buildIdentityPath, $cliIdentity.Stdout, $utf8)

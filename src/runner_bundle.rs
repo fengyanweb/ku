@@ -866,7 +866,60 @@ fn probe_compiler(path: &Path, source: &'static str) -> KuResult<Compiler> {
     })
 }
 
+fn doctor_identity_fields() -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::<String, Value>::new();
+    fields.insert("schema".into(), Value::String("ku-doctor-v1".into()));
+    fields.insert(
+        "ku_version".into(),
+        Value::String(env!("CARGO_PKG_VERSION").into()),
+    );
+    fields.insert(
+        "source_commit".into(),
+        Value::String(env!("KU_BUILD_SOURCE_COMMIT").into()),
+    );
+    fields.insert(
+        "build_source_sha256".into(),
+        Value::String(env!("KU_BUILD_SOURCE_SHA256").into()),
+    );
+    fields.insert(
+        "build_identity_sha256".into(),
+        Value::String(build_identity().into()),
+    );
+    fields.insert(
+        "msrv".into(),
+        Value::String(env!("CARGO_PKG_RUST_VERSION").into()),
+    );
+    fields.insert(
+        "executable".into(),
+        Value::String(
+            env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
+    );
+    fields
+}
+
+fn write_doctor_json(fields: BTreeMap<String, Value>) -> KuResult<()> {
+    println!(
+        "{}",
+        json::stringify_value(
+            &Value::Object(fields.into_iter().collect()),
+            Span::default()
+        )?
+    );
+    Ok(())
+}
+
 pub fn run_doctor(args: &[String]) -> KuResult<()> {
+    if args.get(2).is_some_and(|arg| arg == "--build-identity") {
+        if args.len() != 3 {
+            return Err(error(
+                "doctor --build-identity does not take additional options",
+            ));
+        }
+        return write_doctor_json(doctor_identity_fields());
+    }
     let mut as_json = false;
     let mut backend = None;
     let mut install = false;
@@ -899,36 +952,7 @@ pub fn run_doctor(args: &[String]) -> KuResult<()> {
     let bundle = RuntimeBundle::load(None);
     let mut problems = Vec::new();
     let mut warnings = Vec::new();
-    let mut fields = BTreeMap::<String, Value>::new();
-    fields.insert("schema".into(), Value::String("ku-doctor-v1".into()));
-    fields.insert(
-        "ku_version".into(),
-        Value::String(env!("CARGO_PKG_VERSION").into()),
-    );
-    fields.insert(
-        "source_commit".into(),
-        Value::String(env!("KU_BUILD_SOURCE_COMMIT").into()),
-    );
-    fields.insert(
-        "build_source_sha256".into(),
-        Value::String(env!("KU_BUILD_SOURCE_SHA256").into()),
-    );
-    fields.insert(
-        "build_identity_sha256".into(),
-        Value::String(build_identity().into()),
-    );
-    fields.insert(
-        "msrv".into(),
-        Value::String(env!("CARGO_PKG_RUST_VERSION").into()),
-    );
-    fields.insert(
-        "executable".into(),
-        Value::String(
-            env::current_exe()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-        ),
-    );
+    let mut fields = doctor_identity_fields();
     let installed = match find_program("rustup") {
         Some(path) => match installed_toolchains(&path) {
             Ok(installed) => installed,
@@ -1122,13 +1146,7 @@ pub fn run_doctor(args: &[String]) -> KuResult<()> {
         Value::Array(problems.iter().cloned().map(Value::String).collect()),
     );
     if as_json {
-        println!(
-            "{}",
-            json::stringify_value(
-                &Value::Object(fields.into_iter().collect()),
-                Span::default()
-            )?
-        );
+        write_doctor_json(fields)?;
     } else {
         println!(
             "Ku doctor {}\nExecutable: {}",
