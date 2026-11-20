@@ -238,7 +238,7 @@ fn guardLeafCall(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layo
     position = 0
     while (position < leaves.len()) {
         leaf = leaves[position].clone()
-        if (leaf.name == target.text) {
+        if (leaf.name == target.text && leaf.result_kind != "str") {
             if (node.edge_count != leaf.parameters.len() + 1) {
                 RejectLayout("guarded_leaf_arity", "argument count must match the checked leaf", DeclarationSpan(node))?
             }

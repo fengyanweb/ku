@@ -13,6 +13,7 @@ import { AddGuardCode, JoinManagedCode, ManagedBlank, ManagedCode, ManagedString
 import { EmitManagedBlock, EmitRecordResultPrelude } from "./managed_array_body_c.ku"
 import { EmitOwnedStructOperations, EmitTryCloneString, StructArrayC } from "./struct_array_c.ku"
 import { LowerStructResultLink, ReadOwnedScalarLeaves, RecordResultCallId, ResultLinkClonePrefix, WithoutOwnedBinding } from "./struct_result_link_c.ku"
+import { HasScalarBuiltin } from "./scalar_int_operands.ku"
 
 struct StructResultC {
     symbol: str
@@ -42,6 +43,7 @@ struct StructResultBody {
     drops: str
     clone_layouts: [int]
     plan: [LinkPlanDeclaration]
+    error_exits: str
 }
 
 fn orderResultLayout(&layouts: [StructLayout], index: int, at: Span): CStructOrder! {
@@ -127,21 +129,6 @@ fn readStructResultSignature(&named: NamedModule, &types: [TypeNameBinding], &la
         unused: unused, drops: drops, body_start: result_edge + 1, plan: plan, string_array: string_array, layouts: declared })
 }
 
-fn isBoundOk(&named: NamedModule, &locals: [GuardBinding], &imports: [ImportBinding]): bool {
-    if (GuardBindingIndex(locals, "ok") != 0) { return false }
-    index = 0
-    while (index < named.names.declarations.len()) {
-        if (named.names.declarations[index].name == "ok") { return false }
-        index = index + 1
-    }
-    index = 0
-    while (index < imports.len()) {
-        if (imports[index].local_name == "ok") { return false }
-        index = index + 1
-    }
-    return true
-}
-
 fn emitResultFields(&named: NamedModule, &locals: [GuardBinding], &layouts: [StructLayout],
                     layout: int, &literal: Node, &indent: str, move_locals: bool): ManagedCode! {
     code = ManagedBlank()
@@ -208,7 +195,7 @@ fn emitStructReturn(&named: NamedModule, &imports: [ImportBinding], &supplied: [
     callee = named.parsed.arena.nodes[named.parsed.arena.edges[call.first_edge] - 1].clone()
     payload_id = named.parsed.arena.edges[call.first_edge + 1]
     literal = named.parsed.arena.nodes[payload_id - 1].clone()
-    if (callee.kind != "Variable" || callee.text != "ok" || callee.edge_count != 0 || !isBoundOk(named, locals, imports) ||
+    if (callee.kind != "Variable" || callee.text != "ok" || callee.edge_count != 0 || GuardBindingIndex(locals, "ok") != 0 || !HasScalarBuiltin(named, "ok") ||
         literal.kind != "StructLiteral") {
         RejectLayout("unsupported_struct_result_return", "expected builtin ok with a named payload literal", DeclarationSpan(call))?
     }
@@ -265,7 +252,7 @@ fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports
         cursor = cursor + 1
     }
     return ok(StructResultBody { code: code, prototype: prototype, dependency: dependency,
-        declarations: declarations, drops: drops, clone_layouts: clone_layouts, plan: plan })
+        declarations: declarations, drops: drops, clone_layouts: clone_layouts, plan: plan, error_exits: "" })
 }
 
 fn emitOwnedResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
@@ -284,9 +271,11 @@ fn emitOwnedResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports:
         named.parsed.arena.nodes[named.parsed.arena.edges[end] - 1], "    ", true)?
     plan = prelude.plan
     for leaf in leaves.plan { plan = plan.push(leaf) }
+    declarations = prelude.declarations + block.declarations
+    if (block.error_exits != "") { declarations = "    int record_error = 0;\n" + declarations }
     return ok(StructResultBody { code: JoinManagedCode(prelude.code, JoinManagedCode(block.code, result)),
-        prototype: prelude.prototype + leaves.declarations, dependency: "", declarations: prelude.declarations + block.declarations,
-        drops: block.drops + prelude.drops, clone_layouts: [], plan: plan })
+        prototype: prelude.prototype + leaves.declarations, dependency: "", declarations: declarations,
+        drops: block.drops + prelude.drops, clone_layouts: [], plan: plan, error_exits: block.error_exits })
 }
 
 fn StructResultHeader(): str {
@@ -312,7 +301,7 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     call = RecordResultCallId(named, named.parsed.arena.edges[signature.body_start])
     managed = signature.string_array || call != 0
     body: StructResultBody = StructResultBody { code: ManagedBlank(), prototype: "", dependency: "", declarations: "",
-        drops: "", clone_layouts: [], plan: [] }
+        drops: "", clone_layouts: [], plan: [], error_exits: "" }
     if (managed) {
         body = emitOwnedResultBody(named, types, imports, supplied, layouts, id, inner.layout, signature, call)?
     } else {
@@ -368,7 +357,7 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     if (overflow) {
         text += "    if (overflow) { " + drop + "(&result); fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n"
     }
-    text += "    return result;\n}\n"
+    text += body.error_exits + "    return result;\n}\n"
     return ok(StructResultC { symbol: symbol, dependency: body.dependency, source: text,
         entry_plan: plan, link_plan: body.plan })
 }

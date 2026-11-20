@@ -1797,6 +1797,25 @@ fn ObserveFraction(&characters: [str], index: int, length: int): FractionProbe! 
     let plan = String::from_utf8(plan.stdout).unwrap();
     assert!(plan.contains(r#""source_name":"HasFractionPoint","symbol":"ku_guarded_"#));
     assert!(plan.contains(r#""source_name":"IsDigit","symbol":"ku_bool_"#));
+
+    fs::write(&lexer, include_str!("../bootstrap/stage1/lexer.ku")).unwrap();
+    fs::write(cwd.join("function.txt"), "ScanNumber").unwrap();
+    let plan = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plan);
+    let plan = String::from_utf8(plan.stdout).unwrap();
+    assert!(plan.contains(r#""source_name":"ScanIntegerPrefix","symbol":"ku_struct_result_"#));
+    assert!(plan.contains(r#""source_name":"At","symbol":"ku_str_"#));
+
+    fs::write(cwd.join("mode.txt"), "struct-result").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let (body, cleanup) = text.split_once("\ncleanup:\n").unwrap();
+    assert!(body.contains("record_error = ") && body.contains("error_arg"));
+    assert!(!body.contains("result.error.message = ku_str_"));
+    let call = cleanup.find("result.error.message = ku_str_").unwrap();
+    let last_drop = cleanup.rfind("ku_projection_string_drop(&").unwrap();
+    assert!(last_drop < call);
 }
 
 fn assert_constructor_view(seed: &Path, cwd: &Path) {

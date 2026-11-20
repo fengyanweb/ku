@@ -300,6 +300,15 @@ fn EmitManagedAssignment(&named: NamedModule, &types: [TypeNameBinding], &import
     }
     node_id = named.parsed.arena.edges[statement.first_edge + statement.edge_count - 1]
     node = named.parsed.arena.nodes[node_id - 1].clone()
+    if (root.string_locals && node.kind == "String" && found != 0 && statement.kind == "Assign") {
+        previous = locals[found - 1].clone()
+        if (previous.ty.kind == "str" && !previous.parameter && !previous.view) {
+            target = GuardBindingName(previous)
+            update = ownedStringSetup(named, locals, layouts, root, node_id, target, indent)?
+            update.text = indent.clone() + "ku_projection_string_drop(&" + target + ");\n" + update.text
+            return ok(ManagedAssignment { code: update, binding: previous, introduces: false })
+        }
+    }
     if (root.string_locals && (node.kind == "String" || GuardCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, node_id) != 0)) {
         ty = GuardType { kind: "str", layout: 0 }
         requireNewOwner(found, statement)?

@@ -150,15 +150,13 @@ fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layout
         id = ownedScalarLeafId(named, call)
         if (id == 0 || ContainsIndex(emitted, id)) { continue }
         leaf = named.parsed.arena.nodes[id - 1].clone()
-        position = 0
-        while (position < leaf.edge_count && named.parsed.arena.nodes[named.parsed.arena.edges[leaf.first_edge + position] - 1].kind == "Parameter") {
-            position = position + 1
-        }
-        if (position == 0 || position >= leaf.edge_count - 1) { continue }
+        position = call.edge_count - 1
+        if (position >= leaf.edge_count - 1) { continue }
         result = named.parsed.arena.edges[leaf.first_edge + position]
         if (named.parsed.arena.nodes[result - 1].kind != "TypeName") { continue }
         selected = ExplicitType(types, result, DeclarationSpan(named.parsed.arena.nodes[result - 1]))?
-        if (selected.declaration_kind != "Builtin" || (selected.name != "int" && selected.name != "bool")) { continue }
+        string_result = selected.name == "str"
+        if (selected.declaration_kind != "Builtin" || (!string_result && selected.name != "int" && selected.name != "bool")) { continue }
         view_predicate = false
         owned_string = false
         parameters: [LinkPlanType] = []
@@ -167,11 +165,11 @@ fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layout
         cursor = 0
         while (cursor < position) {
             parameter = named.parsed.arena.nodes[named.parsed.arena.edges[leaf.first_edge + cursor] - 1].clone()
-            if (parameter.edge_count != 1 || parameter.int_value < 0 || parameter.int_value > 1) { break }
+            if (parameter.kind != "Parameter" || parameter.edge_count != 1 || parameter.int_value < 0 || parameter.int_value > 1) { break }
             view = parameter.int_value == 1
             type_id = named.parsed.arena.edges[parameter.first_edge]
             shape = named.parsed.arena.nodes[type_id - 1].kind.clone()
-            if ((view && shape != "TypeArray") || (!view && shape != "TypeName")) { break }
+            if ((view && (shape != "TypeArray" || string_result)) || (!view && shape != "TypeName")) { break }
             input = GuardParameterType(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, type_id, view)?
             c_type = GuardCType(input, layouts)
             if (view) {
@@ -179,8 +177,8 @@ fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layout
                 c_type = "const " + c_type + "*"
                 parameters = parameters.push(StrArrayViewLinkPlanType())
             } else {
-                if (input.kind == "str" && position == 1) { owned_string = true }
-                else if (input.kind != "int" && input.kind != "bool") { break }
+                if (input.kind == "str" && (position == 1 || string_result)) { owned_string = true }
+                else if (input.kind != "int" && (input.kind != "bool" || string_result)) { break }
                 parameters = parameters.push(BuiltinLinkPlanType(input.kind.clone(), c_type.clone(), false))
             }
             if (cursor != 0) { c_args += ", " }
@@ -188,11 +186,12 @@ fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layout
             kinds = kinds.push(input.kind)
             cursor = cursor + 1
         }
-        if (cursor != position || (!owned_string && (!view_predicate || selected.name != "bool"))) { continue }
+        if (cursor != position || (!owned_string && !string_result && (!view_predicate || selected.name != "bool"))) { continue }
         symbol = "ku_guarded_" + str(id)
-        if (owned_string) {
+        if (owned_string || string_result) {
             scalar_type = 1
             if (selected.name == "bool") { scalar_type = 3 }
+            if (string_result) { scalar_type = 2 }
             symbol = ScalarSymbol(id, scalar_type)
         }
         ty = GuardBoundType(selected, layouts)?

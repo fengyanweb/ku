@@ -273,6 +273,12 @@ Link its typed result plan with `project-int` providers for `IsDigit` and
 lexeme buffer. `ScanNumber` still decides whether the same prefix belongs to an
 integer or a decimal float before reporting an overflowing integer.
 
+`ScanNumber` also emits through `struct-result`. Its kind updates replace
+an owned local with a static string. The overflow branch binds the original
+`At` through `project-int`. It snapshots the message's Copy arguments before
+cleanup and calls the provider after releasing the numeric frame's owners.
+The returned Error takes ownership of the provider's formatted string.
+
 The `linked-str` and `struct-result` modes emit `DiagnosticCanonical` and
 `ReadPrimaryAtom` from their original modules. Generated `extern` declarations
 identify dependencies that must be linked as C functions with the bound ABI.

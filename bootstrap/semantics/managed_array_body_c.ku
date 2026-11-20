@@ -12,6 +12,7 @@ import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, Guar
 import { AddGuardCode, EmitManagedAssignment, EmitManagedStringAppend, JoinManagedCode, ManagedBlank, ManagedCode, ManagedExpression, ManagedType } from "./managed_array_values_c.ku"
 import { HasScalarBuiltin } from "./scalar_int_operands.ku"
 import { ScalarStaticErrorFields } from "./scalar_result_null.ku"
+import { LowerManagedRecordError } from "./guarded_string_parts.ku"
 
 struct ManagedBlock {
     code: ManagedCode
@@ -19,6 +20,7 @@ struct ManagedBlock {
     drops: str
     returns: bool
     bindings: [GuardBinding]
+    error_exits: str
 }
 
 fn ownedDrop(&root: ManagedType, &binding: GuardBinding, &indent: str): str {
@@ -77,6 +79,7 @@ fn emitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     declarations = ""
     drops = ""
     scope_drops = ""
+    error_exits = ""
     returns = false
     cursor = start
     while (cursor < end) {
@@ -90,6 +93,14 @@ fn emitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
                 RejectLayout("unsupported_managed_return", "result loops require one return after the managed body", DeclarationSpan(statement))?
             }
             code.text = code.text + managedReturn(named.parsed.arena.nodes, named.parsed.arena.edges, locals, root, statement, indent, checked, can_use_ok)?
+            returns = true
+        } else if (root.string_locals && statement.kind == "Fail" && statement.edge_count == 1) {
+            failure = named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge] - 1].clone()
+            lowered = LowerManagedRecordError(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts,
+                root.leaves, failure, statement_id, indent)?
+            code = AddGuardCode(code, lowered.prep)
+            declarations += lowered.declarations
+            error_exits += lowered.after_cleanup
             returns = true
         } else if (checked && statement.kind == "Fail" && statement.edge_count == 1) {
             failure = named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge] - 1].clone()
@@ -142,6 +153,7 @@ fn emitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
             code.text = code.text + indent.clone() + "}"
             declarations += child.declarations
             drops = child.drops + drops
+            error_exits += child.error_exits
             if (then_count < count) {
                 otherwise = emitManagedBlock(named, types, imports, supplied, layouts, root, locals.clone(),
                     child_start + then_count, child_start + count, depth + 1, inside, checked, can_use_ok)?
@@ -150,6 +162,7 @@ fn emitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
                 code.text = code.text + indent.clone() + "}"
                 declarations += otherwise.declarations
                 drops = otherwise.drops + drops
+                error_exits += otherwise.error_exits
                 returns = child.returns && otherwise.returns
             }
             code.text = code.text + "\n"
@@ -159,7 +172,8 @@ fn emitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
         cursor = cursor + 1
     }
     if (!returns && (!root.string_locals || depth != 0)) { code.text = code.text + scope_drops }
-    return ok(ManagedBlock { code: code, declarations: declarations, drops: drops, returns: returns, bindings: locals })
+    return ok(ManagedBlock { code: code, declarations: declarations, drops: drops, returns: returns,
+        bindings: locals, error_exits: error_exits })
 }
 
 struct OwnedRecordPattern {
