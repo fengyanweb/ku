@@ -1252,7 +1252,10 @@ def installed_native_only_bytes_consumer(install, root, env, report, target):
     """An installed interpreter or Runner explains the native-only bytes call."""
     files = {
         'helper.ku': 'import { bytes } from "std"\n'
-                     'fn Encoded(text: str): int! { return ok(bytes.from_str(text)?.len()) }\n',
+                     'fn Encoded(text: str): int! {\n'
+                     '    packed = bytes.from_str(text)?\n'
+                     '    return ok(packed.len())\n'
+                     '}\n',
         'main.ku': 'import { Encoded as Count } from "./helper.ku"\n'
                    'fn main(): null! { println(Count("中文🙂")?) return ok(null) }\n',
     }
