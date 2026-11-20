@@ -63,7 +63,10 @@ cannot be used as type names. The tool also checks argument counts for direct
 calls to local and named-import functions, including import aliases. Names
 that could be shadowed by a local binding and calls through a value are left
 to lexical binding and expression type checking. A call-count error carries
-the source path and the full call span.
+the source path and the full call span. Once the arity matches, a scalar
+literal passed directly to a parameter with an explicit scalar or scalar union
+annotation must match one of its types. A mismatch points at the argument.
+Arguments that need inference or contextual types remain deferred.
 
 ## Emit C for a structure projection
 

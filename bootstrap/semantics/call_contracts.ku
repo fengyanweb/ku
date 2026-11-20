@@ -4,15 +4,50 @@ import { ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
 
 struct DirectSignature {
     name: str
-    arity: int
+    parameters: [LiteralParameter]
 }
 
-fn parameterCount(&nodes: [Node], &edges: [int], &function: Node): int {
-    count = 0
-    while (count < function.edge_count && nodes[edges[function.first_edge + count] - 1].kind == "Parameter") {
-        count = count + 1
+struct LiteralParameter {
+    scalars: [str]
+}
+
+fn scalarType(&name: str): bool {
+    return name == "int" || name == "float" || name == "bool" || name == "str" || name == "null"
+}
+
+// Use only exact primitive annotations and their finite unions. Generic,
+// unannotated and other parameter types are left to contextual type checking.
+fn literalParameter(&nodes: [Node], &edges: [int], &parameter: Node): LiteralParameter {
+    scalars: [str] = []
+    if (parameter.edge_count == 1) {
+        annotation = nodes[edges[parameter.first_edge] - 1].clone()
+        if (annotation.kind == "TypeName" && scalarType(annotation.text)) {
+            scalars = scalars.push(annotation.text)
+        } else if (annotation.kind == "TypeUnion") {
+            cursor = annotation.first_edge
+            stop = cursor + annotation.edge_count
+            while (cursor < stop) {
+                item = nodes[edges[cursor] - 1].clone()
+                if (item.kind != "TypeName" || !scalarType(item.text)) {
+                    return LiteralParameter { scalars: [] }
+                }
+                scalars = scalars.push(item.text)
+                cursor = cursor + 1
+            }
+        }
     }
-    return count
+    return LiteralParameter { scalars: scalars }
+}
+
+fn directSignature(&nodes: [Node], &edges: [int], &function: Node, name: str): DirectSignature {
+    parameters: [LiteralParameter] = []
+    cursor = function.first_edge
+    stop = cursor + function.edge_count
+    while (cursor < stop && nodes[edges[cursor] - 1].kind == "Parameter") {
+        parameters = parameters.push(literalParameter(nodes, edges, nodes[edges[cursor] - 1]))
+        cursor = cursor + 1
+    }
+    return DirectSignature { name: name, parameters: parameters }
 }
 
 fn directSignatures(&named: NamedModule, &imports: [ImportBinding], &supplied: [SuppliedModule]): [DirectSignature]! {
@@ -21,8 +56,9 @@ fn directSignatures(&named: NamedModule, &imports: [ImportBinding], &supplied: [
     while (index < named.names.declarations.len()) {
         if (named.names.declarations[index].kind == "Function") {
             id = named.names.declarations[index].node
-            arity = parameterCount(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.nodes[id - 1])
-            signatures = signatures.push(DirectSignature { name: named.names.declarations[index].name.clone(), arity: arity })
+            signature = directSignature(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.nodes[id - 1],
+                                        named.names.declarations[index].name.clone())
+            signatures = signatures.push(signature)
         }
         index = index + 1
     }
@@ -33,9 +69,10 @@ fn directSignatures(&named: NamedModule, &imports: [ImportBinding], &supplied: [
             source = ReadImportNode(supplied[module_index - 1].named.parsed.arena.nodes,
                                     imports[index].target_node, imports[index].span.clone())?
             if (source.kind == "Function") {
-                arity = parameterCount(supplied[module_index - 1].named.parsed.arena.nodes,
-                                       supplied[module_index - 1].named.parsed.arena.edges, source)
-                signatures = signatures.push(DirectSignature { name: imports[index].local_name.clone(), arity: arity })
+                signature = directSignature(supplied[module_index - 1].named.parsed.arena.nodes,
+                                            supplied[module_index - 1].named.parsed.arena.edges, source,
+                                            imports[index].local_name.clone())
+                signatures = signatures.push(signature)
             }
         }
         index = index + 1
@@ -43,19 +80,19 @@ fn directSignatures(&named: NamedModule, &imports: [ImportBinding], &supplied: [
     return ok(signatures)
 }
 
-fn expectedArity(&signatures: [DirectSignature], &name: str): int {
+fn directSignatureIndex(&signatures: [DirectSignature], &name: str): int {
     index = 0
     while (index < signatures.len()) {
-        if (signatures[index].name == name) { return signatures[index].arity }
+        if (signatures[index].name == name) { return index }
         index = index + 1
     }
     return -1
 }
 
-fn containsShadow(&shadowed: [str], &name: str): bool {
+fn containsName(&names: [str], &name: str): bool {
     index = 0
-    while (index < shadowed.len()) {
-        if (shadowed[index] == name) { return true }
+    while (index < names.len()) {
+        if (names[index] == name) { return true }
         index = index + 1
     }
     return false
@@ -76,6 +113,35 @@ fn firstSubtreeNode(&nodes: [Node], &edges: [int], root: int): int {
     return node
 }
 
+fn scalarLiteral(&node: Node): str {
+    if (node.edge_count != 0) { return "" }
+    if (node.kind == "Int") { return "int" }
+    if (node.kind == "Float") { return "float" }
+    if (node.kind == "Bool") { return "bool" }
+    if (node.kind == "String") { return "str" }
+    if (node.kind == "Null") { return "null" }
+    return ""
+}
+
+fn checkLiteralArgument(&parameter: LiteralParameter, &nodes: [Node], &edges: [int], &argument: Node): null! {
+    if (parameter.scalars.len() == 0) { return ok(null) }
+    actual = scalarLiteral(argument)
+    if (argument.kind == "Unary" && argument.edge_count == 1 && argument.text == "-") {
+        operand = scalarLiteral(nodes[edges[argument.first_edge] - 1])
+        if (operand == "int" || operand == "float") { actual = operand }
+    }
+    if (actual == "") { return ok(null) }
+    if (containsName(parameter.scalars, actual)) { return ok(null) }
+    expected = parameter.scalars[0].clone()
+    cursor = 1
+    while (cursor < parameter.scalars.len()) {
+        expected += " | " + parameter.scalars[cursor].clone()
+        cursor = cursor + 1
+    }
+    RejectName("call_argument_type", "expected " + expected + " but got " + actual, DeclarationSpan(argument))?
+    return ok(null)
+}
+
 fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignature], function: int): null! {
     start = firstSubtreeNode(nodes, edges, function)
     // This pass proves direct targets. Defer potentially shadowed names,
@@ -83,8 +149,8 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
     shadowed: [str] = []
     index = start
     while (index < function) {
-        if (couldBindLocal(nodes[index - 1].kind) && expectedArity(signatures, nodes[index - 1].text) >= 0
-            && !containsShadow(shadowed, nodes[index - 1].text)) {
+        if (couldBindLocal(nodes[index - 1].kind) && directSignatureIndex(signatures, nodes[index - 1].text) >= 0
+            && !containsName(shadowed, nodes[index - 1].text)) {
             shadowed = shadowed.push(nodes[index - 1].text.clone())
         }
         index = index + 1
@@ -94,12 +160,21 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
     while (index < function) {
         if (nodes[index - 1].kind == "Call" && nodes[index - 1].edge_count > 0) {
             target = edges[nodes[index - 1].first_edge]
-            if (nodes[target - 1].kind == "Variable" && !containsShadow(shadowed, nodes[target - 1].text)) {
-                arity = expectedArity(signatures, nodes[target - 1].text)
-                count = nodes[index - 1].edge_count - 1
-                if (arity >= 0 && count != arity) {
-                    RejectName("call_arity", "function '" + nodes[target - 1].text.clone() + "' expects "
-                               + str(arity) + " arguments but got " + str(count), DeclarationSpan(nodes[index - 1]))?
+            if (nodes[target - 1].kind == "Variable" && !containsName(shadowed, nodes[target - 1].text)) {
+                signature = directSignatureIndex(signatures, nodes[target - 1].text)
+                if (signature >= 0) {
+                    arity = signatures[signature].parameters.len()
+                    count = nodes[index - 1].edge_count - 1
+                    if (count != arity) {
+                        RejectName("call_arity", "function '" + nodes[target - 1].text.clone() + "' expects "
+                                   + str(arity) + " arguments but got " + str(count), DeclarationSpan(nodes[index - 1]))?
+                    }
+                    argument = 0
+                    while (argument < count) {
+                        node = edges[nodes[index - 1].first_edge + argument + 1]
+                        checkLiteralArgument(signatures[signature].parameters[argument], nodes, edges, nodes[node - 1])?
+                        argument = argument + 1
+                    }
                 }
             }
         }
@@ -110,7 +185,7 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
 
 // Use the arenas and import identities from the declaration/explicit type pass.
 // Leave the project's AST IDs and successful output unchanged.
-fn CheckDirectCallArities(&named: NamedModule, &imports: [ImportBinding], &supplied: [SuppliedModule]): null! {
+fn CheckDirectCallContracts(&named: NamedModule, &imports: [ImportBinding], &supplied: [SuppliedModule]): null! {
     signatures = directSignatures(named, imports, supplied)?
     if (signatures.len() == 0) { return ok(null) }
     index = 0

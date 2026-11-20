@@ -296,6 +296,59 @@ fn main() { println(Parameter(Two) + Binding() + Nested() + One(6)) }
         message.contains("|call_arity|<source>|function 'One' expects 1 arguments but got 0|"),
         "{message}"
     );
+
+    fs::write(
+        project.join("parameters.ku"),
+        r#"
+fn RequireInt(value: int): int { return value }
+fn Select(value: bool | null): bool | null { return value }
+fn Ratio(value: float): float { return value }
+"#,
+    )
+    .unwrap();
+    fs::write(&manifest, "main.ku\nparameters.ku\n").unwrap();
+    let scalar_calls = r#"
+import { RequireInt as Amount, Select, Ratio } from "./parameters.ku"
+fn Use(value: str): str { return value }
+fn NameShadow(Amount: fn(str): str): str { return Amount("local") }
+fn main() {
+    a = Amount(-7)
+    b = Select(null)
+    c = Select(false)
+    d = Ratio(-1.5)
+    println(NameShadow(Use) + str(a) + str(b) + str(c) + str(d))
+}
+"#;
+    fs::write(&main, scalar_calls).unwrap();
+    assert_success(&run(Command::new(ku).arg("check").arg(&main), cwd, 20));
+    assert_success(&run(&mut Command::new(executable), cwd, 20));
+    for (original, replacement, argument, expected) in [
+        ("Amount(-7)", "Amount(\"bad\")", "\"bad\"", "int"),
+        ("Select(null)", "Select(0)", "0", r"bool \p null"),
+        ("Ratio(-1.5)", "Ratio(-9)", "-9", "float"),
+    ] {
+        let source = scalar_calls.replace(original, replacement);
+        fs::write(&main, &source).unwrap();
+        let stage0 = run(Command::new(ku).arg("check").arg(&main), cwd, 20);
+        assert_eq!(stage0.status.code(), Some(1));
+        let rejected = run(&mut Command::new(executable), cwd, 20);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        let diagnostic = String::from_utf8(rejected.stderr).unwrap();
+        assert!(
+            diagnostic.starts_with("main.ku: ") && diagnostic.contains("|call_argument_type|"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&format!("expected {expected} but got ")),
+            "{diagnostic}"
+        );
+        let position = source.find(replacement).unwrap() + replacement.find(argument).unwrap();
+        assert!(diagnostic.contains(&format!("@{position}..")));
+        assert!(diagnostic
+            .trim_end()
+            .ends_with(&format!("@{}", position + argument.len())));
+    }
 }
 
 impl Drop for Temp {
