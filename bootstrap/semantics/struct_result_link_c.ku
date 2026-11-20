@@ -2,7 +2,7 @@ import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
-import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardCloneSource, GuardExplicitType, GuardExpression, GuardLeaf } from "./guarded_struct_expr.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression, GuardLeaf } from "./guarded_struct_expr.ku"
 import { GuardParameterType } from "./guarded_struct_c.ku"
 import { AddGuardCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
@@ -133,8 +133,7 @@ fn LowerOwnedRecordCall(&named: NamedModule, &types: [TypeNameBinding], &layouts
 }
 
 fn ownedScalarLeafId(&named: NamedModule, &call: Node): int {
-    if (call.kind != "Call" || call.edge_count != 2 ||
-        GuardCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.edges[call.first_edge + 1]) == 0) { return 0 }
+    if (call.kind != "Call" || call.edge_count < 2) { return 0 }
     target = named.parsed.arena.nodes[named.parsed.arena.edges[call.first_edge] - 1].clone()
     if (target.kind != "Variable" || target.edge_count != 0) { return 0 }
     return resultFunctionNode(named, target.text)
@@ -151,23 +150,58 @@ fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layout
         id = ownedScalarLeafId(named, call)
         if (id == 0 || ContainsIndex(emitted, id)) { continue }
         leaf = named.parsed.arena.nodes[id - 1].clone()
-        if (leaf.edge_count < 3) { continue }
-        parameter = named.parsed.arena.nodes[named.parsed.arena.edges[leaf.first_edge] - 1].clone()
-        result = named.parsed.arena.edges[leaf.first_edge + 1]
-        if (parameter.kind != "Parameter" || parameter.edge_count != 1 || parameter.int_value != 0 ||
-            named.parsed.arena.nodes[result - 1].kind != "TypeName") { continue }
-        arg = GuardExplicitType(types, named.parsed.arena.nodes, layouts, named.parsed.arena.edges[parameter.first_edge])?
-        ty = GuardExplicitType(types, named.parsed.arena.nodes, layouts, result)?
-        if (arg.kind != "str" || (ty.kind != "int" && ty.kind != "bool")) { continue }
-        scalar_type = 1
-        if (ty.kind == "bool") { scalar_type = 3 }
-        symbol = ScalarSymbol(id, scalar_type)
+        position = 0
+        while (position < leaf.edge_count && named.parsed.arena.nodes[named.parsed.arena.edges[leaf.first_edge + position] - 1].kind == "Parameter") {
+            position = position + 1
+        }
+        if (position == 0 || position >= leaf.edge_count - 1) { continue }
+        result = named.parsed.arena.edges[leaf.first_edge + position]
+        if (named.parsed.arena.nodes[result - 1].kind != "TypeName") { continue }
+        selected = ExplicitType(types, result, DeclarationSpan(named.parsed.arena.nodes[result - 1]))?
+        if (selected.declaration_kind != "Builtin" || (selected.name != "int" && selected.name != "bool")) { continue }
+        view_predicate = false
+        owned_string = false
+        parameters: [LinkPlanType] = []
+        kinds: [str] = []
+        c_args = ""
+        cursor = 0
+        while (cursor < position) {
+            parameter = named.parsed.arena.nodes[named.parsed.arena.edges[leaf.first_edge + cursor] - 1].clone()
+            if (parameter.edge_count != 1 || parameter.int_value < 0 || parameter.int_value > 1) { break }
+            view = parameter.int_value == 1
+            type_id = named.parsed.arena.edges[parameter.first_edge]
+            shape = named.parsed.arena.nodes[type_id - 1].kind.clone()
+            if ((view && shape != "TypeArray") || (!view && shape != "TypeName")) { break }
+            input = GuardParameterType(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, type_id, view)?
+            c_type = GuardCType(input, layouts)
+            if (view) {
+                view_predicate = true
+                c_type = "const " + c_type + "*"
+                parameters = parameters.push(StrArrayViewLinkPlanType())
+            } else {
+                if (input.kind == "str" && position == 1) { owned_string = true }
+                else if (input.kind != "int" && input.kind != "bool") { break }
+                parameters = parameters.push(BuiltinLinkPlanType(input.kind.clone(), c_type.clone(), false))
+            }
+            if (cursor != 0) { c_args += ", " }
+            c_args += c_type
+            kinds = kinds.push(input.kind)
+            cursor = cursor + 1
+        }
+        if (cursor != position || (!owned_string && (!view_predicate || selected.name != "bool"))) { continue }
+        symbol = "ku_guarded_" + str(id)
+        if (owned_string) {
+            scalar_type = 1
+            if (selected.name == "bool") { scalar_type = 3 }
+            symbol = ScalarSymbol(id, scalar_type)
+        }
+        ty = GuardBoundType(selected, layouts)?
         c_type = GuardCType(ty, layouts)
-        output.declarations = output.declarations + "extern " + c_type.clone() + " " + symbol.clone() + "(KuProjectionString);\n"
+        output.declarations = output.declarations + "extern " + c_type.clone() + " " + symbol.clone() + "(" + c_args + ");\n"
         output.plan = output.plan.push(LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(),
-            parameters: [BuiltinLinkPlanType("str", "KuProjectionString", false)],
+            parameters: parameters,
             result: BuiltinLinkPlanType(ty.kind.clone(), c_type, false), returns_result: false })
-        output.bindings = output.bindings.push(GuardLeaf { name: leaf.text, symbol: symbol, result_kind: ty.kind })
+        output.bindings = output.bindings.push(GuardLeaf { name: leaf.text, symbol: symbol, result_kind: ty.kind, parameters: kinds })
         emitted = emitted.push(id)
     }
     return ok(output)

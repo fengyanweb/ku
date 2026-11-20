@@ -1715,6 +1715,34 @@ fn ObserveNumberPrefix(&characters: [str], length: int, start_index: int, start_
         .unwrap();
     assert_eq!(clear, format!("        {error} = (KuBootstrapError){{0}};"));
     assert!(text.contains(".value.f0 = (KuProjectionString){0};"));
+
+    let source = fs::read_to_string(&lexer).unwrap();
+    let predicate = r#"
+struct FractionProbe { begins: bool }
+fn ObserveFraction(&characters: [str], index: int, length: int): FractionProbe! {
+    is_float = HasFractionPoint(characters, index, length) && IsDigit(characters[index + 1].clone())
+    return ok(FractionProbe { begins: is_float })
+}
+"#;
+    fs::write(&lexer, format!("{source}{predicate}")).unwrap();
+    fs::write(cwd.join("function.txt"), "ObserveFraction").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let body = text.split_once("    bool t").unwrap().1;
+    let guard = body.find(" = ku_guarded_").unwrap();
+    let selected = body.find("    if (t").unwrap();
+    let indexed = body
+        .find("        if (!ku_guard_string_array_clone_at(a0")
+        .unwrap();
+    let digit = body.find(" = ku_bool_").unwrap();
+    assert!(guard < selected && selected < indexed && indexed < digit);
+    fs::write(cwd.join("mode.txt"), "struct-result-plan").unwrap();
+    let plan = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plan);
+    let plan = String::from_utf8(plan.stdout).unwrap();
+    assert!(plan.contains(r#""source_name":"HasFractionPoint","symbol":"ku_guarded_"#));
+    assert!(plan.contains(r#""source_name":"IsDigit","symbol":"ku_bool_"#));
 }
 
 fn assert_constructor_view(seed: &Path, cwd: &Path) {

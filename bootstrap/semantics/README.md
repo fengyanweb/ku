@@ -253,6 +253,11 @@ or ownership transfer.
 a literal. The array remains owned by the caller. The emitted predicate
 preserves checked arithmetic, array bounds and the clone's failure point.
 The typed link plan identifies this parameter as a readonly builtin array.
+Managed record functions can call a same-module `bool` predicate with
+the declared View `[str]` and Copy bindings. The fractional lookahead
+links that predicate with `IsDigit` and clones the second indexed string
+only on the selected side of `&&`. Bounds failures and allocation errors
+keep their original order, and the array remains with the caller.
 
 For the original `RelocateTokens` in `stage2/context.ku`, select `managed` and
 keep the same project manifest. The emitter handles the loop, per-iteration

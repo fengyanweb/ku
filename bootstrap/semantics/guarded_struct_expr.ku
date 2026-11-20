@@ -33,6 +33,7 @@ struct GuardLeaf {
     name: str
     symbol: str
     result_kind: str
+    parameters: [str]
 }
 
 fn GuardBindingIndex(&bindings: [GuardBinding], &name: str): int {
@@ -81,6 +82,10 @@ fn GuardExplicitType(&types: [TypeNameBinding], &nodes: [Node], &layouts: [Struc
 
 fn GuardRead(ty: GuardType, value: str, view: bool): GuardValue {
     return GuardValue { ty: ty, setup: "", value: value, view: view, uses_add: false, uses_sub: false, uses_eq: false }
+}
+
+fn emptyGuardValue(): GuardValue {
+    return GuardRead(GuardType { kind: "", layout: 0 }, "", false)
 }
 
 fn guardField(&layouts: [StructLayout], &base: GuardValue, &node: Node): GuardValue! {
@@ -157,27 +162,22 @@ fn GuardCloneSource(&nodes: [Node], &edges: [int], id: int): int {
     return edges[member.first_edge]
 }
 
-fn guardClonedIndex(&nodes: [Node], &edges: [int], id: int): int {
-    indexed = GuardCloneSource(nodes, edges, id)
-    if (indexed == 0) { return 0 }
-    if (nodes[indexed - 1].kind != "Index" || nodes[indexed - 1].edge_count != 2) { return 0 }
-    return indexed
-}
-
 fn guardStringArrayCompare(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
                           &node: Node, id: int, depth: int, &indent: str): GuardValue! {
     left = edges[node.first_edge]
     right = edges[node.first_edge + 1]
-    indexed_id = guardClonedIndex(nodes, edges, left)
     literal = nodes[right - 1].clone()
-    if (indexed_id == 0) {
-        indexed_id = guardClonedIndex(nodes, edges, right)
+    input = left
+    if (literal.kind != "String") {
         literal = nodes[left - 1].clone()
+        input = right
     }
+    indexed_id = GuardCloneSource(nodes, edges, input)
     if (indexed_id == 0 || literal.kind != "String" || literal.edge_count != 0) {
-        return ok(GuardRead(GuardType { kind: "", layout: 0 }, "", false))
+        return ok(emptyGuardValue())
     }
     indexed = nodes[indexed_id - 1].clone()
+    if (indexed.kind != "Index" || indexed.edge_count != 2) { return ok(emptyGuardValue()) }
     // Count the clone call, its member and the indexed expression as well.
     array = GuardExpression(nodes, edges, bindings, layouts, edges[indexed.first_edge], depth + 4, indent)?
     if (array.ty.kind != "str_array" || !array.view || array.setup != "") {
@@ -197,35 +197,77 @@ fn guardStringArrayCompare(&nodes: [Node], &edges: [int], &bindings: [GuardBindi
         uses_add: index.uses_add, uses_sub: index.uses_sub, uses_eq: index.uses_eq })
 }
 
-fn guardLeafCall(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &leaves: [GuardLeaf],
+fn cloneLeafString(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
+                   &node: Node, id: int, depth: int, &indent: str): GuardValue! {
+    subject = GuardCloneSource(nodes, edges, edges[node.first_edge + 1])
+    if (subject == 0 || depth + 3 >= 32) {
+        RejectLayout("guarded_owned_argument", "a checked leaf takes an explicit clone of a live str", DeclarationSpan(node))?
+    }
+    source = nodes[subject - 1].clone()
+    temp = "argument" + str(id)
+    result = GuardRead(GuardType { kind: "str", layout: 0 }, temp.clone(), false)
+    declare = indent.clone() + "KuProjectionString " + temp.clone() + " = {0};\n"
+    if (source.kind == "Index" && source.edge_count == 2) {
+        base = GuardExpression(nodes, edges, bindings, layouts, edges[source.first_edge], depth + 4, indent)?
+        index = GuardExpression(nodes, edges, bindings, layouts, edges[source.first_edge + 1], depth + 4, indent)?
+        if (base.ty.kind != "str_array" || !base.view || base.setup != "" || index.ty.kind != "int") {
+            RejectLayout("guarded_owned_argument", "a checked leaf requires an indexed View [str] and an int index", DeclarationSpan(source))?
+        }
+        result.setup = index.setup + declare + indent.clone() + "if (!ku_guard_string_array_clone_at(" + base.value + ", " +
+            index.value + ", &" + temp + ", &array_failure)) goto cleanup;\n"
+        result.uses_add = index.uses_add
+        result.uses_sub = index.uses_sub
+        result.uses_eq = index.uses_eq
+        return ok(result)
+    }
+    found = GuardBindingIndex(bindings, source.text)
+    if (source.kind != "Variable" || found == 0 || bindings[found - 1].ty.kind != "str" || bindings[found - 1].view) {
+        RejectLayout("guarded_owned_argument", "a checked leaf requires a bound str owner", DeclarationSpan(source))?
+    }
+    result.setup = declare + indent.clone() + "if (!ku_result_clone_string(" + GuardBindingName(bindings[found - 1]) + ", &" + temp +
+        ")) { out_of_memory = true; goto cleanup; }\n"
+    return ok(result)
+}
+
+fn guardLeafCall(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout], &leaves: [GuardLeaf],
                  &node: Node, id: int, depth: int, &indent: str): GuardValue! {
-    empty = GuardRead(GuardType { kind: "", layout: 0 }, "", false)
-    if (node.edge_count != 2 || leaves.len() == 0) { return ok(empty) }
+    empty = emptyGuardValue()
+    if (node.edge_count == 0 || leaves.len() == 0) { return ok(empty) }
     target = nodes[edges[node.first_edge] - 1].clone()
-    if (target.kind != "Variable" || GuardBindingIndex(bindings, target.text) != 0) { return ok(empty) }
+    if (target.kind != "Variable" || target.edge_count != 0 || GuardBindingIndex(bindings, target.text) != 0) { return ok(empty) }
     position = 0
     while (position < leaves.len()) {
         leaf = leaves[position].clone()
         if (leaf.name == target.text) {
-            subject = GuardCloneSource(nodes, edges, edges[node.first_edge + 1])
-            if (subject == 0 || nodes[subject - 1].kind != "Variable" || depth + 3 >= 32) {
-                RejectLayout("guarded_owned_argument", "a checked leaf takes an explicit clone of a live str", DeclarationSpan(node))?
+            if (node.edge_count != leaf.parameters.len() + 1) {
+                RejectLayout("guarded_leaf_arity", "argument count must match the checked leaf", DeclarationSpan(node))?
             }
-            found = GuardBindingIndex(bindings, nodes[subject - 1].text)
-            if (found == 0 || bindings[found - 1].ty.kind != "str" || bindings[found - 1].view) {
-                RejectLayout("guarded_owned_argument", "a checked leaf requires a bound str owner", DeclarationSpan(nodes[subject - 1]))?
+            value = empty.clone()
+            if (leaf.parameters.len() == 1 && leaf.parameters[0] == "str") {
+                value = cloneLeafString(nodes, edges, bindings, layouts, node, id, depth, indent)?
+            } else {
+                // For this branch each operand is a side-effect-free binding read.
+                args = ""
+                index = 0
+                while (index < leaf.parameters.len()) {
+                    arg = nodes[edges[node.first_edge + index + 1] - 1].clone()
+                    found = GuardBindingIndex(bindings, arg.text)
+                    kind = leaf.parameters[index].clone()
+                    if (arg.kind != "Variable" || found == 0 || bindings[found - 1].ty.kind != kind ||
+                        bindings[found - 1].view != (kind == "str_array")) {
+                        RejectLayout("guarded_leaf_argument", "expected a matching Copy binding or View [str]", DeclarationSpan(arg))?
+                    }
+                    if (index > 0) { args += ", " }
+                    args += GuardBindingName(bindings[found - 1])
+                    index = index + 1
+                }
+                value.value = args
             }
-            temp = "argument" + str(id)
-            out = "t" + str(id)
-            code = indent.clone() + "KuProjectionString " + temp.clone() + " = {0};\n"
-            code += indent.clone() + "if (!ku_result_clone_string(" + GuardBindingName(bindings[found - 1]) + ", &" + temp.clone() +
-                ")) { out_of_memory = true; goto cleanup; }\n"
-            ty = GuardType { kind: leaf.result_kind.clone(), layout: 0 }
-            c_type = "int64_t"
-            if (ty.kind == "bool") { c_type = "bool" }
-            code += indent.clone() + c_type + " " + out.clone() + " = " + leaf.symbol.clone() + "(" + temp + ");\n"
-            value = GuardRead(ty, out, false)
-            value.setup = code
+            temp = "t" + str(id)
+            ty = GuardType { kind: leaf.result_kind, layout: 0 }
+            value.setup = value.setup + indent.clone() + GuardCType(ty, layouts) + " " + temp.clone() + " = " + leaf.symbol + "(" + value.value + ");\n"
+            value.value = temp
+            value.ty = ty
             return ok(value)
         }
         position = position + 1
@@ -277,7 +319,7 @@ fn GuardOwnedExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding]
         }
     }
     if (node.kind == "Call") {
-        linked = guardLeafCall(nodes, edges, bindings, leaves, node, id, depth, indent)?
+        linked = guardLeafCall(nodes, edges, bindings, layouts, leaves, node, id, depth, indent)?
         if (linked.ty.kind != "") { return ok(linked) }
     }
     if (node.kind == "Unary" && node.edge_count == 1) {
@@ -307,5 +349,5 @@ fn GuardOwnedExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding]
         }
     }
     RejectLayout("unsupported_guarded_operand", "expected a bound scalar, field read or supported scalar expression", DeclarationSpan(node))?
-    return ok(GuardRead(GuardType { kind: "", layout: 0 }, "", false))
+    return ok(emptyGuardValue())
 }
