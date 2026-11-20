@@ -418,6 +418,8 @@ fn bootstrap_parser_preserves_real_failure_and_assignment_syntax() {
     };
 
     let module = include_str!("../bootstrap/stage3/support.ku");
+    // WindowToken sets all three fields of the synthesized boundary token.
+    assert_eq!(expected_assignments(module).len(), 3);
     let example = r#"fn Example(value): null! {
         payload = { "中文|": { rank: 0 }, empty: {}, values: [1, { a: 2 }] }
         if (true) { fail payload; }
@@ -436,27 +438,26 @@ fn bootstrap_parser_preserves_real_failure_and_assignment_syntax() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(actual_rows(&output.stdout), expected);
+        assert_eq!(
+            actual_assignments(&output.stdout),
+            expected_assignments(source)
+        );
     }
 
-    let (window_reader, _) = include_str!("../bootstrap/stage3/parser.ku")
-        .split_once("fn ParseProgram")
-        .expect("real ReadTokenWindow function");
     let assignment = "fn Update(row, rows, id) {
         row.title = Fetch(id); rows[id] = row.title
         rows[Locate(id)].title = \"中文\"; rows[Locate(id)] = 0
         unchanged = row.title == \"previous\"
     }";
-    for source in [window_reader, assignment] {
-        let expected = expected_assignments(source);
-        assert!(!expected.is_empty());
-        let output = invoke(source);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(actual_assignments(&output.stdout), expected);
-    }
+    let expected = expected_assignments(assignment);
+    assert!(!expected.is_empty());
+    let output = invoke(assignment);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(actual_assignments(&output.stdout), expected);
 
     for source in [
         "fn Main(): null! { fail ; }",
