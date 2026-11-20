@@ -124,6 +124,14 @@ as present. The emitter bounds boolean expression nesting at 32 levels.
 Try the complete `IsDigit`, `IsIdentifierStart` and
 `IsIdentifierContinue` definitions in `bootstrap/stage1/lexer.ku`.
 
+The scalar mode also emits `null!` helpers such as `CheckTokenCapacity` and
+`CheckStringCapacity` from the same file. Guards can compare signed integer
+parameters and literals. The supported exits are builtin `return ok(null)`
+and `fail` with exactly one string literal for each Error field, `domain`,
+`code`, and `message`. The generated C uses the Stage0 `KuResult_null` layout.
+Use `ok` to select success or error. A failed result's fields refer to static
+UTF-8 bytes and require no release.
+
 ### Construct a nested struct from a project module
 
 Set `mode.txt` to `construct` and put the selected function name in

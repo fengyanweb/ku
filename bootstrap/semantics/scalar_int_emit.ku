@@ -33,7 +33,7 @@ struct ScalarIntFunction {
     function_node: int
     parameters: [ScalarIntParameter]
     clauses: [ScalarIntClause]
-    // One is int, two is str, and three is bool.
+    // One is int, two is str, three is bool, and four is null!.
     result_type: int
     uses_string_comparison: bool
     uses_string_contains: bool
@@ -79,13 +79,19 @@ fn ScalarIntegerHelpers(add: bool, sub: bool, mul: bool): str {
     return text
 }
 
-fn ScalarStringHelpers(carrier: bool, comparison: bool, contains: bool, owned: bool, join: bool, format: bool): str {
+fn ScalarStringHelpers(carrier: bool, comparison: bool, contains: bool, owned: bool, join: bool, format: bool, null_result: bool): str {
     text = ""
     if (carrier || comparison || contains) { text += "#include <stddef.h>\n" }
     if (comparison || contains || join) { text += "#include <string.h>\n" }
     if (owned || join) { text += "#include <stdlib.h>\n" }
     if (join) { text += "#include <stdio.h>\n" }
-    if (carrier) {
+    if (null_result) {
+        // Use the normal Stage0 tags as well as its layout for a shared C ABI.
+        text += "\ntypedef struct KuString { uint8_t* ptr; size_t len; size_t capacity; uint8_t storage; } KuString;\n"
+        text += "typedef KuString KuBootstrapString;\ntypedef KuString KuScalarString;\n\n"
+        text += "typedef struct KuError { KuString domain; KuString code; KuString message; } KuError;\n"
+        text += "typedef struct KuResult_null { bool ok; uint8_t value; KuError error; } KuResult_null;\n\n"
+    } else if (carrier) {
         text += "\n/* KuString layout. Static results are immutable and never freed by the caller. */\n"
         text += "typedef struct { uint8_t* ptr; size_t len; size_t capacity; uint8_t storage; } KuBootstrapString;\n"
         text += "typedef KuBootstrapString KuScalarString;\n\n"
@@ -111,6 +117,7 @@ fn ScalarStringHelpers(carrier: bool, comparison: bool, contains: bool, owned: b
 fn ScalarSymbol(function_node: int, result_type: int): str {
     if (result_type == 2) { return "ku_str_" + str(function_node) }
     if (result_type == 3) { return "ku_bool_" + str(function_node) }
+    if (result_type == 4) { return "ku_result_null_" + str(function_node) }
     return "ku_int_" + str(function_node)
 }
 
@@ -183,11 +190,12 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
     result_type = "int64_t"
     if (plan.result_type == 2) { result_type = "KuBootstrapString" }
     else if (plan.result_type == 3) { result_type = "bool" }
+    else if (plan.result_type == 4) { result_type = "KuResult_null" }
     signature = result_type.clone() + " " + ScalarSymbol(plan.function_node, plan.result_type) + "("
     if (!external) { signature = "static " + signature }
     declarations = ""
     drops = ""
-    uses_string = plan.result_type == 2
+    uses_string = plan.result_type == 2 || plan.result_type == 4
     if (plan.parameters.len() == 0) { signature += "void" }
     index = 0
     while (index < plan.parameters.len()) {

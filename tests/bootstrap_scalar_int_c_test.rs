@@ -370,6 +370,128 @@ int main(void) {
     assert_success(&execute(&mut Command::new(&app), cwd, 10));
 }
 
+fn assert_capacity_results(ku: &Path, seed: &Path, cwd: &Path) {
+    let lexer = include_str!("../bootstrap/stage1/lexer.ku");
+    for (name, last_ok, code, message) in [
+        (
+            "CheckTokenCapacity",
+            4095,
+            "too_many_tokens",
+            "stage-1 lexer accepts at most 4096 tokens including EOF",
+        ),
+        (
+            "CheckStringCapacity",
+            4096,
+            "string_too_large",
+            "stage-1 string literals accept at most 4096 decoded characters",
+        ),
+    ] {
+        let (_, declaration) = lexer
+            .split_once(&format!("fn {name}("))
+            .expect("real capacity helper");
+        let body = declaration
+            .split_once("\n}")
+            .expect("capacity helper closing brace")
+            .0;
+        let input = format!("fn {name}({body}\n}}\n");
+        let emitted = build_function(seed, cwd, &input, name);
+        assert_success(&emitted);
+        let emitted = String::from_utf8(emitted.stdout).expect("capacity C source");
+        let (symbol, c) = emitted
+            .split_once('\n')
+            .expect("capacity C symbol and source");
+        assert!(symbol.trim().starts_with("ku_result_null_"));
+        assert!(c.contains("struct KuResult_null { bool ok; uint8_t value; KuError error; }"));
+        assert!(!c.contains("malloc("));
+        let driver = r#"
+#include <assert.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static void print_static(KuString value) {
+    assert(value.storage == 0 && value.capacity == 0 && value.ptr != NULL);
+    assert(fwrite(value.ptr, 1, value.len, stdout) == value.len);
+    putchar('\n');
+}
+
+static void check_empty(KuString value) {
+    assert(value.storage == 0 && value.capacity == 0 && value.ptr == NULL && value.len == 0);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    KuResult_null result = CALL(strtoimax(argv[1], NULL, 10));
+    assert(result.value == 0);
+    if (result.ok) {
+        check_empty(result.error.domain);
+        check_empty(result.error.code);
+        check_empty(result.error.message);
+        puts("ok");
+    } else {
+        (void)CALL(0);
+        print_static(result.error.domain);
+        print_static(result.error.code);
+        print_static(result.error.message);
+    }
+    return 0;
+}
+"#;
+        let c_path = cwd.join(format!("{name}.c"));
+        let app = cwd.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        fs::write(
+            &c_path,
+            format!("{c}{}", driver.replace("CALL", symbol.trim())),
+        )
+        .expect("save standalone capacity C");
+        fs::remove_file(cwd.join("input.ku")).expect("retire input before C execution");
+        fs::remove_file(cwd.join("function.txt")).expect("retire function selection");
+        compile_c(&c_path, &app, cwd);
+
+        let oracle = cwd.join("capacity-oracle.ku");
+        for value in [i64::MIN, 4095, 4096, 4097, i64::MAX] {
+            fs::write(
+                &oracle,
+                format!(
+                    r#"{input}
+fn main(): null! {{
+    try {{
+        {name}({})?
+        println("ok")
+    }} catch (err) {{
+        println(err.domain)
+        println(err.code)
+        println(err.message)
+    }}
+    return ok(null)
+}}
+"#,
+                    ku_int(value)
+                ),
+            )
+            .expect("Stage0 interpreter capacity oracle");
+            let interpreted = execute(&mut Command::new(ku).arg("run").arg(&oracle), cwd, 10);
+            assert_success(&interpreted);
+            fs::remove_file(&oracle).expect("no Ku source during the independent C run");
+            let actual = execute(Command::new(&app).arg(value.to_string()), cwd, 10);
+            assert_success(&actual);
+            let expected = if value <= last_ok {
+                String::from("ok\n")
+            } else {
+                format!("bootstrap.lexer\n{code}\n{message}\n")
+            };
+            assert_eq!(
+                String::from_utf8_lossy(&actual.stdout).replace("\r\n", "\n"),
+                expected
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&interpreted.stdout).replace("\r\n", "\n"),
+                expected
+            );
+        }
+    }
+}
+
 #[test]
 fn ku_emits_checked_c11_for_real_math_functions() {
     let work = Temp::new();
@@ -509,8 +631,29 @@ fn ku_emits_checked_c11_for_real_math_functions() {
     );
     assert!(!generated.contains("Irrelevant"));
     assert_string_composition(&ku, &seed, &cwd);
+    assert_capacity_results(&ku, &seed, &cwd);
 
     for (input, diagnostic) in [
+        (
+            "fn Example(): int! { return ok(1) }",
+            "unsupported_int_type",
+        ),
+        (
+            "fn Example(): null! { return ok(1) }",
+            "unsupported_null_result",
+        ),
+        (
+            "fn Example(ok: int): null! { return ok(null) }",
+            "unsupported_null_result",
+        ),
+        (
+            "fn Example(message: str): null! { fail { domain: \"x\", code: \"y\", message: message } }",
+            "unsupported_static_error_field",
+        ),
+        (
+            "fn Example(): null! { if (\"x\" >= 4096) { return ok(null) } return ok(null) }",
+            "unsupported_int_comparison",
+        ),
         (
             "fn Example(str: int): str { return str(1) }",
             "unsupported_string_int_call",

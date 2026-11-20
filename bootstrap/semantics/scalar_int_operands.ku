@@ -54,11 +54,11 @@ fn ScalarStringOperand(&parameters: [ScalarIntParameter], &node: Node): str! {
     return ok("")
 }
 
-// Imported aliases and local declarations can hide the builtin conversion.
-fn HasScalarStringConversion(&named: NamedModule): bool {
+// A local declaration or imported alias can shadow a builtin call.
+fn HasScalarBuiltin(&named: NamedModule, &name: str): bool {
     index = 0
     while (index < named.names.declarations.len()) {
-        if (named.names.declarations[index].name == "str") { return false }
+        if (named.names.declarations[index].name == name) { return false }
         index = index + 1
     }
     index = 0
@@ -69,8 +69,8 @@ fn HasScalarStringConversion(&named: NamedModule): bool {
             request = named.parsed.arena.nodes[named.parsed.arena.edges[group.first_edge + child] - 1].clone()
             if (request.edge_count == 1) {
                 alias = named.parsed.arena.edges[request.first_edge]
-                if (named.parsed.arena.nodes[alias - 1].text == "str") { return false }
-            } else if (request.text == "str") { return false }
+                if (named.parsed.arena.nodes[alias - 1].text == name) { return false }
+            } else if (request.text == name) { return false }
             child = child + 1
         }
         index = index + 1
@@ -78,23 +78,49 @@ fn HasScalarStringConversion(&named: NamedModule): bool {
     return true
 }
 
-fn scalarStringInteger(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], &value: Node): str! {
+fn knownScalarIntegerOperand(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], &value: Node): str {
     if (value.kind == "Variable" && value.edge_count == 0) {
         index = ScalarParameterIndex(parameters, value.text)
         if (index >= 0 && parameters[index].string_mode == 0) {
-            return ok("a" + str(index))
+            return "a" + str(index)
         }
     }
     if (value.kind == "Int" && value.edge_count == 0 && value.int_value >= 0) {
-        return ok("INT64_C(" + str(value.int_value) + ")")
+        return "INT64_C(" + str(value.int_value) + ")"
     }
     if (value.kind == "Unary" && value.text == "-" && value.edge_count == 1) {
         literal = nodes[edges[value.first_edge] - 1].clone()
         if (literal.kind == "Int" && literal.edge_count == 0 && literal.int_value >= 0) {
-            return ok("-INT64_C(" + str(literal.int_value) + ")")
+            return "-INT64_C(" + str(literal.int_value) + ")"
         }
     }
-    RejectScalarInt("unsupported_string_int_operand", "expected an int parameter or literal in str conversion", DeclarationSpan(value))?
+    return ""
+}
+
+fn scalarStringInteger(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], &value: Node): str! {
+    source = knownScalarIntegerOperand(nodes, edges, parameters, value)
+    if (source == "") {
+        RejectScalarInt("unsupported_string_int_operand", "expected an int parameter or literal in str conversion", DeclarationSpan(value))?
+    }
+    return ok(source)
+}
+
+fn ScalarIntComparison(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], &operator: Node): str! {
+    ordered = operator.text == "<" || operator.text == "<=" || operator.text == ">" || operator.text == ">="
+    if (!ordered && operator.text != "==" && operator.text != "!=") { return ok("") }
+    left_node = nodes[edges[operator.first_edge] - 1].clone()
+    right_node = nodes[edges[operator.first_edge + 1] - 1].clone()
+    left = knownScalarIntegerOperand(nodes, edges, parameters, left_node)
+    right = knownScalarIntegerOperand(nodes, edges, parameters, right_node)
+    if (left != "" && right != "") {
+        return ok("(" + left + " " + operator.text.clone() + " " + right + ")")
+    }
+    if (ordered) {
+        at = DeclarationSpan(left_node)
+        if (left != "") { at = DeclarationSpan(right_node) }
+        RejectScalarInt("unsupported_int_comparison", "expected an int literal or parameter in ordered comparison", at)?
+    }
+    // Preserve the existing string equality path and diagnostics.
     return ok("")
 }
 
