@@ -157,4 +157,109 @@ int main(void) {
         assert!(rejected.stdout.is_empty());
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
     }
+    assert_owned_array_member(cwd, &emit);
+}
+
+fn assert_owned_array_member(
+    cwd: &Path,
+    emit: &impl Fn(&str) -> super::bounded_process::BoundedOutput,
+) {
+    fs::write(
+        cwd.join("array-member-source.ku"),
+        r#"struct Row { name: str }
+struct Packet { rows: [Row] other: str }
+fn Take(packet: Packet): [Row]! { return ok(packet.rows) }
+fn Refuse(&packet: Packet): [Row]! { return ok(packet.rows) }
+fn Duplicate(packet: Packet): [Row]! {
+    rows = packet.rows
+    return ok(packet.rows)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "array-member-source.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Take").unwrap();
+    let typed = emit("linked-null-plan");
+    assert_ok(&typed);
+    let Some(Value::Result { ok: true, value }) = json::eval(
+        "decode",
+        &[Value::String(String::from_utf8(typed.stdout).unwrap())],
+        Span::default(),
+    )
+    .unwrap() else {
+        panic!("expected a move plan")
+    };
+    let Value::Object(root) = *value else {
+        panic!("expected plan object")
+    };
+    let Value::Object(entry) = &root["export"] else {
+        panic!("expected export")
+    };
+    let Value::Object(signature) = &entry["signature"] else {
+        panic!("expected signature")
+    };
+    let Value::Array(parameters) = &signature["parameters"] else {
+        panic!("expected parameters")
+    };
+    let Value::Object(parameter) = &parameters[0] else {
+        panic!("expected parameter type")
+    };
+    let Value::Object(result) = &signature["result"] else {
+        panic!("expected result type")
+    };
+    let Value::String(packet) = &parameter["c_type"] else {
+        panic!("expected C parameter type")
+    };
+    let Value::String(result_type) = &result["c_type"] else {
+        panic!("expected C result type")
+    };
+    let Value::String(symbol) = &entry["symbol"] else {
+        panic!("expected export symbol")
+    };
+    let driver = r#"
+int main(void) {
+    (void)test_realloc;
+    __PACKET__ packet = {0};
+    packet.f0.data = malloc(sizeof(*packet.f0.data));
+    uint8_t *bytes = malloc(4);
+    memcpy(bytes, "name", 4);
+    packet.f0.data[0].f0 = (KuProjectionString){bytes,4,4,KU_PROJECTION_STRING_OWNED};
+    packet.f0.len = packet.f0.capacity = 1;
+    packet.f1 = (KuProjectionString){malloc(1),1,1,KU_PROJECTION_STRING_OWNED};
+    const void *array = packet.f0.data;
+    __RESULT__ result = __ENTRY__(packet);
+    assert(result.ok && result.value.data == array && result.value.len == 1);
+    assert(result.value.data[0].f0.ptr == bytes && outstanding() == 2);
+    ku_projection_string_drop(&result.value.data[0].f0);
+    free(result.value.data);
+    assert(outstanding() == 0);
+    return 0;
+}
+"#
+    .replace("__PACKET__", packet)
+    .replace("__RESULT__", result_type)
+    .replace("__ENTRY__", symbol);
+    let c = emit("linked-null");
+    assert_ok(&c);
+    let path = cwd.join("array-member-move.c");
+    let app = cwd.join(format!("array-member-move{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &path,
+        format!(
+            "{CHECKED_ARRAY_ALLOCATOR}{}{driver}",
+            String::from_utf8(c.stdout).unwrap()
+        ),
+    )
+    .unwrap();
+    compile_projection(&path, &app, cwd);
+    assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+    for (function, diagnostic) in [
+        ("Refuse", "linked_result_return"),
+        ("Duplicate", "linked_moved_member"),
+    ] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let rejected = emit("linked-null");
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
 }

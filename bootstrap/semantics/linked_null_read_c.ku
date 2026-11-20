@@ -223,12 +223,18 @@ fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: N
             element = LinkedNullArrayElement(field.value.ty.clone())
             next.code += LinkedNullResultCleanupReference(next.owning_layouts, element)
         }
-        address = "(&(" + field.value.text + "))"
+        address = "(&(" + field.value.text.clone() + "))"
         next.code += "    if (!" + LinkedNullArrayPrefix(field.value.ty) + "_valid(" + address.clone()
             + ") || (uintmax_t)" + address.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
         field.state = next
-        field.value.text = address
-        field.value.borrowed = true
+        // Keep a real lvalue for arrays inside an owned record. A view
+        // receiver still exposes only the readonly address of that field.
+        if (field.value.ty.declaration_kind == "StructArray" && field.value.member_path != "") {
+            field.value.ty.declaration_kind = "OwnedStructArray"
+        } else {
+            field.value.text = address
+            field.value.borrowed = true
+        }
     } else {
         field.value.borrowed = LinkedNullOwner(field.value.ty)
     }
