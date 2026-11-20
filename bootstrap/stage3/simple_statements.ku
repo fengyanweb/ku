@@ -1,0 +1,116 @@
+import { Token } from "../stage1/token.ku"
+import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
+import { Node, ParseOutput } from "../stage2/ast.ku"
+import { ExpressionSpan } from "../stage2/expression_support.ku"
+import { NextBodyWork, ReadExpressionEnd, LocalAssignmentOperator, RejectLetStatement,
+         RejectDeclarationInitializer, SignatureTypeOutput } from "./body_support.ku"
+import { ReadSignatureTypePrefix } from "./signature.ku"
+import { RejectAtSpan, SpanFromNode, WindowKind, WindowToken } from "./support.ku"
+
+struct SimpleStatementRead {
+    node: int
+    cursor: int
+    work: int
+}
+
+// Read and append one non-control statement with the owner’s arena
+// operations. Callable handles are retained only for this call.
+fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_base: int,
+                           initial_work: int, statement_start: Token,
+                           parse_expression: fn(int, int): ParseOutput!,
+                           add_arena: fn(ParseOutput, Token, bool): int!,
+                           add_node: fn(str, str, int, Span, [int], Token): int!,
+                           read_node: fn(int): Node, read_span: fn(int): Span): SimpleStatementRead! {
+    cursor = first
+    parse_steps = initial_work
+    statement = 0
+    assignment_operator = ""
+    if (statement_start.kind == "Ident") { assignment_operator = LocalAssignmentOperator(WindowToken(tokens, cursor + 1, last_index)) }
+    if (statement_start.kind == "Let") {
+        RejectLetStatement(statement_start)?
+    } else if (statement_start.kind == "Return" || statement_start.kind == "Fail") {
+        kind = statement_start.kind.clone()
+        requires_value = kind == "Fail"
+        cursor = cursor + 1
+        children: [int] = []
+        end_span = SpanFromToken(statement_start.clone())
+        if (!requires_value && WindowKind(tokens, cursor, last_index) == "Semicolon") {
+            end_span = SpanFromToken(WindowToken(tokens, cursor, last_index))
+        } else if (requires_value || WindowKind(tokens, cursor, last_index) != "RBrace") {
+            expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
+            value_origin = WindowToken(tokens, cursor, last_index)
+            value_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
+            expression = add_arena(value_parsed, value_origin, false)?
+            children = children.push(expression)
+            expression_node = read_node(expression)
+            end_span = SpanFromNode(expression_node)
+            cursor = expression_end
+        }
+        statement = add_node(kind, "", 0, SpanMerge(SpanFromToken(statement_start.clone()), end_span), children, statement_start.clone())?
+    } else if (statement_start.kind == "Ident" && WindowKind(tokens, cursor + 1, last_index) == "Colon") {
+        name = statement_start.lexeme.clone()
+        cursor = cursor + 2
+        parsed_type = ReadSignatureTypePrefix(tokens, cursor, last_index)?
+        parse_steps = NextBodyWork(parse_steps, parsed_type.work, WindowToken(tokens, cursor, last_index))?
+        type_consumed = parsed_type.consumed
+        type_output = SignatureTypeOutput(parsed_type, WindowToken(tokens, cursor, last_index))?
+        type_node = add_arena(type_output, WindowToken(tokens, cursor, last_index), false)?
+        cursor = cursor + type_consumed
+        if (WindowKind(tokens, cursor, last_index) != "Equal") {
+            RejectDeclarationInitializer(WindowToken(tokens, cursor, last_index))?
+        }
+        cursor = cursor + 1
+        expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
+        declaration_origin = WindowToken(tokens, cursor, last_index)
+        declaration_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
+        expression = add_arena(declaration_parsed, declaration_origin, false)?
+        expression_node = read_node(expression)
+        statement = add_node("VarDecl", name, 0, SpanMerge(SpanFromToken(statement_start.clone()), SpanFromNode(expression_node)), [type_node, expression], statement_start.clone())?
+        cursor = expression_end
+    } else if (assignment_operator != "") {
+        name = statement_start.lexeme.clone()
+        target = 0
+        if (assignment_operator != "=") {
+            target = add_node("Variable", name.clone(), 0, SpanFromToken(statement_start.clone()), [], statement_start.clone())?
+        }
+        cursor = cursor + 2
+        expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
+        assignment_origin = WindowToken(tokens, cursor, last_index)
+        assignment_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
+        expression = add_arena(assignment_parsed, assignment_origin, false)?
+        expression_node = read_node(expression)
+        statement_span = SpanMerge(SpanFromToken(statement_start.clone()), SpanFromNode(expression_node))
+        if (assignment_operator == "=") {
+            statement = add_node("Assign", name, 0, statement_span, [expression], statement_start.clone())?
+        } else {
+            statement = add_node("CompoundAssign", assignment_operator, 0, statement_span, [target, expression], statement_start.clone())?
+        }
+        cursor = expression_end
+    } else {
+        expression_end = ReadExpressionEnd(tokens, cursor, last_index, "assignment_target")?
+        statement_origin = WindowToken(tokens, cursor, last_index)
+        statement_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
+        expression = add_arena(statement_parsed, statement_origin, false)?
+        expression_node = read_node(expression)
+        span = ExpressionSpan(expression_node)
+        cursor = expression_end
+        kind = "ExprStmt"
+        children: [int] = [expression]
+        if (WindowKind(tokens, cursor, last_index) == "Equal") {
+            if (expression_node.kind != "Field" && expression_node.kind != "Index") {
+                RejectAtSpan(span.clone(), "invalid_assignment_target", "invalid assignment target")?
+            }
+            cursor = cursor + 1
+            expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
+            value = parse_expression(token_base + cursor, token_base + expression_end)?
+            rhs = add_arena(value, WindowToken(tokens, cursor, last_index), false)?
+            span = SpanMerge(span, read_span(rhs))
+            children = children.push(rhs)
+            kind = "AssignTarget"
+            cursor = expression_end
+        }
+        statement = add_node(kind, "", 0, span, children, statement_start.clone())?
+    }
+    if (WindowKind(tokens, cursor, last_index) == "Semicolon") { cursor = cursor + 1 }
+    return ok(SimpleStatementRead { node: statement, cursor: cursor, work: parse_steps })
+}

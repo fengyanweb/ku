@@ -2,11 +2,12 @@ import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, ParseOutput } from "../stage2/ast.ku"
 import { ExpressionSpan, MakeExpressionNode } from "../stage2/expression_support.ku"
-import { RejectAtSpan, SpanFromNode, WindowKind, WindowToken, AfterOptionalSemicolon, CheckFunctionBodySpan } from "./support.ku"
-import { ReadSignatureTypePrefix, CheckTypeArenaCapacity } from "./signature.ku"
-import { AppendStatementLinks, PrepareBodyAttachment } from "./statement_links.ku"
+import { WindowKind, WindowToken, AfterOptionalSemicolon, CheckFunctionBodySpan } from "./support.ku"
+import { CheckTypeArenaCapacity } from "./signature.ku"
+import { AppendStatementLinks, BuildCatchClause, PrepareBodyAttachment } from "./statement_links.ku"
 import { LocalFunctionScope, ReadLocalFunctionHeader } from "./function_header.ku"
-import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, ReadControlHeader, IsControlStatement, ReadCatchBinding, ReadExpressionEnd, LocalAssignmentOperator, RejectBodyEof, RejectControlBody, RejectBodyEdgeId, RejectNestedNodeId, ReadElsePhase, CheckStrayClause, RejectFinally, ExpectTryToken, RejectStatementLimit, RejectStatementDepth, RejectLetStatement, RejectDeclarationInitializer, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow, SignatureTypeOutput } from "./body_support.ku"
+import { ReadSimpleBodyStatement } from "./simple_statements.ku"
+import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, ReadControlHeader, IsControlStatement, ReadCatchBinding, RejectBodyEof, RejectControlBody, RejectBodyEdgeId, RejectNestedNodeId, ReadElsePhase, CheckStrayClause, ExpectTryToken, RejectStatementLimit, RejectStatementDepth, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow } from "./body_support.ku"
 
 // Read the remainder of one bounded ordinary-function window, starting at the
 // first token after its opening brace. The standalone entry validates its
@@ -81,6 +82,9 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
         }
         return ok(node_base + attachment.root)
     }
+    fn ReadNode(node: int): Node { return arena_nodes[node - 1].clone() }
+    fn ReadSpan(node: int): Span { return ExpressionSpan(arena_nodes[node - 1]) }
+
     fn AppendStatementList(children: [int], top: int, count: int, error_token: Token): [int]! {
         appended = AppendStatementLinks(children, statement_links, top, count, arena_nodes.len(), parse_steps, error_token)?
         parse_steps = appended.work
@@ -151,13 +155,8 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                         statement_count = scope.parent_statement_count
                     }
                     if (current.kind == "Try") {
-                        RejectFinally(WindowToken(tokens, cursor, last_index))?
-                        catch_start = WindowToken(tokens, current.catch_start, last_index)
-                        catch_open = WindowToken(tokens, current.catch_start + 4, last_index)
-                        catch_children = AppendStatementList([], current.else_top, current.else_count, catch_open.clone())?
-                        catch_body = AddNode("CatchBody", "", 0, SpanMerge(SpanFromToken(catch_open.clone()), SpanFromToken(block_end.clone())), catch_children, catch_open)?
-                        catch_clause = AddNode("Catch", "", 0, SpanMerge(SpanFromToken(catch_start.clone()), SpanFromToken(block_end.clone())), [current.catch_binding, catch_body], catch_start)?
-                        control_children = control_children.push(catch_clause)
+                        control_children = control_children.push(BuildCatchClause(
+                            tokens, cursor, last_index, current, block_end, AppendStatementList.clone(), AddNode.clone())?)
                     } else {
                         control_children = AppendStatementList(control_children, current.body_top, current.body_count, control_start.clone())?
                         if (current.kind == "If") {
@@ -233,96 +232,11 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                 control_depth = control_depth + 1
                 cursor = cursor + 1
             } else {
-                statement = 0
-                assignment_operator = ""
-                if (statement_start.kind == "Ident") { assignment_operator = LocalAssignmentOperator(WindowToken(tokens, cursor + 1, last_index)) }
-                if (statement_start.kind == "Let") {
-                    RejectLetStatement(statement_start)?
-                } else if (statement_start.kind == "Return" || statement_start.kind == "Fail") {
-                    kind = statement_start.kind.clone()
-                    requires_value = kind == "Fail"
-                    cursor = cursor + 1
-                    children: [int] = []
-                    end_span = SpanFromToken(statement_start.clone())
-                    if (!requires_value && WindowKind(tokens, cursor, last_index) == "Semicolon") {
-                        end_span = SpanFromToken(WindowToken(tokens, cursor, last_index))
-                    } else if (requires_value || WindowKind(tokens, cursor, last_index) != "RBrace") {
-                        expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
-                        value_origin = WindowToken(tokens, cursor, last_index)
-                        value_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
-                        expression = AddArena(value_parsed, value_origin, false)?
-                        children = children.push(expression)
-                        expression_node = arena_nodes[expression - 1].clone()
-                        end_span = SpanFromNode(expression_node)
-                        cursor = expression_end
-                    }
-                    statement = AddNode(kind, "", 0, SpanMerge(SpanFromToken(statement_start.clone()), end_span), children, statement_start.clone())?
-                } else if (statement_start.kind == "Ident" && WindowKind(tokens, cursor + 1, last_index) == "Colon") {
-                    name = statement_start.lexeme.clone()
-                    cursor = cursor + 2
-                    parsed_type = ReadSignatureTypePrefix(tokens, cursor, last_index)?
-                    parse_steps = NextBodyWork(parse_steps, parsed_type.work, WindowToken(tokens, cursor, last_index))?
-                    type_consumed = parsed_type.consumed
-                    type_output = SignatureTypeOutput(parsed_type, WindowToken(tokens, cursor, last_index))?
-                    type_node = AddArena(type_output, WindowToken(tokens, cursor, last_index), false)?
-                    cursor = cursor + type_consumed
-                    if (WindowKind(tokens, cursor, last_index) != "Equal") {
-                        RejectDeclarationInitializer(WindowToken(tokens, cursor, last_index))?
-                    }
-                    cursor = cursor + 1
-                    expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
-                    declaration_origin = WindowToken(tokens, cursor, last_index)
-                    declaration_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
-                    expression = AddArena(declaration_parsed, declaration_origin, false)?
-                    expression_node = arena_nodes[expression - 1].clone()
-                    statement = AddNode("VarDecl", name, 0, SpanMerge(SpanFromToken(statement_start.clone()), SpanFromNode(expression_node)), [type_node, expression], statement_start.clone())?
-                    cursor = expression_end
-                } else if (assignment_operator != "") {
-                    name = statement_start.lexeme.clone()
-                    target = 0
-                    if (assignment_operator != "=") {
-                        target = AddNode("Variable", name.clone(), 0, SpanFromToken(statement_start.clone()), [], statement_start.clone())?
-                    }
-                    cursor = cursor + 2
-                    expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
-                    assignment_origin = WindowToken(tokens, cursor, last_index)
-                    assignment_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
-                    expression = AddArena(assignment_parsed, assignment_origin, false)?
-                    expression_node = arena_nodes[expression - 1].clone()
-                    statement_span = SpanMerge(SpanFromToken(statement_start.clone()), SpanFromNode(expression_node))
-                    if (assignment_operator == "=") {
-                        statement = AddNode("Assign", name, 0, statement_span, [expression], statement_start.clone())?
-                    } else {
-                        statement = AddNode("CompoundAssign", assignment_operator, 0, statement_span, [target, expression], statement_start.clone())?
-                    }
-                    cursor = expression_end
-                } else {
-                    expression_end = ReadExpressionEnd(tokens, cursor, last_index, "assignment_target")?
-                    statement_origin = WindowToken(tokens, cursor, last_index)
-                    statement_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
-                    expression = AddArena(statement_parsed, statement_origin, false)?
-                    expression_node = arena_nodes[expression - 1].clone()
-                    span = ExpressionSpan(expression_node)
-                    cursor = expression_end
-                    kind = "ExprStmt"
-                    children: [int] = [expression]
-                    if (WindowKind(tokens, cursor, last_index) == "Equal") {
-                        if (expression_node.kind != "Field" && expression_node.kind != "Index") {
-                            RejectAtSpan(span.clone(), "invalid_assignment_target", "invalid assignment target")?
-                        }
-                        cursor = cursor + 1
-                        expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
-                        value = parse_expression(token_base + cursor, token_base + expression_end)?
-                        rhs = AddArena(value, WindowToken(tokens, cursor, last_index), false)?
-                        span = SpanMerge(span, ExpressionSpan(arena_nodes[rhs - 1]))
-                        children = children.push(rhs)
-                        kind = "AssignTarget"
-                        cursor = expression_end
-                    }
-                    statement = AddNode(kind, "", 0, span, children, statement_start.clone())?
-                }
-                cursor = AfterOptionalSemicolon(tokens, cursor, last_index)
-                RecordStatement(statement)?
+                parsed = ReadSimpleBodyStatement(tokens, cursor, last_index, token_base, parse_steps, statement_start,
+                                                parse_expression.clone(), AddArena.clone(), AddNode.clone(), ReadNode.clone(), ReadSpan.clone())?
+                cursor = parsed.cursor
+                parse_steps = parsed.work
+                RecordStatement(parsed.node)?
             }
         }
     }

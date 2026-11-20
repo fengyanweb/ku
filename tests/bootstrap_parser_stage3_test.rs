@@ -1359,6 +1359,7 @@ fn bootstrap_stage3_function_modules_retain_lexer_headroom() {
     for name in [
         "function_header.ku",
         "functions.ku",
+        "simple_statements.ku",
         "statements.ku",
         "body_support.ku",
         "statement_links.ku",
@@ -3430,6 +3431,7 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         "imports.ku",
         "parser.ku",
         "signature.ku",
+        "simple_statements.ku",
         "statement_links.ku",
         "statements.ku",
         "structs.ku",

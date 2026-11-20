@@ -492,6 +492,30 @@ fn bootstrap_parser_preserves_real_failure_and_assignment_syntax() {
     }
 
     for source in [
+        include_str!("../bootstrap/stage3/statements.ku"),
+        include_str!("../bootstrap/stage3/simple_statements.ku"),
+    ] {
+        let rust = Parser::new(Lexer::new(source).lex().unwrap())
+            .parse_program()
+            .expect("Stage0 parses the whole compiler file");
+        let actual = invoke(source);
+        assert!(
+            actual.status.success(),
+            "{}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        let (nodes, links) = actual_arena(&actual.stdout);
+        let root = nodes.last().expect("compiler module has an arena root");
+        assert_eq!(root.kind, "Program");
+        assert_eq!(links.last().unwrap().len(), rust.items.len());
+        let expected_root = format!("ROOT|{}", nodes.len());
+        assert_eq!(
+            String::from_utf8_lossy(&actual.stdout).lines().next(),
+            Some(expected_root.as_str())
+        );
+    }
+
+    for source in [
         "fn Main(): null! { fail ; }",
         "fn Main(): null! { fail { domain \"missing colon\" } }",
         "fn Main(): null! { fail { message: \"trailing\", } }",

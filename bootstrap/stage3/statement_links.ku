@@ -1,6 +1,8 @@
 import { Token } from "../stage1/token.ku"
 import { Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
-import { StatementLink, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength,
+import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
+import { WindowToken } from "./support.ku"
+import { ControlFrame, RejectFinally, StatementLink, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength,
          RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectNestedRoot } from "./body_support.ku"
 
 struct AppendedStatements {
@@ -60,4 +62,20 @@ fn AppendStatementLinks(children: [int], &links: [StatementLink], top: int, coun
         output = output.push(reversed[reverse_index])
     }
     return ok(AppendedStatements { children: output, work: work })
+}
+
+// Preserve catch-body/list charging before either of its two nodes is added.
+// A finally clause remains unsupported at this boundary.
+fn BuildCatchClause(&tokens: [Token], next: int, last: int, &frame: ControlFrame, &end: Token,
+                    append: fn([int], int, int, Token): [int]!,
+                    add_node: fn(str, str, int, Span, [int], Token): int!): int! {
+    RejectFinally(WindowToken(tokens, next, last))?
+    catch_start = WindowToken(tokens, frame.catch_start, last)
+    catch_open = WindowToken(tokens, frame.catch_start + 4, last)
+    children = append([], frame.else_top, frame.else_count, catch_open.clone())?
+    end_span = SpanFromToken(end.clone())
+    body_span = SpanMerge(SpanFromToken(catch_open.clone()), end_span.clone())
+    catch_body = add_node("CatchBody", "", 0, body_span, children, catch_open)?
+    clause_span = SpanMerge(SpanFromToken(catch_start.clone()), end_span)
+    return add_node("Catch", "", 0, clause_span, [frame.catch_binding, catch_body], catch_start)
 }
