@@ -1179,32 +1179,25 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
     detail['status'] = 'passed'
 
 
-def installed_forward_layout_consumer(install, root, env, report, target):
-    """Check owned forward layout binding through a relative import."""
-    project = root / 'forward-layout-project'
+def validate_installed_relative_program(install, project, env, target, files, expected):
     project.mkdir()
-    library = project / 'data.ku'
-    library.write_text(
-        'struct Packet { detail: Payload }\n'
-        'fn Make(): Packet { return Packet { detail: Payload { name: "Ku🙂" } } }\n'
-        'struct Payload { name: str }\n', encoding='utf-8')
+    for name, contents in files.items():
+        (project / name).write_text(contents, encoding='utf-8')
     entry = project / 'main.ku'
-    entry.write_text(
-        'import { Make } from "./data.ku"\n'
-        'fn main() { packet = Make() println(packet.detail.name) }\n', encoding='utf-8')
+    cwd = project.parent
     ku = install / ('ku.exe' if os.name == 'nt' else 'ku')
     run_env = env
     if target == 'x86_64-pc-windows-gnu':
         system = windows_system_root(env)
         run_env = dict(env, PATH=os.pathsep.join((str(system / 'System32'), str(system))))
-    detail = report['installed_forward_layout'] = {'status': 'running', 'outputs': {}}
+    outputs = {}
     programs = {}
     for backend in ('c', 'runner'):
         program = project / (backend + ('.exe' if os.name == 'nt' else ''))
         selection = ['--backend', 'runner'] if backend == 'runner' else []
-        result = invoke([ku, 'build', '--release', '--verbose', *selection, entry, '-o', program], root, env)
+        result = invoke([ku, 'build', '--release', '--verbose', *selection, entry, '-o', program], cwd, env)
         if result.returncode:
-            raise RuntimeError('installed forward layout build failed: ' +
+            raise RuntimeError(project.name + ' installed build failed: ' +
                                result.stderr.decode('utf-8', errors='replace')[-4096:])
         assert_build_backend(result, backend, 'release')
         programs[backend] = program
@@ -1214,15 +1207,74 @@ def installed_forward_layout_consumer(install, root, env, report, target):
         ('c', [programs['c']], run_env),
     ):
         if mode == 'c':
-            entry.unlink()
-            library.unlink()
-        result = invoke(command, root, selected_env, seconds=20)
+            for name in files:
+                (project / name).unlink()
+        result = invoke(command, cwd, selected_env, seconds=20)
         observed = output(result)
-        if result.returncode or result.stderr or observed != 'Ku🙂\n':
-            raise RuntimeError('installed forward layout execution differed: ' +
+        if result.returncode or result.stderr or observed != expected:
+            raise RuntimeError(project.name + ' installed execution differed: ' +
                                repr((observed + result.stderr.decode('utf-8', errors='replace'))[-4096:]))
-        detail['outputs'][mode] = observed
-    detail.update(status='passed', native_sources_removed=not library.exists() and not entry.exists())
+        outputs[mode] = observed
+    return {'status': 'passed', 'outputs': outputs,
+            'native_sources_removed': all(not (project / name).exists() for name in files)}
+
+
+def installed_forward_layout_consumer(install, root, env, report, target):
+    """Check owned forward layout binding through a relative import."""
+    files = {
+        'data.ku': 'struct Packet { detail: Payload }\n'
+                   'fn Make(): Packet { return Packet { detail: Payload { name: "Ku🙂" } } }\n'
+                   'struct Payload { name: str }\n',
+        'main.ku': 'import { Make } from "./data.ku"\n'
+                   'fn main() { packet = Make() println(packet.detail.name) }\n',
+    }
+    report['installed_forward_layout'] = validate_installed_relative_program(
+        install, root / 'forward-layout-project', env, target, files, 'Ku🙂\n')
+
+
+def installed_task_error_consumer(install, root, env, report, target):
+    """Check inline Error evaluation and same-Task catch ownership after suspension."""
+    files = {
+        'helper.ku': """import time from "std.time"
+struct Reply { body: str }
+async fn Field(marker: int, value: str): str! {
+    time.sleep(2)?
+    println(marker)
+    return ok(value + "!")
+}
+async fn FailCase(): int! {
+    fail {
+        message: (await Field(1, "no input"))?,
+        domain: (await Field(2, "spec"))?,
+        code: (await Field(3, "blocked"))?
+    }
+}
+async fn ReplyPacket(good: bool): Reply! {
+    time.sleep(2)?
+    if (!good) { fail "upstream" }
+    return ok(Reply { body: "过🙂" })
+}
+""",
+        'main.ku': """import time from "std.time"
+import { FailCase, ReplyPacket } from "./helper.ku"
+async fn main(): null! {
+    try { (await FailCase())? } catch (issue) {
+        read: fn(): bool = () => issue.code == "blocked!"
+        alias = read
+        time.sleep(2)?
+        println(alias())
+        println(issue.message)
+    }
+    println(((await ReplyPacket(true))?).body)
+    try { println(((await ReplyPacket(false))?).body) }
+    catch (issue) { println(issue.message) }
+    println(7)
+    return ok(null)
+}
+""",
+    }
+    report['installed_task_error'] = validate_installed_relative_program(
+        install, root / 'task-error-project', env, target, files, '1\n2\n3\ntrue\nno input!\n过🙂\nupstream\n7\n')
 
 
 def run_structured_only(args, report):
@@ -1270,6 +1322,7 @@ def run_structured_only(args, report):
         installed_declaration_inventory_consumer(install, root, env, report, repo, verifier, target)
         installed_bootstrap_module_consumer(install, root, env, report, repo, verifier, target)
         installed_forward_layout_consumer(install, root, env, report, target)
+        installed_task_error_consumer(install, root, env, report, target)
     report.update(status='passed', backend_equivalence=True, owned_temp_removed=not root.exists())
 
 
