@@ -26,7 +26,14 @@ KU
 
 - `check` accepts one source module. It runs the bounded parser,
   declaration and explicit type-name passes, and implemented direct-call
-  checks. Project import graphs use the separate manifest-based tool.
+  checks.
+- `check-project modules.txt` reads the existing manifest format. Each line
+  lists a normalized project-relative `.ku` file. The compiler reads these
+  files relative to the manifest's directory, even when invoked elsewhere.
+  It resolves relative imports, aliases, explicit types and supported direct
+  call contracts across those modules. The manifest accepts up to 64 modules
+  and 32,768 UTF-8 bytes. The path rules are lexical. Symlinks follow normal
+  filesystem behavior.
 - `emit` selects one supported integer function and writes its C11 source
   to standard output. The leading C comment names the generated symbol
   for a caller. Link that source with a C caller or harness.

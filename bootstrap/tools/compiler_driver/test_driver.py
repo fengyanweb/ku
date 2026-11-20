@@ -24,6 +24,74 @@ def execute(args, cwd, status=0):
     return result
 
 
+def exercise_project(compiler, root, caller):
+    project = root / "项目 清单🙂"
+    src, lib = project / "src", project / "lib"
+    src.mkdir(parents=True)
+    lib.mkdir()
+    manifest = project / "modules.txt"
+    library = lib / "数字🙂.ku"
+    library.write_text(
+        "struct Counter { value: int }\n"
+        "fn Increment(value: int): int { return value + 1 }\n",
+        encoding="utf-8",
+    )
+    main = src / "main.ku"
+    valid = (
+        'import { Counter as Record, Increment as Step } from "../lib/数字🙂.ku"\n'
+        'struct Packet { item: Record }\n'
+        'fn Answer(): int { return Step(41) }\n'
+    )
+    main.write_text(valid, encoding="utf-8")
+    listed = "src/main.ku\r\nlib/数字🙂.ku\r\n".encode()
+    manifest.write_bytes(listed)
+    # A matching filename in the caller's directory must never substitute
+    # for a manifest-relative project module.
+    (caller / "src").mkdir()
+    (caller / "src/main.ku").write_text("fn broken( ", encoding="utf-8")
+    relative = Path("..") / project.name / manifest.name
+    assert execute([compiler, "check-project", relative], caller).stdout == b""
+    assert execute([compiler, "check-project", manifest], caller).stdout == b""
+    assert b"usage:" in execute(
+        [compiler, "check-project", relative, "extra"], caller, 2
+    ).stderr
+
+    def project_error(code, logical=None):
+        result = execute([compiler, "check-project", relative], caller, 1)
+        assert not result.stdout and code in result.stderr, result.stderr
+        if logical is not None:
+            assert logical + b": " in result.stderr, result.stderr
+            assert re.search(rb"[0-9]+:[0-9]+@[0-9]+\.\.[0-9]+:[0-9]+@[0-9]+", result.stderr), result.stderr
+
+    for original, replacement, code in [
+        ("Increment as Step", "Unknown as Step", b"missing_export"),
+        ("Increment as Step", "Increment as Record", b"duplicate_import_alias"),
+        ("item: Record", "item: Counter", b"undefined_type"),
+        ("Step(41)", "Step()", b"call_arity"),
+        ("Step(41)", 'Step("not an integer")', b"call_argument_type"),
+    ]:
+        main.write_text(valid.replace(original, replacement, 1), encoding="utf-8")
+        project_error(code, b"src/main.ku")
+    main.write_text("fn broken( ", encoding="utf-8")
+    project_error(b"bootstrap.parser.stage3|unexpected_token", b"src/main.ku")
+    main.write_text(valid, encoding="utf-8")
+
+    manifest.write_bytes(b"src/main.ku\n")
+    project_error(b"unresolved_import", b"src/main.ku")
+    (caller / "only-in-caller.ku").write_text("fn Present(): int { return 1 }\n")
+    manifest.write_bytes(b"only-in-caller.ku\n")
+    project_error(b"only-in-caller.ku: ")
+    (root / "escape.ku").write_text("fn Present(): int { return 1 }\n")
+    manifest.write_bytes(b"../escape.ku\n")
+    project_error(b"project_path")
+    manifest.write_text("".join(f"unit{index}.ku\n" for index in range(65)))
+    project_error(b"accepts at most 64 modules")
+    manifest.write_bytes(b"x" * 32769)
+    project_error(b"exceeds 32768 UTF-8 bytes")
+    manifest.write_bytes(listed)
+    assert execute([compiler, "check-project", relative], caller).stdout == b""
+
+
 def exercise(ku, cc):
     here = Path(__file__).resolve().parent
     with tempfile.TemporaryDirectory(prefix="ku-bootstrap-argv-test-") as temp:
@@ -95,7 +163,8 @@ def exercise(ku, cc):
         )
         execute([cc, "-std=c11", "-O2", "derived.c", "-o", "derived"], caller)
         execute([caller / "derived"], caller)
-        print("bootstrap argv, diagnostics, signature and standalone C verified")
+        exercise_project(compiler, root, caller)
+        print("bootstrap argv, module checks, signature and standalone C verified")
 
 
 def main():

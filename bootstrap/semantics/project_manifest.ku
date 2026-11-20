@@ -36,9 +36,14 @@ fn ManifestPaths(manifest: str, at: Span): [str]! {
     return ok(paths)
 }
 
-fn ReadProjectModule(path: str): SuppliedModule! {
+// An empty prefix preserves the original relative reads. A rooted caller
+// supplies the directory prefix, including its final slash, separately.
+fn readProjectModule(path: str, &prefix: str): SuppliedModule! {
     try {
-        named = BuildNameTable(ParseModule(fs.read(path)?)?)?
+        source: str
+        if (prefix == "") { source = fs.read(path)? }
+        else { source = fs.read(prefix.clone() + path.clone())? }
+        named = BuildNameTable(ParseModule(source)?)?
         return ok(SuppliedModule { path: path, named: named })
     } catch (err) {
         fail {
@@ -48,14 +53,22 @@ fn ReadProjectModule(path: str): SuppliedModule! {
     }
 }
 
-fn ReadProjectModules(&paths: [str]): [SuppliedModule]! {
+fn ReadProjectModule(path: str): SuppliedModule! {
+    return readProjectModule(path, "")
+}
+
+fn ReadProjectModulesAt(&paths: [str], &prefix: str): [SuppliedModule]! {
     supplied: [SuppliedModule] = []
     index = 0
     while (index < paths.len()) {
         path = paths[index].clone()
-        entry = ReadProjectModule(path)?
+        entry = readProjectModule(path, prefix)?
         supplied = supplied.push(entry)
         index = index + 1
     }
     return ok(supplied)
+}
+
+fn ReadProjectModules(&paths: [str]): [SuppliedModule]! {
+    return ReadProjectModulesAt(paths, "")
 }

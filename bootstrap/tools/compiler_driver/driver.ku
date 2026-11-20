@@ -1,12 +1,26 @@
 import "std.fs"
+import { Span } from "../../stage2/span.ku"
 import { ParseModule } from "../../stage3/parser.ku"
 import { CheckDirectCallContracts } from "../../semantics/call_contracts.ku"
 import { ImportBinding, SuppliedModule } from "../../semantics/imports.ku"
 import { BuildNameTable } from "../../semantics/names.ku"
+import { BindProjectModules } from "../../semantics/project_bindings.ku"
+import { ManifestPaths, ReadProjectModulesAt } from "../../semantics/project_manifest.ku"
+import { ProjectParent } from "../../semantics/project_paths.ku"
 import { EmitScalarIntC } from "../../semantics/scalar_int_c.ku"
 import { BindTypeNames } from "../../semantics/type_names.ku"
 
+fn checkProject(&manifest: str): null! {
+    at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    paths = ManifestPaths(fs.read(manifest.clone())?, at)?
+    prefix = ProjectParent(manifest)? + "/"
+    supplied = ReadProjectModulesAt(paths, prefix)?
+    BindProjectModules(supplied)?
+    return ok(null)
+}
+
 fn BootstrapEntry(&command: str, &path: str, &symbol: str): null! {
+    if (command == "check-project") { return checkProject(path) }
     input = BuildNameTable(ParseModule(fs.read(path.clone())?)?)?
     supplied: [SuppliedModule] = []
     imports: [ImportBinding] = []

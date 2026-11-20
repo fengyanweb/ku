@@ -61,9 +61,11 @@ static int finish(KuResult_null result) {
 }
 
 int main(int argc, char** argv) {
-    if ((argc != 3 && argc != 4) || (argc == 3 && strcmp(argv[1], "check")) ||
+    if ((argc != 3 && argc != 4) ||
+        (argc == 3 && strcmp(argv[1], "check") && strcmp(argv[1], "check-project")) ||
         (argc == 4 && strcmp(argv[1], "emit"))) {
         fputs("usage: ku-bootstrap check <file.ku>\n"
+              "       ku-bootstrap check-project <modules.txt>\n"
               "       ku-bootstrap emit <file.ku> <function>\n", stderr);
         return 2;
     }
