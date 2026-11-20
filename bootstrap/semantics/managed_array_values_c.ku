@@ -4,7 +4,8 @@ import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
 import { ContainsIndex, ProjectionCloneSource, ProjectionIsStringArray } from "./struct_projection_c.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { BindManagedLocal, CheckManagedDeclaration, IsManagedLocalArrayClone, IsManagedMethod, ManagedAppendDrop, ManagedCloneStringSetup, ManagedMethodReceiver, ManagedSourceCharsSetup, ManagedStringAppendRuntime, ManagedStringLeaf, ManagedStringLeafSetup, RequireNewManagedOwner } from "./guarded_string_parts.ku"
+import { BindManagedLocal, CheckManagedDeclaration, IsManagedLocalArrayClone, ManagedAppendDrop, ManagedCloneBoundString, ManagedCloneStringSetup, ManagedSourceCharsSetup, ManagedStringLeaf, ManagedStringLeafSetup, RequireNewManagedOwner } from "./guarded_string_parts.ku"
+import { IsManagedMethod, ManagedMethodReceiver } from "./call_contracts.ku"
 import { CheckStructArrayType, StructArrayC } from "./struct_array_c.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression, GuardLeaf, GuardOwnedExpression, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 
@@ -36,15 +37,6 @@ fn ManagedExpression(&named: NamedModule, &locals: [GuardBinding], &layouts: [St
                      &root: ManagedType, id: int, &indent: str): GuardValue! {
     return GuardOwnedExpression(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts, id, 0,
         indent, root.string_locals, root.leaves)
-}
-
-fn ManagedStringRuntime(): str {
-    return "static bool ku_guard_try_mul(int64_t a, int64_t b, int64_t *out) {\n" +
-        "    if (a > 0) {\n" +
-        "        if ((b > 0 && a > INT64_MAX / b) || (b < 0 && b < INT64_MIN / a)) return false;\n" +
-        "    } else if (a < 0) {\n" +
-        "        if ((b > 0 && a < INT64_MIN / b) || (b < 0 && a < INT64_MAX / b)) return false;\n" +
-        "    }\n    *out = a * b;\n    return true;\n}\n\n" + ManagedStringAppendRuntime()
 }
 
 fn AddGuardCode(&code: ManagedCode, &setup: GuardValue): ManagedCode {
@@ -222,6 +214,11 @@ fn ownedStringSetup(&named: NamedModule, &locals: [GuardBinding], &layouts: [Str
         RejectLayout("managed_string_owner", "expected a literal or a cloned array element", DeclarationSpan(node))?
     }
     indexed = named.parsed.arena.nodes[subject - 1].clone()
+    if (root.string_locals && indexed.kind == "Variable") {
+        code = ManagedBlank()
+        code.text = ManagedCloneBoundString(locals, indexed, target, indent)?
+        return ok(code)
+    }
     if (indexed.kind != "Index" || indexed.edge_count != 2) {
         RejectLayout("managed_string_index", "expected a cloned [str] index", DeclarationSpan(indexed))?
     }
@@ -282,7 +279,9 @@ fn EmitManagedAssignment(&named: NamedModule, &types: [TypeNameBinding], &import
     symbol = ""
     if (root.source_strings) { symbol = ManagedStringLeaf(named, locals, root.leaves, node) }
     local_clone = root.source_strings && IsManagedLocalArrayClone(named.parsed.arena.nodes, named.parsed.arena.edges, locals, node_id)
-    fallible = local_clone || symbol != ""
+    subject = ProjectionCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, node_id)
+    named_clone = root.string_locals && subject != 0 && named.parsed.arena.nodes[subject - 1].kind == "Variable"
+    fallible = local_clone || named_clone || symbol != ""
     literal = (root.string_locals || root.source_strings) && node.kind == "String"
     if ((literal || fallible) && found != 0 && statement.kind == "Assign") {
         previous = locals[found - 1].clone()
@@ -304,7 +303,7 @@ fn EmitManagedAssignment(&named: NamedModule, &types: [TypeNameBinding], &import
             return ok(ManagedAssignment { code: update, binding: previous, introduces: false })
         }
     }
-    if (literal || fallible || (root.string_locals && ProjectionCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, node_id) != 0)) {
+    if (literal || fallible || (root.string_locals && subject != 0)) {
         ty = GuardType { kind: "str", layout: 0 }
         RequireNewManagedOwner(found, statement)?
         CheckManagedDeclaration(declared, ty, found, statement)?

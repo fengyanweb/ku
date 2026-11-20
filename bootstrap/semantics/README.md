@@ -278,6 +278,9 @@ an owned local with a static string. The overflow branch binds the original
 `At` through `project-int`. It snapshots the message's Copy arguments before
 cleanup and calls the provider after releasing the numeric frame's owners.
 The returned Error takes ownership of the provider's formatted string.
+Owned record bodies can replace a local string with a clone of a bound string.
+The old destination is released after the clone succeeds. The source string
+keeps its own lifetime.
 
 The `linked-str` and `struct-result` modes emit `DiagnosticCanonical` and
 `ReadPrimaryAtom` from their original modules. Generated `extern` declarations

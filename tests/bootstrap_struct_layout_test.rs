@@ -1741,6 +1741,12 @@ fn ReuseQuote(source: str, first: bool): [SourceLength]! {
     count = quote.byte_len()
     return ok(entries)
 }
+fn ReplaceDecoded(&characters: [str], quote: str): Scanned! {
+    decoded = characters[0].clone()
+    decoded = quote.clone()
+    count = quote.byte_len()
+    return ok(Scanned { text: decoded, count: count })
+}
 "#,
     )
     .unwrap();
@@ -1910,6 +1916,19 @@ fn ReuseQuote(source: str, first: bool): [SourceLength]! {
     let rejected = execute(&mut Command::new(seed), cwd, 30);
     assert!(!rejected.status.success() && rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("managed_call_move"));
+
+    fs::write(cwd.join("function.txt"), "ReplaceDecoded").unwrap();
+    fs::write(cwd.join("mode.txt"), "struct-result").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let clone = text
+        .find("if (!ku_result_clone_string(a1, &replaced")
+        .unwrap();
+    let drop = text[clone..].find("ku_projection_string_drop(&l").unwrap();
+    let replace = text[clone..].find(" = replaced").unwrap();
+    assert!(drop < replace);
+    assert!(text[clone + replace..].contains("a1.len"));
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {

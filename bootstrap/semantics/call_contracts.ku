@@ -5,6 +5,16 @@ import { RejectLayout } from "./struct_layouts.ku"
 
 struct InactiveMoveBranch { start: int, stop: int }
 
+fn ManagedMethodReceiver(&nodes: [Node], &edges: [int], &call: Node): int {
+    return edges[nodes[edges[call.first_edge] - 1].first_edge]
+}
+
+fn IsManagedMethod(&nodes: [Node], &edges: [int], &value: Node, &name: str, arity: int): bool {
+    if (value.kind != "Call" || value.edge_count != arity + 1) { return false }
+    method = nodes[edges[value.first_edge] - 1].clone()
+    return method.kind == "Field" && method.text == name && method.edge_count == 1
+}
+
 fn RecordResultCallId(&named: NamedModule, statement_id: int): int {
     statement = named.parsed.arena.nodes[statement_id - 1].clone()
     if (statement.kind != "Assign" || statement.edge_count != 1) { return 0 }

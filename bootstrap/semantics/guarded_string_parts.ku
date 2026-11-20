@@ -189,25 +189,19 @@ fn ManagedStringLeaf(&named: NamedModule, &locals: [GuardBinding], &leaves: [Gua
 fn ManagedStringLeafSetup(&nodes: [Node], &edges: [int], &locals: [GuardBinding],
                           &call: Node, id: int, &symbol: str, &target: str, &indent: str): str! {
     source = ProjectionCloneSource(nodes, edges, edges[call.first_edge + 1])
-    binding = GuardBindingIndex(locals, nodes[source - 1].text)
-    if (binding == 0 || locals[binding - 1].ty.kind != "str" || locals[binding - 1].view) {
-        RejectLayout("managed_string_leaf_argument", "expected a clone of a bound owned str", DeclarationSpan(nodes[source - 1]))?
-    }
     temporary = "argument" + str(id)
-    return ok(indent.clone() + "KuProjectionString " + temporary.clone() + " = {0};\n" + indent.clone() +
-        "if (!ku_result_clone_string(" + GuardBindingName(locals[binding - 1]) + ", &" + temporary.clone() +
-        ")) { out_of_memory = true; goto cleanup; }\n" + indent.clone() + target.clone() + " = " +
-        symbol.clone() + "(" + temporary + ");\n")
+    prepare = ManagedCloneBoundString(locals, nodes[source - 1], temporary, indent)?
+    return ok(indent.clone() + "KuProjectionString " + temporary.clone() + " = {0};\n" + prepare +
+        indent.clone() + target.clone() + " = " + symbol.clone() + "(" + temporary + ");\n")
 }
 
-fn ManagedMethodReceiver(&nodes: [Node], &edges: [int], &call: Node): int {
-    return edges[nodes[edges[call.first_edge] - 1].first_edge]
-}
-
-fn IsManagedMethod(&nodes: [Node], &edges: [int], &value: Node, &name: str, arity: int): bool {
-    if (value.kind != "Call" || value.edge_count != arity + 1) { return false }
-    method = nodes[edges[value.first_edge] - 1].clone()
-    return method.kind == "Field" && method.text == name && method.edge_count == 1
+fn ManagedCloneBoundString(&locals: [GuardBinding], &source: Node, &target: str, &indent: str): str! {
+    binding = GuardBindingIndex(locals, source.text)
+    if (binding == 0 || locals[binding - 1].ty.kind != "str" || locals[binding - 1].view) {
+        RejectLayout("managed_string_leaf_argument", "expected a clone of a bound owned str", DeclarationSpan(source))?
+    }
+    return ok(indent.clone() + "if (!ku_result_clone_string(" + GuardBindingName(locals[binding - 1]) + ", &" + target.clone() +
+        ")) { out_of_memory = true; goto cleanup; }\n")
 }
 
 fn LowerManagedRecordError(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
@@ -407,4 +401,13 @@ fn ManagedStringAppendRuntime(): str {
         "    }\n" +
         "    memcpy(left->ptr + left->len, right.ptr, right.len);\n" +
         "    left->len = length;\n    return true;\n}\n\n"
+}
+
+fn ManagedStringRuntime(): str {
+    return "static bool ku_guard_try_mul(int64_t a, int64_t b, int64_t *out) {\n" +
+        "    if (a > 0) {\n" +
+        "        if ((b > 0 && a > INT64_MAX / b) || (b < 0 && b < INT64_MIN / a)) return false;\n" +
+        "    } else if (a < 0) {\n" +
+        "        if ((b > 0 && a < INT64_MIN / b) || (b < 0 && a < INT64_MAX / b)) return false;\n" +
+        "    }\n    *out = a * b;\n    return true;\n}\n\n" + ManagedStringAppendRuntime()
 }
