@@ -1,6 +1,7 @@
 import { fs, string } from "std"
 import { Span } from "../stage2/span.ku"
 import { ParseModule } from "../stage3/parser.ku"
+import { EmitGuardedStructC } from "./guarded_struct_c.ku"
 import { BindProjectImports, SuppliedModule } from "./imports.ku"
 import { BuildNameTable } from "./names.ku"
 import { ManifestPaths, ReadProjectModules } from "./project_manifest.ku"
@@ -22,10 +23,15 @@ fn selectedFunction(): str! {
     return ok(function)
 }
 
-fn emitProjectConstructor(&selected: SuppliedModule, &supplied: [SuppliedModule], &function: str): null! {
+fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &function: str, guarded: bool): null! {
     imports = BindProjectImports(selected, supplied)?
     types = BindImportedTypeNames(selected.named, imports, supplied)?
     layouts = BuildStructLayouts(selected.named, types, supplied)?
+    if (guarded) {
+        generated = EmitGuardedStructC(selected.named, types, layouts, function)?
+        print(generated.source)
+        return ok(null)
+    }
     generated = EmitStructConstructorC(selected.named, types, imports, supplied, layouts, function)?
     print(generated.text)
     return ok(null)
@@ -34,12 +40,12 @@ fn emitProjectConstructor(&selected: SuppliedModule, &supplied: [SuppliedModule]
 fn main(): null! {
     mode = "projection"
     if (fs.exists("mode.txt")) { mode = string.trim(fs.read("mode.txt")?) }
-    if (mode == "construct") {
+    if (mode == "construct" || mode == "guarded") {
         function = selectedFunction()?
         at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
         paths = ManifestPaths(fs.read("modules.txt")?, at)?
         supplied = ReadProjectModules(paths)?
-        return emitProjectConstructor(supplied[0], supplied, function)
+        return emitProjectFunction(supplied[0], supplied, function, mode == "guarded")
     }
 
     input = BuildNameTable(ParseModule(fs.read("input.ku")?)?)?
@@ -58,7 +64,7 @@ fn main(): null! {
         return ok(null)
     }
     if (mode != "projection") {
-        fail { domain: "bootstrap.projection", code: "invalid_mode", message: "mode.txt must contain projection, int or construct" }
+        fail { domain: "bootstrap.projection", code: "invalid_mode", message: "mode.txt must contain projection, int, construct or guarded" }
     }
     layouts = BuildStructLayouts(input, bindings, supplied)?
     plan = BindStructReturn(input, bindings, layouts, function)?

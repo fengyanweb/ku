@@ -1,0 +1,177 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan } from "./names.ku"
+import { CTypeName } from "./struct_projection_c.ku"
+import { ExplicitType, FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { TypeNameBinding } from "./type_names.ku"
+
+struct GuardType {
+    // An aggregate uses a one-based index in the bound layout table.
+    kind: str
+    layout: int
+}
+
+struct GuardBinding {
+    name: str
+    ty: GuardType
+    slot: int
+    parameter: bool
+    view: bool
+}
+
+struct GuardValue {
+    ty: GuardType
+    setup: str
+    value: str
+    view: bool
+    uses_add: bool
+    uses_sub: bool
+}
+
+fn GuardBindingIndex(&bindings: [GuardBinding], &name: str): int {
+    index = 0
+    while (index < bindings.len()) {
+        if (bindings[index].name == name) { return index + 1 }
+        index = index + 1
+    }
+    return 0
+}
+
+fn GuardBindingName(&binding: GuardBinding): str {
+    if (binding.parameter) { return "a" + str(binding.slot) }
+    return "l" + str(binding.slot)
+}
+
+fn GuardCType(&ty: GuardType, &layouts: [StructLayout]): str {
+    if (ty.kind == "bool") { return "bool" }
+    if (ty.kind == "str") { return "KuProjectionString" }
+    if (ty.kind == "struct") {
+        return CTypeName(layouts[ty.layout - 1].module_index, layouts[ty.layout - 1].node)
+    }
+    return "int64_t"
+}
+
+fn GuardBoundType(&type_name: TypeNameBinding, &layouts: [StructLayout]): GuardType! {
+    if (type_name.declaration_kind == "Builtin" &&
+        (type_name.name == "int" || type_name.name == "bool" || type_name.name == "str")) {
+        return ok(GuardType { kind: type_name.name.clone(), layout: 0 })
+    }
+    if (type_name.declaration_kind == "Struct") {
+        index = LayoutIndex(layouts, type_name.module_index, type_name.declaration_node)
+        if (index > 0) { return ok(GuardType { kind: "struct", layout: index }) }
+    }
+    RejectLayout("unsupported_guarded_type", "no guarded C representation for '" + type_name.name.clone() + "'", type_name.span.clone())?
+    return ok(GuardType { kind: "", layout: 0 })
+}
+
+fn GuardExplicitType(&types: [TypeNameBinding], &nodes: [Node], &layouts: [StructLayout], type_node: int): GuardType! {
+    bound = ExplicitType(types, type_node, DeclarationSpan(nodes[type_node - 1]))?
+    return GuardBoundType(bound, layouts)
+}
+
+fn GuardRead(ty: GuardType, value: str, view: bool): GuardValue {
+    return GuardValue { ty: ty, setup: "", value: value, view: view, uses_add: false, uses_sub: false }
+}
+
+fn guardField(&layouts: [StructLayout], &base: GuardValue, &node: Node): GuardValue! {
+    if (base.ty.kind != "struct") {
+        RejectLayout("unsupported_guarded_field", "expected a bound struct field receiver", DeclarationSpan(node))?
+    }
+    ordinal = FieldIndex(layouts[base.ty.layout - 1].fields, node.text)
+    if (ordinal == 0) {
+        RejectLayout("unknown_guarded_field", "unknown field '" + node.text.clone() + "'", DeclarationSpan(node))?
+    }
+    ty = GuardBoundType(layouts[base.ty.layout - 1].fields[ordinal - 1].resolved, layouts)?
+    access = ".f"
+    if (base.view) { access = "->f" }
+    return ok(GuardRead(ty, base.value.clone() + access + str(ordinal - 1), false))
+}
+
+fn guardInteger(&left: GuardValue, &right: GuardValue, &node: Node, id: int, &indent: str): GuardValue! {
+    if (left.ty.kind != "int" || right.ty.kind != "int") {
+        RejectLayout("guarded_operand_type", "checked arithmetic requires int operands", DeclarationSpan(node))?
+    }
+    add = node.text == "+"
+    operation = "sub"
+    if (add) { operation = "add" }
+    output = "t" + str(id)
+    setup = left.setup.clone() + right.setup.clone() + indent.clone() + "int64_t " + output.clone() + ";\n"
+    setup += indent.clone() + "if (!ku_guard_try_" + operation + "(" + left.value.clone() + ", " + right.value.clone() + ", &" + output.clone() + ")) { overflow = true; goto cleanup; }\n"
+    return ok(GuardValue { ty: GuardType { kind: "int", layout: 0 }, setup: setup, value: output, view: false,
+        uses_add: left.uses_add || right.uses_add || add, uses_sub: left.uses_sub || right.uses_sub || !add })
+}
+
+fn guardBoolean(&left: GuardValue, &right: GuardValue, &node: Node, id: int, &indent: str): GuardValue! {
+    logical = node.text == "&&" || node.text == "||"
+    equality = node.text == "==" || node.text == "!="
+    if (logical) {
+        if (left.ty.kind != "bool" || right.ty.kind != "bool") {
+            RejectLayout("guarded_operand_type", "short circuit requires bool operands", DeclarationSpan(node))?
+        }
+    } else if (!(left.ty.kind == "int" && right.ty.kind == "int") &&
+        !(equality && left.ty.kind == "bool" && right.ty.kind == "bool")) {
+        RejectLayout("guarded_operand_type", "comparison requires int operands or matching bool equality", DeclarationSpan(node))?
+    }
+    setup = left.setup.clone()
+    value = "(" + left.value.clone() + " " + node.text.clone() + " " + right.value.clone() + ")"
+    if (logical && right.setup != "") {
+        value = "t" + str(id)
+        condition = value.clone()
+        if (node.text == "||") { condition = "!" + condition }
+        setup += indent.clone() + "bool " + value.clone() + " = " + left.value.clone() + ";\n"
+        setup += indent.clone() + "if (" + condition + ") {\n" + right.setup.clone()
+        setup += indent.clone() + "    " + value.clone() + " = " + right.value.clone() + ";\n" + indent.clone() + "}\n"
+    } else {
+        setup += right.setup.clone()
+    }
+    return ok(GuardValue { ty: GuardType { kind: "bool", layout: 0 }, setup: setup, value: value, view: false,
+        uses_add: left.uses_add || right.uses_add, uses_sub: left.uses_sub || right.uses_sub })
+}
+
+fn GuardExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
+                   id: int, depth: int, &indent: str): GuardValue! {
+    node = nodes[id - 1].clone()
+    if (depth >= 32) {
+        RejectLayout("guarded_expression_limit", "guarded C accepts at most 32 expression levels", DeclarationSpan(node))?
+    }
+    if (node.kind == "Int" && node.edge_count == 0 && node.int_value >= 0) {
+        return ok(GuardRead(GuardType { kind: "int", layout: 0 }, "INT64_C(" + str(node.int_value) + ")", false))
+    }
+    if (node.kind == "Bool" && node.edge_count == 0 && (node.text == "true" || node.text == "false")) {
+        return ok(GuardRead(GuardType { kind: "bool", layout: 0 }, node.text, false))
+    }
+    if (node.kind == "Variable" && node.edge_count == 0) {
+        found = GuardBindingIndex(bindings, node.text)
+        if (found == 0) {
+            RejectLayout("undefined_guarded_binding", "no initialized local '" + node.text.clone() + "'", DeclarationSpan(node))?
+        }
+        return ok(GuardRead(bindings[found - 1].ty.clone(), GuardBindingName(bindings[found - 1]), bindings[found - 1].view))
+    }
+    if (node.kind == "Field" && node.edge_count == 1) {
+        base = GuardExpression(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, indent)?
+        return guardField(layouts, base, node)
+    }
+    if (node.kind == "Unary" && node.edge_count == 1) {
+        operand = GuardExpression(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, indent)?
+        if (node.text == "!" && operand.ty.kind == "bool") {
+            operand.value = "(!" + operand.value + ")"
+            return ok(operand)
+        }
+        if (node.text == "-") {
+            zero = GuardRead(GuardType { kind: "int", layout: 0 }, "INT64_C(0)", false)
+            return guardInteger(zero, operand, node, id, indent)
+        }
+    }
+    if (node.kind == "Binary" && node.edge_count == 2) {
+        left = GuardExpression(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, indent)?
+        right_indent = indent.clone()
+        if (node.text == "&&" || node.text == "||") { right_indent += "    " }
+        right = GuardExpression(nodes, edges, bindings, layouts, edges[node.first_edge + 1], depth + 1, right_indent)?
+        if (node.text == "+" || node.text == "-") { return guardInteger(left, right, node, id, indent) }
+        if (node.text == "&&" || node.text == "||" || node.text == "==" || node.text == "!=" ||
+            node.text == "<" || node.text == "<=" || node.text == ">" || node.text == ">=") {
+            return guardBoolean(left, right, node, id, indent)
+        }
+    }
+    RejectLayout("unsupported_guarded_operand", "expected a bound scalar, field read or supported scalar expression", DeclarationSpan(node))?
+    return ok(GuardRead(GuardType { kind: "", layout: 0 }, "", false))
+}

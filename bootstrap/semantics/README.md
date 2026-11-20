@@ -167,6 +167,13 @@ optionally after one Copy struct local initialized by a literal. The emitted
 C11 uses by-value fields for bounded, nonrecursive structs and static storage
 for string literals. The constructor itself allocates no heap storage.
 
+For a function that reads struct fields and returns a static diagnostic
+string, use the same project files with `guarded` in `mode.txt` and
+`ParseContextError` in `function.txt`. This mode supports int and bool locals,
+checked addition and subtraction, short-circuit conditions and `if` branches.
+An owned struct argument releases its owned strings on return or arithmetic
+failure. A View argument leaves its storage with the caller.
+
 The compiler entry scans the module once and parses bounded declaration
 windows. It retains the lexer, per-function, AST and work limits. The legacy
 `ParseProgram` entry retains its 512-token whole-script limit.

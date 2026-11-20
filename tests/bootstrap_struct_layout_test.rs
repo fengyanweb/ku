@@ -1327,4 +1327,242 @@ fn Make(): Outer {
     let rejected = execute(&mut Command::new(&driver_binary), &cwd, 30);
     assert!(!rejected.status.success() && rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("noncopy_constructor_local"));
+    assert_guarded_context(&ku, &driver_binary, &cwd, contexts);
+}
+
+fn assert_guarded_context(ku: &Path, seed: &Path, cwd: &Path, context: &str) {
+    let manifest = cwd.join("modules.txt");
+    fs::write(
+        &manifest,
+        "stage2/context.ku\nstage2/span.ku\nstage1/token.ku\n",
+    )
+    .expect("read the real modules through the project entry");
+    let source = cwd.join("stage2/context.ku");
+    let reference = r#"
+fn GuardEof(line: int, column: int, offset: int): Token {
+    return Token { kind: "Eof", lexeme: "", int_value: 0, line: line, column: column, offset: offset,
+                   end_line: line, end_column: column, end_offset: offset }
+}
+fn GuardContext(origin_line: int, boundary_line: int, boundary_column: int): ParseContext {
+    return ParseContext { diagnostic_domain: "test", has_boundary: true,
+        origin: Span { line: origin_line, column: 7, offset: 10, end_line: origin_line, end_column: 7, end_offset: 10 },
+        boundary: Span { line: boundary_line, column: boundary_column, offset: 12,
+                         end_line: boundary_line, end_column: boundary_column, end_offset: 12 } }
+}
+fn main() {
+    no_boundary = GuardContext(2, 2, 9)
+    no_boundary.has_boundary = false
+    println("0|" + ParseContextError(3, 3, GuardEof(9223372036854775807, 3, 2), no_boundary))
+    println("1|" + ParseContextError(3, 3, GuardEof(1, 3, 2), GuardContext(0, 2, 9)))
+    println("2|" + ParseContextError(9223372036854775807, 3, GuardEof(1, 3, 2), GuardContext(2, 2, 9)))
+    println("3|" + ParseContextError(3, 3, GuardEof(1, 3, 2), GuardContext(2, 2, 9)))
+    println("4|" + ParseContextError(3, 3, GuardEof(1, 3, 2), GuardContext(2, 2, 8)))
+    println("5|" + ParseContextError(3, 3, GuardEof(2, 3, 2), GuardContext(2, 3, 3)))
+}
+"#;
+    fs::write(&source, format!("{context}{reference}"))
+        .expect("trace the original guard with Stage0");
+    let oracle = execute(Command::new(ku).arg("run").arg(&source), cwd, 30);
+    assert_ok(&oracle);
+    let expected = String::from_utf8(oracle.stdout)
+        .expect("oracle output")
+        .replace("\r\n", "\n");
+    assert_eq!(expected, concat!(
+        "0|\n",
+        "1|parse origin must use positive ordered line/column coordinates and a non-negative byte offset\n",
+        "2|parse origin cannot be relocated without integer overflow\n",
+        "3|\n",
+        "4|parse boundary must be an ordered absolute span at or after the source window\n",
+        "5|\n",
+    ));
+
+    fs::write(&source, context).expect("restore the unmodified project source");
+    fs::write(cwd.join("mode.txt"), "guarded").expect("select guarded code generation");
+    fs::write(cwd.join("function.txt"), "ParseContextError").expect("select the original guard");
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).expect("generated C");
+    let declaration = code
+        .lines()
+        .find(|line| line.starts_with("KuProjectionString ku_guarded_"))
+        .expect("guard ABI definition");
+    let (symbol, params) = declaration
+        .trim_start_matches("KuProjectionString ")
+        .split_once('(')
+        .expect("emitted signature");
+    let params: Vec<_> = params.trim_end_matches(") {").split(", ").collect();
+    let token = params[2]
+        .strip_suffix(" a2")
+        .expect("Token is the third parameter");
+    let context = params[3]
+        .strip_suffix(" a3")
+        .expect("ParseContext is the fourth parameter");
+    let probes = r#"
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+static void *owned[3];
+static int remaining;
+static void counted_drop(void *pointer) {
+    for (int i = 0; i < 3; ++i) {
+        if (owned[i] == pointer && pointer) {
+            owned[i] = NULL;
+            --remaining;
+            free(pointer);
+            return;
+        }
+    }
+    abort();
+}
+static void guard_finished(void) {
+    if (remaining != 0) _Exit(97);
+}
+#define free counted_drop
+"#;
+    let main = r#"
+#undef free
+static KuProjectionString own(int index) {
+    assert(owned[index] == NULL);
+    uint8_t *ptr = malloc(1);
+    assert(ptr);
+    *ptr = 'x';
+    owned[index] = ptr;
+    ++remaining;
+    return (KuProjectionString){ ptr, 1, 1, KU_PROJECTION_STRING_OWNED };
+}
+static KuProjectionString invoke(int variant, int64_t eof_line, int64_t characters) {
+    TOKEN token = { own(0), own(1), 0, eof_line, 3, 2, eof_line, 3, 2 };
+    CTX context = {0};
+    context.f0 = own(2);
+    context.f1.f0 = variant == 1 ? 0 : 2;
+    context.f1.f1 = 7;
+    context.f1.f2 = 10;
+    context.f1.f3 = context.f1.f0;
+    context.f1.f4 = 7;
+    context.f1.f5 = 10;
+    context.f2.f0 = variant == 5 ? 3 : 2;
+    context.f2.f1 = variant == 5 ? 3 : variant == 4 ? 8 : 9;
+    context.f2.f2 = 12;
+    context.f2.f3 = context.f2.f0;
+    context.f2.f4 = context.f2.f1;
+    context.f2.f5 = 12;
+    context.f3 = variant != 0;
+    return FUNCTION(characters, 3, token, context);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    assert(atexit(guard_finished) == 0);
+    if (argc > 1) {
+        (void)invoke(3, INT64_MAX, 3);
+        return 98;
+    }
+    for (int i = 0; i < 6; ++i) {
+        int64_t eof_line = i == 0 ? INT64_MAX : i == 5 ? 2 : 1;
+        KuProjectionString result = invoke(i, eof_line, i == 2 ? INT64_MAX : 3);
+        assert(remaining == 0 && result.storage == KU_PROJECTION_STRING_STATIC && result.capacity == 0);
+        printf("%d|%.*s\n", i, (int)result.len, (const char*)result.ptr);
+    }
+    return 0;
+}
+"#;
+    let consumer = cwd.join("guard.c");
+    fs::write(
+        &consumer,
+        format!(
+            "{probes}{code}{}",
+            main.replace("TOKEN", token)
+                .replace("CTX", context)
+                .replace("FUNCTION", symbol)
+        ),
+    )
+    .expect("write independent consumer and ownership probes");
+    let borrowed = emit_guarded_view(seed, cwd, &source, &manifest);
+    for family in ["stage1", "stage2"] {
+        fs::rename(cwd.join(family), cwd.join(format!("guarded-{family}")))
+            .expect("hide Ku input from C consumer");
+    }
+    let binary = cwd.join(format!("guarded-context{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&consumer, &binary, cwd);
+    let result = execute(&mut Command::new(&binary), cwd, 10);
+    assert_ok(&result);
+    assert_eq!(
+        String::from_utf8(result.stdout)
+            .expect("C output")
+            .replace("\r\n", "\n"),
+        expected
+    );
+    let trap = execute(Command::new(&binary).arg("overflow"), cwd, 10);
+    assert_eq!(trap.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&trap.stderr).contains("integer overflow"));
+    let view_binary = cwd.join(format!("guarded-view{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&borrowed, &view_binary, cwd);
+    assert_ok(&execute(&mut Command::new(&view_binary), cwd, 10));
+    let trap = execute(Command::new(&view_binary).arg("evaluate"), cwd, 10);
+    assert_eq!(trap.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&trap.stderr).contains("integer overflow"));
+}
+
+fn emit_guarded_view(seed: &Path, cwd: &Path, source: &Path, manifest: &Path) -> PathBuf {
+    fs::write(manifest, "stage2/context.ku").expect("select a single module");
+    fs::write(
+        source,
+        r#"
+struct Point { label: str high: int }
+struct Outer { point: Point }
+fn Read(&value: Outer, skip: bool): str {
+    ceiling: int = 9223372036854775807
+    if (skip || value.point.high + 1 > ceiling) { return "kept" }
+    return "unexpected"
+}
+"#,
+    )
+    .expect("write typed local and borrowed short circuit");
+    fs::write(cwd.join("function.txt"), "Read").expect("select View function");
+    let output = execute(&mut Command::new(seed), cwd, 15);
+    assert_ok(&output);
+    let code = String::from_utf8(output.stdout).expect("generated View C");
+    assert!(!code.contains("ku_projection_string_drop"));
+    let declaration = code
+        .lines()
+        .find(|line| line.starts_with("KuProjectionString ku_guarded_"))
+        .expect("View signature");
+    let (symbol, params) = declaration
+        .trim_start_matches("KuProjectionString ")
+        .split_once('(')
+        .expect("View signature");
+    let view_type = params
+        .strip_prefix("const ")
+        .and_then(|tail| tail.split_once('*'))
+        .map(|(ty, _)| ty)
+        .expect("const View pointer");
+    let main = r#"
+#include <assert.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    (void)argv;
+    VIEW value = {0};
+    static uint8_t stable = 'x';
+    uint8_t *ptr = argc == 1 ? malloc(1) : &stable;
+    assert(ptr);
+    *ptr = 'x';
+    value.f0.f0 = argc == 1 ? (KuProjectionString){ ptr, 1, 1, KU_PROJECTION_STRING_OWNED }
+                           : (KuProjectionString){ ptr, 1, 0, KU_PROJECTION_STRING_STATIC };
+    value.f0.f1 = INT64_MAX;
+    KuProjectionString result = FUNCTION(&value, argc == 1);
+    assert(result.len == 4 && !memcmp(result.ptr, "kept", 4));
+    assert(value.f0.f0.ptr == ptr && *ptr == 'x');
+    free(ptr);
+    return 0;
+}
+"#;
+    let path = cwd.join("guarded-view.c");
+    fs::write(
+        &path,
+        format!(
+            "{code}{}",
+            main.replace("VIEW", view_type).replace("FUNCTION", symbol)
+        ),
+    )
+    .expect("write standalone View consumer");
+    path
 }
