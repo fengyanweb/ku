@@ -1179,6 +1179,52 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
     detail['status'] = 'passed'
 
 
+def installed_forward_layout_consumer(install, root, env, report, target):
+    """Check owned forward layout binding through a relative import."""
+    project = root / 'forward-layout-project'
+    project.mkdir()
+    library = project / 'data.ku'
+    library.write_text(
+        'struct Packet { detail: Payload }\n'
+        'fn Make(): Packet { return Packet { detail: Payload { name: "Ku🙂" } } }\n'
+        'struct Payload { name: str }\n', encoding='utf-8')
+    entry = project / 'main.ku'
+    entry.write_text(
+        'import { Make } from "./data.ku"\n'
+        'fn main() { packet = Make() println(packet.detail.name) }\n', encoding='utf-8')
+    ku = install / ('ku.exe' if os.name == 'nt' else 'ku')
+    run_env = env
+    if target == 'x86_64-pc-windows-gnu':
+        system = windows_system_root(env)
+        run_env = dict(env, PATH=os.pathsep.join((str(system / 'System32'), str(system))))
+    detail = report['installed_forward_layout'] = {'status': 'running', 'outputs': {}}
+    programs = {}
+    for backend in ('c', 'runner'):
+        program = project / (backend + ('.exe' if os.name == 'nt' else ''))
+        selection = ['--backend', 'runner'] if backend == 'runner' else []
+        result = invoke([ku, 'build', '--release', '--verbose', *selection, entry, '-o', program], root, env)
+        if result.returncode:
+            raise RuntimeError('installed forward layout build failed: ' +
+                               result.stderr.decode('utf-8', errors='replace')[-4096:])
+        assert_build_backend(result, backend, 'release')
+        programs[backend] = program
+    for mode, command, selected_env in (
+        ('interpreter', [ku, 'run', entry], env),
+        ('runner', [programs['runner']], env),
+        ('c', [programs['c']], run_env),
+    ):
+        if mode == 'c':
+            entry.unlink()
+            library.unlink()
+        result = invoke(command, root, selected_env, seconds=20)
+        observed = output(result)
+        if result.returncode or result.stderr or observed != 'Ku🙂\n':
+            raise RuntimeError('installed forward layout execution differed: ' +
+                               repr((observed + result.stderr.decode('utf-8', errors='replace'))[-4096:]))
+        detail['outputs'][mode] = observed
+    detail.update(status='passed', native_sources_removed=not library.exists() and not entry.exists())
+
+
 def run_structured_only(args, report):
     """Check the structured Task and declaration examples from a verified installed archive."""
     repo = args.repo.resolve()
@@ -1223,6 +1269,7 @@ def run_structured_only(args, report):
             raise RuntimeError('installed structured Task backends disagreed on output or request order')
         installed_declaration_inventory_consumer(install, root, env, report, repo, verifier, target)
         installed_bootstrap_module_consumer(install, root, env, report, repo, verifier, target)
+        installed_forward_layout_consumer(install, root, env, report, target)
     report.update(status='passed', backend_equivalence=True, owned_temp_removed=not root.exists())
 
 
