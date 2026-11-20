@@ -396,6 +396,16 @@ fn main(): null! {
 "#;
 
 fn compile_projection(source: &Path, output: &Path, cwd: &Path) {
+    compile_projection_product(source, output, cwd, true, false);
+}
+
+fn compile_projection_product(
+    source: &Path,
+    output: &Path,
+    cwd: &Path,
+    strict: bool,
+    object: bool,
+) {
     let selected = std::env::var("KU_CC").unwrap_or_else(|_| {
         if cfg!(windows) {
             "clang".into()
@@ -418,24 +428,27 @@ fn compile_projection(source: &Path, output: &Path, cwd: &Path) {
         .and_then(|stem| stem.to_str())
         .unwrap_or("");
     if stem.eq_ignore_ascii_case("cl") || stem.eq_ignore_ascii_case("clang-cl") {
-        compile
-            .args(["/nologo", "/std:c11", "/O2", "/WX"])
-            .arg(source)
-            .arg(format!("/Fe{}", output.display()))
-            .arg(format!("/Fo{}", output.with_extension("obj").display()));
+        compile.args(["/nologo", "/std:c11", "/O2"]);
+        if strict {
+            compile.arg("/WX");
+        }
+        if object {
+            compile.arg("/c").arg(format!("/Fo{}", output.display()));
+        } else {
+            compile
+                .arg(format!("/Fe{}", output.display()))
+                .arg(format!("/Fo{}", output.with_extension("obj").display()));
+        }
+        compile.arg(source);
     } else {
-        compile
-            .args([
-                "-std=c11",
-                "-pedantic-errors",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-O2",
-            ])
-            .arg(source)
-            .arg("-o")
-            .arg(output);
+        compile.args(["-std=c11", "-O2"]);
+        if strict {
+            compile.args(["-pedantic-errors", "-Wall", "-Wextra", "-Werror"]);
+        }
+        if object {
+            compile.arg("-c");
+        }
+        compile.arg(source).arg("-o").arg(output);
     }
     assert_ok(&execute(&mut compile, cwd, 30));
 }
@@ -2271,4 +2284,267 @@ int main(int argc, char **argv) {
     let path = project.join("managed_bounds.c");
     fs::write(&path, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{driver}")).unwrap();
     path
+}
+
+const PRIMARY_EMITTER: &str = r#"import { BindProjectImports } from "./imports.ku"
+import { BindImportedTypeNames } from "./type_names.ku"
+import { BuildStructLayouts } from "./struct_layouts.ku"
+import { ReadProjectModules } from "./project_manifest.ku"
+import { EmitStructResultC } from "./struct_result_c.ku"
+fn main(): null! {
+    supplied = ReadProjectModules(["stage2/expression_support.ku", "stage2/span.ku", "stage1/token.ku", "stage2/ast.ku", "stage2/diagnostic.ku"])?
+    imports = BindProjectImports(supplied[0], supplied)?
+    bound = BindImportedTypeNames(supplied[0].named, imports, supplied)?
+    layouts = BuildStructLayouts(supplied[0].named, bound, supplied)?
+    c = EmitStructResultC(supplied[0].named, bound, imports, supplied, layouts, "ReadPrimaryAtom")?
+    println(c.symbol + "|" + c.dependency)
+    print(c.source)
+    return ok(null)
+}
+"#;
+
+const PRIMARY_ORACLE: &str = r#"import { Token } from "./stage1/token.ku"
+import { ReadPrimaryAtom } from "./stage2/expression_support.ku"
+fn observe(kind: str, stage3_domain: bool): null {
+    token = Token { kind: kind, lexeme: "任务🙂", int_value: 703, line: 4, column: 9, offset: 51,
+                     end_line: 4, end_column: 12, end_offset: 59 }
+    try {
+        value = ReadPrimaryAtom(token, stage3_domain)?
+        println("OK|" + value.kind + "|" + value.text + "|" + str(value.int_value))
+    } catch(err) {
+        println("ERR|" + err.domain + "|" + err.code + "|" + err.message)
+    }
+    return null
+}
+fn main(): null! {
+    for kind in ["Int", "Float", "String", "TemplateString", "True", "False", "Null", "Ident", "Plus"] {
+        observe(kind, false)
+    }
+    observe("Plus", true)
+    return ok(null)
+}
+"#;
+
+const PRIMARY_ABI_BRIDGE: &str = r#"
+_Static_assert(sizeof(KuProjectionString) == sizeof(KuString), "string ABI size");
+_Static_assert(offsetof(KuProjectionString, storage) == offsetof(KuString, storage), "string ABI tag");
+_Static_assert(sizeof(KuBootstrapError) == sizeof(KuError), "error ABI size");
+_Static_assert(sizeof(KuBootstrapResultNull) == sizeof(KuResult_null), "null Result ABI size");
+_Static_assert(sizeof(__RESULT__) == sizeof(__STAGE0_RESULT__), "struct Result ABI size");
+_Static_assert(offsetof(__RESULT__, error) == offsetof(__STAGE0_RESULT__, error), "struct Result error offset");
+
+static unsigned calls_to_stage0;
+static KuString into_stage0(KuProjectionString value) {
+    return (KuString){value.ptr, value.len, value.capacity, value.storage};
+}
+static KuProjectionString from_stage0(KuString value) {
+    return (KuProjectionString){value.ptr, value.len, value.capacity, value.storage};
+}
+
+// The only linked dependency is the real Stage0-generated RejectAt.
+// Typed aggregate construction transfers each field to its actual owner.
+KuBootstrapResultNull __DEPENDENCY__(__TOKEN__ token, KuProjectionString code,
+                                    KuProjectionString message, bool stage3_domain) {
+    ++calls_to_stage0;
+    __STAGE0_TOKEN__ input = {
+        .kind = into_stage0(token.f0), .lexeme = into_stage0(token.f1), .int_value = token.f2,
+        .line = token.f3, .column = token.f4, .offset = token.f5,
+        .end_line = token.f6, .end_column = token.f7, .end_offset = token.f8
+    };
+    KuResult_null result = __REJECT__(input, into_stage0(code), into_stage0(message), stage3_domain);
+    KuBootstrapError error = { from_stage0(result.error.domain), from_stage0(result.error.code), from_stage0(result.error.message) };
+    return (KuBootstrapResultNull){ result.ok, result.value, error };
+}
+
+static KuProjectionString make_owned(const uint8_t *text, size_t len) {
+    uint8_t *ptr = malloc(len ? len : 1);
+    if (len) memcpy(ptr, text, len);
+    return (KuProjectionString){ ptr, len, len ? len : 1, KU_PROJECTION_STRING_OWNED };
+}
+static __TOKEN__ token_for(const char *kind) {
+    static const uint8_t content[] = {0xe4,0xbb,0xbb,0xe5,0x8a,0xa1,0xf0,0x9f,0x99,0x82};
+    return (__TOKEN__){ make_owned((const uint8_t*)kind, strlen(kind)), make_owned(content, sizeof(content)),
+        703, 4, 9, 51, 4, 12, 59 };
+}
+static void check_clean(void) {
+    if (outstanding()) _Exit(97);
+}
+static void print_carrier(KuProjectionString value) {
+    if (value.len) printf("%.*s", (int)value.len, (char*)value.ptr);
+}
+int main(int argc, char **argv) {
+    assert(atexit(check_clean) == 0);
+    if (argc == 2) {
+        __TOKEN__ token = token_for("Float");
+        fail_after = atoi(argv[1]);
+        (void)__ENTRY__(token, false);
+        return 98;
+    }
+    const char *kinds[] = { "Int", "Float", "String", "TemplateString", "True", "False", "Null", "Ident", "Plus", "Plus" };
+    for (unsigned i = 0; i < sizeof(kinds)/sizeof(kinds[0]); ++i) {
+        __RESULT__ returned = __ENTRY__(token_for(kinds[i]), i == 9);
+        __RESULT__ result = __ENTRY___move(&returned);
+        __ENTRY___drop(&returned);
+        if (i < 8) {
+            assert(result.ok && !result.error.message.ptr && calls_to_stage0 == 0);
+            int owners = i >= 1 && i <= 3 ? 2 : i == 7 ? 1 : 0;
+            assert(outstanding() == owners);
+            fputs("OK|", stdout); print_carrier(result.value.f0);
+            putchar('|'); print_carrier(result.value.f1);
+            printf("|%lld\n", (long long)result.value.f2);
+        } else {
+            assert(!result.ok && !result.value.f0.ptr && !result.value.f1.ptr && calls_to_stage0 == i - 7);
+            assert(result.error.message.storage == KU_PROJECTION_STRING_OWNED && outstanding() == 1);
+            fputs("ERR|", stdout); print_carrier(result.error.domain);
+            putchar('|'); print_carrier(result.error.code);
+            putchar('|'); print_carrier(result.error.message); putchar('\n');
+        }
+        __ENTRY___drop(&result);
+        __ENTRY___drop(&result);
+        assert(outstanding() == 0);
+    }
+    return 0;
+}
+"#;
+
+#[test]
+fn bootstrap_compiles_primary_atom_with_actual_stage0_error_dependency() {
+    let tmp = Temp::new();
+    let staged = tmp.0.join("compiler");
+    let cwd = tmp.0.join("consumer");
+    fs::create_dir(&staged).unwrap();
+    fs::create_dir(&cwd).unwrap();
+    stage_sources(&staged);
+    let ku = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    let exe = format!("emit-primary{}", std::env::consts::EXE_SUFFIX);
+    let built = staged.join("semantics").join(&exe);
+    let emitter = cwd.join(exe);
+    let entry = staged.join("semantics/emit_primary.ku");
+    fs::write(&entry, PRIMARY_EMITTER).unwrap();
+    assert_ok(&execute(
+        Command::new(&ku)
+            .args(["build", "--release"])
+            .arg(&entry)
+            .arg("-o")
+            .arg(&built),
+        &cwd,
+        150,
+    ));
+    fs::rename(built, &emitter).unwrap();
+    for stage in ["stage1", "stage2"] {
+        fs::rename(staged.join(stage), cwd.join(stage)).unwrap();
+    }
+    fs::remove_dir_all(&staged).unwrap();
+
+    let origin = cwd.join("oracle.ku");
+    let oracle = cwd.join(format!("stage0-oracle{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&origin, PRIMARY_ORACLE).unwrap();
+    assert_ok(&execute(
+        Command::new(&ku)
+            .args(["build", "--release"])
+            .arg(&origin)
+            .arg("-o")
+            .arg(&oracle),
+        &cwd,
+        90,
+    ));
+    let result = execute(&mut Command::new(oracle), &cwd, 20);
+    assert_ok(&result);
+    let expected = String::from_utf8(result.stdout)
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(
+        expected.contains("OK|String|任务🙂|0")
+            && expected.contains("ERR|bootstrap.parser.stage3|unsupported_expression|")
+    );
+    assert!(expected.contains("4:9@51..4:12@59"));
+    assert_ok(&execute(
+        Command::new(&ku).args(["build", "--native"]).arg(&origin),
+        &cwd,
+        30,
+    ));
+    let stage0_code = fs::read_to_string(cwd.join("oracle.c")).unwrap();
+    let reject = stage0_code
+        .lines()
+        .find(|line| {
+            line.starts_with("KuResult_null ")
+                && line.contains("_RejectAt(")
+                && line.ends_with(" {")
+        })
+        .unwrap();
+    let (reject, declared) = reject
+        .trim_start_matches("KuResult_null ")
+        .split_once('(')
+        .unwrap();
+    let (stage0_token, _) = declared.split_once(" token, ").unwrap();
+    let stage0_result = stage0_code
+        .lines()
+        .find(|line| line.contains("_ReadPrimaryAtom(") && line.ends_with(" {"))
+        .unwrap()
+        .split_once(' ')
+        .unwrap()
+        .0;
+
+    let result = execute(&mut Command::new(emitter), &cwd, 30);
+    assert_ok(&result);
+    let emitted = String::from_utf8(result.stdout).unwrap();
+    let (symbols, code) = emitted.split_once('\n').unwrap();
+    let (entry, dependency) = symbols.trim_end().split_once('|').unwrap();
+    let signature = code
+        .lines()
+        .find(|line| line.contains(&format!(" {entry}(")))
+        .unwrap();
+    let (result_type, declaration) = signature.split_once(' ').unwrap();
+    let (_, arguments) = declaration.split_once('(').unwrap();
+    let (token, _) = arguments.split_once(" a0,").unwrap();
+    assert!(code.contains(&format!("extern KuBootstrapResultNull {dependency}(")));
+
+    let strict_file = cwd.join("primary.c");
+    fs::write(&strict_file, code).unwrap();
+    let consumer = PRIMARY_ABI_BRIDGE
+        .replace("__RESULT__", result_type)
+        .replace("__STAGE0_RESULT__", stage0_result)
+        .replace("__STAGE0_TOKEN__", stage0_token)
+        .replace("__TOKEN__", token)
+        .replace("__DEPENDENCY__", dependency)
+        .replace("__REJECT__", reject)
+        .replace("__ENTRY__", entry);
+    let linked = cwd.join("primary_linked.c");
+    let stage0_adapter =
+        format!("\n#define main ku_stage0_original_main\n{stage0_code}\n#undef main\n");
+    fs::write(
+        &linked,
+        format!("{CHECKED_ARRAY_ALLOCATOR}{stage0_adapter}\n{code}{consumer}"),
+    )
+    .unwrap();
+    for stage in ["stage1", "stage2"] {
+        fs::remove_dir_all(cwd.join(stage)).unwrap();
+    }
+    fs::remove_file(cwd.join("oracle.c")).unwrap();
+    fs::remove_file(origin).unwrap();
+    compile_projection_product(&strict_file, &cwd.join("primary.o"), &cwd, true, true);
+    let binary = cwd.join(format!("primary-linked{}", std::env::consts::EXE_SUFFIX));
+    // Stage0 is compiled by its normal C11 O2 options. The strict compiler
+    // gate above already checked the new artifact independently.
+    compile_projection_product(&linked, &binary, &cwd, false, false);
+    let observed = execute(&mut Command::new(&binary), &cwd, 20);
+    assert_ok(&observed);
+    assert_eq!(
+        String::from_utf8(observed.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        expected
+    );
+    for fail_at in ["0", "1"] {
+        let trap = execute(Command::new(&binary).arg(fail_at), &cwd, 10);
+        assert_eq!(
+            trap.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&trap.stderr)
+        );
+        assert!(String::from_utf8_lossy(&trap.stderr).contains("out of memory"));
+    }
 }

@@ -1,0 +1,298 @@
+import { Node } from "../stage2/ast.ku"
+import { Span } from "../stage2/span.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
+import { ImportBinding, SuppliedModule } from "./imports.ku"
+import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
+import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { CStructOrder, OrderCStructLayouts } from "./nested_struct_c.ku"
+import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
+import { GuardArithmetic, GuardOwnedDrops, GuardStringEquality } from "./guarded_struct_c.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression } from "./guarded_struct_expr.ku"
+import { AddGuardCode, JoinManagedCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
+import { EmitTryCloneString } from "./struct_array_c.ku"
+import { LowerStructResultLink } from "./struct_result_link_c.ku"
+
+struct StructResultC {
+    symbol: str
+    dependency: str
+    source: str
+}
+
+struct StructResultSignature {
+    bindings: [GuardBinding]
+    declarations: str
+    parameters: str
+    unused: str
+    drops: str
+    body_start: int
+}
+
+struct StructResultBody {
+    code: ManagedCode
+    prototype: str
+    dependency: str
+}
+
+fn orderResultLayout(&layouts: [StructLayout], index: int, at: Span): CStructOrder! {
+    return OrderCStructLayouts(layouts, layouts[index - 1].module_index, layouts[index - 1].node, at)
+}
+
+fn structResultEdge(&named: NamedModule, &function: Node): int! {
+    cursor = function.first_edge
+    end = cursor + function.edge_count
+    while (cursor < end && named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].kind == "Parameter") {
+        cursor = cursor + 1
+    }
+    if (cursor >= end - 1) {
+        RejectLayout("unsupported_struct_result_signature", "expected parameters, a struct! result and a body", DeclarationSpan(function))?
+    }
+    return ok(cursor)
+}
+
+fn appendStructResultLayouts(&order: CStructOrder, declared: [int]): [int]! {
+    next = declared
+    index = 0
+    while (index < order.entries.len()) {
+        layout = order.entries[index].layout_index
+        if (!ContainsIndex(next, layout)) { next = next.push(layout) }
+        index = index + 1
+    }
+    return ok(next)
+}
+
+fn readStructResultSignature(&named: NamedModule, &types: [TypeNameBinding], &layouts: [StructLayout],
+                              &function: Node, result_edge: int, &result_order: CStructOrder): StructResultSignature! {
+    bindings: [GuardBinding] = []
+    declared = appendStructResultLayouts(result_order, [])?
+    parameters = ""
+    unused = ""
+    drops = ""
+    cursor = function.first_edge
+    while (cursor < result_edge) {
+        parameter = named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].clone()
+        at = DeclarationSpan(parameter)
+        if (parameter.edge_count != 1 || parameter.int_value < 0 || parameter.int_value > 1 ||
+            GuardBindingIndex(bindings, parameter.text) != 0) {
+            RejectLayout("unsupported_struct_result_signature", "expected distinct typed parameters", at.clone())?
+        }
+        id = named.parsed.arena.edges[parameter.first_edge]
+        ty = GuardExplicitType(types, named.parsed.arena.nodes, layouts, id)?
+        view = parameter.int_value == 1
+        if (view && ty.kind != "struct") {
+            RejectLayout("unsupported_struct_result_signature", "only a known struct may be a View parameter", at.clone())?
+        }
+        binding = GuardBinding { name: parameter.text, ty: ty, slot: bindings.len(), parameter: true, view: view }
+        name = GuardBindingName(binding)
+        c_type = GuardCType(binding.ty, layouts)
+        if (view) { c_type = "const " + c_type + "*" }
+        if (bindings.len() != 0) { parameters += ", " }
+        parameters += c_type + " " + name.clone()
+        unused += "    (void)" + name.clone() + ";\n"
+        if (binding.ty.kind == "struct") {
+            dependencies = orderResultLayout(layouts, binding.ty.layout, at)?
+            declared = appendStructResultLayouts(dependencies, declared)?
+            if (!view) { drops = GuardOwnedDrops(layouts, binding.ty.layout, name) + drops }
+        } else if (binding.ty.kind == "str") {
+            drops = "    ku_projection_string_drop(&" + name + ");\n" + drops
+        }
+        bindings = bindings.push(binding)
+        cursor = cursor + 1
+    }
+    declarations = ""
+    for layout in declared {
+        declarations += EmitLayout(layouts[layout - 1], true, true)?
+    }
+    if (parameters == "") { parameters = "void" }
+    return ok(StructResultSignature { bindings: bindings, declarations: declarations, parameters: parameters,
+        unused: unused, drops: drops, body_start: result_edge + 1 })
+}
+
+fn isBoundOk(&named: NamedModule, &locals: [GuardBinding], &imports: [ImportBinding]): bool {
+    if (GuardBindingIndex(locals, "ok") != 0) { return false }
+    index = 0
+    while (index < named.names.declarations.len()) {
+        if (named.names.declarations[index].name == "ok") { return false }
+        index = index + 1
+    }
+    index = 0
+    while (index < imports.len()) {
+        if (imports[index].local_name == "ok") { return false }
+        index = index + 1
+    }
+    return true
+}
+
+fn emitResultFields(&named: NamedModule, &locals: [GuardBinding], &layouts: [StructLayout],
+                    layout: int, &literal: Node, &indent: str): ManagedCode! {
+    code = ManagedBlank()
+    seen: [int] = []
+    index = 0
+    while (index < literal.edge_count) {
+        field = named.parsed.arena.nodes[named.parsed.arena.edges[literal.first_edge + index] - 1].clone()
+        offset = FieldIndex(layouts[layout - 1].fields, field.text)
+        if (field.kind != "StructLiteralField" || field.edge_count != 1 || offset == 0 || ContainsIndex(seen, offset)) {
+            RejectLayout("struct_result_field", "expected every declared payload field once", DeclarationSpan(field))?
+        }
+        ty = GuardBoundType(layouts[layout - 1].fields[offset - 1].resolved, layouts)?
+        rendered = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts,
+            named.parsed.arena.edges[field.first_edge], 0, indent)?
+        if (ty.kind != rendered.ty.kind || ty.layout != rendered.ty.layout) {
+            RejectLayout("struct_result_field_type", "payload field must match its declared type", DeclarationSpan(field))?
+        }
+        code = AddGuardCode(code, rendered)
+        target = "result.value.f" + str(offset - 1)
+        if (ty.kind == "str") {
+            code.text = code.text + indent.clone() + "if (!ku_result_clone_string(" + rendered.value + ", &" + target +
+                ")) { out_of_memory = true; goto cleanup; }\n"
+        } else {
+            value = rendered.value
+            if (ty.kind == "struct") {
+                owned = orderResultLayout(layouts, ty.layout, DeclarationSpan(field))?
+                if (owned.contains_string) {
+                    RejectLayout("unsupported_struct_result_owner", "nested payload field currently requires a Copy layout", DeclarationSpan(field))?
+                }
+                if (rendered.view) { value = "*" + value }
+            }
+            code.text = code.text + indent.clone() + target + " = " + value + ";\n"
+        }
+        index = index + 1
+        seen = seen.push(offset)
+    }
+    if (seen.len() != layouts[layout - 1].fields.len()) {
+        RejectLayout("struct_result_field", "payload literal must initialize all declared fields", DeclarationSpan(literal))?
+    }
+    code.text = code.text + indent.clone() + "result.ok = true;\n" + indent.clone() + "goto cleanup;\n"
+    return ok(code)
+}
+
+fn emitStructReturn(&named: NamedModule, &imports: [ImportBinding], &supplied: [SuppliedModule],
+                     &locals: [GuardBinding], &layouts: [StructLayout], layout: int,
+                     &statement: Node, &indent: str): ManagedCode! {
+    if (statement.kind != "Return" || statement.edge_count != 1) {
+        RejectLayout("unsupported_struct_result_return", "expected a return of ok(struct literal)", DeclarationSpan(statement))?
+    }
+    call = named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge] - 1].clone()
+    if (call.kind != "Call" || call.edge_count != 2) {
+        RejectLayout("unsupported_struct_result_return", "expected the builtin ok with one value", DeclarationSpan(call))?
+    }
+    callee = named.parsed.arena.nodes[named.parsed.arena.edges[call.first_edge] - 1].clone()
+    payload_id = named.parsed.arena.edges[call.first_edge + 1]
+    literal = named.parsed.arena.nodes[payload_id - 1].clone()
+    if (callee.kind != "Variable" || callee.text != "ok" || callee.edge_count != 0 || !isBoundOk(named, locals, imports) ||
+        literal.kind != "StructLiteral") {
+        RejectLayout("unsupported_struct_result_return", "expected builtin ok with a named payload literal", DeclarationSpan(call))?
+    }
+    bound = ResolveTypeName(literal, payload_id, named.names.declarations, imports, supplied)?
+    if (bound.declaration_kind != "Struct" || LayoutIndex(layouts, bound.module_index, bound.declaration_node) != layout) {
+        RejectLayout("struct_result_payload_type", "payload must match the declared struct result", DeclarationSpan(literal))?
+    }
+    return emitResultFields(named, locals, layouts, layout, literal, indent)
+}
+
+fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
+                        &supplied: [SuppliedModule], &layouts: [StructLayout], layout: int,
+                        bindings: [GuardBinding], start: int, end: int): StructResultBody! {
+    code = ManagedBlank()
+    local = bindings
+    prototype = ""
+    dependency = ""
+    cursor = start
+    while (cursor < end) {
+        id = named.parsed.arena.edges[cursor]
+        statement = named.parsed.arena.nodes[id - 1].clone()
+        if (cursor == end - 1) {
+            returned = emitStructReturn(named, imports, supplied, local, layouts, layout, statement, "    ")?
+            code = JoinManagedCode(code, returned)
+        } else if (statement.kind == "If" && statement.edge_count == 2 && statement.int_value == 1) {
+            condition = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, local, layouts,
+                named.parsed.arena.edges[statement.first_edge], 0, "    ")?
+            if (condition.ty.kind != "bool") {
+                RejectLayout("struct_result_condition", "guarded result return requires bool", DeclarationSpan(statement))?
+            }
+            returned = emitStructReturn(named, imports, supplied, local, layouts, layout,
+                named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge + 1] - 1], "        ")?
+            code = AddGuardCode(code, condition)
+            code.text = code.text + "    if ((bool)" + condition.value + ") {\n"
+            code = JoinManagedCode(code, returned)
+            code.text = code.text + "    }\n"
+        } else if (cursor == end - 2 && statement.kind == "ExprStmt") {
+            link = LowerStructResultLink(named, types, layouts, local, id)?
+            local = link.remaining
+            prototype = link.prototype
+            dependency = link.symbol
+            code = JoinManagedCode(code, link.code)
+        } else {
+            RejectLayout("unsupported_struct_result_body", "expected guarded returns or one tail checked dependency", DeclarationSpan(statement))?
+        }
+        cursor = cursor + 1
+    }
+    return ok(StructResultBody { code: code, prototype: prototype, dependency: dependency })
+}
+
+fn StructResultHeader(): str {
+    return "typedef struct { KuProjectionString domain, code, message; } KuBootstrapError;\n" +
+        "typedef struct { bool ok; uint8_t value; KuBootstrapError error; } KuBootstrapResultNull;\n\n"
+}
+
+fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
+                    &supplied: [SuppliedModule], &layouts: [StructLayout], id: int): StructResultC! {
+    function = named.parsed.arena.nodes[id - 1].clone()
+    edge = structResultEdge(named, function)?
+    outer = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
+    if (outer.kind != "TypeResult" || outer.edge_count != 1) {
+        RejectLayout("unsupported_struct_result_signature", "expected an explicit struct! result", DeclarationSpan(outer))?
+    }
+    inner = GuardExplicitType(types, named.parsed.arena.nodes, layouts, named.parsed.arena.edges[outer.first_edge])?
+    if (inner.kind != "struct") {
+        RejectLayout("unsupported_struct_result_signature", "expected a bound struct payload", DeclarationSpan(outer))?
+    }
+    order = orderResultLayout(layouts, inner.layout, DeclarationSpan(outer))?
+    signature = readStructResultSignature(named, types, layouts, function, edge, order)?
+    body = emitStructResultBody(named, types, imports, supplied, layouts, inner.layout, signature.bindings,
+        signature.body_start, function.first_edge + function.edge_count)?
+    symbol = "ku_struct_result_" + str(id)
+    struct_type = GuardCType(inner, layouts)
+    result_type = "KuBootstrapResult_" + struct_type.clone()
+    overflow = body.code.uses_add || body.code.uses_sub
+    text = ProjectionHeaders(true, true) + "#include <stdio.h>\n\n" + GuardArithmetic(body.code.uses_add, body.code.uses_sub)
+    text += GuardStringEquality(body.code.uses_eq) + signature.declarations + StructResultHeader()
+    text += "typedef struct { bool ok; " + struct_type + " value; KuBootstrapError error; } " + result_type.clone() + ";\n\n"
+    if (order.contains_string) { text += "#include <string.h>\n\n" + EmitTryCloneString("ku_result_clone_string") }
+    text += result_type.clone() + " " + symbol.clone() + "_move(" + result_type.clone() + " *result) {\n"
+    text += "    " + result_type.clone() + " moved = *result;\n    *result = (" + result_type.clone() + "){0};\n    return moved;\n}\n\n"
+    drop = symbol.clone() + "_drop"
+    text += "void " + drop.clone() + "(" + result_type.clone() + " *result) {\n"
+    text += GuardOwnedDrops(layouts, inner.layout, "(*result).value")
+    text += "    ku_projection_string_drop(&result->error.domain);\n    ku_projection_string_drop(&result->error.code);\n"
+    text += "    ku_projection_string_drop(&result->error.message);\n    *result = (" + result_type.clone() + "){0};\n}\n\n"
+    text += body.prototype + result_type.clone() + " " + symbol.clone() + "(" + signature.parameters + ") {\n"
+    text += "    " + result_type + " result = {0};\n" + signature.unused
+    if (order.contains_string) { text += "    bool out_of_memory = false;\n" }
+    if (overflow) { text += "    bool overflow = false;\n" }
+    text += body.code.text + "cleanup:\n" + signature.drops
+    if (order.contains_string) {
+        text += "    if (out_of_memory) { " + drop.clone() + "(&result); fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n"
+    }
+    if (overflow) {
+        text += "    if (overflow) { " + drop + "(&result); fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n"
+    }
+    text += "    return result;\n}\n"
+    return ok(StructResultC { symbol: symbol, dependency: body.dependency, source: text })
+}
+
+// The previous stages own the graph and type bindings. This lowering accepts
+// complete named struct payloads and one explicitly typed null! dependency.
+fn EmitStructResultC(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
+                      &supplied: [SuppliedModule], &layouts: [StructLayout], &function_name: str): StructResultC! {
+    index = 0
+    while (index < named.names.declarations.len()) {
+        item = named.names.declarations[index].clone()
+        if (item.kind == "Function" && item.name == function_name) {
+            return emitStructResult(named, types, imports, supplied, layouts, item.node)
+        }
+        index = index + 1
+    }
+    start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    RejectLayout("unknown_struct_result_function", "undefined struct-result function '" + function_name.clone() + "'", start)?
+    return ok(StructResultC { symbol: "", dependency: "", source: "" })
+}

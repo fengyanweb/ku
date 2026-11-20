@@ -32,16 +32,18 @@ fn collectOwnedFields(&layouts: [StructLayout], index: int, &prefix: str, paths:
     return owned
 }
 
+fn EmitTryCloneString(&symbol: str): str {
+    return "static bool " + symbol.clone() + "(KuProjectionString source, KuProjectionString *out) {\n" +
+        "    if (source.storage == KU_PROJECTION_STRING_STATIC) { *out = source; return true; }\n" +
+        "    if (!source.ptr) return true;\n" +
+        "    size_t size = source.len ? source.len : 1;\n    uint8_t *data = malloc(size);\n    if (!data) return false;\n" +
+        "    if (source.len) memcpy(data, source.ptr, source.len);\n" +
+        "    *out = (KuProjectionString){ data, source.len, size, KU_PROJECTION_STRING_OWNED };\n    return true;\n}\n\n"
+}
+
 fn emitArrayOwnedElement(&element: str, &prefix: str, &fields: [str]): str {
     text = ""
-    if (fields.len() != 0) {
-        text += "static bool " + prefix.clone() + "_clone_string(KuProjectionString source, KuProjectionString *out) {\n"
-        text += "    if (source.storage == KU_PROJECTION_STRING_STATIC) { *out = source; return true; }\n"
-        text += "    if (!source.ptr) return true;\n"
-        text += "    size_t size = source.len ? source.len : 1;\n    uint8_t *data = malloc(size);\n    if (!data) return false;\n"
-        text += "    if (source.len) memcpy(data, source.ptr, source.len);\n"
-        text += "    *out = (KuProjectionString){ data, source.len, size, KU_PROJECTION_STRING_OWNED };\n    return true;\n}\n\n"
-    }
+    if (fields.len() != 0) { text = EmitTryCloneString(prefix.clone() + "_clone_string") }
     text += "void " + prefix.clone() + "_element_drop(" + element.clone() + " *value) {\n"
     index = 0
     while (index < fields.len()) {
