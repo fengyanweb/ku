@@ -659,3 +659,130 @@ int main(int argc, char** argv) {
         );
     }
 }
+
+pub(super) fn assert_linked_fs_read(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("module-reader.ku"),
+        r#"import { fs } from "std"
+fn ReadModuleText(&path: str): str! {
+    source = fs.read(path)?
+    return ok(source)
+}
+fn Shadow(&fs: str, &path: str): str! { return fs.read(path) }
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "module-reader.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "ReadModuleText").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+    let projected = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&projected);
+    let metadata = cwd.join("module-reader.json");
+    fs::write(&metadata, &projected.stdout).unwrap();
+    let Some(Value::Result { ok: true, value }) = json::eval(
+        "decode",
+        &[Value::String(String::from_utf8(projected.stdout).unwrap())],
+        Span::default(),
+    )
+    .unwrap() else {
+        panic!("expected checked filesystem link plan");
+    };
+    let Value::Object(plan) = *value else {
+        panic!("expected plan object");
+    };
+    let Value::Object(export) = &plan["export"] else {
+        panic!("expected export");
+    };
+    let (Value::String(entry), Value::Int(node)) = (&export["symbol"], &export["node"]) else {
+        panic!("expected bound entry");
+    };
+    let provider_plan = cwd.join("fs-provider.json");
+    fs::write(
+        &provider_plan,
+        r#"{"schema":"ku-bootstrap-link-plan-v1","mode":"provider","export":{
+    "source_path":"std/fs.ku","node":1,"source_name":"read","symbol":"KuBootstrapFsRead",
+    "signature":{"parameters":[{"kind":"Builtin","source_name":"str","source_path":null,"node":0,
+      "c_type":"const KuString*","passing":"view"}],
+      "result":{"kind":"Builtin","source_name":"str","source_path":null,"node":0,
+      "c_type":"KuResult_str","passing":"value"},"returns_result":true}},"dependencies":[]}"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let projected = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&projected);
+    let c = cwd.join("read-module.c");
+    fs::write(&c, projected.stdout).unwrap();
+    fs::write(cwd.join("source-bytes.ku"), "清单🙂\0\r\n".as_bytes()).unwrap();
+    let host = cwd.join("read-module-host.c");
+    fs::write(
+        &host,
+        r#"
+#include <assert.h>
+#include <string.h>
+int main(void) {
+    static const char expected[] = "\346\270\205\345\215\225\360\237\231\202\000\015\012";
+    KuProjectionString path = {(uint8_t*)"source-bytes.ku", 15, 0, KU_PROJECTION_STRING_STATIC};
+    KuBootstrapResult_KuProjectionString result = __ENTRY__(&path);
+    assert(result.ok && result.value.storage == KU_PROJECTION_STRING_OWNED);
+    assert(result.value.len == sizeof(expected)-1 && !memcmp(result.value.ptr,expected,result.value.len));
+    assert(path.len == 15 && !memcmp(path.ptr,"source-bytes.ku",path.len));
+    ku_projection_string_drop(&result.value);
+    path = (KuProjectionString){(uint8_t*)"missing.ku", 10, 0, KU_PROJECTION_STRING_STATIC};
+    result = __ENTRY__(&path);
+    assert(!result.ok && !result.value.ptr && result.error.code.len == 11);
+    assert(!memcmp(result.error.code.ptr,"read_failed",11));
+    ku_projection_string_drop(&result.error.domain);
+    ku_projection_string_drop(&result.error.code);
+    ku_projection_string_drop(&result.error.message);
+    return 0;
+}
+"#
+        .replace("__ENTRY__", entry),
+    )
+    .unwrap();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tool = repo.join("bootstrap/tools");
+    let provider = tool.join("compiler_driver");
+    let input = repo.join("src/backend");
+    let cc =
+        std::env::var("CC").unwrap_or_else(|_| if cfg!(windows) { "clang" } else { "cc" }.into());
+    let stem = Path::new(&cc)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let include = if stem.eq_ignore_ascii_case("cl") || stem.eq_ignore_ascii_case("clang-cl") {
+        "/I"
+    } else {
+        "-I"
+    };
+    let exe = cwd.join(format!("read-module{}", std::env::consts::EXE_SUFFIX));
+    let linked = execute(
+        Command::new(if cfg!(windows) { "python" } else { "python3" })
+            .arg("-B")
+            .arg(tool.join("link_c.py"))
+            .args(["--cc", &cc])
+            .arg("--unit")
+            .args([&metadata, &c])
+            .arg("--unit")
+            .arg(provider_plan)
+            .arg(provider.join("fs_read.c"))
+            .args(["--entry", "module-reader.ku", &node.to_string(), "--caller"])
+            .arg(host)
+            .arg(format!("--cflag={include}{}", provider.display()))
+            .arg(format!("--cflag={include}{}", input.display()))
+            .arg("-o")
+            .arg(&exe),
+        cwd,
+        120,
+    );
+    assert_ok(&linked);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    fs::write(cwd.join("function.txt"), "Shadow").unwrap();
+    let shadow = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(shadow.status.code(), Some(1));
+    assert!(shadow.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&shadow.stderr).contains("shadowed_linked_dependency"));
+    for name in ["module-reader.ku", "source-bytes.ku", "modules.txt"] {
+        fs::remove_file(cwd.join(name)).unwrap();
+    }
+}

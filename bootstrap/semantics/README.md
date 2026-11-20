@@ -325,6 +325,12 @@ same bound type. The wrappers `ReadProjectModule` and `ReadProjectModules`
 preserve the callee's status and all owned fields. The latter links to the
 typed collector, while the former still requires the private module reader.
 
+Linked entry points can unwrap a `str!` Result and return its owner. A
+checked `fs.read` requires the bound standard namespace and the existing
+`std/fs.ku` provider in the link plan. C uses the provider's `fs_read.h`
+and converts the carrier fields without copying the file contents. The
+caller retains its path, and the original error fields are transferred.
+
 Managed array functions can take a `str` by value and check its byte or
 Unicode scalar length before initializing a local `[str]` with `.chars()`.
 The local array owns its non-ASCII entries independently of the source.

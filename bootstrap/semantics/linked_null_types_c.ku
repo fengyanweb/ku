@@ -9,7 +9,7 @@ import { ContainsType, CTypeName } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
-import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -117,8 +117,12 @@ fn LinkedNullOwnedArray(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "OwnedStructArray"
 }
 
+fn LinkedStringResult(&binding: TypeNameBinding): bool {
+    return binding.declaration_kind == "Builtin" && binding.name == "str"
+}
+
 fn LinkedNullHasResultValue(&binding: TypeNameBinding): bool {
-    return LinkedNullOwnedArray(binding) || binding.declaration_kind == "Struct"
+    return LinkedNullOwnedArray(binding) || binding.declaration_kind == "Struct" || LinkedStringResult(binding)
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
@@ -260,12 +264,51 @@ fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bo
     if (payload.kind == "TypeArray") { return ReadLinkedOwnedArray(project, unit, payload_id) }
     result = LinkedNullType(project, unit, payload_id)?
     if (!LinkedNullHasResultValue(result) && (result.declaration_kind != "Builtin" || result.name != "null")) {
-        RejectLayout("linked_dependency_result", "expected null!, a named record Result or a struct array Result", result.span.clone())?
+        RejectLayout("linked_dependency_result", "expected null!, str!, a named record Result or a struct array Result", result.span.clone())?
     }
     return ok(result)
 }
 
+fn linkedFsRead(&project: LinkedNullProject, unit: int, &target: Node): LinkedNullFunction! {
+    at = DeclarationSpan(target)
+    receiver = LinkedNullNode(project, unit, LinkedNullChild(project, unit, target, 0))
+    found = false
+    if (receiver.kind == "Variable" && receiver.edge_count == 0) {
+        index = 0
+        while (index < project.binding.modules[unit - 1].imports.len()) {
+            binding = project.binding.modules[unit - 1].imports[index].clone()
+            if (binding.local_name == receiver.text && binding.source_name == "fs" && binding.module_index == 0) {
+                found = true
+                break
+            }
+            index = index + 1
+        }
+    }
+    if (!found) {
+        RejectLayout("undefined_linked_dependency", "expected the bound standard filesystem namespace", at.clone())?
+    }
+    index = 0
+    while (index < project.supplied.len()) {
+        if (project.supplied[index].path == "std/fs.ku") {
+            RejectLayout("linked_builtin_collision", "a source module occupies the builtin fs provider path", at.clone())?
+        }
+        index = index + 1
+    }
+    path = LinkedBuiltin("str", at.clone())
+    path.declaration_kind = "StringView"
+    return ok(LinkedNullFunction { unit: 0, node: 1, symbol: "ku_linked_dep_fs_read", parameters: [path],
+        result: LinkedBuiltin("str", at), returns_result: true })
+}
+
+fn LinkedNullCallSymbol(&callee: LinkedNullFunction): str {
+    if (callee.unit == 0) { return "ku_linked_fs_read" }
+    return callee.symbol.clone()
+}
+
 fn LinkedNullDependency(&project: LinkedNullProject, from_unit: int, &target: Node, checked: bool): LinkedNullFunction! {
+    if (checked && target.kind == "Field" && target.text == "read" && target.edge_count == 1) {
+        return linkedFsRead(project, from_unit, target)
+    }
     identity = linkedDirectFunction(project, from_unit, target)?
     unit = identity[0]
     id = identity[1]
@@ -307,7 +350,23 @@ fn LinkedCheckedResultPlan(&result: TypeNameBinding, unit: int): LinkPlanType! {
     return ok(plan)
 }
 
+fn fsReadReference(&symbol: str): str {
+    return "#include \"fs_read.h\"\nextern KuResult_str " + symbol.clone() + "(const KuString*);\n"
+        + "static KuProjectionString ku_linked_from_fs_string(KuString value) {\n"
+        + "    return (KuProjectionString){value.ptr,value.len,value.capacity,value.storage};\n}\n"
+        + "static KuBootstrapResult_KuProjectionString ku_linked_fs_read(const KuProjectionString* path) {\n"
+        + "    KuString input = {path->ptr,path->len,path->capacity,path->storage};\n"
+        + "    KuResult_str read = " + symbol.clone() + "(&input);\n"
+        + "    KuBootstrapResult_KuProjectionString out = {0};\n"
+        + "    out.ok = read.ok;\n"
+        + "    if (read.ok) out.value = ku_linked_from_fs_string(read.value);\n"
+        + "    else out.error = (KuBootstrapError){ku_linked_from_fs_string(read.error.domain), "
+        + "ku_linked_from_fs_string(read.error.code), ku_linked_from_fs_string(read.error.message)};\n"
+        + "    return out;\n}\n"
+}
+
 fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
+    if (callee.unit == 0) { return ok(fsReadReference(callee.symbol)) }
     text = "extern " + LinkedNullResultType(callee)? + " " + callee.symbol.clone() + "("
     if (callee.parameters.len() == 0) { text += "void" }
     index = 0
@@ -322,9 +381,16 @@ fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
 fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &payload: TypeNameBinding): str! {
     text = ""
     records: [str] = []
+    string_result = LinkedStringResult(payload)
+    index = 0
+    while (!string_result && index < links.len()) {
+        string_result = links[index].returns_result && LinkedStringResult(links[index].result)
+        index = index + 1
+    }
+    if (string_result) { text = StructValueResultHeader("KuProjectionString") }
     if (payload.declaration_kind == "Struct") {
         root = LinkedNullCType(payload)?
-        text = StructValueResultHeader(root)
+        text += StructValueResultHeader(root)
         records = records.push(root)
     }
     for dependency in links.clone() {
@@ -341,6 +407,7 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &payload: TypeNameBind
 }
 
 fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
+    if (callee.unit == 0) { return ok(FsReadLinkPlan(callee.symbol.clone())) }
     parameters: [LinkPlanType] = []
     index = 0
     while (index < callee.parameters.len()) {

@@ -1,4 +1,5 @@
 import { json } from "std"
+import { Span } from "../stage2/span.ku"
 import { GuardBoundType, GuardCType, GuardType } from "./guarded_struct_expr.ku"
 import { SuppliedModule } from "./imports.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -65,9 +66,22 @@ fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType): str! {
         + ",\"passing\":" + json.encode(passing)? + "}")
 }
 
+fn FsReadLinkPlan(symbol: str): LinkPlanDeclaration {
+    path = BuiltinLinkPlanType("str", "const KuString*", true)
+    result = BuiltinLinkPlanType("str", "KuResult_str", false)
+    return LinkPlanDeclaration { unit: 0, node: 1, symbol: symbol, parameters: [path], result: result, returns_result: true }
+}
+
 fn plannedDeclaration(&supplied: [SuppliedModule], &declaration: LinkPlanDeclaration): str! {
-    name = supplied[declaration.unit - 1].named.parsed.arena.nodes[declaration.node - 1].text.clone()
-    path = supplied[declaration.unit - 1].path.clone()
+    name = "read"
+    path = "std/fs.ku"
+    if (declaration.unit > 0) {
+        name = supplied[declaration.unit - 1].named.parsed.arena.nodes[declaration.node - 1].text.clone()
+        path = supplied[declaration.unit - 1].path.clone()
+    } else if (declaration.unit != 0 || declaration.node != 1 || declaration.symbol != "ku_linked_dep_fs_read") {
+        at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+        RejectLayout("invalid_linked_builtin", "unsupported builtin declaration identity", at)?
+    }
     text = "{\"source_path\":" + json.encode(path)? + ",\"node\":" + str(declaration.node)
         + ",\"source_name\":" + json.encode(name)? + ",\"symbol\":" + json.encode(declaration.symbol.clone())?
         + ",\"signature\":{\"parameters\":["

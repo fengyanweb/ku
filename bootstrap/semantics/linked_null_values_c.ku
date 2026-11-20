@@ -4,7 +4,7 @@ import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
-import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullFunction, LinkedNullHasResultValue, LinkedNullLiteralType,
+import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullFunction, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullExpression, LinkedNullState, LinkedNullValue, LowerLinkedNullLeaf,
          LowerLinkedNullRead, MoveLinkedNullSlot, ReadLinkedNullBinding, RequireLinkedArrayValidation } from "./linked_null_read_c.ku"
@@ -70,7 +70,12 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
 }
 
 fn resolveLinkedCall(&project: LinkedNullProject, &state: LinkedNullState, &call: Node, &target: Node, checked: bool): LinkedNullFunction! {
-    if (LinkedNullBinding(state.slots, target.text) != 0) {
+    name = target.text.clone()
+    if (target.kind == "Field" && target.edge_count == 1) {
+        receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+        name = receiver.text.clone()
+    }
+    if (LinkedNullBinding(state.slots, name) != 0) {
         RejectLayout("shadowed_linked_dependency", "direct dependency name is shadowed by a local", DeclarationSpan(target))?
     }
     callee = LinkedNullDependency(project, 1, target, checked)?
@@ -178,7 +183,7 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
     result = "dependency" + str(id)
     // The callee owns the arguments at this point. An error skips subsequent
     // statements and transfers its strings before the caller's cleanup.
-    arguments.state.code = arguments.state.code + "    " + LinkedNullResultType(callee)? + " " + result.clone() + " = " + callee.symbol
+    arguments.state.code = arguments.state.code + "    " + LinkedNullResultType(callee)? + " " + result.clone() + " = " + LinkedNullCallSymbol(callee)
         + "(" + arguments.args + ");\n" + arguments.handoff
         + "    if (!" + result.clone() + ".ok) {\n        result.error = " + result.clone() + ".error;\n"
         + "        " + result.clone() + ".error = (KuBootstrapError){0};\n        goto cleanup;\n    }\n"
@@ -275,14 +280,15 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
         RejectLayout("unsupported_linked_success", "expected return ok or a bound Result call", DeclarationSpan(call))?
     }
     callee = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
-    if (callee.kind == "Variable" && callee.edge_count == 0 && callee.text != "ok") {
+    if ((callee.kind == "Variable" && callee.edge_count == 0 && callee.text != "ok")
+        || (callee.kind == "Field" && callee.edge_count == 1)) {
         target = resolveLinkedCall(project, state, call, callee, true)?
         if (!SameLinkedType(target.result, result)) {
             RejectLayout("linked_tail_result", "forwarded Result must match the entry's declared payload", DeclarationSpan(call))?
         }
         call_id = LinkedNullChild(project, 1, statement, 0)
         arguments = lowerLinkedArguments(project, state, call, target, call_id, 0)?
-        arguments.state.code = arguments.state.code + "    result = " + target.symbol + "(" + arguments.args
+        arguments.state.code = arguments.state.code + "    result = " + LinkedNullCallSymbol(target) + "(" + arguments.args
             + ");\n" + arguments.handoff + "    goto cleanup;\n"
         return ok(arguments.state)
     }
