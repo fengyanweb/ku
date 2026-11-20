@@ -5106,6 +5106,9 @@ impl<'a> FunctionLowerer<'a> {
             },
             ty: closure_ty.clone(),
         })?;
+        if self.binding_is_boxed(&name, function.span) {
+            return self.push_cell_new(name, closure_ty, value, function.span);
+        }
         let name = self.define_local(&name, closure_ty.clone());
         emit_ir_instruction!(
             self,
@@ -6791,9 +6794,12 @@ fn collect_boxed_candidates_stmt(
                 visible,
                 out,
             );
-            // A named local function comes into scope only after its closure is
-            // created. Self-recursion is handled by self_recurse, not a cell.
-            visible.insert(function.name.clone(), None);
+            // The name becomes visible to later siblings once its closure has
+            // been made. Capturing that sibling value may box the binding, but
+            // self-recursion in the function itself still uses self_recurse.
+            let binding =
+                (!function.is_async).then(|| BoxedBindingSite::new(&function.name, function.span));
+            visible.insert(function.name.clone(), binding);
         }
         Stmt::Try {
             body,

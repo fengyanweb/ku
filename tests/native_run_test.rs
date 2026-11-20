@@ -9565,6 +9565,32 @@ fn native_local_named_function_captures_outer() {
 }
 
 #[test]
+fn native_local_named_function_captures_a_sibling() {
+    assert_native_callback_matches_interpreter(
+        r#"
+fn Make(base: int): fn(int): int {
+    text = "captured".clone()
+    fn Sum(n: int): int {
+        if (n <= 0) { return base + text.len() }
+        return n + Sum(n - 1)
+    }
+    fn Relay(n: int): int { return Sum(n) }
+    return Relay
+}
+
+fn main(): null! {
+    first = Make(4)
+    second = Make(10)
+    println(first(2))
+    println(second(3))
+    return ok(null)
+}
+"#,
+        "15\n24\n",
+    );
+}
+
+#[test]
 fn native_local_named_function_as_argument() {
     // Stage 6f: a local named function flows as a first-class closure value
     // through a `fn(int): int` parameter and is invoked inside the callee;
