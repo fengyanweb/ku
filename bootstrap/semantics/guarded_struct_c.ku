@@ -55,7 +55,7 @@ fn GuardOwnedDrops(&layouts: [StructLayout], index: int, &base: str): str {
     return drops
 }
 
-fn guardParameterType(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
+fn GuardParameterType(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
                       &layouts: [StructLayout], id: int, view: bool): GuardType! {
     node = nodes[id - 1].clone()
     if (node.kind != "TypeArray") { return GuardExplicitType(types, nodes, layouts, id) }
@@ -87,7 +87,7 @@ fn readGuardSignature(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
             RejectLayout("unsupported_guarded_signature", "expected a distinct, explicitly typed scalar or struct parameter", at.clone())?
         }
         view = parameter.int_value == 1
-        ty = guardParameterType(nodes, edges, types, layouts, edges[parameter.first_edge], view)?
+        ty = GuardParameterType(nodes, edges, types, layouts, edges[parameter.first_edge], view)?
         if (ty.kind == "str" || (view && ty.kind != "struct" && ty.kind != "str_array")) {
             RejectLayout("unsupported_guarded_signature", "guarded C accepts value scalars, value or View structs, and View [str]", at.clone())?
         }
@@ -270,22 +270,25 @@ fn GuardStringEquality(needed: bool): str {
     return "#include <string.h>\n\nstatic bool ku_guard_string_equal(KuProjectionString a, KuProjectionString b) {\n    return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0);\n}\n\n"
 }
 
-fn guardStringArrayC(): str {
+fn GuardStringArrayC(): str {
     text = "#include <stdio.h>\n\ntypedef struct { size_t len; KuProjectionString *data; size_t capacity; } KuGuardStringArray;\n"
     text += "typedef struct { int code; int64_t index; size_t length; } KuGuardArrayFailure;\n\n"
     text += EmitTryCloneString("ku_guard_clone_string")
-    text += "static bool ku_guard_string_array_equal(const KuGuardStringArray *array, int64_t index, KuProjectionString literal, bool *out, KuGuardArrayFailure *failure) {\n"
+    text += "static bool ku_guard_string_array_clone_at(const KuGuardStringArray *array, int64_t index, KuProjectionString *item, KuGuardArrayFailure *failure) {\n"
     text += "    if (!array) { failure->code = 1; return false; }\n"
     text += "    size_t capacity = array->capacity ? array->capacity : array->len;\n"
     text += "    if (array->len > capacity || capacity > SIZE_MAX / sizeof(*array->data) || (capacity && !array->data)) { failure->code = 1; return false; }\n"
     text += "    if (index < 0 || (uint64_t)index >= array->len) { *failure = (KuGuardArrayFailure){2, index, array->len}; return false; }\n"
+    text += "    if (!ku_guard_clone_string(array->data[index], item)) { failure->code = 3; return false; }\n"
+    text += "    return true;\n}\n\n"
+    text += "static bool ku_guard_string_array_equal(const KuGuardStringArray *array, int64_t index, KuProjectionString literal, bool *out, KuGuardArrayFailure *failure) {\n"
     text += "    KuProjectionString item = {0};\n"
-    text += "    if (!ku_guard_clone_string(array->data[index], &item)) { failure->code = 3; return false; }\n"
+    text += "    if (!ku_guard_string_array_clone_at(array, index, &item, failure)) return false;\n"
     text += "    *out = ku_guard_string_equal(item, literal);\n    ku_projection_string_drop(&item);\n    return true;\n}\n\n"
     return text
 }
 
-fn guardArrayErrorC(): str {
+fn GuardArrayErrorC(): str {
     return "    if (array_failure.code == 2) {\n"
         + "        fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", (long long)array_failure.index, array_failure.length);\n"
         + "        exit(EXIT_FAILURE);\n    }\n"
@@ -312,7 +315,7 @@ fn emitGuardedStructFunction(&nodes: [Node], &edges: [int], &types: [TypeNameBin
     arithmetic = body.uses_add || body.uses_sub
     text = ProjectionHeaders(true, signature.drops != "" || signature.string_array)
         + GuardArithmetic(body.uses_add, body.uses_sub) + GuardStringEquality(body.uses_eq || signature.string_array)
-    if (signature.string_array) { text += guardStringArrayC() }
+    if (signature.string_array) { text += GuardStringArrayC() }
     if (body.uses_join) {
         text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\ntypedef KuProjectionString KuBootstrapString;\n"
         text += ScalarStringJoinHelpers(body.uses_format)
@@ -329,7 +332,7 @@ fn emitGuardedStructFunction(&nodes: [Node], &edges: [int], &types: [TypeNameBin
     text += body.source + "cleanup:\n" + signature.drops
     if (body.uses_join) { text += "    if (failure) { fputs(failure, stderr); exit(EXIT_FAILURE); }\n" }
     if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (signature.string_array) { text += guardArrayErrorC() }
+    if (signature.string_array) { text += GuardArrayErrorC() }
     text += "    return result;\n}\n"
     return ok(GuardedStructC { symbol: symbol, source: text })
 }

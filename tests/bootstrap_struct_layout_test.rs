@@ -1358,6 +1358,7 @@ fn Make(): Outer {
     assert_constructor_view(&driver_binary, &cwd);
     assert_guarded_predicate(&driver_binary, &cwd);
     assert_guarded_string_array(&driver_binary, &cwd);
+    assert_integer_prefix_projection(&driver_binary, &cwd);
     assert_project_link_plans(&driver_binary, &cwd);
     linked_null::assert_checked_owned_call(&driver_binary, &cwd);
     token_window::assert_readonly_preflight(&driver_binary, &cwd);
@@ -1502,6 +1503,33 @@ int main(int argc, char **argv) {
         carrier["c_type"],
         Value::String("const KuGuardStringArray*".into())
     );
+}
+
+fn assert_integer_prefix_projection(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("mode.txt"), "struct-result").unwrap();
+    fs::write(cwd.join("function.txt"), "ScanIntegerPrefix").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let (assignment, clear) = text
+        .lines()
+        .zip(text.lines().skip(1))
+        .find(|(assignment, _)| assignment.starts_with("    result.value.f0 = l"))
+        .expect("the actual prefix moves a live lexeme into its result");
+    let local = assignment
+        .strip_prefix("    result.value.f0 = ")
+        .and_then(|value| value.strip_suffix(';'))
+        .unwrap();
+    assert_eq!(clear, format!("    {local} = (KuProjectionString){{0}};"));
+    assert!(text.contains("while (true)") && text.contains("ku_guard_string_array_clone_at(a0"));
+
+    fs::write(cwd.join("mode.txt"), "struct-result-plan").unwrap();
+    let plan = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plan);
+    let plan = String::from_utf8(plan.stdout).unwrap();
+    assert!(plan.contains(r#""kind":"BuiltinArray","source_name":"str""#));
+    assert!(plan.contains(r#""source_name":"IsDigit","symbol":"ku_bool_"#));
+    assert!(plan.contains(r#""source_name":"DigitValue","symbol":"ku_int_"#));
 }
 
 fn assert_constructor_view(seed: &Path, cwd: &Path) {

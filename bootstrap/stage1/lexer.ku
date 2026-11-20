@@ -118,14 +118,21 @@ fn HasFractionPoint(&characters: [str], index: int, length: int): bool {
     return false
 }
 
-fn ScanNumber(&characters: [str], length: int, start_index: int, start_line: int, start_column: int, start_offset: int): ScannedLiteral! {
+struct ScannedNumberPrefix {
+    lexeme: str
+    int_value: int
+    next_index: int
+    column: int
+    offset: int
+    overflow: bool
+}
+
+fn ScanIntegerPrefix(&characters: [str], length: int, start_index: int, start_column: int, start_offset: int): ScannedNumberPrefix! {
     index = start_index
-    line = start_line
     column = start_column
     offset = start_offset
     lexeme = ""
     int_value = 0
-    kind = ""
     // An overflowing integer prefix can still be a valid decimal
     // float. Defer its integer diagnostic until the whole token kind
     // is known, preserving the float spelling instead of rounding it.
@@ -150,6 +157,17 @@ fn ScanNumber(&characters: [str], length: int, start_index: int, start_line: int
             scanning = false
         }
     }
+    return ok(ScannedNumberPrefix {
+        lexeme: lexeme, int_value: int_value, next_index: index,
+        column: column, offset: offset, overflow: overflow
+    })
+}
+
+fn ScanNumber(&characters: [str], length: int, start_index: int, start_line: int, start_column: int, start_offset: int): ScannedLiteral! {
+    prefix = ScanIntegerPrefix(characters, length, start_index, start_column, start_offset)?
+    {lexeme, int_value, next_index: index, column, offset, overflow} = prefix
+    line = start_line
+    kind = ""
     is_float = HasFractionPoint(characters, index, length) && IsDigit(characters[index + 1].clone())
     if (is_float) {
         kind = "Float"

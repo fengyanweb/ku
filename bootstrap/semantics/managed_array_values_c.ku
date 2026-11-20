@@ -5,7 +5,7 @@ import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { CheckStructArrayType, StructArrayC } from "./struct_array_c.ku"
-import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression, GuardType, GuardValue } from "./guarded_struct_expr.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardCloneSource, GuardExplicitType, GuardExpression, GuardLeaf, GuardOwnedExpression, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 
 struct ManagedCode {
     text: str
@@ -23,6 +23,38 @@ struct ManagedAssignment {
 struct ManagedType {
     layout: int
     array: StructArrayC
+    string_locals: bool
+    leaves: [GuardLeaf]
+}
+
+fn ManagedExpression(&named: NamedModule, &locals: [GuardBinding], &layouts: [StructLayout],
+                     &root: ManagedType, id: int, &indent: str): GuardValue! {
+    return GuardOwnedExpression(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts, id, 0,
+        indent, root.string_locals, root.leaves)
+}
+
+fn ManagedStringRuntime(): str {
+    return "static bool ku_guard_try_mul(int64_t a, int64_t b, int64_t *out) {\n" +
+        "    if (a > 0) {\n" +
+        "        if ((b > 0 && a > INT64_MAX / b) || (b < 0 && b < INT64_MIN / a)) return false;\n" +
+        "    } else if (a < 0) {\n" +
+        "        if ((b > 0 && a < INT64_MIN / b) || (b < 0 && a < INT64_MAX / b)) return false;\n" +
+        "    }\n    *out = a * b;\n    return true;\n}\n\n" +
+        "static bool ku_managed_string_append(KuProjectionString *left, KuProjectionString right, bool *too_large) {\n" +
+        "    if (!right.len) return true;\n" +
+        "    if (right.len > SIZE_MAX - left->len) { *too_large = true; return false; }\n" +
+        "    size_t length = left->len + right.len;\n" +
+        "    size_t capacity = left->capacity > left->len ? left->capacity : left->len;\n" +
+        "    if (left->storage != KU_PROJECTION_STRING_OWNED || length > capacity) {\n" +
+        "        if (!capacity) capacity = 8u;\n" +
+        "        while (capacity < length) capacity = capacity > SIZE_MAX / 2u ? SIZE_MAX : capacity * 2u;\n" +
+        "        uint8_t *data = left->storage == KU_PROJECTION_STRING_OWNED ? realloc(left->ptr, capacity) : malloc(capacity);\n" +
+        "        if (!data) return false;\n" +
+        "        if (left->storage != KU_PROJECTION_STRING_OWNED && left->len) memcpy(data, left->ptr, left->len);\n" +
+        "        left->ptr = data;\n        left->capacity = capacity;\n        left->storage = KU_PROJECTION_STRING_OWNED;\n" +
+        "    }\n" +
+        "    memcpy(left->ptr + left->len, right.ptr, right.len);\n" +
+        "    left->len = length;\n    return true;\n}\n\n"
 }
 
 fn AddGuardCode(&code: ManagedCode, &setup: GuardValue): ManagedCode {
@@ -186,10 +218,10 @@ fn managedInitializer(&named: NamedModule, &imports: [ImportBinding], &supplied:
     return ok(ManagedAssignment { code: code, binding: binding, introduces: true })
 }
 
-fn copyAssignment(&nodes: [Node], &edges: [int], &locals: [GuardBinding], &layouts: [StructLayout],
+fn copyAssignment(&named: NamedModule, &locals: [GuardBinding], &layouts: [StructLayout], &root: ManagedType,
                   &statement: Node, statement_id: int, node_id: int, &declared: GuardType, found: int,
                   &indent: str): ManagedAssignment! {
-    value = GuardExpression(nodes, edges, locals, layouts, node_id, 0, indent)?
+    value = ManagedExpression(named, locals, layouts, root, node_id, indent)?
     if (value.ty.kind != "int" && value.ty.kind != "bool") {
         RejectLayout("unsupported_managed_local", "expected a Copy scalar or a supported owner initialization", DeclarationSpan(statement))?
     }
@@ -210,6 +242,52 @@ fn copyAssignment(&nodes: [Node], &edges: [int], &locals: [GuardBinding], &layou
     return ok(ManagedAssignment { code: code, binding: binding, introduces: false })
 }
 
+fn ownedStringSetup(&named: NamedModule, &locals: [GuardBinding], &layouts: [StructLayout], &root: ManagedType,
+                    node_id: int, &target: str, &indent: str): ManagedCode! {
+    node = named.parsed.arena.nodes[node_id - 1].clone()
+    if (node.kind == "String") {
+        value = ManagedExpression(named, locals, layouts, root, node_id, indent)?
+        return ok(ManagedCode { text: indent.clone() + target.clone() + " = " + value.value + ";\n",
+            uses_add: false, uses_sub: false, uses_eq: false })
+    }
+    subject = GuardCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, node_id)
+    if (subject == 0) {
+        RejectLayout("managed_string_owner", "expected a literal or a cloned View element", DeclarationSpan(node))?
+    }
+    indexed = named.parsed.arena.nodes[subject - 1].clone()
+    if (indexed.kind != "Index" || indexed.edge_count != 2) {
+        RejectLayout("managed_string_index", "expected a cloned View [str] index", DeclarationSpan(indexed))?
+    }
+    base = ManagedExpression(named, locals, layouts, root, named.parsed.arena.edges[indexed.first_edge], indent)?
+    index = ManagedExpression(named, locals, layouts, root, named.parsed.arena.edges[indexed.first_edge + 1], indent)?
+    if (!base.view || base.ty.kind != "str_array" || base.setup != "" || index.ty.kind != "int") {
+        RejectLayout("managed_string_index", "expected a declared View [str] and a checked int index", DeclarationSpan(indexed))?
+    }
+    code = AddGuardCode(ManagedBlank(), index)
+    code.text = code.text + indent.clone() + "if (!ku_guard_string_array_clone_at(" + base.value + ", " + index.value + ", &" +
+        target.clone() + ", &array_failure)) goto cleanup;\n"
+    return ok(code)
+}
+
+fn EmitManagedStringAppend(&named: NamedModule, &locals: [GuardBinding], &layouts: [StructLayout],
+                           &root: ManagedType, &statement: Node, &indent: str): ManagedCode! {
+    target = named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge] - 1].clone()
+    found = GuardBindingIndex(locals, target.text)
+    if (target.kind != "Variable" || found == 0 || locals[found - 1].ty.kind != "str" || locals[found - 1].parameter) {
+        RejectLayout("managed_string_append", "string append requires a live local str owner", DeclarationSpan(target))?
+    }
+    id = named.parsed.arena.edges[statement.first_edge + 1]
+    value = ManagedExpression(named, locals, layouts, root, id, indent)?
+    name = GuardBindingName(locals[found - 1])
+    if (value.ty.kind != "str" || value.view || value.value == name) {
+        RejectLayout("managed_string_append", "string append requires a non-aliasing str right hand side", DeclarationSpan(statement))?
+    }
+    code = AddGuardCode(ManagedBlank(), value)
+    code.text = code.text + indent.clone() + "if (!ku_managed_string_append(&" + name + ", " + value.value +
+        ", &string_too_large)) { out_of_memory = !string_too_large; goto cleanup; }\n"
+    return ok(code)
+}
+
 fn EmitManagedAssignment(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
                          &supplied: [SuppliedModule], &layouts: [StructLayout], &root: ManagedType,
                          &locals: [GuardBinding], statement_id: int, &indent: str): ManagedAssignment! {
@@ -222,6 +300,17 @@ fn EmitManagedAssignment(&named: NamedModule, &types: [TypeNameBinding], &import
     }
     node_id = named.parsed.arena.edges[statement.first_edge + statement.edge_count - 1]
     node = named.parsed.arena.nodes[node_id - 1].clone()
+    if (root.string_locals && (node.kind == "String" || GuardCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, node_id) != 0)) {
+        ty = GuardType { kind: "str", layout: 0 }
+        requireNewOwner(found, statement)?
+        validateDeclaration(declared, ty, found, statement)?
+        binding = localBinding(statement, statement_id, ty)
+        code = ownedStringSetup(named, locals, layouts, root, node_id, GuardBindingName(binding), indent)?
+        return ok(ManagedAssignment { code: code, binding: binding, introduces: true })
+    }
+    if (root.string_locals) {
+        return copyAssignment(named, locals, layouts, root, statement, statement_id, node_id, declared, found, indent)
+    }
     if (node.kind == "Array" || node.kind == "StructLiteral" ||
         isMethod(named.parsed.arena.nodes, named.parsed.arena.edges, node, "clone", 0)) {
         return managedInitializer(named, imports, supplied, locals, layouts, root, statement, statement_id, node, node_id, declared, found, indent)
@@ -234,5 +323,5 @@ fn EmitManagedAssignment(&named: NamedModule, &types: [TypeNameBinding], &import
         code = appendToOwner(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts, root, node, binding, indent)?
         return ok(ManagedAssignment { code: code, binding: binding, introduces: false })
     }
-    return copyAssignment(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts, statement, statement_id, node_id, declared, found, indent)
+    return copyAssignment(named, locals, layouts, root, statement, statement_id, node_id, declared, found, indent)
 }

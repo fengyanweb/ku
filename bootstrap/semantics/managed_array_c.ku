@@ -130,7 +130,7 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     // Admit the result graph before either array policy or source generation.
     ordered = orderLayout(layouts, result.layout, DeclarationSpan(function))?
     array = EmitStructArrayOperations(layouts, result.layout)
-    root = ManagedType { layout: result.layout, array: array }
+    root = ManagedType { layout: result.layout, array: array, string_locals: false, leaves: [] }
     signature = readParameters(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, root, ordered, function, edge)?
     body = EmitManagedBlock(named, types, imports, supplied, layouts, root, signature.bindings,
         signature.body_start, function.first_edge + function.edge_count, 0, "    ")?

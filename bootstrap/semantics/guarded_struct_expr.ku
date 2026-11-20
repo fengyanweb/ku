@@ -29,6 +29,12 @@ struct GuardValue {
     uses_eq: bool
 }
 
+struct GuardLeaf {
+    name: str
+    symbol: str
+    result_kind: str
+}
+
 fn GuardBindingIndex(&bindings: [GuardBinding], &name: str): int {
     index = 0
     while (index < bindings.len()) {
@@ -98,11 +104,12 @@ fn guardInteger(&left: GuardValue, &right: GuardValue, &node: Node, id: int, &in
     add = node.text == "+"
     operation = "sub"
     if (add) { operation = "add" }
+    if (node.text == "*") { operation = "mul" }
     output = "t" + str(id)
     setup = left.setup.clone() + right.setup.clone() + indent.clone() + "int64_t " + output.clone() + ";\n"
     setup += indent.clone() + "if (!ku_guard_try_" + operation + "(" + left.value.clone() + ", " + right.value.clone() + ", &" + output.clone() + ")) { overflow = true; goto cleanup; }\n"
     return ok(GuardValue { ty: GuardType { kind: "int", layout: 0 }, setup: setup, value: output, view: false,
-        uses_add: left.uses_add || right.uses_add || add, uses_sub: left.uses_sub || right.uses_sub || !add,
+        uses_add: left.uses_add || right.uses_add || add, uses_sub: left.uses_sub || right.uses_sub || operation == "sub",
         uses_eq: left.uses_eq || right.uses_eq })
 }
 
@@ -142,12 +149,17 @@ fn guardBoolean(&left: GuardValue, &right: GuardValue, &node: Node, id: int, &in
         uses_eq: left.uses_eq || right.uses_eq })
 }
 
-fn guardClonedIndex(&nodes: [Node], &edges: [int], id: int): int {
+fn GuardCloneSource(&nodes: [Node], &edges: [int], id: int): int {
     call = nodes[id - 1].clone()
     if (call.kind != "Call" || call.edge_count != 1) { return 0 }
     member = nodes[edges[call.first_edge] - 1].clone()
     if (member.kind != "Field" || member.text != "clone" || member.edge_count != 1) { return 0 }
-    indexed = edges[member.first_edge]
+    return edges[member.first_edge]
+}
+
+fn guardClonedIndex(&nodes: [Node], &edges: [int], id: int): int {
+    indexed = GuardCloneSource(nodes, edges, id)
+    if (indexed == 0) { return 0 }
     if (nodes[indexed - 1].kind != "Index" || nodes[indexed - 1].edge_count != 2) { return 0 }
     return indexed
 }
@@ -185,8 +197,49 @@ fn guardStringArrayCompare(&nodes: [Node], &edges: [int], &bindings: [GuardBindi
         uses_add: index.uses_add, uses_sub: index.uses_sub, uses_eq: index.uses_eq })
 }
 
+fn guardLeafCall(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &leaves: [GuardLeaf],
+                 &node: Node, id: int, depth: int, &indent: str): GuardValue! {
+    empty = GuardRead(GuardType { kind: "", layout: 0 }, "", false)
+    if (node.edge_count != 2 || leaves.len() == 0) { return ok(empty) }
+    target = nodes[edges[node.first_edge] - 1].clone()
+    if (target.kind != "Variable" || GuardBindingIndex(bindings, target.text) != 0) { return ok(empty) }
+    position = 0
+    while (position < leaves.len()) {
+        leaf = leaves[position].clone()
+        if (leaf.name == target.text) {
+            subject = GuardCloneSource(nodes, edges, edges[node.first_edge + 1])
+            if (subject == 0 || nodes[subject - 1].kind != "Variable" || depth + 3 >= 32) {
+                RejectLayout("guarded_owned_argument", "a checked leaf takes an explicit clone of a live str", DeclarationSpan(node))?
+            }
+            found = GuardBindingIndex(bindings, nodes[subject - 1].text)
+            if (found == 0 || bindings[found - 1].ty.kind != "str" || bindings[found - 1].view) {
+                RejectLayout("guarded_owned_argument", "a checked leaf requires a bound str owner", DeclarationSpan(nodes[subject - 1]))?
+            }
+            temp = "argument" + str(id)
+            out = "t" + str(id)
+            code = indent.clone() + "KuProjectionString " + temp.clone() + " = {0};\n"
+            code += indent.clone() + "if (!ku_result_clone_string(" + GuardBindingName(bindings[found - 1]) + ", &" + temp.clone() +
+                ")) { out_of_memory = true; goto cleanup; }\n"
+            ty = GuardType { kind: leaf.result_kind.clone(), layout: 0 }
+            c_type = "int64_t"
+            if (ty.kind == "bool") { c_type = "bool" }
+            code += indent.clone() + c_type + " " + out.clone() + " = " + leaf.symbol.clone() + "(" + temp + ");\n"
+            value = GuardRead(ty, out, false)
+            value.setup = code
+            return ok(value)
+        }
+        position = position + 1
+    }
+    return ok(empty)
+}
+
 fn GuardExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
                    id: int, depth: int, &indent: str): GuardValue! {
+    return GuardOwnedExpression(nodes, edges, bindings, layouts, id, depth, indent, false, [])
+}
+
+fn GuardOwnedExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
+                         id: int, depth: int, &indent: str, checked_mul: bool, &leaves: [GuardLeaf]): GuardValue! {
     node = nodes[id - 1].clone()
     if (depth >= 32) {
         RejectLayout("guarded_expression_limit", "guarded C accepts at most 32 expression levels", DeclarationSpan(node))?
@@ -209,13 +262,13 @@ fn GuardExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &la
         return ok(GuardRead(bindings[found - 1].ty.clone(), GuardBindingName(bindings[found - 1]), bindings[found - 1].view))
     }
     if (node.kind == "Field" && node.edge_count == 1) {
-        base = GuardExpression(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, indent)?
+        base = GuardOwnedExpression(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, indent, checked_mul, leaves)?
         return guardField(layouts, base, node)
     }
     if (node.kind == "Call" && node.edge_count == 1) {
         method = nodes[edges[node.first_edge] - 1].clone()
         if (method.kind == "Field" && method.text == "len" && method.edge_count == 1) {
-            receiver = GuardExpression(nodes, edges, bindings, layouts, edges[method.first_edge], depth + 1, indent)?
+            receiver = GuardOwnedExpression(nodes, edges, bindings, layouts, edges[method.first_edge], depth + 1, indent, checked_mul, leaves)?
             if (receiver.ty.kind == "array") {
                 access = ".len"
                 if (receiver.view) { access = "->len" }
@@ -223,8 +276,12 @@ fn GuardExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &la
             }
         }
     }
+    if (node.kind == "Call") {
+        linked = guardLeafCall(nodes, edges, bindings, leaves, node, id, depth, indent)?
+        if (linked.ty.kind != "") { return ok(linked) }
+    }
     if (node.kind == "Unary" && node.edge_count == 1) {
-        operand = GuardExpression(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, indent)?
+        operand = GuardOwnedExpression(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, indent, checked_mul, leaves)?
         if (node.text == "!" && operand.ty.kind == "bool") {
             operand.value = "(!" + operand.value + ")"
             return ok(operand)
@@ -239,11 +296,11 @@ fn GuardExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &la
             comparison = guardStringArrayCompare(nodes, edges, bindings, layouts, node, id, depth, indent)?
             if (comparison.ty.kind == "bool") { return ok(comparison) }
         }
-        left = GuardExpression(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, indent)?
+        left = GuardOwnedExpression(nodes, edges, bindings, layouts, edges[node.first_edge], depth + 1, indent, checked_mul, leaves)?
         right_indent = indent.clone()
         if (node.text == "&&" || node.text == "||") { right_indent += "    " }
-        right = GuardExpression(nodes, edges, bindings, layouts, edges[node.first_edge + 1], depth + 1, right_indent)?
-        if (node.text == "+" || node.text == "-") { return guardInteger(left, right, node, id, indent) }
+        right = GuardOwnedExpression(nodes, edges, bindings, layouts, edges[node.first_edge + 1], depth + 1, right_indent, checked_mul, leaves)?
+        if (node.text == "+" || node.text == "-" || (checked_mul && node.text == "*")) { return guardInteger(left, right, node, id, indent) }
         if (node.text == "&&" || node.text == "||" || node.text == "==" || node.text == "!=" ||
             node.text == "<" || node.text == "<=" || node.text == ">" || node.text == ">=") {
             return guardBoolean(left, right, node, id, indent)

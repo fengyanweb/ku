@@ -3,17 +3,19 @@ import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardExpression } from "./guarded_struct_expr.ku"
-import { AddGuardCode, EmitManagedAssignment, JoinManagedCode, ManagedBlank, ManagedCode, ManagedType } from "./managed_array_values_c.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType } from "./guarded_struct_expr.ku"
+import { AddGuardCode, EmitManagedAssignment, EmitManagedStringAppend, JoinManagedCode, ManagedBlank, ManagedCode, ManagedExpression, ManagedType } from "./managed_array_values_c.ku"
 
 struct ManagedBlock {
     code: ManagedCode
     declarations: str
     drops: str
     returns: bool
+    bindings: [GuardBinding]
 }
 
 fn ownedDrop(&root: ManagedType, &binding: GuardBinding, &indent: str): str {
+    if (binding.ty.kind == "str") { return indent.clone() + "ku_projection_string_drop(&" + GuardBindingName(binding) + ");\n" }
     operation = "_element_drop(&"
     if (binding.ty.kind == "array") { operation = "_drop(&" }
     return indent.clone() + root.array.prefix.clone() + operation + GuardBindingName(binding) + ");\n"
@@ -51,15 +53,21 @@ fn EmitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
             RejectLayout("unreachable_managed_statement", "a prior managed statement always returns", DeclarationSpan(statement))?
         }
         if (statement.kind == "Return") {
+            if (root.string_locals) {
+                RejectLayout("unsupported_managed_return", "result loops require one return after the managed body", DeclarationSpan(statement))?
+            }
             code.text = code.text + managedReturn(named.parsed.arena.nodes, named.parsed.arena.edges, locals, root, statement, indent)?
             returns = true
+        } else if (root.string_locals && statement.kind == "CompoundAssign" && statement.text == "+" && statement.edge_count == 2) {
+            update = EmitManagedStringAppend(named, locals, layouts, root, statement, indent)?
+            code = JoinManagedCode(code, update)
         } else if ((statement.kind == "Assign" && statement.edge_count == 1) ||
                    (statement.kind == "VarDecl" && statement.edge_count == 2)) {
             assignment = EmitManagedAssignment(named, types, imports, supplied, layouts, root, locals, statement_id, indent)?
             code = JoinManagedCode(code, assignment.code)
             if (assignment.introduces) {
                 binding = assignment.binding
-                if (binding.ty.kind == "struct" || binding.ty.kind == "array") {
+                if (binding.ty.kind == "struct" || binding.ty.kind == "array" || binding.ty.kind == "str") {
                     // Predeclare only managed owners. Any goto cleanup can
                     // then safely drop zero, partial, complete or moved slots.
                     declarations += "    " + GuardCType(binding.ty, layouts) + " " + GuardBindingName(binding) + " = {0};\n"
@@ -78,8 +86,7 @@ fn EmitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
             inside = indent.clone() + "    "
             guard_indent = indent.clone()
             if (statement.kind == "While") { guard_indent = inside.clone() }
-            guard = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts,
-                named.parsed.arena.edges[statement.first_edge], 0, guard_indent)?
+            guard = ManagedExpression(named, locals, layouts, root, named.parsed.arena.edges[statement.first_edge], guard_indent)?
             if (guard.ty.kind != "bool") {
                 RejectLayout("managed_condition_type", "managed if and while require bool", DeclarationSpan(statement))?
             }
@@ -113,6 +120,6 @@ fn EmitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
         }
         cursor = cursor + 1
     }
-    if (!returns) { code.text = code.text + scope_drops }
-    return ok(ManagedBlock { code: code, declarations: declarations, drops: drops, returns: returns })
+    if (!returns && (!root.string_locals || depth != 0)) { code.text = code.text + scope_drops }
+    return ok(ManagedBlock { code: code, declarations: declarations, drops: drops, returns: returns, bindings: locals })
 }

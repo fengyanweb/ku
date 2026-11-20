@@ -2,10 +2,17 @@ import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
-import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardExplicitType, GuardExpression } from "./guarded_struct_expr.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardCloneSource, GuardExplicitType, GuardExpression, GuardLeaf } from "./guarded_struct_expr.ku"
 import { AddGuardCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { ScalarSymbol } from "./scalar_int_emit.ku"
+
+struct OwnedScalarLeaves {
+    bindings: [GuardLeaf]
+    declarations: str
+    plan: [LinkPlanDeclaration]
+}
 
 struct StructResultLink {
     symbol: str
@@ -28,7 +35,48 @@ fn resultFunctionNode(&named: NamedModule, &name: str): int {
     return 0
 }
 
-fn remainingBindings(&bindings: [GuardBinding], removed: int): [GuardBinding] {
+fn ownedScalarLeafId(&named: NamedModule, &call: Node): int {
+    if (call.kind != "Call" || call.edge_count != 2 ||
+        GuardCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.edges[call.first_edge + 1]) == 0) { return 0 }
+    target = named.parsed.arena.nodes[named.parsed.arena.edges[call.first_edge] - 1].clone()
+    if (target.kind != "Variable" || target.edge_count != 0) { return 0 }
+    return resultFunctionNode(named, target.text)
+}
+
+fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layouts: [StructLayout], &function: Node): OwnedScalarLeaves! {
+    output = OwnedScalarLeaves { bindings: [], declarations: "", plan: [] }
+    emitted: [int] = []
+    index = 0
+    while (index < named.parsed.arena.nodes.len()) {
+        call = named.parsed.arena.nodes[index].clone()
+        index = index + 1
+        if (call.offset < function.offset || call.end_offset > function.end_offset) { continue }
+        id = ownedScalarLeafId(named, call)
+        if (id == 0 || ContainsIndex(emitted, id)) { continue }
+        leaf = named.parsed.arena.nodes[id - 1].clone()
+        if (leaf.edge_count < 3) { continue }
+        parameter = named.parsed.arena.nodes[named.parsed.arena.edges[leaf.first_edge] - 1].clone()
+        result = named.parsed.arena.edges[leaf.first_edge + 1]
+        if (parameter.kind != "Parameter" || parameter.edge_count != 1 || parameter.int_value != 0 ||
+            named.parsed.arena.nodes[result - 1].kind != "TypeName") { continue }
+        arg = GuardExplicitType(types, named.parsed.arena.nodes, layouts, named.parsed.arena.edges[parameter.first_edge])?
+        ty = GuardExplicitType(types, named.parsed.arena.nodes, layouts, result)?
+        if (arg.kind != "str" || (ty.kind != "int" && ty.kind != "bool")) { continue }
+        scalar_type = 1
+        if (ty.kind == "bool") { scalar_type = 3 }
+        symbol = ScalarSymbol(id, scalar_type)
+        c_type = GuardCType(ty, layouts)
+        output.declarations = output.declarations + "extern " + c_type.clone() + " " + symbol.clone() + "(KuProjectionString);\n"
+        output.plan = output.plan.push(LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(),
+            parameters: [BuiltinLinkPlanType("str", "KuProjectionString", false)],
+            result: BuiltinLinkPlanType(ty.kind.clone(), c_type, false), returns_result: false })
+        output.bindings = output.bindings.push(GuardLeaf { name: leaf.text, symbol: symbol, result_kind: ty.kind })
+        emitted = emitted.push(id)
+    }
+    return ok(output)
+}
+
+fn WithoutOwnedBinding(&bindings: [GuardBinding], removed: int): [GuardBinding] {
     kept: [GuardBinding] = []
     index = 0
     while (index < bindings.len()) {
@@ -156,7 +204,7 @@ fn LowerStructResultLink(&named: NamedModule, &types: [TypeNameBinding], &layout
             // Until every argument has been evaluated, the original frame
             // holds the owner. A later overflow then drops it at cleanup.
             transfers += "    " + GuardBindingName(available[source - 1]) + " = (" + c_type + "){0};\n"
-            available = remainingBindings(available, source)
+            available = WithoutOwnedBinding(available, source)
         }
         cursor = cursor + 1
         index = index + 1

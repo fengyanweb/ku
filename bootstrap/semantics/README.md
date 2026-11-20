@@ -236,14 +236,21 @@ or ownership transfer.
 `View [str]` parameter. This subset compares a cloned indexed string with
 a literal. The array remains owned by the caller. The emitted predicate
 preserves checked arithmetic, array bounds and the clone's failure point.
-Use ordinary C emission for this signature. Link plans for a string array
-are unavailable.
+The typed link plan identifies this parameter as a readonly builtin array.
 
 For the original `RelocateTokens` in `stage2/context.ku`, select `managed` and
 keep the same project manifest. The emitter handles the loop, per-iteration
 owners and array return. The no-relocation branch returns the original array
 storage. Relocation produces independent token owners, and bounds, arithmetic
 and allocation failures release all live storage before reporting the error.
+
+`ScanIntegerPrefix` in `stage1/lexer.ku` uses `struct-result` to project the
+complete decimal prefix loop. It borrows a `[str]`, checks each index, and
+uses local owned strings and checked arithmetic within bounded control blocks.
+Link its typed result plan with `project-int` providers for `IsDigit` and
+`DigitValue` from the same manifest. The result takes ownership of the grown
+lexeme buffer. `ScanNumber` still decides whether the same prefix belongs to an
+integer or a decimal float before reporting an overflowing integer.
 
 The `linked-str` and `struct-result` modes emit `DiagnosticCanonical` and
 `ReadPrimaryAtom` from their original modules. Generated `extern` declarations

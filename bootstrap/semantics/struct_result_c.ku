@@ -4,14 +4,15 @@ import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
 import { ExplicitType, FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { BoundLinkPlanType, EmptyLinkPlanDeclaration, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, EmptyLinkPlanDeclaration, LinkPlanDeclaration, LinkPlanType, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 import { CStructOrder, OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
-import { GuardArithmetic, GuardOwnedDrops, GuardStringEquality } from "./guarded_struct_c.ku"
+import { GuardArithmetic, GuardArrayErrorC, GuardOwnedDrops, GuardParameterType, GuardStringArrayC, GuardStringEquality } from "./guarded_struct_c.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression } from "./guarded_struct_expr.ku"
-import { AddGuardCode, JoinManagedCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
-import { EmitOwnedStructOperations, EmitTryCloneString } from "./struct_array_c.ku"
-import { LowerStructResultLink, ResultLinkClonePrefix } from "./struct_result_link_c.ku"
+import { AddGuardCode, JoinManagedCode, ManagedBlank, ManagedCode, ManagedStringRuntime, ManagedType } from "./managed_array_values_c.ku"
+import { EmitManagedBlock } from "./managed_array_body_c.ku"
+import { EmitOwnedStructOperations, EmitTryCloneString, StructArrayC } from "./struct_array_c.ku"
+import { LowerStructResultLink, ReadOwnedScalarLeaves, ResultLinkClonePrefix, WithoutOwnedBinding } from "./struct_result_link_c.ku"
 
 struct StructResultC {
     symbol: str
@@ -29,6 +30,7 @@ struct StructResultSignature {
     drops: str
     body_start: int
     plan: [LinkPlanType]
+    string_array: bool
 }
 
 struct StructResultBody {
@@ -76,6 +78,7 @@ fn readStructResultSignature(&named: NamedModule, &types: [TypeNameBinding], &la
     plan: [LinkPlanType] = []
     unused = ""
     drops = ""
+    string_array = false
     cursor = function.first_edge
     while (cursor < result_edge) {
         parameter = named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].clone()
@@ -85,17 +88,22 @@ fn readStructResultSignature(&named: NamedModule, &types: [TypeNameBinding], &la
             RejectLayout("unsupported_struct_result_signature", "expected distinct typed parameters", at.clone())?
         }
         id = named.parsed.arena.edges[parameter.first_edge]
-        ty = GuardExplicitType(types, named.parsed.arena.nodes, layouts, id)?
-        bound = ExplicitType(types, id, at.clone())?
         view = parameter.int_value == 1
-        if (view && ty.kind != "struct") {
-            RejectLayout("unsupported_struct_result_signature", "only a known struct may be a View parameter", at.clone())?
+        ty = GuardParameterType(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, id, view)?
+        if (view && ty.kind != "struct" && ty.kind != "str_array") {
+            RejectLayout("unsupported_struct_result_signature", "expected a known View layout", at.clone())?
         }
         binding = GuardBinding { name: parameter.text, ty: ty, slot: bindings.len(), parameter: true, view: view }
         name = GuardBindingName(binding)
         c_type = GuardCType(binding.ty, layouts)
         if (view) { c_type = "const " + c_type + "*" }
-        plan = plan.push(BoundLinkPlanType(bound, 1, c_type.clone(), view))
+        if (binding.ty.kind == "str_array") {
+            string_array = true
+            plan = plan.push(StrArrayViewLinkPlanType())
+        } else {
+            bound = ExplicitType(types, id, at.clone())?
+            plan = plan.push(BoundLinkPlanType(bound, 1, c_type.clone(), view))
+        }
         if (bindings.len() != 0) { parameters += ", " }
         parameters += c_type + " " + name.clone()
         unused += "    (void)" + name.clone() + ";\n"
@@ -115,7 +123,7 @@ fn readStructResultSignature(&named: NamedModule, &types: [TypeNameBinding], &la
     }
     if (parameters == "") { parameters = "void" }
     return ok(StructResultSignature { bindings: bindings, declarations: declarations, parameters: parameters,
-        unused: unused, drops: drops, body_start: result_edge + 1, plan: plan })
+        unused: unused, drops: drops, body_start: result_edge + 1, plan: plan, string_array: string_array })
 }
 
 fn isBoundOk(&named: NamedModule, &locals: [GuardBinding], &imports: [ImportBinding]): bool {
@@ -134,8 +142,9 @@ fn isBoundOk(&named: NamedModule, &locals: [GuardBinding], &imports: [ImportBind
 }
 
 fn emitResultFields(&named: NamedModule, &locals: [GuardBinding], &layouts: [StructLayout],
-                    layout: int, &literal: Node, &indent: str): ManagedCode! {
+                    layout: int, &literal: Node, &indent: str, move_locals: bool): ManagedCode! {
     code = ManagedBlank()
+    available = locals.clone()
     seen: [int] = []
     index = 0
     while (index < literal.edge_count) {
@@ -145,16 +154,25 @@ fn emitResultFields(&named: NamedModule, &locals: [GuardBinding], &layouts: [Str
             RejectLayout("struct_result_field", "expected every declared payload field once", DeclarationSpan(field))?
         }
         ty = GuardBoundType(layouts[layout - 1].fields[offset - 1].resolved, layouts)?
-        rendered = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts,
-            named.parsed.arena.edges[field.first_edge], 0, indent)?
+        value_id = named.parsed.arena.edges[field.first_edge]
+        rendered = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, available, layouts, value_id, 0, indent)?
         if (ty.kind != rendered.ty.kind || ty.layout != rendered.ty.layout) {
             RejectLayout("struct_result_field_type", "payload field must match its declared type", DeclarationSpan(field))?
         }
         code = AddGuardCode(code, rendered)
         target = "result.value.f" + str(offset - 1)
         if (ty.kind == "str") {
-            code.text = code.text + indent.clone() + "if (!ku_result_clone_string(" + rendered.value + ", &" + target +
-                ")) { out_of_memory = true; goto cleanup; }\n"
+            payload = named.parsed.arena.nodes[value_id - 1].clone()
+            moved = 0
+            if (move_locals && payload.kind == "Variable") { moved = GuardBindingIndex(available, payload.text) }
+            if (moved != 0 && !available[moved - 1].parameter && !available[moved - 1].view) {
+                code.text = code.text + indent.clone() + target + " = " + rendered.value.clone() + ";\n"
+                code.text = code.text + indent.clone() + rendered.value + " = (KuProjectionString){0};\n"
+                available = WithoutOwnedBinding(available, moved)
+            } else {
+                code.text = code.text + indent.clone() + "if (!ku_result_clone_string(" + rendered.value + ", &" + target +
+                    ")) { out_of_memory = true; goto cleanup; }\n"
+            }
         } else {
             value = rendered.value
             if (ty.kind == "struct") {
@@ -178,7 +196,7 @@ fn emitResultFields(&named: NamedModule, &locals: [GuardBinding], &layouts: [Str
 
 fn emitStructReturn(&named: NamedModule, &imports: [ImportBinding], &supplied: [SuppliedModule],
                      &locals: [GuardBinding], &layouts: [StructLayout], layout: int,
-                     &statement: Node, &indent: str): ManagedCode! {
+                     &statement: Node, &indent: str, move_locals: bool): ManagedCode! {
     if (statement.kind != "Return" || statement.edge_count != 1) {
         RejectLayout("unsupported_struct_result_return", "expected a return of ok(struct literal)", DeclarationSpan(statement))?
     }
@@ -197,7 +215,7 @@ fn emitStructReturn(&named: NamedModule, &imports: [ImportBinding], &supplied: [
     if (bound.declaration_kind != "Struct" || LayoutIndex(layouts, bound.module_index, bound.declaration_node) != layout) {
         RejectLayout("struct_result_payload_type", "payload must match the declared struct result", DeclarationSpan(literal))?
     }
-    return emitResultFields(named, locals, layouts, layout, literal, indent)
+    return emitResultFields(named, locals, layouts, layout, literal, indent, move_locals)
 }
 
 fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
@@ -216,7 +234,7 @@ fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports
         id = named.parsed.arena.edges[cursor]
         statement = named.parsed.arena.nodes[id - 1].clone()
         if (cursor == end - 1) {
-            returned = emitStructReturn(named, imports, supplied, local, layouts, layout, statement, "    ")?
+            returned = emitStructReturn(named, imports, supplied, local, layouts, layout, statement, "    ", false)?
             code = JoinManagedCode(code, returned)
         } else if (statement.kind == "If" && statement.edge_count == 2 && statement.int_value == 1) {
             condition = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, local, layouts,
@@ -225,7 +243,7 @@ fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports
                 RejectLayout("struct_result_condition", "guarded result return requires bool", DeclarationSpan(statement))?
             }
             returned = emitStructReturn(named, imports, supplied, local, layouts, layout,
-                named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge + 1] - 1], "        ")?
+                named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge + 1] - 1], "        ", false)?
             code = AddGuardCode(code, condition)
             code.text = code.text + "    if ((bool)" + condition.value + ") {\n"
             code = JoinManagedCode(code, returned)
@@ -249,6 +267,21 @@ fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports
         declarations: declarations, drops: drops, clone_layouts: clone_layouts, plan: plan })
 }
 
+fn emitOwnedResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
+                       &supplied: [SuppliedModule], &layouts: [StructLayout], &function: Node, layout: int,
+                       &signature: StructResultSignature): StructResultBody! {
+    end = function.first_edge + function.edge_count - 1
+    leaves = ReadOwnedScalarLeaves(named, types, layouts, function)?
+    root = ManagedType { layout: 0, array: StructArrayC { element_type: "", array_type: "", prefix: "", source: "" },
+        string_locals: true, leaves: leaves.bindings }
+    block = EmitManagedBlock(named, types, imports, supplied, layouts, root, signature.bindings.clone(),
+        signature.body_start, end, 0, "    ")?
+    result = emitStructReturn(named, imports, supplied, block.bindings, layouts, layout,
+        named.parsed.arena.nodes[named.parsed.arena.edges[end] - 1], "    ", true)?
+    return ok(StructResultBody { code: JoinManagedCode(block.code, result), prototype: leaves.declarations, dependency: "",
+        declarations: block.declarations, drops: block.drops, clone_layouts: [], plan: leaves.plan })
+}
+
 fn StructResultHeader(): str {
     return "typedef struct { KuProjectionString domain, code, message; } KuBootstrapError;\n" +
         "typedef struct { bool ok; uint8_t value; KuBootstrapError error; } KuBootstrapResultNull;\n\n"
@@ -269,21 +302,28 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     }
     order = orderResultLayout(layouts, inner.layout, DeclarationSpan(outer))?
     signature = readStructResultSignature(named, types, layouts, function, edge, order)?
-    body = emitStructResultBody(named, types, imports, supplied, layouts, inner.layout, signature.bindings,
-        signature.body_start, function.first_edge + function.edge_count)?
+    body: StructResultBody = StructResultBody { code: ManagedBlank(), prototype: "", dependency: "", declarations: "",
+        drops: "", clone_layouts: [], plan: [] }
+    if (signature.string_array) {
+        body = emitOwnedResultBody(named, types, imports, supplied, layouts, function, inner.layout, signature)?
+    } else {
+        body = emitStructResultBody(named, types, imports, supplied, layouts, inner.layout, signature.bindings.clone(),
+            signature.body_start, function.first_edge + function.edge_count)?
+    }
     symbol = "ku_struct_result_" + str(id)
     struct_type = GuardCType(inner, layouts)
     result_type = "KuBootstrapResult_" + struct_type.clone()
     bound = ExplicitType(types, inner_id, DeclarationSpan(outer))?
     plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: signature.plan,
         result: BoundLinkPlanType(bound, 1, result_type.clone(), false), returns_result: true }
-    overflow = body.code.uses_add || body.code.uses_sub
-    may_allocate = order.contains_string || body.clone_layouts.len() != 0
+    overflow = body.code.uses_add || body.code.uses_sub || signature.string_array
+    may_allocate = order.contains_string || body.clone_layouts.len() != 0 || signature.string_array
     text = ProjectionHeaders(true, true) + "#include <stdio.h>\n\n" + GuardArithmetic(body.code.uses_add, body.code.uses_sub)
-    text += GuardStringEquality(body.code.uses_eq) + signature.declarations + StructResultHeader()
+    text += GuardStringEquality(body.code.uses_eq || signature.string_array) + signature.declarations + StructResultHeader()
     text += "typedef struct { bool ok; " + struct_type + " value; KuBootstrapError error; } " + result_type.clone() + ";\n\n"
     if (may_allocate) { text += "#include <string.h>\n\n" }
-    if (order.contains_string) { text += EmitTryCloneString("ku_result_clone_string") }
+    if (order.contains_string || signature.string_array) { text += EmitTryCloneString("ku_result_clone_string") }
+    if (signature.string_array) { text += GuardStringArrayC() + ManagedStringRuntime() }
     for layout in body.clone_layouts {
         text += EmitOwnedStructOperations(layouts, layout, ResultLinkClonePrefix(layout), true)
     }
@@ -298,7 +338,16 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     text += "    " + result_type + " result = {0};\n" + signature.unused + body.declarations
     if (may_allocate) { text += "    bool out_of_memory = false;\n" }
     if (overflow) { text += "    bool overflow = false;\n" }
+    if (signature.string_array) {
+        text += "    bool string_too_large = false;\n    KuGuardArrayFailure array_failure = {0};\n"
+        text += "    (void)ku_guard_try_mul;\n    (void)ku_managed_string_append;\n"
+        text += "    (void)ku_guard_string_array_equal;\n    (void)ku_result_clone_string;\n"
+    }
     text += body.code.text + "cleanup:\n" + body.drops + signature.drops
+    if (signature.string_array) {
+        text += "    if (array_failure.code) " + drop.clone() + "(&result);\n" + GuardArrayErrorC()
+        text += "    if (string_too_large) { " + drop.clone() + "(&result); fputs(\"string allocation is too large\\n\", stderr); exit(EXIT_FAILURE); }\n"
+    }
     if (may_allocate) {
         text += "    if (out_of_memory) { " + drop.clone() + "(&result); fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n"
     }
