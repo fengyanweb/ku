@@ -11,7 +11,7 @@ the current phase, so the existing CI artifact retains either lane's failure.
 
 import argparse
 import concurrent.futures
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from enum import Enum
 import hashlib
 import http.client
@@ -516,11 +516,77 @@ $evidence | ConvertTo-Json -Compress -Depth 4
         raise RuntimeError("PostgreSQL fixture user SID lacks the required inherited Modify rule")
 
 
+class PoolWaitWireProbe:
+    """Observe complete client Parse/Query frames in the private plaintext lane."""
+
+    LABELS = {b"/* ku_pool_h */": "H", b"/* ku_pool_w */": "W", b"/* ku_pool_n */": "N"}
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.queries = []
+        self.errors = []
+
+    def snapshot(self):
+        with self.lock:
+            if self.errors:
+                raise AssertionError(f"pool-wait wire observation failed: {self.errors[0]}")
+            return list(self.queries)
+
+    def fail(self, error):
+        with self.lock:
+            if not self.errors:
+                self.errors.append(str(error))
+
+    def frontend(self):
+        pending = bytearray()
+        startup = True
+
+        def feed(data):
+            nonlocal startup
+            if not data:
+                if startup or pending:
+                    self.fail("incomplete frontend frame")
+                return
+            pending.extend(data)
+            while len(pending) >= (4 if startup else 5):
+                offset = 0 if startup else 1
+                length = int.from_bytes(pending[offset:offset + 4], "big")
+                if not (8 if startup else 4) <= length <= 2 * 1024 * 1024:
+                    raise ValueError("bounded frontend protocol frame has invalid length")
+                if len(pending) < offset + length:
+                    return
+                frame = bytes(pending[:offset + length])
+                del pending[:offset + length]
+                if startup:
+                    if int.from_bytes(frame[4:8], "big") != 196608:
+                        raise ValueError("expected PostgreSQL 3.0 plaintext startup")
+                    startup = False
+                elif frame[0] in (ord("P"), ord("Q")):
+                    query = frame[5:]
+                    if frame[0] == ord("P"):
+                        _, separator, query = query.partition(b"\0")
+                        if not separator:
+                            raise ValueError("invalid Parse frame")
+                    query, separator, _ = query.partition(b"\0")
+                    if not separator:
+                        raise ValueError("unterminated query in frontend frame")
+                    label = next((label for marker, label in self.LABELS.items()
+                                  if query.endswith(marker)), None)
+                    label = label or ("reset" if query == b"DISCARD ALL" else "other")
+                    with self.lock:
+                        if len(self.queries) == 16:
+                            raise ValueError("pool-wait query evidence exceeds bound")
+                        self.queries.append({"label": label, "message": chr(frame[0])})
+
+        return feed
+
+
 class DatabaseProxy:
     """Bounded test proxy; lose one confirmed INSERT acknowledgement."""
 
-    def __init__(self, backend):
+    def __init__(self, backend, frontend_probe=None):
         self.backend = backend
+        self.frontend_probe = frontend_probe
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(8)
@@ -553,6 +619,7 @@ class DatabaseProxy:
 
     def forward(self, client):
         backend = None
+        observe_frontend = self.frontend_probe.frontend() if self.frontend_probe else None
         try:
             backend = socket.create_connection(("127.0.0.1", self.backend), timeout=2)
             with self.lock:
@@ -562,6 +629,8 @@ class DatabaseProxy:
                 readable, _, _ = select.select([client, backend], [], [], 0.1)
                 for source in readable:
                     data = source.recv(65536)
+                    if source is client and observe_frontend:
+                        observe_frontend(data)
                     if not data:
                         return
                     if source is client:
@@ -582,7 +651,10 @@ class DatabaseProxy:
                             self.dropped.set()
                             return
                         client.sendall(frame)
-        except (OSError, ValueError):
+        except ValueError as error:
+            if self.frontend_probe:
+                self.frontend_probe.fail(error)
+        except OSError:
             pass
         finally:
             for connection in (client, backend):
@@ -616,7 +688,7 @@ def parse_args(argv=None):
     parser.add_argument("--loops", type=int, default=4)
     parser.add_argument("--performance-seconds", type=int, default=0, help="Run only bounded read throughput for 3..60s; omit fault replay")
     parser.add_argument("--profile", choices=["debug", "release"], default="debug")
-    parser.add_argument("--lane", choices=["both", "sync", "async", "tasks", "typed", "async-example"], default="both",
+    parser.add_argument("--lane", choices=["both", "sync", "async", "tasks", "typed", "async-example", "pool-wait"], default="both",
                         help="Run independent sync and/or named async HTTP -> PostgreSQL lifecycles")
     parser.add_argument("--database-owner-config", type=Path,
                         help="Private installed-archive verifier only; parent retains the direct postgres child")
@@ -630,20 +702,23 @@ def parse_args(argv=None):
                         help="Check a synchronous typed PG query with native, ku run, and explicit Runner")
     parser.add_argument("--async-example", action="store_true",
                         help="Check asynchronous PG wait, cancellation and recovery with all three entry points")
+    parser.add_argument("--pool-wait-example", action="store_true",
+                        help="Check native cancellation and expiry of a PostgreSQL pool waiter before send")
     args = parser.parse_args(argv)
     if args.performance_seconds and not 3 <= args.performance_seconds <= 60:
         parser.error("performance-seconds must be 3..60")
     if args.performance_seconds and args.installed_contracts:
         parser.error("installed contracts cannot change a performance workload")
-    if args.tasks_example or args.typed_example or args.async_example:
+    if args.tasks_example or args.typed_example or args.async_example or args.pool_wait_example:
         if args.performance_seconds or args.installed_contracts:
             parser.error("the installed examples are standalone functional verification")
         args.profile = "release"
-        lanes = ["tasks"] * args.tasks_example + ["typed"] * args.typed_example + ["async-example"] * args.async_example
+        lanes = (["tasks"] * args.tasks_example + ["typed"] * args.typed_example
+                 + ["async-example"] * args.async_example + ["pool-wait"] * args.pool_wait_example)
         if args.lane not in [*lanes, "both"]:
             parser.error("requested lane does not match the selected examples")
         args.lanes = lanes if args.lane == "both" else [args.lane]
-    elif args.lane in ("tasks", "typed", "async-example"):
+    elif args.lane in ("tasks", "typed", "async-example", "pool-wait"):
         parser.error("example lanes require their corresponding example flag")
     if args.tasks_example:
         args.tasks_backend = args.tasks_backend or "native"
@@ -1266,11 +1341,170 @@ def run_async_pg_example(ku, source, root, sql, execute, psql, environment, runt
     report["checks"]["async_pg_ordered_wait_cancel_deadline_recovery"] = "passed"
 
 
+def run_pool_wait_example(ku, source, root, sql, execute, psql, environment, runtime_environment,
+                          tool_environment, proxy, http_port, control_token, report, progress):
+    """Native H→W→N with one lease, proved by PG, pool and frontend-wire observations."""
+    sql("CREATE TABLE ku_pool_cancelled (label text PRIMARY KEY)")
+    ordinary_setting = sql("SHOW work_mem")
+    (root / "db.conn").write_text(
+        f"hostaddr=127.0.0.1 port={proxy.port} user=ku_accept dbname=postgres "
+        "sslmode=disable gssencmode=disable application_name=ku_runtime_acceptance", encoding="utf-8")
+    (root / "http.addr").write_text(f"127.0.0.1:{http_port}", encoding="utf-8")
+    local_source = root / source.name
+    shutil.copyfile(source, local_source)
+    binary = root / ("pool-wait.exe" if os.name == "nt" else "pool-wait")
+    progress("pool-wait:build")
+    execute([ku, "build", "--verbose", "--release", local_source, "-o", binary],
+            cwd=root, env=environment)
+    local_source.unlink()
+    if (root / ".ku").is_dir():
+        shutil.rmtree(root / ".ku")
+    report["source_removed_before_run"] = True
+    report["executable_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+
+    def request(path, *, control=False, method="GET", deadline=None):
+        connection = DeadlineHTTPConnection("127.0.0.1", http_port, deadline or time.monotonic() + 4)
+        with closing(connection):
+            headers = {"X-Ku-Control-Token": control_token} if control else {}
+            connection.request(method, path, headers=headers)
+            status, body = async_pg_response(connection)
+            report["last_request"] = {"route": path, "status": status}
+            if status != 200:
+                raise AssertionError(f"{path} returned HTTP {status}")
+            return body
+
+    def metrics(deadline):
+        current = json.loads(request("/__ku/metrics", control=True, deadline=deadline))
+        database = current["database"]
+        return {name: database[name] for name in
+                ("pg_client_waiters", "pg_client_active_slots", "pending_operations", "pending_bytes",
+                 "pg_client_acquire_timeouts", "pg_client_metrics_valid")} | {
+                    "peer_reset": current["errors"]["counts"]["peer_reset"],
+                    "net_wait": current["task_blocking"]["net_wait"],
+                }
+
+    def counts_waiting(active, waiting, deadline, predicate=None):
+        return observe_until(lambda _, deadline: metrics(deadline), "", lambda m: (
+            m["pg_client_metrics_valid"] and m["pg_client_active_slots"] == active
+            and m["pg_client_waiters"] == waiting and m["pending_operations"] == active + waiting
+            and (predicate is None or predicate(m))
+        ), deadline)
+
+    logs = root / "pool-wait.log"
+    with logs.open("wb") as stream:
+        service = subprocess.Popen([binary], cwd=root, env=runtime_environment, stdout=stream, stderr=stream)
+    try:
+        start_deadline = time.monotonic() + 10
+        while True:
+            if service.poll() is not None:
+                raise RuntimeError(f"native pool-wait service exited {service.returncode} during startup")
+            try:
+                assert request("/light", deadline=start_deadline) == "ready"
+                break
+            except OSError:
+                time.sleep(min(0.025, deadline_remaining(start_deadline)))
+        if os.name == "nt":
+            report["libpq_module"] = windows_loaded_libpq(service, runtime_environment, start_deadline)
+            if not report["libpq_module"]:
+                raise AssertionError("could not identify the actual loaded libpq.dll")
+        report["pool_wait"] = {}
+        wire_prefix = []
+        wait_sql = (
+            "SELECT json_build_object('pid', pid, 'blockers', pg_blocking_pids(pid)) FROM pg_stat_activity "
+            "WHERE application_name='ku_runtime_acceptance' AND wait_event_type='Lock' AND query LIKE '%/* ku_pool_h */'"
+        )
+        for case in ("cancel", "acquire_deadline"):
+            progress("pool-wait:scenario", scenario=case)
+            row = report["pool_wait"][case] = {"event_order": []}
+            order = row["event_order"]
+            deadline = time.monotonic() + 8
+            with closing(DeadlineHTTPConnection("127.0.0.1", http_port, deadline)) as holder, \
+                 closing(DeadlineHTTPConnection("127.0.0.1", http_port, deadline)) as waiter, \
+                 closing(DeadlineHTTPConnection("127.0.0.1", http_port, deadline)) as successor:
+                with async_pg_lock(psql, root, sql, tool_environment) as locker_pid:
+                    holder_deadline = time.monotonic() + ASYNC_PG_HANDLER_TIMEOUT_SECONDS
+                    holder.request("GET", "/hold")
+                    observed = json.loads(observe_until(sql, wait_sql, bool, holder_deadline))
+                    assert observed["blockers"] == [locker_pid], observed
+                    row["postgres_holder"] = observed
+                    row["h_lent"] = counts_waiting(1, 0, holder_deadline, lambda m: m["net_wait"] > 0)
+                    order.append("H_waits_with_lease")
+                    waiter.request("POST", "/cancelled")
+                    row["w_queued"] = counts_waiting(1, 1, holder_deadline)
+                    order.append("W_queued")
+                    if case == "acquire_deadline":
+                        # Space the two admissions within the fixed 1s acquire
+                        # allowance so N still has slack when W's expires. The
+                        # following two-waiter snapshot is the queue witness.
+                        time.sleep(0.45)
+                    successor.request("GET", "/successor")
+                    row["w_n_queued"] = counts_waiting(1, 2, holder_deadline)
+                    order.append("N_queued_behind_W")
+                    assert request("/light", deadline=holder_deadline) == "ready"
+                    order.append("light_completed")
+                    assert proxy.frontend_probe.snapshot() == wire_prefix + [{"label": "H", "message": "P"}]
+                    if case == "cancel":
+                        waiter.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                               struct.pack("HH" if os.name == "nt" else "ii", 1, 0))
+                        waiter.close()
+                        terminal = "peer_reset"
+                    else:
+                        status, payload = async_pg_response(waiter)
+                        assert (status, payload) == (200, "error:acquire_timeout"), (status, payload)
+                        row["w_response"] = payload
+                        terminal = "pg_client_acquire_timeouts"
+                    row["w_retired"] = counts_waiting(1, 1, holder_deadline, lambda m: (
+                        m[terminal] == row["w_n_queued"][terminal] + 1
+                        and 0 < m["pending_bytes"] < row["w_n_queued"]["pending_bytes"]
+                    ))
+                    row["w_terminal_counter"] = terminal
+                    order.append("W_terminal_and_refunded")
+                    row["wire_before_release"] = proxy.frontend_probe.snapshot()
+                    assert row["wire_before_release"] == wire_prefix + [{"label": "H", "message": "P"}]
+                    assert sql(ASYNC_PG_LOCK_OWNER_SQL, deadline=holder_deadline) == str(locker_pid)
+                order.append("H_control_lock_released")
+                h_status, h_body = async_pg_response(holder)
+                n_status, n_body = async_pg_response(successor)
+                h_result, n_result = json.loads(h_body), json.loads(n_body)
+                assert (h_status, n_status) == (200, 200)
+                assert h_result["text"] == "holder" and h_result["pid"] == observed["pid"]
+                assert h_result["setting"] != ordinary_setting
+                assert n_result == {"text": "successor-n", "pid": observed["pid"], "setting": ordinary_setting}
+                row["h_result"], row["n_result"] = h_result, n_result
+                order.append("N_original_request_completed")
+            row["settled"] = counts_waiting(0, 0, deadline, lambda m: m["pending_bytes"] == 0)
+            wire_prefix.extend({"label": label, "message": "P"} for label in ("H", "reset", "N", "reset"))
+            row["wire"] = proxy.frontend_probe.snapshot()
+            assert row["wire"] == wire_prefix, row["wire"]
+            assert sql("SELECT count(*) FROM ku_pool_cancelled") == "0"
+            row["w_rows"] = 0
+        began = time.monotonic()
+        drain_deadline = began + 5
+        request("/__ku/drain", control=True, method="POST", deadline=drain_deadline)
+        wait_service_exit(service, drain_deadline)
+        assert service.returncode == 0
+        assert "unexpected-w-delivery" not in logs.read_text(encoding="utf-8")
+        observe_database_connections(sql, {}, maximum=0, began=began, deadline=drain_deadline)
+        assert proxy.frontend_probe.snapshot() == wire_prefix
+        report["remaining_database_sessions"] = 0
+        report["checks"]["native_pool_waiter_retires_and_successor_progresses_without_replay"] = "passed"
+    finally:
+        if service.poll() is None:
+            service.kill()
+            service.wait(timeout=5)
+        if logs.is_file():
+            with logs.open("rb") as stream:
+                stream.seek(max(0, stream.seek(0, os.SEEK_END) - 2048))
+                report["service_log_tail"] = stream.read(2048).decode("utf-8", errors="replace").replace(
+                    control_token, "<control-token>")
+
+
 def run_lane(args, lane, on_checkpoint=None):
     ku = args.ku.resolve()
     tasks_example = lane == "tasks"
     typed_example = lane == "typed"
     async_example = lane == "async-example"
+    pool_wait_example = lane == "pool-wait"
     tasks_backend = getattr(args, "tasks_backend", None) or "native"
     prefix = 'http_pg_installed_contract' if getattr(args, 'installed_contracts', False) else 'http_pg_lifecycle'
     filename = prefix + ('' if lane == 'sync' else '_async') + '.ku'
@@ -1283,6 +1517,9 @@ def run_lane(args, lane, on_checkpoint=None):
         source = Path(__file__).resolve().parents[1] / "fixtures" / filename
     elif async_example:
         filename = "pg_async_installed_wait.ku"
+        source = Path(__file__).resolve().parents[1] / "fixtures" / filename
+    elif pool_wait_example:
+        filename = "pg_async_pool_wait.ku"
         source = Path(__file__).resolve().parents[1] / "fixtures" / filename
     report = {"platform": os.uname().sysname if hasattr(os, "uname") else os.name,
               "lane": lane, "fixture": filename,
@@ -1316,15 +1553,16 @@ def run_lane(args, lane, on_checkpoint=None):
         report["parameters"] = {"build_profile": args.profile,
                                 "database_transport": "direct loopback to private PostgreSQL",
                                 "tls": "disabled only inside isolated loopback fixture"}
-    elif async_example:
+    elif async_example or pool_wait_example:
         report["parameters"] = {
-            "build_profile": args.profile, "database_connections": 1, "database_waiters": 1,
+            "build_profile": args.profile, "database_connections": 1, "database_waiters": 2 if pool_wait_example else 1,
             "handler_timeout_ms": 1000 * ASYNC_PG_HANDLER_TIMEOUT_SECONDS,
-            "database_transport": "direct loopback to private PostgreSQL",
+            "database_transport": ("private PostgreSQL via bounded frontend-wire observer" if pool_wait_example
+                                   else "direct loopback to private PostgreSQL"),
             "tls": "disabled only inside isolated loopback fixture",
         }
     def progress(phase, **details):
-        if phase.startswith(("http:", "fault:", "tasks:", "typed:", "async-example:")):
+        if phase.startswith(("http:", "fault:", "tasks:", "typed:", "async-example:", "pool-wait:")):
             report["acceptance_phase"] = phase
         checkpoint(report, args.output, phase, **details)
         if on_checkpoint is not None:
@@ -1369,15 +1607,16 @@ def run_lane(args, lane, on_checkpoint=None):
             environment = os.environ | {"KU_EVENT_LOOPS": str(args.loops), "KU_BLOCKING_THREADS": "8",
                                         "KU_DB_MAX_CONNECTIONS": "4", "KU_DB_MAX_WAITERS": "8",
                                         "KU_DB_MAX_PENDING_BYTES": "1048576"}
-            if tasks_example or typed_example or async_example:
+            if tasks_example or typed_example or async_example or pool_wait_example:
                 environment = {key: value for key, value in environment.items() if not key.upper().startswith("PG")}
             control_token = os.urandom(24).hex()
             environment["KU_SERVICE_CONTROL_TOKEN"] = control_token
-            configure_runtime = typed_example or async_example or (tasks_example and (tasks_backend == "runner" or os.name == "nt"))
+            configure_runtime = (typed_example or async_example or pool_wait_example
+                                 or (tasks_example and (tasks_backend == "runner" or os.name == "nt")))
             if configure_runtime and not environment.get("KU_PG_RUNTIME_DIR"):
                 runtime_dir = tools if os.name == "nt" else Path(execute([pg_config, "--libdir"]))
                 environment["KU_PG_RUNTIME_DIR"] = str(runtime_dir.resolve(strict=True))
-            if (typed_example or async_example) and os.name != "nt":
+            if (typed_example or async_example or pool_wait_example) and os.name != "nt":
                 runtime_dir = Path(environment["KU_PG_RUNTIME_DIR"])
                 link_name, versioned_name = (("libpq.dylib", "libpq.5.dylib")
                                              if sys.platform == "darwin" else ("libpq.so", "libpq.so.5"))
@@ -1475,6 +1714,12 @@ def run_lane(args, lane, on_checkpoint=None):
             if async_example:
                 run_async_pg_example(ku, source, root, sql, execute, psql, environment, runtime_environment,
                                      tool_environment, database_port, http_port, control_token, report, progress)
+                report["status"] = "passed"
+                return report
+            if pool_wait_example:
+                proxy = DatabaseProxy(database_port, PoolWaitWireProbe())
+                run_pool_wait_example(ku, source, root, sql, execute, psql, environment, runtime_environment,
+                                      tool_environment, proxy, http_port, control_token, report, progress)
                 report["status"] = "passed"
                 return report
             sql("CREATE TABLE ku_events(id text PRIMARY KEY, payload text NOT NULL)")

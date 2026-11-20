@@ -1,0 +1,41 @@
+import {http, pg, json, fs} from "std"
+
+fn main(): null! {
+    address = fs.read("http.addr")?
+    client = pg.client({conninfo: fs.read("db.conn")?, max_connections: 1,
+        max_waiters: 2, connect_timeout_ms: 2000, acquire_timeout_ms: 1000,
+        query_timeout_ms: 5000})?
+
+    async fn hold(): HttpResponse! {
+        row = client.query("SELECT $1::text, pg_backend_pid()::text, pg_advisory_xact_lock(197208, 2)::text, set_config('work_mem', CASE WHEN current_setting('work_mem') = '128kB' THEN '256kB' ELSE '128kB' END, false) /* ku_pool_h */", ["holder"])?
+        return ok(http.text(json.encode({text: row.value(0, 0)?,
+            pid: row.value_int(0, 1)?, setting: row.value(0, 3)?})?))
+    }
+    async fn cancelled(): HttpResponse! {
+        body = ""
+        try {
+            row = client.query("INSERT INTO ku_pool_cancelled (label) VALUES ($1) RETURNING label /* ku_pool_w */", ["waiter-w"])?
+            println("unexpected-w-delivery")
+            body = row.value(0, 0)?
+        } catch (err) { body = "error:" + err.code.clone() }
+        return ok(http.text(body))
+    }
+    async fn successor(): HttpResponse! {
+        row = client.query("SELECT $1::text, pg_backend_pid()::text, current_setting('work_mem') /* ku_pool_n */", ["successor-n"])?
+        return ok(http.text(json.encode({text: row.value(0, 0)?,
+            pid: row.value_int(0, 1)?, setting: row.value(0, 2)?})?))
+    }
+    fn light(): HttpResponse { return http.text("ready") }
+
+    app = http.service()
+    app.handler_timeout_ms = 3000
+    app.max_connections = 16
+    app.max_active_requests = 8
+    app.max_pending_requests = 8
+    app.get("/light", light)
+    app.get("/hold", hold)
+    app.post("/cancelled", cancelled)
+    app.get("/successor", successor)
+    app.listen(address)?
+    return ok(null)
+}
