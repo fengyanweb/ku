@@ -2,7 +2,7 @@ import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { SpanFromNode } from "./support.ku"
-import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, ReadControlHeader, ReadCatchBinding, ReadTypeAt, ReadExpressionEnd, LocalAssignmentOperator, RejectBodyEof, RejectControlBody, RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectBodyEdgeId, RejectNestedNodeId, RejectNestedRoot, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength, RejectElseIf, RejectElseBody, CheckStrayClause, RejectFinally, ExpectTryToken, RejectStatementLimit, RejectStatementDepth, RejectLetStatement, RejectDeclarationInitializer, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow, SignatureTypeOutput } from "./body_support.ku"
+import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, ReadControlHeader, ReadCatchBinding, ReadTypeAt, ReadExpressionEnd, LocalAssignmentOperator, RejectBodyEof, RejectControlBody, RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectBodyEdgeId, RejectNestedNodeId, RejectNestedRoot, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength, ReadElsePhase, CheckStrayClause, RejectFinally, ExpectTryToken, RejectStatementLimit, RejectStatementDepth, RejectLetStatement, RejectDeclarationInitializer, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow, SignatureTypeOutput } from "./body_support.ku"
 
 // Read the remainder of one bounded ordinary-function window, starting at the
 // first token after its opening brace. ValidateFunctionBodyWindow runs before
@@ -143,7 +143,7 @@ fn ReadFunctionBody(input_tokens: [Token], body_start: int, token_base: int, ini
         previous = root_top
         if (control_depth > 0) {
             previous = current.body_top
-            if (current.phase == 1) { previous = current.else_top }
+            if (current.phase != 0) { previous = current.else_top }
         }
         link = StatementLink { node: statement, previous: previous }
         statement_links = statement_links.push(link)
@@ -178,14 +178,9 @@ fn ReadFunctionBody(input_tokens: [Token], body_start: int, token_base: int, ini
                 reading_body = false
             } else if (current.kind == "If" && current.phase == 0 && tokens[cursor].kind == "Else") {
                 cursor = cursor + 1
-                if (tokens[cursor].kind == "If") {
-                    RejectElseIf(tokens[cursor].clone())?
-                }
-                if (tokens[cursor].kind != "LBrace") {
-                    RejectElseBody(tokens[cursor].clone())?
-                }
-                current.phase = 1
-                cursor = cursor + 1
+                // Phase 2 leaves the nested If for the next iteration.
+                current.phase = ReadElsePhase(tokens[cursor])?
+                if (current.phase == 1) { cursor = cursor + 1 }
             } else if (current.kind == "Try" && current.phase == 0) {
                 binding = ReadCatchBinding(tokens, cursor)?
                 parse_steps = NextBodyWork(parse_steps, 5, tokens[cursor].clone())?
@@ -197,37 +192,44 @@ fn ReadFunctionBody(input_tokens: [Token], body_start: int, token_base: int, ini
                 current.phase = 1
                 cursor = cursor + 5
             } else {
-                control_start = tokens[current.start].clone()
-                control_children: [int] = [current.condition]
-                control_value = 0
-                is_try = current.kind == "Try"
-                if (is_try) {
-                    RejectFinally(tokens[cursor])?
-                    catch_start = tokens[current.catch_start].clone()
-                    catch_open = tokens[current.catch_start + 4].clone()
-                    catch_children = AppendStatementList([], current.else_top, current.else_count, catch_open.clone())?
-                    catch_body = AddNode("CatchBody", "", 0, SpanMerge(SpanFromToken(catch_open.clone()), SpanFromToken(block_end.clone())), catch_children, catch_open)?
-                    catch_clause = AddNode("Catch", "", 0, SpanMerge(SpanFromToken(catch_start.clone()), SpanFromToken(block_end.clone())), [current.catch_binding, catch_body], catch_start)?
-                    control_children = control_children.push(catch_clause)
-                } else {
-                    control_children = AppendStatementList(control_children, current.body_top, current.body_count, control_start.clone())?
-                    if (current.kind == "If") {
-                        control_value = current.body_count
-                        control_children = AppendStatementList(control_children, current.else_top, current.else_count, control_start.clone())?
+                allow_semicolon = current.kind != "Try"
+                closing_frames = true
+                while (closing_frames) {
+                    control_start = tokens[current.start].clone()
+                    control_children: [int] = [current.condition]
+                    control_value = 0
+                    if (current.kind == "Try") {
+                        RejectFinally(tokens[cursor])?
+                        catch_start = tokens[current.catch_start].clone()
+                        catch_open = tokens[current.catch_start + 4].clone()
+                        catch_children = AppendStatementList([], current.else_top, current.else_count, catch_open.clone())?
+                        catch_body = AddNode("CatchBody", "", 0, SpanMerge(SpanFromToken(catch_open.clone()), SpanFromToken(block_end.clone())), catch_children, catch_open)?
+                        catch_clause = AddNode("Catch", "", 0, SpanMerge(SpanFromToken(catch_start.clone()), SpanFromToken(block_end.clone())), [current.catch_binding, catch_body], catch_start)?
+                        control_children = control_children.push(catch_clause)
+                    } else {
+                        control_children = AppendStatementList(control_children, current.body_top, current.body_count, control_start.clone())?
+                        if (current.kind == "If") {
+                            control_value = current.body_count
+                            control_children = AppendStatementList(control_children, current.else_top, current.else_count, control_start.clone())?
+                        }
+                    }
+                    statement = AddNode(current.kind.clone(), current.binding.clone(), control_value, SpanMerge(SpanFromToken(control_start.clone()), SpanFromToken(block_end.clone())), control_children, control_start)?
+                    control_depth = control_depth - 1
+                    if (control_depth > 0) {
+                        // Every nested open appends exactly one parent frame.
+                        frame = control_frames[frame_top - 1].clone()
+                        frame_top = frame.previous
+                        current = frame
+                    }
+                    RecordStatement(statement)?
+                    // A completed nested If is the whole else arm. It and
+                    // the parents waiting for it share the same end token.
+                    closing_frames = control_depth > 0 && current.phase == 2
+                    if (closing_frames) {
+                        parse_steps = NextBodyWork(parse_steps, 1, block_end.clone())?
                     }
                 }
-                statement = AddNode(current.kind.clone(), current.binding.clone(), control_value, SpanMerge(SpanFromToken(control_start.clone()), SpanFromToken(block_end)), control_children, control_start.clone())?
-                control_depth = control_depth - 1
-                if (control_depth > 0) {
-                    // Every nested open appends exactly one scalar-only parent
-                    // frame before increasing depth, so this NodeId-like index
-                    // is valid whenever a parent depth remains.
-                    frame = control_frames[frame_top - 1].clone()
-                    frame_top = frame.previous
-                    current = frame
-                }
-                RecordStatement(statement)?
-                if (!is_try && tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
+                if (allow_semicolon && tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
             }
         } else {
             CheckStrayClause(tokens[cursor])?

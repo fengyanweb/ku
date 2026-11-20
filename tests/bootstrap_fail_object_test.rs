@@ -268,14 +268,12 @@ fn bootstrap_parser_accepts_actual_stage3_failure_payload() {
         execute(&mut Command::new(&seed), &consumer, 30)
     };
 
-    // Use the actual definitions and their original absolute coordinates.
-    // Later functions in support.ku exercise unrelated syntax.
-    let (module, _) = include_str!("../bootstrap/stage3/support.ku")
-        .split_once("fn ParseExpressionAt")
-        .expect("real failure helpers before remaining support functions");
+    let module = include_str!("../bootstrap/stage3/support.ku");
     let example = r#"fn Example(value): null! {
         payload = { "中文|": { rank: 0 }, empty: {}, values: [1, { a: 2 }] }
-        if (true) { fail payload; } else { fail { domain: "x", code: "y", message: "z" } }
+        if (true) { fail payload; }
+        else if (false) { fail { domain: "x", code: "y", message: "z" } }
+        else { fail { domain: "a", code: "b", message: "c" } }
         return Wrap({ "title": value })
     }"#;
     for source in [module, example] {
@@ -326,4 +324,27 @@ fn bootstrap_parser_accepts_actual_stage3_failure_payload() {
     let rejected = invoke(&deep);
     assert!(!rejected.status.success() && rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("depth_exceeded"));
+
+    let else_if_chain = |depth: usize| {
+        format!(
+            "fn Main() {{ {}if (true) {{}} }}",
+            "if (true) {} else ".repeat(depth - 1)
+        )
+    };
+    let chain = invoke(&else_if_chain(32));
+    assert!(
+        chain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&chain.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&chain.stdout)
+            .lines()
+            .filter(|line| line.split('|').nth(2) == Some("If"))
+            .count(),
+        32
+    );
+    let rejected = invoke(&else_if_chain(33));
+    assert!(!rejected.status.success() && rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("statement_depth_exceeded"));
 }

@@ -1443,6 +1443,8 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "// 前置😀\nfn main() {\n  // gap 中\n  text:str = \"中😀\"\n  text = text + \"!\"\n  println(text)\n}",
         "fn main(){ values:[int] = [1] }",
         "fn main() { if (true) {} }",
+        "fn main() { if (true) {} else if (false) {} }",
+        "fn main() { while (ready) { if (left) { a = 1 } else if (center) { b = 2 } else if (right) { c = 3 } else { d = 4 } after = 5 } }",
         "fn main() { if (value > 0) { left = 1 right = 2 } else { other = 3 return other } }",
         "fn main() { if (outer) { if (inner) { value = 1 } else { value = 2 } } else { if (fallback) { value = 3 } } }",
         "fn main() { if ((left + 1) * 2 >= right && ready || fallback) { return left } else {}; }",
@@ -1484,7 +1486,6 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let missing_else_close = "fn main() { if (true) {} else { value = 1";
     let single_if_body = "fn main() { if (true) value = 1 }";
     let single_else_body = "fn main() { if (true) {} else value = 1 }";
-    let unsupported_else_if = "fn main() { if (true) {} else if (false) {} }";
     let separated_else = "fn main() { if (true) {}; else {} }";
     let stray_else = "fn main() { else {} }";
     let missing_while_lparen = "fn main() { while true {} }";
@@ -2396,11 +2397,6 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         diagnostic_at(single_if_body, 9, "stage-3 if bodies must use braces");
     let single_else_body_message =
         diagnostic_at(single_else_body, 12, "stage-3 else bodies must use braces");
-    let unsupported_else_if_message = diagnostic_at(
-        unsupported_else_if,
-        12,
-        "stage-3 does not support else-if yet; use 'else { if (...) { ... } }'",
-    );
     let separated_else_message = diagnostic_at(
         separated_else,
         12,
@@ -2789,11 +2785,6 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             single_else_body,
             "unsupported_statement",
             single_else_body_message,
-        ),
-        (
-            unsupported_else_if,
-            "unsupported_statement",
-            unsupported_else_if_message,
         ),
         (
             separated_else,

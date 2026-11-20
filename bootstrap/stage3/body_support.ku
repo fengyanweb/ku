@@ -202,8 +202,12 @@ fn RejectBodyWorkLimit(token: Token): null! { RejectAt(token, "work_limit", "sta
 fn RejectStatementLink(token: Token): null! { RejectAt(token, "invalid_node_id", "statement list contains an invalid link")? return ok(null) }
 fn RejectStatementNode(token: Token): null! { RejectAt(token, "invalid_node_id", "statement list contains an invalid NodeId")? return ok(null) }
 fn RejectStatementLength(token: Token): null! { RejectAt(token, "invalid_node_id", "statement list length is inconsistent")? return ok(null) }
-fn RejectElseIf(token: Token): null! { RejectAt(token, "unsupported_statement", "stage-3 does not support else-if yet; use 'else { if (...) { ... } }'")? return ok(null) }
-fn RejectElseBody(token: Token): null! { RejectAt(token, "unsupported_statement", "stage-3 else bodies must use braces")? return ok(null) }
+fn ReadElsePhase(&token: Token): int! {
+    if (token.kind == "If") { return ok(2) }
+    if (token.kind == "LBrace") { return ok(1) }
+    RejectAt(token.clone(), "unsupported_statement", "stage-3 else bodies must use braces")?
+    return ok(0)
+}
 fn CheckStrayClause(&token: Token): null! {
     if (token.kind == "Else") {
         RejectAt(token.clone(), "unsupported_statement", "stage-3 else must immediately follow an if body")?
