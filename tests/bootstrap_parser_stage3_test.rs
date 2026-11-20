@@ -485,6 +485,22 @@ fn project_type(
     }
 }
 
+fn closing_brace(tokens: &[Token], opening: usize) -> usize {
+    assert_eq!(tokens[opening].kind, TokenKind::LBrace);
+    let mut depth = 1;
+    for (index, token) in tokens.iter().enumerate().skip(opening + 1) {
+        match token.kind {
+            TokenKind::LBrace => depth += 1,
+            TokenKind::RBrace => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            return index;
+        }
+    }
+    panic!("Rust accepted a block without its closing brace");
+}
+
 fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> usize {
     match statement {
         Stmt::VarDecl {
@@ -606,6 +622,75 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
                     .map(|statement| project_stmt(source, statement, arena)),
             );
             push_node(arena, "While", String::new(), 0, *span, &children)
+        }
+        Stmt::Try {
+            body,
+            catch_name: Some(catch_name),
+            catch_body,
+            finally_body,
+            span,
+        } if finally_body.is_empty() => {
+            // The Rust AST retains the child statements and binding name,
+            // but does not store the spans of the two braced blocks.
+            let tokens = Lexer::new(source).lex().expect("try projection lex");
+            let start = tokens
+                .iter()
+                .position(|token| token.span.start == span.start)
+                .expect("try start token");
+            assert_eq!(tokens[start].kind, TokenKind::Try);
+            let try_open = start + 1;
+            let try_close = closing_brace(&tokens, try_open);
+            let catch_start = try_close + 1;
+            assert_eq!(tokens[catch_start].kind, TokenKind::Catch);
+            assert_eq!(tokens[catch_start + 1].kind, TokenKind::LParen);
+            assert_eq!(tokens[catch_start + 3].kind, TokenKind::RParen);
+            let binding = &tokens[catch_start + 2];
+            assert!(matches!(&binding.kind, TokenKind::Ident(name) if name == catch_name));
+            let catch_open = catch_start + 4;
+            let catch_close = closing_brace(&tokens, catch_open);
+            assert_eq!(tokens[catch_close].span.end, span.end);
+
+            let body = body
+                .iter()
+                .map(|statement| project_stmt(source, statement, arena))
+                .collect::<Vec<_>>();
+            let try_body = push_node(
+                arena,
+                "TryBody",
+                String::new(),
+                0,
+                Span::new(tokens[try_open].span.start, tokens[try_close].span.end),
+                &body,
+            );
+            let binding = push_node(
+                arena,
+                "CatchBinding",
+                catch_name.clone(),
+                0,
+                binding.span,
+                &[],
+            );
+            let caught = catch_body
+                .iter()
+                .map(|statement| project_stmt(source, statement, arena))
+                .collect::<Vec<_>>();
+            let catch_body = push_node(
+                arena,
+                "CatchBody",
+                String::new(),
+                0,
+                Span::new(tokens[catch_open].span.start, span.end),
+                &caught,
+            );
+            let catch = push_node(
+                arena,
+                "Catch",
+                String::new(),
+                0,
+                Span::new(tokens[catch_start].span.start, span.end),
+                &[binding, catch_body],
+            );
+            push_node(arena, "Try", String::new(), 0, *span, &[try_body, catch])
         }
         other => panic!("stage-3 oracle received unsupported Rust statement: {other:?}"),
     }
@@ -1272,6 +1357,9 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         ENUM_GOLDEN_SOURCE,
         include_str!("../bootstrap/stage2/span.ku"),
         include_str!("../bootstrap/stage1/token.ku"),
+        include_str!("../bootstrap/stage1/main.ku"),
+        include_str!("../bootstrap/stage2/main.ku"),
+        "// 异常😀\r\nfn main() { before = 0 try { if (check) { try {} catch(inner) {} } next = 1 } catch(outer) { one = outer.code try { recover()? } catch(recovery) {} two = outer.message } after = 2 }",
         "fn sum() { count = 0 for n in [1,2] { if (n > 1) { count += n } } count %= 5 return count }",
         "fn mixed() { while (ready) { for next in Source{elements: [1,2]}.elements { acc -= next acc *= 2 acc /= 3 } } }",
 
@@ -3153,6 +3241,50 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         ku_string(&rejected_enum_type_depth),
         ku_string(&rejected_enum_type_depth_message)
     ));
+    for source in [
+        "fn main() { try {} catch {} }",
+        "fn main() { try {} catch() {} }",
+        "fn main() { try {} catch(err",
+    ] {
+        body.push_str(&format!(
+            "    ExpectError({}, \"unexpected_token\", {})?\n",
+            ku_string(source),
+            ku_string(&rust_error_canonical(source))
+        ));
+    }
+    for (source, token, code, detail) in [
+        (
+            "fn main() { try {}",
+            TokenKind::Eof,
+            "unexpected_token",
+            "stage-3 try requires a catch clause",
+        ),
+        (
+            "fn main() { try {} catch(err) {",
+            TokenKind::Eof,
+            "unexpected_eof",
+            "expected '}' after catch body",
+        ),
+        (
+            "fn main() { try {} finally { recover() } }",
+            TokenKind::Finally,
+            "unsupported_statement",
+            "stage-3 finally is not supported",
+        ),
+        (
+            "fn main() { try {} catch(err) {} finally { recover() } }",
+            TokenKind::Finally,
+            "unsupported_statement",
+            "stage-3 finally is not supported",
+        ),
+    ] {
+        body.push_str(&format!(
+            "    ExpectError({}, {}, {})?\n",
+            ku_string(source),
+            ku_string(code),
+            ku_string(&diagnostic_for_kind(source, token, detail))
+        ));
+    }
     body.push_str("    return ok(null)\n}\n");
     let body = body.replacen("fn main(): null! {\n", "fn MainWindows(): null! {\n", 1);
 

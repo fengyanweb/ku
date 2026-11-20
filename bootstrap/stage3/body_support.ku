@@ -3,7 +3,7 @@ import { Node, Arena, ParseOutput } from "../stage2/ast.ku"
 import { SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, RejectAt, RejectAtPoint } from "./support.ku"
 import { IsNamedStructStart } from "../stage2/expression_support.ku"
-import { SignatureType, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
+import { SignatureType, CheckTypeArenaCapacity, TypePartToNode, TypeWindowContinues, PushTypeToken, ParseTypeWindow } from "./signature.ku"
 
 struct StatementLink {
     node: int
@@ -19,12 +19,14 @@ struct ControlFrame {
     body_count: int
     else_top: int
     else_count: int
+    catch_start: int
+    catch_binding: int
     phase: int
     previous: int
 }
 
 fn NewControlFrame(kind: str, binding: str, start: int, condition: int, previous: int): ControlFrame {
-    return ControlFrame { kind: kind, binding: binding, start: start, condition: condition, body_top: 0, body_count: 0, else_top: 0, else_count: 0, phase: 0, previous: previous }
+    return ControlFrame { kind: kind, binding: binding, start: start, condition: condition, body_top: 0, body_count: 0, else_top: 0, else_count: 0, catch_start: 0, catch_binding: 0, phase: 0, previous: previous }
 }
 
 fn NextBodyWork(current: int, amount: int, error_token: Token): int! {
@@ -40,6 +42,10 @@ fn RejectBodyEof(control_depth: int, kind: str, phase: int, error_token: Token):
     }
     if (control_depth > 0 && kind == "While") {
         RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after while body")?
+    }
+    if (control_depth > 0 && kind == "Try") {
+        if (phase == 0) { RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after try body")? }
+        RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after catch body")?
     }
     if (control_depth > 0 && phase == 0) {
         RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after if body")?
@@ -142,6 +148,50 @@ fn ReadControlHeader(&tokens: [Token], start: int, initial_work: int): ControlHe
     return ok(ControlHeader { binding: "", expression_start: condition_start, expression_end: cursor, body_open: cursor + 1, work: work })
 }
 
+fn RejectFinally(&token: Token): null! {
+    if (token.kind == "Finally") {
+        RejectAt(token.clone(), "unsupported_statement", "stage-3 finally is not supported")?
+    }
+    return ok(null)
+}
+
+fn ExpectTryToken(&token: Token, kind: str, message: str): null! {
+    if (token.kind != kind) { RejectAt(token.clone(), "unexpected_token", message)? }
+    return ok(null)
+}
+
+// Each successful check consumes a non-EOF token. The terminal EOF keeps
+// the next lookup inside the window, even in a truncated catch header.
+fn ReadCatchBinding(&tokens: [Token], start: int): Token! {
+    if (start < 0 || start >= tokens.len() || tokens[tokens.len() - 1].kind != "Eof") {
+        RejectAtPoint("invalid_token_stream", "catch header must be in a token window ending at EOF")?
+    }
+    RejectFinally(tokens[start])?
+    ExpectTryToken(tokens[start], "Catch", "stage-3 try requires a catch clause")?
+    ExpectTryToken(tokens[start + 1], "LParen", "expected '(' after 'catch'")?
+    binding = tokens[start + 2].clone()
+    ExpectTryToken(binding, "Ident", "expected catch error name")?
+    ExpectTryToken(tokens[start + 3], "RParen", "expected ')' after catch error name")?
+    ExpectTryToken(tokens[start + 4], "LBrace", "expected '{' before catch body")?
+    return ok(binding)
+}
+
+fn ReadTypeAt(&tokens: [Token], start: int, &terminal: Token): SignatureType! {
+    type_tokens: [Token] = []
+    probe = start
+    complete = false
+    while (!complete) {
+        if (probe >= tokens.len()) { RejectTypeInspection(terminal.clone())? }
+        type_token = tokens[probe].clone()
+        complete = !TypeWindowContinues(type_token.kind.clone())
+        type_tokens = PushTypeToken(type_tokens, type_token)?
+        probe = probe + 1
+    }
+    parsed = ParseTypeWindow(type_tokens)?
+    parsed.work = parsed.work + probe - start
+    return ok(parsed)
+}
+
 fn LocalAssignmentOperator(&token: Token): str {
     if (token.kind == "Equal") { return "=" }
     if (token.kind == "PlusEqual") { return "+" }
@@ -165,7 +215,15 @@ fn RejectStatementNode(token: Token): null! { RejectAt(token, "invalid_node_id",
 fn RejectStatementLength(token: Token): null! { RejectAt(token, "invalid_node_id", "statement list length is inconsistent")? return ok(null) }
 fn RejectElseIf(token: Token): null! { RejectAt(token, "unsupported_statement", "stage-3 does not support else-if yet; use 'else { if (...) { ... } }'")? return ok(null) }
 fn RejectElseBody(token: Token): null! { RejectAt(token, "unsupported_statement", "stage-3 else bodies must use braces")? return ok(null) }
-fn RejectStrayElse(token: Token): null! { RejectAt(token, "unsupported_statement", "stage-3 else must immediately follow an if body")? return ok(null) }
+fn CheckStrayClause(&token: Token): null! {
+    if (token.kind == "Else") {
+        RejectAt(token.clone(), "unsupported_statement", "stage-3 else must immediately follow an if body")?
+    }
+    if (token.kind == "Catch" || token.kind == "Finally") {
+        RejectAt(token.clone(), "unexpected_token", "catch or finally must follow a try clause")?
+    }
+    return ok(null)
+}
 fn RejectStatementLimit(token: Token): null! { RejectAt(token, "statement_limit", "stage-3 parser accepts at most 128 statements per function")? return ok(null) }
 fn RejectStatementDepth(token: Token): null! { RejectAt(token, "statement_depth_exceeded", "stage-3 statement nesting exceeds 32 levels")? return ok(null) }
 fn RejectLetStatement(token: Token): null! { RejectAt(token, "unsupported_statement", "'let' is not supported in Ku; use a typed declaration or assignment")? return ok(null) }
