@@ -21,8 +21,9 @@ If one of the supplied units already defines `main`, omit both options.
 The linker checks the providers and all dependencies before starting the C
 compiler. It compares the ordered parameter identities, passing modes, result
 identity and Result representation. A struct identity comes from its module
-path and declaration node. A readonly `StructArray` identifies its element by
-that pair and keeps its array shape distinct from the element itself.
+path and declaration node. A `StructArray` identifies its element by that
+pair and keeps its array shape distinct from the element itself. An owned
+array carrier is passed by value, and a readonly View uses a const pointer.
 Equivalent types can use different C aliases in
 separate units. Builtin carriers must agree, with aliases for the shared
 bootstrap string layout recognized across emitters. Each provided unit

@@ -93,8 +93,6 @@ class TypeRef:
                 raise LinkError(f"{where} builtin must have a null path and node 0")
             identity = ("builtin", name)
         elif ref["kind"] in ("Struct", "StructArray"):
-            if ref["kind"] == "StructArray" and passing != "view":
-                raise LinkError(f"{where} struct array must have readonly View passing")
             identity = ("struct" if ref["kind"] == "Struct" else "struct_array",
                         module_path(ref["source_path"], f"{where}.source_path"),
                         node_id(ref["node"], f"{where}.node"))

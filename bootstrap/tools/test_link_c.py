@@ -146,9 +146,44 @@ class LinkTests(unittest.TestCase):
             metadata["export"]["signature"]["parameters"][0].update(kind="StructArray", c_type="const Array*")
         self.change_plan(self.left_args, shape)
         self.assert_preflight_error([*self.entry_args, *self.left_args, *self.right_args], "signature mismatch")
-        self.change_plan(self.left_args, lambda p: p["export"]["signature"]["parameters"][0].update(
-            c_type="Array", passing="value"))
-        self.assert_preflight_error([*self.entry_args, *self.left_args, *self.right_args], "readonly View")
+
+    def test_struct_array_value_links_and_view_cannot_replace_it(self):
+        def owned_array(c_type):
+            return dict(view(c_type), kind="StructArray", passing="value")
+
+        entry = declaration("app.ku", 58, "consume", [owned_array("ReceiverArray")])
+        imported = declaration(self.left_path, 17, "take", [owned_array("ReceiverArray")])
+        provider = declaration(self.left_path, 17, "receive", [owned_array("ProviderArray")])
+        common = """#include <stdint.h>
+                    #include <stdlib.h>
+                    typedef struct { int64_t value; } Item;
+                    typedef struct {size_t len; Item *data; size_t capacity;} TYPE;
+                 """
+        units = self.unit(
+            "owned-entry", plan(entry, [imported]), common.replace("TYPE", "ReceiverArray") + """
+                extern int64_t take(ReceiverArray);
+                int64_t consume(ReceiverArray items) { return take(items); }
+            """,
+        )
+        exported = self.unit(
+            "owned-provider", plan(provider), common.replace("TYPE", "ProviderArray") + """
+                int64_t receive(ProviderArray items) {
+                    int64_t result = items.data[0].value;
+                    free(items.data);
+                    return result;
+                }
+            """,
+        )
+        self.caller.write_text(
+            "int main(void) { Item *item = malloc(sizeof(*item)); if (!item) return 2; "
+            "*item = (Item){42}; return consume((ReceiverArray){1,item,1}) != 42; }\n",
+            encoding="ascii",
+        )
+        self.assertEqual(link_c.main([*units, *exported, *self.build_args]), 0)
+        self.assertEqual(subprocess.run([self.output], check=True, timeout=5).returncode, 0)
+        self.change_plan(exported, lambda p: p["export"]["signature"]["parameters"][0].update(
+            c_type="const ProviderArray*", passing="view"))
+        self.assert_preflight_error([*units, *exported], "signature mismatch")
 
     def test_parameter_order_and_result_status_are_checked(self):
         wrong = copy.deepcopy(self.left)
