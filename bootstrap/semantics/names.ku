@@ -1,0 +1,134 @@
+import { Node, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
+import { DiagnosticCanonical, MakeDiagnostic } from "../stage2/diagnostic.ku"
+import { Span, SpanCanonical } from "../stage2/span.ku"
+
+struct TopLevelName {
+    kind: str
+    name: str
+    node: int
+    span: Span
+}
+
+struct ModuleNameTable {
+    declarations: [TopLevelName]
+    imports: [int]
+}
+
+struct NamedModule {
+    parsed: ParseOutput
+    names: ModuleNameTable
+}
+
+fn DeclarationSpan(&node: Node): Span {
+    return Span {
+        line: node.line, column: node.column, offset: node.offset,
+        end_line: node.end_line, end_column: node.end_column, end_offset: node.end_offset
+    }
+}
+
+fn RejectName(code: str, message: str, span: Span): null! {
+    domain = "bootstrap.semantics.names"
+    diagnostic = MakeDiagnostic("error", domain.clone(), code.clone(), message, "<source>", span)
+    fail { domain: domain, code: code, message: DiagnosticCanonical(diagnostic) }
+}
+
+fn CheckReserved(&name: str, span: Span): null! {
+    // Match the Stage0 checker; the import expander owns these exceptions.
+    if (name.starts_with("__ku_") && !name.starts_with("__ku_import") && !name.starts_with("__ku_ns")) {
+        RejectName("reserved_name", "name '" + name.clone() + "' is reserved: identifiers starting with '__ku_' are used by the compiler", span)?
+    }
+    return ok(null)
+}
+
+fn CheckSignatureBindings(&nodes: [Node], &edges: [int], &item: Node): null! {
+    item_span = DeclarationSpan(item)
+    index = 0
+    while (index < item.edge_count) {
+        child = nodes[edges[item.first_edge + index] - 1].clone()
+        if (item.kind == "Function" && child.kind == "Parameter") {
+            CheckReserved(child.text, DeclarationSpan(child))?
+        } else if (item.kind == "Struct" && child.kind == "StructField") {
+            CheckReserved(child.text, item_span.clone())?
+        } else if (item.kind == "Enum" && child.kind == "EnumVariant") {
+            CheckReserved(child.text, item_span.clone())?
+            field_index = 0
+            while (field_index < child.edge_count) {
+                field = nodes[edges[child.first_edge + field_index] - 1].clone()
+                if (field.kind == "EnumVariantField") {
+                    CheckReserved(field.text, item_span.clone())?
+                }
+                field_index = field_index + 1
+            }
+        }
+        index = index + 1
+    }
+    return ok(null)
+}
+
+fn CollectNames(&nodes: [Node], &edges: [int], root: int): ModuleNameTable! {
+    program = nodes[root - 1].clone()
+    program_span = DeclarationSpan(program)
+    if (program.kind != "Program") {
+        RejectName("invalid_module_tree", "name collection requires a Stage 3 Program root", program_span.clone())?
+    }
+    // A 512-token Stage 3 file can contain at most 255 direct items. Keep the
+    // same bound even when a caller constructs an AST with valid arena links.
+    if (program.edge_count > 255) {
+        RejectName("item_limit", "name collection accepts at most 255 top-level items", program_span)?
+    }
+    declarations: [TopLevelName] = []
+    imports: [int] = []
+    index = 0
+    while (index < program.edge_count) {
+        node_id = edges[program.first_edge + index]
+        item = nodes[node_id - 1].clone()
+        if (item.kind == "Import") {
+            imports = imports.push(node_id)
+        } else {
+            span = DeclarationSpan(item)
+            if (item.kind != "Module" && item.kind != "Function" && item.kind != "Struct" && item.kind != "Enum") {
+                RejectName("invalid_module_tree", "unsupported top-level AST item '" + item.kind.clone() + "'", span.clone())?
+            }
+            if (item.kind != "Module") {
+                CheckReserved(item.text, span.clone())?
+                CheckSignatureBindings(nodes, edges, item)?
+            }
+            previous = 0
+            while (previous < declarations.len()) {
+                if (declarations[previous].name == item.text) {
+                    RejectName("duplicate_name", "top-level name '" + item.text.clone() + "' is already defined", span.clone())?
+                }
+                previous = previous + 1
+            }
+            declaration = TopLevelName { kind: item.kind, name: item.text, node: node_id, span: span }
+            declarations = declarations.push(declaration)
+        }
+        index = index + 1
+    }
+    return ok(ModuleNameTable { declarations: declarations, imports: imports })
+}
+
+// No import files are opened here. Keep their NodeIds for a separate module
+// resolution pass, and keep the graph as the owner of all arena positions.
+fn BuildNameTable(output: ParseOutput): NamedModule! {
+    parsed = ValidateParseOutput(output)?
+    root = parsed.root
+    names = CollectNames(parsed.arena.nodes, parsed.arena.edges, root)?
+    return ok(NamedModule { parsed: parsed, names: names })
+}
+
+fn FormatNames(&declarations: [TopLevelName], import_count: int): str {
+    text = "IMPORTS|" + str(import_count)
+    index = 0
+    while (index < declarations.len()) {
+        name = declarations[index].clone()
+        text += "\nNAME|" + name.kind + "|" + name.name + "|" + str(name.node) + "|" + SpanCanonical(name.span)
+        index = index + 1
+    }
+    return text
+}
+
+fn NamesCanonical(&table: ModuleNameTable): str {
+    import_count = table.imports.len()
+    return FormatNames(table.declarations, import_count)
+}

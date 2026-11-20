@@ -1,0 +1,10 @@
+import "std.fs"
+import { ParseProgram } from "../stage3/parser.ku"
+import { BuildNameTable, NamesCanonical } from "./names.ku"
+
+fn main(): null! {
+    source = fs.read("input.ku")?
+    named = BuildNameTable(ParseProgram(source)?)?
+    println(NamesCanonical(named.names))
+    return ok(null)
+}
