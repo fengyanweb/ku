@@ -8967,6 +8967,119 @@ fn native_closure_capture_object_borrowed_read_and_reassign() {
 }
 
 #[test]
+fn native_closure_captures_imported_pattern_bindings_with_defaults() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    let directory = Cleanup(unique_temp_dir("imported-pattern-capture"));
+    let dir = &directory.0;
+    fs::write(
+        dir.join("types.ku"),
+        r#"
+struct Node { text: str line: int }
+struct Options { criteria: Criteria }
+struct Criteria { prefix: str minimum: int | null }
+fn Make(value: int | null): Options {
+    return Options { criteria: Criteria { prefix: "Ke" + "ep", minimum: value } }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("filter.ku"),
+        r#"
+import { Node, Options } from "./types"
+fn Default(value: int): int { println(value) return value }
+fn Select(options: Options): fn(&Node): int | null {
+    criteria = options.criteria
+    {prefix, minimum = Default(70), missing: fallback = Default(2)} = criteria
+    read: fn(&Node): int | null = fn(&node: Node): int | null {
+        if (!node.text.starts_with(prefix)) { return null }
+        if (minimum == null) { return node.line + fallback }
+        return node.line + minimum
+    }
+    return read
+}
+fn Tail(): fn(): str! {
+    options = { prefix: "unused", label: "tail" + "🙂" }
+    {prefix, ...rest} = options
+    read: fn(): str! = fn(): str! {
+        label = rest["label"]?.as_str()?
+        return ok(prefix + ":" + label)
+    }
+    prefix = "rebound"
+    return read
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("main.ku"),
+        r#"
+import { Node, Make } from "./types"
+import { Select, Tail } from "./filter"
+fn Apply(node: Node, location: fn(&Node): int | null): int | null {
+    owned = node.clone()
+    line = location(owned)
+    return line
+}
+fn main(): null! {
+    filter = Select(Make(null))
+    alias = filter.clone()
+    first = Node { text: "KeepFirst", line: 5 }
+    second = Node { text: "KeepSecond", line: 9 }
+    discard = Node { text: "Drop", line: 6 }
+    println(Apply(first, alias))
+    println(filter(second))
+    println(filter(discard))
+    zero = Select(Make(0))
+    zero_node = Node { text: "KeepZero", line: 5 }
+    println(zero(zero_node))
+    tail = Tail()
+    println(tail()?)
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let expected = "2\n7\n11\nnull\n2\n5\nrebound:tail🙂\n";
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(dir).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS).unwrap();
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout).replace('\r', ""),
+        expected
+    );
+    let Some(executable) = native_build(dir, "main.ku", "pattern-capture") else {
+        assert!(env::var_os("GITHUB_ACTIONS").is_none());
+        return;
+    };
+    let output = run_bounded(
+        Command::new(executable).current_dir(dir),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        expected
+    );
+}
+
+#[test]
 fn native_closure_capture_struct_and_result_owned_payloads() {
     let dir = unique_temp_dir("capture-struct-result");
     fs::write(

@@ -6756,7 +6756,7 @@ fn collect_boxed_candidates_stmt(
             bindings,
             rest,
             value,
-            span,
+            ..
         } => {
             collect_boxed_candidates_expr(value, visible, out)?;
             for binding in bindings {
@@ -6764,11 +6764,14 @@ fn collect_boxed_candidates_stmt(
                     collect_boxed_candidates_expr(default, visible, out)?;
                 }
                 if let Some(local) = &binding.local {
-                    define_assignment_binding(local, *span, visible);
+                    define_assignment_binding(local, binding.span, visible);
                 }
             }
-            if let Some(local) = rest.as_ref().and_then(|rest| rest.local.as_ref()) {
-                define_assignment_binding(local, *span, visible);
+            if let Some((rest, local)) = rest
+                .as_ref()
+                .and_then(|rest| rest.local.as_ref().map(|name| (rest, name)))
+            {
+                define_assignment_binding(local, rest.span, visible);
             }
         }
         Stmt::If {
