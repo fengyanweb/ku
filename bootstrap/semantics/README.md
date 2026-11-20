@@ -96,6 +96,13 @@ and select `DigitValue` in `function.txt`. The emitted C compares UTF-8 bytes
 and lengths. A by-value argument transfers its owned buffer to the function.
 A `const KuScalarString*` argument borrows the caller's storage.
 
+The same guarded form can return string literals. For example, copy the
+complete `KeywordKind` definition from `bootstrap/stage1/lexer.ku` and select
+it in `function.txt`. Its C result is a `KuBootstrapString` with static storage
+and stays valid after the input is released. Read its bytes using `len` and
+leave the storage unchanged. Computed strings and returning an input alias
+are outside this subset.
+
 The compiler entry scans the module once and parses bounded declaration
 windows. It retains the lexer, per-function, AST and work limits. The legacy
 `ParseProgram` entry retains its 512-token whole-script limit.

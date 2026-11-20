@@ -30,12 +30,14 @@ struct ScalarIntParameter {
 struct ScalarIntClause {
     condition: str
     instructions: [ScalarIntInstruction]
+    string_result: str
 }
 
 struct ScalarIntFunction {
     function_node: int
     parameters: [ScalarIntParameter]
     clauses: [ScalarIntClause]
+    returns_string: bool
 }
 
 struct ScalarIntC {
@@ -131,6 +133,12 @@ fn bindIntCall(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
     if (call.edge_count - 1 != arity) {
         rejectScalarInt("int_call_arity", "expected " + str(arity) + " arguments for '" + target.text + "'", DeclarationSpan(call))?
     }
+    if (arity < function.edge_count) {
+        result_node = edges[function.first_edge + arity]
+        if (scalarType(bindings, result_node, nodes[result_node - 1]) == 2) {
+            rejectScalarInt("unsupported_int_callee_result", "calls in an int expression cannot return str", DeclarationSpan(call))?
+        }
+    }
     arguments: [int] = []
     index = 1
     while (index < call.edge_count) {
@@ -223,20 +231,24 @@ fn lowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelNam
 
 // Decimal source bytes never enter a C identifier or an unescaped literal.
 // Three-digit C octal escapes preserve all UTF-8 bytes and embedded zeros.
+fn scalarStringLiteral(&node: Node): str! {
+    encoded = bytes.from_str(node.text.clone())?
+    if (encoded.len() > 4095) {
+        rejectScalarInt("string_literal_limit", "standalone C accepts at most 4095 bytes in a string literal", DeclarationSpan(node))?
+    }
+    literal = "\""
+    index = 0
+    while (index < encoded.len()) {
+        byte = encoded.get(index)?
+        literal += "\\" + str(byte / 64) + str((byte / 8) % 8) + str(byte % 8)
+        index = index + 1
+    }
+    return ok(literal + "\", " + str(encoded.len()) + "u")
+}
+
 fn scalarStringOperand(&parameters: [ScalarIntParameter], &node: Node): str! {
     if (node.kind == "String" && node.edge_count == 0) {
-        encoded = bytes.from_str(node.text.clone())?
-        if (encoded.len() > 4095) {
-            rejectScalarInt("string_literal_limit", "standalone C string guards accept at most 4095 literal bytes", DeclarationSpan(node))?
-        }
-        literal = "(const uint8_t*)\""
-        index = 0
-        while (index < encoded.len()) {
-            byte = encoded.get(index)?
-            literal += "\\" + str(byte / 64) + str((byte / 8) % 8) + str(byte % 8)
-            index = index + 1
-        }
-        return ok(literal + "\", " + str(encoded.len()) + "u")
+        return ok("(const uint8_t*)" + scalarStringLiteral(node)?)
     }
     if (node.kind == "Variable" && node.edge_count == 0) {
         index = scalarParameterIndex(parameters, node.text)
@@ -292,10 +304,11 @@ fn lowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLeve
         cursor = cursor + 1
     }
     if (end - cursor < 2) {
-        rejectScalarInt("unsupported_int_body", "expected an explicit int result type and a final return", DeclarationSpan(function))?
+        rejectScalarInt("unsupported_int_body", "expected an explicit scalar result type and a final return", DeclarationSpan(function))?
     }
     type_id = edges[cursor]
-    requireInt(bindings, type_id, nodes[type_id - 1])?
+    returns_string = scalarType(bindings, type_id, nodes[type_id - 1]) == 2
+    if (!returns_string) { requireInt(bindings, type_id, nodes[type_id - 1])? }
     cursor = cursor + 1
     clauses: [ScalarIntClause] = []
     while (cursor < end) {
@@ -310,20 +323,29 @@ fn lowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLeve
             statement = nodes[return_node - 1].clone()
         }
         if (statement.kind != "Return" || statement.edge_count != 1) {
-            rejectScalarInt("unsupported_int_body", "expected a return with one int expression", DeclarationSpan(statement))?
+            rejectScalarInt("unsupported_int_body", "expected a return with one value", DeclarationSpan(statement))?
         }
         result_node = edges[statement.first_edge]
-        // The leaf subset has no arithmetic traps or calls that could bypass
-        // the owned-parameter cleanup on the selected return.
         result = nodes[result_node - 1].clone()
-        if (has_string && (result.kind != "Int" && result.kind != "Variable")) {
-            rejectScalarInt("unsupported_string_leaf_return", "functions with str parameters return an int literal or parameter", DeclarationSpan(result))?
+        instructions: [ScalarIntInstruction] = []
+        string_result = ""
+        if (returns_string) {
+            if (result.kind != "String" || result.edge_count != 0) {
+                rejectScalarInt("unsupported_string_return", "str results in the bootstrap subset must be string literals", DeclarationSpan(result))?
+            }
+            string_result = "(KuBootstrapString){ (uint8_t*)" + scalarStringLiteral(result)? + ", 0u, 0u }"
+        } else {
+            // No trapped expression can bypass the owned-parameter cleanup.
+            if (has_string && (result.kind != "Int" && result.kind != "Variable")) {
+                rejectScalarInt("unsupported_string_leaf_return", "functions with str parameters return an int literal or parameter", DeclarationSpan(result))?
+            }
+            instructions = lowerIntExpression(nodes, edges, declarations, bindings, parameters, result_node)?
         }
-        instructions = lowerIntExpression(nodes, edges, declarations, bindings, parameters, result_node)?
-        clauses = clauses.push(ScalarIntClause { condition: condition, instructions: instructions })
+        clauses = clauses.push(ScalarIntClause { condition: condition, instructions: instructions, string_result: string_result })
         cursor = cursor + 1
     }
-    return ok(ScalarIntFunction { function_node: function_id, parameters: parameters, clauses: clauses })
+    return ok(ScalarIntFunction { function_node: function_id, parameters: parameters, clauses: clauses,
+        returns_string: returns_string })
 }
 
 fn integerHelpers(add: bool, sub: bool, mul: bool): str {
@@ -359,8 +381,9 @@ fn scalarStringHelpers(carrier: bool, comparison: bool, owned: bool): str {
     if (comparison) { text += "#include <string.h>\n" }
     if (owned) { text += "#include <stdlib.h>\n" }
     if (carrier) {
-        text += "\n/* KuString layout. Owned arguments transfer their malloc-compatible backing. */\n"
-        text += "typedef struct { uint8_t* ptr; size_t len; size_t capacity; uint8_t storage; } KuScalarString;\n\n"
+        text += "\n/* KuString layout. Static results are immutable and never freed by the caller. */\n"
+        text += "typedef struct { uint8_t* ptr; size_t len; size_t capacity; uint8_t storage; } KuBootstrapString;\n"
+        text += "typedef KuBootstrapString KuScalarString;\n\n"
     }
     if (comparison) {
         text += "static int ku_scalar_string_equal(const uint8_t* a, size_t n, const uint8_t* b, size_t m) {\n"
@@ -373,12 +396,13 @@ fn scalarStringHelpers(carrier: bool, comparison: bool, owned: bool): str {
     return text
 }
 
-fn scalarSymbol(function_node: int): str {
+fn scalarSymbol(function_node: int, returns_string: bool): str {
+    if (returns_string) { return "ku_str_" + str(function_node) }
     return "ku_int_" + str(function_node)
 }
 
 fn emitIntCall(&call: ScalarIntInstruction): str {
-    text = scalarSymbol(call.operand) + "("
+    text = scalarSymbol(call.operand, false) + "("
     index = 0
     while (index < call.arguments.len()) {
         if (index > 0) { text += ", " }
@@ -389,11 +413,13 @@ fn emitIntCall(&call: ScalarIntInstruction): str {
 }
 
 fn emitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
-    signature = "int64_t " + scalarSymbol(plan.function_node) + "("
+    result_type = "int64_t"
+    if (plan.returns_string) { result_type = "KuBootstrapString" }
+    signature = result_type.clone() + " " + scalarSymbol(plan.function_node, plan.returns_string) + "("
     if (!external) { signature = "static " + signature }
     declarations = ""
     drops = ""
-    uses_string = false
+    uses_string = plan.returns_string
     if (plan.parameters.len() == 0) { signature += "void" }
     index = 0
     while (index < plan.parameters.len()) {
@@ -410,7 +436,7 @@ fn emitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         index = index + 1
     }
     uses_owned = drops != ""
-    if (uses_owned) { declarations += "    int64_t result;\n" }
+    if (uses_owned) { declarations += "    " + result_type + " result;\n" }
     text = signature + ") {\n" + declarations
     uses_add = false
     uses_sub = false
@@ -451,11 +477,14 @@ fn emitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
             text += indent.clone() + "int64_t t" + str(result_node) + " = " + expression + ";\n"
             step = step + 1
         }
+        result = ""
+        if (plan.returns_string) { result = clause.string_result }
+        else { result = "t" + str(result_node) }
         if (uses_owned) {
-            text += indent.clone() + "result = t" + str(result_node) + ";\n"
+            text += indent.clone() + "result = " + result + ";\n"
             if (guarded) { text += indent + "goto cleanup;\n" }
         } else {
-            text += indent + "return t" + str(result_node) + ";\n"
+            text += indent + "return " + result + ";\n"
         }
         if (guarded) { text += "    }\n" }
         index = index + 1
@@ -529,6 +558,7 @@ fn emitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], entry: int):
     uses_string_comparison = false
     uses_owned_string = false
     text = ""
+    symbol = ""
     while (completed.len() < plans.len()) {
         blocked_at = 0
         before = completed.len()
@@ -538,6 +568,7 @@ fn emitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], entry: int):
             if (!containsIntNode(completed, function_node)) {
                 blocked = unresolvedIntCall(plans[index], completed)
                 if (blocked == 0) {
+                    if (function_node == entry) { symbol = scalarSymbol(entry, plans[index].returns_string) }
                     body = emitScalarIntPlan(plans[index], function_node == entry)
                     uses_add = uses_add || body.uses_add
                     uses_sub = uses_sub || body.uses_sub
@@ -558,12 +589,12 @@ fn emitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], entry: int):
                             DeclarationSpan(nodes[blocked_at - 1]))?
         }
     }
-    return ok(ScalarIntC { symbol: scalarSymbol(entry), source: integerHelpers(uses_add, uses_sub, uses_mul)
+    return ok(ScalarIntC { symbol: symbol, source: integerHelpers(uses_add, uses_sub, uses_mul)
         + scalarStringHelpers(uses_string, uses_string_comparison, uses_owned_string) + text })
 }
 
 // The selected function is the only external symbol. Every reachable local
-// callee must also be a checked int function; there is no dynamic dispatch.
+// callee must also be a checked int function. String results are leaf literals.
 fn EmitScalarIntC(&named: NamedModule, &bindings: [TypeNameBinding], &function_name: str): ScalarIntC! {
     entry = scalarFunctionNode(named.names.declarations, function_name)
     if (entry > 0) {
