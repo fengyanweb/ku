@@ -1,6 +1,8 @@
+import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { TypeNameBinding } from "./type_names.ku"
-import { LayoutIndex, RejectLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
+import { DeclarationSpan } from "./names.ku"
+import { ExplicitType, LayoutIndex, RejectLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
 
 fn InvalidPlan(message: str): null! {
     point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
@@ -44,6 +46,43 @@ fn ContainsIndex(&ids: [int], id: int): bool {
         index = index + 1
     }
     return false
+}
+
+fn ProjectionCloneSource(&nodes: [Node], &edges: [int], id: int): int {
+    call = nodes[id - 1].clone()
+    if (call.kind != "Call" || call.edge_count != 1) { return 0 }
+    member = nodes[edges[call.first_edge] - 1].clone()
+    if (member.kind != "Field" || member.text != "clone" || member.edge_count != 1) { return 0 }
+    return edges[member.first_edge]
+}
+
+fn ProjectionIsStringArray(&types: [TypeNameBinding], &nodes: [Node], &edges: [int], id: int): bool! {
+    array = nodes[id - 1].clone()
+    if (array.kind != "TypeArray" || array.edge_count != 1) { return ok(false) }
+    element = edges[array.first_edge]
+    item = nodes[element - 1].clone()
+    if (item.kind != "TypeName" || item.text != "str") { return ok(false) }
+    bound = ExplicitType(types, element, DeclarationSpan(item))?
+    return ok(bound.declaration_kind == "Builtin" && bound.name == "str")
+}
+
+struct ProjectionLengthCode {
+    setup: str
+    value: str
+}
+
+fn ProjectionStringLength(&value: str, view: bool, characters: bool, id: int, &indent: str): ProjectionLengthCode {
+    access = "."
+    if (view) { access = "->" }
+    size = value.clone() + access.clone() + "len"
+    if (!characters) { return ProjectionLengthCode { setup: "", value: "((int64_t)" + size + ")" } }
+    count = "char_count" + str(id)
+    index = "char_index" + str(id)
+    text = indent.clone() + "size_t " + count.clone() + " = 0;\n"
+    text += indent.clone() + "for (size_t " + index.clone() + " = 0; " + index.clone() + " < " + size + "; ++" + index.clone() + ") {\n"
+    text += indent.clone() + "    if ((" + value.clone() + access + "ptr[" + index + "] & 0xC0u) != 0x80u) ++" + count.clone() + ";\n"
+    text += indent.clone() + "}\n"
+    return ProjectionLengthCode { setup: text, value: "((int64_t)" + count + ")" }
 }
 
 fn StructArrayTypeName(&field: TypeNameBinding): str {

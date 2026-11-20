@@ -1568,6 +1568,51 @@ fn Make(): Outer {
     assert_project_link_plans(&driver_binary, &cwd);
     linked_null::assert_checked_owned_call(&driver_binary, &cwd);
     token_window::assert_readonly_preflight(&driver_binary, &cwd);
+    assert_managed_source_characters(&driver_binary, &cwd);
+}
+
+fn assert_managed_source_characters(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("source_probe.ku"),
+        r#"
+struct SourceLength { value: int }
+fn PrepareSource(source: str): [SourceLength]! {
+    entries: [SourceLength] = []
+    if (source.byte_len() > 131072) { return ok(entries) }
+    if (source.len() > 32768) { return ok(entries) }
+    characters: [str] = source.chars()
+    item = SourceLength { value: characters.len() }
+    entries = entries.push(item)
+    return ok(entries)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "source_probe.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "PrepareSource").unwrap();
+    fs::write(cwd.join("mode.txt"), "managed").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let body = text.split_once("(KuProjectionString a0) {").unwrap().1;
+    let bytes = body.find("a0.len").unwrap();
+    let scalars = body.find("for (size_t char_index").unwrap();
+    let characters = body
+        .find("source_status = ku_managed_source_chars(a0")
+        .unwrap();
+    assert!(bytes < scalars && scalars < characters);
+    let cleanup = body.split_once("cleanup:\n").unwrap().1;
+    assert!(cleanup.contains("ku_managed_source_drop(&l"));
+    assert!(cleanup.contains("ku_projection_string_drop(&a0)"));
+    assert!(cleanup.contains("source_status != KU_SOURCE_OK"));
+
+    fs::write(cwd.join("mode.txt"), "managed-plan").unwrap();
+    let plan = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plan);
+    let plan = String::from_utf8(plan.stdout).unwrap();
+    assert!(plan.contains(
+        r#""kind":"Builtin","source_name":"str","source_path":null,"node":0,"c_type":"KuProjectionString","passing":"value""#
+    ));
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {

@@ -1,7 +1,7 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
-import { CTypeName } from "./struct_projection_c.ku"
+import { CTypeName, ProjectionCloneSource, ProjectionStringLength } from "./struct_projection_c.ku"
 import { ExplicitType, FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 
@@ -154,14 +154,6 @@ fn guardBoolean(&left: GuardValue, &right: GuardValue, &node: Node, id: int, &in
         uses_eq: left.uses_eq || right.uses_eq })
 }
 
-fn GuardCloneSource(&nodes: [Node], &edges: [int], id: int): int {
-    call = nodes[id - 1].clone()
-    if (call.kind != "Call" || call.edge_count != 1) { return 0 }
-    member = nodes[edges[call.first_edge] - 1].clone()
-    if (member.kind != "Field" || member.text != "clone" || member.edge_count != 1) { return 0 }
-    return edges[member.first_edge]
-}
-
 fn guardStringArrayCompare(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
                           &node: Node, id: int, depth: int, &indent: str): GuardValue! {
     left = edges[node.first_edge]
@@ -172,7 +164,7 @@ fn guardStringArrayCompare(&nodes: [Node], &edges: [int], &bindings: [GuardBindi
         literal = nodes[left - 1].clone()
         input = right
     }
-    indexed_id = GuardCloneSource(nodes, edges, input)
+    indexed_id = ProjectionCloneSource(nodes, edges, input)
     if (indexed_id == 0 || literal.kind != "String" || literal.edge_count != 0) {
         return ok(emptyGuardValue())
     }
@@ -199,7 +191,7 @@ fn guardStringArrayCompare(&nodes: [Node], &edges: [int], &bindings: [GuardBindi
 
 fn cloneLeafString(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
                    &node: Node, id: int, depth: int, &indent: str): GuardValue! {
-    subject = GuardCloneSource(nodes, edges, edges[node.first_edge + 1])
+    subject = ProjectionCloneSource(nodes, edges, edges[node.first_edge + 1])
     if (subject == 0 || depth + 3 >= 32) {
         RejectLayout("guarded_owned_argument", "a checked leaf takes an explicit clone of a live str", DeclarationSpan(node))?
     }
@@ -309,9 +301,15 @@ fn GuardOwnedExpression(&nodes: [Node], &edges: [int], &bindings: [GuardBinding]
     }
     if (node.kind == "Call" && node.edge_count == 1) {
         method = nodes[edges[node.first_edge] - 1].clone()
-        if (method.kind == "Field" && method.text == "len" && method.edge_count == 1) {
+        if (method.kind == "Field" && method.edge_count == 1 && (method.text == "len" || method.text == "byte_len")) {
             receiver = GuardOwnedExpression(nodes, edges, bindings, layouts, edges[method.first_edge], depth + 1, indent, checked_mul, leaves)?
-            if (receiver.ty.kind == "array") {
+            if (receiver.ty.kind == "str" && receiver.setup == "") {
+                length = ProjectionStringLength(receiver.value, receiver.view, method.text == "len", id, indent)
+                value = GuardRead(GuardType { kind: "int", layout: 0 }, length.value, false)
+                value.setup = length.setup
+                return ok(value)
+            }
+            if (method.text == "len" && (receiver.ty.kind == "array" || receiver.ty.kind == "str_array")) {
                 access = ".len"
                 if (receiver.view) { access = "->len" }
                 return ok(GuardRead(GuardType { kind: "int", layout: 0 }, "((int64_t)" + receiver.value + access + ")", false))

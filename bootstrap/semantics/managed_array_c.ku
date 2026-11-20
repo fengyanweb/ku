@@ -8,6 +8,7 @@ import { CStructOrder, OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
 import { EmitStructArrayOperations, EmitStructArrayResultHeader } from "./struct_array_c.ku"
 import { GuardArithmetic, GuardOwnedDrops, GuardStringEquality } from "./guarded_struct_c.ku"
+import { ManagedSourceCharactersErrors, ManagedSourceCharactersRuntime } from "./guarded_string_parts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType } from "./guarded_struct_expr.ku"
 import { ManagedExplicitType, ManagedType } from "./managed_array_values_c.ku"
 import { EmitManagedBlock, EmitManagedResultBlock, ManagedBlock } from "./managed_array_body_c.ku"
@@ -33,6 +34,7 @@ struct ManagedSignature {
     unused: str
     drops: str
     drop_strings: bool
+    source_strings: bool
     body_start: int
 }
 
@@ -63,6 +65,7 @@ fn readParameters(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &lay
     unused = ""
     drops = ""
     drop_strings = false
+    source_strings = false
     cursor = function.first_edge
     while (cursor < result_edge) {
         parameter = nodes[edges[cursor] - 1].clone()
@@ -73,9 +76,9 @@ fn readParameters(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &lay
         }
         ty = ManagedExplicitType(types, nodes, edges, layouts, edges[parameter.first_edge])?
         view = parameter.int_value == 1
-        if (ty.kind == "str" || (view && ty.kind != "array" && ty.kind != "struct") ||
+        if (ty.kind == "str_array" || (view && ty.kind != "array" && ty.kind != "struct") ||
             (ty.kind == "array" && ty.layout != root.layout)) {
-            RejectLayout("unsupported_managed_signature", "expected Copy scalars, known structs or matching arrays", at.clone())?
+            RejectLayout("unsupported_managed_signature", "expected Copy scalars, owned strings, known structs or matching arrays", at.clone())?
         }
         binding = GuardBinding { name: parameter.text, ty: ty, slot: bindings.len(), parameter: true, view: view }
         name = GuardBindingName(binding)
@@ -84,7 +87,11 @@ fn readParameters(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &lay
         if (bindings.len() > 0) { parameters += ", " }
         parameters += c_type + " " + name.clone()
         unused += "    (void)" + name.clone() + ";\n"
-        if (binding.ty.kind == "struct") {
+        if (binding.ty.kind == "str") {
+            source_strings = true
+            drop_strings = true
+            drops = "    ku_projection_string_drop(&" + name.clone() + ");\n" + drops
+        } else if (binding.ty.kind == "struct") {
             dependencies = orderLayout(layouts, binding.ty.layout, at)?
             declarations = appendLayouts(layouts, dependencies, declarations)?
             if (!view && dependencies.contains_string) {
@@ -98,7 +105,7 @@ fn readParameters(&nodes: [Node], &edges: [int], &types: [TypeNameBinding], &lay
     }
     if (parameters == "") { parameters = "void" }
     return ok(ManagedSignature { bindings: bindings, layouts: declarations, parameters: parameters,
-        unused: unused, drops: drops, drop_strings: drop_strings, body_start: result_edge + 1 })
+        unused: unused, drops: drops, drop_strings: drop_strings, source_strings: source_strings, body_start: result_edge + 1 })
 }
 
 fn managedArrayErrors(): str {
@@ -174,9 +181,10 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     if (!body.returns) { RejectLayout("managed_fallthrough", "every path must return an array owner", DeclarationSpan(function))? }
     symbol = "ku_managed_" + str(function_id)
     arithmetic = body.code.uses_add || body.code.uses_sub
-    text = ProjectionHeaders(checked || signature.layouts.strings || body.code.uses_eq, signature.drop_strings)
+    text = ProjectionHeaders(checked || signature.layouts.strings || body.code.uses_eq || signature.source_strings, signature.drop_strings)
     text += "#include <stdio.h>\n#include <stdlib.h>\n\n"
     text += GuardArithmetic(body.code.uses_add, body.code.uses_sub) + GuardStringEquality(body.code.uses_eq)
+    if (signature.source_strings) { text += ManagedSourceCharactersRuntime() }
     text += signature.layouts.text + root.array.source
     result_type = root.array.array_type.clone()
     if (checked) {
@@ -186,9 +194,13 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     text += result_type.clone() + " " + symbol.clone() + "(" + signature.parameters.clone() + ") {\n"
     text += "    " + result_type.clone() + " result = {0};\n"
     text += "    int array_status = KU_STRUCT_ARRAY_OK;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n"
+    if (signature.source_strings) {
+        text += "    int source_status = KU_SOURCE_OK;\n    (void)ku_managed_source_chars;\n    (void)ku_managed_source_drop;\n"
+    }
     if (arithmetic) { text += "    bool overflow = false;\n" }
     text += signature.unused + body.declarations + body.code.text
     text += "cleanup:\n" + body.drops + signature.drops
+    if (signature.source_strings) { text += ManagedSourceCharactersErrors() }
     if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     text += managedArrayErrors() + "    return result;\n}\n"
     plan = managedPlan(layouts, signature, result.layout, result_type, symbol.clone(), function_id, checked)

@@ -25,6 +25,7 @@ struct ManagedBlock {
 
 fn ownedDrop(&root: ManagedType, &binding: GuardBinding, &indent: str): str {
     if (binding.ty.kind == "str") { return indent.clone() + "ku_projection_string_drop(&" + GuardBindingName(binding) + ");\n" }
+    if (binding.ty.kind == "str_array") { return indent.clone() + "ku_managed_source_drop(&" + GuardBindingName(binding) + ");\n" }
     operation = "_element_drop(&"
     if (binding.ty.kind == "array") { operation = "_drop(&" }
     return indent.clone() + root.array.prefix.clone() + operation + GuardBindingName(binding) + ");\n"
@@ -116,7 +117,7 @@ fn emitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
             code = JoinManagedCode(code, assignment.code)
             if (assignment.introduces) {
                 binding = assignment.binding
-                if (binding.ty.kind == "struct" || binding.ty.kind == "array" || binding.ty.kind == "str") {
+                if (binding.ty.kind == "struct" || binding.ty.kind == "array" || binding.ty.kind == "str" || binding.ty.kind == "str_array") {
                     // Predeclare only managed owners. Any goto cleanup can
                     // then safely drop zero, partial, complete or moved slots.
                     declarations += "    " + GuardCType(binding.ty, layouts) + " " + GuardBindingName(binding) + " = {0};\n"

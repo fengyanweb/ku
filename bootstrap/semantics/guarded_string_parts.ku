@@ -1,10 +1,10 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
-import { GuardBinding, GuardBindingIndex, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 import { ScalarStringPart } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { ContainsType } from "./struct_projection_c.ku"
+import { ContainsType, ProjectionArrayHeader } from "./struct_projection_c.ku"
 
 fn collectProjectedParts(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
                          id: int, depth: int, can_convert: bool, collected: [ScalarStringPart]): [ScalarStringPart]! {
@@ -149,4 +149,64 @@ fn LowerManagedRecordError(&nodes: [Node], &edges: [int], &bindings: [GuardBindi
     }
     prep.setup = prep.setup + indent.clone() + "goto cleanup;\n"
     return ok(ManagedErrorEmission { prep: prep, declarations: declarations, after_cleanup: finish })
+}
+
+fn ManagedSourceCharactersRuntime(): str {
+    ascii = ""
+    index = 0
+    while (index < 128) {
+        if (index > 0) { ascii += ", " }
+        ascii += str(index)
+        index = index + 1
+    }
+    text = "#include <string.h>\n" + ProjectionArrayHeader("KuProjectionString", "KuGuardStringArray")
+    text += "enum { KU_SOURCE_OK, KU_SOURCE_INVALID, KU_SOURCE_TOOBIG, KU_SOURCE_ARRAY_OOM, KU_SOURCE_CHAR_OOM };\n\n"
+    text += "static void ku_managed_source_drop(KuGuardStringArray *array) {\n"
+    text += "    for (size_t i = 0; i < array->len; ++i) ku_projection_string_drop(&array->data[i]);\n"
+    text += "    free(array->data);\n    *array = (KuGuardStringArray){0};\n}\n\n"
+    text += "static int ku_managed_source_chars(KuProjectionString input, KuGuardStringArray *out) {\n"
+    text += "    static const uint8_t ascii[128] = {" + ascii + "};\n"
+    text += "    if (!input.len) return KU_SOURCE_OK;\n"
+    text += "    if (!input.ptr || (input.ptr[0] & 0xC0u) == 0x80u) return KU_SOURCE_INVALID;\n"
+    text += "    size_t count = 0;\n"
+    text += "    for (size_t i = 0; i < input.len; ++i) if ((input.ptr[i] & 0xC0u) != 0x80u) ++count;\n"
+    text += "    if (count > SIZE_MAX / sizeof(*out->data)) return KU_SOURCE_TOOBIG;\n"
+    text += "    out->data = calloc(count, sizeof(*out->data));\n    if (!out->data) return KU_SOURCE_ARRAY_OOM;\n    out->capacity = count;\n"
+    text += "    size_t index = 0;\n    while (index < input.len) {\n"
+    text += "        size_t next = index + 1;\n        while (next < input.len && (input.ptr[next] & 0xC0u) == 0x80u) ++next;\n"
+    text += "        size_t bytes = next - index;\n        KuProjectionString value;\n"
+    text += "        if (bytes == 1 && input.ptr[index] < 128u) {\n"
+    text += "            value = (KuProjectionString){(uint8_t*)(ascii + input.ptr[index]), 1u, 0u, KU_PROJECTION_STRING_STATIC};\n"
+    text += "        } else {\n            uint8_t *data = malloc(bytes);\n            if (!data) return KU_SOURCE_CHAR_OOM;\n"
+    text += "            memcpy(data, input.ptr + index, bytes);\n"
+    text += "            value = (KuProjectionString){data, bytes, bytes, KU_PROJECTION_STRING_OWNED};\n        }\n"
+    // Publish initialized elements one at a time for rollback. No returned
+    // str points into input, including the immutable ASCII representation.
+    text += "        out->data[out->len++] = value;\n        index = next;\n    }\n    return KU_SOURCE_OK;\n}\n\n"
+    return text
+}
+
+fn ManagedSourceCharsSetup(&locals: [GuardBinding], &receiver: Node, &target: str, &indent: str): str! {
+    source = GuardBindingIndex(locals, receiver.text)
+    if (receiver.kind != "Variable" || source == 0 || locals[source - 1].ty.kind != "str" || !locals[source - 1].parameter || locals[source - 1].view) {
+        RejectLayout("managed_source_chars", "expected chars on a bound owned str parameter", DeclarationSpan(receiver))?
+    }
+    return ok(indent.clone() + "source_status = ku_managed_source_chars(" + GuardBindingName(locals[source - 1]) + ", &" +
+        target.clone() + ");\n" + indent.clone() + "if (source_status != KU_SOURCE_OK) goto cleanup;\n")
+}
+
+fn RequireNewManagedOwner(found: int, &statement: Node): null! {
+    if (found != 0) {
+        RejectLayout("unsupported_managed_reassignment", "owner initialization requires a fresh local scope", DeclarationSpan(statement))?
+    }
+    return ok(null)
+}
+
+fn ManagedSourceCharactersErrors(): str {
+    return "    if (source_status != KU_SOURCE_OK) {\n" +
+        "        const char *message = \"invalid string input\\n\";\n" +
+        "        if (source_status == KU_SOURCE_TOOBIG) message = \"string.chars result is too large\\n\";\n" +
+        "        if (source_status == KU_SOURCE_ARRAY_OOM) message = \"string.chars allocation failed\\n\";\n" +
+        "        if (source_status == KU_SOURCE_CHAR_OOM) message = \"out of memory\\n\";\n" +
+        "        fputs(message, stderr);\n        exit(EXIT_FAILURE);\n    }\n"
 }
