@@ -560,3 +560,102 @@ int main(int argc, char **argv) {
         "array allocation failed"
     );
 }
+
+pub(super) fn assert_short_circuit_reads(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("logic-provider.ku"),
+        "fn Mark(): null! { return ok(null) }\n",
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "logic-entry.ku\nlogic-provider.ku\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("function.txt"), "Observe").unwrap();
+    for (operator, skip, expected) in [("||", "chosen", 1), ("&&", "absent", 0)] {
+        fs::write(
+            cwd.join("logic-entry.ku"),
+            format!(
+                "import {{ Mark }} from \"./logic-provider.ku\"\n\
+                 fn Observe(&command: str, &values: [str]): null! {{\n\
+                     if (command == \"chosen\" {operator} values[1] == \"ready\") {{ Mark()? }}\n\
+                     return ok(null)\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+        let output = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&output);
+        let Some(Value::Result { ok: true, value }) = json::eval(
+            "decode",
+            &[Value::String(String::from_utf8(output.stdout).unwrap())],
+            Span::default(),
+        )
+        .unwrap() else {
+            panic!("expected checked logical C plan");
+        };
+        let Value::Object(plan) = *value else {
+            panic!("expected object")
+        };
+        let Value::Object(export) = &plan["export"] else {
+            panic!("expected export")
+        };
+        let Value::Array(links) = &plan["dependencies"] else {
+            panic!("expected links")
+        };
+        let [Value::Object(link)] = links.as_slice() else {
+            panic!("expected one checked call")
+        };
+        let (Value::String(entry), Value::String(callee)) = (&export["symbol"], &link["symbol"])
+        else {
+            panic!("expected C symbols");
+        };
+        fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+        let output = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&output);
+        let program = String::from_utf8(output.stdout).unwrap();
+        let c = cwd.join("logic.c");
+        let exe = cwd.join(format!("logic{}", std::env::consts::EXE_SUFFIX));
+        let witness = r#"
+#include <assert.h>
+static int called;
+KuBootstrapResultNull CALLEE(void) {
+    ++called;
+    return (KuBootstrapResultNull){.ok = true};
+}
+int main(int argc, char** argv) {
+    (void)argv;
+    uint8_t skip[] = "SKIP";
+    uint8_t chosen[] = "chosen", absent[] = "absent", ready[] = "ready";
+    KuProjectionString command = {skip, sizeof(skip) - 1, 0, KU_PROJECTION_STRING_STATIC};
+    KuProjectionString active = {ACTIVE, sizeof(ACTIVE) - 1, 0, KU_PROJECTION_STRING_STATIC};
+    KuProjectionString words[] = {{0}, {ready, 5, 0, KU_PROJECTION_STRING_STATIC}};
+    KuGuardStringArray empty = {0}, values = {2, words, 2};
+    (void)chosen;
+    (void)absent;
+    if (argc > 1) {
+        (void)ENTRY(&active, &empty);
+        return 42;
+    }
+    assert(ENTRY(&command, &empty).ok && called == CALLS);
+    assert(ENTRY(&active, &values).ok && called == CALLS + 1);
+    return 0;
+}
+"#
+        .replace("CALLEE", callee)
+        .replace("ENTRY", entry)
+        .replace("SKIP", skip)
+        .replace("ACTIVE", if operator == "||" { "absent" } else { "chosen" })
+        .replace("CALLS", &expected.to_string());
+        fs::write(&c, format!("{program}{witness}")).unwrap();
+        compile_projection(&c, &exe, cwd);
+        assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+        let failure = execute(Command::new(&exe).arg("selected-empty"), cwd, 10);
+        assert_eq!(failure.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&failure.stderr).contains("index 1 out of bounds for length 0")
+        );
+    }
+}

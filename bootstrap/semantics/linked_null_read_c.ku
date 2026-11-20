@@ -9,7 +9,7 @@ import { EmitOwnedStructArrayDrop, EmitOwnedStructOperations, EmitStructArrayHea
          EmitStructArrayResultHeader, EmitStructArrayDropUsing, EmitTryCloneString, EmitOwnedStructArrayAppend, StructArrayStatuses } from "./struct_array_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullDropC, LinkedNullFunction,
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullDropC, LinkedNullFunction,
          LinkedNullLayout, LinkedNullNode, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullProject, EmitLinkedNullPrototypes, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
 
 struct LinkedNullValue {
@@ -103,12 +103,12 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
         element = LinkedNullArrayElement(ty.clone())
         if (LinkedNullOwnedArray(ty)) { next = registerOwnedElement(project, next, element)? }
         else { next.layouts = LinkedNullLayout(project, element, next.layouts, 0)? }
-        if (LinkedNullOwnedArray(ty) && arrayPosition(next.owned_arrays, ty) == 0) {
+        if (LinkedNullOwnedArray(ty) && LinkedNullArrayPosition(next.owned_arrays, ty) == 0) {
             next.owned_arrays = next.owned_arrays.push(ty.clone())
         }
         carrier = ty.clone()
         carrier.declaration_kind = "StructArray"
-        if (arrayPosition(next.arrays, carrier) == 0) { next.arrays = next.arrays.push(carrier) }
+        if (LinkedNullArrayPosition(next.arrays, carrier) == 0) { next.arrays = next.arrays.push(carrier) }
     } else if (ty.declaration_kind == "Struct") {
         next = registerOwnedElement(project, next, ty)?
     }
@@ -119,7 +119,7 @@ fn RequireLinkedArrayValidation(state: LinkedNullState, ty: TypeNameBinding): Li
     next = state
     carrier = ty
     carrier.declaration_kind = "StructArray"
-    if (arrayPosition(next.validated_arrays, carrier) == 0) {
+    if (LinkedNullArrayPosition(next.validated_arrays, carrier) == 0) {
         next.validated_arrays = next.validated_arrays.push(carrier)
     }
     return next
@@ -140,15 +140,6 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
     if (!parameter) { next.declarations = next.declarations + "    " + kind + " " + name + " = {0};\n" }
     if (!view) { next.drops = LinkedNullDropC(next.layouts, next.owning_layouts, value.ty, value.text) + next.drops }
     return ok(LinkedNullExpression { state: next, value: value })
-}
-
-fn arrayPosition(&arrays: [TypeNameBinding], &type_name: TypeNameBinding): int {
-    index = 0
-    while (index < arrays.len()) {
-        if (SameLinkedType(arrays[index], type_name)) { return index + 1 }
-        index = index + 1
-    }
-    return 0
 }
 
 fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNullState! {
@@ -278,11 +269,24 @@ fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: N
 
 fn readLinkedBinary(&project: LinkedNullProject, state: LinkedNullState, &node: Node, id: int, depth: int): LinkedNullExpression! {
     left = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
+    op = node.text.clone()
+    logical = op == "&&" || op == "||"
+    result = ""
+    if (logical) {
+        result = "b" + str(id)
+        negate = ""
+        if (op == "||") { negate = "!" }
+        left.state.code += "    bool " + result.clone() + " = " + left.value.text.clone() + ";\n"
+            + "    if (" + negate + result.clone() + ") {\n"
+    }
     right = LowerLinkedNullRead(project, left.state, LinkedNullChild(project, 1, node, 1), depth + 1)?
     if (left.value.ty.declaration_kind != "Builtin" || !SameLinkedType(left.value.ty, right.value.ty)) {
         RejectLayout("linked_binary_type", "readonly operation requires matching scalar inputs", DeclarationSpan(node))?
     }
-    op = node.text.clone()
+    if (logical && left.value.ty.name == "bool") {
+        right.state.code += "    " + result.clone() + " = " + right.value.text + ";\n    }\n"
+        return ok(linkedValue(right.state, LinkedBuiltin("bool", DeclarationSpan(node)), result))
+    }
     equality = op == "==" || op == "!="
     if (left.value.ty.name == "str" && equality) {
         right.state.uses_string_equal = true
@@ -348,7 +352,7 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
         element = CTypeName(array.module_index, array.declaration_node)
         array_type = "KuArray_" + element.clone()
         if (!ContainsType(definitions.array_types, array_type)) { text += EmitStructArrayHeader(element, array_type) }
-        if (arrayPosition(body.validated_arrays, array) > 0) {
+        if (LinkedNullArrayPosition(body.validated_arrays, array) > 0) {
             text += EmitStructArrayReadValidation(element, array_type, LinkedNullArrayPrefix(array))
         }
     }
