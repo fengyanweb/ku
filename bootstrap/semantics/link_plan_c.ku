@@ -1,8 +1,6 @@
 import { json } from "std"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
-import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
-import { EmitTryCloneString } from "./struct_array_c.ku"
 import { GuardBoundType, GuardCType, GuardType } from "./guarded_struct_expr.ku"
 import { SuppliedModule } from "./imports.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
@@ -332,14 +330,13 @@ fn ReadLinkedCatchParts(&named: NamedModule, &node: Node): LinkedCatchParts! {
     return ok(LinkedCatchParts { protected: protected, binding: binding, recovery: recovery })
 }
 
-fn LinkedCPrelude(&body: LinkedNullState): str {
-    text = ProjectionHeaders(true, body.drops.contains("ku_projection_string_drop") || body.owning_strings) + GuardArithmetic(body.uses_add, body.uses_sub)
-        + GuardStringEquality(body.uses_string_equal)
+fn LinkedCPrelude(&body: LinkedNullState, guards: str, clone: str): str {
+    text = ProjectionHeaders(true, body.drops.contains("ku_projection_string_drop") || body.owning_strings) + guards
     if (body.arrays.len() > 0 || body.uses_str_array || body.uses_str_view || body.uses_print) {
         text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
     }
     if (body.uses_clone) {
-        text += "#include <stdio.h>\n#include <string.h>\n\n" + EmitTryCloneString("ku_linked_clone_string")
+        text += "#include <stdio.h>\n#include <string.h>\n\n" + clone
     }
     return text
 }

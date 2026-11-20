@@ -1,11 +1,12 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
+import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { ContainsIndex, ContainsType, CTypeName, EmitLayout } from "./struct_projection_c.ku"
 import { BuildProjectOwningLayouts, EmitOwningLayoutDefinitions, OrderProjectOwningLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { EmitLinkedStringArrayPrelude, EmitOwnedStructArrayDrop, EmitOwnedStructOperations, EmitStructArrayHeader, EmitStructArrayReadValidation,
-         EmitStructArrayResultHeader, EmitStructArrayDropUsing, EmitOwnedStructArrayAppend, StructArrayStatuses } from "./struct_array_c.ku"
+         EmitStructArrayResultHeader, EmitStructArrayDropUsing, EmitTryCloneString, EmitOwnedStructArrayAppend, StructArrayStatuses } from "./struct_array_c.ku"
 import { LinkedCPrelude, LinkedNullBinding, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { EmitProjectionStringJoinHelpers, EmitScalarStringPair } from "./scalar_int_emit.ku"
@@ -314,7 +315,10 @@ fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpressio
 fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding): str! {
     // Keep the external prototypes independent of the selected entry's C
     // name. The linker consumes declarations resolved from the source graph.
-    text = LinkedCPrelude(body)
+    guards = GuardArithmetic(body.uses_add, body.uses_sub) + GuardStringEquality(body.uses_string_equal)
+    clone = ""
+    if (body.uses_clone) { clone = EmitTryCloneString("ku_linked_clone_string") }
+    text = LinkedCPrelude(body, guards, clone)
     if (body.uses_concat) { text += EmitProjectionStringJoinHelpers() }
     definitions = EmitOwningLayoutDefinitions(body.owning_layouts, 0, 0)?
     text += definitions.source
