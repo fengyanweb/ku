@@ -6,7 +6,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { CStructOrder, OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
-import { EmitStructArrayOperations, EmitStructArrayResultHeader } from "./struct_array_c.ku"
+import { EmitStructArrayOperations, EmitStructArrayResultHeader, EmitTryCloneString } from "./struct_array_c.ku"
 import { GuardArithmetic, GuardArrayErrorC, GuardOwnedDrops, GuardStringArrayCloneC, GuardStringArrayEqualC, GuardStringEquality } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors, ManagedSourceCharactersRuntime } from "./guarded_string_parts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType } from "./guarded_struct_expr.ku"
@@ -181,6 +181,10 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     root.source_strings = signature.source_strings
     leaves = OwnedScalarLeaves { bindings: [], declarations: "", plan: [] }
     if (checked) { leaves = ReadOwnedScalarLeaves(named, types, layouts, function, true)? }
+    clones = false
+    for dependency in leaves.bindings.clone() {
+        if (dependency.result_kind == "bool") { clones = true }
+    }
     root.leaves = leaves.bindings
     body = managedBody(named, types, imports, supplied, layouts, root, signature.bindings.clone(),
         signature.body_start, function.first_edge + function.edge_count, checked)?
@@ -194,6 +198,7 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
         text += ManagedSourceCharactersRuntime() + GuardStringArrayCloneC()
         if (body.code.uses_eq) { text += GuardStringArrayEqualC() }
     }
+    if (clones) { text += EmitTryCloneString("ku_result_clone_string") }
     text += signature.layouts.text + root.array.source
     result_type = root.array.array_type.clone()
     if (checked) {
@@ -209,11 +214,13 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
         if (body.code.uses_eq) { text += "    (void)ku_guard_string_array_equal;\n" }
     }
     if (arithmetic) { text += "    bool overflow = false;\n" }
+    if (clones) { text += "    bool out_of_memory = false;\n    (void)ku_result_clone_string;\n" }
     if (body.error_exits != "") { text += "    int record_error = 0;\n" }
     text += signature.unused + body.declarations + body.code.text
     text += "cleanup:\n" + body.drops + signature.drops
     if (signature.source_strings) { text += ManagedSourceCharactersErrors() + GuardArrayErrorC() }
     if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (clones) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     text += managedArrayErrors() + body.error_exits + "    return result;\n}\n"
     plan = managedPlan(layouts, signature, result.layout, result_type, symbol.clone(), function_id, checked)
     return ok(ManagedArrayC { symbol: symbol, source: text, entry_plan: plan, link_plan: leaves.plan })

@@ -4,9 +4,9 @@ import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression, GuardLeaf } from "./guarded_struct_expr.ku"
 import { GuardParameterType } from "./guarded_struct_c.ku"
-import { ManagedDeferredMessageCalls } from "./guarded_string_parts.ku"
+import { ManagedDeferredMessageCalls, ManagedPredicateCall } from "./guarded_string_parts.ku"
 import { AddGuardCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
-import { ContainsIndex } from "./struct_projection_c.ku"
+import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 import { ScalarSymbol } from "./scalar_int_emit.ku"
 
@@ -141,20 +141,20 @@ fn ownedScalarLeafId(&named: NamedModule, &call: Node): int {
 }
 
 fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layouts: [StructLayout],
-                         &function: Node, message_only: bool): OwnedScalarLeaves! {
+                         &function: Node, managed: bool): OwnedScalarLeaves! {
     output = OwnedScalarLeaves { bindings: [], declarations: "", plan: [] }
     calls: [int] = []
-    if (message_only) {
+    if (managed) {
         calls = ManagedDeferredMessageCalls(named.parsed.arena.nodes, named.parsed.arena.edges, function)
-        if (calls.len() == 0) { return ok(output) }
     }
     emitted: [int] = []
     index = 0
     while (index < named.parsed.arena.nodes.len()) {
         index = index + 1
-        if (message_only && !ContainsIndex(calls, index)) { continue }
         call = named.parsed.arena.nodes[index - 1].clone()
         if (call.offset < function.offset || call.end_offset > function.end_offset) { continue }
+        message = managed && ContainsIndex(calls, index)
+        if (managed && !message && !ManagedPredicateCall(named.parsed.arena.nodes, named.parsed.arena.edges, call)) { continue }
         id = ownedScalarLeafId(named, call)
         if (id == 0 || ContainsIndex(emitted, id)) { continue }
         leaf = named.parsed.arena.nodes[id - 1].clone()
@@ -164,7 +164,7 @@ fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layout
         if (named.parsed.arena.nodes[result - 1].kind != "TypeName") { continue }
         selected = ExplicitType(types, result, DeclarationSpan(named.parsed.arena.nodes[result - 1]))?
         string_result = selected.name == "str"
-        if (message_only && !string_result) { continue }
+        if (managed && (message != string_result || (!message && selected.name != "bool"))) { continue }
         if (selected.declaration_kind != "Builtin" || (!string_result && selected.name != "int" && selected.name != "bool")) { continue }
         view_predicate = false
         owned_string = false
@@ -195,6 +195,7 @@ fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layout
             kinds = kinds.push(input.kind)
             cursor = cursor + 1
         }
+        if (managed && !message && !owned_string) { continue }
         if (cursor != position || (!owned_string && !string_result && (!view_predicate || selected.name != "bool"))) { continue }
         symbol = "ku_guarded_" + str(id)
         if (owned_string || string_result) {
@@ -239,13 +240,6 @@ fn checkNullResultCallee(&nodes: [Node], &edges: [int], &types: [TypeNameBinding
         RejectLayout("unsupported_struct_result_link", "checked dependency must return null!", bound.span)?
     }
     return ok(null)
-}
-
-fn explicitCloneSource(&nodes: [Node], &edges: [int], &argument: Node): int {
-    if (argument.kind != "Call" || argument.edge_count != 1) { return 0 }
-    method = nodes[edges[argument.first_edge] - 1].clone()
-    if (method.kind != "Field" || method.text != "clone" || method.edge_count != 1) { return 0 }
-    return edges[method.first_edge]
 }
 
 fn ResultLinkClonePrefix(layout: int): str {
@@ -300,7 +294,7 @@ fn LowerStructResultLink(&named: NamedModule, &types: [TypeNameBinding], &layout
         arg = named.parsed.arena.nodes[arg_id - 1].clone()
         subject = 0
         if (ty.kind == "struct") {
-            subject = explicitCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, arg)
+            subject = ProjectionCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, arg_id)
         }
         value_id = arg_id
         if (subject != 0) { value_id = subject }

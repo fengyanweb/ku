@@ -139,6 +139,12 @@ fn ManagedDeferredMessageCalls(&nodes: [Node], &edges: [int], &function: Node): 
     return calls
 }
 
+fn ManagedPredicateCall(&nodes: [Node], &edges: [int], &call: Node): bool {
+    if (call.kind != "Call" || call.edge_count != 2) { return false }
+    source = ProjectionCloneSource(nodes, edges, edges[call.first_edge + 1])
+    return source != 0 && nodes[source - 1].kind == "Variable"
+}
+
 fn LowerManagedRecordError(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
                            &leaves: [GuardLeaf], &literal: Node, id: int, &indent: str): ManagedErrorEmission! {
     if (literal.kind != "ObjectLiteral" || literal.edge_count != 3) {

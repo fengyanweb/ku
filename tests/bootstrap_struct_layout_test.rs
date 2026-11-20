@@ -1613,6 +1613,22 @@ fn DescribeLocal(source: str): [SourceLength]! {
     count = characters.len()
     fail { domain: "test", code: "count", message: Describe("size=", count) }
 }
+fn Allows(value: str): bool {
+    return value != "" && "az_".contains(value)
+}
+fn TestLocal(source: str): [SourceLength]! {
+    entries: [SourceLength] = []
+    characters: [str] = source.chars()
+    if (characters.len() > 0) {
+        ch = characters[0].clone()
+        if (Allows(ch.clone())) {
+            width = ch.byte_len()
+            item = SourceLength { value: width }
+            entries = entries.push(item)
+        }
+    }
+    return ok(entries)
+}
 "#,
     )
     .unwrap();
@@ -1687,6 +1703,28 @@ fn DescribeLocal(source: str): [SourceLength]! {
     assert_eq!(
         dependencies.matches(r#""source_name":"Describe"#).count(),
         1
+    );
+
+    fs::write(cwd.join("function.txt"), "TestLocal").unwrap();
+    fs::write(cwd.join("mode.txt"), "managed").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let body = text.split_once("(KuProjectionString a0) {").unwrap().1;
+    let clone = body.find("if (!ku_result_clone_string(l").unwrap();
+    let predicate = body.find(" = ku_bool_").unwrap();
+    assert!(clone < predicate && body[predicate..].contains(".len"));
+    let cleanup = body.split_once("cleanup:\n").unwrap().1;
+    assert!(cleanup.contains("ku_projection_string_drop(&l"));
+    assert!(cleanup.contains("if (out_of_memory)"));
+    fs::write(cwd.join("mode.txt"), "managed-plan").unwrap();
+    let plan = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plan);
+    let plan = String::from_utf8(plan.stdout).unwrap();
+    let dependency = plan.split_once(r#""dependencies":["#).unwrap().1;
+    assert!(dependency.contains(r#""source_name":"Allows","symbol":"ku_bool_"#));
+    assert!(
+        dependency.contains(r#""source_name":"bool","source_path":null,"node":0,"c_type":"bool"#)
     );
 }
 

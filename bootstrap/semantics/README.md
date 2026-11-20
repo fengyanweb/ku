@@ -351,6 +351,9 @@ replace a live string after the checked clone succeeds. Each loop iteration
 releases its local string owners before advancing to the next iteration.
 Comparisons of an indexed clone with a literal use the same bound check and
 release the cloned character before returning the comparison result.
+An explicit clone of a bound local string can also feed a typed same-module
+Boolean predicate. The callee consumes the clone. The original local string
+remains available in its current scope.
 
 `linked-str` also emits functions such as `TokenCanonical` that consume an
 owned struct. A string field may move into the expression once. A named
