@@ -3704,4 +3704,117 @@ fn main(): null! {
             .replace("\r\n", "\n"),
         "ok\nread:negative:denied🙂\n"
     );
+
+    fs::write(
+        cwd.join("reader.ku"),
+        r#"fn Read(&paths: [str], &prefix: str): null! {
+    copied = paths[0].clone()
+    local = prefix.clone()
+    return ok(null)
+}
+fn MoveAfter(&loan: str, owner: str): null! { return ok(null) }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("view.ku"),
+        r#"import { Read as Load, MoveAfter } from "./reader.ku"
+fn Inspect(&paths: [str], prefix: str): null! {
+    Load(paths, prefix)?
+    Load(paths, prefix)?
+    full = prefix.clone()
+    fail { domain: "loan", code: "checked", message: full }
+}
+fn Invalid(owner: str): null! {
+    MoveAfter(owner, owner)?
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let reader = emit("reader.ku\nview.ku\n", "Read", "linked-null");
+    let view = emit("view.ku\nreader.ku\n", "Inspect", "linked-null");
+    assert!(view.2.contains("const KuGuardStringArray*"));
+    assert!(view.2.contains("const KuProjectionString*"));
+    let Some(Value::Result { ok: true, value }) =
+        json::eval("decode", &[Value::String(view.2)], Span::default()).unwrap()
+    else {
+        panic!("expected checked View metadata")
+    };
+    let Value::Object(plan) = *value else {
+        panic!("expected View plan")
+    };
+    let Value::Object(export) = &plan["export"] else {
+        panic!("expected View export")
+    };
+    let Value::Int(node) = export["node"] else {
+        panic!("expected View node")
+    };
+    let Value::String(symbol) = &export["symbol"] else {
+        panic!("expected View symbol")
+    };
+    let host = cwd.join("loan.c");
+    fs::write(
+        &host,
+        r#"#include <assert.h>
+int main(int argc, char **argv) {
+    (void)argv;
+    uint8_t original[] = "name";
+    KuProjectionString item = { original, 4, 0, KU_PROJECTION_STRING_STATIC };
+    KuGuardStringArray array = {1, &item, 1};
+    if (argc > 1) array = (KuGuardStringArray){0};
+    uint8_t *prefix = malloc(6);
+    assert(prefix);
+    memcpy(prefix, "prefix", 6);
+    KuBootstrapResultNull result = __ENTRY__(&array, (KuProjectionString){ prefix, 6, 6, KU_PROJECTION_STRING_OWNED });
+    assert(!result.ok && result.error.message.len == 6 && memcmp(result.error.message.ptr, "prefix", 6) == 0);
+    assert(array.data == &item && item.ptr == original && memcmp(item.ptr, "name", 4) == 0);
+    ku_projection_string_drop(&result.error.message);
+    return 0;
+}
+"#
+        .replace("__ENTRY__", symbol),
+    )
+    .unwrap();
+    let executable = cwd.join(format!("array-view{suffix}"));
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/tools/link_c.py");
+    let cc = std::env::var("CC").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "clang".into()
+        } else {
+            "cc".into()
+        }
+    });
+    let link = execute(
+        Command::new(python)
+            .arg("-B")
+            .arg(script)
+            .arg("--cc")
+            .arg(cc)
+            .arg("--unit")
+            .args([reader.0, reader.1])
+            .arg("--unit")
+            .args([view.0, view.1])
+            .args(["--entry", "view.ku", &node.to_string(), "--caller"])
+            .arg(host)
+            .arg("-o")
+            .arg(&executable),
+        &cwd,
+        150,
+    );
+    assert_ok(&link);
+
+    fs::write(cwd.join("function.txt"), "Invalid").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let mixed_modes = execute(&mut Command::new(compiler), &cwd, 30);
+    assert_eq!(mixed_modes.status.code(), Some(1));
+    assert!(mixed_modes.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&mixed_modes.stderr).contains("linked_view_move"));
+    for name in ["reader.ku", "view.ku", "modules.txt"] {
+        fs::remove_file(cwd.join(name)).unwrap();
+    }
+    assert_ok(&execute(&mut Command::new(&executable), &cwd, 15));
+    let bounds = execute(Command::new(executable).arg("empty"), &cwd, 15);
+    assert_eq!(bounds.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bounds.stderr).contains("index 0 out of bounds for length 0"));
 }

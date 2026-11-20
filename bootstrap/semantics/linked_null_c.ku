@@ -5,9 +5,9 @@ import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { ContainsType } from "./struct_projection_c.ku"
-import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
 import { LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry, LinkedNullFunction, LinkedNullNode,
-         LinkedNullOwner, LinkedNullParameterType, LinkedNullProject, LinkedNullType } from "./linked_null_types_c.ku"
+         LinkedNullOwner, LinkedNullParameterPlan, LinkedNullParameterType, LinkedNullProject, LinkedNullType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, EmitLinkedNullSource, LinkedNullBinding, LinkedNullState, LowerLinkedNullRead,
          MoveLinkedNullSlot, NewLinkedNullState } from "./linked_null_read_c.ku"
 import { LowerLinkedNullTry, LowerLinkedNullValue } from "./linked_null_values_c.ku"
@@ -39,13 +39,16 @@ fn readParameters(&project: LinkedNullProject, &function: Node): LinkedNullParam
             RejectLayout("linked_entry_parameter", "expected distinct explicitly typed parameters", DeclarationSpan(node))?
         }
         view = node.int_value == 1
-        ty = LinkedNullParameterType(project, LinkedNullChild(project, 1, node, 0), view)?
+        ty = LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, node, 0), view)?
         name = "a" + str(index)
         if (index != 0) { signature += ", " }
         c_type = LinkedNullCType(ty)?
         signature += c_type.clone() + " " + name.clone()
-        plan = plan.push(BoundLinkPlanType(ty, 1, c_type, view))
-        if (view) {
+        plan = plan.push(LinkedNullParameterPlan(ty, 1)?)
+        if (ty.declaration_kind == "StringView") {
+            validation += "    if (!" + name.clone() + " || (" + name.clone() + "->len && !" + name.clone()
+                + "->ptr)) { invalid_str = true; goto cleanup; }\n"
+        } else if (view) {
             validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(" + name.clone() + ") || (uintmax_t)"
                 + name.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
         }

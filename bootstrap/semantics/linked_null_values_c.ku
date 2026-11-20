@@ -4,9 +4,9 @@ import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
-import { LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullFunction, LinkedNullLiteralType,
-         LinkedNullNode, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullProject, LinkedNullResultType, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullExpression, LinkedNullState, LowerLinkedNullLeaf,
+import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullFunction, LinkedNullLiteralType,
+         LinkedNullNode, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
+import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullExpression, LinkedNullState, LinkedNullValue, LowerLinkedNullLeaf,
          LowerLinkedNullRead, MoveLinkedNullSlot, ReadLinkedNullBinding } from "./linked_null_read_c.ku"
 
 struct LinkedNullArguments {
@@ -23,11 +23,24 @@ fn rememberLinkedCall(calls: [LinkedNullFunction], dependency: LinkedNullFunctio
     return result.push(dependency)
 }
 
+fn cloneLinkedString(&project: LinkedNullProject, source: LinkedNullExpression, id: int): LinkedNullExpression! {
+    ty = source.value.ty.clone()
+    output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
+    output.state.code = output.state.code + "    if (!ku_linked_clone_string(" + source.value.text + ", &" + output.value.text.clone()
+        + ")) { out_of_memory = true; goto cleanup; }\n"
+    output.state.uses_clone = true
+    output.state.slots[output.value.slot - 1].live = true
+    return ok(output)
+}
+
 fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int, depth: int): LinkedNullExpression! {
     subject_id = LinkedNullChild(project, 1, target, 0)
     subject = LinkedNullNode(project, 1, subject_id)
     if (subject.kind == "Index") {
         source = LowerLinkedNullRead(project, state, subject_id, depth + 1)?
+        if (source.value.ty.declaration_kind == "Builtin" && source.value.ty.name == "str") {
+            return cloneLinkedString(project, source, id)
+        }
         ty = source.value.ty.clone()
         layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
         output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
@@ -50,13 +63,7 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     if (source.value.ty.declaration_kind != "Builtin" || source.value.ty.name != "str") {
         RejectLayout("unsupported_linked_clone", "only str.clone is in this checked subset", DeclarationSpan(subject))?
     }
-    ty = source.value.ty.clone()
-    output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
-    output.state.code = output.state.code + "    if (!ku_linked_clone_string(" + source.value.text + ", &" + output.value.text.clone()
-        + ")) { out_of_memory = true; goto cleanup; }\n"
-    output.state.uses_clone = true
-    output.state.slots[output.value.slot - 1].live = true
-    return ok(output)
+    return cloneLinkedString(project, source, id)
 }
 
 fn resolveLinkedCall(&project: LinkedNullProject, &state: LinkedNullState, &call: Node, &target: Node, checked: bool): LinkedNullFunction! {
@@ -70,15 +77,38 @@ fn resolveLinkedCall(&project: LinkedNullProject, &state: LinkedNullState, &call
     return ok(callee)
 }
 
+fn linkedViewArgument(&parameter: TypeNameBinding, &value: LinkedNullValue): str! {
+    if (parameter.declaration_kind == "StringView" && value.ty.declaration_kind == "Builtin" && value.ty.name == "str"
+        && (!value.borrowed || value.slot > 0)) {
+        return ok("&(" + value.text.clone() + ")")
+    }
+    if (SameLinkedType(parameter, value.ty)) { return ok(value.text.clone()) }
+    if (parameter.declaration_kind == "StructArray" && LinkedNullOwnedArray(value.ty)
+        && SameLinkedType(LinkedNullArrayElement(parameter.clone()), LinkedNullArrayElement(value.ty.clone()))) {
+        return ok("&(" + value.text.clone() + ")")
+    }
+    RejectLayout("linked_argument_type", "expected a matching stable source for the View argument", value.ty.span.clone())?
+    return ok("")
+}
+
 fn lowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &callee: LinkedNullFunction,
                          id: int, depth: int): LinkedNullArguments! {
     next = state
     next.links = rememberLinkedCall(next.links, callee.clone())
     args = ""
     handoff = ""
+    loans: [int] = []
     index = 0
     while (index < callee.parameters.len()) {
         argument = LowerLinkedNullValue(project, next.clone(), LinkedNullChild(project, 1, call, index + 1), depth + 1)?
+        if (args != "") { args += ", " }
+        if (LinkedNullView(callee.parameters[index])) {
+            args += linkedViewArgument(callee.parameters[index], argument.value)?
+            if (argument.value.slot > 0) { loans = loans.push(argument.value.slot) }
+            next = argument.state
+            index = index + 1
+            continue
+        }
         if (!SameLinkedType(callee.parameters[index], argument.value.ty)) {
             RejectLayout("linked_argument_type", "argument type differs from the bound function parameter", argument.value.ty.span.clone())?
         }
@@ -88,12 +118,18 @@ fn lowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
         pending = AddLinkedNullSlot(project, argument.state, "", "p" + str(id) + "_" + str(index), ty, false)?
         pending.state.code = pending.state.code + "    " + pending.value.text.clone() + " = " + argument.value.text.clone() + ";\n"
         next = MoveLinkedNullSlot(pending.state, argument.value)?
-        if (args != "") { args += ", " }
         args += pending.value.text.clone()
         if (LinkedNullOwner(pending.value.ty)) {
             handoff += "    " + pending.value.text + " = (" + LinkedNullCType(pending.value.ty)? + "){0};\n"
         }
         index = index + 1
+    }
+    // Evaluating a later argument may move an earlier lent binding. The
+    // final direct call cannot outlive a moved source, including nested calls.
+    for loan in loans {
+        if (!next.slots[loan - 1].live) {
+            RejectLayout("linked_view_move", "a later argument consumes an earlier View source", DeclarationSpan(call))?
+        }
     }
     return ok(LinkedNullArguments { state: next, args: args, handoff: handoff })
 }

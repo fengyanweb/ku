@@ -292,6 +292,10 @@ from the project manifest. `linked-null` emits an original `null!` function
 such as `RejectAt`. It evaluates bound call arguments in source order and
 transfers their owners to the declared C dependency. A returned Error owns
 its domain, code and message.
+Borrowed `&[str]` and `&str` parameters pass through const pointers. The
+callee checks the array header and index before reading an element. The
+original binding remains valid after the call, and a later argument cannot
+consume the source of an earlier loan.
 
 `managed` emits constructors returning an owned struct array or a Result
 of that array. In the Result form, the selected function can return

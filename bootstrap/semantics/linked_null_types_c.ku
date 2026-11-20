@@ -7,7 +7,7 @@ import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { CTypeName } from "./struct_projection_c.ku"
 import { OrderCStructLayouts } from "./nested_struct_c.ku"
-import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -62,27 +62,39 @@ fn LinkedNullLiteralType(&project: LinkedNullProject, unit: int, &literal: Node,
     return ok(absoluteType(binding, unit))
 }
 
-fn LinkedNullParameterType(&project: LinkedNullProject, id: int, view: bool): TypeNameBinding! {
-    if (!view) { return LinkedNullType(project, 1, id) }
-    node = LinkedNullNode(project, 1, id)
-    if (node.kind != "TypeArray" || node.edge_count != 1) {
-        RejectLayout("linked_entry_view", "expected a readonly array of bound structs", DeclarationSpan(node))?
+fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view: bool): TypeNameBinding! {
+    if (!view) { return LinkedNullType(project, unit, id) }
+    node = LinkedNullNode(project, unit, id)
+    if (node.kind == "TypeArray" && node.edge_count == 1) {
+        ty = LinkedNullType(project, unit, LinkedNullChild(project, unit, node, 0))?
+        if (ty.declaration_kind == "Struct") {
+            ty.declaration_kind = "StructArray"
+            return ok(ty)
+        }
+        if (ty.declaration_kind == "Builtin" && ty.name == "str") {
+            ty.declaration_kind = "BuiltinArray"
+            return ok(ty)
+        }
+    } else if (node.kind == "TypeName") {
+        ty = LinkedNullType(project, unit, id)?
+        if (ty.declaration_kind == "Builtin" && ty.name == "str") {
+            ty.declaration_kind = "StringView"
+            return ok(ty)
+        }
     }
-    ty = LinkedNullType(project, 1, LinkedNullChild(project, 1, node, 0))?
-    if (ty.declaration_kind != "Struct") {
-        RejectLayout("linked_entry_view", "expected a readonly array of bound structs", ty.span.clone())?
-    }
-    ty.declaration_kind = "StructArray"
-    return ok(ty)
+    RejectLayout("linked_entry_view", "expected a borrowed str or readonly array of strings or bound structs", DeclarationSpan(node))?
+    return ok(LinkedBuiltin("", DeclarationSpan(node)))
 }
 
 fn LinkedNullArrayElement(binding: TypeNameBinding): TypeNameBinding {
     result = binding
-    result.declaration_kind = "Struct"
+    if (result.declaration_kind == "BuiltinArray") { result.declaration_kind = "Builtin" }
+    else { result.declaration_kind = "Struct" }
     return result
 }
 
 fn LinkedNullArrayPrefix(&binding: TypeNameBinding): str {
+    if (binding.declaration_kind == "BuiltinArray") { return "ku_linked_view_str_array" }
     return "ku_linked_view_" + CTypeName(binding.module_index, binding.declaration_node)
 }
 
@@ -99,6 +111,8 @@ fn LinkedNullOwnedArray(&binding: TypeNameBinding): bool {
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
+    if (binding.declaration_kind == "BuiltinArray") { return ok("const KuGuardStringArray*") }
+    if (binding.declaration_kind == "StringView") { return ok("const KuProjectionString*") }
     if (binding.declaration_kind == "Struct") { return ok(CTypeName(binding.module_index, binding.declaration_node)) }
     if (binding.declaration_kind == "StructArray") {
         return ok("const " + LinkedNullArrayType(binding) + "*")
@@ -114,7 +128,20 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
 }
 
 fn LinkedNullOwner(&binding: TypeNameBinding): bool {
-    return binding.declaration_kind == "Struct" || binding.name == "str" || LinkedNullOwnedArray(binding)
+    return binding.declaration_kind == "Struct" || (binding.declaration_kind == "Builtin" && binding.name == "str")
+        || LinkedNullOwnedArray(binding)
+}
+
+fn LinkedNullView(&binding: TypeNameBinding): bool {
+    return binding.declaration_kind == "StructArray" || binding.declaration_kind == "BuiltinArray" || binding.declaration_kind == "StringView"
+}
+
+fn LinkedNullParameterPlan(&binding: TypeNameBinding, unit: int): LinkPlanType! {
+    if (binding.declaration_kind == "BuiltinArray") { return ok(StrArrayViewLinkPlanType()) }
+    if (binding.declaration_kind == "StringView") {
+        return ok(BuiltinLinkPlanType("str", LinkedNullCType(binding)?, true))
+    }
+    return ok(BoundLinkPlanType(binding, unit, LinkedNullCType(binding)?, LinkedNullView(binding)))
 }
 
 fn LinkedNullLayout(&project: LinkedNullProject, &ty: TypeNameBinding, layouts: [StructLayout], depth: int): [StructLayout]! {
@@ -200,10 +227,10 @@ fn LinkedNullDependency(&project: LinkedNullProject, from_unit: int, &target: No
     while (index < callee.edge_count) {
         node = LinkedNullNode(project, unit, LinkedNullChild(project, unit, callee, index))
         if (node.kind != "Parameter") { break }
-        if (node.edge_count != 1 || node.int_value != 0) {
-            RejectLayout("linked_parameter_mode", "direct dependencies require explicit by-value parameters", DeclarationSpan(node))?
+        if (node.edge_count != 1 || node.int_value < 0 || node.int_value > 1) {
+            RejectLayout("linked_parameter_mode", "direct dependencies require explicit value or View parameters", DeclarationSpan(node))?
         }
-        parameters = parameters.push(LinkedNullType(project, unit, LinkedNullChild(project, unit, node, 0))?)
+        parameters = parameters.push(LinkedNullParameterType(project, unit, LinkedNullChild(project, unit, node, 0), node.int_value == 1)?)
         index = index + 1
     }
     if (index >= callee.edge_count) {
@@ -240,7 +267,7 @@ fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
     index = 0
     while (index < callee.parameters.len()) {
         ty = callee.parameters[index].clone()
-        parameters = parameters.push(BoundLinkPlanType(ty, callee.unit, LinkedNullCType(ty)?, false))
+        parameters = parameters.push(LinkedNullParameterPlan(ty, callee.unit)?)
         index = index + 1
     }
     result = BoundLinkPlanType(callee.result, callee.unit, LinkedNullResultType(callee)?, false)
