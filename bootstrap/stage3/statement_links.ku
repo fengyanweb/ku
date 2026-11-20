@@ -1,9 +1,10 @@
 import { Token } from "../stage1/token.ku"
 import { Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
-import { RejectAt, WindowToken } from "./support.ku"
+import { RejectAt, WindowKind, WindowToken } from "./support.ku"
 import { ControlFrame, RejectFinally, StatementLink, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength,
-         RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectNestedRoot } from "./body_support.ku"
+         RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectNestedRoot, ExpectTryToken, NextBodyWork,
+         ReadControlHeader, RejectControlBody } from "./body_support.ku"
 
 struct AppendedStatements {
     children: [int]
@@ -14,6 +15,33 @@ struct BodyAttachment {
     arena: Arena
     node_count: int
     root: int
+}
+
+struct ControlBodyStart {
+    binding: str
+    condition: int
+    body_open: int
+    work: int
+}
+
+fn ReadControlBodyStart(&tokens: [Token], &kind: str, start: int, last: int, token_base: int, work: int,
+                        parse_expression: fn(int, int): ParseOutput!,
+                        add_arena: fn(ParseOutput, Token, bool): int!): ControlBodyStart! {
+    if (kind == "Try") {
+        body_open = start + 1
+        ExpectTryToken(WindowToken(tokens, body_open, last), "LBrace", "expected '{' before try body")?
+        next_work = NextBodyWork(work, 1, WindowToken(tokens, start, last))?
+        return ok(ControlBodyStart { binding: "", condition: 0, body_open: body_open, work: next_work })
+    }
+    header = ReadControlHeader(tokens, start, last, work)?
+    origin = WindowToken(tokens, header.expression_start, last)
+    parsed = parse_expression(token_base + header.expression_start, token_base + header.expression_end)?
+    condition = add_arena(parsed, origin, false)?
+    if (WindowKind(tokens, header.body_open, last) != "LBrace") {
+        RejectControlBody(kind == "While", WindowToken(tokens, header.body_open, last))?
+    }
+    return ok(ControlBodyStart { binding: header.binding, condition: condition,
+                                 body_open: header.body_open, work: header.work })
 }
 
 // For a local signature only the synthetic root is skipped; the forest of
@@ -93,7 +121,7 @@ fn LocalFunctionNodeKind(&start_kind: str): str {
 }
 
 fn BuildControlStatement(&tokens: [Token], next: int, last: int, &frame: ControlFrame, value: int,
-                         children: [int], start: Token, &closing: Token,
+                         function_start: int, declared_type: int, children: [int], start: Token, &closing: Token,
                          add_node: fn(str, str, int, Span, [int], Token): int!): int! {
     end_span = SpanFromToken(closing.clone())
     statement_span = SpanMerge(SpanFromToken(start.clone()), end_span.clone())
@@ -101,15 +129,18 @@ fn BuildControlStatement(&tokens: [Token], next: int, last: int, &frame: Control
         return add_node(frame.kind.clone(), frame.binding.clone(), value, statement_span, children, start)
     }
 
-    // Only complete ordinary assignment RHS values use this path. A group,
+    // Only complete function initializers use this path. A group,
     // index or unary minus can otherwise look like a second statement.
     following = WindowToken(tokens, next, last)
     if (following.kind == "LParen" || following.kind == "LBracket" || following.kind == "Minus"
         || following.kind == "Dot" || following.kind == "Question") {
         RejectAt(following, "unsupported_expression", "stage-3 anonymous function assignments require a complete right-hand side")?
     }
-    opener = WindowToken(tokens, frame.start + 2, last)
+    opener = WindowToken(tokens, function_start, last)
     span = SpanMerge(SpanFromToken(opener.clone()), end_span)
     expression = add_node("FunctionExpr", "", 0, span, children, opener)?
+    if (declared_type != 0) {
+        return add_node("VarDecl", frame.binding.clone(), 0, statement_span, [declared_type, expression], start)
+    }
     return add_node("Assign", frame.binding.clone(), 0, statement_span, [expression], start)
 }

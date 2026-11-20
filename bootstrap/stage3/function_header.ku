@@ -16,6 +16,8 @@ struct FunctionHeader {
 struct LocalFunctionScope {
     children: [int]
     parent_statement_count: int
+    function_start: int
+    declared_type: int
 }
 
 struct LocalFunctionHeader {
@@ -198,10 +200,9 @@ fn PackFunctionHeader(arena: Arena, &children: [int], span: Span, origin: Token)
     return ok(ParseOutput { arena: Arena { nodes: nodes, edges: edges }, root: root })
 }
 
-fn ReadLocalFunctionHeader(&tokens: [Token], first: int, last: int, work: int,
-                           node_base: int, parent_statement_count: int, anonymous_assignment: bool): LocalFunctionHeader! {
-    header_start = first
-    if (anonymous_assignment) { header_start = first + 2 }
+fn ReadLocalFunctionHeader(&tokens: [Token], first: int, header_start: int, last: int, work: int,
+                           node_base: int, parent_statement_count: int, declared_type: int): LocalFunctionHeader! {
+    anonymous_assignment = first != header_start
     header = ReadFunctionHeaderMode(tokens, header_start, last, work, anonymous_assignment)?
     origin = WindowToken(tokens, header_start, last)
     span = SpanMerge(SpanFromToken(origin.clone()), SpanFromToken(WindowToken(tokens, header.body_open, last)))
@@ -212,7 +213,8 @@ fn ReadLocalFunctionHeader(&tokens: [Token], first: int, last: int, work: int,
         next = node_base + child
         relocated = relocated.push(next)
     }
-    scope = LocalFunctionScope { children: relocated, parent_statement_count: parent_statement_count }
+    scope = LocalFunctionScope { children: relocated, parent_statement_count: parent_statement_count,
+                                 function_start: header_start, declared_type: declared_type }
     name = header.name
     if (anonymous_assignment) {
         target = WindowToken(tokens, first, last)

@@ -27,6 +27,33 @@ const NATIVE_BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 const PROCESS_OUTPUT_LIMITS: OutputLimits = OutputLimits::new(1024 * 1024, 2 * 1024 * 1024);
 const FUNCTION_MODULE_TOKEN_LIMIT: usize = 3072;
 
+// The installed pattern-capture example uses both a borrowed parameter
+// with an explicit union result and a zero-argument Result callback.
+const TYPED_FUNCTION_CAPTURE_SOURCE: &str = r#"
+import { Node, Options } from "./types"
+fn Default(value: int): int { println(value) return value }
+fn Select(options: Options): fn(&Node): int | null {
+    criteria = options.criteria
+    {prefix, minimum = Default(70), missing: fallback = Default(2)} = criteria
+    read: fn(&Node): int | null = fn(&node: Node): int | null {
+        if (!node.text.starts_with(prefix)) { return null }
+        if (minimum == null) { return node.line + fallback }
+        return node.line + minimum
+    }
+    return read
+}
+fn Tail(): fn(): str! {
+    options = { prefix: "unused", label: "tail" + "🙂" }
+    {prefix, ...rest} = options
+    read: fn(): str! = fn(): str! {
+        label = rest["label"]?.as_str()?
+        return ok(prefix + ":" + label)
+    }
+    prefix = "rebound"
+    return read
+}
+"#;
+
 // Missing-token diagnostics must point at EOF, never replay the last consumed
 // keyword, alias, comma or opening delimiter.
 const EOF_NAME_DIAGNOSTICS: &[(&str, &str)] = &[
@@ -1565,6 +1592,8 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         include_str!("../bootstrap/stage1/main.ku"),
         include_str!("../bootstrap/stage2/main.ku"),
         include_str!("../bootstrap/tools/declarations/main.ku"),
+        TYPED_FUNCTION_CAPTURE_SOURCE,
+        "// 回调😀\r\nfn f() { if (ready) { read: fn(): int = fn(): int { return 7 }; print(read()) } next: int = 2 return next }",
         "fn Filter(rule: Rule) { {prefix, minimum=Fallback(2), missing: renamed, ...rest} = rule; read = fn(&node:Node): int { return minimum } return read }",
         "// 模式😀\r\nfn f(rule: Rule) { {\"前😀\": _, \"\", min: value = Fallback({first: [1, 2]}, [3, 4]), ..._, } = rule; return value }",
         "fn f() { {} = input; {...rest,} = input; {a,} = input }",
@@ -2486,6 +2515,49 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             ku_string(&rust_canonical(source))
         ));
     }
+    let malformed_callback =
+        "// 参数😀\r\nfn f() { read: fn(&Node): int = fn(&): int { return 7 } }";
+    body.push_str(&format!(
+        "    ExpectError({}, \"unexpected_token\", {})?\n",
+        ku_string(malformed_callback),
+        ku_string(&rust_error_canonical(malformed_callback)),
+    ));
+    let followed = "fn f() { read: fn(): int = fn(): int { return 7 }() }";
+    let follow_token = Lexer::new(followed)
+        .lex()
+        .unwrap()
+        .iter()
+        .rposition(|token| token.kind == TokenKind::LParen)
+        .unwrap();
+    body.push_str(&format!(
+        "    ExpectError({}, \"unsupported_expression\", {})?\n",
+        ku_string(followed),
+        ku_string(&diagnostic_at(
+            followed,
+            follow_token,
+            "stage-3 anonymous function assignments require a complete right-hand side"
+        )),
+    ));
+    let deep_initializer = format!(
+        "fn f() {{ {}{} }}",
+        "read: fn(): null = fn() { ".repeat(33),
+        "}".repeat(33)
+    );
+    let deepest = Lexer::new(&deep_initializer)
+        .lex()
+        .unwrap()
+        .iter()
+        .rposition(|token| matches!(&token.kind, TokenKind::Ident(name) if name == "read"))
+        .unwrap();
+    body.push_str(&format!(
+        "    ExpectError({}, \"statement_depth_exceeded\", {})?\n",
+        ku_string(&deep_initializer),
+        ku_string(&diagnostic_at(
+            &deep_initializer,
+            deepest,
+            "stage-3 statement nesting exceeds 32 levels"
+        )),
+    ));
     body.push_str(&format!(
         "    large = ParseProgram({})?\n    if (large.root != 258 || large.arena.nodes.len() != 258 || large.arena.edges.len() != 257) {{ panic(\"stage-3 statement arena boundary mismatch\") }}\n",
         ku_string(&large_program)

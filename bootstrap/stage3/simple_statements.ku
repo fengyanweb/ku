@@ -11,6 +11,7 @@ struct SimpleStatementRead {
     node: int
     cursor: int
     work: int
+    initializer_type: int
 }
 
 // Read and append one non-control statement with the owner’s arena
@@ -100,6 +101,11 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
             RejectDeclarationInitializer(WindowToken(tokens, cursor, last_index))?
         }
         cursor = cursor + 1
+        if (WindowKind(tokens, cursor, last_index) == "Fn") {
+            // The body reader owns nested function frames. The declared
+            // type is already attached, and the cursor stays on the Fn.
+            return ok(SimpleStatementRead { node: 0, cursor: cursor, work: parse_steps, initializer_type: type_node })
+        }
         expression_end = ReadExpressionEnd(tokens, cursor, last_index, "value")?
         declaration_origin = WindowToken(tokens, cursor, last_index)
         declaration_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
@@ -152,7 +158,7 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         statement = add_node(kind, "", 0, span, children, statement_start.clone())?
     }
     if (WindowKind(tokens, cursor, last_index) == "Semicolon") { cursor = cursor + 1 }
-    return ok(SimpleStatementRead { node: statement, cursor: cursor, work: parse_steps })
+    return ok(SimpleStatementRead { node: statement, cursor: cursor, work: parse_steps, initializer_type: 0 })
 }
 
 fn expectPatternToken(&token: Token, kind: str, message: str): null! {
@@ -210,7 +216,7 @@ fn readObjectDestructureField(
         next = end
     }
     node = add_node("ObjectDestructureBinding", field.lexeme.clone(), 0, span, children, field)?
-    return ok(SimpleStatementRead { node: node, cursor: next, work: work })
+    return ok(SimpleStatementRead { node: node, cursor: next, work: work, initializer_type: 0 })
 }
 
 fn readObjectDestructure(
@@ -263,5 +269,5 @@ fn readObjectDestructure(
     children = children.push(rhs)
     span = SpanMerge(SpanFromToken(opener.clone()), read_span(rhs))
     node = add_node("ObjectDestructureAssign", "", fields.len(), span, children, opener)?
-    return ok(SimpleStatementRead { node: node, cursor: AfterOptionalSemicolon(tokens, end, last_index), work: work })
+    return ok(SimpleStatementRead { node: node, cursor: AfterOptionalSemicolon(tokens, end, last_index), work: work, initializer_type: 0 })
 }
