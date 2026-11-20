@@ -6554,6 +6554,10 @@ impl Checker {
                 }
             }
             conservative.complete = false;
+            let data_only_arguments = argument_types
+                .iter()
+                .zip(arguments)
+                .all(|(ty, provenance)| self.is_closed_capture_data(ty, provenance));
             for target in self
                 .function_body_outer_bindings
                 .get(&body_id)
@@ -6561,10 +6565,11 @@ impl Checker {
                 .flat_map(|bindings| bindings.values().copied())
             {
                 self.reject_http_shared_write(target, span)?;
-                if self
-                    .binding_by_id(target)
-                    .is_some_and(|binding| self.type_may_contain_function_value(&binding.ty))
-                {
+                if self.binding_by_id(target).is_some_and(|binding| {
+                    self.type_may_contain_function_value(&binding.ty)
+                        && !(data_only_arguments
+                            && self.is_immutable_callable_with_data_captures(binding))
+                }) {
                     let mut provenance = conservative.clone();
                     // Merely owning the target cell is not itself a write-back;
                     // remove that tautological edge so an opaque but harmless
@@ -6583,9 +6588,17 @@ impl Checker {
         for effect in summary.effects {
             self.reject_http_shared_write(effect.target, effect.assignment_span.unwrap_or(span))?;
             self.mark_http_callable_body_uncertain(effect.target);
-            environment_effect.merge(&effect.provenance);
-            let Some((target_name, target_type)) = self.binding_name_and_type_by_id(effect.target)
-            else {
+            let target = self.binding_name_and_type_by_id(effect.target);
+            // A typed data write cannot install a function in the captured
+            // environment. An unresolved value alone is not a reason to taint
+            // callable provenance when the destination cannot hold a callable.
+            if !target
+                .as_ref()
+                .is_some_and(|(_, ty)| self.is_closed_capture_data(ty, &effect.provenance))
+            {
+                environment_effect.merge(&effect.provenance);
+            }
+            let Some((target_name, target_type)) = target else {
                 continue;
             };
             if !self.type_may_contain_function_value(&target_type) {
@@ -6614,6 +6627,54 @@ impl Checker {
             }
         }
         Ok(())
+    }
+
+    fn is_immutable_callable_with_data_captures(&self, binding: &VarType) -> bool {
+        // An immutable function slot cannot be overwritten. Treating it as a
+        // proxy for an indirect write through its environment is necessary
+        // only if that environment might carry a callable. Keep the fallback
+        // for missing bindings, erased bodies and non-data captures.
+        !binding.mutable
+            && !binding.borrowed
+            && matches!(
+                &binding.ty,
+                Type::FunctionValue {
+                    body_id: Some(_),
+                    is_async: false,
+                    ..
+                }
+            )
+            && binding.closure_provenance.complete
+            && !binding.closure_provenance.http_callable_body_uncertain
+            && binding
+                .closure_provenance
+                .dependencies
+                .iter()
+                .all(|dependency| {
+                    self.binding_by_id(*dependency).is_some_and(|captured| {
+                        self.is_closed_capture_data(&captured.ty, &captured.closure_provenance)
+                    })
+                })
+    }
+
+    fn is_closed_capture_data(&self, ty: &Type, provenance: &ClosureProvenance) -> bool {
+        provenance.dependencies.is_empty()
+            && !provenance.http_callable_body_uncertain
+            && provenance.http_shared.is_empty()
+            && !self.type_graph_any(ty, |ty| {
+                matches!(
+                    ty,
+                    Type::FunctionValue { .. }
+                        | Type::Task(_)
+                        | Type::Native(_)
+                        | Type::Object(_)
+                        | Type::StringMap
+                        | Type::DynamicObject
+                        | Type::KuValue
+                        | Type::Generic(_)
+                        | Type::Unknown
+                )
+            })
     }
 
     fn apply_top_level_function_closure_effects(

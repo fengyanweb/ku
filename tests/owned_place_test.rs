@@ -1626,6 +1626,65 @@ fn main() {
 }
 
 #[test]
+fn calling_immutable_helpers_with_data_only_captures_does_not_create_a_cycle() {
+    checks(
+        "local-function-data-helpers-in-loop.ku",
+        r#"
+fn main() {
+    count = 0
+    fn Add(): null { count = count + 1 return null }
+    fn Record(): null { count = count + 1 return null }
+    fn Close(limit: int): null {
+        while (count < limit) { Add() Record() }
+        return null
+    }
+    Close(2)
+    println(count)
+}
+"#,
+    );
+
+    rejects(
+        "local-function-loop-can-write-a-captured-callable.ku",
+        r#"
+fn Noop(): null { return null }
+fn main() {
+    f: fn(): null = Noop
+    current: fn(): null = Noop
+    fn Store(): null { f = current.clone() return null }
+    fn Close(): null {
+        rounds = 1
+        while (rounds > 0) { Store() rounds = rounds - 1 }
+        return null
+    }
+    fn Read(): null { f() return null }
+    current = Read
+    Close()
+}
+"#,
+        "E0904 cannot create closure reference cycle",
+    );
+
+    rejects(
+        "local-function-loop-can-retain-a-callable-argument.ku",
+        r#"
+fn Noop(): null { return null }
+fn main() {
+    f: fn(): null = Noop
+    fn Store(value: fn(): null): null { f = value return null }
+    fn Close(value: fn(): null): null {
+        rounds = 1
+        while (rounds > 0) { Store(value.clone()) rounds = rounds - 1 }
+        return null
+    }
+    Close(() => { f() return null })
+}
+"#,
+        "E0904 cannot create closure reference cycle",
+    );
+}
+
+#[test]
 fn captured_setter_calls_cannot_install_a_back_referencing_closure() {
     rejects(
         "local-function-setter-cycle.ku",
