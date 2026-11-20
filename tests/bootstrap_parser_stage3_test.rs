@@ -294,12 +294,19 @@ fn push_node(
 }
 
 fn project_expr(source: &str, expr: &Expr, arena: &mut ProjectedArena) -> usize {
-    if let ExprKind::StructLiteral { name, fields } = &expr.kind {
+    let literal = match &expr.kind {
+        ExprKind::StructLiteral { name, fields } => {
+            Some(("StructLiteral", "StructLiteralField", name.as_str(), fields))
+        }
+        ExprKind::ObjectLiteral { fields } => {
+            Some(("ObjectLiteral", "ObjectLiteralField", "", fields))
+        }
+        _ => None,
+    };
+    if let Some((literal_kind, field_kind, literal_name, fields)) = literal {
         // The Rust AST keeps each value span and field name. Recover the name's
         // location from the original token stream before projecting the pair.
-        let tokens = Lexer::new(source)
-            .lex()
-            .expect("struct literal field tokens");
+        let tokens = Lexer::new(source).lex().expect("literal field tokens");
         let mut lower_bound = expr.span.start.offset;
         let mut children = Vec::with_capacity(fields.len());
         for (name, value) in fields {
@@ -308,16 +315,22 @@ fn project_expr(source: &str, expr: &Expr, arena: &mut ProjectedArena) -> usize 
                 .find(|pair| {
                     pair[0].span.start.offset >= lower_bound
                         && pair[1].span.end.offset <= value.span.start.offset
-                        && matches!(&pair[0].kind, TokenKind::Ident(field) if field == name)
+                        && match &pair[0].kind {
+                            TokenKind::Ident(field) => field == name,
+                            TokenKind::String(field) => {
+                                literal_kind == "ObjectLiteral" && field == name
+                            }
+                            _ => false,
+                        }
                         && pair[1].kind == TokenKind::Colon
                 })
-                .expect("struct literal field's token before its AST value")[0]
+                .expect("literal field's token before its AST value")[0]
                 .span
                 .start;
             let child = project_expr(source, value, arena);
             children.push(push_node(
                 arena,
-                "StructLiteralField",
+                field_kind,
                 name.clone(),
                 0,
                 Span::new(field_start, value.span.end),
@@ -327,8 +340,8 @@ fn project_expr(source: &str, expr: &Expr, arena: &mut ProjectedArena) -> usize 
         }
         return push_node(
             arena,
-            "StructLiteral",
-            name.clone(),
+            literal_kind,
+            literal_name.to_owned(),
             0,
             expr.span,
             &children,
@@ -1475,7 +1488,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         // the same leaves even without a target or in a nested function.
         "fn f() { break; continue }",
         "// 输出😀\r\nfn f() { print \"中😀\"; print((call(1, 2))) println(\"x\") }",
-        "fn f() { print 1 + 2 print({value: [1,2]}) println(g()) }",
+        "fn f() { print 1 + 2 print({value: [1,2], \"中😀\": 0}) println(g()) }",
         "fn f() { while (ready) { fn g() { break; continue } break; } }",
         "fn mixed() { while (ready) { for next in Source{elements: [1,2]}.elements { acc -= next acc *= 2 acc /= 3 } } }",
 
