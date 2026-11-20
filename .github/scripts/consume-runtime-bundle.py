@@ -987,8 +987,116 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                 write_report(report_path,report);cleanup.raise_if_any(primary)
 
 
+def installed_declaration_inventory_consumer(install, root, env, report, repo, commit, target):
+    """Build the commit's inventory tool and exercise both installed backend contracts."""
+    report['installed_declaration_inventory'] = detail = {'status': 'running', 'backends': {}}
+    directories = ('bootstrap/stage1', 'bootstrap/stage2', 'bootstrap/stage3',
+                   'bootstrap/tools/declarations')
+    project = root / 'declaration-project'
+    entry = project / 'bootstrap/tools/declarations/main.ku'
+    tree = invoke(['git', 'ls-tree', '-rz', commit, '--', *directories], repo, env)
+    if tree.returncode:
+        raise RuntimeError('cannot read the commit\'s declaration inventory source tree')
+    names, hashes = set(), []
+    total = 0
+    for record in tree.stdout.decode('utf-8').split('\0'):
+        if not record:
+            continue
+        description, name = record.split('\t', 1)
+        if not name.endswith('.ku'):
+            continue
+        mode, kind, oid = description.split(' ')
+        relative = EXPORT.checked_relative(name)
+        if (mode != '100644' or kind != 'blob' or relative.casefold() in names or
+                len(names) >= 64):
+            raise ValueError('invalid declaration inventory source: ' + relative)
+        names.add(relative.casefold())
+        blob = invoke(['git', 'cat-file', 'blob', oid], repo, env)
+        if blob.returncode:
+            raise RuntimeError('cannot copy committed declaration source: ' + relative)
+        data = EXPORT.canonical_example(blob.stdout)
+        total += len(data)
+        if total > 512 * 1024:
+            raise ValueError('declaration inventory source tree exceeds its fixture bound')
+        destination = project / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        hashes.append((relative, hashlib.sha256(data).hexdigest()))
+    if not entry.is_file() or not (entry.parent / 'collect.ku').is_file():
+        raise ValueError('the selected commit lacks the declaration inventory entry or helper')
+    detail.update(source_files=len(hashes),
+                  source_tree_sha256=hashlib.sha256(EXPORT.json_bytes(sorted(hashes))).hexdigest())
+
+    deployment = root / 'declaration-deployment'
+    deployment.mkdir()
+    ku = install / ('ku.exe' if os.name == 'nt' else 'ku')
+    programs = {}
+    for backend in ('c', 'runner'):
+        check = detail['backends'][backend] = {'status': 'building'}
+        name = 'declarations-' + backend + ('.exe' if os.name == 'nt' else '')
+        program = entry.parent / name
+        selection = ['--backend', 'runner'] if backend == 'runner' else []
+        built = invoke([ku, 'build', '--release', '--verbose', *selection, entry.name, '-o', program],
+                       entry.parent, env)
+        check['build_exit'] = built.returncode
+        if built.returncode:
+            raise RuntimeError('installed declaration inventory ' + backend + ' build failed: ' +
+                               (output(built) + built.stderr.decode('utf-8', errors='replace'))[-4096:])
+        assert_build_backend(built, backend, 'release')
+        if backend == 'c':
+            diagnostics = {}
+            record_native_build_diagnostics(diagnostics, built)
+            check['build_link_contract_passed'] = diagnostics['build_link_contract_passed']
+        check['binary_sha256'] = EXPORT.file_hash(program)
+        programs[backend] = deployment / name
+        relocate_checkout_entry(program, programs[backend])
+    input_source = (
+        'struct Decl { label: str }\n'
+        'fn KeepZeta(): int { return 42 }\n'
+        'fn Drop(): bool { return false }\n'
+        'fn KeepAlpha(): null! { return ok(null) }\n')
+    retired = root / 'installed-sdk-unavailable-for-declarations'
+    expected = '2:1 KeepZeta\n4:1 KeepAlpha\n'
+    policy = 'prefix.txt is empty while filtering line 1'
+    relocate_checkout_entry(install, retired)
+    try:
+        detail['sdk_unavailable_during_run'] = not install.exists()
+        for backend in ('runner', 'c'):
+            check = detail['backends'][backend]
+            # Runner embeds its entry but loads local imports from the original
+            # project. Native captures the module graph at build time.
+            inputs = entry.parent
+            if backend == 'c':
+                shutil.rmtree(project)
+                inputs = deployment
+            check['project_sources_unavailable'] = not project.exists()
+            (inputs / 'source.ku').write_text(input_source, encoding='utf-8')
+            prefix = inputs / 'prefix.txt'
+            run_env = env
+            if target == 'x86_64-pc-windows-gnu' and backend == 'c':
+                system_root = Path(os.environ['SystemRoot']).resolve()
+                run_env = dict(env, PATH=os.pathsep.join((str(system_root / 'System32'), str(system_root))))
+            prefix.write_text('Keep\n', encoding='utf-8')
+            success = invoke([programs[backend]], deployment, run_env, seconds=20)
+            check.update(success_exit=success.returncode, inventory=output(success))
+            if success.returncode or success.stderr or output(success) != expected:
+                raise RuntimeError('installed declaration inventory ' + backend + ' output differed: ' +
+                                   repr((output(success) + success.stderr.decode('utf-8', errors='replace'))[-1024:]))
+            prefix.write_text('\n', encoding='utf-8')
+            failure = invoke([programs[backend]], deployment, run_env, seconds=20)
+            diagnostic = failure.stderr.decode('utf-8', errors='replace')
+            check.update(error_exit=failure.returncode, error_stderr=diagnostic[-1024:])
+            if failure.returncode != 1 or failure.stdout or policy not in diagnostic:
+                raise RuntimeError('installed declaration inventory ' + backend + ' lost its policy error')
+            check['status'] = 'passed'
+    finally:
+        relocate_checkout_entry(retired, install)
+        detail['installation_restored'] = ku.is_file() and not retired.exists()
+    detail['status'] = 'passed'
+
+
 def run_structured_only(args, report):
-    """Check only the structured Task example from a verified installed archive."""
+    """Check the structured Task and declaration examples from a verified installed archive."""
     repo = args.repo.resolve()
     if repo != Path(__file__).resolve().parents[2]:
         raise ValueError('structured Task consumer requires its own checkout')
@@ -1029,6 +1137,7 @@ def run_structured_only(args, report):
             raise RuntimeError('both installed structured Task backends must pass')
         if any(native[key] != runner[key] for key in ('run_stdout', 'requests')):
             raise RuntimeError('installed structured Task backends disagreed on output or request order')
+        installed_declaration_inventory_consumer(install, root, env, report, repo, verifier, target)
     report.update(status='passed', backend_equivalence=True, owned_temp_removed=not root.exists())
 
 
