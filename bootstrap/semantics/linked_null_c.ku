@@ -329,6 +329,7 @@ fn emitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &pa
     if (body.uses_str_view) { text += "    bool invalid_str = false;\n" }
     if (body.uses_add || body.uses_sub) { text += "    bool overflow = false;\n" }
     if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
+    if (body.uses_concat) { text += "    const char* string_failure = NULL;\n" }
     text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
     if (body.uses_print) { text += "    if (output_failed) { fputs(\"output write failed\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (clone) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
@@ -345,6 +346,7 @@ fn emitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &pa
             + "        fputs(message, stderr); exit(EXIT_FAILURE);\n    }\n"
     }
     if (body.uses_str_view) { text += "    if (invalid_str) { fputs(\"invalid str view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_concat) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_add || body.uses_sub) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_index) {
         text += "    if (index_failed) { fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", "

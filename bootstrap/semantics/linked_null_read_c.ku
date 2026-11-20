@@ -8,6 +8,7 @@ import { BuildProjectOwningLayouts, EmitOwningLayoutDefinitions, OrderProjectOwn
 import { EmitOwnedStructArrayDrop, EmitOwnedStructOperations, EmitStructArrayHeader, EmitStructArrayReadValidation,
          EmitStructArrayResultHeader, EmitStructArrayDropUsing, EmitTryCloneString, EmitOwnedStructArrayAppend, StructArrayStatuses } from "./struct_array_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
+import { EmitScalarStringPair, ScalarStringJoinHelpers } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullDropC, LinkedNullFunction,
          LinkedNullLayout, LinkedNullNode, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullProject, EmitLinkedNullPrototypes, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
@@ -47,6 +48,7 @@ struct LinkedNullState {
     uses_sub: bool
     uses_string_equal: bool
     uses_print: bool
+    uses_concat: bool
 }
 
 struct LinkedNullExpression {
@@ -58,7 +60,7 @@ fn NewLinkedNullState(): LinkedNullState {
     return LinkedNullState { layouts: [], owning_layouts: [], owning_strings: false,
         slots: [], links: [], declarations: "", code: "", drops: "", uses_clone: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false,
-        element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false, uses_print: false }
+        element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false, uses_print: false, uses_concat: false }
 }
 
 fn LinkedNullBinding(&slots: [LinkedNullSlot], &name: str): int {
@@ -309,6 +311,13 @@ fn readLinkedBinary(&project: LinkedNullProject, state: LinkedNullState, &node: 
         if (op == "!=") { compare = "!" + compare }
         return ok(linkedValue(right.state, LinkedBuiltin("bool", DeclarationSpan(node)), compare))
     }
+    if (left.value.ty.name == "str" && op == "+") {
+        output = AddLinkedNullSlot(project, right.state, "", "t" + str(id), left.value.ty, false)?
+        output.state.uses_concat = true
+        output.state.code += EmitScalarStringPair(left.value.text, right.value.text, output.value.text)
+        output.state.slots[output.value.slot - 1].live = true
+        return ok(output)
+    }
     if (left.value.ty.name == "int" && (op == "+" || op == "-")) {
         operation = "sub"
         if (op == "+") { operation = "add" right.state.uses_add = true }
@@ -355,6 +364,10 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
     }
     if (body.uses_clone) {
         text += "#include <stdio.h>\n#include <string.h>\n\n" + EmitTryCloneString("ku_linked_clone_string")
+    }
+    if (body.uses_concat) {
+        text += "#include <stdio.h>\n#include <string.h>\n\n"
+            + "typedef KuProjectionString KuBootstrapString;\n" + ScalarStringJoinHelpers(false)
     }
     definitions = EmitOwningLayoutDefinitions(body.owning_layouts, 0, 0)?
     text += definitions.source

@@ -179,6 +179,21 @@ fn ScalarStringJoinHelpers(format: bool): str {
     return text + "    return NULL;\n}\n\n"
 }
 
+// A checked binary join reads both operands once, after Ku's ordered
+// lowering has evaluated them. Their source owners remain with the caller.
+fn EmitScalarStringPair(&left: str, &right: str, &result: str): str {
+    name = result.clone()
+    left_name = name.clone() + "_left"
+    right_name = name.clone() + "_right"
+    return "    const KuProjectionString " + left_name.clone() + " = " + left.clone() + ";\n"
+        + "    const KuProjectionString " + right_name.clone() + " = " + right.clone() + ";\n"
+        + "    const KuScalarStringPart " + name.clone() + "_parts[2] = {{ " + left_name.clone() + ".ptr, "
+        + left_name + ".len }, { " + right_name.clone() + ".ptr, " + right_name + ".len }};\n"
+        + "    ku_projection_string_drop(&" + name.clone() + ");\n"
+        + "    string_failure = ku_scalar_string_join(" + name.clone() + "_parts, 2u, &" + name + ");\n"
+        + "    if (string_failure) goto cleanup;\n"
+}
+
 struct ScalarStringAssignment {
     source: str
     uses_format: bool

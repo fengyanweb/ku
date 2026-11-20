@@ -69,6 +69,71 @@ int main(int argc, char **argv) {
 }
 "#;
 
+pub(super) fn assert_owned_binary_join(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("join.ku"),
+        "fn Join(&left: str, right: str): str! { return ok(left + \"/\" + right) }\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "join.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Join\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null\n").unwrap();
+    let output = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&output);
+    let program = String::from_utf8(output.stdout).unwrap();
+    let Some(entry) = program.lines().find_map(|line| {
+        line.strip_prefix("KuBootstrapResult_KuProjectionString ku_linked_null_")
+            .and_then(|declaration| declaration.split_once('('))
+            .map(|(node, _)| format!("ku_linked_null_{node}"))
+    }) else {
+        panic!("typed str! export missing");
+    };
+    let caller = r#"
+static void after_join_failure(void) {
+    if (outstanding() || attempts != 3) _Exit(82);
+}
+int main(int argc, char** argv) {
+    (void)test_realloc;
+    (void)argv;
+    const KuProjectionString left = {(uint8_t*)"\345\220\215", 3, 0, KU_PROJECTION_STRING_STATIC};
+    KuProjectionString right = {malloc(5), 5, 5, KU_PROJECTION_STRING_OWNED};
+    memcpy(right.ptr, "\000\360\237\231\202", 5);
+    if (argc == 2) {
+        assert(atexit(after_join_failure) == 0);
+        fail_after = 1;
+        (void)__ENTRY__(&left, right);
+        return 83;
+    }
+    KuBootstrapResult_KuProjectionString joined = __ENTRY__(&left, right);
+    assert(joined.ok && joined.value.len == 9);
+    assert(!memcmp(joined.value.ptr, "\345\220\215/\000\360\237\231\202", 9));
+    assert(left.storage == KU_PROJECTION_STRING_STATIC && left.len == 3);
+    assert(attempts == 3 && outstanding() == 1);
+    ku_projection_string_drop(&joined.value);
+    assert(!outstanding());
+    return 0;
+}
+"#;
+    let source = cwd.join("binary-join.c");
+    let executable = cwd.join(format!("binary-join{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &source,
+        format!(
+            "{CHECKED_ARRAY_ALLOCATOR}{program}{}",
+            caller.replace("__ENTRY__", &entry)
+        ),
+    )
+    .unwrap();
+    compile_projection(&source, &executable, cwd);
+    assert_ok(&execute(&mut Command::new(&executable), cwd, 10));
+    let failed = execute(Command::new(executable).arg("inject-second-join"), cwd, 10);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(failed.stderr).unwrap().trim(),
+        "out of memory"
+    );
+}
+
 pub(super) fn assert_checked_owned_call(seed: &Path, cwd: &Path) {
     fs::write(cwd.join("point-entry.ku"), ENTRY).unwrap();
     fs::write(cwd.join("point-provider.ku"), PROVIDER).unwrap();
