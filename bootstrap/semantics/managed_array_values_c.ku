@@ -2,12 +2,12 @@ import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
-import { ContainsIndex, ProjectionCloneSource, ProjectionIsStringArray } from "./struct_projection_c.ku"
+import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { BindManagedLocal, CheckManagedDeclaration, IsManagedLocalArrayClone, ManagedAppendDrop, ManagedCloneBoundString, ManagedCloneStringSetup, ManagedSourceCharsSetup, ManagedStringLeaf, ManagedStringLeafSetup, RequireNewManagedOwner } from "./guarded_string_parts.ku"
-import { IsManagedMethod, ManagedMethodReceiver } from "./call_contracts.ku"
-import { CheckStructArrayType, StructArrayC } from "./struct_array_c.ku"
-import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression, GuardLeaf, GuardOwnedExpression, GuardType, GuardValue } from "./guarded_struct_expr.ku"
+import { BindManagedLocal, CheckManagedDeclaration, IsManagedLocalArrayClone, ManagedAppendDrop, ManagedCloneBoundString, ManagedCloneStringSetup, ManagedExplicitType, ManagedSourceCharsSetup, ManagedStringLeaf, ManagedStringLeafSetup, RequireNewManagedOwner } from "./guarded_string_parts.ku"
+import { IsManagedMethod, ManagedLiteralConcat, ManagedLiteralConcatSetup, ManagedMethodReceiver } from "./call_contracts.ku"
+import { StructArrayC } from "./struct_array_c.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExpression, GuardLeaf, GuardOwnedExpression, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 
 struct ManagedCode {
     text: str
@@ -53,18 +53,6 @@ fn JoinManagedCode(&left: ManagedCode, right: ManagedCode): ManagedCode {
 
 fn ManagedBlank(): ManagedCode {
     return ManagedCode { text: "", uses_add: false, uses_sub: false, uses_eq: false, uses_string_append: false }
-}
-
-fn ManagedExplicitType(&types: [TypeNameBinding], &nodes: [Node], &edges: [int],
-                       &layouts: [StructLayout], id: int): GuardType! {
-    if (nodes[id - 1].kind == "TypeArray") {
-        if (ProjectionIsStringArray(types, nodes, edges, id)?) { return ok(GuardType { kind: "str_array", layout: 0 }) }
-        item = CheckStructArrayType(nodes, edges, types, id)?
-        index = LayoutIndex(layouts, item.module_index, item.declaration_node)
-        if (index <= 0) { RejectLayout("unknown_managed_layout", "array element has no bound layout", item.span.clone())? }
-        return ok(GuardType { kind: "array", layout: index })
-    }
-    return GuardExplicitType(types, nodes, layouts, id)
 }
 
 fn cloneArrayElement(&nodes: [Node], &edges: [int], &locals: [GuardBinding], &layouts: [StructLayout],
@@ -209,6 +197,12 @@ fn ownedStringSetup(&named: NamedModule, &locals: [GuardBinding], &layouts: [Str
         return ok(ManagedCode { text: indent.clone() + target.clone() + " = " + value.value + ";\n",
             uses_add: false, uses_sub: false, uses_eq: false, uses_string_append: false })
     }
+    if (root.string_locals && ManagedLiteralConcat(named.parsed.arena.nodes, named.parsed.arena.edges, node)) {
+        code = ManagedBlank()
+        code.text = ManagedLiteralConcatSetup(named, locals, node, root.function_id, target, indent)?
+        code.uses_string_append = true
+        return ok(code)
+    }
     subject = ProjectionCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, node_id)
     if (subject == 0) {
         RejectLayout("managed_string_owner", "expected a literal or a cloned array element", DeclarationSpan(node))?
@@ -281,7 +275,8 @@ fn EmitManagedAssignment(&named: NamedModule, &types: [TypeNameBinding], &import
     local_clone = root.source_strings && IsManagedLocalArrayClone(named.parsed.arena.nodes, named.parsed.arena.edges, locals, node_id)
     subject = ProjectionCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, node_id)
     named_clone = root.string_locals && subject != 0 && named.parsed.arena.nodes[subject - 1].kind == "Variable"
-    fallible = local_clone || named_clone || symbol != ""
+    concat = root.string_locals && ManagedLiteralConcat(named.parsed.arena.nodes, named.parsed.arena.edges, node)
+    fallible = local_clone || named_clone || concat || symbol != ""
     literal = (root.string_locals || root.source_strings) && node.kind == "String"
     if ((literal || fallible) && found != 0 && statement.kind == "Assign") {
         previous = locals[found - 1].clone()

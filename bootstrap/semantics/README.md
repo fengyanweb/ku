@@ -281,6 +281,8 @@ The returned Error takes ownership of the provider's formatted string.
 Owned record bodies can replace a local string with a clone of a bound string.
 The old destination is released after the clone succeeds. The source string
 keeps its own lifetime.
+Concatenating a literal prefix with a last-use local string uses the same
+checked temporary. A successful concatenation consumes the local suffix.
 
 The `linked-str` and `struct-result` modes emit `DiagnosticCanonical` and
 `ReadPrimaryAtom` from their original modules. Generated `extern` declarations

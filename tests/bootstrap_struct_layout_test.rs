@@ -1747,6 +1747,17 @@ fn ReplaceDecoded(&characters: [str], quote: str): Scanned! {
     count = quote.byte_len()
     return ok(Scanned { text: decoded, count: count })
 }
+fn ReplaceEscaped(&characters: [str], template: bool): Scanned! {
+    escaped = characters[0].clone()
+    decoded = characters[1].clone()
+    if (template) {
+        decoded = "\\" + escaped
+    } else {
+        decoded = escaped.clone()
+    }
+    count = decoded.byte_len()
+    return ok(Scanned { text: decoded, count: count })
+}
 "#,
     )
     .unwrap();
@@ -1929,6 +1940,18 @@ fn ReplaceDecoded(&characters: [str], quote: str): Scanned! {
     let replace = text[clone..].find(" = replaced").unwrap();
     assert!(drop < replace);
     assert!(text[clone + replace..].contains("a1.len"));
+
+    fs::write(cwd.join("function.txt"), "ReplaceEscaped").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let concat = text
+        .find("if (!ku_managed_string_append(&replaced")
+        .unwrap();
+    let next = text[concat..].lines().skip(1).take(3).collect::<Vec<_>>();
+    assert!(next[0].contains("ku_projection_string_drop(&l"));
+    assert!(next[1].contains("ku_projection_string_drop(&l"));
+    assert!(next[2].contains(" = replaced"));
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {

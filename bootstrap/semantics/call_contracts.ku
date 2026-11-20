@@ -2,6 +2,8 @@ import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule, RejectName } from "./names.ku"
 import { ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
 import { RejectLayout } from "./struct_layouts.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName } from "./guarded_struct_expr.ku"
+import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 
 struct InactiveMoveBranch { start: int, stop: int }
 
@@ -78,6 +80,37 @@ fn CheckManagedCallMove(&nodes: [Node], &edges: [int], &operand: Node, born: int
         index = index + 1
     }
     return ok(null)
+}
+
+fn ManagedConsumedString(&named: NamedModule, &locals: [GuardBinding], &operand: Node,
+                         caller_id: int): GuardBinding! {
+    found = GuardBindingIndex(locals, operand.text)
+    if (found == 0 || locals[found - 1].ty.kind != "str" || locals[found - 1].view || locals[found - 1].parameter) {
+        RejectLayout("managed_call_move", "expected a distinct owned local string", DeclarationSpan(operand))?
+    }
+    binding = locals[found - 1].clone()
+    born = named.parsed.arena.nodes[binding.slot - 1].offset
+    stop = named.parsed.arena.nodes[caller_id - 1].end_offset
+    CheckManagedCallMove(named.parsed.arena.nodes, named.parsed.arena.edges, operand, born, stop)?
+    return ok(binding)
+}
+
+fn ManagedLiteralConcat(&nodes: [Node], &edges: [int], &expression: Node): bool {
+    return expression.kind == "Binary" && expression.text == "+" && expression.edge_count == 2 &&
+        nodes[edges[expression.first_edge] - 1].kind == "String" && nodes[edges[expression.first_edge + 1] - 1].kind == "Variable"
+}
+
+fn ManagedLiteralConcatSetup(&named: NamedModule, &locals: [GuardBinding], &expression: Node,
+                             caller_id: int, &target: str, &indent: str): str! {
+    prefix = named.parsed.arena.nodes[named.parsed.arena.edges[expression.first_edge] - 1].clone()
+    suffix = named.parsed.arena.nodes[named.parsed.arena.edges[expression.first_edge + 1] - 1].clone()
+    binding = ManagedConsumedString(named, locals, suffix, caller_id)?
+    source = GuardBindingName(binding)
+    literal = "((KuProjectionString){ (uint8_t*)" + ScalarStringLiteral(prefix)? + ", 0u, KU_PROJECTION_STRING_STATIC })"
+    return ok(indent.clone() + target.clone() + " = " + literal + ";\n" + indent.clone() +
+        "if (!ku_managed_string_append(&" + target.clone() + ", " + source.clone() +
+        ", &string_too_large)) { out_of_memory = !string_too_large; goto cleanup; }\n" +
+        indent.clone() + "ku_projection_string_drop(&" + source + ");\n")
 }
 
 struct DirectSignature {
