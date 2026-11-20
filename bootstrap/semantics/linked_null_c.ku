@@ -1,0 +1,195 @@
+import { Node } from "../stage2/ast.ku"
+import { Span } from "../stage2/span.ku"
+import { DeclarationSpan } from "./names.ku"
+import { SuppliedModule } from "./imports.ku"
+import { BindProjectModules } from "./project_bindings.ku"
+import { RejectLayout } from "./struct_layouts.ku"
+import { ContainsType, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
+import { EmitTryCloneString } from "./struct_array_c.ku"
+import { StructResultHeader } from "./struct_result_c.ku"
+import { LinkedNullCType, LinkedNullChild, LinkedNullEntry, LinkedNullFunction, LinkedNullNode,
+         LinkedNullProject, LinkedNullPrototype, LinkedNullType, SameLinkedType } from "./linked_null_types_c.ku"
+import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullState, LowerLinkedNullValue,
+         MoveLinkedNullSlot, NewLinkedNullState } from "./linked_null_values_c.ku"
+
+struct LinkedNullC {
+    symbol: str
+    links: [LinkedNullFunction]
+    source: str
+}
+
+struct LinkedNullParameters {
+    state: LinkedNullState
+    signature: str
+    body_start: int
+}
+
+fn readParameters(&project: LinkedNullProject, &function: Node): LinkedNullParameters! {
+    state = NewLinkedNullState()
+    signature = ""
+    index = 0
+    while (index < function.edge_count) {
+        node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
+        if (node.kind != "Parameter") { break }
+        if (node.edge_count != 1 || node.int_value != 0 || LinkedNullBinding(state.slots, node.text) != 0) {
+            RejectLayout("linked_entry_parameter", "expected distinct explicitly typed by-value parameters", DeclarationSpan(node))?
+        }
+        ty = LinkedNullType(project, 1, LinkedNullChild(project, 1, node, 0))?
+        name = "a" + str(index)
+        if (index != 0) { signature += ", " }
+        signature += LinkedNullCType(ty)? + " " + name.clone()
+        slot = AddLinkedNullSlot(project, state, node.text, name.clone(), ty, true)?
+        state = slot.state
+        state.code = state.code + "    (void)" + name + ";\n"
+        index = index + 1
+    }
+    if (index >= function.edge_count - 1) {
+        RejectLayout("linked_null_signature", "entry requires a declared null! result and a body", DeclarationSpan(function))?
+    }
+    result = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
+    if (result.kind != "TypeResult" || result.edge_count != 1) {
+        RejectLayout("linked_null_signature", "expected an explicitly declared null! result", DeclarationSpan(result))?
+    }
+    inner = LinkedNullType(project, 1, LinkedNullChild(project, 1, result, 0))?
+    if (inner.declaration_kind != "Builtin" || inner.name != "null") {
+        RejectLayout("linked_null_signature", "expected a null! result", inner.span)?
+    }
+    if (index == 0) { signature = "void" }
+    return ok(LinkedNullParameters { state: state, signature: signature, body_start: index + 1 })
+}
+
+fn addLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
+    if (LinkedNullBinding(state.slots, statement.text) != 0) {
+        RejectLayout("linked_binding_shadowed", "expected a new initialized local binding", DeclarationSpan(statement))?
+    }
+    value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
+    ty = value.value.ty.clone()
+    slot = AddLinkedNullSlot(project, value.state, statement.text.clone(), "l" + str(id), ty, false)?
+    slot.state.code = slot.state.code + "    " + slot.value.text.clone() + " = " + value.value.text.clone() + ";\n"
+    slot.state.slots[slot.value.slot - 1].live = true
+    return MoveLinkedNullSlot(slot.state, value.value)
+}
+
+fn addGuardedAssignment(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    guard_id = LinkedNullChild(project, 1, statement, 0)
+    guard_node = LinkedNullNode(project, 1, guard_id)
+    if (guard_node.kind != "Variable" || guard_node.edge_count != 0) {
+        RejectLayout("unsupported_linked_guard", "expected a bool binding in the guard", DeclarationSpan(guard_node))?
+    }
+    guard = LowerLinkedNullValue(project, state, guard_id, 0)?
+    if (guard.value.ty.declaration_kind != "Builtin" || guard.value.ty.name != "bool") {
+        RejectLayout("unsupported_linked_guard", "expected a bool binding in the guard", DeclarationSpan(guard_node))?
+    }
+    branch = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
+    if (branch.kind != "Assign" || branch.edge_count != 1) {
+        RejectLayout("unsupported_linked_guard", "expected a single assignment in the guard", DeclarationSpan(branch))?
+    }
+    slot = LinkedNullBinding(guard.state.slots, branch.text)
+    if (slot == 0 || !guard.state.slots[slot - 1].live || guard.state.slots[slot - 1].value.ty.name != "str"
+        || guard.state.slots[slot - 1].value.ty.declaration_kind != "Builtin") {
+        RejectLayout("unsupported_linked_guard", "expected an initialized str target in the guard", DeclarationSpan(branch))?
+    }
+    rhs = LinkedNullChild(project, 1, branch, 0)
+    literal = LinkedNullNode(project, 1, rhs)
+    if (literal.kind != "String" || literal.edge_count != 0) {
+        RejectLayout("unsupported_linked_guard", "guarded str assignment requires a static literal", DeclarationSpan(literal))?
+    }
+    target = guard.state.slots[slot - 1].value.text.clone()
+    value = LowerLinkedNullValue(project, guard.state, rhs, 0)?
+    value.state.code = value.state.code + "    if (" + guard.value.text + ") {\n        ku_projection_string_drop(&" + target.clone() + ");\n"
+        + "        " + target + " = " + value.value.text + ";\n    }\n"
+    return ok(value.state)
+}
+
+fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    if (statement.kind != "Fail" || statement.edge_count != 1) {
+        RejectLayout("unsupported_linked_terminal", "expected a final Error literal fail", DeclarationSpan(statement))?
+    }
+    literal = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+    if (literal.kind != "ObjectLiteral" || literal.edge_count != 3) {
+        RejectLayout("unsupported_linked_error", "expected Error domain, code and message", DeclarationSpan(literal))?
+    }
+    next = state
+    seen: [str] = []
+    index = 0
+    while (index < literal.edge_count) {
+        field = LinkedNullNode(project, 1, LinkedNullChild(project, 1, literal, index))
+        label = field.text.clone()
+        if (field.kind != "ObjectLiteralField" || field.edge_count != 1 || (label != "domain" && label != "code" && label != "message")
+            || ContainsType(seen, label)) {
+            RejectLayout("invalid_linked_error_field", "expected each named Error field once", DeclarationSpan(field))?
+        }
+        item = LinkedNullChild(project, 1, field, 0)
+        node = LinkedNullNode(project, 1, item)
+        if ((node.kind != "Variable" && node.kind != "String") || node.edge_count != 0) {
+            RejectLayout("unsupported_linked_error_field", "error fields require initialized str bindings or literals", DeclarationSpan(node))?
+        }
+        value = LowerLinkedNullValue(project, next.clone(), item, 0)?
+        if (value.value.ty.declaration_kind != "Builtin" || value.value.ty.name != "str") {
+            RejectLayout("unsupported_linked_error_field", "error fields require str", DeclarationSpan(node))?
+        }
+        value.state.code = value.state.code + "    result.error." + label.clone() + " = " + value.value.text.clone() + ";\n"
+        owner = value.value.clone()
+        next = MoveLinkedNullSlot(value.state, owner)?
+        seen = seen.push(label)
+        index = index + 1
+    }
+    next.code = next.code + "    goto cleanup;\n"
+    return ok(next)
+}
+
+fn lowerLinkedBody(&project: LinkedNullProject, &function: Node, state: LinkedNullState, start: int): LinkedNullState! {
+    next = state
+    index = start
+    while (index < function.edge_count) {
+        id = LinkedNullChild(project, 1, function, index)
+        statement = LinkedNullNode(project, 1, id)
+        if (index == function.edge_count - 1) {
+            return lowerLinkedFailure(project, next, statement)
+        }
+        if (statement.kind == "Assign" && statement.edge_count == 1) {
+            next = addLocal(project, next, statement, id)?
+        } else if (statement.kind == "If" && statement.edge_count == 2 && statement.int_value == 1) {
+            next = addGuardedAssignment(project, next, statement)?
+        } else {
+            RejectLayout("unsupported_linked_statement", "expected a fresh local, one guarded string assignment or a final fail", DeclarationSpan(statement))?
+        }
+        index = index + 1
+    }
+    RejectLayout("unsupported_linked_terminal", "expected a final Error literal fail", DeclarationSpan(function))?
+    return ok(next)
+}
+
+fn linkedSource(&body: LinkedNullState, &symbol: str, &signature: str): str! {
+    // Keep the external prototypes independent of the selected entry's C
+    // name. The linker consumes declarations resolved from the source graph.
+    text = ProjectionHeaders(true, true)
+    if (body.uses_clone) {
+        text += "#include <stdio.h>\n#include <string.h>\n\n" + EmitTryCloneString("ku_linked_clone_string")
+    }
+    for layout in body.layouts.clone() { text += EmitLayout(layout, true, true)? }
+    text += StructResultHeader()
+    for dependency in body.links.clone() { text += LinkedNullPrototype(dependency)? }
+    text += "\nKuBootstrapResultNull " + symbol.clone() + "(" + signature.clone() + ") {\n"
+    text += "    KuBootstrapResultNull result = {0};\n"
+    if (body.uses_clone) { text += "    bool out_of_memory = false;\n" }
+    text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
+    if (body.uses_clone) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    return ok(text + "    return result;\n}\n")
+}
+
+fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! {
+    if (supplied.len() == 0) {
+        point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+        RejectLayout("missing_linked_entry_module", "a selected source module is required", point)?
+    }
+    bound = BindProjectModules(supplied)?
+    project = LinkedNullProject { supplied: supplied.clone(), binding: bound.modules }
+    id = LinkedNullEntry(project, entry_name)?
+    function = LinkedNullNode(project, 1, id)
+    parameters = readParameters(project, function)?
+    body = lowerLinkedBody(project, function, parameters.state, parameters.body_start)?
+    symbol = "ku_linked_null_" + str(id)
+    source = linkedSource(body, symbol, parameters.signature)?
+    return ok(LinkedNullC { symbol: symbol, links: body.links, source: source })
+}

@@ -2410,6 +2410,76 @@ int main(int argc, char **argv) {
     path
 }
 
+#[test]
+fn bootstrap_emits_typed_dependencies_for_real_parser_reject() {
+    let tmp = Temp::new();
+    let staged = tmp.0.join("compiler");
+    let runtime = tmp.0.join("consumer");
+    fs::create_dir(&staged).unwrap();
+    fs::create_dir(&runtime).unwrap();
+    stage_sources(&staged);
+    let ku = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    let script = staged.join("semantics/linked_reject.ku");
+    fs::write(
+        &script,
+        r#"import { ReadProjectModules } from "./project_manifest.ku"
+import { EmitLinkedNullC } from "./linked_null_c.ku"
+fn main(): null! {
+    supplied = ReadProjectModules(["stage2/expression_support.ku", "stage2/span.ku", "stage2/diagnostic.ku", "stage1/token.ku", "stage2/ast.ku"])?
+    generated = EmitLinkedNullC(supplied, "RejectAt")?
+    print(generated.source)
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let name = format!("emit-reject{}", std::env::consts::EXE_SUFFIX);
+    let built = staged.join("semantics").join(&name);
+    assert_ok(&execute(
+        Command::new(&ku)
+            .args(["build", "--release"])
+            .arg(&script)
+            .arg("-o")
+            .arg(&built),
+        &runtime,
+        150,
+    ));
+    let emitter = runtime.join(name);
+    fs::rename(built, &emitter).unwrap();
+    for stage in ["stage1", "stage2"] {
+        fs::rename(staged.join(stage), runtime.join(stage)).unwrap();
+    }
+    fs::remove_dir_all(&staged).unwrap();
+    let emitted = execute(&mut Command::new(emitter), &runtime, 30);
+    assert_ok(&emitted);
+    let source = String::from_utf8(emitted.stdout).unwrap();
+    for stage in ["stage1", "stage2"] {
+        fs::remove_dir_all(runtime.join(stage)).unwrap();
+    }
+    let dependencies: Vec<_> = source
+        .lines()
+        .filter(|line| line.starts_with("extern "))
+        .collect();
+    assert_eq!(dependencies.len(), 3);
+    assert!(dependencies
+        .iter()
+        .all(|line| line.contains("ku_value_dependency_m")));
+    assert!(dependencies
+        .iter()
+        .any(|line| line.matches("KuProjectionString").count() == 5));
+    assert!(
+        source.contains("result.error.domain = ")
+            && source.contains("result.error.code = ")
+            && source.contains("result.error.message = ")
+            && !source.contains("__ku_import")
+    );
+    let path = runtime.join("reject.c");
+    fs::write(&path, source).unwrap();
+    compile_projection_product(&path, &runtime.join("reject.obj"), &runtime, true, true);
+}
+
 const PRIMARY_EMITTER: &str = r#"import { BindProjectImports } from "./imports.ku"
 import { BindImportedTypeNames } from "./type_names.ku"
 import { BuildStructLayouts } from "./struct_layouts.ku"
