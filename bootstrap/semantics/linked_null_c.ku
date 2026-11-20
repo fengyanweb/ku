@@ -7,6 +7,7 @@ import { RejectLayout } from "./struct_layouts.ku"
 import { ContainsType, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
 import { EmitTryCloneString } from "./struct_array_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
+import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
 import { LinkedNullCType, LinkedNullChild, LinkedNullEntry, LinkedNullFunction, LinkedNullNode,
          LinkedNullProject, LinkedNullPrototype, LinkedNullType, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullState, LowerLinkedNullValue,
@@ -16,17 +17,20 @@ struct LinkedNullC {
     symbol: str
     links: [LinkedNullFunction]
     source: str
+    entry_plan: LinkPlanDeclaration
 }
 
 struct LinkedNullParameters {
     state: LinkedNullState
     signature: str
     body_start: int
+    plan: [LinkPlanType]
 }
 
 fn readParameters(&project: LinkedNullProject, &function: Node): LinkedNullParameters! {
     state = NewLinkedNullState()
     signature = ""
+    plan: [LinkPlanType] = []
     index = 0
     while (index < function.edge_count) {
         node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
@@ -37,7 +41,9 @@ fn readParameters(&project: LinkedNullProject, &function: Node): LinkedNullParam
         ty = LinkedNullType(project, 1, LinkedNullChild(project, 1, node, 0))?
         name = "a" + str(index)
         if (index != 0) { signature += ", " }
-        signature += LinkedNullCType(ty)? + " " + name.clone()
+        c_type = LinkedNullCType(ty)?
+        signature += c_type.clone() + " " + name.clone()
+        plan = plan.push(BoundLinkPlanType(ty, 1, c_type, false))
         slot = AddLinkedNullSlot(project, state, node.text, name.clone(), ty, true)?
         state = slot.state
         state.code = state.code + "    (void)" + name + ";\n"
@@ -55,7 +61,7 @@ fn readParameters(&project: LinkedNullProject, &function: Node): LinkedNullParam
         RejectLayout("linked_null_signature", "expected a null! result", inner.span)?
     }
     if (index == 0) { signature = "void" }
-    return ok(LinkedNullParameters { state: state, signature: signature, body_start: index + 1 })
+    return ok(LinkedNullParameters { state: state, signature: signature, body_start: index + 1, plan: plan })
 }
 
 fn addLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
@@ -191,5 +197,7 @@ fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! 
     body = lowerLinkedBody(project, function, parameters.state, parameters.body_start)?
     symbol = "ku_linked_null_" + str(id)
     source = linkedSource(body, symbol, parameters.signature)?
-    return ok(LinkedNullC { symbol: symbol, links: body.links, source: source })
+    plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: parameters.plan,
+        result: NullLinkPlanResult(), returns_result: true }
+    return ok(LinkedNullC { symbol: symbol, links: body.links, source: source, entry_plan: plan })
 }

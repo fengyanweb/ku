@@ -5,6 +5,7 @@ import { ProjectBindings } from "./project_bindings.ku"
 import { GuardCType, GuardValue } from "./guarded_struct_expr.ku"
 import { OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
 
 struct StructStringDependency {
     symbol: str
@@ -12,6 +13,13 @@ struct StructStringDependency {
     declaration: int
     source_name: str
     parameter: str
+    argument_plan: LinkPlanType
+    result_plan: LinkPlanType
+}
+
+fn StructStringDependencyPlan(&dependency: StructStringDependency): LinkPlanDeclaration {
+    return LinkPlanDeclaration { unit: dependency.module_index, node: dependency.declaration, symbol: dependency.symbol.clone(),
+        parameters: [dependency.argument_plan.clone()], result: dependency.result_plan.clone(), returns_result: false }
 }
 
 fn importedFunctionIndex(&project: ProjectBindings, &name: str): int {
@@ -54,7 +62,9 @@ fn BindStructStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, 
     }
     if (declared.declaration_kind == "Builtin" && declared.name == "str" && value.ty.kind == "str") {
         return ok(StructStringDependency { symbol: "ku_struct_string_link_m" + str(link.module_index) + "_" + str(link.target_node),
-            module_index: link.module_index, declaration: link.target_node, source_name: link.source_name, parameter: "KuProjectionString" })
+            module_index: link.module_index, declaration: link.target_node, source_name: link.source_name, parameter: "KuProjectionString",
+            argument_plan: BoundLinkPlanType(declared, link.module_index, "KuProjectionString", false),
+            result_plan: BoundLinkPlanType(result, link.module_index, "KuProjectionString", false) })
     }
     if (declared.declaration_kind == "Struct" && value.ty.kind == "struct") {
         layout = layouts[value.ty.layout - 1].clone()
@@ -65,12 +75,15 @@ fn BindStructStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, 
         if (expected_module == actual_module && declared.declaration_node == layout.node) {
             order = OrderCStructLayouts(layouts, layout.module_index, layout.node, DeclarationSpan(argument))?
             if (!order.contains_string) {
+                c_type = GuardCType(value.ty, layouts)
                 return ok(StructStringDependency { symbol: "ku_struct_string_link_m" + str(link.module_index) + "_" + str(link.target_node),
                     module_index: link.module_index, declaration: link.target_node, source_name: link.source_name,
-                    parameter: GuardCType(value.ty, layouts) })
+                    parameter: c_type.clone(), argument_plan: BoundLinkPlanType(declared, link.module_index, c_type, false),
+                    result_plan: BoundLinkPlanType(result, link.module_index, "KuProjectionString", false) })
             }
         }
     }
     RejectLayout("struct_string_link_argument", "projected argument must match an owned str or the same Copy struct type", DeclarationSpan(argument))?
-    return ok(StructStringDependency { symbol: "", module_index: 0, declaration: 0, source_name: "", parameter: "" })
+    return ok(StructStringDependency { symbol: "", module_index: 0, declaration: 0, source_name: "", parameter: "",
+        argument_plan: NullLinkPlanResult(), result_plan: NullLinkPlanResult() })
 }

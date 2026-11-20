@@ -1349,6 +1349,114 @@ fn Make(): Outer {
     assert_guarded_context(&ku, &driver_binary, &cwd, contexts);
     assert_projected_span(&ku, &driver_binary, &cwd, span_source);
     assert_constructor_parameter_ownership(&driver_binary, &cwd);
+    assert_project_link_plans(&driver_binary, &cwd);
+}
+
+fn assert_project_link_plans(driver: &Path, cwd: &Path) {
+    for (path, source) in [
+        (
+            "stage2/expression_support.ku",
+            include_str!("../bootstrap/stage2/expression_support.ku"),
+        ),
+        ("stage2/ast.ku", include_str!("../bootstrap/stage2/ast.ku")),
+    ] {
+        fs::write(cwd.join(path), source).unwrap();
+    }
+    let emitter = |mode: &str, name: &str| {
+        fs::write(cwd.join("mode.txt"), mode).unwrap();
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let produced = execute(&mut Command::new(driver), cwd, 30);
+        assert_ok(&produced);
+        assert!(produced.stderr.is_empty());
+        String::from_utf8(produced.stdout).unwrap()
+    };
+    let decode = |document: String| {
+        let Some(Value::Result { ok: true, value }) =
+            json::eval("decode", &[Value::String(document)], Span::default()).unwrap()
+        else {
+            panic!("expected one project link plan JSON document")
+        };
+        let Value::Object(record) = *value else {
+            panic!("expected a plan object")
+        };
+        record
+    };
+    for (mode, name, manifest, wanted) in [
+        (
+            "struct-result",
+            "ReadPrimaryAtom",
+            "stage2/expression_support.ku\nstage2/span.ku\nstage2/diagnostic.ku\nstage1/token.ku\nstage2/ast.ku\n",
+            &["RejectAt"][..],
+        ),
+        (
+            "linked-null",
+            "RejectAt",
+            "stage2/expression_support.ku\nstage2/span.ku\nstage2/diagnostic.ku\nstage1/token.ku\nstage2/ast.ku\n",
+            &["MakeDiagnostic", "SpanFromToken", "DiagnosticCanonical"][..],
+        ),
+        (
+            "linked-str",
+            "DiagnosticCanonical",
+            "stage2/diagnostic.ku\nstage2/span.ku\nstage1/token.ku\n",
+            &["EscapeCanonical", "SpanCanonical"][..],
+        ),
+    ] {
+        fs::write(cwd.join("modules.txt"), manifest).unwrap();
+        let c = emitter(mode, name);
+        let plan_mode = format!("{mode}-plan");
+        let raw = emitter(&plan_mode, name);
+        assert_eq!(raw, emitter(&plan_mode, name));
+        let plan = decode(raw);
+        assert_eq!(plan["schema"], Value::String("ku-bootstrap-link-plan-v1".into()));
+        let Value::Object(export) = &plan["export"] else { panic!("expected one export") };
+        assert_eq!(export["source_name"], Value::String(name.into()));
+        let Value::Array(dependencies) = &plan["dependencies"] else { panic!("expected dependencies") };
+        assert_eq!(dependencies.len(), wanted.len());
+        for (dependency, expected) in dependencies.iter().zip(wanted) {
+            let Value::Object(dependency) = dependency else { panic!("expected a dependency") };
+            assert_eq!(dependency["source_name"], Value::String((*expected).into()));
+            assert!(matches!(dependency["signature"], Value::Object(_)));
+            let Value::String(symbol) = &dependency["symbol"] else { panic!("expected a symbol") };
+            assert!(c.contains(&format!(" {symbol}(")));
+        }
+        assert_eq!(c, emitter(mode, name));
+    }
+
+    for directory in ["left", "right"] {
+        fs::create_dir(cwd.join(directory)).unwrap();
+        fs::write(
+            cwd.join(directory).join("same.ku"),
+            "fn Convert(text: str): str { return text }\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        cwd.join("duplicate.ku"),
+        r#"import { Convert as Left } from "./left/same.ku"
+import { Convert as Right } from "./right/same.ku"
+struct Pair { left: str, right: str }
+fn Display(pair: Pair): str { return Left(pair.left) + Right(pair.right) }
+"#,
+    )
+    .unwrap();
+    for manifest in [
+        "duplicate.ku\nleft/same.ku\nright/same.ku\n",
+        "duplicate.ku\nright/same.ku\nleft/same.ku\n",
+    ] {
+        fs::write(cwd.join("modules.txt"), manifest).unwrap();
+        let plan = decode(emitter("linked-str-plan", "Display"));
+        let Value::Array(deps) = &plan["dependencies"] else {
+            panic!("expected dependencies")
+        };
+        let [Value::Object(left), Value::Object(right)] = deps.as_slice() else {
+            panic!("supplier identities must stay distinct");
+        };
+        assert_eq!(left["source_path"], Value::String("left/same.ku".into()));
+        assert_eq!(right["source_path"], Value::String("right/same.ku".into()));
+        assert_eq!(left["source_name"], right["source_name"]);
+        assert_eq!(left["node"], right["node"]);
+        assert_ne!(left["symbol"], right["symbol"]);
+    }
 }
 
 fn assert_constructor_parameter_ownership(seed: &Path, cwd: &Path) {

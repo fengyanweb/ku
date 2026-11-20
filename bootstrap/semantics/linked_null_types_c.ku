@@ -7,6 +7,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { CTypeName } from "./struct_projection_c.ku"
 import { OrderCStructLayouts } from "./nested_struct_c.ku"
+import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -148,6 +149,19 @@ fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
         index = index + 1
     }
     return ok(text + ");\n")
+}
+
+fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
+    parameters: [LinkPlanType] = []
+    index = 0
+    while (index < callee.parameters.len()) {
+        ty = callee.parameters[index].clone()
+        parameters = parameters.push(BoundLinkPlanType(ty, callee.unit, LinkedNullCType(ty)?, false))
+        index = index + 1
+    }
+    result = BoundLinkPlanType(callee.result, callee.unit, LinkedNullCType(callee.result)?, false)
+    return ok(LinkPlanDeclaration { unit: callee.unit, node: callee.node, symbol: callee.symbol.clone(),
+        parameters: parameters, result: result, returns_result: false })
 }
 
 fn LinkedNullEntry(&project: LinkedNullProject, &name: str): int! {

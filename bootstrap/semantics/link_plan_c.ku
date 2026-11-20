@@ -1,0 +1,80 @@
+import { json } from "std"
+import { SuppliedModule } from "./imports.ku"
+import { TypeNameBinding } from "./type_names.ku"
+
+struct LinkPlanType {
+    kind: str
+    name: str
+    unit: int
+    node: int
+    c_type: str
+    view: bool
+}
+
+struct LinkPlanDeclaration {
+    unit: int
+    node: int
+    symbol: str
+    parameters: [LinkPlanType]
+    result: LinkPlanType
+    returns_result: bool
+}
+
+fn BoundLinkPlanType(&binding: TypeNameBinding, local_unit: int, c_type: str, view: bool): LinkPlanType {
+    unit = binding.module_index
+    if (unit == 0 && binding.declaration_kind == "Struct") { unit = local_unit }
+    return LinkPlanType { kind: binding.declaration_kind.clone(), name: binding.name.clone(),
+        unit: unit, node: binding.declaration_node, c_type: c_type, view: view }
+}
+
+fn NullLinkPlanResult(): LinkPlanType {
+    return LinkPlanType { kind: "Builtin", name: "null", unit: 0, node: 0, c_type: "KuBootstrapResultNull", view: false }
+}
+
+fn EmptyLinkPlanDeclaration(): LinkPlanDeclaration {
+    return LinkPlanDeclaration { unit: 0, node: 0, symbol: "", parameters: [], result: NullLinkPlanResult(), returns_result: false }
+}
+
+fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType): str! {
+    name = ty.name.clone()
+    path = "null"
+    if (ty.unit > 0) {
+        path = json.encode(supplied[ty.unit - 1].path.clone())?
+        name = supplied[ty.unit - 1].named.parsed.arena.nodes[ty.node - 1].text.clone()
+    }
+    passing = "value"
+    if (ty.view) { passing = "view" }
+    return ok("{\"kind\":" + json.encode(ty.kind.clone())? + ",\"source_name\":" + json.encode(name)?
+        + ",\"source_path\":" + path + ",\"node\":" + str(ty.node) + ",\"c_type\":" + json.encode(ty.c_type.clone())?
+        + ",\"passing\":" + json.encode(passing)? + "}")
+}
+
+fn plannedDeclaration(&supplied: [SuppliedModule], &declaration: LinkPlanDeclaration): str! {
+    name = supplied[declaration.unit - 1].named.parsed.arena.nodes[declaration.node - 1].text.clone()
+    path = supplied[declaration.unit - 1].path.clone()
+    text = "{\"source_path\":" + json.encode(path)? + ",\"node\":" + str(declaration.node)
+        + ",\"source_name\":" + json.encode(name)? + ",\"symbol\":" + json.encode(declaration.symbol.clone())?
+        + ",\"signature\":{\"parameters\":["
+    index = 0
+    while (index < declaration.parameters.len()) {
+        if (index > 0) { text += "," }
+        text += plannedType(supplied, declaration.parameters[index])?
+        index = index + 1
+    }
+    wrapper = "false"
+    if (declaration.returns_result) { wrapper = "true" }
+    return ok(text + "],\"result\":" + plannedType(supplied, declaration.result)?
+        + ",\"returns_result\":" + wrapper + "}}")
+}
+
+fn EmitLinkPlan(&supplied: [SuppliedModule], &mode: str, &entry: LinkPlanDeclaration, &links: [LinkPlanDeclaration]): str! {
+    text = "{\"schema\":\"ku-bootstrap-link-plan-v1\",\"mode\":" + json.encode(mode.clone())?
+        + ",\"export\":" + plannedDeclaration(supplied, entry)? + ",\"dependencies\":["
+    index = 0
+    while (index < links.len()) {
+        if (index > 0) { text += "," }
+        text += plannedDeclaration(supplied, links[index])?
+        index = index + 1
+    }
+    return ok(text + "]}\n")
+}

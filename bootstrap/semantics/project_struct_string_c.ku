@@ -7,7 +7,8 @@ import { GuardBinding, GuardBindingIndex, GuardCType, GuardExplicitType, GuardEx
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { EmitOrderedStructLayouts, OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ProjectionHeaders } from "./struct_projection_c.ku"
-import { BuildStructLayouts, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { BuildStructLayouts, ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { BoundLinkPlanType, EmptyLinkPlanDeclaration, LinkPlanDeclaration } from "./link_plan_c.ku"
 import { ScalarStringJoinHelpers } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { BindStructStringCall, StructStringDependency } from "./struct_string_calls.ku"
@@ -16,6 +17,7 @@ struct ProjectStructStringC {
     symbol: str
     dependencies: [StructStringDependency]
     source: str
+    entry_plan: LinkPlanDeclaration
 }
 
 struct StructStringFlow {
@@ -139,6 +141,10 @@ fn emitProjectStringFunction(&supplied: [SuppliedModule], &project: ProjectBindi
     if (input.kind != "struct" || result.kind != "str" || returned.kind != "Return" || returned.edge_count != 1) {
         RejectLayout("struct_string_signature", "expected one owned struct parameter and one str return", DeclarationSpan(fn_node))?
     }
+    param_id = supplied[0].named.parsed.arena.edges[param.first_edge]
+    result_id = supplied[0].named.parsed.arena.edges[fn_node.first_edge + 1]
+    param_type = ExplicitType(project.modules[0].types, param_id, DeclarationSpan(param))?
+    result_type = ExplicitType(project.modules[0].types, result_id, DeclarationSpan(fn_node))?
     order = OrderCStructLayouts(layouts, layouts[input.layout - 1].module_index, layouts[input.layout - 1].node, DeclarationSpan(param))?
     binding = GuardBinding { name: param.text, ty: input, slot: 0, parameter: true, view: false }
     initial = StructStringFlow { source: "", slots: [], dependencies: [], moved_fields: [], result: "", leaves: 0, uses_join: false }
@@ -168,7 +174,10 @@ fn emitProjectStringFunction(&supplied: [SuppliedModule], &project: ProjectBindi
     text += drops
     if (lowered.uses_join) { text += "    if (failure) { fputs(failure, stderr); exit(EXIT_FAILURE); }\n" }
     text += "    return result;\n}\n"
-    return ok(ProjectStructStringC { symbol: symbol, dependencies: lowered.dependencies, source: text })
+    plan = LinkPlanDeclaration { unit: 1, node: function_id, symbol: symbol.clone(),
+        parameters: [BoundLinkPlanType(param_type, 1, GuardCType(binding.ty, layouts), false)],
+        result: BoundLinkPlanType(result_type, 1, "KuProjectionString", false), returns_result: false }
+    return ok(ProjectStructStringC { symbol: symbol, dependencies: lowered.dependencies, source: text, entry_plan: plan })
 }
 
 fn EmitProjectStructStringC(&supplied: [SuppliedModule], &function: str): ProjectStructStringC! {
@@ -185,5 +194,5 @@ fn EmitProjectStructStringC(&supplied: [SuppliedModule], &function: str): Projec
         index = index + 1
     }
     RejectLayout("unknown_struct_string_function", "undefined struct-to-string function '" + function.clone() + "'", start)?
-    return ok(ProjectStructStringC { symbol: "", dependencies: [], source: "" })
+    return ok(ProjectStructStringC { symbol: "", dependencies: [], source: "", entry_plan: EmptyLinkPlanDeclaration() })
 }

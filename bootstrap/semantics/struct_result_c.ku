@@ -3,7 +3,8 @@ import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
-import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { ExplicitType, FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { BoundLinkPlanType, EmptyLinkPlanDeclaration, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
 import { CStructOrder, OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
 import { GuardArithmetic, GuardOwnedDrops, GuardStringEquality } from "./guarded_struct_c.ku"
@@ -16,6 +17,8 @@ struct StructResultC {
     symbol: str
     dependency: str
     source: str
+    entry_plan: LinkPlanDeclaration
+    link_plan: [LinkPlanDeclaration]
 }
 
 struct StructResultSignature {
@@ -25,6 +28,7 @@ struct StructResultSignature {
     unused: str
     drops: str
     body_start: int
+    plan: [LinkPlanType]
 }
 
 struct StructResultBody {
@@ -34,6 +38,7 @@ struct StructResultBody {
     declarations: str
     drops: str
     clone_layouts: [int]
+    plan: [LinkPlanDeclaration]
 }
 
 fn orderResultLayout(&layouts: [StructLayout], index: int, at: Span): CStructOrder! {
@@ -68,6 +73,7 @@ fn readStructResultSignature(&named: NamedModule, &types: [TypeNameBinding], &la
     bindings: [GuardBinding] = []
     declared = appendStructResultLayouts(result_order, [])?
     parameters = ""
+    plan: [LinkPlanType] = []
     unused = ""
     drops = ""
     cursor = function.first_edge
@@ -80,6 +86,7 @@ fn readStructResultSignature(&named: NamedModule, &types: [TypeNameBinding], &la
         }
         id = named.parsed.arena.edges[parameter.first_edge]
         ty = GuardExplicitType(types, named.parsed.arena.nodes, layouts, id)?
+        bound = ExplicitType(types, id, at.clone())?
         view = parameter.int_value == 1
         if (view && ty.kind != "struct") {
             RejectLayout("unsupported_struct_result_signature", "only a known struct may be a View parameter", at.clone())?
@@ -88,6 +95,7 @@ fn readStructResultSignature(&named: NamedModule, &types: [TypeNameBinding], &la
         name = GuardBindingName(binding)
         c_type = GuardCType(binding.ty, layouts)
         if (view) { c_type = "const " + c_type + "*" }
+        plan = plan.push(BoundLinkPlanType(bound, 1, c_type.clone(), view))
         if (bindings.len() != 0) { parameters += ", " }
         parameters += c_type + " " + name.clone()
         unused += "    (void)" + name.clone() + ";\n"
@@ -107,7 +115,7 @@ fn readStructResultSignature(&named: NamedModule, &types: [TypeNameBinding], &la
     }
     if (parameters == "") { parameters = "void" }
     return ok(StructResultSignature { bindings: bindings, declarations: declarations, parameters: parameters,
-        unused: unused, drops: drops, body_start: result_edge + 1 })
+        unused: unused, drops: drops, body_start: result_edge + 1, plan: plan })
 }
 
 fn isBoundOk(&named: NamedModule, &locals: [GuardBinding], &imports: [ImportBinding]): bool {
@@ -202,6 +210,7 @@ fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports
     declarations = ""
     drops = ""
     clone_layouts: [int] = []
+    plan: [LinkPlanDeclaration] = []
     cursor = start
     while (cursor < end) {
         id = named.parsed.arena.edges[cursor]
@@ -229,6 +238,7 @@ fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports
             declarations = link.declarations
             drops = link.drops
             clone_layouts = link.clone_layouts
+            plan = plan.push(link.plan)
             code = JoinManagedCode(code, link.code)
         } else {
             RejectLayout("unsupported_struct_result_body", "expected guarded returns or one tail checked dependency", DeclarationSpan(statement))?
@@ -236,7 +246,7 @@ fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports
         cursor = cursor + 1
     }
     return ok(StructResultBody { code: code, prototype: prototype, dependency: dependency,
-        declarations: declarations, drops: drops, clone_layouts: clone_layouts })
+        declarations: declarations, drops: drops, clone_layouts: clone_layouts, plan: plan })
 }
 
 fn StructResultHeader(): str {
@@ -252,7 +262,8 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     if (outer.kind != "TypeResult" || outer.edge_count != 1) {
         RejectLayout("unsupported_struct_result_signature", "expected an explicit struct! result", DeclarationSpan(outer))?
     }
-    inner = GuardExplicitType(types, named.parsed.arena.nodes, layouts, named.parsed.arena.edges[outer.first_edge])?
+    inner_id = named.parsed.arena.edges[outer.first_edge]
+    inner = GuardExplicitType(types, named.parsed.arena.nodes, layouts, inner_id)?
     if (inner.kind != "struct") {
         RejectLayout("unsupported_struct_result_signature", "expected a bound struct payload", DeclarationSpan(outer))?
     }
@@ -263,6 +274,9 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     symbol = "ku_struct_result_" + str(id)
     struct_type = GuardCType(inner, layouts)
     result_type = "KuBootstrapResult_" + struct_type.clone()
+    bound = ExplicitType(types, inner_id, DeclarationSpan(outer))?
+    plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: signature.plan,
+        result: BoundLinkPlanType(bound, 1, result_type.clone(), false), returns_result: true }
     overflow = body.code.uses_add || body.code.uses_sub
     may_allocate = order.contains_string || body.clone_layouts.len() != 0
     text = ProjectionHeaders(true, true) + "#include <stdio.h>\n\n" + GuardArithmetic(body.code.uses_add, body.code.uses_sub)
@@ -292,7 +306,8 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
         text += "    if (overflow) { " + drop + "(&result); fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n"
     }
     text += "    return result;\n}\n"
-    return ok(StructResultC { symbol: symbol, dependency: body.dependency, source: text })
+    return ok(StructResultC { symbol: symbol, dependency: body.dependency, source: text,
+        entry_plan: plan, link_plan: body.plan })
 }
 
 // The previous stages own the graph and type bindings. This lowering accepts
@@ -309,5 +324,5 @@ fn EmitStructResultC(&named: NamedModule, &types: [TypeNameBinding], &imports: [
     }
     start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
     RejectLayout("unknown_struct_result_function", "undefined struct-result function '" + function_name.clone() + "'", start)?
-    return ok(StructResultC { symbol: "", dependency: "", source: "" })
+    return ok(StructResultC { symbol: "", dependency: "", source: "", entry_plan: EmptyLinkPlanDeclaration(), link_plan: [] })
 }

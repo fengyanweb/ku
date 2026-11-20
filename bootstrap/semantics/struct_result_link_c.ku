@@ -5,6 +5,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardExplicitType, GuardExpression } from "./guarded_struct_expr.ku"
 import { AddGuardCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
+import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
 
 struct StructResultLink {
     symbol: str
@@ -14,6 +15,7 @@ struct StructResultLink {
     declarations: str
     drops: str
     clone_layouts: [int]
+    plan: LinkPlanDeclaration
 }
 
 fn resultFunctionNode(&named: NamedModule, &name: str): int {
@@ -91,6 +93,7 @@ fn LowerStructResultLink(&named: NamedModule, &types: [TypeNameBinding], &layout
     args = ""
     transfers = ""
     moved_scratch = ""
+    parameters: [LinkPlanType] = []
     code = ManagedBlank()
     declarations = ""
     drops = ""
@@ -104,7 +107,8 @@ fn LowerStructResultLink(&named: NamedModule, &types: [TypeNameBinding], &layout
         if (index >= call.edge_count || parameter.edge_count != 1 || parameter.int_value != 0) {
             RejectLayout("struct_result_link_signature", "checked link needs matching by-value arguments", DeclarationSpan(call))?
         }
-        ty = GuardExplicitType(types, named.parsed.arena.nodes, layouts, named.parsed.arena.edges[parameter.first_edge])?
+        parameter_id = named.parsed.arena.edges[parameter.first_edge]
+        ty = GuardExplicitType(types, named.parsed.arena.nodes, layouts, parameter_id)?
         arg_id = named.parsed.arena.edges[call.first_edge + index]
         arg = named.parsed.arena.nodes[arg_id - 1].clone()
         subject = 0
@@ -119,6 +123,8 @@ fn LowerStructResultLink(&named: NamedModule, &types: [TypeNameBinding], &layout
             RejectLayout("struct_result_link_argument", "expected matching by-value arguments and static str", DeclarationSpan(arg))?
         }
         c_type = GuardCType(ty, layouts)
+        bound = ExplicitType(types, parameter_id, DeclarationSpan(parameter))?
+        parameters = parameters.push(BoundLinkPlanType(bound, 1, c_type.clone(), false))
         sequential = "p" + str(statement_id) + "_" + str(index)
         if (index > 1) { prototype += ", " args += ", " }
         prototype += c_type.clone()
@@ -165,6 +171,8 @@ fn LowerStructResultLink(&named: NamedModule, &types: [TypeNameBinding], &layout
     code.text = code.text + moved_scratch
     code.text = code.text + "    if (!" + outcome.clone() + ".ok) {\n        result.error = " + outcome.clone() + ".error;\n"
     code.text = code.text + "        " + outcome + ".error = (KuBootstrapError){0};\n        goto cleanup;\n    }\n"
+    plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(),
+        parameters: parameters, result: NullLinkPlanResult(), returns_result: true }
     return ok(StructResultLink { symbol: symbol, prototype: prototype + ");\n\n", remaining: available, code: code,
-        declarations: declarations, drops: drops, clone_layouts: clone_layouts })
+        declarations: declarations, drops: drops, clone_layouts: clone_layouts, plan: plan })
 }

@@ -4,6 +4,8 @@ import { ParseModule } from "../stage3/parser.ku"
 import { EmitGuardedStructC } from "./guarded_struct_c.ku"
 import { BindProjectImports, SuppliedModule } from "./imports.ku"
 import { EmitLinkedNullC } from "./linked_null_c.ku"
+import { LinkedNullDependencyPlan } from "./linked_null_types_c.ku"
+import { EmitLinkPlan, LinkPlanDeclaration } from "./link_plan_c.ku"
 import { EmitManagedArrayC } from "./managed_array_c.ku"
 import { BuildNameTable } from "./names.ku"
 import { ManifestPaths, ReadProjectModules } from "./project_manifest.ku"
@@ -14,6 +16,7 @@ import { BindStructReturn, BuildStructLayouts } from "./struct_layouts.ku"
 import { EmitStructConstructorC } from "./struct_literal_c.ku"
 import { EmitStructProjectionC } from "./struct_projection_c.ku"
 import { EmitStructResultC } from "./struct_result_c.ku"
+import { StructStringDependencyPlan } from "./struct_string_calls.ku"
 import { BindImportedTypeNames, BindTypeNames } from "./type_names.ku"
 
 fn selectedFunction(): str! {
@@ -28,7 +31,7 @@ fn selectedFunction(): str! {
     return ok(function)
 }
 
-fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &function: str, &mode: str): null! {
+fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &function: str, &mode: str, link_plan: bool): null! {
     imports = BindProjectImports(selected, supplied)?
     types = BindImportedTypeNames(selected.named, imports, supplied)?
     layouts = BuildStructLayouts(selected.named, types, supplied)?
@@ -39,7 +42,8 @@ fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &
     }
     if (mode == "struct-result") {
         generated = EmitStructResultC(selected.named, types, imports, supplied, layouts, function)?
-        print(generated.source)
+        if (link_plan) { print(EmitLinkPlan(supplied, "struct-result", generated.entry_plan, generated.link_plan)?) }
+        else { print(generated.source) }
         return ok(null)
     }
     if (mode == "managed") {
@@ -57,9 +61,42 @@ fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &
     return ok(null)
 }
 
+fn emitLinkedNull(&supplied: [SuppliedModule], &function: str, plan: bool): null! {
+    generated = EmitLinkedNullC(supplied, function)?
+    if (!plan) {
+        print(generated.source)
+        return ok(null)
+    }
+    links: [LinkPlanDeclaration] = []
+    for dependency in generated.links {
+        links = links.push(LinkedNullDependencyPlan(dependency)?)
+    }
+    print(EmitLinkPlan(supplied, "linked-null", generated.entry_plan, links)?)
+    return ok(null)
+}
+
+fn emitLinkedString(&supplied: [SuppliedModule], &function: str, plan: bool): null! {
+    generated = EmitProjectStructStringC(supplied, function)?
+    if (!plan) {
+        print(generated.source)
+        return ok(null)
+    }
+    links: [LinkPlanDeclaration] = []
+    for dependency in generated.dependencies {
+        links = links.push(StructStringDependencyPlan(dependency))
+    }
+    print(EmitLinkPlan(supplied, "linked-str", generated.entry_plan, links)?)
+    return ok(null)
+}
+
 fn main(): null! {
     mode = "projection"
     if (fs.exists("mode.txt")) { mode = string.trim(fs.read("mode.txt")?) }
+    link_plan = true
+    if (mode == "linked-null-plan") { mode = "linked-null" }
+    else if (mode == "linked-str-plan") { mode = "linked-str" }
+    else if (mode == "struct-result-plan") { mode = "struct-result" }
+    else { link_plan = false }
     if (mode == "construct" || mode == "guarded" || mode == "project-int" || mode == "managed" ||
         mode == "linked-str" || mode == "struct-result" || mode == "linked-null" || mode == "project-fields") {
         function = selectedFunction()?
@@ -67,21 +104,17 @@ fn main(): null! {
         paths = ManifestPaths(fs.read("modules.txt")?, at)?
         supplied = ReadProjectModules(paths)?
         if (mode == "linked-null") {
-            generated = EmitLinkedNullC(supplied, function)?
-            print(generated.source)
-            return ok(null)
+            return emitLinkedNull(supplied, function, link_plan)
         }
         if (mode == "linked-str") {
-            generated = EmitProjectStructStringC(supplied, function)?
-            print(generated.source)
-            return ok(null)
+            return emitLinkedString(supplied, function, link_plan)
         }
         if (mode == "project-int") {
             generated = EmitScalarProjectC(supplied, function)?
             print(generated.source)
             return ok(null)
         }
-        return emitProjectFunction(supplied[0], supplied, function, mode)
+        return emitProjectFunction(supplied[0], supplied, function, mode, link_plan)
     }
 
     input = BuildNameTable(ParseModule(fs.read("input.ku")?)?)?
@@ -100,7 +133,7 @@ fn main(): null! {
         return ok(null)
     }
     if (mode != "projection") {
-        fail { domain: "bootstrap.projection", code: "invalid_mode", message: "mode.txt must contain projection, int, project-int, project-fields, construct, guarded, managed, linked-str, linked-null or struct-result" }
+        fail { domain: "bootstrap.projection", code: "invalid_mode", message: "mode.txt must contain projection, int, project-int, project-fields, construct, guarded, managed, linked-str, linked-null, struct-result or one of their linked plan modes" }
     }
     layouts = BuildStructLayouts(input, bindings, supplied)?
     plan = BindStructReturn(input, bindings, layouts, function)?

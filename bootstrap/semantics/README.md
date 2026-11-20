@@ -211,6 +211,22 @@ such as `RejectAt`. It evaluates bound call arguments in source order and
 transfers their owners to the declared C dependency. A returned Error owns
 its domain, code and message.
 
+With the same manifest and selected function, set `mode.txt` to
+`linked-str-plan`, `linked-null-plan` or `struct-result-plan` to emit a
+`ku-bootstrap-link-plan-v1` JSON document on stdout. The `export` record
+describes the selected function. `dependencies` lists the declarations
+used by the emitted C, in the order retained by the emitter. Each record
+contains its normalized `source_path`, declared AST `node`, source name,
+C symbol, and the checked parameter and result signature. A struct type
+uses its own declaration path and node. Builtin types use a null path and
+node zero. The C type and passing mode describe the current emitted
+carrier, including const pointer parameters and Result wrappers.
+
+Use the path and node together to match an import to its source
+declaration. Distinct modules can share the same function name and node
+number. The generated C symbol can change when the manifest order changes.
+Use the ordinary mode name to emit C for the same plan.
+
 The compiler entry scans the module once and parses bounded declaration
 windows. It retains the lexer, per-function, AST and work limits. The legacy
 `ParseProgram` entry retains its 512-token whole-script limit.
