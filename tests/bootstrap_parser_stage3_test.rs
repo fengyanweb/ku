@@ -9,8 +9,8 @@ pub mod bounded_process;
 
 use bounded_process::{run_bounded, OutputLimits};
 use ku::ast::{
-    BinaryOp, EnumDecl, Expr, ExprKind, FnDecl, ImportDecl, ImportKind, Item, Literal, ModuleDecl,
-    ParamMode, Stmt, StructDecl, TypeName, UnaryOp,
+    AssignTarget, BinaryOp, EnumDecl, Expr, ExprKind, FnDecl, ImportDecl, ImportKind, Item,
+    Literal, ModuleDecl, ParamMode, Stmt, StructDecl, TypeName, UnaryOp,
 };
 use ku::lexer::Lexer;
 use ku::parser::Parser;
@@ -509,6 +509,52 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
         Stmt::Assign { name, value, span } => {
             let value = project_expr(source, value, arena);
             push_node(arena, "Assign", name.clone(), 0, *span, &[value])
+        }
+        Stmt::CompoundAssign {
+            target: AssignTarget::Variable(name),
+            op,
+            value,
+            span,
+        } => {
+            let tokens = Lexer::new(source)
+                .lex()
+                .expect("compound assignment tokens");
+            let target = tokens
+                .iter()
+                .find(|token| token.span.start == span.start)
+                .expect("compound assignment target token");
+            let target = push_node(arena, "Variable", name.clone(), 0, target.span, &[]);
+            let value = project_expr(source, value, arena);
+            let operator = match op {
+                BinaryOp::Add => "+",
+                BinaryOp::Subtract => "-",
+                BinaryOp::Multiply => "*",
+                BinaryOp::Divide => "/",
+                BinaryOp::Remainder => "%",
+                _ => panic!("Rust produced an invalid compound assignment operator: {op:?}"),
+            };
+            push_node(
+                arena,
+                "CompoundAssign",
+                operator.into(),
+                0,
+                *span,
+                &[target, value],
+            )
+        }
+        Stmt::For {
+            name,
+            iterable,
+            body,
+            span,
+        } => {
+            let mut children = Vec::<usize>::with_capacity(1 + body.len());
+            children.push(project_expr(source, iterable, arena));
+            children.extend(
+                body.iter()
+                    .map(|statement| project_stmt(source, statement, arena)),
+            );
+            push_node(arena, "For", name.clone(), 0, *span, &children)
         }
         Stmt::Expr { expr, span } => {
             let expr = project_expr(source, expr, arena);
@@ -1225,6 +1271,10 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         STRUCT_GOLDEN_SOURCE,
         ENUM_GOLDEN_SOURCE,
         include_str!("../bootstrap/stage2/span.ku"),
+        include_str!("../bootstrap/stage1/token.ku"),
+        "fn sum() { count = 0 for n in [1,2] { if (n > 1) { count += n } } count %= 5 return count }",
+        "fn mixed() { while (ready) { for next in Source{elements: [1,2]}.elements { acc -= next acc *= 2 acc /= 3 } } }",
+
         r#"fn main() { println(Box{first: Inner{x: 1 + 2}, other: [a(), 4]}?.other) }"#,
         r#"fn main() { value = Box{value: "中😀"} println(value) }"#,
         "fn main() {}",
@@ -1431,6 +1481,13 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let module_alias = "module App as Other";
     let double_module_semicolon = "module App;;";
     let nested_module = "fn main() { module Inner }";
+    let for_missing_name = "fn f() { for in xs {} }";
+    let for_missing_in = "fn f() { for x xs {} }";
+    let for_unbraced = "fn f() { for x in xs println(x) }";
+    let for_else = "fn f() { for x in xs {} else {} }";
+    let for_missing_close = "fn f() { for x in xs { a += 1";
+    let compound_field = "fn f() { row.x += 1 }";
+
     let struct_trailing_comma = "fn main() { return Box{value: 1,} }";
     let struct_missing_comma = "fn main() { return Box{value: 1 next: 2} }";
     let struct_after_newline = "fn main() { return Box\n{value: 1} }";
@@ -2780,6 +2837,48 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             nested_module,
             "unsupported_expression",
             nested_module_message,
+        ),
+        (
+            for_missing_name,
+            "unexpected_token",
+            rust_error_canonical(for_missing_name),
+        ),
+        (
+            for_missing_in,
+            "unexpected_token",
+            rust_error_canonical(for_missing_in),
+        ),
+        (
+            for_unbraced,
+            "unsupported_statement",
+            diagnostic_at(for_unbraced, 9, "stage-3 for bodies must use braces"),
+        ),
+        (
+            for_else,
+            "unsupported_statement",
+            diagnostic_for_kind(
+                for_else,
+                TokenKind::Else,
+                "stage-3 else must immediately follow an if body",
+            ),
+        ),
+        (
+            for_missing_close,
+            "unexpected_eof",
+            diagnostic_for_kind(
+                for_missing_close,
+                TokenKind::Eof,
+                "expected '}' after for body",
+            ),
+        ),
+        (
+            compound_field,
+            "trailing_token",
+            diagnostic_for_kind(
+                compound_field,
+                TokenKind::PlusEqual,
+                "expected end of expression",
+            ),
         ),
         (
             struct_trailing_comma,

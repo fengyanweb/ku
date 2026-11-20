@@ -1,7 +1,8 @@
 import { Token } from "../stage1/token.ku"
 import { Node, Arena, ParseOutput } from "../stage2/ast.ku"
 import { SpanFromToken, SpanMerge } from "../stage2/span.ku"
-import { RejectAt, RejectAtPoint } from "./support.ku"
+import { CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, RejectAt, RejectAtPoint } from "./support.ku"
+import { IsNamedStructStart } from "../stage2/expression_support.ku"
 import { SignatureType, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 
 struct StatementLink {
@@ -10,7 +11,8 @@ struct StatementLink {
 }
 
 struct ControlFrame {
-    is_while: bool
+    kind: str
+    binding: str
     start: int
     condition: int
     body_top: int
@@ -21,8 +23,8 @@ struct ControlFrame {
     previous: int
 }
 
-fn NewControlFrame(is_while: bool, start: int, condition: int, previous: int): ControlFrame {
-    return ControlFrame { is_while: is_while, start: start, condition: condition, body_top: 0, body_count: 0, else_top: 0, else_count: 0, phase: 0, previous: previous }
+fn NewControlFrame(kind: str, binding: str, start: int, condition: int, previous: int): ControlFrame {
+    return ControlFrame { kind: kind, binding: binding, start: start, condition: condition, body_top: 0, body_count: 0, else_top: 0, else_count: 0, phase: 0, previous: previous }
 }
 
 fn NextBodyWork(current: int, amount: int, error_token: Token): int! {
@@ -32,8 +34,11 @@ fn NextBodyWork(current: int, amount: int, error_token: Token): int! {
     return ok(current + amount)
 }
 
-fn RejectBodyEof(control_depth: int, is_while: bool, phase: int, error_token: Token): null! {
-    if (control_depth > 0 && is_while) {
+fn RejectBodyEof(control_depth: int, kind: str, phase: int, error_token: Token): null! {
+    if (control_depth > 0 && kind == "For") {
+        RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after for body")?
+    }
+    if (control_depth > 0 && kind == "While") {
         RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after while body")?
     }
     if (control_depth > 0 && phase == 0) {
@@ -62,6 +67,89 @@ fn RejectControlBody(is_while: bool, error_token: Token): null! {
     if (!is_while) { RejectAt(error_token.clone(), "unsupported_statement", "stage-3 if bodies must use braces")? }
     RejectAt(error_token, "unsupported_statement", "stage-3 while bodies must use braces")?
     return ok(null)
+}
+
+struct ControlHeader {
+    binding: str
+    expression_start: int
+    expression_end: int
+    body_open: int
+    work: int
+}
+
+fn ReadExpressionEnd(&tokens: [Token], start: int, for_header: bool): int! {
+    probe = start
+    boundary = EmptyExpressionBoundary()
+    while (!boundary.complete) {
+        if (probe >= tokens.len()) { RejectExpressionTerminator(tokens[tokens.len() - 1].clone())? }
+        previous_can_end = probe > start && CanEndExpression(tokens[probe - 1].kind.clone())
+        named_struct_open = probe > start && probe + 2 < tokens.len() && tokens[probe].kind == "LBrace"
+            && IsNamedStructStart(tokens[probe - 1], tokens[probe], tokens[probe + 1], tokens[probe + 2])
+        if (for_header && tokens[probe].kind == "LBrace" && !named_struct_open
+            && boundary.paren_depth == 0 && boundary.bracket_depth == 0 && boundary.brace_depth == 0) {
+            return ok(probe)
+        }
+        boundary = PushExpressionBoundary(boundary, tokens[probe].clone(), previous_can_end, named_struct_open)?
+        if (!boundary.complete) { probe = probe + 1 }
+    }
+    return ok(probe)
+}
+
+fn ReadControlHeader(&tokens: [Token], start: int, initial_work: int): ControlHeader! {
+    kind = tokens[start].kind.clone()
+    cursor = start + 1
+    if (kind == "For") {
+        name = tokens[cursor].clone()
+        if (name.kind != "Ident") { RejectAt(name.clone(), "unexpected_token", "expected loop variable after 'for'")? }
+        cursor = cursor + 1
+        if (tokens[cursor].kind != "In") { RejectAt(tokens[cursor].clone(), "unexpected_token", "expected 'in' after loop variable")? }
+        expression_start = cursor + 1
+        expression_end = ReadExpressionEnd(tokens, expression_start, true)?
+        work = NextBodyWork(initial_work, expression_end - start, name.clone())?
+        if (tokens[expression_end].kind != "LBrace") {
+            RejectAt(tokens[expression_end].clone(), "unsupported_statement", "stage-3 for bodies must use braces")?
+        }
+        return ok(ControlHeader { binding: name.lexeme, expression_start: expression_start, expression_end: expression_end, body_open: expression_end, work: work })
+    }
+
+    is_while = kind == "While"
+    if (tokens[cursor].kind != "LParen") {
+        RejectControlOpen(is_while, tokens[cursor].clone())?
+    }
+    cursor = cursor + 1
+    condition_start = cursor
+    condition_depth = 0
+    reading_condition = true
+    work = initial_work
+    while (reading_condition) {
+        work = NextBodyWork(work, 1, tokens[cursor].clone())?
+        condition_token = tokens[cursor].clone()
+        missing_close = condition_token.kind == "Eof" || condition_token.kind == "RBrace" || condition_token.kind == "LBrace" || condition_token.kind == "Semicolon"
+        if (missing_close) {
+            RejectControlClose(is_while, condition_token.clone())?
+        }
+        if (condition_token.kind == "RParen") {
+            if (condition_depth == 0) { reading_condition = false }
+            else {
+                condition_depth = condition_depth - 1
+                cursor = cursor + 1
+            }
+        } else {
+            if (condition_token.kind == "LParen") { condition_depth = condition_depth + 1 }
+            cursor = cursor + 1
+        }
+    }
+    return ok(ControlHeader { binding: "", expression_start: condition_start, expression_end: cursor, body_open: cursor + 1, work: work })
+}
+
+fn LocalAssignmentOperator(&token: Token): str {
+    if (token.kind == "Equal") { return "=" }
+    if (token.kind == "PlusEqual") { return "+" }
+    if (token.kind == "MinusEqual") { return "-" }
+    if (token.kind == "StarEqual") { return "*" }
+    if (token.kind == "SlashEqual") { return "/" }
+    if (token.kind == "PercentEqual") { return "%" }
+    return ""
 }
 
 fn RejectBodyNodeLimit(token: Token): null! { RejectAt(token, "node_limit", "stage-3 parser accepts at most 4096 AST nodes")? return ok(null) }
