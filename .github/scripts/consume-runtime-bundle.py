@@ -987,7 +987,7 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                 write_report(report_path,report);cleanup.raise_if_any(primary)
 
 
-def stage_committed_ku_sources(repo, commit, env, project, directories):
+def stage_committed_ku_sources(repo, commit, env, project, directories, *, file_limit=64):
     tree = invoke(['git', 'ls-tree', '-rz', commit, '--', *directories], repo, env)
     if tree.returncode:
         raise RuntimeError('cannot read committed Ku source tree')
@@ -1002,7 +1002,7 @@ def stage_committed_ku_sources(repo, commit, env, project, directories):
         mode, kind, oid = description.split(' ')
         relative = EXPORT.checked_relative(name)
         if (mode != '100644' or kind != 'blob' or relative.casefold() in names or
-                len(names) >= 64):
+                len(names) >= file_limit):
             raise ValueError('invalid committed Ku source: ' + relative)
         names.add(relative.casefold())
         blob = invoke(['git', 'cat-file', 'blob', oid], repo, env)
@@ -1102,6 +1102,12 @@ def installed_declaration_inventory_consumer(install, root, env, report, repo, c
     detail['status'] = 'passed'
 
 
+BOOTSTRAP_LAUNCHERS = {
+    'stage1/main.ku', 'stage2/main.ku', 'stage3/main.ku',
+    'semantics/main.ku', 'semantics/project_main.ku', 'semantics/projection_main.ku',
+}
+
+
 def bootstrap_compiler_manifests(compiler_modules):
     limit = 64
     if len(compiler_modules) <= limit:
@@ -1110,12 +1116,8 @@ def bootstrap_compiler_manifests(compiler_modules):
     # Each launcher is run as an independent tool and is not imported by
     # another launcher. Keep all shared modules in each manifest so any new
     # import between launchers fails the real binder rather than being skipped.
-    standalone = {
-        'stage1/main.ku', 'stage2/main.ku', 'stage3/main.ku',
-        'semantics/main.ku', 'semantics/project_main.ku', 'semantics/projection_main.ku',
-    }
-    entrypoints = sorted(module for module in compiler_modules if module in standalone)
-    shared = [module for module in compiler_modules if module not in standalone]
+    entrypoints = sorted(module for module in compiler_modules if module in BOOTSTRAP_LAUNCHERS)
+    shared = [module for module in compiler_modules if module not in BOOTSTRAP_LAUNCHERS]
     capacity = limit - len(shared)
     if capacity < 1:
         raise RuntimeError('bootstrap shared source graph no longer fits with an entrypoint')
@@ -1131,7 +1133,7 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
     deployment.mkdir()
     hashes = stage_committed_ku_sources(repo, commit, env, compiler, (
         'bootstrap/stage1', 'bootstrap/stage2', 'bootstrap/stage3', 'bootstrap/semantics',
-    ))
+    ), file_limit=64 + len(BOOTSTRAP_LAUNCHERS))
     inventory_hashes = stage_committed_ku_sources(repo, commit, env, compiler, ('bootstrap/tools/declarations',))
     detail['compiler_source_tree_sha256'] = hashlib.sha256(EXPORT.json_bytes(sorted(hashes))).hexdigest()
     modules = ('stage2/context.ku', 'stage2/span.ku', 'stage1/token.ku')
