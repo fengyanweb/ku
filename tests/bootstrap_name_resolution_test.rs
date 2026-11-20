@@ -364,6 +364,50 @@ fn main() { println(Run(Options { transform: Count })) }
         .expect("object pattern binds a local callable over the import");
     assert_success(&run(Command::new(ku).arg("check").arg(&main), cwd, 20));
     assert_success(&run(&mut Command::new(executable), cwd, 20));
+
+    let return_contract = r#"
+fn Failed(): int! { fail "recoverable" }
+fn Decide(ready: bool): int | null {
+    fn Display(): str { return "selected" }
+    if (ready) { println(Display()); return 0 }
+    try { Failed()? } catch (issue) { return null }
+    return -7
+}
+fn main(): null! { println(Decide(true)); return ok(null) }
+"#;
+    fs::write(&main, return_contract).unwrap();
+    assert_success(&run(Command::new(ku).arg("check").arg(&main), cwd, 20));
+    assert_success(&run(&mut Command::new(executable), cwd, 20));
+    for (original, replacement, literal, expectation) in [
+        (
+            "return 0",
+            "return \"not an int\"",
+            "\"not an int\"",
+            r"int \p null",
+        ),
+        ("return null", "return false", "false", r"int \p null"),
+        ("return \"selected\"", "return 3", "3", "str"),
+    ] {
+        let program = return_contract.replace(original, replacement);
+        fs::write(&main, &program).unwrap();
+        let stage0 = run(Command::new(ku).arg("check").arg(&main), cwd, 20);
+        assert_eq!(stage0.status.code(), Some(1));
+        let stage1 = run(&mut Command::new(executable), cwd, 20);
+        assert_eq!(stage1.status.code(), Some(1));
+        assert!(stage1.stdout.is_empty());
+        let diagnostic = String::from_utf8(stage1.stderr).unwrap();
+        assert!(
+            diagnostic.contains(&format!(
+                "|return_type|<source>|expected {expectation} but got "
+            )),
+            "{diagnostic}"
+        );
+        let offset = program.find(replacement).unwrap() + replacement.find(literal).unwrap();
+        assert!(diagnostic.contains(&format!("@{offset}..")));
+        assert!(diagnostic
+            .trim_end()
+            .ends_with(&format!("@{}", offset + literal.len())));
+    }
 }
 
 impl Drop for Temp {

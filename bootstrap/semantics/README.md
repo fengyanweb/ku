@@ -67,6 +67,9 @@ the source path and the full call span. Once the arity matches, a scalar
 literal passed directly to a parameter with an explicit scalar or scalar union
 annotation must match one of its types. A mismatch points at the argument.
 Arguments that need inference or contextual types remain deferred.
+For explicit scalar result types and scalar unions, literal returns use the
+same check. Control blocks share the surrounding function's result type.
+Nested functions and function expressions use their own annotations.
 
 ## Emit C for a structure projection
 

@@ -1,7 +1,7 @@
 import "std.fs"
 import { Span } from "../../stage2/span.ku"
 import { ParseModule } from "../../stage3/parser.ku"
-import { CheckDirectCallContracts } from "../../semantics/call_contracts.ku"
+import { CheckDirectCallContracts, CheckLiteralResultContracts } from "../../semantics/call_contracts.ku"
 import { ImportBinding, SuppliedModule } from "../../semantics/imports.ku"
 import { BuildNameTable } from "../../semantics/names.ku"
 import { BindProjectModules } from "../../semantics/project_bindings.ku"
@@ -38,6 +38,7 @@ fn BootstrapEntry(&command: str, &path: str, &symbol: str): null! {
     imports: [ImportBinding] = []
     types = BindTypeNames(input, supplied)?
     CheckDirectCallContracts(input, imports, supplied)?
+    CheckLiteralResultContracts(input)?
     if (command == "check") { return ok(null) }
     if (command == "emit") {
         return writeScalarC(EmitScalarIntC(input, types, symbol)?)

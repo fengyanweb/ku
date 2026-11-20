@@ -1,6 +1,6 @@
 import { EscapeCanonical } from "../stage1/token.ku"
 import { Span } from "../stage2/span.ku"
-import { CheckDirectCallContracts } from "./call_contracts.ku"
+import { CheckDirectCallContracts, CheckLiteralResultContracts } from "./call_contracts.ku"
 import { BindProjectImports, ImportBinding, SuppliedModule } from "./imports.ku"
 import { RejectName } from "./names.ku"
 import { BindImportedTypeNames, TypeNameBinding } from "./type_names.ku"
@@ -21,6 +21,7 @@ fn resolveProjectModule(&entry: SuppliedModule, &supplied: [SuppliedModule]): Pr
         imports = BindProjectImports(entry, supplied)?
         types = BindImportedTypeNames(entry.named, imports, supplied)?
         CheckDirectCallContracts(entry.named, imports, supplied)?
+        CheckLiteralResultContracts(entry.named)?
         return ok(ProjectModuleBindings { path: entry.path.clone(), imports: imports, types: types })
     } catch (err) {
         fail {

@@ -4,10 +4,10 @@ import { ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
 
 struct DirectSignature {
     name: str
-    parameters: [LiteralParameter]
+    parameters: [ScalarAnnotation]
 }
 
-struct LiteralParameter {
+struct ScalarAnnotation {
     scalars: [str]
 }
 
@@ -16,35 +16,37 @@ fn scalarType(&name: str): bool {
 }
 
 // Use only exact primitive annotations and their finite unions. Generic,
-// unannotated and other parameter types are left to contextual type checking.
-fn literalParameter(&nodes: [Node], &edges: [int], &parameter: Node): LiteralParameter {
+// unannotated and other types are left to contextual type checking.
+fn scalarAnnotation(&nodes: [Node], &edges: [int], &annotation: Node): ScalarAnnotation {
     scalars: [str] = []
-    if (parameter.edge_count == 1) {
-        annotation = nodes[edges[parameter.first_edge] - 1].clone()
-        if (annotation.kind == "TypeName" && scalarType(annotation.text)) {
-            scalars = scalars.push(annotation.text)
-        } else if (annotation.kind == "TypeUnion") {
-            cursor = annotation.first_edge
-            stop = cursor + annotation.edge_count
-            while (cursor < stop) {
-                item = nodes[edges[cursor] - 1].clone()
-                if (item.kind != "TypeName" || !scalarType(item.text)) {
-                    return LiteralParameter { scalars: [] }
-                }
-                scalars = scalars.push(item.text)
-                cursor = cursor + 1
+    if (annotation.kind == "TypeName" && scalarType(annotation.text)) {
+        scalars = scalars.push(annotation.text.clone())
+    } else if (annotation.kind == "TypeUnion") {
+        cursor = annotation.first_edge
+        stop = cursor + annotation.edge_count
+        while (cursor < stop) {
+            item = nodes[edges[cursor] - 1].clone()
+            if (item.kind != "TypeName" || !scalarType(item.text)) {
+                return ScalarAnnotation { scalars: [] }
             }
+            scalars = scalars.push(item.text)
+            cursor = cursor + 1
         }
     }
-    return LiteralParameter { scalars: scalars }
+    return ScalarAnnotation { scalars: scalars }
+}
+
+fn parameterAnnotation(&nodes: [Node], &edges: [int], &parameter: Node): ScalarAnnotation {
+    if (parameter.edge_count != 1) { return ScalarAnnotation { scalars: [] } }
+    return scalarAnnotation(nodes, edges, nodes[edges[parameter.first_edge] - 1])
 }
 
 fn directSignature(&nodes: [Node], &edges: [int], &function: Node, name: str): DirectSignature {
-    parameters: [LiteralParameter] = []
+    parameters: [ScalarAnnotation] = []
     cursor = function.first_edge
     stop = cursor + function.edge_count
     while (cursor < stop && nodes[edges[cursor] - 1].kind == "Parameter") {
-        parameters = parameters.push(literalParameter(nodes, edges, nodes[edges[cursor] - 1]))
+        parameters = parameters.push(parameterAnnotation(nodes, edges, nodes[edges[cursor] - 1]))
         cursor = cursor + 1
     }
     return DirectSignature { name: name, parameters: parameters }
@@ -124,22 +126,22 @@ fn scalarLiteral(&node: Node): str {
     return ""
 }
 
-fn checkLiteralArgument(&parameter: LiteralParameter, &nodes: [Node], &edges: [int], &argument: Node): null! {
-    if (parameter.scalars.len() == 0) { return ok(null) }
+fn checkLiteralType(&annotation: ScalarAnnotation, &nodes: [Node], &edges: [int], &argument: Node, error_code: str): null! {
+    if (annotation.scalars.len() == 0) { return ok(null) }
     actual = scalarLiteral(argument)
     if (argument.kind == "Unary" && argument.edge_count == 1 && argument.text == "-") {
         operand = scalarLiteral(nodes[edges[argument.first_edge] - 1])
         if (operand == "int" || operand == "float") { actual = operand }
     }
     if (actual == "") { return ok(null) }
-    if (containsName(parameter.scalars, actual)) { return ok(null) }
-    expected = parameter.scalars[0].clone()
+    if (containsName(annotation.scalars, actual)) { return ok(null) }
+    expected = annotation.scalars[0].clone()
     cursor = 1
-    while (cursor < parameter.scalars.len()) {
-        expected += " | " + parameter.scalars[cursor].clone()
+    while (cursor < annotation.scalars.len()) {
+        expected += " | " + annotation.scalars[cursor].clone()
         cursor = cursor + 1
     }
-    RejectName("call_argument_type", "expected " + expected + " but got " + actual, DeclarationSpan(argument))?
+    RejectName(error_code, "expected " + expected + " but got " + actual, DeclarationSpan(argument))?
     return ok(null)
 }
 
@@ -173,13 +175,52 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
                     argument = 0
                     while (argument < count) {
                         node = edges[nodes[index - 1].first_edge + argument + 1]
-                        checkLiteralArgument(signatures[signature].parameters[argument], nodes, edges, nodes[node - 1])?
+                        checkLiteralType(signatures[signature].parameters[argument], nodes, edges, nodes[node - 1], "call_argument_type")?
                         argument = argument + 1
                     }
                 }
             }
         }
         index = index + 1
+    }
+    return ok(null)
+}
+
+fn checkReturnsInStatement(&nodes: [Node], &edges: [int], &result: ScalarAnnotation, &statement: Node): null! {
+    if (statement.kind == "Return" && statement.edge_count == 1) {
+        value = edges[statement.first_edge]
+        return checkLiteralType(result, nodes, edges, nodes[value - 1], "return_type")
+    }
+    // These blocks share the current function's result type. Declaration,
+    // expression and nested function nodes establish no returns in this scope.
+    if (statement.kind == "If" || statement.kind == "While" || statement.kind == "For" ||
+        statement.kind == "Try" || statement.kind == "TryBody" ||
+        statement.kind == "Catch" || statement.kind == "CatchBody") {
+        cursor = statement.first_edge
+        stop = cursor + statement.edge_count
+        while (cursor < stop) {
+            checkReturnsInStatement(nodes, edges, result, nodes[edges[cursor] - 1])?
+            cursor = cursor + 1
+        }
+    }
+    return ok(null)
+}
+
+fn checkLiteralReturns(&nodes: [Node], &edges: [int], &function: Node): null! {
+    cursor = function.first_edge
+    stop = cursor + function.edge_count
+    while (cursor < stop && nodes[edges[cursor] - 1].kind == "Parameter") {
+        cursor = cursor + 1
+    }
+    if (cursor == stop) { return ok(null) }
+    // Return annotations follow the parameters. An omitted annotation
+    // begins directly with a statement and yields the empty scalar set.
+    annotation = scalarAnnotation(nodes, edges, nodes[edges[cursor] - 1])
+    if (annotation.scalars.len() == 0) { return ok(null) }
+    cursor = cursor + 1
+    while (cursor < stop) {
+        checkReturnsInStatement(nodes, edges, annotation, nodes[edges[cursor] - 1])?
+        cursor = cursor + 1
     }
     return ok(null)
 }
@@ -194,6 +235,18 @@ fn CheckDirectCallContracts(&named: NamedModule, &imports: [ImportBinding], &sup
         if (named.names.declarations[index].kind == "Function") {
             function = named.names.declarations[index].node
             checkFunctionCalls(named.parsed.arena.nodes, named.parsed.arena.edges, signatures, function)?
+        }
+        index = index + 1
+    }
+    return ok(null)
+}
+
+fn CheckLiteralResultContracts(&named: NamedModule): null! {
+    index = 0
+    while (index < named.parsed.arena.nodes.len()) {
+        node = named.parsed.arena.nodes[index].clone()
+        if (node.kind == "Function" || node.kind == "FunctionExpr") {
+            checkLiteralReturns(named.parsed.arena.nodes, named.parsed.arena.edges, node)?
         }
         index = index + 1
     }
