@@ -300,6 +300,63 @@ int main(void) {
             with self.assertRaisesRegex(link_c.LinkError, r"checked View \[str\] carrier"):
                 link_c.TypeRef.read(dict(array, **change), "array")
 
+    def test_checked_owned_string_array_result_across_two_c_units(self):
+        result = dict(builtin("str", "KuBootstrapResultStringArray"), kind="BuiltinArray")
+        provider = declaration("parts.ku", 8, "parts", [builtin()])
+        consumer = declaration("consumer.ku", 3, "take", [builtin()])
+        provider["signature"].update(result=result, returns_result=True)
+        consumer["signature"].update(result=result, returns_result=True)
+        abi = """#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+typedef struct { uint8_t* ptr; size_t len, capacity; uint8_t storage; } KuProjectionString;
+typedef struct { size_t len; KuProjectionString* data; size_t capacity; } KuGuardStringArray;
+typedef struct { KuProjectionString domain, code, message; } KuBootstrapError;
+typedef struct { bool ok; KuGuardStringArray value; KuBootstrapError error; } KuBootstrapResultStringArray;
+"""
+        units = self.unit("array-provider", plan(provider), abi + """
+KuBootstrapResultStringArray parts(int64_t choice) {
+    KuBootstrapResultStringArray result = {0};
+    if (choice < 0) {
+        result.error.code = (KuProjectionString){(uint8_t*)"missing", 7, 0, 0};
+        return result;
+    }
+    result.value.data = calloc(1, sizeof *result.value.data);
+    if (!result.value.data) abort();
+    result.value.data[0] = (KuProjectionString){malloc(3), 3, 3, 1};
+    if (!result.value.data[0].ptr) abort();
+    memcpy(result.value.data[0].ptr, "one", 3);
+    result.value.len = result.value.capacity = 1;
+    result.ok = true;
+    return result;
+}
+""", receipt=True)
+        units += self.unit("array-consumer", plan(consumer, [provider]), abi + """
+extern KuBootstrapResultStringArray parts(int64_t);
+KuBootstrapResultStringArray take(int64_t choice) { return parts(choice); }
+""")
+        self.caller.write_text("""
+int main(void) {
+    KuBootstrapResultStringArray value = take(1);
+    if (!value.ok || value.value.len != 1 || value.value.capacity != 1 ||
+        value.value.data[0].len != 3 || memcmp(value.value.data[0].ptr, "one", 3)) return 1;
+    free(value.value.data[0].ptr);
+    free(value.value.data);
+    value = take(-1);
+    return value.ok || value.value.data || value.error.code.len != 7 ||
+           memcmp(value.error.code.ptr, "missing", 7);
+}
+""", encoding="ascii")
+        args = ["--entry", "consumer.ku", "3", "--caller", str(self.caller), "-o", str(self.output)]
+        self.assertEqual(link_c.main([*units, *args]), 0)
+        self.assertEqual(subprocess.run([self.output], timeout=15).returncode, 0)
+        with self.assertRaisesRegex(link_c.LinkError, r"checked owned \[str\]! result carrier"):
+            link_c.Signature.read(dict(provider["signature"], returns_result=False), "plain result")
+        with self.assertRaisesRegex(link_c.LinkError, r"checked owned \[str\]! result carrier"):
+            link_c.Signature.read(dict(provider["signature"], parameters=[result]), "owned parameter")
+
     def test_missing_entry_and_ambiguous_local_symbol_are_rejected(self):
         with patch.object(link_c.subprocess, "run") as cc, contextlib.redirect_stderr(io.StringIO()) as err:
             status = link_c.main([*self.left_args, *self.right_args, *self.build_args])

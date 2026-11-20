@@ -75,7 +75,7 @@ class TypeRef:
     passing: str
     c_type: str
 
-    def read(value, where):
+    def read(value, where, checked_result=False):
         ref = record(value, "kind source_name source_path node c_type passing", where)
         name = text(ref["source_name"], f"{where}.source_name")
         passing = ref["passing"]
@@ -93,10 +93,14 @@ class TypeRef:
                 raise LinkError(f"{where} builtin must have a null path and node 0")
             identity = ("builtin", name)
         elif ref["kind"] == "BuiltinArray":
+            view = (passing == "view" and
+                    c_type[len("const "):-1].rstrip() == "KuGuardStringArray")
+            owned = (checked_result and passing == "value" and
+                     c_type == "KuBootstrapResultStringArray")
             if (ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0
-                    or name != "str" or passing != "view"
-                    or c_type[len("const "):-1].rstrip() != "KuGuardStringArray"):
-                raise LinkError(f"{where} builtin array requires the checked View [str] carrier")
+                    or name != "str" or not (view or owned)):
+                raise LinkError(f"{where} builtin array requires the checked View [str] carrier "
+                                "or checked owned [str]! result carrier")
             identity = ("builtin_array", name)
         elif ref["kind"] in ("Struct", "StructArray"):
             identity = ("struct" if ref["kind"] == "Struct" else "struct_array",
@@ -130,8 +134,10 @@ class Signature:
     def read(value, where):
         sig = record(value, "parameters result returns_result", where)
         params = array(sig["parameters"], f"{where}.parameters")
-        result = TypeRef.read(sig["result"], f"{where}.result")
-        if result.passing != "value" or type(sig["returns_result"]) is not bool:
+        if type(sig["returns_result"]) is not bool:
+            raise LinkError(f"{where} requires a by-value result and boolean returns_result")
+        result = TypeRef.read(sig["result"], f"{where}.result", checked_result=sig["returns_result"])
+        if result.passing != "value":
             raise LinkError(f"{where} requires a by-value result and boolean returns_result")
         return Signature(tuple(TypeRef.read(item, f"{where}.parameters[{i}]")
                                for i, item in enumerate(params)), result, sig["returns_result"])

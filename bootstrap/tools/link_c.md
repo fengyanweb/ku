@@ -24,8 +24,9 @@ identity and Result representation. A struct identity comes from its module
 path and declaration node. A `StructArray` identifies its element by that
 pair and keeps its array shape distinct from the element itself. An owned
 array carrier is passed by value, and a readonly View uses a const pointer.
-`BuiltinArray` currently describes View `[str]` with the generated
-`KuGuardStringArray` carrier.
+`BuiltinArray` describes View `[str]` parameters with the generated
+`KuGuardStringArray` carrier. A checked owning `[str]!` result uses
+`KuBootstrapResultStringArray`, including its Result wrapper.
 Equivalent types can use different C aliases in
 separate units. Builtin carriers must agree, with aliases for the shared
 bootstrap string layout recognized across emitters. Each provided unit
