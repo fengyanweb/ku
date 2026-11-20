@@ -1002,23 +1002,28 @@ fn project_import(source: &str, import: &ImportDecl, arena: &mut ProjectedArena)
 }
 
 fn project_function(source: &str, function: &FnDecl, arena: &mut ProjectedArena) -> usize {
-    assert!(!function.is_async, "stage-3 fixture must be synchronous");
     assert!(function.type_params.is_empty());
     let tokens = Lexer::new(source).lex().expect("signature projection lex");
     let mut cursor = tokens
         .iter()
-        .position(|token| {
-            matches!(token.kind, TokenKind::Fn)
-                && token.span.start.offset == function.span.start.offset
-        })
+        .position(|token| token.span.start.offset == function.span.start.offset)
         .expect("function start token");
+    if function.is_async {
+        assert!(matches!(tokens[cursor].kind, TokenKind::Async));
+        cursor += 1;
+    }
+    assert!(matches!(tokens[cursor].kind, TokenKind::Fn));
     cursor += 1;
     let kind = if function.name.is_empty() {
         "FunctionExpr"
     } else {
         assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
         cursor += 1;
-        "Function"
+        if function.is_async {
+            "AsyncFunction"
+        } else {
+            "Function"
+        }
     };
     assert!(matches!(tokens[cursor].kind, TokenKind::LParen));
     cursor += 1;
@@ -1583,8 +1588,15 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "ParseBoundedModule",
         "AddNode",
     );
+    let structured_http = include_str!("../examples/native_task_structured_http.ku");
+    let structured_http_prelude = &structured_http[..structured_http
+        .find("async fn Send(")
+        .expect("start of structured HTTP service")];
     let cases = [
         "",
+        structured_http_prelude,
+        "// 前😀\r\nasync fn Compute(&value: int): int! { return ok(value) }",
+        "fn Outer() { async fn Inner(value: int): int! { return ok(value) } }\nasync fn Again() { fn Ordinary() {} }",
         "import \"./setup.ku\";\nfn before() {}\nimport math from \"./math.ku\"\nimport { Add, User as Person } from \"./api.ku\"\nfn main() { return Add(1, 2) }",
         "// 导入😀\r\nimport { Add as Plus } from \"./中😀.ku\"\r\nimport \"./tab\\tname.ku\"\r\nfn main() {}",
         "module App",
@@ -1888,7 +1900,8 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let double_enum_variant_comma = "enum State { Ready,, Pending }";
     let enum_semicolon = "enum State {};";
     let unsupported_async_enum_type = "enum State { Ready(op: async fn(int): int) }";
-    let unsupported_item = "async fn main(): null! { return ok(null) }";
+    let malformed_async_item = "async nope";
+    let malformed_async_local = "fn Outer() { async nope }";
     let parameter_boundary = format!(
         "fn many({}): null {{ return null }}",
         (0..32)
@@ -2900,11 +2913,6 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         TokenKind::Module,
         "expression form is outside the stage-2 bootstrap subset",
     );
-    let unsupported_item_message = diagnostic_for_kind(
-        unsupported_item,
-        TokenKind::Async,
-        "stage-3 supports import, module, struct, enum, and ordinary function items only",
-    );
     let leading_union_pipe_message = rust_error_canonical(leading_union_pipe);
     let trailing_union_pipe_message = rust_error_canonical(trailing_union_pipe);
     let nested_trailing_union_pipe_message = rust_error_canonical(nested_trailing_union_pipe);
@@ -3445,9 +3453,14 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         ),
         (enum_semicolon, "expected_item", enum_semicolon_message),
         (
-            unsupported_item,
-            "unsupported_item",
-            unsupported_item_message,
+            malformed_async_item,
+            "unexpected_token",
+            rust_error_canonical(malformed_async_item),
+        ),
+        (
+            malformed_async_local,
+            "unexpected_token",
+            rust_error_canonical(malformed_async_local),
         ),
         (
             unsupported_async_enum_type,

@@ -87,7 +87,7 @@ struct ControlHeader {
 }
 
 fn IsControlStatement(&kind: str): bool {
-    return kind == "If" || kind == "While" || kind == "For" || kind == "Try" || kind == "Fn"
+    return kind == "If" || kind == "While" || kind == "For" || kind == "Try" || kind == "Fn" || kind == "Async"
 }
 
 fn ReadExpressionEnd(&tokens: [Token], start: int, window_end: int, context: str): int! {

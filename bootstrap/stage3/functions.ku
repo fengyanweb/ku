@@ -38,7 +38,7 @@ fn ModuleFunctionEnd(&tokens: [Token], first: int, &eof: Token): int! {
     return ok(function_end)
 }
 
-// Read exactly one ordinary function followed by exactly one EOF sentinel.
+// Read one named function declaration followed by exactly one EOF sentinel.
 // A shared signature reader builds the header; statements.ku owns the function-body
 // state machine and returns an internal synthetic transport tree. The original
 // token window stays owned by the reader while its body borrows that interval.
@@ -60,7 +60,7 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
     }
     last_index = tokens.len() - 1
     last = tokens[last_index].clone()
-    if (last.kind != "Eof" || tokens[0].kind != "Fn") {
+    if (last.kind != "Eof" || (tokens[0].kind != "Fn" && tokens[0].kind != "Async")) {
         RejectAt(tokens[0].clone(), "invalid_token_stream", "function window must start with fn and end with EOF")?
     }
     validation_index = 0
@@ -80,7 +80,7 @@ fn ReadCompilerFunction(&tokens: [Token], first: int, last_index: int, parse_exp
     if (tokens.len() > 4096 || first < 0 || first >= last_index || last_index >= tokens.len()) {
         RejectAtPoint("invalid_token_stream", "compiler function interval lies outside the scanner window")?
     }
-    if (tokens[first].kind != "Fn" || tokens[tokens.len() - 1].kind != "Eof") {
+    if ((tokens[first].kind != "Fn" && tokens[first].kind != "Async") || tokens[tokens.len() - 1].kind != "Eof") {
         RejectAt(tokens[first].clone(), "invalid_token_stream", "compiler function interval must start with fn in a scanner window ending at EOF")?
     }
     index = first
@@ -215,7 +215,9 @@ fn ReadFunctionSpan(&tokens: [Token], first: int, last_index: int, token_base: i
 
     function_children = header.children
     for statement in body_statements { function_children = function_children.push(statement) }
-    function = AddNode("Function", header.name, 0, SpanMerge(SpanFromToken(function_start.clone()), body_span.clone()), function_children, function_start.clone())?
+    function_kind = "Function"
+    if (function_start.kind == "Async") { function_kind = "AsyncFunction" }
+    function = AddNode(function_kind, header.name, 0, SpanMerge(SpanFromToken(function_start.clone()), body_span.clone()), function_children, function_start.clone())?
     output = ValidateParseOutput(ParseOutput {
         arena: Arena { nodes: arena_nodes.clone(), edges: arena_edges.clone() },
         root: function

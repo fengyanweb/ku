@@ -109,14 +109,15 @@ fn BuildCatchClause(&tokens: [Token], next: int, last: int, &frame: ControlFrame
 }
 
 
-// Match the named function body diagnostic for an incomplete anonymous body.
+// Match the ordinary function diagnostic for every incomplete function body.
 fn FunctionEofKind(&kind: str): str {
-    if (kind == "FunctionExpr") { return "Function" }
+    if (kind == "AsyncFunction" || kind == "FunctionExpr") { return "Function" }
     return kind.clone()
 }
 
 fn LocalFunctionNodeKind(&start_kind: str): str {
     if (start_kind == "Ident") { return "FunctionExpr" }
+    if (start_kind == "Async") { return "AsyncFunction" }
     return "Function"
 }
 

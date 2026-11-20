@@ -106,6 +106,13 @@ fn ReadFunctionHeaderMode(&tokens: [Token], first: int, last_index: int, initial
     parameter_error = "expected anonymous function parameter"
     close_error = "expected ')' after anonymous function parameters"
     if (!anonymous) {
+        if (function_start.kind == "Async") {
+            if (WindowKind(tokens, cursor, last_index) != "Fn") {
+                RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected 'fn' after 'async'")?
+            }
+            ChargeWork(1, function_start.clone())?
+            cursor = cursor + 1
+        }
         if (WindowKind(tokens, cursor, last_index) != "Ident") {
             RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected function name")?
         }

@@ -151,7 +151,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                     control_value = 0
                     function_start = 0
                     declared_type = 0
-                    if (current.kind == "Function" || current.kind == "FunctionExpr") {
+                    if (current.kind == "Function" || current.kind == "AsyncFunction" || current.kind == "FunctionExpr") {
                         scope = local_headers[current.condition - 1].clone()
                         control_children = scope.children
                         statement_count = scope.parent_statement_count
@@ -220,7 +220,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                 RejectStatementDepth(statement_start.clone())?
             }
             opened = ControlBodyStart { binding: "", condition: 0, body_open: cursor, work: parse_steps }
-            if (control_kind == "Fn" || control_kind == "Ident") {
+            if (control_kind == "Fn" || control_kind == "Async" || control_kind == "Ident") {
                 local = ReadLocalFunctionHeader(tokens, statement_start_index, function_start, last_index,
                                                 parse_steps, arena_nodes.len(), statement_count, declared_type)?
                 AddArena(local.output, statement_start.clone(), true)?
