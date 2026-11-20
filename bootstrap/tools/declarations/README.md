@@ -16,8 +16,9 @@ ku build --release main.ku -o declarations
 ./declarations
 ```
 
-Expected output is `1:1 Keep`. An empty prefix returns `inventory/empty_prefix`
-when the first declaration is visited.
+Expected output is `1:1 Keep`. The capturing callback returns a line number for
+a matching function and `null` for other declarations. An empty prefix returns
+`inventory/empty_prefix`.
 
 For a native deployment, copy `declarations`, `source.ku` and `prefix.txt`
 together. An explicit Runner build still needs its original module sources.

@@ -1057,7 +1057,7 @@ def installed_declaration_inventory_consumer(install, root, env, report, repo, c
         'fn KeepAlpha(): null! { return ok(null) }\n')
     retired = root / 'installed-sdk-unavailable-for-declarations'
     expected = '2:1 KeepZeta\n4:1 KeepAlpha\n'
-    policy = 'prefix.txt is empty while filtering line 1'
+    policy = 'prefix.txt is empty'
     relocate_checkout_entry(install, retired)
     try:
         detail['sdk_unavailable_during_run'] = not install.exists()

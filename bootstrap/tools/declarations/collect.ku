@@ -1,6 +1,6 @@
 import { Node, ParseOutput } from "../../stage2/ast.ku"
 
-fn Collect(output: ParseOutput, include: fn(&Node): bool!): [str]! {
+fn Collect(output: ParseOutput, location: fn(&Node): int | null): [str]! {
     arena = output.arena
     nodes = arena.nodes
     edges = arena.edges
@@ -9,8 +9,9 @@ fn Collect(output: ParseOutput, include: fn(&Node): bool!): [str]! {
     index = 0
     while (index < module_node.edge_count) {
         node = nodes[edges[module_node.first_edge + index] - 1].clone()
-        if (include(node)?) {
-            inventory = inventory.push(str(node.line) + ":" + str(node.column) + " " + node.text)
+        line = location(node)
+        if (line != null) {
+            inventory = inventory.push(str(line) + ":" + str(node.column) + " " + node.text)
         }
         index = index + 1
     }
