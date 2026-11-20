@@ -1261,7 +1261,7 @@ def installed_native_only_bytes_consumer(install, root, env, report, target):
     }
     report['installed_native_only_bytes'] = validate_installed_relative_program(
         install, root / 'native-only-bytes-project', env, target, files, '10\n',
-        native_only_diagnostic='std.bytes currently requires native C; use ku build --backend c')
+        native_only_diagnostic='std.bytes currently requires native C; use `ku build --backend c`')
 
 
 def installed_task_error_consumer(install, root, env, report, target):
