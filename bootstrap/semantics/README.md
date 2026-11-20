@@ -73,6 +73,27 @@ Nested functions and function expressions use their own annotations.
 Relative imports can omit the `.ku` suffix. Manifest entries still name the
 normalized `.ku` files.
 
+## Emit a complete scalar program
+
+`EmitScalarProjectProgramC` binds and checks the supplied project modules.
+The first module defines `fn main(): null!`. The entry can print integer
+expressions with the builtin `println` and end with `return ok(null)` or an
+`Error` literal in `fail`. Integer expressions use the existing checked
+scalar functions, including relative imports with aliases.
+
+```ku
+import { Increment as Answer } from "./numbers.ku"
+
+fn main(): null! {
+    println(Answer(41))
+    return ok(null)
+}
+```
+
+The emitted C includes the executable's entry point and requires only C11
+and its standard library. Successful completion exits with status 0. A
+returned Error writes its message to stderr and exits with status 1.
+
 ## Emit C for a structure projection
 
 The projection compiler checks field names, scalar field types and ownership

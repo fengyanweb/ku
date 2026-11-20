@@ -18,13 +18,14 @@ import { SuppliedModule } from "./imports.ku"
 import { ManifestPaths, ReadProjectModules } from "./project_manifest.ku"
 import { BindTypeNames } from "./type_names.ku"
 import { EmitScalarIntC, ScalarIntC } from "./scalar_int_c.ku"
-import { EmitScalarProjectC } from "./scalar_project_c.ku"
+import { EmitScalarProjectC, EmitScalarProjectProgramC } from "./scalar_project_c.ku"
 
 fn Emit(&function: str): ScalarIntC! {
     if (fs.exists("modules.txt")) {
         at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
         paths = ManifestPaths(fs.read("modules.txt")?, at)?
         supplied = ReadProjectModules(paths)?
+        if (function == "") { return ok(ScalarIntC { symbol: "", source: EmitScalarProjectProgramC(supplied)? }) }
         return EmitScalarProjectC(supplied, function)
     }
     named = BuildNameTable(ParseProgram(fs.read("input.ku")?)?)?
@@ -35,8 +36,11 @@ fn Emit(&function: str): ScalarIntC! {
 
 fn main(): null! {
     output = Emit(fs.read("function.txt")?)?
-    println(output.symbol)
-    println(output.source)
+    if (output.symbol == "") { print(output.source) }
+    else {
+        println(output.symbol)
+        println(output.source)
+    }
     return ok(null)
 }
 "#;
@@ -755,6 +759,102 @@ fn main() { println(TestScore(5)) }
     fs::remove_file(manifest).unwrap();
 }
 
+fn assert_project_executable(ku: &Path, seed: &Path, cwd: &Path) {
+    let main = cwd.join("entry.ku");
+    let numbers = cwd.join("numbers.ku");
+    let manifest = cwd.join("modules.txt");
+    let symbol = cwd.join("function.txt");
+    let import = "import { Increment as Answer } from \"./numbers.ku\"\n";
+    let body = "fn main(): null! { println(Answer(41));";
+    let helper = "fn Increment(value: int): int { return value + 1 }\n";
+    fs::write(&symbol, "").unwrap();
+    for (name, exit, status, stderr) in [
+        ("success", "return ok(null)", 0, ""),
+        (
+            "failure",
+            "fail { domain: \"demo\", code: \"stopped\", message: \"停止🙂\0末\" }",
+            1,
+            "停止🙂\0末\n",
+        ),
+        (
+            "overflow",
+            "println(Answer(9223372036854775807)); return ok(null)",
+            1,
+            "integer overflow\n",
+        ),
+    ] {
+        fs::write(&main, format!("{import}{body} {exit} }}\n")).unwrap();
+        fs::write(&numbers, helper).unwrap();
+        fs::write(&manifest, "entry.ku\nnumbers.ku\n").unwrap();
+        let generated = execute(&mut Command::new(seed), cwd, 20);
+        assert_success(&generated);
+        let code = String::from_utf8(generated.stdout).unwrap();
+        assert_eq!(code.matches("int main(void)").count(), 1);
+        assert_eq!(code.matches("static int64_t ku_int_").count(), 1);
+        let c_path = cwd.join(format!("{name}.c"));
+        fs::write(&c_path, code).unwrap();
+        let suffix = std::env::consts::EXE_SUFFIX;
+        let native = cwd.join(format!("native-{name}{suffix}"));
+        let standalone = cwd.join(format!("standalone-{name}{suffix}"));
+        assert_success(&execute(
+            Command::new(ku)
+                .args(["build", "--release", "--offline"])
+                .arg(&main)
+                .arg("-o")
+                .arg(&native),
+            cwd,
+            45,
+        ));
+        compile_c(&c_path, &standalone, cwd);
+        for path in [&main, &numbers, &manifest, &c_path] {
+            fs::remove_file(path).unwrap();
+        }
+
+        let native = execute(&mut Command::new(native), cwd, 10);
+        let actual = execute(&mut Command::new(standalone), cwd, 10);
+        assert_eq!(actual.status.code(), Some(status), "{actual:?}");
+        assert_eq!(actual.status.code(), native.status.code(), "{native:?}");
+        assert_eq!(actual.stdout, native.stdout);
+        assert_eq!(actual.stderr, native.stderr);
+        assert_eq!(String::from_utf8_lossy(&actual.stdout).trim_end(), "42");
+        assert_eq!(
+            String::from_utf8_lossy(&actual.stderr).replace("\r\n", "\n"),
+            stderr
+        );
+    }
+
+    fs::write(&numbers, helper).unwrap();
+    fs::write(&manifest, "entry.ku\nnumbers.ku\n").unwrap();
+    for (source, diagnostic) in [
+        (
+            "fn main(value: int): null! { return ok(null) }",
+            "unsupported_program_entry",
+        ),
+        (
+            "fn main(): null! { println(Answer(\"wrong\")); return ok(null) }",
+            "call_argument_type",
+        ),
+        (
+            "fn println(value: int): int { return value }\nfn main(): null! { println(Answer(41)); return ok(null) }",
+            "unsupported_program_statement",
+        ),
+        (
+            "fn main(): null! { println(Answer(41)) }",
+            "unsupported_program_exit",
+        ),
+    ] {
+        fs::write(&main, format!("{import}{source}\n")).unwrap();
+        let blocked = execute(&mut Command::new(seed), cwd, 20);
+        assert_eq!(blocked.status.code(), Some(1), "{blocked:?}");
+        assert!(blocked.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&blocked.stderr).contains(diagnostic),
+            "{blocked:?}"
+        );
+    }
+    fs::remove_file(manifest).unwrap();
+}
+
 #[test]
 fn ku_emits_checked_c11_for_real_math_functions() {
     let work = Temp::new();
@@ -899,6 +999,7 @@ fn ku_emits_checked_c11_for_real_math_functions() {
     assert_owned_replacement(&ku, &seed, &cwd);
     assert_capacity_results(&ku, &seed, &cwd);
     assert_imported_calls(&ku, &seed, &cwd);
+    assert_project_executable(&ku, &seed, &cwd);
 
     for (input, diagnostic) in [
         (

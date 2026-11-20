@@ -6,6 +6,7 @@ import { EmitScalarIntModule, LowerScalarIntFunction, ScalarIntC, AppendScalarIn
 import { ScalarFunctionNode, ScalarIntCalleeSignature, ScalarIntImport } from "./scalar_int_calls.ku"
 import { ScalarIntFunction, ScalarParameterCType, ScalarResultCType } from "./scalar_int_emit.ku"
 import { HasScalarBuiltin, RejectScalarInt } from "./scalar_int_operands.ku"
+import { ComposeScalarProgramC, LowerScalarProgramEntry } from "./scalar_program_c.ku"
 
 struct ScalarProjectModule {
     imports: [ScalarIntImport]
@@ -65,7 +66,18 @@ fn scalarProjectLinkPlan(&plan: ScalarIntFunction, symbol: str): LinkPlanDeclara
         result: result, returns_result: plan.result_type == 4 }
 }
 
-fn scalarProjectPlans(&supplied: [SuppliedModule], &function: str): [ScalarIntFunction]! {
+fn lowerProjectFunction(&unit: SuppliedModule, &binding: ProjectModuleBindings, &info: ScalarProjectModule,
+                        base: int, function: int, program_entry: bool): ScalarIntFunction! {
+    if (program_entry) {
+        return LowerScalarProgramEntry(unit.named.parsed.arena.nodes, unit.named.parsed.arena.edges,
+            unit.named.names.declarations, binding.types, info.imports, function,
+            HasScalarBuiltin(unit.named, "println"), info.has_ok)
+    }
+    return LowerScalarIntFunction(unit.named.parsed.arena.nodes, unit.named.parsed.arena.edges,
+        unit.named.names.declarations, binding.types, info.imports, base, function, info.has_str, info.has_ok)
+}
+
+fn scalarProjectPlans(&supplied: [SuppliedModule], &function: str, program: bool): [ScalarIntFunction]! {
     if (supplied.len() == 0) {
         start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
         RejectScalarInt("unknown_int_function", "a selected project module is required", start)?
@@ -87,9 +99,8 @@ fn scalarProjectPlans(&supplied: [SuppliedModule], &function: str): [ScalarIntFu
         // Keys combine the module ordinal and one-based node ID, without collisions.
         module_slot = (key - 1) / 4096
         base = module_slot * 4096
-        plan = LowerScalarIntFunction(supplied[module_slot].named.parsed.arena.nodes, supplied[module_slot].named.parsed.arena.edges,
-            supplied[module_slot].named.names.declarations, binding[module_slot].types, modules[module_slot].imports, base, key - base,
-            modules[module_slot].has_str, modules[module_slot].has_ok)?
+        plan = lowerProjectFunction(supplied[module_slot], binding[module_slot], modules[module_slot],
+            base, key - base, program && index == 0)?
         reachable = AppendScalarIntCallees(plan, reachable)
         plans = plans.push(plan)
         index = index + 1
@@ -98,12 +109,18 @@ fn scalarProjectPlans(&supplied: [SuppliedModule], &function: str): [ScalarIntFu
 }
 
 fn EmitScalarProjectC(&supplied: [SuppliedModule], &function: str): ScalarIntC! {
-    plans = scalarProjectPlans(supplied, function)?
+    plans = scalarProjectPlans(supplied, function, false)?
     return EmitScalarIntModule(plans, supplied[0].named.parsed.arena.nodes, supplied, plans[0].function_node)
 }
 
+fn EmitScalarProjectProgramC(&supplied: [SuppliedModule]): str! {
+    plans = scalarProjectPlans(supplied, "main", true)?
+    generated = EmitScalarIntModule(plans, supplied[0].named.parsed.arena.nodes, supplied, plans[0].function_node)?
+    return ok(ComposeScalarProgramC(generated.source, generated.symbol))
+}
+
 fn EmitScalarProjectLinkPlan(&supplied: [SuppliedModule], &function: str): str! {
-    plans = scalarProjectPlans(supplied, function)?
+    plans = scalarProjectPlans(supplied, function, false)?
     generated = EmitScalarIntModule(plans, supplied[0].named.parsed.arena.nodes, supplied, plans[0].function_node)?
     // Callees are validated and emitted as internal definitions in this C unit.
     export = scalarProjectLinkPlan(plans[0], generated.symbol)

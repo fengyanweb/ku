@@ -1,0 +1,68 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan, TopLevelName } from "./names.ku"
+import { TypeNameBinding } from "./type_names.ku"
+import { LowerIntExpression, ScalarIntImport } from "./scalar_int_calls.ku"
+import { ScalarIntClause, ScalarIntFunction, ScalarIntInstruction, ScalarIntParameter, ScalarStringPart } from "./scalar_int_emit.ku"
+import { RejectScalarInt } from "./scalar_int_operands.ku"
+import { LowerNullResultExit } from "./scalar_result_null.ku"
+import { ScalarReturnType } from "./scalar_types.ku"
+
+fn programOutputArgument(&nodes: [Node], &edges: [int], &statement: Node, builtin: bool): int! {
+    if (builtin && statement.kind == "ExprStmt" && statement.edge_count == 1) {
+        call = nodes[edges[statement.first_edge] - 1].clone()
+        if (call.kind == "Call" && call.edge_count == 2) {
+            callee = nodes[edges[call.first_edge] - 1].clone()
+            if (callee.kind == "Variable" && callee.edge_count == 0 && callee.text == "println") {
+                return ok(edges[call.first_edge + 1])
+            }
+        }
+    }
+    RejectScalarInt("unsupported_program_statement", "expected the builtin println with one int argument", DeclarationSpan(statement))?
+    return ok(0)
+}
+
+fn LowerScalarProgramEntry(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
+                           &bindings: [TypeNameBinding], &imports: [ScalarIntImport],
+                           entry: int, can_print: bool, can_use_ok: bool): ScalarIntFunction! {
+    function = nodes[entry - 1].clone()
+    cursor = function.first_edge
+    end = cursor + function.edge_count
+    if (function.edge_count < 2 || ScalarReturnType(nodes, edges, bindings, edges[cursor]) != 4) {
+        RejectScalarInt("unsupported_program_entry", "expected an explicit zero-argument main(): null!", DeclarationSpan(function))?
+    }
+    cursor = cursor + 1
+    parameters: [ScalarIntParameter] = []
+    instructions: [ScalarIntInstruction] = []
+    while (cursor < end - 1) {
+        statement_id = edges[cursor]
+        statement = nodes[statement_id - 1].clone()
+        argument = programOutputArgument(nodes, edges, statement, can_print)?
+        for step in LowerIntExpression(nodes, edges, declarations, bindings, parameters, imports, 0, argument)? {
+            instructions = instructions.push(step)
+        }
+        no_arguments: [int] = []
+        instructions = instructions.push(ScalarIntInstruction { operation: "println", result_node: statement_id,
+            operand: argument, right_node: 0, arguments: no_arguments })
+        cursor = cursor + 1
+    }
+    statement = nodes[edges[cursor] - 1].clone()
+    if (statement.edge_count != 1 || (statement.kind != "Return" && statement.kind != "Fail")) {
+        RejectScalarInt("unsupported_program_exit", "expected a final return ok(null) or static fail", DeclarationSpan(statement))?
+    }
+    result = LowerNullResultExit(nodes, edges, parameters, statement, can_use_ok)?
+    no_strings: [ScalarStringPart] = []
+    clause = ScalarIntClause { condition: "", instructions: instructions, scalar_result: result, string_parts: no_strings }
+    return ok(ScalarIntFunction { function_node: entry, parameters: parameters, clauses: [clause], result_type: 4,
+        uses_string_comparison: false, uses_string_contains: false, uses_string_join: false, owned_string_body: "" })
+}
+
+fn ComposeScalarProgramC(source: str, symbol: str): str {
+    text = "#include <stdio.h>\n\n" + source
+    text += "\nint main(void) {\n    KuResult_null result = " + symbol + "();\n"
+    // The admitted null Result carries no owned payload. Its Error fields
+    // can only point at static literals, including strings with zero bytes.
+    text += "    if (result.ok) return 0;\n"
+    text += "    if (result.error.message.len) {\n"
+    text += "        (void)fwrite(result.error.message.ptr, 1, result.error.message.len, stderr);\n    }\n"
+    return text + "    (void)fputc('\\n', stderr);\n    return 1;\n}\n"
+}

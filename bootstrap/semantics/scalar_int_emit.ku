@@ -272,6 +272,12 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         step = 0
         while (step < clause.instructions.len()) {
             instruction = clause.instructions[step].clone()
+            if (instruction.operation == "println") {
+                text += indent.clone() + "(void)printf(\"%lld\\n\", (long long)t" + str(instruction.operand) + ");\n"
+                text += indent.clone() + "(void)fflush(stdout);\n"
+                step = step + 1
+                continue
+            }
             expression = ""
             if (instruction.operation == "constant") {
                 expression = "INT64_C(" + str(instruction.operand) + ")"
