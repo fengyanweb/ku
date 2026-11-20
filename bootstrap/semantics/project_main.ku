@@ -58,8 +58,8 @@ fn ProjectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
                 edge = 0
                 edge_count = modules[index].imports.len()
                 while (edge < edge_count) {
-                    dependency = modules[index].imports[edge].module_index - 1
-                    if (!done[dependency]) {
+                    dependency = modules[index].imports[edge].module_index
+                    if (dependency > 0 && !done[dependency - 1]) {
                         ready = false
                         blocked_at = modules[index].imports[edge].span.clone()
                         blocked_path = modules[index].path.clone()
@@ -100,8 +100,12 @@ fn main(): null! {
         display_path = EscapeCanonical(entry.path)
         println("MODULE|" + display_path.clone())
         for binding in entry.imports {
-            target = EscapeCanonical(paths[binding.module_index - 1].clone())
-            println("IMPORT|" + display_path.clone() + "|" + binding.local_name + "|" + target + "|" + binding.source_name + "|" + str(binding.target_node))
+            if (binding.module_index == 0) {
+                println("STD|" + display_path.clone() + "|" + binding.local_name + "|" + str(binding.import_node) + "|" + str(binding.request_node))
+            } else {
+                target = EscapeCanonical(paths[binding.module_index - 1].clone())
+                println("IMPORT|" + display_path.clone() + "|" + binding.local_name + "|" + target + "|" + binding.source_name + "|" + str(binding.target_node))
+            }
         }
         for binding in entry.types {
             if (binding.module_index > 0) {

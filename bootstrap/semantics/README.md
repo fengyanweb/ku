@@ -55,8 +55,12 @@ Use `ku build --release project_main.ku -o ku-check-project` from this tool's
 directory. With the resulting executable beside `modules.txt`, run it to print
 the validated dependencies in dependency order and the imported declaration and
 explicit type bindings. The tool reads the files named in the manifest and
-resolves named relative imports against that set. This entry handles declaration
-and explicit type names. Expression type checking and C generation are separate.
+resolves named relative imports against that set. It binds standard library
+namespaces from `import { fs, string } from "std"`, `import "std.fs"` or
+`import fs from "std.fs"`. A `STD` row gives the importing path, namespace,
+import node and request node. These namespaces have no file dependency and
+cannot be used as type names. This entry handles declaration and explicit type
+names. Expression type checking and C generation are separate.
 
 ## Emit C for a structure projection
 

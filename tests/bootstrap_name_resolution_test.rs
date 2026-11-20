@@ -100,6 +100,82 @@ fn bootstrap_checks_diamond_modules_from_a_relocated_installation() {
     }
 
     fs::write(
+        project.join("std-user.ku"),
+        r#"import { fs, string } from "std"
+import "std.json"
+import bytes from "std.bytes"
+import { Scalar } from "./std-data.ku"
+struct Local { data: Scalar }
+fn main() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.join("std-data.ku"),
+        "struct Scalar { value: int }\n",
+    )
+    .unwrap();
+    fs::write(&manifest, "std-user.ku\nstd-data.ku\n").unwrap();
+    let result = run(&mut Command::new(&executable), &cwd, 20);
+    assert_success(&result);
+    let rows = String::from_utf8(result.stdout).unwrap();
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        [
+            "MODULE|std-data.ku",
+            "MODULE|std-user.ku",
+            "STD|std-user.ku|fs|3|1",
+            "STD|std-user.ku|string|3|2",
+            "STD|std-user.ku|json|4|4",
+            "STD|std-user.ku|bytes|6|5",
+            "IMPORT|std-user.ku|Scalar|std-data.ku|Scalar|3",
+            "TYPE|std-user.ku|Scalar|std-data.ku|9|3",
+        ]
+    );
+
+    for (source, diagnostic, position) in [
+        ("import \"std\"\n", "std_import_shape", "1:1@0..1:13@12"),
+        (
+            "import { fs as disk } from \"std\"\n",
+            "std_import_alias",
+            "1:10@9..1:12@11",
+        ),
+        (
+            "import { fs, fs } from \"std\"\n",
+            "duplicate_std_module",
+            "1:14@13..1:16@15",
+        ),
+        (
+            "import { fs, kuvalue } from \"std\"\nfn fs() {}\n",
+            "unknown_std_module",
+            "1:14@13..1:21@20",
+        ),
+        (
+            "import disk from \"std.fs\"\n",
+            "std_import_namespace",
+            "1:1@0..1:26@25",
+        ),
+        (
+            "import \"std.fs\"\nstruct Save { source: fs }\n",
+            "undefined_type",
+            "2:23@38..2:25@40",
+        ),
+        (
+            "import \"std.fs\"\nimport { Scalar as fs } from \"./std-data.ku\"\n",
+            "import_name_conflict",
+            "2:10@25..2:16@31",
+        ),
+    ] {
+        fs::write(project.join("std-user.ku"), source).unwrap();
+        let result = run(&mut Command::new(&executable), &cwd, 20);
+        assert_eq!(result.status.code(), Some(1));
+        assert!(result.stdout.is_empty());
+        let stderr = String::from_utf8(result.stderr).unwrap();
+        assert!(stderr.contains(&format!("|{diagnostic}|")), "{stderr}");
+        assert!(stderr.trim_end().ends_with(position), "{stderr}");
+    }
+
+    fs::write(
         project.join("left.ku"),
         "import { Right } from \"./right.ku\"\nstruct Left { other: Right }\n",
     )

@@ -43,7 +43,7 @@ fn ResolveTypeName(&use: Node, use_index: int, &local: [TopLevelName],
     index = 0
     while (index < imports.len()) {
         entry = imports[index].clone()
-        if (entry.local_name == name) {
+        if (entry.module_index > 0 && entry.local_name == name) {
             target = ReadImportNode(supplied[entry.module_index - 1].named.parsed.arena.nodes,
                                     entry.target_node, at.clone())?
             if (target.kind == "Struct" || target.kind == "Enum") {
