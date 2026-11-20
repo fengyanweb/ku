@@ -2,6 +2,7 @@ import "std.string"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule, RejectName, TopLevelName } from "./names.ku"
+import { ResolveProjectImport } from "./project_paths.ku"
 
 struct SuppliedModule {
     path: str
@@ -112,7 +113,7 @@ fn CheckImportName(&local_names: [TopLevelName], &bindings: [ImportBinding], cur
 }
 
 fn CollectImportBindings(&nodes: [Node], &edges: [int], &imports: [int], &local_names: [TopLevelName],
-                         &supplied: [SuppliedModule]): [ImportBinding]! {
+                         &supplied: [SuppliedModule], &importer_path: str): [ImportBinding]! {
     start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
     if (imports.len() > 64 || supplied.len() > 64 || local_names.len() > 255) {
         RejectName("import_limit", "supplied import pass exceeded the module count limit", start.clone())?
@@ -134,7 +135,11 @@ fn CollectImportBindings(&nodes: [Node], &edges: [int], &imports: [int], &local_
         if (first.kind != "ImportName") {
             RejectName("unsupported_import_kind", "supplied module binding accepts only named relative imports", group_span.clone())?
         }
-        module_index = FindModule(supplied, group.text, group_span.clone())?
+        lookup_path = group.text.clone()
+        if (importer_path.len() != 0) {
+            lookup_path = ResolveProjectImport(importer_path, group.text, group_span.clone())?
+        }
+        module_index = FindModule(supplied, lookup_path, group_span.clone())?
         index = 0
         while (index < group.edge_count) {
             request_node = edges[group.first_edge + index]
@@ -177,5 +182,10 @@ fn CollectImportBindings(&nodes: [Node], &edges: [int], &imports: [int], &local_
 // exact import spellings it supports. No filesystem or recursive graph walk.
 fn BindSuppliedImports(&importer: NamedModule, &supplied: [SuppliedModule]): [ImportBinding]! {
     return CollectImportBindings(importer.parsed.arena.nodes, importer.parsed.arena.edges,
-                                 importer.names.imports, importer.names.declarations, supplied)
+                                 importer.names.imports, importer.names.declarations, supplied, "")
+}
+
+fn BindProjectImports(&importer: SuppliedModule, &supplied: [SuppliedModule]): [ImportBinding]! {
+    return CollectImportBindings(importer.named.parsed.arena.nodes, importer.named.parsed.arena.edges,
+                                 importer.named.names.imports, importer.named.names.declarations, supplied, importer.path)
 }

@@ -8,20 +8,120 @@ use ku::{span::Span, stdlib::json, value::Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct Temp(PathBuf);
 
 impl Temp {
     fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock")
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("ku-bootstrap-names-{}-{nonce}", std::process::id()));
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "ku-bootstrap-names-{}-{nonce}-{sequence}",
+            std::process::id()
+        ));
         fs::create_dir(&path).expect("create private bootstrap directory");
         Self(path)
+    }
+}
+
+#[test]
+fn bootstrap_checks_diamond_modules_from_a_relocated_installation() {
+    let temporary = Temp::new();
+    let cwd = temporary.0.join("invocation");
+    let compiler = temporary.0.join("compiler");
+    let project = temporary.0.join("project");
+    fs::create_dir(&cwd).unwrap();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for stage in ["stage1", "stage2", "stage3", "semantics"] {
+        let target = compiler.join(stage);
+        fs::create_dir_all(&target).unwrap();
+        for entry in fs::read_dir(repo.join("bootstrap").join(stage)).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().extension().is_some_and(|ext| ext == "ku") {
+                fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    for file in ["stage2/context.ku", "stage2/span.ku", "stage1/token.ku"] {
+        let target = project.join(file);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(compiler.join(file), target).unwrap();
+    }
+    let entry = compiler.join("semantics/project_main.ku");
+    let file = format!("ku-check-project{}", std::env::consts::EXE_SUFFIX);
+    let built = compiler.join("semantics").join(&file);
+    let executable = project.join(&file);
+    let ku = Path::new(env!("CARGO_BIN_EXE_ku"));
+    assert_success(&run(
+        Command::new(ku)
+            .args(["build", "--release"])
+            .arg(entry)
+            .arg("-o")
+            .arg(&built),
+        &cwd,
+        120,
+    ));
+    fs::rename(built, &executable).unwrap();
+    fs::remove_dir_all(compiler).unwrap();
+    const MANIFEST: &str = "stage2/context.ku\r\nstage2/span.ku\r\nstage1/token.ku\r\n";
+    let manifest = project.join("modules.txt");
+    fs::write(&manifest, MANIFEST).unwrap();
+    let result = run(&mut Command::new(&executable), &cwd, 20);
+    assert_success(&result);
+    let rows = String::from_utf8(result.stdout).unwrap();
+    let modules: Vec<_> = rows
+        .lines()
+        .filter(|row| row.starts_with("MODULE|"))
+        .collect();
+    assert_eq!(
+        modules,
+        [
+            "MODULE|stage1/token.ku",
+            "MODULE|stage2/span.ku",
+            "MODULE|stage2/context.ku"
+        ]
+    );
+    for row in [
+        "IMPORT|stage2/span.ku|Token|stage1/token.ku|Token|19",
+        "IMPORT|stage2/context.ku|Token|stage1/token.ku|Token|19",
+        "TYPE|stage2/context.ku|Span|stage2/span.ku|7|15",
+        "TYPE|stage2/context.ku|Token|stage1/token.ku|46|19",
+    ] {
+        assert!(
+            rows.lines().any(|actual| row == actual),
+            "missing {row}: {rows}"
+        );
+    }
+
+    fs::write(
+        project.join("left.ku"),
+        "import { Right } from \"./right.ku\"\nstruct Left { other: Right }\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("right.ku"),
+        "import { Left } from \"./left.ku\"\nstruct Right { other: Left }\n",
+    )
+    .unwrap();
+    for (input, diagnostic) in [
+        ("stage2/context.ku\nstage2/span.ku\n", "unresolved_import"),
+        ("stage1/token.ku\nstage1/token.ku\n", "ambiguous_module"),
+        ("../outside.ku\n", "project_path"),
+        ("bad\0name.ku\n", "project_path"),
+        ("left.ku\nright.ku\n", "cyclic_import"),
+    ] {
+        fs::write(&manifest, input).unwrap();
+        let result = run(&mut Command::new(&executable), &cwd, 20);
+        assert_eq!(result.status.code(), Some(1));
+        assert!(result.stdout.is_empty());
+        let stderr = String::from_utf8(result.stderr).unwrap();
+        assert!(stderr.contains(&format!("|{diagnostic}|")), "{stderr}");
     }
 }
 

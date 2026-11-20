@@ -1,0 +1,114 @@
+import { fs, string } from "std"
+import { EscapeCanonical } from "../stage1/token.ku"
+import { Span } from "../stage2/span.ku"
+import { ParseModule } from "../stage3/parser.ku"
+import { BindProjectImports, ImportBinding, SuppliedModule } from "./imports.ku"
+import { BuildNameTable, RejectName } from "./names.ku"
+import { CheckProjectManifestPath } from "./project_paths.ku"
+import { BindImportedTypeNames, TypeNameBinding } from "./type_names.ku"
+
+struct ProjectModuleBindings {
+    path: str
+    imports: [ImportBinding]
+    types: [TypeNameBinding]
+}
+
+fn ManifestPaths(manifest: str, at: Span): [str]! {
+    if (manifest.byte_len() > 32768) {
+        RejectName("project_limit", "the module manifest exceeds 32768 UTF-8 bytes", at.clone())?
+    }
+    paths: [str] = []
+    line = ""
+    for character in string.chars(manifest + "\n") {
+        if (character != "\n") {
+            line = line + character
+            if (line.byte_len() > 513) {
+                RejectName("project_path", "manifest lines must fit a 512-byte path", at.clone())?
+            }
+        } else {
+            // Join compatible LF/CRLF input while retaining spaces in filenames.
+            if (line.ends_with("\r")) { line = string.slice(line.clone(), 0, line.len() - 1)? }
+            if (line != "") {
+                CheckProjectManifestPath(line, at.clone())?
+                if (paths.len() == 64) { RejectName("project_limit", "the module manifest accepts at most 64 modules", at.clone())? }
+                for existing in paths {
+                    if (existing == line) { RejectName("ambiguous_module", "duplicate project module '" + line.clone() + "'", at.clone())? }
+                }
+                paths = paths.push(line)
+            }
+            line = ""
+        }
+    }
+    if (paths.len() == 0) { RejectName("project_path", "modules.txt must list at least one project source", at)? }
+    return ok(paths)
+}
+
+fn ProjectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
+    done: [bool] = []
+    while (done.len() < modules.len()) { done = done.push(false) }
+    order: [int] = []
+    while (order.len() < modules.len()) {
+        index = 0
+        next = -1
+        blocked_path = ""
+        blocked_at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+        while (index < modules.len() && next < 0) {
+            if (!done[index]) {
+                ready = true
+                edge = 0
+                edge_count = modules[index].imports.len()
+                while (edge < edge_count) {
+                    dependency = modules[index].imports[edge].module_index - 1
+                    if (!done[dependency]) {
+                        ready = false
+                        blocked_at = modules[index].imports[edge].span.clone()
+                        blocked_path = modules[index].path.clone()
+                        break
+                    }
+                    edge = edge + 1
+                }
+                if (ready) { next = index }
+            }
+            index = index + 1
+        }
+        if (next < 0) {
+            RejectName("cyclic_import", "no remaining project module has resolved dependencies, including '" + blocked_path + "'", blocked_at)?
+        }
+        done[next] = true
+        order = order.push(next)
+    }
+    return ok(order)
+}
+
+fn main(): null! {
+    at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    paths = ManifestPaths(fs.read("modules.txt")?, at)?
+    supplied: [SuppliedModule] = []
+    for path in paths {
+        named = BuildNameTable(ParseModule(fs.read(path)?)?)?
+        supplied = supplied.push(SuppliedModule { path: path, named: named })
+    }
+    modules: [ProjectModuleBindings] = []
+    for entry in supplied {
+        imports = BindProjectImports(entry, supplied)?
+        types = BindImportedTypeNames(entry.named, imports, supplied)?
+        modules = modules.push(ProjectModuleBindings { path: entry.path, imports: imports, types: types })
+    }
+    order = ProjectImportOrder(modules)?
+    for index in order {
+        entry = modules[index].clone()
+        display_path = EscapeCanonical(entry.path)
+        println("MODULE|" + display_path.clone())
+        for binding in entry.imports {
+            target = EscapeCanonical(paths[binding.module_index - 1].clone())
+            println("IMPORT|" + display_path.clone() + "|" + binding.local_name + "|" + target + "|" + binding.source_name + "|" + str(binding.target_node))
+        }
+        for binding in entry.types {
+            if (binding.module_index > 0) {
+                target = EscapeCanonical(paths[binding.module_index - 1].clone())
+                println("TYPE|" + display_path.clone() + "|" + binding.name + "|" + target + "|" + str(binding.use_node) + "|" + str(binding.declaration_node))
+            }
+        }
+    }
+    return ok(null)
+}

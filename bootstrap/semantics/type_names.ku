@@ -85,5 +85,10 @@ fn CollectTypeNames(&nodes: [Node], &local: [TopLevelName],
 // shapes remain in the graph; this pass does not infer expression types.
 fn BindTypeNames(&named: NamedModule, &supplied: [SuppliedModule]): [TypeNameBinding]! {
     imports = BindSuppliedImports(named, supplied)?
+    return BindImportedTypeNames(named, imports, supplied)
+}
+
+fn BindImportedTypeNames(&named: NamedModule, &imports: [ImportBinding],
+                         &supplied: [SuppliedModule]): [TypeNameBinding]! {
     return CollectTypeNames(named.parsed.arena.nodes, named.names.declarations, imports, supplied)
 }

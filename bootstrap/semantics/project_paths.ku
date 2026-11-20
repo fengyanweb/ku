@@ -1,0 +1,59 @@
+import { bytes, string } from "std"
+import { Span } from "../stage2/span.ku"
+import { RejectName } from "./names.ku"
+
+fn ProjectParent(&path: str): str! {
+    characters = string.chars(path.clone())
+    end = characters.len()
+    while (end > 0 && characters[end - 1] != "/") { end = end - 1 }
+    if (end == 0) { return ok("") }
+    return string.slice(path.clone(), 0, end - 1)
+}
+
+fn AppendProjectComponent(path: str, component: str, at: Span): str! {
+    if (component == "") {
+        RejectName("project_path", "project paths require nonempty '/'-separated components", at.clone())?
+    }
+    if (component == ".") { return ok(path) }
+    if (component == "..") {
+        if (path == "") { RejectName("project_path", "relative path leaves the project root", at)? }
+        return ProjectParent(path)
+    }
+    if (path == "") { return ok(component) }
+    return ok(path + "/" + component)
+}
+
+fn NormalizeProjectPath(parent: str, &path: str, at: Span): str! {
+    if (path.byte_len() == 0 || path.byte_len() > 512 || !path.ends_with(".ku")) {
+        RejectName("project_path", "project paths must name a .ku file within 512 UTF-8 bytes", at.clone())?
+    }
+    result = parent
+    component = ""
+    zero_byte = bytes.from_array([0])?
+    zero = zero_byte.to_str()?
+    for character in string.chars(path.clone()) {
+        if (character == "/") {
+            result = AppendProjectComponent(result, component, at.clone())?
+            component = ""
+        } else {
+            if (character == "\\" || character == ":" || character == "\n" || character == "\r" || character == "\t" || character == zero) {
+                RejectName("project_path", "invalid character in project path", at.clone())?
+            }
+            component = component + character
+        }
+    }
+    resolved = AppendProjectComponent(result, component, at.clone())?
+    if (resolved.byte_len() > 512) { RejectName("project_path", "resolved project path exceeds 512 UTF-8 bytes", at)? }
+    return ok(resolved)
+}
+
+fn CheckProjectManifestPath(&path: str, at: Span): null! {
+    if (NormalizeProjectPath("", path, at.clone())? != path) {
+        RejectName("project_path", "manifest paths must be normalized and relative to the project", at)?
+    }
+    return ok(null)
+}
+
+fn ResolveProjectImport(&importer: str, &requested: str, at: Span): str! {
+    return NormalizeProjectPath(ProjectParent(importer)?, requested, at)
+}
