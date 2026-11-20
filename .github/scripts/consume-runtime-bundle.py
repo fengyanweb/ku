@@ -1101,17 +1101,19 @@ def installed_declaration_inventory_consumer(install, root, env, report, repo, c
 
 
 def installed_bootstrap_module_consumer(install, root, env, report, repo, commit, target):
-    """Build Ku's module checker and run it on its actual shared dependencies."""
+    """Run Ku's installed module checker on its real compiler source graph."""
     report['installed_bootstrap_module'] = detail = {'status': 'running'}
     compiler = root / 'bootstrap-compiler'
     deployment = root / 'bootstrap-deployment'
     deployment.mkdir()
     hashes = stage_committed_ku_sources(repo, commit, env, compiler, (
         'bootstrap/stage1', 'bootstrap/stage2', 'bootstrap/stage3', 'bootstrap/semantics',
+        'bootstrap/tools/declarations',
     ))
     detail['compiler_source_tree_sha256'] = hashlib.sha256(EXPORT.json_bytes(sorted(hashes))).hexdigest()
     modules = ('stage2/context.ku', 'stage2/span.ku', 'stage1/token.ku')
-    for relative in modules:
+    project_modules = {name.removeprefix('bootstrap/'): digest for name, digest in hashes}
+    for relative in project_modules:
         path = deployment / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(compiler / 'bootstrap' / relative, path)
@@ -1157,6 +1159,20 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
         detail['missing_dependency'] = diagnostic = failure.stderr.decode('utf-8', errors='replace')
         if failure.returncode != 1 or failure.stdout or '|unresolved_import|' not in diagnostic:
             raise RuntimeError('relocated bootstrap tool lost its missing dependency diagnostic')
+
+        manifest.write_bytes(('\n'.join(sorted(project_modules)) + '\n').encode('utf-8'))
+        whole_project = invoke([runnable], root, run_env, seconds=20)
+        project_rows = output(whole_project).splitlines()
+        bound_paths = [row.split('|', 1)[1] for row in project_rows if row.startswith('MODULE|')]
+        if (whole_project.returncode or whole_project.stderr or
+                sorted(bound_paths) != sorted(project_modules)):
+            raise RuntimeError('relocated bootstrap tool could not bind the complete source graph: ' +
+                               whole_project.stderr.decode('utf-8', errors='replace')[-4096:])
+        detail['complete_project'] = {
+            'modules': len(bound_paths),
+            'rows': len(project_rows),
+            'rows_sha256': hashlib.sha256(('\n'.join(project_rows) + '\n').encode('utf-8')).hexdigest(),
+        }
     finally:
         relocate_checkout_entry(retired, install)
         detail['installation_restored'] = ku.is_file() and not retired.exists()
