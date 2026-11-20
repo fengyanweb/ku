@@ -609,6 +609,13 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op,KuPgAsyncTurn* turn) {
   }
   op->query.value->rows=op->row_next_rows;return 1;
 }
+/* A libpq preflight can consume the caller's deadline or overlap a Task
+ * cancellation. Sample both again at the send site, not at turn entry. */
+static int ku_pg_async_send_ready(KuPgAsyncOp* op,int* cancelled) {
+  *cancelled=op->fresh_cancel &&
+      op->fresh_cancel(op->fresh_cancel_context,op->waiter.diagnostic.job_generation);
+  return !*cancelled && !ku_pg_deadline_expired(op->deadline);
+}
 static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned long long now,int cancelled) {
   if(op->phase==KU_PG_ASYNC_DONE)return 1;
   op->observed_ms=now;if(op->diagnostic_steps!=UINT64_MAX)op->diagnostic_steps++;
@@ -659,6 +666,13 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
       ku_pg_async_set_phase(op,KU_PG_ASYNC_SEND);
     }
     if(op->phase==KU_PG_ASYNC_SEND) {
+      int cancelled_at_send;
+      if(!ku_pg_async_send_ready(op,&cancelled_at_send)) {
+        ku_pg_async_finish(op,cancelled_at_send
+            ? ku_pg_client_error("cancelled",sizeof("cancelled")-1,"PostgreSQL query was cancelled before it was sent",sizeof("PostgreSQL query was cancelled before it was sent")-1)
+            : ku_pg_query_timeout_error(),1);
+        return 1;
+      }
       /* Set sent before entering libpq: a failed send can already have placed
        * bytes on the socket. It is never evidence that no side effect occurred. */
       op->sent=1;
@@ -670,7 +684,9 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
       ku_pg_async_set_phase(op,KU_PG_ASYNC_FLUSH);
     }
     if(op->phase==KU_PG_ASYNC_RESET_SEND) {
+      int cancelled_at_send;
       if(PQstatus(op->conn)!=KU_PG_CONNECTION_OK || PQtransactionStatus(op->conn)!=KU_PQTRANS_IDLE || !ku_pg_connection_is_utf8(op->conn)
+          || !ku_pg_async_send_ready(op,&cancelled_at_send)
           || !PQsendQueryParams(op->conn,"DISCARD ALL",0,NULL,NULL,NULL,NULL,0) || !PQsetSingleRowMode(op->conn))goto reset_failed;
       op->reset_sent=1;ku_pg_async_set_phase(op,KU_PG_ASYNC_RESET_FLUSH);
     }
