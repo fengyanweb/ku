@@ -76,6 +76,7 @@ struct LinkedNullState {
     uses_string_equal: bool
     uses_print: bool
     uses_concat: bool
+    uses_suffix: bool
 }
 
 struct LinkedNullExpression {
@@ -88,7 +89,7 @@ fn NewLinkedNullState(): LinkedNullState {
         slots: [], links: [], declarations: "", code: "", drops: "", catch_slot: 0,
         catch_edges: false, catch_moved: [], uses_clone: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,
-        element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false, uses_print: false, uses_concat: false }
+        element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false, uses_print: false, uses_concat: false, uses_suffix: false }
 }
 
 fn LinkedReadonlyExpression(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNullExpression {
@@ -399,13 +400,10 @@ fn ReadLinkedCatchParts(&named: NamedModule, &node: Node): LinkedCatchParts! {
     return ok(LinkedCatchParts { protected: protected, binding: binding, recovery: recovery })
 }
 
-fn LinkedCPrelude(&body: LinkedNullState, guards: str, clone: str): str {
+fn LinkedCPrelude(&body: LinkedNullState, guards: str): str {
     text = ProjectionHeaders(true, body.drops.contains("ku_projection_string_drop") || body.owning_strings) + guards
     if (body.arrays.len() > 0 || body.uses_str_array || body.uses_str_view || body.uses_struct_view || body.uses_print) {
         text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
-    }
-    if (body.uses_clone) {
-        text += "#include <stdio.h>\n#include <string.h>\n\n" + clone
     }
     return text
 }

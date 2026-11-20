@@ -69,6 +69,69 @@ int main(int argc, char **argv) {
 }
 "#;
 
+pub(super) fn assert_path_byte_guard(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("path-guard.ku"),
+        r#"fn Check(&path: str): null! {
+    if (path.byte_len() == 0 || path.byte_len() > 512 || !path.ends_with(".ku")) {
+        fail { domain: "fixture", code: "project_path", message: "bad path" }
+    }
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "path-guard.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Check\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null\n").unwrap();
+    let output = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&output);
+    let program = String::from_utf8(output.stdout).unwrap();
+    let Some(entry) = program.lines().find_map(|line| {
+        line.strip_prefix("KuBootstrapResultNull ku_linked_null_")
+            .and_then(|declaration| declaration.split_once('('))
+            .map(|(node, _)| format!("ku_linked_null_{node}"))
+    }) else {
+        panic!("typed path predicate export missing");
+    };
+    let caller = r#"
+#include <assert.h>
+static void verify(const uint8_t* bytes, size_t length, bool ok) {
+    const KuProjectionString path = {(uint8_t*)bytes, length, 0u, KU_PROJECTION_STRING_STATIC};
+    KuBootstrapResultNull result = __ENTRY__(&path);
+    assert(result.ok == ok);
+    if (!ok) {
+        assert(result.error.code.len == 12u);
+        assert(result.error.code.storage == KU_PROJECTION_STRING_STATIC);
+        assert(memcmp(result.error.code.ptr, "project_path", 12u) == 0);
+    }
+}
+int main(void) {
+    uint8_t bytes[513];
+    for (size_t i = 0; i < 170u; ++i) memcpy(bytes + i * 3u, "\345\220\215", 3u);
+    memcpy(bytes + 510u, ".ku", 3u);
+    verify(bytes, 513u, false);
+    memcpy(bytes + 507u, ".ku", 3u);
+    verify(bytes, 510u, true);
+    memset(bytes, 'a', sizeof(bytes));
+    memcpy(bytes + 509u, ".ku", 3u);
+    verify(bytes, 512u, true);
+    verify((const uint8_t*)".KU", 3u, false);
+    verify(NULL, 0u, false);
+    return 0;
+}
+"#;
+    let source = cwd.join("path-guard.c");
+    let executable = cwd.join(format!("path-guard{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &source,
+        format!("{program}{}", caller.replace("__ENTRY__", &entry)),
+    )
+    .unwrap();
+    compile_projection(&source, &executable, cwd);
+    assert_ok(&execute(&mut Command::new(executable), cwd, 10));
+}
+
 pub(super) fn assert_owned_binary_join(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("join.ku"),

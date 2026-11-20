@@ -1,15 +1,17 @@
+import { BoundArrayCPrefix, BoundArrayCType, BoundArrayTypePosition, EmitBoundArrayAppenders, EmitBoundArrayDeclarations,
+         EmitBoundArrayResults, EmitBoundElementClones, EmitBoundStringOperations } from "./struct_array_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
-import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
+import { ResolveTypeName, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { ContainsType, CTypeName } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
-import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, LinkedFsReadReference, LinkedNullBinding, LinkedNullFunction, LinkedNullSlot, LinkedNullOwnedArray, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, LinkedFsReadReference, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -21,17 +23,11 @@ fn LinkedBuiltin(name: str, at: Span): TypeNameBinding {
 }
 
 fn SameLinkedType(&a: TypeNameBinding, &b: TypeNameBinding): bool {
-    return a.declaration_kind == b.declaration_kind && a.module_index == b.module_index
-        && a.declaration_node == b.declaration_node && (a.declaration_kind != "Builtin" || a.name == b.name)
+    return SameBoundTypeIdentity(a, b)
 }
 
 fn LinkedNullArrayPosition(&arrays: [TypeNameBinding], &type_name: TypeNameBinding): int {
-    index = 0
-    while (index < arrays.len()) {
-        if (SameLinkedType(arrays[index], type_name)) { return index + 1 }
-        index = index + 1
-    }
-    return 0
+    return BoundArrayTypePosition(arrays, type_name)
 }
 
 fn LinkedNullNode(&project: LinkedNullProject, unit: int, node: int): Node {
@@ -115,12 +111,11 @@ fn LinkedNullArrayElement(binding: TypeNameBinding): TypeNameBinding {
 }
 
 fn LinkedNullArrayPrefix(&binding: TypeNameBinding): str {
-    if (binding.declaration_kind == "BuiltinArray") { return "ku_linked_view_str_array" }
-    return "ku_linked_view_" + CTypeName(binding.module_index, binding.declaration_node)
+    return BoundArrayCPrefix(binding)
 }
 
 fn LinkedNullArrayType(&binding: TypeNameBinding): str {
-    return "KuArray_" + CTypeName(binding.module_index, binding.declaration_node)
+    return BoundArrayCType(binding)
 }
 
 fn LinkedStringResult(&binding: TypeNameBinding): bool {

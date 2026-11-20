@@ -1,10 +1,11 @@
+import { EmitProjectionStringJoinHelpers, ScalarStringSuffixC } from "./scalar_int_emit.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
-import { OrderCStructLayouts, EmitNestedCLayouts } from "./nested_struct_c.ku"
-import { CTypeName, ProjectionArrayHeader } from "./struct_projection_c.ku"
+import { OrderCStructLayouts, EmitNestedCLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
+import { ContainsType, CTypeName, ProjectionArrayHeader } from "./struct_projection_c.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 
 struct StructArrayC {
     element_type: str
@@ -243,4 +244,82 @@ fn EmitReturnedStructArrayC(&named: NamedModule, &bindings: [TypeNameBinding], &
     start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
     RejectLayout("unknown_struct_array_function", "undefined function '" + function_name.clone() + "'", start)?
     return ok(StructArrayC { element_type: "", array_type: "", prefix: "", source: "" })
+}
+
+fn BoundArrayTypePosition(&arrays: [TypeNameBinding], &type_name: TypeNameBinding): int {
+    index = 0
+    while (index < arrays.len()) {
+        if (SameBoundTypeIdentity(arrays[index], type_name)) { return index + 1 }
+        index = index + 1
+    }
+    return 0
+}
+
+fn BoundArrayCType(&binding: TypeNameBinding): str {
+    return "KuArray_" + CTypeName(binding.module_index, binding.declaration_node)
+}
+
+fn BoundArrayCPrefix(&binding: TypeNameBinding): str {
+    if (binding.declaration_kind == "BuiltinArray") { return "ku_linked_view_str_array" }
+    return "ku_linked_view_" + CTypeName(binding.module_index, binding.declaration_node)
+}
+
+fn EmitBoundArrayDeclarations(&arrays: [TypeNameBinding], &validated: [TypeNameBinding],
+                            &defined: [str], str_array: bool): str {
+    source = ""
+    for array in arrays.clone() {
+        element = CTypeName(array.module_index, array.declaration_node)
+        array_type = BoundArrayCType(array)
+        if (!ContainsType(defined, array_type)) { source += EmitStructArrayHeader(element, array_type) }
+        if (BoundArrayTypePosition(validated, array) > 0) {
+            source += EmitStructArrayReadValidation(element, array_type, BoundArrayCPrefix(array))
+        }
+    }
+    if (str_array) { source += EmitLinkedStringArrayPrelude(!ContainsType(defined, "KuGuardStringArray")) }
+    return source
+}
+
+fn EmitBoundArrayResults(&layouts: [StructLayout], &owning_layouts: [StructLayout],
+                         &types: [TypeNameBinding]): str {
+    source = ""
+    for owned in types.clone() {
+        array_type = BoundArrayCType(owned)
+        layout = LayoutIndex(layouts, owned.module_index, owned.declaration_node)
+        source += EmitStructArrayResultHeader(array_type)
+        prefix = BoundArrayCPrefix(owned)
+        if (LayoutIndex(owning_layouts, owned.module_index, owned.declaration_node) != 0) {
+            source += EmitStructArrayDropUsing(array_type, prefix, OwningLayoutDropName(owned.module_index, owned.declaration_node), true)
+        } else { source += EmitOwnedStructArrayDrop(layouts, layout, array_type, prefix) }
+    }
+    return source
+}
+
+fn EmitBoundStringOperations(clone: bool, concat: bool, suffix: bool): str {
+    text = ""
+    if (clone) { text += "#include <stdio.h>\n#include <string.h>\n\n" + EmitTryCloneString("ku_linked_clone_string") }
+    if (concat) { text += EmitProjectionStringJoinHelpers() }
+    if (suffix) { text += ScalarStringSuffixC() }
+    return text
+}
+
+fn EmitBoundElementClones(&layouts: [StructLayout], &requested: [int]): str {
+    text = ""
+    for layout in requested.clone() {
+        text += EmitOwnedStructOperations(layouts, layout, "ku_linked_element_" + str(layout), true)
+    }
+    return text
+}
+
+fn EmitBoundArrayAppenders(&types: [TypeNameBinding]): str {
+    if (types.len() == 0) { return "" }
+    text = StructArrayStatuses()
+    seen: [str] = []
+    for ty in types.clone() {
+        array = BoundArrayCType(ty)
+        if (!ContainsType(seen, array)) {
+            text += EmitOwnedStructArrayAppend(CTypeName(ty.module_index, ty.declaration_node), array, BoundArrayCPrefix(ty))
+            seen = seen.push(array)
+        }
+    }
+    return text
 }

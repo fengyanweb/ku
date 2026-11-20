@@ -1574,6 +1574,7 @@ fn Make(): Outer {
     assert_project_link_plans(&driver_binary, &cwd);
     linked_null::assert_checked_owned_call(&driver_binary, &cwd);
     linked_null::assert_owned_binary_join(&driver_binary, &cwd);
+    linked_null::assert_path_byte_guard(&driver_binary, &cwd);
     token_window::assert_readonly_preflight(&driver_binary, &cwd);
     assert_managed_source_characters(&driver_binary, &cwd);
 }

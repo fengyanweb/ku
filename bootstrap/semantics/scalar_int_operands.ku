@@ -20,6 +20,25 @@ fn ScalarParameterIndex(&parameters: [ScalarIntParameter], &name: str): int {
     return -1
 }
 
+struct ScalarLiteral {
+    kind: str
+    text: str
+}
+
+fn ScalarValueLiteralC(&node: Node): ScalarLiteral! {
+    if (node.kind == "String" && node.edge_count == 0) {
+        value = "(KuProjectionString){(uint8_t*)" + ScalarStringLiteral(node)? + ", 0u, KU_PROJECTION_STRING_STATIC}"
+        return ok(ScalarLiteral { kind: "str", text: value })
+    }
+    if (node.kind == "Bool" && node.edge_count == 0 && (node.text == "true" || node.text == "false")) {
+        return ok(ScalarLiteral { kind: "bool", text: node.text.clone() })
+    }
+    if (node.kind == "Int" && node.edge_count == 0 && node.int_value >= 0) {
+        return ok(ScalarLiteral { kind: "int", text: "INT64_C(" + str(node.int_value) + ")" })
+    }
+    return ok(ScalarLiteral { kind: "", text: "" })
+}
+
 // Decimal source bytes never enter a C identifier or an unescaped literal.
 // Three-digit C octal escapes preserve all UTF-8 bytes and embedded zeros.
 fn ScalarStringLiteral(&node: Node): str! {

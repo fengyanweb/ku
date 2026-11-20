@@ -315,3 +315,13 @@ fn EmitProjectOwningLayoutsC(&layouts: [StructLayout], unit: int, declaration: i
     definitions = EmitOwningLayoutDefinitions(ordered, unit, declaration)?
     return ok(text + definitions.source)
 }
+
+fn EmitCombinedCLayouts(&layouts: [StructLayout], &owning: [StructLayout]): OwningLayoutDefinitions! {
+    definitions = EmitOwningLayoutDefinitions(owning, 0, 0)?
+    for layout in layouts.clone() {
+        if (LayoutIndex(owning, layout.module_index, layout.node) == 0) {
+            definitions.source += EmitLayout(layout, true, true)?
+        }
+    }
+    return ok(definitions)
+}

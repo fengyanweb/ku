@@ -179,6 +179,19 @@ fn ScalarStringJoinHelpers(format: bool): str {
     return text + "    return NULL;\n}\n\n"
 }
 
+fn EmitCheckedScalarArithmetic(&operation: str, &left: str, &right: str, &output: str): str {
+    return "    int64_t " + output.clone() + ";\n"
+        + "    if (!ku_guard_try_" + operation.clone() + "(" + left.clone() + ", " + right.clone()
+        + ", &" + output.clone() + ")) { overflow = true; goto cleanup; }\n"
+}
+
+fn ScalarStringSuffixC(): str {
+    return "#include <string.h>\n\n"
+        + "static bool ku_scalar_ends_with(KuProjectionString value, KuProjectionString suffix) {\n"
+        + "    return suffix.len <= value.len && (!suffix.len || memcmp(value.ptr + (value.len - suffix.len), suffix.ptr, suffix.len) == 0);\n"
+        + "}\n\n"
+}
+
 fn EmitProjectionStringJoinHelpers(): str {
     return "#include <stdio.h>\n#include <string.h>\n\n"
         + "typedef KuProjectionString KuBootstrapString;\n" + ScalarStringJoinHelpers(false)
