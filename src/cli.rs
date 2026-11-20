@@ -9671,6 +9671,8 @@ const IMPORT_CLOSURE_WORDS: usize = MAX_IMPORT_MODULES.div_ceil(64);
 
 #[derive(Clone)]
 struct ModuleClosure {
+    /// Bits index the loader's dependency-before-dependent completion order,
+    /// independent of the discovery IDs used in canonical names.
     words: [u64; IMPORT_CLOSURE_WORDS],
 }
 
@@ -9681,9 +9683,8 @@ impl ModuleClosure {
         }
     }
 
-    fn insert(&mut self, module_id: usize) {
-        debug_assert!((1..=MAX_IMPORT_MODULES).contains(&module_id));
-        let index = module_id - 1;
+    fn insert(&mut self, index: usize) {
+        debug_assert!(index < MAX_IMPORT_MODULES);
         self.words[index / 64] |= 1_u64 << (index % 64);
     }
 
@@ -9700,7 +9701,7 @@ impl ModuleClosure {
             .flat_map(|(word_index, word)| {
                 let word = *word;
                 (0..64).filter_map(move |bit| {
-                    (word & (1_u64 << bit) != 0).then_some(word_index * 64 + bit + 1)
+                    (word & (1_u64 << bit) != 0).then_some(word_index * 64 + bit)
                 })
             })
     }
@@ -10032,7 +10033,8 @@ impl ModuleLoader {
             let module_id = self.module_ids[&canonical];
             let mut check_items = Vec::new();
             let mut check_names = HashSet::new();
-            for dependency_id in closure.iter() {
+            for index in closure.iter() {
+                let dependency_id = self.materialized_order[index];
                 let dependency_material = self.materialized_materials[dependency_id - 1];
                 self.budget.charge_clone(dependency_material, span)?;
                 for item in &self.materialized_modules[dependency_id - 1] {
@@ -10052,7 +10054,7 @@ impl ModuleLoader {
             })?;
             let dependency_snapshot =
                 package::freeze_lock_dependency(&canonical, source.as_bytes())?;
-            closure.insert(module_id);
+            closure.insert(self.materialized_order.len());
             let module = Arc::new(ModuleExports {
                 path: canonical.clone(),
                 exports,

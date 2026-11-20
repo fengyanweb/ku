@@ -699,6 +699,89 @@ fn main(): null! {
 }
 
 #[test]
+fn diamond_import_checks_dependency_layout_before_dependent_regardless_of_discovery_order() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_path("import-struct-completion-order"));
+    let dir = &cleanup.0;
+    fs::create_dir_all(dir).expect("create nested struct import fixture");
+    fs::write(dir.join("base.ku"), "struct Word { value: int }\n").unwrap();
+    fs::write(
+        dir.join("wrapper.ku"),
+        r#"import { Word } from "./base.ku"
+struct Wrapped { word: Word }
+fn Wrap(value: int): Wrapped { return Wrapped { word: Word { value: value } } }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("consumer.ku"),
+        r#"import { Word } from "./base.ku"
+import { Wrapped } from "./wrapper.ku"
+fn Value(&word: Word): int { return word.value }
+fn Read(&wrapped: Wrapped): int { return Value(wrapped.word) }
+"#,
+    )
+    .unwrap();
+    let wrapper = "import { Wrap } from \"./wrapper.ku\"\n";
+    let consumer = "import { Read } from \"./consumer.ku\"\n";
+    let body = r#"
+fn main() {
+    item = Wrap(42)
+    if (Read(item) != 42) { panic("nested imported struct lost its type") }
+    println(item.word.value)
+}
+"#;
+    let main = dir.join("main.ku");
+    let main_arg = main.to_str().unwrap();
+    for (label, imports) in [
+        ("wrapper-first", [wrapper, consumer]),
+        ("consumer-first", [consumer, wrapper]),
+    ] {
+        fs::write(&main, format!("{}{}{}", imports[0], imports[1], body)).unwrap();
+        for command in ["check", "run"] {
+            run_cli(vec!["ku".into(), command.into(), main_arg.into()])
+                .unwrap_or_else(|error| panic!("{command} {label}: {error}"));
+        }
+        let output = dir.join(format!("{label}{}", env::consts::EXE_SUFFIX));
+        match run_cli(vec![
+            "ku".into(),
+            "build".into(),
+            "--release".into(),
+            main_arg.into(),
+            "-o".into(),
+            output.to_str().unwrap().into(),
+        ]) {
+            Ok(()) => {
+                let mut command = Command::new(output);
+                command.current_dir(dir);
+                let executed =
+                    run_bounded(&mut command, NATIVE_RUN_TIMEOUT, NATIVE_RUN_OUTPUT_LIMITS)
+                        .unwrap_or_else(|error| panic!("native {label} was not bounded: {error}"));
+                assert!(
+                    executed.status.success() && executed.stderr.is_empty(),
+                    "{label}: {}",
+                    String::from_utf8_lossy(&executed.stderr)
+                );
+                assert_eq!(String::from_utf8_lossy(&executed.stdout).trim_end(), "42");
+            }
+            Err(error) if error.to_string().contains("C compiler not found") => {
+                assert!(
+                    env::var_os("GITHUB_ACTIONS").is_none(),
+                    "CI needs a C compiler"
+                );
+                eprintln!("skip linked native {label}: no C compiler available");
+            }
+            Err(error) => panic!("default Release native {label}: {error}"),
+        }
+    }
+}
+
+#[test]
 fn namespace_function_values_respect_local_shadowing() {
     let dir = unique_temp_path("namespace-function-value-shadow");
     fs::create_dir_all(&dir).expect("create namespace shadow directory");
