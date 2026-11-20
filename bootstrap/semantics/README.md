@@ -103,6 +103,14 @@ and stays valid after the input is released. Read its bytes using `len` and
 leave the storage unchanged. Computed strings and returning an input alias
 are outside this subset.
 
+An explicit `bool` result selects C11 `bool`. Guards and bool returns can
+use bool literals, `!`, short-circuit `&&` and `||`, and string `==`,
+`!=` or `.contains`. String operands are parameters or literals. The C code
+searches by byte length, including embedded NUL, and treats an empty needle
+as present. The emitter bounds boolean expression nesting at 32 levels.
+Try the complete `IsDigit`, `IsIdentifierStart` and
+`IsIdentifierContinue` definitions in `bootstrap/stage1/lexer.ku`.
+
 The compiler entry scans the module once and parses bounded declaration
 windows. It retains the lexer, per-function, AST and work limits. The legacy
 `ParseProgram` entry retains its 512-token whole-script limit.
