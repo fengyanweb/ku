@@ -177,7 +177,10 @@ impl<'a> FunctionLowerer<'a> {
                     let slot = self.local(name).ok_or_else(|| unsupported(&format!("Task lexical closure capture of {name} without an ordinary local binding"), expression.span))?;
                     let ty = &self.function.slots[slot.0].ty;
                     if !matches!(ty, TaskSlotType::Value { ty: inner, borrowed: false }
-                        if copy_value(ty) || task::record_type(inner) || task::nullable_record(inner))
+                        if copy_value(ty)
+                            || task::record_type(inner)
+                            || task::nullable_record(inner)
+                            || task::error_type(inner))
                     {
                         return Err(unsupported(
                             &format!("Task lexical closure capture of {name} with this type"),

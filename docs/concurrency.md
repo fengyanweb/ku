@@ -140,7 +140,8 @@ async fn main(): null! {
 先清理 try 内的局部和子 Task，再进入最近的 catch。Error 的 domain/code/message
 支持重复读取，也可 `fail problem` 保留原错误继续向外传播。内联 `fail { domain: ..., code: ..., message: ... }`
 按源码顺序求值三个字符串字段，字段可使用已支持的 Await。三个字段都成功后才构造 Error；
-中途退出时释放已取得的字段。取消、handler 超时和
+中途退出时释放已取得的字段。只在同一 Task 内调用的无参闭包及其局部别名可以读取已捕获的
+Error 字段，返回类型仍须显式声明且为 Copy。Task 挂起期间由原槽位持有 Error。取消、handler 超时和
 算术运行错误继续走外层退出，不会误进业务 catch。受限 `try/catch/finally` 已接入：
 普通完成、错误、return、break、continue 都经过对应 body，返回值先保存；finally
 中的新普通跳转可覆盖原跳转，旧 Owned 返回值随替换释放。取消和超时保留原原因，

@@ -382,6 +382,140 @@ int main(void) {
 }
 
 #[test]
+fn native_task_catch_closure_alias_keeps_error_live_across_wait() {
+    use ku::ir::task::TaskOp;
+
+    let source = r#"
+async fn Check(value: str, hold: bool): bool! {
+    try {
+        fail { domain: "inventory", code: value + "!", message: value + " detail" }
+    } catch(problem) {
+        read: fn(): bool = () => problem.code == "abc!" && problem.message == "abc detail"
+        reader = read
+        if (true) {
+            problem: int = 7;
+            (await Wait(hold))?
+            return ok(reader() && problem == 7)
+        }
+        return ok(false)
+    }
+    return ok(false)
+}
+async fn Wait(hold: bool): null! {
+    if (hold) { while (true) {} }
+    return ok(null)
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let lowered = task_lower::lower_program(&checked(source)).unwrap();
+    let function = &lowered.tasks.functions[0];
+    let mut reads = function
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter_map(|operation| match operation {
+            TaskOp::ErrorField { src, field, .. }
+                if matches!(field.as_str(), "code" | "message") =>
+            {
+                Some(src.0)
+            }
+            _ => None,
+        });
+    let owner = reads.next().expect("code read from catch owner");
+    assert_eq!(reads.next(), Some(owner), "message reads the same owner");
+    assert_eq!(reads.next(), None);
+
+    let generated = c::generate_native_task_c_source(&lowered, &Default::default()).unwrap();
+    let instrumented = generated
+        .replacen(
+            "typedef struct KuString {",
+            &format!("{ALLOCATION_HOOK}\ntypedef struct KuString {{"),
+            1,
+        )
+        .replacen(
+            "static uint64_t ku_task_driver_now_ms(void) {",
+            "static uint64_t ku_task_driver_now_ms(void) { return 1000u; }\nstatic uint64_t fixture_original_now(void) {",
+            1,
+        )
+        .replacen("int main(void) {", "static int fixture_original_main(void) {", 1);
+    let fixture = r#"
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"catch closure line %d: %s\n",__LINE__,#c); return 1; } } while(0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_check(bool cancel) {
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[2]={0}; size_t ring[2]={0};
+  size_t fixed=ku_task_driver_fixed_storage_bytes(2u);
+  uint64_t next=UINT64_MAX,deadline=3000u; KuTaskValueV1 task={0};
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+    slots,2u,ring,2u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+4096u,
+    1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  KuString value=ku_string_alloc(3u); memcpy(value.ptr,"abc",3u);
+  bool hold=cancel;
+  CHECK(ku_task_0_start_value(&driver,&value,&hold,&task)==KU_TASK_DRIVER_OK);
+  KuTaskInstance_0* instance=(KuTaskInstance_0*)task.owner.lease.control->context;
+  for(size_t turn=0;turn<128u && !instance->wait.driver;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  KuTaskDriverWaitSnapshotV1 wait={0};
+  CHECK(ku_task_driver_wait_read(&instance->wait,&wait)==KU_TASK_DRIVER_OK);
+  CHECK(wait.kind==KU_TASK_DRIVER_WAIT_KIND_RESULT && wait.state==KU_TASK_DRIVER_WAIT_ARMED);
+  CHECK((instance->frame.header.initialized & (UINT64_C(1)<<@OWNER@))!=0u);
+  const KuError* problem=&instance->frame.s_@OWNER@;
+  CHECK(problem->code.storage==KU_STRING_OWNED && problem->code.len==4u);
+  CHECK(!memcmp(problem->code.ptr,"abc!",4u));
+  CHECK(problem->message.storage==KU_STRING_OWNED && problem->message.len==10u);
+  CHECK(!memcmp(problem->message.ptr,"abc detail",10u));
+  if(cancel)
+    CHECK(ku_task_driver_request_cancel(&task.ticket,&task.owner.lease,KU_TASK_CONTROL_CANCELLED,deadline)==KU_TASK_CONTROL_OK);
+  for(size_t turn=0;turn<512u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_control_status(&task.owner.lease)==
+    (cancel ? KU_TASK_CONTROL_CANCELLED : KU_TASK_CONTROL_COMPLETED));
+  if(!cancel) {
+    KuTaskAdapterOutcomeV1 outcome={0};
+    CHECK(ku_task_value_take(&task,NULL,&outcome)==KU_TASK_CONTROL_OK);
+    CHECK(outcome.result_kind==2u && outcome.value.boolean.ok && outcome.value.boolean.value);
+    ku_task_outcome_drop(&outcome);
+  }
+  CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<512u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.running && !driver.queued && !driver.timers && !driver.reserved_bytes && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK && ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  return 0;
+}
+int main(void) {
+  CHECK(!fixture_check(false));
+  CHECK(!fixture_check(true));
+  puts("catch-closure-owner-ok"); return 0;
+}
+"#
+    .replace("@OWNER@", &owner.to_string());
+    let directory = TempDir::new("native-task-catch-closure");
+    let path = directory.path().join("catch_closure.c");
+    fs::write(&path, instrumented + &fixture).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "catch-closure") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute the native Task catch closure regression"
+        );
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "catch-closure-owner-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_task_string_equality_keeps_pg_fixture_rejection_mapping_exact() {
     let fixture = include_str!("benchmarks/cross_stack/ku/server.ku");
     assert!(fixture
