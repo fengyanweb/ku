@@ -68,6 +68,8 @@ fn emitLayout(&layout: StructLayout, allow_string: bool, allow_nested: bool, arr
             kind = StructArrayTypeName(field)
         } else if (arrays && field.declaration_kind == "BuiltinArray" && field.name == "int") {
             kind = "KuArrayInt"
+        } else if (arrays && field.declaration_kind == "BuiltinArray" && field.name == "str") {
+            kind = "KuGuardStringArray"
         } else if (!(allow_string && StringField(field))) {
             kind = ScalarCType(field)?
         }

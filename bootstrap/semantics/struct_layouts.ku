@@ -100,10 +100,10 @@ fn owningFieldType(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding], 
     element = ExplicitType(bindings, edges[nodes[id - 1].first_edge], at.clone())?
     if (element.declaration_kind == "Struct") {
         element.declaration_kind = "StructArray"
-    } else if (element.declaration_kind == "Builtin" && element.name == "int") {
+    } else if (element.declaration_kind == "Builtin" && (element.name == "int" || element.name == "str")) {
         element.declaration_kind = "BuiltinArray"
     } else {
-        RejectLayout("unsupported_layout_type", "owning C layout supports [int] or an array of bound structs", at.clone())?
+        RejectLayout("unsupported_layout_type", "owning C layout supports [int], [str] or an array of bound structs", at.clone())?
     }
     element.use_node = id
     element.span = at

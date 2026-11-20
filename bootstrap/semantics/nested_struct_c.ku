@@ -42,7 +42,7 @@ fn reachableLayouts(&layouts: [StructLayout], root: int, owning: bool): [int]! {
                 child = dependencyIndex(layouts, field)?
                 if (!ContainsIndex(reachable, child)) { reachable = reachable.push(child) }
             } else if ((field.declaration_kind != "Builtin" || !IsBuiltinType(field.name)) &&
-                       !(owning && field.declaration_kind == "BuiltinArray" && field.name == "int")) {
+                       !(owning && field.declaration_kind == "BuiltinArray" && (field.name == "int" || field.name == "str"))) {
                 RejectLayout("unsupported_nested_layout", "no C field layout for '" + field.name.clone() + "'", field.span)?
             }
             field_index = field_index + 1
@@ -251,6 +251,9 @@ fn emitOwningLayoutDrop(&layout: StructLayout, public: bool): str {
                 child_drop = OwningLayoutDropName(field.module_index, field.declaration_node)
                 text += "    for (size_t i = " + target.clone() + ".len; i != 0; --i) " +
                     child_drop + "(&" + target.clone() + ".data[i - 1]);\n"
+            } else if (field.name == "str") {
+                text += "    for (size_t i = " + target.clone() + ".len; i != 0; --i) " +
+                    "ku_projection_string_drop(&" + target.clone() + ".data[i - 1]);\n"
             }
             text += "    free(" + target + ".data);\n"
         }
@@ -276,8 +279,13 @@ fn EmitProjectOwningLayoutsC(&layouts: [StructLayout], unit: int, declaration: i
                 array = StructArrayTypeName(field)
                 element = CTypeName(field.module_index, field.declaration_node)
             } else if (field.declaration_kind == "BuiltinArray") {
-                array = "KuArrayInt"
-                element = "int64_t"
+                if (field.name == "str") {
+                    array = "KuGuardStringArray"
+                    element = "KuProjectionString"
+                } else {
+                    array = "KuArrayInt"
+                    element = "int64_t"
+                }
             }
             if (array != "" && !ContainsType(arrays, array)) {
                 text += ProjectionArrayHeader(element, array)

@@ -228,7 +228,7 @@ Moving a parameter invalidates later reads, and a View stays with its caller.
 owning fields. `EmitProjectOwningLayoutsC` emits C definitions and a drop function
 for a complete owner or a partially initialized owner whose fields start at
 zero. In addition to the scalar and by-value struct fields, this path covers
-`[int]` and arrays of bound structs. Arrays use the existing typed C carrier
+`[int]`, `[str]` and arrays of bound structs. Arrays use the existing typed C carrier
 and drop only the initialized prefix. The real `SuppliedModule` layout includes
 both the AST arenas and declaration tables. Recursive ownership graphs are
 rejected at the recursive field.
