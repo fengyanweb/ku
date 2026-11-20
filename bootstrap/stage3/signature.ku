@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
-import { RejectAt, RejectAtPoint } from "./support.ku"
+import { RejectAt, RejectAtPoint, WindowToken } from "./support.ku"
 
 // Type parts form a bounded, append-only post-order plan. Child NodeIds refer
 // to earlier parts through the separate edge table, matching the final AST
@@ -121,8 +121,15 @@ fn CheckUnionWidth(count: int, token: Token): null! {
     return ok(null)
 }
 
-fn FunctionReturnStart(&tokens: [Token], close: int): int! {
-    colon = tokens[close + 1].clone()
+fn ReadTypeToken(&tokens: [Token], index: int, end: int, type_last: int): Token! {
+    if (index > type_last) {
+        RejectAt(WindowToken(tokens, type_last, end), "invalid_token_stream", "type window accepts at most 512 tokens")?
+    }
+    return ok(WindowToken(tokens, index, end))
+}
+
+fn FunctionReturnStart(&tokens: [Token], close: int, end: int, type_last: int): int! {
+    colon = ReadTypeToken(tokens, close + 1, end, type_last)?
     if (colon.kind != "Colon") {
         RejectAt(colon.clone(), "unexpected_token", "expected ':' before function type return")?
     }
@@ -135,9 +142,16 @@ fn ReadSignatureTypeAt(&tokens: [Token], start: int): SignatureType! {
     if (tokens.len() > 512) {
         RejectAtPoint("invalid_token_stream", "type window accepts at most 512 tokens")?
     }
-    if (start < 0 || start >= tokens.len() || tokens[tokens.len() - 1].kind != "Eof") {
+    return ReadSignatureTypePrefix(tokens, start, tokens.len() - 1)
+}
+
+fn ReadSignatureTypePrefix(&tokens: [Token], start: int, window_end: int): SignatureType! {
+    if (start < 0 || start > window_end || window_end >= tokens.len() || tokens.len() > 4096 || tokens[tokens.len() - 1].kind != "Eof") {
         RejectAtPoint("invalid_token_stream", "type inspection escaped its bounded token window")?
     }
+    // A type may use 511 source tokens and its boundary, independently of
+    // the size of the enclosing declaration or module.
+    type_last = start + 511
 
     work = 0
     cursor = start
@@ -154,7 +168,7 @@ fn ReadSignatureTypeAt(&tokens: [Token], start: int): SignatureType! {
     parsing = true
 
     while (parsing) {
-        token = tokens[cursor].clone()
+        token = ReadTypeToken(tokens, cursor, window_end, type_last)?
         member_root = 0
         member_origin = token.clone()
         if (expect_atom) {
@@ -163,14 +177,15 @@ fn ReadSignatureTypeAt(&tokens: [Token], start: int): SignatureType! {
                 opener = cursor
                 cursor = cursor + 1
                 if (token.kind == "Fn") {
-                    if (tokens[cursor].kind != "LParen") {
-                        RejectAt(tokens[cursor].clone(), "unexpected_token", "expected '(' after 'fn' in function type")?
+                    lparen = ReadTypeToken(tokens, cursor, window_end, type_last)?
+                    if (lparen.kind != "LParen") {
+                        RejectAt(lparen, "unexpected_token", "expected '(' after 'fn' in function type")?
                     }
                     cursor = cursor + 1
                 }
                 type_frame = NewTypeFrame(token, frame_top, value_top, member_count, cursor)
-                if (type_frame.opener.kind == "Fn" && tokens[cursor].kind == "RParen") {
-                    cursor = FunctionReturnStart(tokens, cursor)?
+                if (type_frame.opener.kind == "Fn" && (ReadTypeToken(tokens, cursor, window_end, type_last)?).kind == "RParen") {
+                    cursor = FunctionReturnStart(tokens, cursor, window_end, type_last)?
                     type_frame.returning = true
                 }
                 work = work + cursor - opener
@@ -202,16 +217,18 @@ fn ReadSignatureTypeAt(&tokens: [Token], start: int): SignatureType! {
                 else { RejectAt(atom.clone(), "unexpected_token", "expected type name")? }
                 cursor = cursor + 1
                 work = work + 1
-                if (!custom && tokens[cursor].kind == "Dot") { RejectAt(tokens[cursor].clone(), "unsupported_type", "dotted type names must start with a custom identifier")? }
-                while (custom && tokens[cursor].kind == "Dot") {
+                lookahead = ReadTypeToken(tokens, cursor, window_end, type_last)?
+                if (!custom && lookahead.kind == "Dot") { RejectAt(lookahead.clone(), "unsupported_type", "dotted type names must start with a custom identifier")? }
+                while (custom && lookahead.kind == "Dot") {
                     cursor = cursor + 1
                     work = work + 1
-                    part = tokens[cursor].clone()
+                    part = ReadTypeToken(tokens, cursor, window_end, type_last)?
                     if (part.kind != "Ident") { RejectAt(part.clone(), "unexpected_token", "expected type name after '.'")? }
                     name = name + "." + part.lexeme.clone()
                     end = part
                     cursor = cursor + 1
                     work = work + 1
+                    lookahead = ReadTypeToken(tokens, cursor, window_end, type_last)?
                 }
 
                 CheckTypeArenaCapacity(parts.len(), edges.len(), 0, atom.clone())?
@@ -280,7 +297,7 @@ fn ReadSignatureTypeAt(&tokens: [Token], start: int): SignatureType! {
                 root = level_root
                 parsing = false
             } else if (frame.opener.kind == "Fn" && !frame.returning) {
-                parameter = tokens[frame.param_index].clone()
+                parameter = ReadTypeToken(tokens, frame.param_index, window_end, type_last)?
                 mode = ""
                 if (parameter.kind == "Ampersand") { mode = "&" }
                 param_span = SpanMerge(SpanFromToken(parameter.clone()), parts[level_root - 1].span.clone())
@@ -297,7 +314,7 @@ fn ReadSignatureTypeAt(&tokens: [Token], start: int): SignatureType! {
                     work = work + 1
                     frame.param_index = cursor
                 } else {
-                    cursor = FunctionReturnStart(tokens, cursor)?
+                    cursor = FunctionReturnStart(tokens, cursor, window_end, type_last)?
                     work = work + 2
                     frame.returning = true
                 }
@@ -352,8 +369,8 @@ fn ReadSignatureTypeAt(&tokens: [Token], start: int): SignatureType! {
             }
         }
         if (member_root > 0) {
-            if (tokens[cursor].kind == "Bang") {
-                bang = tokens[cursor].clone()
+            bang = ReadTypeToken(tokens, cursor, window_end, type_last)?
+            if (bang.kind == "Bang") {
                 result_depth = parts[member_root - 1].depth + 1
                 CheckTypeDepth(result_depth, bang.clone())?
                 CheckTypeArenaCapacity(parts.len(), edges.len(), 1, bang.clone())?
@@ -375,7 +392,7 @@ fn ReadSignatureTypeAt(&tokens: [Token], start: int): SignatureType! {
         }
     }
 
-    if (root <= 0 || root > parts.len()) { RejectAt(tokens[cursor].clone(), "invalid_node_id", "type plan root is invalid")? }
+    if (root <= 0 || root > parts.len()) { RejectAt(ReadTypeToken(tokens, cursor, window_end, type_last)?, "invalid_node_id", "type plan root is invalid")? }
     consumed = cursor - start
     // Retain the admission charge for the previous scan and validation passes
     // (including their boundary token), even though this pass borrows tokens.

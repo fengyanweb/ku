@@ -12,6 +12,13 @@ struct SourceMap {
     ends: [int]
 }
 
+// Read from an admitted scanner interval without copying it. Its exclusive
+// end acts as EOF, even when another declaration follows in the source.
+fn WindowToken(&tokens: [Token], index: int, end: int): Token {
+    if (index >= end) { return tokens[tokens.len() - 1].clone() }
+    return tokens[index].clone()
+}
+
 fn SpanFromNode(node: Node): Span {
     return Span {
         line: node.line,
