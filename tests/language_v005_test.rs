@@ -121,6 +121,86 @@ fn main() {
     run_source("inline.ku", source).expect("program should run");
 }
 
+const TRY_RETURNS_SOURCE: &str = r#"
+struct Loaded { text: str }
+
+fn read(flag: bool): str! {
+    if (flag) { return ok("loaded") }
+    fail "missing"
+}
+
+fn load(flag: bool): Loaded! {
+    try {
+        text = read(flag)?
+        return ok(Loaded { text: text })
+    } catch (err) {
+        fail { domain: err.domain, code: err.code, message: "module: " + err.message }
+    } finally {
+        println("load cleanup")
+    }
+}
+
+fn recover(flag: bool): str {
+    try { return read(flag)? }
+    catch (err) { return "caught " + err.message }
+}
+
+fn clean(flag: bool): str! {
+    try { return ok(read(flag)?) }
+    finally { println("clean cleanup") }
+}
+
+fn final_value(): int {
+    try { println("body") }
+    finally { return 9 }
+}
+
+fn main(): null! {
+    value = load(true)?
+    println(value.text)
+    try { load(false)? }
+    catch (err) { println(err.message) }
+    println(recover(true))
+    println(recover(false))
+    println(clean(true)?)
+    try { clean(false)? }
+    catch (err) { println(err.message) }
+    println(final_value())
+    return ok(null)
+}
+"#;
+
+#[test]
+fn checker_counts_only_complete_try_return_paths() {
+    check_source("inline.ku", TRY_RETURNS_SOURCE).expect("all protected exits supply the return");
+    run_source("inline.ku", TRY_RETURNS_SOURCE).expect("protected returns must execute");
+
+    for source in [
+        // The caught branch can complete normally.
+        r#"fn read(): int! { fail "missing" }
+           fn value(): int! { try { return ok(read()?) } catch (err) {} }"#,
+        // The successful branch can complete normally.
+        r#"fn value(flag: bool): int! {
+               try { if (flag) { return ok(2) } }
+               catch (err) { fail err.message }
+           }"#,
+        // Conditional cleanup cannot turn ordinary fallthrough into a return.
+        r#"fn value(flag: bool): int! {
+               try { println("body") }
+               finally { if (flag) { return ok(2) } }
+           }"#,
+        // A finally alone cannot convert a propagating failure to a plain int.
+        r#"fn value(): int { try { fail "missing" } finally { println("cleanup") } }"#,
+    ] {
+        let program = format!("{source}\nfn main() {{}}");
+        let error = check_err(&program);
+        assert!(
+            error.contains("function 'value' must return"),
+            "{source}: {error}"
+        );
+    }
+}
+
 #[test]
 fn question_can_propagate_through_result_functions() {
     let source = r#"

@@ -1014,7 +1014,9 @@ impl Checker {
             }
         }
         if let Some(expected) = &explicit_return {
-            if expected != &Type::Void && !block_may_return(&function.body) {
+            if expected != &Type::Void
+                && !block_may_return(&function.body, matches!(expected, Type::Result(_)))
+            {
                 return Err(KuError::runtime(
                     format!(
                         "function '{}' must return {}",
@@ -1031,7 +1033,10 @@ impl Checker {
         }
         if self.current_return != Type::Unknown
             && self.current_return != Type::Void
-            && !block_may_return(&function.body)
+            && !block_may_return(
+                &function.body,
+                matches!(self.current_return, Type::Result(_)),
+            )
         {
             return Err(KuError::runtime(
                 format!(
@@ -3634,7 +3639,7 @@ impl Checker {
                 return Err(http_handler_return_error(span, return_type));
             }
         }
-        if !block_may_return(body) {
+        if !block_may_return(body, matches!(return_type, Some(Type::Result(_)))) {
             return Err(http_handler_return_error(span, &Type::Null));
         }
         let actual = self.check_function_value_call_with_types_readonly_captures(
@@ -5266,7 +5271,9 @@ impl Checker {
                 }
             }
             if let Some(expected) = return_type {
-                if expected != &Type::Void && !block_may_return(body) {
+                if expected != &Type::Void
+                    && !block_may_return(body, matches!(expected, Type::Result(_)))
+                {
                     return Err(KuError::runtime(
                         format!("function value must return {}", type_name(expected)),
                         span,
@@ -5469,7 +5476,9 @@ impl Checker {
                 }
             }
             if let Some(expected) = function.return_type {
-                if expected != &Type::Void && !block_may_return(function.body) {
+                if expected != &Type::Void
+                    && !block_may_return(function.body, matches!(expected, Type::Result(_)))
+                {
                     return Err(KuError::runtime(
                         format!("function value must return {}", type_name(expected)),
                         span,
@@ -10651,13 +10660,15 @@ fn is_constant_name(name: &str) -> bool {
     has_alpha
 }
 
-fn block_may_return(body: &[Stmt]) -> bool {
-    body.iter().any(stmt_may_return)
+fn block_may_return(body: &[Stmt], can_propagate_error: bool) -> bool {
+    body.iter()
+        .any(|stmt| stmt_may_return(stmt, can_propagate_error))
 }
 
-fn stmt_may_return(stmt: &Stmt) -> bool {
+fn stmt_may_return(stmt: &Stmt, can_propagate_error: bool) -> bool {
     match stmt {
-        Stmt::Return { .. } | Stmt::Fail { .. } => true,
+        Stmt::Return { .. } => true,
+        Stmt::Fail { .. } => can_propagate_error,
         Stmt::Break { .. } | Stmt::Continue { .. } => false,
         Stmt::If {
             then_branch,
@@ -10665,8 +10676,27 @@ fn stmt_may_return(stmt: &Stmt) -> bool {
             ..
         } => {
             !else_branch.is_empty()
-                && block_may_return(then_branch)
-                && block_may_return(else_branch)
+                && block_may_return(then_branch, can_propagate_error)
+                && block_may_return(else_branch, can_propagate_error)
+        }
+        Stmt::Try {
+            body,
+            catch_name,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            // A terminating finally covers paths that otherwise fall through.
+            // If it completes normally, both the regular and caught paths
+            // must supply an exit. A failure can count as an exit only when
+            // an enclosing catch or a Result function can receive it.
+            block_may_return(finally_body, can_propagate_error)
+                || (block_may_return(body, true)
+                    && if catch_name.is_some() {
+                        block_may_return(catch_body, can_propagate_error)
+                    } else {
+                        can_propagate_error
+                    })
         }
         _ => false,
     }
