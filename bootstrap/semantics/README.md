@@ -37,3 +37,27 @@ private export produce different positioned errors.
 
 This pass takes explicit module inputs. It leaves glob, namespace, standard
 library and package imports to a later stage.
+
+## Emit C for a structure projection
+
+The projection compiler checks field names, scalar field types and ownership
+modes, then emits standalone C11. The following example compiles the real
+`SpanFromToken` function from the Ku bootstrap sources. Use a copy of the
+bootstrap tree so the tool's input files stay separate from the source checkout.
+
+```sh
+cd bootstrap/semantics
+cp ../stage2/span.ku input.ku
+cp ../stage1/token.ku supplier.ku
+printf '../stage1/token.ku\n' > supplier_path.txt
+printf 'SpanFromToken\n' > function.txt
+ku build --release projection_main.ku -o ku-project
+./ku-project > projection.c
+cc -std=c11 -O2 -c projection.c -o projection.o
+```
+
+The generated function uses numeric declaration IDs in C identifiers. An
+owned input struct releases its owned string fields after the scalar reads. A
+View parameter retains the caller's storage. The current subset returns one
+local struct of scalar projections. General function bodies and returning
+owned fields remain outside this tool's supported scope.

@@ -1,0 +1,32 @@
+import { fs, string } from "std"
+import { ParseProgram } from "../stage3/parser.ku"
+import { SuppliedModule } from "./imports.ku"
+import { BuildNameTable } from "./names.ku"
+import { BindStructReturn, BuildStructLayouts } from "./struct_layouts.ku"
+import { EmitStructProjectionC } from "./struct_projection_c.ku"
+import { BindTypeNames } from "./type_names.ku"
+
+fn main(): null! {
+    input = BuildNameTable(ParseProgram(fs.read("input.ku")?)?)?
+    function = string.trim(fs.read("function.txt")?)
+    if (function.len() == 0) {
+        fail {
+            domain: "bootstrap.projection",
+            code: "missing_function",
+            message: "function.txt must name a function"
+        }
+    }
+
+    supplied: [SuppliedModule] = []
+    if (fs.exists("supplier.ku")) {
+        path = string.trim(fs.read("supplier_path.txt")?)
+        library = BuildNameTable(ParseProgram(fs.read("supplier.ku")?)?)?
+        supplied = supplied.push(SuppliedModule { path: path, named: library })
+    }
+    bindings = BindTypeNames(input, supplied)?
+    layouts = BuildStructLayouts(input, bindings, supplied)?
+    plan = BindStructReturn(input, bindings, layouts, function)?
+    c = EmitStructProjectionC(layouts, plan)?
+    print(c)
+    return ok(null)
+}
