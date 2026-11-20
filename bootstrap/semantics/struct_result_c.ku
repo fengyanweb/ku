@@ -12,7 +12,8 @@ import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, Guar
 import { AddGuardCode, JoinManagedCode, ManagedBlank, ManagedCode, ManagedStringRuntime, ManagedType } from "./managed_array_values_c.ku"
 import { EmitManagedBlock, EmitRecordResultPrelude } from "./managed_array_body_c.ku"
 import { EmitOwnedStructOperations, EmitTryCloneString, StructArrayC } from "./struct_array_c.ku"
-import { LowerStructResultLink, ReadOwnedScalarLeaves, RecordResultCallId, ResultLinkClonePrefix, WithoutOwnedBinding } from "./struct_result_link_c.ku"
+import { LowerStructResultLink, ReadOwnedScalarLeaves, ResultLinkClonePrefix, WithoutOwnedBinding } from "./struct_result_link_c.ku"
+import { RecordResultCallId } from "./call_contracts.ku"
 import { HasScalarBuiltin } from "./scalar_int_operands.ku"
 
 struct StructResultC {

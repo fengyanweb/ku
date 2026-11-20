@@ -1,6 +1,74 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule, RejectName } from "./names.ku"
 import { ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
+import { RejectLayout } from "./struct_layouts.ku"
+
+struct InactiveMoveBranch { start: int, stop: int }
+
+fn RecordResultCallId(&named: NamedModule, statement_id: int): int {
+    statement = named.parsed.arena.nodes[statement_id - 1].clone()
+    if (statement.kind != "Assign" || statement.edge_count != 1) { return 0 }
+    source = named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge] - 1].clone()
+    if (source.kind != "TryUnwrap" || source.edge_count != 1) { return 0 }
+    call = named.parsed.arena.edges[source.first_edge]
+    if (named.parsed.arena.nodes[call - 1].kind != "Call") { return 0 }
+    return call
+}
+
+fn inactiveMoveBranches(&nodes: [Node], &edges: [int], &operand: Node, stop: int): [InactiveMoveBranch] {
+    inactive: [InactiveMoveBranch] = []
+    index = 0
+    while (index < nodes.len()) {
+        if (nodes[index].kind == "If" && nodes[index].offset < operand.offset && nodes[index].end_offset <= stop &&
+            nodes[index].end_offset >= operand.end_offset) {
+            first = nodes[index].first_edge
+            then_count = nodes[index].int_value
+            final = first + nodes[index].edge_count - 1
+            if (then_count > 0 && first + then_count < final && nodes[edges[first + 1] - 1].offset <= operand.offset &&
+                nodes[edges[first + then_count] - 1].end_offset >= operand.end_offset) {
+                other = nodes[edges[first + then_count + 1] - 1].offset
+                inactive = inactive.push(InactiveMoveBranch { start: other, stop: nodes[edges[final] - 1].end_offset })
+            }
+        }
+        index = index + 1
+    }
+    return inactive
+}
+
+fn reachableMoveUse(&node: Node, &operand: Node, stop: int, &inactive: [InactiveMoveBranch]): bool {
+    if (node.kind != "Variable" || node.offset < operand.end_offset || node.end_offset > stop || node.text != operand.text) {
+        return false
+    }
+    index = 0
+    while (index < inactive.len()) {
+        if (node.offset >= inactive[index].start && node.end_offset <= inactive[index].stop) { return false }
+        index = index + 1
+    }
+    return true
+}
+
+fn CheckManagedCallMove(&nodes: [Node], &edges: [int], &operand: Node, born: int, function_end: int): null! {
+    stop = function_end
+    index = 0
+    while (index < nodes.len()) {
+        if (nodes[index].kind == "While" && nodes[index].offset < operand.offset && nodes[index].end_offset >= operand.end_offset) {
+            if (born <= nodes[index].offset) {
+                RejectLayout("managed_call_move", "a repeated call cannot consume an owner created outside the loop", DeclarationSpan(operand))?
+            }
+            if (nodes[index].end_offset < stop) { stop = nodes[index].end_offset }
+        }
+        index = index + 1
+    }
+    inactive = inactiveMoveBranches(nodes, edges, operand, stop)
+    index = 0
+    while (index < nodes.len()) {
+        if (reachableMoveUse(nodes[index], operand, stop, inactive)) {
+            RejectLayout("managed_call_move", "checked call consumes the local string before this reference", DeclarationSpan(nodes[index]))?
+        }
+        index = index + 1
+    }
+    return ok(null)
+}
 
 struct DirectSignature {
     name: str

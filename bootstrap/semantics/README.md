@@ -390,6 +390,9 @@ Immediately following assignments can take distinct record fields into
 existing matching locals. Selected strings move directly, and the carrier
 releases unselected owners. On failure the original Error moves to the
 enclosing Result before scope cleanup.
+Such a call can consume a local `str` argument after all arguments have been
+prepared. Its checks allow consumption in mutually exclusive branches and
+reject a later reachable use of the moved string.
 
 `linked-str` also emits functions such as `TokenCanonical` that consume an
 owned struct. A string field may move into the expression once. A named

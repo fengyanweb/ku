@@ -1,5 +1,6 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
+import { CheckManagedCallMove } from "./call_contracts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 import { ScalarStringPart } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
@@ -365,6 +366,19 @@ fn ManagedAppendDrop(&nodes: [Node], &locals: [GuardBinding], id: int, &statemen
         index = index + 1
     }
     return ok(indent.clone() + "ku_projection_string_drop(&" + GuardBindingName(source) + ");\n")
+}
+
+fn ManagedRecordStringMove(&named: NamedModule, &locals: [GuardBinding], &operand: Node,
+                           caller_id: int, &indent: str): str! {
+    found = GuardBindingIndex(locals, operand.text)
+    if (found == 0 || locals[found - 1].ty.kind != "str" || locals[found - 1].view || locals[found - 1].parameter) {
+        RejectLayout("managed_call_move", "checked call requires a distinct owned local string", DeclarationSpan(operand))?
+    }
+    binding = locals[found - 1].clone()
+    born = named.parsed.arena.nodes[binding.slot - 1].offset
+    stop = named.parsed.arena.nodes[caller_id - 1].end_offset
+    CheckManagedCallMove(named.parsed.arena.nodes, named.parsed.arena.edges, operand, born, stop)?
+    return ok(indent.clone() + GuardBindingName(binding) + " = (KuProjectionString){0};\n")
 }
 
 fn ManagedSourceCharactersErrors(): str {

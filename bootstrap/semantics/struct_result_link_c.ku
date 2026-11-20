@@ -4,7 +4,7 @@ import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression, GuardLeaf } from "./guarded_struct_expr.ku"
 import { GuardParameterType } from "./guarded_struct_c.ku"
-import { BoundSameModuleFunction, ManagedClonedStringCall, ManagedDeferredMessageCalls, ManagedLiteralStringReturns } from "./guarded_string_parts.ku"
+import { BoundSameModuleFunction, ManagedClonedStringCall, ManagedDeferredMessageCalls, ManagedLiteralStringReturns, ManagedRecordStringMove } from "./guarded_string_parts.ku"
 import { AddGuardCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
@@ -38,19 +38,9 @@ struct OwnedRecordCall {
     plan: LinkPlanDeclaration
 }
 
-fn RecordResultCallId(&named: NamedModule, statement_id: int): int {
-    statement = named.parsed.arena.nodes[statement_id - 1].clone()
-    if (statement.kind != "Assign" || statement.edge_count != 1) { return 0 }
-    source = named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge] - 1].clone()
-    if (source.kind != "TryUnwrap" || source.edge_count != 1) { return 0 }
-    call = named.parsed.arena.edges[source.first_edge]
-    if (named.parsed.arena.nodes[call - 1].kind != "Call") { return 0 }
-    return call
-}
-
 fn LowerOwnedRecordCall(&named: NamedModule, &types: [TypeNameBinding], &layouts: [StructLayout],
                          &bindings: [GuardBinding], caller_id: int, call_id: int,
-                         borrow_local: bool, &indent: str): OwnedRecordCall! {
+                         managed: bool, &indent: str): OwnedRecordCall! {
     call = named.parsed.arena.nodes[call_id - 1].clone()
     if (call.edge_count == 0) {
         RejectLayout("unsupported_record_call", "expected a direct checked record call", DeclarationSpan(call))?
@@ -67,6 +57,7 @@ fn LowerOwnedRecordCall(&named: NamedModule, &types: [TypeNameBinding], &layouts
     code = ManagedBlank()
     signature = ""
     inputs = ""
+    moved = ""
     while (cursor < end && named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].kind == "Parameter") {
         parameter = named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].clone()
         index = arguments.len() + 1
@@ -79,10 +70,11 @@ fn LowerOwnedRecordCall(&named: NamedModule, &types: [TypeNameBinding], &layouts
         view = parameter.int_value == 1
         ty = GuardParameterType(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, type_id, view)?
         value = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, bindings, layouts, input, 0, indent)?
-        borrow = borrow_local && view && !value.view && ty.kind == "str_array" && input_node.kind == "Variable"
+        borrow = managed && view && !value.view && ty.kind == "str_array" && input_node.kind == "Variable"
+        consume = managed && !view && ty.kind == "str" && input_node.kind == "Variable"
         if (value.ty.kind != ty.kind || value.ty.layout != ty.layout || (!borrow && value.view != view) ||
             (view && (input_node.kind != "Variable" || (ty.kind != "str_array" && ty.kind != "struct"))) ||
-            (!view && ty.kind != "int" && ty.kind != "bool" && (ty.kind != "str" || input_node.kind != "String"))) {
+            (!view && ty.kind != "int" && ty.kind != "bool" && (ty.kind != "str" || (input_node.kind != "String" && !consume)))) {
             RejectLayout("record_call_argument", "expected a matching Copy value, static str or existing View", DeclarationSpan(input_node))?
         }
         c_type = GuardCType(ty, layouts)
@@ -98,6 +90,7 @@ fn LowerOwnedRecordCall(&named: NamedModule, &types: [TypeNameBinding], &layouts
         code = AddGuardCode(code, value)
         if (borrow) { value.value = "&" + value.value }
         code.text = code.text + indent.clone() + c_type + " " + temp.clone() + " = " + value.value + ";\n"
+        if (consume) { moved += ManagedRecordStringMove(named, bindings, input_node, caller_id, indent)? }
         inputs += temp
         cursor = cursor + 1
     }
@@ -122,7 +115,9 @@ fn LowerOwnedRecordCall(&named: NamedModule, &types: [TypeNameBinding], &layouts
     prototype = "extern " + c_type.clone() + " " + symbol.clone() + "(" + signature + ");\n"
     plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: arguments,
         result: BoundLinkPlanType(bound, 1, c_type.clone(), false), returns_result: true }
-    code.text = code.text + indent.clone() + c_type.clone() + " " + name.clone() + " = " + symbol + "(" + inputs + ");\n"
+    // A failed later argument still leaves the original string owner in
+    // scope. Only hand over its already prepared carrier at the call.
+    code.text = code.text + moved + indent.clone() + c_type.clone() + " " + name.clone() + " = " + symbol + "(" + inputs + ");\n"
     return ok(OwnedRecordCall { code: code, prototype: prototype, payload_layout: payload.layout,
         payload_type: payload_type, result_type: c_type, name: name, plan: plan })
 }

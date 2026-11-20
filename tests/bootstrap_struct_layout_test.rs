@@ -1703,6 +1703,37 @@ fn TakeScanned(source: str): [SourceLength]! {
     entries = entries.push(entry)
     return ok(entries)
 }
+fn ReadQuote(&characters: [str], quote: str, count: int): Scanned! {
+    return ok(Scanned { text: "found", count: count })
+}
+fn TakeQuote(source: str, first: bool, index: int): [SourceLength]! {
+    entries: [SourceLength] = []
+    characters: [str] = source.chars()
+    quote = characters[0].clone()
+    count = 0
+    if (first) {
+        item = ReadQuote(characters, quote, index + 1)?
+        count = item.count
+    } else {
+        item = ReadQuote(characters, quote, index)?
+        count = item.count
+    }
+    entry = SourceLength { value: count }
+    entries = entries.push(entry)
+    return ok(entries)
+}
+fn ReuseQuote(source: str, first: bool): [SourceLength]! {
+    entries: [SourceLength] = []
+    characters: [str] = source.chars()
+    quote = characters[0].clone()
+    count = 0
+    if (first) {
+        item = ReadQuote(characters, quote, count)?
+        count = item.count
+    }
+    count = quote.byte_len()
+    return ok(entries)
+}
 "#,
     )
     .unwrap();
@@ -1854,6 +1885,24 @@ fn TakeScanned(source: str): [SourceLength]! {
     let plan = String::from_utf8(plan.stdout).unwrap();
     assert!(plan.contains(r#""source_name":"ReadScanned","symbol":"ku_struct_result_"#));
     assert!(plan.contains(r#""c_type":"const KuGuardStringArray*","passing":"view""#));
+
+    fs::write(cwd.join("function.txt"), "TakeQuote").unwrap();
+    fs::write(cwd.join("mode.txt"), "managed").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let overflow = text.find("{ overflow = true; goto cleanup; }").unwrap();
+    let cleared = text[overflow..]
+        .find(" = (KuProjectionString){0};")
+        .unwrap();
+    let call = text[overflow..].find(" = ku_struct_result_").unwrap();
+    assert!(cleared < call);
+    assert_eq!(text.matches(" = ku_struct_result_").count(), 2);
+
+    fs::write(cwd.join("function.txt"), "ReuseQuote").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert!(!rejected.status.success() && rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("managed_call_move"));
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {
