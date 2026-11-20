@@ -190,6 +190,12 @@ allocates the joined output once. An owned struct argument releases its
 strings on return, allocation failure or arithmetic failure. A View argument
 leaves its storage with the caller.
 
+For the original `RelocateTokens` in `stage2/context.ku`, select `managed` and
+keep the same project manifest. The emitter handles the loop, per-iteration
+owners and array return. The no-relocation branch returns the original array
+storage. Relocation produces independent token owners, and bounds, arithmetic
+and allocation failures release all live storage before reporting the error.
+
 The compiler entry scans the module once and parses bounded declaration
 windows. It retains the lexer, per-function, AST and work limits. The legacy
 `ParseProgram` entry retains its 512-token whole-script limit.

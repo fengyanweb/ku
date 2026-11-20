@@ -3,6 +3,7 @@ import { Span } from "../stage2/span.ku"
 import { ParseModule } from "../stage3/parser.ku"
 import { EmitGuardedStructC } from "./guarded_struct_c.ku"
 import { BindProjectImports, SuppliedModule } from "./imports.ku"
+import { EmitManagedArrayC } from "./managed_array_c.ku"
 import { BuildNameTable } from "./names.ku"
 import { ManifestPaths, ReadProjectModules } from "./project_manifest.ku"
 import { EmitScalarIntC } from "./scalar_int_c.ku"
@@ -24,11 +25,16 @@ fn selectedFunction(): str! {
     return ok(function)
 }
 
-fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &function: str, guarded: bool): null! {
+fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &function: str, &mode: str): null! {
     imports = BindProjectImports(selected, supplied)?
     types = BindImportedTypeNames(selected.named, imports, supplied)?
     layouts = BuildStructLayouts(selected.named, types, supplied)?
-    if (guarded) {
+    if (mode == "managed") {
+        generated = EmitManagedArrayC(selected.named, types, imports, supplied, layouts, function)?
+        print(generated.source)
+        return ok(null)
+    }
+    if (mode == "guarded") {
         generated = EmitGuardedStructC(selected.named, types, layouts, function)?
         print(generated.source)
         return ok(null)
@@ -41,7 +47,7 @@ fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &
 fn main(): null! {
     mode = "projection"
     if (fs.exists("mode.txt")) { mode = string.trim(fs.read("mode.txt")?) }
-    if (mode == "construct" || mode == "guarded" || mode == "project-int") {
+    if (mode == "construct" || mode == "guarded" || mode == "project-int" || mode == "managed") {
         function = selectedFunction()?
         at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
         paths = ManifestPaths(fs.read("modules.txt")?, at)?
@@ -51,7 +57,7 @@ fn main(): null! {
             print(generated.source)
             return ok(null)
         }
-        return emitProjectFunction(supplied[0], supplied, function, mode == "guarded")
+        return emitProjectFunction(supplied[0], supplied, function, mode)
     }
 
     input = BuildNameTable(ParseModule(fs.read("input.ku")?)?)?
@@ -70,7 +76,7 @@ fn main(): null! {
         return ok(null)
     }
     if (mode != "projection") {
-        fail { domain: "bootstrap.projection", code: "invalid_mode", message: "mode.txt must contain projection, int, project-int, construct or guarded" }
+        fail { domain: "bootstrap.projection", code: "invalid_mode", message: "mode.txt must contain projection, int, project-int, construct, guarded or managed" }
     }
     layouts = BuildStructLayouts(input, bindings, supplied)?
     plan = BindStructReturn(input, bindings, layouts, function)?
