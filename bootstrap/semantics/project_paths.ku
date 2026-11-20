@@ -1,4 +1,4 @@
-import { bytes, string } from "std"
+import { json, string } from "std"
 import { Span } from "../stage2/span.ku"
 import { RejectName } from "./names.ku"
 
@@ -29,8 +29,9 @@ fn NormalizeProjectPath(parent: str, &path: str, at: Span): str! {
     }
     result = parent
     component = ""
-    zero_byte = bytes.from_array([0])?
-    zero = zero_byte.to_str()?
+    // A text NUL is representable in all three execution modes.
+    decoded_zero = json.parse("\"\\u0000\"")?
+    zero = decoded_zero.as_str()?
     for character in string.chars(path.clone()) {
         if (character == "/") {
             result = AppendProjectComponent(result, component, at.clone())?

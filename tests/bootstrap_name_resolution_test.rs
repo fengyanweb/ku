@@ -198,6 +198,9 @@ fn main() {}
         assert!(result.stdout.is_empty());
         let stderr = String::from_utf8(result.stderr).unwrap();
         assert!(stderr.contains(&format!("|{diagnostic}|")), "{stderr}");
+        if diagnostic == "unresolved_import" {
+            assert!(stderr.starts_with("stage2/context.ku: "), "{stderr}");
+        }
     }
 }
 

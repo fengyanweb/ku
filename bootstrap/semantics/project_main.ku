@@ -13,6 +13,31 @@ struct ProjectModuleBindings {
     types: [TypeNameBinding]
 }
 
+fn ReadProjectModule(path: str): SuppliedModule! {
+    try {
+        named = BuildNameTable(ParseModule(fs.read(path)?)?)?
+        return ok(SuppliedModule { path: path, named: named })
+    } catch (err) {
+        fail {
+            domain: err.domain, code: err.code,
+            message: EscapeCanonical(path) + ": " + err.message
+        }
+    }
+}
+
+fn ResolveProjectModule(&entry: SuppliedModule, &supplied: [SuppliedModule]): ProjectModuleBindings! {
+    try {
+        imports = BindProjectImports(entry, supplied)?
+        types = BindImportedTypeNames(entry.named, imports, supplied)?
+        return ok(ProjectModuleBindings { path: entry.path.clone(), imports: imports, types: types })
+    } catch (err) {
+        fail {
+            domain: err.domain, code: err.code,
+            message: EscapeCanonical(entry.path.clone()) + ": " + err.message
+        }
+    }
+}
+
 fn ManifestPaths(manifest: str, at: Span): [str]! {
     if (manifest.byte_len() > 32768) {
         RejectName("project_limit", "the module manifest exceeds 32768 UTF-8 bytes", at.clone())?
@@ -85,14 +110,13 @@ fn main(): null! {
     paths = ManifestPaths(fs.read("modules.txt")?, at)?
     supplied: [SuppliedModule] = []
     for path in paths {
-        named = BuildNameTable(ParseModule(fs.read(path)?)?)?
-        supplied = supplied.push(SuppliedModule { path: path, named: named })
+        entry = ReadProjectModule(path)?
+        supplied = supplied.push(entry)
     }
     modules: [ProjectModuleBindings] = []
     for entry in supplied {
-        imports = BindProjectImports(entry, supplied)?
-        types = BindImportedTypeNames(entry.named, imports, supplied)?
-        modules = modules.push(ProjectModuleBindings { path: entry.path, imports: imports, types: types })
+        resolved = ResolveProjectModule(entry, supplied)?
+        modules = modules.push(resolved)
     }
     order = ProjectImportOrder(modules)?
     for index in order {
