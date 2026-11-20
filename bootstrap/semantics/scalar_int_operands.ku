@@ -1,0 +1,132 @@
+import { bytes } from "std"
+import { Node } from "../stage2/ast.ku"
+import { DiagnosticCanonical, MakeDiagnostic } from "../stage2/diagnostic.ku"
+import { Span } from "../stage2/span.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
+import { ScalarIntParameter, ScalarStringPart } from "./scalar_int_emit.ku"
+
+fn RejectScalarInt(code: str, message: str, span: Span): null! {
+    domain = "bootstrap.semantics.int"
+    diagnostic = MakeDiagnostic("error", domain.clone(), code.clone(), message, "<source>", span)
+    fail { domain: domain, code: code, message: DiagnosticCanonical(diagnostic) }
+}
+
+fn ScalarParameterIndex(&parameters: [ScalarIntParameter], &name: str): int {
+    index = 0
+    while (index < parameters.len()) {
+        if (parameters[index].name == name) { return index }
+        index = index + 1
+    }
+    return -1
+}
+
+// Decimal source bytes never enter a C identifier or an unescaped literal.
+// Three-digit C octal escapes preserve all UTF-8 bytes and embedded zeros.
+fn ScalarStringLiteral(&node: Node): str! {
+    encoded = bytes.from_str(node.text.clone())?
+    if (encoded.len() > 4095) {
+        RejectScalarInt("string_literal_limit", "standalone C accepts at most 4095 bytes in a string literal", DeclarationSpan(node))?
+    }
+    literal = "\""
+    index = 0
+    while (index < encoded.len()) {
+        byte = encoded.get(index)?
+        literal += "\\" + str(byte / 64) + str((byte / 8) % 8) + str(byte % 8)
+        index = index + 1
+    }
+    return ok(literal + "\", " + str(encoded.len()) + "u")
+}
+
+fn ScalarStringOperand(&parameters: [ScalarIntParameter], &node: Node): str! {
+    if (node.kind == "String" && node.edge_count == 0) {
+        return ok("(const uint8_t*)" + ScalarStringLiteral(node)?)
+    }
+    if (node.kind == "Variable" && node.edge_count == 0) {
+        index = ScalarParameterIndex(parameters, node.text)
+        if (index >= 0 && parameters[index].string_mode != 0) {
+            access = "."
+            if (parameters[index].string_mode == 2) { access = "->" }
+            name = "a" + str(index)
+            return ok(name.clone() + access.clone() + "ptr, " + name + access + "len")
+        }
+    }
+    RejectScalarInt("unsupported_string_operand", "expected a bound str parameter or string literal", DeclarationSpan(node))?
+    return ok("")
+}
+
+// Imported aliases and local declarations can hide the builtin conversion.
+fn HasScalarStringConversion(&named: NamedModule): bool {
+    index = 0
+    while (index < named.names.declarations.len()) {
+        if (named.names.declarations[index].name == "str") { return false }
+        index = index + 1
+    }
+    index = 0
+    while (index < named.names.imports.len()) {
+        group = named.parsed.arena.nodes[named.names.imports[index] - 1].clone()
+        child = 0
+        while (child < group.edge_count) {
+            request = named.parsed.arena.nodes[named.parsed.arena.edges[group.first_edge + child] - 1].clone()
+            if (request.edge_count == 1) {
+                alias = named.parsed.arena.edges[request.first_edge]
+                if (named.parsed.arena.nodes[alias - 1].text == "str") { return false }
+            } else if (request.text == "str") { return false }
+            child = child + 1
+        }
+        index = index + 1
+    }
+    return true
+}
+
+fn scalarStringInteger(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], &value: Node): str! {
+    if (value.kind == "Variable" && value.edge_count == 0) {
+        index = ScalarParameterIndex(parameters, value.text)
+        if (index >= 0 && parameters[index].string_mode == 0) {
+            return ok("a" + str(index))
+        }
+    }
+    if (value.kind == "Int" && value.edge_count == 0 && value.int_value >= 0) {
+        return ok("INT64_C(" + str(value.int_value) + ")")
+    }
+    if (value.kind == "Unary" && value.text == "-" && value.edge_count == 1) {
+        literal = nodes[edges[value.first_edge] - 1].clone()
+        if (literal.kind == "Int" && literal.edge_count == 0 && literal.int_value >= 0) {
+            return ok("-INT64_C(" + str(literal.int_value) + ")")
+        }
+    }
+    RejectScalarInt("unsupported_string_int_operand", "expected an int parameter or literal in str conversion", DeclarationSpan(value))?
+    return ok("")
+}
+
+fn collectStringParts(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], can_convert: bool,
+                      node_id: int, depth: int, parts: [ScalarStringPart]): [ScalarStringPart]! {
+    node = nodes[node_id - 1].clone()
+    if (depth >= 32) {
+        RejectScalarInt("string_depth_limit", "standalone C string expressions accept at most 32 levels", DeclarationSpan(node))?
+    }
+    if (node.kind == "Binary" && node.text == "+" && node.edge_count == 2) {
+        left = collectStringParts(nodes, edges, parameters, can_convert, edges[node.first_edge], depth + 1, parts)?
+        return collectStringParts(nodes, edges, parameters, can_convert, edges[node.first_edge + 1], depth + 1, left)
+    }
+    if (node.kind == "Call" && node.edge_count > 0) {
+        target = nodes[edges[node.first_edge] - 1].clone()
+        if (!can_convert || target.kind != "Variable" || target.edge_count != 0 || target.text != "str" ||
+            ScalarParameterIndex(parameters, "str") >= 0 || node.edge_count != 2) {
+            RejectScalarInt("unsupported_string_int_call", "expected an unshadowed str conversion with one argument", DeclarationSpan(node))?
+        }
+        argument = nodes[edges[node.first_edge + 1] - 1].clone()
+        source = scalarStringInteger(nodes, edges, parameters, argument)?
+        return ok(parts.push(ScalarStringPart { source: source, integer: true }))
+    }
+    source = ScalarStringOperand(parameters, node)?
+    return ok(parts.push(ScalarStringPart { source: source, integer: false }))
+}
+
+fn LowerScalarStringParts(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], can_convert: bool,
+                          root_id: int): [ScalarStringPart]! {
+    root = nodes[root_id - 1].clone()
+    if (root.kind != "Call" && (root.kind != "Binary" || root.text != "+")) {
+        RejectScalarInt("unsupported_string_return", "expected a str literal or checked string composition", DeclarationSpan(root))?
+    }
+    return collectStringParts(nodes, edges, parameters, can_convert, root_id, 0, [])
+}

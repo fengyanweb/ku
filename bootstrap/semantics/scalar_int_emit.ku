@@ -16,10 +16,17 @@ struct ScalarIntParameter {
     string_mode: int
 }
 
+struct ScalarStringPart {
+    // A checked int expression, or a byte pointer and explicit length.
+    source: str
+    integer: bool
+}
+
 struct ScalarIntClause {
     condition: str
     instructions: [ScalarIntInstruction]
     scalar_result: str
+    string_parts: [ScalarStringPart]
 }
 
 struct ScalarIntFunction {
@@ -30,6 +37,7 @@ struct ScalarIntFunction {
     result_type: int
     uses_string_comparison: bool
     uses_string_contains: bool
+    uses_string_join: bool
 }
 
 struct ScalarIntBodyC {
@@ -41,6 +49,7 @@ struct ScalarIntBodyC {
     uses_string_comparison: bool
     uses_string_contains: bool
     uses_owned_string: bool
+    uses_string_format: bool
 }
 
 fn ScalarIntegerHelpers(add: bool, sub: bool, mul: bool): str {
@@ -70,11 +79,12 @@ fn ScalarIntegerHelpers(add: bool, sub: bool, mul: bool): str {
     return text
 }
 
-fn ScalarStringHelpers(carrier: bool, comparison: bool, contains: bool, owned: bool): str {
+fn ScalarStringHelpers(carrier: bool, comparison: bool, contains: bool, owned: bool, join: bool, format: bool): str {
     text = ""
     if (carrier || comparison || contains) { text += "#include <stddef.h>\n" }
-    if (comparison || contains) { text += "#include <string.h>\n" }
-    if (owned) { text += "#include <stdlib.h>\n" }
+    if (comparison || contains || join) { text += "#include <string.h>\n" }
+    if (owned || join) { text += "#include <stdlib.h>\n" }
+    if (join) { text += "#include <stdio.h>\n" }
     if (carrier) {
         text += "\n/* KuString layout. Static results are immutable and never freed by the caller. */\n"
         text += "typedef struct { uint8_t* ptr; size_t len; size_t capacity; uint8_t storage; } KuBootstrapString;\n"
@@ -94,6 +104,7 @@ fn ScalarStringHelpers(carrier: bool, comparison: bool, contains: bool, owned: b
         text += "static void ku_scalar_string_drop(KuScalarString value) {\n"
         text += "    if (value.storage == 1 && value.ptr) free(value.ptr);\n}\n\n"
     }
+    if (join) { text += scalarStringJoinHelpers(format) }
     return text
 }
 
@@ -112,6 +123,60 @@ fn emitIntCall(&call: ScalarIntInstruction): str {
         index = index + 1
     }
     return text + ")"
+}
+
+fn scalarStringJoinHelpers(format: bool): str {
+    text = "typedef struct { const uint8_t* ptr; size_t len; } KuScalarStringPart;\n\n"
+    if (format) {
+        text += "static KuScalarStringPart ku_scalar_string_int(int64_t value, uint8_t digits[20]) {\n"
+        text += "    uint64_t magnitude = (uint64_t)value;\n"
+        text += "    if (value < 0) magnitude = UINT64_C(0) - magnitude;\n"
+        text += "    size_t first = 20;\n"
+        text += "    do { digits[--first] = (uint8_t)('0' + magnitude % 10); magnitude /= 10; } while (magnitude != 0);\n"
+        text += "    if (value < 0) digits[--first] = '-';\n"
+        text += "    return (KuScalarStringPart){ digits + first, 20 - first };\n}\n\n"
+    }
+    text += "static const char* ku_scalar_string_join(const KuScalarStringPart* parts, size_t count, KuBootstrapString* result) {\n"
+    text += "    size_t len = 0;\n"
+    text += "    for (size_t i = 0; i < count; ++i) {\n"
+    text += "        if (parts[i].len > SIZE_MAX - len) return \"string allocation is too large\\n\";\n"
+    text += "        len += parts[i].len;\n    }\n"
+    text += "    uint8_t* data = malloc(len ? len : 1);\n"
+    text += "    if (!data) return \"out of memory\\n\";\n"
+    text += "    size_t at = 0;\n"
+    text += "    for (size_t i = 0; i < count; ++i) {\n"
+    text += "        if (parts[i].len != 0) memcpy(data + at, parts[i].ptr, parts[i].len);\n"
+    text += "        at += parts[i].len;\n    }\n"
+    text += "    *result = (KuBootstrapString){ data, len, len, 1u };\n"
+    return text + "    return NULL;\n}\n\n"
+}
+
+struct ScalarStringAssignment {
+    source: str
+    uses_format: bool
+}
+
+fn scalarStringAssignment(&parts: [ScalarStringPart], &indent: str): ScalarStringAssignment {
+    count = str(parts.len())
+    text = indent.clone() + "KuScalarStringPart parts[" + count.clone() + "];\n"
+    uses_format = false
+    index = 0
+    while (index < parts.len()) {
+        number = str(index)
+        part = parts[index].clone()
+        text += indent.clone()
+        if (part.integer) {
+            uses_format = true
+            digits = "digits" + number.clone()
+            text += "uint8_t " + digits.clone() + "[20];\n" + indent.clone()
+            text += "parts[" + number + "] = ku_scalar_string_int(" + part.source + ", " + digits + ");\n"
+        } else {
+            text += "parts[" + number + "] = (KuScalarStringPart){ " + part.source + " };\n"
+        }
+        index = index + 1
+    }
+    text += indent.clone() + "failure = ku_scalar_string_join(parts, " + count + "u, &result);\n"
+    return ScalarStringAssignment { source: text, uses_format: uses_format }
 }
 
 fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
@@ -139,11 +204,17 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         index = index + 1
     }
     uses_owned = drops != ""
-    if (uses_owned) { declarations += "    " + result_type + " result;\n" }
+    uses_cleanup = uses_owned || plan.uses_string_join
+    if (plan.uses_string_join) {
+        declarations += "    KuBootstrapString result = {0};\n    const char* failure = NULL;\n"
+    } else if (uses_owned) {
+        declarations += "    " + result_type + " result;\n"
+    }
     text = signature + ") {\n" + declarations
     uses_add = false
     uses_sub = false
     uses_mul = false
+    uses_format = false
     index = 0
     while (index < plan.clauses.len()) {
         clause = plan.clauses[index].clone()
@@ -180,7 +251,12 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         }
         result = clause.scalar_result
         if (plan.result_type == 1) { result = "t" + str(result_node) }
-        if (uses_owned) {
+        if (clause.string_parts.len() != 0) {
+            assignment = scalarStringAssignment(clause.string_parts, indent)
+            text += assignment.source
+            uses_format = uses_format || assignment.uses_format
+            if (guarded) { text += indent + "goto cleanup;\n" }
+        } else if (uses_cleanup) {
             text += indent.clone() + "result = " + result + ";\n"
             if (guarded) { text += indent + "goto cleanup;\n" }
         } else {
@@ -189,12 +265,19 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         if (guarded) { text += "    }\n" }
         index = index + 1
     }
-    if (uses_owned) {
+    if (uses_cleanup) {
         if (plan.clauses.len() > 1) { text += "cleanup:\n" }
-        text += drops + "    return result;\n"
+        text += drops
+        // Allocation is fatal in the native str ABI. Give moved input
+        // parameters back before reporting it, including the overflow case.
+        if (plan.uses_string_join) {
+            text += "    if (failure) { fputs(failure, stderr); exit(EXIT_FAILURE); }\n"
+        }
+        text += "    return result;\n"
     }
     text += "}\n"
     return ScalarIntBodyC { source: text, uses_add: uses_add, uses_sub: uses_sub, uses_mul: uses_mul,
         uses_string: uses_string, uses_string_comparison: plan.uses_string_comparison,
-        uses_string_contains: plan.uses_string_contains, uses_owned_string: uses_owned }
+        uses_string_contains: plan.uses_string_contains, uses_owned_string: uses_owned,
+        uses_string_format: uses_format }
 }

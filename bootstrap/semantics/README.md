@@ -104,8 +104,17 @@ The same guarded form can return string literals. For example, copy the
 complete `KeywordKind` definition from `bootstrap/stage1/lexer.ku` and select
 it in `function.txt`. Its C result is a `KuBootstrapString` with static storage
 and stays valid after the input is released. Read its bytes using `len` and
-leave the storage unchanged. Computed strings and returning an input alias
-are outside this subset.
+leave the storage unchanged.
+
+The same mode can compile the complete `At` function from
+`bootstrap/stage1/lexer.ku`. String composition supports `+` over literals,
+bound `str` or `&str` parameters, and builtin `str` conversion of an int
+parameter or literal. The compiler evaluates those pieces left to right
+and writes them into one owned result. Read its bytes using `len` and free
+`ptr` when `storage == 1`. Owned input strings are released before returning
+and before a fatal allocation failure. Borrowed inputs stay with the caller.
+Directly returning an input alias and arbitrary calls inside the composition
+remain outside this subset.
 
 An explicit `bool` result selects C11 `bool`. Guards and bool returns can
 use bool literals, `!`, short-circuit `&&` and `||`, and string `==`,

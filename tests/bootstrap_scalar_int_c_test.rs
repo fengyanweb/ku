@@ -236,6 +236,144 @@ fn compare_function(
     generated
 }
 
+const ALLOCATOR_WATCH: &str = r#"
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+static void *input_to_drop;
+static size_t input_drops;
+static size_t output_allocations;
+static int fail_allocation;
+static void *watch_malloc(size_t size) {
+    ++output_allocations;
+    return fail_allocation ? NULL : malloc(size);
+}
+static void watch_free(void *ptr) {
+    assert(ptr == input_to_drop);
+    ++input_drops;
+    free(ptr);
+}
+static void verify_input_drop(void) { assert(input_drops == 1); }
+#define malloc watch_malloc
+#define free watch_free
+"#;
+
+fn assert_string_composition(ku: &Path, seed: &Path, cwd: &Path) {
+    let lexer = include_str!("../bootstrap/stage1/lexer.ku");
+    let (_, at) = lexer.split_once("fn At(").expect("real lexer At");
+    let at = at.split_once("\n}").expect("At closing brace").0;
+    let input = format!("fn At({at}\n}}\n");
+    let generated = build_function(seed, cwd, &input, "At");
+    assert_success(&generated);
+    let generated = String::from_utf8(generated.stdout).expect("C output");
+    let (name, source) = generated.split_once('\n').expect("C symbol and source");
+    assert!(name.trim().starts_with("ku_str_"));
+    let driver = r#"
+#undef malloc
+#undef free
+int main(int argc, char **argv) {
+    static const char input[] = "\344\270\255\360\237\231\202\000z";
+    static const char expected[] =
+        "-9223372036854775808:0@9223372036854775807: \344\270\255\360\237\231\202\000z";
+    assert(argc == 2);
+    fail_allocation = strcmp(argv[1], "oom") == 0;
+    size_t len = strcmp(argv[1], "overflow") == 0 ? SIZE_MAX : sizeof(input) - 1;
+    input_to_drop = malloc(sizeof(input));
+    assert(input_to_drop && atexit(verify_input_drop) == 0);
+    memcpy(input_to_drop, input, sizeof(input));
+    KuScalarString message = { input_to_drop, len, sizeof(input), 1 };
+    KuBootstrapString result = CALL(message, INT64_MIN, 0, INT64_MAX);
+    assert(result.storage == 1 && result.len == sizeof(expected) - 1);
+    assert(result.capacity == result.len && input_drops == 1 && output_allocations == 1);
+    assert(memcmp(result.ptr, expected, result.len) == 0);
+    assert(fwrite(result.ptr, 1, result.len, stdout) == result.len);
+    free(result.ptr);
+    return 0;
+}
+"#;
+    let c_path = cwd.join("at.c");
+    let app = cwd.join(format!("at{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &c_path,
+        format!(
+            "{ALLOCATOR_WATCH}{source}{}",
+            driver.replace("CALL", name.trim())
+        ),
+    )
+    .expect("standalone At C");
+    fs::remove_file(cwd.join("input.ku")).expect("retire input before running emitted At");
+    compile_c(&c_path, &app, cwd);
+
+    let expected_source = cwd.join("at-oracle.ku");
+    fs::write(
+        &expected_source,
+        format!(
+            "{input}\nfn main() {{ print(At(\"中🙂\0z\", {}, 0, {})) }}\n",
+            ku_int(i64::MIN),
+            i64::MAX
+        ),
+    )
+    .expect("At interpreter oracle");
+    let expected = execute(
+        &mut Command::new(ku).arg("run").arg(&expected_source),
+        cwd,
+        10,
+    );
+    assert_success(&expected);
+    fs::remove_file(&expected_source).expect("source-free standalone At");
+    let actual = execute(Command::new(&app).arg("success"), cwd, 10);
+    assert_success(&actual);
+    assert_eq!(actual.stdout, expected.stdout);
+
+    for (mode, diagnostic) in [
+        ("oom", "out of memory"),
+        ("overflow", "string allocation is too large"),
+    ] {
+        let failed = execute(Command::new(&app).arg(mode), cwd, 10);
+        assert_eq!(failed.status.code(), Some(1), "{mode}: {failed:?}");
+        assert!(failed.stdout.is_empty(), "{mode}: {failed:?}");
+        assert_eq!(String::from_utf8_lossy(&failed.stderr).trim(), diagnostic);
+    }
+
+    let borrowed = build_function(
+        seed,
+        cwd,
+        r#"fn Show(&value: str): str {
+            if (value == "") { return "empty" }
+            return "[" + value + "]"
+        }"#,
+        "Show",
+    );
+    assert_success(&borrowed);
+    let borrowed = String::from_utf8(borrowed.stdout).expect("C output");
+    let (name, body) = borrowed.split_once('\n').expect("C symbol and source");
+    let driver = r#"
+#include <assert.h>
+int main(void) {
+    uint8_t original[] = {'a', 0, 'b'};
+    KuScalarString input = { original, sizeof(original), sizeof(original), 1 };
+    KuBootstrapString result = CALL(&input);
+    assert(result.storage == 1 && result.len == 5 && memcmp(result.ptr, "[a\000b]", 5) == 0);
+    assert(input.ptr == original && input.len == 3 && memcmp(input.ptr, "a\000b", 3) == 0);
+    free(result.ptr);
+    KuScalarString empty = {0};
+    result = CALL(&empty);
+    assert(result.storage == 0 && result.len == 5 && memcmp(result.ptr, "empty", 5) == 0);
+    return 0;
+}
+"#;
+    let c_path = cwd.join("show.c");
+    let app = cwd.join(format!("show{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &c_path,
+        format!("{body}{}", driver.replace("CALL", name.trim())),
+    )
+    .expect("standalone Show C");
+    fs::remove_file(cwd.join("input.ku")).expect("retire input before running emitted Show");
+    compile_c(&c_path, &app, cwd);
+    assert_success(&execute(&mut Command::new(&app), cwd, 10));
+}
+
 #[test]
 fn ku_emits_checked_c11_for_real_math_functions() {
     let work = Temp::new();
@@ -374,8 +512,21 @@ fn ku_emits_checked_c11_for_real_math_functions() {
         "only reachable local helpers, each emitted once"
     );
     assert!(!generated.contains("Irrelevant"));
+    assert_string_composition(&ku, &seed, &cwd);
 
     for (input, diagnostic) in [
+        (
+            "fn Example(str: int): str { return str(1) }",
+            "unsupported_string_int_call",
+        ),
+        (
+            "fn Example(a: str): str { return \"x\" + str(a) }",
+            "unsupported_string_int_operand",
+        ),
+        (
+            "fn Example(a: str): str { return a }",
+            "unsupported_string_return",
+        ),
         (
             "fn Example(a: float): int { return 1 }",
             "unsupported_int_type",
