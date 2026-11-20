@@ -1534,6 +1534,12 @@ fn assert_project_link_plans(driver: &Path, cwd: &Path) {
             "stage2/diagnostic.ku\nstage2/span.ku\nstage1/token.ku\n",
             &["EscapeCanonical", "SpanCanonical"][..],
         ),
+        (
+            "linked-str",
+            "TokenCanonical",
+            "stage1/token.ku\n",
+            &["EscapeCanonical"][..],
+        ),
     ] {
         fs::write(cwd.join("modules.txt"), manifest).unwrap();
         let c = emitter(mode, name);
@@ -1549,6 +1555,12 @@ fn assert_project_link_plans(driver: &Path, cwd: &Path) {
         for (dependency, expected) in dependencies.iter().zip(wanted) {
             let Value::Object(dependency) = dependency else { panic!("expected a dependency") };
             assert_eq!(dependency["source_name"], Value::String((*expected).into()));
+            if name == "TokenCanonical" {
+                assert_eq!(dependency["source_path"], export["source_path"]);
+                assert_ne!(dependency["node"], export["node"]);
+                assert!(c.contains("= a0.f0;\n    a0.f0 = (KuProjectionString){0};"));
+                assert!(c.contains("ku_scalar_string_int(a0.f2, digits)"));
+            }
             assert!(matches!(dependency["signature"], Value::Object(_)));
             if name == "RejectAtPoint" {
                 let Value::Object(signature) = &dependency["signature"] else {

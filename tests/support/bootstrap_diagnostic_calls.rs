@@ -221,6 +221,19 @@ fn Probe(e: E): str { return EscapeCanonical(e.text) + EscapeCanonical(e.text) }
             "reused_struct_string_owner",
         ),
         (
+            r#"struct E { text: str }
+fn Local(input: str): str { return input }
+fn Probe(e: E): str { return e.text + Local(e.text) }
+"#,
+            "reused_struct_string_owner",
+        ),
+        (
+            r#"struct E { text: str }
+fn Probe(e: E): str { return str(e.text) }
+"#,
+            "struct_string_int_argument",
+        ),
+        (
             r#"import { SpanCanonical } from "./span.ku"
 struct Span { line: int }
 struct E { span: Span }

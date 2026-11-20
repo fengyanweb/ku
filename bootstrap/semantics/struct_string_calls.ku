@@ -4,6 +4,7 @@ import { SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
 import { GuardCType, GuardValue } from "./guarded_struct_expr.ku"
 import { OrderCStructLayouts } from "./nested_struct_c.ku"
+import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
 
@@ -15,6 +16,12 @@ struct StructStringDependency {
     parameter: str
     argument_plan: LinkPlanType
     result_plan: LinkPlanType
+}
+
+struct StructStringTarget {
+    unit: int
+    node: int
+    source_name: str
 }
 
 fn StructStringDependencyPlan(&dependency: StructStringDependency): LinkPlanDeclaration {
@@ -31,20 +38,32 @@ fn importedFunctionIndex(&project: ProjectBindings, &name: str): int {
     return 0
 }
 
+fn resolveStructStringTarget(&supplied: [SuppliedModule], &project: ProjectBindings, &target: Node): StructStringTarget! {
+    if (target.kind != "Variable" || target.edge_count != 0) {
+        RejectLayout("unsupported_struct_string_call", "expected a named direct string function", DeclarationSpan(target))?
+    }
+    index = importedFunctionIndex(project, target.text)
+    if (index != 0) {
+        link = project.modules[0].imports[index - 1].clone()
+        if (link.module_index <= 0) {
+            RejectLayout("unsupported_struct_string_call", "expected an explicit project module dependency", DeclarationSpan(target))?
+        }
+        return ok(StructStringTarget { unit: link.module_index, node: link.target_node, source_name: link.source_name })
+    }
+    node = ScalarFunctionNode(supplied[0].named.names.declarations, target.text)
+    if (node == 0) {
+        RejectLayout("unsupported_struct_string_call", "expected a named direct string function", DeclarationSpan(target))?
+    }
+    return ok(StructStringTarget { unit: 1, node: node, source_name: target.text.clone() })
+}
+
 // Both the declaration and the type identities are resolved in the callee's
 // own module. A same-spelling local struct is not interchangeable with it.
 fn BindStructStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, &layouts: [StructLayout],
                         &target: Node, &argument: Node, &value: GuardValue): StructStringDependency! {
-    index = importedFunctionIndex(project, target.text)
-    if (target.kind != "Variable" || target.edge_count != 0 || index == 0) {
-        RejectLayout("unsupported_struct_string_call", "expected a named imported string function", DeclarationSpan(target))?
-    }
-    link = project.modules[0].imports[index - 1].clone()
-    if (link.module_index <= 0) {
-        RejectLayout("unsupported_struct_string_call", "expected an explicit project module dependency", DeclarationSpan(target))?
-    }
-    module_slot = link.module_index - 1
-    function = supplied[module_slot].named.parsed.arena.nodes[link.target_node - 1].clone()
+    link = resolveStructStringTarget(supplied, project, target)?
+    module_slot = link.unit - 1
+    function = supplied[module_slot].named.parsed.arena.nodes[link.node - 1].clone()
     if (function.kind != "Function" || function.edge_count < 3) {
         RejectLayout("struct_string_link_signature", "expected one typed argument and a str result", DeclarationSpan(target))?
     }
@@ -60,26 +79,27 @@ fn BindStructStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, 
     if (result.declaration_kind != "Builtin" || result.name != "str" || value.setup != "" || value.view || argument.kind != "Field") {
         RejectLayout("struct_string_link_argument", "expected a str return and one checked projected value", DeclarationSpan(argument))?
     }
+    symbol = "ku_struct_string_link_m" + str(link.unit) + "_" + str(link.node)
     if (declared.declaration_kind == "Builtin" && declared.name == "str" && value.ty.kind == "str") {
-        return ok(StructStringDependency { symbol: "ku_struct_string_link_m" + str(link.module_index) + "_" + str(link.target_node),
-            module_index: link.module_index, declaration: link.target_node, source_name: link.source_name, parameter: "KuProjectionString",
-            argument_plan: BoundLinkPlanType(declared, link.module_index, "KuProjectionString", false),
-            result_plan: BoundLinkPlanType(result, link.module_index, "KuProjectionString", false) })
+        return ok(StructStringDependency { symbol: symbol,
+            module_index: link.unit, declaration: link.node, source_name: link.source_name, parameter: "KuProjectionString",
+            argument_plan: BoundLinkPlanType(declared, link.unit, "KuProjectionString", false),
+            result_plan: BoundLinkPlanType(result, link.unit, "KuProjectionString", false) })
     }
     if (declared.declaration_kind == "Struct" && value.ty.kind == "struct") {
         layout = layouts[value.ty.layout - 1].clone()
         expected_module = declared.module_index
-        if (expected_module == 0) { expected_module = link.module_index }
+        if (expected_module == 0) { expected_module = link.unit }
         actual_module = layout.module_index
         if (actual_module == 0) { actual_module = 1 }
         if (expected_module == actual_module && declared.declaration_node == layout.node) {
             order = OrderCStructLayouts(layouts, layout.module_index, layout.node, DeclarationSpan(argument))?
             if (!order.contains_string) {
                 c_type = GuardCType(value.ty, layouts)
-                return ok(StructStringDependency { symbol: "ku_struct_string_link_m" + str(link.module_index) + "_" + str(link.target_node),
-                    module_index: link.module_index, declaration: link.target_node, source_name: link.source_name,
-                    parameter: c_type.clone(), argument_plan: BoundLinkPlanType(declared, link.module_index, c_type, false),
-                    result_plan: BoundLinkPlanType(result, link.module_index, "KuProjectionString", false) })
+                return ok(StructStringDependency { symbol: symbol,
+                    module_index: link.unit, declaration: link.node, source_name: link.source_name,
+                    parameter: c_type.clone(), argument_plan: BoundLinkPlanType(declared, link.unit, c_type, false),
+                    result_plan: BoundLinkPlanType(result, link.unit, "KuProjectionString", false) })
             }
         }
     }

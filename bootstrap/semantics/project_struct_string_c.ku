@@ -3,14 +3,14 @@ import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules, ProjectBindings } from "./project_bindings.ku"
-import { GuardBinding, GuardBindingIndex, GuardCType, GuardExplicitType, GuardExpression } from "./guarded_struct_expr.ku"
+import { GuardBinding, GuardBindingIndex, GuardCType, GuardExplicitType, GuardExpression, GuardValue } from "./guarded_struct_expr.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { EmitOrderedStructLayouts, OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ProjectionHeaders } from "./struct_projection_c.ku"
 import { BuildStructLayouts, ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { BoundLinkPlanType, EmptyLinkPlanDeclaration, LinkPlanDeclaration } from "./link_plan_c.ku"
 import { ScalarStringJoinHelpers } from "./scalar_int_emit.ku"
-import { ScalarStringLiteral } from "./scalar_int_operands.ku"
+import { HasScalarBuiltin, ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { BindStructStringCall, StructStringDependency } from "./struct_string_calls.ku"
 
 struct ProjectStructStringC {
@@ -28,6 +28,7 @@ struct StructStringFlow {
     result: str
     leaves: int
     uses_join: bool
+    uses_format: bool
 }
 
 fn hasMovedField(&moved: [str], &field: str): bool {
@@ -50,29 +51,55 @@ fn addStringDependency(dependencies: [StructStringDependency], dependency: Struc
     return dependencies.push(dependency)
 }
 
+fn moveStructStringField(&field: Node, &value: GuardValue, destination: str, flow: StructStringFlow): StructStringFlow! {
+    if (field.kind != "Field" || value.ty.kind != "str" || value.setup != "" || value.view) {
+        RejectLayout("struct_string_link_argument", "expected a checked owned str field", DeclarationSpan(field))?
+    }
+    current = flow
+    if (hasMovedField(current.moved_fields, value.value)) {
+        RejectLayout("reused_struct_string_owner", "owned field was already consumed by this expression", DeclarationSpan(field))?
+    }
+    current.source = current.source + "    " + destination + " = " + value.value.clone() + ";\n"
+    current.source = current.source + "    " + value.value.clone() + " = (KuProjectionString){0};\n"
+    current.moved_fields = current.moved_fields.push(value.value.clone())
+    return ok(current)
+}
+
+fn formatStructIntField(&field: Node, &value: GuardValue, &output: str, flow: StructStringFlow): StructStringFlow! {
+    if (field.kind != "Field" || value.ty.kind != "int" || value.setup != "" || value.view) {
+        RejectLayout("struct_string_int_argument", "str requires a checked Copy int field", DeclarationSpan(field))?
+    }
+    current = flow
+    // str allocates before this leaf's parent concatenation. Keep that
+    // failure point and evaluate no later call when it fails.
+    current.source = current.source + "    {\n        uint8_t digits[20];\n"
+    current.source = current.source + "        KuScalarStringPart part = ku_scalar_string_int(" + value.value.clone() + ", digits);\n"
+    current.source = current.source + "        failure = ku_scalar_string_join(&part, 1u, &" + output.clone() + ");\n"
+    current.source = current.source + "        if (failure) goto cleanup;\n    }\n"
+    current.uses_join = true
+    current.uses_format = true
+    return ok(current)
+}
+
 fn structStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, &layouts: [StructLayout],
-                    &bindings: [GuardBinding], &call: Node, &output: str, flow: StructStringFlow): StructStringFlow! {
+                    &bindings: [GuardBinding], &call: Node, &output: str, can_convert: bool, flow: StructStringFlow): StructStringFlow! {
     current = flow
     target = supplied[0].named.parsed.arena.nodes[supplied[0].named.parsed.arena.edges[call.first_edge] - 1].clone()
     if (GuardBindingIndex(bindings, target.text) != 0) {
-        RejectLayout("shadowed_struct_string_call", "a local binding shadows the imported string function", DeclarationSpan(target))?
+        RejectLayout("shadowed_struct_string_call", "a local binding shadows the named string function", DeclarationSpan(target))?
     }
     arg_id = supplied[0].named.parsed.arena.edges[call.first_edge + 1]
     argument = supplied[0].named.parsed.arena.nodes[arg_id - 1].clone()
     value = GuardExpression(supplied[0].named.parsed.arena.nodes, supplied[0].named.parsed.arena.edges,
         bindings, layouts, arg_id, 0, "    ")?
+    if (can_convert && target.kind == "Variable" && target.edge_count == 0 && target.text == "str") {
+        return formatStructIntField(argument, value, output, current)
+    }
     dependency = BindStructStringCall(supplied, project, layouts, target, argument, value)?
     argument_c = value.value.clone()
     if (value.ty.kind == "str") {
-        if (hasMovedField(current.moved_fields, argument_c)) {
-            RejectLayout("reused_struct_string_owner", "owned field was already consumed by a direct call", DeclarationSpan(argument))?
-        }
-        // This position is solely a by-value field use in an owned parameter.
-        // Clear its old owner before the call. Repeated reads are rejected.
         held = "arg_" + output.clone()
-        current.source = current.source + "    KuProjectionString " + held.clone() + " = " + argument_c.clone() + ";\n"
-        current.source = current.source + "    " + argument_c.clone() + " = (KuProjectionString){0};\n"
-        current.moved_fields = current.moved_fields.push(argument_c)
+        current = moveStructStringField(argument, value, "KuProjectionString " + held.clone(), current)?
         argument_c = held
     }
     current.source = current.source + "    " + output.clone() + " = " + dependency.symbol.clone() + "(" + argument_c + ");\n"
@@ -81,7 +108,7 @@ fn structStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, &lay
 }
 
 fn lowerStructString(&supplied: [SuppliedModule], &project: ProjectBindings, &layouts: [StructLayout],
-                     &bindings: [GuardBinding], id: int, depth: int, flow: StructStringFlow): StructStringFlow! {
+                     &bindings: [GuardBinding], id: int, depth: int, can_convert: bool, flow: StructStringFlow): StructStringFlow! {
     if (depth >= 32) {
         RejectLayout("struct_string_depth", "imported string expressions accept at most 32 levels",
             DeclarationSpan(supplied[0].named.parsed.arena.nodes[id - 1]))?
@@ -92,9 +119,9 @@ fn lowerStructString(&supplied: [SuppliedModule], &project: ProjectBindings, &la
     if (node.kind == "Binary" && node.text == "+" && node.edge_count == 2) {
         lhs = supplied[0].named.parsed.arena.edges[node.first_edge]
         rhs = supplied[0].named.parsed.arena.edges[node.first_edge + 1]
-        current = lowerStructString(supplied, project, layouts, bindings, lhs, depth + 1, current)?
+        current = lowerStructString(supplied, project, layouts, bindings, lhs, depth + 1, can_convert, current)?
         left = current.result.clone()
-        current = lowerStructString(supplied, project, layouts, bindings, rhs, depth + 1, current)?
+        current = lowerStructString(supplied, project, layouts, bindings, rhs, depth + 1, can_convert, current)?
         right = current.result.clone()
         // Match the source tree's left/right evaluation and concatenation
         // boundaries. A join failure cannot run subsequent direct calls.
@@ -112,9 +139,13 @@ fn lowerStructString(&supplied: [SuppliedModule], &project: ProjectBindings, &la
             current.source = current.source + "    " + output.clone() + " = (KuProjectionString){ (uint8_t*)" + literal +
                 ", 0u, KU_PROJECTION_STRING_STATIC };\n"
         } else if (node.kind == "Call" && node.edge_count == 2) {
-            current = structStringCall(supplied, project, layouts, bindings, node, output, current)?
+            current = structStringCall(supplied, project, layouts, bindings, node, output, can_convert, current)?
+        } else if (node.kind == "Field" && node.edge_count == 1) {
+            value = GuardExpression(supplied[0].named.parsed.arena.nodes, supplied[0].named.parsed.arena.edges,
+                bindings, layouts, id, 0, "    ")?
+            current = moveStructStringField(node, value, output.clone(), current)?
         } else {
-            RejectLayout("unsupported_struct_string_part", "expected a string literal or a typed direct import call", DeclarationSpan(node))?
+            RejectLayout("unsupported_struct_string_part", "expected a string literal, owned field, or checked direct call", DeclarationSpan(node))?
         }
         current.leaves = current.leaves + 1
     }
@@ -147,13 +178,15 @@ fn emitProjectStringFunction(&supplied: [SuppliedModule], &project: ProjectBindi
     result_type = ExplicitType(project.modules[0].types, result_id, DeclarationSpan(fn_node))?
     order = OrderCStructLayouts(layouts, layouts[input.layout - 1].module_index, layouts[input.layout - 1].node, DeclarationSpan(param))?
     binding = GuardBinding { name: param.text, ty: input, slot: 0, parameter: true, view: false }
-    initial = StructStringFlow { source: "", slots: [], dependencies: [], moved_fields: [], result: "", leaves: 0, uses_join: false }
-    lowered = lowerStructString(supplied, project, layouts, [binding.clone()], supplied[0].named.parsed.arena.edges[returned.first_edge], 0, initial)?
+    initial = StructStringFlow { source: "", slots: [], dependencies: [], moved_fields: [], result: "", leaves: 0, uses_join: false, uses_format: false }
+    can_convert = HasScalarBuiltin(supplied[0].named, "str")
+    lowered = lowerStructString(supplied, project, layouts, [binding.clone()],
+        supplied[0].named.parsed.arena.edges[returned.first_edge], 0, can_convert, initial)?
     symbol = "ku_struct_string_" + str(function_id)
     text = ProjectionHeaders(true, true) + "#include <stdio.h>\n\n" + EmitOrderedStructLayouts(layouts, order)?
     if (lowered.uses_join) {
         text += "#include <string.h>\n\ntypedef KuProjectionString KuBootstrapString;\n"
-        text += ScalarStringJoinHelpers(false)
+        text += ScalarStringJoinHelpers(lowered.uses_format)
     }
     for dependency in lowered.dependencies {
         text += "extern KuProjectionString " + dependency.symbol + "(" + dependency.parameter + ");\n"

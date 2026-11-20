@@ -224,6 +224,14 @@ such as `RejectAt`. It evaluates bound call arguments in source order and
 transfers their owners to the declared C dependency. A returned Error owns
 its domain, code and message.
 
+`linked-str` also emits functions such as `TokenCanonical` that consume an
+owned struct. A string field may move into the expression once. A named
+function in the same source module is linked by its declaration path and
+node, just like an imported function. The builtin `str` accepts checked
+Copy integer fields in this expression subset. Concatenations and integer
+conversions retain source evaluation order and release partially built
+strings if allocation fails.
+
 With the same manifest and selected function, append `-plan` to
 `linked-str`, `linked-null`, `struct-result`, `construct`, `project-fields`,
 `guarded` or `project-int` in `mode.txt` to emit a `ku-bootstrap-link-plan-v1`
