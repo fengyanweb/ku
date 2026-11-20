@@ -1,5 +1,5 @@
 import { Node } from "../stage2/ast.ku"
-import { DeclarationSpan } from "./names.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 import { ScalarStringPart } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
@@ -139,10 +139,69 @@ fn ManagedDeferredMessageCalls(&nodes: [Node], &edges: [int], &function: Node): 
     return calls
 }
 
-fn ManagedPredicateCall(&nodes: [Node], &edges: [int], &call: Node): bool {
+fn ManagedClonedStringCall(&nodes: [Node], &edges: [int], &call: Node): bool {
     if (call.kind != "Call" || call.edge_count != 2) { return false }
     source = ProjectionCloneSource(nodes, edges, edges[call.first_edge + 1])
     return source != 0 && nodes[source - 1].kind == "Variable"
+}
+
+fn ManagedLiteralStringReturns(&nodes: [Node], &edges: [int], &function: Node): bool {
+    cursor = function.first_edge + 2
+    end = function.first_edge + function.edge_count
+    if (cursor >= end) { return false }
+    while (cursor < end) {
+        statement = nodes[edges[cursor] - 1].clone()
+        if (cursor < end - 1 && statement.kind == "If" && statement.int_value == 1 && statement.edge_count == 2) {
+            statement = nodes[edges[statement.first_edge + 1] - 1].clone()
+        }
+        if (statement.kind != "Return" || statement.edge_count != 1 || nodes[edges[statement.first_edge] - 1].kind != "String") {
+            return false
+        }
+        cursor = cursor + 1
+    }
+    return true
+}
+
+fn ManagedStringLeaf(&named: NamedModule, &locals: [GuardBinding], &leaves: [GuardLeaf], &call: Node): str {
+    if (!ManagedClonedStringCall(named.parsed.arena.nodes, named.parsed.arena.edges, call)) { return "" }
+    target = named.parsed.arena.nodes[named.parsed.arena.edges[call.first_edge] - 1].clone()
+    if (target.kind != "Variable" || GuardBindingIndex(locals, target.text) != 0) { return "" }
+    for leaf in leaves.clone() {
+        if (leaf.name == target.text && leaf.result_kind == "str" && leaf.parameters.len() == 1 && leaf.parameters[0] == "str") {
+            // Deferred message providers may allocate only after cleanup.
+            // A direct call may run while an old owner is still live.
+            for declaration in named.names.declarations.clone() {
+                if (declaration.kind == "Function" && declaration.name == target.text &&
+                    ManagedLiteralStringReturns(named.parsed.arena.nodes, named.parsed.arena.edges,
+                        named.parsed.arena.nodes[declaration.node - 1])) { return leaf.symbol }
+            }
+        }
+    }
+    return ""
+}
+
+fn ManagedStringLeafSetup(&nodes: [Node], &edges: [int], &locals: [GuardBinding],
+                          &call: Node, id: int, &symbol: str, &target: str, &indent: str): str! {
+    source = ProjectionCloneSource(nodes, edges, edges[call.first_edge + 1])
+    binding = GuardBindingIndex(locals, nodes[source - 1].text)
+    if (binding == 0 || locals[binding - 1].ty.kind != "str" || locals[binding - 1].view) {
+        RejectLayout("managed_string_leaf_argument", "expected a clone of a bound owned str", DeclarationSpan(nodes[source - 1]))?
+    }
+    temporary = "argument" + str(id)
+    return ok(indent.clone() + "KuProjectionString " + temporary.clone() + " = {0};\n" + indent.clone() +
+        "if (!ku_result_clone_string(" + GuardBindingName(locals[binding - 1]) + ", &" + temporary.clone() +
+        ")) { out_of_memory = true; goto cleanup; }\n" + indent.clone() + target.clone() + " = " +
+        symbol.clone() + "(" + temporary + ");\n")
+}
+
+fn ManagedMethodReceiver(&nodes: [Node], &edges: [int], &call: Node): int {
+    return edges[nodes[edges[call.first_edge] - 1].first_edge]
+}
+
+fn IsManagedMethod(&nodes: [Node], &edges: [int], &value: Node, &name: str, arity: int): bool {
+    if (value.kind != "Call" || value.edge_count != arity + 1) { return false }
+    method = nodes[edges[value.first_edge] - 1].clone()
+    return method.kind == "Field" && method.text == name && method.edge_count == 1
 }
 
 fn LowerManagedRecordError(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],

@@ -180,12 +180,9 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
         function_end: function.end_offset, leaves: [] }
     signature = readParameters(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, root, ordered, function, edge)?
     root.source_strings = signature.source_strings
-    leaves = OwnedScalarLeaves { bindings: [], declarations: "", plan: [] }
+    leaves = OwnedScalarLeaves { bindings: [], declarations: "", plan: [], needs_clone: false }
     if (checked) { leaves = ReadOwnedScalarLeaves(named, types, layouts, function, true)? }
-    clones = false
-    for dependency in leaves.bindings.clone() {
-        if (dependency.result_kind == "bool") { clones = true }
-    }
+    clones = leaves.needs_clone
     root.leaves = leaves.bindings
     body = managedBody(named, types, imports, supplied, layouts, root, signature.bindings.clone(),
         signature.body_start, function.first_edge + function.edge_count, checked)?

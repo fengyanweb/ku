@@ -377,6 +377,11 @@ A managed string accumulator can append a literal or consume a distinct
 local string whose final use is the append. The emitter rejects later reads
 of that local and consuming a string created outside a repeating loop. The
 accumulator reuses its owned capacity and releases live owners if growth fails.
+A bound same-module string function with literal return branches can also
+consume a cloned argument and supply a local value. Replacement keeps the old
+owner live through argument preparation and takes the returned string without
+another clone. Providers that allocate their returned string remain available
+as deferred Error message providers.
 
 `linked-str` also emits functions such as `TokenCanonical` that consume an
 owned struct. A string field may move into the expression once. A named

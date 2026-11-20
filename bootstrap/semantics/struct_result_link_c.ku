@@ -4,7 +4,7 @@ import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression, GuardLeaf } from "./guarded_struct_expr.ku"
 import { GuardParameterType } from "./guarded_struct_c.ku"
-import { ManagedDeferredMessageCalls, ManagedPredicateCall } from "./guarded_string_parts.ku"
+import { ManagedClonedStringCall, ManagedDeferredMessageCalls, ManagedLiteralStringReturns } from "./guarded_string_parts.ku"
 import { AddGuardCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
@@ -14,6 +14,7 @@ struct OwnedScalarLeaves {
     bindings: [GuardLeaf]
     declarations: str
     plan: [LinkPlanDeclaration]
+    needs_clone: bool
 }
 
 struct StructResultLink {
@@ -142,7 +143,7 @@ fn ownedScalarLeafId(&named: NamedModule, &call: Node): int {
 
 fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layouts: [StructLayout],
                          &function: Node, managed: bool): OwnedScalarLeaves! {
-    output = OwnedScalarLeaves { bindings: [], declarations: "", plan: [] }
+    output = OwnedScalarLeaves { bindings: [], declarations: "", plan: [], needs_clone: false }
     calls: [int] = []
     if (managed) {
         calls = ManagedDeferredMessageCalls(named.parsed.arena.nodes, named.parsed.arena.edges, function)
@@ -154,9 +155,9 @@ fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layout
         call = named.parsed.arena.nodes[index - 1].clone()
         if (call.offset < function.offset || call.end_offset > function.end_offset) { continue }
         message = managed && ContainsIndex(calls, index)
-        if (managed && !message && !ManagedPredicateCall(named.parsed.arena.nodes, named.parsed.arena.edges, call)) { continue }
+        if (managed && !message && !ManagedClonedStringCall(named.parsed.arena.nodes, named.parsed.arena.edges, call)) { continue }
         id = ownedScalarLeafId(named, call)
-        if (id == 0 || ContainsIndex(emitted, id)) { continue }
+        if (id == 0 || (!managed && ContainsIndex(emitted, id))) { continue }
         leaf = named.parsed.arena.nodes[id - 1].clone()
         position = call.edge_count - 1
         if (position >= leaf.edge_count - 1) { continue }
@@ -164,7 +165,7 @@ fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layout
         if (named.parsed.arena.nodes[result - 1].kind != "TypeName") { continue }
         selected = ExplicitType(types, result, DeclarationSpan(named.parsed.arena.nodes[result - 1]))?
         string_result = selected.name == "str"
-        if (managed && (message != string_result || (!message && selected.name != "bool"))) { continue }
+        if (managed && !string_result && (message || selected.name != "bool")) { continue }
         if (selected.declaration_kind != "Builtin" || (!string_result && selected.name != "int" && selected.name != "bool")) { continue }
         view_predicate = false
         owned_string = false
@@ -197,6 +198,9 @@ fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layout
         }
         if (managed && !message && !owned_string) { continue }
         if (cursor != position || (!owned_string && !string_result && (!view_predicate || selected.name != "bool"))) { continue }
+        if (managed && !message && string_result && !ManagedLiteralStringReturns(named.parsed.arena.nodes, named.parsed.arena.edges, leaf)) { continue }
+        if (managed && !message) { output.needs_clone = true }
+        if (ContainsIndex(emitted, id)) { continue }
         symbol = "ku_guarded_" + str(id)
         if (owned_string || string_result) {
             scalar_type = 1

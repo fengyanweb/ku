@@ -1659,6 +1659,30 @@ fn RepeatedAppend(source: str): [SourceLength]! {
     }
     return ok(entries)
 }
+fn ResolveKind(word: str): str {
+    if (word == "fn") { return "Fn" }
+    return "Ident"
+}
+fn ChooseKind(source: str): [SourceLength]! {
+    entries: [SourceLength] = []
+    tag = "previous"
+    tag = ResolveKind(source.clone())
+    width = tag.byte_len()
+    item = SourceLength { value: width }
+    entries = entries.push(item)
+    return ok(entries)
+}
+fn AllocatingMessage(word: str): str {
+    return word + "!"
+}
+fn RejectAllocatingKind(source: str): [SourceLength]! {
+    entries: [SourceLength] = []
+    if (source.byte_len() == 0) {
+        fail { domain: "test", code: "empty", message: AllocatingMessage("empty") }
+    }
+    tag = AllocatingMessage(source.clone())
+    return ok(entries)
+}
 "#,
     )
     .unwrap();
@@ -1771,6 +1795,28 @@ fn RepeatedAppend(source: str): [SourceLength]! {
     let rejected = execute(&mut Command::new(seed), cwd, 30);
     assert!(!rejected.status.success() && rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("outside its iteration"));
+
+    fs::write(cwd.join("function.txt"), "ChooseKind").unwrap();
+    fs::write(cwd.join("mode.txt"), "managed").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let body = text.split_once("(KuProjectionString a0) {").unwrap().1;
+    let clone = body.find("if (!ku_result_clone_string(a0").unwrap();
+    let result = body.find(" = ku_str_").unwrap();
+    let drop = body.find("ku_projection_string_drop(&l").unwrap();
+    assert!(clone < result && result < drop);
+    assert!(body[drop..].contains(" = replaced"));
+    fs::write(cwd.join("mode.txt"), "managed-plan").unwrap();
+    let plan = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plan);
+    let plan = String::from_utf8(plan.stdout).unwrap();
+    assert!(plan.contains(r#""source_name":"ResolveKind","symbol":"ku_str_"#));
+
+    fs::write(cwd.join("function.txt"), "RejectAllocatingKind").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert!(!rejected.status.success() && rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unsupported_guarded_operand"));
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {

@@ -4,7 +4,7 @@ import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
 import { ContainsIndex, ProjectionCloneSource, ProjectionIsStringArray } from "./struct_projection_c.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { BindManagedLocal, CheckManagedDeclaration, IsManagedLocalArrayClone, ManagedAppendDrop, ManagedCloneStringSetup, ManagedSourceCharsSetup, ManagedStringAppendRuntime, RequireNewManagedOwner } from "./guarded_string_parts.ku"
+import { BindManagedLocal, CheckManagedDeclaration, IsManagedLocalArrayClone, IsManagedMethod, ManagedAppendDrop, ManagedCloneStringSetup, ManagedMethodReceiver, ManagedSourceCharsSetup, ManagedStringAppendRuntime, ManagedStringLeaf, ManagedStringLeafSetup, RequireNewManagedOwner } from "./guarded_string_parts.ku"
 import { CheckStructArrayType, StructArrayC } from "./struct_array_c.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression, GuardLeaf, GuardOwnedExpression, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 
@@ -74,19 +74,9 @@ fn ManagedExplicitType(&types: [TypeNameBinding], &nodes: [Node], &edges: [int],
     return GuardExplicitType(types, nodes, layouts, id)
 }
 
-fn isMethod(&nodes: [Node], &edges: [int], &value: Node, &name: str, arity: int): bool {
-    if (value.kind != "Call" || value.edge_count != arity + 1) { return false }
-    method = nodes[edges[value.first_edge] - 1].clone()
-    return method.kind == "Field" && method.text == name && method.edge_count == 1
-}
-
-fn methodReceiver(&nodes: [Node], &edges: [int], &call: Node): int {
-    return edges[nodes[edges[call.first_edge] - 1].first_edge]
-}
-
 fn cloneArrayElement(&nodes: [Node], &edges: [int], &locals: [GuardBinding], &layouts: [StructLayout],
                      &root: ManagedType, &call: Node, &binding: GuardBinding, &indent: str): ManagedCode! {
-    indexed = nodes[methodReceiver(nodes, edges, call) - 1].clone()
+    indexed = nodes[ManagedMethodReceiver(nodes, edges, call) - 1].clone()
     if (indexed.kind != "Index" || indexed.edge_count != 2) {
         RejectLayout("unsupported_managed_clone", "expected a checked array index followed by clone", DeclarationSpan(call))?
     }
@@ -111,7 +101,7 @@ fn cloneArrayElement(&nodes: [Node], &edges: [int], &locals: [GuardBinding], &la
 
 fn appendToOwner(&nodes: [Node], &edges: [int], &locals: [GuardBinding], &layouts: [StructLayout],
                  &root: ManagedType, &call: Node, &binding: GuardBinding, &indent: str): ManagedCode! {
-    receiver = nodes[methodReceiver(nodes, edges, call) - 1].clone()
+    receiver = nodes[ManagedMethodReceiver(nodes, edges, call) - 1].clone()
     if (binding.ty.kind != "array" || binding.ty.layout != root.layout || binding.parameter || binding.view ||
         receiver.kind != "Variable" || receiver.text != binding.name) {
         RejectLayout("unsupported_managed_append", "append requires assigning to the same owning local array", DeclarationSpan(call))?
@@ -214,8 +204,13 @@ fn copyAssignment(&named: NamedModule, &locals: [GuardBinding], &layouts: [Struc
 }
 
 fn ownedStringSetup(&named: NamedModule, &locals: [GuardBinding], &layouts: [StructLayout], &root: ManagedType,
-                    node_id: int, &target: str, &indent: str): ManagedCode! {
+                    node_id: int, &target: str, &indent: str, &symbol: str): ManagedCode! {
     node = named.parsed.arena.nodes[node_id - 1].clone()
+    if (symbol != "") {
+        code = ManagedBlank()
+        code.text = ManagedStringLeafSetup(named.parsed.arena.nodes, named.parsed.arena.edges, locals, node, node_id, symbol, target, indent)?
+        return ok(code)
+    }
     if (node.kind == "String") {
         value = ManagedExpression(named, locals, layouts, root, node_id, indent)?
         return ok(ManagedCode { text: indent.clone() + target.clone() + " = " + value.value + ";\n",
@@ -264,7 +259,7 @@ fn sourceCharacters(&named: NamedModule, &locals: [GuardBinding], &statement: No
     RequireNewManagedOwner(found, statement)?
     ty = GuardType { kind: "str_array", layout: 0 }
     CheckManagedDeclaration(declared, ty, found, statement)?
-    base = methodReceiver(named.parsed.arena.nodes, named.parsed.arena.edges, node)
+    base = ManagedMethodReceiver(named.parsed.arena.nodes, named.parsed.arena.edges, node)
     binding = BindManagedLocal(statement, statement_id, ty)
     code = ManagedBlank()
     code.text = ManagedSourceCharsSetup(locals, named.parsed.arena.nodes[base - 1], GuardBindingName(binding), indent)?
@@ -283,47 +278,50 @@ fn EmitManagedAssignment(&named: NamedModule, &types: [TypeNameBinding], &import
     }
     node_id = named.parsed.arena.edges[statement.first_edge + statement.edge_count - 1]
     node = named.parsed.arena.nodes[node_id - 1].clone()
+    symbol = ""
+    if (root.source_strings) { symbol = ManagedStringLeaf(named, locals, root.leaves, node) }
     local_clone = root.source_strings && IsManagedLocalArrayClone(named.parsed.arena.nodes, named.parsed.arena.edges, locals, node_id)
+    fallible = local_clone || symbol != ""
     literal = (root.string_locals || root.source_strings) && node.kind == "String"
-    if ((literal || local_clone) && found != 0 && statement.kind == "Assign") {
+    if ((literal || fallible) && found != 0 && statement.kind == "Assign") {
         previous = locals[found - 1].clone()
         if (previous.ty.kind == "str" && !previous.parameter && !previous.view) {
             target = GuardBindingName(previous)
             drop = indent.clone() + "ku_projection_string_drop(&" + target.clone() + ");\n"
             update = ManagedBlank()
-            if (local_clone) {
+            if (fallible) {
                 // Until the checked clone succeeds, the previous owner still
                 // belongs to the existing scope and fatal cleanup path.
                 temporary = "replaced" + str(statement_id)
-                update = ownedStringSetup(named, locals, layouts, root, node_id, temporary, indent)?
+                update = ownedStringSetup(named, locals, layouts, root, node_id, temporary, indent, symbol)?
                 update.text = indent.clone() + "KuProjectionString " + temporary.clone() + " = {0};\n" +
                     update.text + drop + indent.clone() + target + " = " + temporary + ";\n"
             } else {
-                update = ownedStringSetup(named, locals, layouts, root, node_id, target, indent)?
+                update = ownedStringSetup(named, locals, layouts, root, node_id, target, indent, symbol)?
                 update.text = drop + update.text
             }
             return ok(ManagedAssignment { code: update, binding: previous, introduces: false })
         }
     }
-    if (literal || local_clone || (root.string_locals && ProjectionCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, node_id) != 0)) {
+    if (literal || fallible || (root.string_locals && ProjectionCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, node_id) != 0)) {
         ty = GuardType { kind: "str", layout: 0 }
         RequireNewManagedOwner(found, statement)?
         CheckManagedDeclaration(declared, ty, found, statement)?
         binding = BindManagedLocal(statement, statement_id, ty)
-        code = ownedStringSetup(named, locals, layouts, root, node_id, GuardBindingName(binding), indent)?
+        code = ownedStringSetup(named, locals, layouts, root, node_id, GuardBindingName(binding), indent, symbol)?
         return ok(ManagedAssignment { code: code, binding: binding, introduces: true })
     }
     if (root.string_locals) {
         return copyAssignment(named, locals, layouts, root, statement, statement_id, node_id, declared, found, indent)
     }
-    if (isMethod(named.parsed.arena.nodes, named.parsed.arena.edges, node, "chars", 0)) {
+    if (IsManagedMethod(named.parsed.arena.nodes, named.parsed.arena.edges, node, "chars", 0)) {
         return sourceCharacters(named, locals, statement, statement_id, node, declared, found, indent)
     }
     if (node.kind == "Array" || node.kind == "StructLiteral" ||
-        isMethod(named.parsed.arena.nodes, named.parsed.arena.edges, node, "clone", 0)) {
+        IsManagedMethod(named.parsed.arena.nodes, named.parsed.arena.edges, node, "clone", 0)) {
         return managedInitializer(named, imports, supplied, locals, layouts, root, statement, statement_id, node, node_id, declared, found, indent)
     }
-    if (isMethod(named.parsed.arena.nodes, named.parsed.arena.edges, node, "push", 1)) {
+    if (IsManagedMethod(named.parsed.arena.nodes, named.parsed.arena.edges, node, "push", 1)) {
         if (found == 0 || statement.kind != "Assign") {
             RejectLayout("unsupported_managed_append", "append requires an existing owning local", DeclarationSpan(node))?
         }
