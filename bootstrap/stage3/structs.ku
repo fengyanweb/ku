@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
-import { TypeWindowContinues, PushTypeToken, ParseTypeWindow, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
+import { ReadSignatureTypeAt, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { RejectAt, RejectAtPoint } from "./support.ku"
 
 struct DeclarationRead {
@@ -91,63 +91,14 @@ fn ReadStruct(tokens: [Token]): DeclarationRead! {
             RejectAt(tokens[cursor].clone(), "unexpected_token", "expected ':' after struct field name")?
         }
         cursor = cursor + 1
-        // Commas are optional. Once a complete top-level type atom has been
-        // read, Ident Colon belongs to the next field. Only the Colon is copied
-        // as this type window's final boundary; dotted, union and array states
-        // suppress that shortcut. Keeping this loop here avoids capturing and
-        // repeatedly cloning the complete struct token window per field.
-        type_tokens: [Token] = []
-        probe = cursor
-        bracket_depth = 0
-        expect_atom = true
-        expect_component = false
-        scan_work = 0
-        complete = false
-        while (!complete) {
-            if (probe >= tokens.len()) {
-                RejectAt(last.clone(), "invalid_token_stream", "struct type inspection escaped its bounded token window")?
-            }
-            token = tokens[probe].clone()
-            next_field = bracket_depth == 0 && !expect_atom && !expect_component && token.kind == "Ident" && probe + 1 < tokens.len() && tokens[probe + 1].kind == "Colon"
-            window_token: Token = token.clone()
-            if (next_field) {
-                window_token = tokens[probe + 1].clone()
-                scan_work = scan_work + 2
-            } else {
-                scan_work = scan_work + 1
-            }
-            continues = TypeWindowContinues(window_token.kind.clone())
-            type_tokens = PushTypeToken(type_tokens, window_token)?
-            if (!continues) {
-                complete = true
-            } else if (!next_field) {
-                if (token.kind == "LBracket") {
-                    bracket_depth = bracket_depth + 1
-                    expect_atom = true
-                    expect_component = false
-                } else if (token.kind == "RBracket") {
-                    if (bracket_depth > 0) { bracket_depth = bracket_depth - 1 }
-                    expect_atom = false
-                    expect_component = false
-                } else if (token.kind == "Pipe") {
-                    expect_atom = true
-                    expect_component = false
-                } else if (token.kind == "Dot") {
-                    expect_component = true
-                } else if (token.kind == "Ident" || token.kind == "Null" || token.kind == "Fn" || token.kind == "Async") {
-                    expect_atom = false
-                    expect_component = false
-                }
-                probe = probe + 1
-            }
-        }
-        parsed_type = ParseTypeWindow(type_tokens)?
-        parsed_type.work = parsed_type.work + scan_work
+        parsed_type = ReadSignatureTypeAt(tokens, cursor)?
         if (parsed_type.consumed <= 0 || parsed_type.consumed > tokens.len() - 1 - cursor) {
             RejectAt(tokens[cursor].clone(), "invalid_token_stream", "struct type parser did not advance within its bounded window")?
         }
         cursor = cursor + parsed_type.consumed
         work = work + parsed_type.work
+        // Preserve the previous work charge for a following unseparated field.
+        if (tokens[cursor].kind == "Ident" && tokens[cursor + 1].kind == "Colon") { work = work + 1 }
         if (work > 16384) {
             RejectAt(field_name.clone(), "work_limit", "stage-3 parser work budget exceeded")?
         }

@@ -1,5 +1,5 @@
 import { Token } from "../stage1/token.ku"
-import { Span } from "../stage2/span.ku"
+import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
 import { RejectAt, RejectAtPoint } from "./support.ku"
 
@@ -33,17 +33,14 @@ struct TypeFrame {
     previous: int
     value_base: int
     outer_member_count: int
+    param_index: int
+    param_top: int
+    param_count: int
+    returning: bool
 }
 
-fn TypeWindowContinues(kind: str): bool {
-    return kind == "LBracket" || kind == "RBracket" || kind == "Ident" || kind == "Null" || kind == "Dot" || kind == "Bang" || kind == "Pipe" || kind == "Fn" || kind == "Async"
-}
-
-fn PushTypeToken(tokens: [Token], token: Token): [Token]! {
-    if (tokens.len() >= 512) { RejectAt(token.clone(), "invalid_token_stream", "type inspection escaped its bounded token window")? }
-    appended: [Token] = tokens
-    appended = appended.push(token)
-    return ok(appended)
+fn NewTypeFrame(opener: Token, previous: int, value_base: int, outer_count: int, param_index: int): TypeFrame {
+    return TypeFrame { opener: opener, previous: previous, value_base: value_base, outer_member_count: outer_count, param_index: param_index, param_top: 0, param_count: 0, returning: false }
 }
 
 fn TypeNamePart(text: str, start: Token, end: Token): TypePart {
@@ -124,36 +121,33 @@ fn CheckUnionWidth(count: int, token: Token): null! {
     return ok(null)
 }
 
-fn ParseTypeWindow(tokens: [Token]): SignatureType! {
-    if (tokens.len() == 0) {
-        RejectAtPoint("invalid_token_stream", "type window must contain one final non-type boundary token")?
+fn FunctionReturnStart(&tokens: [Token], close: int): int! {
+    colon = tokens[close + 1].clone()
+    if (colon.kind != "Colon") {
+        RejectAt(colon.clone(), "unexpected_token", "expected ':' before function type return")?
     }
+    return ok(close + 2)
+}
+
+// Parse one type from a caller-owned declaration window. Return delimiters
+// to the caller; commas inside callable parameters stay in the type grammar.
+fn ReadSignatureTypeAt(&tokens: [Token], start: int): SignatureType! {
     if (tokens.len() > 512) {
-        RejectAt(tokens[0].clone(), "invalid_token_stream", "type window accepts at most 512 tokens")?
+        RejectAtPoint("invalid_token_stream", "type window accepts at most 512 tokens")?
     }
-    work = 0
-    validation_index = 0
-    while (validation_index < tokens.len()) {
-        validation_token = tokens[validation_index].clone()
-        final_token = validation_index == tokens.len() - 1
-        if (final_token && TypeWindowContinues(validation_token.kind.clone())) {
-            RejectAt(validation_token.clone(), "invalid_token_stream", "type window is missing its final non-type boundary")?
-        }
-        if (!final_token && !TypeWindowContinues(validation_token.kind.clone())) {
-            RejectAt(validation_token.clone(), "invalid_token_stream", "type window boundary must be final")?
-        }
-        validation_index = validation_index + 1
-        work = work + 1
+    if (start < 0 || start >= tokens.len() || tokens[tokens.len() - 1].kind != "Eof") {
+        RejectAtPoint("invalid_token_stream", "type inspection escaped its bounded token window")?
     }
 
-    cursor = 0
+    work = 0
+    cursor = start
     parts: [TypePart] = []
     edges: [int] = []
     values: [TypeValueEntry] = []
     frames: [TypeFrame] = []
     value_top = 0
     frame_top = 0
-    array_depth = 0
+    frame_depth = 0
     member_count = 0
     expect_atom = true
     root = 0
@@ -161,19 +155,38 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
 
     while (parsing) {
         token = tokens[cursor].clone()
+        member_root = 0
+        member_origin = token.clone()
         if (expect_atom) {
-            if (token.kind == "LBracket") {
-                if (array_depth >= 32) { RejectAt(token.clone(), "type_depth_exceeded", "stage-3 type nesting exceeds 32 levels")? }
-                type_frame = TypeFrame {
-                    opener: token,
-                    previous: frame_top,
-                    value_base: value_top,
-                    outer_member_count: member_count
+            if (token.kind == "LBracket" || token.kind == "Fn") {
+                if (frame_depth >= 32) { RejectAt(token.clone(), "type_depth_exceeded", "stage-3 type nesting exceeds 32 levels")? }
+                opener = cursor
+                cursor = cursor + 1
+                if (token.kind == "Fn") {
+                    if (tokens[cursor].kind != "LParen") {
+                        RejectAt(tokens[cursor].clone(), "unexpected_token", "expected '(' after 'fn' in function type")?
+                    }
+                    cursor = cursor + 1
                 }
+                type_frame = NewTypeFrame(token, frame_top, value_top, member_count, cursor)
+                if (type_frame.opener.kind == "Fn" && tokens[cursor].kind == "RParen") {
+                    cursor = FunctionReturnStart(tokens, cursor)?
+                    type_frame.returning = true
+                }
+                work = work + cursor - opener
                 frames = frames.push(type_frame)
                 frame_top = frames.len()
-                array_depth = array_depth + 1
+                frame_depth = frame_depth + 1
                 member_count = 0
+            } else if (token.kind == "Ampersand") {
+                valid_mode = false
+                if (frame_top > 0) {
+                    mode_frame = frames[frame_top - 1].clone()
+                    valid_mode = mode_frame.opener.kind == "Fn" && !mode_frame.returning && cursor == mode_frame.param_index
+                }
+                if (!valid_mode) {
+                    RejectAt(token.clone(), "unexpected_token", "single '&' is only allowed before a function parameter; Ku does not provide reference types")?
+                }
                 cursor = cursor + 1
                 work = work + 1
             } else {
@@ -185,7 +198,7 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
                 else if (atom.kind == "Null") { name = "null" }
                 else if (atom.kind == "Ident" && (atom.lexeme == "string" || atom.lexeme == "nil")) { RejectAt(atom.clone(), "unexpected_token", "expected type name")? }
                 else if (atom.kind == "Ident") { name = atom.lexeme.clone(); custom = true }
-                else if (atom.kind == "Fn" || atom.kind == "Async") { RejectAt(atom.clone(), "unsupported_type", "stage-3 types do not support function or async function types")? }
+                else if (atom.kind == "Async") { RejectAt(atom.clone(), "unsupported_type", "stage-3 async function types are not supported")? }
                 else { RejectAt(atom.clone(), "unexpected_token", "expected type name")? }
                 cursor = cursor + 1
                 work = work + 1
@@ -205,26 +218,6 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
                 name_part = TypeNamePart(name, atom.clone(), end)
                 parts = parts.push(name_part)
                 member_root = parts.len()
-                if (tokens[cursor].kind == "Bang") {
-                    bang = tokens[cursor].clone()
-                    result_depth = parts[member_root - 1].depth + 1
-                    CheckTypeDepth(result_depth, bang.clone())?
-                    CheckTypeArenaCapacity(parts.len(), edges.len(), 1, bang.clone())?
-                    first_edge = edges.len()
-                    edges = edges.push(member_root)
-                    inner_span = parts[member_root - 1].span.clone()
-                    result_part = TypeResultPart(inner_span, bang, first_edge, result_depth)
-                    parts = parts.push(result_part)
-                    member_root = parts.len()
-                    cursor = cursor + 1
-                    work = work + 1
-                }
-                value_entry = TypeValueEntry { node: member_root, previous: value_top }
-                values = values.push(value_entry)
-                value_top = values.len()
-                member_count = member_count + 1
-                CheckUnionWidth(member_count, atom)?
-                expect_atom = false
             }
         } else if (token.kind == "Pipe") {
             cursor = cursor + 1
@@ -232,12 +225,16 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
             expect_atom = true
         } else {
             value_base = 0
-            closing_array = frame_top > 0
-            frame = TypeFrame { opener: token.clone(), previous: 0, value_base: 0, outer_member_count: 0 }
-            if (closing_array) {
+            frame = NewTypeFrame(token.clone(), 0, 0, 0, 0)
+            if (frame_top > 0) {
                 frame = frames[frame_top - 1].clone()
                 value_base = frame.value_base
-                if (token.kind != "RBracket") { RejectAt(token.clone(), "unexpected_token", "expected ']' after array type")? }
+                if (frame.opener.kind == "LBracket" && token.kind != "RBracket") {
+                    RejectAt(token.clone(), "unexpected_token", "expected ']' after array type")?
+                }
+                if (frame.opener.kind == "Fn" && !frame.returning && token.kind != "Comma" && token.kind != "RParen") {
+                    RejectAt(token.clone(), "unexpected_token", "expected ')' after function type parameters")?
+                }
             }
 
             reversed: [int] = []
@@ -279,48 +276,150 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
                 level_root = parts.len()
             }
 
-            if (!closing_array) {
+            if (frame_top == 0) {
                 root = level_root
                 parsing = false
+            } else if (frame.opener.kind == "Fn" && !frame.returning) {
+                parameter = tokens[frame.param_index].clone()
+                mode = ""
+                if (parameter.kind == "Ampersand") { mode = "&" }
+                param_span = SpanMerge(SpanFromToken(parameter.clone()), parts[level_root - 1].span.clone())
+                CheckTypeArenaCapacity(parts.len(), edges.len(), 1, parameter)?
+                parameter_part = TypePart { kind: "TypeParameter", text: mode, span: param_span, first_edge: edges.len(), edge_count: 1, depth: parts[level_root - 1].depth }
+                edges = edges.push(level_root)
+                parts = parts.push(parameter_part)
+                param_entry = TypeValueEntry { node: parts.len(), previous: frame.param_top }
+                values = values.push(param_entry)
+                frame.param_top = values.len()
+                frame.param_count = frame.param_count + 1
+                if (token.kind == "Comma") {
+                    cursor = cursor + 1
+                    work = work + 1
+                    frame.param_index = cursor
+                } else {
+                    cursor = FunctionReturnStart(tokens, cursor)?
+                    work = work + 2
+                    frame.returning = true
+                }
+                value_top = value_base
+                member_count = 0
+                expect_atom = true
+                // Retain immutable parent links while replacing this frame.
+                frames = frames.push(frame)
+                frame_top = frames.len()
             } else {
                 value_top = value_base
                 frame_top = frame.previous
-                array_depth = array_depth - 1
+                frame_depth = frame_depth - 1
                 member_count = frame.outer_member_count
-                array_node_depth = parts[level_root - 1].depth + 1
-                CheckTypeDepth(array_node_depth, frame.opener.clone())?
-                CheckTypeArenaCapacity(parts.len(), edges.len(), 1, frame.opener.clone())?
+                member_origin = frame.opener.clone()
+                node_depth = parts[level_root - 1].depth + 1
+                if (frame.opener.kind == "LBracket") {
+                    CheckTypeDepth(node_depth, member_origin.clone())?
+                    CheckTypeArenaCapacity(parts.len(), edges.len(), 1, member_origin.clone())?
+                    first_edge = edges.len()
+                    edges = edges.push(level_root)
+                    array_part = TypeArrayPart(member_origin.clone(), token, first_edge, node_depth)
+                    parts = parts.push(array_part)
+                    cursor = cursor + 1
+                    work = work + 1
+                } else {
+                    parameters: [int] = []
+                    param_link = frame.param_top
+                    while (param_link > 0) {
+                        param = values[param_link - 1].clone()
+                        parameters = parameters.push(param.node)
+                        child_depth = parts[param.node - 1].depth + 1
+                        if (child_depth > node_depth) { node_depth = child_depth }
+                        param_link = param.previous
+                        work = work + 1
+                    }
+                    CheckTypeDepth(node_depth, member_origin.clone())?
+                    CheckTypeArenaCapacity(parts.len(), edges.len(), frame.param_count + 1, member_origin.clone())?
+                    first_edge = edges.len()
+                    param_index = parameters.len()
+                    while (param_index > 0) {
+                        param_index = param_index - 1
+                        edges = edges.push(parameters[param_index])
+                        work = work + 1
+                    }
+                    edges = edges.push(level_root)
+                    span = SpanMerge(SpanFromToken(member_origin.clone()), parts[level_root - 1].span.clone())
+                    callable = TypePart { kind: "TypeFunction", text: "", span: span, first_edge: first_edge, edge_count: frame.param_count + 1, depth: node_depth }
+                    parts = parts.push(callable)
+                }
+                member_root = parts.len()
+            }
+        }
+        if (member_root > 0) {
+            if (tokens[cursor].kind == "Bang") {
+                bang = tokens[cursor].clone()
+                result_depth = parts[member_root - 1].depth + 1
+                CheckTypeDepth(result_depth, bang.clone())?
+                CheckTypeArenaCapacity(parts.len(), edges.len(), 1, bang.clone())?
                 first_edge = edges.len()
-                edges = edges.push(level_root)
-                array_part = TypeArrayPart(frame.opener.clone(), token, first_edge, array_node_depth)
-                parts = parts.push(array_part)
+                edges = edges.push(member_root)
+                inner_span = parts[member_root - 1].span.clone()
+                result_part = TypeResultPart(inner_span, bang, first_edge, result_depth)
+                parts = parts.push(result_part)
                 member_root = parts.len()
                 cursor = cursor + 1
                 work = work + 1
-                if (tokens[cursor].kind == "Bang") {
-                    bang = tokens[cursor].clone()
-                    result_depth = parts[member_root - 1].depth + 1
-                    CheckTypeDepth(result_depth, bang.clone())?
-                    CheckTypeArenaCapacity(parts.len(), edges.len(), 1, bang.clone())?
-                    first_edge = edges.len()
-                    edges = edges.push(member_root)
-                    inner_span = parts[member_root - 1].span.clone()
-                    array_result_part = TypeResultPart(inner_span, bang, first_edge, result_depth)
-                    parts = parts.push(array_result_part)
-                    member_root = parts.len()
-                    cursor = cursor + 1
-                    work = work + 1
-                }
-                array_value_entry = TypeValueEntry { node: member_root, previous: value_top }
-                values = values.push(array_value_entry)
-                value_top = values.len()
-                member_count = member_count + 1
-                CheckUnionWidth(member_count, frame.opener)?
-                expect_atom = false
             }
+            value_entry = TypeValueEntry { node: member_root, previous: value_top }
+            values = values.push(value_entry)
+            value_top = values.len()
+            member_count = member_count + 1
+            CheckUnionWidth(member_count, member_origin)?
+            expect_atom = false
         }
     }
 
     if (root <= 0 || root > parts.len()) { RejectAt(tokens[cursor].clone(), "invalid_node_id", "type plan root is invalid")? }
-    return ok(SignatureType { parts: parts, edges: edges, root: root, consumed: cursor, work: work })
+    consumed = cursor - start
+    // Retain the admission charge for the previous scan and validation passes
+    // (including their boundary token), even though this pass borrows tokens.
+    work = work + 2 * (consumed + 1)
+    return ok(SignatureType { parts: parts, edges: edges, root: root, consumed: consumed, work: work })
+}
+
+// The exact-window entry retains its validation and single-pass work charge.
+// Declaration readers instead use the bounded borrowed entry above.
+fn ParseTypeWindow(tokens: [Token]): SignatureType! {
+    if (tokens.len() == 0) {
+        RejectAtPoint("invalid_token_stream", "type window must contain one final non-type boundary token")?
+    }
+    if (tokens.len() > 512) {
+        RejectAt(tokens[0].clone(), "invalid_token_stream", "type window accepts at most 512 tokens")?
+    }
+    last_index = tokens.len() - 1
+    terminal = tokens[last_index].clone()
+    kind = terminal.kind.clone()
+    if (kind == "LBracket" || kind == "RBracket" || kind == "Ident" || kind == "Null" || kind == "Dot" || kind == "Bang" || kind == "Pipe" || kind == "Fn" || kind == "Async") {
+        RejectAt(terminal.clone(), "invalid_token_stream", "type window is missing its final non-type boundary")?
+    }
+    index = 0
+    while (index < last_index) {
+        if (tokens[index].kind == "Eof") {
+            RejectAt(tokens[index].clone(), "invalid_token_stream", "type window boundary must be final")?
+        }
+        index = index + 1
+    }
+    window: [Token] = tokens
+    if (kind != "Eof") {
+        delimited: [Token] = []
+        index = 0
+        while (index < last_index) {
+            delimited = delimited.push(window[index].clone())
+            index = index + 1
+        }
+        terminal.kind = "Eof"
+        window = delimited.push(terminal)
+    }
+    parsed = ReadSignatureTypeAt(window, 0)?
+    if (parsed.consumed != last_index) {
+        RejectAt(window[parsed.consumed].clone(), "invalid_token_stream", "type window boundary must be final")?
+    }
+    parsed.work = parsed.work - window.len()
+    return ok(parsed)
 }

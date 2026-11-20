@@ -408,6 +408,59 @@ fn project_type(
     arena: &mut ProjectedArena,
 ) -> usize {
     match ty {
+        TypeName::Function {
+            params,
+            param_modes,
+            return_type,
+            is_async: false,
+        } => {
+            assert_eq!(tokens[*cursor].kind, TokenKind::Fn);
+            let start = tokens[*cursor].span.start;
+            *cursor += 1;
+            assert_eq!(tokens[*cursor].kind, TokenKind::LParen);
+            *cursor += 1;
+            assert_eq!(params.len(), param_modes.len());
+            let mut children = Vec::with_capacity(params.len() + 1);
+            for (index, (param, mode)) in params.iter().zip(param_modes).enumerate() {
+                let param_start = tokens[*cursor].span.start;
+                let text = if *mode == ParamMode::View {
+                    assert_eq!(tokens[*cursor].kind, TokenKind::Ampersand);
+                    *cursor += 1;
+                    "&"
+                } else {
+                    ""
+                };
+                let child = project_type(tokens, cursor, param, arena);
+                let end = arena.nodes[child - 1].span.end;
+                children.push(push_node(
+                    arena,
+                    "TypeParameter",
+                    text.into(),
+                    0,
+                    Span::new(param_start, end),
+                    &[child],
+                ));
+                if index + 1 < params.len() {
+                    assert_eq!(tokens[*cursor].kind, TokenKind::Comma);
+                    *cursor += 1;
+                }
+            }
+            assert_eq!(tokens[*cursor].kind, TokenKind::RParen);
+            *cursor += 1;
+            assert_eq!(tokens[*cursor].kind, TokenKind::Colon);
+            *cursor += 1;
+            let result = project_type(tokens, cursor, return_type, arena);
+            children.push(result);
+            let end = arena.nodes[result - 1].span.end;
+            push_node(
+                arena,
+                "TypeFunction",
+                String::new(),
+                0,
+                Span::new(start, end),
+                &children,
+            )
+        }
         TypeName::Array(inner) => {
             assert!(matches!(tokens[*cursor].kind, TokenKind::LBracket));
             let start = tokens[*cursor].span.start;
@@ -1329,6 +1382,11 @@ fn run_ku(arguments: &[&str]) {
 
 #[test]
 fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
+    let compiler_signature = include_str!("../bootstrap/stage3/functions.ku")
+        .lines()
+        .find(|line| line.starts_with("fn ReadFunction("))
+        .expect("production bootstrap function reader signature");
+    let compiler_declaration = format!("{compiler_signature}}}");
     let cases = [
         "",
         "import \"./setup.ku\";\nfn before() {}\nimport math from \"./math.ku\"\nimport { Add, User as Person } from \"./api.ku\"\nfn main() { return Add(1, 2) }",
@@ -1372,6 +1430,12 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "fn typed(values: [pkg.model.User!]!): [[int]!]! { local:[pkg.Item!] = [] return values }",
         "fn choose(value: int | str): int | str { local:int | str = value return local }",
         "fn nested(value: [int | str], other: [int] | str!): [int | str]! { local:[int] | str! = other return value }",
+        &compiler_declaration,
+        "fn f(op: fn(int): int) {}",
+        "// 回调😀\r\nfn nested(op: fn(&[int], fn(&str, pkg.Token): int | null): [str]!, other: int): fn(): int!! {}",
+        "struct Callbacks { read: fn(&str): str on_exit: fn(): null! count:int }",
+        "enum State { Ready(op: fn(int): int, hint: str) }",
+        "fn local() { callback: fn(&str): str = other }",
         "fn duplicate(value: int | int | null): int | int | null { return value }",
         "// 前😀\r\nfn dotted(value: pkg.model.User | other.Type!): [pkg.model.User | other.Type!]! {\r\n  local:pkg.model.User | other.Type! = value\r\n  return local\r\n}",
         "fn helper() { return 7 }\nfn main() {\n  answer:int = 40 + 2\n  answer = answer + 1\n  println(answer)\n  return\n}",
@@ -1500,7 +1564,6 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let missing_signature_body = "fn f(): int!";
     let legacy_type_alias = "fn f(value: string) {}";
     let unicode_broken_signature = "// 前😀\r\nfn f(value: str, : int): null! {}";
-    let unsupported_signature_type = "fn f(op: fn(int): int) {}";
     let leading_union_pipe = "fn f(value: | int) {}";
     let trailing_union_pipe = "fn f(value: int |) {}";
     let nested_trailing_union_pipe = "fn f(value: [int |]) {}";
@@ -1602,7 +1665,6 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let missing_enum_close = "enum State { Ready";
     let double_enum_variant_comma = "enum State { Ready,, Pending }";
     let enum_semicolon = "enum State {};";
-    let unsupported_enum_type = "enum State { Ready(op: fn(int): int) }";
     let unsupported_async_enum_type = "enum State { Ready(op: async fn(int): int) }";
     let unsupported_item = "async fn main(): null! { return ok(null) }";
     let parameter_boundary = format!(
@@ -2553,15 +2615,10 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
     let missing_enum_close_message = rust_error_canonical(missing_enum_close);
     let double_enum_variant_comma_message = rust_error_canonical(double_enum_variant_comma);
     let enum_semicolon_message = rust_error_canonical(enum_semicolon);
-    let unsupported_enum_type_message = diagnostic_for_kind(
-        unsupported_enum_type,
-        TokenKind::Fn,
-        "stage-3 types do not support function or async function types",
-    );
     let unsupported_async_enum_type_message = diagnostic_for_kind(
         unsupported_async_enum_type,
         TokenKind::Async,
-        "stage-3 types do not support function or async function types",
+        "stage-3 async function types are not supported",
     );
     let nested_module_message = diagnostic_for_kind(
         nested_module,
@@ -2572,11 +2629,6 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         unsupported_item,
         TokenKind::Async,
         "stage-3 supports import, module, struct, enum, and ordinary function items only",
-    );
-    let unsupported_signature_type_message = diagnostic_at(
-        unsupported_signature_type,
-        5,
-        "stage-3 types do not support function or async function types",
     );
     let leading_union_pipe_message = rust_error_canonical(leading_union_pipe);
     let trailing_union_pipe_message = rust_error_canonical(trailing_union_pipe);
@@ -3108,19 +3160,9 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             unsupported_item_message,
         ),
         (
-            unsupported_enum_type,
-            "unsupported_type",
-            unsupported_enum_type_message,
-        ),
-        (
             unsupported_async_enum_type,
             "unsupported_type",
             unsupported_async_enum_type_message,
-        ),
-        (
-            unsupported_signature_type,
-            "unsupported_type",
-            unsupported_signature_type_message,
         ),
         (
             leading_union_pipe,
@@ -3245,6 +3287,12 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         "fn main() { try {} catch {} }",
         "fn main() { try {} catch() {} }",
         "fn main() { try {} catch(err",
+        "fn f(op: fn int) {}",
+        "fn f(op: fn(int,): int) {}",
+        "fn f(op: fn(int) int) {}",
+        "fn f(op: fn(int str): null) {}",
+        "fn f(op: fn(): &str) {}",
+        "fn f(op: fn(int | &str): null) {}",
     ] {
         body.push_str(&format!(
             "    ExpectError({}, \"unexpected_token\", {})?\n",
@@ -3285,6 +3333,22 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             ku_string(&diagnostic_for_kind(source, token, detail))
         ));
     }
+    let over_callable_depth = format!("fn f(op: {}int) {{}}", "fn(): ".repeat(33));
+    let last_callable = Lexer::new(&over_callable_depth)
+        .lex()
+        .expect("lex callable depth fixture")
+        .iter()
+        .rposition(|token| token.kind == TokenKind::Fn)
+        .expect("deepest callable type token");
+    body.push_str(&format!(
+        "    ExpectError({}, \"type_depth_exceeded\", {})?\n",
+        ku_string(&over_callable_depth),
+        ku_string(&diagnostic_at(
+            &over_callable_depth,
+            last_callable,
+            "stage-3 type nesting exceeds 32 levels",
+        ))
+    ));
     body.push_str("    return ok(null)\n}\n");
     let body = body.replacen("fn main(): null! {\n", "fn MainWindows(): null! {\n", 1);
 

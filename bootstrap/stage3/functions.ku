@@ -2,7 +2,7 @@ import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { RejectAt, RejectAtPoint, SpanFromNode } from "./support.ku"
-import { SignatureType, TypeWindowContinues, PushTypeToken, ParseTypeWindow, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
+import { SignatureType, ReadSignatureTypeAt, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { DeclarationRead } from "./structs.ku"
 import { ReadFunctionBody } from "./statements.ku"
 
@@ -224,18 +224,7 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
         parameter_children: [int] = []
         if (tokens[cursor].kind == "Colon") {
             type_start = cursor + 1
-            type_tokens: [Token] = []
-            probe = type_start
-            complete = false
-            while (!complete) {
-                if (probe >= tokens.len()) { RejectAt(last.clone(), "invalid_token_stream", "type inspection escaped its bounded token window")? }
-                type_token = tokens[probe].clone()
-                complete = !TypeWindowContinues(type_token.kind.clone())
-                type_tokens = PushTypeToken(type_tokens, type_token)?
-                probe = probe + 1
-            }
-            parsed_type = ParseTypeWindow(type_tokens)?
-            parsed_type.work = parsed_type.work + probe - type_start
+            parsed_type = ReadSignatureTypeAt(tokens, type_start)?
             ChargeWork(parsed_type.work, tokens[type_start].clone())?
             cursor = cursor + 1 + parsed_type.consumed
             type_node = AddParsedType(parsed_type, parameter_token.clone())?
@@ -259,18 +248,7 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
     has_return_type = false
     if (tokens[cursor].kind == "Colon") {
         type_start = cursor + 1
-        type_tokens: [Token] = []
-        probe = type_start
-        complete = false
-        while (!complete) {
-            if (probe >= tokens.len()) { RejectAt(last.clone(), "invalid_token_stream", "type inspection escaped its bounded token window")? }
-            type_token = tokens[probe].clone()
-            complete = !TypeWindowContinues(type_token.kind.clone())
-            type_tokens = PushTypeToken(type_tokens, type_token)?
-            probe = probe + 1
-        }
-        parsed_type = ParseTypeWindow(type_tokens)?
-        parsed_type.work = parsed_type.work + probe - type_start
+        parsed_type = ReadSignatureTypeAt(tokens, type_start)?
         ChargeWork(parsed_type.work, tokens[type_start].clone())?
         has_return_type = true
         cursor = cursor + 1 + parsed_type.consumed

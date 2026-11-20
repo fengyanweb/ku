@@ -3,7 +3,7 @@ import { Node, Arena, ParseOutput } from "../stage2/ast.ku"
 import { SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, RejectAt, RejectAtPoint } from "./support.ku"
 import { IsNamedStructStart } from "../stage2/expression_support.ku"
-import { SignatureType, CheckTypeArenaCapacity, TypePartToNode, TypeWindowContinues, PushTypeToken, ParseTypeWindow } from "./signature.ku"
+import { SignatureType, CheckTypeArenaCapacity, TypePartToNode, ReadSignatureTypeAt } from "./signature.ku"
 
 struct StatementLink {
     node: int
@@ -177,19 +177,8 @@ fn ReadCatchBinding(&tokens: [Token], start: int): Token! {
 }
 
 fn ReadTypeAt(&tokens: [Token], start: int, &terminal: Token): SignatureType! {
-    type_tokens: [Token] = []
-    probe = start
-    complete = false
-    while (!complete) {
-        if (probe >= tokens.len()) { RejectTypeInspection(terminal.clone())? }
-        type_token = tokens[probe].clone()
-        complete = !TypeWindowContinues(type_token.kind.clone())
-        type_tokens = PushTypeToken(type_tokens, type_token)?
-        probe = probe + 1
-    }
-    parsed = ParseTypeWindow(type_tokens)?
-    parsed.work = parsed.work + probe - start
-    return ok(parsed)
+    if (start < 0 || start >= tokens.len()) { RejectTypeInspection(terminal.clone())? }
+    return ReadSignatureTypeAt(tokens, start)
 }
 
 fn LocalAssignmentOperator(&token: Token): str {

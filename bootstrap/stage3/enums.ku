@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
-import { TypeWindowContinues, PushTypeToken, ParseTypeWindow, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
+import { ReadSignatureTypeAt, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { RejectAt, RejectAtPoint } from "./support.ku"
 import { DeclarationRead, ReadStruct } from "./structs.ku"
 
@@ -76,54 +76,7 @@ fn ReadEnum(tokens: [Token]): DeclarationRead! {
                 }
                 cursor = cursor + 1
 
-                // Keep the scan in this frame: a nested reader that captures
-                // tokens would clone the complete enum window once per field.
-                // An adjacent top-level atom is not part of the type grammar;
-                // use the cached EOF only as ParseTypeWindow's boundary and let
-                // the enclosing ')' check diagnose the still-unconsumed token.
-                type_tokens: [Token] = []
-                probe = cursor
-                bracket_depth = 0
-                expect_atom = true
-                expect_component = false
-                scan_work = 0
-                complete = false
-                while (!complete) {
-                    if (probe >= tokens.len()) {
-                        RejectAt(last.clone(), "invalid_token_stream", "enum type inspection escaped its bounded token window")?
-                    }
-                    token = tokens[probe].clone()
-                    adjacent_atom = bracket_depth == 0 && !expect_atom && !expect_component && (token.kind == "Ident" || token.kind == "Null" || token.kind == "Fn" || token.kind == "Async" || token.kind == "LBracket")
-                    window_token: Token = token.clone()
-                    if (adjacent_atom) { window_token = last.clone() }
-                    scan_work = scan_work + 1
-                    continues = TypeWindowContinues(window_token.kind.clone())
-                    type_tokens = PushTypeToken(type_tokens, window_token)?
-                    if (!continues) {
-                        complete = true
-                    } else if (!adjacent_atom) {
-                        if (token.kind == "LBracket") {
-                            bracket_depth = bracket_depth + 1
-                            expect_atom = true
-                            expect_component = false
-                        } else if (token.kind == "RBracket") {
-                            if (bracket_depth > 0) { bracket_depth = bracket_depth - 1 }
-                            expect_atom = false
-                            expect_component = false
-                        } else if (token.kind == "Pipe") {
-                            expect_atom = true
-                            expect_component = false
-                        } else if (token.kind == "Dot") {
-                            expect_component = true
-                        } else if (token.kind == "Ident" || token.kind == "Null" || token.kind == "Fn" || token.kind == "Async") {
-                            expect_atom = false
-                            expect_component = false
-                        }
-                        probe = probe + 1
-                    }
-                }
-                parsed_type = ParseTypeWindow(type_tokens)?
-                parsed_type.work = parsed_type.work + scan_work
+                parsed_type = ReadSignatureTypeAt(tokens, cursor)?
                 if (parsed_type.consumed <= 0 || parsed_type.consumed > tokens.len() - 1 - cursor) {
                     RejectAt(tokens[cursor].clone(), "invalid_token_stream", "enum type parser did not advance within its bounded window")?
                 }
