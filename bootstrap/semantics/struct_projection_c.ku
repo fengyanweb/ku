@@ -46,15 +46,18 @@ fn ContainsIndex(&ids: [int], id: int): bool {
     return false
 }
 
-fn EmitLayout(&layout: StructLayout, allow_string: bool): str! {
+fn EmitLayout(&layout: StructLayout, allow_string: bool, allow_nested: bool): str! {
     text = "typedef struct {\n"
     count = layout.fields.len()
     if (count == 0) { text += "    unsigned char empty;\n" }
     index = 0
     while (index < count) {
+        field = layout.fields[index].resolved.clone()
         kind = "KuProjectionString"
-        if (!(allow_string && StringField(layout.fields[index].resolved))) {
-            kind = ScalarCType(layout.fields[index].resolved)?
+        if (allow_nested && field.declaration_kind == "Struct") {
+            kind = CTypeName(field.module_index, field.declaration_node)
+        } else if (!(allow_string && StringField(field))) {
+            kind = ScalarCType(field)?
         }
         text += "    " + kind + " f" + str(index) + ";\n"
         index = index + 1
@@ -76,7 +79,7 @@ fn FindLayout(&layouts: [StructLayout], module_index: int, node: int): StructLay
 fn EmitStructProjectionC(&layouts: [StructLayout], &plan: StructReturnPlan): str! {
     if (plan.function_node <= 0) { InvalidPlan("expected a positive function ID")? }
     result = FindLayout(layouts, 0, plan.result_layout)?
-    text = EmitLayout(result, false)?
+    text = EmitLayout(result, false, false)?
     emitted: [str] = [CTypeName(0, result.node)]
     signature = CTypeName(0, result.node) + " ku_project_" + str(plan.function_node) + "("
     parameters_count = plan.parameters.len()
@@ -89,7 +92,7 @@ fn EmitStructProjectionC(&layouts: [StructLayout], &plan: StructReturnPlan): str
         input = FindLayout(layouts, parameter.layout_module, parameter.layout_node)?
         type_name = CTypeName(parameter.layout_module, parameter.layout_node)
         if (!ContainsType(emitted, type_name)) {
-            text += EmitLayout(input, true)?
+            text += EmitLayout(input, true, false)?
             emitted = emitted.push(type_name.clone())
         }
         if (index > 0) { signature += ", " }
@@ -144,21 +147,25 @@ fn EmitStructProjectionC(&layouts: [StructLayout], &plan: StructReturnPlan): str
     }
     if (field_count == 0) { text += "    result.empty = 0;\n" }
     text += drops + "    return result;\n}\n"
+    return ok(ProjectionHeaders(needs_string, drops != "") + text)
+}
+
+fn ProjectionHeaders(needs_string: bool, drop_strings: bool): str {
     header = "#include <stdbool.h>\n#include <stdint.h>\n\n"
     if (needs_string) {
         // Private emitted ABI. The carrier and storage tags match Stage0
         // KuString. A caller moves malloc-compatible OWNED fields into an
         // owned argument and retains all fields when passing a View.
         header += "#include <stddef.h>\n"
-        if (drops != "") { header += "#include <stdlib.h>\n" }
+        if (drop_strings) { header += "#include <stdlib.h>\n" }
         header += "/* KuString-compatible carrier: STATIC is borrowed storage; OWNED uses free. */\n"
         header += "typedef struct { uint8_t *ptr; size_t len; size_t capacity; uint8_t storage; } KuProjectionString;\n"
         header += "enum { KU_PROJECTION_STRING_STATIC = 0, KU_PROJECTION_STRING_OWNED = 1 };\n\n"
-        if (drops != "") {
+        if (drop_strings) {
             header += "static void ku_projection_string_drop(KuProjectionString *value) {\n"
             header += "    if (value->storage == KU_PROJECTION_STRING_OWNED && value->ptr) free(value->ptr);\n"
             header += "    *value = (KuProjectionString){0};\n}\n\n"
         }
     }
-    return ok(header + text)
+    return header
 }

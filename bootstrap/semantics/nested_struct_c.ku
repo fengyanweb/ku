@@ -1,0 +1,167 @@
+import { Span } from "../stage2/span.ku"
+import { IsBuiltinType, TypeNameBinding } from "./type_names.ku"
+import { LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
+
+struct CStructMetrics {
+    layout_index: int
+    depth: int
+    leaves: int
+    contains_string: bool
+}
+
+struct CStructOrder {
+    entries: [CStructMetrics]
+    contains_string: bool
+}
+
+fn dependencyIndex(&layouts: [StructLayout], &field: TypeNameBinding): int! {
+    index = LayoutIndex(layouts, field.module_index, field.declaration_node)
+    if (index == 0 || field.module_index < 0 || field.declaration_node <= 0) {
+        RejectLayout("missing_nested_layout", "no bound struct layout for '" + field.name.clone() + "'", field.span.clone())?
+    }
+    return ok(index)
+}
+
+fn reachableLayouts(&layouts: [StructLayout], root: int): [int]! {
+    reachable = [root]
+    index = 0
+    while (index < reachable.len()) {
+        item = reachable[index] - 1
+        field_index = 0
+        while (field_index < layouts[item].fields.len()) {
+            field = layouts[item].fields[field_index].resolved.clone()
+            if (field.declaration_kind == "Struct") {
+                child = dependencyIndex(layouts, field)?
+                if (!ContainsIndex(reachable, child)) { reachable = reachable.push(child) }
+            } else if (field.declaration_kind != "Builtin" || !IsBuiltinType(field.name)) {
+                RejectLayout("unsupported_nested_layout", "no C field layout for '" + field.name.clone() + "'", field.span)?
+            }
+            field_index = field_index + 1
+        }
+        index = index + 1
+    }
+    return ok(reachable)
+}
+
+fn metricIndex(&entries: [CStructMetrics], layout_index: int): int {
+    index = 0
+    while (index < entries.len()) {
+        if (entries[index].layout_index == layout_index) { return index + 1 }
+        index = index + 1
+    }
+    return 0
+}
+
+fn measureLayout(&layouts: [StructLayout], &entries: [CStructMetrics], index: int): CStructMetrics! {
+    depth = 1
+    leaves = 0
+    contains_string = false
+    field_index = 0
+    while (field_index < layouts[index - 1].fields.len()) {
+        field = layouts[index - 1].fields[field_index].resolved.clone()
+        field_leaves = 1
+        if (field.declaration_kind == "Struct") {
+            child = dependencyIndex(layouts, field)?
+            completed = metricIndex(entries, child)
+            if (completed == 0) {
+                return ok(CStructMetrics { layout_index: index, depth: 0, leaves: 0, contains_string: false })
+            }
+            metric = entries[completed - 1].clone()
+            if (metric.depth >= 8) {
+                RejectLayout("nested_layout_depth", "C struct layouts accept at most 8 levels", field.span.clone())?
+            }
+            if (metric.depth + 1 > depth) { depth = metric.depth + 1 }
+            field_leaves = metric.leaves
+            contains_string = contains_string || metric.contains_string
+        } else if (field.name == "str") {
+            contains_string = true
+        }
+        if (field_leaves > 64 - leaves) {
+            RejectLayout("nested_layout_fields", "C struct layouts accept at most 64 expanded fields", field.span.clone())?
+        }
+        leaves = leaves + field_leaves
+        field_index = field_index + 1
+    }
+    // The C representation needs one byte even for an empty struct.
+    if (leaves == 0) { leaves = 1 }
+    return ok(CStructMetrics { layout_index: index, depth: depth, leaves: leaves, contains_string: contains_string })
+}
+
+fn rejectLayoutCycle(&layouts: [StructLayout], &completed: [CStructMetrics], first: int, at: Span): null! {
+    // Each unfinished layout depends on another unfinished layout. Follow
+    // these edges until one repeats to report an actual cycle edge.
+    path: [int] = []
+    index = first
+    while (path.len() < layouts.len()) {
+        path = path.push(index)
+        next = 0
+        cursor = 0
+        while (next == 0 && cursor < layouts[index - 1].fields.len()) {
+            field = layouts[index - 1].fields[cursor].resolved.clone()
+            if (field.declaration_kind == "Struct") {
+                child = dependencyIndex(layouts, field)?
+                if (metricIndex(completed, child) == 0) {
+                    if (ContainsIndex(path, child)) {
+                        name = layouts[index - 1].fields[cursor].name.clone()
+                        RejectLayout("recursive_nested_layout", "recursive by-value struct field '" + name + "'", field.span)?
+                    }
+                    next = child
+                }
+            }
+            cursor = cursor + 1
+        }
+        if (next == 0) {
+            RejectLayout("invalid_nested_layout_order", "unfinished layout has no dependency", at.clone())?
+        }
+        index = next
+    }
+    RejectLayout("invalid_nested_layout_order", "unfinished layout has no bounded order", at)?
+    return ok(null)
+}
+
+// Order only a selected layout and its by-value dependencies. Identity comes
+// from binding (module ordinal and declaration node), never a C identifier
+// made from a user-written type name.
+fn OrderCStructLayouts(&layouts: [StructLayout], module_index: int, node: int, at: Span): CStructOrder! {
+    root = LayoutIndex(layouts, module_index, node)
+    if (root == 0 || module_index < 0 || node <= 0) {
+        RejectLayout("missing_nested_layout", "expected a bound root struct layout", at.clone())?
+    }
+    reachable = reachableLayouts(layouts, root)?
+    entries: [CStructMetrics] = []
+    contains_string = false
+    while (entries.len() < reachable.len()) {
+        before = entries.len()
+        blocked = 0
+        index = 0
+        while (index < reachable.len()) {
+            item = reachable[index]
+            if (metricIndex(entries, item) == 0) {
+                metrics = measureLayout(layouts, entries, item)?
+                if (metrics.depth != 0) {
+                    contains_string = contains_string || metrics.contains_string
+                    entries = entries.push(metrics)
+                } else if (blocked == 0) {
+                    blocked = item
+                }
+            }
+            index = index + 1
+        }
+        if (entries.len() == before) {
+            rejectLayoutCycle(layouts, entries, blocked, at.clone())?
+        }
+    }
+    return ok(CStructOrder { entries: entries, contains_string: contains_string })
+}
+
+fn EmitNestedCLayouts(&layouts: [StructLayout], &order: CStructOrder): str! {
+    text = ProjectionHeaders(order.contains_string, false)
+    index = 0
+    while (index < order.entries.len()) {
+        layout_index = order.entries[index].layout_index
+        text += EmitLayout(layouts[layout_index - 1], true, true)?
+        index = index + 1
+    }
+    return ok(text)
+}

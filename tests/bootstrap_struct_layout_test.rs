@@ -983,3 +983,197 @@ fn main(): null! {
     assert_ok(&output);
     assert_eq!(output.stdout, interpreted.stdout);
 }
+
+const NESTED_LAYOUT_EMITTER: &str = r#"import "std.fs"
+import { ParseModule } from "../stage3/parser.ku"
+import { BuildNameTable } from "./names.ku"
+import { SuppliedModule } from "./imports.ku"
+import { BindTypeNames } from "./type_names.ku"
+import { BuildStructLayouts } from "./struct_layouts.ku"
+import { CTypeName } from "./struct_projection_c.ku"
+import { OrderCStructLayouts, EmitNestedCLayouts } from "./nested_struct_c.ku"
+
+fn main(): null! {
+    named = BuildNameTable(ParseModule(fs.read("input.ku")?)?)?
+    spans = BuildNameTable(ParseModule(fs.read("span.ku")?)?)?
+    tokens = BuildNameTable(ParseModule(fs.read("token.ku")?)?)?
+    supplied: [SuppliedModule] = [
+        SuppliedModule { path: "./span.ku", named: spans },
+        SuppliedModule { path: "../stage1/token.ku", named: tokens }
+    ]
+    bindings = BindTypeNames(named, supplied)?
+    layouts = BuildStructLayouts(named, bindings, supplied)?
+    root = fs.read("type.txt")?
+    index = 0
+    while (index < named.names.declarations.len()) {
+        item = named.names.declarations[index].clone()
+        if (item.kind == "Struct" && item.name == root) {
+            order = OrderCStructLayouts(layouts, 0, item.node, item.span)?
+            println(CTypeName(0, item.node))
+            println(EmitNestedCLayouts(layouts, order)?)
+            return ok(null)
+        }
+        index = index + 1
+    }
+    panic("no selected layout")
+    return ok(null)
+}
+"#;
+
+#[test]
+fn native_seed_emits_nested_c_for_real_parse_context() {
+    let tmp = Temp::new();
+    let copied = tmp.0.join("source");
+    let compiler = copied.join("semantics");
+    let cwd = tmp.0.join("consumer");
+    fs::create_dir(&copied).expect("create isolated stage source");
+    fs::create_dir(&cwd).expect("create isolated layout invocation");
+    stage_sources(&copied);
+    let entry = compiler.join("nested_layout.ku");
+    fs::write(&entry, NESTED_LAYOUT_EMITTER).expect("write C layout emitter fixture");
+    let ku = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    let executable = format!("nested-layout{}", std::env::consts::EXE_SUFFIX);
+    let built = compiler.join(&executable);
+    let seed = cwd.join(executable);
+    let build = execute(
+        Command::new(&ku)
+            .args(["build", "--release"])
+            .arg(&entry)
+            .arg("-o")
+            .arg(&built),
+        &cwd,
+        150,
+    );
+    assert_ok(&build);
+    fs::rename(built, &seed).expect("relocate installed-build native layout compiler");
+    fs::remove_dir_all(copied).expect("retire compiler design sources before emission");
+
+    let span_source = include_str!("../bootstrap/stage2/span.ku");
+    let token_source = include_str!("../bootstrap/stage1/token.ku");
+    let run = |input: &str, root: &str| {
+        fs::write(cwd.join("input.ku"), input).expect("write layout subject");
+        fs::write(cwd.join("span.ku"), span_source).expect("write real supplied Span");
+        fs::write(cwd.join("token.ku"), token_source).expect("write real supplied Token");
+        fs::write(cwd.join("type.txt"), root).expect("select required aggregate");
+        execute(&mut Command::new(&seed), &cwd, 30)
+    };
+    let contexts = include_str!("../bootstrap/stage2/context.ku");
+    let cases = [
+        (
+            contexts,
+            "ParseContext",
+            r#"
+#include <stdio.h>
+int main(void) {
+    RESULT value = {0};
+    value.f0 = (KuProjectionString){0};
+    value.f1.f0 = INT64_C(1);
+    value.f1.f1 = INT64_C(2);
+    value.f2 = value.f1;
+    value.f2.f1 = INT64_C(3);
+    value.f3 = false;
+    _Static_assert(sizeof(value.f1) == 6 * sizeof(int64_t), "Span size");
+    _Static_assert(offsetof(RESULT, f2) == offsetof(RESULT, f1) + sizeof(value.f1), "adjacent spans");
+    if (value.f0.storage != KU_PROJECTION_STRING_STATIC ||
+        value.f1.f0 != 1 || value.f1.f1 != 2 ||
+        value.f2.f0 != 1 || value.f2.f1 != 3 || value.f3) return 1;
+    puts("context");
+    return 0;
+}
+"#,
+            "context",
+        ),
+        (
+            "import { Span as External } from \"./span.ku\"\n\
+             struct Root { pair: Pair copied: External flag: bool }\n\
+             struct Pair { here: Span remote: External }\n\
+             struct Span { marker: bool }\n",
+            "Root",
+            r#"
+#include <stdio.h>
+int main(void) {
+    RESULT value = {0};
+    value.f0.f0.f0 = true;
+    value.f0.f1.f0 = INT64_C(42);
+    value.f1 = value.f0.f1;
+    value.f2 = false;
+    if (!value.f0.f0.f0 || value.f1.f0 != 42 || value.f2) return 1;
+    puts("aliases");
+    return 0;
+}
+"#,
+            "aliases",
+        ),
+    ];
+    for (source, root, driver, expected) in cases {
+        let generated = run(source, root);
+        assert_ok(&generated);
+        let generated = String::from_utf8(generated.stdout).expect("C output");
+        let (symbol, c) = generated
+            .split_once('\n')
+            .expect("numeric C symbol then layouts");
+        let symbol = symbol.trim();
+        assert!(symbol
+            .strip_prefix("KuStruct_")
+            .is_some_and(|id| { !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) }));
+        assert!(
+            c.matches("} KuStruct_m1_").count() == 1,
+            "one Span definition: {c}"
+        );
+        assert!(
+            !c.contains("KuStruct_m2_"),
+            "unreachable Token layout must not appear"
+        );
+        assert!(!c.contains("malloc(") && !c.contains("free("));
+        let c_path = cwd.join("ctx.c");
+        fs::write(&c_path, format!("{c}{}", driver.replace("RESULT", symbol)))
+            .expect("independent C input");
+        for file in ["input.ku", "span.ku", "token.ku", "type.txt"] {
+            fs::remove_file(cwd.join(file)).expect("remove Ku subject before C build");
+        }
+        let app = cwd.join(format!("layout-app{}", std::env::consts::EXE_SUFFIX));
+        compile_projection(&c_path, &app, &cwd);
+        let output = execute(&mut Command::new(&app), &cwd, 10);
+        assert_ok(&output);
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+    }
+
+    let cycle = "struct Root { child: A }\nstruct A { next: B }\nstruct B { last: A }\n";
+    let repeated = run(cycle, "Root");
+    assert!(!repeated.status.success() && repeated.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&repeated.stderr);
+    assert!(
+        stderr.contains("recursive_nested_layout|<source>|recursive by-value struct field 'last'|")
+    );
+    let start = cycle.rfind("A }").expect("cycle edge type");
+    assert!(stderr.contains(&format!(
+        "{}..{}",
+        coordinates(cycle, start),
+        coordinates(cycle, start + 1)
+    )));
+    let unsupported = run("enum E { Item }\nstruct Root { field: E }", "Root");
+    assert!(!unsupported.status.success() && unsupported.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("unsupported_nested_layout"));
+    for (steps, duplicate, code) in [
+        (8, false, "nested_layout_depth"),
+        (7, true, "nested_layout_fields"),
+    ] {
+        let mut source = "struct S0 { marker: int }\n".to_owned();
+        for i in 1..=steps {
+            let right = if duplicate {
+                format!(" right: S{}", i - 1)
+            } else {
+                String::new()
+            };
+            source.push_str(&format!("struct S{i} {{ left: S{}{right} }}\n", i - 1));
+        }
+        let rejected = run(&source, &format!("S{steps}"));
+        assert!(
+            !rejected.status.success() && rejected.stdout.is_empty(),
+            "{source}"
+        );
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(code));
+    }
+}
