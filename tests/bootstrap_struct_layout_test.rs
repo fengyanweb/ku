@@ -1544,6 +1544,12 @@ fn assert_project_link_plans(driver: &Path, cwd: &Path) {
             "stage1/token.ku\n",
             &["EscapeCanonical"][..],
         ),
+        (
+            "linked-str",
+            "Canonical",
+            "stage1/token.ku\n",
+            &["TokenCanonical"][..],
+        ),
     ] {
         fs::write(cwd.join("modules.txt"), manifest).unwrap();
         let c = emitter(mode, name);
@@ -1554,6 +1560,17 @@ fn assert_project_link_plans(driver: &Path, cwd: &Path) {
         assert_eq!(plan["schema"], Value::String("ku-bootstrap-link-plan-v1".into()));
         let Value::Object(export) = &plan["export"] else { panic!("expected one export") };
         assert_eq!(export["source_name"], Value::String(name.into()));
+        if name == "Canonical" {
+            let Value::Object(signature) = &export["signature"] else { panic!("expected signature") };
+            let Value::Array(params) = &signature["parameters"] else { panic!("expected parameters") };
+            let [Value::Object(array)] = params.as_slice() else { panic!("expected one array") };
+            assert_eq!(array["kind"], Value::String("StructArray".into()));
+            assert_eq!(array["source_name"], Value::String("Token".into()));
+            assert_eq!(array["source_path"], export["source_path"]);
+            assert_eq!(array["passing"], Value::String("value".into()));
+            assert!(c.contains("element = a0.data[cursor++];"));
+            assert!(c.contains("for (; cursor < a0.len; ++cursor)"));
+        }
         let Value::Array(dependencies) = &plan["dependencies"] else { panic!("expected dependencies") };
         assert_eq!(dependencies.len(), wanted.len());
         for (dependency, expected) in dependencies.iter().zip(wanted) {

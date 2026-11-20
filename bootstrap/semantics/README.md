@@ -232,6 +232,13 @@ Copy integer fields in this expression subset. Concatenations and integer
 conversions retain source evaluation order and release partially built
 strings if allocation fails.
 
+`Canonical` uses the consuming array form of `linked-str`. It takes one
+declared struct array by value, formats each element with a bound function,
+and appends a literal separator between elements. The loop transfers each
+element once. If concatenation fails, cleanup releases the accumulator, the
+current line and the remaining array elements. Its link signature names the
+array separately from the nominal identity of its element type.
+
 With the same manifest and selected function, append `-plan` to
 `linked-str`, `linked-null`, `struct-result`, `construct`, `project-fields`,
 `guarded` or `project-int` in `mode.txt` to emit a `ku-bootstrap-link-plan-v1`

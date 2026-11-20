@@ -1,10 +1,11 @@
-import { Node } from "../stage2/ast.ku"
+import { Arena, Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
-import { GuardCType, GuardValue } from "./guarded_struct_expr.ku"
+import { GuardCType, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 import { OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
+import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
 
@@ -60,7 +61,7 @@ fn resolveStructStringTarget(&supplied: [SuppliedModule], &project: ProjectBindi
 // Both the declaration and the type identities are resolved in the callee's
 // own module. A same-spelling local struct is not interchangeable with it.
 fn BindStructStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, &layouts: [StructLayout],
-                        &target: Node, &argument: Node, &value: GuardValue): StructStringDependency! {
+                        &target: Node, &argument: Node, &value: GuardValue, consume_element: bool): StructStringDependency! {
     link = resolveStructStringTarget(supplied, project, target)?
     module_slot = link.unit - 1
     function = supplied[module_slot].named.parsed.arena.nodes[link.node - 1].clone()
@@ -76,7 +77,9 @@ fn BindStructStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, 
     type_id = supplied[module_slot].named.parsed.arena.edges[parameter.first_edge]
     declared = ExplicitType(project.modules[module_slot].types, type_id, DeclarationSpan(parameter))?
     result = ExplicitType(project.modules[module_slot].types, result_id, DeclarationSpan(returned))?
-    if (result.declaration_kind != "Builtin" || result.name != "str" || value.setup != "" || value.view || argument.kind != "Field") {
+    projected = argument.kind == "Field"
+    if (consume_element) { projected = argument.kind == "Variable" && value.ty.kind == "struct" }
+    if (result.declaration_kind != "Builtin" || result.name != "str" || value.setup != "" || value.view || !projected) {
         RejectLayout("struct_string_link_argument", "expected a str return and one checked projected value", DeclarationSpan(argument))?
     }
     symbol = "ku_struct_string_link_m" + str(link.unit) + "_" + str(link.node)
@@ -94,7 +97,7 @@ fn BindStructStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, 
         if (actual_module == 0) { actual_module = 1 }
         if (expected_module == actual_module && declared.declaration_node == layout.node) {
             order = OrderCStructLayouts(layouts, layout.module_index, layout.node, DeclarationSpan(argument))?
-            if (!order.contains_string) {
+            if (consume_element || !order.contains_string) {
                 c_type = GuardCType(value.ty, layouts)
                 return ok(StructStringDependency { symbol: symbol,
                     module_index: link.unit, declaration: link.node, source_name: link.source_name,
@@ -103,7 +106,106 @@ fn BindStructStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, 
             }
         }
     }
+    if (consume_element) {
+        RejectLayout("struct_string_link_argument", "loop element must match the formatter's owned struct type", DeclarationSpan(argument))?
+    }
     RejectLayout("struct_string_link_argument", "projected argument must match an owned str or the same Copy struct type", DeclarationSpan(argument))?
     return ok(StructStringDependency { symbol: "", module_index: 0, declaration: 0, source_name: "", parameter: "",
         argument_plan: NullLinkPlanResult(), result_plan: NullLinkPlanResult() })
+}
+
+struct StructStringFold {
+    initial: str
+    separator: str
+    dependency: StructStringDependency
+}
+
+fn foldChild(&arena: Arena, &parent: Node, index: int): Node {
+    return arena.nodes[arena.edges[parent.first_edge + index] - 1].clone()
+}
+
+fn foldNamed(&node: Node, &name: str): bool {
+    return node.kind == "Variable" && node.edge_count == 0 && node.text == name
+}
+
+fn foldAppend(&arena: Arena, &statement: Node, &output: str): bool {
+    if (statement.kind != "CompoundAssign" || statement.text != "+" || statement.edge_count != 2) { return false }
+    return foldNamed(foldChild(arena, statement, 0), output)
+}
+
+fn rejectStringFold(&node: Node, message: str): null! {
+    return RejectLayout("struct_string_fold_body", message, DeclarationSpan(node))
+}
+
+fn foldSeparator(&arena: Arena, &guard: Node, &output: str, &first: str): str! {
+    if (guard.kind != "If" || guard.edge_count != 2 || guard.int_value != 1) {
+        rejectStringFold(guard, "expected a first-element guard followed by one separator append")?
+    }
+    condition = foldChild(arena, guard, 0)
+    append = foldChild(arena, guard, 1)
+    if (condition.kind != "Unary" || condition.text != "!" || condition.edge_count != 1
+        || !foldNamed(foldChild(arena, condition, 0), first) || !foldAppend(arena, append, output)) {
+        rejectStringFold(guard, "expected the guard to append a separator except on the first element")?
+    }
+    value = foldChild(arena, append, 1)
+    if (value.kind != "String" || value.edge_count != 0) {
+        rejectStringFold(value, "expected a literal separator")?
+    }
+    return ScalarStringLiteral(value)
+}
+
+fn foldElementCall(&supplied: [SuppliedModule], &project: ProjectBindings, &layouts: [StructLayout],
+                   &arena: Arena, &iteration: Node, &input: str, &output: str, &first: str, root: int): StructStringDependency! {
+    line = foldChild(arena, iteration, 2)
+    append = foldChild(arena, iteration, 3)
+    next = foldChild(arena, iteration, 4)
+    if (line.kind != "Assign" || line.edge_count != 1 || line.text == input || line.text == output
+        || line.text == first || line.text == iteration.text || !foldAppend(arena, append, output)
+        || !foldNamed(foldChild(arena, append, 1), line.text) || next.kind != "Assign"
+        || next.edge_count != 1 || next.text != first) {
+        rejectStringFold(iteration, "expected a formatted element, one append and the first-element update")?
+    }
+    advanced = foldChild(arena, next, 0)
+    call = foldChild(arena, line, 0)
+    if (advanced.kind != "Bool" || advanced.edge_count != 0 || advanced.text != "false"
+        || call.kind != "Call" || call.edge_count != 2) {
+        rejectStringFold(line, "expected a direct formatting call and first assigned false")?
+    }
+    target = foldChild(arena, call, 0)
+    argument = foldChild(arena, call, 1)
+    if (!foldNamed(argument, iteration.text) || target.text == input || target.text == output
+        || target.text == first || target.text == iteration.text) {
+        rejectStringFold(call, "expected a known formatter called with the owned loop element")?
+    }
+    value = GuardRead(GuardType { kind: "struct", layout: root }, "element", false)
+    return BindStructStringCall(supplied, project, layouts, target, argument, value, true)
+}
+
+fn ReadStructStringFold(&supplied: [SuppliedModule], &project: ProjectBindings, &layouts: [StructLayout],
+                        &arena: Arena, &function: Node, &param: Node, root: int): StructStringFold! {
+    if (function.edge_count != 6) {
+        rejectStringFold(function, "expected an initializer, first-element flag, consuming for and return")?
+    }
+    initial = foldChild(arena, function, 2)
+    first = foldChild(arena, function, 3)
+    iteration = foldChild(arena, function, 4)
+    returned = foldChild(arena, function, 5)
+    if (initial.kind != "Assign" || initial.edge_count != 1 || initial.text == param.text
+        || first.kind != "Assign" || first.edge_count != 1 || first.text == param.text || first.text == initial.text
+        || returned.kind != "Return" || returned.edge_count != 1
+        || !foldNamed(foldChild(arena, returned, 0), initial.text)) {
+        rejectStringFold(function, "expected distinct accumulator and first-element locals and a return of the accumulator")?
+    }
+    value = foldChild(arena, initial, 0)
+    flag = foldChild(arena, first, 0)
+    if (value.kind != "String" || value.edge_count != 0 || flag.kind != "Bool" || flag.edge_count != 0 || flag.text != "true") {
+        rejectStringFold(initial, "expected a literal initial string and first assigned true")?
+    }
+    if (iteration.kind != "For" || iteration.edge_count != 5 || !foldNamed(foldChild(arena, iteration, 0), param.text)
+        || iteration.text == param.text || iteration.text == initial.text || iteration.text == first.text) {
+        rejectStringFold(iteration, "expected a consuming for over the owned array")?
+    }
+    separator = foldSeparator(arena, foldChild(arena, iteration, 1), initial.text, first.text)?
+    call = foldElementCall(supplied, project, layouts, arena, iteration, param.text, initial.text, first.text, root)?
+    return ok(StructStringFold { initial: ScalarStringLiteral(value)?, separator: separator, dependency: call })
 }

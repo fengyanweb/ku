@@ -5,13 +5,15 @@ import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules, ProjectBindings } from "./project_bindings.ku"
 import { GuardBinding, GuardBindingIndex, GuardCType, GuardExplicitType, GuardExpression, GuardValue } from "./guarded_struct_expr.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
-import { EmitOrderedStructLayouts, OrderCStructLayouts } from "./nested_struct_c.ku"
+import { CStructOrder, EmitOrderedStructLayouts, OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ProjectionHeaders } from "./struct_projection_c.ku"
-import { BuildStructLayouts, ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { CheckStructArrayType, EmitStructArrayHeader, EmitStructArrayReadValidation } from "./struct_array_c.ku"
+import { BuildStructLayouts, ExplicitType, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { BoundLinkPlanType, EmptyLinkPlanDeclaration, LinkPlanDeclaration } from "./link_plan_c.ku"
 import { ScalarStringJoinHelpers } from "./scalar_int_emit.ku"
 import { HasScalarBuiltin, ScalarStringLiteral } from "./scalar_int_operands.ku"
-import { BindStructStringCall, StructStringDependency } from "./struct_string_calls.ku"
+import { BindStructStringCall, ReadStructStringFold, StructStringDependency, StructStringFold } from "./struct_string_calls.ku"
+import { TypeNameBinding } from "./type_names.ku"
 
 struct ProjectStructStringC {
     symbol: str
@@ -95,7 +97,7 @@ fn structStringCall(&supplied: [SuppliedModule], &project: ProjectBindings, &lay
     if (can_convert && target.kind == "Variable" && target.edge_count == 0 && target.text == "str") {
         return formatStructIntField(argument, value, output, current)
     }
-    dependency = BindStructStringCall(supplied, project, layouts, target, argument, value)?
+    dependency = BindStructStringCall(supplied, project, layouts, target, argument, value, false)?
     argument_c = value.value.clone()
     if (value.ty.kind == "str") {
         held = "arg_" + output.clone()
@@ -213,6 +215,87 @@ fn emitProjectStringFunction(&supplied: [SuppliedModule], &project: ProjectBindi
     return ok(ProjectStructStringC { symbol: symbol, dependencies: lowered.dependencies, source: text, entry_plan: plan })
 }
 
+fn foldAppendC(): str {
+    return "static const char *ku_string_fold_append(KuProjectionString *output, KuProjectionString part) {\n"
+        + "    KuScalarStringPart parts[2] = {{output->ptr, output->len}, {part.ptr, part.len}};\n"
+        + "    KuProjectionString next = {0};\n"
+        + "    const char *failure = ku_scalar_string_join(parts, 2u, &next);\n"
+        + "    if (failure) return failure;\n"
+        + "    ku_projection_string_drop(output);\n    *output = next;\n    return NULL;\n}\n\n"
+}
+
+fn foldFunctionC(&fold: StructStringFold, &symbol: str, &element: str, &array: str, &drops: str): str {
+    text = "\nKuProjectionString " + symbol.clone() + "(" + array.clone() + " a0) {\n"
+    text += "    if (!ku_string_fold_array_valid(&a0)) { fputs(\"invalid struct array ownership\\n\", stderr); exit(EXIT_FAILURE); }\n"
+    text += "    KuProjectionString result = {(uint8_t*)" + fold.initial.clone() + ", 0u, KU_PROJECTION_STRING_STATIC};\n"
+    text += "    KuProjectionString separator = {(uint8_t*)" + fold.separator.clone() + ", 0u, KU_PROJECTION_STRING_STATIC};\n"
+    text += "    KuProjectionString line = {0};\n    const char *failure = NULL;\n    size_t cursor = 0;\n"
+    text += "    while (cursor < a0.len) {\n"
+    text += "        if (cursor != 0) {\n            failure = ku_string_fold_append(&result, separator);\n"
+    text += "            if (failure) break;\n        }\n"
+    // Advancing transfers ownership. From then on only the formatter may
+    // drop this element; the failure path drops the still-owned suffix.
+    text += "        " + element.clone() + " element = a0.data[cursor++];\n"
+    text += "        line = " + fold.dependency.symbol.clone() + "(element);\n"
+    text += "        failure = ku_string_fold_append(&result, line);\n        if (failure) break;\n"
+    text += "        ku_projection_string_drop(&line);\n    }\n"
+    if (drops != "") { text += "    for (; cursor < a0.len; ++cursor) {\n" + drops.clone() + "    }\n" }
+    text += "    free(a0.data);\n    ku_projection_string_drop(&line);\n"
+    text += "    if (failure) { ku_projection_string_drop(&result); fputs(failure, stderr); exit(EXIT_FAILURE); }\n"
+    return text + "    return result;\n}\n"
+}
+
+fn emitProjectStringFold(&supplied: [SuppliedModule], &project: ProjectBindings, &layouts: [StructLayout],
+                         function_id: int, &function: Node, &param: Node): ProjectStructStringC! {
+    if (param.int_value != 0 || function.edge_count < 2) {
+        RejectLayout("struct_string_fold_signature", "expected one owned struct array and explicit str result", DeclarationSpan(function))?
+    }
+    param_id = supplied[0].named.parsed.arena.edges[param.first_edge]
+    return_id = supplied[0].named.parsed.arena.edges[function.first_edge + 1]
+    element = CheckStructArrayType(supplied[0].named.parsed.arena.nodes, supplied[0].named.parsed.arena.edges,
+        project.modules[0].types, param_id)?
+    result = ExplicitType(project.modules[0].types, return_id, DeclarationSpan(function))?
+    if (result.declaration_kind != "Builtin" || result.name != "str") {
+        RejectLayout("struct_string_fold_signature", "expected one owned struct array and explicit str result", DeclarationSpan(function))?
+    }
+    root = LayoutIndex(layouts, element.module_index, element.declaration_node)
+    order = OrderCStructLayouts(layouts, element.module_index, element.declaration_node, DeclarationSpan(param))?
+    fold = ReadStructStringFold(supplied, project, layouts, supplied[0].named.parsed.arena, function, param, root)?
+    return emitCheckedStringFold(layouts, order, fold, element, result, root, function_id)
+}
+
+fn emitCheckedStringFold(&layouts: [StructLayout], &order: CStructOrder, &fold: StructStringFold,
+                         &element: TypeNameBinding, &result: TypeNameBinding, root: int, function_id: int): ProjectStructStringC! {
+    element_c = fold.dependency.parameter.clone()
+    array = "KuArray_" + element_c.clone()
+    symbol = "ku_struct_string_" + str(function_id)
+    text = ProjectionHeaders(true, true) + "#include <stdio.h>\n#include <string.h>\n\n"
+    text += EmitOrderedStructLayouts(layouts, order)? + EmitStructArrayHeader(element_c, array)
+    text += EmitStructArrayReadValidation(element_c, array, "ku_string_fold_array")
+    text += "\ntypedef KuProjectionString KuBootstrapString;\n" + ScalarStringJoinHelpers(false) + foldAppendC()
+    text += "extern KuProjectionString " + fold.dependency.symbol.clone() + "(" + element_c.clone() + ");\n"
+    drops = GuardOwnedDrops(layouts, root, "a0.data[cursor]")
+    text += foldFunctionC(fold, symbol, element_c, array, drops)
+    parameter = BoundLinkPlanType(element, 1, array, false)
+    parameter.kind = "StructArray"
+    plan = LinkPlanDeclaration { unit: 1, node: function_id, symbol: symbol.clone(), parameters: [parameter],
+        result: BoundLinkPlanType(result, 1, "KuProjectionString", false), returns_result: false }
+    return ok(ProjectStructStringC { symbol: symbol, dependencies: [fold.dependency.clone()], source: text, entry_plan: plan })
+}
+
+fn emitSelectedStringFunction(&supplied: [SuppliedModule], &project: ProjectBindings, &layouts: [StructLayout],
+                              function_id: int): ProjectStructStringC! {
+    function = supplied[0].named.parsed.arena.nodes[function_id - 1].clone()
+    if (function.edge_count > 0) {
+        param = supplied[0].named.parsed.arena.nodes[supplied[0].named.parsed.arena.edges[function.first_edge] - 1].clone()
+        if (param.kind == "Parameter" && param.edge_count == 1
+            && supplied[0].named.parsed.arena.nodes[supplied[0].named.parsed.arena.edges[param.first_edge] - 1].kind == "TypeArray") {
+            return emitProjectStringFold(supplied, project, layouts, function_id, function, param)
+        }
+    }
+    return emitProjectStringFunction(supplied, project, layouts, function_id)
+}
+
 fn EmitProjectStructStringC(&supplied: [SuppliedModule], &function: str): ProjectStructStringC! {
     start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
     if (supplied.len() == 0) { RejectLayout("unknown_struct_string_function", "expected a supplied project module", start.clone())? }
@@ -222,7 +305,7 @@ fn EmitProjectStructStringC(&supplied: [SuppliedModule], &function: str): Projec
         if (entry.kind == "Function" && entry.name == function) {
             project = BindProjectModules(supplied)?
             layouts = BuildStructLayouts(supplied[0].named, project.modules[0].types, supplied)?
-            return emitProjectStringFunction(supplied, project, layouts, entry.node)
+            return emitSelectedStringFunction(supplied, project, layouts, entry.node)
         }
         index = index + 1
     }

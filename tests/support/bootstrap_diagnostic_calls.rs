@@ -234,6 +234,23 @@ fn Probe(e: E): str { return str(e.text) }
             "struct_string_int_argument",
         ),
         (
+            r#"struct E { text: str }
+fn Render(input: E): str { return input.text }
+fn Probe(items: [E]): str {
+    output = ""
+    first = true
+    for item in items {
+        if (first) { output += "|" }
+        line = Render(item)
+        output += line
+        first = false
+    }
+    return output
+}
+"#,
+            "struct_string_fold_body",
+        ),
+        (
             r#"import { SpanCanonical } from "./span.ku"
 struct Span { line: int }
 struct E { span: Span }
