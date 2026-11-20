@@ -126,6 +126,7 @@ fn LinkedNullHasResultValue(&binding: TypeNameBinding): bool {
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
+    if (binding.declaration_kind == "OwnedStringArray") { return ok("KuGuardStringArray") }
     if (binding.declaration_kind == "CaughtError") { return ok("KuBootstrapError") }
     if (binding.declaration_kind == "BuiltinArray") { return ok("const KuGuardStringArray*") }
     if (binding.declaration_kind == "StringView") { return ok("const KuProjectionString*") }
@@ -147,6 +148,7 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
 }
 
 fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &ty: TypeNameBinding, &name: str): str {
+    if (ty.declaration_kind == "OwnedStringArray") { return "    ku_managed_source_drop(&" + name.clone() + ");\n" }
     if (ty.declaration_kind == "CaughtError") {
         return "    ku_projection_string_drop(&" + name.clone() + ".domain);\n"
             + "    ku_projection_string_drop(&" + name.clone() + ".code);\n"

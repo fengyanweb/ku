@@ -213,7 +213,7 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     text += "#include <stdio.h>\n#include <stdlib.h>\n\n"
     text += GuardArithmetic(body.code.uses_add, body.code.uses_sub) + GuardStringEquality(body.code.uses_eq)
     if (signature.source_strings) {
-        text += ManagedSourceCharactersRuntime() + GuardStringArrayCloneC()
+        text += ManagedSourceCharactersRuntime(true) + GuardStringArrayCloneC()
         if (body.code.uses_eq) { text += GuardStringArrayEqualC() }
     }
     if (clones) { text += EmitTryCloneString("ku_result_clone_string") }

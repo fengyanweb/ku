@@ -1,0 +1,87 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan } from "./names.ku"
+import { RejectLayout } from "./struct_layouts.ku"
+import { LinkedNullBinding, LinkedNullRegion, LinkedNullSlot, LinkedNullState,
+    PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
+import { LinkedBuiltin, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedStringResult } from "./linked_null_types_c.ku"
+import { AddLinkedNullSlot, DropLinkedNullScope } from "./linked_null_read_c.ku"
+import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
+
+struct LinkedCharacterLoop {
+    state: LinkedNullState
+    outer: [LinkedNullSlot]
+    before: int
+}
+
+fn linkedCharacterSource(&project: LinkedNullProject, &state: LinkedNullState, &statement: Node): int! {
+    at = DeclarationSpan(statement)
+    call = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+    if (call.kind == "Call" && call.edge_count == 2) {
+        method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+        if (method.kind == "Field" && method.text == "chars" && method.edge_count == 1) {
+            namespace = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
+            if (namespace.kind == "Variable" && namespace.edge_count == 0 &&
+                LinkedNullBinding(state.slots, namespace.text) == 0) {
+                for binding in project.binding.modules[0].imports.clone() {
+                    if (binding.local_name == namespace.text && binding.module_index == 0 && binding.source_name == "string") {
+                        return ok(LinkedNullChild(project, 1, call, 1))
+                    }
+                }
+            }
+        }
+    }
+    RejectLayout("unsupported_linked_for", "expected one argument to the bound std.string.chars", at)?
+    return ok(0)
+}
+
+fn OpenLinkedCharacterLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int, depth: int): LinkedCharacterLoop! {
+    at = DeclarationSpan(statement)
+    if (statement.edge_count == 0 || depth >= 32) {
+        RejectLayout("linked_control_depth", "expected a finite For within the linked control depth", at.clone())?
+    }
+    if (LinkedNullBinding(state.slots, statement.text) != 0) {
+        RejectLayout("linked_binding_shadowed", "character iteration requires a fresh local binding", at.clone())?
+    }
+    before = state.slots.len()
+    source = linkedCharacterSource(project, state, statement)?
+    input = LowerLinkedNullValue(project, state, source, 0)?
+    if (!LinkedStringResult(input.value.ty)) {
+        RejectLayout("linked_chars_type", "string.chars requires a str input", input.value.ty.span.clone())?
+    }
+
+    ty = LinkedBuiltin("str", at.clone())
+    array_type = ty.clone()
+    array_type.declaration_kind = "OwnedStringArray"
+    suffix = str(id) + "_chars"
+    items = AddLinkedNullSlot(project, input.state, "", "a" + suffix.clone(), array_type, false)?
+    array = items.value.text.clone()
+    items.state.uses_chars = true
+    items.state.slots[items.value.slot - 1].live = true
+    items.state.code += "    source_status = ku_managed_source_chars(" + input.value.text + ", &" + array.clone() + ");\n"
+        + "    if (source_status != KU_SOURCE_OK) goto cleanup;\n"
+    outer = items.state.slots.clone()
+    item = AddLinkedNullSlot(project, items.state, statement.text.clone(), "t" + suffix.clone(), ty, false)?
+    item.state.slots[item.value.slot - 1].live = true
+    name = item.value.text.clone()
+    index = "i" + suffix
+    source_item = array.clone() + ".data[" + index.clone() + "]"
+    // The array is freshly materialized and holds independent strings. Move
+    // each element into its iteration's slot before user code can fail.
+    item.state.code += "    for (size_t " + index.clone() + " = 0; " + index.clone() + " < "
+        + array + ".len; ++" + index + ") {\n"
+        + "    " + name + " = " + source_item.clone() + ";\n"
+        + "    " + source_item + " = (KuProjectionString){0};\n"
+    return ok(LinkedCharacterLoop { state: item.state, outer: outer, before: before })
+}
+
+fn CloseLinkedCharacterLoop(loop: LinkedNullRegion, &outer: [LinkedNullSlot], before: int, &statement: Node): LinkedNullState! {
+    body = loop
+    if (body.terminal) {
+        body.state = RestoreLinkedNullSlots(body.state, outer)
+    } else {
+        PreserveLinkedOwners(outer, body.state.slots, statement)?
+        body.state = DropLinkedNullScope(body.state, outer.len())
+    }
+    body.state.code += "    }\n"
+    return ok(DropLinkedNullScope(body.state, before))
+}

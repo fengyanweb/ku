@@ -1,3 +1,5 @@
+import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
+import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -316,6 +318,10 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             else { next = addLocal(project, next, statement, id)? }
         } else if (statement.kind == "If" && statement.edge_count > 1) {
             next = addGuardedRegion(project, next, statement, result, depth)?
+        } else if (statement.kind == "For") {
+            opened = OpenLinkedCharacterLoop(project, next, statement, id, depth)?
+            stepped = lowerLinkedRegion(project, statement, opened.state, 1, result, depth + 1)?
+            next = CloseLinkedCharacterLoop(stepped, opened.outer, opened.before, statement)?
         } else if (statement.kind == "While" && statement.edge_count >= 2 && index > start) {
             initial = LinkedNullNode(project, 1, LinkedNullChild(project, 1, region, index - 1))
             next = addCountedLoop(project, next, statement, initial, result, depth)?
@@ -333,7 +339,9 @@ fn emitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &pa
     header = EmitLinkedNullDeclarations(body, payload)?
     result = LinkedCheckedResultCType(payload)?
     keep = LinkedNullResultCleanupReference(body.owning_layouts, payload)
-    return ok(FinishLinkedFunctionC(header, body, symbol, signature, result, keep))
+    char_errors = ""
+    if (body.uses_chars) { char_errors = ManagedSourceCharactersErrors() }
+    return ok(FinishLinkedFunctionC(header, body, symbol, signature, result, keep, char_errors))
 }
 
 fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! {

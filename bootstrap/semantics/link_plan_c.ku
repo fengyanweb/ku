@@ -77,6 +77,7 @@ struct LinkedNullState {
     uses_print: bool
     uses_concat: bool
     uses_suffix: bool
+    uses_chars: bool
 }
 
 struct LinkedNullExpression {
@@ -89,7 +90,7 @@ fn NewLinkedNullState(): LinkedNullState {
         slots: [], links: [], declarations: "", code: "", drops: "", catch_slot: 0,
         catch_edges: false, catch_moved: [], uses_clone: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,
-        element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false, uses_print: false, uses_concat: false, uses_suffix: false }
+        element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false, uses_print: false, uses_concat: false, uses_suffix: false, uses_chars: false }
 }
 
 fn LinkedReadonlyExpression(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNullExpression {
@@ -270,7 +271,7 @@ fn LinkedRecordFields(&layouts: [StructLayout], &managed: [StructLayout], &type:
 }
 
 fn LinkedNullOwner(&binding: TypeNameBinding): bool {
-    return binding.declaration_kind == "Struct" || binding.declaration_kind == "CaughtError"
+    return binding.declaration_kind == "Struct" || binding.declaration_kind == "CaughtError" || binding.declaration_kind == "OwnedStringArray"
         || (binding.declaration_kind == "Builtin" && binding.name == "str")
         || LinkedNullOwnedArray(binding)
 }
@@ -409,7 +410,7 @@ fn LinkedCPrelude(&body: LinkedNullState, guards: str): str {
 }
 
 fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &signature: str,
-                         &result_type: str, &payload_cleanup: str): str {
+                         &result_type: str, &payload_cleanup: str, char_errors: str): str {
     text = header
     array_checks = body.validated_arrays.len() > 0 || body.uses_str_array
     text += "\n" + result_type.clone() + " " + symbol.clone() + "(" + signature.clone() + ") {\n"
@@ -425,6 +426,7 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
     if (body.uses_add || body.uses_sub) { text += "    bool overflow = false;\n" }
     if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
     if (body.uses_concat) { text += "    const char* string_failure = NULL;\n" }
+    if (body.uses_chars) { text += "    int source_status = KU_SOURCE_OK;\n" }
     text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
     if (body.uses_print) { text += "    if (output_failed) { fputs(\"output write failed\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (clone) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
@@ -443,6 +445,7 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
     if (body.uses_str_view) { text += "    if (invalid_str) { fputs(\"invalid str view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_struct_view) { text += "    if (invalid_struct_view) { fputs(\"invalid struct view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_concat) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_chars) { text += char_errors }
     if (body.uses_add || body.uses_sub) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_index) {
         text += "    if (index_failed) { fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", "

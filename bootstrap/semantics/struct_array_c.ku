@@ -1,3 +1,4 @@
+import { ManagedSourceCharactersRuntime } from "./guarded_string_parts.ku"
 import { LinkedNullState } from "./link_plan_c.ku"
 import { EmitProjectionStringJoinHelpers, ScalarStringSuffixC } from "./scalar_int_emit.ku"
 import { Node } from "../stage2/ast.ku"
@@ -331,6 +332,10 @@ fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str):
     definitions = EmitCombinedCLayouts(body.layouts, body.owning_layouts)?
     text += definitions.source
     text += EmitBoundArrayDeclarations(body.arrays, body.validated_arrays, definitions.array_types, body.uses_str_array)
+    if (body.uses_chars) {
+        text += "#include <stdio.h>\n" + ManagedSourceCharactersRuntime(!body.uses_str_array &&
+            !ContainsType(definitions.array_types, "KuGuardStringArray"))
+    }
     text += EmitBoundElementClones(body.layouts, body.element_clones)
     text += result_header + EmitBoundArrayResults(body.layouts, body.owning_layouts, body.owned_arrays)
     append_types: [TypeNameBinding] = []
