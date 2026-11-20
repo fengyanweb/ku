@@ -13,14 +13,6 @@ import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullArrayType, LinkedNullCType, LinkedNullChild, LinkedNullDropC,
          LinkedNullLayout, LinkedNullNode, LinkedNullProject, EmitLinkedNullPrototypes, LinkedNullView, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
 
-fn NewLinkedNullState(): LinkedNullState {
-    return LinkedNullState { layouts: [], owning_layouts: [], owning_strings: false,
-        slots: [], links: [], declarations: "", code: "", drops: "", catch_slot: 0,
-        catch_edges: false, catch_moved: [], uses_clone: false,
-        arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false,
-        element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false, uses_print: false, uses_concat: false }
-}
-
 fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &element: TypeNameBinding): LinkedNullState! {
     next = state
     try {

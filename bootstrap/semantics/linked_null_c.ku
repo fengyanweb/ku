@@ -6,12 +6,12 @@ import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { ContainsType } from "./struct_projection_c.ku"
-import { ExitLinkedFailure, FinishLinkedFunctionC, LinkedFailureTarget, LinkedNullBinding, LinkedNullFunction, LinkedNullRegion, LinkedNullState, LinkPlanDeclaration, LinkPlanType, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
+import { ExitLinkedFailure, FinishLinkedFunctionC, LinkedFailureTarget, LinkedNullBinding, LinkedNullFunction, LinkedNullRegion, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NewLinkedNullState, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedCheckedResultPlan, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullParameterPlan, LinkedNullParameterType,
          LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, BindLinkedCatch, DropLinkedNullScope, EmitLinkedNullDeclarations, LowerLinkedArrayLocal, LowerLinkedNullRead,
-         MoveLinkedNullSlot, NewLinkedNullState, RegisterLinkedNullType } from "./linked_null_read_c.ku"
+         MoveLinkedNullSlot, RegisterLinkedNullType } from "./linked_null_read_c.ku"
 import { LowerLinkedArrayAppend, LowerLinkedSuccess,
          LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
