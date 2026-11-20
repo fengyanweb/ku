@@ -11,7 +11,7 @@ import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResul
 import { LinkedNullCType, LinkedNullChild, LinkedNullEntry, LinkedNullFunction, LinkedNullNode,
          LinkedNullProject, LinkedNullPrototype, LinkedNullType, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, LinkedNullBinding, LinkedNullState, LowerLinkedNullValue,
-         MoveLinkedNullSlot, NewLinkedNullState } from "./linked_null_values_c.ku"
+         LowerLinkedNullTry, MoveLinkedNullSlot, NewLinkedNullState } from "./linked_null_values_c.ku"
 
 struct LinkedNullC {
     symbol: str
@@ -109,7 +109,7 @@ fn addGuardedAssignment(&project: LinkedNullProject, state: LinkedNullState, &st
 
 fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
     if (statement.kind != "Fail" || statement.edge_count != 1) {
-        RejectLayout("unsupported_linked_terminal", "expected a final Error literal fail", DeclarationSpan(statement))?
+        RejectLayout("unsupported_linked_terminal", "expected a final Error fail or return ok(null)", DeclarationSpan(statement))?
     }
     literal = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
     if (literal.kind != "ObjectLiteral" || literal.edge_count != 3) {
@@ -144,6 +144,36 @@ fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &stat
     return ok(next)
 }
 
+fn unshadowedOk(&project: LinkedNullProject, &state: LinkedNullState): bool {
+    if (LinkedNullBinding(state.slots, "ok") != 0) { return false }
+    for name in project.supplied[0].named.names.declarations.clone() {
+        if (name.name == "ok") { return false }
+    }
+    for binding in project.binding[0].imports.clone() {
+        if (binding.local_name == "ok") { return false }
+    }
+    return true
+}
+
+fn lowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    if (statement.edge_count != 1) {
+        RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(statement))?
+    }
+    call = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+    if (call.kind != "Call" || call.edge_count != 2) {
+        RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(call))?
+    }
+    callee = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    value = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 1))
+    if (callee.kind != "Variable" || callee.edge_count != 0 || callee.text != "ok"
+        || value.kind != "Null" || value.edge_count != 0 || !unshadowedOk(project, state)) {
+        RejectLayout("unsupported_linked_success", "expected builtin ok with literal null", DeclarationSpan(call))?
+    }
+    next = state
+    next.code = next.code + "    result.ok = true;\n    goto cleanup;\n"
+    return ok(next)
+}
+
 fn lowerLinkedBody(&project: LinkedNullProject, &function: Node, state: LinkedNullState, start: int): LinkedNullState! {
     next = state
     index = start
@@ -151,18 +181,21 @@ fn lowerLinkedBody(&project: LinkedNullProject, &function: Node, state: LinkedNu
         id = LinkedNullChild(project, 1, function, index)
         statement = LinkedNullNode(project, 1, id)
         if (index == function.edge_count - 1) {
+            if (statement.kind == "Return") { return lowerLinkedSuccess(project, next, statement) }
             return lowerLinkedFailure(project, next, statement)
         }
         if (statement.kind == "Assign" && statement.edge_count == 1) {
             next = addLocal(project, next, statement, id)?
         } else if (statement.kind == "If" && statement.edge_count == 2 && statement.int_value == 1) {
             next = addGuardedAssignment(project, next, statement)?
+        } else if (statement.kind == "ExprStmt" && statement.edge_count == 1) {
+            next = LowerLinkedNullTry(project, next, statement)?
         } else {
-            RejectLayout("unsupported_linked_statement", "expected a fresh local, one guarded string assignment or a final fail", DeclarationSpan(statement))?
+            RejectLayout("unsupported_linked_statement", "expected a fresh local, guarded string assignment or checked call", DeclarationSpan(statement))?
         }
         index = index + 1
     }
-    RejectLayout("unsupported_linked_terminal", "expected a final Error literal fail", DeclarationSpan(function))?
+    RejectLayout("unsupported_linked_terminal", "expected a final Error fail or return ok(null)", DeclarationSpan(function))?
     return ok(next)
 }
 

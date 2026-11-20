@@ -3,11 +3,11 @@ import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { ProjectModuleBindings } from "./project_bindings.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { CTypeName } from "./struct_projection_c.ku"
 import { OrderCStructLayouts } from "./nested_struct_c.ku"
-import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -20,6 +20,7 @@ struct LinkedNullFunction {
     symbol: str
     parameters: [TypeNameBinding]
     result: TypeNameBinding
+    returns_result: bool
 }
 
 fn LinkedBuiltin(name: str, at: Span): TypeNameBinding {
@@ -28,7 +29,7 @@ fn LinkedBuiltin(name: str, at: Span): TypeNameBinding {
 
 fn SameLinkedType(&a: TypeNameBinding, &b: TypeNameBinding): bool {
     return a.declaration_kind == b.declaration_kind && a.module_index == b.module_index
-        && a.declaration_node == b.declaration_node && a.name == b.name
+        && a.declaration_node == b.declaration_node && (a.declaration_kind == "Struct" || a.name == b.name)
 }
 
 fn LinkedNullNode(&project: LinkedNullProject, unit: int, node: int): Node {
@@ -50,6 +51,15 @@ fn absoluteType(binding: TypeNameBinding, unit: int): TypeNameBinding {
 fn LinkedNullType(&project: LinkedNullProject, unit: int, node: int): TypeNameBinding! {
     resolved = ExplicitType(project.binding[unit - 1].types, node, DeclarationSpan(LinkedNullNode(project, unit, node)))?
     return ok(absoluteType(resolved, unit))
+}
+
+fn LinkedNullLiteralType(&project: LinkedNullProject, unit: int, &literal: Node, id: int): TypeNameBinding! {
+    binding = ResolveTypeName(literal, id, project.supplied[unit - 1].named.names.declarations,
+                              project.binding[unit - 1].imports, project.supplied)?
+    if (binding.declaration_kind != "Struct") {
+        RejectLayout("linked_literal_type", "expected the declaration of a concrete struct", DeclarationSpan(literal))?
+    }
+    return ok(absoluteType(binding, unit))
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
@@ -115,7 +125,22 @@ fn linkedDirectFunction(&project: LinkedNullProject, unit: int, &target: Node): 
     return ok([])
 }
 
-fn LinkedNullDependency(&project: LinkedNullProject, from_unit: int, &target: Node): LinkedNullFunction! {
+fn readLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bool): TypeNameBinding! {
+    node = LinkedNullNode(project, unit, id)
+    if (!checked) {
+        return LinkedNullType(project, unit, id)
+    }
+    if (node.kind != "TypeResult" || node.edge_count != 1) {
+        RejectLayout("linked_dependency_result", "checked dependency requires an explicit null! result", DeclarationSpan(node))?
+    }
+    result = LinkedNullType(project, unit, LinkedNullChild(project, unit, node, 0))?
+    if (result.declaration_kind != "Builtin" || result.name != "null") {
+        RejectLayout("linked_dependency_result", "checked dependency must return null!", result.span.clone())?
+    }
+    return ok(result)
+}
+
+fn LinkedNullDependency(&project: LinkedNullProject, from_unit: int, &target: Node, checked: bool): LinkedNullFunction! {
     identity = linkedDirectFunction(project, from_unit, target)?
     unit = identity[0]
     id = identity[1]
@@ -134,13 +159,19 @@ fn LinkedNullDependency(&project: LinkedNullProject, from_unit: int, &target: No
     if (index >= callee.edge_count) {
         RejectLayout("linked_dependency_result", "direct dependency needs an explicit value result", DeclarationSpan(callee))?
     }
-    result = LinkedNullType(project, unit, LinkedNullChild(project, unit, callee, index))?
+    result = readLinkedResult(project, unit, LinkedNullChild(project, unit, callee, index), checked)?
     symbol = "ku_value_dependency_m" + str(unit) + "_" + str(id)
-    return ok(LinkedNullFunction { unit: unit, node: id, symbol: symbol, parameters: parameters, result: result })
+    return ok(LinkedNullFunction { unit: unit, node: id, symbol: symbol, parameters: parameters,
+        result: result, returns_result: checked })
+}
+
+fn linkedResultType(&callee: LinkedNullFunction): str! {
+    if (callee.returns_result) { return ok("KuBootstrapResultNull") }
+    return LinkedNullCType(callee.result)
 }
 
 fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
-    text = "extern " + LinkedNullCType(callee.result)? + " " + callee.symbol.clone() + "("
+    text = "extern " + linkedResultType(callee)? + " " + callee.symbol.clone() + "("
     if (callee.parameters.len() == 0) { text += "void" }
     index = 0
     while (index < callee.parameters.len()) {
@@ -159,9 +190,10 @@ fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
         parameters = parameters.push(BoundLinkPlanType(ty, callee.unit, LinkedNullCType(ty)?, false))
         index = index + 1
     }
-    result = BoundLinkPlanType(callee.result, callee.unit, LinkedNullCType(callee.result)?, false)
+    result = BoundLinkPlanType(callee.result, callee.unit, linkedResultType(callee)?, false)
+    if (callee.returns_result) { result = NullLinkPlanResult() }
     return ok(LinkPlanDeclaration { unit: callee.unit, node: callee.node, symbol: callee.symbol.clone(),
-        parameters: parameters, result: result, returns_result: false })
+        parameters: parameters, result: result, returns_result: callee.returns_result })
 }
 
 fn LinkedNullEntry(&project: LinkedNullProject, &name: str): int! {

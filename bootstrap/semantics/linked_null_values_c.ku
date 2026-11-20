@@ -1,10 +1,11 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
-import { LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { ContainsIndex } from "./struct_projection_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
-import { LinkedBuiltin, LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullFunction, LinkedNullLayout,
+import { LinkedBuiltin, LinkedNullCType, LinkedNullChild, LinkedNullDependency, LinkedNullFunction, LinkedNullLayout, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullOwner, LinkedNullProject, SameLinkedType } from "./linked_null_types_c.ku"
 
 struct LinkedNullValue {
@@ -32,6 +33,12 @@ struct LinkedNullState {
 struct LinkedNullExpression {
     state: LinkedNullState
     value: LinkedNullValue
+}
+
+struct LinkedNullArguments {
+    state: LinkedNullState
+    args: str
+    handoff: str
 }
 
 fn NewLinkedNullState(): LinkedNullState {
@@ -119,18 +126,19 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     return ok(output)
 }
 
-fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: Node, id: int, depth: int): LinkedNullExpression! {
-    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
-    if (target.kind == "Field" && target.text == "clone" && target.edge_count == 1 && call.edge_count == 1) {
-        return emitLinkedClone(project, state, target, id)
-    }
+fn resolveLinkedCall(&project: LinkedNullProject, &state: LinkedNullState, &call: Node, &target: Node, checked: bool): LinkedNullFunction! {
     if (LinkedNullBinding(state.slots, target.text) != 0) {
         RejectLayout("shadowed_linked_dependency", "direct dependency name is shadowed by a local", DeclarationSpan(target))?
     }
-    callee = LinkedNullDependency(project, 1, target)?
+    callee = LinkedNullDependency(project, 1, target, checked)?
     if (callee.parameters.len() != call.edge_count - 1) {
         RejectLayout("linked_dependency_arity", "argument count differs from the bound function declaration", DeclarationSpan(call))?
     }
+    return ok(callee)
+}
+
+fn lowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &callee: LinkedNullFunction,
+                         id: int, depth: int): LinkedNullArguments! {
     next = state
     next.links = rememberLinkedCall(next.links, callee.clone())
     args = ""
@@ -154,10 +162,75 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
         }
         index = index + 1
     }
-    output = AddLinkedNullSlot(project, next, "", "t" + str(id), callee.result, false)?
-    output.state.code = output.state.code + "    " + output.value.text.clone() + " = " + callee.symbol + "(" + args + ");\n" + handoff
+    return ok(LinkedNullArguments { state: next, args: args, handoff: handoff })
+}
+
+fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: Node, id: int, depth: int): LinkedNullExpression! {
+    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (target.kind == "Field" && target.text == "clone" && target.edge_count == 1 && call.edge_count == 1) {
+        return emitLinkedClone(project, state, target, id)
+    }
+    callee = resolveLinkedCall(project, state, call, target, false)?
+    arguments = lowerLinkedArguments(project, state, call, callee, id, depth)?
+    output = AddLinkedNullSlot(project, arguments.state, "", "t" + str(id), callee.result, false)?
+    output.state.code = output.state.code + "    " + output.value.text.clone() + " = " + callee.symbol + "(" + arguments.args + ");\n" + arguments.handoff
     output.state.slots[output.value.slot - 1].live = true
     return ok(output)
+}
+
+fn LowerLinkedNullTry(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    unwrap = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+    if (unwrap.kind != "TryUnwrap" || unwrap.edge_count != 1) {
+        RejectLayout("unsupported_linked_try", "expected a direct null! call followed by ?", DeclarationSpan(unwrap))?
+    }
+    id = LinkedNullChild(project, 1, unwrap, 0)
+    call = LinkedNullNode(project, 1, id)
+    if (call.kind != "Call" || call.edge_count == 0) {
+        RejectLayout("unsupported_linked_try", "expected a direct checked dependency call", DeclarationSpan(call))?
+    }
+    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    callee = resolveLinkedCall(project, state, call, target, true)?
+    arguments = lowerLinkedArguments(project, state, call, callee, id, 0)?
+    result = "dependency" + str(id)
+    // The callee owns the arguments at this point. An error skips subsequent
+    // statements and transfers its strings before the caller's cleanup.
+    arguments.state.code = arguments.state.code + "    KuBootstrapResultNull " + result.clone() + " = " + callee.symbol
+        + "(" + arguments.args + ");\n" + arguments.handoff
+        + "    if (!" + result.clone() + ".ok) {\n        result.error = " + result.clone() + ".error;\n"
+        + "        " + result + ".error = (KuBootstrapError){0};\n        goto cleanup;\n    }\n"
+    return ok(arguments.state)
+}
+
+fn lowerLinkedLiteral(&project: LinkedNullProject, state: LinkedNullState, &node: Node, id: int, depth: int): LinkedNullExpression! {
+    ty = LinkedNullLiteralType(project, 1, node, id)?
+    output = AddLinkedNullSlot(project, state, "", "t" + str(id), ty, false)?
+    layout = LayoutIndex(output.state.layouts, output.value.ty.module_index, output.value.ty.declaration_node)
+    fields = output.state.layouts[layout - 1].fields.clone()
+    target = output.value.text.clone()
+    next = output.state
+    seen: [int] = []
+    index = 0
+    while (index < node.edge_count) {
+        field = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, index))
+        ordinal = FieldIndex(fields, field.text)
+        if (field.kind != "StructLiteralField" || field.edge_count != 1 || ordinal == 0 || ContainsIndex(seen, ordinal)) {
+            RejectLayout("invalid_linked_literal_field", "expected each declared struct field once", DeclarationSpan(field))?
+        }
+        value = LowerLinkedNullValue(project, next.clone(), LinkedNullChild(project, 1, field, 0), depth + 1)?
+        if (!SameLinkedType(fields[ordinal - 1].resolved, value.value.ty)) {
+            RejectLayout("linked_literal_field_type", "field value differs from the bound struct field type", value.value.ty.span.clone())?
+        }
+        value.state.code = value.state.code + "    " + target.clone() + ".f" + str(ordinal - 1) + " = " + value.value.text.clone() + ";\n"
+        owner = value.value.clone()
+        next = MoveLinkedNullSlot(value.state, owner)?
+        seen = seen.push(ordinal)
+        index = index + 1
+    }
+    if (seen.len() != fields.len()) {
+        RejectLayout("missing_linked_literal_field", "expected all declared struct fields", DeclarationSpan(node))?
+    }
+    next.slots[output.value.slot - 1].live = true
+    return ok(LinkedNullExpression { state: next, value: output.value })
 }
 
 fn LowerLinkedNullValue(&project: LinkedNullProject, state: LinkedNullState, id: int, depth: int): LinkedNullExpression! {
@@ -178,6 +251,7 @@ fn LowerLinkedNullValue(&project: LinkedNullProject, state: LinkedNullState, id:
         return ok(linkedValue(state, LinkedBuiltin("int", at), "INT64_C(" + str(node.int_value) + ")"))
     }
     if (node.kind == "Call" && node.edge_count > 0) { return emitLinkedCall(project, state, node, id, depth) }
+    if (node.kind == "StructLiteral") { return lowerLinkedLiteral(project, state, node, id, depth) }
     RejectLayout("unsupported_linked_operand", "expected a bound value, literal or checked direct call", at.clone())?
     return ok(linkedValue(state, LinkedBuiltin("", at), ""))
 }

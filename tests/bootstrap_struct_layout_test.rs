@@ -9,6 +9,9 @@ mod binary_operator;
 #[path = "support/bootstrap_diagnostic_calls.rs"]
 mod diagnostic_calls;
 
+#[path = "support/bootstrap_linked_null.rs"]
+mod linked_null;
+
 use bounded_process::{run_bounded, BoundedOutput, OutputLimits};
 use ku::{span::Span, stdlib::json, value::Value};
 use std::fs;
@@ -1352,6 +1355,7 @@ fn Make(): Outer {
     assert_constructor_view(&driver_binary, &cwd);
     assert_guarded_predicate(&driver_binary, &cwd);
     assert_project_link_plans(&driver_binary, &cwd);
+    linked_null::assert_checked_owned_call(&driver_binary, &cwd);
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {
@@ -1519,6 +1523,12 @@ fn assert_project_link_plans(driver: &Path, cwd: &Path) {
             &["MakeDiagnostic", "SpanFromToken", "DiagnosticCanonical"][..],
         ),
         (
+            "linked-null",
+            "RejectAtPoint",
+            "stage2/expression_support.ku\nstage2/span.ku\nstage2/diagnostic.ku\nstage1/token.ku\nstage2/ast.ku\n",
+            &["RejectAt"][..],
+        ),
+        (
             "linked-str",
             "DiagnosticCanonical",
             "stage2/diagnostic.ku\nstage2/span.ku\nstage1/token.ku\n",
@@ -1540,6 +1550,12 @@ fn assert_project_link_plans(driver: &Path, cwd: &Path) {
             let Value::Object(dependency) = dependency else { panic!("expected a dependency") };
             assert_eq!(dependency["source_name"], Value::String((*expected).into()));
             assert!(matches!(dependency["signature"], Value::Object(_)));
+            if name == "RejectAtPoint" {
+                let Value::Object(signature) = &dependency["signature"] else {
+                    unreachable!("checked dependency signature")
+                };
+                assert_eq!(signature["returns_result"], Value::Bool(true));
+            }
             let Value::String(symbol) = &dependency["symbol"] else { panic!("expected a symbol") };
             assert!(c.contains(&format!(" {symbol}(")));
         }
