@@ -132,6 +132,16 @@ class LinkTests(unittest.TestCase):
         cc.assert_not_called()
         self.assertEqual(self.output.read_bytes(), old)
 
+    def test_builtin_integer_array_view_has_its_own_carrier(self):
+        integer = dict(builtin("int", "const KuArrayInt*"), kind="BuiltinArray", passing="view")
+        strings = dict(builtin("str", "const KuGuardStringArray*"), kind="BuiltinArray", passing="view")
+        self.assertNotEqual(link_c.TypeRef.read(integer, "view").semantic(),
+                            link_c.TypeRef.read(strings, "view").semantic())
+        with self.assertRaises(link_c.LinkError):
+            link_c.TypeRef.read(dict(integer, c_type=strings["c_type"]), "view")
+        with self.assertRaises(link_c.LinkError):
+            link_c.TypeRef.read(dict(integer, c_type="KuArrayInt", passing="value"), "value")
+
     def test_fs_read_provider_links_and_preserves_bytes_and_errors(self):
         tools = Path(__file__).resolve().parent
         driver = tools / "compiler_driver"

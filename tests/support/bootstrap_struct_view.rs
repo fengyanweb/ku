@@ -310,3 +310,117 @@ int main(void) {
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_view_escape"));
 }
+
+const INT_VIEW_SOURCE: &str = r#"struct Graph { edges: [int] }
+fn See(value: int): null! { return ok(null) }
+fn Check(&edges: [int]): null! {
+    first = edges[0]
+    See(first)?
+    return ok(null)
+}
+fn Inspect(&graph: Graph): null! {
+    Check(graph.edges)?
+    See(graph.edges[0])?
+    return ok(null)
+}
+fn Wrong(&edges: [str]): null! {
+    Check(edges)?
+    return ok(null)
+}
+"#;
+
+const INT_VIEW_HOST: &str = r#"
+static int calls;
+KuBootstrapResultNull __SEE__(int64_t value) {
+    assert(value == INT64_MIN);
+    ++calls;
+    return (KuBootstrapResultNull){.ok = true};
+}
+int main(int argc, char **argv) {
+    int64_t data[] = { INT64_MIN };
+    KuArrayInt edges = {1, data, 1};
+    if (argc == 2) {
+        if (!strcmp(argv[1], "bounds")) { edges.len = 0; edges.capacity = 0; }
+        else { edges.len = 2; }
+    }
+    KuBootstrapResultNull result = __ENTRY__(&edges);
+    assert(argc == 1 && result.ok && calls == 1);
+    assert(edges.data == data && edges.len == 1 && edges.capacity == 1 && data[0] == INT64_MIN);
+    return 0;
+}
+"#;
+
+pub(super) fn assert_checked_int_view(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("int-view.ku"), INT_VIEW_SOURCE).unwrap();
+    fs::write(cwd.join("modules.txt"), "int-view.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Check").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+    let plan = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plan);
+    let Some(Value::Result { ok: true, value }) = json::eval(
+        "decode",
+        &[Value::String(String::from_utf8(plan.stdout).unwrap())],
+        Span::default(),
+    )
+    .unwrap() else {
+        panic!("expected integer View link plan")
+    };
+    let Value::Object(plan) = *value else {
+        panic!("expected typed plan")
+    };
+    let Value::Object(export) = &plan["export"] else {
+        panic!("expected export")
+    };
+    let Value::Object(signature) = &export["signature"] else {
+        panic!("expected signature")
+    };
+    let Value::Array(params) = &signature["parameters"] else {
+        panic!("expected params")
+    };
+    let [Value::Object(view)] = params.as_slice() else {
+        panic!("expected one View")
+    };
+    assert_eq!(view["kind"], Value::String("BuiltinArray".into()));
+    assert_eq!(view["source_name"], Value::String("int".into()));
+    assert_eq!(view["c_type"], Value::String("const KuArrayInt*".into()));
+    let Value::Array(deps) = &plan["dependencies"] else {
+        panic!("expected dependency")
+    };
+    let [Value::Object(see)] = deps.as_slice() else {
+        panic!("expected Copy consumer")
+    };
+    let (Value::String(entry), Value::String(see)) = (&export["symbol"], &see["symbol"]) else {
+        panic!("expected symbols")
+    };
+    let host = INT_VIEW_HOST
+        .replace("__ENTRY__", entry)
+        .replace("__SEE__", see);
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let c = cwd.join("int-view.c");
+    let exe = cwd.join(format!("int-view{}", std::env::consts::EXE_SUFFIX));
+    let source = String::from_utf8(emitted.stdout).unwrap();
+    fs::write(&c, format!("#include <assert.h>\n{source}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    for (argument, reason) in [
+        ("bounds", "index 0 out of bounds for length 0"),
+        ("header", "invalid struct array ownership"),
+    ] {
+        let outcome = execute(Command::new(&exe).arg(argument), cwd, 15);
+        assert_eq!(outcome.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&outcome.stderr).contains(reason));
+    }
+    fs::write(cwd.join("function.txt"), "Inspect").unwrap();
+    let nested = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&nested);
+    fs::write(&c, nested.stdout).unwrap();
+    super::compile_projection_product(&c, &cwd.join("int-view.o"), cwd, true, true);
+
+    fs::write(cwd.join("function.txt"), "Wrong").unwrap();
+    let wrong = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(wrong.status.code(), Some(1));
+    assert!(wrong.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("linked_argument_type"));
+}

@@ -95,5 +95,6 @@ fn BindImportedTypeNames(&named: NamedModule, &imports: [ImportBinding],
 
 fn SameBoundTypeIdentity(&a: TypeNameBinding, &b: TypeNameBinding): bool {
     return a.declaration_kind == b.declaration_kind && a.module_index == b.module_index
-        && a.declaration_node == b.declaration_node && (a.declaration_kind != "Builtin" || a.name == b.name)
+        && a.declaration_node == b.declaration_node
+        && ((a.declaration_kind != "Builtin" && a.declaration_kind != "BuiltinArray") || a.name == b.name)
 }

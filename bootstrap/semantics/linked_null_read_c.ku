@@ -9,7 +9,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
-import { LinkedErrorField, ReadLinkedNullBinding, CheckLinkedAddition, LinkedCPrelude, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { RegisterLinkedIntArray, LinkedErrorField, ReadLinkedNullBinding, CheckLinkedAddition, LinkedCPrelude, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullDropC,
@@ -42,7 +42,10 @@ fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &el
 
 fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, ty: TypeNameBinding): LinkedNullState! {
     next = state
-    if (ty.declaration_kind == "BuiltinArray") { next.uses_str_array = true }
+    if (ty.declaration_kind == "BuiltinArray") {
+        if (ty.name == "str") { next.uses_str_array = true }
+        else { next = RegisterLinkedIntArray(next, ty.clone()) }
+    }
     if (ty.declaration_kind == "StringView") { next.uses_str_view = true }
     if (ty.declaration_kind == "StructView") { next.uses_struct_view = true }
     if (ty.declaration_kind == "StructArray" || LinkedNullOwnedArray(ty)) {
@@ -226,11 +229,11 @@ fn readLinkedIndex(&project: LinkedNullProject, state: LinkedNullState, &node: N
         + "    if (" + offset.clone() + " < 0 || (uint64_t)" + offset.clone() + " >= " + header.clone() + "->len) {\n"
         + "        index_failed = true; failure_index = " + offset.clone() + "; failure_length = " + header.clone() + "->len; goto cleanup;\n    }\n"
     item = LinkedReadonlyExpression(index.state, LinkedNullArrayElement(array.value.ty), header + "->data[" + offset + "]")
-    if (item.value.ty.declaration_kind == "Builtin") {
+    if (item.value.ty.declaration_kind == "Builtin" && item.value.ty.name == "str") {
         item.state.code += "    if (" + item.value.text.clone() + ".len && !" + item.value.text.clone()
             + ".ptr) { invalid_array = true; goto cleanup; }\n"
     }
-    item.value.borrowed = true
+    item.value.borrowed = LinkedNullOwner(item.value.ty)
     item.value.slot = array.value.slot
     return ok(item)
 }
@@ -259,8 +262,7 @@ fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: N
     if (LinkedMemberUnavailable(field.state, field.value, false)) {
         RejectLayout("linked_moved_member", "cannot read a field already moved from its parent", DeclarationSpan(node))?
     }
-    if (field.value.ty.declaration_kind == "StructArray" ||
-        (field.value.ty.declaration_kind == "BuiltinArray" && field.value.ty.name == "str")) {
+    if (field.value.ty.declaration_kind == "StructArray" || field.value.ty.declaration_kind == "BuiltinArray") {
         ty = field.value.ty.clone()
         next = RegisterLinkedNullType(project, field.state, ty)?
         if (field.value.ty.declaration_kind == "StructArray") {
@@ -274,8 +276,6 @@ fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: N
         field.state = next
         field.value.text = address
         field.value.borrowed = true
-    } else if (field.value.ty.declaration_kind == "BuiltinArray") {
-        RejectLayout("linked_nested_array_projection", "nested builtin array View requires supported str elements", DeclarationSpan(node))?
     } else {
         field.value.borrowed = LinkedNullOwner(field.value.ty)
     }

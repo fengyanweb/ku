@@ -93,14 +93,15 @@ class TypeRef:
                 raise LinkError(f"{where} builtin must have a null path and node 0")
             identity = ("builtin", name)
         elif ref["kind"] == "BuiltinArray":
-            view = (passing == "view" and
-                    c_type[len("const "):-1].rstrip() == "KuGuardStringArray")
-            owned = (checked_result and passing == "value" and
+            view_carrier = {"str": "KuGuardStringArray", "int": "KuArrayInt"}.get(name)
+            view = (passing == "view" and view_carrier is not None and
+                    c_type[len("const "):-1].rstrip() == view_carrier)
+            owned = (name == "str" and checked_result and passing == "value" and
                      c_type == "KuBootstrapResultStringArray")
             if (ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0
-                    or name != "str" or not (view or owned)):
-                raise LinkError(f"{where} builtin array requires the checked View [str] carrier "
-                                "or checked owned [str]! result carrier")
+                    or not (view or owned)):
+                raise LinkError(f"{where} builtin array requires the checked View [str] carrier, "
+                                "checked View [int] carrier or checked owned [str]! result carrier")
             identity = ("builtin_array", name)
         elif ref["kind"] in ("Struct", "StructArray"):
             identity = ("struct" if ref["kind"] == "Struct" else "struct_array",

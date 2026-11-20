@@ -258,11 +258,15 @@ fn BoundArrayTypePosition(&arrays: [TypeNameBinding], &type_name: TypeNameBindin
 }
 
 fn BoundArrayCType(&binding: TypeNameBinding): str {
+    if (binding.declaration_kind == "BuiltinArray" && binding.name == "int") { return "KuArrayInt" }
     return "KuArray_" + CTypeName(binding.module_index, binding.declaration_node)
 }
 
 fn BoundArrayCPrefix(&binding: TypeNameBinding): str {
-    if (binding.declaration_kind == "BuiltinArray") { return "ku_linked_view_str_array" }
+    if (binding.declaration_kind == "BuiltinArray") {
+        if (binding.name == "int") { return "ku_linked_view_int_array" }
+        return "ku_linked_view_str_array"
+    }
     return "ku_linked_view_" + CTypeName(binding.module_index, binding.declaration_node)
 }
 
@@ -271,6 +275,7 @@ fn EmitBoundArrayDeclarations(&arrays: [TypeNameBinding], &validated: [TypeNameB
     source = ""
     for array in arrays.clone() {
         element = CTypeName(array.module_index, array.declaration_node)
+        if (array.declaration_kind == "BuiltinArray" && array.name == "int") { element = "int64_t" }
         array_type = BoundArrayCType(array)
         if (!ContainsType(defined, array_type)) { source += EmitStructArrayHeader(element, array_type) }
         if (BoundArrayTypePosition(validated, array) > 0) {
