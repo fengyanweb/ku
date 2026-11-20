@@ -51,6 +51,11 @@ KU
   listed module. The emitted C includes its supported reachable callees
   from the project. It uses the same manifest and import resolution as
   `check-project`.
+- `emit-program modules.txt` emits a complete C11 program, including its
+  entry point. The first module defines `main(): null!`. The current
+  program emitter supports integer `println` expressions, bound scalar
+  callees, and the supported `return ok(null)` or static failure. Compile
+  the result directly with `cc -std=c11 -O2 app.c -o app`.
 - Success returns zero. File, checker and emitter errors return one and
   report the existing diagnostic on standard error. Invalid command forms
   or arguments return two. Inputs must be nonempty UTF-8 and at most 512

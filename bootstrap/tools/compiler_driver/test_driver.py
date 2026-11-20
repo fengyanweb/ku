@@ -59,6 +59,7 @@ def exercise_project(compiler, cc, root, caller):
         'import { Counter as Record, Increment as Step } from "../lib/数字🙂.ku"\n'
         'struct Packet { item: Record }\n'
         'fn Answer(): int { return Step(41) }\n'
+        'fn main(): null! { println(Answer()); return ok(null) }\n'
     )
     main.write_text(valid, encoding="utf-8")
     listed = "src/main.ku\r\nlib/数字🙂.ku\r\n".encode()
@@ -112,11 +113,21 @@ def exercise_project(compiler, cc, root, caller):
     assert execute([compiler, "check-project", relative], caller).stdout == b""
     emitted = execute([compiler, "emit-project", relative, "Answer"], caller).stdout
     exercise_emitted(cc, emitted, caller, "project-derived", b"()", b"42")
+    source = caller / "complete-program.c"
+    whole = execute([compiler, "emit-program", relative], caller)
+    assert not whole.stderr and b"int main(void)" in whole.stdout
+    source.write_bytes(whole.stdout)
+    program = "complete-program.exe" if os.name == "nt" else "complete-program"
+    link_c(cc, source.name, program, caller)
+    result = execute([caller / program], caller)
+    assert result.stdout.replace(b"\r\n", b"\n") == b"42\n" and not result.stderr
     missing = execute([compiler, "emit-project", relative, "Unknown"], caller, 1)
     assert not missing.stdout and b"unknown_int_function" in missing.stderr, missing.stderr
     manifest.write_bytes(b"src/main.ku\n")
     unresolved = execute([compiler, "emit-project", relative, "Answer"], caller, 1)
     assert not unresolved.stdout and b"unresolved_import" in unresolved.stderr, unresolved.stderr
+    unresolved_program = execute([compiler, "emit-program", relative], caller, 1)
+    assert not unresolved_program.stdout and b"unresolved_import" in unresolved_program.stderr
 
 
 def exercise(ku, cc):

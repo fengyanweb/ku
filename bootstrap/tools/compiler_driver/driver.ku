@@ -8,7 +8,7 @@ import { BindProjectModules } from "../../semantics/project_bindings.ku"
 import { ManifestPaths, ReadProjectModulesAt } from "../../semantics/project_manifest.ku"
 import { ProjectParent } from "../../semantics/project_paths.ku"
 import { EmitScalarIntC, ScalarIntC } from "../../semantics/scalar_int_c.ku"
-import { EmitScalarProjectC } from "../../semantics/scalar_project_c.ku"
+import { EmitScalarProjectC, EmitScalarProjectProgramC } from "../../semantics/scalar_project_c.ku"
 import { BindTypeNames } from "../../semantics/type_names.ku"
 
 fn readProject(&manifest: str): [SuppliedModule]! {
@@ -25,10 +25,14 @@ fn writeScalarC(generated: ScalarIntC): null! {
 }
 
 fn BootstrapEntry(&command: str, &path: str, &symbol: str): null! {
-    if (command == "check-project" || command == "emit-project") {
+    if (command == "check-project" || command == "emit-project" || command == "emit-program") {
         project = readProject(path)?
         if (command == "emit-project") {
             return writeScalarC(EmitScalarProjectC(project, symbol)?)
+        }
+        if (command == "emit-program") {
+            print(EmitScalarProjectProgramC(project)?)
+            return ok(null)
         }
         BindProjectModules(project)?
         return ok(null)
