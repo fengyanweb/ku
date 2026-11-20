@@ -111,6 +111,34 @@ fn deferredMessage(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &la
     return ok(ManagedErrorEmission { prep: prep, declarations: declarations, after_cleanup: finish })
 }
 
+fn ManagedDeferredMessageId(&nodes: [Node], &edges: [int], &literal: Node): int {
+    if (literal.kind != "ObjectLiteral") { return 0 }
+    index = 0
+    while (index < literal.edge_count) {
+        field = nodes[edges[literal.first_edge + index] - 1].clone()
+        if (field.kind == "ObjectLiteralField" && field.text == "message" && field.edge_count == 1) {
+            value = edges[field.first_edge]
+            if (nodes[value - 1].kind == "Call") { return value }
+        }
+        index = index + 1
+    }
+    return 0
+}
+
+fn ManagedDeferredMessageCalls(&nodes: [Node], &edges: [int], &function: Node): [int] {
+    calls: [int] = []
+    index = 0
+    while (index < nodes.len()) {
+        if (nodes[index].kind == "Fail" && nodes[index].offset >= function.offset &&
+            nodes[index].end_offset <= function.end_offset && nodes[index].edge_count == 1) {
+            id = ManagedDeferredMessageId(nodes, edges, nodes[edges[nodes[index].first_edge] - 1])
+            if (id != 0) { calls = calls.push(id) }
+        }
+        index = index + 1
+    }
+    return calls
+}
+
 fn LowerManagedRecordError(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
                            &leaves: [GuardLeaf], &literal: Node, id: int, &indent: str): ManagedErrorEmission! {
     if (literal.kind != "ObjectLiteral" || literal.edge_count != 3) {

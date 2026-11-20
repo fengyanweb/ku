@@ -13,12 +13,14 @@ import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType } from ".
 import { ManagedExplicitType, ManagedType } from "./managed_array_values_c.ku"
 import { EmitManagedBlock, EmitManagedResultBlock, ManagedBlock } from "./managed_array_body_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
+import { OwnedScalarLeaves, ReadOwnedScalarLeaves } from "./struct_result_link_c.ku"
 import { BuiltinLinkPlanType, EmptyLinkPlanDeclaration, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
 
 struct ManagedArrayC {
     symbol: str
     source: str
     entry_plan: LinkPlanDeclaration
+    link_plan: [LinkPlanDeclaration]
 }
 
 struct ManagedLayoutOutput {
@@ -177,6 +179,9 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     root = ManagedType { layout: result.layout, array: array, string_locals: false, source_strings: false, leaves: [] }
     signature = readParameters(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, root, ordered, function, edge)?
     root.source_strings = signature.source_strings
+    leaves = OwnedScalarLeaves { bindings: [], declarations: "", plan: [] }
+    if (checked) { leaves = ReadOwnedScalarLeaves(named, types, layouts, function, true)? }
+    root.leaves = leaves.bindings
     body = managedBody(named, types, imports, supplied, layouts, root, signature.bindings.clone(),
         signature.body_start, function.first_edge + function.edge_count, checked)?
     if (!body.returns) { RejectLayout("managed_fallthrough", "every path must return an array owner", DeclarationSpan(function))? }
@@ -195,7 +200,7 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
         text += StructResultHeader() + EmitStructArrayResultHeader(root.array.array_type)
         result_type = "KuBootstrapResult_" + result_type
     }
-    text += result_type.clone() + " " + symbol.clone() + "(" + signature.parameters.clone() + ") {\n"
+    text += leaves.declarations + result_type.clone() + " " + symbol.clone() + "(" + signature.parameters.clone() + ") {\n"
     text += "    " + result_type.clone() + " result = {0};\n"
     text += "    int array_status = KU_STRUCT_ARRAY_OK;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n"
     if (signature.source_strings) {
@@ -204,13 +209,14 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
         if (body.code.uses_eq) { text += "    (void)ku_guard_string_array_equal;\n" }
     }
     if (arithmetic) { text += "    bool overflow = false;\n" }
+    if (body.error_exits != "") { text += "    int record_error = 0;\n" }
     text += signature.unused + body.declarations + body.code.text
     text += "cleanup:\n" + body.drops + signature.drops
     if (signature.source_strings) { text += ManagedSourceCharactersErrors() + GuardArrayErrorC() }
     if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    text += managedArrayErrors() + "    return result;\n}\n"
+    text += managedArrayErrors() + body.error_exits + "    return result;\n}\n"
     plan = managedPlan(layouts, signature, result.layout, result_type, symbol.clone(), function_id, checked)
-    return ok(ManagedArrayC { symbol: symbol, source: text, entry_plan: plan })
+    return ok(ManagedArrayC { symbol: symbol, source: text, entry_plan: plan, link_plan: leaves.plan })
 }
 
 fn EmitManagedArrayC(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
@@ -225,5 +231,5 @@ fn EmitManagedArrayC(&named: NamedModule, &types: [TypeNameBinding], &imports: [
     }
     start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
     RejectLayout("unknown_managed_function", "undefined managed function '" + function_name.clone() + "'", start)?
-    return ok(ManagedArrayC { symbol: "", source: "", entry_plan: EmptyLinkPlanDeclaration() })
+    return ok(ManagedArrayC { symbol: "", source: "", entry_plan: EmptyLinkPlanDeclaration(), link_plan: [] })
 }

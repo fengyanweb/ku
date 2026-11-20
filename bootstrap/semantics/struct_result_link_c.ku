@@ -4,6 +4,7 @@ import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression, GuardLeaf } from "./guarded_struct_expr.ku"
 import { GuardParameterType } from "./guarded_struct_c.ku"
+import { ManagedDeferredMessageCalls } from "./guarded_string_parts.ku"
 import { AddGuardCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
@@ -139,13 +140,20 @@ fn ownedScalarLeafId(&named: NamedModule, &call: Node): int {
     return resultFunctionNode(named, target.text)
 }
 
-fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layouts: [StructLayout], &function: Node): OwnedScalarLeaves! {
+fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layouts: [StructLayout],
+                         &function: Node, message_only: bool): OwnedScalarLeaves! {
     output = OwnedScalarLeaves { bindings: [], declarations: "", plan: [] }
+    calls: [int] = []
+    if (message_only) {
+        calls = ManagedDeferredMessageCalls(named.parsed.arena.nodes, named.parsed.arena.edges, function)
+        if (calls.len() == 0) { return ok(output) }
+    }
     emitted: [int] = []
     index = 0
     while (index < named.parsed.arena.nodes.len()) {
-        call = named.parsed.arena.nodes[index].clone()
         index = index + 1
+        if (message_only && !ContainsIndex(calls, index)) { continue }
+        call = named.parsed.arena.nodes[index - 1].clone()
         if (call.offset < function.offset || call.end_offset > function.end_offset) { continue }
         id = ownedScalarLeafId(named, call)
         if (id == 0 || ContainsIndex(emitted, id)) { continue }
@@ -156,6 +164,7 @@ fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layout
         if (named.parsed.arena.nodes[result - 1].kind != "TypeName") { continue }
         selected = ExplicitType(types, result, DeclarationSpan(named.parsed.arena.nodes[result - 1]))?
         string_result = selected.name == "str"
+        if (message_only && !string_result) { continue }
         if (selected.declaration_kind != "Builtin" || (!string_result && selected.name != "int" && selected.name != "bool")) { continue }
         view_predicate = false
         owned_string = false

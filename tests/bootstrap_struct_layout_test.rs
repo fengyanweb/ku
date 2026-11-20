@@ -1604,6 +1604,15 @@ fn ReadLocal(source: str): [SourceLength]! {
     }
     return ok(entries)
 }
+fn Describe(message: str, count: int): str {
+    return message + str(count)
+}
+fn DescribeLocal(source: str): [SourceLength]! {
+    entries: [SourceLength] = []
+    characters: [str] = source.chars()
+    count = characters.len()
+    fail { domain: "test", code: "count", message: Describe("size=", count) }
+}
 "#,
     )
     .unwrap();
@@ -1632,6 +1641,7 @@ fn ReadLocal(source: str): [SourceLength]! {
     assert!(plan.contains(
         r#""kind":"Builtin","source_name":"str","source_path":null,"node":0,"c_type":"KuProjectionString","passing":"value""#
     ));
+    assert!(plan.contains(r#""dependencies":[]"#));
 
     fs::write(cwd.join("function.txt"), "ReadLocal").unwrap();
     fs::write(cwd.join("mode.txt"), "managed").unwrap();
@@ -1658,6 +1668,26 @@ fn ReadLocal(source: str): [SourceLength]! {
     assert!(replacement[branch..compare].contains("array_match"));
     assert!(cleanup.contains("ku_managed_source_drop(&l"));
     assert!(cleanup.contains("array_failure.code == 2"));
+
+    fs::write(cwd.join("function.txt"), "DescribeLocal").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    assert!(text.contains("extern KuProjectionString ku_str_"));
+    let cleanup = text.split_once("cleanup:\n").unwrap().1;
+    let message = cleanup.find("result.error.message = ku_str_").unwrap();
+    assert!(cleanup[..message].contains("ku_managed_source_drop(&l"));
+    assert!(cleanup[..message].contains("ku_projection_string_drop(&a0)"));
+    fs::write(cwd.join("mode.txt"), "managed-plan").unwrap();
+    let plan = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plan);
+    let plan = String::from_utf8(plan.stdout).unwrap();
+    let dependencies = plan.split_once(r#""dependencies":["#).unwrap().1;
+    assert!(dependencies.contains(r#""source_name":"Describe","symbol":"ku_str_"#));
+    assert_eq!(
+        dependencies.matches(r#""source_name":"Describe"#).count(),
+        1
+    );
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {

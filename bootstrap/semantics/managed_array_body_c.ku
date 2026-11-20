@@ -12,7 +12,7 @@ import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, Guar
 import { AddGuardCode, EmitManagedAssignment, EmitManagedStringAppend, JoinManagedCode, ManagedBlank, ManagedCode, ManagedExpression, ManagedType } from "./managed_array_values_c.ku"
 import { HasScalarBuiltin } from "./scalar_int_operands.ku"
 import { ScalarStaticErrorFields } from "./scalar_result_null.ku"
-import { LowerManagedRecordError } from "./guarded_string_parts.ku"
+import { LowerManagedRecordError, ManagedDeferredMessageId } from "./guarded_string_parts.ku"
 
 struct ManagedBlock {
     code: ManagedCode
@@ -95,18 +95,18 @@ fn emitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
             }
             code.text = code.text + managedReturn(named.parsed.arena.nodes, named.parsed.arena.edges, locals, root, statement, indent, checked, can_use_ok)?
             returns = true
-        } else if (root.string_locals && statement.kind == "Fail" && statement.edge_count == 1) {
+        } else if ((root.string_locals || checked) && statement.kind == "Fail" && statement.edge_count == 1) {
             failure = named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge] - 1].clone()
-            lowered = LowerManagedRecordError(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts,
-                root.leaves, failure, statement_id, indent)?
-            code = AddGuardCode(code, lowered.prep)
-            declarations += lowered.declarations
-            error_exits += lowered.after_cleanup
-            returns = true
-        } else if (checked && statement.kind == "Fail" && statement.edge_count == 1) {
-            failure = named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge] - 1].clone()
-            fields = ScalarStaticErrorFields(named.parsed.arena.nodes, named.parsed.arena.edges, failure, "KuProjectionString")?
-            code.text = code.text + indent.clone() + "result.error = (KuBootstrapError){" + fields + "};\n" + indent.clone() + "goto cleanup;\n"
+            if (root.string_locals || ManagedDeferredMessageId(named.parsed.arena.nodes, named.parsed.arena.edges, failure) != 0) {
+                lowered = LowerManagedRecordError(named.parsed.arena.nodes, named.parsed.arena.edges, locals, layouts,
+                    root.leaves, failure, statement_id, indent)?
+                code = AddGuardCode(code, lowered.prep)
+                declarations += lowered.declarations
+                error_exits += lowered.after_cleanup
+            } else {
+                fields = ScalarStaticErrorFields(named.parsed.arena.nodes, named.parsed.arena.edges, failure, "KuProjectionString")?
+                code.text = code.text + indent.clone() + "result.error = (KuBootstrapError){" + fields + "};\n" + indent.clone() + "goto cleanup;\n"
+            }
             returns = true
         } else if (root.string_locals && statement.kind == "CompoundAssign" && statement.text == "+" && statement.edge_count == 2) {
             update = EmitManagedStringAppend(named, locals, layouts, root, statement, indent)?

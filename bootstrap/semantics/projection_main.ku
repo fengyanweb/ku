@@ -50,7 +50,7 @@ fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &
     }
     if (mode == "managed") {
         generated = EmitManagedArrayC(selected.named, types, imports, supplied, layouts, function)?
-        if (link_plan) { print(EmitLinkPlan(supplied, mode, generated.entry_plan, [])?) }
+        if (link_plan) { print(EmitLinkPlan(supplied, mode, generated.entry_plan, generated.link_plan)?) }
         else { print(generated.source) }
         return ok(null)
     }

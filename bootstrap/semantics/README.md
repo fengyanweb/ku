@@ -310,6 +310,11 @@ imported call with `items = Read(...) ?`, then read its length or elements.
 The caller releases initialized arrays on success and when a later Result
 fails. The link plan matches the producer and consumer by the element's
 nominal declaration.
+A managed Result can format its Error message through a typed same-module
+provider. The generated function snapshots integer arguments, releases its
+local arrays and strings, then transfers the provider's returned string into
+the Error. The provider is recorded as a dependency in the link plan.
+
 Linked checked bodies can use nested readonly guards with local bindings.
 Fallthrough releases a branch's local owners at the closing brace. An early
 return or failure transfers its selected Result through the same cleanup as
