@@ -60,6 +60,50 @@ fn main(): null! {
 }
 
 #[test]
+fn native_only_bytes_is_diagnosed_after_resolving_an_imported_call() {
+    let dir = unique_temp_path("native-only-bytes");
+    fs::create_dir(&dir).expect("create import fixture");
+    let helper = r#"import { bytes } from "std"
+fn Encoded(text: str): int! {
+    packed = bytes.from_str(text)?
+    return ok(packed.len())
+}
+"#;
+    fs::write(dir.join("helper.ku"), helper).expect("write imported function");
+    let entry = dir.join("main.ku");
+    let source = r#"import { Encoded as Count } from "./helper.ku"
+fn main(): null! { println(Count("中文🙂")?) return ok(null) }
+"#;
+    fs::write(&entry, source).expect("write entry");
+    let checked = check_source(entry.to_str().unwrap(), source);
+    let result = run_source(entry.to_str().unwrap(), source);
+    fs::remove_dir_all(dir).expect("remove import fixture");
+    checked.expect("the same program must remain valid for the native backend");
+    let error = result.expect_err("bytes needs native C").to_string();
+    assert!(
+        error.contains("std.bytes currently requires native C"),
+        "{error}"
+    );
+    assert!(error.contains("ku build --backend c"), "{error}");
+
+    let shadowed = format!(
+        r#"{helper}
+fn main() {{
+    bytes = {{from_str: fn(text: str): int {{ return len(text) }}}}
+    if (bytes.from_str("hi") != 2) {{ panic("local callable was not used") }}
+}}
+"#
+    );
+    run_source("shadowed.ku", &shadowed).expect("a local callable can shadow std.bytes");
+    assert!(
+        run_err(r#"fn main(): null! { bytes.from_str("hi")? return ok(null) }"#)
+            .contains("std module 'bytes' must be imported")
+    );
+    assert!(run_err("fn main() { print(ordinary_missing) }")
+        .contains("undefined variable 'ordinary_missing'"));
+}
+
+#[test]
 fn std_string_array_json_and_time_check_and_run() {
     let source = r#"
 fn main(): null! {

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::{
     ast::{Expr, ExprKind},
-    error::KuResult,
+    error::{KuError, KuResult},
     span::Span,
     value::Value,
 };
@@ -56,6 +56,12 @@ pub fn eval_dotted_builtin(
         "object" => object::eval(&function, args, span),
         "time" => time::eval(&function, args, span),
         "http" => http::eval(&function, args, span),
+        "bytes" if metadata::dotted_signature(&module, &function).is_some() => {
+            Err(KuError::runtime(
+                "std.bytes currently requires native C; use `ku build --backend c`",
+                span,
+            ))
+        }
         _ => Ok(None),
     }
 }
