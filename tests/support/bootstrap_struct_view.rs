@@ -424,3 +424,64 @@ pub(super) fn assert_checked_int_view(seed: &Path, cwd: &Path) {
     assert!(wrong.stdout.is_empty());
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("linked_argument_type"));
 }
+
+const FIELD_CLONE_SOURCE: &str = r#"struct Stamp { value: int }
+struct Index { stamp: Stamp offsets: [int] }
+struct Wrapped { index: Index }
+fn See(value: int): null! { return ok(null) }
+fn Clone(&owner: Wrapped, stamp: Stamp): null! {
+    copied = stamp.clone()
+    See(copied.value)?
+    return ok(null)
+}
+fn Refuse(&values: [Wrapped]): null! {
+    copied = values[0].clone()
+    return ok(null)
+}
+"#;
+
+pub(super) fn assert_checked_field_clone(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("field-clone.ku"), FIELD_CLONE_SOURCE).unwrap();
+    fs::write(cwd.join("modules.txt"), "field-clone.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Clone").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (entry, params) = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResultNull ku_linked_null_"))
+        .unwrap()
+        .split_once("(const ")
+        .unwrap();
+    let (owner, stamp) = params.split_once("* a0, ").unwrap();
+    let (stamp, _) = stamp.split_once(' ').unwrap();
+    let see = code
+        .lines()
+        .find_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    assert!(!code.contains("_clone_element"));
+    let c = cwd.join("field-clone.c");
+    let exe = cwd.join(format!("field-clone{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &c,
+        format!(
+            "#include <assert.h>\n{code}\n\
+            KuBootstrapResultNull {see}(int64_t v) {{ assert(v == 47); return (KuBootstrapResultNull){{.ok = true}}; }}\n\
+            int main(void) {{ {owner} owner = {{0}}; {stamp} stamp = {{47}}; \
+            assert(ku_linked_null_{entry}(&owner, stamp).ok); return 0; }}\n"
+        ),
+    )
+    .unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+
+    fs::write(cwd.join("function.txt"), "Refuse").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_nested_array_clone"));
+}

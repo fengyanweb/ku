@@ -4264,4 +4264,5 @@ int main(int argc, char **argv) {
     linked_guard::assert_linked_call_addition(&compiler, &cwd);
     linked_guard::assert_decorated_caught_error(&compiler, &cwd);
     struct_view::assert_checked_int_view(&compiler, &cwd);
+    struct_view::assert_checked_field_clone(&compiler, &cwd);
 }

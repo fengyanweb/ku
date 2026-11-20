@@ -7,6 +7,7 @@ import { ContainsIndex } from "./struct_projection_c.ku"
 import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, RememberLinkedCall, LinkedNullBinding, LinkedOkAvailable, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedViewPointee } from "./link_plan_c.ku"
 import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
+import { HasBoundArrayMembers } from "./struct_array_c.ku"
 import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, LinkedNullDropC, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, EmitLinkedAddition, LowerLinkedNullLeaf,
@@ -36,10 +37,10 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     if (ty.declaration_kind != "Struct") {
         RejectLayout("unsupported_linked_clone", "expected str or a finite struct for clone", DeclarationSpan(subject))?
     }
-    if (LayoutIndex(source.state.owning_layouts, ty.module_index, ty.declaration_node) != 0) {
+    layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
+    if (HasBoundArrayMembers(source.state.layouts, layout)) {
         RejectLayout("linked_nested_array_clone", "a struct with nested owning arrays does not yet support clone", ty.span.clone())?
     }
-    layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
     output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
     if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
         output.state.code += "    " + output.value.text.clone() + " = " + source.value.text + ";\n"
