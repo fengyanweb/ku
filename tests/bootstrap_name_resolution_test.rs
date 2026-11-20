@@ -297,6 +297,55 @@ fn main() { println(Parameter(Two) + Binding() + Nested() + One(6)) }
         "{message}"
     );
 
+    let worker = project.join("worker.ku");
+    let worker_source = "async fn Work(amount: int): int! { return ok(amount) }\n";
+    fs::write(&worker, worker_source).unwrap();
+    fs::write(&manifest, "main.ku\nworker.ku\n").unwrap();
+    let async_calls = r#"
+import { Work as Start } from "./worker"
+async fn main(): null! {
+    pending = Start(3)
+    return ok(null)
+}
+"#;
+    fs::write(&main, async_calls).unwrap();
+    assert_success(&run(Command::new(ku).arg("check").arg(&main), cwd, 20));
+    let accepted = run(&mut Command::new(executable), cwd, 20);
+    assert_success(&accepted);
+    assert!(
+        String::from_utf8_lossy(&accepted.stdout).contains("IMPORT|main.ku|Start|worker.ku|Work|")
+    );
+
+    for (source, code) in [
+        (async_calls.replace("Start(3)", "Start()"), "|call_arity|"),
+        (
+            async_calls.replace("Start(3)", "Start(\"bad\")"),
+            "|call_argument_type|",
+        ),
+    ] {
+        fs::write(&main, source).unwrap();
+        let rust = run(Command::new(ku).arg("check").arg(&main), cwd, 20);
+        assert_eq!(rust.status.code(), Some(1));
+        let rejected = run(&mut Command::new(executable), cwd, 20);
+        assert_eq!(rejected.status.code(), Some(1));
+        let message = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            message.starts_with("main.ku: ") && message.contains(code),
+            "{message}"
+        );
+    }
+    fs::write(&main, async_calls).unwrap();
+    fs::write(&worker, worker_source.replace("amount", "__ku_amount")).unwrap();
+    let rust = run(Command::new(ku).arg("check").arg(&main), cwd, 20);
+    assert_eq!(rust.status.code(), Some(1));
+    let rejected = run(&mut Command::new(executable), cwd, 20);
+    assert_eq!(rejected.status.code(), Some(1));
+    let message = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        message.starts_with("worker.ku: ") && message.contains("|reserved_name|"),
+        "{message}"
+    );
+
     fs::write(
         project.join("parameters.ku"),
         r#"

@@ -40,12 +40,16 @@ fn CheckReserved(&name: str, span: Span): null! {
     return ok(null)
 }
 
+fn IsNamedFunction(&kind: str): bool {
+    return kind == "Function" || kind == "AsyncFunction"
+}
+
 fn CheckSignatureBindings(&nodes: [Node], &edges: [int], &item: Node): null! {
     item_span = DeclarationSpan(item)
     index = 0
     while (index < item.edge_count) {
         child = nodes[edges[item.first_edge + index] - 1].clone()
-        if (item.kind == "Function" && child.kind == "Parameter") {
+        if (IsNamedFunction(item.kind) && child.kind == "Parameter") {
             CheckReserved(child.text, DeclarationSpan(child))?
         } else if (item.kind == "Struct" && child.kind == "StructField") {
             CheckReserved(child.text, item_span.clone())?
@@ -86,7 +90,7 @@ fn CollectNames(&nodes: [Node], &edges: [int], root: int): ModuleNameTable! {
             imports = imports.push(node_id)
         } else {
             span = DeclarationSpan(item)
-            if (item.kind != "Module" && item.kind != "Function" && item.kind != "Struct" && item.kind != "Enum") {
+            if (item.kind != "Module" && !IsNamedFunction(item.kind) && item.kind != "Struct" && item.kind != "Enum") {
                 RejectName("invalid_module_tree", "unsupported top-level AST item '" + item.kind.clone() + "'", span.clone())?
             }
             if (item.kind != "Module") {

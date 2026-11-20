@@ -1,7 +1,7 @@
 import "std.string"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
-import { DeclarationSpan, NamedModule, RejectName, TopLevelName } from "./names.ku"
+import { DeclarationSpan, IsNamedFunction, NamedModule, RejectName, TopLevelName } from "./names.ku"
 import { ResolveProjectImport } from "./project_paths.ku"
 
 struct SuppliedModule {
@@ -55,6 +55,10 @@ fn FindModule(&supplied: [SuppliedModule], &path: str, at: Span): int! {
     return ok(found)
 }
 
+fn isExportKind(&kind: str): bool {
+    return IsNamedFunction(kind) || kind == "Struct" || kind == "Enum"
+}
+
 fn FindExport(&declarations: [TopLevelName], &request: str, at: Span): int! {
     if (declarations.len() > 255) {
         RejectName("item_limit", "supplied module accepts at most 255 declarations", at)?
@@ -65,7 +69,7 @@ fn FindExport(&declarations: [TopLevelName], &request: str, at: Span): int! {
     index = 0
     while (index < declarations.len()) {
         entry = declarations[index].clone()
-        if (entry.name == request && (entry.kind == "Function" || entry.kind == "Struct" || entry.kind == "Enum")) {
+        if (entry.name == request && isExportKind(entry.kind)) {
             return ok(entry.node)
         }
         index = index + 1
@@ -77,7 +81,7 @@ fn ResolveSuppliedExport(&supplied: NamedModule, &request: str, at: Span): int! 
     node = FindExport(supplied.names.declarations, request, at.clone())?
     if (node == 0) { return ok(0) }
     target = ReadImportNode(supplied.parsed.arena.nodes, node, at.clone())?
-    if (target.text != request || (target.kind != "Function" && target.kind != "Struct" && target.kind != "Enum")) {
+    if (target.text != request || !isExportKind(target.kind)) {
         RejectName("invalid_module_tree", "supplied export does not match its declaration", at)?
     }
     return ok(node)

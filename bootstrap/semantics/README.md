@@ -13,7 +13,8 @@ ku build --release main.ku -o ku-names
 Pass `-o ku-names.exe` on Windows and run `.\ku-names.exe` in PowerShell.
 
 The tool builds a declaration table from the Stage 3 parser's bounded AST.
-Functions, structs, enums and module declarations share one namespace. Rows
+Sync functions, async functions, structs, enums and module declarations share
+one namespace. Async declarations keep their own AST and name-table kind. Rows
 appear in source order and include their arena node ID and source span. The
 pass checks reserved compiler names in declarations and signature bindings.
 Errors include the source position.
@@ -66,7 +67,9 @@ to lexical binding and expression type checking. A call-count error carries
 the source path and the full call span. Once the arity matches, a scalar
 literal passed directly to a parameter with an explicit scalar or scalar union
 annotation must match one of its types. A mismatch points at the argument.
-Arguments that need inference or contextual types remain deferred.
+Arguments that need inference or contextual types remain deferred. Named async
+functions use the same declaration and direct-call checks. The scalar C emitter
+requires synchronous functions.
 For explicit scalar result types and scalar unions, literal returns use the
 same check. Control blocks share the surrounding function's result type.
 Nested functions and function expressions use their own annotations.

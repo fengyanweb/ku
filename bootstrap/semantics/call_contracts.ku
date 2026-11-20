@@ -1,5 +1,5 @@
 import { Node } from "../stage2/ast.ku"
-import { DeclarationSpan, NamedModule, RejectName } from "./names.ku"
+import { DeclarationSpan, IsNamedFunction, NamedModule, RejectName } from "./names.ku"
 import { ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
 
 struct DirectSignature {
@@ -56,7 +56,7 @@ fn directSignatures(&named: NamedModule, &imports: [ImportBinding], &supplied: [
     signatures: [DirectSignature] = []
     index = 0
     while (index < named.names.declarations.len()) {
-        if (named.names.declarations[index].kind == "Function") {
+        if (IsNamedFunction(named.names.declarations[index].kind)) {
             id = named.names.declarations[index].node
             signature = directSignature(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.nodes[id - 1],
                                         named.names.declarations[index].name.clone())
@@ -70,7 +70,7 @@ fn directSignatures(&named: NamedModule, &imports: [ImportBinding], &supplied: [
         if (module_index > 0) {
             source = ReadImportNode(supplied[module_index - 1].named.parsed.arena.nodes,
                                     imports[index].target_node, imports[index].span.clone())?
-            if (source.kind == "Function") {
+            if (IsNamedFunction(source.kind)) {
                 signature = directSignature(supplied[module_index - 1].named.parsed.arena.nodes,
                                             supplied[module_index - 1].named.parsed.arena.edges, source,
                                             imports[index].local_name.clone())
@@ -102,7 +102,7 @@ fn containsName(&names: [str], &name: str): bool {
 
 fn couldBindLocal(&kind: str): bool {
     return kind == "Parameter" || kind == "VarDecl" || kind == "Assign"
-        || kind == "For" || kind == "CatchBinding" || kind == "Function"
+        || kind == "For" || kind == "CatchBinding" || IsNamedFunction(kind)
         || kind == "ObjectDestructureLocal" || kind == "ObjectDestructureRest"
 }
 
@@ -232,7 +232,7 @@ fn CheckDirectCallContracts(&named: NamedModule, &imports: [ImportBinding], &sup
     if (signatures.len() == 0) { return ok(null) }
     index = 0
     while (index < named.names.declarations.len()) {
-        if (named.names.declarations[index].kind == "Function") {
+        if (IsNamedFunction(named.names.declarations[index].kind)) {
             function = named.names.declarations[index].node
             checkFunctionCalls(named.parsed.arena.nodes, named.parsed.arena.edges, signatures, function)?
         }
@@ -245,7 +245,7 @@ fn CheckLiteralResultContracts(&named: NamedModule): null! {
     index = 0
     while (index < named.parsed.arena.nodes.len()) {
         node = named.parsed.arena.nodes[index].clone()
-        if (node.kind == "Function" || node.kind == "FunctionExpr") {
+        if (IsNamedFunction(node.kind) || node.kind == "FunctionExpr") {
             checkLiteralReturns(named.parsed.arena.nodes, named.parsed.arena.edges, node)?
         }
         index = index + 1
