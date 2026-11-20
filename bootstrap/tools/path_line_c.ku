@@ -58,7 +58,7 @@ fn requireNamespace(&project: LinkedNullProject, &line: str, &context: str, &ent
     require(line != context && line != "string" && context != "string" && line != "ok" && context != "ok",
         entry, "parameters must leave string and ok unshadowed")?
     string_bound = false
-    for binding in project.binding[0].imports.clone() {
+    for binding in project.binding.modules[0].imports.clone() {
         require(binding.local_name != "ok", entry, "an import shadows the ok constructor")?
         if (binding.local_name == "string" && binding.source_name == "string" && binding.module_index == 0) { string_bound = true }
     }
@@ -171,7 +171,7 @@ fn emitLine(&plan: PathLinePlan, &symbol: str, &context_type: str, layouts: str)
 
 fn EmitPathLineC(&supplied: [SuppliedModule], &name: str): PathLineC! {
     bound = BindProjectModules(supplied)?
-    project = LinkedNullProject { supplied: supplied.clone(), binding: bound.modules }
+    project = LinkedNullProject { supplied: supplied.clone(), binding: bound }
     id = LinkedNullEntry(project, name)?
     entry = LinkedNullNode(project, 1, id)
     shape(entry, "Function", 7)?
