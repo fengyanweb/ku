@@ -2,8 +2,13 @@ import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { TypeNameBinding } from "./type_names.ku"
-import { RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType } from "./guarded_struct_expr.ku"
+import { FieldIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { GuardOwnedDrops } from "./guarded_struct_c.ku"
+import { LinkPlanDeclaration } from "./link_plan_c.ku"
+import { OrderCStructLayouts } from "./nested_struct_c.ku"
+import { ContainsIndex, EmitLayout } from "./struct_projection_c.ku"
+import { LowerOwnedRecordCall, OwnedRecordCall } from "./struct_result_link_c.ku"
+import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType } from "./guarded_struct_expr.ku"
 import { AddGuardCode, EmitManagedAssignment, EmitManagedStringAppend, JoinManagedCode, ManagedBlank, ManagedCode, ManagedExpression, ManagedType } from "./managed_array_values_c.ku"
 
 struct ManagedBlock {
@@ -122,4 +127,114 @@ fn EmitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     }
     if (!returns && (!root.string_locals || depth != 0)) { code.text = code.text + scope_drops }
     return ok(ManagedBlock { code: code, declarations: declarations, drops: drops, returns: returns, bindings: locals })
+}
+
+struct OwnedRecordPattern {
+    code: str
+    declarations: str
+    drops: str
+    bindings: [GuardBinding]
+}
+
+fn LowerOwnedRecordPattern(&named: NamedModule, &layouts: [StructLayout], &call: OwnedRecordCall,
+                           &statement: Node, &pattern: Node, bindings: [GuardBinding]): OwnedRecordPattern! {
+    if (pattern.kind != "ObjectDestructureAssign" || pattern.edge_count != pattern.int_value + 1 || pattern.int_value < 0) {
+        RejectLayout("record_call_pattern", "consume the checked record with a named field pattern without rest", DeclarationSpan(pattern))?
+    }
+    source = named.parsed.arena.nodes[named.parsed.arena.edges[pattern.first_edge + pattern.int_value] - 1].clone()
+    if (source.kind != "Variable" || source.edge_count != 0 || source.text != statement.text || GuardBindingIndex(bindings, source.text) != 0) {
+        RejectLayout("record_call_pattern", "consume the fresh checked record binding", DeclarationSpan(source))?
+    }
+    locals = bindings
+    code = ""
+    declarations = ""
+    drops = ""
+    seen: [int] = []
+    index = 0
+    while (index < pattern.int_value) {
+        field = named.parsed.arena.nodes[named.parsed.arena.edges[pattern.first_edge + index] - 1].clone()
+        ordinal = FieldIndex(layouts[call.payload_layout - 1].fields, field.text)
+        if (field.kind != "ObjectDestructureBinding" || field.edge_count != 1 || ordinal == 0 || ContainsIndex(seen, ordinal)) {
+            RejectLayout("record_call_field", "expected one declared result field and no default expression", DeclarationSpan(field))?
+        }
+        local_id = named.parsed.arena.edges[field.first_edge]
+        local = named.parsed.arena.nodes[local_id - 1].clone()
+        if (local.kind != "ObjectDestructureLocal" || local.edge_count != 0 || local.int_value < 0 || local.int_value > 1) {
+            RejectLayout("record_call_field", "expected a local or ignored result field", DeclarationSpan(local))?
+        }
+        if (local.int_value == 1) {
+            if (GuardBindingIndex(locals, local.text) != 0) {
+                RejectLayout("record_call_field", "bind the result field to a fresh local", DeclarationSpan(local))?
+            }
+            ty = GuardBoundType(layouts[call.payload_layout - 1].fields[ordinal - 1].resolved, layouts)?
+            if (ty.kind != "int" && ty.kind != "bool" && ty.kind != "str") {
+                RejectLayout("record_call_field", "selected fields require Copy scalars or owned str", DeclarationSpan(field))?
+            }
+            binding = GuardBinding { name: local.text, ty: ty, slot: local_id, parameter: false, view: false }
+            name = GuardBindingName(binding)
+            before = GuardCType(binding.ty, layouts)
+            source_field = call.name.clone() + ".value.f" + str(ordinal - 1)
+            declarations += "    " + before + " " + name.clone() + " = {0};\n"
+            code += "        " + name.clone() + " = " + source_field.clone() + ";\n"
+            if (binding.ty.kind == "str") {
+                code += "        " + source_field + " = (KuProjectionString){0};\n"
+                drops = "    ku_projection_string_drop(&" + name.clone() + ");\n" + drops
+            }
+            code += "        (void)" + name + ";\n"
+            locals = locals.push(binding)
+        }
+        seen = seen.push(ordinal)
+        index = index + 1
+    }
+    return ok(OwnedRecordPattern { code: code, declarations: declarations, drops: drops, bindings: locals })
+}
+
+struct RecordResultPrelude {
+    code: ManagedCode
+    prototype: str
+    declarations: str
+    drops: str
+    bindings: [GuardBinding]
+    plan: [LinkPlanDeclaration]
+    next_edge: int
+}
+
+fn EmitRecordResultPrelude(&named: NamedModule, &types: [TypeNameBinding], &layouts: [StructLayout],
+                     &bindings: [GuardBinding], &declared: [int], start: int, end: int, caller_id: int, call_id: int, layout: int): RecordResultPrelude! {
+    if (call_id == 0) {
+        return ok(RecordResultPrelude { code: ManagedBlank(), prototype: "", declarations: "", drops: "",
+            bindings: bindings.clone(), plan: [], next_edge: start })
+    }
+    statement = named.parsed.arena.nodes[named.parsed.arena.edges[start] - 1].clone()
+    if (start + 1 >= end) {
+        RejectLayout("record_call_pattern", "consume the checked result in a following field pattern", DeclarationSpan(statement))?
+    }
+    call = LowerOwnedRecordCall(named, types, layouts, bindings, caller_id, call_id)?
+    binding = LowerOwnedRecordPattern(named, layouts, call, statement,
+        named.parsed.arena.nodes[named.parsed.arena.edges[start + 1] - 1], bindings.clone())?
+    order = OrderCStructLayouts(layouts, layouts[call.payload_layout - 1].module_index, layouts[call.payload_layout - 1].node, DeclarationSpan(statement))?
+    header = ""
+    for entry in order.entries {
+        if (!ContainsIndex(declared, entry.layout_index)) {
+            header += EmitLayout(layouts[entry.layout_index - 1], true, true)?
+        }
+    }
+    if (call.payload_layout != layout) {
+        header += "typedef struct { bool ok; " + call.payload_type.clone() + " value; KuBootstrapError error; } " + call.result_type.clone() + ";\n"
+    }
+    code = call.code
+    name = call.name
+    code.text = code.text + "    if (" + name.clone() + ".ok) {\n" + binding.code + "    } else {\n"
+    code.text = code.text + "        result.error = " + name.clone() + ".error;\n"
+    code.text = code.text + "        " + name.clone() + ".error = (KuBootstrapError){0};\n    }\n"
+    // Clear unselected payload owners on either result edge, including an
+    // error carrying a partially initialized record. Selected owners have
+    // already been cleared in the child carrier before this drop.
+    code.text = code.text + GuardOwnedDrops(layouts, call.payload_layout, name.clone() + ".value")
+    code.text = code.text + "    ku_projection_string_drop(&" + name.clone() + ".error.domain);\n"
+    code.text = code.text + "    ku_projection_string_drop(&" + name.clone() + ".error.code);\n"
+    code.text = code.text + "    ku_projection_string_drop(&" + name.clone() + ".error.message);\n"
+    code.text = code.text + "    if (!" + name + ".ok) goto cleanup;\n"
+    return ok(RecordResultPrelude { code: code, prototype: header + call.prototype, declarations: binding.declarations,
+        drops: binding.drops, bindings: binding.bindings, plan: [call.plan], next_edge: start + 2 })
 }

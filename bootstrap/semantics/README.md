@@ -265,6 +265,14 @@ identify dependencies that must be linked as C functions with the bound ABI.
 The struct Result owns one successful payload or one Error. Moving the result
 clears the source record before cleanup.
 
+`struct-result` also accepts an initial checked call to a declared same-module
+record `Result`, followed by a consuming named-field pattern. Call arguments
+use matching Copy values, literals, and existing Views. The pattern can rename
+or ignore fields and takes selected `str` owners directly. The caller releases
+unselected fields and propagates the original Error on failure. The typed
+link plan records the provider and its nominal result. Patterns with defaults
+or `...rest` and record Results retained for later use remain outside this subset.
+
 Use `project-fields` to emit a bound field projection such as `SpanFromToken`
 from the project manifest. `linked-null` emits an original `null!` function
 such as `RejectAt`. It evaluates bound call arguments in source order and

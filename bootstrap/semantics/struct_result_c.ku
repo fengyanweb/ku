@@ -10,9 +10,9 @@ import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projectio
 import { GuardArithmetic, GuardArrayErrorC, GuardOwnedDrops, GuardParameterType, GuardStringArrayC, GuardStringEquality } from "./guarded_struct_c.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression } from "./guarded_struct_expr.ku"
 import { AddGuardCode, JoinManagedCode, ManagedBlank, ManagedCode, ManagedStringRuntime, ManagedType } from "./managed_array_values_c.ku"
-import { EmitManagedBlock } from "./managed_array_body_c.ku"
+import { EmitManagedBlock, EmitRecordResultPrelude } from "./managed_array_body_c.ku"
 import { EmitOwnedStructOperations, EmitTryCloneString, StructArrayC } from "./struct_array_c.ku"
-import { LowerStructResultLink, ReadOwnedScalarLeaves, ResultLinkClonePrefix, WithoutOwnedBinding } from "./struct_result_link_c.ku"
+import { LowerStructResultLink, ReadOwnedScalarLeaves, RecordResultCallId, ResultLinkClonePrefix, WithoutOwnedBinding } from "./struct_result_link_c.ku"
 
 struct StructResultC {
     symbol: str
@@ -31,6 +31,7 @@ struct StructResultSignature {
     body_start: int
     plan: [LinkPlanType]
     string_array: bool
+    layouts: [int]
 }
 
 struct StructResultBody {
@@ -123,7 +124,7 @@ fn readStructResultSignature(&named: NamedModule, &types: [TypeNameBinding], &la
     }
     if (parameters == "") { parameters = "void" }
     return ok(StructResultSignature { bindings: bindings, declarations: declarations, parameters: parameters,
-        unused: unused, drops: drops, body_start: result_edge + 1, plan: plan, string_array: string_array })
+        unused: unused, drops: drops, body_start: result_edge + 1, plan: plan, string_array: string_array, layouts: declared })
 }
 
 fn isBoundOk(&named: NamedModule, &locals: [GuardBinding], &imports: [ImportBinding]): bool {
@@ -268,18 +269,24 @@ fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports
 }
 
 fn emitOwnedResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
-                       &supplied: [SuppliedModule], &layouts: [StructLayout], &function: Node, layout: int,
-                       &signature: StructResultSignature): StructResultBody! {
+                       &supplied: [SuppliedModule], &layouts: [StructLayout], caller_id: int, layout: int,
+                       &signature: StructResultSignature, record_call: int): StructResultBody! {
+    function = named.parsed.arena.nodes[caller_id - 1].clone()
     end = function.first_edge + function.edge_count - 1
+    prelude = EmitRecordResultPrelude(named, types, layouts, signature.bindings, signature.layouts,
+        signature.body_start, end, caller_id, record_call, layout)?
     leaves = ReadOwnedScalarLeaves(named, types, layouts, function)?
     root = ManagedType { layout: 0, array: StructArrayC { element_type: "", array_type: "", prefix: "", source: "" },
         string_locals: true, leaves: leaves.bindings }
-    block = EmitManagedBlock(named, types, imports, supplied, layouts, root, signature.bindings.clone(),
-        signature.body_start, end, 0, "    ")?
+    block = EmitManagedBlock(named, types, imports, supplied, layouts, root, prelude.bindings,
+        prelude.next_edge, end, 0, "    ")?
     result = emitStructReturn(named, imports, supplied, block.bindings, layouts, layout,
         named.parsed.arena.nodes[named.parsed.arena.edges[end] - 1], "    ", true)?
-    return ok(StructResultBody { code: JoinManagedCode(block.code, result), prototype: leaves.declarations, dependency: "",
-        declarations: block.declarations, drops: block.drops, clone_layouts: [], plan: leaves.plan })
+    plan = prelude.plan
+    for leaf in leaves.plan { plan = plan.push(leaf) }
+    return ok(StructResultBody { code: JoinManagedCode(prelude.code, JoinManagedCode(block.code, result)),
+        prototype: prelude.prototype + leaves.declarations, dependency: "", declarations: prelude.declarations + block.declarations,
+        drops: block.drops + prelude.drops, clone_layouts: [], plan: plan })
 }
 
 fn StructResultHeader(): str {
@@ -302,10 +309,12 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     }
     order = orderResultLayout(layouts, inner.layout, DeclarationSpan(outer))?
     signature = readStructResultSignature(named, types, layouts, function, edge, order)?
+    call = RecordResultCallId(named, named.parsed.arena.edges[signature.body_start])
+    managed = signature.string_array || call != 0
     body: StructResultBody = StructResultBody { code: ManagedBlank(), prototype: "", dependency: "", declarations: "",
         drops: "", clone_layouts: [], plan: [] }
-    if (signature.string_array) {
-        body = emitOwnedResultBody(named, types, imports, supplied, layouts, function, inner.layout, signature)?
+    if (managed) {
+        body = emitOwnedResultBody(named, types, imports, supplied, layouts, id, inner.layout, signature, call)?
     } else {
         body = emitStructResultBody(named, types, imports, supplied, layouts, inner.layout, signature.bindings.clone(),
             signature.body_start, function.first_edge + function.edge_count)?
@@ -316,14 +325,15 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     bound = ExplicitType(types, inner_id, DeclarationSpan(outer))?
     plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: signature.plan,
         result: BoundLinkPlanType(bound, 1, result_type.clone(), false), returns_result: true }
-    overflow = body.code.uses_add || body.code.uses_sub || signature.string_array
-    may_allocate = order.contains_string || body.clone_layouts.len() != 0 || signature.string_array
+    overflow = body.code.uses_add || body.code.uses_sub || managed
+    may_allocate = order.contains_string || body.clone_layouts.len() != 0 || managed
     text = ProjectionHeaders(true, true) + "#include <stdio.h>\n\n" + GuardArithmetic(body.code.uses_add, body.code.uses_sub)
     text += GuardStringEquality(body.code.uses_eq || signature.string_array) + signature.declarations + StructResultHeader()
     text += "typedef struct { bool ok; " + struct_type + " value; KuBootstrapError error; } " + result_type.clone() + ";\n\n"
     if (may_allocate) { text += "#include <string.h>\n\n" }
-    if (order.contains_string || signature.string_array) { text += EmitTryCloneString("ku_result_clone_string") }
-    if (signature.string_array) { text += GuardStringArrayC() + ManagedStringRuntime() }
+    if (order.contains_string || managed) { text += EmitTryCloneString("ku_result_clone_string") }
+    if (signature.string_array) { text += GuardStringArrayC() }
+    if (managed) { text += ManagedStringRuntime() }
     for layout in body.clone_layouts {
         text += EmitOwnedStructOperations(layouts, layout, ResultLinkClonePrefix(layout), true)
     }
@@ -338,14 +348,18 @@ fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
     text += "    " + result_type + " result = {0};\n" + signature.unused + body.declarations
     if (may_allocate) { text += "    bool out_of_memory = false;\n" }
     if (overflow) { text += "    bool overflow = false;\n" }
-    if (signature.string_array) {
-        text += "    bool string_too_large = false;\n    KuGuardArrayFailure array_failure = {0};\n"
+    if (managed) {
+        text += "    bool string_too_large = false;\n"
+        if (signature.string_array) { text += "    KuGuardArrayFailure array_failure = {0};\n" }
         text += "    (void)ku_guard_try_mul;\n    (void)ku_managed_string_append;\n"
-        text += "    (void)ku_guard_string_array_equal;\n    (void)ku_result_clone_string;\n"
+        if (signature.string_array) { text += "    (void)ku_guard_string_array_equal;\n" }
+        text += "    (void)ku_result_clone_string;\n"
     }
     text += body.code.text + "cleanup:\n" + body.drops + signature.drops
     if (signature.string_array) {
         text += "    if (array_failure.code) " + drop.clone() + "(&result);\n" + GuardArrayErrorC()
+    }
+    if (managed) {
         text += "    if (string_too_large) { " + drop.clone() + "(&result); fputs(\"string allocation is too large\\n\", stderr); exit(EXIT_FAILURE); }\n"
     }
     if (may_allocate) {

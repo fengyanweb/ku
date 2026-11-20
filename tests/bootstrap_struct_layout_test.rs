@@ -1530,6 +1530,39 @@ fn assert_integer_prefix_projection(seed: &Path, cwd: &Path) {
     assert!(plan.contains(r#""kind":"BuiltinArray","source_name":"str""#));
     assert!(plan.contains(r#""source_name":"IsDigit","symbol":"ku_bool_"#));
     assert!(plan.contains(r#""source_name":"DigitValue","symbol":"ku_int_"#));
+
+    let lexer = cwd.join("stage1/lexer.ku");
+    let source = fs::read_to_string(&lexer).unwrap();
+    let caller = r#"
+fn ObserveNumberPrefix(&characters: [str], length: int, start_index: int, start_line: int,
+                       start_column: int, start_offset: int): ScannedLiteral! {
+    prefix = ScanIntegerPrefix(characters, length, start_index, start_column, start_offset)?
+    {lexeme, int_value, next_index: index, column, offset, overflow: _} = prefix
+    return ok(ScannedLiteral { kind: "Int", lexeme: lexeme, int_value: int_value,
+        next_index: index, line: start_line, column: column, offset: offset })
+}
+"#;
+    fs::write(&lexer, format!("{source}{caller}")).unwrap();
+    fs::write(cwd.join("function.txt"), "ObserveNumberPrefix").unwrap();
+    let plan = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plan);
+    let plan = String::from_utf8(plan.stdout).unwrap();
+    assert!(plan.contains(r#""source_name":"ScanIntegerPrefix","symbol":"ku_struct_result_"#));
+    fs::write(cwd.join("mode.txt"), "struct-result").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let (transfer, clear) = text
+        .lines()
+        .zip(text.lines().skip(1))
+        .find(|(line, _)| line.starts_with("        result.error = record_result"))
+        .expect("the caller moves the exact child Error carrier");
+    let error = transfer
+        .strip_prefix("        result.error = ")
+        .and_then(|value| value.strip_suffix(';'))
+        .unwrap();
+    assert_eq!(clear, format!("        {error} = (KuBootstrapError){{0}};"));
+    assert!(text.contains(".value.f0 = (KuProjectionString){0};"));
 }
 
 fn assert_constructor_view(seed: &Path, cwd: &Path) {

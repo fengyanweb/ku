@@ -3,9 +3,10 @@ import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardCloneSource, GuardExplicitType, GuardExpression, GuardLeaf } from "./guarded_struct_expr.ku"
+import { GuardParameterType } from "./guarded_struct_c.ku"
 import { AddGuardCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 import { ScalarSymbol } from "./scalar_int_emit.ku"
 
 struct OwnedScalarLeaves {
@@ -25,6 +26,16 @@ struct StructResultLink {
     plan: LinkPlanDeclaration
 }
 
+struct OwnedRecordCall {
+    code: ManagedCode
+    prototype: str
+    payload_layout: int
+    payload_type: str
+    result_type: str
+    name: str
+    plan: LinkPlanDeclaration
+}
+
 fn resultFunctionNode(&named: NamedModule, &name: str): int {
     index = 0
     while (index < named.names.declarations.len()) {
@@ -33,6 +44,92 @@ fn resultFunctionNode(&named: NamedModule, &name: str): int {
         index = index + 1
     }
     return 0
+}
+
+fn RecordResultCallId(&named: NamedModule, statement_id: int): int {
+    statement = named.parsed.arena.nodes[statement_id - 1].clone()
+    if (statement.kind != "Assign" || statement.edge_count != 1) { return 0 }
+    source = named.parsed.arena.nodes[named.parsed.arena.edges[statement.first_edge] - 1].clone()
+    if (source.kind != "TryUnwrap" || source.edge_count != 1) { return 0 }
+    call = named.parsed.arena.edges[source.first_edge]
+    if (named.parsed.arena.nodes[call - 1].kind != "Call") { return 0 }
+    return call
+}
+
+fn LowerOwnedRecordCall(&named: NamedModule, &types: [TypeNameBinding], &layouts: [StructLayout],
+                         &bindings: [GuardBinding], caller_id: int, call_id: int): OwnedRecordCall! {
+    call = named.parsed.arena.nodes[call_id - 1].clone()
+    if (call.edge_count == 0) {
+        RejectLayout("unsupported_record_call", "expected a direct checked record call", DeclarationSpan(call))?
+    }
+    target = named.parsed.arena.nodes[named.parsed.arena.edges[call.first_edge] - 1].clone()
+    id = resultFunctionNode(named, target.text)
+    if (target.kind != "Variable" || target.edge_count != 0 || id == 0 || id == caller_id || GuardBindingIndex(bindings, target.text) != 0) {
+        RejectLayout("unknown_record_call", "expected a distinct, unshadowed same-module function", DeclarationSpan(target))?
+    }
+    callee = named.parsed.arena.nodes[id - 1].clone()
+    cursor = callee.first_edge
+    end = cursor + callee.edge_count
+    arguments: [LinkPlanType] = []
+    code = ManagedBlank()
+    signature = ""
+    inputs = ""
+    while (cursor < end && named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].kind == "Parameter") {
+        parameter = named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].clone()
+        index = arguments.len() + 1
+        if (index >= call.edge_count || parameter.edge_count != 1 || parameter.int_value < 0 || parameter.int_value > 1) {
+            RejectLayout("record_call_signature", "checked record call requires matching typed parameters", DeclarationSpan(parameter))?
+        }
+        input = named.parsed.arena.edges[call.first_edge + index]
+        input_node = named.parsed.arena.nodes[input - 1].clone()
+        type_id = named.parsed.arena.edges[parameter.first_edge]
+        view = parameter.int_value == 1
+        ty = GuardParameterType(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, type_id, view)?
+        value = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, bindings, layouts, input, 0, "    ")?
+        if (value.ty.kind != ty.kind || value.ty.layout != ty.layout || value.view != view ||
+            (view && (input_node.kind != "Variable" || (ty.kind != "str_array" && ty.kind != "struct"))) ||
+            (!view && ty.kind != "int" && ty.kind != "bool" && (ty.kind != "str" || input_node.kind != "String"))) {
+            RejectLayout("record_call_argument", "expected a matching Copy value, static str or existing View", DeclarationSpan(input_node))?
+        }
+        c_type = GuardCType(ty, layouts)
+        if (view) { c_type = "const " + c_type + "*" }
+        if (ty.kind == "str_array") { arguments = arguments.push(StrArrayViewLinkPlanType()) }
+        else {
+            bound = ExplicitType(types, type_id, DeclarationSpan(parameter))?
+            arguments = arguments.push(BoundLinkPlanType(bound, 1, c_type.clone(), view))
+        }
+        if (signature != "") { signature += ", " inputs += ", " }
+        signature += c_type.clone()
+        temp = "record_arg" + str(call_id) + "_" + str(index)
+        code = AddGuardCode(code, value)
+        code.text = code.text + "    " + c_type + " " + temp.clone() + " = " + value.value + ";\n"
+        inputs += temp
+        cursor = cursor + 1
+    }
+    if (arguments.len() + 1 != call.edge_count || cursor >= end - 1) {
+        RejectLayout("record_call_signature", "expected the declared argument count and explicit record Result", DeclarationSpan(call))?
+    }
+    result = named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].clone()
+    if (result.kind != "TypeResult" || result.edge_count != 1) {
+        RejectLayout("record_call_result", "checked record call requires a named struct Result", DeclarationSpan(result))?
+    }
+    type_id = named.parsed.arena.edges[result.first_edge]
+    payload = GuardExplicitType(types, named.parsed.arena.nodes, layouts, type_id)?
+    if (payload.kind != "struct") {
+        RejectLayout("record_call_result", "checked record call requires a named struct Result", DeclarationSpan(result))?
+    }
+    bound = ExplicitType(types, type_id, DeclarationSpan(result))?
+    payload_type = GuardCType(payload, layouts)
+    c_type = "KuBootstrapResult_" + payload_type.clone()
+    symbol = "ku_struct_result_" + str(id)
+    name = "record_result" + str(call_id)
+    if (signature == "") { signature = "void" }
+    prototype = "extern " + c_type.clone() + " " + symbol.clone() + "(" + signature + ");\n"
+    plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: arguments,
+        result: BoundLinkPlanType(bound, 1, c_type.clone(), false), returns_result: true }
+    code.text = code.text + "    " + c_type.clone() + " " + name.clone() + " = " + symbol + "(" + inputs + ");\n"
+    return ok(OwnedRecordCall { code: code, prototype: prototype, payload_layout: payload.layout,
+        payload_type: payload_type, result_type: c_type, name: name, plan: plan })
 }
 
 fn ownedScalarLeafId(&named: NamedModule, &call: Node): int {
