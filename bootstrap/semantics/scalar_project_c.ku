@@ -1,29 +1,15 @@
 import { Span } from "../stage2/span.ku"
-import { BindProjectImports, SuppliedModule } from "./imports.ku"
-import { ProjectImportOrder, ProjectModuleBindings } from "./project_bindings.ku"
+import { SuppliedModule } from "./imports.ku"
+import { BindProjectModules, ProjectModuleBindings } from "./project_bindings.ku"
 import { EmitScalarIntModule, LowerScalarIntFunction, ScalarIntC, AppendScalarIntCallees } from "./scalar_int_c.ku"
 import { ScalarFunctionNode, ScalarIntCalleeSignature, ScalarIntImport } from "./scalar_int_calls.ku"
 import { ScalarIntFunction } from "./scalar_int_emit.ku"
 import { HasScalarBuiltin, RejectScalarInt } from "./scalar_int_operands.ku"
-import { BindImportedTypeNames } from "./type_names.ku"
 
 struct ScalarProjectModule {
     imports: [ScalarIntImport]
     has_str: bool
     has_ok: bool
-}
-
-fn projectBindings(&supplied: [SuppliedModule]): [ProjectModuleBindings]! {
-    modules: [ProjectModuleBindings] = []
-    index = 0
-    while (index < supplied.len()) {
-        imports = BindProjectImports(supplied[index], supplied)?
-        types = BindImportedTypeNames(supplied[index].named, imports, supplied)?
-        modules = modules.push(ProjectModuleBindings { path: supplied[index].path.clone(), imports: imports, types: types })
-        index = index + 1
-    }
-    ProjectImportOrder(modules)?
-    return ok(modules)
 }
 
 fn linkedImports(&current: ProjectModuleBindings, &supplied: [SuppliedModule],
@@ -69,7 +55,8 @@ fn EmitScalarProjectC(&supplied: [SuppliedModule], &function: str): ScalarIntC! 
         start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
         RejectScalarInt("unknown_int_function", "undefined function '" + function.clone() + "'", start)?
     }
-    binding = projectBindings(supplied)?
+    project = BindProjectModules(supplied)?
+    binding = project.modules
     modules = scalarModules(supplied, binding)
     reachable = [entry]
     plans: [ScalarIntFunction] = []

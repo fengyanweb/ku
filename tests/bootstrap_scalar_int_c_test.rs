@@ -566,10 +566,10 @@ fn main() { println(TestScore(5)) }
     }
 
     for (mutated, diagnostic) in [
-        (source.replace("Primary(a)", "Primary()"), "int_call_arity"),
+        (source.replace("Primary(a)", "Primary()"), "call_arity"),
         (
             source.replace("Primary(a)", "Secondary(a, a)"),
-            "int_call_arity",
+            "call_arity",
         ),
         (
             source.replace("TestScore(a: int)", "TestScore(Primary: int, a: int)"),

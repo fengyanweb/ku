@@ -1,36 +1,16 @@
 import "std.fs"
 import { EscapeCanonical } from "../stage1/token.ku"
 import { Span } from "../stage2/span.ku"
-import { CheckDirectCallArities } from "./call_contracts.ku"
-import { BindProjectImports, SuppliedModule } from "./imports.ku"
 import { ManifestPaths, ReadProjectModules } from "./project_manifest.ku"
-import { BindImportedTypeNames } from "./type_names.ku"
-import { ProjectModuleBindings, ProjectImportOrder } from "./project_bindings.ku"
-
-fn ResolveProjectModule(&entry: SuppliedModule, &supplied: [SuppliedModule]): ProjectModuleBindings! {
-    try {
-        imports = BindProjectImports(entry, supplied)?
-        types = BindImportedTypeNames(entry.named, imports, supplied)?
-        CheckDirectCallArities(entry.named, imports, supplied)?
-        return ok(ProjectModuleBindings { path: entry.path.clone(), imports: imports, types: types })
-    } catch (err) {
-        fail {
-            domain: err.domain, code: err.code,
-            message: EscapeCanonical(entry.path.clone()) + ": " + err.message
-        }
-    }
-}
+import { BindProjectModules } from "./project_bindings.ku"
 
 fn main(): null! {
     at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
     paths = ManifestPaths(fs.read("modules.txt")?, at)?
     supplied = ReadProjectModules(paths)?
-    modules: [ProjectModuleBindings] = []
-    for entry in supplied {
-        resolved = ResolveProjectModule(entry, supplied)?
-        modules = modules.push(resolved)
-    }
-    order = ProjectImportOrder(modules)?
+    project = BindProjectModules(supplied)?
+    order = project.order
+    modules = project.modules
     for index in order {
         entry = modules[index].clone()
         display_path = EscapeCanonical(entry.path)

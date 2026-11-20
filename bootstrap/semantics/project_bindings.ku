@@ -1,7 +1,9 @@
+import { EscapeCanonical } from "../stage1/token.ku"
 import { Span } from "../stage2/span.ku"
-import { ImportBinding } from "./imports.ku"
+import { CheckDirectCallArities } from "./call_contracts.ku"
+import { BindProjectImports, ImportBinding, SuppliedModule } from "./imports.ku"
 import { RejectName } from "./names.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { BindImportedTypeNames, TypeNameBinding } from "./type_names.ku"
 
 struct ProjectModuleBindings {
     path: str
@@ -9,7 +11,26 @@ struct ProjectModuleBindings {
     types: [TypeNameBinding]
 }
 
-fn ProjectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
+struct ProjectBindings {
+    modules: [ProjectModuleBindings]
+    order: [int]
+}
+
+fn resolveProjectModule(&entry: SuppliedModule, &supplied: [SuppliedModule]): ProjectModuleBindings! {
+    try {
+        imports = BindProjectImports(entry, supplied)?
+        types = BindImportedTypeNames(entry.named, imports, supplied)?
+        CheckDirectCallArities(entry.named, imports, supplied)?
+        return ok(ProjectModuleBindings { path: entry.path.clone(), imports: imports, types: types })
+    } catch (err) {
+        fail {
+            domain: err.domain, code: err.code,
+            message: EscapeCanonical(entry.path.clone()) + ": " + err.message
+        }
+    }
+}
+
+fn projectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
     done: [bool] = []
     while (done.len() < modules.len()) { done = done.push(false) }
     order: [int] = []
@@ -44,4 +65,17 @@ fn ProjectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
         order = order.push(next)
     }
     return ok(order)
+}
+
+
+fn BindProjectModules(&supplied: [SuppliedModule]): ProjectBindings! {
+    modules: [ProjectModuleBindings] = []
+    index = 0
+    while (index < supplied.len()) {
+        bound = resolveProjectModule(supplied[index], supplied)?
+        modules = modules.push(bound)
+        index = index + 1
+    }
+    order = projectImportOrder(modules)?
+    return ok(ProjectBindings { modules: modules, order: order })
 }
