@@ -162,6 +162,13 @@ fn ManagedLiteralStringReturns(&nodes: [Node], &edges: [int], &function: Node): 
     return true
 }
 
+fn BoundSameModuleFunction(&named: NamedModule, &name: str): int {
+    for declaration in named.names.declarations.clone() {
+        if (declaration.kind == "Function" && declaration.name == name) { return declaration.node }
+    }
+    return 0
+}
+
 fn ManagedStringLeaf(&named: NamedModule, &locals: [GuardBinding], &leaves: [GuardLeaf], &call: Node): str {
     if (!ManagedClonedStringCall(named.parsed.arena.nodes, named.parsed.arena.edges, call)) { return "" }
     target = named.parsed.arena.nodes[named.parsed.arena.edges[call.first_edge] - 1].clone()
@@ -170,11 +177,9 @@ fn ManagedStringLeaf(&named: NamedModule, &locals: [GuardBinding], &leaves: [Gua
         if (leaf.name == target.text && leaf.result_kind == "str" && leaf.parameters.len() == 1 && leaf.parameters[0] == "str") {
             // Deferred message providers may allocate only after cleanup.
             // A direct call may run while an old owner is still live.
-            for declaration in named.names.declarations.clone() {
-                if (declaration.kind == "Function" && declaration.name == target.text &&
-                    ManagedLiteralStringReturns(named.parsed.arena.nodes, named.parsed.arena.edges,
-                        named.parsed.arena.nodes[declaration.node - 1])) { return leaf.symbol }
-            }
+            declaration = BoundSameModuleFunction(named, target.text)
+            if (declaration != 0 && ManagedLiteralStringReturns(named.parsed.arena.nodes, named.parsed.arena.edges,
+                named.parsed.arena.nodes[declaration - 1])) { return leaf.symbol }
         }
     }
     return ""

@@ -36,23 +36,37 @@ struct GuardBlock {
     returns: bool
 }
 
-fn GuardOwnedDrops(&layouts: [StructLayout], index: int, &base: str): str {
+fn guardOwnedDropsAt(&layouts: [StructLayout], index: int, &base: str, &indent: str): str {
     drops = ""
     cursor = 0
     while (cursor < layouts[index - 1].fields.len()) {
         field = layouts[index - 1].fields[cursor].resolved.clone()
         name = base.clone() + ".f" + str(cursor)
         if (field.declaration_kind == "Builtin" && field.name == "str") {
-            drops += "    ku_projection_string_drop(&" + name + ");\n"
+            drops += indent.clone() + "ku_projection_string_drop(&" + name + ");\n"
         } else if (field.declaration_kind == "Struct") {
             child = LayoutIndex(layouts, field.module_index, field.declaration_node)
             // The ordered layout has already validated this acyclic graph
             // (at most eight levels). Each path is one owned field instance.
-            drops += GuardOwnedDrops(layouts, child, name)
+            drops += guardOwnedDropsAt(layouts, child, name, indent)
         }
         cursor = cursor + 1
     }
     return drops
+}
+
+fn GuardOwnedDrops(&layouts: [StructLayout], index: int, &base: str): str {
+    return guardOwnedDropsAt(layouts, index, base, "    ")
+}
+
+fn GuardRecordCarrierDrops(&layouts: [StructLayout], layout: int, &name: str, &indent: str): str {
+    // Clear unselected payload owners even on an error. Selected
+    // owned fields and a transferred Error were already cleared in-place.
+    drops = guardOwnedDropsAt(layouts, layout, name.clone() + ".value", indent)
+    drops += indent.clone() + "ku_projection_string_drop(&" + name.clone() + ".error.domain);\n"
+    drops += indent.clone() + "ku_projection_string_drop(&" + name.clone() + ".error.code);\n"
+    drops += indent.clone() + "ku_projection_string_drop(&" + name.clone() + ".error.message);\n"
+    return drops + indent.clone() + "if (!" + name.clone() + ".ok) goto cleanup;\n"
 }
 
 fn GuardParameterType(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],

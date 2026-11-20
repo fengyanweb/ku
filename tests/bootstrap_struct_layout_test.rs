@@ -1684,6 +1684,25 @@ fn RejectAllocatingKind(source: str): [SourceLength]! {
     tag = AllocatingMessage(source.clone())
     return ok(entries)
 }
+struct Scanned { text: str, count: int }
+fn ReadScanned(&characters: [str], count: int): Scanned! {
+    return ok(Scanned { text: "found", count: count })
+}
+fn TakeScanned(source: str): [SourceLength]! {
+    entries: [SourceLength] = []
+    characters: [str] = source.chars()
+    text = "previous"
+    count = 0
+    if (characters.len() > 0) {
+        item = ReadScanned(characters, count)?
+        text = item.text
+        count = item.count
+    }
+    width = text.byte_len()
+    entry = SourceLength { value: width }
+    entries = entries.push(entry)
+    return ok(entries)
+}
 "#,
     )
     .unwrap();
@@ -1818,6 +1837,23 @@ fn RejectAllocatingKind(source: str): [SourceLength]! {
     let rejected = execute(&mut Command::new(seed), cwd, 30);
     assert!(!rejected.status.success() && rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("unsupported_guarded_operand"));
+
+    fs::write(cwd.join("function.txt"), "TakeScanned").unwrap();
+    fs::write(cwd.join("mode.txt"), "managed").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    assert!(text.contains("const KuGuardStringArray* record_arg"));
+    assert!(text.contains(" = &l"));
+    assert!(text.contains(".value.f0 = (KuProjectionString){0};"));
+    assert!(text.contains("result.error = record_result"));
+    assert!(text.contains(".error = (KuBootstrapError){0};"));
+    fs::write(cwd.join("mode.txt"), "managed-plan").unwrap();
+    let plan = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plan);
+    let plan = String::from_utf8(plan.stdout).unwrap();
+    assert!(plan.contains(r#""source_name":"ReadScanned","symbol":"ku_struct_result_"#));
+    assert!(plan.contains(r#""c_type":"const KuGuardStringArray*","passing":"view""#));
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {

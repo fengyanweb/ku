@@ -27,6 +27,7 @@ struct ManagedType {
     array: StructArrayC
     string_locals: bool
     source_strings: bool
+    function_id: int
     function_end: int
     leaves: [GuardLeaf]
 }

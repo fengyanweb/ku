@@ -12,7 +12,7 @@ import { ManagedSourceCharactersErrors, ManagedSourceCharactersRuntime, ManagedS
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType } from "./guarded_struct_expr.ku"
 import { ManagedExplicitType, ManagedType } from "./managed_array_values_c.ku"
 import { EmitManagedBlock, EmitManagedResultBlock, ManagedBlock } from "./managed_array_body_c.ku"
-import { StructResultHeader } from "./struct_result_c.ku"
+import { StructResultHeader, StructValueResultHeader } from "./struct_result_c.ku"
 import { OwnedScalarLeaves, ReadOwnedScalarLeaves } from "./struct_result_link_c.ku"
 import { BuiltinLinkPlanType, EmptyLinkPlanDeclaration, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
 
@@ -177,7 +177,7 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     ordered = orderLayout(layouts, result.layout, DeclarationSpan(function))?
     array = EmitStructArrayOperations(layouts, result.layout)
     root = ManagedType { layout: result.layout, array: array, string_locals: false, source_strings: false,
-        function_end: function.end_offset, leaves: [] }
+        function_id: function_id, function_end: function.end_offset, leaves: [] }
     signature = readParameters(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, root, ordered, function, edge)?
     root.source_strings = signature.source_strings
     leaves = OwnedScalarLeaves { bindings: [], declarations: "", plan: [], needs_clone: false }
@@ -187,10 +187,29 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     body = managedBody(named, types, imports, supplied, layouts, root, signature.bindings.clone(),
         signature.body_start, function.first_edge + function.edge_count, checked)?
     if (!body.returns) { RejectLayout("managed_fallthrough", "every path must return an array owner", DeclarationSpan(function))? }
+    declarations = signature.layouts
+    prototypes = leaves.declarations
+    dependencies = leaves.plan
+    result_headers = ""
+    declared_results: [int] = []
+    declared_calls: [int] = []
+    for link in body.record_links {
+        if (!ContainsIndex(declared_results, link.payload_layout)) {
+            order = orderLayout(layouts, link.payload_layout, DeclarationSpan(function))?
+            declarations = appendLayouts(layouts, order, declarations)?
+            result_headers += StructValueResultHeader(link.payload_type)
+            declared_results = declared_results.push(link.payload_layout)
+        }
+        if (!ContainsIndex(declared_calls, link.plan.node)) {
+            prototypes += link.prototype
+            declared_calls = declared_calls.push(link.plan.node)
+            dependencies = dependencies.push(link.plan)
+        }
+    }
     symbol = "ku_managed_" + str(function_id)
     arithmetic = body.code.uses_add || body.code.uses_sub
     append = body.code.uses_string_append
-    text = ProjectionHeaders(checked || signature.layouts.strings || body.code.uses_eq || signature.source_strings, signature.drop_strings)
+    text = ProjectionHeaders(checked || declarations.strings || body.code.uses_eq || signature.source_strings, signature.drop_strings)
     text += "#include <stdio.h>\n#include <stdlib.h>\n\n"
     text += GuardArithmetic(body.code.uses_add, body.code.uses_sub) + GuardStringEquality(body.code.uses_eq)
     if (signature.source_strings) {
@@ -199,13 +218,13 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     }
     if (clones) { text += EmitTryCloneString("ku_result_clone_string") }
     if (append) { text += ManagedStringAppendRuntime() }
-    text += signature.layouts.text + root.array.source
+    text += declarations.text + root.array.source
     result_type = root.array.array_type.clone()
     if (checked) {
         text += StructResultHeader() + EmitStructArrayResultHeader(root.array.array_type)
         result_type = "KuBootstrapResult_" + result_type
     }
-    text += leaves.declarations + result_type.clone() + " " + symbol.clone() + "(" + signature.parameters.clone() + ") {\n"
+    text += result_headers + prototypes + result_type.clone() + " " + symbol.clone() + "(" + signature.parameters.clone() + ") {\n"
     text += "    " + result_type.clone() + " result = {0};\n"
     text += "    int array_status = KU_STRUCT_ARRAY_OK;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n"
     if (signature.source_strings) {
@@ -226,7 +245,7 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     if (clones || append) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     text += managedArrayErrors() + body.error_exits + "    return result;\n}\n"
     plan = managedPlan(layouts, signature, result.layout, result_type, symbol.clone(), function_id, checked)
-    return ok(ManagedArrayC { symbol: symbol, source: text, entry_plan: plan, link_plan: leaves.plan })
+    return ok(ManagedArrayC { symbol: symbol, source: text, entry_plan: plan, link_plan: dependencies })
 }
 
 fn EmitManagedArrayC(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],

@@ -4,7 +4,7 @@ import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExplicitType, GuardExpression, GuardLeaf } from "./guarded_struct_expr.ku"
 import { GuardParameterType } from "./guarded_struct_c.ku"
-import { ManagedClonedStringCall, ManagedDeferredMessageCalls, ManagedLiteralStringReturns } from "./guarded_string_parts.ku"
+import { BoundSameModuleFunction, ManagedClonedStringCall, ManagedDeferredMessageCalls, ManagedLiteralStringReturns } from "./guarded_string_parts.ku"
 import { AddGuardCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
@@ -38,16 +38,6 @@ struct OwnedRecordCall {
     plan: LinkPlanDeclaration
 }
 
-fn resultFunctionNode(&named: NamedModule, &name: str): int {
-    index = 0
-    while (index < named.names.declarations.len()) {
-        item = named.names.declarations[index].clone()
-        if (item.kind == "Function" && item.name == name) { return item.node }
-        index = index + 1
-    }
-    return 0
-}
-
 fn RecordResultCallId(&named: NamedModule, statement_id: int): int {
     statement = named.parsed.arena.nodes[statement_id - 1].clone()
     if (statement.kind != "Assign" || statement.edge_count != 1) { return 0 }
@@ -59,13 +49,14 @@ fn RecordResultCallId(&named: NamedModule, statement_id: int): int {
 }
 
 fn LowerOwnedRecordCall(&named: NamedModule, &types: [TypeNameBinding], &layouts: [StructLayout],
-                         &bindings: [GuardBinding], caller_id: int, call_id: int): OwnedRecordCall! {
+                         &bindings: [GuardBinding], caller_id: int, call_id: int,
+                         borrow_local: bool, &indent: str): OwnedRecordCall! {
     call = named.parsed.arena.nodes[call_id - 1].clone()
     if (call.edge_count == 0) {
         RejectLayout("unsupported_record_call", "expected a direct checked record call", DeclarationSpan(call))?
     }
     target = named.parsed.arena.nodes[named.parsed.arena.edges[call.first_edge] - 1].clone()
-    id = resultFunctionNode(named, target.text)
+    id = BoundSameModuleFunction(named, target.text)
     if (target.kind != "Variable" || target.edge_count != 0 || id == 0 || id == caller_id || GuardBindingIndex(bindings, target.text) != 0) {
         RejectLayout("unknown_record_call", "expected a distinct, unshadowed same-module function", DeclarationSpan(target))?
     }
@@ -87,8 +78,9 @@ fn LowerOwnedRecordCall(&named: NamedModule, &types: [TypeNameBinding], &layouts
         type_id = named.parsed.arena.edges[parameter.first_edge]
         view = parameter.int_value == 1
         ty = GuardParameterType(named.parsed.arena.nodes, named.parsed.arena.edges, types, layouts, type_id, view)?
-        value = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, bindings, layouts, input, 0, "    ")?
-        if (value.ty.kind != ty.kind || value.ty.layout != ty.layout || value.view != view ||
+        value = GuardExpression(named.parsed.arena.nodes, named.parsed.arena.edges, bindings, layouts, input, 0, indent)?
+        borrow = borrow_local && view && !value.view && ty.kind == "str_array" && input_node.kind == "Variable"
+        if (value.ty.kind != ty.kind || value.ty.layout != ty.layout || (!borrow && value.view != view) ||
             (view && (input_node.kind != "Variable" || (ty.kind != "str_array" && ty.kind != "struct"))) ||
             (!view && ty.kind != "int" && ty.kind != "bool" && (ty.kind != "str" || input_node.kind != "String"))) {
             RejectLayout("record_call_argument", "expected a matching Copy value, static str or existing View", DeclarationSpan(input_node))?
@@ -104,7 +96,8 @@ fn LowerOwnedRecordCall(&named: NamedModule, &types: [TypeNameBinding], &layouts
         signature += c_type.clone()
         temp = "record_arg" + str(call_id) + "_" + str(index)
         code = AddGuardCode(code, value)
-        code.text = code.text + "    " + c_type + " " + temp.clone() + " = " + value.value + ";\n"
+        if (borrow) { value.value = "&" + value.value }
+        code.text = code.text + indent.clone() + c_type + " " + temp.clone() + " = " + value.value + ";\n"
         inputs += temp
         cursor = cursor + 1
     }
@@ -129,7 +122,7 @@ fn LowerOwnedRecordCall(&named: NamedModule, &types: [TypeNameBinding], &layouts
     prototype = "extern " + c_type.clone() + " " + symbol.clone() + "(" + signature + ");\n"
     plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: arguments,
         result: BoundLinkPlanType(bound, 1, c_type.clone(), false), returns_result: true }
-    code.text = code.text + "    " + c_type.clone() + " " + name.clone() + " = " + symbol + "(" + inputs + ");\n"
+    code.text = code.text + indent.clone() + c_type.clone() + " " + name.clone() + " = " + symbol + "(" + inputs + ");\n"
     return ok(OwnedRecordCall { code: code, prototype: prototype, payload_layout: payload.layout,
         payload_type: payload_type, result_type: c_type, name: name, plan: plan })
 }
@@ -138,7 +131,7 @@ fn ownedScalarLeafId(&named: NamedModule, &call: Node): int {
     if (call.kind != "Call" || call.edge_count < 2) { return 0 }
     target = named.parsed.arena.nodes[named.parsed.arena.edges[call.first_edge] - 1].clone()
     if (target.kind != "Variable" || target.edge_count != 0) { return 0 }
-    return resultFunctionNode(named, target.text)
+    return BoundSameModuleFunction(named, target.text)
 }
 
 fn ReadOwnedScalarLeaves(&named: NamedModule, &types: [TypeNameBinding], &layouts: [StructLayout],
@@ -268,7 +261,7 @@ fn LowerStructResultLink(&named: NamedModule, &types: [TypeNameBinding], &layout
         RejectLayout("unsupported_struct_result_link", "expected a direct checked call", DeclarationSpan(call))?
     }
     target = named.parsed.arena.nodes[named.parsed.arena.edges[call.first_edge] - 1].clone()
-    id = resultFunctionNode(named, target.text)
+    id = BoundSameModuleFunction(named, target.text)
     if (target.kind != "Variable" || target.edge_count != 0 || id == 0 || GuardBindingIndex(bindings, target.text) != 0) {
         RejectLayout("unknown_struct_result_link", "expected an unshadowed same-module function", DeclarationSpan(target))?
     }

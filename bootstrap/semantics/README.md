@@ -383,6 +383,11 @@ consume a cloned argument and supply a local value. Replacement keeps the old
 owner live through argument preparation and takes the returned string without
 another clone. Providers that allocate their returned string remain available
 as deferred Error message providers.
+Inside a managed block, a checked record call may borrow a local `[str]`.
+Immediately following assignments can take distinct record fields into
+existing matching locals. Selected strings move directly, and the carrier
+releases unselected owners. On failure the original Error moves to the
+enclosing Result before scope cleanup.
 
 `linked-str` also emits functions such as `TokenCanonical` that consume an
 owned struct. A string field may move into the expression once. A named
