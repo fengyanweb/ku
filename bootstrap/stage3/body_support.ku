@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { Node, Arena, ParseOutput } from "../stage2/ast.ku"
 import { SpanFromToken, SpanMerge } from "../stage2/span.ku"
-import { CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, RejectAt, RejectAtPoint, WindowToken, WindowKind } from "./support.ku"
+import { CanEndExpression, EmptyExpressionBoundary, EndsAtExpressionSeparator, PushExpressionBoundary, RejectAt, RejectAtPoint, WindowToken, WindowKind } from "./support.ku"
 import { IsNamedStructStart } from "../stage2/expression_support.ku"
 import { SignatureType, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 
@@ -92,26 +92,25 @@ fn IsControlStatement(&kind: str): bool {
 
 fn ReadExpressionEnd(&tokens: [Token], start: int, window_end: int, context: str): int! {
     probe = start
-    print_argument = context == "print_argument"
     boundary = EmptyExpressionBoundary()
     while (!boundary.complete) {
         if (probe > window_end) { RejectExpressionTerminator(WindowToken(tokens, probe, window_end))? }
+        token = WindowToken(tokens, probe, window_end)
         previous_can_end = probe > start && CanEndExpression(WindowKind(tokens, probe - 1, window_end))
-        named_struct_open = probe > start && probe + 2 < window_end && WindowKind(tokens, probe, window_end) == "LBrace"
+        named_struct_open = probe > start && probe + 2 < window_end && token.kind == "LBrace"
             && IsNamedStructStart(tokens[probe - 1], tokens[probe], tokens[probe + 1], tokens[probe + 2])
         if (boundary.paren_depth == 0 && boundary.bracket_depth == 0 && boundary.brace_depth == 0) {
-            if (context == "for_header" && WindowKind(tokens, probe, window_end) == "LBrace" && !named_struct_open) {
+            if (context == "for_header" && token.kind == "LBrace" && !named_struct_open) {
                 return ok(probe)
             }
-            if (context == "assignment_target" && WindowKind(tokens, probe, window_end) == "Equal") {
+            if (context == "assignment_target" && token.kind == "Equal") {
                 return ok(probe)
             }
-            if (print_argument) {
-                kind = WindowKind(tokens, probe, window_end)
-                if (kind == "RParen" || kind == "Comma") { return ok(probe) }
+            if (EndsAtExpressionSeparator(tokens, probe, window_end, context, token.kind, previous_can_end, named_struct_open)) {
+                return ok(probe)
             }
         }
-        boundary = PushExpressionBoundary(boundary, WindowToken(tokens, probe, window_end), previous_can_end, named_struct_open)?
+        boundary = PushExpressionBoundary(boundary, token, previous_can_end, named_struct_open)?
         if (!boundary.complete) { probe = probe + 1 }
     }
     return ok(probe)

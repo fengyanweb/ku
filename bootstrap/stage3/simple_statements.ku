@@ -5,7 +5,7 @@ import { ExpressionSpan } from "../stage2/expression_support.ku"
 import { NextBodyWork, ReadExpressionEnd, LocalAssignmentOperator, RejectLetStatement,
          RejectDeclarationInitializer, SignatureTypeOutput } from "./body_support.ku"
 import { ReadSignatureTypePrefix } from "./signature.ku"
-import { RejectAt, RejectAtSpan, SpanFromNode, WindowKind, WindowToken } from "./support.ku"
+import { AfterOptionalSemicolon, ObjectDestructureClose, RejectAt, RejectAtSpan, SpanFromNode, WindowKind, WindowToken } from "./support.ku"
 
 struct SimpleStatementRead {
     node: int
@@ -24,6 +24,14 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
     cursor = first
     parse_steps = initial_work
     statement = 0
+    if (statement_start.kind == "LBrace") {
+        closing = ObjectDestructureClose(tokens, first, last_index)
+        if (closing != 0) {
+            work = NextBodyWork(initial_work, closing - first + 1, statement_start.clone())?
+            return readObjectDestructure(tokens, first, last_index, token_base, work, statement_start,
+                                         parse_expression, add_arena, add_node, read_span)
+        }
+    }
     assignment_operator = ""
     if (statement_start.kind == "Ident") { assignment_operator = LocalAssignmentOperator(WindowToken(tokens, cursor + 1, last_index)) }
     if (statement_start.kind == "Let") {
@@ -145,4 +153,115 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
     }
     if (WindowKind(tokens, cursor, last_index) == "Semicolon") { cursor = cursor + 1 }
     return ok(SimpleStatementRead { node: statement, cursor: cursor, work: parse_steps })
+}
+
+fn expectPatternToken(&token: Token, kind: str, message: str): null! {
+    if (token.kind != kind) { RejectAt(token.clone(), "unexpected_token", message)? }
+    return ok(null)
+}
+
+fn patternBinding(
+    kind: str, name: str, span: Span, origin: Token,
+    add_node: fn(str, str, int, Span, [int], Token): int!
+): int! {
+    if (name == "_") { return add_node(kind, "", 0, span, [], origin) }
+    return add_node(kind, name, 1, span, [], origin)
+}
+
+fn checkPatternField(&seen: [str], &field: Token, initial_work: int): int! {
+    index = 0
+    work = initial_work
+    while (index < seen.len()) {
+        work = NextBodyWork(work, 1, field.clone())?
+        if (seen[index] == field.lexeme) {
+            RejectAt(field.clone(), "unexpected_token", "duplicate object destructuring field '" + field.lexeme.clone() + "'")?
+        }
+        index = index + 1
+    }
+    return ok(work)
+}
+
+fn readObjectDestructureField(
+    &tokens: [Token], cursor: int, last_index: int, token_base: int, initial_work: int, field: Token,
+    parse_expression: fn(int, int): ParseOutput!, add_arena: fn(ParseOutput, Token, bool): int!,
+    add_node: fn(str, str, int, Span, [int], Token): int!
+): SimpleStatementRead! {
+    next = cursor
+    work = initial_work
+    local = field.lexeme.clone()
+    span = SpanFromToken(field.clone())
+    if (WindowKind(tokens, next, last_index) == "Colon") {
+        alias = WindowToken(tokens, next + 1, last_index)
+        expectPatternToken(alias, "Ident", "expected local binding name after ':'")?
+        local = alias.lexeme
+        work = NextBodyWork(work, 2, field.clone())?
+        next = next + 2
+    }
+    binding = patternBinding("ObjectDestructureLocal", local, span.clone(), field.clone(), add_node.clone())?
+    children: [int] = [binding]
+    if (WindowKind(tokens, next, last_index) == "Equal") {
+        start = next + 1
+        origin = WindowToken(tokens, start, last_index)
+        end = ReadExpressionEnd(tokens, start, last_index, "destructure_default")?
+        work = NextBodyWork(work, end - next, origin.clone())?
+        parsed = parse_expression(token_base + start, token_base + end)?
+        value = add_arena(parsed, origin, false)?
+        children = children.push(value)
+        next = end
+    }
+    node = add_node("ObjectDestructureBinding", field.lexeme.clone(), 0, span, children, field)?
+    return ok(SimpleStatementRead { node: node, cursor: next, work: work })
+}
+
+fn readObjectDestructure(
+    &tokens: [Token], first: int, last_index: int, token_base: int, initial_work: int, opener: Token,
+    parse_expression: fn(int, int): ParseOutput!, add_arena: fn(ParseOutput, Token, bool): int!,
+    add_node: fn(str, str, int, Span, [int], Token): int!, read_span: fn(int): Span
+): SimpleStatementRead! {
+    cursor = first + 1
+    work = initial_work
+    fields: [str] = []
+    children: [int] = []
+    while (WindowKind(tokens, cursor, last_index) != "RBrace") {
+        field = WindowToken(tokens, cursor, last_index)
+        work = NextBodyWork(work, 1, field.clone())?
+        cursor = cursor + 1
+        if (field.kind == "Ellipsis") {
+            local = WindowToken(tokens, cursor, last_index)
+            expectPatternToken(local, "Ident", "expected rest binding name after '...'")?
+            rest = patternBinding("ObjectDestructureRest", local.lexeme.clone(), SpanFromToken(local.clone()), local, add_node.clone())?
+            children = children.push(rest)
+            cursor = cursor + 1
+            if (WindowKind(tokens, cursor, last_index) == "Comma") {
+                cursor = cursor + 1
+                if (WindowKind(tokens, cursor, last_index) != "RBrace") {
+                    RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "object destructuring rest binding must be last")?
+                }
+            }
+            break
+        }
+        if (field.kind != "Ident" && field.kind != "String") {
+            RejectAt(field.clone(), "unexpected_token", "expected object destructuring field name")?
+        }
+        work = checkPatternField(fields, field, work)?
+        fields = fields.push(field.lexeme.clone())
+        binding = readObjectDestructureField(tokens, cursor, last_index, token_base, work, field,
+            parse_expression.clone(), add_arena.clone(), add_node.clone())?
+        work = binding.work
+        cursor = binding.cursor
+        children = children.push(binding.node)
+        if (WindowKind(tokens, cursor, last_index) != "Comma") { break }
+        cursor = cursor + 1
+    }
+    expectPatternToken(WindowToken(tokens, cursor, last_index), "RBrace", "expected '}' after object destructuring pattern")?
+    expectPatternToken(WindowToken(tokens, cursor + 1, last_index), "Equal", "expected '=' after object destructuring pattern")?
+    start = cursor + 2
+    end = ReadExpressionEnd(tokens, start, last_index, "value")?
+    origin = WindowToken(tokens, start, last_index)
+    work = NextBodyWork(work, end - start, origin.clone())?
+    rhs = add_arena(parse_expression(token_base + start, token_base + end)?, origin, false)?
+    children = children.push(rhs)
+    span = SpanMerge(SpanFromToken(opener.clone()), read_span(rhs))
+    node = add_node("ObjectDestructureAssign", "", fields.len(), span, children, opener)?
+    return ok(SimpleStatementRead { node: node, cursor: AfterOptionalSemicolon(tokens, end, last_index), work: work })
 }

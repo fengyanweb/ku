@@ -618,6 +618,55 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
             let value = project_expr(source, value, arena);
             push_node(arena, "Assign", name.clone(), 0, *span, &[value])
         }
+        Stmt::ObjectDestructureAssign {
+            bindings,
+            rest,
+            value,
+            span,
+        } => {
+            let mut children = Vec::with_capacity(bindings.len() + 2);
+            for binding in bindings {
+                let target = push_node(
+                    arena,
+                    "ObjectDestructureLocal",
+                    binding.local.clone().unwrap_or_default(),
+                    i64::from(binding.local.is_some()),
+                    binding.span,
+                    &[],
+                );
+                let mut binding_children = vec![target];
+                if let Some(default) = &binding.default {
+                    binding_children.push(project_expr(source, default, arena));
+                }
+                children.push(push_node(
+                    arena,
+                    "ObjectDestructureBinding",
+                    binding.field.clone(),
+                    0,
+                    binding.span,
+                    &binding_children,
+                ));
+            }
+            if let Some(rest) = rest {
+                children.push(push_node(
+                    arena,
+                    "ObjectDestructureRest",
+                    rest.local.clone().unwrap_or_default(),
+                    i64::from(rest.local.is_some()),
+                    rest.span,
+                    &[],
+                ));
+            }
+            children.push(project_expr(source, value, arena));
+            push_node(
+                arena,
+                "ObjectDestructureAssign",
+                String::new(),
+                bindings.len() as i64,
+                *span,
+                &children,
+            )
+        }
         Stmt::CompoundAssign {
             target: AssignTarget::Variable(name),
             op,
@@ -1516,6 +1565,11 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         include_str!("../bootstrap/stage1/main.ku"),
         include_str!("../bootstrap/stage2/main.ku"),
         include_str!("../bootstrap/tools/declarations/main.ku"),
+        "fn Filter(rule: Rule) { {prefix, minimum=Fallback(2), missing: renamed, ...rest} = rule; read = fn(&node:Node): int { return minimum } return read }",
+        "// 模式😀\r\nfn f(rule: Rule) { {\"前😀\": _, \"\", min: value = Fallback({first: [1, 2]}, [3, 4]), ..._, } = rule; return value }",
+        "fn f() { {} = input; {...rest,} = input; {a,} = input }",
+        "fn f() { initial = Make{value: 7}\n{value: first} = initial\n{tail: other} = source\nreturn other }",
+        "fn f() { {plain: 1}; {...remaining} = Named{field: 2} }",
         "// 捕获😀\r\nfn outer(prefix: int) { read = fn(&value: int): int { if (ready) { return prefix } return value }; after = read }",
         "// 异常😀\r\nfn main() { before = 0 try { if (check) { try {} catch(inner) {} } next = 1 } catch(outer) { one = outer.code try { recover()? } catch(recovery) {} two = outer.message } after = 2 }",
         "fn sum() { count = 0 for n in [1,2] { if (n > 1) { count += n } } count %= 5 return count }",
@@ -3456,6 +3510,20 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             ku_string(source),
             ku_string(code),
             ku_string(&diagnostic_for_kind(source, token, detail))
+        ));
+    }
+    for source in [
+        "fn f() { {a: first, \"a\": second} = input }",
+        "// 缺省😀\r\nfn f() { {a = Fallback(1,2), a} = input }",
+        "fn f() { {...rest, a} = input }",
+        "fn f() { {...} = input }",
+        "fn f() { {a: null} = input }",
+        "fn f() { {7} = input }",
+    ] {
+        body.push_str(&format!(
+            "    ExpectError({}, \"unexpected_token\", {})?\n",
+            ku_string(source),
+            ku_string(&rust_error_canonical(source)),
         ));
     }
     let over_callable_depth = format!("fn f(op: {}int) {{}}", "fn(): ".repeat(33));
