@@ -516,6 +516,151 @@ int main(void) {
 }
 
 #[test]
+fn native_task_optional_absence_releases_awaited_records_before_timer() {
+    use ku::ir::task::TaskOp;
+
+    let lowered = task_lower::lower_program(&checked(
+        r#"
+import time from "std.time"
+struct Reply { detail: Detail }
+struct Detail { body: str }
+async fn Check(): bool! {
+    named = (await Fetch())?
+    println(named?.detail?.unknown)
+    println(((await Fetch())?)?.detail?.unknown)
+    println(((await Fetch())?)?.unknown)
+    println(null?.unknown)
+    time.sleep(2)?
+    return ok(named.detail.body == "owned text")
+}
+async fn Fetch(): Reply! {
+    return ok(Reply { detail: Detail { body: "owned" + " text" } })
+}
+async fn main(): null! { return ok(null) }
+"#,
+    ))
+    .unwrap();
+    let function = &lowered.tasks.functions[0];
+    let named = function
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .find_map(|operation| match operation {
+            TaskOp::RecordField { src, path, .. } if path.last().unwrap().0 == "body" => {
+                Some(src.0)
+            }
+            _ => None,
+        })
+        .expect("field should read from the named owner after sleep");
+    let reply_slots = function
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.ty == function.slots[named].ty)
+        .fold(0u64, |mask, (slot, _)| mask | (1u64 << slot));
+    let generated = c::generate_native_task_c_source(&lowered, &Default::default()).unwrap();
+    let generated = generated
+        .replacen(
+            "typedef struct KuString {",
+            &format!("{ALLOCATION_HOOK}\ntypedef struct KuString {{"),
+            1,
+        )
+        .replacen(
+            "static uint64_t ku_task_driver_now_ms(void) {",
+            "static uint64_t fixture_now=1000u;\nstatic uint64_t ku_task_driver_now_ms(void) { return fixture_now; }\nstatic uint64_t fixture_original_now(void) {",
+            1,
+        )
+        .replacen(
+            "int main(void) {",
+            "static int fixture_original_main(void) {",
+            1,
+        );
+    let fixture = r#"
+#define CHECK(c) do { if (!(c)) { fprintf(stderr,"optional owner line %d: %s\n",__LINE__,#c); return 1; } } while (0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_case(bool cancel) {
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[4]={0}; size_t ring[4]={0};
+  size_t fixed=ku_task_driver_fixed_storage_bytes(4u);
+  uint64_t next=UINT64_MAX,deadline=3000u; KuTaskValueV1 task={0};
+  fixture_now=1000u;
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+    slots,4u,ring,4u,fixed+sizeof(KuTaskInstance_0)+3u*sizeof(KuTaskInstance_1)+4096u,
+    1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  const size_t driver_allocations=ku_perf_live_allocations, driver_bytes=ku_perf_live_bytes;
+  CHECK(ku_task_0_start_value(&driver,&task)==KU_TASK_DRIVER_OK);
+  KuTaskInstance_0* instance=(KuTaskInstance_0*)task.owner.lease.control->context;
+  KuTaskDriverSlotV1* root=&slots[task.ticket.slot];
+  for(size_t turn=0;turn<128u && root->timer_state!=KU_TASK_DRIVER_TIMER_ARMED;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(root->timer_state==KU_TASK_DRIVER_TIMER_ARMED && driver.timers==1u);
+  CHECK(root->state==KU_TASK_DRIVER_PARKED);
+  for(size_t turn=0;turn<16u && driver.queued;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(driver.resident==1u && !driver.queued);
+  CHECK((instance->frame.header.initialized & UINT64_C(@MASK@))==(UINT64_C(1)<<@NAMED@));
+  KuString named=instance->frame.s_@NAMED@.detail.body;
+  CHECK(named.storage==KU_STRING_OWNED && named.len==10u);
+  CHECK(!memcmp(named.ptr,"owned text",10u));
+  CHECK(driver.reserved_bytes==sizeof(*instance)+named.capacity);
+  CHECK(ku_perf_live_allocations==driver_allocations+2u);
+  CHECK(ku_perf_live_bytes==driver_bytes+driver.reserved_bytes);
+
+  if(cancel)
+    CHECK(ku_task_driver_request_cancel(&task.ticket,&task.owner.lease,KU_TASK_CONTROL_CANCELLED,deadline)==KU_TASK_CONTROL_OK);
+  else
+    fixture_now+=2u;
+  for(size_t turn=0;turn<256u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_control_status(&task.owner.lease)==
+    (cancel ? KU_TASK_CONTROL_CANCELLED : KU_TASK_CONTROL_COMPLETED));
+  if(!cancel) {
+    KuTaskAdapterOutcomeV1 outcome={0};
+    CHECK(ku_task_value_take(&task,NULL,&outcome)==KU_TASK_CONTROL_OK);
+    CHECK(outcome.result_kind==2u && outcome.value.boolean.ok && outcome.value.boolean.value);
+    ku_task_outcome_drop(&outcome);
+  }
+  CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<256u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.running && !driver.queued && !driver.timers && !driver.reserved_bytes && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK && ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  return 0;
+}
+int main(void) {
+  CHECK(!fixture_case(false));
+  CHECK(!fixture_case(true));
+  puts("optional-owner-ok"); return 0;
+}
+"#
+    .replace("@MASK@", &reply_slots.to_string())
+    .replace("@NAMED@", &named.to_string());
+    let directory = TempDir::new("native-task-optional-owner");
+    let path = directory.path().join("optional_owner.c");
+    fs::write(&path, generated + &fixture).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "optional-owner") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute the native Task optional owner regression"
+        );
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "null\nnull\nnull\nnull\nnull\nnull\nnull\nnull\noptional-owner-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_task_string_equality_keeps_pg_fixture_rejection_mapping_exact() {
     let fixture = include_str!("benchmarks/cross_stack/ku/server.ku");
     assert!(fixture

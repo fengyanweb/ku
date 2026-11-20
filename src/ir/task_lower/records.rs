@@ -257,7 +257,7 @@ impl FunctionLowerer<'_> {
                 ty = *inner;
             }
             if ty == IrType::Null && *optional {
-                return Ok(Some(self.constant(TaskConstant::Null, IrType::Null)?));
+                return self.null_record_projection(source, drop_source);
             }
             let IrType::Named(ref record) = ty else {
                 return Err(unsupported(
@@ -273,9 +273,7 @@ impl FunctionLowerer<'_> {
                 .and_then(|layout| layout.fields.iter().find(|field| field.name == *name));
             match field {
                 Some(field) => ty = field.ty.clone(),
-                None if *optional => {
-                    return Ok(Some(self.constant(TaskConstant::Null, IrType::Null)?))
-                }
+                None if *optional => return self.null_record_projection(source, drop_source),
                 None => {
                     return Err(unsupported(
                         &format!("field {name} of {}", public_name(record)),
@@ -298,6 +296,18 @@ impl FunctionLowerer<'_> {
             self.emit(TaskOp::Drop { slot: source })?;
         }
         Ok(Some(dst))
+    }
+
+    fn null_record_projection(
+        &mut self,
+        source: SlotId,
+        drop_source: bool,
+    ) -> KuResult<Option<SlotId>> {
+        // No field will be read, but the receiver was already evaluated.
+        if drop_source && owned_value(&self.function.slots[source.0].ty) {
+            self.emit(TaskOp::Drop { slot: source })?;
+        }
+        Ok(Some(self.constant(TaskConstant::Null, IrType::Null)?))
     }
 
     pub(super) fn record_pattern(
