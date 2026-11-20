@@ -1469,6 +1469,39 @@ int main(int argc, char **argv) {
         assert_eq!(run.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&run.stderr).contains(wanted));
     }
+    fs::write(cwd.join("mode.txt"), "guarded-plan").unwrap();
+    let plan = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plan);
+    let document = String::from_utf8(plan.stdout).unwrap();
+    let Some(Value::Result { ok: true, value }) =
+        json::eval("decode", &[Value::String(document)], Span::default()).unwrap()
+    else {
+        panic!("expected a typed array link plan");
+    };
+    let Value::Object(plan) = *value else {
+        panic!("expected a plan object");
+    };
+    let Value::Object(export) = &plan["export"] else {
+        panic!("expected the emitted export");
+    };
+    let Value::Object(signature) = &export["signature"] else {
+        panic!("expected a checked signature");
+    };
+    let Value::Array(parameters) = &signature["parameters"] else {
+        panic!("expected three planned parameters");
+    };
+    assert_eq!(parameters.len(), 3);
+    let Value::Object(carrier) = &parameters[0] else {
+        panic!("expected a typed array carrier");
+    };
+    assert_eq!(carrier["kind"], Value::String("BuiltinArray".into()));
+    assert_eq!(carrier["source_name"], Value::String("str".into()));
+    assert_eq!(carrier["source_path"], Value::Null);
+    assert_eq!(carrier["passing"], Value::String("view".into()));
+    assert_eq!(
+        carrier["c_type"],
+        Value::String("const KuGuardStringArray*".into())
+    );
 }
 
 fn assert_constructor_view(seed: &Path, cwd: &Path) {

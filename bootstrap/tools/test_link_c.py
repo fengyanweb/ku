@@ -206,6 +206,17 @@ class LinkTests(unittest.TestCase):
         self.change_plan(self.left_args, lambda p: p["export"]["signature"]["parameters"][1].update(c_type="int32_t"))
         self.assert_preflight_error([*self.entry_args, *self.left_args, *self.right_args], "signature mismatch")
 
+    def test_builtin_string_array_requires_its_view_carrier(self):
+        array = {"kind": "BuiltinArray", "source_name": "str", "source_path": None,
+                 "node": 0, "passing": "view", "c_type": "const KuGuardStringArray*"}
+        identity = link_c.TypeRef.read(array, "array").semantic()
+        self.assertNotEqual(identity, link_c.TypeRef.read(builtin("str", "KuProjectionString"), "str").semantic())
+        for change in ({"source_name": "int"}, {"source_path": "types.ku"},
+                       {"passing": "value", "c_type": "KuGuardStringArray"},
+                       {"c_type": "const OtherArray*"}):
+            with self.assertRaisesRegex(link_c.LinkError, r"checked View \[str\] carrier"):
+                link_c.TypeRef.read(dict(array, **change), "array")
+
     def test_missing_entry_and_ambiguous_local_symbol_are_rejected(self):
         with patch.object(link_c.subprocess, "run") as cc, contextlib.redirect_stderr(io.StringIO()) as err:
             status = link_c.main([*self.left_args, *self.right_args, *self.build_args])

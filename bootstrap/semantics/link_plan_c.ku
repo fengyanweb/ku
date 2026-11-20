@@ -1,5 +1,5 @@
 import { json } from "std"
-import { GuardBoundType, GuardCType } from "./guarded_struct_expr.ku"
+import { GuardBoundType, GuardCType, GuardType } from "./guarded_struct_expr.ku"
 import { SuppliedModule } from "./imports.ku"
 import { DeclarationSpan } from "./names.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
@@ -34,6 +34,13 @@ fn BoundLinkPlanType(&binding: TypeNameBinding, local_unit: int, c_type: str, vi
 
 fn BuiltinLinkPlanType(name: str, c_type: str, view: bool): LinkPlanType {
     return LinkPlanType { kind: "Builtin", name: name, unit: 0, node: 0, c_type: c_type, view: view }
+}
+
+fn StrArrayViewLinkPlanType(): LinkPlanType {
+    layouts: [StructLayout] = []
+    carrier = GuardCType(GuardType { kind: "str_array", layout: 0 }, layouts)
+    return LinkPlanType { kind: "BuiltinArray", name: "str", unit: 0, node: 0,
+        c_type: "const " + carrier + "*", view: true }
 }
 
 fn NullLinkPlanResult(): LinkPlanType {
@@ -136,10 +143,12 @@ fn NamedProjectionLinkPlan(&selected: SuppliedModule, &types: [TypeNameBinding],
         parameter = selected.named.parsed.arena.nodes[selected.named.parsed.arena.edges[cursor] - 1].clone()
         type_id = selected.named.parsed.arena.edges[parameter.first_edge]
         if (guarded && selected.named.parsed.arena.nodes[type_id - 1].kind == "TypeArray") {
-            RejectLayout("unsupported_guarded_link_array", "View [str] is available in guarded C emission; link plans do not yet describe it", DeclarationSpan(parameter))?
+            // The guarded emitter has already checked this exact signature.
+            parameters = parameters.push(StrArrayViewLinkPlanType())
+        } else {
+            bound = ExplicitType(types, type_id, DeclarationSpan(parameter))?
+            parameters = parameters.push(namedProjectionType(bound, layouts, guarded, parameter.int_value == 1)?)
         }
-        bound = ExplicitType(types, type_id, DeclarationSpan(parameter))?
-        parameters = parameters.push(namedProjectionType(bound, layouts, guarded, parameter.int_value == 1)?)
         cursor = cursor + 1
     }
     result = ExplicitType(types, selected.named.parsed.arena.edges[cursor], DeclarationSpan(declaration))?

@@ -92,12 +92,18 @@ class TypeRef:
             if ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0:
                 raise LinkError(f"{where} builtin must have a null path and node 0")
             identity = ("builtin", name)
+        elif ref["kind"] == "BuiltinArray":
+            if (ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0
+                    or name != "str" or passing != "view"
+                    or c_type[len("const "):-1].rstrip() != "KuGuardStringArray"):
+                raise LinkError(f"{where} builtin array requires the checked View [str] carrier")
+            identity = ("builtin_array", name)
         elif ref["kind"] in ("Struct", "StructArray"):
             identity = ("struct" if ref["kind"] == "Struct" else "struct_array",
                         module_path(ref["source_path"], f"{where}.source_path"),
                         node_id(ref["node"], f"{where}.node"))
         else:
-            raise LinkError(f"{where}.kind must be Builtin, Struct or StructArray")
+            raise LinkError(f"{where}.kind must be Builtin, BuiltinArray, Struct or StructArray")
         return TypeRef(identity, passing, c_type)
 
     def semantic(self):
