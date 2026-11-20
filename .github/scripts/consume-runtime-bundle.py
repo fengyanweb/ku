@@ -1102,6 +1102,27 @@ def installed_declaration_inventory_consumer(install, root, env, report, repo, c
     detail['status'] = 'passed'
 
 
+def bootstrap_compiler_manifests(compiler_modules):
+    limit = 64
+    if len(compiler_modules) <= limit:
+        return [compiler_modules]
+
+    # Each launcher is run as an independent tool and is not imported by
+    # another launcher. Keep all shared modules in each manifest so any new
+    # import between launchers fails the real binder rather than being skipped.
+    standalone = {
+        'stage1/main.ku', 'stage2/main.ku', 'stage3/main.ku',
+        'semantics/main.ku', 'semantics/project_main.ku', 'semantics/projection_main.ku',
+    }
+    entrypoints = sorted(module for module in compiler_modules if module in standalone)
+    shared = [module for module in compiler_modules if module not in standalone]
+    capacity = limit - len(shared)
+    if capacity < 1:
+        raise RuntimeError('bootstrap shared source graph no longer fits with an entrypoint')
+    return [shared + entrypoints[begin:begin + capacity]
+            for begin in range(0, len(entrypoints), capacity)]
+
+
 def installed_bootstrap_module_consumer(install, root, env, report, repo, commit, target):
     """Run Ku's installed module checker on its real compiler source graph."""
     report['installed_bootstrap_module'] = detail = {'status': 'running'}
@@ -1165,21 +1186,43 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
         if failure.returncode != 1 or failure.stdout or '|unresolved_import|' not in diagnostic:
             raise RuntimeError('relocated bootstrap tool lost its missing dependency diagnostic')
 
-        # Check the compiler and the standalone inventory as separate projects.
-        for key, project_modules in (('complete_project', compiler_modules), ('inventory_project', inventory_modules)):
+        # The compiler, independent launchers and declaration inventory are
+        # checked through the shipped binder after its SDK and build sources
+        # have been removed.
+        def bind_project(label, project_modules):
             ordered = sorted(project_modules)
             manifest.write_bytes(('\n'.join(ordered) + '\n').encode('utf-8'))
             whole_project = invoke([runnable], root, run_env, seconds=20)
             project_rows = output(whole_project).splitlines()
             bound_paths = [row.split('|', 1)[1] for row in project_rows if row.startswith('MODULE|')]
             if whole_project.returncode or whole_project.stderr or sorted(bound_paths) != ordered:
-                raise RuntimeError(f'relocated bootstrap tool could not bind {key}: ' +
+                raise RuntimeError(f'relocated bootstrap tool could not bind {label}: ' +
                                    whole_project.stderr.decode('utf-8', errors='replace')[-4096:])
-            detail[key] = {
-                'modules': len(bound_paths),
+            return project_rows
+
+        def bound_summary(project_modules, project_rows):
+            return {
+                'modules': len(project_modules),
                 'rows': len(project_rows),
                 'rows_sha256': hashlib.sha256(('\n'.join(project_rows) + '\n').encode('utf-8')).hexdigest(),
             }
+
+        compiler_manifests = bootstrap_compiler_manifests(compiler_modules)
+        if {module for project in compiler_manifests for module in project} != set(compiler_modules):
+            raise RuntimeError('bootstrap compiler manifests omitted committed source modules')
+        compiler_rows = []
+        manifest_results = []
+        for index, project in enumerate(compiler_manifests, start=1):
+            result = bind_project(f'compiler manifest {index}', project)
+            compiler_rows.extend(result)
+            manifest_results.append(bound_summary(project, result))
+        if len(compiler_manifests) > 1:
+            compiler_rows = sorted(set(compiler_rows))
+        detail['complete_project'] = bound_summary(compiler_modules, compiler_rows)
+        if len(compiler_manifests) > 1:
+            detail['complete_project']['manifests'] = manifest_results
+        inventory = bind_project('the declaration inventory', inventory_modules)
+        detail['inventory_project'] = bound_summary(inventory_modules, inventory)
     finally:
         relocate_checkout_entry(retired, install)
         detail['installation_restored'] = ku.is_file() and not retired.exists()
