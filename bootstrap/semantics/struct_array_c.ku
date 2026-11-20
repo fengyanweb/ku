@@ -1,8 +1,9 @@
+import { LinkedNullState } from "./link_plan_c.ku"
 import { EmitProjectionStringJoinHelpers, ScalarStringSuffixC } from "./scalar_int_emit.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
-import { OrderCStructLayouts, EmitNestedCLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
+import { OrderCStructLayouts, EmitCombinedCLayouts, EmitNestedCLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { ContainsType, CTypeName, ProjectionArrayHeader } from "./struct_projection_c.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
@@ -322,4 +323,17 @@ fn EmitBoundArrayAppenders(&types: [TypeNameBinding]): str {
         }
     }
     return text
+}
+
+fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str): str! {
+    text = header
+    text += EmitBoundStringOperations(body.uses_clone, body.uses_concat, body.uses_suffix)
+    definitions = EmitCombinedCLayouts(body.layouts, body.owning_layouts)?
+    text += definitions.source
+    text += EmitBoundArrayDeclarations(body.arrays, body.validated_arrays, definitions.array_types, body.uses_str_array)
+    text += EmitBoundElementClones(body.layouts, body.element_clones)
+    text += result_header + EmitBoundArrayResults(body.layouts, body.owning_layouts, body.owned_arrays)
+    append_types: [TypeNameBinding] = []
+    for index in body.append_slots.clone() { append_types = append_types.push(body.slots[index - 1].value.ty.clone()) }
+    return ok(text + EmitBoundArrayAppenders(append_types))
 }

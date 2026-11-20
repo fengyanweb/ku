@@ -1,12 +1,12 @@
 import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
-import { EmitBoundArrayAppenders, EmitBoundArrayDeclarations, EmitBoundArrayResults, EmitBoundElementClones, EmitBoundStringOperations } from "./struct_array_c.ku"
+import { EmitLinkedArrayBody } from "./struct_array_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { BuildProjectOwningLayouts, EmitCombinedCLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
+import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
 import { LinkedCPrelude, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
@@ -250,6 +250,7 @@ fn readLinkedIndex(&project: LinkedNullProject, state: LinkedNullState, &node: N
             + ".ptr) { invalid_array = true; goto cleanup; }\n"
     }
     item.value.borrowed = true
+    item.value.slot = array.value.slot
     return ok(item)
 }
 
@@ -265,11 +266,29 @@ fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: N
         RejectLayout("linked_unknown_field", "unknown field '" + node.text.clone() + "'", DeclarationSpan(node))?
     }
     field_type = fields[ordinal - 1].resolved.clone()
-    if (field_type.declaration_kind == "StructArray" || field_type.declaration_kind == "BuiltinArray") {
-        RejectLayout("linked_nested_array_projection", "a nested owning array field does not yet support projection", DeclarationSpan(node))?
+    member = receiver.value.text + ".f" + str(ordinal - 1)
+    field = LinkedReadonlyExpression(receiver.state, field_type, member)
+    field.value.slot = receiver.value.slot
+    if (field.value.ty.declaration_kind == "StructArray" ||
+        (field.value.ty.declaration_kind == "BuiltinArray" && field.value.ty.name == "str")) {
+        ty = field.value.ty.clone()
+        next = RegisterLinkedNullType(project, field.state, ty)?
+        if (field.value.ty.declaration_kind == "StructArray") {
+            next = RequireLinkedArrayValidation(next, field.value.ty.clone())
+            element = LinkedNullArrayElement(field.value.ty.clone())
+            next.code += LinkedNullResultCleanupReference(next.owning_layouts, element)
+        }
+        address = "(&(" + field.value.text + "))"
+        next.code += "    if (!" + LinkedNullArrayPrefix(field.value.ty) + "_valid(" + address.clone()
+            + ") || (uintmax_t)" + address.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
+        field.state = next
+        field.value.text = address
+        field.value.borrowed = true
+    } else if (field.value.ty.declaration_kind == "BuiltinArray") {
+        RejectLayout("linked_nested_array_projection", "nested builtin array View requires supported str elements", DeclarationSpan(node))?
+    } else {
+        field.value.borrowed = LinkedNullOwner(field.value.ty)
     }
-    field = LinkedReadonlyExpression(receiver.state, field_type, receiver.value.text + ".f" + str(ordinal - 1))
-    field.value.borrowed = LinkedNullOwner(field.value.ty)
     return ok(field)
 }
 
@@ -334,14 +353,7 @@ fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpressio
 }
 
 fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding): str! {
-    text = LinkedCPrelude(body, GuardArithmetic(body.uses_add, body.uses_sub) + GuardStringEquality(body.uses_string_equal))
-    text += EmitBoundStringOperations(body.uses_clone, body.uses_concat, body.uses_suffix)
-    definitions = EmitCombinedCLayouts(body.layouts, body.owning_layouts)?
-    text += definitions.source
-    text += EmitBoundArrayDeclarations(body.arrays, body.validated_arrays, definitions.array_types, body.uses_str_array)
-    text += EmitBoundElementClones(body.layouts, body.element_clones)
-    text += StructResultHeader() + EmitBoundArrayResults(body.layouts, body.owning_layouts, body.owned_arrays)
-    append_types: [TypeNameBinding] = []
-    for index in body.append_slots.clone() { append_types = append_types.push(body.slots[index - 1].value.ty.clone()) }
-    return ok(text + EmitBoundArrayAppenders(append_types) + EmitLinkedNullPrototypes(body.links, result)?)
+    header = LinkedCPrelude(body, GuardArithmetic(body.uses_add, body.uses_sub) + GuardStringEquality(body.uses_string_equal))
+    declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
+    return ok(declarations + EmitLinkedNullPrototypes(body.links, result)?)
 }

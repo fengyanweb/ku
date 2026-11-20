@@ -326,6 +326,8 @@ statement and transfers the original Error if the call fails.
 A named struct View uses a const pointer to the bound declaration. Field
 reads and View-to-View calls keep the original parent owner live.
 A View of a record array can also describe elements with nested owned arrays.
+A nested record-array field can be passed as a View. The call tracks the
+parent owner so a later argument cannot move it before using the View.
 
 The linked path also moves an owned record out of a checked dependency.
 It uses the project's nominal layout and destructor for nested fields. A

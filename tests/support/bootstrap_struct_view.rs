@@ -6,16 +6,19 @@ pub(super) fn assert_named_struct_view(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("struct-view-types.ku"),
         r#"struct Item { label: str count: int }
-struct Packet { item: Item offsets: [int] }
+struct Packet { item: Item offsets: [int] branches: [Item] }
 fn Probe(&item: Packet): null! { return ok(null) }
 fn See(value: int): null! { return ok(null) }
 fn Own(item: Packet): null! { return ok(null) }
+fn ProbeArray(&items: [Item]): null! { return ok(null) }
+fn Pair(&items: [Item], text: str): null! { return ok(null) }
+fn Consume(item: Packet): str! { output = "taken"; return ok(output) }
 "#,
     )
     .unwrap();
     fs::write(
         cwd.join("struct-view.ku"),
-        r#"import { Packet as Envelope, Probe, See, Own } from "./struct-view-types.ku"
+        r#"import { Packet as Envelope, Probe, See, Own, ProbeArray, Pair, Consume } from "./struct-view-types.ku"
 fn Inspect(&item: Envelope): null! {
     Probe(item)?
     See(item.item.count)?
@@ -27,6 +30,15 @@ fn Wrong(&item: Envelope): null! {
 }
 fn InspectArray(&items: [Envelope]): null! {
     See(items[0].item.count)?
+    return ok(null)
+}
+fn InspectNested(&item: Envelope): null! {
+    ProbeArray(item.branches)?
+    See(item.branches[0].count)?
+    return ok(null)
+}
+fn WrongLoan(item: Envelope): null! {
+    Pair(item.branches, Consume(item)?)?
     return ok(null)
 }
 "#,
@@ -216,6 +228,81 @@ int main(void) {
     .unwrap();
     compile_projection(&c, &app, cwd);
     assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+
+    fs::write(cwd.join("function.txt"), "InspectNested").unwrap();
+    let projected = output("linked-null");
+    assert_ok(&projected);
+    let projected = String::from_utf8(projected.stdout).unwrap();
+    let definition = |prefix: &str| {
+        let line = projected
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap();
+        let (function, _) = line.split_once('(').unwrap();
+        function.rsplit_once(' ').unwrap().1
+    };
+    let probe_signature = projected
+        .lines()
+        .find(|line| {
+            line.starts_with("extern KuBootstrapResultNull") && line.contains("(const KuArray_")
+        })
+        .expect("checked nested view prototype");
+    let (before_argument, argument) = probe_signature.split_once("(const ").unwrap();
+    let (_, nested_probe) = before_argument.rsplit_once(' ').unwrap();
+    let (nested_type, _) = argument.split_once('*').unwrap();
+    let nested = r#"
+static const __ARRAY__ *expected;
+static int checks;
+KuBootstrapResultNull __PROBE__(const __ARRAY__ *items) {
+    assert(items == expected && items->len == 1 && items->data[0].f1 == 42);
+    ++checks;
+    return (KuBootstrapResultNull){.ok = true};
+}
+KuBootstrapResultNull __SEE__(int64_t count) {
+    assert(count == 42 && checks == 1);
+    ++checks;
+    return (KuBootstrapResultNull){.ok = true};
+}
+int main(void) {
+    (void)test_realloc;
+    __PACKET__ owner = {0};
+    owner.f2.data = malloc(sizeof(*owner.f2.data));
+    memset(owner.f2.data, 0, sizeof(*owner.f2.data));
+    owner.f2.len = owner.f2.capacity = 1;
+    uint8_t *text = malloc(7);
+    memcpy(text, "payload", 7);
+    owner.f2.data[0].f0 = (KuProjectionString){text,7,7,KU_PROJECTION_STRING_OWNED};
+    owner.f2.data[0].f1 = 42;
+    expected = &owner.f2;
+    assert(__ENTRY__(&owner).ok && checks == 2 && outstanding() == 2);
+    assert(owner.f2.data[0].f0.ptr == text && memcmp(text, "payload", 7) == 0);
+    free(text);
+    free(owner.f2.data);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace(
+        "__ENTRY__",
+        definition("KuBootstrapResultNull ku_linked_null_"),
+    )
+    .replace("__PACKET__", packet)
+    .replace("__PROBE__", nested_probe)
+    .replace("__ARRAY__", nested_type)
+    .replace("__SEE__", &symbol("See"));
+    let c = cwd.join("nested-record-field-view.c");
+    let app = cwd.join(format!(
+        "nested-record-field-view{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{projected}{nested}")).unwrap();
+    compile_projection(&c, &app, cwd);
+    assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+    fs::write(cwd.join("function.txt"), "WrongLoan").unwrap();
+    let refused = output("linked-null");
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(refused.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("linked_view_move"));
 
     fs::write(cwd.join("function.txt"), "Wrong").unwrap();
     let rejected = output("linked-null");
