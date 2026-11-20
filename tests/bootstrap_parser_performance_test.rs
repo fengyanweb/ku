@@ -263,6 +263,7 @@ fn copy_bootstrap_sources(directory: &std::path::Path) {
                 "body_support.ku",
                 "support.ku",
                 "signature.ku",
+                "signature_tokens.ku",
                 "imports.ku",
                 "structs.ku",
                 "enums.ku",

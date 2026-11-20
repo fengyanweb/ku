@@ -2315,6 +2315,9 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         ku_string(ENUM_GOLDEN_SOURCE),
         ku_string(ENUM_GOLDEN)
     ));
+    body.push_str(
+        "    mixed_callable = ParseTypeWindow(Scan(\"fn(&[pkg.Item!] | null, [int]): str!\")?)?\n    if (mixed_callable.consumed != 19 || mixed_callable.work != 52 || mixed_callable.root != 12) { panic(\"callable type planning cursor, work or root changed\") }\n",
+    );
     body.push_str("    return ok(null)\n}\n\nfn MainGrammar(): null! {\n");
     for source in accepted {
         body.push_str(&format!(
@@ -3477,6 +3480,7 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         "imports.ku",
         "parser.ku",
         "signature.ku",
+        "signature_tokens.ku",
         "simple_statements.ku",
         "statement_links.ku",
         "statements.ku",

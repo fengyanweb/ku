@@ -1,0 +1,53 @@
+import { Token } from "../stage1/token.ku"
+import { RejectAt, WindowKind, WindowToken } from "./support.ku"
+
+fn CheckTypeTokenBound(&tokens: [Token], index: int, end: int, type_last: int): null! {
+    if (index > type_last) {
+        RejectAt(WindowToken(tokens, type_last, end), "invalid_token_stream", "type window accepts at most 512 tokens")?
+    }
+    return ok(null)
+}
+
+fn ReadTypeToken(&tokens: [Token], index: int, end: int, type_last: int): Token! {
+    CheckTypeTokenBound(tokens, index, end, type_last)?
+    return ok(WindowToken(tokens, index, end))
+}
+
+fn ReadTypeTokenKind(&tokens: [Token], index: int, end: int, type_last: int): str! {
+    CheckTypeTokenBound(tokens, index, end, type_last)?
+    return ok(WindowKind(tokens, index, end))
+}
+
+fn FunctionReturnStart(&tokens: [Token], close: int, end: int, type_last: int): int! {
+    colon = ReadTypeToken(tokens, close + 1, end, type_last)?
+    if (colon.kind != "Colon") {
+        RejectAt(colon.clone(), "unexpected_token", "expected ':' before function type return")?
+    }
+    return ok(close + 2)
+}
+
+struct TypeOpening {
+    cursor: int
+    parameter_index: int
+    returning: bool
+}
+
+fn ReadTypeOpening(&tokens: [Token], start: int, end: int, type_last: int, frame_depth: int, &token: Token): TypeOpening! {
+    if (frame_depth >= 32) { RejectAt(token.clone(), "type_depth_exceeded", "stage-3 type nesting exceeds 32 levels")? }
+    cursor = start + 1
+    parameter_index = cursor
+    returning = false
+    if (token.kind == "Fn") {
+        lparen = ReadTypeToken(tokens, cursor, end, type_last)?
+        if (lparen.kind != "LParen") {
+            RejectAt(lparen, "unexpected_token", "expected '(' after 'fn' in function type")?
+        }
+        cursor = cursor + 1
+        parameter_index = cursor
+        if ((ReadTypeToken(tokens, cursor, end, type_last)?).kind == "RParen") {
+            cursor = FunctionReturnStart(tokens, cursor, end, type_last)?
+            returning = true
+        }
+    }
+    return ok(TypeOpening { cursor: cursor, parameter_index: parameter_index, returning: returning })
+}
