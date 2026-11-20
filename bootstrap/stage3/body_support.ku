@@ -1,8 +1,8 @@
 import { Token } from "../stage1/token.ku"
 import { Node, Arena, ParseOutput } from "../stage2/ast.ku"
-import { SpanFromToken, SpanMerge } from "../stage2/span.ku"
-import { CanEndExpression, EmptyExpressionBoundary, EndsAtExpressionSeparator, PushExpressionBoundary, RejectAt, RejectAtPoint, WindowToken, WindowKind } from "./support.ku"
-import { IsNamedStructStart } from "../stage2/expression_support.ku"
+import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
+import { CanEndExpression, EmptyExpressionBoundary, EndsAtExpressionSeparator, PushExpressionBoundary, RejectAt, RejectAtSpan, RejectAtPoint, WindowToken, WindowKind } from "./support.ku"
+import { ExpressionSpan, IsNamedStructStart } from "../stage2/expression_support.ku"
 import { SignatureType, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 
 struct StatementLink {
@@ -198,6 +198,40 @@ fn AssignmentOperator(&kind: str): str {
     if (kind == "SlashEqual") { return "/" }
     if (kind == "PercentEqual") { return "%" }
     return ""
+}
+
+struct BodyExpressionRead {
+    node: int
+    cursor: int
+}
+
+fn ReadBodyExpression(&tokens: [Token], start: int, last_index: int, token_base: int,
+                      origin: Token, &target_context: str, &value_context: str,
+                      parse: fn(int, int): ParseOutput!, append: fn(ParseOutput, Token, bool): int!,
+                      add: fn(str, str, int, Span, [int], Token): int!,
+                      read_node: fn(int): Node, read_span: fn(int): Span): BodyExpressionRead! {
+    cursor = ReadExpressionEnd(tokens, start, last_index, target_context)?
+    expression = append(parse(token_base + start, token_base + cursor)?, WindowToken(tokens, start, last_index), false)?
+    target = read_node(expression)
+    span = ExpressionSpan(target)
+    kind = "ExprStmt"
+    children = [expression]
+    operator = AssignmentOperator(WindowKind(tokens, cursor, last_index))
+    if (operator != "") {
+        if (target.kind != "Field" && target.kind != "Index") {
+            RejectAtSpan(span.clone(), "invalid_assignment_target", "invalid assignment target")?
+        }
+        start_value = cursor + 1
+        cursor = ReadExpressionEnd(tokens, start_value, last_index, value_context)?
+        rhs = append(parse(token_base + start_value, token_base + cursor)?,
+                     WindowToken(tokens, start_value, last_index), false)?
+        span = SpanMerge(span, read_span(rhs))
+        children = children.push(rhs)
+        kind = "CompoundAssign"
+        if (operator == "=") { kind = "AssignTarget" operator = "" }
+    }
+    statement = add(kind, operator, 0, span, children, origin)?
+    return ok(BodyExpressionRead { node: statement, cursor: cursor })
 }
 
 fn RejectBodyNodeLimit(token: Token): null! { RejectAt(token, "node_limit", "stage-3 parser accepts at most 4096 AST nodes")? return ok(null) }

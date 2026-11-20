@@ -2,7 +2,7 @@ import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, ParseOutput } from "../stage2/ast.ku"
 import { ExpressionSpan } from "../stage2/expression_support.ku"
-import { NextBodyWork, ReadExpressionEnd, AssignmentOperator, RejectLetStatement,
+import { NextBodyWork, ReadExpressionEnd, AssignmentOperator, ReadBodyExpression, RejectLetStatement,
          SignatureTypeOutput } from "./body_support.ku"
 import { ReadTypedInitializer } from "./function_header.ku"
 import { ReadSignatureTypePrefix } from "./signature.ku"
@@ -139,31 +139,10 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         }
         cursor = expression_end
     } else {
-        expression_end = ReadExpressionEnd(tokens, cursor, last_index, target_context)?
-        statement_origin = WindowToken(tokens, cursor, last_index)
-        statement_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
-        expression = add_arena(statement_parsed, statement_origin, false)?
-        expression_node = read_node(expression)
-        span = ExpressionSpan(expression_node)
-        cursor = expression_end
-        kind = "ExprStmt"
-        children: [int] = [expression]
-        assignment_operator = AssignmentOperator(WindowKind(tokens, cursor, last_index))
-        if (assignment_operator != "") {
-            if (expression_node.kind != "Field" && expression_node.kind != "Index") {
-                RejectAtSpan(span.clone(), "invalid_assignment_target", "invalid assignment target")?
-            }
-            cursor = cursor + 1
-            expression_end = ReadExpressionEnd(tokens, cursor, last_index, value_context)?
-            value = parse_expression(token_base + cursor, token_base + expression_end)?
-            rhs = add_arena(value, WindowToken(tokens, cursor, last_index), false)?
-            span = SpanMerge(span, read_span(rhs))
-            children = children.push(rhs)
-            kind = "CompoundAssign"
-            if (assignment_operator == "=") { kind = "AssignTarget" assignment_operator = "" }
-            cursor = expression_end
-        }
-        statement = add_node(kind, assignment_operator, 0, span, children, statement_start.clone())?
+        read = ReadBodyExpression(tokens, cursor, last_index, token_base, statement_start.clone(), target_context, value_context,
+                                  parse_expression, add_arena, add_node, read_node, read_span)?
+        statement = read.node
+        cursor = read.cursor
     }
     if (WindowKind(tokens, cursor, last_index) == "Semicolon") { cursor = cursor + 1 }
     return ok(SimpleStatementRead { node: statement, cursor: cursor, work: parse_steps, initializer_type: 0 })
