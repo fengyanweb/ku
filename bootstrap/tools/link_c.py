@@ -92,11 +92,14 @@ class TypeRef:
             if ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0:
                 raise LinkError(f"{where} builtin must have a null path and node 0")
             identity = ("builtin", name)
-        elif ref["kind"] == "Struct":
-            identity = ("struct", module_path(ref["source_path"], f"{where}.source_path"),
+        elif ref["kind"] in ("Struct", "StructArray"):
+            if ref["kind"] == "StructArray" and passing != "view":
+                raise LinkError(f"{where} struct array must have readonly View passing")
+            identity = ("struct" if ref["kind"] == "Struct" else "struct_array",
+                        module_path(ref["source_path"], f"{where}.source_path"),
                         node_id(ref["node"], f"{where}.node"))
         else:
-            raise LinkError(f"{where}.kind must be Builtin or Struct")
+            raise LinkError(f"{where}.kind must be Builtin, Struct or StructArray")
         return TypeRef(identity, passing, c_type)
 
     def semantic(self):

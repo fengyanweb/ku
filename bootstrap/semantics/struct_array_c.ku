@@ -80,7 +80,11 @@ fn EmitOwnedStructOperations(&layouts: [StructLayout], root: int, &prefix: str, 
     return emitOwnedStructElement(element, prefix, owned, private_drop)
 }
 
-fn emitArrayBoundary(&element: str, &array: str, &prefix: str): str {
+fn EmitStructArrayHeader(&element: str, &array: str): str {
+    return "\ntypedef struct { size_t len; " + element.clone() + " *data; size_t capacity; } " + array.clone() + ";\n"
+}
+
+fn EmitStructArrayReadValidation(&element: str, &array: str, &prefix: str): str {
     text = "static size_t " + prefix.clone() + "_capacity(const " + array.clone() + " *array) {\n"
     // Stage0 still accepts a zero explicit capacity for legacy len-slot
     // initializers. Every newly produced header writes its full capacity.
@@ -88,6 +92,11 @@ fn emitArrayBoundary(&element: str, &array: str, &prefix: str): str {
     text += "static bool " + prefix.clone() + "_valid(const " + array.clone() + " *array) {\n"
     text += "    if (!array) return false;\n    size_t capacity = " + prefix.clone() + "_capacity(array);\n"
     text += "    return array->len <= capacity && capacity <= SIZE_MAX / sizeof(" + element.clone() + ") && (array->data || !capacity);\n}\n\n"
+    return text
+}
+
+fn emitArrayBoundary(&element: str, &array: str, &prefix: str): str {
+    text = EmitStructArrayReadValidation(element, array, prefix)
     text += "static bool " + prefix.clone() + "_contains(const " + array.clone() + " *array, const " + element.clone() + " *value) {\n"
     text += "    uintptr_t slot = (uintptr_t)value, base = (uintptr_t)array->data;\n"
     text += "    return array->data && slot >= base && slot - base < " + prefix.clone() + "_capacity(array) * sizeof(" + element.clone() + ");\n}\n\n"
@@ -147,7 +156,7 @@ fn EmitStructArrayOperations(&layouts: [StructLayout], root: int): StructArrayC 
     owned = collectOwnedFields(layouts, root, "", [])
     text = "#include <stddef.h>\n#include <stdlib.h>\n"
     if (owned.len() != 0) { text += "#include <string.h>\n" }
-    text += "\ntypedef struct { size_t len; " + element.clone() + " *data; size_t capacity; } " + array.clone() + ";\n"
+    text += EmitStructArrayHeader(element, array)
     text += "enum { KU_STRUCT_ARRAY_OK, KU_STRUCT_ARRAY_INVALID, KU_STRUCT_ARRAY_BOUNDS, KU_STRUCT_ARRAY_CAPACITY, KU_STRUCT_ARRAY_OOM };\n\n"
     text += emitOwnedStructElement(element, prefix, owned, false) + emitArrayBoundary(element, array, prefix) + emitArrayTransfer(element, array, prefix)
     return StructArrayC { element_type: element, array_type: array, prefix: prefix, source: text }

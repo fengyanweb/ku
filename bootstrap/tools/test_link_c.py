@@ -141,6 +141,15 @@ class LinkTests(unittest.TestCase):
         self.change_plan(self.left_args, lambda p: p["export"]["signature"]["parameters"][0].update(source_path="other/point.ku"))
         self.assert_preflight_error([*self.entry_args, *self.left_args, *self.right_args], "signature mismatch")
 
+    def test_readonly_struct_array_identity_is_not_its_element_identity(self):
+        def shape(metadata):
+            metadata["export"]["signature"]["parameters"][0].update(kind="StructArray", c_type="const Array*")
+        self.change_plan(self.left_args, shape)
+        self.assert_preflight_error([*self.entry_args, *self.left_args, *self.right_args], "signature mismatch")
+        self.change_plan(self.left_args, lambda p: p["export"]["signature"]["parameters"][0].update(
+            c_type="Array", passing="value"))
+        self.assert_preflight_error([*self.entry_args, *self.left_args, *self.right_args], "readonly View")
+
     def test_parameter_order_and_result_status_are_checked(self):
         wrong = copy.deepcopy(self.left)
         wrong["signature"]["parameters"].reverse()

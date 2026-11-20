@@ -21,7 +21,9 @@ If one of the supplied units already defines `main`, omit both options.
 The linker checks the providers and all dependencies before starting the C
 compiler. It compares the ordered parameter identities, passing modes, result
 identity and Result representation. A struct identity comes from its module
-path and declaration node. Equivalent types can use different C aliases in
+path and declaration node. A readonly `StructArray` identifies its element by
+that pair and keeps its array shape distinct from the element itself.
+Equivalent types can use different C aliases in
 separate units. Builtin carriers must agree, with aliases for the shared
 bootstrap string layout recognized across emitters. Each provided unit
 compiles once with C11 O2 and compile-time aliases for the checked symbols.
