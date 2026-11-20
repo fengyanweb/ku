@@ -1,7 +1,7 @@
 import { ReadLinkedNullParameters } from "./linked_parameters_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
-import { BindLinkedCatch, DropLinkedNullScope, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { BindLinkedCatch, CheckLinkedGuardOwners, DropLinkedNullScope, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedNullDeclarations, FinishLinkedFunctionC } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -48,7 +48,7 @@ fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statem
     if (split == statement.edge_count) {
         if (taken.terminal) { taken.state = RestoreLinkedNullSlots(taken.state, outer) }
         else {
-            PreserveLinkedOwners(outer, taken.state.slots, statement)?
+            CheckLinkedGuardOwners(outer, taken.state, statement)?
             taken.state = DropLinkedNullScope(taken.state, outer.len())
         }
         taken.state.code += "    }\n"

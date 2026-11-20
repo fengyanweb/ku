@@ -433,7 +433,7 @@ fn LinkedSlotPrefix(&slots: [LinkedNullSlot], length: int): [LinkedNullSlot] {
     return result
 }
 
-fn linkedSlotOwnershipMatches(&before: LinkedNullSlot, &after: LinkedNullSlot): bool {
+fn LinkedSlotOwnershipMatches(&before: LinkedNullSlot, &after: LinkedNullSlot): bool {
     if (before.live != after.live || before.moved_members.len() != after.moved_members.len()) { return false }
     index = 0
     while (index < before.moved_members.len()) {
@@ -446,7 +446,7 @@ fn linkedSlotOwnershipMatches(&before: LinkedNullSlot, &after: LinkedNullSlot): 
 fn PreserveLinkedOwners(&before: [LinkedNullSlot], &after: [LinkedNullSlot], &statement: Node): null! {
     index = 0
     while (index < before.len()) {
-        if (LinkedNullOwner(before[index].value.ty) && !linkedSlotOwnershipMatches(before[index], after[index])) {
+        if (LinkedNullOwner(before[index].value.ty) && !LinkedSlotOwnershipMatches(before[index], after[index])) {
             RejectLayout("linked_control_move", "conditional code cannot consume an outer owner", DeclarationSpan(statement))?
         }
         index = index + 1

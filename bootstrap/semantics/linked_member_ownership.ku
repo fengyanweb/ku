@@ -1,9 +1,34 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { RejectLayout } from "./struct_layouts.ku"
+import { GuardOwnedDrops } from "./guarded_struct_c.ku"
+import { HasBoundArrayMembers } from "./struct_array_c.ku"
+import { LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { LinkedNullCType, LinkedNullDropC } from "./linked_null_types_c.ku"
-import { LinkedNullBinding, LinkedNullSlot, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { LinkedNullBinding, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches } from "./link_plan_c.ku"
+
+fn scalarGuardSlotMove(&before: LinkedNullSlot, &after: LinkedNullSlot, &state: LinkedNullState): bool {
+    ty = before.value.ty.clone()
+    if (ty.declaration_kind != "Struct" || before.value.borrowed || !before.live || after.live
+        || before.moved_members.len() != 0 || after.moved_members.len() != 0) { return false }
+    layout = LayoutIndex(state.layouts, ty.module_index, ty.declaration_node)
+    return layout > 0 && !HasBoundArrayMembers(state.layouts, layout)
+        && GuardOwnedDrops(state.layouts, layout, before.value.text) == ""
+}
+
+fn CheckLinkedGuardOwners(&outer: [LinkedNullSlot], &taken: LinkedNullState, &statement: Node): null! {
+    index = 0
+    while (index < outer.len()) {
+        if (LinkedNullOwner(outer[index].value.ty) && !LinkedSlotOwnershipMatches(outer[index], taken.slots[index])
+            && !scalarGuardSlotMove(outer[index], taken.slots[index], taken)) {
+            RejectLayout("linked_control_move", "conditional code cannot consume an outer owner", DeclarationSpan(statement))?
+        }
+        index = index + 1
+    }
+    // On continuation the taken-arm liveness is already conservative. The
+    // untaken scalar record has no resources requiring divergent cleanup.
+    return ok(null)
+}
 
 fn LinkedMemberPath(&receiver: LinkedNullValue, ordinal: int): str {
     if (receiver.slot == 0 || (receiver.borrowed && receiver.member_path == "")) { return "" }

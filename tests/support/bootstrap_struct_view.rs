@@ -438,7 +438,47 @@ fn Refuse(&values: [Wrapped]): null! {
     copied = values[0].clone()
     return ok(null)
 }
+struct Pair { left: Index right: Index }
+fn Take(stamp: Stamp): null! { return ok(null) }
+fn TakeIndex(index: Index): null! { return ok(null) }
+fn Guard(&owner: Wrapped, stamp: Stamp, active: bool): null! {
+    if (active) { Take(stamp)? }
+    return ok(null)
+}
+fn ReuseAfterMove(&owner: Wrapped, stamp: Stamp, active: bool): null! {
+    if (active) { Take(stamp)? }
+    See(stamp.value)?
+    return ok(null)
+}
+fn ConditionalArrayMove(index: Index, active: bool): null! {
+    if (active) { TakeIndex(index)? }
+    return ok(null)
+}
+fn DifferentMembers(pair: Pair, active: bool): null! {
+    if (active) { TakeIndex(pair.left)? }
+    else { TakeIndex(pair.right)? }
+    return ok(null)
+}
 "#;
+
+fn scalar_record_test_symbols(code: &str) -> (&str, &str, &str, &str) {
+    let (entry, params) = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResultNull ku_linked_null_"))
+        .unwrap()
+        .split_once("(const ")
+        .unwrap();
+    let (owner, stamp) = params.split_once("* a0, ").unwrap();
+    let (stamp, _) = stamp.split_once(' ').unwrap();
+    let dependency = code
+        .lines()
+        .find_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    (entry, owner, stamp, dependency)
+}
 
 pub(super) fn assert_checked_field_clone(seed: &Path, cwd: &Path) {
     fs::write(cwd.join("field-clone.ku"), FIELD_CLONE_SOURCE).unwrap();
@@ -448,21 +488,7 @@ pub(super) fn assert_checked_field_clone(seed: &Path, cwd: &Path) {
     let emitted = execute(&mut Command::new(seed), cwd, 30);
     assert_ok(&emitted);
     let code = String::from_utf8(emitted.stdout).unwrap();
-    let (entry, params) = code
-        .lines()
-        .find_map(|line| line.strip_prefix("KuBootstrapResultNull ku_linked_null_"))
-        .unwrap()
-        .split_once("(const ")
-        .unwrap();
-    let (owner, stamp) = params.split_once("* a0, ").unwrap();
-    let (stamp, _) = stamp.split_once(' ').unwrap();
-    let see = code
-        .lines()
-        .find_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
-        .unwrap()
-        .split_once('(')
-        .unwrap()
-        .0;
+    let (entry, owner, stamp, see) = scalar_record_test_symbols(&code);
     assert!(!code.contains("_clone_element"));
     let c = cwd.join("field-clone.c");
     let exe = cwd.join(format!("field-clone{}", std::env::consts::EXE_SUFFIX));
@@ -484,4 +510,57 @@ pub(super) fn assert_checked_field_clone(seed: &Path, cwd: &Path) {
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_nested_array_clone"));
+
+    fs::write(cwd.join("function.txt"), "Guard").unwrap();
+    let guard = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&guard);
+    let code = String::from_utf8(guard.stdout).unwrap();
+    let (entry, owner, stamp, take) = scalar_record_test_symbols(&code);
+    let host = r#"
+static int called;
+KuBootstrapResultNull __TAKE__(__STAMP__ stamp) {
+    ++called;
+    assert(stamp.f0 == 47 || stamp.f0 == -47);
+    if (stamp.f0 > 0) return (KuBootstrapResultNull){.ok = true};
+    KuBootstrapResultNull error = {0};
+    const char *code = "injected";
+    error.error.code = (KuProjectionString){(uint8_t *)code,8,0,KU_PROJECTION_STRING_STATIC};
+    return error;
+}
+int main(void) {
+    __OWNER__ parent = {0};
+    assert(__GUARD__(&parent, (__STAMP__){47}, false).ok && called == 0);
+    assert(__GUARD__(&parent, (__STAMP__){47}, true).ok && called == 1);
+    KuBootstrapResultNull rejected = __GUARD__(&parent, (__STAMP__){-47}, true);
+    assert(!rejected.ok && called == 2 && rejected.error.code.len == 8);
+    assert(!memcmp(rejected.error.code.ptr, "injected", 8));
+    return 0;
+}
+"#
+    .replace("__GUARD__", &format!("ku_linked_null_{entry}"))
+    .replace("__TAKE__", take)
+    .replace("__OWNER__", owner)
+    .replace("__STAMP__", stamp);
+    fs::write(
+        &c,
+        format!("#include <assert.h>\n#include <string.h>\n{code}{host}"),
+    )
+    .unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+
+    for (name, reason) in [
+        ("ReuseAfterMove", "unavailable_linked_binding"),
+        ("ConditionalArrayMove", "linked_control_move"),
+        ("DifferentMembers", "linked_control_move"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains(reason),
+            "{name}"
+        );
+    }
 }
