@@ -1,6 +1,6 @@
 # PostgreSQL 类型化单行查询
 
-同步类型化查询可通过默认 native、`ku run` 或显式 Runner 执行。普通文本查询使用 `client.query(sql, [str])`。Task 中的 PostgreSQL I/O 使用 native。
+类型化查询可通过默认 native、`ku run` 或显式 Runner 在同步代码或 Task 中执行。普通文本查询使用 `client.query(sql, [str])`。
 
 ```ku
 row = client.query_one_typed(
@@ -37,11 +37,13 @@ absent = row.is_null(0, 3)?
 
 [pg_typed_http.ku](../examples/pg_typed_http.ku) 展示 HTTP Task 绑定动态文本、整数、布尔值与 NULL。Task 参数桥支持本地、扁平的参数字面量，元素为 `int`／`bool`／`str`／`null` 标量；它不代表通用 `KuValue` Task 参数、返回值、嵌套 JSON 参数或任意动态参数数组已经支持。示例的类型声明使用固定数组。native 同步接口也能借用元素已是 `KuValue` 的现有 `[KuValue]` 数组。两个接口都不会 move 或释放输入。
 
+在同步启动代码中调用 `pg.client`，异步 HTTP handler 再调用现有的 `query` 或 `query_one_typed`。native 由网络就绪事件推进 PG 请求。Runner 和 `ku run` 把等待交给已有的有界阻塞线程池，Task 线程在等待期间可协助执行其他就绪任务。HTTP 套接字仍由独立事件循环处理。
+
 ## 错误与生命周期
 
 无效参数、声明、数值范围、结果 OID、format、长度或 UTF-8 返回明确错误；主要代码为 `typed_value_error`，NULL 使用 `null_value`。声明或参数错误在 SQL 发出前被拒绝；结果错误发生时 SQL 可能已经执行。不要据此重放写入。
 
-Ku 独立持有返回的单行数据。释放 libpq 结果、重置或关闭连接后，返回行仍有效。整数和布尔值从二进制结果读取。Task 路径将结果、参数副本和元数据计入 Task 账本。同步路径没有逐 Task 计费。libpq 内部缓冲受支持的 supervise 隔离模式或外部 cgroup／Windows Job 进程内存限制约束。
+Ku 独立持有返回的单行数据。释放 libpq 结果、重置或关闭连接后，返回行仍有效。整数和布尔值从二进制结果读取。native Task 路径将结果、参数副本和元数据计入 Task 账本。Runner 在查询入队前计入进程级 PG 待处理输入预算。libpq 内部缓冲受支持的 supervise 隔离模式或外部 cgroup／Windows Job 进程内存限制约束。
 
 获取连接、发送、读取和重置共用原绝对期限。每次查询独占一个 lease，收尽结果后执行同 lease 的 `DISCARD ALL`；不能清理或确认状态时驱逐连接。业务结果已独立保存后，重置失败仍按既有规则保留结果并驱逐连接。取消、断连和期限到达可能返回 `execution_unknown`；关闭连接不证明数据库操作已经回滚，不自动重试。
 

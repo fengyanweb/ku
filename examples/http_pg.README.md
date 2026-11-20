@@ -48,7 +48,7 @@ $env:KU_PG_RUNTIME_DIR = '<包含 libpq.dll 及其依赖的目录>'
 ku build --release --backend runner http_pg.ku -o task-list-runner.exe && .\task-list-runner.exe
 ```
 
-Runner 和 `ku run` 支持同步普通查询与 [类型化单行查询](../docs/pg-typed.md)。异步函数中的 PostgreSQL I/O 使用 native。
+普通查询和 [类型化单行查询](../docs/pg-typed.md) 都可在同步代码或 Task 中调用。先在同步启动代码里创建 `pg.client`，再把它交给异步 handler。
 
 ## 创建和查询
 

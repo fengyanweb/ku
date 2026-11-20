@@ -226,6 +226,51 @@ struct QueryDeadline<'a> {
     cancelled: &'a dyn Fn() -> bool,
 }
 
+enum QueryParameters {
+    Text(Vec<Option<CString>>),
+    Typed(Vec<typed::Param>, Vec<typed::Column>),
+}
+
+/// The original deadline and input reservation follow the query through
+/// blocking admission, execution and physical connection retirement.
+pub(crate) struct PreparedQuery {
+    client: Arc<Client>,
+    sql: CString,
+    parameters: QueryParameters,
+    deadline: Instant,
+    _budget: Reservation,
+}
+
+impl PreparedQuery {
+    pub(crate) fn execute(self, cancelled: &dyn Fn() -> bool) -> Value {
+        let timing = QueryDeadline {
+            end: self.deadline,
+            cancelled,
+        };
+        let result = timing.check().and_then(|()| {
+            self.client
+                .run_query(&timing, |connection| match self.parameters {
+                    QueryParameters::Text(bound) => connection
+                        .execute(&self.sql, &bound, timing.end, &mut || timing.check_cancel())
+                        .map(|table| Ok(Rows(ResultData::Text(table)))),
+                    QueryParameters::Typed(bound, columns) => {
+                        let result = connection.execute_typed(
+                            &self.sql,
+                            &bound,
+                            &columns,
+                            timing.end,
+                            &mut || timing.check_cancel(),
+                        )?;
+                        Ok(result.map(|cells| Rows(ResultData::Typed { columns, cells })))
+                    }
+                })
+        });
+        result.map_or_else(result_error, |rows| {
+            errors::ok(Value::PgResult(Arc::new(rows)))
+        })
+    }
+}
+
 impl QueryDeadline<'_> {
     fn check_cancel(&self) -> PgResult<()> {
         if (self.cancelled)() {
@@ -413,19 +458,19 @@ impl Client {
         }
     }
 
-    fn query(
-        &self,
+    fn prepare_query(
+        self: &Arc<Self>,
         sql: &str,
         params: &[Value],
         span: Span,
         caller_deadline: Option<Instant>,
         cancelled: &dyn Fn() -> bool,
-    ) -> PgResult<Rows> {
+    ) -> PgResult<PreparedQuery> {
         let timing = self.query_deadline(caller_deadline, cancelled);
         let check = || timing.check();
         validate_query_sql(sql, &check)?;
         let input_bytes = pending_input_bytes(sql, params, span, &check)?;
-        let _budget = reserve_query_inputs(input_bytes)?;
+        let budget = reserve_query_inputs(input_bytes)?;
         let sql = copy_to_cstr(sql, &check)?;
         let mut bound = Vec::new();
         bound
@@ -437,33 +482,35 @@ impl Client {
             })?));
         }
 
-        self.run_query(&timing, |connection| {
-            connection
-                .execute(&sql, &bound, timing.end, &mut || timing.check_cancel())
-                .map(|table| Ok(Rows(ResultData::Text(table))))
+        Ok(PreparedQuery {
+            client: Arc::clone(self),
+            sql,
+            parameters: QueryParameters::Text(bound),
+            deadline: timing.end,
+            _budget: budget,
         })
     }
 
-    fn query_typed(
-        &self,
+    fn prepare_typed_query(
+        self: &Arc<Self>,
         sql: &str,
         arguments: typed::Arguments<'_>,
         span: Span,
         caller_deadline: Option<Instant>,
         cancelled: &dyn Fn() -> bool,
-    ) -> PgResult<Rows> {
+    ) -> PgResult<PreparedQuery> {
         let timing = self.query_deadline(caller_deadline, cancelled);
         let check = || timing.check();
         validate_query_sql(sql, &check)?;
-        let _budget = reserve_query_inputs(arguments.input_bytes(sql.len(), span, &check)?)?;
+        let budget = reserve_query_inputs(arguments.input_bytes(sql.len(), span, &check)?)?;
         let sql = copy_to_cstr(sql, &check)?;
         let (bound, columns) = arguments.bind(span, &check)?;
-        self.run_query(&timing, |connection| {
-            let result =
-                connection.execute_typed(&sql, &bound, &columns, timing.end, &mut || {
-                    timing.check_cancel()
-                })?;
-            Ok(result.map(|cells| Rows(ResultData::Typed { columns, cells })))
+        Ok(PreparedQuery {
+            client: Arc::clone(self),
+            sql,
+            parameters: QueryParameters::Typed(bound, columns),
+            deadline: timing.end,
+            _budget: budget,
         })
     }
 
@@ -744,55 +791,60 @@ pub(crate) fn eval(
     })
 }
 
-pub(crate) fn eval_method(
-    module: &str,
+pub(crate) fn prepare_query(
     function: &str,
     values: &[Value],
     span: Span,
     caller_deadline: Option<Instant>,
     cancelled: &dyn Fn() -> bool,
+) -> KuResult<Result<PreparedQuery, Value>> {
+    let result = match (function, values) {
+        ("query", [Value::PgClient(client), sql, params]) => sql.with_read(span, |sql| {
+            let Value::String(sql) = sql else {
+                return Err(expected_type("str", sql, span));
+            };
+            params.with_read(span, |params| {
+                let Value::Array(params) = params else {
+                    return Err(expected_type("[str]", params, span));
+                };
+                Ok(client.prepare_query(sql, params, span, caller_deadline, cancelled))
+            })
+        })?,
+        (
+            "query_one_typed",
+            [Value::PgClient(client), Value::String(sql), Value::Array(params), Value::Array(param_types), Value::Array(result_types)],
+        ) => client.prepare_typed_query(
+            sql,
+            typed::Arguments {
+                values: params,
+                param_types,
+                result_types,
+            },
+            span,
+            caller_deadline,
+            cancelled,
+        ),
+        _ => {
+            return Err(KuError::runtime(
+                format!("invalid arguments to pg_client.{function}"),
+                span,
+            ))
+        }
+    };
+    Ok(result.map_err(result_error))
+}
+
+pub(crate) fn eval_method(
+    module: &str,
+    function: &str,
+    values: &[Value],
+    span: Span,
 ) -> KuResult<Option<Value>> {
     let value = match (module, function, values) {
-        ("pg_client", "query", [Value::PgClient(client), sql, params]) => {
-            sql.with_read(span, |sql| {
-                let Value::String(sql) = sql else {
-                    return Err(expected_type("str", sql, span));
-                };
-                params.with_read(span, |params| {
-                    let Value::Array(params) = params else {
-                        return Err(expected_type("[str]", params, span));
-                    };
-                    Ok(client
-                        .query(sql, params, span, caller_deadline, cancelled)
-                        .map_or_else(result_error, |rows| {
-                            errors::ok(Value::PgResult(Arc::new(rows)))
-                        }))
-                })
-            })?
-        }
         ("pg_client", "close", [Value::PgClient(client)]) => {
             client.close();
             Value::Null
         }
-        (
-            "pg_client",
-            "query_one_typed",
-            [Value::PgClient(client), Value::String(sql), Value::Array(params), Value::Array(param_types), Value::Array(result_types)],
-        ) => client
-            .query_typed(
-                sql,
-                typed::Arguments {
-                    values: params,
-                    param_types,
-                    result_types,
-                },
-                span,
-                caller_deadline,
-                cancelled,
-            )
-            .map_or_else(result_error, |rows| {
-                errors::ok(Value::PgResult(Arc::new(rows)))
-            }),
         ("pg_result", "rows", [Value::PgResult(rows)]) => Value::Int(rows.row_count() as i64),
         ("pg_result", "cols", [Value::PgResult(rows)]) => Value::Int(rows.col_count() as i64),
         (

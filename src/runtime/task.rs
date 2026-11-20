@@ -3033,6 +3033,11 @@ pub fn current_task_cancelled() -> bool {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn current_blocking_owner_cancelled() -> bool {
+    blocking_owner_cancellation().is_some()
+}
+
 pub(crate) fn current_task_cancellation() -> Option<CancellationContext> {
     CURRENT_TASK_STATE.with(|current| {
         current

@@ -15,7 +15,7 @@ impl TaskRetirementWitness {
         Self { state, runtime }
     }
 
-    fn observe(&self) -> (bool, Option<CancellationContext>) {
+    pub(crate) fn observe(&self) -> (bool, Option<CancellationContext>) {
         let submission = self.state.submission.load(Ordering::Acquire);
         let owner = self.state.owner_cleanup_done.load(Ordering::Acquire);
         let completion = self.state.completion_cleanup_done.load(Ordering::Acquire);
@@ -31,6 +31,15 @@ impl TaskRetirementWitness {
             _ => false,
         } && blocking == 0;
         (retired, cancellation)
+    }
+}
+
+impl TaskHandle {
+    /// Consume the result of an internal Task whose sole logical handle is
+    /// held by a service dispatcher. This is not a Ku await edge, and does not
+    /// block, drive other work or claim an enclosing user Task's wait slot.
+    pub(crate) fn take_internal_completion(&self) -> KuResult<Option<KuResult<Value>>> {
+        self.state.observe_result(true).map(|(result, _)| result)
     }
 }
 

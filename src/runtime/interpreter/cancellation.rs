@@ -259,6 +259,14 @@ impl Interpreter {
         if let Some(context) = current_task_cancellation() {
             self.latch_termination(context);
         }
+        if let Some(context) = self
+            .execution_deadline
+            .as_ref()
+            .and_then(|state| state.peer_cancel.as_ref())
+            .and_then(|cancel| cancel.context())
+        {
+            self.latch_termination(context);
+        }
         if let Some(state) = &mut self.execution_deadline {
             if state.poll(now) {
                 let cleanup_deadline = *state

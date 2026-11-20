@@ -27,8 +27,8 @@ use crate::{
         http_listener_registry,
         task::{
             current_cleanup_context, current_task_cancellation, set_execution_termination,
-            CancellationContext, CleanupGuard, ExecutionTerminationGuard, TaskRuntime,
-            TaskRuntimeSnapshot, TaskStressReport,
+            CancellationContext, CleanupGuard, ExecutionTerminationGuard, TaskHandle,
+            TaskRetirementWitness, TaskRuntime, TaskRuntimeSnapshot, TaskStressReport,
         },
     },
     span::{Position, Span},
@@ -136,6 +136,7 @@ struct HttpHandlerDeadline {
     timed_out: bool,
     cleanup_deadline: Option<Instant>,
     flight: Option<Arc<http_flight::FlightRecord>>,
+    peer_cancel: Option<Arc<http_io::HandlerCancellation>>,
 }
 
 impl HttpHandlerDeadline {
@@ -145,6 +146,7 @@ impl HttpHandlerDeadline {
             timed_out: false,
             cleanup_deadline: None,
             flight: http_flight::current(),
+            peer_cancel: None,
         }
     }
 
@@ -158,6 +160,69 @@ impl HttpHandlerDeadline {
         self.timed_out |= now >= self.deadline;
         self.timed_out
     }
+}
+
+struct PendingHttpTask {
+    task: Option<TaskHandle>,
+    retirement: TaskRetirementWitness,
+    cancellation: Arc<http_io::HandlerCancellation>,
+    token: http_io::HttpIoToken,
+    reply: Option<http_io::HttpIoReply>,
+}
+
+impl PendingHttpTask {
+    fn new(
+        task: TaskHandle,
+        cancellation: Arc<http_io::HandlerCancellation>,
+        token: http_io::HttpIoToken,
+        reply: http_io::HttpIoReply,
+    ) -> Self {
+        Self {
+            retirement: task.retirement_witness(),
+            task: Some(task),
+            cancellation,
+            token,
+            reply: Some(reply),
+        }
+    }
+
+    fn poll(&mut self, span: Span) -> KuResult<bool> {
+        if let Some(task) = &self.task {
+            if let Some(context) = self.cancellation.context() {
+                task.request_cancel_with(context);
+            }
+            if let Some(result) = task.take_internal_completion()? {
+                let mut reply = self.reply.take().expect("one reply per HTTP task");
+                let (response, origin) = match result {
+                    Ok(ref value) if http_task_admission_failed(value) => (
+                        status_response(503, "Service Unavailable"),
+                        http_io::HttpTraceOrigin::Response,
+                    ),
+                    result => http_handler_response(result),
+                };
+                reply.handler_finished(None, response.status, origin);
+                if self.cancellation.context().is_none() {
+                    reply.respond(self.token, response).map_err(|err| {
+                        KuError::runtime(format!("http handler reply failed: {err}"), span)
+                    })?;
+                }
+                self.task = None;
+            }
+        }
+        Ok(self.task.is_none() && self.retirement.observe().0)
+    }
+}
+
+fn poll_http_tasks(tasks: &mut Vec<PendingHttpTask>, span: Span) -> KuResult<()> {
+    let mut index = 0;
+    while index < tasks.len() {
+        if tasks[index].poll(span)? {
+            tasks.swap_remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
 }
 
 // Opt-in, bounded timing only. Request fields never enter this diagnostic.
@@ -1724,14 +1789,10 @@ impl Interpreter {
             "kuvalue" => eval_kuvalue_method(name, &mut values, span),
             #[cfg(not(target_arch = "wasm32"))]
             "pg_client" if name == "query" || name == "query_one_typed" => {
-                self.eval_pg_io(span, move |deadline, cancelled| {
-                    stdlib::pg::eval_method(module, name, &values, span, deadline, cancelled)
-                })
+                self.eval_pg_query(name, &values, span)
             }
             #[cfg(not(target_arch = "wasm32"))]
-            "pg_client" | "pg_result" => {
-                stdlib::pg::eval_method(module, name, &values, span, None, &|| false)
-            }
+            "pg_client" | "pg_result" => stdlib::pg::eval_method(module, name, &values, span),
             _ => Ok(None),
         }?;
         value
@@ -1740,23 +1801,53 @@ impl Interpreter {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn eval_pg_io(
+    fn eval_pg_query(
         &mut self,
+        method: &str,
+        values: &[Value],
         span: Span,
-        run: impl FnOnce(Option<Instant>, &dyn Fn() -> bool) -> KuResult<Option<Value>>,
     ) -> KuResult<Option<Value>> {
+        use crate::runtime::task::{current_blocking_owner_cancelled, current_task_cancelled};
+
         self.reject_cleanup_submission(span)?;
-        if self.async_execution {
-            return Ok(Some(stdlib::errors::err(
-                "pg",
-                "backend_unsupported",
-                "PostgreSQL I/O in an async function requires the native backend",
-            )));
-        }
         let deadline = self.execution_deadline.as_ref().map(|state| state.deadline);
-        let value = run(deadline, &crate::runtime::task::current_task_cancelled)?;
+        let peer = self
+            .execution_deadline
+            .as_ref()
+            .and_then(|state| state.peer_cancel.clone());
+        let prepared = stdlib::pg::prepare_query(method, values, span, deadline, &|| {
+            current_task_cancelled() || peer.as_ref().is_some_and(|peer| peer.context().is_some())
+        })?;
+        let query = match prepared {
+            Ok(query) => query,
+            Err(error) => {
+                self.poll_termination(span)?;
+                return Ok(Some(error));
+            }
+        };
+        let value = if self.async_execution {
+            let runtime = self
+                .task_runtime
+                .clone()
+                .ok_or_else(|| KuError::runtime("async task runtime is not initialized", span))?;
+            runtime.run_blocking(
+                move || {
+                    Ok(query.execute(&|| {
+                        current_blocking_owner_cancelled()
+                            || peer.as_ref().is_some_and(|peer| peer.context().is_some())
+                    }))
+                },
+                span,
+            )?
+        } else {
+            query.execute(&current_task_cancelled)
+        };
         self.poll_termination(span)?;
-        Ok(value)
+        if let Some(error) = task_error_payload(&value) {
+            self.pending_fail = Some(error);
+            return Ok(Some(Value::Null));
+        }
+        Ok(Some(value))
     }
 
     fn eval_dotted_builtin(
@@ -1774,9 +1865,24 @@ impl Interpreter {
                 if crate::browser::active() {
                     return Err(crate::browser::unsupported("pg", span));
                 }
-                return self.eval_pg_io(span, move |deadline, cancelled| {
-                    stdlib::pg::eval("client", args, span, deadline, cancelled)
-                });
+                self.reject_cleanup_submission(span)?;
+                if self.async_execution {
+                    return Ok(Some(stdlib::errors::err(
+                        "pg",
+                        "backend_unsupported",
+                        "create the PostgreSQL client in synchronous setup before issuing Task queries",
+                    )));
+                }
+                let deadline = self.execution_deadline.as_ref().map(|state| state.deadline);
+                let value = stdlib::pg::eval(
+                    "client",
+                    args,
+                    span,
+                    deadline,
+                    &crate::runtime::task::current_task_cancelled,
+                )?;
+                self.poll_termination(span)?;
+                return Ok(value);
             }
             if matches!(&target.kind, ExprKind::Variable(module) if module == "task")
                 && self.std_modules.contains("task")
@@ -2865,8 +2971,10 @@ impl Interpreter {
         let mut io = http_io::HttpIo::start(tcp, limits).map_err(|err| {
             KuError::runtime(format!("http I/O reactor setup failed: {err}"), span)
         })?;
+        let mut pending: Vec<PendingHttpTask> = Vec::new();
         loop {
             self.poll_termination(span)?;
+            poll_http_tasks(&mut pending, span)?;
             // Preserve the original termination observation interval. Socket
             // readiness and every connection deadline progress independently on
             // the single I/O thread, including while this handler is running.
@@ -2875,7 +2983,7 @@ impl Interpreter {
                 .map_err(|err| KuError::runtime(format!("http I/O reactor failed: {err}"), span))?
             else {
                 if io.is_finished() {
-                    return Ok(());
+                    return self.drain_http_handlers(&mut pending, span);
                 }
                 continue;
             };
@@ -2884,12 +2992,49 @@ impl Interpreter {
             let trace_start = slow_trace
                 .as_ref()
                 .and_then(|trace| trace.begin(job.deadline, limits.handler_timeout));
-            let (response, origin) = self.execute_http_handler_job_traced(
-                job.request,
-                &compiled_router,
-                span,
-                job.deadline,
-            );
+            let (response, origin) =
+                match prepare_http_handler(job.request, &compiled_router, span, job.deadline) {
+                    Err(response) => response,
+                    Ok((handler, request))
+                        if matches!(handler, Value::Function { is_async: true, .. }) =>
+                    {
+                        if pending.len() < limits.max_active_requests
+                            && pending.try_reserve(1).is_ok()
+                        {
+                            let cancellation = job.reply.watch_peer().map_err(|err| {
+                                KuError::runtime(
+                                    format!("http handler peer watch failed: {err}"),
+                                    span,
+                                )
+                            })?;
+                            let task = self.spawn_http_handler(
+                                handler,
+                                request,
+                                span,
+                                job.deadline,
+                                job.flight,
+                                Arc::clone(&cancellation),
+                            )?;
+                            pending.push(PendingHttpTask::new(
+                                task,
+                                cancellation,
+                                job.token,
+                                job.reply,
+                            ));
+                            continue;
+                        }
+                        (
+                            status_response(503, "Service Unavailable"),
+                            http_io::HttpTraceOrigin::Response,
+                        )
+                    }
+                    Ok((handler, request)) => http_handler_response(self.call_http_handler(
+                        handler,
+                        request,
+                        span,
+                        job.deadline,
+                    )),
+                };
             let trace_sample = trace_start.map(HttpSlowTraceStart::finish);
             let status = response.status;
             job.reply
@@ -2906,6 +3051,40 @@ impl Interpreter {
         }
     }
 
+    fn drain_http_handlers(
+        &mut self,
+        pending: &mut Vec<PendingHttpTask>,
+        span: Span,
+    ) -> KuResult<()> {
+        let mut deadline = http_deadline(HTTP_HANDLER_CLEANUP_GRACE);
+        loop {
+            self.poll_termination(span)?;
+            poll_http_tasks(pending, span)?;
+            if pending.is_empty() {
+                return Ok(());
+            }
+            for handler in pending.iter() {
+                for context in [
+                    handler.cancellation.context(),
+                    handler.retirement.observe().1,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    deadline = deadline.min(context.cleanup_deadline);
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(KuError::runtime(
+                    "async HTTP handler cleanup timed out",
+                    span,
+                ));
+            }
+            std::thread::sleep(remaining.min(HTTP_EVENT_LOOP_SLEEP));
+        }
+    }
+
     #[cfg(test)]
     fn execute_http_handler_job(
         &mut self,
@@ -2914,59 +3093,38 @@ impl Interpreter {
         span: Span,
         deadline: Instant,
     ) -> HttpWireResponse {
-        self.execute_http_handler_job_traced(request, compiled_router, span, deadline)
-            .0
+        match prepare_http_handler(request, compiled_router, span, deadline) {
+            Ok((handler, request)) => {
+                http_handler_response(self.call_http_handler(handler, request, span, deadline)).0
+            }
+            Err((response, _)) => response,
+        }
     }
 
-    fn execute_http_handler_job_traced(
-        &mut self,
-        request: ParsedHttpRequest,
-        compiled_router: &Value,
+    fn spawn_http_handler(
+        &self,
+        handler: Value,
+        request: Value,
         span: Span,
         deadline: Instant,
-    ) -> (HttpWireResponse, http_io::HttpTraceOrigin) {
-        use http_io::HttpTraceOrigin;
-        // Queueing spends the same handler deadline. Do not prepare an expired
-        // job or enter its handler/cleanup state after the original deadline.
-        let now = Instant::now();
-        if now >= deadline {
-            if let Some(flight) = http_flight::current() {
-                flight.expire_at(http_flight::Stage::QueueExpired, now);
+        flight: Option<Arc<http_flight::FlightRecord>>,
+        cancellation: Arc<http_io::HandlerCancellation>,
+    ) -> KuResult<TaskHandle> {
+        let runtime = self
+            .task_runtime
+            .clone()
+            .ok_or_else(|| KuError::runtime("async task runtime is not initialized", span))?;
+        let child_runtime = runtime.clone();
+        runtime.spawn_deferred(|| {
+            let template = self.template();
+            move || {
+                let _flight = http_flight::FlightGuard::enter(flight);
+                let mut interpreter = Self::from_template(template, child_runtime);
+                let mut state = HttpHandlerDeadline::new(deadline);
+                state.peer_cancel = Some(cancellation);
+                interpreter.invoke_http_handler(handler, request, span, state)
             }
-            return (
-                status_response(504, "Gateway Timeout"),
-                HttpTraceOrigin::QueueExpired,
-            );
-        }
-        let route = match find_http_route(compiled_router, &request, span) {
-            Ok(route) => route,
-            Err(_) => {
-                return (
-                    status_response(500, "Internal Server Error"),
-                    HttpTraceOrigin::Response,
-                )
-            }
-        };
-        let response = match route {
-            RouteLookup::Found(handler, params) => {
-                let req = http_request_value(request, params);
-                match self.call_http_handler(handler, req, span, deadline) {
-                    Ok(value) => value_to_http_response(value).unwrap_or_else(|| {
-                        status_response(500, "handler did not return HttpResponse")
-                    }),
-                    Err(err) if err.message == HTTP_HANDLER_TIMEOUT_MESSAGE => {
-                        return (
-                            status_response(504, "Gateway Timeout"),
-                            HttpTraceOrigin::HandlerExpired,
-                        );
-                    }
-                    Err(_) => status_response(500, "Internal Server Error"),
-                }
-            }
-            RouteLookup::MethodNotAllowed => status_response(405, "Method Not Allowed"),
-            RouteLookup::NotFound => status_response(404, "Not Found"),
-        };
-        (response, HttpTraceOrigin::Response)
+        })
     }
 
     fn call_http_handler(
@@ -2975,6 +3133,16 @@ impl Interpreter {
         req: Value,
         span: Span,
         deadline: Instant,
+    ) -> KuResult<Value> {
+        self.invoke_http_handler(handler, req, span, HttpHandlerDeadline::new(deadline))
+    }
+
+    fn invoke_http_handler(
+        &mut self,
+        handler: Value,
+        req: Value,
+        span: Span,
+        deadline: HttpHandlerDeadline,
     ) -> KuResult<Value> {
         let _execution = ExecutionTerminationGuard::enter();
         let Value::Function {
@@ -2988,12 +3156,6 @@ impl Interpreter {
         else {
             return Err(KuError::runtime("http handler must be a function", span));
         };
-        if is_async {
-            return Err(KuError::runtime(
-                "async HTTP handlers are not supported in the first async runtime",
-                span,
-            ));
-        }
         let args = match params.len() {
             0 => Vec::new(),
             1 => vec![req],
@@ -3007,9 +3169,7 @@ impl Interpreter {
         let previous_termination = self.termination.take();
         let previous_cleanup_recorded =
             std::mem::replace(&mut self.cleanup_timeout_recorded, false);
-        let previous_deadline = self
-            .execution_deadline
-            .replace(HttpHandlerDeadline::new(deadline));
+        let previous_deadline = self.execution_deadline.replace(deadline);
         if let Some(flight) = self
             .execution_deadline
             .as_ref()
@@ -3017,16 +3177,25 @@ impl Interpreter {
         {
             flight.mark(http_flight::Stage::ActualHandlerStart);
         }
-        let result = self.call_function_value(FunctionValueCall {
+        let call = FunctionValueCall {
             params: &params,
             param_modes: &param_modes,
             body: &body,
             captures: &captures,
             self_name: &self_name,
-            is_async: false,
+            is_async,
             args,
             span,
             depth: 0,
+        };
+        let result = self.poll_termination(span).and_then(|()| {
+            if is_async {
+                // The enclosing listener already admitted this request as
+                // a Task. Run that Task's owned body without spawning it again.
+                self.call_function_value_direct(call, true)
+            } else {
+                self.call_function_value(call)
+            }
         });
         let timed_out = self.execution_deadline.as_mut().is_some_and(|state| {
             state.poll(Instant::now());
@@ -3196,6 +3365,72 @@ impl Interpreter {
         self.steps = self.steps.saturating_add(1);
         Ok(())
     }
+}
+
+fn http_task_admission_failed(value: &Value) -> bool {
+    let Value::Result { ok: false, value } = value else {
+        return false;
+    };
+    let Value::Object(fields) = value.as_ref() else {
+        return false;
+    };
+    matches!(fields.get("domain"), Some(Value::String(domain)) if domain == "task")
+        && matches!(
+            fields.get("code"),
+            Some(Value::String(code)) if matches!(
+                code.as_str(), "too_many_tasks" | "queue_full" | "runtime_stopped"
+            )
+        )
+}
+
+fn prepare_http_handler(
+    request: ParsedHttpRequest,
+    compiled_router: &Value,
+    span: Span,
+    deadline: Instant,
+) -> Result<(Value, Value), (HttpWireResponse, http_io::HttpTraceOrigin)> {
+    use http_io::HttpTraceOrigin;
+    // Do not materialize the request or enter its handler after the original D.
+    let now = Instant::now();
+    if now >= deadline {
+        if let Some(flight) = http_flight::current() {
+            flight.expire_at(http_flight::Stage::QueueExpired, now);
+        }
+        return Err((
+            status_response(504, "Gateway Timeout"),
+            HttpTraceOrigin::QueueExpired,
+        ));
+    }
+    let response = match find_http_route(compiled_router, &request, span) {
+        Ok(RouteLookup::Found(handler, params)) => {
+            return Ok((handler, http_request_value(request, params)));
+        }
+        Ok(RouteLookup::MethodNotAllowed) => status_response(405, "Method Not Allowed"),
+        Ok(RouteLookup::NotFound) => status_response(404, "Not Found"),
+        Err(_) => status_response(500, "Internal Server Error"),
+    };
+    Err((response, HttpTraceOrigin::Response))
+}
+
+fn http_handler_response(result: KuResult<Value>) -> (HttpWireResponse, http_io::HttpTraceOrigin) {
+    use http_io::HttpTraceOrigin;
+    let response = match result {
+        Ok(value) => value_to_http_response(value)
+            .unwrap_or_else(|| status_response(500, "handler did not return HttpResponse")),
+        Err(err)
+            if err.message == HTTP_HANDLER_TIMEOUT_MESSAGE
+                || err
+                    .runtime_termination()
+                    .is_some_and(|context| context.reason == TerminationReason::TimedOut) =>
+        {
+            return (
+                status_response(504, "Gateway Timeout"),
+                HttpTraceOrigin::HandlerExpired,
+            );
+        }
+        Err(_) => status_response(500, "Internal Server Error"),
+    };
+    (response, HttpTraceOrigin::Response)
 }
 
 #[cfg(test)]
