@@ -166,7 +166,8 @@ fn emitPrefix(&plan: CharPrefixPlan, &symbol: str): str! {
     delimiter = ScalarStringLiteral(plan.delimiter)?
     fallback = ScalarStringLiteral(plan.fallback)?
     text = "#include <stdbool.h>\n#include <stdint.h>\n" + ScalarStringHelpers(true, false, false, false, true, false, true)
-    text += "typedef struct KuResult_str { bool ok; KuString value; KuError error; } KuResult_str;\n\n"
+    text += "typedef struct KuResult_str { bool ok; KuString value; KuError error; } KuResult_str;\n"
+    text += "typedef KuResult_str KuBootstrapResult_KuProjectionString;\n\n"
     text += "KuResult_str " + symbol.clone() + "(const KuBootstrapString* input) {\n"
     text += "    const KuScalarStringPart delimiter = {(const uint8_t*)" + delimiter + "};\n"
     text += "    KuResult_str result = {.ok = true};\n"
@@ -202,7 +203,7 @@ fn EmitCharPrefixC(&supplied: [SuppliedModule], &function: str): CharPrefixC! {
     source = emitPrefix(plan, symbol)?
     export = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol,
         parameters: [BuiltinLinkPlanType("str", "const KuBootstrapString*", true)],
-        result: BuiltinLinkPlanType("str", "KuResult_str", false), returns_result: true }
+        result: BuiltinLinkPlanType("str", "KuBootstrapResult_KuProjectionString", false), returns_result: true }
     return ok(CharPrefixC { source: source, export: export })
 }
 

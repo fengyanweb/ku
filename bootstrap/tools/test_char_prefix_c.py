@@ -47,7 +47,7 @@ def link_and_compare(ku, cc, tool, fixtures, consumer, selected, function, value
     assert export["source_path"] == selected[0] and export["source_name"] == function
     assert not identity["dependencies"]
     signature = export["signature"]
-    assert signature["returns_result"] and signature["result"]["c_type"] == "KuResult_str"
+    assert signature["returns_result"] and signature["result"]["c_type"] == "KuBootstrapResult_KuProjectionString"
 
     oracle = fixtures / "oracle.ku"
     oracle.write_text(
@@ -70,6 +70,7 @@ def link_and_compare(ku, cc, tool, fixtures, consumer, selected, function, value
     call_path = consumer / "call.c"
     call_path.write_text("""
 #include "fs_read.h"
+typedef KuResult_str KuBootstrapResult_KuProjectionString;
 extern KuResult_str call_prefix(const KuBootstrapString*);
 KuResult_str consume_prefix(const KuBootstrapString* path) { return call_prefix(path); }
 """, encoding="ascii")
