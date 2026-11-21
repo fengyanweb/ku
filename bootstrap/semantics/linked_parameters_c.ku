@@ -112,7 +112,7 @@ fn ReadLinkedNullParametersFrom(&project: LinkedNullProject, &function: Node, se
             }
             slot = AddLinkedNullSlot(project, state, node.text, name.clone(), ty, true)?
             state = slot.state
-            state.code = state.code + "    (void)" + name + ";\n"
+            state.code += "    (void)" + name + ";\n"
             index = index + 1
             reading = index < function.edge_count
         } else { reading = false }
