@@ -48,32 +48,36 @@ fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statem
     then_region = statement.clone()
     then_region.edge_count = split
     taken = lowerLinkedRegion(project, then_region, guard.state, 1, result, depth + 1)?
+    then_terminal = taken.terminal
+    next = taken.state
     if (split == statement.edge_count) {
-        if (taken.terminal) { taken.state = RestoreLinkedNullSlots(taken.state, outer) }
+        if (then_terminal) { next = RestoreLinkedNullSlots(next, outer) }
         else {
-            merged = MergeLinkedGuardOwners(taken.state, outer, statement)?
-            taken.state = DropLinkedNullScope(merged, outer.len())
+            next = MergeLinkedGuardOwners(next, outer, statement)?
+            next = DropLinkedNullScope(next, outer.len())
         }
-        taken.state.code += "    }\n"
-        return ok(LinkedNullRegion { state: taken.state, terminal: false })
+        next.code += "    }\n"
+        return ok(LinkedNullRegion { state: next, terminal: false })
     }
 
     after_then: [LinkedNullSlot] = []
-    if (!taken.terminal) {
-        after_then = LinkedSlotPrefix(taken.state.slots, outer.len())
-        taken.state = DropLinkedNullScope(taken.state, outer.len())
+    if (!then_terminal) {
+        after_then = LinkedSlotPrefix(next.slots, outer.len())
+        next = DropLinkedNullScope(next, outer.len())
     }
-    taken.state = RestoreLinkedNullSlots(taken.state, outer)
-    taken.state.code += "    } else {\n"
-    other = lowerLinkedRegion(project, statement, taken.state, split, result, depth + 1)?
-    if (!other.terminal) {
-        if (!taken.terminal) { other.state = MergeLinkedConditionalMembers(other.state, after_then, statement)? }
-        other.state = DropLinkedNullScope(other.state, outer.len())
-    } else if (!taken.terminal) {
-        other.state = RestoreLinkedNullSlots(other.state, after_then)
+    next = RestoreLinkedNullSlots(next, outer)
+    next.code += "    } else {\n"
+    other = lowerLinkedRegion(project, statement, next, split, result, depth + 1)?
+    else_terminal = other.terminal
+    next = other.state
+    if (!else_terminal) {
+        if (!then_terminal) { next = MergeLinkedConditionalMembers(next, after_then, statement)? }
+        next = DropLinkedNullScope(next, outer.len())
+    } else if (!then_terminal) {
+        next = RestoreLinkedNullSlots(next, after_then)
     }
-    other.state.code += "    }\n"
-    return ok(LinkedNullRegion { state: other.state, terminal: taken.terminal && other.terminal })
+    next.code += "    }\n"
+    return ok(LinkedNullRegion { state: next, terminal: then_terminal && else_terminal })
 }
 
 fn countedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &initial: Node, &step: Node): int! {
@@ -119,12 +123,13 @@ fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statemen
     next = state
     next.code = next.code + "    while (true) {\n"
     guard = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, statement, 0), 0)?
-    if (countdown == 0) { CheckLinkedCountedBoundWrites(project, guard.state, statement)? }
-    guard.state.code = guard.state.code + "    if (!(" + guard.value.text + ")) break;\n"
-    locals = guard.state.slots.len()
+    next = guard.state
+    if (countdown == 0) { CheckLinkedCountedBoundWrites(project, next, statement)? }
+    next.code += "    if (!(" + guard.value.text + ")) break;\n"
+    locals = next.slots.len()
     body = statement.clone()
     body.edge_count = body.edge_count - 1
-    lowered = lowerLinkedRegion(project, body, guard.state, 1, result, depth + 1)?
+    lowered = lowerLinkedRegion(project, body, next, 1, result, depth + 1)?
     if (lowered.terminal) {
         update = "increment"
         if (countdown != 0) { update = "decrement" }
@@ -133,8 +138,9 @@ fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statemen
     PreserveLinkedOwners(outer, lowered.state.slots, statement)?
     next = DropLinkedNullScope(lowered.state, locals)
     advanced = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, step, 0), 0)?
-    advanced.state.code = advanced.state.code + "    " + advanced.state.slots[cursor - 1].value.text.clone() + " = " + advanced.value.text + ";\n    }\n"
-    return ok(advanced.state)
+    next = advanced.state
+    next.code += "    " + next.slots[cursor - 1].value.text.clone() + " = " + advanced.value.text + ";\n    }\n"
+    return ok(next)
 }
 
 fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
