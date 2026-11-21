@@ -9,7 +9,7 @@ import { LinkedNullChild, LinkedNullEntry, LinkedNullNode, LinkedNullProject,
     LinkedNullType, LinkedStringResult } from "../semantics/linked_null_types_c.ku"
 import { BuiltinLinkPlanType, LinkPlanDeclaration } from "../semantics/link_plan_c.ku"
 import { EmitLinkPlan } from "../semantics/link_plan_json_c.ku"
-import { ScalarStringHelpers } from "../semantics/scalar_int_emit.ku"
+import { EmitStaticJsonString } from "../semantics/scalar_int_emit.ku"
 import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
 
 fn child(&project: LinkedNullProject, &parent: Node, index: int): Node {
@@ -78,34 +78,10 @@ fn emitLiteral(&literal: Node, &symbol: str): str! {
     value = decodeLiteral(literal)?
     length = value.byte_len()
     require(length <= 64, literal, "decoded JSON string must fit the first 64-byte escape buffer")?
-    text = "#include <stdbool.h>\n#include <stdint.h>\n" + ScalarStringHelpers(true, false, false, false, false, false, true)
-    text += "typedef struct KuResult_str { bool ok; KuString value; KuError error; } KuResult_str;\n"
-    text += "typedef KuResult_str KuBootstrapResult_KuProjectionString;\n\n"
-    text += "KuResult_str " + symbol.clone() + "(void) {\n"
-    if (length == 0) {
-        return ok(text + "    return (KuResult_str){.ok = true, .value = {(uint8_t*)\"\", 0u, 0u, 0u}};\n}\n")
-    }
-
-    // With valid JSON and <=64 decoded bytes, Stage0 can allocate only
-    // once. Preserve its exact unescaped allocation or first escape buffer
-    // reserve, as well as the checked allocation failure it returns.
-    capacity = length
-    allocation = "malloc(" + str(length) + "u)"
-    if (literal.text.contains("\\")) {
-        capacity = 64
-        allocation = "realloc(NULL, 64u)"
-    }
     rendered = literal.clone()
     rendered.text = value
     bytes = ScalarStringLiteral(rendered)?
-    text += "    uint8_t* decoded = " + allocation + ";\n"
-    text += "    if (!decoded) return (KuResult_str){.error = {\n"
-        + "        {(uint8_t*)\"json\", sizeof(\"json\") - 1u, 0u, 0u},\n"
-        + "        {(uint8_t*)\"out_of_memory\", sizeof(\"out_of_memory\") - 1u, 0u, 0u},\n"
-        + "        {(uint8_t*)\"json allocation failed\", sizeof(\"json allocation failed\") - 1u, 0u, 0u}}};\n"
-    text += "    memcpy(decoded, " + bytes + ");\n"
-    text += "    return (KuResult_str){.ok = true, .value = {decoded, " + str(length) + "u, " + str(capacity) + "u, 1u}};\n"
-    return ok("#include <stdlib.h>\n#include <string.h>\n" + text + "}\n")
+    return ok(EmitStaticJsonString(symbol, bytes, length, literal.text.contains("\\")))
 }
 
 fn main(): null! {

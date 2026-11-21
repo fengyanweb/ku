@@ -436,3 +436,30 @@ fn EmitCheckedRecordArrayClone(&source: str, &target: str, &prefix: str, layout:
         + ".data[" + target.clone() + ".len]" + failure
     return text + "            ++" + target.clone() + ".len;\n        }\n    }\n"
 }
+
+fn EmitStaticJsonString(&symbol: str, &literal: str, length: int, escaped: bool): str {
+    text = "#include <stdbool.h>\n#include <stdint.h>\n" + ScalarStringHelpers(true, false, false, false, false, false, true)
+    text += "typedef struct KuResult_str { bool ok; KuString value; KuError error; } KuResult_str;\n"
+    text += "typedef KuResult_str KuBootstrapResult_KuProjectionString;\n\n"
+    text += "KuResult_str " + symbol.clone() + "(void) {\n"
+    if (length == 0) {
+        return text + "    return (KuResult_str){.ok = true, .value = {(uint8_t*)\"\", 0u, 0u, 0u}};\n}\n"
+    }
+
+    // The callers prove valid JSON and <=64 decoded bytes. Match Stage0's
+    // one exact allocation for a plain string or first buffer for an escape.
+    capacity = length
+    allocation = "malloc(" + str(length) + "u)"
+    if (escaped) {
+        capacity = 64
+        allocation = "realloc(NULL, 64u)"
+    }
+    text += "    uint8_t* decoded = " + allocation + ";\n"
+    text += "    if (!decoded) return (KuResult_str){.error = {\n"
+        + "        {(uint8_t*)\"json\", sizeof(\"json\") - 1u, 0u, 0u},\n"
+        + "        {(uint8_t*)\"out_of_memory\", sizeof(\"out_of_memory\") - 1u, 0u, 0u},\n"
+        + "        {(uint8_t*)\"json allocation failed\", sizeof(\"json allocation failed\") - 1u, 0u, 0u}}};\n"
+    text += "    memcpy(decoded, " + literal.clone() + ");\n"
+    text += "    return (KuResult_str){.ok = true, .value = {decoded, " + str(length) + "u, " + str(capacity) + "u, 1u}};\n"
+    return "#include <stdlib.h>\n#include <string.h>\n" + text + "}\n"
+}

@@ -252,3 +252,67 @@ fn LowerScalarStringParts(&nodes: [Node], &edges: [int], &parameters: [ScalarInt
     empty: [ScalarStringPart] = []
     return collectStringParts(nodes, edges, parameters, can_convert, root_id, 0, empty)
 }
+
+struct StaticAsciiJsonString {
+    accepted: bool
+    literal: str
+    length: int
+    escaped: bool
+}
+
+fn rejectStaticAsciiJsonString(): StaticAsciiJsonString {
+    return StaticAsciiJsonString { accepted: false, literal: "", length: 0, escaped: false }
+}
+
+fn jsonHexDigit(byte: int): int {
+    if (byte >= 48 && byte <= 57) { return byte - 48 }
+    if (byte >= 65 && byte <= 70) { return byte - 55 }
+    if (byte >= 97 && byte <= 102) { return byte - 87 }
+    return 0 - 1
+}
+
+// Subset of complete JSON string literals. Outside this subset, the ordinary
+// linked emitter handles the input without any assumption about its JSON.
+fn ReadStaticAsciiJsonString(&source: str): StaticAsciiJsonString! {
+    size = source.byte_len()
+    if (size < 2 || size > 386) { return ok(rejectStaticAsciiJsonString()) }
+    encoded = bytes.from_str(source.clone())?
+    end = size - 1
+    first = encoded.get(0)?
+    last = encoded.get(end)?
+    if (first != 34 || last != 34) { return ok(rejectStaticAsciiJsonString()) }
+
+    literal = "(const uint8_t[]){"
+    length = 0
+    escaped = false
+    index = 1
+    scanning = index < end
+    while (scanning) {
+        if (length == 64) { return ok(rejectStaticAsciiJsonString()) }
+        byte = encoded.get(index)?
+        if (byte == 92) {
+            if (end - index < 6) { return ok(rejectStaticAsciiJsonString()) }
+            marker = encoded.get(index + 1)?
+            zero_a = encoded.get(index + 2)?
+            zero_b = encoded.get(index + 3)?
+            high_byte = encoded.get(index + 4)?
+            low_byte = encoded.get(index + 5)?
+            high = jsonHexDigit(high_byte)
+            low = jsonHexDigit(low_byte)
+            if (marker != 117 || zero_a != 48 || zero_b != 48 || high < 0 || high > 7 || low < 0) {
+                return ok(rejectStaticAsciiJsonString())
+            }
+            byte = high * 16 + low
+            index = index + 5
+            escaped = true
+        } else if (byte < 32 || byte >= 128 || byte == 34) {
+            return ok(rejectStaticAsciiJsonString())
+        }
+        literal += str(byte) + "u,"
+        length = length + 1
+        index = index + 1
+        scanning = index < end
+    }
+    return ok(StaticAsciiJsonString { accepted: true, literal: literal + "}, " + str(length) + "u",
+        length: length, escaped: escaped })
+}

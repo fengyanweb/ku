@@ -29,13 +29,13 @@ void *tracked_malloc(size_t size) {
     ++calls;
     reserved = size;
     reallocated = false;
-    return reject ? NULL : malloc(size);
+    return reject && calls == 1u ? NULL : malloc(size);
 }
 void *tracked_realloc(void *value, size_t size) {
     ++calls;
     reserved = size;
     reallocated = true;
-    if (reject) return NULL;
+    if (reject && calls == 1u) return NULL;
     return realloc(value, size);
 }
 static KuResult_str call(Make function, bool deny) {
@@ -102,32 +102,41 @@ def compile_obj(cc, source, output, path, flags, optimized):
         run([cc, *options, "-c", source, "-o", output], path)
 
 
-def emit(tool, sandbox, function, output):
+def emit(tool, sandbox, function, output, linked):
     (sandbox / "function.txt").write_text(function + "\n", encoding="utf-8")
+    mode = sandbox / "mode.txt"
+    if linked:
+        mode.write_text("linked-null\n", encoding="ascii")
     program = run([tool], sandbox).stdout
     flag = sandbox / "plan.txt"
-    flag.touch()
+    if linked:
+        mode.write_text("linked-null-plan\n", encoding="ascii")
+    else:
+        flag.touch()
     try:
         plan = json.loads(run([tool], sandbox).stdout)
     finally:
-        flag.unlink()
+        (mode if linked else flag).unlink()
     assert plan["export"]["source_name"] == function and not plan["dependencies"]
     assert plan["export"]["signature"]["result"]["c_type"] == "KuBootstrapResult_KuProjectionString"
     (sandbox / output).write_bytes(program)
     return plan["export"]["symbol"]
 
 
-def exercise(ku, cc, root, sanitize):
+def exercise(ku, cc, root, sanitize, projection):
     bootstrap = Path(__file__).resolve().parents[1]
     for stage in ("stage1", "stage2", "stage3", "semantics"):
         shutil.copytree(bootstrap / stage, root / stage)
     sandbox = root / "tools"
     sandbox.mkdir()
     fixture(bootstrap, sandbox)
-    shutil.copyfile(bootstrap / "tools/json_literal_string_c.ku", sandbox / "json_literal_string_c.ku")
     suffix = ".exe" if os.name == "nt" else ""
     tool = sandbox / f"emitter{suffix}"
-    run([ku, "build", "--debug", "--offline", "json_literal_string_c.ku", "-o", tool], sandbox)
+    if projection:
+        shutil.copy2(projection, tool)
+    else:
+        shutil.copyfile(bootstrap / "tools/json_literal_string_c.ku", sandbox / "json_literal_string_c.ku")
+        run([ku, "build", "--debug", "--offline", "json_literal_string_c.ku", "-o", tool], sandbox)
     paths = (sandbox / "modules.txt").read_text(encoding="utf-8").splitlines()
 
     def select(entry):
@@ -135,12 +144,14 @@ def exercise(ku, cc, root, sanitize):
             "\n".join([entry, *(p for p in paths if p != entry)]) + "\n", encoding="utf-8"
         )
 
-    literals = {
-        "Escaped": r'"\uD83D\uDE42/甲\n"',
-        "Plain": '"甲/🙂"',
-        "Empty": '  ""  ',
+    ascii_literals = {
+        "AsciiPlain": '"clean path 123"',
+        "AsciiMixed": r'"a\u0000Z\u007f\u0022"',
+        "Empty": '""',
         "Bound": '"\\u0000' + ("x" * 63) + '"',
     }
+    other_literals = {"Escaped": r'"\uD83D\uDE42/甲\n"', "Plain": '"甲/🙂"', "Padded": '  ""  '}
+    literals = ascii_literals | other_literals
     variants = ['import "std.json"']
     for name, raw in literals.items():
         variants.append(f'fn {name}(): str! {{ box = json.parse({json.dumps(raw, ensure_ascii=False)})?\n'
@@ -149,13 +160,17 @@ def exercise(ku, cc, root, sanitize):
     variants.append('fn Malformed(): str! { box = json.parse("invalid")? return box.as_str() }')
     raw = '"' + "x" * 65 + '"'
     variants.append(f'fn Oversize(): str! {{ box = json.parse({json.dumps(raw)})? return box.as_str() }}')
+    malformed_escape = json.dumps(r'"a\u00fg"')
+    variants.append(f'fn BadEscape(): str! {{ box = json.parse({malformed_escape})? return box.as_str() }}')
     variants.append('fn Dynamic(): str! { box = json.parse(str(5))? return box.as_str() }')
     variants.append('fn Shadowed(): str! { json = json.parse("\\\"abc\\\"")? return json.as_str() }')
     (sandbox / "cases.ku").write_text("\n".join(variants) + "\n", encoding="utf-8")
-    functions = {"ProjectPathNul": "semantics/project_paths.ku", **dict.fromkeys(literals, "cases.ku")}
+    actual = {"ProjectPathNul": "semantics/project_paths.ku", "LinkPlanJsonControls": "semantics/project_paths.ku"}
+    accepted = ascii_literals if projection else literals
+    functions = actual | dict.fromkeys(accepted, "cases.ku")
     oracle = sandbox / "oracle.ku"
-    oracle.write_text('import { ProjectPathNul } from "./semantics/project_paths.ku"\n'
-                      'import { ' + ", ".join(literals) + ' } from "./cases.ku"\n'
+    oracle.write_text('import { ' + ", ".join(actual) + ' } from "./semantics/project_paths.ku"\n'
+                      'import { ' + ", ".join(accepted) + ' } from "./cases.ku"\n'
                       + "".join(f"fn Ref{name}(): str! {{ return {name}() }}\n" for name in functions)
                       + "fn main() {}\n", encoding="ascii")
     run([ku, "build", "--native", "--offline", "oracle.ku"], sandbox)
@@ -169,7 +184,7 @@ def exercise(ku, cc, root, sanitize):
     for name, entry in functions.items():
         select(entry)
         source = sandbox / f"{name}.c"
-        symbol = emit(tool, sandbox, name, source.name)
+        symbol = emit(tool, sandbox, name, source.name, bool(projection))
         native_obj = sandbox / (name + obj)
         warning = ["/WX"] if msvc else ["-pedantic-errors", "-Wall", "-Wextra", "-Werror"]
         compile_obj(cc, source, native_obj, sandbox, [*flags, *warning, *instrument(cc)], True)
@@ -184,10 +199,16 @@ def exercise(ku, cc, root, sanitize):
         run([binary], sandbox)
 
     select("cases.ku")
-    for name in ("WrongType", "Malformed", "Oversize", "Dynamic", "Shadowed"):
+    rejected_names = ["WrongType", "Malformed", "Oversize", "BadEscape", "Dynamic", "Shadowed"]
+    expected_error = b"unsupported_json_literal_string"
+    if projection:
+        rejected_names += other_literals.keys()
+        (sandbox / "mode.txt").write_text("linked-null\n", encoding="ascii")
+        expected_error = b"undefined_linked_dependency"
+    for name in rejected_names:
         (sandbox / "function.txt").write_text(name + "\n", encoding="ascii")
         rejected = run([tool], sandbox, 1)
-        assert not rejected.stdout and b"unsupported_json_literal_string" in rejected.stderr
+        assert not rejected.stdout and expected_error in rejected.stderr, (name, rejected.stderr)
 
 
 if __name__ == "__main__":
@@ -195,7 +216,9 @@ if __name__ == "__main__":
     parser.add_argument("--ku", default="ku")
     parser.add_argument("--cc", default="cc")
     parser.add_argument("--sanitize", action="store_true")
+    parser.add_argument("--projection", help="use the already-built linked-unit production emitter")
     options = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="ku-bootstrap-json-literal-") as workspace:
-        exercise(executable(options.ku), executable(options.cc), Path(workspace), options.sanitize)
+        projection = executable(options.projection) if options.projection else None
+        exercise(executable(options.ku), executable(options.cc), Path(workspace), options.sanitize, projection)
     print("Checked JSON literal C matches Stage0 decoded bytes, owned results and allocation errors")

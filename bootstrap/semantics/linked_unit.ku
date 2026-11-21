@@ -1,10 +1,28 @@
+import { Node } from "../stage2/ast.ku"
 import { SuppliedModule } from "./imports.ku"
-import { LinkPlanDeclaration } from "./link_plan_c.ku"
+import { BuiltinLinkPlanType, LinkPlanDeclaration } from "./link_plan_c.ku"
 import { EmitLinkPlan, LinkedNullDependencyPlan, PrepareLinkedAppendCallbackPlan } from "./link_plan_json_c.ku"
 import { EmitLinkedNullC, PrepareLinkedNullProject } from "./linked_null_c.ku"
+import { LinkedNullChild, LinkedNullEntry, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult } from "./linked_null_types_c.ku"
+import { EmitStaticJsonString } from "./scalar_int_emit.ku"
+import { ReadStaticAsciiJsonString } from "./scalar_int_operands.ku"
 
 fn EmitLinkedUnit(supplied: [SuppliedModule], &function: str, plan: bool): str! {
     project = PrepareLinkedNullProject(supplied)?
+    node = LinkedNullEntry(project, function)?
+    literal_id = linkedJsonLiteral(project, LinkedNullNode(project, 1, node))?
+    if (literal_id != 0) {
+        literal = LinkedNullNode(project, 1, literal_id)
+        decoded = ReadStaticAsciiJsonString(literal.text)?
+        if (decoded.accepted) {
+            symbol = "ku_linked_null_" + str(node)
+            if (!plan) { return ok(EmitStaticJsonString(symbol, decoded.literal, decoded.length, decoded.escaped)) }
+            entry = LinkPlanDeclaration { unit: 1, node: node, symbol: symbol, parameters: [],
+                result: BuiltinLinkPlanType("str", "KuBootstrapResult_KuProjectionString", false), returns_result: true }
+            no_dependencies: [LinkPlanDeclaration] = []
+            return EmitLinkPlan(project.supplied, "linked-null", entry, no_dependencies)
+        }
+    }
     generated = EmitLinkedNullC(project, function)?
     if (!plan) {
         source = generated.source
@@ -21,4 +39,54 @@ fn EmitLinkedUnit(supplied: [SuppliedModule], &function: str, plan: bool): str! 
     }
     entry = PrepareLinkedAppendCallbackPlan(project, generated.entry_plan)?
     return EmitLinkPlan(project.supplied, "linked-null", entry, links)
+}
+
+fn linkedMethodReceiver(&project: LinkedNullProject, &call: Node, &method: str, arguments: int): int {
+    if (call.kind != "Call" || call.edge_count != arguments + 1) { return 0 }
+    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (target.kind != "Field" || target.edge_count != 1 || target.text != method) { return 0 }
+    id = LinkedNullChild(project, 1, target, 0)
+    receiver = LinkedNullNode(project, 1, id)
+    if (receiver.kind != "Variable" || receiver.edge_count != 0) { return 0 }
+    return id
+}
+
+fn linkedJsonLiteral(&project: LinkedNullProject, &function: Node): int! {
+    if (function.kind != "Function" || function.edge_count != 3) { return ok(0) }
+    result = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, 0))
+    if (result.kind != "TypeResult" || result.edge_count != 1) { return ok(0) }
+    binding = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, 1))
+    if (binding.kind != "Assign" || binding.edge_count != 1) { return ok(0) }
+    checked = LinkedNullNode(project, 1, LinkedNullChild(project, 1, binding, 0))
+    if (checked.kind != "TryUnwrap" || checked.edge_count != 1) { return ok(0) }
+    parse = LinkedNullNode(project, 1, LinkedNullChild(project, 1, checked, 0))
+    namespace_id = linkedMethodReceiver(project, parse, "parse", 1)
+    if (namespace_id == 0) { return ok(0) }
+    namespace = LinkedNullNode(project, 1, namespace_id)
+    if (namespace.text == binding.text) { return ok(0) }
+
+    returned = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, 2))
+    if (returned.kind != "Return" || returned.edge_count != 1) { return ok(0) }
+    convert = LinkedNullNode(project, 1, LinkedNullChild(project, 1, returned, 0))
+    converted_id = linkedMethodReceiver(project, convert, "as_str", 0)
+    if (converted_id == 0) { return ok(0) }
+    converted = LinkedNullNode(project, 1, converted_id)
+    if (converted.text != binding.text) { return ok(0) }
+
+    literal_id = LinkedNullChild(project, 1, parse, 1)
+    literal = LinkedNullNode(project, 1, literal_id)
+    if (literal.kind != "String" || literal.edge_count != 0) { return ok(0) }
+    count = project.binding.modules[0].imports.len()
+    index = 0
+    while (index < count) {
+        imported = project.binding.modules[0].imports[index].clone()
+        if (imported.local_name == namespace.text && imported.source_name == "json" && imported.module_index == 0 &&
+            (imported.path == "std" || imported.path == "std.json")) {
+            ty = LinkedNullType(project, 1, LinkedNullChild(project, 1, result, 0))?
+            if (LinkedStringResult(ty)) { return ok(literal_id) }
+            return ok(0)
+        }
+        index = index + 1
+    }
+    return ok(0)
 }
