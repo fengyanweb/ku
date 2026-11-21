@@ -185,13 +185,14 @@ fn LinkedScopedCallbackTypes(&links: [LinkedNullFunction], &slots: [LinkedNullSl
 }
 
 fn RememberLinkedCall(calls: [LinkedNullFunction], dependency: LinkedNullFunction): [LinkedNullFunction] {
+    result = calls
     index = 0
-    while (index < calls.len()) {
-        if (calls[index].unit == dependency.unit && calls[index].node == dependency.node) { return calls }
+    while (index < result.len()) {
+        if (result[index].unit == dependency.unit && result[index].node == dependency.node) { return result }
         index = index + 1
     }
-    calls = calls.push(dependency)
-    return calls
+    result = result.push(dependency)
+    return result
 }
 
 fn LinkedDirectCallExpression(&callee: LinkedNullFunction, &arguments: str): str {
@@ -329,7 +330,7 @@ fn LinkedNullIntArrayOwner(&binding: TypeNameBinding): bool {
 
 fn LinkedNullReadableArray(&type: TypeNameBinding): bool {
     return type.declaration_kind == "StructArray" || type.declaration_kind == "BuiltinArray"
-        || type.declaration_kind == "OwnedStringArray" || LinkedNullOwnedArray(type) || LinkedNullIntArrayOwner(type)
+        || LinkedNullOwnedArray(type) || LinkedScalarArrayOwner(type)
 }
 
 fn RegisterLinkedIntArray(state: LinkedNullState, ty: TypeNameBinding): LinkedNullState {
