@@ -4,7 +4,7 @@ import { DeclarationSpan } from "./names.ku"
 import { ProjectBindings } from "./project_bindings.ku"
 import { IsBuiltinType, TypeNameBinding } from "./type_names.ku"
 import { CollectOwningFields, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
-import { EmitLinkedFlatRecordArrayClone } from "./scalar_int_emit.ku"
+import { EmitLinkedFlatRecordArrayClone, EmitOwnedStringArrayClone, EmitProjectionCloneString } from "./scalar_int_emit.ku"
 import { ContainsIndex, ContainsType, CTypeName, EmitLayout, EmitOwningLayout, ProjectionArrayHeader, ProjectionHeaders, StringField, StructArrayTypeName } from "./struct_projection_c.ku"
 
 struct CStructMetrics {
@@ -325,31 +325,6 @@ fn CollectOwnedMemberPaths(&layouts: [StructLayout], index: int, &prefix: str, p
         field_index = field_index + 1
     }
     return owned
-}
-
-fn EmitProjectionCloneString(&symbol: str): str {
-    return "static bool " + symbol.clone() + "(KuProjectionString source, KuProjectionString *out) {\n" +
-        "    if (source.storage == KU_PROJECTION_STRING_STATIC) { *out = source; return true; }\n" +
-        "    if (!source.ptr) return true;\n" +
-        "    size_t size = source.len ? source.len : 1;\n    uint8_t *data = malloc(size);\n    if (!data) return false;\n" +
-        "    if (source.len) memcpy(data, source.ptr, source.len);\n" +
-        "    *out = (KuProjectionString){ data, source.len, size, KU_PROJECTION_STRING_OWNED };\n    return true;\n}\n\n"
-}
-
-fn EmitOwnedStringArrayClone(&prefix: str, &clone_string: str): str {
-    return "static bool " + prefix.clone() + "_clone_strings(const KuGuardStringArray *source, KuGuardStringArray *out, bool *invalid) {\n"
-        + "    size_t capacity = source->capacity ? source->capacity : source->len;\n"
-        + "    if (source->len > capacity || capacity > SIZE_MAX / sizeof(*source->data) || (capacity && !source->data)) { *invalid = true; return false; }\n"
-        + "    if (!source->len) return true;\n"
-        + "    out->data = malloc(source->len * sizeof(*out->data));\n"
-        + "    if (!out->data) return false;\n"
-        + "    out->capacity = source->len;\n"
-        + "    while (out->len < source->len) {\n"
-        + "        KuProjectionString string = source->data[out->len];\n"
-        + "        if (string.len && !string.ptr) { *invalid = true; return false; }\n"
-        + "        out->data[out->len] = (KuProjectionString){0};\n"
-        + "        if (!" + clone_string.clone() + "(string, &out->data[out->len])) return false;\n"
-        + "        ++out->len;\n    }\n    return true;\n}\n\n"
 }
 
 struct OwnedRecordArrayMember {
