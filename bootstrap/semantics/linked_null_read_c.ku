@@ -166,11 +166,10 @@ fn CloneLinkedRecordArray(&project: LinkedNullProject, source: LinkedNullExpress
     if (value.borrowed || LinkedMemberUnavailable(source.state, value, true) || layout == 0) {
         RejectLayout("unsupported_linked_array_clone", "expected a live owned array of cloneable records with owned fields", value.ty.span.clone())?
     }
-    prefix = LinkedNullArrayPrefix(value.ty)
     output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), value.ty.clone(), false)?
     next = RequireLinkedArrayValidation(output.state, value.ty)
     if (!ContainsIndex(next.element_clones, layout)) { next.element_clones = next.element_clones.push(layout) }
-    next.code += EmitLinkedOwnedArrayClone(value.text, output.value.text, prefix, layout)
+    next.code += EmitLinkedOwnedArrayClone(next.layouts, value.text, output.value.text, output.value.ty, layout)
     next.slots[output.value.slot - 1].live = true
     output.state = next
     return ok(output)

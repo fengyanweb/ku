@@ -5,7 +5,7 @@ import { EmitCheckedRecordArrayClone, EmitProjectionStringJoinHelpers, ScalarStr
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
-import { OrderCStructLayouts, EmitCombinedCLayouts, EmitNestedCLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
+import { CanCloneNestedStringArrays, CollectOwnedMemberPaths, EmitCombinedCLayouts, EmitLinkedStringArrayElementClone, EmitNestedCLayouts, EmitProjectionCloneString, OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { ContainsType, CTypeName, ProjectionArrayHeader, ProjectionIsStringArray } from "./struct_projection_c.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
@@ -30,32 +30,11 @@ fn HasBoundArrayMembers(&layouts: [StructLayout], index: int): bool {
 }
 
 fn collectOwnedFields(&layouts: [StructLayout], index: int, &prefix: str, paths: [str]): [str] {
-    owned = paths
-    field_count = layouts[index - 1].fields.len()
-    field_index = 0
-    while (field_index < field_count) {
-        field = layouts[index - 1].fields[field_index].resolved.clone()
-        path = prefix.clone() + ".f" + str(field_index)
-        if (field.declaration_kind == "Builtin" && field.name == "str") {
-            owned = owned.push(path)
-        } else if (field.declaration_kind == "Struct") {
-            child = LayoutIndex(layouts, field.module_index, field.declaration_node)
-            // The checked layout order establishes an acyclic, eight-level
-            // bound before walking this graph.
-            owned = collectOwnedFields(layouts, child, path, owned)
-        }
-        field_index = field_index + 1
-    }
-    return owned
+    return CollectOwnedMemberPaths(layouts, index, prefix, paths, false)
 }
 
 fn EmitTryCloneString(&symbol: str): str {
-    return "static bool " + symbol.clone() + "(KuProjectionString source, KuProjectionString *out) {\n" +
-        "    if (source.storage == KU_PROJECTION_STRING_STATIC) { *out = source; return true; }\n" +
-        "    if (!source.ptr) return true;\n" +
-        "    size_t size = source.len ? source.len : 1;\n    uint8_t *data = malloc(size);\n    if (!data) return false;\n" +
-        "    if (source.len) memcpy(data, source.ptr, source.len);\n" +
-        "    *out = (KuProjectionString){ data, source.len, size, KU_PROJECTION_STRING_OWNED };\n    return true;\n}\n\n"
+    return EmitProjectionCloneString(symbol)
 }
 
 fn emitOwnedStructElement(&element: str, &prefix: str, &fields: [str], private_drop: bool): str {
@@ -360,7 +339,12 @@ fn EmitBoundElementClones(&layouts: [StructLayout], &requested: [int]): str {
     index = 0
     while (index < requested.len()) {
         layout = requested[index]
-        text += EmitOwnedStructOperations(layouts, layout, "ku_linked_element_" + str(layout), true)
+        prefix = "ku_linked_element_" + str(layout)
+        if (HasBoundArrayMembers(layouts, layout)) {
+            text += EmitLinkedStringArrayElementClone(layouts, layout, prefix)
+        } else {
+            text += EmitOwnedStructOperations(layouts, layout, prefix, true)
+        }
         index = index + 1
     }
     return text
@@ -395,13 +379,17 @@ fn EmitLinkedIntAppend(&array: str, &value: str): str {
 
 fn OwnedRecordArrayCloneLayout(&layouts: [StructLayout], &array: TypeNameBinding): int {
     index = LayoutIndex(layouts, array.module_index, array.declaration_node)
-    if (index == 0 || HasBoundArrayMembers(layouts, index)) { return 0 }
+    if (index == 0) { return 0 }
+    if (HasBoundArrayMembers(layouts, index)) {
+        if (CanCloneNestedStringArrays(layouts, index)) { return index }
+        return 0
+    }
     if (collectOwnedFields(layouts, index, "", []).len() == 0) { return 0 }
     return index
 }
 
-fn EmitLinkedOwnedArrayClone(&source: str, &target: str, &prefix: str, layout: int): str {
-    return EmitCheckedRecordArrayClone(source, target, prefix, layout)
+fn EmitLinkedOwnedArrayClone(&layouts: [StructLayout], &source: str, &target: str, &array: TypeNameBinding, layout: int): str {
+    return EmitCheckedRecordArrayClone(source, target, BoundArrayCPrefix(array), layout, HasBoundArrayMembers(layouts, layout))
 }
 
 fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str): str! {
