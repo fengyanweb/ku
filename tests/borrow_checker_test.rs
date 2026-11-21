@@ -370,6 +370,30 @@ fn main(): null! {
 }
 
 #[test]
+fn unicode_transforms_borrow_input_and_return_independent_strings() {
+    let source = include_str!("fixtures/native_string_view_transforms/main.ku");
+    accepts(source);
+    run_source("borrow-unicode-transforms.ku", source).expect("namespace and method both borrow");
+}
+
+#[test]
+fn unicode_transform_names_preserve_enum_and_object_calls() {
+    let source = r#"
+enum Choice { trim(value: str) }
+fn main() {
+    value = Choice.trim("enum")
+    string = { trim: (): str => "custom" }
+    if (str(value) != "Choice.trim(enum)" || string.trim() != "custom") {
+        panic("read-only dispatch intercepted a different call")
+    }
+}
+"#;
+    accepts(source);
+    run_source("borrow-unicode-transform-names.ku", source)
+        .expect("non-string calls still resolve");
+}
+
+#[test]
 fn borrow_checker_json_parser_aliases_accept_readonly_forwarding() {
     accepts(
         r#"

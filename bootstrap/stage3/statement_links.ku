@@ -1,8 +1,8 @@
 import { Token } from "../stage1/token.ku"
 import { Arena, Node, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
-import { AfterOptionalSemicolon, RejectAt, WindowKind, WindowKindIs, WindowToken } from "./support.ku"
-import { ControlFrame, RejectFinally, StatementLink, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength,
+import { AfterOptionalSemicolon, RejectAt, RejectAtSpan, WindowKind, WindowKindIs, WindowToken } from "./support.ku"
+import { ControlFrame, NewControlFrame, StatementLink, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength,
          RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectNestedRoot, ExpectTryToken, NextBodyWork,
          IsControlStatement, ReadExpressionEnd, RejectStatementLimit, RejectWhileBody } from "./body_support.ku"
 import { ReadSimpleBodyStatement } from "./simple_statements.ku"
@@ -200,12 +200,19 @@ fn AppendStatementLinks(children: [int], &links: [StatementLink], top: int, coun
     return ok(AppendedStatements { children: output, work: work })
 }
 
+fn BuildTryBody(&tokens: [Token], last: int, &frame: ControlFrame, &end: Token,
+                append: fn([int], int, int, Token): [int]!,
+                add_node: fn(str, str, int, Span, [int], Token): int!): int! {
+    opener = WindowToken(tokens, frame.start + 1, last)
+    children = append([], frame.body_top, frame.body_count, opener.clone())?
+    span = SpanMerge(SpanFromToken(opener.clone()), SpanFromToken(end.clone()))
+    return add_node("TryBody", "", 0, span, children, opener)
+}
+
 // Preserve catch-body/list charging before either of its two nodes is added.
-// A finally clause remains unsupported at this boundary.
-fn BuildCatchClause(&tokens: [Token], next: int, last: int, &frame: ControlFrame, &end: Token,
+fn BuildCatchClause(&tokens: [Token], last: int, &frame: ControlFrame, &end: Token,
                     append: fn([int], int, int, Token): [int]!,
                     add_node: fn(str, str, int, Span, [int], Token): int!): int! {
-    RejectFinally(WindowToken(tokens, next, last))?
     catch_start = WindowToken(tokens, frame.catch_start, last)
     catch_open = WindowToken(tokens, frame.catch_start + 4, last)
     children = append([], frame.else_top, frame.else_count, catch_open.clone())?
@@ -214,6 +221,50 @@ fn BuildCatchClause(&tokens: [Token], next: int, last: int, &frame: ControlFrame
     catch_body = add_node("CatchBody", "", 0, body_span, children, catch_open)?
     clause_span = SpanMerge(SpanFromToken(catch_start.clone()), end_span)
     return add_node("Catch", "", 0, clause_span, [frame.catch_binding, catch_body], catch_start)
+}
+
+fn ContinueTry(&tokens: [Token], last: int, &frame: ControlFrame, &end: Token, cursor: int, width: int,
+               binding: Token, append: fn([int], int, int, Token): [int]!,
+               add_node: fn(str, str, int, Span, [int], Token): int!): ControlFrame! {
+    // The prior clause is sealed in an arena node. Only the new clause
+    // needs a statement list, while the parent frame stays in place.
+    next = NewControlFrame("Try", "", frame.start, frame.condition, frame.previous)
+    next.catch_start = cursor
+    if (width == 5) {
+        next.condition = BuildTryBody(tokens, last, frame, end, append, add_node.clone())?
+        span = SpanFromToken(binding.clone())
+        next.catch_binding = add_node("CatchBinding", binding.lexeme.clone(), 0, span, [], binding)?
+        next.phase = 1
+        return ok(next)
+    }
+    if (frame.phase == 0) {
+        next.condition = BuildTryBody(tokens, last, frame, end, append, add_node)?
+    } else {
+        next.catch_binding = BuildCatchClause(tokens, last, frame, end, append, add_node)?
+    }
+    next.phase = 3
+    return ok(next)
+}
+
+fn BuildTryChildren(&tokens: [Token], last: int, &frame: ControlFrame, &end: Token,
+                    append: fn([int], int, int, Token): [int]!,
+                    add_node: fn(str, str, int, Span, [int], Token): int!): [int]! {
+    if (frame.phase != 3) {
+        caught = BuildCatchClause(tokens, last, frame, end, append, add_node)?
+        return ok([frame.condition, caught])
+    }
+    end_span = SpanFromToken(end.clone())
+    if (frame.catch_binding == 0 && frame.else_count == 0) {
+        span = SpanMerge(SpanFromToken(WindowToken(tokens, frame.start, last)), end_span.clone())
+        RejectAtSpan(span, "unexpected_token", "try requires catch or finally")?
+    }
+    opener = WindowToken(tokens, frame.catch_start + 1, last)
+    children = append([], frame.else_top, frame.else_count, opener)?
+    keyword = WindowToken(tokens, frame.catch_start, last)
+    clause_span = SpanMerge(SpanFromToken(keyword.clone()), end_span)
+    cleanup = add_node("Finally", "", 0, clause_span, children, keyword)?
+    if (frame.catch_binding != 0) { return ok([frame.condition, frame.catch_binding, cleanup]) }
+    return ok([frame.condition, cleanup])
 }
 
 

@@ -64,12 +64,16 @@ fn parameterBlockExit(&nodes: [Node], &edges: [int], start: int, stop: int, seek
         } else if (seeking_break) {
             if (statement.kind == "Break") { return true }
             if (statement.kind == "Try") {
-                try_body = nodes[edges[first] - 1].clone()
-                catch_clause = nodes[edges[first + 1] - 1].clone()
-                catch_body = nodes[edges[catch_clause.first_edge + 1] - 1].clone()
-                if (parameterBlockExit(nodes, edges, try_body.first_edge, try_body.first_edge + try_body.edge_count, true)
-                    || parameterBlockExit(nodes, edges, catch_body.first_edge, catch_body.first_edge + catch_body.edge_count, true)) {
-                    return true
+                clause_index = first
+                while (clause_index < end) {
+                    clause = nodes[edges[clause_index] - 1].clone()
+                    if (clause.kind == "Catch") {
+                        clause = nodes[edges[clause.first_edge + 1] - 1].clone()
+                    }
+                    if (parameterBlockExit(nodes, edges, clause.first_edge, clause.first_edge + clause.edge_count, true)) {
+                        return true
+                    }
+                    clause_index = clause_index + 1
                 }
             }
         } else if (statement.kind == "Break" || statement.kind == "Continue" || statement.kind == "Return"
@@ -137,12 +141,18 @@ fn checkParameterBlock(&nodes: [Node], &edges: [int], start: int, stop: int, &na
                 checkParameterBlock(nodes, edges, first + 1, end, name, false, false)?
             }
         } else if (statement.kind == "Try") {
-            try_body = nodes[edges[first] - 1].clone()
-            checkParameterBlock(nodes, edges, try_body.first_edge, try_body.first_edge + try_body.edge_count, name, false, true)?
-            catch_clause = nodes[edges[first + 1] - 1].clone()
-            if (nodes[edges[catch_clause.first_edge] - 1].text != name) {
-                catch_body = nodes[edges[catch_clause.first_edge + 1] - 1].clone()
-                checkParameterBlock(nodes, edges, catch_body.first_edge, catch_body.first_edge + catch_body.edge_count, name, false, true)?
+            clause_index = first
+            while (clause_index < end) {
+                clause = nodes[edges[clause_index] - 1].clone()
+                visible = true
+                if (clause.kind == "Catch") {
+                    visible = nodes[edges[clause.first_edge] - 1].text != name
+                    clause = nodes[edges[clause.first_edge + 1] - 1].clone()
+                }
+                if (visible) {
+                    checkParameterBlock(nodes, edges, clause.first_edge, clause.first_edge + clause.edge_count, name, false, true)?
+                }
+                clause_index = clause_index + 1
             }
         } else {
             if (writesParameter(nodes, edges, statement, name)) {

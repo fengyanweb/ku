@@ -1016,6 +1016,36 @@ fn main(): null! {
         assert error in rejected.stderr and not rejected.stdout, rejected.stderr
 
 
+def exercise_linked_string_return_match(compiler, cc, caller):
+    project = caller / "linked-string-return-match"
+    project.mkdir()
+    source = project / "main.ku"
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\n", encoding="utf-8")
+    source.write_text('''struct Token { kind: str }
+fn Classify(&token: Token): int! {
+    return match token.kind { "If" => ok(2), "LBrace" => ok(1), _ => ok(0) }
+}
+fn Subject(): str { println("subject"); return "行" + "🙂" }
+fn Owned(): int { return match Subject() { "行🙂" => 7, _ => 0 } }
+fn main(): null! {
+    keyword = Token { kind: "If" }
+    brace = Token { kind: "LBrace" }
+    end = Token { kind: "Eof" }
+    println(str(Classify(keyword)?))
+    println(str(Classify(brace)?))
+    println(str(Classify(end)?))
+    println(str(Owned()))
+    return ok(null)
+}
+''', encoding="utf-8")
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    output = caller / ("string-return-match.exe" if os.name == "nt" else "string-return-match")
+    execute([sys.executable, "-B", builder, manifest, "--compiler", compiler, "--cc", cc, "-o", output], caller)
+    source.unlink()
+    assert execute([output], caller).stdout.replace(b"\r\n", b"\n") == b"2\n1\n0\nsubject\n7\n"
+
+
 def exercise_linked_unit_enum_result(compiler, cc, caller):
     project = caller / "linked-unit-enum-result"
     project.mkdir()
@@ -1090,6 +1120,183 @@ fn Bad(&token: Token): Other! { return model.ReadElsePhase(token) }
     model.write_text(supplier.replace(" Braces\n ElseIf", " Braces\n ElseIf\n Invalid(code: int)"), encoding="utf-8")
     rejected = execute([compiler, "emit-unit-plan", manifest, "Bad"], caller, 1)
     assert b"linked_enum_layout" in rejected.stderr and not rejected.stdout, rejected.stderr
+
+
+def exercise_linked_unit_enum_member(compiler, cc, caller):
+    project = caller / "linked-unit-enum-member"
+    project.mkdir()
+    phases = project / "phase.ku"
+    phases.write_text("enum Phase { Body\n ElseIf }\n", encoding="utf-8")
+    model = project / "model.ku"
+    supplier = '''import { Phase } from "./phase.ku"
+struct Frame { phase: Phase, context: str, cursor: int }
+fn Open(body: bool, context: str, cursor: int): Frame {
+    if (body) { return Frame { phase: Phase.Body, context: context, cursor: cursor } }
+    return Frame { phase: Phase.ElseIf, context: context, cursor: cursor }
+}
+fn Pass(frame: Frame): Frame! { return ok(frame) }
+fn Take(frame: Frame): int! {
+    phase = frame.phase
+    println(frame.context)
+    return match phase { Phase.Body => ok(0), Phase.ElseIf => ok(1) }
+}
+'''
+    model.write_text(supplier, encoding="utf-8")
+    main = project / "main.ku"
+    header = 'import model from "./model.ku"\nimport phase from "./phase.ku"\n'
+    main.write_text(header + '''fn Classify(&frame: model.Frame): int! {
+    return match frame.phase { phase.Phase.Body => ok(frame.context.len()), phase.Phase.ElseIf => ok(frame.cursor) }
+}
+fn main(): null! {
+    opened = model.Open(true, "位🙂" + str(7), 23)
+    frame = model.Pass(opened)?
+    println(str(Classify(frame)?))
+    println(str(model.Take(frame)?))
+    other = model.Open(false, "后续🙂", 44)
+    println(str(Classify(other)?))
+    return ok(null)
+}
+''', encoding="utf-8")
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\nphase.ku\nmodel.ku\n", encoding="utf-8")
+    provider_order = project / "provider.txt"
+    provider_order.write_text("model.ku\nmain.ku\nphase.ku\n", encoding="utf-8")
+    provider = json.loads(execute([compiler, "emit-unit-plan", provider_order, "Open"], caller).stdout)
+    consumer = json.loads(execute([compiler, "emit-unit-plan", manifest, "main"], caller).stdout)
+    request = next(call for call in consumer["dependencies"] if call["source_name"] == "Open")
+    declared = provider["export"]["signature"]["result"]["nominals"][0]
+    imported = request["signature"]["result"]["nominals"][0]
+    assert declared["field"] == imported["field"] == 0
+    assert declared["source_path"] == imported["source_path"] == "phase.ku"
+    assert declared["node"] == imported["node"]
+    assert declared["c_type"] != imported["c_type"]
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    output = caller / ("enum-member.exe" if os.name == "nt" else "enum-member")
+    execute([sys.executable, "-B", builder, manifest, "--compiler", compiler, "--cc", cc, "-o", output], caller)
+    assert execute([output], caller).stdout.replace(b"\r\n", b"\n") == "3\n位🙂7\n0\n44\n".encode()
+    for program, error in [
+        ('''struct Mark { phase: phase.Phase }
+fn Consume(mark: Mark): int { return 1 }
+fn Bad(): int {
+    mark = Mark { phase: phase.Phase.Body }
+    first = Consume(mark)
+    return Consume(mark)
+}
+''', b"unavailable_linked_binding"),
+        ("fn Bad(&frame: model.Frame): phase.Phase { return frame.phase }\n", b"linked_value_return"),
+        ('''fn Bad(frame: model.Frame): phase.Phase {
+    phase = frame.phase
+    return frame.phase
+}
+''', b"linked_moved_member"),
+        ('''struct Nested { frame: model.Frame }
+fn Bad(frame: Nested): Nested { return frame }
+''', b"linked_enum_member_carrier"),
+    ]:
+        main.write_text(header + program, encoding="utf-8")
+        rejected = execute([compiler, "emit-unit-plan", manifest, "Bad"], caller, 1)
+        assert not rejected.stdout and error in rejected.stderr, rejected.stderr
+    phases.write_text("enum Phase { Body\n ElseIf\n Value(index: int) }\n", encoding="utf-8")
+    rejected = execute([compiler, "emit-unit-plan", provider_order, "Open"], caller, 1)
+    assert not rejected.stdout and b"linked_enum_layout" in rejected.stderr, rejected.stderr
+
+
+def exercise_finally_frontend(compiler, caller):
+    project = caller / "finally-frontend"
+    project.mkdir()
+    entry = project / "main.ku"
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\n", encoding="utf-8")
+    entry.write_text('''fn main(): null! {
+    try { println("work") } finally { println("cleanup") }
+    try { fail "missing" } catch (err) { println(err.message) }
+    finally { try { println("release") } finally { println("done") } }
+    return ok(null)
+}
+''', encoding="utf-8")
+    execute([compiler, "check", entry], caller)
+    execute([compiler, "check-project", manifest], caller)
+    for source, diagnostic in [
+        ("fn Bad(): int! { try {} finally { return ok(\"wrong\") } }", b"return_type"),
+        ("fn Bad(value: int): null { try {} finally { value = 7 } }", b"immutable_parameter"),
+        ("fn Bad(): null { try {} finally {} }", b"try requires catch or finally"),
+    ]:
+        entry.write_text(source + "\n", encoding="utf-8")
+        rejected = execute([compiler, "check-project", manifest], caller, 1)
+        assert diagnostic in rejected.stderr and not rejected.stdout, rejected.stderr
+
+
+def exercise_linked_finally(compiler, cc, caller):
+    project = caller / "linked-finally"
+    project.mkdir()
+    main = project / "main.ku"
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\n", encoding="utf-8")
+    main.write_text('''fn ReadName(succeed: bool): str! {
+    if (!succeed) { fail { domain: "example", code: "missing", message: "cannot read " + "name🙂" } }
+    return ok("name-" + "🙂")
+}
+fn Report(succeed: bool): str! {
+    resource = "session-" + "owned"
+    try {
+        name = ReadName(succeed)?
+        println(name)
+    } finally { println(resource) }
+    println("continued")
+    return ok("normal")
+}
+fn ReturnEarly(succeed: bool): str! {
+    resource = "early-" + "cleanup"
+    try {
+        read = ReadName(succeed)?
+        return ok(read)
+    } finally { println(resource) }
+}
+fn Observe(succeed: bool): null! {
+    try { println(ReturnEarly(succeed)?); return ok(null) }
+    catch(err) { println(err.domain); println(err.code); println(err.message); return ok(null) }
+}
+fn main(): null! {
+    println(Report(true)?)
+    Observe(true)?
+    Observe(false)?
+    return ok(null)
+}
+''', encoding="utf-8")
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    output = caller / ("finally.exe" if os.name == "nt" else "finally")
+    build = [sys.executable, "-B", builder, manifest, "--compiler", compiler, "--cc", cc, "-o", output]
+    execute(build, caller)
+    assert execute([output], caller).stdout.replace(b"\r\n", b"\n") == (
+        "name-🙂\nsession-owned\ncontinued\nnormal\nearly-cleanup\nname-🙂\n"
+        "early-cleanup\nexample\nmissing\ncannot read name🙂\n".encode()
+    )
+
+    for body, cleanup, before_fatal in [
+        ("value = 18 / divisor; return ok(str(value))", 'println("BAD: fatal cleanup")', b""),
+        ('return ok("saved-" + "value")', 'println("started-cleanup"); println(str(18 / divisor))', b"started-cleanup\n"),
+    ]:
+        main.write_text("fn Divide(divisor: int): str! {\n"
+                        f"    try {{ {body} }} finally {{ {cleanup} }}\n}}\n"
+                        'fn main(): null! { println(Divide(0)?); return ok(null) }\n', encoding="utf-8")
+        execute(build, caller)
+        failed = execute([output], caller, 1)
+        assert failed.stdout.replace(b"\r\n", b"\n") == before_fatal
+        assert b"division by zero" in failed.stderr
+
+    for invalid, error in [
+        ('try { if (read) { return ok("x") } } finally { println("done") }\n    return ok("y")',
+         b"unsupported_linked_finally"),
+        ('try { return ok("x") } finally { return ok("y") }', b"unsupported_linked_finally_cleanup"),
+        ('try { return ok("x") } finally { println(Probe(false)?) }', b"unsupported_linked_finally_cleanup"),
+        ('try { return ok(text) } finally { println("done") }', b"linked_control_move"),
+        ('try { return ok("x") } catch (err) { return ok("z") } finally { println("done") }',
+         b"unsupported_linked_catch"),
+    ]:
+        main.write_text('fn Probe(read: bool): str! { return ok("probe") }\n'
+                        f'fn Bad(read: bool, text: str): str! {{ {invalid} }}\n', encoding="utf-8")
+        rejected = execute([compiler, "emit-unit-plan", manifest, "Bad"], caller, 1)
+        assert not rejected.stdout and error in rejected.stderr, rejected.stderr
 
 
 def exercise_linked_reader_factory(compiler, cc, caller):
@@ -1690,7 +1897,11 @@ def exercise(ku, cc):
         exercise_linked_unit_enum_branch(compiler, cc, caller)
         exercise_linked_unit_enum_match(compiler, cc, caller)
         exercise_linked_checked_enum_match(compiler, cc, caller)
+        exercise_linked_string_return_match(compiler, cc, caller)
         exercise_linked_unit_enum_result(compiler, cc, caller)
+        exercise_linked_unit_enum_member(compiler, cc, caller)
+        exercise_finally_frontend(compiler, caller)
+        exercise_linked_finally(compiler, cc, caller)
         exercise_linked_reader_factory(compiler, cc, caller)
         exercise_linked_owned_string_for(compiler, cc, caller)
         exercise_parameter_bindings(compiler, cc, caller)

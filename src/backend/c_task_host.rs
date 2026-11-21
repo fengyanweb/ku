@@ -21,7 +21,7 @@ fn record_field(name: &str) -> String {
 }
 
 fn enum_name(ty: &IrType) -> Option<&str> {
-    crate::ir::task::unit_enum_name(match ty {
+    crate::ir::task::enum_name(match ty {
         IrType::Result(inner) => inner,
         ty => ty,
     })
@@ -164,15 +164,19 @@ impl<'a> OutcomeKinds<'a> {
 }
 
 pub(super) fn empty_expr(layouts: &IrLayoutTable, ty: &IrType, place: &str) -> KuResult<String> {
-    if record_name(ty).is_some() {
-        return record_empty_expr(layouts, ty, place, 0, &mut 64);
+    let payload = match ty {
+        IrType::Result(inner) => inner,
+        ty => ty,
+    };
+    if record_name(ty).is_some() || crate::ir::task::enum_int_layout(layouts, payload).is_some() {
+        return typed_empty_expr(layouts, ty, place, 0, &mut 64);
     }
     super::super::task::empty_value_expr(ty, place)
 }
 
 // Test fields rather than padding. A nullable field may use its null form or
 // the all-zero form emitted for a vacant typed output object.
-fn record_empty_expr(
+fn typed_empty_expr(
     layouts: &IrLayoutTable,
     ty: &IrType,
     place: &str,
@@ -182,8 +186,20 @@ fn record_empty_expr(
     if depth > 24 {
         return Err(unsupported("Task record outcome layout is too deep"));
     }
+    if let Some(variant) = crate::ir::task::enum_int_layout(layouts, ty) {
+        // The zero tag chooses the only active storage in a vacant enum.
+        // A unit alternative has no field that needs inspection.
+        if variant.tag != 0 {
+            return Ok(format!("({place}).tag == 0"));
+        }
+        return Ok(format!(
+            "({place}).tag == 0 && ({place}).payload.{}.{} == 0",
+            c_ident(&variant.name),
+            c_ident(&variant.fields[0].name),
+        ));
+    }
     let mut child = |ty: &IrType, field: &str| {
-        record_empty_expr(
+        typed_empty_expr(
             layouts,
             ty,
             &format!("({place}).{field}"),
@@ -212,7 +228,7 @@ fn record_empty_expr(
                 *remaining_fields = remaining_fields.checked_sub(1).ok_or_else(|| {
                     unsupported("Task record outcome has too many transitive fields")
                 })?;
-                let expr = record_empty_expr(
+                let expr = typed_empty_expr(
                     layouts,
                     &field.ty,
                     &format!("({place}).{}", c_ident(&field.name)),

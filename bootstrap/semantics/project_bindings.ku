@@ -336,7 +336,7 @@ fn checkReturnsInStatement(&nodes: [Node], &edges: [int], &result: ScalarAnnotat
     // expression and nested function nodes establish no returns in this scope.
     if (statement.kind == "If" || statement.kind == "While" || statement.kind == "For" ||
         statement.kind == "Try" || statement.kind == "TryBody" ||
-        statement.kind == "Catch" || statement.kind == "CatchBody") {
+        statement.kind == "Catch" || statement.kind == "CatchBody" || statement.kind == "Finally") {
         start = statement.first_edge
         stop = start + statement.edge_count
         cursor = start

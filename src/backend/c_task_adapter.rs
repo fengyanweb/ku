@@ -373,7 +373,7 @@ pub(super) fn parameter_move(ty: &TaskSlotType, place: &str) -> KuResult<String>
 fn parameter_owned(ty: &TaskSlotType) -> bool {
     match ty {
         TaskSlotType::Value { ty, .. } => {
-            owned(ty) || task_record_type(ty) || crate::ir::task::unit_enum_name(ty).is_some()
+            owned(ty) || task_record_type(ty) || crate::ir::task::enum_name(ty).is_some()
         }
         TaskSlotType::Callable { .. } => true,
         _ => false,
@@ -407,7 +407,7 @@ fn enum_tag_check(
     tag: &str,
     invalid: &str,
 ) -> KuResult<String> {
-    if crate::ir::task::unit_enum_name(ty).is_none() {
+    if crate::ir::task::enum_name(ty).is_none() {
         return Ok(String::new());
     }
     let layout = crate::ir::task::unit_enum_layout(layouts, ty)
@@ -500,7 +500,7 @@ fn record_leaves(
                 Ok(format!("  if (!({place}).is_null) {{\n{code}  }}\n"))
             }
             IrType::Int | IrType::Bool | IrType::Null | IrType::Str => body(ty, place),
-            ty if crate::ir::task::unit_enum_name(ty).is_some() => body(ty, place),
+            ty if crate::ir::task::enum_name(ty).is_some() => body(ty, place),
             _ => Err(unsupported(format!(
                 "unsupported native Task record field type: {ty:?}"
             ))),
@@ -746,7 +746,7 @@ fn emit_function(
     };
     if !supported_type(&function.result)
         && !task_record_type(inner)
-        && crate::ir::task::unit_enum_name(inner).is_none()
+        && crate::ir::task::enum_name(inner).is_none()
     {
         return Err(unsupported(
             "native task adapter requires a supported Result",
@@ -764,7 +764,7 @@ fn emit_function(
             } if supported_type(ty)
                 || crate::ir::task::flat_array(ty)
                 || task_record_type(ty)
-                || crate::ir::task::unit_enum_name(ty).is_some() => {}
+                || crate::ir::task::enum_name(ty).is_some() => {}
             TaskSlotType::Callable { .. } => {}
             _ => return Err(unsupported("native task adapter parameter is unsupported")),
         }

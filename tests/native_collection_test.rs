@@ -1033,6 +1033,33 @@ fn main() {
 }
 
 #[test]
+fn native_nullable_int_to_string_evaluates_the_source_once() {
+    let source = r#"
+fn Location(value: int): int | null {
+    println("location")
+    if (value == -1) { return null }
+    return value
+}
+
+fn main() {
+    println(str(Location(-1)))
+    println(str(Location(0)))
+    println(str(Location(-9223372036854775807 - 1)))
+    println(str(null))
+}
+"#;
+    run_source("native-nullable-int-to-string.ku", source)
+        .expect("interpreter nullable formatting");
+    let Some(stdout) = native_stdout("nullable-int-to-string", source) else {
+        return;
+    };
+    assert_eq!(
+        stdout,
+        "location\nnull\nlocation\n0\nlocation\n-9223372036854775808\nnull\n"
+    );
+}
+
+#[test]
 fn native_collection_nullable_containers_print_and_encode_without_boxing_scalars() {
     let source = r#"
 import json from "std.json"

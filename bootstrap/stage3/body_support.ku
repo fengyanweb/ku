@@ -21,6 +21,7 @@ struct ControlFrame {
     else_count: int
     catch_start: int
     catch_binding: int
+    // 0: protected body, 1: else/catch, 2: nested else-if, 3: finally.
     phase: int
     previous: int
 }
@@ -48,6 +49,7 @@ fn RejectBodyEof(control_depth: int, kind: str, phase: int, error_token: Token):
     }
     if (control_depth > 0 && kind == "Try") {
         if (phase == 0) { RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after try body")? }
+        if (phase == 3) { RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after finally body")? }
         RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after catch body")?
     }
     if (control_depth > 0 && phase == 0) {
@@ -110,13 +112,6 @@ fn ReadExpressionEnd(&tokens: [Token], start: int, window_end: int, &context: st
     return ok(probe)
 }
 
-fn RejectFinally(&token: Token): null! {
-    if (token.kind == "Finally") {
-        RejectAt(token.clone(), "unsupported_statement", "stage-3 finally is not supported")?
-    }
-    return ok(null)
-}
-
 fn ExpectTryToken(&token: Token, kind: str, message: str): null! {
     if (token.kind != kind) { RejectAt(token.clone(), "unexpected_token", message)? }
     return ok(null)
@@ -128,14 +123,29 @@ fn ReadCatchBinding(&tokens: [Token], start: int, window_end: int): Token! {
     if (start < 0 || start > window_end || window_end >= tokens.len() || tokens[tokens.len() - 1].kind != "Eof") {
         RejectAtPoint("invalid_token_stream", "catch header must be in a token window ending at EOF")?
     }
-    RejectFinally(WindowToken(tokens, start, window_end))?
-    ExpectTryToken(WindowToken(tokens, start, window_end), "Catch", "stage-3 try requires a catch clause")?
+    ExpectTryToken(WindowToken(tokens, start, window_end), "Catch", "try requires catch or finally")?
     ExpectTryToken(WindowToken(tokens, start + 1, window_end), "LParen", "expected '(' after 'catch'")?
     binding = WindowToken(tokens, start + 2, window_end)
     ExpectTryToken(binding, "Ident", "expected catch error name")?
     ExpectTryToken(WindowToken(tokens, start + 3, window_end), "RParen", "expected ')' after catch error name")?
     ExpectTryToken(WindowToken(tokens, start + 4, window_end), "LBrace", "expected '{' before catch body")?
     return ok(binding)
+}
+
+struct TryClauseHeader {
+    width: int
+    token: Token
+}
+
+fn ReadTryClauseHeader(&tokens: [Token], start: int, last: int): TryClauseHeader! {
+    kind = WindowKind(tokens, start, last)
+    if (kind == "Finally") {
+        opener = WindowToken(tokens, start + 1, last)
+        ExpectTryToken(opener, "LBrace", "expected '{' before finally body")?
+        return ok(TryClauseHeader { width: 2, token: opener })
+    }
+    binding = ReadCatchBinding(tokens, start, last)?
+    return ok(TryClauseHeader { width: 5, token: binding })
 }
 
 fn AssignmentOperator(&kind: str): str {

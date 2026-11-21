@@ -192,7 +192,7 @@ fn EmitPathLineC(&supplied: [SuppliedModule], &name: str): PathLineC! {
     require(inner.kind == "TypeName" && inner.edge_count == 0 && inner.text == "str", inner, "expected a str! result")?
 
     empty: [StructLayout] = []
-    layouts = LinkedNullLayout(project, record, empty, 0)?
+    layouts = LinkedNullLayout(project, record, empty, 0, false)?
     order = OrderCStructLayouts(layouts, record.module_index, record.declaration_node, record.span.clone())?
     require(!order.contains_string, context, "the validation context must be Copy")?
     plan = readPlan(project, entry, line.text, context.text, record)?

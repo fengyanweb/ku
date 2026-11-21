@@ -179,7 +179,7 @@ fn EmitManifestPathsC(&supplied: [SuppliedModule], &name: str): ManifestPathsC! 
     RequireManifest(inner.text == "str", inner, "expected an owned [str]! result")?
 
     layouts: [StructLayout] = []
-    needed = LinkedNullLayout(project, context, layouts, 0)?
+    needed = LinkedNullLayout(project, context, layouts, 0, false)?
     order = OrderCStructLayouts(needed, context.module_index, context.declaration_node, context.span.clone())?
     RequireManifest(!order.contains_string, entry, "context must be Copy")?
     input_node = ManifestChild(project, entry, 0)

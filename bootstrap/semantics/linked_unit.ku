@@ -1,12 +1,24 @@
+import { Span } from "../stage2/span.ku"
+import { BindProjectModules } from "./project_bindings.ku"
+import { DeclarationSpan } from "./names.ku"
+import { ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
+import { RejectLayout } from "./struct_layouts.ku"
+import { TypeNameBinding } from "./type_names.ku"
+import { EmitLinkedNullPrototypes } from "./scalar_project_c.ku"
+import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
+import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
+import { LinkedOptionalReaderHeader } from "./linked_nullable_reader_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { SuppliedModule } from "./imports.ku"
-import { BuiltinLinkPlanType, LinkPlanDeclaration } from "./link_plan_c.ku"
-import { EmitLinkPlan, LinkedNullDependencyPlan, PrepareLinkedAppendCallbackPlan } from "./link_plan_json_c.ku"
-import { EmitLinkedNullC, PrepareLinkedNullProject } from "./linked_null_c.ku"
-import { LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult } from "./linked_null_types_c.ku"
+import { BuiltinLinkPlanType, LinkedNullC, LinkedNullState, LinkPlanDeclaration, LinkPlanNominalType, LinkPlanType, NewLinkedNullState } from "./link_plan_c.ku"
+import { CallbackPlanNominals, EmitLinkPlan, EmitLinkedBodyPrelude, LinkedNullDependencyPlan } from "./link_plan_json_c.ku"
+import { LowerLinkedRegion } from "./linked_null_c.ku"
+import { LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, LinkedCheckedResultCType, LinkedNullCType, LinkedNullResultCleanupReference, LinkedResultPlan } from "./linked_null_types_c.ku"
 import { RequireProjectionLocalFunction } from "./struct_projection_c.ku"
 import { EmitStaticJsonString } from "./scalar_int_emit.ku"
 import { ReadStaticAsciiJsonString } from "./scalar_int_operands.ku"
+import { LayoutIndex, StructLayout } from "./struct_layouts.ku"
+import { BoundArrayTypePosition, UnitEnumTypeName } from "./type_names.ku"
 
 fn EmitLinkedUnit(supplied: [SuppliedModule], &function: str, plan: bool): str! {
     project = PrepareLinkedNullProject(supplied)?
@@ -32,14 +44,55 @@ fn EmitLinkedUnit(supplied: [SuppliedModule], &function: str, plan: bool): str! 
 
     links: [LinkPlanDeclaration] = []
     dependencies = generated.links
+    layouts = generated.layouts
     count = dependencies.len()
     index = 0
     while (index < count) {
-        links = links.push(PrepareLinkedAppendCallbackPlan(project, LinkedNullDependencyPlan(dependencies[index])?)?)
+        links = links.push(prepareLinkedPlan(project, LinkedNullDependencyPlan(dependencies[index])?, layouts)?)
         index = index + 1
     }
-    entry = PrepareLinkedAppendCallbackPlan(project, generated.entry_plan)?
+    entry = prepareLinkedPlan(project, generated.entry_plan, layouts)?
     return EmitLinkPlan(project.supplied, "linked-null", entry, links)
+}
+
+fn linkedRecordPlanType(ty: LinkPlanType, &layouts: [StructLayout]): LinkPlanType {
+    next = ty
+    if (next.kind != "Struct") { return next }
+    layout = LayoutIndex(layouts, next.unit, next.node)
+    if (layout == 0) { return next }
+    field_count = layouts[layout - 1].fields.len()
+    index = 0
+    while (index < field_count) {
+        if (layouts[layout - 1].fields[index].resolved.declaration_kind == "UnitEnum") {
+            member = layouts[layout - 1].fields[index].resolved.clone()
+            next.nominals = next.nominals.push(LinkPlanNominalType { field: index + 1,
+                unit: member.module_index, node: member.declaration_node, c_type: UnitEnumTypeName(member) })
+        }
+        index = index + 1
+    }
+    return next
+}
+
+fn prepareLinkedPlan(&project: LinkedNullProject, declaration: LinkPlanDeclaration, &layouts: [StructLayout]): LinkPlanDeclaration! {
+    parameters: [LinkPlanType] = []
+    count = declaration.parameters.len()
+    index = 0
+    while (index < count) {
+        nominals = CallbackPlanNominals(project, declaration.parameters[index])?
+        ty = LinkPlanType {
+            kind: declaration.parameters[index].kind.clone(),
+            name: declaration.parameters[index].name.clone(),
+            unit: declaration.parameters[index].unit,
+            node: declaration.parameters[index].node,
+            c_type: declaration.parameters[index].c_type.clone(),
+            view: declaration.parameters[index].view,
+            nominals: nominals
+        }
+        parameters = parameters.push(linkedRecordPlanType(ty, layouts))
+        index = index + 1
+    }
+    return ok(LinkPlanDeclaration { unit: declaration.unit, node: declaration.node, symbol: declaration.symbol,
+        parameters: parameters, result: linkedRecordPlanType(declaration.result, layouts), returns_result: declaration.returns_result })
 }
 
 fn linkedMethodReceiver(&project: LinkedNullProject, &call: Node, &method: str, arguments: int): int {
@@ -90,4 +143,65 @@ fn linkedJsonLiteral(&project: LinkedNullProject, &function: Node): int! {
         index = index + 1
     }
     return ok(0)
+}
+
+fn PrepareLinkedNullProject(supplied: [SuppliedModule]): LinkedNullProject! {
+    if (supplied.len() == 0) {
+        point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+        RejectLayout("missing_linked_entry_module", "a selected source module is required", point)?
+    }
+    bound = BindProjectModules(supplied)?
+    return ok(LinkedNullProject { supplied: supplied, binding: bound })
+}
+
+fn EmitLinkedNullC(&project: LinkedNullProject, &entry_name: str): LinkedNullC! {
+    id = RequireProjectionLocalFunction(project.supplied, entry_name)?
+    function = LinkedNullNode(project, 1, id)
+    parameters = ReadLinkedNullParametersFrom(project, function, NewLinkedNullState())?
+    result = parameters.result.clone()
+    region = LowerLinkedRegion(project, function, parameters.state, parameters.body_start, result, 0)?
+    if (!region.terminal) {
+        RejectLayout("unsupported_linked_terminal", "expected a final return or Error fail", DeclarationSpan(function))?
+    }
+    symbol = "ku_linked_null_" + str(id)
+    source = EmitLinkedFunction(project, region.state, symbol, parameters.signature, result)?
+    checked = !region.state.plain_value_result
+    plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: parameters.plan,
+        result: LinkedResultPlan(result, 1, checked)?, returns_result: checked }
+    return ok(LinkedNullC { symbol: symbol, links: region.state.links, source: source, entry_plan: plan, layouts: region.state.layouts })
+}
+
+fn linkedRecordEnums(&layouts: [StructLayout]): [TypeNameBinding] {
+    types: [TypeNameBinding] = []
+    row = 0
+    while (row < layouts.len()) {
+        field_count = layouts[row].fields.len()
+        field = 0
+        while (field < field_count) {
+            if (layouts[row].fields[field].resolved.declaration_kind == "UnitEnum") {
+                ty = layouts[row].fields[field].resolved.clone()
+                if (BoundArrayTypePosition(types, ty) == 0) { types = types.push(ty) }
+            }
+            field = field + 1
+        }
+        row = row + 1
+    }
+    return types
+}
+
+fn EmitLinkedNullDeclarations(&project: LinkedNullProject, &body: LinkedNullState, &result: TypeNameBinding): str! {
+    declarations = EmitLinkedBodyPrelude(body, linkedRecordEnums(body.layouts))?
+    checked = !body.plain_value_result
+    return ok(declarations + LinkedOptionalReaderHeader(body.slots, result)? + EmitLinkedNullPrototypes(project, body.links, body.slots, body.local_appends, result, checked)?)
+}
+
+fn EmitLinkedFunction(&project: LinkedNullProject, &body: LinkedNullState, &symbol: str, &signature: str, &payload: TypeNameBinding): str! {
+    header = EmitLinkedNullDeclarations(project, body, payload)?
+    result = ""
+    if (body.plain_value_result) { result = LinkedNullCType(payload)? }
+    else { result = LinkedCheckedResultCType(payload)? }
+    keep = LinkedNullResultCleanupReference(body.owning_layouts, payload)
+    char_errors = ""
+    if (body.uses_chars) { char_errors = ManagedSourceCharactersErrors() }
+    return ok(FinishLinkedFunctionC(header + body.callback_helpers.clone(), body, symbol, signature, result, keep, char_errors, ""))
 }

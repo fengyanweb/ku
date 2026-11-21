@@ -12,7 +12,7 @@ import { DeclarationSpan, TopLevelName } from "./names.ku"
 import { AppendLinkedCheckedInvocation, ExitLinkedFailure, FsReadLinkPlan, LinkedCPrelude, LinkedCheckedCall, LinkedDirectCallExpression, LinkedFailureTarget, LinkPlanDeclaration, LinkPlanNominalType, LinkPlanType, LinkedIntArrayCallbackFunction, LinkedNullArguments, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullSlot, LinkedNullState, LinkedReadonlyExpression, LinkedNullValue } from "./link_plan_c.ku"
 import { LinkPlanJsonControls, LinkPlanJsonText } from "./project_paths.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { EmitUnitEnumHeader, TypeNameBinding } from "./type_names.ku"
 import { ContainsType, LinkedFsReadReference, LinkedIntAppendCallbackDeclaration, LinkedIntAppendCallbackNominals, LinkedIntArrayCallbackDeclaration, LinkedIntArrayCallbackFaultPending, ProjectionBuiltinLinkFor } from "./struct_projection_c.ku"
 
 fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): str! {
@@ -20,7 +20,7 @@ fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): 
     path = "null"
     if (ty.unit > 0) {
         path = LinkPlanJsonText(supplied[ty.unit - 1].path.clone(), controls)?
-        if (ty.nominals.len() == 0) {
+        if (ty.nominals.len() == 0 || ty.kind == "Struct") {
             name = supplied[ty.unit - 1].named.parsed.arena.nodes[ty.node - 1].text.clone()
         }
     }
@@ -37,7 +37,9 @@ fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): 
             nominal = ty.nominals[index].clone()
             if (index != 0) { text += "," }
             text += "{\"source_path\":" + LinkPlanJsonText(supplied[nominal.unit - 1].path.clone(), controls)?
-                + ",\"node\":" + str(nominal.node) + ",\"c_type\":" + LinkPlanJsonText(nominal.c_type, controls)? + "}"
+                + ",\"node\":" + str(nominal.node) + ",\"c_type\":" + LinkPlanJsonText(nominal.c_type, controls)?
+            if (nominal.field > 0) { text += ",\"field\":" + str(nominal.field - 1) }
+            text += "}"
             index = index + 1
         }
         text += "]"
@@ -171,8 +173,8 @@ fn CallbackPlanNominals(&project: LinkedNullProject, &ty: LinkPlanType): [LinkPl
         a = checked.parameters[first].clone()
         b = checked.parameters[second].clone()
         return ok([
-            LinkPlanNominalType { unit: a.module_index, node: a.declaration_node, c_type: LinkedNullCType(a)? },
-            LinkPlanNominalType { unit: b.module_index, node: b.declaration_node, c_type: LinkedNullCType(b)? }
+            LinkPlanNominalType { field: 0, unit: a.module_index, node: a.declaration_node, c_type: LinkedNullCType(a)? },
+            LinkPlanNominalType { field: 0, unit: b.module_index, node: b.declaration_node, c_type: LinkedNullCType(b)? }
         ])
     }
     nominals: [LinkPlanNominalType] = []
@@ -184,28 +186,6 @@ fn CallbackPlanNominals(&project: LinkedNullProject, &ty: LinkPlanType): [LinkPl
         index = index + 1
     }
     return ok(nominals)
-}
-
-fn PrepareLinkedAppendCallbackPlan(&project: LinkedNullProject, declaration: LinkPlanDeclaration): LinkPlanDeclaration! {
-    parameters: [LinkPlanType] = []
-    count = declaration.parameters.len()
-    index = 0
-    while (index < count) {
-        nominals = CallbackPlanNominals(project, declaration.parameters[index])?
-        ty = LinkPlanType {
-            kind: declaration.parameters[index].kind.clone(),
-            name: declaration.parameters[index].name.clone(),
-            unit: declaration.parameters[index].unit,
-            node: declaration.parameters[index].node,
-            c_type: declaration.parameters[index].c_type.clone(),
-            view: declaration.parameters[index].view,
-            nominals: nominals
-        }
-        parameters = parameters.push(ty)
-        index = index + 1
-    }
-    return ok(LinkPlanDeclaration { unit: declaration.unit, node: declaration.node, symbol: declaration.symbol,
-        parameters: parameters, result: declaration.result, returns_result: declaration.returns_result })
 }
 
 fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
@@ -262,7 +242,7 @@ fn HoldLinkedCopyOperand(value: LinkedNullExpression, target: int): LinkedNullEx
     return ok(LinkedReadonlyExpression(next, ty, name))
 }
 
-fn EmitLinkedBodyPrelude(&body: LinkedNullState): str! {
+fn EmitLinkedBodyPrelude(&body: LinkedNullState, &member_enums: [TypeNameBinding]): str! {
     ops = GuardArithmetic(body.uses_add, body.uses_sub)
     if (body.uses_mul || body.uses_div) { ops += "#include <stdio.h>\n#include <stdlib.h>\n\n" }
     if (body.uses_mul) { ops += ScalarCheckedMultiplyC() }
@@ -272,7 +252,12 @@ fn EmitLinkedBodyPrelude(&body: LinkedNullState): str! {
             + "    return ku_scalar_string_contains(hay.ptr, hay.len, needle.ptr, needle.len);\n}\n\n"
     }
     header = LinkedCPrelude(body, ops + GuardStringEquality(body.uses_string_equal))
-    declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
+    index = 0
+    while (index < member_enums.len()) {
+        header += EmitUnitEnumHeader(member_enums[index])
+        index = index + 1
+    }
+    declarations = EmitLinkedArrayBody(body, header, StructResultHeader(), member_enums)?
     if ((body.local_appends.len() > 0 || body.uses_scoped_reader) && body.append_slots.len() == 0 && body.local_append_types.len() == 0) {
         declarations += StructArrayStatuses()
     }

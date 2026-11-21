@@ -10,6 +10,7 @@ import { ContainsIndex, ContainsType, CTypeName, ProjectionHeaders, ScalarCType 
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 
 struct LinkPlanNominalType {
+    field: int
     unit: int
     node: int
     c_type: str
@@ -534,4 +535,5 @@ struct LinkedNullC {
     links: [LinkedNullFunction]
     source: str
     entry_plan: LinkPlanDeclaration
+    layouts: [StructLayout]
 }

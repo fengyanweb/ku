@@ -173,6 +173,24 @@ class LinkTests(unittest.TestCase):
             wrong = self.unit("wrong-enum-result", plan(changed), "/* no C before preflight */\n")
             self.assert_preflight_error([*original, *wrong], "signature mismatch")
 
+    def test_struct_enum_fields_require_agreeing_nominal_identity_and_ctype(self):
+        member = {"source_path": "phase.ku", "node": 3, "c_type": "KuEnum_m2_3", "field": 0}
+        shape = {"kind": "Struct", "source_name": "Frame", "source_path": "model.ku", "node": 9,
+                 "c_type": "const KuStruct_m1_9*", "passing": "view", "nominals": [member]}
+        request = declaration("model.ku", 17, "ku_read", [shape])
+        original = self.unit("uses-enum-member", plan(self.input, [request]), "/* no C before preflight */\n")
+        receiver = dict(shape, c_type="const KuStruct_m3_9*", nominals=[dict(member, c_type="KuEnum_m4_3")])
+        required = link_c.TypeRef.read(shape, "required")
+        self.assertEqual(required.semantic(), link_c.TypeRef.read(receiver, "receiver").semantic())
+        for change in ({"field": 1}, {"source_path": "other.ku"}, {"node": 4, "c_type": "KuEnum_m4_4"}):
+            wrong_shape = dict(receiver, nominals=[dict(receiver["nominals"][0], **change)])
+            definition = declaration("model.ku", 17, "ku_provider", [wrong_shape])
+            wrong = self.unit("wrong-enum-field", plan(definition), "/* no C before preflight */\n")
+            self.assert_preflight_error([*original, *wrong], "signature mismatch")
+        for change in ({"field": -1}, {"field": 64}, {"c_type": "int32_t"}, {"c_type": "KuEnum_m2_4"}):
+            with self.subTest(change=change), self.assertRaises(link_c.LinkError):
+                link_c.TypeRef.read(dict(shape, nominals=[dict(member, **change)]), "field")
+
     def test_windows_gnu_stages_compiler_paths_away_from_unicode_output(self):
         destination = self.root / "调用目录 🙂"
         destination.mkdir()

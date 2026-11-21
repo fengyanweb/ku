@@ -6,6 +6,7 @@ pub(super) fn assert_named_array_parameter_move(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("array-parameter.ku"),
         r#"struct Item { text: str }
+struct Bundle { item: Item retained: str }
 fn Transfer(input: [Item]): [Item]! {
     local: [Item] = input
     return ok(local)
@@ -24,6 +25,22 @@ fn Snapshot(input: [Item]): [Item]! {
         fail { domain: "clone", code: "length", message: "array length changed" }
     }
     return ok(copy)
+}
+fn MoveField(input: Bundle, reject: bool): [Item]! {
+    local = input
+    items: [Item] = []
+    items = items.push(local.item)
+    if (local.retained != "keep" || reject) {
+        fail { domain: "array", code: "rejected", message: "discard the array" }
+    }
+    return ok(items)
+}
+fn MoveTwice(input: Bundle): [Item]! {
+    local = input
+    items: [Item] = []
+    items = items.push(local.item)
+    items = items.push(local.item)
+    return ok(items)
 }
 "#,
     )
@@ -144,6 +161,60 @@ int main(int argc, char **argv) {
         String::from_utf8(failed.stderr).unwrap().trim(),
         "out of memory"
     );
+
+    fs::write(cwd.join("function.txt"), "MoveField").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let definition = code.lines().find(|line| line.starts_with(result)).unwrap();
+    let (symbol, signature) = definition
+        .trim_start_matches(result)
+        .trim_start()
+        .split_once('(')
+        .unwrap();
+    let bundle = signature.split_once(" a0,").unwrap().0;
+    let host = r#"
+static KuProjectionString owner(const char *text) {
+    size_t length = strlen(text);
+    uint8_t *bytes = malloc(length);
+    memcpy(bytes, text, length);
+    return (KuProjectionString){bytes, length, length, KU_PROJECTION_STRING_OWNED};
+}
+static void check_cleanup(void) { if (outstanding()) _Exit(82); }
+int main(int argc, char **argv) {
+    (void)argv;
+    assert(atexit(check_cleanup) == 0);
+    KuProjectionString payload = owner("Ku");
+    BUNDLE input = {.f0 = {payload}, .f1 = owner("keep")};
+    if (argc > 1) fail_after = 0;
+    RESULT output = MOVE_FIELD(input, false);
+    assert(output.ok && output.value.len == 1 && output.value.data[0].f0.ptr == payload.ptr);
+    assert(outstanding() == 2);
+    DROP(&output.value);
+    output = MOVE_FIELD((BUNDLE){.f0 = {owner("Ku")}, .f1 = owner("keep")}, true);
+    assert(!output.ok && output.error.code.len == 8 && outstanding() == 0);
+    return 0;
+}
+"#
+    .replace("MOVE_FIELD", symbol)
+    .replace("RESULT", result)
+    .replace("BUNDLE", bundle)
+    .replace("DROP", &format!("ku_linked_view_{element}_drop"));
+    let source = cwd.join("array-move-field.c");
+    let program = cwd.join(format!("array-move-field{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &program, cwd);
+    assert_ok(&execute(&mut Command::new(&program), cwd, 10));
+    let failed = execute(Command::new(program).arg("grow"), cwd, 10);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stderr).trim(),
+        "array allocation failed"
+    );
+    fs::write(cwd.join("function.txt"), "MoveTwice").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_moved_member"));
 }
 
 pub(super) fn assert_checked_callback_forwarding(seed: &Path, cwd: &Path) {
@@ -476,6 +547,867 @@ int main(void) {
     assert_ok(&execute(&mut Command::new(exe), cwd, 10));
 }
 
+pub(super) fn assert_empty_owned_int_argument(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("empty-argument.ku"),
+        r#"fn Left(text: str): str! { return ok(text) }
+fn Right(failing: bool): str! {
+    if (failing) { fail { domain: "witness", code: "right", message: "right failed" } }
+    late = "late"
+    return ok(late)
+}
+fn Take(left: str, children: [int], right: str): null! { return ok(null) }
+fn Use(owner: str, failing: bool): null! { return Take(Left(owner)?, [], Right(failing)?) }
+fn Nonempty(left: str, right: str): null! { return Take(left, [1], right) }
+fn View(&children: [int]): null! { return ok(null) }
+fn ViewEmpty(): null! { return View([]) }
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "empty-argument.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emit = |name| {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        execute(&mut Command::new(seed), cwd, 30)
+    };
+    let projected = emit("Use");
+    assert_ok(&projected);
+    let code = String::from_utf8(projected.stdout).unwrap();
+    assert!(code.contains(" = (KuArrayInt){0};"));
+    assert!(!code.contains("array_append_move("));
+    let entry = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResultNull ku_linked_null_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let provider = |result: &str, signature: &str| {
+        code.lines()
+            .filter_map(|line| line.strip_prefix(&format!("extern {result} ")))
+            .find_map(|line| line.strip_suffix(signature))
+            .expect("matching generated dependency")
+    };
+    let string_result = "KuBootstrapResult_KuProjectionString";
+    let host = r#"
+static int order;
+static KuProjectionString owned(uint8_t value) {
+    uint8_t *data = malloc(1);
+    assert(data);
+    *data = value;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+KuBootstrapResult_KuProjectionString LEFT(KuProjectionString value) {
+    assert(order == 0 && *value.ptr == 'l');
+    order = 1;
+    return (KuBootstrapResult_KuProjectionString){.ok = true, .value = value};
+}
+KuBootstrapResult_KuProjectionString RIGHT(bool failing) {
+    assert(order == 1);
+    order = 2;
+    if (failing) return (KuBootstrapResult_KuProjectionString){
+        .error.code = {(uint8_t*)"right", 5, 0, KU_PROJECTION_STRING_STATIC}};
+    return (KuBootstrapResult_KuProjectionString){.ok = true, .value = owned('r')};
+}
+KuBootstrapResultNull TAKE(KuProjectionString left, KuArrayInt empty, KuProjectionString right) {
+    assert(order == 2 && *left.ptr == 'l' && *right.ptr == 'r');
+    assert(!empty.len && !empty.data && !empty.capacity);
+    order = 3;
+    ku_projection_string_drop(&left);
+    ku_projection_string_drop(&right);
+    return (KuBootstrapResultNull){.ok = true};
+}
+int main(void) {
+    (void)test_realloc;
+    KuBootstrapResultNull result = ENTRY(owned('l'), false);
+    assert(result.ok && order == 3 && attempts == 2 && !outstanding());
+    order = 0;
+    result = ENTRY(owned('l'), true);
+    assert(!result.ok && order == 2 && attempts == 3 && !outstanding());
+    assert(result.error.code.len == 5 && !memcmp(result.error.code.ptr, "right", 5));
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("LEFT", provider(string_result, "(KuProjectionString);"))
+    .replace("RIGHT", provider(string_result, "(bool);"))
+    .replace(
+        "TAKE",
+        provider(
+            "KuBootstrapResultNull",
+            "(KuProjectionString, KuArrayInt, KuProjectionString);",
+        ),
+    );
+    let source = cwd.join("empty-argument.c");
+    let exe = cwd.join(format!("empty-argument{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 10));
+
+    let nonempty = emit("Nonempty");
+    assert_ok(&nonempty);
+    assert!(String::from_utf8_lossy(&nonempty.stdout).contains("array_append_move("));
+    let borrowed = emit("ViewEmpty");
+    assert_eq!(borrowed.status.code(), Some(1));
+    assert!(borrowed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&borrowed.stderr).contains("unsupported_linked_operand"));
+}
+
+pub(super) fn assert_checked_int_array_result(seed: &Path, python: &str, cwd: &Path) {
+    fs::write(
+        cwd.join("checked-int-array.ku"),
+        r#"struct Prepared { items: [int] used: int }
+fn Pack(input: [int], count: int): Prepared! {
+    return ok(Prepared { items: input, used: count })
+}
+fn Transfer(held: [int], input: [int], reject: bool): [int]! {
+    used = 0
+    fn Prepare(payload: [int], failing: bool): [int]! {
+        if (failing) { fail { domain: "example", code: "reject", message: "requested error" } }
+        ready = Pack(payload, held.len())?
+        used = ready.used
+        return ok(ready.items)
+    }
+    result = Prepare(input, reject)?
+    if (used != 1) { fail { domain: "example", code: "scope", message: "unshared capture" } }
+    return ok(result)
+}
+fn Forward(held: [int], input: [int], reject: bool): [int]! {
+    result = Transfer(held, input, reject)?
+    return ok(result)
+}
+fn Borrowed(&input: [int]): [int]! { return ok(input) }
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "checked-int-array.ku\n").unwrap();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cc =
+        std::env::var("CC").unwrap_or_else(|_| if cfg!(windows) { "clang" } else { "cc" }.into());
+    let mut link = Command::new(python);
+    link.arg("-B")
+        .arg(repo.join("bootstrap/tools/link_c.py"))
+        .args(["--cc", &cc]);
+    let mut entry = String::new();
+    for name in ["Forward", "Transfer", "Pack"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        if name != "Pack" {
+            assert_eq!(code.matches("} KuBootstrapResult_KuArrayInt;").count(), 1);
+        }
+        if name == "Forward" {
+            entry = code
+                .lines()
+                .find_map(|line| line.strip_prefix("KuBootstrapResult_KuArrayInt "))
+                .unwrap()
+                .split_once('(')
+                .unwrap()
+                .0
+                .to_owned();
+        } else if name == "Transfer" {
+            assert!(code.contains("ku_local_append_"));
+            assert!(!code.contains("_append_move("));
+        }
+        let unit = cwd.join(format!("{name}.c"));
+        fs::write(&unit, code).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+        let planned = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&planned);
+        let plan = cwd.join(format!("{name}.plan.json"));
+        fs::write(&plan, planned.stdout).unwrap();
+        link.arg("--unit").args([plan, unit]);
+    }
+    let host = r#"
+#include <assert.h>
+#include <string.h>
+static KuArrayInt array(int64_t value) {
+    int64_t *data = malloc(sizeof(*data));
+    assert(data);
+    *data = value;
+    return (KuArrayInt){1, data, 1};
+}
+int main(void) {
+    KuArrayInt source = array(42);
+    KuBootstrapResult_KuArrayInt output = ENTRY(array(1), source, false);
+    assert(output.ok && output.value.len == 1 && output.value.data == source.data && output.value.data[0] == 42);
+    ku_linked_view_int_array_drop(&output.value);
+    output = ENTRY(array(1), array(99), true);
+    assert(!output.ok && !output.value.data && output.error.code.len == 6 && !memcmp(output.error.code.ptr, "reject", 6));
+    assert(output.error.domain.storage == KU_PROJECTION_STRING_STATIC);
+    assert(output.error.code.storage == KU_PROJECTION_STRING_STATIC);
+    assert(output.error.message.storage == KU_PROJECTION_STRING_STATIC);
+    return 0;
+}
+"#
+    .replace("ENTRY", &entry);
+    let input = cwd.join("checked-int-array-host.c");
+    let exe = cwd.join(format!("checked-int-array{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&input, host).unwrap();
+    link.arg("--entry")
+        .args([
+            "checked-int-array.ku",
+            entry.strip_prefix("ku_linked_null_").unwrap(),
+        ])
+        .arg("--caller")
+        .arg(input)
+        .arg("-o")
+        .arg(&exe);
+    assert_ok(&execute(&mut link, cwd, 45));
+    assert_ok(&execute(&mut Command::new(exe), cwd, 10));
+    fs::write(cwd.join("function.txt"), "Borrowed").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_result_return"));
+}
+
+pub(super) fn assert_captured_record_updates(seed: &Path, cwd: &Path) {
+    let fixture = r#"struct Frame { label: str count: int }
+struct Nested { frame: Frame complete: bool }
+fn Run(first: str, second: str, reject: bool): int! {
+    frame = Frame { label: first, count: 10 }
+    items: [int] = []
+    fn Record(step: int): null! {
+        if (step < 0) { fail { domain: "test", code: "reject", message: "requested error" } }
+        if (step != 0) { frame.count = frame.count + step }
+        items = items.push(frame.count)
+        return ok(null)
+    }
+    Record(2)?
+    if (reject) { Record(0 - 1)? }
+    frame = Frame { label: second, count: 20 }
+    Record(3)?
+    if (frame.label != "second") { fail { domain: "test", code: "owner", message: "wrong live record" } }
+    result = Nested { frame: Frame { label: "result", count: 0 }, complete: true }
+    if (result.complete) { result.frame.count = items[0] * 100 }
+    summaries: [Nested] = []
+    summaries = summaries.push(result)
+    summaries[0].frame.count = summaries[0].frame.count + items[1]
+    return ok(summaries[0].frame.count)
+}
+"#;
+    let ku = cwd.join("record-capture.ku");
+    fs::write(&ku, fixture).unwrap();
+    fs::write(cwd.join("modules.txt"), "record-capture.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Run").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let projected = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&projected);
+    let code = String::from_utf8(projected.stdout).unwrap();
+    let entry = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+#include <assert.h>
+#include <string.h>
+static KuProjectionString owned(const char *label) {
+    size_t bytes = strlen(label);
+    uint8_t *data = malloc(bytes);
+    assert(data);
+    memcpy(data, label, bytes);
+    return (KuProjectionString){data, bytes, bytes, KU_PROJECTION_STRING_OWNED};
+}
+int main(void) {
+    KuBootstrapResult_int64_t result = ENTRY(owned("first"), owned("second"), false);
+    assert(result.ok && result.value == 1223 && !outstanding());
+    result = ENTRY(owned("first"), owned("second"), true);
+    assert(!result.ok && result.error.code.len == 6 && !memcmp(result.error.code.ptr, "reject", 6));
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("ENTRY", entry);
+    let source = cwd.join("record-capture.c");
+    let exe = cwd.join(format!("record-capture{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 10));
+    for (statement, diagnostic) in [
+        ("frame.label = \"wrong\"", "linked_member_target"),
+        (
+            "frame = Frame { label: \"wrong\", count: 0 }",
+            "linked_capture_rebind",
+        ),
+        ("moved = frame.label", "linked_callback_owner"),
+    ] {
+        fs::write(
+            &ku,
+            fixture.replace(
+                "items = items.push",
+                &format!("{statement}\n        items = items.push"),
+            ),
+        )
+        .unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}
+
+pub(super) fn assert_int_array_record_snapshot(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("array-record-snapshot.ku"),
+        r#"struct Scope { children: [int] limits: [int] cursor: int active: bool }
+struct Mixed { children: [int] name: str }
+fn Snapshot(&entries: [Scope]): Scope! { return ok(entries[0].clone()) }
+fn Unsupported(&entry: Mixed): Mixed! { return ok(entry.clone()) }
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "array-record-snapshot.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Snapshot").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let projected = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&projected);
+    let code = String::from_utf8(projected.stdout).unwrap();
+    assert_eq!(code.matches("= ku_linked_int_snapshot(").count(), 2);
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let record = result.strip_prefix("KuBootstrapResult_").unwrap();
+    let (entry, _) = signature.split_once('(').unwrap();
+    let host = r#"
+#include <assert.h>
+static void verify_prefix_cleanup(void) {
+    assert(attempts == 2 && !outstanding());
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    (void)test_realloc;
+    int64_t child[] = {1, 2};
+    int64_t limit[] = {3, 4};
+    RECORD source = {{2, child, 2}, {2, limit, 2}, 41, true};
+    KuArray_RECORD entries = {1, &source, 1};
+    if (argc > 1) {
+        fail_after = 1;
+        assert(atexit(verify_prefix_cleanup) == 0);
+        (void)ENTRY(&entries);
+        return 2;
+    }
+    RESULT result = ENTRY(&entries);
+    assert(result.ok && result.value.f2 == 41 && result.value.f3 && outstanding() == 2);
+    assert(result.value.f0.len == 2 && result.value.f0.data != child && result.value.f0.data[1] == 2);
+    assert(result.value.f1.len == 2 && result.value.f1.data != limit && result.value.f1.data[0] == 3);
+    result.value.f0.data[0] = 77;
+    assert(source.f0.data == child && child[0] == 1 && source.f1.data == limit && limit[0] == 3);
+    ku_drop_RECORD(&result.value);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("RESULT", result)
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("RECORD", record);
+    let source = cwd.join("array-record-snapshot.c");
+    let exe = cwd.join(format!(
+        "array-record-snapshot{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    let failed = execute(Command::new(&exe).arg("oom"), cwd, 10);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stderr).trim(),
+        "out of memory"
+    );
+    fs::write(cwd.join("function.txt"), "Unsupported").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_nested_array_clone"));
+}
+
+pub(super) fn assert_scoped_int_array_callback(seed: &Path, python: &str, cwd: &Path) {
+    let caller = "array-callback-caller.ku";
+    let receiver = "array-callback-receiver.ku";
+    fs::write(
+        cwd.join(caller),
+        r#"import { Marker, Relay } from "./array-callback-receiver.ku"
+fn Run(payload: [int], label: str, marker: Marker, fatal: bool): int! {
+    seen: [int] = []
+    sum = 0
+    fn Collect(items: [int], low: int, high: int, note: Marker): [int]! {
+        if (low == 99) { sum = seen[0 - 1] }
+        if (note.reject) {
+            message = note.label.clone()
+            fail { domain: "test", code: "reject", message: message }
+        }
+        sum = sum + low + high
+        seen = seen.push(note.score)
+        return ok(items)
+    }
+    result = Relay(Collect.clone(), payload, label, marker, fatal)?
+    return ok(sum * 100 + result[0])
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join(receiver),
+        r#"struct Marker { label: str score: int reject: bool }
+fn Apply(action: fn([int], int, int, Marker): [int]!, data: [int], label: str, note: Marker, fatal: bool): [int]! {
+    first = action(data, 1, 2, Marker { label: label, score: 1, reject: false })?
+    if (fatal) { return ok(action(first, 99, 0, note)?) }
+    return ok(action(first, 4, 5, note)?)
+}
+fn Relay(action: fn([int], int, int, Marker): [int]!, data: [int], label: str, note: Marker, fatal: bool): [int]! {
+    return Apply(action.clone(), data, label, note, fatal)
+}
+fn Wrong(action: fn(&[int], int, int, Marker): [int]!): null! { return ok(null) }
+fn Escape(action: fn([int], int, int, Marker): [int]!): null! {
+    escaped = action
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let cc =
+        std::env::var("CC").unwrap_or_else(|_| if cfg!(windows) { "clang" } else { "cc" }.into());
+    let mut link = Command::new(python);
+    link.arg("-B")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/tools/link_c.py"))
+        .args(["--cc", &cc]);
+    let invoke = |name, mode| {
+        fs::write(cwd.join("mode.txt"), mode).unwrap();
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        execute(&mut Command::new(seed), cwd, 30)
+    };
+    let mut entry = String::new();
+    let mut marker = String::new();
+    for (name, manifest) in [
+        ("Run", format!("{caller}\n{receiver}\n")),
+        ("Relay", format!("{receiver}\n")),
+        ("Apply", format!("{receiver}\n")),
+    ] {
+        fs::write(cwd.join("modules.txt"), manifest).unwrap();
+        let emitted = invoke(name, "linked-null");
+        assert_ok(&emitted);
+        let source = String::from_utf8(emitted.stdout).unwrap();
+        assert!(source.contains("KuBootstrapIntArrayCallback_KuStruct_"));
+        if name == "Run" {
+            let (symbol, parameters) = source
+                .lines()
+                .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t "))
+                .unwrap()
+                .split_once('(')
+                .unwrap();
+            entry = symbol.to_owned();
+            marker = parameters
+                .split(", ")
+                .nth(2)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap()
+                .to_owned();
+        }
+        let c = cwd.join(format!("{name}.c"));
+        let plan = cwd.join(format!("{name}.plan.json"));
+        fs::write(c.clone(), source).unwrap();
+        let described = invoke(name, "linked-null-plan");
+        assert_ok(&described);
+        fs::write(&plan, described.stdout).unwrap();
+        link.arg("--unit").args([plan, c]);
+    }
+    let host = r#"
+#include <assert.h>
+#include <string.h>
+static KuProjectionString owned(const char *text) {
+    size_t len = strlen(text);
+    uint8_t *data = malloc(len);
+    assert(data);
+    memcpy(data, text, len);
+    return (KuProjectionString){data, len, len, KU_PROJECTION_STRING_OWNED};
+}
+static KuBootstrapResult_int64_t sample(bool reject, bool fatal) {
+    int64_t *item = malloc(sizeof(*item));
+    assert(item);
+    *item = 42;
+    return ENTRY((KuArrayInt){1, item, 1}, owned("first"), (MARKER){owned("second"), 2, reject}, fatal);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) { (void)sample(false, true); return 2; }
+    KuBootstrapResult_int64_t result = sample(false, false);
+    assert(result.ok && result.value == 1242);
+    result = sample(true, false);
+    assert(!result.ok && result.error.code.len == 6 && !memcmp(result.error.code.ptr, "reject", 6));
+    assert(result.error.message.len == 6 && !memcmp(result.error.message.ptr, "second", 6));
+    assert(result.error.message.storage == KU_PROJECTION_STRING_OWNED);
+    free(result.error.message.ptr);
+    return 0;
+}
+"#
+    .replace("ENTRY", &entry)
+    .replace("MARKER", &marker);
+    let host_path = cwd.join("array-callback-host.c");
+    let exe = cwd.join(format!("array-callback{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&host_path, host).unwrap();
+    link.args([
+        "--entry",
+        caller,
+        entry.strip_prefix("ku_linked_null_").unwrap(),
+    ])
+    .arg("--caller")
+    .arg(host_path)
+    .arg("-o")
+    .arg(&exe);
+    assert_ok(&execute(&mut link, cwd, 45));
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    let fatal = execute(Command::new(exe).arg("invalid-index"), cwd, 10);
+    assert_eq!(fatal.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&fatal.stderr).contains("index -1 out of bounds for length 1"));
+    for (name, error) in [
+        ("Wrong", "linked_callback_type"),
+        ("Escape", "linked_callback_escape"),
+    ] {
+        let rejected = invoke(name, "linked-null");
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(error));
+    }
+}
+
+pub(super) fn assert_two_nominal_callback(seed: &Path, python: &str, cwd: &Path) {
+    let source = r#"import { Place, Note, Relay } from "./append-callback-receiver.ku"
+fn Run(note: Note): int! {
+    nodes: [int] = []
+    fn Build(kind: str, text: str, value: int, place: Place, children: [int], tag: Note): int! {
+        if (tag.reject) {
+            message = tag.label.clone()
+            fail { domain: "test", code: "reject", message: message }
+        }
+        total = value + place.offset + tag.score
+        if (children.len() > 0) { total = total + children[0] }
+        if (tag.fatal) { total = nodes[0 - 1] }
+        nodes = nodes.push(total)
+        return ok(total)
+    }
+    result = Relay(Build.clone(), note)?
+    return ok(nodes[0] + result)
+}
+"#;
+    let provider = r#"struct Place { offset: int }
+struct OtherPlace { offset: int }
+struct Note { label: str score: int reject: bool fatal: bool }
+fn Apply(action: fn(str, str, int, Place, [int], Note): int!, note: Note): int! {
+    try {
+        first = action("kind", "body", 3, Place { offset: 20 }, [7],
+                       Note { label: "begin", score: 1, reject: false, fatal: false })?
+        return action("kind", "tail", first, Place { offset: 2 }, [], note)
+    } catch(err) {
+        return ok(0)
+    }
+}
+fn Relay(action: fn(str, str, int, Place, [int], Note): int!, note: Note): int! {
+    return Apply(action.clone(), note)
+}
+"#;
+    let mismatched_nominal = source
+        .replace("Place, Note", "Place, OtherPlace, Note")
+        .replace("place: Place", "place: OtherPlace");
+    assert_nominal_int_callback(
+        seed,
+        python,
+        cwd,
+        (source, provider),
+        &mismatched_nominal,
+        "KuBootstrapIntAppendCallback_m",
+    );
+}
+
+pub(super) fn assert_arena_callback(seed: &Path, python: &str, cwd: &Path) {
+    let source = r#"import { Parcel, Note, Relay } from "./append-callback-receiver.ku"
+fn Run(note: Note): int! {
+    nodes: [int] = []
+    fn Build(packet: Parcel, tag: Note, combine: bool): int! {
+        if (tag.reject) {
+            message = tag.label.clone()
+            fail { domain: "test", code: "reject", message: message }
+        }
+        total = packet.count
+        if (combine) { total = total + tag.score }
+        if (tag.fatal) { total = nodes[0 - 1] }
+        nodes = nodes.push(total)
+        return ok(total)
+    }
+    result = Relay(Build.clone(), note)?
+    return ok(nodes[0] + result)
+}
+"#;
+    let provider = r#"struct Parcel { payload: str count: int }
+struct OtherParcel { payload: str count: int }
+struct Note { label: str score: int reject: bool fatal: bool }
+fn Apply(action: fn(Parcel, Note, bool): int!, note: Note): int! {
+    try {
+        begin_text = "first"
+        begin = begin_text.clone()
+        first = action(Parcel { payload: begin, count: 31 },
+                       Note { label: "begin", score: 1, reject: false, fatal: false }, false)?
+        tail_text = "second"
+        tail = tail_text.clone()
+        return action(Parcel { payload: tail, count: first + 2 }, note, true)
+    } catch(err) {
+        return ok(0)
+    }
+}
+fn Relay(action: fn(Parcel, Note, bool): int!, note: Note): int! {
+    return Apply(action.clone(), note)
+}
+"#;
+    let mismatched_nominal = source
+        .replace("Parcel, Note", "Parcel, OtherParcel, Note")
+        .replace("packet: Parcel", "packet: OtherParcel");
+    assert_nominal_int_callback(
+        seed,
+        python,
+        cwd,
+        (source, provider),
+        &mismatched_nominal,
+        "KuBootstrapIntArenaCallback_m",
+    );
+}
+
+fn assert_nominal_int_callback(
+    seed: &Path,
+    python: &str,
+    cwd: &Path,
+    sources: (&str, &str),
+    mismatched_nominal: &str,
+    carrier_prefix: &str,
+) {
+    let caller = "append-callback-caller.ku";
+    let receiver = "append-callback-receiver.ku";
+    fs::write(cwd.join(caller), sources.0).unwrap();
+    fs::write(cwd.join(receiver), sources.1).unwrap();
+    let cc =
+        std::env::var("CC").unwrap_or_else(|_| if cfg!(windows) { "clang" } else { "cc" }.into());
+    let mut link = Command::new(python);
+    link.arg("-B")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/tools/link_c.py"))
+        .args(["--cc", &cc]);
+    let mut entry = String::new();
+    let mut carrier = String::new();
+    for (name, manifest) in [
+        ("Run", format!("{caller}\n{receiver}\n")),
+        ("Relay", format!("{receiver}\n")),
+        ("Apply", format!("{receiver}\n")),
+    ] {
+        fs::write(cwd.join("modules.txt"), manifest).unwrap();
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        assert!(code.contains(carrier_prefix));
+        if name == "Run" {
+            let (symbol, parameters) = code
+                .lines()
+                .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t "))
+                .unwrap()
+                .split_once('(')
+                .unwrap();
+            entry = symbol.to_owned();
+            carrier = parameters.split(' ').next().unwrap().to_owned();
+        }
+        let c = cwd.join(format!("two-nominal-{name}.c"));
+        let plan = cwd.join(format!("two-nominal-{name}.plan.json"));
+        fs::write(&c, code).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+        let description = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&description);
+        fs::write(&plan, description.stdout).unwrap();
+        link.arg("--unit").args([plan, c]);
+    }
+    let host = r#"
+#include <assert.h>
+#include <string.h>
+static NOTE input(bool reject, bool fatal) {
+    uint8_t *label = malloc(6);
+    assert(label);
+    memcpy(label, "second", 6);
+    return (NOTE){{label, 6, 6, KU_PROJECTION_STRING_OWNED}, 5, reject, fatal};
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) { (void)ENTRY(input(false, true)); return 2; }
+    KuBootstrapResult_int64_t result = ENTRY(input(false, false));
+    assert(result.ok && result.value == 69);
+    result = ENTRY(input(true, false));
+    assert(!result.ok && result.error.code.len == 6 && !memcmp(result.error.code.ptr, "reject", 6));
+    assert(result.error.message.len == 6 && !memcmp(result.error.message.ptr, "second", 6));
+    assert(result.error.message.storage == KU_PROJECTION_STRING_OWNED);
+    free(result.error.message.ptr);
+    return 0;
+}
+"#
+    .replace("ENTRY", &entry)
+    .replace("NOTE", &carrier);
+    let host_path = cwd.join("two-nominal-host.c");
+    let exe = cwd.join(format!("two-nominal{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&host_path, host).unwrap();
+    link.args([
+        "--entry",
+        caller,
+        entry.strip_prefix("ku_linked_null_").unwrap(),
+    ])
+    .arg("--caller")
+    .arg(host_path)
+    .arg("-o")
+    .arg(&exe);
+    assert_ok(&execute(&mut link, cwd, 45));
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    let fatal = execute(Command::new(exe).arg("invalid-index"), cwd, 10);
+    assert_eq!(fatal.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&fatal.stderr).contains("index -1 out of bounds for length 1"));
+    fs::write(cwd.join(caller), mismatched_nominal).unwrap();
+    fs::write(cwd.join("modules.txt"), format!("{caller}\n{receiver}\n")).unwrap();
+    fs::write(cwd.join("function.txt"), "Run").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_callback_forward"));
+}
+
+pub(super) fn assert_scoped_record_reader(seed: &Path, python: &str, cwd: &Path) {
+    let caller = "reader-caller.ku";
+    let receiver = "reader-receiver.ku";
+    let source = r#"import { Item, Marker, Measure, Relay } from "./reader-receiver.ku"
+fn Run(first: Item, second: Item, requested: int): int! {
+    items: [Item] = []
+    items = items.push(first)
+    items = items.push(second)
+    fn Read(index: int): Item { return items[index - 1].clone() }
+    fn ReadMarker(index: int): Marker { return Measure(items[index - 1]) }
+    result = Relay(Read.clone(), ReadMarker.clone(), requested)?
+    return ok(result + items[0].units)
+}
+"#;
+    let provider = r#"struct Item { text: str units: int }
+struct OtherItem { text: str units: int }
+struct Marker { amount: int }
+fn Measure(&item: Item): Marker { return Marker { amount: item.units } }
+fn Apply(read: fn(int): Item, marker: fn(int): Marker, index: int): int! {
+    item = read(1)
+    coordinate = marker(index)
+    return ok(item.text.len() + item.units + coordinate.amount)
+}
+fn Relay(read: fn(int): Item, marker: fn(int): Marker, index: int): int! {
+    return Apply(read.clone(), marker.clone(), index)
+}
+"#;
+    fs::write(cwd.join(caller), source).unwrap();
+    fs::write(cwd.join(receiver), provider).unwrap();
+    let cc =
+        std::env::var("CC").unwrap_or_else(|_| if cfg!(windows) { "clang" } else { "cc" }.into());
+    let mut link = Command::new(python);
+    link.arg("-B")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/tools/link_c.py"))
+        .args(["--cc", &cc]);
+    let mut entry = String::new();
+    let mut carrier = String::new();
+    for (name, manifest) in [
+        ("Run", format!("{caller}\n{receiver}\n")),
+        ("Relay", format!("{receiver}\n")),
+        ("Apply", format!("{receiver}\n")),
+        ("Measure", format!("{receiver}\n")),
+    ] {
+        fs::write(cwd.join("modules.txt"), manifest).unwrap();
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        if name != "Measure" {
+            assert!(code.contains("KuBootstrapIntReaderCallback_KuStruct_m"));
+        }
+        if name == "Run" {
+            let (symbol, parameters) = code
+                .lines()
+                .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t ku_linked_null_"))
+                .unwrap()
+                .split_once('(')
+                .unwrap();
+            entry = format!("ku_linked_null_{symbol}");
+            carrier = parameters.split(' ').next().unwrap().to_owned();
+            assert!(code.contains("const KuArray_KuStruct_m"));
+            assert_eq!(code.matches("static \nKuStruct_m").count(), 2);
+        }
+        let c = cwd.join(format!("reader-{name}.c"));
+        let plan = cwd.join(format!("reader-{name}.plan.json"));
+        fs::write(&c, code).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+        let description = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&description);
+        fs::write(&plan, description.stdout).unwrap();
+        link.arg("--unit").args([plan, c]);
+    }
+    let host = r#"
+#include <assert.h>
+#include <string.h>
+static ITEM input(int value) {
+    uint8_t *text = malloc(1);
+    assert(text);
+    text[0] = 'x';
+    return (ITEM){{text, 1, 1, KU_PROJECTION_STRING_OWNED}, value};
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) { (void)ENTRY(input(5), input(7), 0); return 2; }
+    KuBootstrapResult_int64_t result = ENTRY(input(5), input(7), 2);
+    assert(result.ok && result.value == 18);
+    result = ENTRY(input(5), input(7), 1);
+    assert(result.ok && result.value == 16);
+    return 0;
+}
+"#
+    .replace("ENTRY", &entry)
+    .replace("ITEM", &carrier);
+    let host_path = cwd.join("reader-host.c");
+    let exe = cwd.join(format!("record-reader{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&host_path, host).unwrap();
+    link.args([
+        "--entry",
+        caller,
+        entry.strip_prefix("ku_linked_null_").unwrap(),
+    ])
+    .arg("--caller")
+    .arg(host_path)
+    .arg("-o")
+    .arg(&exe);
+    assert_ok(&execute(&mut link, cwd, 45));
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    let fatal = execute(Command::new(exe).arg("invalid-index"), cwd, 10);
+    assert_eq!(fatal.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&fatal.stderr).contains("index -1 out of bounds for length 2"));
+    let wrong = provider.replace(
+        "read: fn(int): Item, marker",
+        "read: fn(int): OtherItem, marker",
+    );
+    fs::write(cwd.join(receiver), wrong).unwrap();
+    fs::write(cwd.join("modules.txt"), format!("{caller}\n{receiver}\n")).unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Run").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr)
+        .contains("local reader must match the declared nominal result"));
+}
+
 pub(super) fn assert_terminal_branch_ownership(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("guard-provider.ku"),
@@ -624,7 +1556,9 @@ fn Publish(&prefix: str, fail_read: bool): null! {
     .unwrap();
     fs::write(
         cwd.join("output-dependency.ku"),
-        "fn Load(fail_read: bool): str! { return ok(\"payload\") }\n",
+        r#"fn Load(fail_read: bool): str! { return ok("Ku🙂") }
+fn Borrow(&value: str): str! { return ok(value) }
+"#,
     )
     .unwrap();
     fs::write(
@@ -729,6 +1663,40 @@ int main(int argc, char **argv) {
         String::from_utf8_lossy(&failed_output.stderr).trim(),
         "output write failed"
     );
+
+    fs::write(cwd.join("modules.txt"), "output-dependency.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Load").unwrap();
+    let static_output = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&static_output);
+    let code = String::from_utf8(static_output.stdout).unwrap();
+    let load = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_KuProjectionString "))
+        .and_then(|line| line.split_once('('))
+        .unwrap()
+        .0;
+    let host = r#"
+int main(void) {
+    (void)test_malloc; (void)test_realloc; (void)test_free;
+    static const uint8_t expected[] = {0x4b,0x75,0xf0,0x9f,0x99,0x82};
+    KuBootstrapResult_KuProjectionString result = __LOAD__(false);
+    assert(result.ok && result.value.len == sizeof(expected));
+    assert(!memcmp(result.value.ptr, expected, sizeof(expected)));
+    assert(result.value.storage == KU_PROJECTION_STRING_STATIC && !result.value.capacity);
+    assert(!outstanding() && !attempts);
+    return 0;
+}
+"#
+    .replace("__LOAD__", load);
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &program, cwd);
+    assert_ok(&execute(&mut Command::new(&program), cwd, 15));
+
+    fs::write(cwd.join("function.txt"), "Borrow").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_result_return"));
 }
 
 const TRY_SOURCE: &str = r#"import { Supply, Take, Observe } from "./try-provider.ku"
@@ -1266,6 +2234,423 @@ int main(void) {
     assert_ok(&execute(&mut Command::new(binary), cwd, 15));
 }
 
+pub(super) fn assert_conditional_whole_record_move(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("conditional-record.ku"),
+        r#"struct Parcel { label: str }
+
+fn Receive(parcel: Parcel, fail_now: bool): null! { return ok(null) }
+fn Observe(&parcel: Parcel): null! { return ok(null) }
+fn End(fail_later: bool): null! { return ok(null) }
+
+fn Handle(move: bool, fail_now: bool, fail_later: bool, parcel: Parcel): null! {
+    if (move) {
+        Receive(parcel, fail_now)?
+    } else {
+        Observe(parcel)?
+    }
+    End(fail_later)?
+    return ok(null)
+}
+
+fn Replace(move: bool, parcel: Parcel, replacement: Parcel): null! {
+    if (move) { Receive(parcel, false)? }
+    parcel = replacement
+    Observe(parcel)?
+    return ok(null)
+}
+
+fn InvalidRead(move: bool, parcel: Parcel): null! {
+    if (move) { Receive(parcel, false)? }
+    Observe(parcel)?
+    return ok(null)
+}
+
+fn InvalidBorrow(move: bool, parcel: Parcel): null! {
+    if (move) { Receive(parcel, false)? }
+    alias: Parcel = parcel.clone()
+    Observe(alias)?
+    return ok(null)
+}
+
+fn InvalidBackedge(move: bool, upper: int, parcel: Parcel): null! {
+    count = 0
+    while (count < upper) {
+        if (move) { Receive(parcel, false)? }
+        count = count + 1
+    }
+    return ok(null)
+}
+
+fn TakeLabel(label: str): null! { return ok(null) }
+fn InvalidPartial(move: bool, parcel: Parcel): null! {
+    if (move) { Receive(parcel, false)? }
+    else { TakeLabel(parcel.label)? }
+    return ok(null)
+}
+
+fn InvalidView(move: bool, &parcel: Parcel): null! {
+    if (move) { Receive(parcel, false)? }
+    return ok(null)
+}
+
+fn TakeArray(boxes: [Parcel]): null! { return ok(null) }
+fn InvalidArray(move: bool, boxes: [Parcel]): null! {
+    if (move) { TakeArray(boxes)? }
+    return ok(null)
+}
+
+fn ReboundStep(move: bool, count: int, parcel: Parcel): null! {
+    step = 0
+    while (step < count) {
+        next = parcel.clone()
+        if (move) { Receive(parcel, false)? }
+        parcel = next
+        step = step + 1
+    }
+    Observe(parcel)?
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "conditional-record.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+
+    for name in ["Handle", "Replace", "ReboundStep"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        let mut dependencies = code
+            .lines()
+            .filter_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
+            .filter_map(|signature| signature.split_once('('));
+        let (consume, parameters) = dependencies.next().unwrap();
+        let record = parameters.split_once(',').unwrap().0;
+        let (observe, _) = dependencies.next().unwrap();
+        let end = if let Some((symbol, _)) = dependencies.next() {
+            symbol
+        } else {
+            "unused_final_check"
+        };
+        let entry = code
+            .lines()
+            .find_map(|line| line.strip_prefix("KuBootstrapResultNull "))
+            .and_then(|signature| signature.split_once('('))
+            .unwrap()
+            .0;
+        let host = r#"
+static unsigned consumed, observed, final_checks;
+static unsigned live_before_final;
+static uint8_t expected;
+
+static __RECORD__ parcel(uint8_t byte) {
+    uint8_t *label = malloc(1);
+    *label = byte;
+    return (__RECORD__){{label,1,1,KU_PROJECTION_STRING_OWNED}};
+}
+KuBootstrapResultNull __CONSUME__(__RECORD__ value, bool fail_now) {
+    ++consumed;
+    assert(value.f0.len == 1 && *value.f0.ptr == 3);
+    if (fail_now) return (KuBootstrapResultNull){.error={.message=value.f0}};
+    ku_projection_string_drop(&value.f0);
+    return (KuBootstrapResultNull){.ok=true};
+}
+KuBootstrapResultNull __OBSERVE__(const __RECORD__ *value) {
+    ++observed;
+    assert(value->f0.len == 1 && *value->f0.ptr == expected);
+    return (KuBootstrapResultNull){.ok=true};
+}
+KuBootstrapResultNull __END__(bool fail_later) {
+    ++final_checks;
+    assert(outstanding() == (int)live_before_final);
+    if (fail_later) return (KuBootstrapResultNull){.error={.message=parcel(8).f0}};
+    return (KuBootstrapResultNull){.ok=true};
+}
+int main(void) {
+    (void)test_realloc;
+#if __REPLACE__
+    expected = 9;
+    assert(__ENTRY__(false,parcel(3),parcel(9)).ok);
+    assert(!outstanding() && consumed == 0 && observed == 1);
+    assert(__ENTRY__(true,parcel(3),parcel(9)).ok);
+    assert(!outstanding() && consumed == 1 && observed == 2);
+#elif __REBOUND__
+    expected = 3;
+    assert(__ENTRY__(true,2,parcel(3)).ok);
+    assert(!outstanding() && consumed == 2 && observed == 1);
+    assert(__ENTRY__(false,2,parcel(3)).ok);
+    assert(!outstanding() && consumed == 2 && observed == 2);
+#else
+    expected = 3;
+    for (unsigned move = 0; move < 2; ++move) {
+        live_before_final = move ? 0 : 1;
+        assert(__ENTRY__(move,false,false,parcel(3)).ok);
+        assert(!outstanding());
+        KuBootstrapResultNull late = __ENTRY__(move,false,true,parcel(3));
+        assert(!late.ok && outstanding() == 1 && *late.error.message.ptr == 8);
+        ku_projection_string_drop(&late.error.message);
+        assert(!outstanding());
+    }
+    assert(consumed == 2 && observed == 2 && final_checks == 4);
+    KuBootstrapResultNull early = __ENTRY__(true,true,false,parcel(3));
+    assert(!early.ok && consumed == 3 && final_checks == 4);
+    assert(outstanding() == 1 && *early.error.message.ptr == 3);
+    ku_projection_string_drop(&early.error.message);
+    assert(!outstanding());
+#endif
+    return 0;
+}
+"#
+        .replace("__ENTRY__", entry)
+        .replace("__RECORD__", record)
+        .replace("__CONSUME__", consume)
+        .replace("__OBSERVE__", observe)
+        .replace("__END__", end)
+        .replace("__REBOUND__", if name == "ReboundStep" { "1" } else { "0" })
+        .replace("__REPLACE__", if name == "Replace" { "1" } else { "0" });
+        let source = cwd.join("conditional-record.c");
+        let exe = cwd.join(format!(
+            "conditional-record{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+        compile_projection(&source, &exe, cwd);
+        assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    }
+
+    for (name, diagnostic) in [
+        ("InvalidRead", "unavailable_linked_binding"),
+        ("InvalidBorrow", "unavailable_linked_binding"),
+        ("InvalidBackedge", "linked_control_move"),
+        ("InvalidPartial", "linked_control_move"),
+        ("InvalidView", "linked_view_escape"),
+        ("InvalidArray", "linked_control_move"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}
+
+pub(super) fn assert_local_bool_while(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("local-bool-while.ku"),
+        r#"struct Parcel { label: str }
+
+fn Visit(step: int, producer: str): null! { return ok(null) }
+fn ReadLabel(parcel: Parcel): Parcel! { return ok(parcel) }
+fn Inspect(&parcel: Parcel): null! { return ok(null) }
+
+fn Count(begin: bool, limit: int, &label: str): int! {
+    active = begin
+    step = 0
+    while (active) {
+        current = label.clone()
+        Visit(step, current)?
+        step = step + 1
+        if (step >= limit) { active = false }
+    }
+    return ok(step)
+}
+
+fn TakeNow(begin: bool, parcel: Parcel): Parcel! {
+    active = begin
+    while (active) {
+        local = ReadLabel(parcel)?
+        return ok(local)
+    }
+    return ok(parcel)
+}
+
+fn Nested(begin: bool): int! {
+    active = true
+    step = 0
+    if (begin) {
+        while (active) {
+            step = step + 1
+            active = false
+        }
+    }
+    return ok(step)
+}
+
+fn Conjunction(start: int, score: int): int! {
+    step = start
+    count = 0
+    while (step != 0 && score / step > 0) {
+        count = count + 1
+        step = step - 1
+    }
+    return ok(count)
+}
+fn NonBooleanConjunction(input: int): int! {
+    count = 0
+    while (input && true) { count = count + 1 }
+    return ok(count)
+}
+fn ForbiddenParameter(active: bool): int! {
+    step = 0
+    while (active) { step = step + 1 }
+    return ok(step)
+}
+fn ForbiddenExpression(begin: bool): int! {
+    active = begin
+    while (!active) { active = true }
+    return ok(0)
+}
+fn ForbiddenMove(begin: bool, parcel: Parcel): null! {
+    active = begin
+    while (active) {
+        ReadLabel(parcel)?
+        active = false
+    }
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "local-bool-while.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+
+    for name in ["Count", "TakeNow", "Nested", "Conjunction"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        if name == "Conjunction" {
+            assert!(code.contains("while (true)"));
+        } else {
+            assert!(code.contains("while (l") && !code.contains("while (true)"));
+        }
+        let entry = code
+            .lines()
+            .find(|line| {
+                line.starts_with("KuBootstrapResult_") && line.contains(" ku_linked_null_")
+            })
+            .and_then(|signature| signature.split_once(' '))
+            .and_then(|(_, signature)| signature.split_once('('))
+            .unwrap()
+            .0;
+        let provider = code
+            .lines()
+            .find_map(|line| line.strip_prefix("extern KuBootstrapResult"))
+            .and_then(|signature| signature.split_once(' '))
+            .and_then(|(_, signature)| signature.split_once('('));
+        let (provider, parameters) = provider.unwrap_or(("", ""));
+        let record = parameters.split_once(')').map_or("", |(record, _)| record);
+        let host = r#"
+#if __COUNT__
+static unsigned visits;
+static int fail_step = -1;
+static const uint8_t *source_owner;
+KuBootstrapResultNull __PROVIDER__(int64_t step, KuProjectionString label) {
+    assert(step == (int64_t)visits++ && label.len == 1 && *label.ptr == 6);
+    assert(outstanding() == 2 && label.ptr != source_owner);
+    if (step == fail_step) return (KuBootstrapResultNull){.error={.message=label}};
+    ku_projection_string_drop(&label);
+    return (KuBootstrapResultNull){.ok=true};
+}
+#elif __TAKE__
+static unsigned calls;
+static bool fail_now;
+KuBootstrapResult___RECORD__ __PROVIDER__(__RECORD__ parcel) {
+    ++calls;
+    assert(parcel.f0.len == 1 && *parcel.f0.ptr == 3);
+    if (fail_now) return (KuBootstrapResult___RECORD__){.error={.message=parcel.f0}};
+    return (KuBootstrapResult___RECORD__){.ok=true,.value=parcel};
+}
+#endif
+int main(void) {
+    (void)test_malloc;
+    (void)test_realloc;
+    (void)test_free;
+#if __COUNT__
+    uint8_t *bytes = malloc(1);
+    *bytes = 6;
+    source_owner = bytes;
+    KuProjectionString label = {bytes,1,1,KU_PROJECTION_STRING_OWNED};
+    KuBootstrapResult_int64_t output = __ENTRY__(false,4,&label);
+    assert(output.ok && output.value == 0 && visits == 0 && outstanding() == 1);
+    output = __ENTRY__(true,4,&label);
+    assert(output.ok && output.value == 4 && visits == 4 && outstanding() == 1);
+    fail_step = 1;
+    visits = 0;
+    output = __ENTRY__(true,4,&label);
+    assert(!output.ok && visits == 2 && outstanding() == 2 && *output.error.message.ptr == 6);
+    ku_projection_string_drop(&output.error.message);
+    assert(label.ptr == source_owner && *label.ptr == 6 && outstanding() == 1);
+    ku_projection_string_drop(&label);
+    assert(!outstanding());
+#elif __TAKE__
+    for (int take = 0; take <= 1; ++take) {
+        uint8_t *bytes = malloc(1);
+        *bytes = 3;
+        __RECORD__ parcel = {{bytes,1,1,KU_PROJECTION_STRING_OWNED}};
+        KuBootstrapResult___RECORD__ output = __ENTRY__(take, parcel);
+        assert(output.ok && calls == (unsigned)take && outstanding() == 1);
+        assert(output.value.f0.ptr == bytes);
+        ku_projection_string_drop(&output.value.f0);
+        assert(!outstanding());
+    }
+    fail_now = true;
+    uint8_t *bytes = malloc(1);
+    *bytes = 3;
+    __RECORD__ parcel = {{bytes,1,1,KU_PROJECTION_STRING_OWNED}};
+    KuBootstrapResult___RECORD__ output = __ENTRY__(true, parcel);
+    assert(!output.ok && calls == 2 && outstanding() == 1 && output.error.message.ptr == bytes);
+    ku_projection_string_drop(&output.error.message);
+    assert(!outstanding());
+#elif __CONJUNCTION__
+    KuBootstrapResult_int64_t output = __ENTRY__(0, 0);
+    assert(output.ok && output.value == 0);
+    output = __ENTRY__(4, 1);
+    assert(output.ok && output.value == 0);
+    output = __ENTRY__(4, 4);
+    assert(output.ok && output.value == 4);
+#else
+    KuBootstrapResult_int64_t output = __ENTRY__(false);
+    assert(output.ok && output.value == 0);
+    output = __ENTRY__(true);
+    assert(output.ok && output.value == 1);
+#endif
+    assert(!outstanding());
+    return 0;
+}
+"#
+        .replace("__ENTRY__", entry)
+        .replace("__PROVIDER__", provider)
+        .replace("__RECORD__", record)
+        .replace("__COUNT__", if name == "Count" { "1" } else { "0" })
+        .replace("__TAKE__", if name == "TakeNow" { "1" } else { "0" })
+        .replace(
+            "__CONJUNCTION__",
+            if name == "Conjunction" { "1" } else { "0" },
+        );
+        let source = cwd.join("local-bool-while.c");
+        let exe = cwd.join(format!("local-bool-while{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+        compile_projection(&source, &exe, cwd);
+        assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    }
+
+    for (name, diagnostic) in [
+        ("ForbiddenParameter", "unsupported_linked_loop"),
+        ("ForbiddenExpression", "unsupported_linked_loop"),
+        ("ForbiddenMove", "linked_control_move"),
+        ("NonBooleanConjunction", "linked_binary_type"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}
+
 const ADD_CALL_SOURCE: &str = r#"import { Decorate, Suffix } from "./plus-provider.ku"
 fn Compose(path: str): str! {
     result = Decorate(path) + Suffix(1)
@@ -1636,6 +3021,85 @@ pub(super) fn assert_decorated_caught_error(seed: &Path, cwd: &Path) {
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("linked_error_member_moved"));
 }
 
+pub(super) fn assert_local_string_lengths(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("local-string-lengths.ku"),
+        r#"struct Measurement { scalars: int bytes: int }
+fn Read(source: str): Measurement! {
+    scalars = source.len()
+    octets = source.byte_len()
+    return ok(Measurement { scalars: scalars, bytes: octets })
+}
+fn ReadView(&source: str): Measurement! {
+    scalars = source.len()
+    octets = source.byte_len()
+    return ok(Measurement { scalars: scalars, bytes: octets })
+}
+fn Refuse(source: int): int! {
+    local = source.byte_len()
+    return ok(local)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "local-string-lengths.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    for name in ["Read", "ReadView"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        let (result, signature) = code
+            .lines()
+            .find_map(|line| line.split_once(" ku_linked_null_"))
+            .unwrap();
+        let entry = signature.split_once('(').unwrap().0;
+        let host = r#"
+#include <assert.h>
+#include <string.h>
+static void visit(const uint8_t *text, size_t len, int64_t scalars) {
+    size_t cap = len ? len : 1;
+    uint8_t *bytes = malloc(cap);
+    assert(bytes);
+    memcpy(bytes,text,len);
+    KuProjectionString value = {bytes,len,cap,KU_PROJECTION_STRING_OWNED};
+#if __VIEW__
+    __RESULT__ result = __ENTRY__(&value);
+    assert(value.ptr == bytes && !memcmp(value.ptr,text,len));
+    free(bytes);
+#else
+    __RESULT__ result = __ENTRY__(value);
+#endif
+    assert(result.ok && result.value.f0 == scalars && result.value.f1 == (int64_t)len);
+}
+int main(void) {
+    static const uint8_t ascii[] = {0x61,0x62,0x63};
+    static const uint8_t mixed[] = {0x61,0xe4,0xb8,0xad,0xf0,0x9f,0x99,0x82};
+    visit(ascii,0,0);
+    visit(ascii,sizeof(ascii),3);
+    visit(mixed,sizeof(mixed),3);
+    return 0;
+}
+"#
+        .replace("__RESULT__", result)
+        .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
+        .replace("__VIEW__", if name == "ReadView" { "1" } else { "0" });
+        let source = cwd.join("local-string-lengths.c");
+        let exe = cwd.join(format!(
+            "local-string-lengths{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        fs::write(&source, format!("{code}{host}")).unwrap();
+        compile_projection(&source, &exe, cwd);
+        assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    }
+    fs::write(cwd.join("function.txt"), "Refuse").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unsupported_linked_read"));
+}
+
 pub(super) fn assert_checked_copy_int(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("checked-int.ku"),
@@ -1647,6 +3111,15 @@ pub(super) fn assert_checked_copy_int(seed: &Path, cwd: &Path) {
 fn Read(value: int): int! {
     out = Copy(value, false, false)?
     return ok(out)
+}
+fn Rebind(value: int, zero: bool, deny: bool): int! {
+    out = 17
+    try {
+        out = Copy(value, zero, deny)?
+        return ok(out)
+    } catch (error) {
+        return ok(out)
+    }
 }
 fn Wrong(): int! { return ok("wrong") }
 fn Indexed(&items: [int], slot: int): int { return items[slot] }
@@ -1690,6 +3163,53 @@ int main(void) {
     let text = String::from_utf8(forwarded.stdout).unwrap();
     assert_eq!(text.matches("} KuBootstrapResult_int64_t;").count(), 1);
     assert!(text.contains("extern KuBootstrapResult_int64_t"));
+    fs::write(cwd.join("function.txt"), "Rebind").unwrap();
+    let rebound = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&rebound);
+    let text = String::from_utf8(rebound.stdout).unwrap();
+    let entry = text
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t ku_linked_null_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let provider = text
+        .lines()
+        .find_map(|line| line.strip_prefix("extern KuBootstrapResult_int64_t "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+#include <assert.h>
+static int calls;
+KuBootstrapResult_int64_t PROVIDER(int64_t value, bool zero, bool deny) {
+    ++calls;
+    if (deny) return (KuBootstrapResult_int64_t){0};
+    return (KuBootstrapResult_int64_t){.ok = true, .value = zero ? 0 : value};
+}
+int main(void) {
+    KuBootstrapResult_int64_t retained = ENTRY(98, false, true);
+    KuBootstrapResult_int64_t zero = ENTRY(98, true, false);
+    KuBootstrapResult_int64_t stored = ENTRY(98, false, false);
+    assert(retained.ok && retained.value == 17);
+    assert(zero.ok && zero.value == 0 && stored.ok && stored.value == 98);
+    assert(calls == 3);
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("PROVIDER", provider);
+    let c = cwd.join("checked-int-rebind.c");
+    let exe = cwd.join(format!(
+        "checked-int-rebind{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&c, format!("{text}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+
     fs::write(cwd.join("function.txt"), "Wrong").unwrap();
     let rejected = execute(&mut Command::new(seed), cwd, 30);
     assert_eq!(rejected.status.code(), Some(1));
@@ -1755,6 +3275,10 @@ fn Validate(&path: str, mode: int): null! {
     if (Project(path, mode)? != path) { Observe()? }
     return ok(null)
 }
+fn Contains(&hay: str, &needle: str): int! {
+    if (hay.contains(needle)) { return ok(1) }
+    return ok(0)
+}
 "#,
     )
     .unwrap();
@@ -1816,6 +3340,39 @@ int main(void) {
         format!("{CHECKED_ARRAY_ALLOCATOR}{program}{caller}"),
     )
     .unwrap();
+    compile_projection(&source, &executable, cwd);
+    assert_ok(&execute(&mut Command::new(executable), cwd, 10));
+
+    fs::write(cwd.join("function.txt"), "Contains\n").unwrap();
+    let output = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&output);
+    let program = String::from_utf8(output.stdout).unwrap();
+    let (entry, _) = program
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("KuBootstrapResult_int64_t ")?
+                .split_once('(')
+        })
+        .unwrap();
+    let caller = r#"
+#include <assert.h>
+int main(void) {
+    const KuProjectionString hay = {(uint8_t*)"a\0b", 3u, 0u, KU_PROJECTION_STRING_STATIC};
+    const KuProjectionString needle = {(uint8_t*)"\0b", 2u, 0u, KU_PROJECTION_STRING_STATIC};
+    const KuProjectionString miss = {(uint8_t*)"ab", 2u, 0u, KU_PROJECTION_STRING_STATIC};
+    const KuProjectionString empty = {0};
+    const KuBootstrapResult_int64_t hit = __ENTRY__(&hay, &needle);
+    const KuBootstrapResult_int64_t absent = __ENTRY__(&hay, &miss);
+    const KuBootstrapResult_int64_t vacuous = __ENTRY__(&empty, &empty);
+    assert(hit.ok && hit.value == 1 && absent.ok && absent.value == 0);
+    assert(vacuous.ok && vacuous.value == 1);
+    return 0;
+}
+"#
+    .replace("__ENTRY__", entry);
+    let source = cwd.join("checked-contains.c");
+    let executable = cwd.join(format!("checked-contains{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{program}{caller}")).unwrap();
     compile_projection(&source, &executable, cwd);
     assert_ok(&execute(&mut Command::new(executable), cwd, 10));
 }
@@ -2286,6 +3843,178 @@ int main(int argc, char **argv) {
     }
 }
 
+pub(super) fn assert_guarded_copy_field_set(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("guarded-copy-field.ku"),
+        r#"struct Parcel { id: int label: str active: bool }
+struct Holder { box: Parcel }
+
+fn Next(&parcel: Parcel, stop: bool): int! { return ok(parcel.id + 1) }
+fn Take(parcel: Parcel): int! { return ok(parcel.id) }
+
+fn Run(input: Parcel, changed: bool, stop: bool): Parcel! {
+    value = input
+    if (changed) {
+        value.id = Next(value, stop)?
+    } else {
+        value.id = value.id + 2
+    }
+    return ok(value)
+}
+
+fn Recover(input: Parcel, changed: bool, stop: bool): Parcel! {
+    value = input
+    try {
+        if (changed) { value.id = Next(value, stop)? }
+        return ok(value)
+    } catch (error) {
+        return ok(value)
+    }
+}
+
+fn BadParameter(input: Parcel, changed: bool): Parcel! {
+    if (changed) { input.id = 1 }
+    return ok(input)
+}
+fn BadView(&input: Parcel, changed: bool): int! {
+    if (changed) { input.id = 1 }
+    return ok(input.id)
+}
+fn BadNested(input: Holder, changed: bool): Holder! {
+    value = input
+    if (changed) { value.box.id = 1 }
+    return ok(value)
+}
+fn BadString(input: Parcel, replacement: str, changed: bool): Parcel! {
+    value = input
+    if (changed) { value.label = replacement }
+    return ok(value)
+}
+fn SetFlag(input: Parcel, changed: bool, flag: bool): Parcel! {
+    value = input
+    if (changed) { value.active = flag }
+    return ok(value)
+}
+fn BadType(input: Parcel, changed: bool): Parcel! {
+    value = input
+    if (changed) { value.id = false }
+    return ok(value)
+}
+fn BadMove(input: Parcel, changed: bool): Parcel! {
+    value = input
+    if (changed) { value.id = Take(value)? }
+    return ok(value)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "guarded-copy-field.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+
+    for name in ["Run", "Recover", "SetFlag"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        let next = code
+            .lines()
+            .find_map(|line| line.strip_prefix("extern KuBootstrapResult_int64_t "))
+            .and_then(|signature| signature.split_once('('))
+            .map_or("unused_checked_next", |(symbol, _)| symbol);
+        let (result, signature) = code
+            .lines()
+            .find_map(|line| line.split_once(" ku_linked_null_"))
+            .unwrap();
+        let (entry, args) = signature.split_once('(').unwrap();
+        let record = args.split_once(" a0").unwrap().0;
+        let host = r#"
+static uint8_t *original;
+#if !__FLAG__
+static unsigned calls;
+
+KuBootstrapResult_int64_t __NEXT__(const __RECORD__ *parcel, bool stop) {
+    ++calls;
+    assert(parcel->f0 == 10 && parcel->f1.ptr == original && *original == 5 && parcel->f2);
+    if (stop) {
+        uint8_t *message = malloc(1);
+        *message = 7;
+        return (KuBootstrapResult_int64_t){.error={.message={message,1,1,KU_PROJECTION_STRING_OWNED}}};
+    }
+    return (KuBootstrapResult_int64_t){.ok=true,.value=11};
+}
+#endif
+
+int main(void) {
+    (void)test_realloc;
+#if __FLAG__
+    for (int apply = 0; apply < 2; ++apply) {
+        for (int flag = 0; flag < 2; ++flag) {
+            original = malloc(1);
+            *original = 5;
+            __RECORD__ input = {10,{original,1,1,KU_PROJECTION_STRING_OWNED},true};
+            __RESULT__ result = __ENTRY__(input, apply, flag);
+            assert(result.ok && result.value.f0 == 10 && result.value.f2 == (!apply || flag));
+            assert(result.value.f1.ptr == original && *original == 5 && outstanding() == 1);
+            ku_projection_string_drop(&result.value.f1);
+            assert(!outstanding());
+        }
+    }
+#else
+    for (int i = 0; i < 3; ++i) {
+        bool changed = i != 0, stop = i != 1;
+        calls = 0;
+        original = malloc(1);
+        *original = 5;
+        __RECORD__ input = {10,{original,1,1,KU_PROJECTION_STRING_OWNED},true};
+        __RESULT__ result = __ENTRY__(input, changed, stop);
+        assert(calls == (unsigned)changed && outstanding() == 1);
+        if (changed && stop && !__RECOVER__) {
+            assert(!result.ok && result.error.message.len == 1 && *result.error.message.ptr == 7);
+            ku_projection_string_drop(&result.error.message);
+        } else {
+            int expected = !changed ? (__RECOVER__ ? 10 : 12) : (stop ? 10 : 11);
+            assert(result.ok && result.value.f0 == expected && result.value.f2);
+            assert(result.value.f1.ptr == original && *original == 5);
+            ku_projection_string_drop(&result.value.f1);
+        }
+        assert(!outstanding());
+    }
+#endif
+    return 0;
+}
+"#
+        .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
+        .replace("__RECORD__", record)
+        .replace("__RESULT__", result)
+        .replace("__NEXT__", next)
+        .replace("__FLAG__", if name == "SetFlag" { "1" } else { "0" })
+        .replace("__RECOVER__", if name == "Recover" { "1" } else { "0" });
+        let source = cwd.join("guarded-copy-field.c");
+        let exe = cwd.join(format!(
+            "guarded-copy-field{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+        compile_projection(&source, &exe, cwd);
+        assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    }
+
+    for (name, diagnostic) in [
+        ("BadParameter", "linked_member_target"),
+        ("BadView", "linked_member_target"),
+        ("BadNested", "linked_member_target"),
+        ("BadString", "linked_member_target"),
+        ("BadType", "linked_member_rebind_type"),
+        ("BadMove", "unavailable_linked_binding"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}
+
 pub(super) fn assert_owned_local_member_set(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("member-set.ku"),
@@ -2610,4 +4339,447 @@ pub(super) fn assert_record_field_string_rebind(seed: &Path, cwd: &Path) {
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("|linked_rebind_type|"));
+}
+
+pub(super) fn assert_guarded_record_field_append(seed: &Path, cwd: &Path) {
+    let fixture = r#"struct Item { text: str }
+struct Bag { items: [Item] }
+fn Append(include: bool): int! {
+    items: [Item] = []
+    bag = Bag { items: items }
+    if (include) {
+        bag.items = bag.items.push(Item { text: str(8) })
+    }
+    return ok(bag.items.len())
+}
+"#;
+    fs::write(cwd.join("field-append.ku"), fixture).unwrap();
+    fs::write(cwd.join("modules.txt"), "field-append.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Append").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let entry = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t "))
+        .and_then(|line| line.split_once('('))
+        .unwrap()
+        .0;
+    let host = r#"
+static int fail_on;
+static void verify_oom(void) {
+    if (outstanding() || attempts != fail_on) _Exit(94);
+}
+int main(int argc, char **argv) {
+    (void)test_realloc;
+    if (argc == 2) {
+        fail_on = argv[1][0] - '0';
+        fail_after = fail_on - 1;
+        assert(atexit(verify_oom) == 0);
+        (void)__ENTRY__(true);
+        return 95;
+    }
+    KuBootstrapResult_int64_t result = __ENTRY__(false);
+    assert(result.ok && result.value == 0 && !outstanding() && !attempts);
+    result = __ENTRY__(true);
+    assert(result.ok && result.value == 1 && !outstanding() && attempts == 2);
+    return 0;
+}
+"#
+    .replace("__ENTRY__", entry);
+    let source = cwd.join("field-append-owning.c");
+    let binary = cwd.join(format!(
+        "field-append-owning{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(&binary), cwd, 15));
+    for (point, expected) in [("1", "out of memory"), ("2", "array allocation failed")] {
+        let failed = execute(Command::new(&binary).arg(point), cwd, 15);
+        assert_eq!(failed.status.code(), Some(1));
+        assert_eq!(String::from_utf8_lossy(&failed.stderr).trim(), expected);
+    }
+}
+
+pub(super) fn assert_owned_int_member_append(seed: &Path, cwd: &Path) {
+    let fixture = r#"struct Bag { items: [int] }
+fn Append(input: Bag, enabled: bool): int! {
+    bag = input
+    if (enabled) { bag.items = bag.items.push(bag.items[0] + 5) }
+    return ok(bag.items.len() * 100 + bag.items[bag.items.len() - 1])
+}
+fn Count(values: [int]): int! { return ok(values.len()) }
+fn Moved(input: Bag): int! {
+    bag = input
+    count = Count(bag.items)?
+    bag.items = bag.items.push(1)
+    return ok(count)
+}
+fn Borrowed(&bag: Bag): null! {
+    bag.items = bag.items.push(1)
+    return ok(null)
+}
+fn Wrong(input: Bag): null! {
+    bag = input
+    bag.items = bag.items.push("wrong")
+    return ok(null)
+}
+fn Indexed(input: [Bag]): null! {
+    bags: [Bag] = input
+    bags[0].items = bags[0].items.push(1)
+    return ok(null)
+}
+"#;
+    fs::write(cwd.join("int-member-append.ku"), fixture).unwrap();
+    fs::write(cwd.join("modules.txt"), "int-member-append.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Append\n").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (entry, parameters) = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t "))
+        .and_then(|line| line.split_once('('))
+        .unwrap();
+    let bag = parameters.split_once(" a0,").unwrap().0;
+    let snapshot = code.find("int64_t append_item").unwrap();
+    let after_snapshot = &code[snapshot..];
+    let target_check = after_snapshot
+        .find("if (!ku_linked_view_int_array_valid")
+        .unwrap();
+    let append_call = after_snapshot
+        .find("append_status = ku_linked_view_int_array_append_move")
+        .unwrap();
+    assert!(target_check < append_call);
+
+    let host = r#"
+static void verify_failed_growth(void) {
+    if (attempts != 2 || outstanding()) _Exit(94);
+}
+static __BAG__ full_bag(void) {
+    int64_t *value = malloc(sizeof(*value));
+    assert(value);
+    *value = 10;
+    return (__BAG__){.f0 = {.len = 1, .data = value, .capacity = 1}};
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    __BAG__ first = full_bag();
+    if (argc > 1) {
+        fail_after = 0;
+        assert(atexit(verify_failed_growth) == 0);
+        (void)__ENTRY__(first, true);
+        return 95;
+    }
+    KuBootstrapResult_int64_t kept = __ENTRY__(first, false);
+    assert(kept.ok && kept.value == 110 && attempts == 1 && !outstanding());
+    KuBootstrapResult_int64_t appended = __ENTRY__(full_bag(), true);
+    assert(appended.ok && appended.value == 215 && attempts == 3 && !outstanding());
+    return 0;
+}
+"#
+    .replace("__BAG__", bag)
+    .replace("__ENTRY__", entry);
+    let source = cwd.join("int-member-append.c");
+    let binary = cwd.join(format!("int-member-append{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(&binary), cwd, 15));
+    let failed = execute(Command::new(&binary).arg("oom"), cwd, 15);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stderr).trim(),
+        "array allocation failed"
+    );
+    for (name, diagnostic) in [
+        ("Moved", "linked_moved_member"),
+        ("Borrowed", "linked_member_target"),
+        ("Wrong", "linked_field_append"),
+        ("Indexed", "linked_member_target"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}
+
+pub(super) fn assert_owned_string_member_append(seed: &Path, cwd: &Path) {
+    let fixture = r#"struct Entry { text: str, suffix: str }
+struct Document { header: str, inner: Entry }
+fn Append(): str! {
+    doc = Document { header: str(10), inner: Entry { text: str(20), suffix: str(30) } }
+    doc.header += "/"
+    doc.inner.text += doc.inner.suffix
+    return ok(doc.header + doc.inner.text)
+}
+fn SelfMove(input: Document): null! {
+    doc = input
+    doc.inner.text += doc.inner.text
+    return ok(null)
+}
+fn MovedSibling(input: Document): str! {
+    doc = input
+    doc.inner.text += doc.inner.suffix
+    return ok(doc.inner.suffix.clone())
+}
+fn Borrowed(&doc: Document): null! {
+    doc.inner.text += "/"
+    return ok(null)
+}
+fn Indexed(input: [Document]): null! {
+    docs: [Document] = input
+    docs[0].inner.text += "/"
+    return ok(null)
+}
+"#;
+    fs::write(cwd.join("string-member-append.ku"), fixture).unwrap();
+    fs::write(cwd.join("modules.txt"), "string-member-append.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Append\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null\n").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let entry = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_KuProjectionString "))
+        .and_then(|line| line.split_once('('))
+        .unwrap()
+        .0;
+    let host = r#"
+static int expected_attempts;
+static void verify_oom(void) {
+    if (outstanding() || attempts != expected_attempts) _Exit(94);
+}
+int main(int argc, char **argv) {
+    (void)test_realloc;
+    if (argc == 2) {
+        expected_attempts = argv[1][0] - '0';
+        fail_after = expected_attempts - 1;
+        assert(atexit(verify_oom) == 0);
+        (void)__ENTRY__();
+        return 95;
+    }
+    KuBootstrapResult_KuProjectionString result = __ENTRY__();
+    assert(result.ok && result.value.len == 7 && !memcmp(result.value.ptr, "10/2030", 7));
+    ku_projection_string_drop(&result.value);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("__ENTRY__", entry);
+    let source = cwd.join("string-member-append.c");
+    let program = cwd.join(format!(
+        "string-member-append{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &program, cwd);
+    assert_ok(&execute(&mut Command::new(&program), cwd, 15));
+    for point in ["4", "5"] {
+        let failed = execute(Command::new(&program).arg(point), cwd, 15);
+        assert_eq!(failed.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&failed.stderr).trim(),
+            "out of memory"
+        );
+    }
+    for (name, code) in [
+        ("SelfMove", "linked_moved_member"),
+        ("MovedSibling", "linked_moved_member"),
+        ("Borrowed", "linked_append_target"),
+        ("Indexed", "linked_append_target"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(code));
+    }
+}
+
+pub(super) fn assert_local_append_thunk(seed: &Path, cwd: &Path) {
+    let body = r#"struct Location { line: int }
+struct Entry { kind: str, text: str, score: int, location: Location, first: int }
+struct ClosingToken { kind: str, lexeme: str, score: int }
+struct Outcome { total: int }
+
+fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [int], reject: bool): Outcome! {
+    nodes: [Entry] = []
+    edges: [int] = []
+    cursor = 7
+    fn Append(kind: str, text: str, score: int, location: Location, children: [int]): int! {
+        if (reject && score < 0) { fail { domain: kind.clone(), code: kind, message: text } }
+        offset = edges.len()
+        for edge in children { edges = edges.push(edge) }
+        item = Entry { kind: kind, text: text, score: score + cursor, location: location, first: offset }
+        nodes = nodes.push(item)
+        return ok(nodes.len() + cursor)
+    }
+    fn AppendWithOrigin(kind: str, text: str, score: int, location: Location, children: [int], origin: ClosingToken): int! {
+        added = Append(kind, text, score, location, children)?
+        edge = origin.score
+        edges = edges.push(edge)
+        return ok(added)
+    }
+    fn Advance(): null! {
+        edges = edges.push(cursor)
+        cursor = cursor + 1
+        return ok(null)
+    }
+    fn Close(token: ClosingToken): null! {
+        Advance()?
+        added = 0
+        added = AppendWithOrigin(token.kind, token.lexeme, token.score, Location { line: 5 }, [cursor, cursor],
+                                 ClosingToken { kind: "结束", lexeme: "🙂", score: cursor })?
+        edges = edges.push(added)
+        cursor = added
+        return ok(null)
+    }
+    left = Append(first, second, 3, Location { line: 2 }, choices)?
+    cursor = 8
+    Close(ClosingToken { kind: third, lexeme: fourth, score: 0 - 5 })?
+    first_score = nodes[0].score
+    return ok(Outcome { total: left * 1000 + cursor * 100 + nodes.len() + edges.len() + cursor + first_score })
+}
+"#;
+    let file = cwd.join("append-thunk.ku");
+    fs::write(&file, body).unwrap();
+    fs::write(cwd.join("modules.txt"), "append-thunk.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Run").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let positive = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&positive);
+    let code = String::from_utf8(positive.stdout).unwrap();
+    let (outcome, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, _) = signature.split_once('(').unwrap();
+    assert_eq!(code.matches("} KuBootstrapResult_int64_t;").count(), 1);
+    assert!(code.contains("_append_move(&(*capture->"));
+    assert!(code.contains("&environment"));
+    assert!(code.contains("(capture->f"));
+    assert!(!code.contains("memcpy(copy, (*capture"));
+    let host = r#"
+static int failure_attempt;
+static void after_nested_failure(void) {
+    assert(attempts == failure_attempt);
+    assert(!outstanding());
+    fputs("allocator: cleared every scope\n", stderr);
+}
+
+static KuProjectionString owned(uint8_t marker) {
+    uint8_t *data = malloc(1);
+    *data = marker;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+static KuArrayInt children(size_t len, int64_t first) {
+    int64_t *data = malloc(len * sizeof(*data));
+    for (size_t i = 0; i < len; ++i) data[i] = first + (int64_t)i;
+    return (KuArrayInt){len, data, len};
+}
+static OUTCOME run(bool reject, int allocation_before_failure) {
+    KuProjectionString a = owned('A'), b = owned('B'), c = owned('C'), d = owned('D');
+    KuArrayInt left = children(7, 1), right = children(3, 8);
+    if (allocation_before_failure >= 0) {
+        fail_after = allocation_before_failure;
+        failure_attempt = attempts + allocation_before_failure + 1;
+        assert(atexit(after_nested_failure) == 0);
+    }
+    return ENTRY(a, b, c, d, left, right, reject);
+}
+int main(int argc, char **argv) {
+    if (argc > 1) {
+        (void)run(false, !strcmp(argv[1], "fail-snapshot") ? 4 : 5);
+        return 2;
+    }
+    OUTCOME first = run(false, -1);
+    assert(first.ok && first.value.f0 == 9135 && !outstanding());
+    OUTCOME next = run(true, -1);
+    assert(!next.ok && next.error.domain.len == 1 && *next.error.domain.ptr == 'C');
+    assert(next.error.code.len == 1 && *next.error.code.ptr == 'C');
+    assert(next.error.message.len == 1 && *next.error.message.ptr == 'D');
+    assert(outstanding() == 3);
+    ku_projection_string_drop(&next.error.domain);
+    ku_projection_string_drop(&next.error.code);
+    ku_projection_string_drop(&next.error.message);
+    assert(!outstanding());
+    OUTCOME last = run(false, -1);
+    assert(last.ok && last.value.f0 == 9135 && !outstanding());
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("OUTCOME", outcome);
+    let source = cwd.join("append-thunk.c");
+    let program = cwd.join(format!("append-thunk{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &program, cwd);
+    assert_ok(&execute(&mut Command::new(&program), cwd, 10));
+    for (fault, expected) in [
+        ("fail-second-growth", "array allocation failed"),
+        ("fail-snapshot", "out of memory"),
+    ] {
+        let failed = execute(Command::new(&program).arg(fault), cwd, 10);
+        assert_eq!(failed.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&failed.stderr).trim(),
+            format!("{expected}\nallocator: cleared every scope")
+        );
+    }
+
+    for (from, to, diagnostic) in [
+        (
+            "edges = edges.push(edge)",
+            "edges = []",
+            "linked_capture_rebind",
+        ),
+        (
+            "offset = edges.len()",
+            "moved: [int] = edges\n        offset = moved.len()",
+            "linked_callback_owner",
+        ),
+        (
+            "Advance()?",
+            "wrong = Advance()?",
+            "linked_dependency_result",
+        ),
+        ("Advance()?", "Advance(9)?", "linked_local_append_arity"),
+        (
+            "ClosingToken { kind: \"结束\", lexeme: \"🙂\", score: cursor }",
+            "cursor",
+            "linked_argument_type",
+        ),
+        (
+            "Advance()?\n        added = 0",
+            "alias = Advance\n        Advance()?\n        added = 0",
+            "unavailable_linked_binding",
+        ),
+        (
+            "Advance()?\n        added = 0",
+            "Close(token)?\n        Advance()?\n        added = 0",
+            "unsupported_linked_local_capture",
+        ),
+        (
+            "Close(ClosingToken { kind: third, lexeme: fourth, score: 0 - 5 })?",
+            "Close(0)?",
+            "linked_argument_type",
+        ),
+    ] {
+        assert!(body.contains(from));
+        fs::write(&file, body.replace(from, to)).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains(diagnostic),
+            "{}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
 }

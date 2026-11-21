@@ -44,7 +44,7 @@ fn reachableLayouts(&layouts: [StructLayout], root: int, owning: bool): [int]! {
             if (isLayoutDependency(field, owning)) {
                 child = dependencyIndex(layouts, field)?
                 if (!ContainsIndex(reachable, child)) { reachable = reachable.push(child) }
-            } else if ((field.declaration_kind != "Builtin" || !IsBuiltinType(field.name)) &&
+            } else if (field.declaration_kind != "UnitEnum" && (field.declaration_kind != "Builtin" || !IsBuiltinType(field.name)) &&
                        !(owning && field.declaration_kind == "BuiltinArray" && (field.name == "int" || field.name == "str"))) {
                 RejectLayout("unsupported_nested_layout", "no C field layout for '" + field.name.clone() + "'", field.span)?
             }

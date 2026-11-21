@@ -9,7 +9,7 @@ import { IsLinkedNullableIntType, LinkedCopyResult, LinkedNominalReaderPrefix, L
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { CTypeName, ResolveProjectionDirectFunction, RequireProjectionBuiltin, ProjectionBuiltinLinkId, ProjectionBuiltinLinkFor, LinkedBufferResult, LinkedIntArrayCallbackNominal, LinkedIntAppendCallbackNominals } from "./struct_projection_c.ku"
 import { OwningStructDropReference } from "./nested_struct_c.ku"
-import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, IntArrayLinkPlanType, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullState, LinkedReadonlyExpression, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, ReadLinkedNullBinding, RememberLinkedCall, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, IntArrayLinkPlanType, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedReadonlyExpression, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, PreserveLinkedOwners, ReadLinkedNullBinding, RememberLinkedCall, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -409,4 +409,16 @@ fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpressio
     if (value.kind != "") { return ok(LinkedReadonlyExpression(state, LinkedBuiltin(value.kind, at), value.text)) }
     RejectLayout("unsupported_linked_operand", "expected a bound value, literal or checked direct call", at.clone())?
     return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", at), ""))
+}
+
+fn CheckLinkedFinallyMoves(&before: [LinkedNullSlot], &state: LinkedNullState, &node: Node): null! {
+    PreserveLinkedOwners(before, state.slots, node)?
+    index = 0
+    while (index < state.catch_moved.len()) {
+        if (before[state.catch_moved[index]].live) {
+            RejectLayout("linked_finally_move", "protected error cannot consume an outer owner", DeclarationSpan(node))?
+        }
+        index = index + 1
+    }
+    return ok(null)
 }

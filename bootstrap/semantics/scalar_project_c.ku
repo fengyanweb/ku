@@ -4,11 +4,11 @@ import { DropLinkedNullScope } from "./linked_member_ownership.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FindLinkedLocalRead } from "./call_contracts.ku"
-import { LinkedAbsoluteType, LinkedBuiltin, LinkedNullChild, LinkedIntResult, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullView } from "./linked_null_types_c.ku"
+import { LinkedAbsoluteType, LinkedBuiltin, LinkedNullChild, LinkedIntResult, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullView, LinkedStringResult } from "./linked_null_types_c.ku"
 import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedScopedCallbackTypes } from "./link_plan_c.ku"
-import { CollectFields, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
+import { CollectFields, HasBoundArrayMembers, HasUnitEnumMember, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { BuildProjectOwningLayouts, OrderCStructLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
-import { FindUnitEnumType, LinkedCopyResult, ReadUnitEnumVariant, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
+import { FindUnitEnumType, LinkedCopyResult, ReadUnitEnumVariant, RequireUnitEnum, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { Span } from "../stage2/span.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
@@ -147,13 +147,19 @@ fn EmitScalarProjectLinkPlan(&supplied: [SuppliedModule], &function: str): str! 
     return EmitLinkPlan(supplied, "project-int", export, [])
 }
 
-fn LinkedNullLayout(&project: LinkedNullProject, &ty: TypeNameBinding, layouts: [StructLayout], depth: int): [StructLayout]! {
+fn LinkedNullLayout(&project: LinkedNullProject, &ty: TypeNameBinding, layouts: [StructLayout], depth: int, enum_members: bool): [StructLayout]! {
     if (ty.declaration_kind != "Struct") {
         LinkedNullCType(ty)?
         return ok(layouts)
     }
     unit = ty.module_index
-    if (LayoutIndex(layouts, unit, ty.declaration_node) != 0) { return ok(layouts) }
+    cached = LayoutIndex(layouts, unit, ty.declaration_node)
+    if (cached > 0) {
+        if ((!enum_members || depth != 0) && HasUnitEnumMember(layouts[cached - 1])) {
+            RejectLayout("linked_enum_member_carrier", "unit enum fields require a direct linked record", ty.span.clone())?
+        }
+        return ok(layouts)
+    }
     if (depth >= 8) {
         RejectLayout("linked_layout_depth", "linked structs require an acyclic layout of at most 8 levels", ty.span.clone())?
     }
@@ -165,7 +171,13 @@ fn LinkedNullLayout(&project: LinkedNullProject, &ty: TypeNameBinding, layouts: 
                                project.supplied[module_index].named.parsed.arena.edges,
                                project.binding.modules[module_index].types, declaration, false)? {
         resolved = LinkedAbsoluteType(field.resolved, unit)
-        ordered = LinkedNullLayout(project, resolved, ordered, depth + 1)?
+        if (resolved.declaration_kind == "Enum") {
+            if (!enum_members || depth != 0) {
+                RejectLayout("linked_enum_member_carrier", "unit enum fields require a direct linked record", resolved.span.clone())?
+            }
+            resolved = RequireUnitEnum(project.supplied, resolved, unit)?
+        }
+        ordered = LinkedNullLayout(project, resolved, ordered, depth + 1, enum_members)?
         local = StructFieldLayout { name: field.name, ordinal: field.ordinal, node: field.node, resolved: resolved }
         relocated = relocated.push(local)
     }
@@ -174,10 +186,10 @@ fn LinkedNullLayout(&project: LinkedNullProject, &ty: TypeNameBinding, layouts: 
     return ok(ordered)
 }
 
-fn RegisterLinkedOwnedRecord(&project: LinkedNullProject, state: LinkedNullState, &element: TypeNameBinding): LinkedNullState! {
+fn RegisterLinkedOwnedRecord(&project: LinkedNullProject, state: LinkedNullState, &element: TypeNameBinding, enum_members: bool): LinkedNullState! {
     next = state
     try {
-        next.layouts = LinkedNullLayout(project, element, next.layouts.clone(), 0)?
+        next.layouts = LinkedNullLayout(project, element, next.layouts.clone(), 0, enum_members)?
         return ok(next)
     } catch (err) {
         // A cached owning child can reach the scalar layout order check
@@ -277,16 +289,25 @@ fn FinishLinkedEnumComparison(value: LinkedNullExpression, &left: LinkedNullValu
     return ok(LinkedReadonlyExpression(done, LinkedBuiltin("bool", at), result))
 }
 
-fn PlanLinkedUnitMatch(&project: LinkedNullProject, &state: LinkedNullState,
-                       &match_node: Node, &ty: TypeNameBinding): [int]! {
-    at = DeclarationSpan(match_node)
-    if (ty.declaration_kind != "UnitEnum" || match_node.edge_count < 2) {
-        RejectLayout("linked_match_subject", "expected a payload-free enum and at least one match arm", at.clone())?
+fn RequireLinkedIntMatch(&ty: TypeNameBinding, &node: Node, arm: bool): null! {
+    if (LinkedIntResult(ty)) { return ok(null) }
+    if (arm) {
+        return RejectLayout("linked_match_arm_result", "expected an int match arm value", DeclarationSpan(node))
     }
-    declaration = LinkedNullNode(project, ty.module_index, ty.declaration_node)
+    return RejectLayout("linked_match_result", "expected an int or int! result for return match", DeclarationSpan(node))
+}
+
+fn PlanLinkedReturnMatch(&project: LinkedNullProject, &state: LinkedNullState,
+                         &match_node: Node, &ty: TypeNameBinding): [int]! {
+    at = DeclarationSpan(match_node)
+    string = LinkedStringResult(ty)
+    if ((!string && ty.declaration_kind != "UnitEnum") || match_node.edge_count < 2) {
+        RejectLayout("linked_match_subject", "expected a str or payload-free enum and at least one match arm", at.clone())?
+    }
     arm_count = match_node.edge_count - 1
-    variant_count = declaration.edge_count
+    // Zero marks the wildcard. Other entries identify a variant or a literal node.
     plan: [int] = []
+    literals: [str] = []
     wildcard = false
     index = 0
     while (index < arm_count) {
@@ -294,10 +315,20 @@ fn PlanLinkedUnitMatch(&project: LinkedNullProject, &state: LinkedNullState,
         if (arm.kind != "MatchArm" || arm.edge_count != 2 || wildcard) {
             RejectLayout("linked_match_arm", "expected an unguarded match arm before any wildcard", DeclarationSpan(arm))?
         }
-        pattern = LinkedNullNode(project, 1, LinkedNullChild(project, 1, arm, 0))
+        pattern_id = LinkedNullChild(project, 1, arm, 0)
+        pattern = LinkedNullNode(project, 1, pattern_id)
         if (pattern.kind == "MatchWildcard") {
             wildcard = true
             plan = plan.push(0)
+        } else if (string) {
+            if (pattern.kind != "String" || pattern.edge_count != 0) {
+                RejectLayout("linked_match_pattern", "expected a string literal or wildcard", DeclarationSpan(pattern))?
+            }
+            if (ContainsType(literals, pattern.text)) {
+                RejectLayout("linked_match_unreachable", "duplicate string literal match arm", DeclarationSpan(arm))?
+            }
+            literals = literals.push(pattern.text)
+            plan = plan.push(pattern_id)
         } else {
             if (pattern.kind != "Field" || pattern.edge_count != 1) {
                 RejectLayout("linked_match_pattern", "expected a unit enum variant or wildcard", DeclarationSpan(pattern))?
@@ -313,7 +344,13 @@ fn PlanLinkedUnitMatch(&project: LinkedNullProject, &state: LinkedNullState,
         }
         index = index + 1
     }
-    if (!wildcard && plan.len() != variant_count) {
+    if (wildcard) { return ok(plan) }
+    if (string) {
+        RejectLayout("linked_match_nonexhaustive", "standalone string return match requires a final wildcard", at.clone())?
+    }
+    declaration = LinkedNullNode(project, ty.module_index, ty.declaration_node)
+    variant_count = declaration.edge_count
+    if (plan.len() != variant_count) {
         missing = ""
         index = 0
         while (index < variant_count) {

@@ -4,10 +4,10 @@ import { Node, ParseOutput } from "../stage2/ast.ku"
 import { ExpressionSpan, MakeExpressionNode } from "../stage2/expression_support.ku"
 import { WindowKind, WindowToken, AfterOptionalSemicolon, CheckFunctionBodySpan } from "./support.ku"
 import { CheckTypeArenaCapacity } from "./signature.ku"
-import { AppendStatementLinks, BuildCatchClause, BuildControlStatement, ControlBodyStart, FunctionEofKind, LocalFunctionNodeKind, PrepareBodyAttachment, ReadControlBodyStart } from "./statement_links.ku"
+import { AppendStatementLinks, BuildControlStatement, BuildTryChildren, ContinueTry, ControlBodyStart, FunctionEofKind, LocalFunctionNodeKind, PrepareBodyAttachment, ReadControlBodyStart } from "./statement_links.ku"
 import { LocalFunctionScope, ReadLocalFunctionHeader } from "./function_header.ku"
 import { ReadSimpleBodyStatement } from "./simple_statements.ku"
-import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, IsControlStatement, ReadCatchBinding, RejectBodyEof, RejectBodyEdgeId, RejectNestedNodeId, ReadElsePhase, IsLocalFunctionAssignment, CheckStrayClause, RejectStatementLimit, RejectStatementDepth, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow } from "./body_support.ku"
+import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, IsControlStatement, ReadTryClauseHeader, RejectBodyEof, RejectBodyEdgeId, RejectNestedNodeId, ReadElsePhase, IsLocalFunctionAssignment, CheckStrayClause, RejectStatementLimit, RejectStatementDepth, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow } from "./body_support.ku"
 
 // Read the remainder of one bounded ordinary-function window, starting at the
 // first token after its opening brace. The standalone entry validates its
@@ -132,16 +132,13 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                 // Phase 2 leaves the nested If for the next iteration.
                 current.phase = ReadElsePhase(WindowToken(tokens, cursor, last_index))?
                 if (current.phase == 1) { cursor = cursor + 1 }
-            } else if (current.kind == "Try" && current.phase == 0) {
-                binding = ReadCatchBinding(tokens, cursor, last_index)?
-                parse_steps = NextBodyWork(parse_steps, 5, WindowToken(tokens, cursor, last_index))?
-                try_open = WindowToken(tokens, current.start + 1, last_index)
-                body_children = AppendStatementList([], current.body_top, current.body_count, try_open.clone())?
-                current.condition = AddNode("TryBody", "", 0, SpanMerge(SpanFromToken(try_open.clone()), SpanFromToken(block_end)), body_children, try_open)?
-                current.catch_start = cursor
-                current.catch_binding = AddNode("CatchBinding", binding.lexeme.clone(), 0, SpanFromToken(binding.clone()), [], binding)?
-                current.phase = 1
-                cursor = cursor + 5
+            } else if (HasTryContinuation(tokens, cursor, last_index, current)) {
+                clause = ReadTryClauseHeader(tokens, cursor, last_index)?
+                width = clause.width
+                parse_steps = NextBodyWork(parse_steps, width, WindowToken(tokens, cursor, last_index))?
+                current = ContinueTry(tokens, last_index, current, block_end, cursor, width, clause.token,
+                                      AppendStatementList.clone(), AddNode.clone())?
+                cursor = cursor + width
             } else {
                 allow_semicolon = current.kind != "Try"
                 closing_frames = true
@@ -159,8 +156,8 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                         declared_type = scope.declared_type
                     }
                     if (current.kind == "Try") {
-                        control_children = control_children.push(BuildCatchClause(
-                            tokens, cursor, last_index, current, block_end, AppendStatementList.clone(), AddNode.clone())?)
+                        control_children = BuildTryChildren(tokens, last_index, current, block_end,
+                                                           AppendStatementList.clone(), AddNode.clone())?
                     } else {
                         control_children = AppendStatementList(control_children, current.body_top, current.body_count, control_start.clone())?
                         if (current.kind == "If") {
@@ -261,4 +258,11 @@ fn HasUnopenedElse(&tokens: [Token], next: int, last: int, &frame: ControlFrame)
     if (frame.kind != "If" || frame.phase != 0) { return false }
     following = WindowKind(tokens, next, last)
     return following == "Else"
+}
+
+fn HasTryContinuation(&tokens: [Token], next: int, last: int, &frame: ControlFrame): bool {
+    if (frame.kind != "Try" || frame.phase == 3) { return false }
+    if (frame.phase == 0) { return true }
+    following = WindowKind(tokens, next, last)
+    return following == "Finally"
 }

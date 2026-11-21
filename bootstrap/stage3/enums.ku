@@ -251,8 +251,8 @@ struct ReturnMatchRead {
     work: int
 }
 
-// A complete return value can use an unguarded match with a unit-variant
-// pattern or a final wildcard. Ordinary expressions still use Stage 2.
+// A complete return value can use unit variants, string literals, or a final
+// wildcard. Ordinary expressions still use Stage 2.
 fn ReadReturnMatch(&tokens: [Token], first: int, last: int, token_base: int,
                       initial_work: int,
                       parse: fn(int, int): ParseOutput!, append: fn(ParseOutput, Token, bool): int!,
@@ -288,10 +288,10 @@ fn ReadReturnMatch(&tokens: [Token], first: int, last: int, token_base: int,
         }
         wildcard = arm_start.kind == "Ident" && arm_start.lexeme == "_"
         pattern_end = cursor + 1
-        if (!wildcard) {
+        if (!wildcard && arm_start.kind != "String") {
             if (arm_start.kind != "Ident" || !WindowKindIs(tokens, pattern_end, last, "Dot")
                 || !WindowKindIs(tokens, pattern_end + 1, last, "Ident")) {
-                RejectAt(arm_start.clone(), "unsupported_match_pattern", "expected an enum variant or '_'")?
+                RejectAt(arm_start.clone(), "unsupported_match_pattern", "expected an enum variant, string literal, or '_'")?
             }
             pattern_end = pattern_end + 2
             if (WindowKindIs(tokens, pattern_end, last, "Dot")) {

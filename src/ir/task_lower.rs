@@ -180,7 +180,7 @@ fn value_slot(ty: IrType) -> TaskSlotType {
 fn owned_value(ty: &TaskSlotType) -> bool {
     matches!(ty, TaskSlotType::Callable { .. })
         || matches!(ty, TaskSlotType::Value { ty, borrowed: false }
-        if matches!(ty, IrType::Str | IrType::Result(_)) || matches!(ty, IrType::Nullable(inner) if inner.as_ref() == &IrType::Str) || task::flat_array(ty) || task::pg_params_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty) || task::local_json_type(ty) || task::record_type(ty) || task::nullable_record(ty) || task::unit_enum_name(ty).is_some())
+        if matches!(ty, IrType::Str | IrType::Result(_)) || matches!(ty, IrType::Nullable(inner) if inner.as_ref() == &IrType::Str) || task::flat_array(ty) || task::pg_params_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty) || task::local_json_type(ty) || task::record_type(ty) || task::nullable_record(ty) || task::enum_name(ty).is_some())
 }
 
 fn local_type(ty: &TypeName, span: Span, layouts: &super::IrLayoutTable) -> KuResult<TaskSlotType> {
@@ -559,7 +559,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
                 function.span,
             ));
         };
-        let payload = records::unit_enum_type(inner, &layouts)
+        let payload = records::enum_type(inner, &layouts)
             .or_else(|| records::payload(inner, &layouts))
             .ok_or_else(|| {
                 unsupported(&format!("async Result payload {inner:?}"), function.span)
@@ -575,7 +575,13 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
                 .ty
                 .as_ref()
                 .ok_or_else(|| unsupported("untyped async parameters", parameter.span))?;
-            let parameter_type = if let Some(ty) = records::unit_enum_type(annotation, &layouts) {
+            let parameter_type = if let Some(ty) = records::enum_type(annotation, &layouts) {
+                if task::unit_enum_layout(&layouts, &ty).is_none() {
+                    return Err(unsupported(
+                        "a payload-bearing enum Task parameter",
+                        parameter.span,
+                    ));
+                }
                 value_slot(ty)
             } else {
                 local_type(annotation, parameter.span, &layouts)?
@@ -1155,7 +1161,7 @@ impl<'a> FunctionLowerer<'a> {
                 let equality = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual);
                 if equality
                     && matches!(&self.function.slots[source.0].ty,
-                        TaskSlotType::Value { ty, .. } if task::unit_enum_name(ty).is_some())
+                        TaskSlotType::Value { ty, .. } if task::enum_name(ty).is_some())
                 {
                     return self.unit_enum_equality(source, *op, right, depth);
                 }
@@ -1272,7 +1278,7 @@ impl<'a> FunctionLowerer<'a> {
                     unsupported("optional projection of this Task value", expression.span)
                 }),
             ExprKind::Field { target, name } => {
-                if let Some(value) = self.unit_enum_literal(target, name, expression.span)? {
+                if let Some(value) = self.enum_literal(target, name, expression.span)? {
                     return Ok(value);
                 }
                 if let Some(field) =
@@ -1453,9 +1459,7 @@ impl<'a> FunctionLowerer<'a> {
                 self.current = Some(ok);
                 Ok(destination)
             }
-            ExprKind::Match { value, arms } => {
-                self.unit_enum_match(value, arms, expression.span, depth)
-            }
+            ExprKind::Match { value, arms } => self.enum_match(value, arms, expression.span, depth),
             _ => Err(unsupported(
                 "this expression in the bounded primitive Task subset",
                 expression.span,
@@ -1944,6 +1948,9 @@ impl<'a> FunctionLowerer<'a> {
         span: Span,
         depth: usize,
     ) -> KuResult<SlotId> {
+        if let Some(value) = self.int_enum_constructor(object, name, args, span, depth)? {
+            return Ok(value);
+        }
         if let Some(value) = self.array_collection_call(object, name, args, span, depth)? {
             return Ok(value);
         }
@@ -2797,7 +2804,7 @@ impl<'a> FunctionLowerer<'a> {
             && !task::flat_array(ty)
             && !task::http_response_type(ty)
             && !task::record_type(ty)
-            && task::unit_enum_name(ty).is_none()
+            && task::enum_name(ty).is_none()
         {
             return Err(unsupported(&format!("Result payload {ty}"), span));
         }

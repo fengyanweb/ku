@@ -3824,14 +3824,60 @@ impl Checker {
         if consumes_scrutinee && self.borrowed_expr_root(value).is_some() {
             return Err(KuError::runtime("borrowed operation is not supported: match with owned payload binding; clone the scrutinee first", value.span));
         }
+        let has_final_wildcard = arms.last().is_some_and(|arm| {
+            arm.guard.is_none() && matches!(&arm.pattern, MatchPattern::Wildcard)
+        });
+        let unit_variant_count = match &value_type {
+            Type::Enum(name) => self
+                .enums
+                .get(name)
+                .filter(|layout| {
+                    layout.variants.values().all(Vec::is_empty)
+                        && arms[..arms.len() - usize::from(has_final_wildcard)]
+                            .iter()
+                            .all(|arm| {
+                                matches!(&arm.pattern, MatchPattern::EnumVariant { fields, .. }
+                                    if fields.is_empty())
+                            })
+                })
+                .map(|layout| layout.variants.len()),
+            _ => None,
+        };
         let before_arms = self.scopes.clone();
+        let mut guard_fallthrough = HashMap::new();
         let mut arm_scopes = Vec::with_capacity(arms.len());
         let mut result_type = Type::Unknown;
         let mut saw_unguarded_catch_all = false;
         let mut covered_full_variants = HashSet::new();
         let mut covered_patterns = HashSet::new();
         for arm in arms {
-            self.scopes = before_arms.clone();
+            let unit_variant = match &arm.pattern {
+                MatchPattern::EnumVariant { variant, .. } if unit_variant_count.is_some() => {
+                    Some(variant.as_str())
+                }
+                _ => None,
+            };
+            self.scopes = match (unit_variant, unit_variant_count) {
+                (Some(variant), _) => guard_fallthrough
+                    .remove(variant)
+                    .unwrap_or_else(|| before_arms.clone()),
+                (None, Some(count))
+                    if matches!(&arm.pattern, MatchPattern::Wildcard)
+                        && !guard_fallthrough.is_empty() =>
+                {
+                    // An unguarded variant removed its snapshot when it selected
+                    // its arm. Remaining snapshots are false guards on tags that
+                    // can still reach the wildcard. Unseen tags share the baseline.
+                    let mut paths = std::mem::take(&mut guard_fallthrough)
+                        .into_values()
+                        .collect::<Vec<_>>();
+                    if paths.len() + covered_full_variants.len() < count {
+                        paths.push(before_arms.clone());
+                    }
+                    merge_moved_scope_paths(before_arms.clone(), &paths)
+                }
+                _ => before_arms.clone(),
+            };
             if saw_unguarded_catch_all {
                 return Err(KuError::runtime(
                     "match arm after catch-all pattern is unreachable",
@@ -3909,6 +3955,11 @@ impl Checker {
                         ).with_diagnostic_id(crate::error::DiagnosticId::TaskGuardMove));
                     }
                 }
+                if let Some(variant) = unit_variant {
+                    // A false guard leaves its outer moves in effect. A different
+                    // tag skips this guard, and the arm's own bindings expire here.
+                    guard_fallthrough.insert(variant, self.scopes[..before_arms.len()].to_vec());
+                }
             }
             let actual = self.consume_expr(&arm.value);
             self.pop_scope();
@@ -3947,7 +3998,8 @@ impl Checker {
             }
         }
         if consumes_scrutinee {
-            self.consume_expr(value)?;
+            // Record a move from the checked place without replaying a subject's await or calls.
+            self.consume_checked_expr(value, value_type)?;
         }
         Ok(result_type)
     }

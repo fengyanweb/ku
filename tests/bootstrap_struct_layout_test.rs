@@ -432,10 +432,11 @@ fn bootstrap_emits_owning_layout_for_real_supplied_module() {
     fs::create_dir(&cwd).unwrap();
     stage_sources(&copied);
     for file in [
-        "semantics/call_contracts.ku",
         "semantics/imports.ku",
         "semantics/names.ku",
+        "semantics/project_bindings.ku",
         "semantics/project_paths.ku",
+        "semantics/type_names.ku",
         "stage2/ast.ku",
         "stage2/diagnostic.ku",
         "stage2/span.ku",
@@ -455,14 +456,19 @@ import { BuildProjectOwningLayouts, EmitProjectOwningLayoutsC, OwningLayoutDropN
 import { CTypeName } from "./struct_projection_c.ku"
 fn main(): null! {
     subject = fs.read("subject.txt")?
-    needs_imports = subject == "semantics/call_contracts.ku"
+    signature = subject == "semantics/project_bindings.ku"
+    name = ""
     paths = [subject, "semantics/names.ku", "semantics/project_paths.ku",
         "stage2/ast.ku", "stage2/diagnostic.ku", "stage2/span.ku", "stage1/token.ku"]
-    if (needs_imports) { paths = paths.push("semantics/imports.ku") }
+    if (signature) {
+        name = "DirectSignature"
+        paths = paths.push("semantics/imports.ku")
+        paths = paths.push("semantics/type_names.ku")
+    }
     supplied = ReadProjectModules(paths)?
     project = BindProjectModules(supplied)?
     for item in supplied[0].named.names.declarations {
-        if (item.kind == "Struct") {
+        if (item.kind == "Struct" && (name == "" || item.name == name)) {
             layouts = BuildProjectOwningLayouts(supplied, project, 1, item.node, item.span.clone())?
             emitted = EmitProjectOwningLayoutsC(layouts, 1, item.node, item.span)?
             println(CTypeName(1, item.node) + "|" + OwningLayoutDropName(1, item.node))
@@ -563,7 +569,7 @@ int main(void) {
         "partial and complete Project owners released"
     );
 
-    fs::write(cwd.join("subject.txt"), "semantics/call_contracts.ku").unwrap();
+    fs::write(cwd.join("subject.txt"), "semantics/project_bindings.ku").unwrap();
     let output = execute(&mut Command::new(&seed), &cwd, 30);
     assert_ok(&output);
     let emitted = String::from_utf8(output.stdout).unwrap();
@@ -1583,6 +1589,7 @@ fn Make(): Outer {
     linked_null::assert_path_byte_guard(&driver_binary, &cwd);
     linked_chars::assert_owned_characters(&driver_binary, &cwd);
     linked_chars::assert_owned_record_result_iteration(&driver_binary, &cwd);
+    linked_chars::assert_fresh_cloned_record_iteration(&driver_binary, &cwd);
     linked_chars::assert_owned_copy_ints(&driver_binary, &cwd);
     token_window::assert_readonly_preflight(&driver_binary, &cwd);
     assert_managed_source_characters(&driver_binary, &cwd);
@@ -2397,6 +2404,53 @@ int main(void) {
         let output = execute(&mut Command::new(seed), cwd, 30);
         assert!(!output.status.success() && output.stdout.is_empty());
         assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
+}
+
+#[test]
+fn project_link_plan_uses_standard_json_string_quoting_in_the_interpreter() {
+    let sandbox = Temp::new();
+    stage_sources(&sandbox.0);
+    fs::write(
+        sandbox.0.join("quote-plan.ku"),
+        r#"import { fs } from "std"
+import { FsReadLinkPlan } from "./semantics/link_plan_c.ku"
+import { EmitLinkPlan } from "./semantics/link_plan_json_c.ku"
+import { SuppliedModule } from "./semantics/imports.ku"
+
+fn main(): null! {
+    mode = fs.read("mode.bin")?
+    supplied: [SuppliedModule] = []
+    export = FsReadLinkPlan("ku_linked_dep_fs_read")
+    print(EmitLinkPlan(supplied, mode, export, [])?)
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let ku_bin = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    let escapes = String::from("\"\\/中🙂") + &(0_u8..32).map(char::from).collect::<String>();
+    for mode in [
+        String::from("linked-null"),
+        escapes.clone(),
+        escapes.repeat(20),
+    ] {
+        fs::write(sandbox.0.join("mode.bin"), mode.as_bytes()).unwrap();
+        let output = execute(
+            Command::new(&ku_bin).args(["run", "quote-plan.ku"]),
+            &sandbox.0,
+            15,
+        );
+        assert_ok(&output);
+        assert!(output.stderr.is_empty());
+        let quoted = json::stringify_value(&Value::String(mode), Span::default()).unwrap();
+        let expected =
+            format!("{{\"schema\":\"ku-bootstrap-link-plan-v1\",\"mode\":{quoted},\"export\":");
+        let actual = String::from_utf8(output.stdout).unwrap();
+        assert!(actual.starts_with(&expected), "{actual:?}");
+        assert!(actual.ends_with(",\"dependencies\":[]}\n"), "{actual:?}");
     }
 }
 
@@ -3769,10 +3823,11 @@ fn bootstrap_emits_typed_dependencies_for_real_parser_reject() {
     fs::write(
         &script,
         r#"import { ReadProjectModules } from "./project_manifest.ku"
-import { EmitLinkedNullC } from "./linked_null_c.ku"
+import { EmitLinkedNullC, PrepareLinkedNullProject } from "./linked_null_c.ku"
 fn main(): null! {
     supplied = ReadProjectModules(["stage2/expression_support.ku", "stage2/span.ku", "stage2/diagnostic.ku", "stage1/token.ku", "stage2/ast.ku"])?
-    generated = EmitLinkedNullC(supplied, "RejectAt")?
+    project = PrepareLinkedNullProject(supplied)?
+    generated = EmitLinkedNullC(project, "RejectAt")?
     print(generated.source)
     return ok(null)
 }
@@ -4110,6 +4165,31 @@ fn bootstrap_links_owned_array_results_and_cleans_up_checked_locals() {
         &cwd,
         180,
     ));
+    fs::write(
+        semantics.join("indexed-read.ku"),
+        "fn Read(&values: [int], position: int): int! { return ok(values[position]) }\n",
+    )
+    .unwrap();
+    fs::write(semantics.join("modules.txt"), "indexed-read.ku\n").unwrap();
+    fs::write(semantics.join("function.txt"), "Read\n").unwrap();
+    fs::write(semantics.join("mode.txt"), "linked-null\n").unwrap();
+    let interpreted = execute(
+        Command::new(&ku)
+            .args(["run", "--offline"])
+            .arg(semantics.join("projection_main.ku")),
+        &cwd,
+        30,
+    );
+    assert_ok(&interpreted);
+    let native = execute(&mut Command::new(&built), &cwd, 30);
+    assert_ok(&native);
+    let interpreted = String::from_utf8(interpreted.stdout).unwrap();
+    let native = String::from_utf8(native.stdout).unwrap();
+    assert!(native.contains("index_failed"));
+    assert_eq!(
+        interpreted.replace("\r\n", "\n"),
+        native.replace("\r\n", "\n")
+    );
     let compiler = cwd.join(format!("ku-project{suffix}"));
     fs::rename(built, &compiler).unwrap();
     fs::remove_dir_all(&copied).unwrap();
@@ -4411,26 +4491,44 @@ int main(int argc, char **argv) {
     assert!(String::from_utf8_lossy(&bounds.stderr).contains("index 0 out of bounds for length 0"));
     linked_null::assert_nested_array_result_cleanup(&compiler, &cwd);
     linked_null::assert_checked_string_array_borrow(&compiler, &cwd);
+    linked_null::assert_plain_owned_string_array(&compiler, &cwd);
     linked_null::assert_checked_local_string_array(&compiler, &cwd);
     linked_null::assert_short_circuit_reads(&compiler, &cwd);
     linked_null::assert_named_record_clone(&compiler, &cwd);
     linked_null::assert_named_record_rebind(&compiler, &cwd);
     linked_null::assert_owned_record_destructure(&compiler, &cwd);
     linked_null::assert_owned_record_field_literal(&compiler, &cwd);
-    linked_null::assert_local_array_reader(&compiler, &cwd);
+    linked_null::assert_owned_record_result_literal(&compiler, &cwd);
+    linked_null::assert_local_array_reader(&compiler, python, &cwd);
     linked_null::assert_linked_fs_read(&compiler, &cwd);
     linked_guard::assert_terminal_branch_ownership(&compiler, &cwd);
     linked_guard::assert_checked_output_ownership(&compiler, &cwd);
     linked_guard::assert_terminal_try_unwind(&compiler, &cwd);
     linked_guard::assert_ignored_result_cleanup(&compiler, &cwd);
     linked_guard::assert_checked_string_rebind(&compiler, &cwd);
+    linked_guard::assert_conditional_whole_record_move(&compiler, &cwd);
+    linked_guard::assert_local_bool_while(&compiler, &cwd);
     linked_guard::assert_record_field_string_rebind(&compiler, &cwd);
+    linked_guard::assert_guarded_record_field_append(&compiler, &cwd);
+    linked_guard::assert_owned_int_member_append(&compiler, &cwd);
+    linked_guard::assert_owned_string_member_append(&compiler, &cwd);
     linked_guard::assert_checked_str_predicate(&compiler, &cwd);
     linked_guard::assert_checked_copy_int(&compiler, &cwd);
+    linked_guard::assert_local_string_lengths(&compiler, &cwd);
     linked_guard::assert_checked_callback_forwarding(&compiler, &cwd);
     linked_guard::assert_local_callback_thunk(&compiler, python, &cwd);
+    linked_guard::assert_local_append_thunk(&compiler, &cwd);
+    linked_guard::assert_checked_int_array_result(&compiler, python, &cwd);
+    linked_guard::assert_captured_record_updates(&compiler, &cwd);
+    linked_guard::assert_int_array_record_snapshot(&compiler, &cwd);
+    linked_guard::assert_scoped_int_array_callback(&compiler, python, &cwd);
+    linked_guard::assert_two_nominal_callback(&compiler, python, &cwd);
+    linked_guard::assert_arena_callback(&compiler, python, &cwd);
+    linked_guard::assert_scoped_record_reader(&compiler, python, &cwd);
+    linked_guard::assert_empty_owned_int_argument(&compiler, &cwd);
     linked_guard::assert_named_array_parameter_move(&compiler, &cwd);
     linked_guard::assert_owned_local_member_set(&compiler, &cwd);
+    linked_guard::assert_guarded_copy_field_set(&compiler, &cwd);
     linked_guard::assert_owned_int_array_store(&compiler, &cwd);
     struct_view::assert_named_struct_view(&compiler, &cwd);
     member_move::assert_owned_member_transfer(&compiler, &cwd);
@@ -4444,6 +4542,7 @@ int main(int argc, char **argv) {
     linked_guard::assert_named_counted_bound(&compiler, &cwd);
     struct_view::assert_lazy_readonly_bool_call(&compiler, &cwd);
     struct_view::assert_owned_string_field_clone(&compiler, &cwd);
+    struct_view::assert_owned_record_array_field_clone(&compiler, &cwd);
     struct_view::assert_stable_owned_count_bound(&compiler, &cwd);
     struct_view::assert_conditional_partial_members(&compiler, &cwd);
     struct_view::assert_string_prefix_suffix(&compiler, &cwd);

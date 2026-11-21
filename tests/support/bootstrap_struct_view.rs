@@ -550,9 +550,63 @@ int main(void) {
     compile_projection(&c, &exe, cwd);
     assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
 
+    fs::write(cwd.join("function.txt"), "ConditionalArrayMove").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (entry, arguments) = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResultNull ku_linked_null_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap();
+    let record = arguments.split_once(' ').unwrap().0;
+    let take = code
+        .lines()
+        .find_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+static int visits;
+KuBootstrapResultNull __TAKE__(__RECORD__ value) {
+    ++visits;
+    assert(value.f0.f0 == 47 && value.f1.len == 2 && outstanding() == 1);
+    assert(value.f1.data[0] == 7);
+    bool accept = value.f1.data[1] == 8;
+    free(value.f1.data);
+    if (accept) return (KuBootstrapResultNull){.ok = true};
+    static uint8_t code[] = "refused";
+    return (KuBootstrapResultNull){
+        .error.code = {code, sizeof(code) - 1, 0, KU_PROJECTION_STRING_STATIC}
+    };
+}
+static __RECORD__ value(int64_t last) {
+    int64_t *data = malloc(2 * sizeof(*data));
+    data[0] = 7;
+    data[1] = last;
+    return (__RECORD__){{47},{2,data,2}};
+}
+int main(void) {
+    (void)test_realloc;
+    assert(__ENTRY__(value(8), false).ok && visits == 0 && !outstanding());
+    assert(__ENTRY__(value(8), true).ok && visits == 1 && !outstanding());
+    KuBootstrapResultNull failed = __ENTRY__(value(9), true);
+    assert(!failed.ok && visits == 2 && !outstanding() && attempts == 3);
+    assert(failed.error.code.len == 7 && !memcmp(failed.error.code.ptr, "refused", 7));
+    return 0;
+}
+"#
+    .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
+    .replace("__TAKE__", take)
+    .replace("__RECORD__", record);
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+
     for (name, reason) in [
         ("ReuseAfterMove", "unavailable_linked_binding"),
-        ("ConditionalArrayMove", "linked_control_move"),
         ("DifferentMembers", "linked_control_move"),
     ] {
         fs::write(cwd.join("function.txt"), name).unwrap();
@@ -1003,6 +1057,29 @@ fn RefuseOwned(kind: str): null! {
     if (Own(kind)) { return ok(null) }
     return ok(null)
 }
+fn Four(&a: Entry, &b: Entry, &c: Entry, &d: Entry): bool {
+    return a.kind == b.kind && c.kind != d.kind
+}
+fn ReadFour(enabled: bool, &entries: [Entry]): bool {
+    return enabled && Four(entries[0], entries[1], entries[2], entries[3])
+}
+fn Find(&ids: [int], id: int): int {
+    if (ids.len() > 0 && ids[0] == id) { return id }
+    return 0
+}
+fn ReadMixed(enabled: bool, &ids: [int], id: int): bool {
+    return enabled && Find(ids, id) == id
+}
+fn OwnFirst(a: Entry, &b: Entry, &c: Entry, &d: Entry): bool {
+    return a.kind == b.kind && c.kind != d.kind
+}
+fn RefuseOwnedFour(&entries: [Entry]): bool {
+    return true && OwnFirst(entries[0], entries[1], entries[2], entries[3])
+}
+fn RefuseMovedFour(entry: Entry, &other: Entry): bool {
+    label = entry.kind
+    return true && Four(entry, other, other, other)
+}
 fn Measure(&kind: str): int { return 1 }
 fn RefuseNonBool(&entry: Entry): null! {
     if (Measure(entry.kind)) { return ok(null) }
@@ -1073,16 +1150,127 @@ pub(super) fn assert_lazy_readonly_bool_call(seed: &Path, cwd: &Path) {
     compile_projection(&c, &exe, cwd);
     assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
 
-    for (name, reason) in [
-        ("RefuseOwned", "matching str View or scalar Copy argument"),
-        ("RefuseNonBool", "requires a plain bool result"),
+    fs::write(cwd.join("function.txt"), "ReadFour").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (entry, params) = code
+        .lines()
+        .find_map(|line| line.strip_prefix("bool ku_linked_null_"))
+        .unwrap()
+        .split_once("(bool a0, const ")
+        .unwrap();
+    let (array, _) = params.split_once('*').unwrap();
+    let record = array.strip_prefix("KuArray_").unwrap();
+    let provider = code
+        .lines()
+        .find_map(|line| line.strip_prefix("extern bool "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+static const RECORD *items;
+static int visits;
+bool PROVIDER(const RECORD *a, const RECORD *b, const RECORD *c, const RECORD *d) {
+    assert(a == items && b == items + 1 && c == items + 2 && d == items + 3);
+    ++visits;
+    return true;
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    ARRAY entries = {0};
+    assert(!ENTRY(false, &entries) && visits == 0);
+    RECORD storage[4] = {0};
+    items = storage;
+    entries = (ARRAY){argc > 1 ? 2u : 4u, storage, 4};
+    if (argc > 1) { (void)ENTRY(true, &entries); return 2; }
+    assert(ENTRY(true, &entries) && visits == 1);
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("ARRAY", array)
+    .replace("RECORD", record)
+    .replace("PROVIDER", provider);
+    let c = cwd.join("readonly-four.c");
+    let exe = cwd.join(format!("readonly-four{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    let bounds = execute(Command::new(&exe).arg("short"), cwd, 15);
+    assert_eq!(bounds.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bounds.stderr).contains("index 2 out of bounds for length 2"));
+
+    fs::write(cwd.join("function.txt"), "ReadMixed").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let symbol = |prefix| {
+        code.lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap()
+            .split_once('(')
+            .unwrap()
+            .0
+    };
+    let host = r#"
+static const KuArrayInt *expected;
+static unsigned calls;
+int64_t PROVIDER(const KuArrayInt *ids, int64_t id) {
+    assert(ids == expected && ids->len == 2 && id == 23);
+    ++calls;
+    return ids->data[1];
+}
+int main(void) {
+    int64_t values[] = {17, 23};
+    KuArrayInt ids = {2, values, 2};
+    expected = &ids;
+    assert(!ENTRY(false, &ids, 23) && calls == 0);
+    assert(ENTRY(true, &ids, 23) && calls == 1);
+    assert(ids.data == values && values[1] == 23);
+    return 0;
+}
+"#
+    .replace(
+        "ENTRY",
+        &format!("ku_linked_null_{}", symbol("bool ku_linked_null_")),
+    )
+    .replace("PROVIDER", symbol("extern int64_t "));
+    let c = cwd.join("readonly-mixed.c");
+    let exe = cwd.join(format!("readonly-mixed{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+
+    for (name, diagnostic, reason) in [
+        (
+            "RefuseOwned",
+            "linked_readonly_call",
+            "requires View or scalar Copy arguments",
+        ),
+        (
+            "RefuseNonBool",
+            "linked_guard_type",
+            "expected a readonly bool condition",
+        ),
+        (
+            "RefuseOwnedFour",
+            "linked_readonly_call",
+            "requires View or scalar Copy arguments",
+        ),
+        (
+            "RefuseMovedFour",
+            "linked_view_move",
+            "requires an intact View source",
+        ),
     ] {
         fs::write(cwd.join("function.txt"), name).unwrap();
         let rejected = execute(&mut Command::new(seed), cwd, 30);
         assert_eq!(rejected.status.code(), Some(1));
         assert!(rejected.stdout.is_empty());
         let stderr = String::from_utf8_lossy(&rejected.stderr);
-        assert!(stderr.contains("linked_readonly_call") && stderr.contains(reason));
+        assert!(stderr.contains(diagnostic) && stderr.contains(reason));
     }
 }
 
@@ -1131,6 +1319,209 @@ int main(int argc, char **argv) {
     return 0;
 }
 "#;
+
+pub(super) fn assert_owned_record_array_field_clone(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("array-field-clone.ku"),
+        r#"struct Word { text: str }
+struct Entry { original: Word, alias: Word }
+struct Batch { entries: [Entry], label: str }
+struct Outcome { retained: [Entry], copied: [Entry], label: str }
+fn Snapshot(batch: Batch): Outcome! {
+    copied = batch.entries.clone()
+    retained = batch.entries
+    label = batch.label
+    return ok(Outcome { retained: retained, copied: copied, label: label })
+}
+fn View(&batch: Batch): [Entry]! {
+    copied = batch.entries.clone()
+    return ok(copied)
+}
+fn Take(entries: [Entry]): null! { return ok(null) }
+fn Moved(batch: Batch): [Entry]! {
+    Take(batch.entries)?
+    copied = batch.entries.clone()
+    return ok(copied)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "array-field-clone.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emit = |entry| {
+        fs::write(cwd.join("function.txt"), entry).unwrap();
+        execute(&mut Command::new(seed), cwd, 30)
+    };
+    let emitted = emit("Snapshot");
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, parameters) = signature.split_once('(').unwrap();
+    let batch = parameters.strip_suffix(" a0) {").unwrap();
+    let outcome = result.strip_prefix("KuBootstrapResult_").unwrap();
+    let element = code
+        .lines()
+        .find_map(|line| line.split_once(" } KuArray_"))
+        .unwrap()
+        .1
+        .strip_suffix(';')
+        .unwrap();
+    let host = r#"
+static KuProjectionString owned(uint8_t value) {
+    uint8_t *data = malloc(1);
+    assert(data);
+    *data = value;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+static void check_failure(void) { assert(attempts == 11 && !outstanding()); }
+int main(int argc, char **argv) {
+    (void)argv;
+    (void)test_realloc;
+    ELEMENT *original = malloc(2 * sizeof(*original));
+    assert(original);
+    BATCH input = {.f0 = {2, original, 2}, .f1 = owned('z')};
+    uint8_t *label = input.f1.ptr;
+    for (size_t i = 0; i < 2; ++i) {
+        original[i].f0.f0 = owned((uint8_t)('a' + i));
+        original[i].f1.f0 = owned((uint8_t)('A' + i));
+    }
+    if (argc > 1) {
+        // Header, both strings in entry zero, and the first string in entry
+        // one succeed. The next allocation fails in the partial element.
+        fail_after = 4;
+        assert(atexit(check_failure) == 0);
+        (void)ENTRY(input);
+        return 90;
+    }
+    RESULT result = ENTRY(input);
+    assert(result.ok && attempts == 11 && outstanding() == 11);
+    assert(result.value.f0.data == original && result.value.f1.data != original);
+    assert(result.value.f0.len == 2 && result.value.f1.len == 2);
+    assert(result.value.f2.ptr == label && *label == 'z');
+    for (size_t i = 0; i < 2; ++i) {
+        ELEMENT copied = result.value.f1.data[i];
+        assert(copied.f0.f0.ptr != original[i].f0.f0.ptr && *copied.f0.f0.ptr == (uint8_t)('a' + i));
+        assert(copied.f1.f0.ptr != original[i].f1.f0.ptr && *copied.f1.f0.ptr == (uint8_t)('A' + i));
+    }
+    DROP(&result.value);
+    assert(!outstanding());
+    result = ENTRY((BATCH){0});
+    assert(result.ok && !result.value.f0.len && !result.value.f1.len);
+    DROP(&result.value);
+    assert(attempts == 11 && !outstanding());
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("RESULT", result)
+    .replace("BATCH", batch)
+    .replace("ELEMENT", element)
+    .replace("DROP", &format!("ku_drop_{outcome}"));
+    let c = cwd.join("array-field-clone.c");
+    let exe = cwd.join(format!("array-field-clone{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    let oom = execute(Command::new(exe).arg("partial"), cwd, 10);
+    assert_eq!(oom.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&oom.stderr).trim(), "out of memory");
+    for (name, reason) in [
+        ("View", "unsupported_linked_clone"),
+        ("Moved", "linked_moved_member"),
+    ] {
+        let rejected = emit(name);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(reason));
+    }
+    assert_nested_string_array_snapshot(seed, cwd);
+}
+
+fn assert_nested_string_array_snapshot(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("nested-string-snapshot.ku"),
+        r#"struct State { moved: [str] }
+struct Slot { name: str state: State }
+fn Snapshot(input: [Slot]): [Slot]! {
+    snapshot = input.clone()
+    return ok(snapshot)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "nested-string-snapshot.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Snapshot").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let output = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&output);
+    let code = String::from_utf8(output.stdout).unwrap();
+    let (result, declaration) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, _) = declaration.split_once('(').unwrap();
+    let array = result.strip_prefix("KuBootstrapResult_").unwrap();
+    let element = array.strip_prefix("KuArray_").unwrap();
+    let witness = r#"
+static void clean(void) { assert(!outstanding()); }
+static KuProjectionString owned(uint8_t byte) {
+    uint8_t *data = malloc(1);
+    assert(data);
+    *data = byte;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+int main(int argc, char **argv) {
+    (void)test_realloc;
+    ARRAY input = {1, malloc(sizeof(ELEMENT)), 1};
+    assert(input.data && atexit(clean) == 0);
+    input.data[0] = (ELEMENT){0};
+    input.data[0].f0 = owned('N');
+    KuProjectionString external[1] = {0};
+    if (argc == 2 && strcmp(argv[1], "malformed") == 0) {
+        input.data[0].f1.f0 = (KuGuardStringArray){2, external, 1};
+    } else {
+        KuProjectionString *data = malloc(2 * sizeof(*data));
+        assert(data);
+        data[0] = owned('A');
+        data[1] = owned('B');
+        input.data[0].f1.f0 = (KuGuardStringArray){2, data, 2};
+        if (argc == 2) fail_after = 4;
+    }
+    RESULT result = ENTRY(input);
+    if (argc == 2) return 90;
+    assert(result.ok && result.value.len == 1 && outstanding() == 5);
+    ELEMENT *snapshot = result.value.data;
+    assert(*snapshot->f0.ptr == 'N' && snapshot->f1.f0.len == 2);
+    assert(*snapshot->f1.f0.data[0].ptr == 'A' && *snapshot->f1.f0.data[1].ptr == 'B');
+    DROP(&result.value);
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("RESULT", result)
+    .replace("ARRAY", array)
+    .replace("ELEMENT", element)
+    .replace("DROP", &format!("ku_linked_view_{element}_drop"));
+    let c = cwd.join("nested-string-snapshot.c");
+    let exe = cwd.join(format!(
+        "nested-string-snapshot{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{witness}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    for (case, expected) in [
+        ("partial", "out of memory"),
+        ("malformed", "invalid struct array ownership"),
+    ] {
+        let failed = execute(Command::new(&exe).arg(case), cwd, 10);
+        assert_eq!(failed.status.code(), Some(1));
+        assert_eq!(String::from_utf8_lossy(&failed.stderr).trim(), expected);
+    }
+}
 
 pub(super) fn assert_owned_string_field_clone(seed: &Path, cwd: &Path) {
     fs::write(cwd.join("field-string.ku"), STR_FIELD_SOURCE).unwrap();

@@ -7972,6 +7972,31 @@ fn native_match_binding_used_more_than_once_is_not_re_moved() {
 }
 
 #[test]
+fn native_guarded_match_preserves_nested_owned_payload_until_selection() {
+    let dir = unique_temp_dir("match-owned-guard");
+    fs::write(
+        dir.join("summary.ku"),
+        include_str!("fixtures/native_guarded_match/summary.ku"),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("main.ku"),
+        include_str!("fixtures/native_guarded_match/main.ku"),
+    )
+    .unwrap();
+    let Some(exe) = native_build(&dir, "main.ku", "guardmatch") else {
+        return;
+    };
+    let (stdout, code) = run_binary(&exe);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        include_str!("fixtures/native_guarded_match/expected.txt").replace("\r\n", "\n")
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_void_returning_function_call_compiles() {
     // A call to a user function with no return type must not emit `void t0 = f()`.
     let dir = unique_temp_dir("void-call");

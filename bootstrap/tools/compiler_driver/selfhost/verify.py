@@ -203,6 +203,10 @@ def verify_stage3_applications(repo, source, binary, cc, caller):
             "exercise_linked_unit_enum_match": (cc, caller),
             "exercise_linked_checked_enum_match": (cc, caller),
             "exercise_linked_unit_enum_result": (cc, caller),
+            "exercise_linked_unit_enum_member": (cc, caller),
+            "exercise_linked_string_return_match": (cc, caller),
+            "exercise_finally_frontend": (caller,),
+            "exercise_linked_finally": (cc, caller),
         }
         for name, arguments in checks.items():
             try:

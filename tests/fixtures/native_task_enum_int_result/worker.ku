@@ -1,0 +1,14 @@
+import time from "std.time"
+enum ScanStatus { Missing, Found(index: int) }
+async fn Locate(line: str, failed: bool): ScanStatus! {
+    println("locate")
+    time.sleep(10)?
+    if (failed) { fail "could not scan line" }
+    if (line.len() == 0) { return ok(ScanStatus.Missing) }
+    return ok(ScanStatus.Found(line.len() - 1))
+}
+async fn Selected(index: int): int! {
+    println("selected")
+    time.sleep(10)?
+    return ok(index)
+}

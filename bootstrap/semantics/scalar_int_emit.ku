@@ -534,3 +534,37 @@ fn EmitStaticJsonString(&symbol: str, &literal: str, length: int, escaped: bool)
     text += "    return (KuResult_str){.ok = true, .value = {decoded, " + str(length) + "u, " + str(capacity) + "u, 1u}};\n"
     return "#include <stdlib.h>\n#include <string.h>\n" + text + "}\n"
 }
+
+fn EmitLinkedMatchStart(&subject: str, id: int, string: bool, compare_string: bool): str {
+    if (!string) { return "    switch ((" + subject.clone() + ").tag) {\n" }
+    if (compare_string) {
+        return "    const KuProjectionString match_" + str(id) + " = " + subject.clone() + ";\n"
+    }
+    return "    (void)(" + subject.clone() + ");\n"
+}
+
+fn EmitLinkedEnumMatchCase(selected: int): str {
+    if (selected > 0) { return "    case " + str(selected - 1) + ": {\n" }
+    return "    default: {\n"
+}
+
+fn EmitLinkedMatchEnd(string: bool, has_default: bool): str {
+    if (string) { return "" }
+    if (has_default) { return "    }\n" }
+    return "    default: { extern void abort(void); abort(); }\n    }\n"
+}
+
+fn EmitLinkedFinallyJoin(&error: str, catches: bool, resumes: bool): str {
+    join = error.clone() + "_run"
+    code = ""
+    if (resumes) { code += "    goto " + join.clone() + ";\n" }
+    if (catches) {
+        code += error.clone() + "_handler:\n    " + error.clone() + "_failed = true;\n    goto " + join.clone() + ";\n"
+    }
+    return code + join + ":;\n"
+}
+
+fn EmitLinkedFinallyError(&error: str): str {
+    return "    if (" + error.clone() + "_failed) {\n        result.error = " + error.clone() + ";\n        "
+        + error.clone() + " = (KuBootstrapError){0};\n        goto cleanup;\n    }\n"
+}

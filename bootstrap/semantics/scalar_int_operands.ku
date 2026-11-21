@@ -3,7 +3,7 @@ import { Node } from "../stage2/ast.ku"
 import { DiagnosticCanonical, MakeDiagnostic } from "../stage2/diagnostic.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
-import { ScalarIntParameter, ScalarStringPart } from "./scalar_int_emit.ku"
+import { EmitLinkedEnumMatchCase, ScalarIntParameter, ScalarStringPart } from "./scalar_int_emit.ku"
 
 fn RejectScalarInt(code: str, message: str, span: Span): null! {
     domain = "bootstrap.semantics.int"
@@ -64,6 +64,14 @@ fn ScalarStringLiteral(&node: Node): str! {
         index = index + 1
     }
     return ok(literal + "\", " + str(length) + "u")
+}
+
+fn LinkedMatchCase(&nodes: [Node], id: int, selected: int, string: bool): str! {
+    if (!string) { return ok(EmitLinkedEnumMatchCase(selected)) }
+    if (selected == 0) { return ok("    {\n") }
+    literal = nodes[selected - 1].clone()
+    return ok("    if (ku_guard_string_equal(match_" + str(id)
+        + ", (KuProjectionString){(uint8_t*)" + ScalarStringLiteral(literal)? + ", 0u, KU_PROJECTION_STRING_STATIC})) {\n")
 }
 
 fn ScalarStringOperand(&parameters: [ScalarIntParameter], &node: Node): str! {

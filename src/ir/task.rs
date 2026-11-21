@@ -136,6 +136,8 @@ pub enum TaskUnaryOp {
     Negate,
     Not,
     EnumTag,
+    EnumFromInt { tag: i32 },
+    EnumPayloadInt { tag: i32 },
 }
 
 /// Logical And/Or are intentionally absent: they require Branch/Jump control
@@ -665,24 +667,69 @@ pub(crate) fn record_type(ty: &IrType) -> bool {
     matches!(ty, IrType::Named(name) if name.starts_with("__ku_task_record_"))
 }
 
-/// Nominal enum identity after Task layout validation has excluded payloads.
-pub(crate) fn unit_enum_name(ty: &IrType) -> Option<&str> {
+/// Nominal identity, independent of the supported Task layout of its variants.
+pub(crate) fn enum_name(ty: &IrType) -> Option<&str> {
     match ty {
         IrType::Named(name) => super::enum_type_name(name),
         _ => None,
     }
 }
 
-fn unit_enum_result(ty: &IrType) -> bool {
-    matches!(ty, IrType::Result(inner) if unit_enum_name(inner).is_some())
+fn enum_result(ty: &IrType) -> bool {
+    matches!(ty, IrType::Result(inner) if enum_name(inner).is_some())
+}
+
+pub(crate) fn enum_layout<'a>(
+    layouts: &'a super::IrLayoutTable,
+    ty: &IrType,
+) -> Option<&'a super::IrEnumLayout> {
+    let name = enum_name(ty)?;
+    layouts.enums.iter().find(|layout| layout.name == name)
+}
+
+pub(crate) fn enum_int_variant(layout: &super::IrEnumLayout) -> Option<&super::IrVariantLayout> {
+    if layout.variants.len() > 64 {
+        return None;
+    }
+    let mut payloads = layout
+        .variants
+        .iter()
+        .filter(|variant| !variant.fields.is_empty());
+    let variant = payloads.next()?;
+    match variant.fields.as_slice() {
+        [field]
+            if field.ty == IrType::Int
+                && field.offset == 0
+                && !field.is_async_callable
+                && payloads.next().is_none() =>
+        {
+            Some(variant)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn enum_variant_layout_supported(layout: &super::IrEnumLayout) -> bool {
+    layout
+        .variants
+        .iter()
+        .all(|variant| variant.fields.is_empty())
+        || enum_int_variant(layout).is_some()
 }
 
 pub(crate) fn unit_enum_layout<'a>(
     layouts: &'a super::IrLayoutTable,
     ty: &IrType,
 ) -> Option<&'a super::IrEnumLayout> {
-    let name = unit_enum_name(ty)?;
-    layouts.enums.iter().find(|layout| layout.name == name)
+    // The caller uses a table already checked for supported variant layouts.
+    enum_layout(layouts, ty).filter(|layout| enum_int_variant(layout).is_none())
+}
+
+pub(crate) fn enum_int_layout<'a>(
+    layouts: &'a super::IrLayoutTable,
+    ty: &IrType,
+) -> Option<&'a super::IrVariantLayout> {
+    enum_layout(layouts, ty).and_then(enum_int_variant)
 }
 
 /// This check also bounds generated traversal of owned storage and byte ranges.
@@ -732,8 +779,8 @@ fn verify_record_reference(layouts: &super::IrLayoutTable, ty: &IrType) -> bool 
     } else {
         ty
     };
-    if unit_enum_name(ty).is_some() {
-        return unit_enum_layout(layouts, ty).is_some();
+    if enum_name(ty).is_some() {
+        return enum_layout(layouts, ty).is_some();
     }
     !record_type(ty)
         || matches!(ty, IrType::Named(name)
@@ -745,21 +792,27 @@ fn parameter_type(ty: &IrType) -> bool {
         || nullable_leaf(ty)
         || error_type(ty)
         || flat_array(ty)
-        || (result_type(ty) && !unit_enum_result(ty))
+        || (result_type(ty) && !enum_result(ty))
         || http_type(ty)
         || pg_capture_type(ty)
         || record_type(ty)
         || nullable_record(ty)
-        || unit_enum_name(ty).is_some()
+        || enum_name(ty).is_some()
 }
 fn value_type(ty: &IrType) -> bool {
     parameter_type(ty)
-        || unit_enum_result(ty)
+        || enum_result(ty)
         || pg_params_array(ty)
         || local_bytes_type(ty)
         || local_net_type(ty)
         || local_pg_type(ty)
         || local_json_type(ty)
+}
+
+fn verified_parameter_type(layouts: &super::IrLayoutTable, ty: &IrType) -> bool {
+    parameter_type(ty)
+        && (enum_name(ty).is_none() || unit_enum_layout(layouts, ty).is_some())
+        && verify_record_reference(layouts, ty)
 }
 
 /// A local-only typed PostgreSQL parameter vector. It cannot become a Task
@@ -792,7 +845,7 @@ pub(crate) fn http_type(ty: &IrType) -> bool {
 }
 
 fn result_type(ty: &IrType) -> bool {
-    matches!(ty, IrType::Result(inner) if primitive(inner) || nullable_leaf(inner) || flat_array(inner) || http_response_type(inner) || record_type(inner) || unit_enum_name(inner).is_some() || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
+    matches!(ty, IrType::Result(inner) if primitive(inner) || nullable_leaf(inner) || flat_array(inner) || http_response_type(inner) || record_type(inner) || enum_name(inner).is_some() || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
 }
 
 fn copy_type(ty: &IrType) -> bool {
@@ -989,7 +1042,7 @@ fn preflight(
                     parameters.len() <= limits.max_slots
                         && parameters
                             .iter()
-                            .all(|ty| parameter_type(ty) && verify_record_reference(layouts, ty))
+                            .all(|ty| verified_parameter_type(layouts, ty))
                         && result_type(result)
                         && verify_record_reference(layouts, result)
                 }
@@ -1225,7 +1278,7 @@ fn validate_shape(
             TaskSlotType::Value {
                 ty,
                 borrowed: false,
-            } if parameter_type(ty) => {}
+            } if verified_parameter_type(layouts, ty) => {}
             TaskSlotType::Value {
                 borrowed: false, ..
             } => {
@@ -1332,8 +1385,11 @@ fn validate_shape(
                 TaskOp::Init { dst, value } => {
                     let ty = slot_type(get_slot(*dst)?)?.0;
                     if let TaskConstant::UnitEnum { tag } = value {
-                        if !unit_enum_layout(layouts, ty).is_some_and(|layout| {
-                            usize::try_from(*tag).is_ok_and(|index| index < layout.variants.len())
+                        if !enum_layout(layouts, ty).is_some_and(|layout| {
+                            usize::try_from(*tag)
+                                .ok()
+                                .and_then(|index| layout.variants.get(index))
+                                .is_some_and(|variant| variant.fields.is_empty())
                         }) {
                             return Err(invalid(
                                 "Task enum initializer requires a declared variant",
@@ -1598,20 +1654,30 @@ fn validate_shape(
                 TaskOp::Unary { dst, op, src } => {
                     budget.spend()?;
                     let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
-                    let (source, _) = slot_type(get_slot(*src)?)?;
+                    let (source, source_borrowed) = slot_type(get_slot(*src)?)?;
                     let valid = match op {
                         TaskUnaryOp::Negate => {
                             source == &IrType::Int && destination == &IrType::Int
                         }
                         TaskUnaryOp::Not => source == &IrType::Bool && destination == &IrType::Bool,
                         TaskUnaryOp::EnumTag => {
-                            unit_enum_layout(layouts, source).is_some()
+                            enum_layout(layouts, source).is_some() && destination == &IrType::Int
+                        }
+                        TaskUnaryOp::EnumFromInt { tag } => {
+                            source == &IrType::Int
+                                && enum_int_layout(layouts, destination)
+                                    .is_some_and(|variant| usize::try_from(*tag) == Ok(variant.tag))
+                        }
+                        TaskUnaryOp::EnumPayloadInt { tag } => {
+                            !source_borrowed
                                 && destination == &IrType::Int
+                                && enum_int_layout(layouts, source)
+                                    .is_some_and(|variant| usize::try_from(*tag) == Ok(variant.tag))
                         }
                     };
                     if dst == src || destination_borrowed || !valid {
                         return Err(invalid(
-                            "Unary requires distinct int, bool or payload-free enum Value slots",
+                            "Unary requires distinct slots with matching scalar or enum types and tags",
                         ));
                     }
                 }
@@ -1680,7 +1746,7 @@ fn validate_shape(
                             || flat_array(source)
                             || http_response_type(source)
                             || record_type(source)
-                            || unit_enum_name(source).is_some())
+                            || enum_name(source).is_some())
                         || !matches!(destination, IrType::Result(inner) if inner.as_ref() == source)
                         || (source_borrowed && !copy_type(source))
                     {
@@ -4593,9 +4659,12 @@ pub(crate) fn verify_and_plan_with_layouts(
 ) -> KuResult<TaskFramePlan> {
     if layouts.enums.len() > limits.max_functions
         || layouts.enums.iter().any(|layout| {
-            layout.variants.iter().enumerate().any(|(index, variant)| {
-                !variant.fields.is_empty() || variant.tag != index || i32::try_from(index).is_err()
-            })
+            !enum_variant_layout_supported(layout)
+                || layout
+                    .variants
+                    .iter()
+                    .enumerate()
+                    .any(|(index, variant)| variant.tag != index || i32::try_from(index).is_err())
         })
     {
         return Err(invalid("unsupported or over-budget Task enum layout"));

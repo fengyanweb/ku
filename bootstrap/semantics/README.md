@@ -59,12 +59,28 @@ namespace imports keep the enum's declaration identity across C units.
 Passing or returning an existing enum binding moves it. Equality and inequality
 compare values of the same payload-free enum without moving either operand.
 Direct calls in readonly operands still require View or scalar Copy arguments.
-A complete `return match` can choose an `int` or `int!` result from unit-variant
-arms or a final wildcard. The subject is evaluated once, and the selected arm
-alone runs. An `int!` arm can call `ok` with an int expression that propagates
-errors with `?`, or forward a declared `int!` call directly. Payload patterns,
-guards, other match expression positions, enum payloads, and enum containers
-remain outside the linked emitter subset.
+A linked struct can store a direct payload-free enum field alongside its other
+fields. A View supports inspecting and matching the field. Moving the field
+from an owned struct consumes that field and leaves its siblings available.
+Separate C units use the enum declaration's identity even when their signatures
+mention only the struct. Arrays, callbacks and further nesting of records with
+these members remain outside this subset.
+A complete `return match` can choose an `int` or `int!` result. A payload-free
+enum subject uses unit-variant arms and may end with a wildcard. A `str` subject
+uses string literal arms and requires a final wildcard. String patterns compare
+decoded UTF-8 bytes, including embedded zeros.
+The subject is evaluated once, and the selected arm alone runs. An `int!` arm
+can call `ok` with an int expression that propagates errors with `?`, or forward
+a declared `int!` call directly. Payload patterns, guards, other match expression
+positions, enum payloads, and enum containers remain outside the linked subset.
+
+The linked emitter also supports a top-level synchronous `try/finally` in a
+checked function returning `null`, `int`, `bool`, or `str`. A straight-line
+protected block can finish normally, propagate an Error, or end with
+`return ok(...)`. The `finally` block can print while the selected result or
+Error remains owned. Its output statements must fall through. Nested cleanup,
+combined catch/finally, transfers of outer owners in the protected block, and
+cleanup that returns or propagates an Error still require a different backend.
 
 ## Check a set of relative modules
 

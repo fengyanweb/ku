@@ -373,3 +373,33 @@ fn CheckDirectOwnedMoves(&nodes: [Node], &edges: [int], &transfers: [int], first
     checkDirectMoveBlock(nodes, edges, transfers, flow, start, stop, 0, scope_start)?
     return ok(null)
 }
+
+fn ReadLinkedProtectedTail(&named: NamedModule, &protected: Node): Node! {
+    if (protected.kind != "TryBody") {
+        RejectLayout("unsupported_linked_finally", "expected a protected body", DeclarationSpan(protected))?
+    }
+    tail = protected.clone()
+    count = protected.edge_count
+    index = 0
+    while (index < count) {
+        id = named.parsed.arena.edges[protected.first_edge + index]
+        tail = named.parsed.arena.nodes[id - 1].clone()
+        kind = tail.kind.clone()
+        if (!(kind == "Print" || kind == "ExprStmt" || kind == "Assign" || kind == "VarDecl" ||
+            (index == count - 1 && (kind == "Return" || kind == "Fail")))) {
+            RejectLayout("unsupported_linked_finally", "protected body requires straight-line statements and an optional terminal", DeclarationSpan(tail))?
+        }
+        index = index + 1
+    }
+    if (tail.kind == "Return") {
+        if (tail.edge_count != 1) {
+            RejectLayout("unsupported_linked_finally_return", "protected return requires builtin ok", DeclarationSpan(tail))?
+        }
+        call_id = named.parsed.arena.edges[tail.first_edge]
+        call = named.parsed.arena.nodes[call_id - 1].clone()
+        if (call.kind != "Call" || call.edge_count != 2) {
+            RejectLayout("unsupported_linked_finally_return", "protected return requires builtin ok", DeclarationSpan(call))?
+        }
+    }
+    return ok(tail)
+}

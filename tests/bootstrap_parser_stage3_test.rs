@@ -957,13 +957,13 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
         Stmt::Continue { span } => push_node(arena, "Continue", String::new(), 0, *span, &[]),
         Stmt::Try {
             body,
-            catch_name: Some(catch_name),
+            catch_name,
             catch_body,
             finally_body,
             span,
-        } if finally_body.is_empty() => {
+        } => {
             // The Rust AST retains the child statements and binding name,
-            // but does not store the spans of the two braced blocks.
+            // but does not store the spans of the braced blocks.
             let tokens = Lexer::new(source).lex().expect("try projection lex");
             let start = tokens
                 .iter()
@@ -972,16 +972,6 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
             assert_eq!(tokens[start].kind, TokenKind::Try);
             let try_open = start + 1;
             let try_close = closing_brace(&tokens, try_open);
-            let catch_start = try_close + 1;
-            assert_eq!(tokens[catch_start].kind, TokenKind::Catch);
-            assert_eq!(tokens[catch_start + 1].kind, TokenKind::LParen);
-            assert_eq!(tokens[catch_start + 3].kind, TokenKind::RParen);
-            let binding = &tokens[catch_start + 2];
-            assert!(matches!(&binding.kind, TokenKind::Ident(name) if name == catch_name));
-            let catch_open = catch_start + 4;
-            let catch_close = closing_brace(&tokens, catch_open);
-            assert_eq!(tokens[catch_close].span.end, span.end);
-
             let body = body
                 .iter()
                 .map(|statement| project_stmt(source, statement, arena))
@@ -994,35 +984,65 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
                 Span::new(tokens[try_open].span.start, tokens[try_close].span.end),
                 &body,
             );
-            let binding = push_node(
-                arena,
-                "CatchBinding",
-                catch_name.clone(),
-                0,
-                binding.span,
-                &[],
-            );
-            let caught = catch_body
-                .iter()
-                .map(|statement| project_stmt(source, statement, arena))
-                .collect::<Vec<_>>();
-            let catch_body = push_node(
-                arena,
-                "CatchBody",
-                String::new(),
-                0,
-                Span::new(tokens[catch_open].span.start, span.end),
-                &caught,
-            );
-            let catch = push_node(
-                arena,
-                "Catch",
-                String::new(),
-                0,
-                Span::new(tokens[catch_start].span.start, span.end),
-                &[binding, catch_body],
-            );
-            push_node(arena, "Try", String::new(), 0, *span, &[try_body, catch])
+            let mut children = vec![try_body];
+            let mut close = try_close;
+            if let Some(catch_name) = catch_name {
+                let catch_start = close + 1;
+                assert_eq!(tokens[catch_start].kind, TokenKind::Catch);
+                assert_eq!(tokens[catch_start + 1].kind, TokenKind::LParen);
+                assert_eq!(tokens[catch_start + 3].kind, TokenKind::RParen);
+                let binding = &tokens[catch_start + 2];
+                assert!(matches!(&binding.kind, TokenKind::Ident(name) if name == catch_name));
+                let catch_open = catch_start + 4;
+                close = closing_brace(&tokens, catch_open);
+                let end = tokens[close].span.end;
+                let binding = push_node(
+                    arena,
+                    "CatchBinding",
+                    catch_name.clone(),
+                    0,
+                    binding.span,
+                    &[],
+                );
+                let caught = catch_body
+                    .iter()
+                    .map(|statement| project_stmt(source, statement, arena))
+                    .collect::<Vec<_>>();
+                let catch_body = push_node(
+                    arena,
+                    "CatchBody",
+                    String::new(),
+                    0,
+                    Span::new(tokens[catch_open].span.start, end),
+                    &caught,
+                );
+                children.push(push_node(
+                    arena,
+                    "Catch",
+                    String::new(),
+                    0,
+                    Span::new(tokens[catch_start].span.start, end),
+                    &[binding, catch_body],
+                ));
+            }
+            let finally_start = close + 1;
+            if tokens[finally_start].kind == TokenKind::Finally {
+                close = closing_brace(&tokens, finally_start + 1);
+                let cleanup = finally_body
+                    .iter()
+                    .map(|statement| project_stmt(source, statement, arena))
+                    .collect::<Vec<_>>();
+                children.push(push_node(
+                    arena,
+                    "Finally",
+                    String::new(),
+                    0,
+                    Span::new(tokens[finally_start].span.start, tokens[close].span.end),
+                    &cleanup,
+                ));
+            }
+            assert_eq!(tokens[close].span.end, span.end);
+            push_node(arena, "Try", String::new(), 0, *span, &children)
         }
         other => panic!("stage-3 oracle received unsupported Rust statement: {other:?}"),
     }
@@ -1787,14 +1807,14 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         .find(|line| line.starts_with("fn ReadFunction("))
         .expect("production bootstrap function reader signature");
     let compiler_declaration = format!("{compiler_signature}}}");
-    let real_charge_work = real_local_function(
-        include_str!("../bootstrap/stage3/function_header.ku"),
-        "ReadFunctionHeaderMode",
-        "ChargeWork",
-    );
-    let real_add_node = real_local_function(
+    let real_parse_window = real_local_function(
         include_str!("../bootstrap/stage3/parser.ku"),
         "ParseBoundedModule",
+        "ParseExpressionWindow",
+    );
+    let real_add_node = real_local_function(
+        include_str!("../bootstrap/stage3/statements.ku"),
+        "ReadFunctionBodySpan",
         "AddNode",
     );
     let structured_http = include_str!("../examples/native_task_structured_http.ku");
@@ -1849,6 +1869,9 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "fn f() { {plain: 1}; {...remaining} = Named{field: 2} }",
         "// 捕获😀\r\nfn outer(prefix: int) { read = fn(&value: int): int { if (ready) { return prefix } return value }; after = read }",
         "// 异常😀\r\nfn main() { before = 0 try { if (check) { try {} catch(inner) {} } next = 1 } catch(outer) { one = outer.code try { recover()? } catch(recovery) {} two = outer.message } after = 2 }",
+        "// 清理😀\r\nfn main() { try { work() } finally { release() } next() }",
+        "fn main() { try { work() } catch(err) { report(err) } finally { try { release() } finally { end() } } next() }",
+        "fn main() { try {} catch(err) { report(err) } finally {} }",
         "fn sum() { count = 0 for n in [1,2] { if (n > 1) { count += n } } count %= 5 return count }",
         "// 字段🙂\r\nfn f() { item.state.code += Build(1); item.cells[next(2)] -= 3; if (ready) row.x *= 4; row.y = 5; row.z /= 2; row.items[0] %= 3 }",
         "// 跳转😀\r\nfn f() { for value in [1,2] { try { if (value == 1) { continue; } break } catch(err) { break; } } while (ready) { continue } }",
@@ -1862,7 +1885,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
 
         r#"fn main() { println(Box{first: Inner{x: 1 + 2}, other: [a(), 4]}?.other) }"#,
         r#"fn main() { value = Box{value: "中😀"} println(value) }"#,
-        &real_charge_work,
+        &real_parse_window,
         &real_add_node,
         "fn outer(value: int): int { before = 1 fn read(&row: Row, transform: fn(int): int): int { fn inner(x: int): int { return x + before } return inner(transform(row.value)) }; return read(item, callback) }",
         "// 局部😀\r\nfn main() { if (ready) { fn inside(value): int { return value + 1 } same = inside(0) } else { fn inside(value): int { return value - 1 }; same = inside(0) } after = 2 }",
@@ -2539,7 +2562,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let direct_body_while_source =
         "fn f() { before; while (looping) { if (ready) { inner; } } after; }";
 
-    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { Node, Arena, AstCanonical, ParseOutput } from \"../stage2/ast.ku\"\nimport { ParseModule, ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ModuleFunctionEnd, ReadFunction } from \"./functions.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
+    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { Node, Arena, AstCanonical, ParseOutput } from \"../stage2/ast.ku\"\nimport { ParseModule, ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ModuleFunctionEnd, ReadFunction } from \"./functions.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { ParseTypeWindow, ReadSignatureTypePrefix } from \"./signature.ku\"\n\n".to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
@@ -2653,6 +2676,21 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         "    ExpectEmptyImportWindowError()?\n    direct_tokens = Scan(\"int\")?\n    direct = ParseTypeWindow(direct_tokens.clone())?\n    if (direct.work != 4) {{ panic(\"type-window validation work was not counted\") }}\n    empty_window: [Token] = []\n    ExpectTypeWindowError(empty_window, \"type window must contain one final non-type boundary token|1:1@0..1:1@0\")?\n    missing_boundary: [Token] = [direct_tokens[0].clone()]\n    ExpectTypeWindowError(missing_boundary, \"type window is missing its final non-type boundary|1:1@0..1:4@3\")?\n    early_boundary = direct_tokens.push(direct_tokens[direct_tokens.len() - 1].clone())\n    ExpectTypeWindowError(early_boundary, \"type window boundary must be final|1:4@3..1:4@3\")?\n    too_many_type_tokens = Scan({})?\n    ExpectTypeWindowError(too_many_type_tokens, \"type window accepts at most 512 tokens|1:1@0..1:2@1\")?\n",
         ku_string(&over_type_window_source)
     ));
+    body.push_str(
+        r#"    delimited = Scan("int;")?
+    type_tokens = [delimited[0].clone(), delimited[1].clone()]
+    typed = ParseTypeWindow(type_tokens.clone())?
+    if (typed.root != direct.root || typed.consumed != direct.consumed || typed.work != direct.work) {
+        panic("a punctuation boundary changed the admitted type plan")
+    }
+    missing_physical_eof = false
+    try { ReadSignatureTypePrefix(type_tokens, 0, 1)? } catch(error) {
+        missing_physical_eof = error.code == "invalid_token_stream"
+            && error.message == "error|bootstrap.parser.stage3|invalid_token_stream|<source>|type inspection escaped its bounded token window|1:1@0..1:1@0"
+    }
+    if (!missing_physical_eof) { panic("a public type prefix requires a physical EOF") }
+"#,
+    );
     body.push_str(&format!(
         "    empty_struct_window: [Token] = []\n    ExpectStructWindowError(empty_struct_window, \"struct window must start with struct and end with EOF|1:1@0..1:1@0\")?\n    direct_struct_tokens = Scan({})?\n    missing_struct_eof: [Token] = [direct_struct_tokens[0].clone(), direct_struct_tokens[1].clone(), direct_struct_tokens[2].clone(), direct_struct_tokens[3].clone()]\n    ExpectStructWindowError(missing_struct_eof, {})?\n    early_struct_eof: [Token] = [direct_struct_tokens[0].clone(), direct_struct_tokens[1].clone(), direct_struct_tokens[2].clone(), direct_struct_tokens[4].clone(), direct_struct_tokens[3].clone(), direct_struct_tokens[4].clone()]\n    ExpectStructWindowError(early_struct_eof, {})?\n    wrong_struct_start = Scan({})?\n    ExpectStructWindowError(wrong_struct_start, {})?\n    trailing_struct_tokens = Scan({})?\n    ExpectStructWindowError(trailing_struct_tokens, {})?\n    struct_window_over = Scan({})?\n    ExpectStructWindowError(struct_window_over, \"struct window accepts at most 512 tokens|1:1@0..1:1@0\")?\n",
         ku_string(direct_struct_source),
@@ -3906,7 +3944,7 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             "fn main() { try {}",
             TokenKind::Eof,
             "unexpected_token",
-            "stage-3 try requires a catch clause",
+            "try requires catch or finally",
         ),
         (
             "fn main() { try {} catch(err) {",
@@ -3915,16 +3953,16 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             "expected '}' after catch body",
         ),
         (
-            "fn main() { try {} finally { recover() } }",
-            TokenKind::Finally,
-            "unsupported_statement",
-            "stage-3 finally is not supported",
+            "fn main() { try {} finally 7 }",
+            TokenKind::Int(7),
+            "unexpected_token",
+            "expected '{' before finally body",
         ),
         (
-            "fn main() { try {} catch(err) {} finally { recover() } }",
-            TokenKind::Finally,
-            "unsupported_statement",
-            "stage-3 finally is not supported",
+            "fn main() { try {} catch(err) {} finally { recover()",
+            TokenKind::Eof,
+            "unexpected_eof",
+            "expected '}' after finally body",
         ),
         (
             "fn f() { return match value { Kind.Ident if true => 1 } }",

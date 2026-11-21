@@ -1,0 +1,22 @@
+import { ScanStatus as Status, Locate, Selected } from "./worker"
+async fn main(): null! {
+    pending = Locate("整理🙂", false)
+    kept = (await pending)?
+    println(match kept {
+        Status.Missing => -1
+        Status.Found(index) => (await Selected(index))?
+    })
+    println(match kept { Status.Missing => -1 Status.Found(index) => index })
+    println(match (await Locate("", false))? {
+        Status.Missing => -1
+        Status.Found(index) => (await Selected(index))?
+    })
+    println(match (await Locate("文", false))? { Status.Found(index) => index _ => -1 })
+    try {
+        println(match (await Locate("不可读", true))? {
+            Status.Found(index) => (await Selected(index))?
+            _ => -1
+        })
+    } catch (issue) { println(issue.message) }
+    return ok(null)
+}

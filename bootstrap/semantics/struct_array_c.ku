@@ -259,13 +259,13 @@ fn BoundArrayCPrefix(&binding: TypeNameBinding): str {
 }
 
 fn EmitBoundCarrierDeclarations(&types: [TypeNameBinding], &validated: [TypeNameBinding],
-                            &defined: [str], str_array: bool): str {
+                            &defined: [str], str_array: bool, &member_enums: [TypeNameBinding]): str {
     source = ""
     index = 0
     while (index < types.len()) {
         carrier = types[index].clone()
         if (carrier.declaration_kind == "UnitEnum") {
-            source += EmitUnitEnumHeader(carrier)
+            if (BoundArrayTypePosition(member_enums, carrier) == 0) { source += EmitUnitEnumHeader(carrier) }
         } else {
             element = CTypeName(carrier.module_index, carrier.declaration_node)
             if (carrier.declaration_kind == "BuiltinArray" && carrier.name == "int") { element = "int64_t" }
@@ -394,7 +394,7 @@ fn EmitLinkedOwnedArrayClone(&layouts: [StructLayout], &source: str, &target: st
     return EmitCheckedRecordArrayClone(source, target, prefix, layout, nested)
 }
 
-fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str): str! {
+fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str, &member_enums: [TypeNameBinding]): str! {
     text = header
     text += EmitBoundStringOperations(body.uses_clone, body.uses_concat, body.uses_int_format, body.uses_prefix_suffix)
     definitions = EmitCombinedCLayouts(body.layouts, body.owning_layouts)?
@@ -402,7 +402,7 @@ fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str):
         text += "#include <stdlib.h>\n"
     }
     text += definitions.source
-    text += EmitBoundCarrierDeclarations(body.carriers, body.validated_arrays, definitions.array_types, body.uses_str_array)
+    text += EmitBoundCarrierDeclarations(body.carriers, body.validated_arrays, definitions.array_types, body.uses_str_array, member_enums)
     if (body.uses_chars) {
         text += "#include <stdio.h>\n" + ManagedSourceCharactersRuntime(!body.uses_str_array &&
             !ContainsType(definitions.array_types, "KuGuardStringArray"))

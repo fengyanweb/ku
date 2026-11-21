@@ -21,8 +21,8 @@ use crate::ir::IrType;
 
 use super::output::COutput;
 use super::{
-    c_drop_value, c_move_value, c_static_utf8_string, c_type, c_type_suffix, c_zero_initializer,
-    unsupported,
+    c_drop_value, c_ident, c_move_value, c_static_utf8_string, c_type, c_type_suffix,
+    c_zero_initializer, unsupported,
 };
 
 #[path = "c_task_region.rs"]
@@ -524,7 +524,7 @@ impl<'a> FrameEmitter<'a> {
                             || crate::ir::task::http_type(ty)
                             || crate::ir::task::record_type(ty)
                             || crate::ir::task::nullable_record(ty)
-                            || crate::ir::task::unit_enum_name(ty).is_some())
+                            || crate::ir::task::enum_name(ty).is_some())
                         && !persistent.contains(&index)
                     {
                         return Err(unsupported(
@@ -820,7 +820,7 @@ impl<'a> FrameEmitter<'a> {
                         || crate::ir::task::http_type(ty)
                         || crate::ir::task::record_type(ty)
                         || crate::ir::task::nullable_record(ty)
-                        || crate::ir::task::unit_enum_name(ty).is_some())
+                        || crate::ir::task::enum_name(ty).is_some())
             }
         }
     }
@@ -3244,6 +3244,33 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     ));
                     self.set_init(out, *dst, true);
                 }
+                TaskUnaryOp::EnumFromInt { tag } => {
+                    let ty = self.slot_type(*dst)?;
+                    let variant = crate::ir::task::enum_int_layout(self.layouts, ty)
+                        .ok_or_else(|| unsupported("missing Task enum constructor layout"))?;
+                    out.push_str(&format!(
+                        "  {} = ({}){{.tag={tag},.payload.{}.{}={}}};\n",
+                        self.place(*dst),
+                        c_type(ty)?,
+                        c_ident(&variant.name),
+                        c_ident(&variant.fields[0].name),
+                        self.place(*src),
+                    ));
+                    self.set_init(out, *dst, true);
+                }
+                TaskUnaryOp::EnumPayloadInt { tag } => {
+                    let variant =
+                        crate::ir::task::enum_int_layout(self.layouts, self.slot_type(*src)?)
+                            .ok_or_else(|| unsupported("missing Task enum payload layout"))?;
+                    let src = self.place(*src);
+                    out.push_str(&format!(
+                        "  if ({src}.tag!={tag}) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  {} = {src}.payload.{}.{};\n",
+                        self.place(*dst),
+                        c_ident(&variant.name),
+                        c_ident(&variant.fields[0].name),
+                    ));
+                    self.set_init(out, *dst, true);
+                }
                 TaskUnaryOp::Not => {
                     out.push_str(&format!(
                         "  {} = !{};\n",
@@ -4625,6 +4652,16 @@ static uint32_t {prefix}_finish_finally(void* storage, size_t bytes, uint32_t ab
         let prefix = &self.prefix;
         let frame_type = &self.frame_type;
         let result_type = c_type(&self.function.result)?;
+        let tag_check = match &self.function.result {
+            IrType::Result(inner) => crate::ir::task::enum_layout(self.layouts, inner)
+                .filter(|layout| crate::ir::task::enum_int_variant(layout).is_some())
+                .map(|layout| format!(
+                    "if (frame->result.ok && (uint32_t)frame->result.value.tag>={}u) return KU_TASK_FRAME_INVALID_STATE;\n",
+                    layout.variants.len(),
+                ))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
         out.push_str(&format!(
             "static uint32_t {prefix}_take_result(void* storage, size_t bytes, uint32_t abi, {result_type}* output) {{\n\
                uint32_t checked = {prefix}_check(storage, bytes, abi);\n\
@@ -4633,7 +4670,7 @@ static uint32_t {prefix}_finish_finally(void* storage, size_t bytes, uint32_t ab
                if (frame->header.status != KU_TASK_FRAME_READY || !frame->header.result_initialized) return KU_TASK_FRAME_INVALID_STATE;\n\
                if (!ku_task_frame_storage_valid(output, sizeof(*output), sizeof(*output), KU_TASK_FRAME_ALIGNOF({result_type})) || ku_task_frame_ranges_overlap(storage, bytes, output, sizeof(*output))) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
                if (!({})) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
-               *output = {};\n\
+               {tag_check}*output = {};\n\
                frame->header.result_initialized = 0;\n\
                return KU_TASK_FRAME_OK;\n\
              }}\n",
@@ -4681,7 +4718,7 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
         || crate::ir::task::local_json_type(ty)
         || crate::ir::task::record_type(ty)
         || crate::ir::task::nullable_record(ty)
-        || crate::ir::task::unit_enum_name(ty).is_some()
+        || crate::ir::task::enum_name(ty).is_some()
     {
         return Ok(());
     }
@@ -4701,7 +4738,7 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
 }
 
 fn require_result_type(ty: &IrType) -> KuResult<()> {
-    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner) || crate::ir::task::http_response_type(inner) || crate::ir::task::record_type(inner) || crate::ir::task::unit_enum_name(inner).is_some() || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
+    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner) || crate::ir::task::http_response_type(inner) || crate::ir::task::record_type(inner) || crate::ir::task::enum_name(inner).is_some() || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
     {
         Ok(())
     } else {
@@ -4725,7 +4762,7 @@ pub(super) fn drop_statement(ty: &IrType, place: &str) -> KuResult<String> {
 // Empty typed output is checked by fields, not indeterminate C struct padding.
 // This neither dereferences payload pointers nor drops an existing output.
 pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
-    if crate::ir::task::unit_enum_name(ty).is_some() {
+    if crate::ir::task::enum_name(ty).is_some() {
         return Ok(format!(
             "({place}).tag == 0 && ({place}).payload.empty == 0"
         ));

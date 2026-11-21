@@ -1,0 +1,10 @@
+locate
+selected
+2
+2
+locate
+-1
+locate
+0
+locate
+could not scan line

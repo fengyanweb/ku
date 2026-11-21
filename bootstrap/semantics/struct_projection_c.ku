@@ -1,7 +1,7 @@
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { ImportBinding, SuppliedModule } from "./imports.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { TypeNameBinding, UnitEnumTypeName } from "./type_names.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
@@ -45,10 +45,6 @@ fn ContainsAllTypes(&members: [str], &possible: [str]): bool {
         index = index + 1
     }
     return true
-}
-
-fn OnlyWholeMemberMoves(&members: [str]): bool {
-    return members.len() == 0 || (members.len() == 1 && members[0] == "")
 }
 
 fn StringField(&field: TypeNameBinding): bool {
@@ -162,6 +158,8 @@ fn emitLayout(&layout: StructLayout, allow_string: bool, allow_nested: bool, arr
         kind = "KuProjectionString"
         if (allow_nested && field.declaration_kind == "Struct") {
             kind = CTypeName(field.module_index, field.declaration_node)
+        } else if (field.declaration_kind == "UnitEnum") {
+            kind = UnitEnumTypeName(field)
         } else if (arrays && field.declaration_kind == "StructArray") {
             kind = StructArrayTypeName(field)
         } else if (arrays && field.declaration_kind == "BuiltinArray" && field.name == "int") {

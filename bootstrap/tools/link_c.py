@@ -90,16 +90,43 @@ def no_duplicate_fields(pairs):
 
 
 @dataclass(frozen=True)
+class EnumMember:
+    field: int
+    path: str
+    node: int
+    c_type: str
+
+    @classmethod
+    def read(cls, value, where):
+        member = record(value, "field source_path node c_type", where)
+        field = member["field"]
+        if type(field) is not int or not 0 <= field < 64:
+            raise LinkError(f"{where}.field requires a field ordinal from 0 through 63")
+        path = module_path(member["source_path"], f"{where}.source_path")
+        node = node_id(member["node"], f"{where}.node")
+        c_type = text(member["c_type"], f"{where}.c_type")
+        match = UNIT_ENUM_CARRIER.fullmatch(c_type)
+        if not match or int(match[1]) != node:
+            raise LinkError(f"{where} requires its nominal unit enum field carrier")
+        return cls(field, path, node, c_type)
+
+    def semantic(self):
+        return self.field, self.path, self.node
+
+
+@dataclass(frozen=True)
 class TypeRef:
     identity: tuple
     passing: str
     c_type: str
     callback_nominals: tuple[str, ...] = ()
+    enum_members: tuple[EnumMember, ...] = ()
 
     def read(value, where, checked_result=False):
         fields = "kind source_name source_path node c_type passing"
         candidate_kind = value.get("kind") if isinstance(value, dict) else None
-        if isinstance(candidate_kind, str) and candidate_kind in CHECKED_INT_CALLBACK_PARAMETERS:
+        if (isinstance(candidate_kind, str) and candidate_kind in CHECKED_INT_CALLBACK_PARAMETERS
+                or candidate_kind == "Struct" and "nominals" in value):
             fields += " nominals"
         ref = record(value, fields, where)
         kind_name = text(ref["kind"], f"{where}.kind")
@@ -147,6 +174,20 @@ class TypeRef:
             identity = ("struct" if kind_name == "Struct" else "struct_array",
                         module_path(ref["source_path"], f"{where}.source_path"),
                         node_id(ref["node"], f"{where}.node"))
+            if "nominals" in ref:
+                members = tuple(EnumMember.read(member, f"{where}.nominals[{index}]")
+                                for index, member in enumerate(array(ref["nominals"], f"{where}.nominals")))
+                positions = [member.field for member in members]
+                if not members or positions != sorted(set(positions)):
+                    raise LinkError(f"{where} requires nonempty, ordered, distinct unit enum fields")
+                carrier = c_type if passing == "value" else c_type[6:-1].rstrip()
+                if checked_result:
+                    if passing != "value" or not carrier.startswith(CHECKED_RESULT_PREFIX):
+                        raise LinkError(f"{where} requires a checked nominal struct carrier for unit enum fields")
+                    carrier = carrier.removeprefix(CHECKED_RESULT_PREFIX)
+                if not re.fullmatch(rf"KuStruct_m[1-9][0-9]*_{identity[2]}", carrier):
+                    raise LinkError(f"{where} requires its nominal struct carrier for unit enum fields")
+                return TypeRef(identity, passing, c_type, enum_members=members)
         elif kind_name == "UnitEnum":
             path = module_path(ref["source_path"], f"{where}.source_path")
             node = node_id(ref["node"], f"{where}.node")
@@ -201,7 +242,10 @@ class TypeRef:
                 carrier = "bootstrap string"
             if self.identity[1] == "bool" and carrier == "_Bool":
                 carrier = "bool"
-        return self.identity, self.passing, carrier
+        semantic = self.identity, self.passing, carrier
+        if self.enum_members:
+            return (*semantic, tuple(member.semantic() for member in self.enum_members))
+        return semantic
 
 
 @dataclass(frozen=True)
@@ -406,6 +450,11 @@ def carrier_aliases(unit):
         for prefix in ("", "KuArray_", "KuBootstrapResult_", "KuBootstrapResult_KuArray_"):
             bind(prefix + local, prefix + canonical)
 
+    def enum(local, path, node):
+        stable = "KuEnum_" + canonical_symbol((path, node))
+        bind(local, stable)
+        return stable
+
     for declaration in (unit.export, *unit.dependencies):
         for ref in (*declaration.signature.parameters, declaration.signature.result):
             kind, *identity = ref.identity
@@ -417,11 +466,12 @@ def carrier_aliases(unit):
                     if int(match[2]) != node:
                         raise LinkError(f"{unit.plan}: C carrier for {label((path, node))} has the wrong declaration node")
                     nominal(match[1], path, node)
+                for member in ref.enum_members:
+                    enum(member.c_type, member.path, member.node)
             elif kind == "unit_enum":
                 path, node = identity
                 carrier = ref.c_type.removeprefix(CHECKED_RESULT_PREFIX)
-                stable = "KuEnum_" + canonical_symbol((path, node))
-                bind(carrier, stable)
+                stable = enum(carrier, path, node)
                 if carrier != ref.c_type:
                     bind(ref.c_type, CHECKED_RESULT_PREFIX + stable)
             elif kind in CHECKED_INT_CALLBACK_ABI:
@@ -452,9 +502,11 @@ def wrapper(unit, include_caller):
     callbacks = sorted({(ref.identity[0], ref.c_type, ref.callback_nominals) for decl in declarations
                         for ref in (*decl.signature.parameters, decl.signature.result)
                         if ref.identity[0] in CALLBACK_IDENTITIES})
-    unit_enums = sorted({ref.c_type.removeprefix(CHECKED_RESULT_PREFIX) for decl in declarations
-                         for ref in (*decl.signature.parameters, decl.signature.result)
-                         if ref.identity[0] == "unit_enum"})
+    references = {ref for decl in declarations for ref in (*decl.signature.parameters, decl.signature.result)}
+    unit_enums = {ref.c_type.removeprefix(CHECKED_RESULT_PREFIX) for ref in references if ref.identity[0] == "unit_enum"}
+    unit_enums.update(member.c_type for ref in references for member in ref.enum_members)
+    enum_fields = sorted({(ref.c_type if ref.passing == "value" else ref.c_type[6:-1].rstrip(),
+                           member.field, member.c_type) for ref in references for member in ref.enum_members})
     checked_enums = sorted({decl.signature.result.c_type for decl in declarations
                             if decl.signature.returns_result
                             and decl.signature.result.identity[0] == "unit_enum"})
@@ -463,7 +515,7 @@ def wrapper(unit, include_caller):
         lines.append('#include <stddef.h>')
     if unit_enums:
         lines.append("typedef struct { int32_t tag; union { unsigned char empty; } payload; } ku_bootstrap_enum_layout;")
-    for carrier in unit_enums:
+    for carrier in sorted(unit_enums):
         lines.append(f'_Static_assert(sizeof({carrier}) == sizeof(ku_bootstrap_enum_layout) && '
                      f'_Alignof({carrier}) == _Alignof(ku_bootstrap_enum_layout) && '
                      f'offsetof({carrier}, tag) == offsetof(ku_bootstrap_enum_layout, tag) && '
@@ -472,6 +524,10 @@ def wrapper(unit, include_caller):
                      f'_Generic((({carrier}){{0}}).payload.empty, unsigned char: 1, default: 0) && '
                      f'sizeof((({carrier}){{0}}).payload) == sizeof(unsigned char), '
                      f'"link-plan C unit enum has a different carrier");')
+    for carrier, field, enum_carrier in enum_fields:
+        outer = carrier.removeprefix(CHECKED_RESULT_PREFIX)
+        lines.append(f'_Static_assert(_Generic((({outer}){{0}}).f{field}, {enum_carrier}: 1, default: 0), '
+                     '"link-plan C struct enum field has a different carrier");')
     if checked_enums:
         lines.extend(check_carrier_layout("KuProjectionString", "ku_checked_enum_string_layout",
                                          (("ptr", "uint8_t *"), ("len", "size_t"),
