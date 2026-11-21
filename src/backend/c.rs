@@ -849,7 +849,9 @@ fn generate_c_source_with_frames_attempt(
     // Their bodies/helpers are completed later, after their by-value
     // dependencies are available.
     emit_result_forward_decls(&mut out, &abi_program, &frame_result_types)?;
-    emit_closure_forward_decls(&mut out, program)?;
+    let mut closure_types = Vec::new();
+    collect_closure_types_program(program, &mut closure_types);
+    emit_closure_forward_decls(&mut out, &closure_types)?;
     emit_array_typedefs(&mut out, &abi_program, &frame_array_elements)?;
     emit_array_helper_prototypes(&mut out, &abi_program, &frame_array_elements)?;
     // Opaque libpq handle typedefs must precede the Result ABI.
@@ -858,6 +860,22 @@ fn generate_c_source_with_frames_attempt(
     emit_mysql_types(&mut out, program);
     emit_bytes_types(&mut out, program, task_bytes);
     emit_net_types(&mut out, program, task_net);
+    let mut closure_header_done = false;
+    let mut closure_emitted = HashSet::new();
+    // Struct fields embed the closure by value. Complete these signatures and
+    // their ownership helpers before emitting the containing structs.
+    let field_types = program
+        .layouts
+        .structs
+        .iter()
+        .flat_map(|layout| layout.fields.iter().map(|field| &field.ty));
+    emit_closure_types(
+        &mut out,
+        field_types,
+        &mut closure_header_done,
+        &mut closure_emitted,
+        true,
+    )?;
     let mut nullable_emitted = HashSet::new();
     emit_layouts(&mut out, &abi_program, &mut nullable_emitted)?;
     emit_named_ownership_helpers(&mut out, program)?;
@@ -878,14 +896,12 @@ fn generate_c_source_with_frames_attempt(
     // and the `KuValue` Function tag. Emit it up front whenever either feature is
     // present so the object ABI (which clones/drops Function values) and the
     // closure structs can all reference it, regardless of emission order below.
-    let mut closure_types_present = Vec::new();
-    collect_closure_types_program(program, &mut closure_types_present);
-    let mut closure_header_done = false;
-    if !closure_types_present.is_empty()
-        || program_uses_object(program)
-        || program_uses_http(program)
-        // Task controls reuse the atomic representation even with no closures.
-        || frames.is_some_and(|(frames, _, _)| !frames.functions.is_empty())
+    if !closure_header_done
+        && (!closure_types.is_empty()
+            || program_uses_object(program)
+            || program_uses_http(program)
+            // Task controls reuse the atomic representation even with no closures.
+            || frames.is_some_and(|(frames, _, _)| !frames.functions.is_empty()))
     {
         emit_closure_refcount_header(&mut out);
         closure_header_done = true;
@@ -893,10 +909,9 @@ fn generate_c_source_with_frames_attempt(
     // Closure struct typedefs come in two passes around the aggregate ABIs so the
     // cyclic-looking (but acyclic) dependency between array-of-closures and
     // closure-returning-array is resolved by emission order (see `emit_closure_types`).
-    let mut closure_emitted = std::collections::HashSet::new();
     emit_closure_types(
         &mut out,
-        program,
+        &closure_types,
         &mut closure_header_done,
         &mut closure_emitted,
         true,
@@ -913,7 +928,7 @@ fn generate_c_source_with_frames_attempt(
     emit_http_types(&mut out, &abi_program, !program.functions.is_empty())?;
     emit_closure_types(
         &mut out,
-        program,
+        &closure_types,
         &mut closure_header_done,
         &mut closure_emitted,
         false,
@@ -1107,12 +1122,10 @@ fn closure_signature_is_self_contained(params: &[IrType], ret: &IrType) -> bool 
 /// Declare every signature-specific closure tag before any array typedef. An
 /// array only stores `KuClosure_*` behind a pointer, so the tag may remain
 /// incomplete until its signature's aggregate types are available.
-fn emit_closure_forward_decls(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+fn emit_closure_forward_decls(out: &mut COutput, types: &[IrType]) -> KuResult<()> {
     out.check()?;
-    let mut types = Vec::new();
-    collect_closure_types_program(program, &mut types);
     let mut emitted = std::collections::HashSet::new();
-    for ty in &types {
+    for ty in types {
         let IrType::Closure {
             params,
             param_modes,
@@ -1236,18 +1249,16 @@ typedef struct KuEnvHeader {
 /// signatures over primitives before the array/result ABI (so array-of-closures
 /// resolves `KuClosure_*`); the second pass (`false`) emits the remainder after
 /// those ABIs exist (so a closure returning e.g. `[int]` sees `KuArray_int`).
-fn emit_closure_types(
+fn emit_closure_types<'a>(
     out: &mut COutput,
-    program: &IrProgram,
+    types: impl IntoIterator<Item = &'a IrType>,
     header_done: &mut bool,
     emitted: &mut std::collections::HashSet<String>,
     self_contained_only: bool,
 ) -> KuResult<()> {
     out.check()?;
-    let mut types = Vec::new();
-    collect_closure_types_program(program, &mut types);
     let selected: Vec<&IrType> = types
-        .iter()
+        .into_iter()
         .filter(|ty| match ty {
             IrType::Closure { params, ret, .. } => {
                 closure_signature_is_self_contained(params, ret) == self_contained_only
@@ -1657,6 +1668,11 @@ fn collect_closure_types_program(program: &IrProgram, types: &mut Vec<IrType>) {
             });
         }
     }
+    for layout in &program.layouts.structs {
+        for field in &layout.fields {
+            collect_closure_type(&field.ty, types);
+        }
+    }
 }
 
 fn collect_closure_type(ty: &IrType, types: &mut Vec<IrType>) {
@@ -1775,6 +1791,24 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
         for field in &layout.fields {
             match &field.ty {
                 IrType::Int | IrType::Float | IrType::Bool | IrType::Str => {}
+                IrType::Closure { .. } if field.is_async_callable => {
+                    return Err(unsupported(format!(
+                        "native C struct '{}.{}' does not support async callable fields",
+                        layout.name, field.name
+                    )));
+                }
+                IrType::Closure {
+                    params,
+                    param_modes,
+                    ret,
+                } if params.len() == param_modes.len()
+                    && closure_signature_is_self_contained(params, ret) => {}
+                IrType::Closure { .. } => {
+                    return Err(unsupported(format!(
+                        "native C struct '{}.{}' requires a synchronous callable field signature over int, float, bool, str or null",
+                        layout.name, field.name
+                    )));
+                }
                 IrType::Nullable(inner) if optional_layout_field_supported(inner, program) => {}
                 IrType::Named(name) if is_runtime_object_name(name) => {}
                 // Array fields (`[int]`, `[Person]`, `[[int]]`): the array typedef is

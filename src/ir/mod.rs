@@ -102,6 +102,9 @@ pub struct IrFieldLayout {
     pub name: String,
     pub ty: IrType,
     pub offset: usize,
+    /// Async and synchronous function declarations share the closure shape in
+    /// `IrType` but require distinct calling conventions.
+    pub is_async_callable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6250,6 +6253,10 @@ fn lower_struct_layout(
                 name: field.name.clone(),
                 ty: lower_layout_type(&field.ty, enum_names, struct_names),
                 offset,
+                is_async_callable: matches!(
+                    field.ty,
+                    Some(TypeName::Function { is_async: true, .. })
+                ),
             })
             .collect(),
     }
@@ -6277,6 +6284,10 @@ fn lower_enum_layout(
                         name: field.name.clone(),
                         ty: lower_layout_type(&field.ty, enum_names, struct_names),
                         offset,
+                        is_async_callable: matches!(
+                            field.ty,
+                            Some(TypeName::Function { is_async: true, .. })
+                        ),
                     })
                     .collect(),
             })

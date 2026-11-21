@@ -8,7 +8,7 @@ fn StoreWithSameLocalName(): null! {
 }
 fn main(): null! {
     StoreWithSameLocalName()?
-    item = { text: "清单" + "🙂", sibling: "independent", zero: 0, empty: "", absent: null }
+    item = { text: "清单" + "🙂", sibling: "independent", done: false, zero: 0, empty: "", absent: null }
     Take(item.text)?
     Take(item.text)?
     println(item.text)
@@ -16,5 +16,11 @@ fn main(): null! {
     println(item.zero)
     println(item.empty)
     println(item.absent)
+    previous = item.text
+    item.text = "完成🙂"
+    item.done = true
+    Take(item.text)?
+    println(previous)
+    println(item.done)
     return ok(null)
 }

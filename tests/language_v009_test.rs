@@ -850,6 +850,7 @@ fn main() {
                     name: "next".to_string(),
                     ty: ir::IrType::Named("Node".to_string()),
                     offset: 0,
+                    is_async_callable: false,
                 }],
             }],
             enums: Vec::new(),

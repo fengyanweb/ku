@@ -146,14 +146,21 @@ fn borrow_native_c_uses_const_parameter_abi_and_preserves_modes() {
 
 #[test]
 fn borrow_ir_function_field_call_preserves_parameter_modes() {
-    // Native struct storage of function fields has its own pre-existing
-    // capability boundary; this test pins mode preservation before that gate.
     let program = ir("struct Reader { read: fn(&str): int } fn Read(&text: str): int { return text.len() } fn Use(&reader: Reader, &text: str): int { return reader.read(text) } fn main() { text = \"Ku\" reader = Reader { read: Read } println(Use(reader, text)) println(reader.read(text)) }");
     let dump = program.to_string();
     assert!(
         dump.contains("borrow(borrowed text)") || dump.contains("borrow(text)"),
         "{dump}"
     );
+    let c = generate_c_source(&program).unwrap();
+    let signature = c
+        .find("struct KuClosure_fn_view_str__to_int { int64_t (*invoke)(void*, const KuString*);")
+        .expect("complete typed closure ABI");
+    let reader = c
+        .find("struct KuStruct_Reader {\n  KuClosure_fn_view_str__to_int read;")
+        .expect("closure field stored by value");
+    assert!(signature < reader);
+    assert!(c.contains("value.read = ku_closure_clone_fn_view_str__to_int(value.read);"));
     // Adding KuValue.take must not reserve the same spelling for ordinary
     // callable struct fields. Keep the old indirect-call path and its modes.
     let take = ir("struct Reader { take: fn(&str): int } fn Read(&text: str): int { return text.len() } fn Use(&reader: Reader, &text: str): int { return reader.take(text) } fn main() { text = \"Ku\" reader = Reader { take: Read } println(Use(reader, text)) println(reader.take(text)) }");
@@ -161,6 +168,66 @@ fn borrow_ir_function_field_call_preserves_parameter_modes() {
     assert!(
         dump.contains("borrow(borrowed text)") || dump.contains("borrow(text)"),
         "{dump}"
+    );
+    assert!(generate_c_source(&take).is_ok());
+
+    let unused = ir("struct Unused { pick: fn(): bool } fn main() {}");
+    let c = generate_c_source(&unused).unwrap();
+    assert!(c.contains("(*invoke)(void*); void* env;"));
+    assert!(c.contains("struct KuStruct_Unused {"));
+
+    let aggregate =
+        ir("struct Payload { value: int } struct Reader { read: fn(&Payload): int } fn main() {}");
+    let error = generate_c_source(&aggregate).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("struct 'Reader.read' requires a synchronous callable field signature"),
+        "{error}"
+    );
+
+    let enum_payload = ir("struct Reader { read: fn(&str): int } enum Operation { Invoke(read: fn(&str): int) } fn main() {}");
+    let error = generate_c_source(&enum_payload).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("enum 'Operation.Invoke.read' does not support payload type closure"),
+        "{error}"
+    );
+}
+
+#[test]
+fn borrow_native_mixed_http_rejects_async_callable_field() {
+    let source = r#"
+import http from "std.http"
+struct Reader { read: async fn(int): int }
+fn main(): null! {
+    async fn Handler(req: HttpRequest): HttpResponse! { return ok(http.text(req.method)) }
+    server = http.server()
+    server.get("/", Handler)
+    server.listen("127.0.0.1:0")?
+    return ok(null)
+}
+"#;
+    let mut ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_program()
+        .unwrap();
+    ast.items.insert(
+        0,
+        ku::ast::Item::Module(ku::ast::ModuleDecl {
+            name: "std:http".into(),
+            span: Default::default(),
+        }),
+    );
+    Checker::new().check(&ast).unwrap();
+    let (program, handlers) = ku::ir::lower_mixed_http_setup(&ast).unwrap();
+    assert_eq!(handlers.len(), 1);
+    let error = generate_c_source(&program).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("struct 'Reader.read' does not support async callable fields"),
+        "{error}"
     );
 }
 

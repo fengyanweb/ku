@@ -791,7 +791,7 @@ impl Checker {
         if let Some(binding) = self.scopes.iter().rev().find_map(|scope| scope.get(name)) {
             // Bracket writes can change the tag without changing the checker's
             // structural type. Trust only literal bindings confined to plain field
-            // reads. Binding IDs keep writes to shadowing locals independent.
+            // reads and same-type literal stores. Binding IDs distinguish shadowing.
             if matches!(
                 ty,
                 Type::Int | Type::Float | Type::Bool | Type::String | Type::Null
@@ -1402,7 +1402,17 @@ impl Checker {
                 } else {
                     None
                 };
-                let expected = self.check_assign_target(target, *span)?;
+                let literal_type = match &value.kind {
+                    ExprKind::Literal(
+                        Literal::Int(_)
+                        | Literal::Float(_)
+                        | Literal::Bool(_)
+                        | Literal::String(_)
+                        | Literal::Null,
+                    ) => Some(&actual),
+                    _ => None,
+                };
+                let expected = self.check_assign_target(target, *span, literal_type)?;
                 if !type_matches(&expected, &actual) {
                     return Err(type_error(*span, &expected, &actual));
                 }
@@ -1437,7 +1447,7 @@ impl Checker {
                 // after consuming the RHS lets the normal moved-place diagnostic
                 // reject a receiver/key that the RHS just moved.
                 let right = self.consume_expr(value)?;
-                let left = self.check_assign_target(target, *span)?;
+                let left = self.check_assign_target(target, *span, None)?;
                 // `a += b` reads the target before writing it, so the target place
                 // must still be live — a compound-assign to a moved field is a
                 // use-after-move (`check_assign_target` only checks the base).
@@ -3076,13 +3086,20 @@ impl Checker {
         Ok(Some(self.apply_stdlib_signature(&signature, args, span)?))
     }
 
-    fn check_assign_target(&mut self, target: &AssignTarget, span: Span) -> KuResult<Type> {
-        if self.native_field_facts.is_some() {
-            if let Some(name) = assign_target_root_name(target) {
-                self.invalidate_native_object_binding(name);
-            }
-        }
-        match target {
+    fn check_assign_target(
+        &mut self,
+        target: &AssignTarget,
+        span: Span,
+        literal_type: Option<&Type>,
+    ) -> KuResult<Type> {
+        // This exemption only covers one fixed field on the original binding.
+        // A key expression, nested destination or effectful RHS keeps the
+        // conservative invalidation, regardless of its inferred type.
+        let direct_literal_field = self.native_field_facts.is_some()
+            && literal_type.is_some()
+            && matches!(target, AssignTarget::Field { target, .. }
+                if matches!(target.kind, ExprKind::Variable(_)));
+        let expected = match target {
             AssignTarget::Variable(name) => {
                 let binding = self.get(name, span)?;
                 if !binding.mutable {
@@ -3128,33 +3145,42 @@ impl Checker {
                     )),
                 }
             }
-            AssignTarget::Field { target, name } => match self.check_expr(target)? {
-                Type::Struct(struct_name) => {
-                    let Some(struct_type) = self.structs.get(&struct_name) else {
-                        return Err(KuError::runtime(
-                            format!("undefined struct '{struct_name}'"),
-                            target.span,
-                        ));
-                    };
-                    struct_type.fields.get(name).cloned().ok_or_else(|| {
-                        KuError::runtime(
-                            format!("struct '{struct_name}' has no field '{name}'"),
-                            span,
-                        )
-                    })
+            AssignTarget::Field { target, name } => {
+                match self.check_expr_with_field_receiver(target, None, direct_literal_field)? {
+                    Type::Struct(struct_name) => {
+                        let Some(struct_type) = self.structs.get(&struct_name) else {
+                            return Err(KuError::runtime(
+                                format!("undefined struct '{struct_name}'"),
+                                target.span,
+                            ));
+                        };
+                        struct_type.fields.get(name).cloned().ok_or_else(|| {
+                            KuError::runtime(
+                                format!("struct '{struct_name}' has no field '{name}'"),
+                                span,
+                            )
+                        })
+                    }
+                    Type::Object(fields) => fields.get(name).cloned().ok_or_else(|| {
+                        KuError::runtime(format!("object has no field '{name}'"), span)
+                    }),
+                    Type::StringMap => Ok(Type::String),
+                    Type::DynamicObject => Ok(Type::Unknown),
+                    other => Err(KuError::runtime(
+                        format!("type error: {} has no fields", type_name(&other)),
+                        target.span,
+                    )),
                 }
-                Type::Object(fields) => fields
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| KuError::runtime(format!("object has no field '{name}'"), span)),
-                Type::StringMap => Ok(Type::String),
-                Type::DynamicObject => Ok(Type::Unknown),
-                other => Err(KuError::runtime(
-                    format!("type error: {} has no fields", type_name(&other)),
-                    target.span,
-                )),
-            },
+            }
+        }?;
+        if self.native_field_facts.is_some()
+            && (!direct_literal_field || literal_type != Some(&expected))
+        {
+            if let Some(name) = assign_target_root_name(target) {
+                self.invalidate_native_object_binding(name);
+            }
         }
+        Ok(expected)
     }
 
     fn check_http_service_method_call(

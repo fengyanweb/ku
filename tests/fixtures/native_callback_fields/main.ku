@@ -1,0 +1,39 @@
+
+fn Make(): fn(): int {
+    value = 41
+    return () => { return value }
+}
+fn Use(&callback: fn(): int, n: int): int { return callback() + n }
+struct Reader { read: fn(&str): str, consume: fn(str): int }
+fn Consume(text: str): int { return text.byte_len() }
+fn Replace(&text: str): str { return "replacement:" + text }
+fn MakeReader(prefix: str): Reader {
+    fn read(&text: str): str { return prefix + text }
+    return Reader { read: read, consume: Consume }
+}
+fn Read(&reader: Reader, &text: str): str { return reader.read(text) }
+fn FailedArgument(): str! { return err("failed argument") }
+fn main(): null! {
+    println(Use(Make(), 1))
+    shared = Make()
+    println(Use(shared, 1))
+    println(shared())
+    reader = MakeReader("captured" + ":")
+    saved = reader.clone()
+    reader.read = Replace
+    text = "Ku"
+    println(Read(saved, text))
+    println(reader.read(text))
+    println(saved.consume("世" + "🙂"))
+    calls = 0
+    args = 0
+    fn receiver(): Reader { calls += 1 return MakeReader("temporary" + ":") }
+    fn argument(): str { args += 1 return str(calls) }
+    println(receiver().read(argument()))
+    if (calls != 1 || args != 1) { panic("callable field evaluation order") }
+    try { receiver().read(FailedArgument()?) }
+    catch(error) { println(error.message) }
+    println(Read(saved, text))
+    if (text != "Ku" || calls != 2) { panic("callable field ownership") }
+    return ok(null)
+}

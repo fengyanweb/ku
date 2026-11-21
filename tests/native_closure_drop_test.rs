@@ -11,20 +11,7 @@ use native_allocation_harness::ALLOCATION_HOOK;
 use native_harness::{compile_harness, run_bounded, TempDir, RUN_LIMITS, RUN_TIMEOUT};
 use std::{fs, process::Command};
 
-const SOURCE: &str = r#"
-fn Make(): fn(): int {
-    value = 41
-    return () => { return value }
-}
-fn Use(&callback: fn(): int, n: int): int { return callback() + n }
-fn main(): null! {
-    println(Use(Make(), 1))
-    shared = Make()
-    println(Use(shared, 1))
-    println(shared())
-    return ok(null)
-}
-"#;
+const SOURCE: &str = include_str!("fixtures/native_callback_fields/main.ku");
 
 const MAIN: &str = r#"
 #undef malloc
@@ -37,7 +24,7 @@ int main(void) {
     assert(!ku_perf_live_allocations && !ku_perf_live_bytes);
     size_t before = ku_perf_calls;
     assert(ku_source_entry() == 0);
-    /* Both Make calls must create actual captured environments/cells. */
+    /* Capturing calls create real environments/cells. */
     assert(ku_perf_calls > before);
     assert(!ku_perf_live_allocations && !ku_perf_live_bytes);
     assert(!ku_perf_overflow && ku_perf_peak_bytes > 0);
@@ -87,7 +74,7 @@ fn native_closure_fresh_borrow_drop_clears_owner_before_frame_cleanup() {
         "{}",
         String::from_utf8_lossy(&interpreted.stderr)
     );
-    let expected = "42\n42\n41\n";
+    let expected = include_str!("fixtures/native_callback_fields/expected.txt").replace('\r', "");
     assert_eq!(
         String::from_utf8(interpreted.stdout)
             .unwrap()

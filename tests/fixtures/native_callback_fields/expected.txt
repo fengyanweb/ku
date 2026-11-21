@@ -1,0 +1,9 @@
+42
+42
+41
+captured:Ku
+replacement:Ku
+7
+temporary:1
+failed argument
+captured:Ku

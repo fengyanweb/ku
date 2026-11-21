@@ -3363,6 +3363,7 @@ fn main(): null! {
 
     let c = native_emit_c(&dir, "main.ku");
     assert!(c.contains("__ku_object_required_field(item,"));
+    assert!(c.contains("__ku_object_store_key = ku_string_static((const uint8_t*)\"done\", 4)"));
     assert!(!c.contains("(item).text"));
     let mut changed = Command::new(ku_binary());
     changed
@@ -3372,6 +3373,56 @@ fn main(): null! {
         .expect("native rejection of object with an unknown stored type");
     assert!(!changed.status.success());
     assert!(String::from_utf8_lossy(&changed.stderr).contains("does not support type unknown"));
+
+    for (scenario, statements, diagnostic) in [
+        (
+            "wrong-type",
+            "item.text = false",
+            "type error: expected str but got bool",
+        ),
+        (
+            "moved-whole",
+            "saved = { entry: item }",
+            "does not support type unknown",
+        ),
+        (
+            "rebound",
+            "item = { text: \"new owner\" }",
+            "does not support type unknown",
+        ),
+        (
+            "captured",
+            "read = fn(): str { return item.text }; println(read())",
+            "does not support type unknown",
+        ),
+        (
+            "computed-value",
+            "item.text = \"after\" + \"🙂\"",
+            "does not support type unknown",
+        ),
+    ] {
+        fs::write(
+            dir.join("guard.ku"),
+            format!(
+                "fn main(): null! {{\n\
+                 item = {{ text: \"initial\" }}\n\
+                 println(item.text)\n\
+                 item.text = \"completed\"\n\
+                 {statements}\n\
+                 return ok(null)\n}}\n"
+            ),
+        )
+        .expect("write guarded object store source");
+        let mut guard = Command::new(ku_binary());
+        guard
+            .current_dir(&dir)
+            .args(["build", "--native", "guard.ku"]);
+        let guard = run_bounded(&mut guard, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS)
+            .expect("bounded native object-store guard");
+        let stderr = String::from_utf8_lossy(&guard.stderr);
+        assert!(!guard.status.success(), "{scenario} unexpectedly built");
+        assert!(stderr.contains(diagnostic), "{scenario}: {stderr}");
+    }
 
     if let Some(exe) = native_build(&dir, "main.ku", "static-object-field") {
         let (stdout, code) = run_binary(&exe);
