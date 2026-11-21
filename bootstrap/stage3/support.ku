@@ -76,7 +76,7 @@ fn ParseExpressionAt(source: str, origin: Token, boundary: Token): ParseOutput! 
     })?)
 }
 
-fn CanEndExpression(kind: str): bool {
+fn CanEndExpression(&kind: str): bool {
     return kind == "Ident" || kind == "Int" || kind == "Float" || kind == "String" || kind == "TemplateString" || kind == "True" || kind == "False" || kind == "Null" || kind == "RParen" || kind == "RBracket" || kind == "RBrace" || kind == "Question"
 }
 

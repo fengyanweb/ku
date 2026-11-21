@@ -80,25 +80,32 @@ fn IsControlStatement(&kind: str): bool {
 fn ReadExpressionEnd(&tokens: [Token], start: int, window_end: int, &context: str): int! {
     probe = start
     boundary = EmptyExpressionBoundary()
-    while (!boundary.complete) {
+    scanning = !boundary.complete
+    while (scanning) {
         if (probe > window_end) { RejectExpressionTerminator(WindowToken(tokens, probe, window_end))? }
         token = WindowToken(tokens, probe, window_end)
-        previous_can_end = probe > start && CanEndExpression(WindowKind(tokens, probe - 1, window_end))
+        previous_can_end = false
+        if (probe > start) {
+            previous_kind = WindowKind(tokens, probe - 1, window_end)
+            previous_can_end = CanEndExpression(previous_kind)
+        }
         named_struct_open = probe > start && probe + 2 < window_end && token.kind == "LBrace"
             && IsNamedStructStart(tokens[probe - 1], tokens[probe], tokens[probe + 1], tokens[probe + 2])
         if (boundary.paren_depth == 0 && boundary.bracket_depth == 0 && boundary.brace_depth == 0) {
             if (context == "for_header" && token.kind == "LBrace" && !named_struct_open) {
                 return ok(probe)
             }
-            if ((context == "assignment_target" || context == "inline_if_target") && AssignmentOperator(token.kind) != "") {
-                return ok(probe)
+            if (context == "assignment_target" || context == "inline_if_target") {
+                operator = AssignmentOperator(token.kind)
+                if (operator != "") { return ok(probe) }
             }
             if (EndsAtExpressionSeparator(tokens, probe, window_end, context, token.kind, previous_can_end, named_struct_open)) {
                 return ok(probe)
             }
         }
         boundary = PushExpressionBoundary(boundary, token, previous_can_end, named_struct_open)?
-        if (!boundary.complete) { probe = probe + 1 }
+        scanning = !boundary.complete
+        if (scanning) { probe = probe + 1 }
     }
     return ok(probe)
 }

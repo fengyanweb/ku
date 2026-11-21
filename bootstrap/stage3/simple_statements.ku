@@ -237,7 +237,8 @@ fn readObjectDestructure(
     work = initial_work
     fields: [str] = []
     children: [int] = []
-    while (!WindowKindIs(tokens, cursor, last_index, "RBrace")) {
+    reading_fields = !WindowKindIs(tokens, cursor, last_index, "RBrace")
+    while (reading_fields) {
         field = WindowToken(tokens, cursor, last_index)
         work = NextBodyWork(work, 1, field.clone())?
         cursor = cursor + 1
@@ -253,20 +254,23 @@ fn readObjectDestructure(
                     RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "object destructuring rest binding must be last")?
                 }
             }
-            break
+            reading_fields = false
+        } else {
+            if (field.kind != "Ident" && field.kind != "String") {
+                RejectAt(field.clone(), "unexpected_token", "expected object destructuring field name")?
+            }
+            work = checkPatternField(fields, field, work)?
+            fields = fields.push(field.lexeme.clone())
+            binding = readObjectDestructureField(tokens, cursor, last_index, token_base, work, field,
+                parse_expression.clone(), add_arena.clone(), add_node.clone())?
+            work = binding.work
+            cursor = binding.cursor
+            children = children.push(binding.node)
+            if (WindowKindIs(tokens, cursor, last_index, "Comma")) {
+                cursor = cursor + 1
+                reading_fields = !WindowKindIs(tokens, cursor, last_index, "RBrace")
+            } else { reading_fields = false }
         }
-        if (field.kind != "Ident" && field.kind != "String") {
-            RejectAt(field.clone(), "unexpected_token", "expected object destructuring field name")?
-        }
-        work = checkPatternField(fields, field, work)?
-        fields = fields.push(field.lexeme.clone())
-        binding = readObjectDestructureField(tokens, cursor, last_index, token_base, work, field,
-            parse_expression.clone(), add_arena.clone(), add_node.clone())?
-        work = binding.work
-        cursor = binding.cursor
-        children = children.push(binding.node)
-        if (!WindowKindIs(tokens, cursor, last_index, "Comma")) { break }
-        cursor = cursor + 1
     }
     expectPatternToken(WindowToken(tokens, cursor, last_index), "RBrace", "expected '}' after object destructuring pattern")?
     expectPatternToken(WindowToken(tokens, cursor + 1, last_index), "Equal", "expected '=' after object destructuring pattern")?
