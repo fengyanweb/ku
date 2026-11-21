@@ -1,3 +1,4 @@
+import { RequireLinkedMutableName } from "./call_contracts.ku"
 import { AddLinkedNullSlot, LinkedCountedInitial, LinkedCountdownIndex, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
 import { OpenLinkedForLoop, CloseLinkedForLoop } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
@@ -140,6 +141,7 @@ fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statemen
     countdown = LinkedCountdownIndex(project, state, statement, step)?
     cursor = countdown
     if (cursor == 0) { cursor = countedIndex(project, state, statement, initial, step)? }
+    RequireLinkedMutableName(state.slots[cursor - 1].binding, DeclarationSpan(step))?
     outer = state.slots.clone()
     next = state
     next.code = next.code + "    while (true) {\n"
@@ -285,6 +287,7 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
         }
         if (statement.kind == "Assign" && statement.edge_count == 1) {
             slot = LinkedNullBinding(next.slots, statement.text)
+            if (slot != 0) { RequireLinkedMutableName(statement.text, DeclarationSpan(statement))? }
             if (slot == 0) { next = addLocal(project, next, statement, id)? }
             else if (LinkedNullIntArrayOwner(next.slots[slot - 1].value.ty) || LinkedNullOwnedArray(next.slots[slot - 1].value.ty)) {
                 next = LowerLinkedArrayAppend(project, next, statement, slot)?

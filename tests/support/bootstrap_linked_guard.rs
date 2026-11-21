@@ -1436,6 +1436,16 @@ fn MutableCursor(start: int): null! {
     }
     return ok(null)
 }
+fn ImmutableWrite(): int! {
+    COUNT = 1
+    COUNT = 2
+    return ok(COUNT)
+}
+fn ImmutableCursor(limit: int): int! {
+    COUNT = 0
+    while (COUNT < limit) { COUNT = COUNT + 1 }
+    return ok(COUNT)
+}
 fn SameBinding(): null! {
     cursor = 0
     while (cursor < cursor) { cursor = cursor + 1 }
@@ -1499,6 +1509,8 @@ int main(void) {
         ("MutableCursor", "linked_loop_cursor_write"),
         ("SameBinding", "linked_loop_bound_cursor"),
         ("InterveningWrite", "linked_loop_initial_write"),
+        ("ImmutableWrite", "linked_immutable_binding"),
+        ("ImmutableCursor", "linked_immutable_binding"),
     ] {
         fs::write(cwd.join("function.txt"), function).unwrap();
         let rejected = execute(&mut Command::new(seed), cwd, 30);

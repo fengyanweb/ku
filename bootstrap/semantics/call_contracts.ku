@@ -1,3 +1,4 @@
+import { Span } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule, RejectName } from "./names.ku"
 import { ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
@@ -421,6 +422,22 @@ fn CheckLiteralResultContracts(&named: NamedModule): null! {
             checkLiteralReturns(named.parsed.arena.nodes, named.parsed.arena.edges, node)?
         }
         index = index + 1
+    }
+    return ok(null)
+}
+
+fn linkedConstantBinding(&name: str): bool {
+    letter = false
+    for char in name.clone().chars() {
+        if ("ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(char.clone())) { letter = true }
+        else if (!"_0123456789".contains(char)) { return false }
+    }
+    return letter
+}
+
+fn RequireLinkedMutableName(&name: str, &at: Span): null! {
+    if (linkedConstantBinding(name)) {
+        RejectLayout("linked_immutable_binding", "cannot assign to an immutable local", at.clone())?
     }
     return ok(null)
 }

@@ -10,7 +10,7 @@ import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
 import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { FindLinkedLocalRead, LinkedLocalReadCaptures } from "./call_contracts.ku"
+import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
 import { EmitLinkedNullPrototypes, LinkedCheckedResultCType, LinkedNullChild, LinkedNullCType, LinkedNullProject,
          LinkedNullNode, LinkedNullResultCleanupReference, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { EmitLinkedAddition, LowerLinkedNullRead } from "./linked_null_read_c.ku"
@@ -98,6 +98,8 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
         RejectLayout("linked_member_target", "assignment requires a direct field of a mutable local record", DeclarationSpan(root))?
     }
 
+    RequireLinkedMutableName(root.text, DeclarationSpan(root))?
+
     // Generate the RHS and finish its fallible work before selecting the
     // target in the resulting state. The old member still belongs to cleanup
     // if the RHS fails or consumes its record.
@@ -122,6 +124,7 @@ fn LowerLinkedStringAppend(&project: LinkedNullProject, state: LinkedNullState, 
     if (target.kind != "Variable" || target.edge_count != 0) {
         RejectLayout("linked_append_target", "string append requires a named local", DeclarationSpan(target))?
     }
+    RequireLinkedMutableName(target.text, DeclarationSpan(target))?
     // Ku evaluates the right operand before reading the destination. If that
     // operand consumed the destination, the normal live-binding check refuses it.
     right = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 1), 0)?
@@ -160,15 +163,6 @@ fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,
     return ok(next)
 }
 
-fn linkedDestructureConstant(&name: str): bool {
-    letter = false
-    for char in name.clone().chars() {
-        if ("ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(char.clone())) { letter = true }
-        else if (!"_0123456789".contains(char)) { return false }
-    }
-    return letter
-}
-
 fn putLinkedDestructuredField(&project: LinkedNullProject, state: LinkedNullState, &local: Node,
                               id: int, &field: LinkedNullValue): LinkedNullState! {
     target = LinkedNullBinding(state.slots, local.text)
@@ -180,9 +174,10 @@ fn putLinkedDestructuredField(&project: LinkedNullProject, state: LinkedNullStat
     } else {
         old = next.slots[target - 1].value.clone()
         if (target == field.slot || next.slots[target - 1].parameter || old.borrowed || !SameLinkedType(old.ty, field.ty) ||
-            linkedDestructureConstant(local.text) || LinkedLocalReadCaptures(next.local_readers, target)) {
+            LinkedLocalReadCaptures(next.local_readers, target)) {
             RejectLayout("linked_destructure_target", "replacement requires a distinct mutable local of the same type", DeclarationSpan(local))?
         }
+        RequireLinkedMutableName(local.text, DeclarationSpan(local))?
         next.code += LinkedNullDropC(next.layouts, next.owning_layouts, old.ty, old.text)
     }
     next.code += "    " + next.slots[target - 1].value.text.clone() + " = " + field.text.clone() + ";\n"
