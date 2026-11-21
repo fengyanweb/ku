@@ -22,15 +22,16 @@ fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): 
     text = "{\"kind\":" + LinkPlanJsonText(ty.kind.clone(), controls)? + ",\"source_name\":" + LinkPlanJsonText(name, controls)?
         + ",\"source_path\":" + path + ",\"node\":" + str(ty.node) + ",\"c_type\":" + LinkPlanJsonText(ty.c_type.clone(), controls)?
         + ",\"passing\":" + LinkPlanJsonText(passing, controls)?
-    if (ty.nominals.len() > 0) {
+    count = ty.nominals.len()
+    if (count > 0) {
         text += ",\"nominals\":["
         index = 0
-        while (index < ty.nominals.len()) {
+        while (index < count) {
             nominal = ty.nominals[index].clone()
             if (index != 0) { text += "," }
             text += "{\"source_path\":" + LinkPlanJsonText(supplied[nominal.unit - 1].path.clone(), controls)?
                 + ",\"node\":" + str(nominal.node) + ",\"c_type\":" + LinkPlanJsonText(nominal.c_type, controls)? + "}"
-            index += 1
+            index = index + 1
         }
         text += "]"
     }
@@ -121,19 +122,21 @@ fn LinkedScopedCallbackFunction(&project: LinkedNullProject, &callback: TypeName
 }
 
 fn SameLinkedCallbackSignature(&left: LinkedNullFunction, &right: LinkedNullFunction): bool {
-    if (left.parameters.len() != right.parameters.len() || left.returns_result != right.returns_result ||
+    count = left.parameters.len()
+    if (count != right.parameters.len() || left.returns_result != right.returns_result ||
         !SameLinkedType(left.result, right.result)) { return false }
     index = 0
-    while (index < left.parameters.len()) {
+    while (index < count) {
         if (!SameLinkedType(left.parameters[index], right.parameters[index])) { return false }
-        index += 1
+        index = index + 1
     }
     return true
 }
 fn PrepareLinkedAppendCallbackPlan(&project: LinkedNullProject, declaration: LinkPlanDeclaration): LinkPlanDeclaration! {
     parameters: [LinkPlanType] = []
+    count = declaration.parameters.len()
     index = 0
-    while (index < declaration.parameters.len()) {
+    while (index < count) {
         ty = declaration.parameters[index].clone()
         if (ty.kind == "IntResultAppendCallback" || ty.kind == "IntResultArenaCallback") {
             checked = LinkedIntAppendCallbackFunction(project, ty.unit, ty.node)?
@@ -150,7 +153,7 @@ fn PrepareLinkedAppendCallbackPlan(&project: LinkedNullProject, declaration: Lin
                 c_type: ty.c_type, view: ty.view, nominals: nominals }
         }
         parameters = parameters.push(ty)
-        index += 1
+        index = index + 1
     }
     return ok(LinkPlanDeclaration { unit: declaration.unit, node: declaration.node, symbol: declaration.symbol,
         parameters: parameters, result: declaration.result, returns_result: declaration.returns_result })
