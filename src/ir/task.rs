@@ -673,7 +673,7 @@ pub(crate) fn unit_enum_name(ty: &IrType) -> Option<&str> {
     }
 }
 
-fn unit_enum_layout<'a>(
+pub(crate) fn unit_enum_layout<'a>(
     layouts: &'a super::IrLayoutTable,
     ty: &IrType,
 ) -> Option<&'a super::IrEnumLayout> {
@@ -746,10 +746,10 @@ fn parameter_type(ty: &IrType) -> bool {
         || pg_capture_type(ty)
         || record_type(ty)
         || nullable_record(ty)
+        || unit_enum_name(ty).is_some()
 }
 fn value_type(ty: &IrType) -> bool {
     parameter_type(ty)
-        || unit_enum_name(ty).is_some()
         || pg_params_array(ty)
         || local_bytes_type(ty)
         || local_net_type(ty)

@@ -568,14 +568,16 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
                 return Err(unsupported("borrowed async parameters", parameter.span));
             }
             budget.text(parameter.name.len(), parameter.span)?;
-            let parameter_type = local_type(
-                parameter
-                    .ty
-                    .as_ref()
-                    .ok_or_else(|| unsupported("untyped async parameters", parameter.span))?,
-                parameter.span,
-                &layouts,
-            )?;
+            let annotation = parameter
+                .ty
+                .as_ref()
+                .ok_or_else(|| unsupported("untyped async parameters", parameter.span))?;
+            let parameter_type = match annotation {
+                TypeName::Custom(name) if layouts.enums.iter().any(|decl| &decl.name == name) => {
+                    value_slot(super::enum_ir_type(name))
+                }
+                _ => local_type(annotation, parameter.span, &layouts)?,
+            };
             parameters.push(parameter_type);
         }
         let id = TaskFunctionId(declarations.len());

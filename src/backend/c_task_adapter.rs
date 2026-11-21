@@ -372,10 +372,39 @@ pub(super) fn parameter_move(ty: &TaskSlotType, place: &str) -> KuResult<String>
 
 fn parameter_owned(ty: &TaskSlotType) -> bool {
     match ty {
-        TaskSlotType::Value { ty, .. } => owned(ty) || task_record_type(ty),
+        TaskSlotType::Value { ty, .. } => {
+            owned(ty) || task_record_type(ty) || crate::ir::task::unit_enum_name(ty).is_some()
+        }
         TaskSlotType::Callable { .. } => true,
         _ => false,
     }
+}
+
+pub(super) fn enum_parameter_check(
+    layouts: &IrLayoutTable,
+    ty: &TaskSlotType,
+    index: usize,
+    invalid: &str,
+) -> KuResult<String> {
+    let TaskSlotType::Value {
+        ty,
+        borrowed: false,
+    } = ty
+    else {
+        return Ok(String::new());
+    };
+    if crate::ir::task::unit_enum_name(ty).is_none() {
+        return Ok(String::new());
+    }
+    let layout = crate::ir::task::unit_enum_layout(layouts, ty)
+        .ok_or_else(|| unsupported("missing native Task enum parameter layout"))?;
+    if layout.variants.is_empty() {
+        return Ok(format!("  return {invalid};\n"));
+    }
+    let variants = layout.variants.len();
+    Ok(format!(
+        "  if ((uint32_t)arg_{index}->tag >= UINT32_C({variants})) return {invalid};\n"
+    ))
 }
 
 fn task_record_type(ty: &IrType) -> bool {
@@ -700,7 +729,10 @@ fn emit_function(
             TaskSlotType::Value {
                 ty,
                 borrowed: false,
-            } if supported_type(ty) || crate::ir::task::flat_array(ty) || task_record_type(ty) => {}
+            } if supported_type(ty)
+                || crate::ir::task::flat_array(ty)
+                || task_record_type(ty)
+                || crate::ir::task::unit_enum_name(ty).is_some() => {}
             TaskSlotType::Callable { .. } => {}
             _ => return Err(unsupported("native task adapter parameter is unsupported")),
         }
@@ -782,7 +814,7 @@ fn emit_function(
     let mut declarations = String::new();
     let mut arguments = String::new();
     let mut preflight = String::new();
-    let mut callable_checks = String::new();
+    let mut value_checks = String::new();
     let mut charge = String::new();
     let mut restore = String::new();
     let mut rejected_drops = String::new();
@@ -880,8 +912,14 @@ fn emit_function(
         }));
         if matches!(ty, TaskSlotType::Callable { .. }) {
             let check = format!("  if (!ku_task_frame_{id}_callable_{slot}(*arg_{index})) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n");
-            callable_checks.push_str(&check);
+            value_checks.push_str(&check);
         }
+        value_checks.push_str(&enum_parameter_check(
+            layouts,
+            ty,
+            index,
+            "KU_TASK_DRIVER_INVALID_ARGUMENT",
+        )?);
         if parameter_owned(ty) {
             rejected_drops.push_str(&format!(
                 "  {}\n",
@@ -1046,7 +1084,7 @@ fn emit_function(
         .replace("@PARAM_DECLS@", &declarations)
         .replace("@PARAM_ARGS@", &arguments)
         .replace("@PREFLIGHT@", &preflight)
-        .replace("@CALLABLE_CHECKS@", &callable_checks)
+        .replace("@PARAMETER_VALUE_CHECKS@", &value_checks)
         .replace("@CHARGE@", &charge)
         .replace("@SOURCE_HEADERS@", &source_headers)
         .replace("@SOURCE_BUFFERS@", &source_buffers)
@@ -1830,7 +1868,7 @@ static uint32_t ku_task_@ID@_try_start_impl(KuTaskDriverV1* driver,
   size_t charge = sizeof(KuTaskInstance_@ID@);
 @CHARGE@
 @SOURCE_BUFFERS@
-@CALLABLE_CHECKS@
+@PARAMETER_VALUE_CHECKS@
   if (source && source->owned_bytes != charge-sizeof(KuTaskInstance_@ID@)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
   /* Header/deep-alias rejection precedes typed output reads. A pointer into
    * an input int/string buffer need not actually contain a full Handle. */
@@ -1892,7 +1930,7 @@ static uint32_t ku_task_@ID@_start_value_impl(KuTaskDriverV1* driver,
   size_t charge=0;
 @CHARGE@
 @SOURCE_BUFFERS@
-@CALLABLE_CHECKS@
+@PARAMETER_VALUE_CHECKS@
   (void)charge;
   if (output->tag || output->owner.lease.control || output->ticket.driver) return KU_TASK_DRIVER_INVALID_STATE;
   KuTaskHandle_@ID@ handle={0};
@@ -1953,7 +1991,7 @@ static uint32_t ku_task_@ID@_start_hosted(const KuTaskAdapterHostV1* host@PARAM_
       || !ku_task_driver_external_storage(driver,host->control,sizeof(KuTaskControlV1),KU_TASK_FRAME_ALIGNOF(KuTaskControlV1)))
     return KU_TASK_DRIVER_INVALID_ARGUMENT;
 @HOSTED_RUNTIME_INPUTS@
-@CALLABLE_CHECKS@
+@PARAMETER_VALUE_CHECKS@
   source=(KuTaskDriverStartChargeV1){*parent,host->control,host->minimum_charge,charge};
 #if defined(KU_TASK_OUTBOUND_HTTP)
   uint64_t previous_deadline=ku_task_http_entry_deadline;

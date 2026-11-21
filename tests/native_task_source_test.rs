@@ -112,6 +112,83 @@ async fn main(): null! { println(Phase.Ready == OtherPhase.Ready) return ok(null
 }
 
 #[test]
+fn native_task_moves_a_nominal_unit_enum_into_a_waiting_child() {
+    let directory = TempDir::new("task-enum-parameter");
+    let path = directory.path();
+    fs::write(
+        path.join("worker.ku"),
+        r#"
+import time from "std.time"
+enum Phase { Ready, Done }
+async fn Approve(phase: Phase, label: str): bool! {
+    time.sleep(30)?
+    println(label)
+    if (phase == Phase.Done) { return ok(true) }
+    return ok(false)
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"
+import { Phase, Approve } from "./worker"
+async fn main(): null! {
+    phase = Phase.Ready
+    println((await Approve(phase, "准备🙂"))?)
+    println((await Approve(Phase.Done, "完成🙂"))?)
+    return ok(null)
+}
+"#;
+    fs::write(path.join("main.ku"), source).unwrap();
+    fs::write(
+        path.join("moved.ku"),
+        source.replace(
+            "    println((await Approve(Phase.Done, \"完成🙂\"))?)",
+            "    println(phase == Phase.Ready)",
+        ),
+    )
+    .unwrap();
+    let result = |args: &[&str]| {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_ku"));
+        cli.current_dir(path).args(args);
+        let output = run_bounded(&mut cli, BUILD_TIMEOUT, BUILD_LIMITS).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+        (output.status.success(), stdout, stderr)
+    };
+    let (passed, stdout, stderr) = result(&["run", "main.ku"]);
+    let expected = "准备🙂\nfalse\n完成🙂\ntrue\n";
+    assert!(passed, "{stderr}");
+    assert_eq!(stdout, expected);
+    let (accepted_move, _, stderr) = result(&["build", "--native", "moved.ku"]);
+    assert!(!accepted_move);
+    assert!(stderr.contains("use of moved value 'phase'"), "{stderr}");
+
+    let filename = if cfg!(windows) { "app.exe" } else { "app" };
+    let (built, _, stderr) =
+        result(&["build", "--release", "--offline", "main.ku", "-o", filename]);
+    if !built && stderr.contains("C compiler not found") {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none(), "{stderr}");
+        return;
+    }
+    assert!(built, "{stderr}");
+    let output = run_bounded(
+        Command::new(path.join(filename)).current_dir(path),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        expected
+    );
+}
+
+#[test]
 fn native_task_keeps_unused_enum_declarations_out_and_rejects_payload_layouts() {
     let scalar = "async fn main(): null! { println(17) return ok(null) }";
     let unused = format!("enum Unused {{ First, Payload(message: str) }}\n{scalar}");

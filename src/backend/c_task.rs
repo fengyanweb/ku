@@ -1172,6 +1172,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             }
         }
         for (index, slot) in self.function.parameters.iter().enumerate() {
+            out.push_str(&super::task_adapter::enum_parameter_check(
+                self.layouts,
+                &self.function.slots[slot.0].ty,
+                index,
+                "KU_TASK_FRAME_INVALID_ARGUMENT",
+            )?);
             if matches!(
                 self.function.slots[slot.0].ty,
                 TaskSlotType::Callable { .. }
