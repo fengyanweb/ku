@@ -890,6 +890,140 @@ fn Refuse(token: Token): Token! {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_clone_moved"));
 }
 
+pub(super) fn assert_named_record_rebind(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("rebind-provider.ku"),
+        r#"struct Pair { first: str second: str }
+fn Choose(input: Pair, label: str, refuse: bool): Pair! {
+    if (refuse) { fail { domain: "rebind", code: "refused", message: label } }
+    return ok(input)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("rebind-entry.ku"),
+        r#"import { Pair, Choose } from "./rebind-provider.ku"
+struct Count { value: int }
+struct Other { first: str second: str }
+fn Replace(previous: Pair, input: Pair, refuse: bool): Pair! {
+    local = previous
+    kept = local.first
+    local = Choose(input, local.second.clone(), refuse)?
+    return ok(Pair { first: local.first, second: kept })
+}
+fn RefuseView(previous: Pair, &view: Pair): Pair! {
+    local = previous
+    local = view
+    return ok(local)
+}
+fn RefuseType(previous: Pair, other: Other): Pair! {
+    local = previous
+    local = other
+    return ok(local)
+}
+fn RefuseSelf(previous: Pair): Pair! {
+    local = previous
+    local = local
+    return ok(local)
+}
+fn RefuseMovedCopyRecord(previous: Count, input: Count): Count! {
+    local = previous
+    local = input
+    return ok(input)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "rebind-entry.ku\nrebind-provider.ku\n",
+    )
+    .unwrap();
+    let NestedPlan {
+        entry,
+        entry_result,
+        dependency,
+        dependency_result,
+        code,
+    } = nested_plan(seed, cwd, "Replace", "Struct");
+    assert_eq!(entry_result, dependency_result);
+    let payload = entry_result.strip_prefix("KuBootstrapResult_").unwrap();
+    let host = r#"
+static unsigned calls;
+static const uint8_t *old_second;
+static KuProjectionString own(char ch) {
+    uint8_t *data = malloc(1);
+    *data = (uint8_t)ch;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+static void drop_pair(__PAIR__ *value) {
+    ku_projection_string_drop(&value->f0);
+    ku_projection_string_drop(&value->f1);
+}
+__RESULT__ __CHOOSE__(__PAIR__ input, KuProjectionString label, bool refuse) {
+    ++calls;
+    assert(outstanding() == 5 && label.ptr != old_second && *label.ptr == *old_second);
+    __RESULT__ result = {0};
+    if (refuse) {
+        drop_pair(&input);
+        result.error.message = label;
+    } else {
+        ku_projection_string_drop(&label);
+        result.ok = true;
+        result.value = input;
+    }
+    return result;
+}
+int main(void) {
+    (void)test_realloc;
+    __PAIR__ previous = {own('a'), own('b')};
+    __PAIR__ input = {own('c'), own('d')};
+    old_second = previous.f1.ptr;
+    __RESULT__ result = __ENTRY__(previous, input, false);
+    assert(result.ok && result.value.f0.ptr == input.f0.ptr && result.value.f1.ptr == previous.f0.ptr);
+    assert(outstanding() == 2 && calls == 1 && attempts == 5);
+    drop_pair(&result.value);
+    assert(outstanding() == 0);
+
+    previous = (__PAIR__){own('e'), own('f')};
+    input = (__PAIR__){own('g'), own('h')};
+    old_second = previous.f1.ptr;
+    result = __ENTRY__(previous, input, true);
+    assert(!result.ok && result.error.message.len == 1 && *result.error.message.ptr == 'f');
+    assert(outstanding() == 1 && calls == 2 && attempts == 10);
+    ku_projection_string_drop(&result.error.message);
+    assert(outstanding() == 0);
+    return 0;
+}
+"#
+    .replace("__RESULT__", &entry_result)
+    .replace("__ENTRY__", &entry)
+    .replace("__CHOOSE__", &dependency)
+    .replace("__PAIR__", payload);
+    let c = cwd.join("named-record-rebind.c");
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    let exe = cwd.join(format!(
+        "named-record-rebind{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    for (function, diagnostic) in [
+        ("RefuseView", "linked_rebind_type"),
+        ("RefuseType", "linked_rebind_type"),
+        ("RefuseSelf", "linked_rebind_type"),
+        ("RefuseMovedCopyRecord", "unavailable_linked_binding"),
+    ] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(error.contains(diagnostic), "{diagnostic}, got {error}");
+    }
+}
+
 pub(super) fn assert_owned_record_destructure(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("pattern-provider.ku"),
