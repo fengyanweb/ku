@@ -862,10 +862,28 @@ pub(super) fn assert_named_record_clone(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("named-clone.ku"),
         r#"struct Token { kind: str lexeme: str line: int }
+struct Envelope { content: Token }
+struct Numbers { items: [int] }
+struct Collection { content: Numbers }
 fn Copy(token: Token): Token! { return ok(token.clone()) }
+fn CopyField(&envelope: Envelope): Token! {
+    result = envelope.content.clone()
+    result.line = envelope.content.line
+    return ok(result)
+}
 fn Refuse(token: Token): Token! {
     moved = token.kind
     return ok(token.clone())
+}
+fn RefuseField(envelope: Envelope): Token! {
+    moved = envelope.content.kind
+    return ok(envelope.content.clone())
+}
+fn RefuseFieldArray(&collection: Collection): Numbers! {
+    return ok(collection.content.clone())
+}
+fn RefuseScalarField(&envelope: Envelope): int! {
+    return ok(envelope.content.line.clone())
 }
 "#,
     )
@@ -883,11 +901,26 @@ fn Refuse(token: Token): Token! {
     assert!(cleanup.contains("ku_projection_string_drop(&a0.f0)"));
     assert!(cleanup.contains("ku_projection_string_drop(&a0.f1)"));
 
-    fs::write(cwd.join("function.txt"), "Refuse").unwrap();
-    let rejected = execute(&mut Command::new(seed), cwd, 30);
-    assert_eq!(rejected.status.code(), Some(1));
-    assert!(rejected.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_clone_moved"));
+    fs::write(cwd.join("function.txt"), "CopyField").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    assert!(code.contains("_clone_element(&(*a0).f0,"));
+    assert!(code.contains(" = (*a0).f0.f2;"));
+
+    for (function, diagnostic) in [
+        ("Refuse", "linked_clone_moved"),
+        ("RefuseField", "linked_clone_moved"),
+        ("RefuseFieldArray", "linked_nested_array_clone"),
+        ("RefuseScalarField", "unsupported_linked_clone"),
+    ] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(error.contains(diagnostic), "{diagnostic}, got {error}");
+    }
 }
 
 pub(super) fn assert_named_record_rebind(seed: &Path, cwd: &Path) {

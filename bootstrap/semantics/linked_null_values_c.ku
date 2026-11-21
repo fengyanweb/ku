@@ -17,22 +17,19 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     subject = LinkedNullNode(project, 1, subject_id)
     field = subject.kind == "Field" && subject.edge_count == 1
     if (!field && subject.kind != "Index" && (subject.kind != "Variable" || subject.edge_count != 0)) {
-        RejectLayout("unsupported_linked_clone", "expected a bound variable, indexed element or str field for clone", DeclarationSpan(subject))?
+        RejectLayout("unsupported_linked_clone", "expected a bound variable, indexed element or field for clone", DeclarationSpan(subject))?
     }
     source = LowerLinkedNullRead(project, state, subject_id, depth + 1)?
     ty = source.value.ty.clone()
     if (ty.declaration_kind == "Builtin" && ty.name == "str") {
         return CloneLinkedStringSlot(project, source, "t" + str(id))
     }
-    if (field) {
-        RejectLayout("unsupported_linked_clone", "field clone requires a bound str", DeclarationSpan(subject))?
+    if (field && ty.declaration_kind != "Struct") {
+        RejectLayout("unsupported_linked_clone", "field clone requires a bound str or finite struct", DeclarationSpan(subject))?
     }
     if (LinkedNullOwnedArray(ty)) { return CloneLinkedRecordArray(project, source, id) }
     if (ty.declaration_kind != "Struct") {
         RejectLayout("unsupported_linked_clone", "expected str or a finite struct for clone", DeclarationSpan(subject))?
-    }
-    if (subject.kind != "Index" && subject.kind != "Variable") {
-        RejectLayout("unsupported_linked_clone", "struct clone needs a bound or indexed value", DeclarationSpan(subject))?
     }
     return CloneLinkedRecord(project, source, subject, id)
 }
