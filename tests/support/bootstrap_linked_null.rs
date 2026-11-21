@@ -707,7 +707,7 @@ pub(super) fn assert_short_circuit_reads(seed: &Path, cwd: &Path) {
             format!(
                 "import {{ Mark }} from \"./logic-provider.ku\"\n\
                  fn Observe(&command: str, &values: [str]): null! {{\n\
-                     if (command == \"chosen\" {operator} values[1] == \"ready\") {{ Mark()? }}\n\
+                     if (command == \"chosen\" {operator} (values[1].len() == 2 && values[1] == \"中🙂\")) {{ Mark()? }}\n\
                      return ok(null)\n\
                  }}\n"
             ),
@@ -756,10 +756,11 @@ KuBootstrapResultNull CALLEE(void) {
 int main(int argc, char** argv) {
     (void)argv;
     uint8_t skip[] = "SKIP";
-    uint8_t chosen[] = "chosen", absent[] = "absent", ready[] = "ready";
+    uint8_t chosen[] = "chosen", absent[] = "absent";
+    uint8_t ready[] = {0xe4, 0xb8, 0xad, 0xf0, 0x9f, 0x99, 0x82};
     KuProjectionString command = {skip, sizeof(skip) - 1, 0, KU_PROJECTION_STRING_STATIC};
     KuProjectionString active = {ACTIVE, sizeof(ACTIVE) - 1, 0, KU_PROJECTION_STRING_STATIC};
-    KuProjectionString words[] = {{0}, {ready, 5, 0, KU_PROJECTION_STRING_STATIC}};
+    KuProjectionString words[] = {{0}, {ready, sizeof(ready), 0, KU_PROJECTION_STRING_STATIC}};
     KuGuardStringArray empty = {0}, values = {2, words, 2};
     (void)chosen;
     (void)absent;

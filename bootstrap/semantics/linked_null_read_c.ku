@@ -7,6 +7,7 @@ import { FieldIndex, ReadLinkedErrorMember, RejectLayout } from "./struct_layout
 import { LinkedErrorField, ReadLinkedNullBinding, CheckLinkedAddition, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
+import { ProjectionStringLength } from "./struct_projection_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedStringResult, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
 
@@ -75,7 +76,7 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
     if (node.kind == "Call" && node.edge_count > 0) {
         target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
         if (target.kind == "Field" && target.edge_count == 1) {
-            return readLinkedMethod(project, state, node, target, depth)
+            return readLinkedMethod(project, state, node, target, id, depth)
         }
     }
     if (node.edge_count == 0 && (node.kind == "Variable" || node.kind == "Int" ||
@@ -86,7 +87,7 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
     return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", DeclarationSpan(node)), ""))
 }
 
-fn readLinkedMethod(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &target: Node, depth: int): LinkedNullExpression! {
+fn readLinkedMethod(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &target: Node, id: int, depth: int): LinkedNullExpression! {
     next = state
     at = DeclarationSpan(call)
     if (call.edge_count == 1 && (target.text == "len" || target.text == "byte_len")) {
@@ -94,13 +95,18 @@ fn readLinkedMethod(&project: LinkedNullProject, state: LinkedNullState, &call: 
         if (target.text == "byte_len" && LinkedStringResult(value.value.ty)) {
             return ok(LinkedReadonlyExpression(value.state, LinkedBuiltin("int", at), "(int64_t)(" + value.value.text + ").len"))
         }
+        if (target.text == "len" && LinkedStringResult(value.value.ty)) {
+            length = ProjectionStringLength("(" + value.value.text + ")", false, true, id, "    ")
+            value.state.code += length.setup
+            return ok(LinkedReadonlyExpression(value.state, LinkedBuiltin("int", at), length.value))
+        }
         if (target.text == "len" && LinkedNullReadableArray(value.value.ty)) {
             return ok(LinkedReadonlyExpression(value.state, LinkedBuiltin("int", at),
                 "(int64_t)" + LinkedNullArrayHeader(value.value.ty, value.value.text) + "->len"))
         }
         next = value.state
         if (target.text == "len") {
-            RejectLayout("linked_array_length", "len requires a struct array", at.clone())?
+            RejectLayout("linked_array_length", "len requires a str or a supported array", at.clone())?
         }
     } else if (call.edge_count == 2 && target.text == "ends_with") {
         left = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, target, 0), depth + 1)?
