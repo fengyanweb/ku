@@ -213,7 +213,11 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
     returns_null_result = false
     text = ""
     symbol = ""
-    while (completed.len() < plans.len()) {
+    plan_count = plans.len()
+    round = 0
+    // Each successful round completes at least one plan. A stalled round
+    // still reports the same recursive call before the cursor advances.
+    while (round < plan_count && completed.len() < plan_count) {
         blocked_at = 0
         blocked_module = 0
         before = completed.len()
@@ -260,6 +264,7 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
             }
             rejectScalarInt("recursive_int_call", "recursive call graph is outside the bootstrap int subset", at)?
         }
+        round = round + 1
     }
     headers = ScalarIntegerHelpers(uses_add, uses_sub, uses_mul, uses_div, uses_rem)
     if (uses_output) { headers += "#include <stdio.h>\n" }

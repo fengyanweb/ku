@@ -334,9 +334,17 @@ fn RejectLinkedLoopWrite(&project: LinkedNullProject, &loop: Node, &name: str, c
     return RejectLinkedWriteRange(project, start, end, name, code, message)
 }
 
+fn LinkedIncreasingGuard(&project: LinkedNullProject, &loop: Node): Node {
+    guard = LinkedNullNode(project, 1, LinkedNullChild(project, 1, loop, 0))
+    if (guard.kind == "Binary" && guard.text == "&&" && guard.edge_count == 2) {
+        // The readonly right operand may stop before the fixed upper bound.
+        return LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
+    }
+    return guard
+}
+
 fn CheckLinkedCountedBoundWrites(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node): null! {
-    guard_id = LinkedNullChild(project, 1, loop, 0)
-    guard = LinkedNullNode(project, 1, guard_id)
+    guard = LinkedIncreasingGuard(project, loop)
     bound_id = LinkedNullChild(project, 1, guard, 1)
     bound = LinkedNullNode(project, 1, bound_id)
     cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))

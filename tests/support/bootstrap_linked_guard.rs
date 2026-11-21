@@ -1302,6 +1302,12 @@ fn CountSeparated(&available: [int], skip: int): CountResult! {
     }
     return ok(CountResult { value: cursor })
 }
+fn CountWhileAvailable(&available: [int], skip: int): CountResult! {
+    work_limit = available.len() - skip
+    cursor = 0
+    while (cursor < work_limit && available[cursor] > 0) { cursor = cursor + 1 }
+    return ok(CountResult { value: cursor })
+}
 fn MutableBound(start: int): null! {
     work_limit = start
     cursor = 0
@@ -1351,13 +1357,16 @@ int main(void) {
     assert(result.ok && result.value.f0 == 0);
     result = __ENTRY__(&available, INT64_MAX);
     assert(result.ok && result.value.f0 == 0);
+    const KuArrayInt empty = {0};
+    result = __ENTRY__(&empty, 0);
+    assert(result.ok && result.value.f0 == 0);
     assert(available.data == data && available.len == 3);
     return 0;
 }
 "#;
     let c = cwd.join("counted-int-bound.c");
     let app = cwd.join(format!("counted-int-bound{}", std::env::consts::EXE_SUFFIX));
-    for function in ["Count", "CountSeparated"] {
+    for function in ["Count", "CountSeparated", "CountWhileAvailable"] {
         fs::write(cwd.join("function.txt"), function).unwrap();
         let emitted = execute(&mut Command::new(seed), cwd, 30);
         assert_ok(&emitted);

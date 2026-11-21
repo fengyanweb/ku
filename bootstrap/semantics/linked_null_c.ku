@@ -1,6 +1,6 @@
 import { AddLinkedNullSlot, LinkedCountedInitial, LinkedCountdownIndex, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
 import { OpenLinkedForLoop, CloseLinkedForLoop } from "./linked_char_iter_c.ku"
-import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedPlainReturn } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -98,7 +98,7 @@ fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statem
 }
 
 fn countedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &initial: Node, &step: Node): int! {
-    guard = LinkedNullNode(project, 1, LinkedNullChild(project, 1, loop, 0))
+    guard = LinkedIncreasingGuard(project, loop)
     if (guard.kind != "Binary" || guard.edge_count != 2 || guard.text != "<" ||
         !LinkedCountBound(project, state, LinkedNullChild(project, 1, guard, 1))?) {
         RejectLayout("unsupported_linked_loop", "counted while requires a readonly array length or stable int bound", DeclarationSpan(guard))?
