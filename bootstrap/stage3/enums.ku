@@ -45,7 +45,8 @@ fn ReadEnum(tokens: [Token]): DeclarationRead! {
     variants: [int] = []
     work = validation_index
 
-    while (tokens[cursor].kind != "RBrace" && tokens[cursor].kind != "Eof") {
+    reading_variants = tokens[cursor].kind != "RBrace" && tokens[cursor].kind != "Eof"
+    while (reading_variants) {
         work = work + 1
         if (work > 16384) {
             RejectAt(tokens[cursor].clone(), "work_limit", "stage-3 parser work budget exceeded")?
@@ -77,20 +78,17 @@ fn ReadEnum(tokens: [Token]): DeclarationRead! {
                 cursor = cursor + 1
 
                 parsed_type = ReadSignatureTypeAt(tokens, cursor)?
-                if (parsed_type.consumed <= 0 || parsed_type.consumed > tokens.len() - 1 - cursor) {
+                // Take the type plan and its bounds from the same owned result.
+                { root: parsed_root, parts: parsed_parts, edges: parsed_edges, consumed: type_consumed, work: type_work } = parsed_type
+                if (type_consumed <= 0 || type_consumed > tokens.len() - 1 - cursor) {
                     RejectAt(tokens[cursor].clone(), "invalid_token_stream", "enum type parser did not advance within its bounded window")?
                 }
-                cursor = cursor + parsed_type.consumed
-                work = work + parsed_type.work
+                cursor = cursor + type_consumed
+                work = work + type_work
                 if (work > 16384) {
                     RejectAt(field_name.clone(), "work_limit", "stage-3 parser work budget exceeded")?
                 }
 
-                // Flatten the owned type plan once; repeated field projections
-                // would otherwise copy the growing plan on the interpreter path.
-                parsed_root = parsed_type.root
-                parsed_parts = parsed_type.parts
-                parsed_edges = parsed_type.edges
                 node_base = arena_nodes.len()
                 part_index = 0
                 while (part_index < parsed_parts.len()) {
@@ -178,6 +176,7 @@ fn ReadEnum(tokens: [Token]): DeclarationRead! {
         variant = arena_nodes.len()
         variants = variants.push(variant)
         if (tokens[cursor].kind == "Comma") { cursor = cursor + 1 }
+        reading_variants = tokens[cursor].kind != "RBrace" && tokens[cursor].kind != "Eof"
     }
 
     end = tokens[cursor].clone()
