@@ -46,6 +46,12 @@ Record the provider's own bound declaration and emitted ABI in the receipt.
 The linker checks the digest and the receiving C declaration. The receipt
 follows the same signature and dependency rules as a generated plan.
 
+Use `--builtin fs.read` to provide the declared `std/fs.ku#1` filesystem
+operation. The linker validates its `(&str) -> str!` signature and bundles
+the existing native filesystem code and ABI header in the temporary build.
+Pass this option explicitly for units that depend on `fs.read`. The file
+read uses the supplied path and keeps the native limit and error contract.
+
 `json_literal_string_c.ku` emits a standalone checked string provider from
 the bound zero-argument function named in `function.txt`. It reads the
 project-relative paths in `modules.txt` and uses the first path as the input

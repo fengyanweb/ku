@@ -200,6 +200,21 @@ class Unit:
             raise LinkError(f"{plan}: {error}") from error
 
 
+def fs_read_provider():
+    tools = Path(__file__).resolve().parent
+    driver = tools / "compiler_driver"
+    backend = tools.parents[1] / "src" / "backend"
+    source = (driver / "fs_read.c").resolve()
+    headers = (driver / "fs_read.h", backend / "c_fs_common.c",
+               backend / "c_fs_current_directory.c", backend / "c_fs_read.c")
+    # This declaration must match FsReadLinkPlan and the checked fs_read.h ABI.
+    signature = Signature((TypeRef(("builtin", "str"), "view", "const KuString*"),),
+                          TypeRef(("builtin", "str"), "value", "KuResult_str"), True)
+    export = Declaration(("std/fs.ku", 1), "KuBootstrapFsRead", signature)
+    unit = Unit(source, source, source.read_bytes(), export, ())
+    return unit, {path.resolve(): path.read_bytes() for path in headers}
+
+
 def label(key):
     return f"{key[0]}#{key[1]}"
 
@@ -268,12 +283,18 @@ def run_cc(args, timeout):
         raise LinkError(f"C compiler timed out after {timeout:g}s") from error
 
 
-def link(units, aliases, output, entry, caller, cc, cflags, ldflags, timeout):
+def link(units, aliases, output, entry, caller, cc, cflags, ldflags, timeout, builtin_headers):
     msvc = Path(cc).stem.lower() in {"cl", "clang-cl"}
     flags = (["/nologo", "/std:c11", "/O2", "/WX"] if msvc else
              ["-std=c11", "-O2", "-pedantic-errors", "-Wall", "-Wextra", "-Werror"])
     with tempfile.TemporaryDirectory(prefix=".ku-bootstrap-link-", dir=output.parent) as tmp:
         root = Path(tmp)
+        if builtin_headers:
+            include = root / "builtin"
+            include.mkdir()
+            for path, code in builtin_headers.items():
+                (include / path.name).write_bytes(code)
+            cflags = [f"{'/I' if msvc else '-I'}{include}", *cflags]
         objects = []
         for i, unit in enumerate(sorted(units, key=lambda item: item.export.key)):
             work = root / str(i)
@@ -300,6 +321,7 @@ def link(units, aliases, output, entry, caller, cc, cflags, ldflags, timeout):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--unit", nargs=2, required=True, action="append", metavar=("PLAN", "C"))
+    parser.add_argument("--builtin", action="append", choices=("fs.read",), default=[])
     parser.add_argument("--entry", nargs=2, metavar=("MODULE", "NODE"))
     parser.add_argument("--caller", type=Path)
     parser.add_argument("-o", "--output", type=Path)
@@ -317,6 +339,12 @@ def main(argv=None):
         if not 0 < args.timeout < float("inf"):
             raise LinkError("--timeout must be a finite positive number")
         units = [Unit.read(Path(plan).resolve(), Path(source).resolve()) for plan, source in args.unit]
+        builtin_headers = {}
+        if args.builtin:
+            if len(args.builtin) > 1:
+                raise LinkError("duplicate provider for std/fs.ku#1")
+            provider, builtin_headers = fs_read_provider()
+            units.append(provider)
         aliases = checked_aliases(units)
         entry = None
         caller = None
@@ -330,12 +358,14 @@ def main(argv=None):
             return 0
         output = args.output.resolve()
         inputs = {path for unit in units for path in (unit.plan, unit.source)}
+        inputs.update(builtin_headers)
         if args.caller:
             inputs.add(args.caller.resolve())
         if output in inputs:
             raise LinkError("output refers to an input file")
         output.parent.mkdir(parents=True, exist_ok=True)
-        link(units, aliases, output, entry, caller, args.cc, args.cflag, args.ldflag, args.timeout)
+        link(units, aliases, output, entry, caller, args.cc, args.cflag, args.ldflag,
+             args.timeout, builtin_headers)
     except (OSError, ValueError) as error:
         print(f"bootstrap link: {error}", file=sys.stderr)
         return 1

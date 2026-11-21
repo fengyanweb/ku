@@ -143,10 +143,7 @@ class LinkTests(unittest.TestCase):
             link_c.TypeRef.read(dict(integer, c_type="KuArrayInt", passing="value"), "value")
 
     def test_fs_read_provider_links_and_preserves_bytes_and_errors(self):
-        tools = Path(__file__).resolve().parent
-        driver = tools / "compiler_driver"
-        backend = tools.parents[1] / "src" / "backend"
-        path_type = dict(builtin("str", "const KuBootstrapString*"), passing="view")
+        path_type = dict(builtin("str", "const KuString*"), passing="view")
         result_type = builtin("str", "KuResult_str")
         provider = declaration("std/fs.ku", 1, "KuBootstrapFsRead", [path_type])
         provider["signature"].update(result=result_type, returns_result=True)
@@ -159,8 +156,11 @@ class LinkTests(unittest.TestCase):
 extern KuResult_str read_builtin(const KuString*);
 KuResult_str read_manifest(const KuString* path) { return read_builtin(path); }
 """)
-        units += self.unit("provider", plan(provider),
-                           (driver / "fs_read.c").read_text(encoding="ascii"), receipt=True)
+        self.assert_preflight_error(units, "missing provider for std/fs.ku#1")
+        fs_builtin = ["--builtin", "fs.read"]
+        duplicate = self.unit("extra-provider", plan(provider), "/* never compiled */\n", receipt=True)
+        self.assert_preflight_error([*units, *fs_builtin, *duplicate], "duplicate provider for std/fs.ku#1")
+        self.assert_preflight_error([*units, *fs_builtin, *fs_builtin], "duplicate provider for std/fs.ku#1")
 
         filename = "条目🙂.txt"
         content = "清单🙂".encode("utf-8") + b"\0\r\n"
@@ -217,13 +217,17 @@ int main(void) {
 }
 """.replace("__NAME__", c_bytes(filename.encode("utf-8")))
    .replace("__CONTENT__", c_bytes(content)), encoding="ascii")
-        cc = os.environ.get("CC", "cc")
-        include = "/I" if Path(cc).stem.lower() in {"cl", "clang-cl"} else "-I"
         self.assertEqual(link_c.main([
-            *units, "--entry", "manifest.ku", "1", "--caller", str(self.caller),
-            "-o", str(self.output), f"--cflag={include}{driver}", f"--cflag={include}{backend}",
+            *units, *fs_builtin, "--entry", "manifest.ku", "1", "--caller", str(self.caller),
+            "-o", str(self.output),
         ]), 0)
         subprocess.run([self.output], cwd=self.root, check=True, timeout=5)
+
+        def change_result(p):
+            p["dependencies"][0]["signature"].update(returns_result=False)
+
+        self.change_plan(units, change_result)
+        self.assert_preflight_error([*units, *fs_builtin], "signature mismatch for std/fs.ku#1")
 
     def test_missing_and_duplicate_providers_are_rejected_before_compiling(self):
         self.assert_preflight_error([*self.entry_args, *self.left_args], "missing provider for tools/右.ku#17")
