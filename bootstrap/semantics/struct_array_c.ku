@@ -372,7 +372,9 @@ fn OwnedRecordArrayCloneLayout(&layouts: [StructLayout], &array: TypeNameBinding
         if (CanCloneNestedStringArrays(layouts, index)) { return index }
         return 0
     }
-    if (collectOwnedFields(layouts, index, "", []).len() == 0) { return 0 }
+    empty_paths: [str] = []
+    owned_paths = collectOwnedFields(layouts, index, "", empty_paths)
+    if (owned_paths.len() == 0) { return 0 }
     return index
 }
 
