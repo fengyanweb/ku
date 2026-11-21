@@ -1219,6 +1219,131 @@ int main(int argc, char **argv) {
     }
 }
 
+pub(super) fn assert_owned_record_field_literal(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("literal-provider.ku"),
+        r#"struct Item { label: str note: str }
+struct Output { items: [Item] edges: [int] }
+fn Choose(item: Item, refuse: bool): Item! {
+    if (refuse) { fail { domain: "literal", code: "refused", message: item.label } }
+    return ok(item)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("literal-entry.ku"),
+        r#"import { Item, Output, Choose } from "./literal-provider.ku"
+struct Wrong { label: str note: str }
+fn Build(first: Item, second: Item, refuse: bool): Output! {
+    return ok(Output { items: [first, Choose(second.clone(), refuse)?], edges: [] })
+}
+fn Borrowed(&entry: Item): Output! { return ok(Output { items: [entry], edges: [] }) }
+fn WrongType(entry: Wrong): Output! { return ok(Output { items: [entry], edges: [] }) }
+fn Repeated(entry: Item): Output! { return ok(Output { items: [entry, entry], edges: [] }) }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "literal-entry.ku\nliteral-provider.ku\n",
+    )
+    .unwrap();
+    let NestedPlan {
+        entry,
+        entry_result,
+        dependency,
+        dependency_result,
+        code,
+    } = nested_plan(seed, cwd, "Build", "Struct");
+    let output = entry_result.strip_prefix("KuBootstrapResult_").unwrap();
+    let item = dependency_result
+        .strip_prefix("KuBootstrapResult_")
+        .unwrap();
+    let host = r#"
+static unsigned calls;
+static KuProjectionString owner(char ch) {
+    uint8_t *data = malloc(1);
+    *data = (uint8_t)ch;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+__ITEM_RESULT__ __CHOOSE__(__ITEM__ value, bool refuse) {
+    ++calls;
+    __ITEM_RESULT__ result = {0};
+    if (refuse) {
+        ku_projection_string_drop(&value.f1);
+        result.error.message = value.f0;
+    } else {
+        result.ok = true;
+        result.value = value;
+    }
+    return result;
+}
+static void check_partial_clone_cleanup(void) {
+    if (outstanding() || calls || attempts != 7) _Exit(84);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    __ITEM__ first = {owner('a'), owner('b')};
+    __ITEM__ second = {owner('c'), owner('d')};
+    if (argc == 2) {
+        assert(atexit(check_partial_clone_cleanup) == 0);
+        fail_after = 2;
+        (void)__ENTRY__(first, second, false);
+        return 85;
+    }
+    __ENTRY_RESULT__ result = __ENTRY__(first, second, false);
+    assert(result.ok && result.value.f0.len == 2 && !result.value.f1.len && !result.value.f1.data);
+    assert(result.value.f0.data[0].f0.ptr == first.f0.ptr && result.value.f0.data[0].f1.ptr == first.f1.ptr);
+    assert(*result.value.f0.data[1].f0.ptr == 'c' && *result.value.f0.data[1].f1.ptr == 'd');
+    assert(attempts == 7 && outstanding() == 5 && calls == 1);
+    __DROP__(&result.value);
+    assert(!outstanding());
+
+    first = (__ITEM__){owner('e'), owner('f')};
+    second = (__ITEM__){owner('g'), owner('h')};
+    result = __ENTRY__(first, second, true);
+    assert(!result.ok && !result.value.f0.data && result.error.message.len == 1);
+    assert(*result.error.message.ptr == 'g' && outstanding() == 1 && calls == 2 && attempts == 14);
+    ku_projection_string_drop(&result.error.message);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("__ITEM_RESULT__", &dependency_result)
+    .replace("__ENTRY_RESULT__", &entry_result)
+    .replace("__ITEM__", item)
+    .replace("__ENTRY__", &entry)
+    .replace("__CHOOSE__", &dependency)
+    .replace("__DROP__", &format!("ku_drop_{output}"));
+    let c = cwd.join("record-field-literal.c");
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    let exe = cwd.join(format!(
+        "record-field-literal{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    let trapped = execute(Command::new(&exe).arg("oom"), cwd, 10);
+    assert_eq!(trapped.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&trapped.stderr).trim(),
+        "out of memory"
+    );
+    for (function, diagnostic) in [
+        ("Borrowed", "linked_record_array_literal"),
+        ("WrongType", "linked_record_array_literal"),
+        ("Repeated", "unavailable_linked_binding"),
+    ] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(error.contains(diagnostic), "{diagnostic}, got {error}");
+    }
+}
+
 pub(super) fn assert_local_array_reader(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("local-reader.ku"),

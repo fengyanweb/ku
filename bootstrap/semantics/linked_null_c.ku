@@ -15,8 +15,8 @@ import { LinkedReadonlyExpression, LinkedSlotPrefix, ExitLinkedFailure, LinkedFa
 import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedCopyRebind, LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { LowerLinkedArrayAppend,
-         LowerLinkedNullValue, LowerLinkedOwnerRebind } from "./linked_null_values_c.ku"
+import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
+import { LowerLinkedArrayAppend, LowerLinkedOwnerRebind } from "./linked_owner_assignment_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
 
 struct LinkedNullC {
