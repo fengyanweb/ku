@@ -169,7 +169,15 @@ fn assert_owned_array_member(
         r#"struct Row { name: str }
 struct Packet { rows: [Row] other: str }
 fn Take(packet: Packet): [Row]! { return ok(packet.rows) }
+fn TakePlain(packet: Packet): [Row] { return packet.rows }
+fn TakeThroughPlain(packet: Packet): [Row]! { return ok(TakePlain(packet)) }
 fn Refuse(&packet: Packet): [Row]! { return ok(packet.rows) }
+fn RefusePlain(&packet: Packet): [Row] { return packet.rows }
+fn RejectUnchecked(): null! { return ok(null) }
+fn RefuseEscapingError(packet: Packet): [Row] {
+    RejectUnchecked()?
+    return packet.rows
+}
 fn Duplicate(packet: Packet): [Row]! {
     rows = packet.rows
     return ok(packet.rows)
@@ -178,7 +186,34 @@ fn Duplicate(packet: Packet): [Row]! {
     )
     .unwrap();
     fs::write(cwd.join("modules.txt"), "array-member-source.ku\n").unwrap();
-    fs::write(cwd.join("function.txt"), "Take").unwrap();
+    assert_array_transfer(cwd, emit, "Take", true);
+    assert_array_transfer(cwd, emit, "TakePlain", false);
+    fs::write(cwd.join("function.txt"), "TakeThroughPlain").unwrap();
+    let forward = emit("linked-null-plan");
+    assert_ok(&forward);
+    let plan = String::from_utf8(forward.stdout).unwrap();
+    assert!(plan.contains("\"source_name\":\"TakePlain\""));
+    assert!(plan.contains("\"returns_result\":false"));
+    for (function, diagnostic) in [
+        ("Refuse", "linked_result_return"),
+        ("RefusePlain", "linked_array_return"),
+        ("RefuseEscapingError", "linked_array_failure"),
+        ("Duplicate", "linked_moved_member"),
+    ] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let rejected = emit("linked-null");
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}
+
+fn assert_array_transfer(
+    cwd: &Path,
+    emit: &impl Fn(&str) -> super::bounded_process::BoundedOutput,
+    function: &str,
+    checked: bool,
+) {
+    fs::write(cwd.join("function.txt"), function).unwrap();
     let typed = emit("linked-null-plan");
     assert_ok(&typed);
     let Some(Value::Result { ok: true, value }) = json::eval(
@@ -198,6 +233,7 @@ fn Duplicate(packet: Packet): [Row]! {
     let Value::Object(signature) = &entry["signature"] else {
         panic!("expected signature")
     };
+    assert_eq!(signature["returns_result"], Value::Bool(checked));
     let Value::Array(parameters) = &signature["parameters"] else {
         panic!("expected parameters")
     };
@@ -216,6 +252,14 @@ fn Duplicate(packet: Packet): [Row]! {
     let Value::String(symbol) = &entry["symbol"] else {
         panic!("expected export symbol")
     };
+    let invocation = if checked {
+        format!(
+            "{result_type} result = {symbol}(packet);\n    assert(result.ok);\n    {} returned = result.value;",
+            result_type.strip_prefix("KuBootstrapResult_").unwrap()
+        )
+    } else {
+        format!("{result_type} returned = {symbol}(packet);")
+    };
     let driver = r#"
 int main(void) {
     (void)test_realloc;
@@ -227,18 +271,17 @@ int main(void) {
     packet.f0.len = packet.f0.capacity = 1;
     packet.f1 = (KuProjectionString){malloc(1),1,1,KU_PROJECTION_STRING_OWNED};
     const void *array = packet.f0.data;
-    __RESULT__ result = __ENTRY__(packet);
-    assert(result.ok && result.value.data == array && result.value.len == 1);
-    assert(result.value.data[0].f0.ptr == bytes && outstanding() == 2);
-    ku_projection_string_drop(&result.value.data[0].f0);
-    free(result.value.data);
+    __INVOKE__
+    assert(returned.data == array && returned.len == 1);
+    assert(returned.data[0].f0.ptr == bytes && outstanding() == 2);
+    ku_projection_string_drop(&returned.data[0].f0);
+    free(returned.data);
     assert(outstanding() == 0);
     return 0;
 }
 "#
     .replace("__PACKET__", packet)
-    .replace("__RESULT__", result_type)
-    .replace("__ENTRY__", symbol);
+    .replace("__INVOKE__", &invocation);
     let c = emit("linked-null");
     assert_ok(&c);
     let path = cwd.join("array-member-move.c");
@@ -253,13 +296,4 @@ int main(void) {
     .unwrap();
     compile_projection(&path, &app, cwd);
     assert_ok(&execute(&mut Command::new(&app), cwd, 15));
-    for (function, diagnostic) in [
-        ("Refuse", "linked_result_return"),
-        ("Duplicate", "linked_moved_member"),
-    ] {
-        fs::write(cwd.join("function.txt"), function).unwrap();
-        let rejected = emit("linked-null");
-        assert_eq!(rejected.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
-    }
 }

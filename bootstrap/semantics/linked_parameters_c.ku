@@ -51,7 +51,10 @@ fn ReadLinkedNullParameters(&project: LinkedNullProject, &function: Node): Linke
     if (index >= function.edge_count - 1) {
         RejectLayout("linked_null_signature", "entry requires a declared null! result and a body", DeclarationSpan(function))?
     }
-    result = ReadLinkedResult(project, 1, LinkedNullChild(project, 1, function, index), true)?
+    result_id = LinkedNullChild(project, 1, function, index)
+    declared = LinkedNullNode(project, 1, result_id)
+    state.plain_array_result = declared.kind == "TypeArray"
+    result = ReadLinkedResult(project, 1, result_id, !state.plain_array_result)?
     if (index == 0) { signature = "void" }
     state.code = state.code + validation
     state = RegisterLinkedNullType(project, state, result.clone())?

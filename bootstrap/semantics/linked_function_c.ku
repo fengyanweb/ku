@@ -2,7 +2,14 @@ import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { EmitLinkedArrayBody } from "./struct_array_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
-import { EmitLinkedNullPrototypes } from "./linked_null_types_c.ku"
+import { Node } from "../stage2/ast.ku"
+import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
+import { DeclarationSpan } from "./names.ku"
+import { RejectLayout } from "./struct_layouts.ku"
+import { MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { EmitLinkedNullPrototypes, LinkedCheckedResultCType, LinkedNullChild, LinkedNullCType, LinkedNullProject,
+         LinkedNullResultCleanupReference, SameLinkedType } from "./linked_null_types_c.ku"
+import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { LinkedCPrelude, LinkedNullState } from "./link_plan_c.ku"
 
 fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &signature: str,
@@ -54,4 +61,31 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
     header = LinkedCPrelude(body, GuardArithmetic(body.uses_add, body.uses_sub) + GuardStringEquality(body.uses_string_equal))
     declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
     return ok(declarations + EmitLinkedNullPrototypes(body.links, result)?)
+}
+
+fn EmitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &payload: TypeNameBinding): str! {
+    header = EmitLinkedNullDeclarations(body, payload)?
+    result = ""
+    if (body.plain_array_result) { result = LinkedNullCType(payload)? }
+    else { result = LinkedCheckedResultCType(payload)? }
+    keep = LinkedNullResultCleanupReference(body.owning_layouts, payload)
+    char_errors = ""
+    if (body.uses_chars) { char_errors = ManagedSourceCharactersErrors() }
+    return ok(FinishLinkedFunctionC(header, body, symbol, signature, result, keep, char_errors))
+}
+
+fn LowerLinkedPlainArrayReturn(&project: LinkedNullProject, state: LinkedNullState,
+                               &statement: Node, &result: TypeNameBinding): LinkedNullState! {
+    if (statement.edge_count != 1) {
+        RejectLayout("linked_array_return", "expected one array value", DeclarationSpan(statement))?
+    }
+    value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
+    if (!SameLinkedType(value.value.ty, result) || value.value.borrowed || value.value.slot == 0) {
+        RejectLayout("linked_array_return", "expected an initialized array owner matching the declared result", DeclarationSpan(statement))?
+    }
+    value.state.code += "    result = " + value.value.text.clone() + ";\n"
+    owner = value.value.clone()
+    next = MoveLinkedNullSlot(value.state, owner)?
+    next.code += "    goto cleanup;\n"
+    return ok(next)
 }

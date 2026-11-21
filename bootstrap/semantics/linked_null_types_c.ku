@@ -246,6 +246,7 @@ fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, for_loc
 fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bool): TypeNameBinding! {
     node = LinkedNullNode(project, unit, id)
     if (!checked) {
+        if (node.kind == "TypeArray") { return ReadLinkedOwnedArray(project, unit, id) }
         return LinkedNullType(project, unit, id)
     }
     if (node.kind != "TypeResult" || node.edge_count != 1) {
@@ -342,6 +343,13 @@ fn LinkedCheckedResultPlan(&result: TypeNameBinding, unit: int): LinkPlanType! {
     return ok(plan)
 }
 
+fn LinkedResultPlan(&result: TypeNameBinding, unit: int, checked: bool): LinkPlanType! {
+    if (checked) { return LinkedCheckedResultPlan(result, unit) }
+    plan = BoundLinkPlanType(result, unit, LinkedNullCType(result)?, false)
+    if (LinkedNullOwnedArray(result)) { plan.kind = "StructArray" }
+    return ok(plan)
+}
+
 fn ResolveLinkedCall(&project: LinkedNullProject, &slots: [LinkedNullSlot], &call: Node, &target: Node, checked: bool): LinkedNullFunction! {
     name = target.text.clone()
     if (target.kind == "Field" && target.edge_count == 1) {
@@ -408,8 +416,7 @@ fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
         parameters = parameters.push(LinkedNullParameterPlan(ty, callee.unit)?)
         index = index + 1
     }
-    result = BoundLinkPlanType(callee.result, callee.unit, LinkedNullResultType(callee)?, false)
-    if (callee.returns_result) { result = LinkedCheckedResultPlan(callee.result, callee.unit)? }
+    result = LinkedResultPlan(callee.result, callee.unit, callee.returns_result)?
     return ok(LinkPlanDeclaration { unit: callee.unit, node: callee.node, symbol: callee.symbol.clone(),
         parameters: parameters, result: result, returns_result: callee.returns_result })
 }

@@ -1,8 +1,7 @@
 import { ReadLinkedNullParameters } from "./linked_parameters_c.ku"
-import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedGuardOwners, DropLinkedNullScope, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
-import { EmitLinkedNullDeclarations, FinishLinkedFunctionC } from "./linked_function_c.ku"
+import { EmitLinkedFunction, LowerLinkedPlainArrayReturn } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -11,8 +10,8 @@ import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
 import { LinkedReadonlyExpression, LinkedSlotPrefix, ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
-import { LinkedBuiltin, LinkedCheckedResultCType, LinkedCheckedResultPlan, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
-         LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
+         LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, LowerLinkedArrayLocal, LowerLinkedNullRead,
          RegisterLinkedNullType } from "./linked_null_read_c.ku"
 import { LowerLinkedArrayAppend, LowerLinkedSuccess,
@@ -279,8 +278,14 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             if (index != region.edge_count - 1) {
                 RejectLayout("unsupported_linked_terminal", "expected the terminal at the end of its block", DeclarationSpan(statement))?
             }
-            if (statement.kind == "Return") { next = LowerLinkedSuccess(project, next, statement, result)? }
-            else { next = lowerLinkedFailure(project, next, statement)? }
+            if (statement.kind == "Fail") {
+                if (next.plain_array_result && next.catch_slot == 0) {
+                    RejectLayout("linked_array_failure", "a plain array result cannot propagate an Error", DeclarationSpan(statement))?
+                }
+                next = lowerLinkedFailure(project, next, statement)?
+            } else if (next.plain_array_result) {
+                next = LowerLinkedPlainArrayReturn(project, next, statement, result)?
+            } else { next = LowerLinkedSuccess(project, next, statement, result)? }
             return ok(LinkedNullRegion { state: next, terminal: true })
         }
         if (statement.kind == "Try" && index == region.edge_count - 1) {
@@ -321,15 +326,6 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
     return ok(LinkedNullRegion { state: next, terminal: false })
 }
 
-fn emitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &payload: TypeNameBinding): str! {
-    header = EmitLinkedNullDeclarations(body, payload)?
-    result = LinkedCheckedResultCType(payload)?
-    keep = LinkedNullResultCleanupReference(body.owning_layouts, payload)
-    char_errors = ""
-    if (body.uses_chars) { char_errors = ManagedSourceCharactersErrors() }
-    return ok(FinishLinkedFunctionC(header, body, symbol, signature, result, keep, char_errors))
-}
-
 fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! {
     if (supplied.len() == 0) {
         point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
@@ -343,11 +339,12 @@ fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! 
     result = parameters.result.clone()
     region = lowerLinkedRegion(project, function, parameters.state, parameters.body_start, result, 0)?
     if (!region.terminal) {
-        RejectLayout("unsupported_linked_terminal", "expected a final Error fail or return ok(null)", DeclarationSpan(function))?
+        RejectLayout("unsupported_linked_terminal", "expected a final return or Error fail", DeclarationSpan(function))?
     }
     symbol = "ku_linked_null_" + str(id)
-    source = emitLinkedFunction(region.state, symbol, parameters.signature, result)?
+    source = EmitLinkedFunction(region.state, symbol, parameters.signature, result)?
+    checked = !region.state.plain_array_result
     plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: parameters.plan,
-        result: LinkedCheckedResultPlan(result, 1)?, returns_result: true }
+        result: LinkedResultPlan(result, 1, checked)?, returns_result: checked }
     return ok(LinkedNullC { symbol: symbol, links: region.state.links, source: source, entry_plan: plan })
 }
