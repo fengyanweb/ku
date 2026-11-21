@@ -158,6 +158,82 @@ int main(void) {
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
     }
     assert_owned_array_member(cwd, &emit);
+    assert_owned_int_array_member(cwd, &emit);
+}
+
+fn assert_owned_int_array_member(
+    cwd: &Path,
+    emit: &impl Fn(&str) -> super::bounded_process::BoundedOutput,
+) {
+    fs::write(
+        cwd.join("int-array-member.ku"),
+        r#"struct IntRecord { values: [int] tag: str }
+struct Outer { inner: IntRecord tag: str }
+fn TransferInts(outer: Outer): IntRecord! {
+    inner = outer.inner
+    integers = inner.values
+    return ok(IntRecord { values: integers, tag: "done" })
+}
+fn RefuseBorrow(&outer: Outer): IntRecord! {
+    integers = outer.inner.values
+    return ok(IntRecord { values: integers, tag: "no" })
+}
+fn RefuseRepeatedMove(outer: Outer): IntRecord! {
+    integers = outer.inner.values
+    return ok(IntRecord { values: outer.inner.values, tag: "no" })
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "int-array-member.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "TransferInts").unwrap();
+    let emitted = emit("linked-null");
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let signature = code
+        .lines()
+        .find(|line| line.contains(" ku_linked_null_"))
+        .expect("entry declaration");
+    let (result, definition) = signature.split_once(' ').unwrap();
+    let (entry, arguments) = definition.split_once('(').unwrap();
+    let outer = arguments.split_whitespace().next().unwrap();
+    let host = r#"
+int main(void) {
+    (void)test_realloc;
+    int64_t *integers = malloc(2 * sizeof(*integers));
+    integers[0] = INT64_MIN;
+    integers[1] = 42;
+    __OUTER__ packet = {0};
+    packet.f0.f0 = (KuArrayInt){2, integers, 2};
+    packet.f0.f1 = (KuProjectionString){malloc(1), 1, 1, KU_PROJECTION_STRING_OWNED};
+    packet.f1 = (KuProjectionString){malloc(1), 1, 1, KU_PROJECTION_STRING_OWNED};
+    __RESULT__ result = __ENTRY__(packet);
+    assert(result.ok && result.value.f0.data == integers && result.value.f0.len == 2);
+    assert(result.value.f0.data[0] == INT64_MIN && result.value.f0.data[1] == 42);
+    assert(outstanding() == 1 && attempts == 3);
+    free(result.value.f0.data);
+    assert(outstanding() == 0);
+    return 0;
+}
+"#
+    .replace("__OUTER__", outer)
+    .replace("__RESULT__", result)
+    .replace("__ENTRY__", entry);
+    let path = cwd.join("int-array-member.c");
+    let app = cwd.join(format!("int-array-member{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&path, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&path, &app, cwd);
+    assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+    for (function, diagnostic) in [
+        ("RefuseBorrow", "linked_view_escape"),
+        ("RefuseRepeatedMove", "linked_moved_member"),
+    ] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let rejected = emit("linked-null");
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
 }
 
 fn assert_owned_array_member(

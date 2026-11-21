@@ -186,10 +186,13 @@ fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: N
         next.code += "    if (!" + LinkedNullArrayPrefix(field.value.ty) + "_valid(" + address.clone()
             + ") || (uintmax_t)" + address.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
         field.state = next
-        // Keep a real lvalue for arrays inside an owned record. A view
-        // receiver still exposes only the readonly address of that field.
+        // A field of an owned record can transfer its array header. A
+        // field reached from a View exposes only its readonly address.
         if (field.value.ty.declaration_kind == "StructArray" && field.value.member_path != "") {
             field.value.ty.declaration_kind = "OwnedStructArray"
+        } else if (field.value.ty.declaration_kind == "BuiltinArray" && field.value.ty.name == "int"
+            && field.value.member_path != "") {
+            field.value.ty.declaration_kind = "OwnedIntArray"
         } else {
             field.value.text = address
             field.value.borrowed = true
