@@ -78,41 +78,44 @@ fn ReadLinkedNullParametersFrom(&project: LinkedNullProject, &function: Node, se
     plan: [LinkPlanType] = []
     index = 0
     validation = ""
-    while (index < function.edge_count) {
+    reading = index < function.edge_count
+    while (reading) {
         node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
-        if (node.kind != "Parameter") { break }
-        if (node.edge_count != 1 || node.int_value < 0 || node.int_value > 1 || LinkedNullBinding(state.slots, node.text) != 0) {
-            RejectLayout("linked_entry_parameter", "expected distinct explicitly typed parameters", DeclarationSpan(node))?
-        }
-        view = node.int_value == 1
-        ty = LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, node, 0), view)?
-        name = "a" + str(index)
-        if (index != 0) { signature += ", " }
-        c_type = LinkedNullCType(ty)?
-        signature += c_type.clone() + " " + name.clone()
-        plan = plan.push(LinkedNullParameterPlan(ty, 1)?)
-        if (ty.declaration_kind == "StringView") {
-            validation += "    if (!" + name.clone() + " || (" + name.clone() + "->len && !" + name.clone()
-                + "->ptr)) { invalid_str = true; goto cleanup; }\n"
-        } else if (ty.declaration_kind == "StructView") {
-            validation += "    if (!" + name.clone() + ") { invalid_struct_view = true; goto cleanup; }\n"
-        } else if (LinkedNullIntArrayOwner(ty) || LinkedNullOwnedArray(ty) || ty.declaration_kind == "OwnedStringArray") {
-            state = RequireLinkedArrayValidation(state, ty.clone())
-            discard = ""
-            if (!LinkedNullIntArrayOwner(ty)) {
-                // A malformed FFI header cannot be walked by the element destructor.
-                discard = name.clone() + " = (" + c_type + "){0}; "
+        if (node.kind == "Parameter") {
+            if (node.edge_count != 1 || node.int_value < 0 || node.int_value > 1 || LinkedNullBinding(state.slots, node.text) != 0) {
+                RejectLayout("linked_entry_parameter", "expected distinct explicitly typed parameters", DeclarationSpan(node))?
             }
-            validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(&" + name.clone() + ") || (uintmax_t)"
-                + name.clone() + ".len > (uintmax_t)INT64_MAX) { " + discard + "invalid_array = true; goto cleanup; }\n"
-        } else if (view) {
-            validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(" + name.clone() + ") || (uintmax_t)"
-                + name.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
-        }
-        slot = AddLinkedNullSlot(project, state, node.text, name.clone(), ty, true)?
-        state = slot.state
-        state.code = state.code + "    (void)" + name + ";\n"
-        index = index + 1
+            view = node.int_value == 1
+            ty = LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, node, 0), view)?
+            name = "a" + str(index)
+            if (index != 0) { signature += ", " }
+            c_type = LinkedNullCType(ty)?
+            signature += c_type.clone() + " " + name.clone()
+            plan = plan.push(LinkedNullParameterPlan(ty, 1)?)
+            if (ty.declaration_kind == "StringView") {
+                validation += "    if (!" + name.clone() + " || (" + name.clone() + "->len && !" + name.clone()
+                    + "->ptr)) { invalid_str = true; goto cleanup; }\n"
+            } else if (ty.declaration_kind == "StructView") {
+                validation += "    if (!" + name.clone() + ") { invalid_struct_view = true; goto cleanup; }\n"
+            } else if (LinkedNullIntArrayOwner(ty) || LinkedNullOwnedArray(ty) || ty.declaration_kind == "OwnedStringArray") {
+                state = RequireLinkedArrayValidation(state, ty.clone())
+                discard = ""
+                if (!LinkedNullIntArrayOwner(ty)) {
+                    // A malformed FFI header cannot be walked by the element destructor.
+                    discard = name.clone() + " = (" + c_type + "){0}; "
+                }
+                validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(&" + name.clone() + ") || (uintmax_t)"
+                    + name.clone() + ".len > (uintmax_t)INT64_MAX) { " + discard + "invalid_array = true; goto cleanup; }\n"
+            } else if (view) {
+                validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(" + name.clone() + ") || (uintmax_t)"
+                    + name.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
+            }
+            slot = AddLinkedNullSlot(project, state, node.text, name.clone(), ty, true)?
+            state = slot.state
+            state.code = state.code + "    (void)" + name + ";\n"
+            index = index + 1
+            reading = index < function.edge_count
+        } else { reading = false }
     }
     if (index >= function.edge_count - 1) {
         RejectLayout("linked_null_signature", "entry requires a declared null! result and a body", DeclarationSpan(function))?
