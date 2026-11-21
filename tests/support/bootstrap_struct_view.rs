@@ -1040,3 +1040,92 @@ pub(super) fn assert_lazy_readonly_bool_call(seed: &Path, cwd: &Path) {
         assert!(stderr.contains("linked_readonly_call") && stderr.contains(reason));
     }
 }
+
+const STR_FIELD_SOURCE: &str = r#"struct Payload { text: str }
+struct Envelope { payload: Payload }
+fn Clone(&entry: Envelope): str! {
+    copy = entry.payload.text.clone()
+    return ok(copy)
+}
+fn RefuseStructField(&entry: Envelope): null! {
+    copy = entry.payload.clone()
+    return ok(null)
+}
+fn Take(payload: Payload): null! { return ok(null) }
+fn RefuseMovedField(entry: Envelope): str! {
+    Take(entry.payload)?
+    copy = entry.payload.text.clone()
+    return ok(copy)
+}
+"#;
+
+const STR_FIELD_HOST: &str = r#"
+static const uint8_t original[] = {0xe4,0xb8,0xad,0xf0,0x9f,0x99,0x82,0};
+static uint8_t *caller_owned;
+static void check_failure(void) {
+    if (outstanding() != 1 || attempts != 2 || memcmp(caller_owned, original, sizeof original)) _Exit(88);
+    free(caller_owned);
+    if (outstanding()) _Exit(89);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    (void)test_realloc;
+    caller_owned = malloc(sizeof original);
+    memcpy(caller_owned, original, sizeof original);
+    __ENVELOPE__ envelope = {{{caller_owned,sizeof original,sizeof original,KU_PROJECTION_STRING_OWNED}}};
+    if (argc == 2) {
+        fail_after = 0;
+        assert(atexit(check_failure) == 0);
+        (void)__CLONE__(&envelope);
+        return 90;
+    }
+    __RESULT__ result = __CLONE__(&envelope);
+    assert(result.ok && outstanding() == 2 && attempts == 2);
+    assert(result.value.len == sizeof original && result.value.ptr != caller_owned);
+    assert(envelope.f0.f0.ptr == caller_owned && !memcmp(caller_owned, original, sizeof original));
+    free(caller_owned);
+    assert(!memcmp(result.value.ptr, original, sizeof original));
+    ku_projection_string_drop(&result.value);
+    assert(!outstanding());
+    return 0;
+}
+"#;
+
+pub(super) fn assert_owned_string_field_clone(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("field-string.ku"), STR_FIELD_SOURCE).unwrap();
+    fs::write(cwd.join("modules.txt"), "field-string.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Clone").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, params) = signature.split_once("(const ").unwrap();
+    let (envelope, _) = params.split_once('*').unwrap();
+    let host = STR_FIELD_HOST
+        .replace("__CLONE__", &format!("ku_linked_null_{entry}"))
+        .replace("__RESULT__", result)
+        .replace("__ENVELOPE__", envelope);
+    let c = cwd.join("field-string.c");
+    let exe = cwd.join(format!("field-string{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    let oom = execute(Command::new(&exe).arg("oom"), cwd, 15);
+    assert_eq!(oom.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&oom.stderr).trim(), "out of memory");
+
+    for (name, reason) in [
+        ("RefuseStructField", "unsupported_linked_clone"),
+        ("RefuseMovedField", "linked_moved_member"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(reason));
+    }
+}

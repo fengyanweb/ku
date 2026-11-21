@@ -25,13 +25,17 @@ fn cloneLinkedString(&project: LinkedNullProject, source: LinkedNullExpression, 
 fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int, depth: int): LinkedNullExpression! {
     subject_id = LinkedNullChild(project, 1, target, 0)
     subject = LinkedNullNode(project, 1, subject_id)
-    if (subject.kind != "Index" && (subject.kind != "Variable" || subject.edge_count != 0)) {
-        RejectLayout("unsupported_linked_clone", "expected a bound variable or indexed element for clone", DeclarationSpan(subject))?
+    field = subject.kind == "Field" && subject.edge_count == 1
+    if (!field && subject.kind != "Index" && (subject.kind != "Variable" || subject.edge_count != 0)) {
+        RejectLayout("unsupported_linked_clone", "expected a bound variable, indexed element or str field for clone", DeclarationSpan(subject))?
     }
     source = LowerLinkedNullRead(project, state, subject_id, depth + 1)?
     ty = source.value.ty.clone()
     if (ty.declaration_kind == "Builtin" && ty.name == "str") {
         return cloneLinkedString(project, source, id)
+    }
+    if (field) {
+        RejectLayout("unsupported_linked_clone", "field clone requires a bound str", DeclarationSpan(subject))?
     }
     if (ty.declaration_kind != "Struct") {
         RejectLayout("unsupported_linked_clone", "expected str or a finite struct for clone", DeclarationSpan(subject))?
