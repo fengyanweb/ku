@@ -2,7 +2,7 @@ import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
 import { LinkedIntSnapshotCall } from "./guarded_string_parts.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC } from "./linked_member_ownership.ku"
-import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
+import { BuildProjectOwningLayouts, CanCloneNestedStringArrays, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
 import { EmitScalarIntString } from "./scalar_int_emit.ku"
 import { HasScalarBuiltin } from "./scalar_int_operands.ku"
 import { Node } from "../stage2/ast.ku"
@@ -373,7 +373,7 @@ fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, 
     layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
     arrays = HasBoundArrayMembers(source.state.layouts, layout)
     output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
-    if (arrays) {
+    if (arrays && !CanCloneNestedStringArrays(output.state.layouts, layout)) {
         fields = LinkedRecordFields(output.state.layouts, output.state.owning_layouts, output.value.ty)?
         index = 0
         while (index < fields.len()) {
@@ -388,11 +388,11 @@ fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, 
             } else if (field.declaration_kind == "Builtin" && (field.name == "int" || field.name == "bool")) {
                 output.state.code += "    " + target + " = " + origin + ";\n"
             } else {
-                RejectLayout("linked_nested_array_clone", "record snapshot requires immediate [int] or Copy int and bool fields", field.span.clone())?
+                RejectLayout("linked_nested_array_clone", "record snapshot requires immediate [int] or Copy int and bool fields", field.span)?
             }
             index += 1
         }
-    } else if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
+    } else if (!arrays && GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
         output.state.code += "    " + output.value.text.clone() + " = " + source.value.text + ";\n"
     } else {
         if (!ContainsIndex(output.state.element_clones, layout)) {
