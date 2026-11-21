@@ -143,16 +143,27 @@ def compare_units(first, second):
                 path = ledger.with_name(unit[field])
                 if digest(path) != unit[field + "_sha256"]:
                     raise ValueError(f"changed provider artifact: {path}")
-            result[tuple(unit["key"])] = unit["c_sha256"], unit["plan_sha256"], unit["object_sha256"]
+            result[tuple(unit["key"])] = unit
         return result
 
     earlier, later = fingerprints(first), fingerprints(second)
     if earlier.keys() != later.keys():
         raise ValueError("Stage2 and Stage3 selected different provider identities")
     for key, details in earlier.items():
-        if details[:2] != later[key][:2]:
-            raise ValueError(f"Stage2 and Stage3 emitted different C or typed plans for {key!r}")
-    return {"providers": len(earlier), "c_and_plans_identical": True, "objects_identical": earlier == later}
+        for field in ("c", "plan"):
+            second_record = later[key]
+            if details[field + "_sha256"] == second_record[field + "_sha256"]:
+                continue
+            a = first.with_name(details[field]).read_bytes()
+            b = second.with_name(second_record[field]).read_bytes()
+            difference = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+            start = max(0, difference - 24)
+            stop = difference + 72
+            raise ValueError(f"Stage2/Stage3 {field} mismatch for {key!r} "
+                             f"({details['source_name']}) at byte {difference}, lengths {len(a)}/{len(b)}: "
+                             f"{a[start:stop]!r} != {b[start:stop]!r}")
+    objects_identical = all(item["object_sha256"] == later[key]["object_sha256"] for key, item in earlier.items())
+    return {"providers": len(earlier), "c_and_plans_identical": True, "objects_identical": objects_identical}
 
 
 def main():
