@@ -1653,6 +1653,79 @@ fn run_ku(arguments: &[&str]) {
 }
 
 #[test]
+fn bootstrap_stage3_declaration_bound_keeps_eof_and_error_order() {
+    let mixed = "// 中文😀\r\nimport { Add as Sum } from \"./util.ku\"\r\nmodule Demo;\nstruct Plan { size:int }\nenum State { Ready Row(value:Plan) }\nfn Ready():int { return Sum(2,3) }\nasync fn Work():int { return 4 }";
+    let invalid = "module A; return 1\nfn later(";
+    let tree = rust_canonical(mixed);
+    let diagnostic = "error|bootstrap.parser.stage3|return_outside_function|<source>|return outside function|1:11@10..1:17@16";
+    let expected = format!("{tree}\n{tree}\n{diagnostic}\n{diagnostic}\n");
+    let temp = TempDirGuard::new(unique_temp_dir("stage3-declaration-bound"));
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap");
+    for module in ["stage1", "stage2", "stage3"] {
+        let to = temp.path.join(module);
+        fs::create_dir_all(&to).expect("create private parser source directory");
+        for file in fs::read_dir(source.join(module)).expect("read parser source directory") {
+            let file = file.expect("read parser source name");
+            if file.path().extension().is_some_and(|ext| ext == "ku") {
+                fs::copy(file.path(), to.join(file.file_name())).expect("stage parser source");
+            }
+        }
+    }
+    let driver = temp.path.join("stage3/declaration-bound.ku");
+    let mut program = r#"import { AstCanonical } from "../stage2/ast.ku"
+import { ParseProgram, ParseModule } from "./parser.ku"
+fn Check(source: str, compiler: bool): null! {
+    try {
+        if (compiler) { println(AstCanonical(ParseModule(source)?)) }
+        else { println(AstCanonical(ParseProgram(source)?)) }
+    } catch(err) { println(err.message) }
+    return ok(null)
+}
+fn main(): null! {
+"#
+    .to_string();
+    for input in [mixed, invalid] {
+        for compiler in [false, true] {
+            program.push_str(&format!("    Check({}, {compiler})?\n", ku_string(input)));
+        }
+    }
+    program.push_str("    return ok(null)\n}\n");
+    fs::write(&driver, program).expect("write scoped parser witness");
+    let executable = temp
+        .path
+        .join(format!("declaration-bound{}", std::env::consts::EXE_SUFFIX));
+    let build = run_bounded(
+        Command::new(ku_binary())
+            .args(["build", "--release", "--offline"])
+            .arg(&driver)
+            .arg("-o")
+            .arg(&executable),
+        NATIVE_BUILD_TIMEOUT,
+        PROCESS_OUTPUT_LIMITS,
+    )
+    .expect("build native parser witness");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    for mut entry in [Command::new(&executable), {
+        let mut command = Command::new(ku_binary());
+        command.args(["run", "--offline"]).arg(&driver);
+        command
+    }] {
+        let output = run_bounded(&mut entry, PROCESS_TIMEOUT, PROCESS_OUTPUT_LIMITS)
+            .expect("run scoped parser witness");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, expected.as_bytes());
+    }
+}
+
+#[test]
 fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let compiler_signature = include_str!("../bootstrap/stage3/functions.ku")
         .lines()

@@ -155,7 +155,12 @@ fn ParseBoundedModule(source: str, compiler_input: bool): ParseOutput! {
     }
     parse_expression: fn(int, int): ParseOutput! = ParseExpressionWindow
 
-    while (tokens[cursor].kind != "Eof") {
+    // Each successful declaration advances the scanner cursor. The file's
+    // token count bounds those visits while the original EOF check retains
+    // its bounds and diagnostic order.
+    declaration_limit = tokens.len()
+    declaration_index = 0
+    while (declaration_index < declaration_limit && tokens[cursor].kind != "Eof") {
         parse_steps = parse_steps + 1
         if (parse_steps > 16384) {
             RejectAt(tokens[cursor].clone(), "work_limit", "stage-3 parser work budget exceeded")?
@@ -241,6 +246,7 @@ fn ParseBoundedModule(source: str, compiler_input: bool): ParseOutput! {
         items = items.push(function)
         function_count = function_count + 1
         }
+        declaration_index = declaration_index + 1
     }
 
     program_span = SpanFromToken(eof.clone())
