@@ -9,6 +9,12 @@ import { ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayou
 import { ContainsIndex, ContainsType, CTypeName, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 
+struct LinkPlanNominalType {
+    unit: int
+    node: int
+    c_type: str
+}
+
 struct LinkPlanType {
     kind: str
     name: str
@@ -16,6 +22,7 @@ struct LinkPlanType {
     node: int
     c_type: str
     view: bool
+    nominals: [LinkPlanNominalType]
 }
 
 struct LinkPlanDeclaration {
@@ -133,6 +140,15 @@ fn LinkedIntArrayCallbackCarrier(&ty: TypeNameBinding): str {
     return "KuBootstrapIntArrayCallback_" + CTypeName(ty.module_index, ty.declaration_node)
 }
 
+fn LinkedIntAppendCallbackBinding(unit: int, node: int, at: Span): TypeNameBinding {
+    return TypeNameBinding { use_node: node, name: "fn", declaration_kind: "IntResultAppendCallback",
+        module_index: unit, declaration_node: node, span: at }
+}
+
+fn LinkedIntAppendCallbackCarrier(&ty: TypeNameBinding): str {
+    return "KuBootstrapIntAppendCallback_m" + str(ty.module_index) + "_" + str(ty.declaration_node)
+}
+
 fn LinkedIntArrayCallbackFunction(&ty: TypeNameBinding): LinkedNullFunction {
     array = TypeNameBinding { use_node: 0, name: "int", declaration_kind: "OwnedIntArray",
         module_index: 0, declaration_node: 0, span: ty.span.clone() }
@@ -144,11 +160,15 @@ fn LinkedIntArrayCallbackFunction(&ty: TypeNameBinding): LinkedNullFunction {
         parameters: [array.clone(), integer.clone(), integer, nominal], result: array, returns_result: true }
 }
 
-fn LinkedIntArrayCallbackTypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlot]): [TypeNameBinding] {
+fn IsLinkedScopedCallback(&ty: TypeNameBinding): bool {
+    return ty.declaration_kind == "IntArrayResultCallback" || ty.declaration_kind == "IntResultAppendCallback"
+}
+
+fn LinkedScopedCallbackTypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlot]): [TypeNameBinding] {
     types: [TypeNameBinding] = []
     index = 0
     while (index < slots.len()) {
-        if (slots[index].value.ty.declaration_kind == "IntArrayResultCallback") {
+        if (IsLinkedScopedCallback(slots[index].value.ty)) {
             types = types.push(slots[index].value.ty.clone())
         }
         index = index + 1
@@ -158,7 +178,7 @@ fn LinkedIntArrayCallbackTypes(&links: [LinkedNullFunction], &slots: [LinkedNull
         parameter_count = links[index].parameters.len()
         param = 0
         while (param < parameter_count) {
-            if (links[index].parameters[param].declaration_kind == "IntArrayResultCallback") {
+            if (IsLinkedScopedCallback(links[index].parameters[param])) {
                 types = types.push(links[index].parameters[param].clone())
             }
             param = param + 1
@@ -206,24 +226,24 @@ fn BoundLinkPlanTypeWithKind(&binding: TypeNameBinding, local_unit: int, c_type:
     unit = binding.module_index
     if (unit == 0 && binding.declaration_kind == "Struct") { unit = local_unit }
     return LinkPlanType { kind: kind, name: binding.name.clone(),
-        unit: unit, node: binding.declaration_node, c_type: c_type, view: view }
+        unit: unit, node: binding.declaration_node, c_type: c_type, view: view, nominals: [] }
 }
 
 fn BuiltinLinkPlanType(name: str, c_type: str, view: bool): LinkPlanType {
-    return LinkPlanType { kind: "Builtin", name: name, unit: 0, node: 0, c_type: c_type, view: view }
+    return LinkPlanType { kind: "Builtin", name: name, unit: 0, node: 0, c_type: c_type, view: view, nominals: [] }
 }
 
 fn StrArrayViewLinkPlanType(): LinkPlanType {
     layouts: [StructLayout] = []
     carrier = GuardCType(GuardType { kind: "str_array", layout: 0 }, layouts)
     return LinkPlanType { kind: "BuiltinArray", name: "str", unit: 0, node: 0,
-        c_type: "const " + carrier + "*", view: true }
+        c_type: "const " + carrier + "*", view: true, nominals: [] }
 }
 
 fn IntArrayLinkPlanType(view: bool): LinkPlanType {
     carrier = "KuArrayInt"
     if (view) { carrier = "const KuArrayInt*" }
-    return LinkPlanType { kind: "BuiltinArray", name: "int", unit: 0, node: 0, c_type: carrier, view: view }
+    return LinkPlanType { kind: "BuiltinArray", name: "int", unit: 0, node: 0, c_type: carrier, view: view, nominals: [] }
 }
 
 fn NullLinkPlanResult(): LinkPlanType {
@@ -245,7 +265,7 @@ fn projectedStructType(module_index: int, node: int, view: bool): LinkPlanType {
     if (unit == 0) { unit = 1 }
     c_type = CTypeName(module_index, node)
     if (view) { c_type = "const " + c_type + "*" }
-    return LinkPlanType { kind: "Struct", name: "", unit: unit, node: node, c_type: c_type, view: view }
+    return LinkPlanType { kind: "Struct", name: "", unit: unit, node: node, c_type: c_type, view: view, nominals: [] }
 }
 
 fn StructProjectionLinkPlan(&plan: StructReturnPlan): LinkPlanDeclaration {

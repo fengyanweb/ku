@@ -1,8 +1,7 @@
 import { SuppliedModule } from "./imports.ku"
 import { LinkPlanDeclaration } from "./link_plan_c.ku"
-import { EmitLinkPlan } from "./link_plan_json_c.ku"
+import { EmitLinkPlan, LinkedNullDependencyPlan, PrepareLinkedAppendCallbackPlan } from "./link_plan_json_c.ku"
 import { EmitLinkedNullC, PrepareLinkedNullProject } from "./linked_null_c.ku"
-import { LinkedNullDependencyPlan } from "./linked_null_types_c.ku"
 
 fn EmitLinkedUnit(supplied: [SuppliedModule], &function: str, plan: bool): str! {
     project = PrepareLinkedNullProject(supplied)?
@@ -17,8 +16,9 @@ fn EmitLinkedUnit(supplied: [SuppliedModule], &function: str, plan: bool): str! 
     count = dependencies.len()
     index = 0
     while (index < count) {
-        links = links.push(LinkedNullDependencyPlan(dependencies[index])?)
+        links = links.push(PrepareLinkedAppendCallbackPlan(project, LinkedNullDependencyPlan(dependencies[index])?)?)
         index = index + 1
     }
-    return EmitLinkPlan(project.supplied, "linked-null", generated.entry_plan, links)
+    entry = PrepareLinkedAppendCallbackPlan(project, generated.entry_plan)?
+    return EmitLinkPlan(project.supplied, "linked-null", entry, links)
 }

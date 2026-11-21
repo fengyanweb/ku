@@ -360,13 +360,13 @@ fn ResolveProjectionDirectFunction(&supplied: [SuppliedModule], &imports: [Impor
     return ok([])
 }
 
-fn linkedCallbackIntType(&named: NamedModule, id: int, array: bool): bool {
+fn linkedCallbackBuiltinType(&named: NamedModule, id: int, array: bool, &name: str): bool {
     node = named.parsed.arena.nodes[id - 1].clone()
     if (array) {
         if (node.kind != "TypeArray" || node.edge_count != 1) { return false }
         node = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge] - 1].clone()
     }
-    return node.kind == "TypeName" && node.edge_count == 0 && node.text == "int"
+    return node.kind == "TypeName" && node.edge_count == 0 && node.text == name
 }
 
 fn LinkedIntArrayCallbackNominal(&named: NamedModule, &node: Node): int! {
@@ -379,17 +379,44 @@ fn LinkedIntArrayCallbackNominal(&named: NamedModule, &node: Node): int! {
         }
         ty = named.parsed.arena.edges[part.first_edge]
         if (index == 3) { nominal = ty }
-        else if (!linkedCallbackIntType(named, ty, index == 0)) {
+        else if (!linkedCallbackBuiltinType(named, ty, index == 0, "int")) {
             RejectLayout("linked_callback_type", "scoped array callback needs [int], int, int and a named record", DeclarationSpan(part))?
         }
         index += 1
     }
     result = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge + 4] - 1].clone()
     if (result.kind != "TypeResult" || result.edge_count != 1 ||
-        !linkedCallbackIntType(named, named.parsed.arena.edges[result.first_edge], true)) {
+        !linkedCallbackBuiltinType(named, named.parsed.arena.edges[result.first_edge], true, "int")) {
         RejectLayout("linked_callback_type", "scoped array callback must return [int]!", DeclarationSpan(result))?
     }
     return ok(nominal)
+}
+
+fn LinkedIntAppendCallbackNominals(&named: NamedModule, &node: Node): [int]! {
+    nominals: [int] = []
+    index = 0
+    while (index < 6) {
+        part = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge + index] - 1].clone()
+        if (part.kind != "TypeParameter" || part.edge_count != 1 || part.text != "") {
+            RejectLayout("linked_callback_type", "scoped append callback arguments must be by-value", DeclarationSpan(part))?
+        }
+        ty = named.parsed.arena.edges[part.first_edge]
+        if (index == 3 || index == 5) { nominals = nominals.push(ty) }
+        else {
+            name = "int"
+            if (index < 2) { name = "str" }
+            if (!linkedCallbackBuiltinType(named, ty, index == 4, name)) {
+                RejectLayout("linked_callback_type", "scoped append callback needs str, str, int, a record, [int] and a record", DeclarationSpan(part))?
+            }
+        }
+        index += 1
+    }
+    result = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge + 6] - 1].clone()
+    if (result.kind != "TypeResult" || result.edge_count != 1 ||
+        !linkedCallbackBuiltinType(named, named.parsed.arena.edges[result.first_edge], false, "int")) {
+        RejectLayout("linked_callback_type", "scoped append callback must return int!", DeclarationSpan(result))?
+    }
+    return ok(nominals)
 }
 
 fn RequireProjectionLocalFunction(&supplied: [SuppliedModule], &name: str): int! {
@@ -408,6 +435,11 @@ fn LinkedAppendFailureDeclaration(): str {
 fn LinkedIntArrayCallbackDeclaration(&name: str, &nominal: str): str {
     return "typedef struct { KuBootstrapResult_KuArrayInt (*entry)(void*, KuLocalAppendFailure*, KuArrayInt, int64_t, int64_t, "
         + nominal.clone() + "); void *environment; KuLocalAppendFailure *failure; } " + name.clone() + ";\n"
+}
+
+fn LinkedIntAppendCallbackDeclaration(&name: str, &first: str, &second: str): str {
+    return "typedef struct { KuBootstrapResult_int64_t (*entry)(void*, KuLocalAppendFailure*, KuProjectionString, KuProjectionString, int64_t, "
+        + first.clone() + ", KuArrayInt, " + second.clone() + "); void *environment; KuLocalAppendFailure *failure; } " + name.clone() + ";\n"
 }
 
 fn LinkedIntArrayCallbackFaultPending(&pointer: str): str {

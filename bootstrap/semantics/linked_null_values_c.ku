@@ -1,4 +1,5 @@
-import { AppendLinkedArrayElement, CheckLinkedIntArrayCallback, EmitLinkedClone, EmitLinkedIntArrayCallbackCall, PrepareLinkedIntArrayCallbackArgument } from "./linked_array_fields_c.ku"
+import { AppendLinkedArrayElement, EmitLinkedClone, PrepareLinkedScopedCallbackArgument } from "./linked_array_fields_c.ku"
+import { CheckLinkedScopedCallback, EmitLinkedScopedCallbackCall, LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
 import { CheckedAppendFault, CheckedAppendFaultHandoff, CheckedAppendInvocation, CheckedLinkedCallbackExpression } from "./guarded_string_parts.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MatchesLinkedFieldValue, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { Node } from "../stage2/ast.ku"
@@ -7,7 +8,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { LinkedDirectCallExpression, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedIntArrayCallbackFunction, LinkedScalarArrayOwner, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
+import { LinkedDirectCallExpression, AppendLinkedCheckedInvocation, IsLinkedScopedCallback, LinkedCheckedCall, LinkedScalarArrayOwner, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
 import { LinkedCallArgument, LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { ReadLinkedLocalArrayItem, EmitLinkedAddition, IsLinkedLogicalNegation, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
@@ -43,10 +44,10 @@ fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
             index = index + 1
             continue
         }
-        if (callee.parameters[index].declaration_kind == "IntArrayResultCallback") {
+        if (IsLinkedScopedCallback(callee.parameters[index])) {
             parameter = callee.parameters[index].clone()
             next = RegisterLinkedNullType(project, next, parameter.clone())?
-            prepared = PrepareLinkedIntArrayCallbackArgument(project, next, argument_id, parameter,
+            prepared = PrepareLinkedScopedCallbackArgument(project, next, argument_id, parameter,
                 "callback_fault" + str(id) + "_" + str(index))?
             next.code += prepared.setup
             args += prepared.text
@@ -154,6 +155,18 @@ fn emitCheckedCallback(&project: LinkedNullProject, state: LinkedNullState, &cal
     return ok(LinkedCheckedCall { state: next, result: payload, text: result, id: id })
 }
 
+fn LowerLinkedScopedCallbackCall(&project: LinkedNullProject, state: LinkedNullState, &call: Node, slot: int,
+                                 id: int, depth: int, unwrap: bool): LinkedCheckedCall! {
+    callback = state.slots[slot - 1].value.clone()
+    checked = LinkedScopedCallbackFunction(project, callback.ty)?
+    if (!LinkedCallableSlot(state, slot) || call.edge_count != checked.parameters.len() + 1) {
+        RejectLayout("linked_callback_call", "expected the declared arguments of a live checked callback", DeclarationSpan(call))?
+    }
+    next = CheckLinkedScopedCallback(state, callback.text, unwrap)
+    arguments = LowerLinkedArguments(project, next, call, checked, id, depth, false)?
+    return EmitLinkedScopedCallbackCall(arguments, callback, checked.result, id, unwrap)
+}
+
 fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap: Node, owns_value: bool, depth: int): LinkedCheckedCall! {
     if (state.plain_value_result && state.catch_slot == 0) {
         RejectLayout("linked_value_failure", "a checked call needs a catch before returning a plain value", DeclarationSpan(unwrap))?
@@ -173,14 +186,8 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
         if (slot != 0 && state.slots[slot - 1].value.ty.declaration_kind == "IntPairResultCallback") {
             return emitCheckedCallback(project, state, call, slot, id, depth)
         }
-        if (slot != 0 && state.slots[slot - 1].value.ty.declaration_kind == "IntArrayResultCallback") {
-            if (!LinkedCallableSlot(state, slot) || call.edge_count != 5) {
-                RejectLayout("linked_callback_call", "expected a live checked array callback with four arguments", DeclarationSpan(call))?
-            }
-            callback = state.slots[slot - 1].value.clone()
-            next = CheckLinkedIntArrayCallback(state, callback.text)
-            arguments = LowerLinkedArguments(project, next, call, LinkedIntArrayCallbackFunction(callback.ty), id, depth, false)?
-            return ok(EmitLinkedIntArrayCallbackCall(arguments, callback, id))
+        if (slot != 0 && IsLinkedScopedCallback(state.slots[slot - 1].value.ty)) {
+            return LowerLinkedScopedCallbackCall(project, state, call, slot, id, depth, true)
         }
         if (slot == 0) { local = LinkedLocalAppendIndex(state, target.text) }
     }

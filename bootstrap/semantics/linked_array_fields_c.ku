@@ -1,15 +1,16 @@
 import { FindLinkedLocalRead, LinkedLocalReadBinding, RequireLinkedMutableName } from "./call_contracts.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, CloneLinkedIntArray, CloneLinkedRecord, CloneLinkedStringSlot, LinkedCallableSlot, RejectLocalReader, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
+import { LinkedScopedCallbackFunction, SameLinkedCallbackSignature } from "./link_plan_json_c.ku"
 import { ContainsIndex, LinkedAppendFaultRelayCode, LinkedIntArrayCallbackFaultPending, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { AppendLinkedCheckedInvocation, ExitLinkedFailure, LinkedCheckedCall, LinkedFailureTarget, LinkedIntArrayCallbackCarrier, LinkedIntArrayCallbackFunction,
-    LinkedLocalAppendIndex, LinkedNullArguments, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray,
+import { IsLinkedScopedCallback,
+    LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray,
     LinkedNullReadableArray, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
-import { LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult,
+import { LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult,
     ReadLinkedOwnedArray, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead } from "./linked_null_read_c.ku"
@@ -297,72 +298,49 @@ fn FinishLinkedStringAppend(&project: LinkedNullProject, input: LinkedNullExpres
     return MoveLinkedNullSlot(joined.state, replacement)
 }
 
-struct LinkedIntArrayCallbackArgument {
+struct LinkedScopedCallbackArgument {
     text: str
     setup: str
     relay: str
 }
 
-fn PrepareLinkedIntArrayCallbackArgument(&project: LinkedNullProject, &state: LinkedNullState, id: int,
-                                         &parameter: TypeNameBinding, fault: str): LinkedIntArrayCallbackArgument! {
+fn PrepareLinkedScopedCallbackArgument(&project: LinkedNullProject, &state: LinkedNullState, id: int,
+                                       &parameter: TypeNameBinding, fault: str): LinkedScopedCallbackArgument! {
     source = ProjectionCloneSource(project.supplied[0].named.parsed.arena.nodes, project.supplied[0].named.parsed.arena.edges, id)
     node = LinkedNullNode(project, 1, id)
     if (source != 0) { node = LinkedNullNode(project, 1, source) }
     if (node.kind != "Variable" || node.edge_count != 0) {
         RejectLayout("linked_callback_forward", "expected a named synchronous array callback", DeclarationSpan(node))?
     }
+    expected = LinkedScopedCallbackFunction(project, parameter)?
+    carrier = LinkedNullCType(parameter)?
     slot = LinkedNullBinding(state.slots, node.text)
     if (slot != 0) {
-        if (!LinkedCallableSlot(state, slot) || !SameLinkedType(state.slots[slot - 1].value.ty, parameter)) {
-            RejectLayout("linked_callback_forward", "expected a live callback with the same array signature", DeclarationSpan(node))?
+        value = state.slots[slot - 1].value.clone()
+        if (!LinkedCallableSlot(state, slot) || !IsLinkedScopedCallback(value.ty) ||
+            !SameLinkedCallbackSignature(LinkedScopedCallbackFunction(project, value.ty)?, expected)) {
+            RejectLayout("linked_callback_forward", "expected a live callback with the same checked signature", DeclarationSpan(node))?
         }
-        text = state.slots[slot - 1].value.text.clone()
-        relay = "    if (" + LinkedIntArrayCallbackFaultPending(text.clone() + ".failure") + ") goto cleanup;\n"
-        return ok(LinkedIntArrayCallbackArgument { text: text, setup: "", relay: relay })
+        name = value.text
+        relay = "    if (" + LinkedIntArrayCallbackFaultPending(name.clone() + ".failure") + ") goto cleanup;\n"
+        text = name.clone()
+        if (carrier != LinkedNullCType(value.ty)?) {
+            text = "(" + carrier + "){" + name.clone() + ".entry, " + name.clone() + ".environment, " + name + ".failure}"
+        }
+        return ok(LinkedScopedCallbackArgument { text: text, setup: "", relay: relay })
     }
     index = LinkedLocalAppendIndex(state, node.text)
     if (index == 0) {
         RejectLayout("linked_callback_forward", "expected a live checked local array callback", DeclarationSpan(node))?
     }
     local = state.local_appends[index - 1].clone()
-    expected = LinkedIntArrayCallbackFunction(parameter)
-    if (local.function.parameters.len() != 4 || !SameLinkedType(local.function.result, expected.result)) {
-        RejectLayout("linked_callback_forward", "local callback must match the declared array signature", DeclarationSpan(node))?
+    if (!SameLinkedCallbackSignature(local.function, expected)) {
+        RejectLayout("linked_callback_forward", "local callback must match the declared checked signature", DeclarationSpan(node))?
     }
-    index = 0
-    while (index < 4) {
-        if (!SameLinkedType(local.function.parameters[index], expected.parameters[index])) {
-            RejectLayout("linked_callback_forward", "local callback argument differs from the declared signature", DeclarationSpan(node))?
-        }
-        index += 1
-    }
-    text = "(" + LinkedIntArrayCallbackCarrier(parameter) + "){" + local.function.symbol + ", " + local.environment
+    text = "(" + carrier + "){" + local.function.symbol + ", " + local.environment
         + ", &" + fault.clone() + "}"
     setup = "    KuLocalAppendFailure " + fault.clone() + " = {0};\n"
-    return ok(LinkedIntArrayCallbackArgument { text: text, setup: setup, relay: LinkedAppendFaultRelayCode(fault) })
-}
-
-fn CheckLinkedIntArrayCallback(state: LinkedNullState, &callback: str): LinkedNullState {
-    next = state
-    next.code += "    if (!" + callback.clone() + ".entry || !" + callback.clone() + ".failure) {\n        "
-        + LinkedFailureTarget(next) + " = (KuBootstrapError){"
-        + ".domain={(uint8_t*)\"bootstrap.callback\",sizeof(\"bootstrap.callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
-        + ".code={(uint8_t*)\"invalid_callback\",sizeof(\"invalid_callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
-        + ".message={(uint8_t*)\"callback entry or failure relay is missing\",sizeof(\"callback entry or failure relay is missing\")-1u,0u,KU_PROJECTION_STRING_STATIC}};\n"
-    next = ExitLinkedFailure(next, "        ")
-    next.code += "    }\n"
-    return next
-}
-
-fn EmitLinkedIntArrayCallbackCall(arguments: LinkedNullArguments, &callback: LinkedNullValue, id: int): LinkedCheckedCall {
-    name = callback.text.clone()
-    pointer = name.clone() + ".failure"
-    invoke = name.clone() + ".entry(" + name + ".environment, " + pointer.clone() + ", " + arguments.args + ")"
-    relay = "    if (" + LinkedIntArrayCallbackFaultPending(pointer) + ") goto cleanup;\n"
-    result = "dependency" + str(id)
-    next = AppendLinkedCheckedInvocation(arguments.state, "KuBootstrapResult_KuArrayInt", result, invoke, arguments.handoff + relay)
-    ty = LinkedIntArrayCallbackFunction(callback.ty).result
-    return LinkedCheckedCall { state: next, result: ty, text: result, id: id }
+    return ok(LinkedScopedCallbackArgument { text: text, setup: setup, relay: LinkedAppendFaultRelayCode(fault) })
 }
 
 fn LinkedBooleanWhileCondition(&state: LinkedNullState, &guard: Node): str {

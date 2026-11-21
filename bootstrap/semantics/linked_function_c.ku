@@ -1,8 +1,9 @@
+import { LinkedNullPrototype, LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
 import { FinishLinkedFunctionC, GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { ScalarCheckedMultiplyC, ScalarStringHelpers } from "./scalar_int_emit.ku"
 import { StructResultHeader, StructValueResultHeader } from "./struct_result_c.ku"
 import { EmitLinkedArrayBody, StructArrayStatuses } from "./struct_array_c.ku"
-import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult, LinkedFsReadReference, LinkedIntArrayCallbackDeclaration } from "./struct_projection_c.ku"
+import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult, LinkedIntAppendCallbackDeclaration, LinkedIntArrayCallbackDeclaration } from "./struct_projection_c.ku"
 import { TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { CheckLinkedStringAppendTarget, FinishLinkedFieldAppend, FinishLinkedStringAppend, LinkedFieldAppendArgument, LowerLinkedArrayBinding } from "./linked_array_fields_c.ku"
@@ -14,30 +15,17 @@ import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
-         LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+         LinkedNullNode, LinkedNullProject,  LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { LinkedCPrelude, LinkedIntArrayCallbackCarrier, LinkedIntArrayCallbackTypes, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
+import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue, LowerLinkedScopedCallbackCall } from "./linked_null_values_c.ku"
+import { LinkedCPrelude, IsLinkedScopedCallback, LinkedScopedCallbackTypes, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedOkAvailable, LinkedRecordFields } from "./link_plan_c.ku"
 
-fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
-    if (callee.unit == 0 && callee.node == 1) { return ok(LinkedFsReadReference(callee.symbol)) }
-    text = "extern " + LinkedNullResultType(callee)? + " " + callee.symbol.clone() + "("
-    if (callee.parameters.len() == 0) { text += "void" }
-    index = 0
-    while (index < callee.parameters.len()) {
-        if (index > 0) { text += ", " }
-        text += LinkedNullCType(callee.parameters[index])?
-        index = index + 1
-    }
-    return ok(text + ");\n")
-}
-
-fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlot],
+fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunction], &slots: [LinkedNullSlot],
                             &locals: [LinkedLocalAppend], &payload: TypeNameBinding, checked: bool): str! {
     text = ""
     records: [str] = []
-    callbacks = LinkedIntArrayCallbackTypes(links, slots)
+    callbacks = LinkedScopedCallbackTypes(links, slots)
     if (callbacks.len() > 0 || locals.len() > 0) { text += LinkedAppendFailureDeclaration() }
     string_result = LinkedBufferResult(payload)
     index = 0
@@ -51,16 +39,21 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlo
         text += StructValueResultHeader(root)
         records = records.push(root)
     }
-    if (callbacks.len() > 0 && !ContainsType(records, "KuArrayInt")) {
-        array_result = "KuArrayInt"
-        text += StructValueResultHeader(array_result)
-        records = records.push(array_result)
-    }
     index = 0
     while (index < callbacks.len()) {
-        kind = LinkedIntArrayCallbackCarrier(callbacks[index])
+        kind = LinkedNullCType(callbacks[index])?
         if (!ContainsType(records, kind)) {
-            text += LinkedIntArrayCallbackDeclaration(kind, CTypeName(callbacks[index].module_index, callbacks[index].declaration_node))
+            signature = LinkedScopedCallbackFunction(project, callbacks[index])?
+            result = LinkedNullCType(signature.result)?
+            if (!ContainsType(records, result)) {
+                text += StructValueResultHeader(result)
+                records = records.push(result)
+            }
+            if (callbacks[index].declaration_kind == "IntArrayResultCallback") {
+                text += LinkedIntArrayCallbackDeclaration(kind, LinkedNullCType(signature.parameters[3])?)
+            } else {
+                text += LinkedIntAppendCallbackDeclaration(kind, LinkedNullCType(signature.parameters[3])?, LinkedNullCType(signature.parameters[5])?)
+            }
             records = records.push(kind)
         }
         index = index + 1
@@ -112,7 +105,7 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlo
     return ok(text)
 }
 
-fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding): str! {
+fn EmitLinkedNullDeclarations(&project: LinkedNullProject, &body: LinkedNullState, &result: TypeNameBinding): str! {
     ops = GuardArithmetic(body.uses_add, body.uses_sub)
     if (body.uses_mul || body.uses_div) { ops += "#include <stdio.h>\n#include <stdlib.h>\n\n" }
     if (body.uses_mul) { ops += ScalarCheckedMultiplyC() }
@@ -128,11 +121,11 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
     }
     if (body.uses_int_snapshot) { declarations += LinkedIntSnapshotRuntime() }
     checked = !body.plain_value_result
-    return ok(declarations + EmitLinkedNullPrototypes(body.links, body.slots, body.local_appends, result, checked)?)
+    return ok(declarations + EmitLinkedNullPrototypes(project, body.links, body.slots, body.local_appends, result, checked)?)
 }
 
-fn EmitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &payload: TypeNameBinding): str! {
-    header = EmitLinkedNullDeclarations(body, payload)?
+fn EmitLinkedFunction(&project: LinkedNullProject, &body: LinkedNullState, &symbol: str, &signature: str, &payload: TypeNameBinding): str! {
+    header = EmitLinkedNullDeclarations(project, body, payload)?
     result = ""
     if (body.plain_value_result) { result = LinkedNullCType(payload)? }
     else { result = LinkedCheckedResultCType(payload)? }
@@ -328,11 +321,21 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
     callee = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
     if ((callee.kind == "Variable" && callee.edge_count == 0 && callee.text != "ok")
         || (callee.kind == "Field" && callee.edge_count == 1)) {
+        call_id = LinkedNullChild(project, 1, statement, 0)
+        if (callee.kind == "Variable") {
+            slot = LinkedNullBinding(state.slots, callee.text)
+            if (slot > 0 && IsLinkedScopedCallback(state.slots[slot - 1].value.ty)) {
+                forwarded = LowerLinkedScopedCallbackCall(project, state, call, slot, call_id, 0, false)?
+                if (!SameLinkedType(forwarded.result, result)) {
+                    RejectLayout("linked_tail_result", "forwarded callback must match the entry's declared result", DeclarationSpan(call))?
+                }
+                return ok(forwarded.state)
+            }
+        }
         target = ResolveLinkedCall(project, state.slots, call, callee, true)?
         if (!SameLinkedType(target.result, result)) {
             RejectLayout("linked_tail_result", "forwarded Result must match the entry's declared payload", DeclarationSpan(call))?
         }
-        call_id = LinkedNullChild(project, 1, statement, 0)
         arguments = LowerLinkedArguments(project, state, call, target, call_id, 0, true)?
         arguments.state.code = arguments.state.code + "    result = " + LinkedNullCallSymbol(target) + "(" + arguments.args
             + ");\n" + arguments.handoff + "    goto cleanup;\n"

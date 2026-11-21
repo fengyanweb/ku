@@ -1,22 +1,40 @@
+import { LinkedBuiltin, LinkedCheckedResultCType, LinkedNullCType, LinkedNullNode, LinkedNullParameterPlan, LinkedNullProject, LinkedNullResultType, LinkedNullType, LinkedResultPlan, SameLinkedType } from "./linked_null_types_c.ku"
 import { Span } from "../stage2/span.ku"
 import { SuppliedModule } from "./imports.ku"
-import { LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
+import { DeclarationSpan } from "./names.ku"
+import { AppendLinkedCheckedInvocation, ExitLinkedFailure, FsReadLinkPlan, LinkedCheckedCall, LinkedFailureTarget, LinkPlanDeclaration, LinkPlanNominalType, LinkPlanType, LinkedIntArrayCallbackFunction, LinkedNullArguments, LinkedNullFunction, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { LinkPlanJsonControls, LinkPlanJsonText } from "./project_paths.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { ProjectionBuiltinLinkFor } from "./struct_projection_c.ku"
+import { TypeNameBinding } from "./type_names.ku"
+import { LinkedFsReadReference, LinkedIntAppendCallbackNominals, LinkedIntArrayCallbackFaultPending, ProjectionBuiltinLinkFor } from "./struct_projection_c.ku"
 
 fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): str! {
     name = ty.name.clone()
     path = "null"
     if (ty.unit > 0) {
         path = LinkPlanJsonText(supplied[ty.unit - 1].path.clone(), controls)?
-        name = supplied[ty.unit - 1].named.parsed.arena.nodes[ty.node - 1].text.clone()
+        if (ty.kind != "IntResultAppendCallback") {
+            name = supplied[ty.unit - 1].named.parsed.arena.nodes[ty.node - 1].text.clone()
+        }
     }
     passing = "value"
     if (ty.view) { passing = "view" }
-    return ok("{\"kind\":" + LinkPlanJsonText(ty.kind.clone(), controls)? + ",\"source_name\":" + LinkPlanJsonText(name, controls)?
+    text = "{\"kind\":" + LinkPlanJsonText(ty.kind.clone(), controls)? + ",\"source_name\":" + LinkPlanJsonText(name, controls)?
         + ",\"source_path\":" + path + ",\"node\":" + str(ty.node) + ",\"c_type\":" + LinkPlanJsonText(ty.c_type.clone(), controls)?
-        + ",\"passing\":" + LinkPlanJsonText(passing, controls)? + "}")
+        + ",\"passing\":" + LinkPlanJsonText(passing, controls)?
+    if (ty.kind == "IntResultAppendCallback") {
+        text += ",\"nominals\":["
+        index = 0
+        while (index < ty.nominals.len()) {
+            nominal = ty.nominals[index].clone()
+            if (index != 0) { text += "," }
+            text += "{\"source_path\":" + LinkPlanJsonText(supplied[nominal.unit - 1].path.clone(), controls)?
+                + ",\"node\":" + str(nominal.node) + ",\"c_type\":" + LinkPlanJsonText(nominal.c_type, controls)? + "}"
+            index += 1
+        }
+        text += "]"
+    }
+    return ok(text + "}")
 }
 
 fn plannedDeclaration(&supplied: [SuppliedModule], &declaration: LinkPlanDeclaration, &controls: str): str! {
@@ -60,4 +78,116 @@ fn EmitLinkPlan(&supplied: [SuppliedModule], &mode: str, &entry: LinkPlanDeclara
         index = index + 1
     }
     return ok(text + "]}\n")
+}
+
+fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
+    if (callee.unit == 0 && callee.node == 1) { return ok(FsReadLinkPlan(callee.symbol.clone())) }
+    parameters: [LinkPlanType] = []
+    index = 0
+    while (index < callee.parameters.len()) {
+        ty = callee.parameters[index].clone()
+        parameters = parameters.push(LinkedNullParameterPlan(ty, callee.unit)?)
+        index = index + 1
+    }
+    result = LinkedResultPlan(callee.result, callee.unit, callee.returns_result)?
+    return ok(LinkPlanDeclaration { unit: callee.unit, node: callee.node, symbol: callee.symbol.clone(),
+        parameters: parameters, result: result, returns_result: callee.returns_result })
+}
+
+fn LinkedIntAppendCallbackFunction(&project: LinkedNullProject, unit: int, id: int): LinkedNullFunction! {
+    node = LinkedNullNode(project, unit, id)
+    ids = LinkedIntAppendCallbackNominals(project.supplied[unit - 1].named, node)?
+    first_record = LinkedNullType(project, unit, ids[0])?
+    second_record = LinkedNullType(project, unit, ids[1])?
+    if (first_record.declaration_kind != "Struct" || second_record.declaration_kind != "Struct") {
+        RejectLayout("linked_callback_type", "both scoped append record arguments must be nominal structs", DeclarationSpan(node))?
+    }
+    string = LinkedBuiltin("str", DeclarationSpan(node))
+    integer = LinkedBuiltin("int", DeclarationSpan(node))
+    array = integer.clone()
+    array.declaration_kind = "OwnedIntArray"
+    return ok(LinkedNullFunction { unit: unit, node: id, symbol: "",
+        parameters: [string.clone(), string, integer.clone(), first_record, array, second_record], result: integer, returns_result: true })
+}
+
+fn LinkedScopedCallbackFunction(&project: LinkedNullProject, &callback: TypeNameBinding): LinkedNullFunction! {
+    if (callback.declaration_kind == "IntArrayResultCallback") { return ok(LinkedIntArrayCallbackFunction(callback)) }
+    return LinkedIntAppendCallbackFunction(project, callback.module_index, callback.declaration_node)
+}
+
+fn SameLinkedCallbackSignature(&left: LinkedNullFunction, &right: LinkedNullFunction): bool {
+    if (left.parameters.len() != right.parameters.len() || left.returns_result != right.returns_result ||
+        !SameLinkedType(left.result, right.result)) { return false }
+    index = 0
+    while (index < left.parameters.len()) {
+        if (!SameLinkedType(left.parameters[index], right.parameters[index])) { return false }
+        index += 1
+    }
+    return true
+}
+fn PrepareLinkedAppendCallbackPlan(&project: LinkedNullProject, declaration: LinkPlanDeclaration): LinkPlanDeclaration! {
+    parameters: [LinkPlanType] = []
+    index = 0
+    while (index < declaration.parameters.len()) {
+        ty = declaration.parameters[index].clone()
+        if (ty.kind == "IntResultAppendCallback") {
+            checked = LinkedIntAppendCallbackFunction(project, ty.unit, ty.node)?
+            a = checked.parameters[3].clone()
+            b = checked.parameters[5].clone()
+            nominals: [LinkPlanNominalType] = [
+                LinkPlanNominalType { unit: a.module_index, node: a.declaration_node, c_type: LinkedNullCType(a)? },
+                LinkPlanNominalType { unit: b.module_index, node: b.declaration_node, c_type: LinkedNullCType(b)? }
+            ]
+            ty = LinkPlanType { kind: ty.kind, name: ty.name, unit: ty.unit, node: ty.node,
+                c_type: ty.c_type, view: ty.view, nominals: nominals }
+        }
+        parameters = parameters.push(ty)
+        index += 1
+    }
+    return ok(LinkPlanDeclaration { unit: declaration.unit, node: declaration.node, symbol: declaration.symbol,
+        parameters: parameters, result: declaration.result, returns_result: declaration.returns_result })
+}
+
+fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
+    if (callee.unit == 0 && callee.node == 1) { return ok(LinkedFsReadReference(callee.symbol)) }
+    text = "extern " + LinkedNullResultType(callee)? + " " + callee.symbol.clone() + "("
+    if (callee.parameters.len() == 0) { text += "void" }
+    index = 0
+    while (index < callee.parameters.len()) {
+        if (index > 0) { text += ", " }
+        text += LinkedNullCType(callee.parameters[index])?
+        index = index + 1
+    }
+    return ok(text + ");\n")
+}
+
+fn CheckLinkedScopedCallback(state: LinkedNullState, &callback: str, unwrap: bool): LinkedNullState {
+    next = state
+    target = "result.error"
+    if (unwrap) { target = LinkedFailureTarget(next) }
+    next.code += "    if (!" + callback.clone() + ".entry || !" + callback.clone() + ".failure) {\n        "
+        + target + " = (KuBootstrapError){"
+        + ".domain={(uint8_t*)\"bootstrap.callback\",sizeof(\"bootstrap.callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
+        + ".code={(uint8_t*)\"invalid_callback\",sizeof(\"invalid_callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
+        + ".message={(uint8_t*)\"callback entry or failure relay is missing\",sizeof(\"callback entry or failure relay is missing\")-1u,0u,KU_PROJECTION_STRING_STATIC}};\n"
+    if (unwrap) { next = ExitLinkedFailure(next, "        ") }
+    else { next.code += "        goto cleanup;\n" }
+    next.code += "    }\n"
+    return next
+}
+
+fn EmitLinkedScopedCallbackCall(arguments: LinkedNullArguments, &callback: LinkedNullValue, result_type: TypeNameBinding,
+                                 id: int, unwrap: bool): LinkedCheckedCall! {
+    name = callback.text.clone()
+    pointer = name.clone() + ".failure"
+    invoke = name.clone() + ".entry(" + name + ".environment, " + pointer.clone() + ", " + arguments.args + ")"
+    relay = "    if (" + LinkedIntArrayCallbackFaultPending(pointer) + ") goto cleanup;\n"
+    result = "dependency" + str(id)
+    next = arguments.state
+    if (unwrap) {
+        next = AppendLinkedCheckedInvocation(next, LinkedCheckedResultCType(result_type)?, result, invoke, arguments.handoff + relay)
+    } else {
+        next.code += "    result = " + invoke + ";\n" + arguments.handoff + "    goto cleanup;\n"
+    }
+    return ok(LinkedCheckedCall { state: next, result: result_type, text: result, id: id })
 }

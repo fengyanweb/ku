@@ -351,7 +351,7 @@ fn EmitLinkedNullC(&project: LinkedNullProject, &entry_name: str): LinkedNullC! 
         RejectLayout("unsupported_linked_terminal", "expected a final return or Error fail", DeclarationSpan(function))?
     }
     symbol = "ku_linked_null_" + str(id)
-    source = EmitLinkedFunction(region.state, symbol, parameters.signature, result)?
+    source = EmitLinkedFunction(project, region.state, symbol, parameters.signature, result)?
     checked = !region.state.plain_value_result
     plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: parameters.plan,
         result: LinkedResultPlan(result, 1, checked)?, returns_result: checked }

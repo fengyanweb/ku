@@ -134,7 +134,7 @@ fn resultEdge(&nodes: [Node], &edges: [int], &function: Node): int! {
 fn managedDeclaration(&layout: StructLayout, kind: str, c_type: str, view: bool): LinkPlanType {
     unit = layout.module_index
     if (unit == 0) { unit = 1 }
-    return LinkPlanType { kind: kind, name: layout.name.clone(), unit: unit, node: layout.node, c_type: c_type, view: view }
+    return LinkPlanType { kind: kind, name: layout.name.clone(), unit: unit, node: layout.node, c_type: c_type, view: view, nominals: [] }
 }
 
 fn managedPlan(&layouts: [StructLayout], &signature: ManagedSignature, result_layout: int, result_type: str,

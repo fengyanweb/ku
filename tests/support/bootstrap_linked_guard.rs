@@ -1003,6 +1003,144 @@ int main(int argc, char **argv) {
     }
 }
 
+pub(super) fn assert_two_nominal_callback(seed: &Path, python: &str, cwd: &Path) {
+    let caller = "append-callback-caller.ku";
+    let receiver = "append-callback-receiver.ku";
+    let source = r#"import { Place, Note, Relay } from "./append-callback-receiver.ku"
+fn Run(note: Note): int! {
+    nodes: [int] = []
+    fn Build(kind: str, text: str, value: int, place: Place, children: [int], tag: Note): int! {
+        if (tag.reject) {
+            message = tag.label.clone()
+            fail { domain: "test", code: "reject", message: message }
+        }
+        total = value + place.offset + tag.score
+        if (children.len() > 0) { total = total + children[0] }
+        if (tag.fatal) { total = nodes[0 - 1] }
+        nodes = nodes.push(total)
+        return ok(total)
+    }
+    result = Relay(Build.clone(), note)?
+    return ok(nodes[0] + result)
+}
+"#;
+    fs::write(cwd.join(caller), source).unwrap();
+    fs::write(
+        cwd.join(receiver),
+        r#"struct Place { offset: int }
+struct OtherPlace { offset: int }
+struct Note { label: str score: int reject: bool fatal: bool }
+fn Apply(action: fn(str, str, int, Place, [int], Note): int!, note: Note): int! {
+    try {
+        first = action("kind", "body", 3, Place { offset: 20 }, [7],
+                       Note { label: "begin", score: 1, reject: false, fatal: false })?
+        return action("kind", "tail", first, Place { offset: 2 }, [], note)
+    } catch(err) {
+        return ok(0)
+    }
+}
+fn Relay(action: fn(str, str, int, Place, [int], Note): int!, note: Note): int! {
+    return Apply(action.clone(), note)
+}
+"#,
+    )
+    .unwrap();
+    let cc =
+        std::env::var("CC").unwrap_or_else(|_| if cfg!(windows) { "clang" } else { "cc" }.into());
+    let mut link = Command::new(python);
+    link.arg("-B")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/tools/link_c.py"))
+        .args(["--cc", &cc]);
+    let mut entry = String::new();
+    let mut carrier = String::new();
+    for (name, manifest) in [
+        ("Run", format!("{caller}\n{receiver}\n")),
+        ("Relay", format!("{receiver}\n")),
+        ("Apply", format!("{receiver}\n")),
+    ] {
+        fs::write(cwd.join("modules.txt"), manifest).unwrap();
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        assert!(code.contains("KuBootstrapIntAppendCallback_m"));
+        if name == "Run" {
+            let (symbol, parameters) = code
+                .lines()
+                .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t "))
+                .unwrap()
+                .split_once('(')
+                .unwrap();
+            entry = symbol.to_owned();
+            carrier = parameters.split(' ').next().unwrap().to_owned();
+        }
+        let c = cwd.join(format!("two-nominal-{name}.c"));
+        let plan = cwd.join(format!("two-nominal-{name}.plan.json"));
+        fs::write(&c, code).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+        let description = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&description);
+        fs::write(&plan, description.stdout).unwrap();
+        link.arg("--unit").args([plan, c]);
+    }
+    let host = r#"
+#include <assert.h>
+#include <string.h>
+static NOTE input(bool reject, bool fatal) {
+    uint8_t *label = malloc(6);
+    assert(label);
+    memcpy(label, "second", 6);
+    return (NOTE){{label, 6, 6, KU_PROJECTION_STRING_OWNED}, 5, reject, fatal};
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) { (void)ENTRY(input(false, true)); return 2; }
+    KuBootstrapResult_int64_t result = ENTRY(input(false, false));
+    assert(result.ok && result.value == 69);
+    result = ENTRY(input(true, false));
+    assert(!result.ok && result.error.code.len == 6 && !memcmp(result.error.code.ptr, "reject", 6));
+    assert(result.error.message.len == 6 && !memcmp(result.error.message.ptr, "second", 6));
+    assert(result.error.message.storage == KU_PROJECTION_STRING_OWNED);
+    free(result.error.message.ptr);
+    return 0;
+}
+"#
+    .replace("ENTRY", &entry)
+    .replace("NOTE", &carrier);
+    let host_path = cwd.join("two-nominal-host.c");
+    let exe = cwd.join(format!("two-nominal{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&host_path, host).unwrap();
+    link.args([
+        "--entry",
+        caller,
+        entry.strip_prefix("ku_linked_null_").unwrap(),
+    ])
+    .arg("--caller")
+    .arg(host_path)
+    .arg("-o")
+    .arg(&exe);
+    assert_ok(&execute(&mut link, cwd, 45));
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    let fatal = execute(Command::new(exe).arg("invalid-index"), cwd, 10);
+    assert_eq!(fatal.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&fatal.stderr).contains("index -1 out of bounds for length 1"));
+    fs::write(
+        cwd.join(caller),
+        source
+            .replace("Place, Note", "Place, OtherPlace, Note")
+            .replace("place: Place", "place: OtherPlace"),
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), format!("{caller}\n{receiver}\n")).unwrap();
+    fs::write(cwd.join("function.txt"), "Run").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_callback_forward"));
+}
+
 pub(super) fn assert_terminal_branch_ownership(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("guard-provider.ku"),

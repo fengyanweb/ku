@@ -6,9 +6,9 @@ import { SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
 import { ResolveTypeName, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
-import { CTypeName, ProjectionBuiltinLinkFor, ProjectionBuiltinLinkId, ProjectionBytesGet, LinkedBufferResult, LinkedIntArrayCallbackNominal, RequireProjectionLocalFunction, ProjectionPlaceRoot, RequireProjectionBuiltin, ResolveProjectionDirectFunction } from "./struct_projection_c.ku"
+import { CTypeName, ProjectionBuiltinLinkFor, ProjectionBuiltinLinkId, ProjectionBytesGet, LinkedBufferResult, LinkedIntArrayCallbackNominal, LinkedIntAppendCallbackNominals, RequireProjectionLocalFunction, ProjectionPlaceRoot, RequireProjectionBuiltin, ResolveProjectionDirectFunction } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningStructDropReference } from "./nested_struct_c.ku"
-import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayLinkPlanType, LinkedIntArrayCallbackCarrier, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, IntArrayLinkPlanType, LinkedIntArrayCallbackCarrier, LinkedIntAppendCallbackBinding, LinkedIntAppendCallbackCarrier, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -83,6 +83,10 @@ fn readIntPairResultCallback(&project: LinkedNullProject, unit: int, &node: Node
 
 fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view: bool): TypeNameBinding! {
     node = LinkedNullNode(project, unit, id)
+    if (!view && node.kind == "TypeFunction" && node.edge_count == 7) {
+        LinkedIntAppendCallbackNominals(project.supplied[unit - 1].named, node)?
+        return ok(LinkedIntAppendCallbackBinding(unit, id, DeclarationSpan(node)))
+    }
     if (!view && node.kind == "TypeFunction" && node.edge_count == 5) {
         nominal = LinkedIntArrayCallbackNominal(project.supplied[unit - 1].named, node)?
         ty = LinkedNullType(project, unit, nominal)?
@@ -154,6 +158,7 @@ fn LinkedNullHasResultValue(&binding: TypeNameBinding): bool {
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
+    if (binding.declaration_kind == "IntResultAppendCallback") { return ok(LinkedIntAppendCallbackCarrier(binding)) }
     if (binding.declaration_kind == "IntArrayResultCallback") { return ok(LinkedIntArrayCallbackCarrier(binding)) }
     if (binding.declaration_kind == "IntPairResultCallback") {
         return ok("KuBootstrapIntPairCallback_" + CTypeName(binding.module_index, binding.declaration_node))
@@ -408,20 +413,6 @@ fn LinkedCallArgument(&project: LinkedNullProject, &call: Node, &callee: LinkedN
         return LinkedNullChild(project, 1, LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0)), 0)
     }
     return LinkedNullChild(project, 1, call, index + 1)
-}
-
-fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
-    if (callee.unit == 0 && callee.node == 1) { return ok(FsReadLinkPlan(callee.symbol.clone())) }
-    parameters: [LinkPlanType] = []
-    index = 0
-    while (index < callee.parameters.len()) {
-        ty = callee.parameters[index].clone()
-        parameters = parameters.push(LinkedNullParameterPlan(ty, callee.unit)?)
-        index = index + 1
-    }
-    result = LinkedResultPlan(callee.result, callee.unit, callee.returns_result)?
-    return ok(LinkPlanDeclaration { unit: callee.unit, node: callee.node, symbol: callee.symbol.clone(),
-        parameters: parameters, result: result, returns_result: callee.returns_result })
 }
 
 fn LinkedNullEntry(&project: LinkedNullProject, &name: str): int! {
