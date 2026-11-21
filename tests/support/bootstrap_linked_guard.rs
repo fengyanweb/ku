@@ -18,6 +18,13 @@ fn Borrowed(&input: [Item]): [Item]! {
     local: [Item] = input
     return ok(local)
 }
+fn Snapshot(input: [Item]): [Item]! {
+    copy = input.clone()
+    if (copy.len() != input.len()) {
+        fail { domain: "clone", code: "length", message: "array length changed" }
+    }
+    return ok(copy)
+}
 "#,
     )
     .unwrap();
@@ -78,6 +85,65 @@ int main(int argc, char **argv) {
         assert!(rejected.stdout.is_empty());
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(error));
     }
+
+    fs::write(cwd.join("function.txt"), "Snapshot").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (snapshot, _) = code
+        .lines()
+        .find(|line| line.starts_with("KuBootstrapResult_KuArray_"))
+        .and_then(|line| line.strip_prefix(result))
+        .and_then(|line| line.trim_start().split_once('('))
+        .unwrap();
+    let host = r#"
+static void after_clone_failure(void) {
+    assert(attempts == 6 && !outstanding());
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    (void)test_realloc;
+    ELEMENT *items = malloc(2 * sizeof(*items));
+    uintptr_t former[2];
+    for (size_t i = 0; i < 2; ++i) {
+        uint8_t *text = malloc(1);
+        *text = (uint8_t)(42 + i);
+        former[i] = (uintptr_t)text;
+        items[i].f0 = (KuProjectionString){text, 1, 1, KU_PROJECTION_STRING_OWNED};
+    }
+    uintptr_t former_data = (uintptr_t)items;
+    if (argc > 1) {
+        assert(atexit(after_clone_failure) == 0);
+        fail_after = 2;
+    }
+    RESULT output = SNAPSHOT((ARRAY){2, items, 2});
+    assert(output.ok && output.value.len == 2 && outstanding() == 3);
+    assert((uintptr_t)output.value.data != former_data);
+    for (size_t i = 0; i < 2; ++i) {
+        assert((uintptr_t)output.value.data[i].f0.ptr != former[i]);
+        assert(*output.value.data[i].f0.ptr == 42 + i);
+    }
+    DROP(&output.value);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("SNAPSHOT", snapshot)
+    .replace("RESULT", result)
+    .replace("ARRAY", array)
+    .replace("ELEMENT", element)
+    .replace("DROP", &format!("ku_linked_view_{element}_drop"));
+    let source = cwd.join("array-snapshot.c");
+    let program = cwd.join(format!("array-snapshot{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &program, cwd);
+    assert_ok(&execute(&mut Command::new(&program), cwd, 10));
+    let failed = execute(Command::new(program).arg("fail-second-element"), cwd, 10);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(failed.stderr).unwrap().trim(),
+        "out of memory"
+    );
 }
 
 pub(super) fn assert_checked_callback_forwarding(seed: &Path, cwd: &Path) {

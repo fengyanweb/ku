@@ -377,6 +377,27 @@ fn EmitLinkedIntAppend(&array: str, &value: str): str {
         + "    }\n    if (append_status != KU_STRUCT_ARRAY_OK) goto cleanup;\n"
 }
 
+fn OwnedRecordArrayCloneLayout(&layouts: [StructLayout], &array: TypeNameBinding): int {
+    index = LayoutIndex(layouts, array.module_index, array.declaration_node)
+    if (index == 0 || HasBoundArrayMembers(layouts, index)) { return 0 }
+    if (collectOwnedFields(layouts, index, "", []).len() == 0) { return 0 }
+    return index
+}
+
+fn EmitLinkedOwnedArrayClone(&source: str, &target: str, &prefix: str, layout: int): str {
+    // The common drop owns only the destination's initialized prefix.
+    text = "    if (!" + prefix.clone() + "_valid(&" + source.clone() + ")) { invalid_array = true; goto cleanup; }\n"
+    text += "    if (" + source.clone() + ".len) {\n"
+        + "        " + target.clone() + ".data = malloc(" + source.clone() + ".len * sizeof(*" + target.clone() + ".data));\n"
+        + "        if (!" + target.clone() + ".data) { out_of_memory = true; goto cleanup; }\n"
+    text += "        " + target.clone() + ".capacity = " + source.clone() + ".len;\n"
+        + "        while (" + target.clone() + ".len < " + source.clone() + ".len) {\n"
+    text += "            if (!ku_linked_element_" + str(layout) + "_clone_element(&" + source.clone()
+        + ".data[" + target.clone() + ".len], &" + target.clone()
+        + ".data[" + target.clone() + ".len])) { out_of_memory = true; goto cleanup; }\n"
+    return text + "            ++" + target.clone() + ".len;\n        }\n    }\n"
+}
+
 fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str): str! {
     text = header
     text += EmitBoundStringOperations(body.uses_clone, body.uses_concat, body.uses_int_format, body.uses_prefix_suffix)

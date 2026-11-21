@@ -9,7 +9,7 @@ import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall
 import { EmitLinkedIntAppend, ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
 import { LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { CloneLinkedLocalArrayItem, CloneLinkedRecord, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { CloneLinkedLocalArrayItem, CloneLinkedRecord, CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AddLinkedNullSlot, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix } from "./linked_parameters_c.ku"
 
 fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int, depth: int): LinkedNullExpression! {
@@ -27,6 +27,7 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     if (field) {
         RejectLayout("unsupported_linked_clone", "field clone requires a bound str", DeclarationSpan(subject))?
     }
+    if (LinkedNullOwnedArray(ty)) { return CloneLinkedRecordArray(project, source, id) }
     if (ty.declaration_kind != "Struct") {
         RejectLayout("unsupported_linked_clone", "expected str or a finite struct for clone", DeclarationSpan(subject))?
     }
