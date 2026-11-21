@@ -659,8 +659,9 @@ def exercise_linked_program(compiler, cc, caller):
     project.mkdir()
     main = project / "main.ku"
     provider = project / "读取.ku"
-    main.write_text('import { CloneLabel, Location, ReadSource } from "./读取"\n'
+    main.write_text('import { CloneLabel, Location, ReadSource, Note } from "./读取"\n'
                     'fn main(): null! { source = ReadSource("input.txt")?; println(source);\n'
+                    '    unused = 7; noted = Note()?;\n'
                     '    println(CloneLabel());\n'
                     '    line = Location(0, true); if (line != null) { println(str(line)) }\n'
                     '    println(str(Location(0, false))); return ok(null) }\n',
@@ -669,6 +670,7 @@ def exercise_linked_program(compiler, cc, caller):
                         'fn Clean(&text: str): str { return string.trim(text) }\n'
                         'fn ReadSource(path: str): str! { raw = fs.read(path)?; result = Clean(raw);'
                         ' raw = "released"; return ok(result) }\n'
+                        'fn Note(): int! { println("note"); return ok(7) }\n'
                         'fn CloneLabel(): str { return "前缀🙂".clone() }\n'
                         'fn Location(line: int, present: bool): int | null { println("lookup");\n'
                         '    if (!present) { return null }; return line }\n', encoding="utf-8")
@@ -704,7 +706,7 @@ def exercise_linked_program(compiler, cc, caller):
                           ("\u0085　\u00a0", "\n")):
         input_file.write_bytes(raw.encode("utf-8"))
         success = execute([binary], caller)
-        assert success.stdout.replace(b"\r\n", b"\n") == (expected + "前缀🙂\nlookup\n0\nlookup\nnull\n").encode("utf-8")
+        assert success.stdout.replace(b"\r\n", b"\n") == (expected + "note\n前缀🙂\nlookup\n0\nlookup\nnull\n").encode("utf-8")
         assert not success.stderr
     input_file.unlink()
     missing = execute([binary], caller, 1)

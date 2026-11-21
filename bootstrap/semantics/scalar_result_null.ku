@@ -9,6 +9,14 @@ import { TypeNameBinding } from "./type_names.ku"
 import { EmitScalarIntString, ScalarIntParameter } from "./scalar_int_emit.ku"
 import { RejectScalarInt, ScalarParameterIndex, ScalarStringLiteral } from "./scalar_int_operands.ku"
 
+fn LinkedSlotDeclaration(kind: str, name: str, named: bool, &drop_c: str): str {
+    ending = ";\n"
+    // An unused source local is legal. Refer to its storage without loading
+    // its value or changing when its initializer runs.
+    if (named && drop_c == "") { ending = "; (void)&" + name.clone() + ";\n" }
+    return "    " + kind + " " + name + " = {0}" + ending
+}
+
 fn ScalarStaticErrorFields(&nodes: [Node], &edges: [int], &object: Node, &string_type: str): str! {
     if (object.kind != "ObjectLiteral" || object.edge_count != 3) {
         RejectScalarInt("unsupported_static_error", "expected an Error literal with domain, code, and message", DeclarationSpan(object))?
