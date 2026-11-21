@@ -1,6 +1,6 @@
 import { RequireLinkedMutableName } from "./call_contracts.ku"
 import { AddLinkedNullSlot, LinkedCountedInitial, LinkedCountdownIndex, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
-import { OpenLinkedForLoop, CloseLinkedForLoop } from "./linked_char_iter_c.ku"
+import { OpenLinkedForLoop, CloseLinkedForLoop, ValidLinkedCountedStart } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedArrayLocal, LowerLinkedTargetSet, LowerLinkedOwnedDestructure,
          LowerLinkedPlainReturn, LowerLinkedStringAppend, LowerLinkedSuccess } from "./linked_function_c.ku"
@@ -112,22 +112,18 @@ fn countedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Nod
         step.kind != "Assign" || step.edge_count != 1 || step.text != left.text) {
         RejectLayout("unsupported_linked_loop", "counted while requires one distinct int cursor", DeclarationSpan(loop))?
     }
-    initial_value = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 0))
-    valid_start = initial_value.kind == "Int" && initial_value.edge_count == 0 && initial_value.int_value == 0
-    if (!valid_start) {
-        bound = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 1))
-        input = LinkedLiveIntBinding(state, initial_value)
-        valid_start = input > 0 && input != slot && LinkedLiveIntBinding(state, bound) > 0
-    }
+    bound = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 1))
+    named_bound = LinkedLiveIntBinding(state, bound) > 0
+    valid_start = ValidLinkedCountedStart(project, state, LinkedNullChild(project, 1, initial, 0), slot, named_bound)
     rhs = LinkedNullNode(project, 1, LinkedNullChild(project, 1, step, 0))
     if (!valid_start || rhs.kind != "Binary" || rhs.edge_count != 2 || rhs.text != "+") {
-        RejectLayout("unsupported_linked_loop", "counted while requires initialization to zero and a unit increment", DeclarationSpan(loop))?
+        RejectLayout("unsupported_linked_loop", "counted while requires initialization to zero or a supported stable int start and a fixed increment", DeclarationSpan(loop))?
     }
     cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, rhs, 0))
-    one = LinkedNullNode(project, 1, LinkedNullChild(project, 1, rhs, 1))
+    amount = LinkedNullNode(project, 1, LinkedNullChild(project, 1, rhs, 1))
     if (cursor.kind != "Variable" || cursor.edge_count != 0 || cursor.text != left.text ||
-        one.kind != "Int" || one.edge_count != 0 || one.int_value != 1) {
-        RejectLayout("unsupported_linked_loop", "counted while must advance the cursor by one", DeclarationSpan(step))?
+        amount.kind != "Int" || amount.edge_count != 0 || amount.int_value <= 0 || (!named_bound && amount.int_value != 1)) {
+        RejectLayout("unsupported_linked_loop", "counted while requires a positive constant step with a named int bound and a unit step otherwise", DeclarationSpan(step))?
     }
     return ok(slot)
 }

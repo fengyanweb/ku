@@ -5,7 +5,7 @@ import { LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullRegion, LinkedNul
     PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedStringResult } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
-import { DropLinkedNullScope } from "./linked_member_ownership.ku"
+import { DropLinkedNullScope, LinkedLiveIntBinding } from "./linked_member_ownership.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
 struct LinkedForLoop {
@@ -141,4 +141,17 @@ fn CloseLinkedForLoop(loop: LinkedNullRegion, &outer: [LinkedNullSlot], before: 
     }
     body.state.code += "    }\n"
     return ok(DropLinkedNullScope(body.state, before))
+}
+
+fn ValidLinkedCountedStart(&project: LinkedNullProject, &state: LinkedNullState, id: int, slot: int, named_bound: bool): bool {
+    initial = LinkedNullNode(project, 1, id)
+    if (initial.kind == "Int" && initial.edge_count == 0 && initial.int_value == 0) { return true }
+    if (!named_bound) { return false }
+    if (initial.kind == "Binary" && initial.text == "+" && initial.edge_count == 2) {
+        offset = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 1))
+        if (offset.kind != "Int" || offset.edge_count != 0 || offset.int_value < 0) { return false }
+        initial = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 0))
+    }
+    input = LinkedLiveIntBinding(state, initial)
+    return input > 0 && input != slot
 }

@@ -1965,6 +1965,41 @@ fn LegacyStart(&values: [int], start: int): CountResult! {
     while (cursor < values.len()) { cursor = cursor + 1 }
     return ok(CountResult { value: cursor })
 }
+fn StrideFrom(start: int, stop: int): CountResult! {
+    cursor = start + 2
+    while (cursor < stop) {
+        Visit(cursor)?
+        cursor = cursor + 2
+    }
+    return ok(CountResult { value: cursor })
+}
+fn LegacyStride(&values: [int]): CountResult! {
+    cursor = 0
+    while (cursor < values.len()) { cursor = cursor + 2 }
+    return ok(CountResult { value: cursor })
+}
+fn ZeroStride(start: int, stop: int): CountResult! {
+    cursor = start + 2
+    while (cursor < stop) { cursor = cursor + 0 }
+    return ok(CountResult { value: cursor })
+}
+fn ChangesBound(start: int, stop: int): CountResult! {
+    bound = stop
+    cursor = start + 2
+    while (cursor < bound) {
+        bound = bound + 1
+        cursor = cursor + 2
+    }
+    return ok(CountResult { value: cursor })
+}
+fn MovesOwner(start: int, stop: int, input: str): CountResult! {
+    cursor = start + 2
+    while (cursor < stop) {
+        moved = input
+        cursor = cursor + 2
+    }
+    return ok(CountResult { value: cursor })
+}
 "#,
     )
     .unwrap();
@@ -2025,6 +2060,91 @@ int main(void) {
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("requires initialization to zero"));
+    assert_named_counted_stride(seed, cwd);
+}
+
+fn assert_named_counted_stride(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("function.txt"), "StrideFrom").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let definition = code
+        .lines()
+        .find(|line| line.contains(" ku_linked_null_"))
+        .unwrap();
+    let (result, entry) = definition.split_once(' ').unwrap();
+    let entry = entry.split_once('(').unwrap().0;
+    let visit = code
+        .lines()
+        .find_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+static int64_t observed[5];
+static size_t called, expect_calls;
+KuBootstrapResultNull __VISIT__(int64_t value) {
+    assert(called < sizeof(observed)/sizeof(observed[0]));
+    observed[called++] = value;
+    if (value == 6) return (KuBootstrapResultNull){.error = {
+        .code = {(uint8_t*)"stop",4,0,KU_PROJECTION_STRING_STATIC}}};
+    return (KuBootstrapResultNull){.ok = true};
+}
+static void check_overflow(void) {
+    if (called != expect_calls || (called && observed[0] != INT64_MAX-1)) _Exit(80);
+}
+int main(int argc, char **argv) {
+    if (argc > 1) {
+        expect_calls = argv[1][0] == 's';
+        assert(atexit(check_overflow) == 0);
+        int64_t start = expect_calls ? INT64_MAX-3 : INT64_MAX-1;
+        (void)__ENTRY__(start,INT64_MAX);
+        return 81;
+    }
+    __RESULT__ result = __ENTRY__(-5,0);
+    assert(result.ok && result.value.f0 == 1 && called == 2);
+    assert(observed[0] == -3 && observed[1] == -1);
+    result = __ENTRY__(4,6);
+    assert(result.ok && result.value.f0 == 6 && called == 2);
+    result = __ENTRY__(2,8);
+    assert(!result.ok && result.error.code.len == 4 && called == 4);
+    assert(observed[2] == 4 && observed[3] == 6);
+    return 0;
+}
+"#
+    .replace("__RESULT__", result)
+    .replace("__ENTRY__", entry)
+    .replace("__VISIT__", visit);
+    let c = cwd.join("counted-int-stride.c");
+    let app = cwd.join(format!(
+        "counted-int-stride{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
+    compile_projection(&c, &app, cwd);
+    assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+    for overflow in ["offset", "step"] {
+        let trapped = execute(Command::new(&app).arg(overflow), cwd, 15);
+        assert_eq!(trapped.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&trapped.stderr).trim(),
+            "integer overflow"
+        );
+    }
+    for (function, diagnostic) in [
+        ("LegacyStride", "unsupported_linked_loop"),
+        ("ZeroStride", "unsupported_linked_loop"),
+        ("ChangesBound", "linked_loop_bound_write"),
+        ("MovesOwner", "linked_control_move"),
+    ] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(error.contains(diagnostic), "{diagnostic}, got {error}");
+    }
 }
 
 pub(super) fn assert_owned_local_member_set(seed: &Path, cwd: &Path) {
