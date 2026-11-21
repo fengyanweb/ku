@@ -115,8 +115,12 @@ fn FinishLinkedLocalThunk(&parent: LinkedNullState, &thunk: LinkedLocalThunk,
         + FinishLinkedFunctionC("", next, symbol, "void *raw, int64_t a0, int64_t a1", type, keep, char_errors, "")
 
     next = RestoreLinkedThunkFrame(next, parent)
-    for owner in thunk.owners.clone() {
+    count = thunk.owners.len()
+    cursor = 0
+    while (cursor < count) {
+        owner = thunk.owners[cursor]
         if (!ContainsIndex(next.callback_owners, owner)) { next.callback_owners = next.callback_owners.push(owner) }
+        cursor = cursor + 1
     }
     callback = thunk.result.clone()
     callback.declaration_kind = "IntPairResultCallback"
@@ -303,20 +307,21 @@ fn OpenLinkedConditionalWhile(&project: LinkedNullProject, state: LinkedNullStat
         RejectLayout("linked_while_condition", "while requires a readonly bool condition", tested.value.ty.span.clone())?
     }
     tested.state.code += "    if (!(" + tested.value.text + ")) break;\n"
-    opened.state = tested.state
-    return ok(opened)
+    body = tested.state
+    return ok(LinkedForLoop { state: body, outer: opened.outer, before: opened.before })
 }
 
 fn CloseLinkedForLoop(loop: LinkedNullRegion, &outer: [LinkedNullSlot], before: int, &statement: Node): LinkedNullState! {
-    body = loop
-    if (body.terminal) {
-        body.state = RestoreLinkedNullSlots(body.state, outer)
+    terminal = loop.terminal
+    state = loop.state
+    if (terminal) {
+        state = RestoreLinkedNullSlots(state, outer)
     } else {
-        PreserveLinkedOwners(outer, body.state.slots, statement)?
-        body.state = DropLinkedNullScope(body.state, outer.len())
+        PreserveLinkedOwners(outer, state.slots, statement)?
+        state = DropLinkedNullScope(state, outer.len())
     }
-    body.state.code += "    }\n"
-    return ok(DropLinkedNullScope(body.state, before))
+    state.code += "    }\n"
+    return ok(DropLinkedNullScope(state, before))
 }
 
 fn ValidLinkedCountedStart(&project: LinkedNullProject, &state: LinkedNullState, id: int, slot: int, named_bound: bool): bool {
