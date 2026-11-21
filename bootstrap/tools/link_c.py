@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -347,9 +348,13 @@ def run_cc(args, timeout):
 
 def link(units, aliases, output, entry, caller, cc, cflags, ldflags, timeout, builtin_headers):
     msvc = Path(cc).stem.lower() in {"cl", "clang-cl"}
+    windows_gnu = sys.platform == "win32" and not msvc
     flags = (["/nologo", "/std:c11", "/O2", "/WX"] if msvc else
              ["-std=c11", "-O2", "-pedantic-errors", "-Wall", "-Wextra", "-Werror"])
-    with tempfile.TemporaryDirectory(prefix=".ku-bootstrap-link-", dir=output.parent) as tmp:
+    # MinGW's assembler can lose Unicode in absolute object paths. Use
+    # compiler-owned scratch independent of the project's output directory.
+    scratch_parent = None if windows_gnu else output.parent
+    with tempfile.TemporaryDirectory(prefix=".ku-bootstrap-link-", dir=scratch_parent) as tmp:
         root = Path(tmp)
         if builtin_headers:
             include = root / "builtin"
@@ -377,7 +382,15 @@ def link(units, aliases, output, entry, caller, cc, cflags, ldflags, timeout, bu
         binary = root / ("program.exe" if os.name == "nt" or msvc else "program")
         link_args = ["/nologo", *objects, f"/Fe{binary}"] if msvc else [*objects, "-o", binary]
         run_cc([cc, *link_args, *ldflags], timeout)
-        os.replace(binary, output)
+        if windows_gnu:
+            # Scratch can be on another volume. Stage the finished binary
+            # beside the output so replacement keeps its atomic semantics.
+            with tempfile.TemporaryDirectory(prefix=".ku-bootstrap-publish-", dir=output.parent) as publish:
+                staged = Path(publish) / "program.exe"
+                shutil.copy2(binary, staged)
+                os.replace(staged, output)
+        else:
+            os.replace(binary, output)
 
 
 def main(argv=None):

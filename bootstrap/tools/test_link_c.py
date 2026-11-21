@@ -132,6 +132,26 @@ class LinkTests(unittest.TestCase):
         cc.assert_not_called()
         self.assertEqual(self.output.read_bytes(), old)
 
+    def test_windows_gnu_stages_compiler_paths_away_from_unicode_output(self):
+        destination = self.root / "调用目录 🙂"
+        destination.mkdir()
+        output = destination / "linked.exe"
+        output.write_bytes(b"old program")
+        compiler = shutil.which("gcc") if os.name == "nt" else shutil.which("cc")
+        if not compiler:
+            self.skipTest("no GNU-like C compiler available")
+        units = [*self.entry_args, *self.left_args, *self.right_args]
+        options = ["--entry", "app.ku", "58", "--caller", str(self.caller),
+                   "-o", str(output), "--cc", compiler]
+        with patch.object(link_c.sys, "platform", "win32"), patch.object(
+                link_c, "run_cc", wraps=link_c.run_cc) as runs:
+            self.assertEqual(link_c.main([*units, *options]), 0)
+        self.assertEqual(runs.call_count, 4)
+        for call in runs.call_args_list:
+            self.assertFalse(any(str(destination) in str(arg) for arg in call.args[0]))
+        subprocess.run([output], check=True, timeout=15)
+        self.assertEqual(list(destination.iterdir()), [output])
+
     def test_builtin_integer_array_view_has_its_own_carrier(self):
         integer = dict(builtin("int", "const KuArrayInt*"), kind="BuiltinArray", passing="view")
         strings = dict(builtin("str", "const KuGuardStringArray*"), kind="BuiltinArray", passing="view")
