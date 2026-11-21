@@ -97,7 +97,7 @@ def bootstrap_chain(repo, source, ku, cc, output, scratch, limit, sanitizers):
                 any("libku" in item.lower() for item in imports)):
             raise ValueError(f"Stage1 identity or imports do not match: {identity}")
         result = {"binary": binary.relative_to(output).as_posix(), "sha256": seed["sha256"],
-                  "archive_sha256": seed["archive_sha256"], "dynamic_imports": imports}
+                  "source_snapshot_sha256": seed["source_snapshot_sha256"], "dynamic_imports": imports}
         if os.name == "nt":
             sys.path.insert(0, str(repo / "bootstrap/tools/compiler_driver"))
             from build import windows_stack_reserve

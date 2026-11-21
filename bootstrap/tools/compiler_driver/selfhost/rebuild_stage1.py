@@ -4,16 +4,56 @@ from hashlib import sha256
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 
 
 def digest(path):
     return sha256(path.read_bytes()).hexdigest()
+
+
+def stage_source_blobs(repo, source, destination):
+    """Use the same raw Git source bytes as the later generation resolver."""
+    records = subprocess.check_output(
+        ["git", "ls-tree", "-r", "-z", source, "--", "bootstrap", ".github/scripts/verify-native-three-os.py"],
+        cwd=repo, timeout=30,
+    ).split(b"\0")
+    entries = []
+    for record in records[:-1]:
+        metadata, encoded = record.split(b"\t", 1)
+        mode, kind, object_id = metadata.split()
+        relative = PurePosixPath(encoded.decode("utf-8"))
+        if (kind != b"blob" or mode not in (b"100644", b"100755")
+                or relative.is_absolute() or ".." in relative.parts or b"\\" in encoded):
+            raise ValueError(f"unexpected bootstrap snapshot entry: {record!r}")
+        entries.append((relative, encoded, object_id))
+    if records[-1] or not entries:
+        raise ValueError("missing committed bootstrap sources")
+
+    blobs = subprocess.run(["git", "cat-file", "--batch"], cwd=repo,
+                           input=b"".join(object_id + b"\n" for _, _, object_id in entries),
+                           check=True, capture_output=True, timeout=60).stdout
+    digest_input = sha256()
+    with io.BytesIO(blobs) as data:
+        for relative, encoded, object_id in entries:
+            header = data.readline().split()
+            if len(header) != 3 or header[:2] != [object_id, b"blob"]:
+                raise ValueError(f"unexpected bootstrap blob for {relative}: {header!r}")
+            length = int(header[2])
+            content = data.read(length)
+            if len(content) != length or data.read(1) != b"\n":
+                raise ValueError(f"truncated bootstrap blob for {relative}")
+            target = destination.joinpath(*relative.parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            digest_input.update(encoded + b"\0" + header[2] + b"\0")
+            digest_input.update(content)
+        if data.read(1):
+            raise ValueError("unexpected trailing bootstrap blob data")
+    return digest_input.hexdigest()
 
 
 def main():
@@ -43,19 +83,9 @@ def main():
     identity = output.parent / "build-identity.json"
     if output.exists() or identity.exists():
         parser.error("choose a fresh output directory")
-    archive = subprocess.check_output(["git", "archive", source, "bootstrap",
-                                       ".github/scripts/verify-native-three-os.py"], cwd=repo)
     with tempfile.TemporaryDirectory(prefix="ku-long-stage1-sources-", dir=temp_dir) as temporary:
         location = Path(temporary)
-        with tarfile.open(fileobj=io.BytesIO(archive)) as opened:
-            for member in opened:
-                relative = Path(member.name)
-                if relative.is_absolute() or ".." in relative.parts or member.issym() or member.islnk():
-                    raise ValueError(f"unexpected snapshot path: {relative}")
-                if member.isfile():
-                    destination = location / relative
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    destination.write_bytes(opened.extractfile(member).read())
+        source_snapshot = stage_source_blobs(repo, source, location)
         builder = location / "bootstrap/tools/compiler_driver/build.py"
         environment = dict(os.environ, KU_CC=cc) if args.cc is not None else None
         # The builder owns the per-command deadlines and process-tree
@@ -63,7 +93,7 @@ def main():
         subprocess.run([sys.executable, "-B", builder, "--ku", ku, "--cc", cc, "-o", output],
                        cwd=location, env=environment, check=True)
     identity.write_text(json.dumps({"commit": source, "seed": str(ku), "seed_sha256": digest(ku),
-                                    "sha256": digest(output), "archive_sha256": sha256(archive).hexdigest(),
+                                    "sha256": digest(output), "source_snapshot_sha256": source_snapshot,
                                     "c_compiler": cc, "c_target": c_target},
                                    indent=2) + "\n")
     print(output)
