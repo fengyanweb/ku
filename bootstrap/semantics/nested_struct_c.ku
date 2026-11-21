@@ -242,7 +242,8 @@ fn emitOwningLayoutDrop(&layout: StructLayout, public: bool): str {
     type_name = CTypeName(layout.module_index, layout.node)
     text = storage + "void " + OwningLayoutDropName(layout.module_index, layout.node) + "(" + type_name.clone() + " *value) {\n"
     cursor = layout.fields.len()
-    while (cursor > 0) {
+    has_field = cursor > 0
+    while (has_field) {
         cursor = cursor - 1
         field = layout.fields[cursor].resolved.clone()
         target = "value->f" + str(cursor)
@@ -261,6 +262,7 @@ fn emitOwningLayoutDrop(&layout: StructLayout, public: bool): str {
             }
             text += "    free(" + target + ".data);\n"
         }
+        has_field = cursor > 0
     }
     return text + "    *value = (" + type_name + "){0};\n}\n\n"
 }
@@ -275,9 +277,12 @@ struct OwningLayoutDefinitions {
 fn EmitOwningLayoutDefinitions(&ordered: [StructLayout], unit: int, declaration: int): OwningLayoutDefinitions! {
     text = ""
     arrays: [str] = []
-    for layout in ordered.clone() {
-        for member in layout.fields {
-            field = member.resolved
+    layout_index = 0
+    while (layout_index < ordered.len()) {
+        field_count = ordered[layout_index].fields.len()
+        field_index = 0
+        while (field_index < field_count) {
+            field = ordered[layout_index].fields[field_index].resolved.clone()
             array = ""
             element = ""
             if (field.declaration_kind == "StructArray") {
@@ -296,9 +301,12 @@ fn EmitOwningLayoutDefinitions(&ordered: [StructLayout], unit: int, declaration:
                 text += ProjectionArrayHeader(element, array)
                 arrays = arrays.push(array)
             }
+            field_index = field_index + 1
         }
-        text += EmitOwningLayout(layout)?
-        text += emitOwningLayoutDrop(layout, layout.module_index == unit && layout.node == declaration)
+        text += EmitOwningLayout(ordered[layout_index])?
+        text += emitOwningLayoutDrop(ordered[layout_index],
+            ordered[layout_index].module_index == unit && ordered[layout_index].node == declaration)
+        layout_index = layout_index + 1
     }
     return ok(OwningLayoutDefinitions { source: text, array_types: arrays })
 }
@@ -318,10 +326,13 @@ fn EmitProjectOwningLayoutsC(&layouts: [StructLayout], unit: int, declaration: i
 
 fn EmitCombinedCLayouts(&layouts: [StructLayout], &owning: [StructLayout]): OwningLayoutDefinitions! {
     definitions = EmitOwningLayoutDefinitions(owning, 0, 0)?
-    for layout in layouts.clone() {
-        if (LayoutIndex(owning, layout.module_index, layout.node) == 0) {
-            definitions.source += EmitLayout(layout, true, true)?
+    index = 0
+    while (index < layouts.len()) {
+        existing = LayoutIndex(owning, layouts[index].module_index, layouts[index].node)
+        if (existing == 0) {
+            definitions.source += EmitLayout(layouts[index], true, true)?
         }
+        index = index + 1
     }
     return ok(definitions)
 }
