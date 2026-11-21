@@ -160,7 +160,7 @@ fn LowerLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, id:
         return LowerLinkedNullRead(project, state, id, 0)
     }
     left_id = LinkedNullChild(project, 1, node, 0)
-    checked = LinkedNullNode(project, 1, left_id).kind == "TryUnwrap"
+    checked = project.supplied[0].named.parsed.arena.nodes[left_id - 1].kind == "TryUnwrap"
     if (!checked && ProjectionCloneSource(project.supplied[0].named.parsed.arena.nodes,
         project.supplied[0].named.parsed.arena.edges, left_id) == 0) {
         return LowerLinkedNullRead(project, state, id, 0)
