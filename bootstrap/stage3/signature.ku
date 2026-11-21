@@ -234,16 +234,19 @@ fn ReadTypeLevelChildren(&values: [TypeValueEntry], &parts: [TypePart], top: int
     return ok(TypeMembers { reversed: reversed, depth: depth, first: first, last: last })
 }
 
-fn ReadCallableTypeChildren(&values: [TypeValueEntry], &parts: [TypePart], top: int, return_depth: int): TypeChildren {
+// Both fields advance together whenever the caller adds a parameter entry.
+fn ReadCallableTypeChildren(&values: [TypeValueEntry], &parts: [TypePart], &frame: TypeFrame, return_depth: int): TypeChildren {
     reversed: [int] = []
-    walk = top
+    walk = frame.param_top
     depth = return_depth
-    while (walk > 0) {
+    remaining = frame.param_count
+    while (remaining > 0) {
         parameter = values[walk - 1].clone()
         reversed = reversed.push(parameter.node)
         child_depth = parts[parameter.node - 1].depth + 1
         if (child_depth > depth) { depth = child_depth }
         walk = parameter.previous
+        remaining = remaining - 1
     }
     return TypeChildren { reversed: reversed, depth: depth }
 }
@@ -416,7 +419,7 @@ fn ReadSignatureTypePrefix(&tokens: [Token], start: int, window_end: int): Signa
                     cursor = cursor + 1
                     work = work + 1
                 } else {
-                    parameters = ReadCallableTypeChildren(values, parts, frame.param_top, node_depth)
+                    parameters = ReadCallableTypeChildren(values, parts, frame, node_depth)
                     count = parameters.reversed.len()
                     callable = CheckedCallableTypePart(member_origin, parts[level_root - 1], parts.len(), edges.len(), frame.param_count, parameters.depth)?
                     edges = AppendReversedTypeEdges(edges, parameters.reversed)
