@@ -7,7 +7,7 @@ import { CheckTypeArenaCapacity } from "./signature.ku"
 import { AppendStatementLinks, BuildCatchClause, BuildControlStatement, ControlBodyStart, FunctionEofKind, LocalFunctionNodeKind, PrepareBodyAttachment, ReadControlBodyStart } from "./statement_links.ku"
 import { LocalFunctionScope, ReadLocalFunctionHeader } from "./function_header.ku"
 import { ReadSimpleBodyStatement } from "./simple_statements.ku"
-import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, IsControlStatement, ReadCatchBinding, RejectBodyEof, RejectBodyEdgeId, RejectNestedNodeId, ReadElsePhase, CheckStrayClause, RejectStatementLimit, RejectStatementDepth, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow } from "./body_support.ku"
+import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, IsControlStatement, ReadCatchBinding, RejectBodyEof, RejectBodyEdgeId, RejectNestedNodeId, ReadElsePhase, IsLocalFunctionAssignment, CheckStrayClause, RejectStatementLimit, RejectStatementDepth, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow } from "./body_support.ku"
 
 // Read the remainder of one bounded ordinary-function window, starting at the
 // first token after its opening brace. The standalone entry validates its
@@ -199,9 +199,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
             control_kind = statement_start.kind.clone()
             function_start = cursor
             declared_type = 0
-            if (control_kind == "Ident"
-                && WindowKind(tokens, cursor + 1, last_index) == "Equal"
-                && WindowKind(tokens, cursor + 2, last_index) == "Fn") {
+            if (IsLocalFunctionAssignment(tokens, cursor, last_index, control_kind)) {
                 function_start = cursor + 2
             } else if (!IsControlStatement(control_kind)) {
                 parsed = ReadSimpleBodyStatement(tokens, cursor, last_index, token_base, parse_steps, statement_start, false,

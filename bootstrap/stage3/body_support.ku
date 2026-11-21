@@ -65,6 +65,14 @@ fn RejectWhileBody(error_token: Token): null! {
     return ok(null)
 }
 
+fn IsLocalFunctionAssignment(&tokens: [Token], index: int, last: int, &kind: str): bool {
+    if (kind != "Ident") { return false }
+    next = WindowKind(tokens, index + 1, last)
+    if (next != "Equal") { return false }
+    initializer = WindowKind(tokens, index + 2, last)
+    return initializer == "Fn"
+}
+
 fn IsControlStatement(&kind: str): bool {
     return kind == "If" || kind == "While" || kind == "For" || kind == "Try" || kind == "Fn" || kind == "Async"
 }
