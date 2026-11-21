@@ -300,6 +300,20 @@ fn linkedCountedBoundWrite(&node: Node, &name: str): bool {
     return (node.kind == "Assign" || node.kind == "VarDecl") && node.text == name
 }
 
+fn rejectLinkedLoopWrite(&project: LinkedNullProject, &loop: Node, &name: str, code: str, message: str): null! {
+    // The checked AST is contiguous and in post-order. This region includes
+    // all nested writes before the terminal cursor update.
+    end = LinkedNullChild(project, 1, loop, loop.edge_count - 1)
+    index = LinkedNullChild(project, 1, loop, 0) + 1
+    while (index < end) {
+        if (linkedCountedBoundWrite(project.supplied[0].named.parsed.arena.nodes[index - 1], name)) {
+            RejectLayout(code.clone(), message.clone(), DeclarationSpan(project.supplied[0].named.parsed.arena.nodes[index - 1]))?
+        }
+        index = index + 1
+    }
+    return ok(null)
+}
+
 fn CheckLinkedCountedBoundWrites(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node): null! {
     guard_id = LinkedNullChild(project, 1, loop, 0)
     guard = LinkedNullNode(project, 1, guard_id)
@@ -309,18 +323,35 @@ fn CheckLinkedCountedBoundWrites(&project: LinkedNullProject, &state: LinkedNull
     ty = state.slots[slot - 1].value.ty.clone()
     if (!LinkedNullOwnedArray(ty) && !LinkedNullIntArrayOwner(ty)) { return ok(null) }
 
-    // The validated source tree is contiguous and in post-order. The nodes
-    // between the condition and the final increment include nested body writes.
-    end = LinkedNullChild(project, 1, loop, loop.edge_count - 1)
-    index = guard_id + 1
-    while (index < end) {
-        if (linkedCountedBoundWrite(project.supplied[0].named.parsed.arena.nodes[index - 1], name)) {
-            RejectLayout("linked_loop_bound_write", "a counted loop cannot rebind its owned array length source",
-                         DeclarationSpan(project.supplied[0].named.parsed.arena.nodes[index - 1]))?
-        }
-        index = index + 1
+    return rejectLinkedLoopWrite(project, loop, name, "linked_loop_bound_write",
+        "a counted loop cannot rebind its owned array length source")
+}
+
+fn LinkedCountdownIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &step: Node): int! {
+    guard = LinkedNullNode(project, 1, LinkedNullChild(project, 1, loop, 0))
+    if (guard.kind != "Binary" || guard.text != ">" || guard.edge_count != 2) { return ok(0) }
+    zero = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 1))
+    if (zero.kind != "Int" || zero.int_value != 0 || zero.edge_count != 0) { return ok(0) }
+    cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
+    slot = LinkedNullBinding(state.slots, cursor.text)
+    at = DeclarationSpan(step)
+    if (cursor.kind != "Variable" || cursor.edge_count != 0 || slot == 0 || !state.slots[slot - 1].live
+        || state.slots[slot - 1].value.ty.declaration_kind != "Builtin" || state.slots[slot - 1].value.ty.name != "int"
+        || step.kind != "Assign" || step.edge_count != 1 || step.text != cursor.text) {
+        RejectLayout("unsupported_linked_countdown", "countdown requires a live int cursor and its final assignment", at.clone())?
     }
-    return ok(null)
+    changed = LinkedNullNode(project, 1, LinkedNullChild(project, 1, step, 0))
+    if (changed.kind != "Binary" || changed.text != "-" || changed.edge_count != 2) {
+        RejectLayout("unsupported_linked_countdown", "countdown must end with a unit decrement", at.clone())?
+    }
+    previous = LinkedNullNode(project, 1, LinkedNullChild(project, 1, changed, 0))
+    one = LinkedNullNode(project, 1, LinkedNullChild(project, 1, changed, 1))
+    if (previous.kind != "Variable" || previous.edge_count != 0 || previous.text != cursor.text
+        || one.kind != "Int" || one.edge_count != 0 || one.int_value != 1) {
+        RejectLayout("unsupported_linked_countdown", "countdown must end with a unit decrement", at.clone())?
+    }
+    rejectLinkedLoopWrite(project, loop, cursor.text, "linked_loop_cursor_write", "countdown can change its cursor only at the end")?
+    return ok(slot)
 }
 
 fn EmitLinkedMultiplyDivide(state: LinkedNullState, &node: Node, id: int,

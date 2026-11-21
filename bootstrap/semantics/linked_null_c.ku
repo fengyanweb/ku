@@ -1,6 +1,6 @@
 import { AddLinkedNullSlot, ReadLinkedNullParameters } from "./linked_parameters_c.ku"
 import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
-import { BindLinkedCatch, CheckLinkedCountedBoundWrites, CheckLinkedGuardOwners, DropLinkedNullScope, LinkedCountBound, MergeLinkedConditionalMembers, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { BindLinkedCatch, CheckLinkedCountedBoundWrites, CheckLinkedGuardOwners, DropLinkedNullScope, LinkedCountBound, LinkedCountdownIndex, MergeLinkedConditionalMembers, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedPlainReturn } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -12,7 +12,7 @@ import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
 import { LinkedReadonlyExpression, LinkedSlotPrefix, ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { LowerLinkedArrayLocal, LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { LowerLinkedArrayLocal, LowerLinkedCountdownRebind, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedArrayAppend, LowerLinkedSuccess,
          LowerLinkedNullValue, LowerLinkedOwnerRebind } from "./linked_null_values_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
@@ -130,22 +130,29 @@ fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statemen
         RejectLayout("linked_control_depth", "linked control flow allows at most 32 levels", DeclarationSpan(statement))?
     }
     step = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, statement.edge_count - 1))
-    cursor = countedIndex(project, state, statement, initial, step)?
+    countdown = LinkedCountdownIndex(project, state, statement, step)?
+    cursor = countdown
+    if (cursor == 0) { cursor = countedIndex(project, state, statement, initial, step)? }
     outer = state.slots.clone()
+    parent_countdown = state.countdown_body
     next = state
     next.code = next.code + "    while (true) {\n"
     guard = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, statement, 0), 0)?
-    CheckLinkedCountedBoundWrites(project, guard.state, statement)?
+    if (countdown == 0) { CheckLinkedCountedBoundWrites(project, guard.state, statement)? }
+    guard.state.countdown_body = countdown != 0
     guard.state.code = guard.state.code + "    if (!(" + guard.value.text + ")) break;\n"
     locals = guard.state.slots.len()
     body = statement.clone()
     body.edge_count = body.edge_count - 1
     lowered = lowerLinkedRegion(project, body, guard.state, 1, result, depth + 1)?
     if (lowered.terminal) {
-        RejectLayout("unsupported_linked_loop_body", "a counted iteration must reach its checked increment", DeclarationSpan(body))?
+        update = "increment"
+        if (countdown != 0) { update = "decrement" }
+        RejectLayout("unsupported_linked_loop_body", "a counted iteration must reach its checked " + update, DeclarationSpan(body))?
     }
     PreserveLinkedOwners(outer, lowered.state.slots, statement)?
     next = DropLinkedNullScope(lowered.state, locals)
+    next.countdown_body = parent_countdown
     advanced = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, step, 0), 0)?
     advanced.state.code = advanced.state.code + "    " + advanced.state.slots[cursor - 1].value.text.clone() + " = " + advanced.value.text + ";\n    }\n"
     return ok(advanced.state)
@@ -277,8 +284,12 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             if (slot == 0) { next = addLocal(project, next, statement, id)? }
             else if (LinkedNullIntArrayOwner(next.slots[slot - 1].value.ty) || LinkedNullOwnedArray(next.slots[slot - 1].value.ty)) {
                 next = LowerLinkedArrayAppend(project, next, statement, slot)?
+            } else if (next.countdown_body && next.slots[slot - 1].value.ty.declaration_kind == "Builtin"
+                && next.slots[slot - 1].value.ty.name == "int") {
+                next = LowerLinkedCountdownRebind(project, next, statement, slot)?
+            } else {
+                next = LowerLinkedOwnerRebind(project, next, statement)?
             }
-            else { next = LowerLinkedOwnerRebind(project, next, statement)? }
         } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {
             kind = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0)).kind
             if (kind == "TypeArray") { next = LowerLinkedArrayLocal(project, next, statement, id)? }

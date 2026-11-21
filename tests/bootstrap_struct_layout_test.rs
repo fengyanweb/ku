@@ -4412,6 +4412,7 @@ int main(int argc, char **argv) {
     struct_view::assert_checked_field_clone(&compiler, &cwd);
     struct_view::assert_owned_int_locals(&compiler, &cwd);
     struct_view::assert_counted_branch_owners(&compiler, &cwd);
+    linked_guard::assert_countdown_edges(&compiler, &cwd);
     struct_view::assert_lazy_readonly_bool_call(&compiler, &cwd);
     struct_view::assert_owned_string_field_clone(&compiler, &cwd);
     struct_view::assert_stable_owned_count_bound(&compiler, &cwd);

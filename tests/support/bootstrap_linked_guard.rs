@@ -1029,3 +1029,109 @@ int main(void) {
     compile_projection(&source, &executable, cwd);
     assert_ok(&execute(&mut Command::new(executable), cwd, 10));
 }
+pub(super) fn assert_countdown_edges(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("countdown-edges.ku"),
+        r#"struct Cursor { index: int }
+fn CheckEdges(&edges: [int], first: int, count: int, index: int): Cursor! {
+    slice_cursor = first
+    slice_remaining = count
+    parent_id = index + 1
+    while (slice_remaining > 0) {
+        child = edges[slice_cursor]
+        if (child <= 0 || child >= parent_id) {
+            fail { domain: "bootstrap.ast", code: "invalid_node_id", message: "invalid child" }
+        }
+        slice_cursor = slice_cursor + 1
+        slice_remaining = slice_remaining - 1
+    }
+    return ok(Cursor { index: slice_cursor })
+}
+fn WrongStep(start: int): null! {
+    remaining = start
+    while (remaining > 0) { remaining = remaining + 1 }
+    return ok(null)
+}
+fn NestedWrite(start: int): null! {
+    remaining = start
+    while (remaining > 0) {
+        if (remaining == 2) { remaining = remaining + 2 }
+        remaining = remaining - 1
+    }
+    return ok(null)
+}
+fn OutsideWrite(start: int): null! {
+    cursor = start
+    remaining = start
+    while (remaining > 0) { remaining = remaining - 1 }
+    cursor = cursor + 1
+    return ok(null)
+}
+fn NestedIncrease(&edges: [int], start: int): null! {
+    remaining = start
+    while (remaining > 0) {
+        cursor = 0
+        while (cursor < edges.len()) {
+            cursor = cursor - 1
+            cursor = cursor + 1
+        }
+        remaining = remaining - 1
+    }
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "countdown-edges.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "CheckEdges").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let definition = code
+        .lines()
+        .find(|line| line.contains(" ku_linked_null_"))
+        .unwrap();
+    let (result, entry) = definition.split_once(' ').unwrap();
+    let entry = entry.split_once('(').unwrap().0;
+    let host = r#"
+int main(void) {
+    int64_t data[] = {0, 1, 2, 4};
+    KuArrayInt edges = {4, data, 4};
+    __RESULT__ result = __ENTRY__(&edges, 1, 2, 2);
+    assert(result.ok && result.value.f0 == 3);
+    result = __ENTRY__(&edges, 3, 1, 2);
+    assert(!result.ok && result.error.code.len == sizeof("invalid_node_id")-1);
+    assert(!memcmp(result.error.code.ptr, "invalid_node_id", result.error.code.len));
+    result = __ENTRY__(&edges, 3, 0, 2);
+    assert(result.ok && result.value.f0 == 3);
+    result = __ENTRY__(&edges, 3, INT64_MIN, 2);
+    assert(result.ok && result.value.f0 == 3);
+    assert(edges.data == data && edges.len == 4 && data[3] == 4);
+    return 0;
+}
+"#
+    .replace("__RESULT__", result)
+    .replace("__ENTRY__", entry);
+    let c = cwd.join("countdown-edges.c");
+    let app = cwd.join(format!("countdown-edges{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &c,
+        format!("#include <assert.h>\n#include <string.h>\n{code}{host}"),
+    )
+    .unwrap();
+    compile_projection(&c, &app, cwd);
+    assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+    for (function, diagnostic) in [
+        ("WrongStep", "unsupported_linked_countdown"),
+        ("NestedWrite", "linked_loop_cursor_write"),
+        ("OutsideWrite", "linked_rebind_type"),
+        ("NestedIncrease", "linked_rebind_type"),
+    ] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}

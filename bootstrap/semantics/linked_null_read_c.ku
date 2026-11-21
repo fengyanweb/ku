@@ -278,3 +278,14 @@ fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpressio
     RejectLayout("unsupported_linked_operand", "expected a bound value, literal or checked direct call", at.clone())?
     return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", at), ""))
 }
+
+fn LowerLinkedCountdownRebind(&project: LinkedNullProject, state: LinkedNullState, &assignment: Node, index: int): LinkedNullState! {
+    destination = state.slots[index - 1].clone()
+    value = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, assignment, 0), 0)?
+    if (!destination.live || destination.value.borrowed || !SameLinkedType(destination.value.ty, value.value.ty)) {
+        RejectLayout("linked_countdown_assignment", "countdown adjustment requires a live int target and an int expression",
+                     DeclarationSpan(assignment))?
+    }
+    value.state.code += "    " + destination.value.text + " = " + value.value.text + ";\n"
+    return ok(value.state)
+}
