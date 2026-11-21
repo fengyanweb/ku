@@ -1,4 +1,3 @@
-import { LinkedFieldAppendArgument } from "./linked_owner_assignment_c.ku"
 import { EmitLinkedBodyPrelude, HoldLinkedCopyOperand, LinkedBuiltinNameAvailable, LinkedFieldRoot, LinkedNullPrototype, LinkedScopedCallbackFunction, LinkedScopedCallbackPrototype, RestoreLinkedAssignedMember } from "./link_plan_json_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
@@ -16,7 +15,7 @@ import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName 
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
          LinkedNullNode, LinkedNullProject,  LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { ReadLinkedMemberPlace } from "./struct_string_calls.ku"
+import { LinkedFieldAppendArgument, ReadLinkedMemberPlace } from "./struct_string_calls.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue, LowerLinkedScopedCallbackCall } from "./linked_null_values_c.ku"
 import { IsLinkedScopedCallback, LinkedScopedCallbackTypes, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedRecordFields } from "./link_plan_c.ku"

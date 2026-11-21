@@ -11,7 +11,7 @@ import { IsLinkedScopedCallback,
     LinkedLocalAppendIndex, LinkedNullArguments, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray,
     LinkedNullReadableArray, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult,
-    ReadLinkedOwnedArray, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+    ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
 import { CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead, ReadLinkedLocalArrayItem } from "./linked_null_read_c.ku"
 
@@ -98,13 +98,8 @@ fn RegisterLinkedLocalRead(&project: LinkedNullProject, state: LinkedNullState, 
     return ok(next)
 }
 
-fn LowerLinkedArrayBinding(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
-    ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0), true, true)?
-    value_id = LinkedNullChild(project, 1, statement, 1)
-    value = LinkedNullNode(project, 1, value_id)
-    if (LinkedNullBinding(state.slots, statement.text) != 0) {
-        RejectLayout("linked_array_local", "expected a new typed array owner", DeclarationSpan(statement))?
-    }
+fn LowerLinkedArrayBinding(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int,
+                           &value: Node, value_id: int, ty: TypeNameBinding): LinkedNullState! {
     if (value.kind == "Variable" && value.edge_count == 0) {
         input = ReadLinkedNullBinding(state, value)?
         if (!SameLinkedType(input.value.ty, ty) || input.value.borrowed) {

@@ -4,14 +4,14 @@ import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { LinkedAppendFailureRelay, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
-import { AppendLinkedArrayElement } from "./linked_array_fields_c.ku"
+import { AppendLinkedArrayElement, LowerLinkedArrayBinding } from "./linked_array_fields_c.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
 import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
-import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
-import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
+import { LowerLinkedExpectedValue, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
 fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, index: int): LinkedNullState! {
     array = state.slots[index - 1].value.clone()
@@ -380,6 +380,23 @@ fn LowerLinkedLocal(&project: LinkedNullProject, state: LinkedNullState, &statem
     return MoveLinkedNullSlot(slot.state, value.value)
 }
 
+fn LowerLinkedTypedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
+    ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0), true, true)?
+    value_id = LinkedNullChild(project, 1, statement, 1)
+    value = LinkedNullNode(project, 1, value_id)
+    if (LinkedNullBinding(state.slots, statement.text) != 0) {
+        RejectLayout("linked_array_local", "expected a new typed array owner", DeclarationSpan(statement))?
+    }
+    if (value.kind == "Array" && value.edge_count > 0 && LinkedNullOwnedArray(ty)) {
+        literal = LowerLinkedExpectedValue(project, state, ty, value_id, 0)?
+        slot = literal.value.slot - 1
+        next = literal.state
+        next.slots[slot].binding = statement.text.clone()
+        return ok(next)
+    }
+    return LowerLinkedArrayBinding(project, state, statement, id, value, value_id, ty)
+}
+
 fn StoreLinkedCopyAssignment(&destination: LinkedNullSlot, value: LinkedNullExpression, &assignment: Node): LinkedNullState! {
     if (!destination.live || destination.value.borrowed || !SameLinkedType(destination.value.ty, value.value.ty)) {
         RejectLayout("linked_copy_assignment", "assignment requires a live Copy target and matching scalar expression",
@@ -388,16 +405,4 @@ fn StoreLinkedCopyAssignment(&destination: LinkedNullSlot, value: LinkedNullExpr
     next = value.state
     next.code += "    " + destination.value.text + " = " + value.value.text + ";\n"
     return ok(next)
-}
-
-fn LinkedFieldAppendArgument(&project: LinkedNullProject, &target: Node, &root: Node, rhs: int): int {
-    call = LinkedNullNode(project, 1, rhs)
-    if (call.kind != "Call" || call.edge_count != 2) { return 0 }
-    method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
-    if (method.kind != "Field" || method.edge_count != 1 || method.text != "push") { return 0 }
-    field = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
-    if (field.kind != "Field" || field.edge_count != 1 || field.text != target.text) { return 0 }
-    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, field, 0))
-    if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != root.text) { return 0 }
-    return LinkedNullChild(project, 1, call, 1)
 }

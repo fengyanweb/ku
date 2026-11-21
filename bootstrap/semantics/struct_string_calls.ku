@@ -319,3 +319,15 @@ fn LinkedOwnedStringPredicate(&project: LinkedNullProject, &state: LinkedNullSta
     }
     return ok(owns_string)
 }
+
+fn LinkedFieldAppendArgument(&project: LinkedNullProject, &target: Node, &root: Node, rhs: int): int {
+    call = LinkedNullNode(project, 1, rhs)
+    if (call.kind != "Call" || call.edge_count != 2) { return 0 }
+    method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (method.kind != "Field" || method.edge_count != 1 || method.text != "push") { return 0 }
+    field = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
+    if (field.kind != "Field" || field.edge_count != 1 || field.text != target.text) { return 0 }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, field, 0))
+    if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != root.text) { return 0 }
+    return LinkedNullChild(project, 1, call, 1)
+}

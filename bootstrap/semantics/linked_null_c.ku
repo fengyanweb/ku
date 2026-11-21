@@ -1,5 +1,5 @@
 import { LinkedCharacterSource } from "./struct_string_calls.ku"
-import { LowerLinkedArrayBinding, RegisterLinkedLocalRead } from "./linked_array_fields_c.ku"
+import { RegisterLinkedLocalRead } from "./linked_array_fields_c.ku"
 import { RequireLinkedMutableName } from "./call_contracts.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, ReadLinkedNullParameters } from "./linked_parameters_c.ku"
 import { OpenLinkedForLoop, OpenLinkedConditionalWhile, ReadLinkedWhileCondition, CloseLinkedForLoop, LinkedCountdownIndex, LinkedCountedInitial, ValidLinkedCountedStart, ReadLinkedLocalThunk, FinishLinkedLocalThunk, LowerLinkedLocalAlias, LowerLinkedPredicate, LowerLinkedCharacterLocal } from "./linked_char_iter_c.ku"
@@ -18,7 +18,7 @@ import { LinkedBuiltin, LinkedResultPlan, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { FinishLinkedAppendThunk, IsLinkedAppendThunk, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, ReadLinkedAppendThunk, ReadLinkedCatchParts, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
+import { FinishLinkedAppendThunk, IsLinkedAppendThunk, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, LowerLinkedTypedArrayLocal, ReadLinkedAppendThunk, ReadLinkedCatchParts, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 
@@ -294,7 +294,7 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             type_node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
             if (type_node.kind == "TypeArray") {
                 source = LinkedCharacterSource(project, next, LinkedNullChild(project, 1, statement, 1), true)
-                if (source == 0) { next = LowerLinkedArrayBinding(project, next, statement, id)? }
+                if (source == 0) { next = LowerLinkedTypedArrayLocal(project, next, statement, id)? }
                 else { next = LowerLinkedCharacterLocal(project, next, statement, id, source)? }
             }
             else if (type_node.kind == "TypeFunction") { next = LowerLinkedLocalAlias(project, next, statement)? }
