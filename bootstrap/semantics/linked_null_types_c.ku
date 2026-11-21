@@ -163,6 +163,7 @@ fn LinkedIntResult(&binding: TypeNameBinding): bool {
 fn LinkedNullHasResultValue(&binding: TypeNameBinding): bool {
     return LinkedNullOwnedArray(binding) || binding.declaration_kind == "Struct" || LinkedBufferResult(binding)
         || LinkedCopyResult(binding) || LinkedNullIntArrayOwner(binding) || binding.declaration_kind == "OwnedStringArray"
+        || binding.declaration_kind == "UnitEnum"
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
@@ -275,7 +276,7 @@ fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bo
     }
     result = LinkedNullType(project, unit, payload_id)?
     if (!LinkedNullHasResultValue(result) && (result.declaration_kind != "Builtin" || result.name != "null")) {
-        RejectLayout("linked_dependency_result", "expected a checked null, bool, int, string, buffer, record or supported array", result.span.clone())?
+        RejectLayout("linked_dependency_result", "expected a checked null, bool, int, string, buffer, record, payload-free enum or supported array", result.span.clone())?
     }
     return ok(result)
 }

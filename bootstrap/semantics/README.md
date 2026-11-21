@@ -52,7 +52,9 @@ parameter or returning it moves the callback. Other function value conversions
 and package imports remain outside this subset.
 
 The linked emitter can construct variants of a named enum whose variants
-all have no payload, and pass or return such a value by value. Named and
+all have no payload, and pass or return such a value by value. A function can
+also return that enum as a checked result. `?` propagates its Error before any
+successful enum payload is taken. Named and
 namespace imports keep the enum's declaration identity across C units.
 Passing or returning an existing enum binding moves it. Equality and inequality
 compare values of the same payload-free enum without moving either operand.

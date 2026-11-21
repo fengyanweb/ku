@@ -342,7 +342,8 @@ fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunc
         index = index + 1
     }
     if (string_result) { text += StructValueResultHeader("KuProjectionString") }
-    if (payload.declaration_kind == "Struct" || (checked && (LinkedCopyResult(payload) || LinkedNullIntArrayOwner(payload)))) {
+    if (payload.declaration_kind == "Struct" || (checked && (LinkedCopyResult(payload) ||
+        LinkedNullIntArrayOwner(payload) || payload.declaration_kind == "UnitEnum"))) {
         root = LinkedNullCType(payload)?
         text += StructValueResultHeader(root)
         records = records.push(root)
@@ -383,6 +384,7 @@ fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunc
     link_index = 0
     while (link_index < links.len()) {
         if (links[link_index].returns_result && (links[link_index].result.declaration_kind == "Struct"
+            || links[link_index].result.declaration_kind == "UnitEnum"
             || LinkedCopyResult(links[link_index].result) || LinkedNullIntArrayOwner(links[link_index].result))) {
             kind = LinkedNullCType(links[link_index].result)?
             if (!ContainsType(records, kind)) {

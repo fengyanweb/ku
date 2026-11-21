@@ -34,6 +34,7 @@ CALLBACK_IDENTITIES = {identity for identity, _ in CALLBACK_TYPES.values()}
 CALLBACK_PREFIXES = {identity: prefix for identity, prefix in CALLBACK_TYPES.values()}
 NOMINAL_CARRIER = re.compile(r"(?:KuBootstrapResult_)?(?:KuArray_)?(KuStruct_m[1-9][0-9]*_([1-9][0-9]*))\Z")
 UNIT_ENUM_CARRIER = re.compile(r"KuEnum_m[1-9][0-9]*_([1-9][0-9]*)\Z")
+CHECKED_RESULT_PREFIX = "KuBootstrapResult_"
 CHECKED_INT_CALLBACK_PARAMETERS = {
     "IntResultAppendCallback": ("KuProjectionString", "KuProjectionString", "int64_t", 0, "KuArrayInt", 1),
     "IntResultArenaCallback": (0, 1, "bool"),
@@ -149,9 +150,12 @@ class TypeRef:
         elif kind_name == "UnitEnum":
             path = module_path(ref["source_path"], f"{where}.source_path")
             node = node_id(ref["node"], f"{where}.node")
-            match = UNIT_ENUM_CARRIER.fullmatch(c_type)
-            if passing != "value" or checked_result or not match or int(match[1]) != node:
-                raise LinkError(f"{where} requires the plain by-value unit enum carrier for {label((path, node))}")
+            carrier = c_type.removeprefix(CHECKED_RESULT_PREFIX) if checked_result else c_type
+            match = UNIT_ENUM_CARRIER.fullmatch(carrier)
+            if (passing != "value" or (checked_result and carrier == c_type)
+                    or not match or int(match[1]) != node):
+                mode = "checked result" if checked_result else "plain value"
+                raise LinkError(f"{where} requires the by-value unit enum carrier for {mode} {label((path, node))}")
             identity = ("unit_enum", path, node)
         elif kind_name in CALLBACK_TYPES:
             path = module_path(ref["source_path"], f"{where}.source_path")
@@ -415,7 +419,11 @@ def carrier_aliases(unit):
                     nominal(match[1], path, node)
             elif kind == "unit_enum":
                 path, node = identity
-                bind(ref.c_type, "KuEnum_" + canonical_symbol((path, node)))
+                carrier = ref.c_type.removeprefix(CHECKED_RESULT_PREFIX)
+                stable = "KuEnum_" + canonical_symbol((path, node))
+                bind(carrier, stable)
+                if carrier != ref.c_type:
+                    bind(ref.c_type, CHECKED_RESULT_PREFIX + stable)
             elif kind in CHECKED_INT_CALLBACK_ABI:
                 for local, (path, node) in zip(ref.callback_nominals, identity):
                     nominal(local, path, node)
@@ -444,9 +452,12 @@ def wrapper(unit, include_caller):
     callbacks = sorted({(ref.identity[0], ref.c_type, ref.callback_nominals) for decl in declarations
                         for ref in (*decl.signature.parameters, decl.signature.result)
                         if ref.identity[0] in CALLBACK_IDENTITIES})
-    unit_enums = sorted({ref.c_type for decl in declarations
+    unit_enums = sorted({ref.c_type.removeprefix(CHECKED_RESULT_PREFIX) for decl in declarations
                          for ref in (*decl.signature.parameters, decl.signature.result)
                          if ref.identity[0] == "unit_enum"})
+    checked_enums = sorted({decl.signature.result.c_type for decl in declarations
+                            if decl.signature.returns_result
+                            and decl.signature.result.identity[0] == "unit_enum"})
     nullable_int = nullable_int or any(kind == "nullable_record_view_reader" for kind, _, _ in callbacks)
     if callbacks or nullable_int or unit_enums:
         lines.append('#include <stddef.h>')
@@ -461,6 +472,19 @@ def wrapper(unit, include_caller):
                      f'_Generic((({carrier}){{0}}).payload.empty, unsigned char: 1, default: 0) && '
                      f'sizeof((({carrier}){{0}}).payload) == sizeof(unsigned char), '
                      f'"link-plan C unit enum has a different carrier");')
+    if checked_enums:
+        lines.extend(check_carrier_layout("KuProjectionString", "ku_checked_enum_string_layout",
+                                         (("ptr", "uint8_t *"), ("len", "size_t"),
+                                          ("capacity", "size_t"), ("storage", "uint8_t")),
+                                         "link-plan C unit enum Error has a different string carrier"))
+        lines.extend(check_carrier_layout("KuBootstrapError", "ku_checked_enum_error_layout",
+                                         tuple((name, "KuProjectionString") for name in ("domain", "code", "message")),
+                                         "link-plan C unit enum Result has a different Error carrier"))
+    for i, carrier in enumerate(checked_enums):
+        enum = carrier.removeprefix(CHECKED_RESULT_PREFIX)
+        lines.extend(check_carrier_layout(carrier, f"ku_checked_enum_result_layout_{i}",
+                                         (("ok", "bool"), ("value", enum), ("error", "KuBootstrapError")),
+                                         "link-plan C unit enum Result has a different carrier"))
     if nullable_int:
         lines.extend(check_carrier_layout("KuBootstrapOptionalInt", "ku_bootstrap_optional_int_layout",
                                          (("is_null", "bool"), ("value", "int64_t")),

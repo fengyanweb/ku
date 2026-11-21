@@ -1016,6 +1016,82 @@ fn main(): null! {
         assert error in rejected.stderr and not rejected.stdout, rejected.stderr
 
 
+def exercise_linked_unit_enum_result(compiler, cc, caller):
+    project = caller / "linked-unit-enum-result"
+    project.mkdir()
+    shutil.copyfile(Path(__file__).resolve().parents[2] / "stage1/token.ku", project / "token.ku")
+    model = project / "model.ku"
+    supplier = '''import { Token } from "./token.ku"
+enum ElsePhase { Braces\n ElseIf }
+fn ReadElsePhase(&token: Token): ElsePhase! {
+    if (token.kind == "If") { return ok(ElsePhase.ElseIf) }
+    if (token.kind == "LBrace") { return ok(ElsePhase.Braces) }
+    fail { domain: "bootstrap.parser", code: "unsupported_statement", message: "stage-3 else body @" + str(token.offset) }
+}
+'''
+    model.write_text(supplier, encoding="utf-8")
+    header = 'import model from "./model.ku"\nimport { Token } from "./token.ku"\n'
+    main = project / "main.ku"
+    main.write_text(header + '''fn Code(&token: Token): int! {
+    return match model.ReadElsePhase(token)? {
+        model.ElsePhase.Braces => ok(1)
+        model.ElsePhase.ElseIf => ok(2)
+    }
+}
+fn TokenAt(kind: str, offset: int): Token {
+    return Token { kind: kind, lexeme: "", int_value: 0, line: 2, column: 19, offset: offset,
+        end_line: 2, end_column: 20, end_offset: offset + 1 }
+}
+fn Observe(&token: Token): null! {
+    try {
+        println(str(Code(token)?))
+        return ok(null)
+    } catch (err) {
+        println(err.domain)
+        println(err.code)
+        println(err.message)
+        return ok(null)
+    }
+}
+fn main(): null! {
+    first = TokenAt("If", 26)
+    println(str(Code(first)?))
+    second = TokenAt("LBrace", 27)
+    println(str(Code(second)?))
+    bad = TokenAt("Ident", 34)
+    Observe(bad)?
+    println(str(Code(first)?))
+    return ok(null)
+}
+''', encoding="utf-8")
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\nmodel.ku\ntoken.ku\n", encoding="utf-8")
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    output = project / ("enum-result.exe" if os.name == "nt" else "enum-result")
+    execute([sys.executable, "-B", builder, manifest, "--compiler", compiler, "--cc", cc, "-o", output], caller)
+    assert execute([output], caller).stdout.replace(b"\r\n", b"\n") == (
+        b"2\n1\nbootstrap.parser\nunsupported_statement\nstage-3 else body @34\n2\n"
+    )
+    for program, error in [
+        ('''fn Pass(phase: model.ElsePhase): model.ElsePhase { return phase }
+fn Bad(&token: Token): model.ElsePhase! {
+    phase = model.ReadElsePhase(token)?
+    taken = Pass(phase)
+    return ok(Pass(phase))
+}
+''', b"unavailable_linked_binding"),
+        ('''enum Other { Braces\n ElseIf }
+fn Bad(&token: Token): Other! { return model.ReadElsePhase(token) }
+''', b"linked_tail_result"),
+    ]:
+        main.write_text(header + program, encoding="utf-8")
+        rejected = execute([compiler, "emit-unit-plan", manifest, "Bad"], caller, 1)
+        assert error in rejected.stderr and not rejected.stdout, rejected.stderr
+    model.write_text(supplier.replace(" Braces\n ElseIf", " Braces\n ElseIf\n Invalid(code: int)"), encoding="utf-8")
+    rejected = execute([compiler, "emit-unit-plan", manifest, "Bad"], caller, 1)
+    assert b"linked_enum_layout" in rejected.stderr and not rejected.stdout, rejected.stderr
+
+
 def exercise_linked_reader_factory(compiler, cc, caller):
     project = caller / "linked-reader-factory"
     project.mkdir()
@@ -1614,6 +1690,7 @@ def exercise(ku, cc):
         exercise_linked_unit_enum_branch(compiler, cc, caller)
         exercise_linked_unit_enum_match(compiler, cc, caller)
         exercise_linked_checked_enum_match(compiler, cc, caller)
+        exercise_linked_unit_enum_result(compiler, cc, caller)
         exercise_linked_reader_factory(compiler, cc, caller)
         exercise_linked_owned_string_for(compiler, cc, caller)
         exercise_parameter_bindings(compiler, cc, caller)
