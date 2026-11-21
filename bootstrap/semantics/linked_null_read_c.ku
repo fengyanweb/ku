@@ -151,6 +151,7 @@ fn readArrayItem(&array: LinkedNullValue, input: LinkedNullExpression, &node: No
     index.state.code += EmitLinkedArrayIndexGuard(offset, index.value.text, header)
     item = LinkedReadonlyExpression(index.state, LinkedNullArrayElement(array.ty.clone()), header + "->data[" + offset + "]")
     if (item.value.ty.declaration_kind == "Builtin" && item.value.ty.name == "str") {
+        item.state.checks_str_item = true
         item.state.code += "    if (" + item.value.text.clone() + ".len && !" + item.value.text.clone()
             + ".ptr) { invalid_array = true; goto cleanup; }\n"
     }

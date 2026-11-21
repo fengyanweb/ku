@@ -139,11 +139,16 @@ fn assert_character_values(seed: &Path, cwd: &Path) {
         r#"import { string } from "std"
 fn Typed(source: str): [str]! {
     characters: [str] = source.chars()
+    if (characters.len() > 0 && characters[0].byte_len() == 1) { return ok(characters) }
     return ok(characters)
 }
 fn Borrowed(&source: str): [str]! {
     characters = string.chars(source.clone())
     return ok(characters)
+}
+fn View(&characters: [str]): null! {
+    if (characters[0].byte_len() == 1) { return ok(null) }
+    return ok(null)
 }
 fn Wrong(source: str): null! {
     characters: [int] = source.chars()
@@ -228,6 +233,37 @@ int main(int argc, char **argv) {
             );
         }
     }
+
+    fs::write(cwd.join("function.txt"), "View").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let source = String::from_utf8(emitted.stdout).unwrap();
+    let entry = source
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResultNull ")?.split_once('('))
+        .unwrap()
+        .0;
+    let driver = r#"
+int main(int argc, char **argv) {
+    (void)argv;
+    KuProjectionString item = {(uint8_t*)"a", 1, 0, KU_PROJECTION_STRING_STATIC};
+    if (argc > 1) item.ptr = NULL;
+    KuGuardStringArray view = {1, &item, 1};
+    return ENTRY(&view).ok ? 0 : 2;
+}
+"#
+    .replace("ENTRY", entry);
+    let path = cwd.join("view-character.c");
+    let binary = cwd.join(format!("view-character{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&path, format!("{source}{driver}")).unwrap();
+    compile_projection(&path, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(&binary), cwd, 10));
+    let failed = execute(Command::new(binary).arg("invalid-item"), cwd, 10);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stderr).trim(),
+        "invalid array view"
+    );
 
     fs::write(cwd.join("function.txt"), "Wrong").unwrap();
     let rejected = execute(&mut Command::new(seed), cwd, 30);

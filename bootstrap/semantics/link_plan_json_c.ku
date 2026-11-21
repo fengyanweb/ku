@@ -333,7 +333,7 @@ fn LinkedAppendFailureRelay(&body: LinkedNullState): str {
     if (calls_append || body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0) {
         text += "    failure->out_of_memory = out_of_memory;\n"
     }
-    if (body.validated_arrays.len() > 0) {
+    if (body.validated_arrays.len() > 0 || body.checks_str_item) {
         message = "invalid struct array ownership"
         if (body.uses_str_array) { message = "invalid array view" }
         text += "    if (invalid_array) failure->array_error = \"" + message + "\\n\";\n"
