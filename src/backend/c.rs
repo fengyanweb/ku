@@ -874,7 +874,6 @@ fn generate_c_source_with_frames_attempt(
         field_types,
         &mut closure_header_done,
         &mut closure_emitted,
-        true,
     )?;
     let mut nullable_emitted = HashSet::new();
     emit_layouts(&mut out, &abi_program, &mut nullable_emitted)?;
@@ -906,15 +905,16 @@ fn generate_c_source_with_frames_attempt(
         emit_closure_refcount_header(&mut out);
         closure_header_done = true;
     }
-    // Closure struct typedefs come in two passes around the aggregate ABIs so the
-    // cyclic-looking (but acyclic) dependency between array-of-closures and
-    // closure-returning-array is resolved by emission order (see `emit_closure_types`).
+    // Complete the remaining closure signatures in two passes around the
+    // aggregate ABIs.
+    let (primitive_closures, aggregate_closures): (Vec<_>, Vec<_>) = closure_types
+        .iter()
+        .partition(|ty| closure_has_primitive_signature(ty));
     emit_closure_types(
         &mut out,
-        &closure_types,
+        primitive_closures,
         &mut closure_header_done,
         &mut closure_emitted,
-        true,
     )?;
     emit_object_abi(
         &mut out,
@@ -928,10 +928,9 @@ fn generate_c_source_with_frames_attempt(
     emit_http_types(&mut out, &abi_program, !program.functions.is_empty())?;
     emit_closure_types(
         &mut out,
-        &closure_types,
+        aggregate_closures,
         &mut closure_header_done,
         &mut closure_emitted,
-        false,
     )?;
     emit_result_abi(
         &mut out,
@@ -1104,19 +1103,24 @@ fn register_closure_invoke_symbols(program: &IrProgram) {
     CLOSURE_INVOKE_SYMBOLS.with(|slot| *slot.borrow_mut() = symbols);
 }
 
-/// True when every type in a closure signature lowers to a self-contained C type
-/// (no `KuArray_*`/`KuResult_*`/`KuObject`/nested closure). Such a signature can
-/// be emitted before the array/result ABI, which is required so an
-/// array-of-closures (`[fn(): int]`) sees `KuClosure_*` already defined. Closures
-/// whose signature *does* reference those aggregates are emitted in the later
-/// pass, after those ABIs exist.
-fn closure_signature_is_self_contained(params: &[IrType], ret: &IrType) -> bool {
-    params.iter().chain(std::iter::once(ret)).all(|ty| {
-        matches!(
-            ty,
-            IrType::Int | IrType::Float | IrType::Bool | IrType::Str | IrType::Null | IrType::Void
-        )
-    })
+fn is_primitive_closure_type(ty: &IrType) -> bool {
+    matches!(
+        ty,
+        IrType::Int | IrType::Float | IrType::Bool | IrType::Str | IrType::Null | IrType::Void
+    )
+}
+
+fn closure_has_primitive_signature(ty: &IrType) -> bool {
+    matches!(ty, IrType::Closure { params, ret, .. }
+        if is_primitive_closure_type(ret) && params.iter().all(is_primitive_closure_type))
+}
+
+fn supported_closure_field_signature(params: &[IrType], ret: &IrType) -> bool {
+    let result: &IrType = match ret {
+        IrType::Result(inner) => inner,
+        _ => ret,
+    };
+    params.iter().all(is_primitive_closure_type) && is_primitive_closure_type(result)
 }
 
 /// Declare every signature-specific closure tag before any array typedef. An
@@ -1244,29 +1248,20 @@ typedef struct KuEnvHeader {
 }
 
 /// Emit a `typedef struct { ret (*invoke)(void*, params...); void* env; }` for
-/// every distinct closure signature the program uses (Stage 6a). Runs in two
-/// passes sharing `header_done`/`emitted`: `self_contained_only == true` emits
-/// signatures over primitives before the array/result ABI (so array-of-closures
-/// resolves `KuClosure_*`); the second pass (`false`) emits the remainder after
-/// those ABIs exist (so a closure returning e.g. `[int]` sees `KuArray_int`).
+/// the supplied closure signatures. Share `header_done` and `emitted` across
+/// passes so layout fields and ordinary closures can use the same signature.
 fn emit_closure_types<'a>(
     out: &mut COutput,
     types: impl IntoIterator<Item = &'a IrType>,
     header_done: &mut bool,
     emitted: &mut std::collections::HashSet<String>,
-    self_contained_only: bool,
 ) -> KuResult<()> {
     out.check()?;
-    let selected: Vec<&IrType> = types
+    let mut selected = types
         .into_iter()
-        .filter(|ty| match ty {
-            IrType::Closure { params, ret, .. } => {
-                closure_signature_is_self_contained(params, ret) == self_contained_only
-            }
-            _ => false,
-        })
-        .collect();
-    if selected.is_empty() {
+        .filter(|ty| matches!(ty, IrType::Closure { .. }))
+        .peekable();
+    if selected.peek().is_none() {
         return Ok(());
     }
     // Stage 6b: a shared env header so a closure can retain/release its env
@@ -1802,10 +1797,10 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
                     param_modes,
                     ret,
                 } if params.len() == param_modes.len()
-                    && closure_signature_is_self_contained(params, ret) => {}
+                    && supported_closure_field_signature(params, ret) => {}
                 IrType::Closure { .. } => {
                     return Err(unsupported(format!(
-                        "native C struct '{}.{}' requires a synchronous callable field signature over int, float, bool, str or null",
+                        "native C struct '{}.{}' requires a synchronous callable field signature over int, float, bool, str or null, with an optional Result return",
                         layout.name, field.name
                     )));
                 }
@@ -4299,6 +4294,15 @@ fn emit_result_abi_phase(
 ) -> KuResult<()> {
     out.check()?;
     let mut result_types = extra_types.to_vec();
+    // Even an unused struct can declare a closure returning Result by value.
+    // Declare that Result before defining the closure's function pointer.
+    for layout in &program.layouts.structs {
+        for field in &layout.fields {
+            if let IrType::Closure { ret, .. } = &field.ty {
+                collect_result_type(ret, &mut result_types)?;
+            }
+        }
+    }
     for function in &program.functions {
         collect_result_type(&function.return_type, &mut result_types)?;
         for param in &function.params {

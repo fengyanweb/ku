@@ -621,7 +621,7 @@ fn main() {
 
 函数类型写 `fn(&User): str`，普通 owning 槽位写 `fn(User): str`。两种函数类型精确区分，不做隐式 adapter，也不依据函数体推断参数模式。`async fn(fn(&User): str): null!` 中的 callback 是一个 owned 同步函数值，内部的借用参数不会使外层 async 参数变成 borrowed。
 
-native 支持调用函数数组元素，并保留其参数模式。struct 函数字段目前仅在 IR 中保留类型与模式，C backend 尚不支持该字段布局；两者是不同的存储路径。
+native 支持调用函数数组元素。同步 struct 函数字段的参数和结果可使用 `int`、`float`、`bool`、`str`、`null`，结果也可写成 `T!`，例如 `read: fn(&str): str!`。调用保留声明的参数模式，支持用 `?` 传播错误，struct 的移动和克隆沿用闭包环境的所有权。包含 struct、数组等其他复合类型的字段签名，以及 async 函数字段，仍未支持。
 
 借用遵循这些边界：
 

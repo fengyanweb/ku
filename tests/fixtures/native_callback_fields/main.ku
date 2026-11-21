@@ -5,6 +5,7 @@ fn Make(): fn(): int {
 }
 fn Use(&callback: fn(): int, n: int): int { return callback() + n }
 struct Reader { read: fn(&str): str, consume: fn(str): int }
+struct CheckedReader { read: fn(&str): str! }
 fn Consume(text: str): int { return text.byte_len() }
 fn Replace(&text: str): str { return "replacement:" + text }
 fn MakeReader(prefix: str): Reader {
@@ -12,6 +13,14 @@ fn MakeReader(prefix: str): Reader {
     return Reader { read: read, consume: Consume }
 }
 fn Read(&reader: Reader, &text: str): str { return reader.read(text) }
+fn MakeCheckedReader(prefix: str): CheckedReader {
+    fn read(&text: str): str! {
+        if (text == "") { return err(prefix + "missing declaration") }
+        return ok(prefix + text)
+    }
+    return CheckedReader { read: read }
+}
+fn ReadChecked(&reader: CheckedReader, &text: str): str! { return reader.read(text) }
 fn FailedArgument(): str! { return err("failed argument") }
 fn main(): null! {
     println(Use(Make(), 1))
@@ -35,5 +44,10 @@ fn main(): null! {
     catch(error) { println(error.message) }
     println(Read(saved, text))
     if (text != "Ku" || calls != 2) { panic("callable field ownership") }
+    checked = MakeCheckedReader("checked" + ":")
+    empty = ""
+    try { println(ReadChecked(checked, empty)?) }
+    catch(error) { println(error.message) }
+    println(ReadChecked(checked, "模块🙂")?)
     return ok(null)
 }

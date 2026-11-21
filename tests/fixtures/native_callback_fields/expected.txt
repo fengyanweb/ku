@@ -7,3 +7,5 @@ replacement:Ku
 temporary:1
 failed argument
 captured:Ku
+checked:missing declaration
+checked:模块🙂

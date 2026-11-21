@@ -176,6 +176,16 @@ fn borrow_ir_function_field_call_preserves_parameter_modes() {
     assert!(c.contains("(*invoke)(void*); void* env;"));
     assert!(c.contains("struct KuStruct_Unused {"));
 
+    let checked = ir("struct Checked { read: fn(&str): str! } fn main() {}");
+    let c = generate_c_source(&checked).unwrap();
+    let result_decl = c.find("typedef struct KuResult_str KuResult_str;").unwrap();
+    let field_signature = c
+        .find("KuResult_str (*invoke)(void*, const KuString*);")
+        .unwrap();
+    let containing_record = c.find("struct KuStruct_Checked {").unwrap();
+    assert!(result_decl < field_signature && field_signature < containing_record);
+    assert!(c.contains("struct KuResult_str { bool ok; KuString value; KuError error; };"));
+
     let aggregate =
         ir("struct Payload { value: int } struct Reader { read: fn(&Payload): int } fn main() {}");
     let error = generate_c_source(&aggregate).unwrap_err();
