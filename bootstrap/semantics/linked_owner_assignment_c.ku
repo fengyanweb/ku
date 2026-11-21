@@ -268,7 +268,8 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     initializers = ""
     sources: [int] = []
     captures = ReadLinkedLocalCaptures(project, parent, function, id, parameters.body_start)?
-    for index in captures.slots {
+    captured_slots = captures.slots
+    for index in captured_slots {
         outer = parent.slots[index - 1].clone()
         ty = outer.value.ty.clone()
         array = LinkedNullOwnedArray(ty) || LinkedNullIntArrayOwner(ty)
@@ -298,7 +299,8 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     }
     // Only previously declared local callees are available. Forward their
     // original environment address, never a rebuilt copy of its owners.
-    for index in captures.calls {
+    captured_calls = captures.calls
+    for index in captured_calls {
         callee = parent.local_appends[index - 1].clone()
         suffix = str(callee.function.node)
         field = "f" + suffix.clone()
@@ -321,9 +323,13 @@ fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
         next.uses_str_view || next.uses_struct_view || next.uses_concat || next.uses_div) {
         RejectLocalCapture(function, "a local append function needs checked exits and append-only captured array effects")?
     }
-    for index in next.append_slots.clone() {
+    count = next.append_slots.len()
+    cursor = 0
+    while (cursor < count) {
+        index = next.append_slots[cursor]
         ty = next.slots[index - 1].value.ty.clone()
         next.local_append_types = next.local_append_types.push(ty)
+        cursor = cursor + 1
     }
     signature = "void *raw, KuLocalAppendFailure *failure"
     if (thunk.body_start > 1) { signature += ", " + thunk.signature.clone() }
@@ -332,8 +338,12 @@ fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
         + FinishLinkedFunctionC("", next, symbol, signature, LinkedCheckedResultCType(thunk.result)?,
             "", "", LinkedAppendFailureRelay(next))
     next = RestoreLinkedThunkFrame(next, parent)
-    for index in thunk.sources.clone() {
+    source_count = thunk.sources.len()
+    cursor = 0
+    while (cursor < source_count) {
+        index = thunk.sources[cursor]
         if (!ContainsIndex(next.append_captures, index)) { next.append_captures = next.append_captures.push(index) }
+        cursor = cursor + 1
     }
     frame = "environment" + str(id)
     callee = LinkedNullFunction { unit: 1, node: id, symbol: symbol.clone(), parameters: thunk.arguments.clone(),
