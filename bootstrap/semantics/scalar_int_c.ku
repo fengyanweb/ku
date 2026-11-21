@@ -224,7 +224,8 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
         index = 0
         while (index < plans.len()) {
             function_node = plans[index].function_node
-            if (!ContainsScalarIntNode(completed, function_node)) {
+            emitted = ContainsScalarIntNode(completed, function_node)
+            if (!emitted) {
                 blocked = unresolvedIntCall(plans[index], completed)
                 if (blocked == 0) {
                     if (function_node == entry) {
