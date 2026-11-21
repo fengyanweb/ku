@@ -100,16 +100,14 @@ fn owningFieldType(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding], 
         RejectLayout("unsupported_layout_type", "an array field must declare one element type", at.clone())?
     }
     element = ExplicitType(bindings, edges[nodes[id - 1].first_edge], at.clone())?
+    kind = "BuiltinArray"
     if (element.declaration_kind == "Struct") {
-        element.declaration_kind = "StructArray"
-    } else if (element.declaration_kind == "Builtin" && (element.name == "int" || element.name == "str")) {
-        element.declaration_kind = "BuiltinArray"
-    } else {
+        kind = "StructArray"
+    } else if (!(element.declaration_kind == "Builtin" && (element.name == "int" || element.name == "str"))) {
         RejectLayout("unsupported_layout_type", "owning C layout supports [int], [str] or an array of bound structs", at.clone())?
     }
-    element.use_node = id
-    element.span = at
-    return ok(element)
+    return ok(TypeNameBinding { use_node: id, name: element.name, declaration_kind: kind,
+                                module_index: element.module_index, declaration_node: element.declaration_node, span: at })
 }
 
 fn collectFields(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
