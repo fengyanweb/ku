@@ -31,7 +31,14 @@ fn resolveProjectModule(&entry: SuppliedModule, &supplied: [SuppliedModule]): Pr
     }
 }
 
-fn projectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
+struct ProjectImportSchedule { order: [int] }
+
+fn projectImportSpan(&span: Span): Span {
+    return Span { line: span.line, column: span.column, offset: span.offset,
+        end_line: span.end_line, end_column: span.end_column, end_offset: span.end_offset }
+}
+
+fn projectImportOrder(&modules: [ProjectModuleBindings]): ProjectImportSchedule! {
     module_count = modules.len()
     done: [int] = []
     init = 0
@@ -43,8 +50,8 @@ fn projectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
     placed = 0
     while (placed < module_count) {
         next = 0 - 1
-        blocked_path = ""
-        blocked_at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+        blocked_module = 0
+        blocked_edge = 0
         index = 0
         while (index < module_count && next < 0) {
             if (done[index] == 0) {
@@ -55,8 +62,8 @@ fn projectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
                     dependency = modules[index].imports[edge].module_index
                     if (dependency > 0 && done[dependency - 1] == 0) {
                         ready = false
-                        blocked_at = modules[index].imports[edge].span.clone()
-                        blocked_path = modules[index].path.clone()
+                        blocked_module = index
+                        blocked_edge = edge
                     }
                     edge = edge + 1
                 }
@@ -65,13 +72,17 @@ fn projectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
             index = index + 1
         }
         if (next < 0) {
+            // At least one unplaced module was blocked. Materialize its
+            // diagnostic at failure, rather than on every dependency check.
+            blocked_at = projectImportSpan(modules[blocked_module].imports[blocked_edge].span)
+            blocked_path = modules[blocked_module].path.clone()
             RejectName("cyclic_import", "no remaining project module has resolved dependencies, including '" + blocked_path + "'", blocked_at)?
         }
         done[next] = 1
         order = order.push(next)
         placed = placed + 1
     }
-    return ok(order)
+    return ok(ProjectImportSchedule { order: order })
 }
 
 
@@ -83,6 +94,6 @@ fn BindProjectModules(&supplied: [SuppliedModule]): ProjectBindings! {
         modules = modules.push(bound)
         index = index + 1
     }
-    order = projectImportOrder(modules)?
+    {order} = projectImportOrder(modules)?
     return ok(ProjectBindings { modules: modules, order: order })
 }

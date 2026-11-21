@@ -1882,8 +1882,9 @@ int main(int argc, char **argv) {
 pub(super) fn assert_owned_int_array_store(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("int-array-store.ku"),
-        r#"fn Replacement(input: int): int! { return ok(input) }
-fn Store(index: int, divisor: int, input: int): [int]! {
+        r#"struct IntStore { values: [int] }
+fn Replacement(input: int): int! { return ok(input) }
+fn Store(index: int, divisor: int, input: int): IntStore! {
     values: [int] = [5, 9]
     limit = 1
     step = 0
@@ -1891,7 +1892,7 @@ fn Store(index: int, divisor: int, input: int): [int]! {
         values[index / divisor] = Replacement(input)?
         step = step + 1
     }
-    return ok(values)
+    return ok(IntStore { values: values })
 }
 fn Refuse(&values: [int]): null! {
     values[0] = 1
@@ -1937,9 +1938,9 @@ int main(int argc, char **argv) {
         return 9;
     }
     RESULT result = ENTRY(1, 1, 7);
-    assert(result.ok && result.value.len == 2 && result.value.data[0] == 5 && result.value.data[1] == 7);
+    assert(result.ok && result.value.f0.len == 2 && result.value.f0.data[0] == 5 && result.value.f0.data[1] == 7);
     assert(seen == 1 && outstanding() == 1);
-    free(result.value.data);
+    free(result.value.f0.data);
     result = ENTRY(1, 0, -1);
     assert(!result.ok && result.error.code.len == 3 && !memcmp(result.error.code.ptr, "rhs", 3));
     assert(seen == 2 && outstanding() == 0);
