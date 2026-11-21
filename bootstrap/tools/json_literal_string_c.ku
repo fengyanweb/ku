@@ -1,0 +1,126 @@
+import { fs, json, string } from "std"
+import { Node } from "../stage2/ast.ku"
+import { Span } from "../stage2/span.ku"
+import { DeclarationSpan } from "../semantics/names.ku"
+import { BindProjectModules } from "../semantics/project_bindings.ku"
+import { ManifestPaths, ReadProjectModulesAt } from "../semantics/project_manifest.ku"
+import { RejectLayout } from "../semantics/struct_layouts.ku"
+import { LinkedNullChild, LinkedNullEntry, LinkedNullNode, LinkedNullProject,
+    LinkedNullType, LinkedStringResult } from "../semantics/linked_null_types_c.ku"
+import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration } from "../semantics/link_plan_c.ku"
+import { ScalarStringHelpers } from "../semantics/scalar_int_emit.ku"
+import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
+
+fn child(&project: LinkedNullProject, &parent: Node, index: int): Node {
+    return LinkedNullNode(project, 1, LinkedNullChild(project, 1, parent, index))
+}
+
+fn require(valid: bool, &node: Node, message: str): null! {
+    if (!valid) { RejectLayout("unsupported_json_literal_string", message, DeclarationSpan(node))? }
+    return ok(null)
+}
+
+fn method(&project: LinkedNullProject, &call: Node, &name: str, arguments: int): Node! {
+    require(call.kind == "Call" && call.edge_count == arguments + 1, call, "expected one direct method call")?
+    target = child(project, call, 0)
+    require(target.kind == "Field" && target.edge_count == 1 && target.text == name, target, "expected method " + name.clone())?
+    receiver = child(project, target, 0)
+    require(receiver.kind == "Variable" && receiver.edge_count == 0, receiver, "expected a direct binding")?
+    return ok(receiver)
+}
+
+fn readLiteral(&project: LinkedNullProject, &entry: Node): Node! {
+    require(entry.kind == "Function" && entry.edge_count == 3, entry,
+        "expected a synchronous zero-argument function with a checked literal and a return")?
+    result = child(project, entry, 0)
+    require(result.kind == "TypeResult" && result.edge_count == 1, result, "expected explicit str!")?
+    ty = LinkedNullType(project, 1, LinkedNullChild(project, 1, result, 0))?
+    require(LinkedStringResult(ty), result, "expected a standard str result")?
+
+    binding = child(project, entry, 1)
+    require(binding.kind == "Assign" && binding.edge_count == 1, binding, "expected one fresh local binding")?
+    checked = child(project, binding, 0)
+    require(checked.kind == "TryUnwrap" && checked.edge_count == 1, checked, "expected a checked JSON parse")?
+    parse = child(project, checked, 0)
+    namespace = method(project, parse, "parse", 1)?
+    require(namespace.text != binding.text, namespace, "the local must not shadow the JSON namespace")?
+    standard = false
+    for entry_binding in project.binding.modules[0].imports.clone() {
+        if (entry_binding.local_name == namespace.text && entry_binding.source_name == "json" &&
+            entry_binding.module_index == 0 && (entry_binding.path == "std" || entry_binding.path == "std.json")) {
+            standard = true
+        }
+    }
+    require(standard, namespace, "expected the bound std.json namespace")?
+    literal = child(project, parse, 1)
+    require(literal.kind == "String" && literal.edge_count == 0, literal, "JSON input must be a static str literal")?
+
+    returned = child(project, entry, 2)
+    require(returned.kind == "Return" && returned.edge_count == 1, returned, "expected the conversion's checked result")?
+    converted = method(project, child(project, returned, 0), "as_str", 0)?
+    require(converted.text == binding.text, converted, "conversion must read the parsed local binding")?
+    return ok(literal)
+}
+
+fn decodeLiteral(&literal: Node): str! {
+    try {
+        decoded = json.parse(literal.text.clone())?
+        value = decoded.as_str()?
+        return ok(value)
+    } catch (_error) {
+        RejectLayout("unsupported_json_literal_string", "expected a valid JSON string literal", DeclarationSpan(literal))?
+    }
+    return ok("")
+}
+
+fn emitLiteral(&literal: Node, &symbol: str): str! {
+    value = decodeLiteral(literal)?
+    length = value.byte_len()
+    require(length <= 64, literal, "decoded JSON string must fit the first 64-byte escape buffer")?
+    text = "#include <stdbool.h>\n#include <stdint.h>\n" + ScalarStringHelpers(true, false, false, false, false, false, true)
+    text += "typedef struct KuResult_str { bool ok; KuString value; KuError error; } KuResult_str;\n"
+    text += "typedef KuResult_str KuBootstrapResult_KuProjectionString;\n\n"
+    text += "KuResult_str " + symbol.clone() + "(void) {\n"
+    if (length == 0) {
+        return ok(text + "    return (KuResult_str){.ok = true, .value = {(uint8_t*)\"\", 0u, 0u, 0u}};\n}\n")
+    }
+
+    // With valid JSON and <=64 decoded bytes, Stage0 can allocate only
+    // once. Preserve its exact unescaped allocation or first escape buffer
+    // reserve, as well as the checked allocation failure it returns.
+    capacity = length
+    allocation = "malloc(" + str(length) + "u)"
+    if (literal.text.contains("\\")) {
+        capacity = 64
+        allocation = "realloc(NULL, 64u)"
+    }
+    rendered = literal.clone()
+    rendered.text = value
+    bytes = ScalarStringLiteral(rendered)?
+    text += "    uint8_t* decoded = " + allocation + ";\n"
+    text += "    if (!decoded) return (KuResult_str){.error = {\n"
+        + "        {(uint8_t*)\"json\", sizeof(\"json\") - 1u, 0u, 0u},\n"
+        + "        {(uint8_t*)\"out_of_memory\", sizeof(\"out_of_memory\") - 1u, 0u, 0u},\n"
+        + "        {(uint8_t*)\"json allocation failed\", sizeof(\"json allocation failed\") - 1u, 0u, 0u}}};\n"
+    text += "    memcpy(decoded, " + bytes + ");\n"
+    text += "    return (KuResult_str){.ok = true, .value = {decoded, " + str(length) + "u, " + str(capacity) + "u, 1u}};\n"
+    return ok("#include <stdlib.h>\n#include <string.h>\n" + text + "}\n")
+}
+
+fn main(): null! {
+    at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    supplied = ReadProjectModulesAt(ManifestPaths(fs.read("modules.txt")?, at)?, "")?
+    binding = BindProjectModules(supplied)?
+    project = LinkedNullProject { supplied: supplied.clone(), binding: binding }
+    name = string.trim(fs.read("function.txt")?)
+    entry = LinkedNullEntry(project, name)?
+    literal = readLiteral(project, LinkedNullNode(project, 1, entry))?
+    symbol = "ku_json_literal_str_" + str(entry)
+    source = emitLiteral(literal, symbol)?
+    if (fs.exists("plan.txt")) {
+        declaration = LinkPlanDeclaration { unit: 1, node: entry, symbol: symbol,
+            parameters: [], result: BuiltinLinkPlanType("str", "KuBootstrapResult_KuProjectionString", false), returns_result: true }
+        print(EmitLinkPlan(supplied, "json-literal-str", declaration, [])?)
+    } else { print(source) }
+    return ok(null)
+}

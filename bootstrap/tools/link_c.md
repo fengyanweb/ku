@@ -46,6 +46,16 @@ Record the provider's own bound declaration and emitted ABI in the receipt.
 The linker checks the digest and the receiving C declaration. The receipt
 follows the same signature and dependency rules as a generated plan.
 
+`json_literal_string_c.ku` emits a standalone checked string provider from
+the bound zero-argument function named in `function.txt`. It reads the
+project-relative paths in `modules.txt` and uses the first path as the input
+module. Run it once for C and again with `plan.txt` present for the typed
+plan. It accepts a checked `std.json.parse` of a string literal followed by
+returning that local's `as_str()` result. The decoded JSON string must fit
+the native engine's first 64-byte escape buffer. The generated provider
+retains the native allocation and failure contract. Use it to emit
+`ProjectPathNul` when linking `ManifestPaths`.
+
 Run the local linker tests with this command.
 
 ```sh
