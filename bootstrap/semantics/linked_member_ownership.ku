@@ -110,7 +110,10 @@ fn joinedLinkedMemberMoves(&first: LinkedNullSlot, &second: LinkedNullSlot, &sta
     if (same_owner && (string_owner || record_move)) {
         // Unavailable for every later read. Cleanup still sees a live slot:
         // the arm transferring its owner zeroes the runtime carrier.
-        return ok([""])
+        moved: [str] = []
+        whole = ""
+        moved = moved.push(whole)
+        return ok(moved)
     }
     if (first.live && second.live && !first.value.borrowed && !second.value.borrowed
         && first.value.ty.declaration_kind == "Struct" && SameLinkedType(first.value.ty, second.value.ty)) {
