@@ -690,9 +690,13 @@ fn CloneViews(&prefix: str, &path: str): str! {
     result = prefix.clone() + path.clone()
     return ok(result)
 }
-fn MovedOperand(path: str): str! {
+fn ReadBeforeMove(path: str): str! {
     result = path + Decorate(path)
     return ok(result)
+}
+fn ReadAfterMove(path: str): str! {
+    moved = Decorate(path)
+    return ok(path)
 }
 "#;
 
@@ -790,11 +794,15 @@ pub(super) fn assert_linked_call_addition(seed: &Path, cwd: &Path) {
     assert_ok(&execute(&mut Command::new(exe), cwd, 15));
     fs::write(cwd.join("function.txt"), "CloneViews").unwrap();
     assert_ok(&execute(&mut Command::new(seed), cwd, 30));
-    fs::write(cwd.join("function.txt"), "MovedOperand").unwrap();
+    fs::write(cwd.join("function.txt"), "ReadBeforeMove").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    assert!(String::from_utf8_lossy(&emitted.stdout).contains("ku_linked_clone_string(a0, &lhs"));
+    fs::write(cwd.join("function.txt"), "ReadAfterMove").unwrap();
     let bad = execute(&mut Command::new(seed), cwd, 30);
     assert_eq!(bad.status.code(), Some(1));
     assert!(bad.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&bad.stderr).contains("linked_addition_moved_operand"));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("unavailable_linked_binding"));
 }
 
 const DECORATED_CATCH_SOURCE: &str = r#"import { Supply, Decorate } from "./decorated-provider.ku"
