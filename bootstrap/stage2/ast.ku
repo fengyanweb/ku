@@ -171,3 +171,14 @@ fn AstCanonical(output: ParseOutput): str {
     }
     return text
 }
+
+fn FirstSubtreeNode(&nodes: [Node], &edges: [int], root: int): int {
+    // Validated post-order child IDs strictly decrease and are positive.
+    node = root
+    hops = 0
+    while (hops < root && nodes[node - 1].edge_count > 0) {
+        node = edges[nodes[node - 1].first_edge]
+        hops = hops + 1
+    }
+    return node
+}

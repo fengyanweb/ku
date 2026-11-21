@@ -1,5 +1,5 @@
 import { Span } from "../stage2/span.ku"
-import { Node } from "../stage2/ast.ku"
+import { FirstSubtreeNode, Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule, RejectName } from "./names.ku"
 import { ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
 import { TypeNameBinding } from "./type_names.ku"
@@ -217,8 +217,9 @@ fn parameterAnnotation(&nodes: [Node], &edges: [int], &parameter: Node): ScalarA
 
 fn directSignature(&nodes: [Node], &edges: [int], &function: Node, name: str): DirectSignature {
     parameters: [ScalarAnnotation] = []
-    cursor = function.first_edge
-    stop = cursor + function.edge_count
+    start = function.first_edge
+    stop = start + function.edge_count
+    cursor = start
     while (cursor < stop && nodes[edges[cursor] - 1].kind == "Parameter") {
         parameters = parameters.push(parameterAnnotation(nodes, edges, nodes[edges[cursor] - 1]))
         cursor = cursor + 1
@@ -260,10 +261,10 @@ fn directSignatures(&named: NamedModule, &imports: [ImportBinding], &supplied: [
 fn directSignatureIndex(&signatures: [DirectSignature], &name: str): int {
     index = 0
     while (index < signatures.len()) {
-        if (signatures[index].name == name) { return index }
+        if (signatures[index].name == name) { return index + 1 }
         index = index + 1
     }
-    return -1
+    return 0
 }
 
 fn containsName(&names: [str], &name: str): bool {
@@ -279,16 +280,6 @@ fn couldBindLocal(&kind: str): bool {
     return kind == "Parameter" || kind == "VarDecl" || kind == "Assign"
         || kind == "For" || kind == "CatchBinding" || IsNamedFunction(kind)
         || kind == "ObjectDestructureLocal" || kind == "ObjectDestructureRest"
-}
-
-fn firstSubtreeNode(&nodes: [Node], &edges: [int], root: int): int {
-    // The accepted arena uses contiguous post-order subtrees. Follow strictly
-    // decreasing IDs to the leftmost node instead of copying a function AST.
-    node = root
-    while (nodes[node - 1].edge_count > 0) {
-        node = edges[nodes[node - 1].first_edge]
-    }
-    return node
 }
 
 fn scalarLiteral(&node: Node): str {
@@ -324,7 +315,7 @@ fn checkLiteralType(&annotation: ScalarAnnotation, &nodes: [Node], &edges: [int]
 }
 
 fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignature], function: int): null! {
-    start = firstSubtreeNode(nodes, edges, function)
+    start = FirstSubtreeNode(nodes, edges, function)
     // This pass proves direct targets. Defer potentially shadowed names,
     // including local functions/captures, to a later lexical binding pass.
     shadowed: [str] = []
@@ -332,7 +323,7 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
     while (index < function) {
         if (couldBindLocal(nodes[index - 1].kind)) {
             candidate = directSignatureIndex(signatures, nodes[index - 1].text)
-            if (candidate >= 0) {
+            if (candidate > 0) {
                 present = containsName(shadowed, nodes[index - 1].text)
                 if (!present) { shadowed = shadowed.push(nodes[index - 1].text.clone()) }
             }
@@ -348,8 +339,9 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
                 present = containsName(shadowed, nodes[target - 1].text)
                 if (!present) {
                     signature = directSignatureIndex(signatures, nodes[target - 1].text)
-                    if (signature >= 0) {
-                        arity = signatures[signature].parameters.len()
+                    if (signature > 0) {
+                        binding = signature - 1
+                        arity = signatures[binding].parameters.len()
                         count = nodes[index - 1].edge_count - 1
                         if (count != arity) {
                             RejectName("call_arity", "function '" + nodes[target - 1].text.clone() + "' expects "
@@ -358,7 +350,7 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
                         argument = 0
                         while (argument < count) {
                             node = edges[nodes[index - 1].first_edge + argument + 1]
-                            checkLiteralType(signatures[signature].parameters[argument], nodes, edges, nodes[node - 1], "call_argument_type")?
+                            checkLiteralType(signatures[binding].parameters[argument], nodes, edges, nodes[node - 1], "call_argument_type")?
                             argument = argument + 1
                         }
                     }
