@@ -130,8 +130,10 @@ fn emitArrayAppend(&element: str, &array: str, &prefix: str, private_append: boo
     if (private_append) { text = "static " }
     text += "int " + prefix.clone() + "_append_move(" + array.clone() + " *array, " + element.clone() + " *value) {\n"
     text += "    if (!value || !" + prefix.clone() + "_valid(array) || " + prefix.clone() + "_contains(array, value)) return KU_STRUCT_ARRAY_INVALID;\n"
-    text += "    size_t limit = SIZE_MAX / sizeof(" + element.clone() + ");\n    if (array->len == limit) return KU_STRUCT_ARRAY_CAPACITY;\n"
+    // One allocated C object must fit in the pointer-difference range.
+    text += "    size_t limit = (size_t)PTRDIFF_MAX / sizeof(" + element.clone() + ");\n"
     text += "    size_t capacity = " + prefix.clone() + "_capacity(array);\n"
+    text += "    if (capacity > limit || array->len == limit) return KU_STRUCT_ARRAY_CAPACITY;\n"
     text += "    if (array->len == capacity) {\n"
     text += "        size_t next = capacity ? (capacity > limit / 2 ? limit : capacity * 2) : (limit < 8 ? limit : 8);\n"
     text += "        " + element.clone() + " *data = realloc(array->data, next * sizeof(" + element.clone() + "));\n"

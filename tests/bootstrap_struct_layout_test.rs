@@ -3211,6 +3211,20 @@ int main(void) {
     assert(__PREFIX___clone_at(&tokens, 0, &tokens.data[0]) == KU_STRUCT_ARRAY_INVALID);
     assert(__PREFIX___append_move(&tokens, &tokens.data[0]) == KU_STRUCT_ARRAY_INVALID);
 
+    // The header exercises only the append boundary. Fail injection prevents
+    // the allocator from ever accessing the synthetic oversized backing.
+    __ELEMENT__ sentinels[2] = {0};
+    sentinels[0].f2 = 25;
+    size_t oversized = (size_t)PTRDIFF_MAX / sizeof(__ELEMENT__) + 1;
+    __ARRAY__ oversized_header = { oversized, &sentinels[1], oversized };
+    int before_reject = attempts;
+    fail_after = 0;
+    assert(__PREFIX___append_move(&oversized_header, &sentinels[0]) == KU_STRUCT_ARRAY_CAPACITY);
+    assert(attempts == before_reject && sentinels[0].f2 == 25);
+    assert(oversized_header.data == &sentinels[1] && oversized_header.len == oversized);
+    assert(oversized_header.capacity == oversized);
+    fail_after = -1;
+
     assert(__PREFIX___clone_at(&tokens, 0, &clone) == KU_STRUCT_ARRAY_OK);
     uint8_t *cloned_body = clone.f1.ptr;
     assert(outstanding() == 5 && cloned_body != tokens.data[0].f1.ptr);
