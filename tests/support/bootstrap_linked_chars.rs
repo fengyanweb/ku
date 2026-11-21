@@ -313,7 +313,7 @@ pub(super) fn assert_owned_record_result_iteration(seed: &Path, cwd: &Path) {
     let emitted = execute(&mut Command::new(seed), cwd, 30);
     assert_ok(&emitted);
     let source = String::from_utf8(emitted.stdout).unwrap();
-    let symbol = |prefix| {
+    let symbol = |prefix: &str| {
         source
             .lines()
             .find_map(|line| line.strip_prefix(prefix)?.split_once('('))
