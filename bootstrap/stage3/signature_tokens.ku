@@ -44,8 +44,10 @@ fn ReadTypeOpening(&tokens: [Token], start: int, end: int, type_last: int, frame
         }
         cursor = cursor + 1
         parameter_index = cursor
-        if ((ReadTypeToken(tokens, cursor, end, type_last)?).kind == "RParen") {
-            cursor = FunctionReturnStart(tokens, cursor, end, type_last)?
+        kind = ReadTypeTokenKind(tokens, cursor, end, type_last)?
+        if (kind == "RParen") {
+            returned = FunctionReturnStart(tokens, cursor, end, type_last)?
+            cursor = returned
             returning = true
         }
     }
