@@ -1459,3 +1459,61 @@ pub(super) fn assert_string_prefix_suffix(seed: &Path, cwd: &Path) {
     compile_projection(&c, &exe, cwd);
     assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
 }
+
+const PLAIN_RECORD_SOURCE: &str = r#"struct Input { line: int text: str }
+struct Position { line: int text: str }
+struct Unrelated { rows: [Position] }
+fn Extract(&source: Input): Position {
+    return Position { line: source.line, text: source.text.clone() }
+}
+fn Refuse(&source: Input): Input { return source }
+"#;
+
+const PLAIN_RECORD_HOST: &str = r#"
+int main(void) {
+    (void)test_realloc;
+    uint8_t *data = malloc(4);
+    memcpy(data, "text", 4);
+    __INPUT__ input = {INT64_MIN, {data,4,4,KU_PROJECTION_STRING_OWNED}};
+    __RESULT__ result = __ENTRY__(&input);
+    assert(result.f0 == INT64_MIN && result.f1.len == 4 && result.f1.ptr != data);
+    assert(input.f1.ptr == data && outstanding() == 2 && attempts == 2);
+    free(data);
+    assert(!memcmp(result.f1.ptr, "text", 4) && outstanding() == 1);
+    ku_projection_string_drop(&result.f1);
+    assert(!outstanding());
+    return 0;
+}
+"#;
+
+pub(super) fn assert_plain_named_record_result(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("plain-record.ku"), PLAIN_RECORD_SOURCE).unwrap();
+    fs::write(cwd.join("modules.txt"), "plain-record.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Extract").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, params) = signature.split_once("(const ").unwrap();
+    let (input, _) = params.split_once('*').unwrap();
+    assert!(result.starts_with("KuStruct_") && input.starts_with("KuStruct_"));
+    let host = PLAIN_RECORD_HOST
+        .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
+        .replace("__RESULT__", result)
+        .replace("__INPUT__", input);
+    let c = cwd.join("plain-record.c");
+    let exe = cwd.join(format!("plain-record{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+
+    fs::write(cwd.join("function.txt"), "Refuse").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_value_return"));
+}

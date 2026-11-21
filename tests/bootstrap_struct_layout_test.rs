@@ -4421,4 +4421,5 @@ int main(int argc, char **argv) {
     struct_view::assert_stable_owned_count_bound(&compiler, &cwd);
     struct_view::assert_conditional_partial_members(&compiler, &cwd);
     struct_view::assert_string_prefix_suffix(&compiler, &cwd);
+    struct_view::assert_plain_named_record_result(&compiler, &cwd);
 }
