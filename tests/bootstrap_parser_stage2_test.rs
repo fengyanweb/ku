@@ -546,6 +546,19 @@ fn main(): null! {
     ExpectContextError("1", max_line, point.clone(), false, "parse origin cannot be relocated without integer overflow")?
     ExpectContextError("1", max_column, point.clone(), false, "parse origin cannot be relocated without integer overflow")?
     ExpectContextError("1", max_offset, point.clone(), false, "parse origin cannot be relocated without integer overflow")?
+    near_max = Span { line: 1, column: 9223372036854775806, offset: 9223372036854775806,
+        end_line: 1, end_column: 9223372036854775806, end_offset: 9223372036854775806 }
+    on_max = Span { line: 1, column: 9223372036854775807, offset: 9223372036854775807,
+        end_line: 1, end_column: 9223372036854775807, end_offset: 9223372036854775807 }
+    for with_boundary in [true, false] {
+        edge_case = ParseWithContext("1", ParseContext { origin: near_max.clone(), boundary: on_max.clone(),
+            has_boundary: with_boundary, diagnostic_domain: "bootstrap.parser" })?
+        edge_node = edge_case.arena.nodes[edge_case.root - 1].clone()
+        if (edge_node.kind != "Int" || edge_node.int_value != 1 || edge_node.column != near_max.column ||
+            edge_node.offset != near_max.offset || edge_node.end_column != on_max.column || edge_node.end_offset != on_max.offset) {
+            panic("valid maximum source position must remain representable")
+        }
+    }
     overlap = Span { line: 7, column: 7, offset: 42, end_line: 7, end_column: 8, end_offset: 43 }
     ExpectContextError("1 +", context_origin.clone(), overlap, true, "parse boundary must be an ordered absolute span at or after the source window")?
     malformed_end = Span { line: 7, column: 12, offset: 47, end_line: 0, end_column: 0, end_offset: 48 }
