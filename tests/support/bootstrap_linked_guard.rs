@@ -2899,9 +2899,9 @@ fn BadString(input: Parcel, replacement: str, changed: bool): Parcel! {
     if (changed) { value.label = replacement }
     return ok(value)
 }
-fn BadBool(input: Parcel, changed: bool): Parcel! {
+fn SetFlag(input: Parcel, changed: bool, flag: bool): Parcel! {
     value = input
-    if (changed) { value.active = false }
+    if (changed) { value.active = flag }
     return ok(value)
 }
 fn BadType(input: Parcel, changed: bool): Parcel! {
@@ -2920,7 +2920,7 @@ fn BadMove(input: Parcel, changed: bool): Parcel! {
     fs::write(cwd.join("modules.txt"), "guarded-copy-field.ku\n").unwrap();
     fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
 
-    for name in ["Run", "Recover"] {
+    for name in ["Run", "Recover", "SetFlag"] {
         fs::write(cwd.join("function.txt"), name).unwrap();
         let emitted = execute(&mut Command::new(seed), cwd, 30);
         assert_ok(&emitted);
@@ -2929,8 +2929,7 @@ fn BadMove(input: Parcel, changed: bool): Parcel! {
             .lines()
             .find_map(|line| line.strip_prefix("extern KuBootstrapResult_int64_t "))
             .and_then(|signature| signature.split_once('('))
-            .unwrap()
-            .0;
+            .map_or("unused_checked_next", |(symbol, _)| symbol);
         let (result, signature) = code
             .lines()
             .find_map(|line| line.split_once(" ku_linked_null_"))
@@ -2939,6 +2938,7 @@ fn BadMove(input: Parcel, changed: bool): Parcel! {
         let record = args.split_once(" a0").unwrap().0;
         let host = r#"
 static uint8_t *original;
+#if !__FLAG__
 static unsigned calls;
 
 KuBootstrapResult_int64_t __NEXT__(const __RECORD__ *parcel, bool stop) {
@@ -2951,9 +2951,24 @@ KuBootstrapResult_int64_t __NEXT__(const __RECORD__ *parcel, bool stop) {
     }
     return (KuBootstrapResult_int64_t){.ok=true,.value=11};
 }
+#endif
 
 int main(void) {
     (void)test_realloc;
+#if __FLAG__
+    for (int apply = 0; apply < 2; ++apply) {
+        for (int flag = 0; flag < 2; ++flag) {
+            original = malloc(1);
+            *original = 5;
+            __RECORD__ input = {10,{original,1,1,KU_PROJECTION_STRING_OWNED},true};
+            __RESULT__ result = __ENTRY__(input, apply, flag);
+            assert(result.ok && result.value.f0 == 10 && result.value.f2 == (!apply || flag));
+            assert(result.value.f1.ptr == original && *original == 5 && outstanding() == 1);
+            ku_projection_string_drop(&result.value.f1);
+            assert(!outstanding());
+        }
+    }
+#else
     for (int i = 0; i < 3; ++i) {
         bool changed = i != 0, stop = i != 1;
         calls = 0;
@@ -2973,6 +2988,7 @@ int main(void) {
         }
         assert(!outstanding());
     }
+#endif
     return 0;
 }
 "#
@@ -2980,6 +2996,7 @@ int main(void) {
         .replace("__RECORD__", record)
         .replace("__RESULT__", result)
         .replace("__NEXT__", next)
+        .replace("__FLAG__", if name == "SetFlag" { "1" } else { "0" })
         .replace("__RECOVER__", if name == "Recover" { "1" } else { "0" });
         let source = cwd.join("guarded-copy-field.c");
         let exe = cwd.join(format!(
@@ -2996,7 +3013,6 @@ int main(void) {
         ("BadView", "linked_member_target"),
         ("BadNested", "linked_member_target"),
         ("BadString", "linked_member_target"),
-        ("BadBool", "linked_member_target"),
         ("BadType", "linked_member_rebind_type"),
         ("BadMove", "unavailable_linked_binding"),
     ] {

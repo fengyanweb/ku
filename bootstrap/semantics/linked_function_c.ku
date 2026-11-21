@@ -187,8 +187,8 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     ty = place.value.ty.clone()
     string = LinkedStringResult(ty)
     copy = ty.declaration_kind == "Builtin" && (ty.name == "int" || ty.name == "bool")
-    if (guarded && (!copy || ty.name != "int")) {
-        RejectLayout("linked_member_target", "guarded record assignment requires an int field of a mutable local", DeclarationSpan(target))?
+    if (guarded && !copy) {
+        RejectLayout("linked_member_target", "guarded record assignment requires a Copy int or bool field of a mutable local", DeclarationSpan(target))?
     }
     if (!SameLinkedType(ty, replacement.ty) || (!copy && (!string || replacement.borrowed))) {
         RejectLayout("linked_member_rebind_type", "replacement requires a matching Copy field or separate str owner", DeclarationSpan(target))?
