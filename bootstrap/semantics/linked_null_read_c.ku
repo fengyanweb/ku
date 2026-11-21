@@ -49,7 +49,7 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
         return readLinkedIndex(project, state, node, id, depth)
     }
     if (node.kind == "Field" && node.edge_count == 1) {
-        return readLinkedField(project, state, node, depth)
+        return readLinkedField(project, state, node, depth, false)
     }
     if (node.kind == "Binary" && node.edge_count == 2) {
         return readLinkedBinary(project, state, node, id, depth)
@@ -208,24 +208,12 @@ fn ReadLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalRea
     return ok(output)
 }
 
-fn LinkedFieldRoot(&project: LinkedNullProject, receiver: int): int {
-    cursor = receiver
-    depth = 0
-    indexed = false
-    while (depth < 32) {
-        node = LinkedNullNode(project, 1, cursor)
-        if (node.kind == "Index" && node.edge_count == 2 && !indexed) {
-            indexed = true
-        } else if (node.kind != "Field" || node.edge_count != 1) {
-            return cursor
-        }
-        cursor = LinkedNullChild(project, 1, node, 0)
-        depth = depth + 1
-    }
-    return cursor
+fn ReadLinkedMemberPlace(&project: LinkedNullProject, state: LinkedNullState, &node: Node): LinkedNullExpression! {
+    return readLinkedField(project, state, node, 0, true)
 }
 
-fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: Node, depth: int): LinkedNullExpression! {
+fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: Node, depth: int,
+                   place: bool): LinkedNullExpression! {
     receiver = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
     ty = receiver.value.ty.clone()
     if (ty.declaration_kind == "CaughtError") {
@@ -246,7 +234,9 @@ fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: N
     field = LinkedReadonlyExpression(receiver.state, field_type, member)
     field.value.slot = receiver.value.slot
     field.value.member_path = LinkedMemberPath(receiver.value, ordinal)
-    if (LinkedMemberUnavailable(field.state, field.value, false)) {
+    // A target may replace a field that was moved. Resolving its receiver
+    // still requires every enclosing part on that path to be live.
+    if ((!place || field.value.member_path == "") && LinkedMemberUnavailable(field.state, field.value, false)) {
         RejectLayout("linked_moved_member", "cannot read a field already moved from its parent", DeclarationSpan(node))?
     }
     if (field.value.ty.declaration_kind == "StructArray" || field.value.ty.declaration_kind == "BuiltinArray") {

@@ -5,7 +5,7 @@ import { ScalarCheckedMultiplyC, ScalarStringHelpers } from "./scalar_int_emit.k
 import { ScalarStringReplaceHelpers } from "./scalar_string_replace.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { LinkedIntSnapshotRuntime } from "./guarded_string_parts.ku"
-import { LinkedBuiltin, LinkedCheckedResultCType, LinkedNullCType, LinkedNullNode, LinkedNullParameterPlan, LinkedNullProject, LinkedNullResultType, LinkedNullType, LinkedResultPlan, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedCheckedResultCType, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullParameterPlan, LinkedNullProject, LinkedNullResultType, LinkedNullType, LinkedResultPlan, SameLinkedType } from "./linked_null_types_c.ku"
 import { Span } from "../stage2/span.ku"
 import { SuppliedModule } from "./imports.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -13,7 +13,7 @@ import { AppendLinkedCheckedInvocation, ExitLinkedFailure, FsReadLinkPlan, Linke
 import { LinkPlanJsonControls, LinkPlanJsonText } from "./project_paths.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
-import { LinkedFsReadReference, LinkedIntAppendCallbackDeclaration, LinkedIntAppendCallbackNominals, LinkedIntArrayCallbackDeclaration, LinkedIntArrayCallbackFaultPending, ProjectionBuiltinLinkFor } from "./struct_projection_c.ku"
+import { ContainsType, LinkedFsReadReference, LinkedIntAppendCallbackDeclaration, LinkedIntAppendCallbackNominals, LinkedIntArrayCallbackDeclaration, LinkedIntArrayCallbackFaultPending, ProjectionBuiltinLinkFor } from "./struct_projection_c.ku"
 
 fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): str! {
     name = ty.name.clone()
@@ -393,4 +393,36 @@ fn PublishLinkedCheckedValue(destination: LinkedNullExpression, payload: str): L
         + "    " + payload + " = (" + LinkedNullCType(slot.value.ty)? + "){0};\n"
     slot.state.slots[slot.value.slot - 1].live = true
     return ok(slot)
+}
+
+fn LinkedFieldRoot(&project: LinkedNullProject, receiver: int): int {
+    cursor = receiver
+    depth = 0
+    indexed = false
+    while (depth < 32) {
+        node = LinkedNullNode(project, 1, cursor)
+        if (node.kind == "Index" && node.edge_count == 2 && !indexed) {
+            indexed = true
+        } else if (node.kind != "Field" || node.edge_count != 1) {
+            return cursor
+        }
+        cursor = LinkedNullChild(project, 1, node, 0)
+        depth = depth + 1
+    }
+    return cursor
+}
+
+fn RestoreLinkedAssignedMember(state: LinkedNullState, &value: LinkedNullValue): LinkedNullState {
+    next = state
+    slot = value.slot - 1
+    if (!ContainsType(next.slots[slot].moved_members, value.member_path)) { return next }
+    tracked = next.slots[slot].moved_members.clone()
+    kept: [str] = []
+    index = 0
+    while (index < tracked.len()) {
+        if (tracked[index] != value.member_path) { kept = kept.push(tracked[index].clone()) }
+        index = index + 1
+    }
+    next.slots[slot].moved_members = kept
+    return next
 }

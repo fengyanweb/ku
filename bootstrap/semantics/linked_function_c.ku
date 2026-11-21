@@ -1,11 +1,11 @@
 import { LinkedFieldAppendArgument } from "./linked_owner_assignment_c.ku"
-import { EmitLinkedBodyPrelude, HoldLinkedCopyOperand, LinkedNullPrototype, LinkedScopedCallbackFunction, LinkedScopedCallbackPrototype } from "./link_plan_json_c.ku"
+import { EmitLinkedBodyPrelude, HoldLinkedCopyOperand, LinkedFieldRoot, LinkedNullPrototype, LinkedScopedCallbackFunction, LinkedScopedCallbackPrototype, RestoreLinkedAssignedMember } from "./link_plan_json_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
 import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult } from "./struct_projection_c.ku"
 import { TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
-import { CheckLinkedStringAppendTarget, FinishLinkedFieldAppend, FinishLinkedStringAppend, LowerLinkedArrayBinding } from "./linked_array_fields_c.ku"
+import { CheckLinkedStringAppendTarget, FinishLinkedFieldAppend, FinishLinkedStringAppend } from "./linked_array_fields_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
@@ -15,7 +15,7 @@ import { ContainsIndex } from "./struct_projection_c.ku"
 import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
          LinkedNullNode, LinkedNullProject,  LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
-import { LinkedFieldRoot, LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { LowerLinkedNullRead, ReadLinkedMemberPlace } from "./linked_null_read_c.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue, LowerLinkedScopedCallbackCall } from "./linked_null_values_c.ku"
 import { IsLinkedScopedCallback, LinkedScopedCallbackTypes, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedOkAvailable, LinkedRecordFields } from "./link_plan_c.ku"
@@ -117,10 +117,6 @@ fn EmitLinkedFunction(&project: LinkedNullProject, &body: LinkedNullState, &symb
     return ok(FinishLinkedFunctionC(header + body.callback_helpers.clone(), body, symbol, signature, result, keep, char_errors, ""))
 }
 
-fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
-    return LowerLinkedArrayBinding(project, state, statement, id)
-}
-
 fn LowerLinkedTargetSet(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
                        id: int, depth: int): LinkedNullState! {
     target_id = LinkedNullChild(project, 1, statement, 0)
@@ -179,27 +175,39 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     // if the RHS fails or consumes its record.
     rhs = LowerLinkedNullValue(project, state, rhs_id, 0)?
     record = rhs.state.slots[slot - 1].value.ty.declaration_kind == "Struct"
-    if (nested && !(record && LinkedStringResult(rhs.value.ty))) { rhs = HoldLinkedCopyOperand(rhs, target_id)? }
+    owner = LinkedStringResult(rhs.value.ty) || rhs.value.ty.declaration_kind == "Struct"
+    if (nested && !(record && owner)) { rhs = HoldLinkedCopyOperand(rhs, target_id)? }
     replacement = rhs.value.clone()
-    place = LowerLinkedNullRead(project, rhs.state, target_id, 0)?
+    place = ReadLinkedMemberPlace(project, rhs.state, target)?
     ty = place.value.ty.clone()
     string = LinkedStringResult(ty)
     copy = ty.declaration_kind == "Builtin" && (ty.name == "int" || ty.name == "bool")
     if (capture && !copy) {
         RejectLayout("linked_member_target", "a local callback can only assign Copy fields of a captured record", DeclarationSpan(target))?
     }
-    // A named member path is stable through the guard and excludes indexed
-    // borrows. Only replace an owned string when cleanup still owns its root.
-    owned_string = string && place.value.slot == slot && place.value.member_path != ""
-    if ((guarded || nested) && !copy && !owned_string) {
+    // Only named member paths have enough ownership information for a
+    // replacement after a move. Indexed borrows continue to allow Copy writes.
+    tracked = place.value.slot == slot && place.value.member_path != ""
+    drop = ""
+    if (tracked && (string || ty.declaration_kind == "Struct")) {
+        drop = LinkedNullDropC(place.state.layouts, place.state.owning_layouts, ty, place.value.text)
+    }
+    if ((guarded || nested) && !copy && drop == "") {
         RejectLayout("linked_member_target", "guarded or nested assignment requires a Copy int or bool field of a mutable local", DeclarationSpan(target))?
     }
-    if (!SameLinkedType(ty, replacement.ty) || (!copy && (!string || replacement.borrowed))) {
-        RejectLayout("linked_member_rebind_type", "replacement requires a matching Copy field or separate str owner", DeclarationSpan(target))?
+    if (!SameLinkedType(ty, replacement.ty) || (!copy && (drop == "" || replacement.borrowed ||
+        replacement.slot == slot || (!string && replacement.slot == 0)))) {
+        RejectLayout("linked_member_rebind_type", "replacement requires a matching Copy field or separate owner", DeclarationSpan(target))?
     }
-    if (string) { place.state.code += LinkedNullDropC(place.state.layouts, place.state.owning_layouts, ty, place.value.text) }
-    place.state.code += "    " + place.value.text + " = " + replacement.text.clone() + ";\n"
-    if (string) { return MoveLinkedNullSlot(place.state, replacement) }
+    if (!copy && LinkedMemberUnavailable(place.state, place.value, true) &&
+        !ContainsType(place.state.slots[slot - 1].moved_members, place.value.member_path)) {
+        RejectLayout("linked_moved_member", "replacement requires a live member or a whole moved field", DeclarationSpan(target))?
+    }
+    place.state.code += drop + "    " + place.value.text + " = " + replacement.text.clone() + ";\n"
+    if (!copy) {
+        moved = MoveLinkedNullSlot(place.state, replacement)?
+        return ok(RestoreLinkedAssignedMember(moved, place.value))
+    }
     return ok(place.state)
 }
 
