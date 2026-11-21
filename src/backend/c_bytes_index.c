@@ -12,5 +12,5 @@ static KuResult_int ku_bytes_get(KuBytes value, int64_t index) {
     return (KuResult_int){ false, 0,
       ku_bytes_error("index_out_of_bounds", "bytes index is out of bounds") };
   }
-  return (KuResult_int){ true, (int64_t)value.ptr[(size_t)index], (KuError){0} };
+  return (KuResult_int){ .ok = true, .value = (int64_t)value.ptr[(size_t)index] };
 }

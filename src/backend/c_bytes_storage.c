@@ -54,5 +54,5 @@ static KuResult_bytes ku_bytes_from_str(KuString text) {
     return (KuResult_bytes){ false, (KuBytes){0},
       ku_bytes_error("out_of_memory", "bytes allocation failed") };
   }
-  return (KuResult_bytes){ true, value, (KuError){0} };
+  return (KuResult_bytes){ .ok = true, .value = value };
 }
