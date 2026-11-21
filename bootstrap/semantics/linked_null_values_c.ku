@@ -15,6 +15,8 @@ import { LinkedCallArgument, LinkedCheckedResultCType, LinkedIntResult, LinkedNu
 import { ReadLinkedLocalArrayItem, EmitLinkedAddition, IsLinkedLogicalNegation, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalAppendArguments, ForwardLinkedCallback, LinkedCallableSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix, ValidateLinkedPayload } from "./linked_parameters_c.ku"
 
+import { SnapshotLinkedFunction } from "./struct_result_link_c.ku"
+
 fn lowerLinkedArgument(&project: LinkedNullProject, state: LinkedNullState, &parameter: TypeNameBinding,
                        id: int, depth: int): LinkedNullExpression! {
     if (depth < 32 && LinkedScalarArrayOwner(parameter)) {
@@ -31,7 +33,7 @@ fn lowerLinkedArgument(&project: LinkedNullProject, state: LinkedNullState, &par
 fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &callee: LinkedNullFunction,
                          id: int, depth: int, external: bool): LinkedNullArguments! {
     next = state
-    if (external) { next.links = RememberLinkedCall(next.links, callee.clone()) }
+    if (external) { next.links = RememberLinkedCall(next.links, SnapshotLinkedFunction(callee)) }
     args = ""
     handoff = ""
     fault_relays = ""
@@ -209,7 +211,7 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
         if (slot == 0) { local = LinkedLocalAppendIndex(state, target.text) }
     }
     if (local > 0) {
-        callee = state.local_appends[local - 1].function.clone()
+        callee = SnapshotLinkedFunction(state.local_appends[local - 1].function)
         environment = state.local_appends[local - 1].environment.clone()
         CheckLinkedLocalAppendArguments(callee, call, unwrap, owns_value)?
         arguments = LowerLinkedArguments(project, state, call, callee, id, depth, false)?
