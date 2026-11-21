@@ -1402,6 +1402,13 @@ def verify_enum_equality_c(source):
     return {'compares_tags': True, 'sha256': hashlib.sha256(source).hexdigest()}
 
 
+def verify_task_enum_record_c(source):
+    if (b'ku_task_driver_set_intent(host->ticket,KU_TASK_DRIVER_WAIT)' not in source or
+            b'if (timer_status==KU_TASK_CONTROL_PENDING)' not in source or b').tag' not in source):
+        raise RuntimeError('installed Task enum fixture must use the timer Pending path and native tags')
+    return {'timer_pending_path': True, 'compares_tags': True, 'sha256': hashlib.sha256(source).hexdigest()}
+
+
 def installed_forward_layout_consumer(install, root, env, report, target):
     """Check owned forward layout binding through a relative import."""
     files = {
@@ -1681,6 +1688,9 @@ def run_structured_only(args, report):
             installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
                                                  'native_payloadless_enum_equality', sources=('main.ku', 'phase.ku'),
                                                  native_c_abi=verify_enum_equality_c)
+            installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
+                                                 'native_task_enum_record', sources=('main.ku', 'worker.ku'),
+                                                 native_c_abi=verify_task_enum_record_c)
             verification = repo / 'bootstrap/tools/compiler_driver/selfhost/verify.py'
             cc = env.get('KU_GNU_CC') if target == 'x86_64-pc-windows-gnu' else 'clang'
             if not cc:
