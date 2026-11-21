@@ -338,6 +338,90 @@ int main(void) {
         with self.assertRaisesRegex(link_c.LinkError, "cannot be a returned value"):
             link_c.Signature.read({"parameters": [], "result": callback(1), "returns_result": False}, "bad")
 
+    def test_typed_int_array_callback_checks_nominal_argument_and_failure_record(self):
+        def callback(module):
+            return dict(view(f"KuBootstrapIntArrayCallback_KuStruct_m{module}_9"),
+                        kind="IntArrayResultCallback", passing="value")
+
+        code = """#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+typedef struct { size_t len; int64_t *data; size_t capacity; } KuArrayInt;
+typedef struct { bool ok; KuArrayInt value; } KuBootstrapResult_KuArrayInt;
+typedef struct {
+    int append_status;
+    bool out_of_memory, overflow, index_failed;
+    const char *array_error;
+    int64_t index;
+    size_t length;
+} KuLocalAppendFailure;
+typedef struct { int64_t value; } TOKEN;
+typedef struct {
+    KuBootstrapResult_KuArrayInt (*entry)(void *, KuLocalAppendFailure *, KuArrayInt, int64_t, int64_t, TOKEN);
+    void *environment;
+    KuLocalAppendFailure *failure;
+} KuBootstrapIntArrayCallback_TOKEN;
+"""
+        entry = declaration("app.ku", 58, "forward_array", [callback(1)])
+        requested = declaration(self.left_path, 17, "apply_array", [callback(1)])
+        supplied = declaration(self.left_path, 17, "invoke_array", [callback(4)])
+        units = self.unit("array-callback-entry", plan(entry, [requested]), (code + """
+extern int64_t apply_array(KuBootstrapIntArrayCallback_TOKEN);
+int64_t forward_array(KuBootstrapIntArrayCallback_TOKEN f) { return apply_array(f); }
+""").replace("TOKEN", "KuStruct_m1_9"))
+        provider_code = (code + """
+int64_t invoke_array(KuBootstrapIntArrayCallback_TOKEN f) {
+    int64_t *data = malloc(sizeof(*data));
+    if (!data) return -2;
+    data[0] = 12;
+    KuBootstrapResult_KuArrayInt result = f.entry(f.environment, f.failure,
+        (KuArrayInt){1, data, 1}, 3, 10, (TOKEN){16});
+    if (f.failure->index_failed) return -1;
+    if (!result.ok) return -3;
+    int64_t total = result.value.data[0];
+    free(result.value.data);
+    return total;
+}
+""").replace("TOKEN", "KuStruct_m4_9")
+        provider = self.unit("array-callback-provider", plan(supplied), provider_code)
+        self.caller.write_text("""
+static KuBootstrapResult_KuArrayInt update(void *environment, KuLocalAppendFailure *failure, KuArrayInt input,
+                                          int64_t a, int64_t b, KuStruct_m1_9 token) {
+    int64_t *calls = environment;
+    ++*calls;
+    if (*calls > 1) {
+        free(input.data);
+        failure->index_failed = true;
+        failure->index = a;
+        return (KuBootstrapResult_KuArrayInt){0};
+    }
+    input.data[0] += a + b + token.value;
+    return (KuBootstrapResult_KuArrayInt){true, input};
+}
+int main(void) {
+    int64_t calls = 0;
+    KuLocalAppendFailure failure = {0};
+    KuBootstrapIntArrayCallback_KuStruct_m1_9 callback = {update, &calls, &failure};
+    if (forward_array(callback) != 41 || calls != 1 || failure.index_failed) return 1;
+    return forward_array(callback) != -1 || calls != 2 || !failure.index_failed || failure.index != 3;
+}
+""", encoding="ascii")
+        self.assertEqual(link_c.main([*units, *provider, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+
+        wrong_plan = copy.deepcopy(supplied)
+        wrong_plan["signature"]["parameters"][0].update(source_path="other/point.ku")
+        wrong = self.unit("array-callback-other-type", plan(wrong_plan), provider_code)
+        self.assert_preflight_error([*units, *wrong], "signature mismatch")
+        wrong = self.unit("array-callback-wrong-failure", plan(supplied),
+                          provider_code.replace("int64_t index;", "uint64_t index;"))
+        with contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(link_c.main([*units, *wrong, *self.build_args]), 1)
+        self.assertIn("C compiler exited", error.getvalue())
+        with self.assertRaisesRegex(link_c.LinkError, "cannot be a returned value"):
+            link_c.Signature.read({"parameters": [], "result": callback(1), "returns_result": False}, "bad")
+
     def test_parameter_order_and_result_status_are_checked(self):
         wrong = copy.deepcopy(self.left)
         wrong["signature"]["parameters"].reverse()
