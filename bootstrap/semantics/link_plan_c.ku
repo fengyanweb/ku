@@ -339,6 +339,15 @@ fn ExitLinkedFailure(state: LinkedNullState, &indent: str): LinkedNullState {
     return next
 }
 
+fn BindLinkedLocalCallback(state: LinkedNullState, name: str, ty: TypeNameBinding, text: str): LinkedNullState {
+    next = state
+    index = next.slots.len() + 1
+    value = LinkedNullValue { ty: ty, text: text, slot: index, borrowed: true, member_path: "" }
+    next.slots = next.slots.push(LinkedNullSlot { binding: name, value: value, parameter: false, live: true, moved_members: [] })
+    next.local_callbacks = next.local_callbacks.push(index)
+    return next
+}
+
 fn LinkedNullBinding(&slots: [LinkedNullSlot], &name: str): int {
     if (name == "") { return 0 }
     index = 0

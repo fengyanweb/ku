@@ -1,7 +1,7 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkedNullValue,
+import { BindLinkedLocalCallback, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkedNullValue,
     LinkedReadonlyExpression, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedIntResult, LinkedNullChild, LinkedNullCType, LinkedNullNode,
     LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedStringResult,
@@ -91,15 +91,6 @@ fn ReadLinkedLocalThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     return ok(LinkedLocalBody { state: body, thunk: thunk })
 }
 
-fn bindLinkedLocalCallback(state: LinkedNullState, name: str, ty: TypeNameBinding, text: str): LinkedNullState {
-    next = state
-    index = next.slots.len() + 1
-    value = LinkedNullValue { ty: ty, text: text, slot: index, borrowed: true, member_path: "" }
-    next.slots = next.slots.push(LinkedNullSlot { binding: name, value: value, parameter: false, live: true, moved_members: [] })
-    next.local_callbacks = next.local_callbacks.push(index)
-    return next
-}
-
 fn FinishLinkedLocalThunk(&parent: LinkedNullState, &thunk: LinkedLocalThunk,
                           lowered: LinkedNullRegion, &function: Node, id: int): LinkedNullState! {
     if (!lowered.terminal || lowered.state.append_slots.len() > 0) {
@@ -132,7 +123,7 @@ fn FinishLinkedLocalThunk(&parent: LinkedNullState, &thunk: LinkedLocalThunk,
     next.code += "    " + frame.clone() + " = (" + thunk.environment.clone() + "){" + thunk.initializers.clone() + " };\n"
         + "    " + descriptor.clone() + " = (" + carrier + "){" + symbol + ", &" + frame + "};\n"
         + "    (void)" + descriptor.clone() + ";\n"
-    return ok(bindLinkedLocalCallback(next, function.text.clone(), callback, descriptor))
+    return ok(BindLinkedLocalCallback(next, function.text.clone(), callback, descriptor))
 }
 
 fn LowerLinkedLocalAlias(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
