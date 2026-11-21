@@ -7,7 +7,7 @@ import { RejectLayout } from "./struct_layouts.ku"
 import { BindLinkedLocalCallback, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState,
     LinkedReadonlyExpression, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedIntResult, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullNode,
-    LinkedNullProject, LinkedNullType, LinkedStringResult, ReadLinkedOwnedArray, ReadLinkedResult } from "./linked_null_types_c.ku"
+    LinkedNullProject, LinkedNullType, LinkedStringResult, LowerLinkedContextualArgument, ReadLinkedOwnedArray, ReadLinkedResult } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, CheckLinkedUnitDecrement, RegisterLinkedNullType } from "./linked_parameters_c.ku"
 import { DropLinkedNullScope, LinkedIncreasingGuard, LinkedLiveIntBinding, RejectLinkedLoopWrite, RejectLinkedWriteRange } from "./linked_member_ownership.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
@@ -17,7 +17,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { LinkedChildKindIs, RestoreLinkedThunkFrame } from "./link_plan_json_c.ku"
-import { EmitLinkedOptionalIntTest, StartLinkedThunkFrame } from "./scalar_result_null.ku"
+import { EmitLinkedOptionalIntTest, HasLinkedContextualArgument, StartLinkedThunkFrame } from "./scalar_result_null.ku"
 import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedOwnedForLoop, ReadLinkedLocalCaptures, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
 
 struct LinkedLocalThunk {
@@ -130,6 +130,21 @@ fn FinishLinkedLocalThunk(&parent: LinkedNullState, &thunk: LinkedLocalThunk,
         + "    " + descriptor.clone() + " = (" + carrier + "){" + symbol + ", &" + frame + "};\n"
         + "    (void)" + descriptor.clone() + ";\n"
     return ok(BindLinkedLocalCallback(next, function.text.clone(), callback, descriptor))
+}
+
+fn LowerLinkedReturnValue(&project: LinkedNullProject, state: LinkedNullState,
+                          &result: TypeNameBinding, id: int): LinkedNullExpression! {
+    if (result.declaration_kind == "NullableRecordViewReader") {
+        eligible = HasLinkedContextualArgument(project, state, result, id, 0)?
+        if (eligible) {
+            reader = LowerLinkedContextualArgument(project, state, result, id)?
+            slot = AddLinkedNullSlot(project, reader.state, "", "returned_reader_" + str(id), result.clone(), false)?
+            slot.state.code += "    " + slot.value.text.clone() + " = " + reader.value.text.clone() + ";\n"
+            slot.state.slots[slot.value.slot - 1].live = true
+            return ok(slot)
+        }
+    }
+    return LowerLinkedNullValue(project, state, id, 0)
 }
 
 fn LowerLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, id: int): LinkedNullExpression! {

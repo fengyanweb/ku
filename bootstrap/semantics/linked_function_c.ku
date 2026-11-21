@@ -17,6 +17,7 @@ import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName 
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
          LinkedNullNode, LinkedNullProject,  LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { LowerLinkedReturnValue } from "./linked_char_iter_c.ku"
 import { LinkedFieldAppendArgument, ReadLinkedMemberPlace } from "./struct_string_calls.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue, LowerLinkedScopedCallbackCall } from "./linked_null_values_c.ku"
 import { IsLinkedScopedCallback, LinkedScopedCallbackTypes, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue,
@@ -221,7 +222,7 @@ fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,
         RejectLayout("linked_value_return", "expected one value", DeclarationSpan(statement))?
     }
     id = LinkedNullChild(project, 1, statement, 0)
-    value = LowerLinkedNullValue(project, state, id, 0)?
+    value = LowerLinkedReturnValue(project, state, result, id)?
     if (result.declaration_kind == "NullableInt") { return EmitLinkedOptionalIntReturn(value, statement) }
     copy = LinkedPlainCopyResult(result)
     static_string = false
