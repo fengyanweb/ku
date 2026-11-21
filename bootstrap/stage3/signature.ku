@@ -395,7 +395,8 @@ fn ReadSignatureTypePrefix(&tokens: [Token], start: int, window_end: int): Signa
                     work = work + 1
                     frame.param_index = cursor
                 } else {
-                    cursor = FunctionReturnStart(tokens, cursor, window_end, type_last)?
+                    returned = FunctionReturnStart(tokens, cursor, window_end, type_last)?
+                    cursor = returned
                     work = work + 2
                     frame.returning = true
                 }
