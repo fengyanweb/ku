@@ -896,6 +896,63 @@ fn main(): null! {
         assert error in rejected.stderr and not rejected.stdout, rejected.stderr
 
 
+def exercise_linked_unit_enum_match(compiler, cc, caller):
+    project = caller / "linked-unit-enum-match"
+    project.mkdir()
+    (project / "model.ku").write_text("""enum Phase { Ready\n Done }
+enum Other { Ready\n Done }
+fn Select(flag: int): Phase {
+    println(str(flag))
+    if (flag == 1) { return Phase.Ready }
+    return Phase.Done
+}
+fn Finish(phase: Phase, code: int): int {
+    println(str(code))
+    return code
+}
+""", encoding="utf-8")
+    header = 'import model from "./model.ku"\n'
+    main = project / "main.ku"
+    main.write_text(header + """fn Dispatch(flag: int): int {
+    phase = model.Select(flag)
+    return match phase {
+        model.Phase.Ready => model.Finish(phase, 31)
+        model.Phase.Done => model.Finish(phase, 47)
+    }
+}
+fn WithDefault(flag: int): int {
+    return match model.Select(flag) {
+        model.Phase.Ready => 53
+        _ => 61
+    }
+}
+fn main(): null! {
+    println(str(Dispatch(1)))
+    println(str(Dispatch(2)))
+    println(str(WithDefault(1)))
+    println(str(WithDefault(2)))
+    return ok(null)
+}
+""", encoding="utf-8")
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\nmodel.ku\n", encoding="utf-8")
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    output = project / ("match.exe" if os.name == "nt" else "match")
+    execute([sys.executable, "-B", builder, manifest, "--compiler", compiler, "--cc", cc, "-o", output], caller)
+    assert execute([output], caller).stdout.replace(b"\r\n", b"\n") == b"1\n31\n31\n2\n47\n47\n1\n53\n2\n61\n"
+    for arms, error in [
+        ("model.Phase.Ready => 1", b"linked_match_nonexhaustive"),
+        ("model.Phase.Ready => 1, model.Phase.Ready => 3, _ => 5", b"linked_match_unreachable"),
+        ("_ => 1, model.Phase.Ready => 3", b"unreachable_match_arm"),
+        ("model.Other.Ready => 1, _ => 5", b"linked_match_pattern"),
+        ("model.Phase.Ready => false, _ => 5", b"linked_match_arm_result"),
+    ]:
+        main.write_text(header + "fn Bad(phase: model.Phase): int {\n"
+                        "    return match phase { " + arms + " }\n}\n", encoding="utf-8")
+        rejected = execute([compiler, "emit-unit-plan", manifest, "Bad"], caller, 1)
+        assert error in rejected.stderr and not rejected.stdout, rejected.stderr
+
+
 def exercise_linked_reader_factory(compiler, cc, caller):
     project = caller / "linked-reader-factory"
     project.mkdir()
@@ -1492,6 +1549,7 @@ def exercise(ku, cc):
         exercise_static_reader_argument(compiler, cc, caller)
         exercise_linked_unit_enum(compiler, cc, caller)
         exercise_linked_unit_enum_branch(compiler, cc, caller)
+        exercise_linked_unit_enum_match(compiler, cc, caller)
         exercise_linked_reader_factory(compiler, cc, caller)
         exercise_linked_owned_string_for(compiler, cc, caller)
         exercise_parameter_bindings(compiler, cc, caller)

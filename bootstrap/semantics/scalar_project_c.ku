@@ -1,16 +1,18 @@
+import { ContainsIndex, ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult } from "./struct_projection_c.ku"
+import { StructValueResultHeader } from "./struct_result_c.ku"
 import { DropLinkedNullScope } from "./linked_member_ownership.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FindLinkedLocalRead } from "./call_contracts.ku"
-import { LinkedAbsoluteType, LinkedBuiltin, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullView } from "./linked_null_types_c.ku"
-import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
+import { LinkedAbsoluteType, LinkedBuiltin, LinkedNullChild, LinkedIntResult, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullView } from "./linked_null_types_c.ku"
+import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedScopedCallbackTypes } from "./link_plan_c.ku"
 import { CollectFields, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { BuildProjectOwningLayouts, OrderCStructLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
-import { FindUnitEnumType, ReadUnitEnumVariant, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
+import { FindUnitEnumType, LinkedCopyResult, ReadUnitEnumVariant, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { Span } from "../stage2/span.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
-import { EmitLinkPlan } from "./link_plan_json_c.ku"
+import { EmitLinkPlan, LinkedNullPrototype, LinkedScopedCallbackFunction, LinkedScopedCallbackPrototype } from "./link_plan_json_c.ku"
 import { BindProjectModules, ProjectModuleBindings } from "./project_bindings.ku"
 import { EmitScalarIntModule, LowerScalarIntFunction, ScalarIntC, AppendScalarIntCallees } from "./scalar_int_c.ku"
 import { ScalarFunctionNode, ScalarIntCalleeSignature, ScalarIntImport } from "./scalar_int_calls.ku"
@@ -273,4 +275,136 @@ fn FinishLinkedEnumComparison(value: LinkedNullExpression, &left: LinkedNullValu
         + node.text.clone() + " (" + right.value.text.clone() + ").tag;\n"
     done = DropLinkedNullScope(right.state, before)
     return ok(LinkedReadonlyExpression(done, LinkedBuiltin("bool", at), result))
+}
+
+fn PlanLinkedUnitMatch(&project: LinkedNullProject, &state: LinkedNullState,
+                       &match_node: Node, &ty: TypeNameBinding): [int]! {
+    at = DeclarationSpan(match_node)
+    if (ty.declaration_kind != "UnitEnum" || match_node.edge_count < 2) {
+        RejectLayout("linked_match_subject", "expected a payload-free enum and at least one match arm", at.clone())?
+    }
+    declaration = LinkedNullNode(project, ty.module_index, ty.declaration_node)
+    arm_count = match_node.edge_count - 1
+    variant_count = declaration.edge_count
+    plan: [int] = []
+    wildcard = false
+    index = 0
+    while (index < arm_count) {
+        arm = LinkedNullNode(project, 1, LinkedNullChild(project, 1, match_node, index + 1))
+        if (arm.kind != "MatchArm" || arm.edge_count != 2 || wildcard) {
+            RejectLayout("linked_match_arm", "expected an unguarded match arm before any wildcard", DeclarationSpan(arm))?
+        }
+        pattern = LinkedNullNode(project, 1, LinkedNullChild(project, 1, arm, 0))
+        if (pattern.kind == "MatchWildcard") {
+            wildcard = true
+            plan = plan.push(0)
+        } else {
+            if (pattern.kind != "Field" || pattern.edge_count != 1) {
+                RejectLayout("linked_match_pattern", "expected a unit enum variant or wildcard", DeclarationSpan(pattern))?
+            }
+            selected = FindLinkedEnumSelection(project, state, pattern)?
+            if (selected.index == 0 || !SameBoundTypeIdentity(ty, selected.ty)) {
+                RejectLayout("linked_match_pattern", "expected a variant from the subject enum", DeclarationSpan(pattern))?
+            }
+            if (ContainsIndex(plan, selected.index)) {
+                RejectLayout("linked_match_unreachable", "duplicate enum variant match arm", DeclarationSpan(arm))?
+            }
+            plan = plan.push(selected.index)
+        }
+        index = index + 1
+    }
+    if (!wildcard && plan.len() != variant_count) {
+        missing = ""
+        index = 0
+        while (index < variant_count) {
+            if (!ContainsIndex(plan, index + 1)) {
+                variant = LinkedNullNode(project, ty.module_index, LinkedNullChild(project, ty.module_index, declaration, index))
+                if (missing != "") { missing += ", " }
+                missing += variant.text
+            }
+            index = index + 1
+        }
+        RejectLayout("linked_match_nonexhaustive", "enum match is not exhaustive; missing " + missing, at)?
+    }
+    return ok(plan)
+}
+
+fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunction], &slots: [LinkedNullSlot],
+                            &locals: [LinkedLocalAppend], &payload: TypeNameBinding, checked: bool): str! {
+    text = ""
+    records: [str] = []
+    callbacks = LinkedScopedCallbackTypes(links, slots)
+    if (callbacks.len() > 0 || locals.len() > 0) { text += LinkedAppendFailureDeclaration() }
+    string_result = LinkedBufferResult(payload)
+    index = 0
+    while (!string_result && index < links.len()) {
+        string_result = links[index].returns_result && LinkedBufferResult(links[index].result)
+        index = index + 1
+    }
+    if (string_result) { text += StructValueResultHeader("KuProjectionString") }
+    if (payload.declaration_kind == "Struct" || (checked && (LinkedCopyResult(payload) || LinkedNullIntArrayOwner(payload)))) {
+        root = LinkedNullCType(payload)?
+        text += StructValueResultHeader(root)
+        records = records.push(root)
+    }
+    index = 0
+    while (index < callbacks.len()) {
+        kind = LinkedNullCType(callbacks[index])?
+        if (!ContainsType(records, kind)) {
+            signature = LinkedScopedCallbackFunction(project, callbacks[index])?
+            result = LinkedNullCType(signature.result)?
+            if (signature.returns_result && !ContainsType(records, result)) {
+                text += StructValueResultHeader(result)
+                records = records.push(result)
+            }
+            text += LinkedScopedCallbackPrototype(callbacks[index], signature, kind)?
+            records = records.push(kind)
+        }
+        index = index + 1
+    }
+    index = 0
+    while (index < slots.len()) {
+        if (slots[index].value.ty.declaration_kind == "IntPairResultCallback") {
+            callback = slots[index].value.ty.clone()
+            carrier = LinkedNullCType(callback)?
+            if (!ContainsType(records, carrier)) {
+                result = CTypeName(callback.module_index, callback.declaration_node)
+                if (!ContainsType(records, result)) {
+                    text += StructValueResultHeader(result)
+                    records = records.push(result.clone())
+                }
+                text += "typedef struct { KuBootstrapResult_" + result + " (*entry)(void*, int64_t, int64_t); "
+                    + "void *environment; } " + carrier.clone() + ";\n"
+                records = records.push(carrier)
+            }
+        }
+        index = index + 1
+    }
+    link_index = 0
+    while (link_index < links.len()) {
+        if (links[link_index].returns_result && (links[link_index].result.declaration_kind == "Struct"
+            || LinkedCopyResult(links[link_index].result) || LinkedNullIntArrayOwner(links[link_index].result))) {
+            kind = LinkedNullCType(links[link_index].result)?
+            if (!ContainsType(records, kind)) {
+                text += StructValueResultHeader(kind)
+                records = records.push(kind)
+            }
+        }
+        text += LinkedNullPrototype(links[link_index])?
+        link_index = link_index + 1
+    }
+    // Local append thunks are private; their carriers belong in the
+    // prelude, even when no link dependency or exported result needs one.
+    local_index = 0
+    while (local_index < locals.len()) {
+        if (LinkedIntResult(locals[local_index].function.result) || LinkedNullIntArrayOwner(locals[local_index].function.result)) {
+            kind = LinkedNullCType(locals[local_index].function.result)?
+            if (!ContainsType(records, kind)) {
+                text += StructValueResultHeader(kind)
+                records = records.push(kind)
+            }
+        }
+        local_index = local_index + 1
+    }
+    return ok(text)
 }

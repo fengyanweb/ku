@@ -57,8 +57,10 @@ namespace imports keep the enum's declaration identity across C units.
 Passing or returning an existing enum binding moves it. Equality and inequality
 compare values of the same payload-free enum without moving either operand.
 Direct calls in readonly operands still require View or scalar Copy arguments.
-Enum matching, enum payloads, and enum containers remain outside the linked
-emitter subset.
+A complete `return match` can choose an int result from unit-variant arms or a
+final wildcard. The subject is evaluated once, and the selected arm alone runs.
+Payload patterns, guards, other match expression positions, enum payloads, and
+enum containers remain outside the linked emitter subset.
 
 ## Check a set of relative modules
 
