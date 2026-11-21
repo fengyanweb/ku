@@ -108,7 +108,9 @@ class TypeRef:
             owned_int = name == "int" and passing == "value" and c_type == int_array
             if (ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0
                     or not (view or owned or owned_int)):
-                raise LinkError(f"{where} builtin array requires a matching readonly or owned C carrier")
+                raise LinkError(f"{where} builtin array requires the checked View [str] carrier, "
+                                "the checked owned [str]! result carrier, or a matching View, owned, "
+                                "or checked owned [int] carrier")
             identity = ("builtin_array", name)
         elif kind_name in ("Struct", "StructArray"):
             identity = ("struct" if kind_name == "Struct" else "struct_array",
