@@ -82,15 +82,20 @@ fn RegisterLinkedLocalRead(&project: LinkedNullProject, state: LinkedNullState, 
         }
         callee = ResolveLinkedCall(project, state.slots, call, target, false)?
         view = callee.parameters[0].clone()
-        if (view.declaration_kind != "StructView" || !SameLinkedType(LinkedViewPointee(view), element) ||
-            !SameLinkedType(callee.result, result)) {
+        matching = false
+        if (view.declaration_kind == "StructView") {
+            pointee = LinkedViewPointee(view)
+            matching = SameLinkedType(pointee, element) && SameLinkedType(callee.result, result)
+        }
+        if (!matching) {
             RejectLocalReader(call, "mapper must borrow one matching element and return the declared record")?
         }
     }
     shift = readLocalIndexShift(project, LinkedNullNode(project, 1, LinkedNullChild(project, 1, index, 1)), parameter.text)?
-    state.local_readers = state.local_readers.push(LinkedLocalReadBinding {
+    next = state
+    next.local_readers = next.local_readers.push(LinkedLocalReadBinding {
         name: function.text.clone(), node: id, captured_slot: capture, index_shift: shift })
-    return ok(state)
+    return ok(next)
 }
 
 fn LowerLinkedArrayBinding(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
