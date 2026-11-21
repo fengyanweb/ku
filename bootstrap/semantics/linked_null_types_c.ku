@@ -4,7 +4,7 @@ import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
-import { ResolveTypeName, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
+import { ResolveTypeName, RetagTypeNameBinding, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { CTypeName, ProjectionBuiltinLinkFor, ProjectionBuiltinLinkId, ProjectionBytesGet, LinkedBufferResult, LinkedIntArrayCallbackNominal, LinkedIntAppendCallbackNominals, RequireProjectionLocalFunction, ProjectionPlaceRoot, RequireProjectionBuiltin, ResolveProjectionDirectFunction } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningStructDropReference } from "./nested_struct_c.ku"
@@ -78,9 +78,8 @@ fn readIntCallback(&project: LinkedNullProject, unit: int, &node: Node, view: bo
     if (result.declaration_kind != "Struct") {
         RejectLayout("linked_callback_type", "callback result must be a named record with the declared result mode", result.span.clone())?
     }
-    result.declaration_kind = "IntPairResultCallback"
-    if (count == 1) { result.declaration_kind = "IntRecordReaderCallback" }
-    return ok(result)
+    if (count == 1) { return ok(RetagTypeNameBinding(result, "IntRecordReaderCallback")) }
+    return ok(RetagTypeNameBinding(result, "IntPairResultCallback"))
 }
 
 fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view: bool): TypeNameBinding! {
@@ -98,8 +97,7 @@ fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view
         if (ty.declaration_kind != "Struct") {
             RejectLayout("linked_callback_type", "expected a by-value nominal record", ty.span.clone())?
         }
-        ty.declaration_kind = "IntArrayResultCallback"
-        return ok(ty)
+        return ok(RetagTypeNameBinding(ty, "IntArrayResultCallback"))
     }
     if (node.kind == "TypeFunction") { return readIntCallback(project, unit, node, view) }
     if (!view) {
@@ -111,22 +109,18 @@ fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view
     if (node.kind == "TypeArray" && node.edge_count == 1) {
         ty = LinkedNullType(project, unit, LinkedNullChild(project, unit, node, 0))?
         if (ty.declaration_kind == "Struct") {
-            ty.declaration_kind = "StructArray"
-            return ok(ty)
+            return ok(RetagTypeNameBinding(ty, "StructArray"))
         }
         if (ty.declaration_kind == "Builtin" && (ty.name == "str" || ty.name == "int")) {
-            ty.declaration_kind = "BuiltinArray"
-            return ok(ty)
+            return ok(RetagTypeNameBinding(ty, "BuiltinArray"))
         }
     } else if (node.kind == "TypeName") {
         ty = LinkedNullType(project, unit, id)?
         if (ty.declaration_kind == "Builtin" && ty.name == "str") {
-            ty.declaration_kind = "StringView"
-            return ok(ty)
+            return ok(RetagTypeNameBinding(ty, "StringView"))
         }
         if (ty.declaration_kind == "Struct") {
-            ty.declaration_kind = "StructView"
-            return ok(ty)
+            return ok(RetagTypeNameBinding(ty, "StructView"))
         }
     }
     RejectLayout("linked_entry_view", "expected a readonly str, named struct or supported array", DeclarationSpan(node))?
@@ -134,11 +128,9 @@ fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view
 }
 
 fn LinkedNullArrayElement(binding: TypeNameBinding): TypeNameBinding {
-    result = binding
-    if (result.declaration_kind == "BuiltinArray" || result.declaration_kind == "OwnedStringArray" ||
-        LinkedNullIntArrayOwner(result)) { result.declaration_kind = "Builtin" }
-    else { result.declaration_kind = "Struct" }
-    return result
+    if (binding.declaration_kind == "BuiltinArray" || binding.declaration_kind == "OwnedStringArray" ||
+        LinkedNullIntArrayOwner(binding)) { return RetagTypeNameBinding(binding, "Builtin") }
+    return RetagTypeNameBinding(binding, "Struct")
 }
 
 fn LinkedNullArrayPrefix(&binding: TypeNameBinding): str {
@@ -268,18 +260,15 @@ fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, allow_i
     }
     element = LinkedNullType(project, unit, LinkedNullChild(project, unit, array, 0))?
     if (allow_int && element.declaration_kind == "Builtin" && element.name == "int") {
-        element.declaration_kind = "OwnedIntArray"
-        return ok(element)
+        return ok(RetagTypeNameBinding(element, "OwnedIntArray"))
     }
     if (allow_str && LinkedStringResult(element)) {
-        element.declaration_kind = "OwnedStringArray"
-        return ok(element)
+        return ok(RetagTypeNameBinding(element, "OwnedStringArray"))
     }
     if (element.declaration_kind != "Struct") {
         RejectLayout("linked_owned_array_type", "expected a bound struct element", DeclarationSpan(array))?
     }
-    element.declaration_kind = "OwnedStructArray"
-    return ok(element)
+    return ok(RetagTypeNameBinding(element, "OwnedStructArray"))
 }
 
 fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bool): TypeNameBinding! {

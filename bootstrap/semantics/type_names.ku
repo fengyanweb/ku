@@ -106,3 +106,10 @@ fn SameBoundTypeIdentity(&a: TypeNameBinding, &b: TypeNameBinding): bool {
         && a.declaration_node == b.declaration_node
         && ((a.declaration_kind != "Builtin" && a.declaration_kind != "BuiltinArray") || a.name == b.name)
 }
+
+fn RetagTypeNameBinding(binding: TypeNameBinding, kind: str): TypeNameBinding {
+    return TypeNameBinding {
+        use_node: binding.use_node, name: binding.name, declaration_kind: kind,
+        module_index: binding.module_index, declaration_node: binding.declaration_node, span: binding.span
+    }
+}
