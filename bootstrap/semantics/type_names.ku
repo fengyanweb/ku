@@ -1,8 +1,9 @@
+import "std.string"
 import { Node } from "../stage2/ast.ku"
 import { DiagnosticCanonical, MakeDiagnostic } from "../stage2/diagnostic.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
-import { BindSuppliedImports, ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
+import { BindSuppliedImports, ImportBinding, ReadImportNode, ResolveSuppliedExport, SuppliedModule } from "./imports.ku"
 
 // Node IDs are local to the relevant AST. Module 0 denotes the source module;
 // supplied modules are one-based. Built-ins have no declaration node.
@@ -51,13 +52,25 @@ fn ResolveTypeName(&use: Node, use_index: int, &local: [TopLevelName],
     index = 0
     while (index < imports.len()) {
         entry = imports[index].clone()
-        if (entry.module_index > 0 && entry.local_name == name) {
-            target = ReadImportNode(supplied[entry.module_index - 1].named.parsed.arena.nodes,
-                                    entry.target_node, at.clone())?
+        target_node = 0
+        if (entry.module_index > 0) {
+            if (entry.target_node > 0 && entry.local_name == name) {
+                target_node = entry.target_node
+            } else if ((use.kind == "TypeName" || use.kind == "StructLiteral") &&
+                entry.target_node == 0 && entry.local_name != "") {
+                start = entry.local_name.len() + 1
+                if (name.starts_with(entry.local_name + ".")) {
+                    member = string.slice(name.clone(), start, name.len())?
+                    target_node = ResolveSuppliedExport(supplied[entry.module_index - 1].named, member, at.clone())?
+                }
+            }
+        }
+        if (target_node > 0) {
+            target = ReadImportNode(supplied[entry.module_index - 1].named.parsed.arena.nodes, target_node, at.clone())?
             if (target.kind == "Struct" || target.kind == "Enum") {
                 return ok(TypeNameBinding {
                     use_node: use_index, name: name, declaration_kind: target.kind,
-                    module_index: entry.module_index, declaration_node: entry.target_node, span: at
+                    module_index: entry.module_index, declaration_node: target_node, span: at
                 })
             }
         }

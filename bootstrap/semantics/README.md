@@ -39,7 +39,15 @@ private export produce different positioned errors.
 This pass takes explicit module inputs. A full relative import
 (`import "./library.ku"`) brings the supplier's public declarations into
 scope and adds a project dependency even when the supplier has no exports.
-User file namespace and package imports remain outside this pass.
+A relative namespace import (`import lib from "./library"`) binds one alias
+and preserves the same dependency edge. Typed units and the linked application
+builder resolve direct calls such as `lib.Step(value)` to the supplier's
+function declaration. A type annotation such as `&value: lib.Counter` and
+a literal such as `lib.Counter { value: 8 }` use the same declaration as a
+named import of `Counter`. A named or namespace-qualified function can be
+passed directly to a matching `fn(&Row): int | null` parameter from a module
+function when its declared View and return type match. Other function value
+conversions and package imports remain outside this subset.
 
 ## Check a set of relative modules
 
@@ -58,13 +66,13 @@ Use `ku build --release project_main.ku -o ku-check-project` from this tool's
 directory. With the resulting executable beside `modules.txt`, run it to print
 the validated dependencies in dependency order and the imported declaration and
 explicit type bindings. The tool reads the files named in the manifest and
-resolves named relative imports, aliases and full relative imports against
-that set. It binds standard library
+resolves named relative imports, aliases, full relative imports and relative
+namespace imports against that set. It binds standard library
 namespaces from `import { fs, string } from "std"`, `import "std.fs"` or
 `import fs from "std.fs"`. A `STD` row gives the importing path, namespace,
 import node and request node. These namespaces have no file dependency and
 cannot be used as type names. The tool also checks argument counts for direct
-calls to local and named-import functions, including import aliases. Names
+calls to local and imported functions, including direct namespace calls. Names
 that could be shadowed by a local binding and calls through a value are left
 to lexical binding and expression type checking. A call-count error carries
 the source path and the full call span. Once the arity matches, a scalar

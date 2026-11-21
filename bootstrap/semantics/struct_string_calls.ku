@@ -1,3 +1,4 @@
+import { ResolveLinkedCall } from "./scalar_result_null.ku"
 import { LinkedIntSnapshotCall } from "./guarded_string_parts.ku"
 import { Arena, Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -11,7 +12,7 @@ import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { BoundLinkPlanType, LinkedNullArrayHeader, LinkedNullBinding, LinkedNullExpression, LinkedNullOwnedArray, LinkedIntArrayLayout, LinkedNullState, LinkedNullValue, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
 import { LinkedMemberUnavailable, RequireLinkedMove } from "./linked_member_ownership.ku"
 import { AddLinkedNullSlot, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
-import { LinkedBuiltin, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullView, LinkedStringResult, ResolveLinkedCall } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullView, LinkedStringResult } from "./linked_null_types_c.ku"
 import { LinkedCopyResult, NamedFieldPushArgument, RetagTypeNameBinding, TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { FinishLinkedFieldRead, LowerLinkedNullRead, ReadLinkedArrayElementAfterBase } from "./linked_null_read_c.ku"
 
@@ -47,7 +48,7 @@ fn resolveStructStringTarget(&supplied: [SuppliedModule], &project: ProjectBindi
     index = importedFunctionIndex(project, target.text)
     if (index != 0) {
         link = project.modules[0].imports[index - 1].clone()
-        if (link.module_index <= 0) {
+        if (link.target_node <= 0) {
             RejectLayout("unsupported_struct_string_call", "expected an explicit project module dependency", DeclarationSpan(target))?
         }
         return ok(StructStringTarget { unit: link.module_index, node: link.target_node, source_name: link.source_name })
@@ -310,7 +311,7 @@ fn LinkedOwnedStringPredicate(&project: LinkedNullProject, &state: LinkedNullSta
     if (call.kind != "Call" || call.edge_count < 2 || call.edge_count > 9) { return ok(false) }
     target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
     if (target.kind != "Variable" || target.edge_count != 0) { return ok(false) }
-    callee = ResolveLinkedCall(project, state.slots, call, target, false)?
+    callee = ResolveLinkedCall(project, state, call, target, false)?
     if (callee.returns_result || callee.result.declaration_kind != "Builtin" || callee.result.name != "bool") {
         return ok(false)
     }

@@ -2,7 +2,7 @@ import { CheckDirectOwnedMoves } from "./call_contracts.ku"
 import { EscapeCanonical } from "../stage1/token.ku"
 import { FirstSubtreeNode, Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
-import { BindProjectImports, ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
+import { BindProjectImports, ImportBinding, ProjectNamespaceModule, ReadImportNode, ResolveProjectNamespaceFunction, SuppliedModule } from "./imports.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule, RejectName, CheckParameterWrites } from "./names.ku"
 import { BindImportedTypeNames, TypeNameBinding } from "./type_names.ku"
 
@@ -242,7 +242,29 @@ fn checkLiteralType(&annotation: ScalarAnnotation, &nodes: [Node], &edges: [int]
     return ok(null)
 }
 
-fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignature], function: int): null! {
+fn checkBoundCall(&nodes: [Node], &edges: [int], &signature: DirectSignature, &call: Node, transfers: [int]): [int]! {
+    arity = signature.parameters.len()
+    count = call.edge_count - 1
+    if (count != arity) {
+        RejectName("call_arity", "function '" + signature.name.clone() + "' expects "
+                   + str(arity) + " arguments but got " + str(count), DeclarationSpan(call))?
+    }
+    moved = transfers
+    argument = 0
+    while (argument < count) {
+        node = edges[call.first_edge + argument + 1]
+        checkLiteralType(signature.parameters[argument], nodes, edges, nodes[node - 1], "call_argument_type")?
+        if (signature.parameters[argument].owns_string &&
+            (nodes[node - 1].kind == "Variable" || nodes[node - 1].kind == "Field")) {
+            moved = moved.push(node)
+        }
+        argument = argument + 1
+    }
+    return ok(moved)
+}
+
+fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignature],
+                      &imports: [ImportBinding], &supplied: [SuppliedModule], function: int): null! {
     start = FirstSubtreeNode(nodes, edges, function)
     // This pass proves direct targets. Defer potentially shadowed names,
     // including local functions/captures, to a later lexical binding pass.
@@ -251,7 +273,7 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
     while (index < function) {
         if (couldBindLocal(nodes[index - 1].kind)) {
             candidate = directSignatureIndex(signatures, nodes[index - 1].text)
-            if (candidate > 0) {
+            if (candidate > 0 || ProjectNamespaceModule(imports, nodes[index - 1].text) > 0) {
                 present = containsName(shadowed, nodes[index - 1].text)
                 if (!present) { shadowed = shadowed.push(nodes[index - 1].text.clone()) }
             }
@@ -269,23 +291,21 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
                 if (!present) {
                     signature = directSignatureIndex(signatures, nodes[target - 1].text)
                     if (signature > 0) {
-                        binding = signature - 1
-                        arity = signatures[binding].parameters.len()
-                        count = nodes[index - 1].edge_count - 1
-                        if (count != arity) {
-                            RejectName("call_arity", "function '" + nodes[target - 1].text.clone() + "' expects "
-                                       + str(arity) + " arguments but got " + str(count), DeclarationSpan(nodes[index - 1]))?
-                        }
-                        argument = 0
-                        while (argument < count) {
-                            node = edges[nodes[index - 1].first_edge + argument + 1]
-                            checkLiteralType(signatures[binding].parameters[argument], nodes, edges, nodes[node - 1], "call_argument_type")?
-                            if (signatures[binding].parameters[argument].owns_string &&
-                                (nodes[node - 1].kind == "Variable" || nodes[node - 1].kind == "Field")) {
-                                transfers = transfers.push(node)
-                            }
-                            argument = argument + 1
-                        }
+                        transfers = checkBoundCall(nodes, edges, signatures[signature - 1], nodes[index - 1], transfers)?
+                    }
+                }
+            } else if (nodes[target - 1].kind == "Field" && nodes[target - 1].edge_count == 1) {
+                receiver = edges[nodes[target - 1].first_edge]
+                if (nodes[receiver - 1].kind == "Variable" && nodes[receiver - 1].edge_count == 0 &&
+                    !containsName(shadowed, nodes[receiver - 1].text)) {
+                    unit = ProjectNamespaceModule(imports, nodes[receiver - 1].text)
+                    if (unit > 0) {
+                        declaration = ResolveProjectNamespaceFunction(supplied[unit - 1], nodes[target - 1])?
+                        provider = supplied[unit - 1].named.parsed.arena.nodes[declaration - 1].clone()
+                        member = nodes[receiver - 1].text + "." + nodes[target - 1].text
+                        bound = directSignature(supplied[unit - 1].named.parsed.arena.nodes,
+                                                supplied[unit - 1].named.parsed.arena.edges, provider, member)
+                        transfers = checkBoundCall(nodes, edges, bound, nodes[index - 1], transfers)?
                     }
                 }
             }
@@ -348,7 +368,8 @@ fn CheckDirectCallContracts(&named: NamedModule, &imports: [ImportBinding], &sup
     while (index < declaration_count) {
         if (IsNamedFunction(named.names.declarations[index].kind)) {
             function = named.names.declarations[index].node
-            checkFunctionCalls(named.parsed.arena.nodes, named.parsed.arena.edges, signatures, function)?
+            checkFunctionCalls(named.parsed.arena.nodes, named.parsed.arena.edges,
+                               signatures, imports, supplied, function)?
         }
         index = index + 1
     }

@@ -6,27 +6,22 @@ import { LinkedViewArgument, MatchesLinkedFieldValue, MoveLinkedNullSlot } from 
 import { Node } from "../stage2/ast.ku"
 import { FindLinkedLocalRead } from "./call_contracts.ku"
 import { FinishLinkedCheckedStatement, InvokeLinkedReader, LinkedCallArgument, LinkedReaderCallable, LinkedRetainedViewUnavailable, LinkedViewRetention, NoLinkedRetention, RetainLinkedField } from "./linked_nullable_reader_c.ku"
-import { LinkedNullCallSymbol } from "./scalar_result_null.ku"
+import { HasLinkedContextualArgument, LinkedNullCallSymbol, ResolveLinkedCall } from "./scalar_result_null.ku"
 import { IsLinkedReaderParameter, TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { AppendLinkedCheckedInvocation, IsLinkedScopedCallback, LinkedCheckedCall, LinkedDirectCallExpression, LinkedScalarArrayLayout, LinkedScalarArrayOwner, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
-import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
-         LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
+import { AppendLinkedCheckedInvocation, IsLinkedScopedCallback, LinkedCheckedCall, LinkedDirectCallExpression, LinkedScalarArrayLayout, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
+import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullHasResultValue, LinkedNullLiteralType,
+         LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LowerLinkedContextualArgument, SameLinkedType } from "./linked_null_types_c.ku"
 import { ReadLinkedLocalArrayItem, EmitLinkedAddition, IsLinkedLogicalNegation, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalAppendArguments, ForwardLinkedCallback, LinkedCallableSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RestoreLinkedConcatPrefix, ValidateLinkedPayload } from "./linked_parameters_c.ku"
 
 
 fn lowerLinkedArgument(&project: LinkedNullProject, state: LinkedNullState, &parameter: TypeNameBinding,
                        id: int, depth: int): LinkedNullExpression! {
-    if (depth < 32 && LinkedScalarArrayOwner(parameter)) {
-        argument = LinkedNullNode(project, 1, id)
-        if (argument.kind == "Array" && argument.edge_count == 0) {
-            // The ordinary pending argument slot acquires the zero descriptor.
-            // There is no buffer to allocate or temporary owner to transfer.
-            return ok(LinkedReadonlyExpression(state, parameter.clone(), "(" + LinkedNullCType(parameter)? + "){0}"))
-        }
+    if (HasLinkedContextualArgument(project, state, parameter, id, depth)?) {
+        return LowerLinkedContextualArgument(project, state, parameter, id)
     }
     return LowerLinkedNullValue(project, state, id, depth)
 }
@@ -136,7 +131,7 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
         input = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, call, 1), depth + 1)?
         return LowerLinkedIntString(project, input, call, id)
     }
-    callee = ResolveLinkedCall(project, state.slots, call, target, false)?
+    callee = ResolveLinkedCall(project, state, call, target, false)?
     arguments = LowerLinkedArguments(project, state, call, callee, id, depth, true, NoLinkedRetention())?
     invoke = LinkedDirectCallExpression(callee, arguments.args)
     output = AddLinkedNullSlot(project, arguments.state, "", "t" + str(id), callee.result, false)?
@@ -223,7 +218,7 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
             arguments.handoff + CheckedAppendFaultHandoff(id))
         return ok(LinkedCheckedCall { state: next, result: callee.result, text: result, id: id })
     }
-    callee = ResolveLinkedCall(project, state.slots, call, target, true)?
+    callee = ResolveLinkedCall(project, state, call, target, true)?
     if (owns_value && !LinkedNullHasResultValue(callee.result)) {
         RejectLayout("linked_dependency_result", "expected a Result with a value payload", DeclarationSpan(unwrap))?
     }

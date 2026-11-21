@@ -354,7 +354,7 @@ fn ResolveProjectionDirectFunction(&supplied: [SuppliedModule], &imports: [Impor
         local = ProjectionLocalFunction(supplied, unit, target.text)
         if (local > 0) { return ok([unit, local]) }
         for binding in imports.clone() {
-            if (binding.local_name == target.text && binding.module_index > 0) {
+            if (binding.local_name == target.text && binding.module_index > 0 && binding.target_node > 0) {
                 if (supplied[binding.module_index - 1].named.parsed.arena.nodes[binding.target_node - 1].kind == "Function") {
                     return ok([binding.module_index, binding.target_node])
                 }

@@ -3,7 +3,7 @@ import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken, SpanMerge } from "./span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "./ast.ku"
 import { ParseContext, DefaultParseContext, ParseContextError, RelocateTokens } from "./context.ku"
-import { OperatorEntry, ValueEntry, MakeOperator, OperatorSpan, ExpressionSpan, MakeExpressionNode, MakeUnaryNode, IsNamedStructStart, IsBraceLiteralMarker, ReadBinaryOperator, ReadPrimaryAtom, RejectAt, RejectAtPoint } from "./expression_support.ku"
+import { OperatorEntry, ValueEntry, MakeOperator, OperatorSpan, ExpressionSpan, MakeExpressionNode, MakeUnaryNode, NamedStructBrace, NamedStructLiteralName, IsBraceLiteralMarker, ReadBinaryOperator, ReadPrimaryAtom, RejectAt, RejectAtPoint } from "./expression_support.ku"
 
 // Stage 2B uses append-only operator/value stacks and integer links. Flat
 // binary and postfix chains are iterative; nested delimiters and unary prefixes
@@ -384,17 +384,17 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
             operator_top = operators.len()
             cursor = cursor + 2
         } else if (expect_operand) {
-            if (token.kind == "Ident" && tokens[cursor + 1].kind == "LBrace" && cursor + 3 < tokens.len()
-                && IsNamedStructStart(token, tokens[cursor + 1], tokens[cursor + 2], tokens[cursor + 3])) {
+            brace = NamedStructBrace(tokens, cursor)
+            if (brace != 0) {
                 if (depth >= 32) {
                     RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested", stage3_domain)?
                 }
-                entry = MakeOperator("struct", token.lexeme.clone(), 0, false, token, operator_top, value_top, true)
+                entry = MakeOperator("struct", NamedStructLiteralName(tokens, cursor, brace), 0, false, token, operator_top, value_top, true)
                 operators = operators.push(entry)
                 operator_top = operators.len()
                 depth = depth + 1
                 brace_depth = brace_depth + 1
-                cursor = cursor + 2
+                cursor = brace + 1
             } else if (token.kind == "Bang" || token.kind == "Minus" || token.kind == "Await") {
                 if (depth >= 32) {
                     RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested", stage3_domain)?

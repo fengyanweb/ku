@@ -3,7 +3,7 @@ import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, CloneLinkedRecord, Clo
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
 import { CloneLinkedIntArray, CloneLinkedStringArray, RequireLinkedStringFieldAppend } from "./struct_string_calls.ku"
 import { FinishLinkedReaderThunk, LinkedScopedCallbackFunction, SameLinkedCallbackSignature } from "./link_plan_json_c.ku"
-import { StartLinkedThunkFrame } from "./scalar_result_null.ku"
+import { StartLinkedThunkFrame, ResolveLinkedCall } from "./scalar_result_null.ku"
 import { ContainsIndex, LinkedAppendFaultRelayCode, LinkedIntArrayCallbackFaultPending, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { SameRecordArrayElement, TypeNameBinding } from "./type_names.ku"
@@ -13,7 +13,7 @@ import { IsLinkedScopedCallback,
     LinkedLocalAppendIndex, LinkedNullArguments, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray,
     LinkedNullReadableArray, LinkedIntArrayLayout, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult,
-    ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+    SameLinkedType } from "./linked_null_types_c.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
 import { CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead, ReadLinkedLocalArrayItem } from "./linked_null_read_c.ku"
 
@@ -82,7 +82,7 @@ fn RegisterLinkedLocalRead(&project: LinkedNullProject, state: LinkedNullState, 
             LinkedLocalAppendIndex(state, target.text) != 0) {
             RejectLocalReader(target, "expected a statically bound readonly mapper")?
         }
-        callee = ResolveLinkedCall(project, state.slots, call, target, false)?
+        callee = ResolveLinkedCall(project, state, call, target, false)?
         view = callee.parameters[0].clone()
         matching = false
         if (view.declaration_kind == "StructView") {

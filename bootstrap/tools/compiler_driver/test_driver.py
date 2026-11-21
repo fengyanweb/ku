@@ -227,6 +227,160 @@ def exercise_glob_import(compiler, cc, caller):
     assert b"cyclic_import" in rejected, rejected
 
 
+def exercise_namespace_import(compiler, cc, caller):
+    project = caller / "namespace-import"
+    project.mkdir()
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\ncalc.ku\n", encoding="utf-8")
+    main = project / "main.ku"
+    library = project / "calc.ku"
+    library.write_text(
+        "struct Counter { value: int }\n"
+        "fn privateStep(value: int): int { return value - 1 }\n"
+        "fn Step(value: int): int { return privateStep(value) + 3 }\n",
+        encoding="utf-8",
+    )
+    header = 'import calc from "./calc"\n'
+    entry = (
+        "fn main(): null! {\n"
+        "    first = calc.Step(40)\n"
+        "    if (true) { calc = 7 println(str(calc)) }\n"
+        "    last = calc.Step(39)\n"
+        "    println(str(first))\n"
+        "    println(str(last))\n"
+        "    return ok(null)\n"
+        "}\n"
+    )
+    main.write_text(header + entry, encoding="utf-8")
+    assert not execute([compiler, "check-project", manifest], caller).stdout
+    plan = execute([compiler, "emit-unit-plan", manifest, "main"], caller)
+    dependency, = json.loads(plan.stdout)["dependencies"]
+    assert (dependency["source_path"], dependency["source_name"]) == ("calc.ku", "Step")
+    signature = dependency["signature"]
+    assert signature["parameters"][0]["c_type"] == signature["result"]["c_type"] == "int64_t"
+    assert signature["parameters"][0]["passing"] == "value" and not signature["returns_result"]
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    binary = caller / ("namespace-app.exe" if os.name == "nt" else "namespace-app")
+    execute([sys.executable, "-B", builder, manifest, "--compiler", compiler,
+             "--cc", cc, "-o", binary], caller)
+    assert execute([binary], caller).stdout.replace(b"\r\n", b"\n") == b"7\n42\n41\n"
+
+    for expression, diagnostic in [
+        ("calc.Missing(40)", b"missing_export"),
+        ("calc.privateStep(40)", b"missing_export"),
+        ("calc.Counter(40)", b"namespace_member_not_function"),
+        ("calc.Step()", b"call_arity"),
+        ('calc.Step("40")', b"call_argument_type"),
+    ]:
+        main.write_text(header + f"fn Result(): int {{ return {expression} }}\n", encoding="utf-8")
+        result = execute([compiler, "check-project", manifest], caller, 1)
+        assert diagnostic in result.stderr and b"main.ku:" in result.stderr and not result.stdout
+    main.write_text(header + "fn Shadow(calc: int): int { return calc.Step(40) }\n", encoding="utf-8")
+    rejected_shadow = execute([compiler, "emit-unit-plan", manifest, "Shadow"], caller, 1)
+    assert b"shadowed_linked_dependency" in rejected_shadow.stderr and not rejected_shadow.stdout
+
+    main.write_text(header, encoding="utf-8")
+    library.write_text('import entry from "./main"\n', encoding="utf-8")
+    cycle = execute([compiler, "check-project", manifest], caller, 1)
+    assert b"cyclic_import" in cycle.stderr and not cycle.stdout
+
+
+def exercise_qualified_types(compiler, cc, caller):
+    project = caller / "qualified-types"
+    project.mkdir()
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\ncalc.ku\n", encoding="utf-8")
+    main = project / "main.ku"
+    provider = (
+        "struct Counter { value: int }\n"
+        "struct privateCounter { value: int }\n"
+        "enum Mode { Ready }\n"
+        "fn Make(): Counter { return Counter { value: 42 } }\n"
+    )
+    (project / "calc.ku").write_text(provider, encoding="utf-8")
+    header = 'import calc from "./calc"\n'
+    read = "fn Read(&value: calc.Counter): int { return value.value }\n"
+    entry = (
+        "fn main(): null! {\n"
+        "    value = calc.Make()\n"
+        "    first = Read(value)\n"
+        "    again = Read(value)\n"
+        "    println(str(first))\n"
+        "    println(str(again))\n"
+        "    return ok(null)\n"
+        "}\n"
+    )
+    main.write_text(header + 'import { Counter } from "./calc"\n' + read.replace("calc.Counter", "Counter") + entry,
+                    encoding="utf-8")
+    named = execute([compiler, "emit-unit-plan", manifest, "Read"], caller)
+    named_view, = json.loads(named.stdout)["export"]["signature"]["parameters"]
+    qualified = header + read + entry
+    main.write_text(qualified, encoding="utf-8")
+    plan = execute([compiler, "emit-unit-plan", manifest, "Read"], caller)
+    view, = json.loads(plan.stdout)["export"]["signature"]["parameters"]
+    assert view["source_name"] == "Counter" and view["source_path"] == "calc.ku", view
+    assert view["kind"] == "Struct" and view["passing"] == "view" and view["node"] > 0
+    assert view == named_view, (view, named_view)
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    binary = caller / ("qualified-app.exe" if os.name == "nt" else "qualified-app")
+    execute([sys.executable, "-B", builder, manifest, "--compiler", compiler, "--cc", cc, "-o", binary], caller)
+    assert execute([binary], caller).stdout.replace(b"\r\n", b"\n") == b"42\n42\n"
+
+    main.write_text(header + "fn ReadMode(value: calc.Mode): null! { return ok(null) }\n", encoding="utf-8")
+    assert not execute([compiler, "check-project", manifest], caller).stdout
+    for name in ("calc.Missing", "calc.privateCounter", "calc.Make", "other.Counter"):
+        main.write_text(header + read.replace("calc.Counter", name), encoding="utf-8")
+        rejected = execute([compiler, "check-project", manifest], caller, 1)
+        assert b"undefined_type" in rejected.stderr and name.encode() in rejected.stderr and not rejected.stdout
+    main.write_text('import "std.fs"\n' + read.replace("calc.Counter", "fs.Counter"), encoding="utf-8")
+    rejected = execute([compiler, "check-project", manifest], caller, 1)
+    assert b"undefined_type" in rejected.stderr and b"fs.Counter" in rejected.stderr, rejected.stderr
+
+    (project / "other.ku").write_text(provider, encoding="utf-8")
+    manifest.write_text("main.ku\ncalc.ku\nother.ku\n", encoding="utf-8")
+    main.write_text('import other from "./other"\n' + qualified.replace("calc.Make()", "other.Make()"), encoding="utf-8")
+    rejected = execute([compiler, "emit-unit-plan", manifest, "main"], caller, 1)
+    assert b"linked_argument_type" in rejected.stderr and not rejected.stdout
+
+
+def exercise_qualified_constructor(compiler, cc, caller):
+    project = caller / "qualified-constructor"
+    project.mkdir()
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\nvalues.ku\n", encoding="utf-8")
+    (project / "values.ku").write_text(
+        "struct Entry { value: int, label: str }\n", encoding="utf-8",
+    )
+    entry = project / "main.ku"
+    source = '''\
+import values from "./values"
+fn main(): null! {
+    result = values.Entry { value: 41, label: "条目" + "🙂" }
+    println(str(result.value + 1))
+    println(result.label)
+    return ok(null)
+}
+'''
+    entry.write_text(source, encoding="utf-8")
+    assert execute([compiler, "check-project", manifest], caller).stdout == b""
+    build_program = Path(__file__).resolve().parents[1] / "build_program.py"
+    binary = caller / ("qualified-constructor-app.exe" if os.name == "nt" else "qualified-constructor-app")
+    execute([sys.executable, "-B", build_program, manifest, "--compiler", compiler,
+             "--cc", cc, "-o", binary], caller)
+    for original, replacement, diagnostic in (
+        ("value: 41", "missing: 41", b"invalid_linked_literal_field"),
+        ("value: 41", "value: true", b"linked_literal_field_type"),
+        ("values.Entry", "values.Hidden", b"undefined_type"),
+    ):
+        entry.write_text(source.replace(original, replacement, 1), encoding="utf-8")
+        rejected = execute([compiler, "emit-unit", manifest, "main"], caller, 1)
+        assert diagnostic in rejected.stderr and not rejected.stdout, rejected.stderr
+    entry.unlink()
+    (project / "values.ku").unlink()
+    result = execute([binary], caller)
+    assert not result.stderr and result.stdout.replace(b"\r\n", b"\n") == "42\n条目🙂\n".encode("utf-8")
+
+
 def exercise_checked_bool(compiler, cc, caller):
     source = caller / "boolean.ku"
     source.write_text('''\
@@ -505,6 +659,73 @@ int main(int argc, char **argv) {{
     assert b"signature mismatch" in refused.stderr
     refused_source = execute([compiler, "emit-unit", local, "Bad"], caller, 1)
     assert not refused_source.stdout and b"linked_argument_type" in refused_source.stderr
+
+
+def exercise_static_reader_argument(compiler, cc, caller):
+    project = caller / "static-reader-argument"
+    project.mkdir()
+    provider = (
+        "struct Row { line: int }\n"
+        "fn Pick(&row: Row): int | null { if (row.line == 1) { return null } return row.line }\n"
+        "fn ByValue(row: Row): int | null { return row.line }\n"
+        "fn Apply(filter: fn(&Row): int | null, &row: Row): int | null { return filter(row) }\n"
+    )
+    (project / "reader.ku").write_text(provider, encoding="utf-8")
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\nreader.ku\n", encoding="utf-8")
+    main = project / "main.ku"
+    header = 'import picker from "./reader"\nimport { Row, Apply, Pick } from "./reader.ku"\n'
+    main.write_text(header + (
+        "fn Named(&row: Row): int | null { return Apply(Pick, row) }\n"
+        "fn Qualified(&row: Row): int | null { return Apply(picker.Pick, row) }\n"
+        "fn main(): null! {\n"
+        "    miss = Row { line: 1 }\n"
+        "    zero = Row { line: 0 }\n"
+        "    hit = Row { line: 7 }\n"
+        "    println(str(Named(miss)))\n"
+        "    println(str(Qualified(miss)))\n"
+        "    println(str(Named(zero)))\n"
+        "    println(str(Qualified(zero)))\n"
+        "    println(str(Named(hit)))\n"
+        "    println(str(Qualified(hit)))\n"
+        "    return ok(null)\n"
+        "}\n"
+    ), encoding="utf-8")
+    for function in ("Named", "Qualified"):
+        plan = execute([compiler, "emit-unit-plan", manifest, function], caller)
+        dependencies = {item["source_name"]: item for item in json.loads(plan.stdout)["dependencies"]}
+        assert dependencies.keys() == {"Apply", "Pick"}
+        provider_view, = dependencies["Pick"]["signature"]["parameters"]
+        assert provider_view["source_path"] == "reader.ku" and provider_view["passing"] == "view"
+        code = execute([compiler, "emit-unit", manifest, function], caller).stdout
+        assert b"static KuBootstrapOptionalInt ku_static_reader_" in code and b".capture={0}" in code
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    binary = caller / ("static-reader.exe" if os.name == "nt" else "static-reader")
+    execute([sys.executable, "-B", builder, manifest, "--compiler", compiler, "--cc", cc, "-o", binary], caller)
+    assert execute([binary], caller).stdout.replace(b"\r\n", b"\n") == b"null\nnull\n0\n0\n7\n7\n"
+
+    (project / "other.ku").write_text(provider, encoding="utf-8")
+    manifest.write_text("main.ku\nreader.ku\nother.ku\n", encoding="utf-8")
+    header += 'import other from "./other"\nimport { ByValue } from "./reader.ku"\n'
+    for source, diagnostic in [
+        ("fn Bad(&row: Row): int | null { return Apply(other.Pick, row) }", b"linked_static_reader_signature"),
+        ("fn Bad(&row: Row): int | null { return Apply(ByValue, row) }", b"linked_static_reader_signature"),
+        ("fn Bad(picker: int, &row: Row): int | null { return Apply(picker.Pick, row) }", b"linked_field_type"),
+        ("fn Bad(Pick: fn(&Row): int | null, &row: Row): int | null {\n"
+         "    first = Apply(Pick, row)\n"
+         "    return Apply(Pick, row)\n"
+         "}", b"unavailable_linked_binding"),
+        ("fn Bad(prefix: str): fn(&Row): int | null {\n"
+         "    nested = fn(&row: Row) {\n"
+         "        if (prefix.len() == 0) { return null }\n"
+         "        return Apply(picker.Pick, row)\n"
+         "    }\n"
+         "    return nested\n"
+         "}", b"linked_static_reader_scope"),
+    ]:
+        main.write_text(header + source + "\n", encoding="utf-8")
+        rejected = execute([compiler, "emit-unit-plan", manifest, "Bad"], caller, 1)
+        assert diagnostic in rejected.stderr and not rejected.stdout, (source, rejected.stderr)
 
 
 def exercise_linked_reader_factory(compiler, cc, caller):
@@ -1091,12 +1312,16 @@ def exercise(ku, cc):
         exercise_emitted(cc, emitted, caller, "derived", b"(41)", b"42")
         exercise_project(compiler, cc, root, caller)
         exercise_glob_import(compiler, cc, caller)
+        exercise_namespace_import(compiler, cc, caller)
+        exercise_qualified_types(compiler, cc, caller)
+        exercise_qualified_constructor(compiler, cc, caller)
         exercise_linked_program(compiler, cc, caller)
         exercise_partial_record_view(compiler, cc, caller)
         exercise_plain_null_entry(compiler, cc, caller)
         exercise_checked_bool(compiler, cc, caller)
         exercise_linked_nullable_int(compiler, cc, caller)
         exercise_linked_owned_reader(compiler, cc, caller)
+        exercise_static_reader_argument(compiler, cc, caller)
         exercise_linked_reader_factory(compiler, cc, caller)
         exercise_linked_owned_string_for(compiler, cc, caller)
         exercise_parameter_bindings(compiler, cc, caller)

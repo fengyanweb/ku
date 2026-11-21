@@ -11,6 +11,7 @@ struct SuppliedModule {
 
 // File imports use one-based module and declaration IDs. An import of a
 // file with no exports keeps its module ID and has no local name or target.
+// A relative namespace keeps its module ID and local alias but has no target.
 // A standard namespace has neither ID. Shorthand imports use their import
 // node as the request node.
 struct ImportBinding {
@@ -90,6 +91,31 @@ fn ResolveSuppliedExport(&supplied: NamedModule, &request: str, at: Span): int! 
     target = ReadImportNode(supplied.parsed.arena.nodes, node, at.clone())?
     if (target.text != request || !isExportKind(target.kind)) {
         RejectName("invalid_module_tree", "supplied export does not match its declaration", at)?
+    }
+    return ok(node)
+}
+
+fn ProjectNamespaceModule(&bindings: [ImportBinding], &alias: str): int {
+    if (alias == "") { return 0 }
+    index = 0
+    while (index < bindings.len()) {
+        if (bindings[index].module_index > 0 && bindings[index].target_node == 0 && bindings[index].local_name == alias) {
+            return bindings[index].module_index
+        }
+        index = index + 1
+    }
+    return 0
+}
+
+fn ResolveProjectNamespaceFunction(&provider: SuppliedModule, &target: Node): int! {
+    at = DeclarationSpan(target)
+    node = ResolveSuppliedExport(provider.named, target.text, at.clone())?
+    if (node == 0) {
+        RejectName("missing_export", "'" + target.text.clone() + "' is not exported by '" + provider.path.clone() + "'", at.clone())?
+    }
+    declaration = ReadImportNode(provider.named.parsed.arena.nodes, node, at.clone())?
+    if (declaration.kind != "Function") {
+        RejectName("namespace_member_not_function", "expected a synchronous function export '" + target.text.clone() + "'", at)?
     }
     return ok(node)
 }
@@ -252,10 +278,17 @@ fn CollectImportBindings(&nodes: [Node], &edges: [int], &imports: [int], &local_
             if (!(group.text.starts_with("./") || group.text.starts_with("../"))) {
                 RejectName("unsupported_import_kind", "supplied file imports must use a relative path", group_span.clone())?
             }
+            namespace_node = 0
             if (group.edge_count > 0) {
-                first = ReadImportNode(nodes, edges[group.first_edge], group_span.clone())?
-                if (first.kind != "ImportName") {
-                    RejectName("unsupported_import_kind", "supplied file imports support named or full imports", group_span.clone())?
+                first_id = edges[group.first_edge]
+                first = ReadImportNode(nodes, first_id, group_span.clone())?
+                if (first.kind == "ImportNamespace") {
+                    if (group.edge_count != 1 || first.edge_count != 0 || first.text == "") {
+                        RejectName("invalid_module_tree", "expected a namespace import leaf", DeclarationSpan(first))?
+                    }
+                    namespace_node = first_id
+                } else if (first.kind != "ImportName") {
+                    RejectName("unsupported_import_kind", "expected a supplied named, full or namespace import", group_span.clone())?
                 }
             }
             lookup_path = group.text.clone()
@@ -263,7 +296,17 @@ fn CollectImportBindings(&nodes: [Node], &edges: [int], &imports: [int], &local_
                 lookup_path = ResolveProjectImport(importer_path, group.text, group_span.clone())?
             }
             module_index = FindModule(supplied, lookup_path, group_span.clone())?
-            if (group.edge_count == 0) {
+            if (namespace_node != 0) {
+                request = ReadImportNode(nodes, namespace_node, group_span.clone())?
+                at = DeclarationSpan(request)
+                if (bindings.len() >= 255) {
+                    RejectName("import_limit", "supplied import pass accepts at most 255 imported bindings", at.clone())?
+                }
+                CheckImportName(local_names, bindings, import_id, request.text, request.text, true, group_span.clone())?
+                bindings = bindings.push(ImportBinding { local_name: request.text.clone(), source_name: request.text,
+                    path: group.text.clone(), import_node: import_id, request_node: namespace_node,
+                    module_index: module_index, target_node: 0, span: at })
+            } else if (group.edge_count == 0) {
                 for binding in CollectGlobBindings(supplied[module_index - 1].named.parsed.arena.nodes,
                                                    supplied[module_index - 1].named.names.declarations,
                                                    group, import_id, module_index)? {

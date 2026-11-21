@@ -1,7 +1,7 @@
 import { EmitLinkedBodyPrelude, HoldLinkedCopyOperand, LinkedBuiltinNameAvailable, LinkedFieldRoot, LinkedNullPrototype, LinkedScopedCallbackFunction, LinkedScopedCallbackPrototype, RestoreLinkedAssignedMember } from "./link_plan_json_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { NoLinkedRetention, LinkedOptionalReaderHeader } from "./linked_nullable_reader_c.ku"
-import { EmitLinkedOptionalIntReturn, LinkedNullCallSymbol } from "./scalar_result_null.ku"
+import { EmitLinkedOptionalIntReturn, LinkedNullCallSymbol, ResolveLinkedCall } from "./scalar_result_null.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
 import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult } from "./struct_projection_c.ku"
 import { LinkedCopyResult, LinkedPlainCopyResult, TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
@@ -15,7 +15,7 @@ import { AddLinkedNullSlot, LinkedStringArrayAssignmentPlace } from "./linked_pa
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
-         LinkedNullNode, LinkedNullProject,  LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+         LinkedNullNode, LinkedNullProject,  LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LinkedFieldAppendArgument, ReadLinkedMemberPlace } from "./struct_string_calls.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue, LowerLinkedScopedCallbackCall } from "./linked_null_values_c.ku"
@@ -343,7 +343,7 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
                 return ok(forwarded.state)
             }
         }
-        target = ResolveLinkedCall(project, state.slots, call, callee, true)?
+        target = ResolveLinkedCall(project, state, call, callee, true)?
         if (!SameLinkedType(target.result, result)) {
             RejectLayout("linked_tail_result", "forwarded Result must match the entry's declared payload", DeclarationSpan(call))?
         }

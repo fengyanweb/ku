@@ -1,10 +1,13 @@
+import { CheckLinkedStaticReaderSite, FindLinkedLocalRead } from "./call_contracts.ku"
+import { ProjectNamespaceModule } from "./imports.ku"
+import { LinkedBuiltinDependency, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
-import { LinkedNullExpression, LinkedNullFunction, LinkedNullSlot, LinkedNullState, LinkedReadonlyExpression, NewLinkedNullState } from "./link_plan_c.ku"
-import { ContainsType } from "./struct_projection_c.ku"
-import { RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullSlot, LinkedNullState, LinkedReadonlyExpression, LinkedScalarArrayOwner, NewLinkedNullState } from "./link_plan_c.ku"
+import { ContainsType, ProjectionBytesGet, ProjectionPlaceRoot } from "./struct_projection_c.ku"
+import { RejectLayout, RejectLinkedBuiltinBorrow, StructLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { EmitScalarIntString, ScalarIntParameter } from "./scalar_int_emit.ku"
 import { RejectScalarInt, ScalarParameterIndex, ScalarStringLiteral } from "./scalar_int_operands.ku"
@@ -342,4 +345,64 @@ fn EmitLinkedIntString(&value: str, &out: str, optional: bool): str {
         + "    if (" + saved + ".is_null) {\n"
         + "        " + out + " = (KuProjectionString){.ptr=(uint8_t*)\"null\", .len=4u};\n"
         + "    } else {\n" + EmitScalarIntString(saved + ".value", out) + "    }\n"
+}
+
+fn linkedHasLocalFunction(&state: LinkedNullState, &name: str): bool {
+    return FindLinkedLocalRead(state.local_readers, name) != 0 || LinkedLocalAppendIndex(state, name) != 0
+}
+
+fn HasLinkedContextualArgument(&project: LinkedNullProject, &state: LinkedNullState,
+                               &parameter: TypeNameBinding, id: int, depth: int): bool! {
+    if (depth >= 32) { return ok(false) }
+    if (LinkedScalarArrayOwner(parameter)) {
+        node = LinkedNullNode(project, 1, id)
+        return ok(node.kind == "Array" && node.edge_count == 0)
+    }
+    if (parameter.declaration_kind != "NullableRecordViewReader") { return ok(false) }
+    node = LinkedNullNode(project, 1, id)
+    if (node.kind == "Variable" && node.edge_count == 0) {
+        selected = LinkedNullBinding(state.slots, node.text) == 0 && !linkedHasLocalFunction(state, node.text)
+        return CheckLinkedStaticReaderSite(project.supplied[0].named, node, id, selected)
+    }
+    if (node.kind != "Field" || node.edge_count != 1) { return ok(false) }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
+    selected = receiver.kind == "Variable" && receiver.edge_count == 0 &&
+        LinkedNullBinding(state.slots, receiver.text) == 0 && !linkedHasLocalFunction(state, receiver.text) &&
+        ProjectNamespaceModule(project.binding.modules[0].imports, receiver.text) > 0
+    return CheckLinkedStaticReaderSite(project.supplied[0].named, node, id, selected)
+}
+
+fn ResolveLinkedCall(&project: LinkedNullProject, &state: LinkedNullState, &call: Node, &target: Node, checked: bool): LinkedNullFunction! {
+    name = target.text.clone()
+    if (target.kind == "Field" && target.edge_count == 1) {
+        receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+        name = receiver.text.clone()
+        if (receiver.kind == "Variable" && receiver.edge_count == 0 &&
+            ProjectNamespaceModule(project.binding.modules[0].imports, name) != 0 &&
+            linkedHasLocalFunction(state, name)) {
+            RejectLayout("shadowed_linked_dependency", "direct dependency name is shadowed by a local", DeclarationSpan(target))?
+        }
+    }
+    local = LinkedNullBinding(state.slots, name)
+    if (local != 0) {
+        if (!state.slots[local - 1].value.borrowed
+            && ProjectionBytesGet(target, state.slots[local - 1].value.ty, call.edge_count - 1, checked)) {
+            return LinkedBuiltinDependency(project, 1, target, 4)
+        }
+        RejectLayout("shadowed_linked_dependency", "direct dependency name is shadowed by a local", DeclarationSpan(target))?
+    }
+    callee = LinkedNullDependency(project, 1, target, checked)?
+    if (callee.parameters.len() != call.edge_count - 1) {
+        RejectLayout("linked_dependency_arity", "argument count differs from the bound function declaration", DeclarationSpan(call))?
+    }
+    if (callee.unit == 0 && callee.node >= 2 && callee.node <= 4) {
+        input = LinkedNullChild(project, 1, call, 1)
+        root = ProjectionPlaceRoot(project.supplied[0].named.parsed.arena.nodes,
+                                   project.supplied[0].named.parsed.arena.edges, input)
+        slot = LinkedNullBinding(state.slots, root)
+        if (slot != 0 && state.slots[slot - 1].value.borrowed) {
+            RejectLinkedBuiltinBorrow(callee.node, DeclarationSpan(LinkedNullNode(project, 1, input)))?
+        }
+    }
+    return ok(callee)
 }

@@ -5,10 +5,10 @@ import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan, IsNamedFunction } from "./names.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
 import { AddLinkedNullSlot, CloneLinkedStringSlot, LinkedCallableSlot, RegisterLinkedNullType, ValidateLinkedPayload } from "./linked_parameters_c.ku"
-import { LinkedBuiltin, LinkedIntResult, LinkedNullCType, LinkedNullChild, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedStringResult, ReadLinkedResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullCType, LinkedNullChild, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { LinkedCheckedCall, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullRegion, LinkedNullSlot, LinkedRecordFields, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { RestoreLinkedThunkFrame } from "./link_plan_json_c.ku"
-import { LinkedOptionalIntHeader, StartLinkedThunkFrame } from "./scalar_result_null.ku"
+import { LinkedOptionalIntHeader, StartLinkedThunkFrame, ResolveLinkedCall } from "./scalar_result_null.ku"
 import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex, ContainsType, CTypeName, LinkedIntArrayCallbackFaultPending } from "./struct_projection_c.ku"
 import { RetagTypeNameBinding, TypeNameBinding } from "./type_names.ku"
@@ -262,7 +262,7 @@ fn retainedFieldSite(&project: LinkedNullProject, &state: LinkedNullState, &stat
     target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
     if (target.kind != "Variable" || LinkedLocalAppendIndex(state, target.text) != 0) { return 0 }
     try {
-        callee = ResolveLinkedCall(project, state.slots, call, target, true)?
+        callee = ResolveLinkedCall(project, state, call, target, true)?
         if (LinkedStringResult(callee.parameters[0])) { return field }
         return 0
     } catch (err) { return 0 }
@@ -338,7 +338,7 @@ fn PlanLinkedRetainedView(&project: LinkedNullProject, &state: LinkedNullState, 
             if (argument.kind != "Variable" || argument.text != root.text || target.kind != "Variable"
                 || target.text == statement.text || LinkedLocalAppendIndex(state, target.text) != 0) { return none }
             try {
-                callee = ResolveLinkedCall(project, state.slots, call, target, true)?
+                callee = ResolveLinkedCall(project, state, call, target, true)?
                 parameter = callee.parameters[0].clone()
                 if (parameter.declaration_kind == "StructView" && parameter.module_index == owner.module_index
                     && parameter.declaration_node == owner.declaration_node) {

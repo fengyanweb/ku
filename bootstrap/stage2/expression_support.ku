@@ -85,6 +85,23 @@ fn IsNamedStructStart(&name: Token, &opener: Token, &field: Token, &separator: T
     return name.kind == "Ident" && opener.kind == "LBrace" && name.end_line == opener.line && field.kind == "Ident" && separator.kind == "Colon"
 }
 
+fn NamedStructBrace(&tokens: [Token], cursor: int): int {
+    if (tokens[cursor].kind != "Ident" || cursor + 3 >= tokens.len()) { return 0 }
+    brace = cursor + 1
+    if (tokens[brace].kind == "Dot") { brace = brace + 2 }
+    if (brace + 2 >= tokens.len()) { return 0 }
+    if (IsNamedStructStart(tokens[brace - 1], tokens[brace], tokens[brace + 1], tokens[brace + 2])) {
+        return brace
+    }
+    return 0
+}
+
+fn NamedStructLiteralName(&tokens: [Token], cursor: int, brace: int): str {
+    name = tokens[brace - 1].lexeme.clone()
+    if (brace == cursor + 1) { return name }
+    return tokens[cursor].lexeme.clone() + "." + name
+}
+
 fn IsBraceLiteralMarker(&marker: str): bool {
     return marker == "struct" || marker == "object"
 }
