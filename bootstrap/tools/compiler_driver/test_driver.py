@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -113,6 +114,42 @@ def exercise_project(compiler, cc, root, caller):
     assert execute([compiler, "check-project", relative], caller).stdout == b""
     emitted = execute([compiler, "emit-project", relative, "Answer"], caller).stdout
     exercise_emitted(cc, emitted, caller, "project-derived", b"()", b"42")
+
+    library_manifest = project / "library.txt"
+    library_manifest.write_text("lib/数字🙂.ku\n", encoding="utf-8")
+    units = []
+    plans = []
+    for input_path, name in [(relative, "Answer"), (library_manifest, "Increment")]:
+        plan = caller / f"{name}.plan.json"
+        document = execute([compiler, "emit-unit-plan", input_path, name], caller)
+        assert not document.stderr
+        plan.write_bytes(document.stdout)
+        parsed = json.loads(document.stdout)
+        assert parsed["export"]["source_name"] == name
+        plans.append(parsed)
+        code = caller / f"{name}.c"
+        record = execute([compiler, "emit-unit", input_path, name], caller)
+        assert not record.stderr
+        code.write_bytes(record.stdout)
+        units.extend(["--unit", plan, code])
+
+    entry = plans[0]["export"]
+    dependency, = plans[0]["dependencies"]
+    assert entry["source_path"] == "src/main.ku" and entry["signature"]["parameters"] == []
+    assert (dependency["source_path"], dependency["node"]) == ("lib/数字🙂.ku", plans[1]["export"]["node"])
+    host = caller / "linked-main.c"
+    host.write_text(
+        f'extern int64_t {entry["symbol"]}(void);\n'
+        f'int main(void) {{ return {entry["symbol"]}() == 42 ? 0 : 1; }}\n',
+        encoding="utf-8",
+    )
+    binary = caller / ("linked-answer.exe" if os.name == "nt" else "linked-answer")
+    linker = Path(__file__).resolve().parents[1] / "link_c.py"
+    execute([sys.executable, "-B", linker, *units, "--cc", cc, "--entry", entry["source_path"],
+             str(entry["node"]), "--caller", host, "-o", binary], caller)
+    assert execute([binary], caller).stdout == b""
+    assert b"usage:" in execute([compiler, "emit-unit-plan", relative], caller, 2).stderr
+
     source = caller / "complete-program.c"
     whole = execute([compiler, "emit-program", relative], caller)
     assert not whole.stderr and b"int main(void)" in whole.stdout
@@ -128,6 +165,9 @@ def exercise_project(compiler, cc, root, caller):
     assert not unresolved.stdout and b"unresolved_import" in unresolved.stderr, unresolved.stderr
     unresolved_program = execute([compiler, "emit-program", relative], caller, 1)
     assert not unresolved_program.stdout and b"unresolved_import" in unresolved_program.stderr
+    for command in ("emit-unit", "emit-unit-plan"):
+        missing_unit = execute([compiler, command, relative, "Answer"], caller, 1)
+        assert not missing_unit.stdout and b"unresolved_import" in missing_unit.stderr
 
 
 def exercise(ku, cc):

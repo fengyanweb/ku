@@ -179,8 +179,7 @@ fn ParseBoundedModule(source: str, compiler_input: bool): ParseOutput! {
                 { arena, root: namespace } = AppendStage3Node("ImportNamespace", parsed.namespace.lexeme.clone(), 0, SpanFromToken(parsed.namespace.clone()), [], parsed.namespace.clone(), arena)?
                 import_children = import_children.push(namespace)
             }
-            imported_names = parsed.names.clone()
-            for imported in imported_names {
+            for imported in parsed.names.clone() {
                 imported_has_alias = imported.has_alias
                 name_children: [int] = []
                 if (imported_has_alias) {

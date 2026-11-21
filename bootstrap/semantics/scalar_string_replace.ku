@@ -14,8 +14,8 @@ fn isReplace(&nodes: [Node], &edges: [int], &value: Node): bool {
 fn HasScalarOwnedStringBody(&nodes: [Node], &edges: [int], start: int, end: int): bool {
     first = nodes[edges[start] - 1].clone()
     if (first.kind == "Assign" || first.kind == "VarDecl") { return true }
-    return start + 1 == end && first.kind == "Return" && first.edge_count == 1
-        && isReplace(nodes, edges, nodes[edges[first.first_edge] - 1])
+    if (start + 1 != end || first.kind != "Return" || first.edge_count != 1) { return false }
+    return isReplace(nodes, edges, nodes[edges[first.first_edge] - 1])
 }
 
 fn localIndex(&locals: [str], &name: str): int {
@@ -24,12 +24,13 @@ fn localIndex(&locals: [str], &name: str): int {
         if (locals[index] == name) { return index }
         index = index + 1
     }
-    return -1
+    return 0 - 1
 }
 
 fn namedOwner(&parameters: [ScalarIntParameter], &locals: [str], &moved: [str], &node: Node): str! {
     if (node.kind == "Variable" && node.edge_count == 0) {
-        if (localIndex(moved, node.text) >= 0) {
+        moved_index = localIndex(moved, node.text)
+        if (moved_index >= 0) {
             RejectScalarInt("moved_scalar_string", "owned str was already consumed by an append", DeclarationSpan(node))?
         }
         local = localIndex(locals, node.text)
@@ -52,7 +53,8 @@ fn stringOperand(&parameters: [ScalarIntParameter], &locals: [str], &moved: [str
 
 fn emitReplace(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], &locals: [str], &moved: [str],
                &call: Node, &target: str): str! {
-    if (!isReplace(nodes, edges, call) || call.edge_count != 3) {
+    replace = isReplace(nodes, edges, call)
+    if (!replace || call.edge_count != 3) {
         RejectScalarInt("unsupported_replace_call", "expected str.replace with two str arguments", DeclarationSpan(call))?
     }
     callee = nodes[edges[call.first_edge] - 1].clone()
@@ -79,18 +81,26 @@ fn joinParts(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], &
     if (depth >= 32) {
         RejectScalarInt("string_depth_limit", "standalone C string expressions accept at most 32 levels", DeclarationSpan(value))?
     }
-    if (joinExpression(value)) {
+    joined = joinExpression(value)
+    if (joined) {
         left = joinParts(nodes, edges, parameters, locals, moved, nodes[edges[value.first_edge] - 1], depth + 1, parts)?
         return joinParts(nodes, edges, parameters, locals, moved, nodes[edges[value.first_edge + 1] - 1], depth + 1, left)
     }
     if (value.kind == "String" && value.edge_count == 0) {
-        return ok(parts.push(ScalarStringPart { source: "(const uint8_t*)" + ScalarStringLiteral(value)?, integer: false }))
+        literal = ScalarStringLiteral(value)?
+        part = ScalarStringPart { source: "(const uint8_t*)" + literal, integer: false }
+        output: [ScalarStringPart] = parts
+        output = output.push(part)
+        return ok(output)
     }
     owner = namedOwner(parameters, locals, moved, value)?
     if (owner == "") {
         RejectScalarInt("unsupported_owned_string_operand", "expected a str literal or a live owned str binding", DeclarationSpan(value))?
     }
-    return ok(parts.push(ownerPart(owner)))
+    part = ownerPart(owner)
+    output: [ScalarStringPart] = parts
+    output = output.push(part)
+    return ok(output)
 }
 
 fn emitOwnedJoin(&parts: [ScalarStringPart], &target: str, &consumed: str): str {
@@ -117,14 +127,14 @@ struct ScalarOwnedStringBody {
     uses_replace: bool
 }
 
-fn withoutMovedName(&moved: [str], &name: str): [str] {
+fn withoutMovedName(&moved: [str], &name: str): [str]! {
     rest: [str] = []
     index = 0
     while (index < moved.len()) {
         if (moved[index] != name) { rest = rest.push(moved[index].clone()) }
         index = index + 1
     }
-    return rest
+    return ok(rest)
 }
 
 fn LowerScalarOwnedStringBody(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
@@ -136,59 +146,76 @@ fn LowerScalarOwnedStringBody(&nodes: [Node], &edges: [int], &types: [TypeNameBi
     declarations = "    KuBootstrapString result = {0};\n    const char* failure = NULL;\n"
     code = ""
     drops = ""
+    final_edge = end - 1
     cursor = start
-    while (cursor < end - 1) {
+    while (cursor < final_edge) {
         statement = nodes[edges[cursor] - 1].clone()
         if (statement.kind == "CompoundAssign" && statement.text == "+" && statement.edge_count == 2) {
             left = nodes[edges[statement.first_edge] - 1].clone()
             right = nodes[edges[statement.first_edge + 1] - 1].clone()
             target = namedOwner(parameters, locals, moved, left)?
-            if (target == "" || localIndex(locals, left.text) < 0) {
+            append_target = target != ""
+            if (append_target) {
+                target_local = localIndex(locals, left.text)
+                append_target = target_local >= 0
+            }
+            if (!append_target) {
                 RejectScalarInt("unsupported_owned_string_append", "expected a live owned str local before +=", DeclarationSpan(left))?
             }
             consumed = namedOwner(parameters, locals, moved, right)?
             if (consumed == target) {
                 RejectScalarInt("moved_scalar_string", "cannot append a str local to itself by move", DeclarationSpan(right))?
             }
-            parts = joinParts(nodes, edges, parameters, locals, moved, right, 0, [ownerPart(target)])?
+            part = ownerPart(target)
+            prefix: [ScalarStringPart] = []
+            prefix = prefix.push(part)
+            parts = joinParts(nodes, edges, parameters, locals, moved, right, 0, prefix)?
             code += emitOwnedJoin(parts, target, consumed)
-            if (consumed != "") { moved = moved.push(right.text) }
-            uses_join = true
-            cursor = cursor + 1
-            continue
-        }
-        explicit = statement.kind == "VarDecl" && statement.edge_count == 2
-        if (!explicit && (statement.kind != "Assign" || statement.edge_count != 1)) {
-            RejectScalarInt("unsupported_replace_statement", "expected a straight-line owned str assignment", DeclarationSpan(statement))?
-        }
-        local = localIndex(locals, statement.text)
-        if (ScalarParameterIndex(parameters, statement.text) >= 0 || (explicit && local >= 0)) {
-            RejectScalarInt("unsupported_replace_binding", "expected a distinct str local", DeclarationSpan(statement))?
-        }
-        if (explicit) {
-            type_id = edges[statement.first_edge]
-            if (ScalarType(types, type_id, nodes[type_id - 1]) != 2) {
-                RejectScalarInt("unsupported_replace_binding", "explicit replacement locals require builtin str", DeclarationSpan(statement))?
+            if (consumed != "") {
+                consumed_name = right.text
+                moved = moved.push(consumed_name)
             }
-        }
-        fresh = local < 0
-        if (fresh) { local = locals.len() }
-        target = "s" + str(local)
-        value = nodes[edges[statement.first_edge + statement.edge_count - 1] - 1].clone()
-        if (joinExpression(value)) {
-            parts = joinParts(nodes, edges, parameters, locals, moved, value, 0, [])?
-            code += emitOwnedJoin(parts, target, "")
             uses_join = true
         } else {
-            code += emitReplace(nodes, edges, parameters, locals, moved, value, target)?
-            uses_replace = true
-        }
-        if (localIndex(moved, statement.text) >= 0) { moved = withoutMovedName(moved, statement.text) }
-        if (fresh) {
-            // The new name is not visible while lowering its initializer.
-            locals = locals.push(statement.text)
-            declarations += "    KuScalarString " + target.clone() + " = {0};\n"
-            drops = "    ku_scalar_string_drop(" + target + ");\n" + drops
+            explicit = statement.kind == "VarDecl" && statement.edge_count == 2
+            if (!explicit && (statement.kind != "Assign" || statement.edge_count != 1)) {
+                RejectScalarInt("unsupported_replace_statement", "expected a straight-line owned str assignment", DeclarationSpan(statement))?
+            }
+            local = localIndex(locals, statement.text)
+            parameter = ScalarParameterIndex(parameters, statement.text)
+            if (parameter >= 0 || (explicit && local >= 0)) {
+                RejectScalarInt("unsupported_replace_binding", "expected a distinct str local", DeclarationSpan(statement))?
+            }
+            if (explicit) {
+                type_id = edges[statement.first_edge]
+                value_type = ScalarType(types, type_id, nodes[type_id - 1])
+                if (value_type != 2) {
+                    RejectScalarInt("unsupported_replace_binding", "explicit replacement locals require builtin str", DeclarationSpan(statement))?
+                }
+            }
+            fresh = local < 0
+            if (fresh) { local = locals.len() }
+            target = "s" + str(local)
+            value = nodes[edges[statement.first_edge + statement.edge_count - 1] - 1].clone()
+            joined = joinExpression(value)
+            if (joined) {
+                initial_parts: [ScalarStringPart] = []
+                parts = joinParts(nodes, edges, parameters, locals, moved, value, 0, initial_parts)?
+                code += emitOwnedJoin(parts, target, "")
+                uses_join = true
+            } else {
+                code += emitReplace(nodes, edges, parameters, locals, moved, value, target)?
+                uses_replace = true
+            }
+            moved_index = localIndex(moved, statement.text)
+            if (moved_index >= 0) { moved = withoutMovedName(moved, statement.text)? }
+            if (fresh) {
+                // The new name is not visible while lowering its initializer.
+                binding = statement.text
+                locals = locals.push(binding)
+                declarations += "    KuScalarString " + target.clone() + " = {0};\n"
+                drops = "    ku_scalar_string_drop(" + target + ");\n" + drops
+            }
         }
         cursor = cursor + 1
     }
@@ -197,15 +224,20 @@ fn LowerScalarOwnedStringBody(&nodes: [Node], &edges: [int], &types: [TypeNameBi
         RejectScalarInt("unsupported_replace_return", "expected a final owned str return", DeclarationSpan(final))?
     }
     value = nodes[edges[final.first_edge] - 1].clone()
-    if (joinExpression(value)) {
-        parts = joinParts(nodes, edges, parameters, locals, moved, value, 0, [])?
+    joined = joinExpression(value)
+    if (joined) {
+        initial_parts: [ScalarStringPart] = []
+        parts = joinParts(nodes, edges, parameters, locals, moved, value, 0, initial_parts)?
         code += emitOwnedJoin(parts, "result", "")
         uses_join = true
-    } else if (isReplace(nodes, edges, value)) {
-        code += emitReplace(nodes, edges, parameters, locals, moved, value, "result")?
-        uses_replace = true
     } else {
-        code += ownedResult(parameters, locals, moved, value)?
+        replace = isReplace(nodes, edges, value)
+        if (replace) {
+            code += emitReplace(nodes, edges, parameters, locals, moved, value, "result")?
+            uses_replace = true
+        } else {
+            code += ownedResult(parameters, locals, moved, value)?
+        }
     }
     return ok(ScalarOwnedStringBody { source: declarations + code + "cleanup:\n" + drops,
         uses_join: uses_join, uses_replace: uses_replace })

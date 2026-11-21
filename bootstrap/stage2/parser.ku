@@ -178,13 +178,15 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
 
         reversed: [int] = []
         walk = value_top
-        while (walk != marker.base_value) {
+        walking = walk != marker.base_value
+        while (walking) {
             if (walk == 0) {
                 RejectAt(token.clone(), "invalid_expression", "delimiter lost its value stack base", stage3_domain)?
             }
             entry = values[walk - 1].clone()
             reversed = reversed.push(entry.node)
             walk = entry.previous
+            walking = walk != marker.base_value
         }
         count = reversed.len()
         if ((marker.marker == "group" || marker.marker == "index") && count != 1) {
@@ -204,9 +206,11 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
                 children = children.push(start_node)
             }
             reverse_index = reversed.len()
-            while (reverse_index > 0) {
+            reversing = reverse_index > 0
+            while (reversing) {
                 reverse_index = reverse_index - 1
                 children = children.push(reversed[reverse_index])
+                reversing = reverse_index > 0
             }
             value_top = previous_value
             end_span = SpanFromToken(token.clone())
@@ -214,7 +218,8 @@ fn ParseTokenWindow(tokens: [Token], stage3_domain: bool): ParseOutput! {
             if (marker.marker == "array") {
                 node = AddNode("Array", "", 0, SpanMerge(OperatorSpan(marker), end_span), children)?
             } else if (marker.marker == "struct") {
-                node = AddNode("StructLiteral", marker.text, 0, SpanMerge(OperatorSpan(marker), end_span), children)?
+                literal_span = SpanMerge(OperatorSpan(marker), end_span)
+                node = AddNode("StructLiteral", marker.text, 0, literal_span, children)?
             } else if (marker.marker == "object") {
                 node = AddNode("ObjectLiteral", "", 0, SpanMerge(OperatorSpan(marker), end_span), children)?
             } else {

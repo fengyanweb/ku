@@ -35,9 +35,10 @@ fn ParseContextError(source_characters: int, source_bytes: int, eof: Token, cont
         return "parse origin cannot be relocated without integer overflow"
     }
     if (!context.has_boundary) { return "" }
-    window_end_line = context.origin.line + eof.line - 1
+    // Convert one-based coordinates to deltas before adding the origin.
+    window_end_line = context.origin.line + (eof.line - 1)
     window_end_column = eof.column
-    if (eof.line == 1) { window_end_column = window_end_column + context.origin.column - 1 }
+    if (eof.line == 1) { window_end_column = context.origin.column + (window_end_column - 1) }
     window_end_offset = context.origin.offset + eof.offset
     boundary_end_before_start = context.boundary.end_line < context.boundary.line || (context.boundary.end_line == context.boundary.line && context.boundary.end_column < context.boundary.column)
     boundary_before_window = context.boundary.offset < window_end_offset || context.boundary.line < window_end_line || (context.boundary.line == window_end_line && context.boundary.column < window_end_column)
@@ -54,12 +55,12 @@ fn RelocateTokens(tokens: [Token], context: ParseContext): [Token] {
     relocate_index = 0
     while (relocate_index < tokens.len()) {
         input = tokens[relocate_index].clone()
-        line = input.line + context.origin.line - 1
+        line = context.origin.line + (input.line - 1)
         column = input.column
-        if (input.line == 1) { column = column + context.origin.column - 1 }
-        end_line = input.end_line + context.origin.line - 1
+        if (input.line == 1) { column = context.origin.column + (column - 1) }
+        end_line = context.origin.line + (input.end_line - 1)
         end_column = input.end_column
-        if (input.end_line == 1) { end_column = end_column + context.origin.column - 1 }
+        if (input.end_line == 1) { end_column = context.origin.column + (end_column - 1) }
         offset = input.offset + context.origin.offset
         end_offset = input.end_offset + context.origin.offset
         if (context.has_boundary && input.kind == "Eof") {

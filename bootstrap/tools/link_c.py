@@ -226,6 +226,40 @@ def fs_read_provider():
     return unit, {path.resolve(): path.read_bytes() for path in headers}
 
 
+def string_slice_provider():
+    tools = Path(__file__).resolve().parent
+    source = tools / "compiler_driver" / "string_slice.c"
+    implementation = tools.parents[1] / "src" / "backend" / "c_string_slice.c"
+    index = TypeRef(("builtin", "int"), "value", "int64_t")
+    signature = Signature((TypeRef(("builtin", "str"), "view", "const KuProjectionString*"), index, index),
+                          TypeRef(("builtin", "str"), "value", "KuBootstrapResult_KuProjectionString"), True)
+    export = Declaration(("std/string.ku", 2), "KuBootstrapStringSlice", signature)
+    return Unit(source, source, source.read_bytes(), export, ()), {implementation: implementation.read_bytes()}
+
+
+def bytes_provider(method, number, symbol, parameters, result):
+    tools = Path(__file__).resolve().parent
+    driver = tools / "compiler_driver"
+    backend = tools.parents[1] / "src" / "backend"
+    source = driver / f"bytes_{method}.c"
+    headers = (driver / "bytes_abi.h", backend / "c_bytes_storage.c", backend / "c_bytes_index.c")
+    export = Declaration(("std/bytes.ku", number), symbol, Signature(parameters, result, True))
+    return Unit(source, source, source.read_bytes(), export, ()), {path: path.read_bytes() for path in headers}
+
+
+def bytes_from_str_provider():
+    source = TypeRef(("builtin", "str"), "view", "const KuProjectionString*")
+    result = TypeRef(("builtin", "bytes"), "value", "KuBootstrapResult_KuProjectionString")
+    return bytes_provider("from_str", 3, "KuBootstrapBytesFromString", (source,), result)
+
+
+def bytes_get_provider():
+    source = TypeRef(("builtin", "bytes"), "view", "const KuProjectionString*")
+    index = TypeRef(("builtin", "int"), "value", "int64_t")
+    result = TypeRef(("builtin", "int"), "value", "KuBootstrapResult_int64_t")
+    return bytes_provider("get", 4, "KuBootstrapBytesGet", (source, index), result)
+
+
 def label(key):
     return f"{key[0]}#{key[1]}"
 
@@ -349,7 +383,11 @@ def link(units, aliases, output, entry, caller, cc, cflags, ldflags, timeout, bu
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--unit", nargs=2, required=True, action="append", metavar=("PLAN", "C"))
-    parser.add_argument("--builtin", action="append", choices=("fs.read",), default=[])
+    builtin_providers = {
+        "fs.read": fs_read_provider, "string.slice": string_slice_provider,
+        "bytes.from_str": bytes_from_str_provider, "bytes.get": bytes_get_provider,
+    }
+    parser.add_argument("--builtin", action="append", choices=builtin_providers, default=[])
     parser.add_argument("--entry", nargs=2, metavar=("MODULE", "NODE"))
     parser.add_argument("--caller", type=Path)
     parser.add_argument("-o", "--output", type=Path)
@@ -368,11 +406,10 @@ def main(argv=None):
             raise LinkError("--timeout must be a finite positive number")
         units = [Unit.read(Path(plan).resolve(), Path(source).resolve()) for plan, source in args.unit]
         builtin_headers = {}
-        if args.builtin:
-            if len(args.builtin) > 1:
-                raise LinkError("duplicate provider for std/fs.ku#1")
-            provider, builtin_headers = fs_read_provider()
+        for name in args.builtin:
+            provider, headers = builtin_providers[name]()
             units.append(provider)
+            builtin_headers.update(headers)
         aliases = checked_aliases(units)
         entry = None
         caller = None

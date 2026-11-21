@@ -44,12 +44,15 @@ fn LowerNullResultExit(&nodes: [Node], &edges: [int], &parameters: [ScalarIntPar
         fields = ScalarStaticErrorFields(nodes, edges, value, "KuString")?
         return ok("(KuResult_null){false, 0u, (KuError){" + fields + "}}")
     }
-    if (value.kind == "Call" && value.edge_count == 2 && can_use_ok && ScalarParameterIndex(parameters, "ok") < 0) {
-        target = nodes[edges[value.first_edge] - 1].clone()
-        payload = nodes[edges[value.first_edge + 1] - 1].clone()
-        if (target.kind == "Variable" && target.edge_count == 0 && target.text == "ok"
-            && payload.kind == "Null" && payload.edge_count == 0) {
-            return ok("(KuResult_null){true, 0u, (KuError){0}}")
+    if (value.kind == "Call" && value.edge_count == 2 && can_use_ok) {
+        parameter = ScalarParameterIndex(parameters, "ok")
+        if (parameter < 0) {
+            target = nodes[edges[value.first_edge] - 1].clone()
+            payload = nodes[edges[value.first_edge + 1] - 1].clone()
+            if (target.kind == "Variable" && target.edge_count == 0 && target.text == "ok"
+                && payload.kind == "Null" && payload.edge_count == 0) {
+                return ok("(KuResult_null){true, 0u, (KuError){0}}")
+            }
         }
     }
     RejectScalarInt("unsupported_null_result", "expected return with the builtin ok(null)", DeclarationSpan(value))?

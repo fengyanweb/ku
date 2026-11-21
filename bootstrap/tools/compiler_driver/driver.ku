@@ -3,6 +3,7 @@ import { Span } from "../../stage2/span.ku"
 import { ParseModule } from "../../stage3/parser.ku"
 import { CheckDirectCallContracts, CheckLiteralResultContracts } from "../../semantics/call_contracts.ku"
 import { ImportBinding, SuppliedModule } from "../../semantics/imports.ku"
+import { EmitLinkedUnit } from "../../semantics/linked_unit.ku"
 import { BuildNameTable } from "../../semantics/names.ku"
 import { BindProjectModules } from "../../semantics/project_bindings.ku"
 import { ManifestPaths, ReadProjectModulesAt } from "../../semantics/project_manifest.ku"
@@ -25,6 +26,10 @@ fn writeScalarC(generated: ScalarIntC): null! {
 }
 
 fn BootstrapEntry(&command: str, &path: str, &symbol: str): null! {
+    if (command == "emit-unit" || command == "emit-unit-plan") {
+        print(EmitLinkedUnit(readProject(path)?, symbol, command == "emit-unit-plan")?)
+        return ok(null)
+    }
     if (command == "check-project" || command == "emit-project" || command == "emit-program") {
         project = readProject(path)?
         if (command == "emit-project") {

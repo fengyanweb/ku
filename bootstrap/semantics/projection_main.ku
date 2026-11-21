@@ -3,8 +3,7 @@ import { Span } from "../stage2/span.ku"
 import { ParseModule } from "../stage3/parser.ku"
 import { EmitGuardedStructC } from "./guarded_struct_c.ku"
 import { BindProjectImports, SuppliedModule } from "./imports.ku"
-import { EmitLinkedNullC } from "./linked_null_c.ku"
-import { LinkedNullDependencyPlan } from "./linked_null_types_c.ku"
+import { EmitLinkedUnit } from "./linked_unit.ku"
 import { EmitLinkPlan, LinkPlanDeclaration, NamedProjectionLinkPlan, StructProjectionLinkPlan } from "./link_plan_c.ku"
 import { EmitManagedArrayC } from "./managed_array_c.ku"
 import { BuildNameTable } from "./names.ku"
@@ -70,20 +69,6 @@ fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &
     return ok(null)
 }
 
-fn emitLinkedNull(&supplied: [SuppliedModule], &function: str, plan: bool): null! {
-    generated = EmitLinkedNullC(supplied, function)?
-    if (!plan) {
-        print(generated.source)
-        return ok(null)
-    }
-    links: [LinkPlanDeclaration] = []
-    for dependency in generated.links {
-        links = links.push(LinkedNullDependencyPlan(dependency)?)
-    }
-    print(EmitLinkPlan(supplied, "linked-null", generated.entry_plan, links)?)
-    return ok(null)
-}
-
 fn emitLinkedString(&supplied: [SuppliedModule], &function: str, plan: bool): null! {
     generated = EmitProjectStructStringC(supplied, function)?
     if (!plan) {
@@ -118,7 +103,8 @@ fn main(): null! {
         paths = ManifestPaths(fs.read("modules.txt")?, at)?
         supplied = ReadProjectModules(paths)?
         if (mode == "linked-null") {
-            return emitLinkedNull(supplied, function, link_plan)
+            print(EmitLinkedUnit(supplied, function, link_plan)?)
+            return ok(null)
         }
         if (mode == "linked-str") {
             return emitLinkedString(supplied, function, link_plan)

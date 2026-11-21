@@ -6,7 +6,7 @@ import { SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
 import { ResolveTypeName, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
-import { CTypeName } from "./struct_projection_c.ku"
+import { CTypeName, ProjectionBuiltinLinkFor, ProjectionBuiltinLinkId, ProjectionBytesGet, ProjectionLocalFunction, ProjectionPlaceRoot, RequireProjectionBuiltin, ResolveProjectionDirectFunction } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayLinkPlanType, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
@@ -135,12 +135,16 @@ fn LinkedStringResult(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Builtin" && binding.name == "str"
 }
 
+fn LinkedBufferResult(&binding: TypeNameBinding): bool {
+    return binding.declaration_kind == "Builtin" && (binding.name == "str" || binding.name == "bytes")
+}
+
 fn LinkedIntResult(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Builtin" && binding.name == "int"
 }
 
 fn LinkedNullHasResultValue(&binding: TypeNameBinding): bool {
-    return LinkedNullOwnedArray(binding) || binding.declaration_kind == "Struct" || LinkedStringResult(binding)
+    return LinkedNullOwnedArray(binding) || binding.declaration_kind == "Struct" || LinkedBufferResult(binding)
         || LinkedIntResult(binding) || binding.declaration_kind == "OwnedStringArray"
 }
 
@@ -164,7 +168,7 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
     }
     if (LinkedNullOwnedArray(binding) || LinkedNullIntArrayOwner(binding)) { return ok(LinkedNullArrayType(binding)) }
     if (binding.declaration_kind == "Builtin") {
-        if (binding.name == "str") { return ok("KuProjectionString") }
+        if (LinkedBufferResult(binding)) { return ok("KuProjectionString") }
         if (binding.name == "int") { return ok("int64_t") }
         if (binding.name == "bool") { return ok("bool") }
     }
@@ -204,7 +208,7 @@ fn LinkedNullParameterPlan(&binding: TypeNameBinding, unit: int): LinkPlanType! 
         return ok(StrArrayViewLinkPlanType())
     }
     if (binding.declaration_kind == "StringView") {
-        return ok(BuiltinLinkPlanType("str", LinkedNullCType(binding)?, true))
+        return ok(BuiltinLinkPlanType(binding.name.clone(), LinkedNullCType(binding)?, true))
     }
     type = LinkedViewPointee(binding.clone())
     return ok(BoundLinkPlanType(type, unit, LinkedNullCType(binding)?, LinkedNullView(binding)))
@@ -234,28 +238,6 @@ fn LinkedNullLayout(&project: LinkedNullProject, &ty: TypeNameBinding, layouts: 
     ordered = ordered.push(StructLayout { name: ty.name.clone(), module_index: unit, node: ty.declaration_node, fields: relocated })
     OrderCStructLayouts(ordered, unit, ty.declaration_node, ty.span.clone())?
     return ok(ordered)
-}
-
-fn localFunction(&project: LinkedNullProject, unit: int, &name: str): int {
-    for entry in project.supplied[unit - 1].named.names.declarations.clone() {
-        if (entry.kind == "Function" && entry.name == name) { return entry.node }
-    }
-    return 0
-}
-
-fn linkedDirectFunction(&project: LinkedNullProject, unit: int, &target: Node): [int]! {
-    if (target.kind == "Variable" && target.edge_count == 0) {
-        local = localFunction(project, unit, target.text)
-        if (local > 0) { return ok([unit, local]) }
-        for binding in project.binding.modules[unit - 1].imports.clone() {
-            if (binding.local_name == target.text && binding.module_index > 0) {
-                item = LinkedNullNode(project, binding.module_index, binding.target_node)
-                if (item.kind == "Function") { return ok([binding.module_index, binding.target_node]) }
-            }
-        }
-    }
-    RejectLayout("undefined_linked_dependency", "expected a bound direct function", DeclarationSpan(target))?
-    return ok([])
 }
 
 fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, allow_int: bool, allow_str: bool): TypeNameBinding! {
@@ -307,47 +289,39 @@ fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bo
     return ok(result)
 }
 
-fn linkedFsRead(&project: LinkedNullProject, unit: int, &target: Node): LinkedNullFunction! {
+fn linkedBuiltinDependency(&project: LinkedNullProject, unit: int, &target: Node, id: int): LinkedNullFunction! {
+    operation = ProjectionBuiltinLinkFor(id)
     at = DeclarationSpan(target)
     receiver = LinkedNullNode(project, unit, LinkedNullChild(project, unit, target, 0))
-    found = false
-    if (receiver.kind == "Variable" && receiver.edge_count == 0) {
-        index = 0
-        while (index < project.binding.modules[unit - 1].imports.len()) {
-            binding = project.binding.modules[unit - 1].imports[index].clone()
-            if (binding.local_name == receiver.text && binding.source_name == "fs" && binding.module_index == 0) {
-                found = true
-                break
-            }
-            index = index + 1
-        }
+    if (id != 4) {
+        RequireProjectionBuiltin(project.binding.modules[unit - 1].imports, project.supplied, receiver,
+            operation.namespace, operation.path, at.clone())?
     }
-    if (!found) {
-        RejectLayout("undefined_linked_dependency", "expected the bound standard filesystem namespace", at.clone())?
-    }
-    index = 0
-    while (index < project.supplied.len()) {
-        if (project.supplied[index].path == "std/fs.ku") {
-            RejectLayout("linked_builtin_collision", "a source module occupies the builtin fs provider path", at.clone())?
-        }
-        index = index + 1
-    }
-    path = LinkedBuiltin("str", at.clone())
-    path.declaration_kind = "StringView"
-    return ok(LinkedNullFunction { unit: 0, node: 1, symbol: "ku_linked_dep_fs_read", parameters: [path],
-        result: LinkedBuiltin("str", at), returns_result: true })
+    input = LinkedBuiltin("str", at.clone())
+    input.declaration_kind = "StringView"
+    if (id >= 4) { input.name = "bytes" }
+    index_type = LinkedBuiltin("int", at.clone())
+    parameters: [TypeNameBinding] = [input]
+    if (id == 2) { parameters = parameters.push(index_type.clone()) }
+    if (id == 2 || id == 4) { parameters = parameters.push(index_type) }
+    result = "str"
+    if (id == 3) { result = "bytes" }
+    else if (id == 4) { result = "int" }
+    return ok(LinkedNullFunction { unit: 0, node: id, symbol: operation.symbol,
+        parameters: parameters, result: LinkedBuiltin(result, at), returns_result: true })
 }
 
 fn LinkedNullCallSymbol(&callee: LinkedNullFunction): str {
-    if (callee.unit == 0) { return "ku_linked_fs_read" }
+    if (callee.unit == 0 && callee.node == 1) { return "ku_linked_fs_read" }
     return callee.symbol.clone()
 }
 
 fn LinkedNullDependency(&project: LinkedNullProject, from_unit: int, &target: Node, checked: bool): LinkedNullFunction! {
-    if (checked && target.kind == "Field" && target.text == "read" && target.edge_count == 1) {
-        return linkedFsRead(project, from_unit, target)
+    if (target.kind == "Field" && target.edge_count == 1) {
+        id = ProjectionBuiltinLinkId(target.text, checked)
+        if (id != 0) { return linkedBuiltinDependency(project, from_unit, target, id) }
     }
-    identity = linkedDirectFunction(project, from_unit, target)?
+    identity = ResolveProjectionDirectFunction(project.supplied, project.binding.modules[from_unit - 1].imports, from_unit, target)?
     unit = identity[0]
     id = identity[1]
     callee = LinkedNullNode(project, unit, id)
@@ -404,18 +378,45 @@ fn ResolveLinkedCall(&project: LinkedNullProject, &slots: [LinkedNullSlot], &cal
         receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
         name = receiver.text.clone()
     }
-    if (LinkedNullBinding(slots, name) != 0) {
+    local = LinkedNullBinding(slots, name)
+    if (local != 0) {
+        if (!slots[local - 1].value.borrowed
+            && ProjectionBytesGet(target, slots[local - 1].value.ty, call.edge_count - 1, checked)) {
+            return linkedBuiltinDependency(project, 1, target, 4)
+        }
         RejectLayout("shadowed_linked_dependency", "direct dependency name is shadowed by a local", DeclarationSpan(target))?
     }
     callee = LinkedNullDependency(project, 1, target, checked)?
     if (callee.parameters.len() != call.edge_count - 1) {
         RejectLayout("linked_dependency_arity", "argument count differs from the bound function declaration", DeclarationSpan(call))?
     }
+    if (callee.unit == 0 && callee.node >= 2) {
+        input = LinkedNullChild(project, 1, call, 1)
+        root = ProjectionPlaceRoot(project.supplied[0].named.parsed.arena.nodes,
+                                   project.supplied[0].named.parsed.arena.edges, input)
+        slot = LinkedNullBinding(slots, root)
+        if (slot != 0 && slots[slot - 1].value.borrowed) {
+            borrowed_at = DeclarationSpan(LinkedNullNode(project, 1, input))
+            if (callee.node == 2) {
+                RejectLayout("linked_slice_borrow", "string.slice requires an owned source value; clone the View explicitly", borrowed_at)?
+            } else {
+                RejectLayout("linked_bytes_borrow", "the bytes operation requires an ordinary source value", borrowed_at)?
+            }
+        }
+    }
     return ok(callee)
 }
 
+fn LinkedCallArgument(&project: LinkedNullProject, &call: Node, &callee: LinkedNullFunction, index: int): int {
+    if (callee.unit == 0 && callee.node == 4) {
+        if (index == 1) { return LinkedNullChild(project, 1, call, 1) }
+        return LinkedNullChild(project, 1, LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0)), 0)
+    }
+    return LinkedNullChild(project, 1, call, index + 1)
+}
+
 fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
-    if (callee.unit == 0) { return ok(FsReadLinkPlan(callee.symbol.clone())) }
+    if (callee.unit == 0 && callee.node == 1) { return ok(FsReadLinkPlan(callee.symbol.clone())) }
     parameters: [LinkPlanType] = []
     index = 0
     while (index < callee.parameters.len()) {
@@ -429,7 +430,7 @@ fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
 }
 
 fn LinkedNullEntry(&project: LinkedNullProject, &name: str): int! {
-    entry = localFunction(project, 1, name)
+    entry = ProjectionLocalFunction(project.supplied, 1, name)
     if (entry == 0) {
         point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
         RejectLayout("unknown_linked_null_entry", "expected a selected null! function", point)?

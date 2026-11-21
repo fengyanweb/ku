@@ -1,4 +1,4 @@
-import { json } from "std"
+import { LinkPlanJsonControls, LinkPlanJsonText } from "./project_paths.ku"
 import { LinkedLocalReadBinding, RejectMissingLinkedValue } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -7,7 +7,7 @@ import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
-import { ContainsIndex, ContainsType, CTypeName, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
+import { ContainsIndex, ContainsType, CTypeName, ProjectionBuiltinLinkFor, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 
 struct LinkPlanType {
@@ -53,6 +53,12 @@ struct LinkedNullSlot {
     moved_members: [str]
 }
 
+struct LinkedLocalAppend {
+    binding: str
+    function: LinkedNullFunction
+    environment: str
+}
+
 struct LinkedNullState {
     plain_value_result: bool
     layouts: [StructLayout]
@@ -64,6 +70,9 @@ struct LinkedNullState {
     local_callbacks: [int]
     callback_owners: [int]
     callback_helpers: str
+    local_appends: [LinkedLocalAppend]
+    append_captures: [int]
+    local_append_types: [TypeNameBinding]
     declarations: str
     code: str
     drops: str
@@ -91,6 +100,7 @@ struct LinkedNullState {
     uses_concat: bool
     uses_int_format: bool
     uses_prefix_suffix: bool
+    uses_string_contains: bool
     uses_chars: bool
 }
 
@@ -102,11 +112,12 @@ struct LinkedNullExpression {
 fn NewLinkedNullState(): LinkedNullState {
     return LinkedNullState { plain_value_result: false, layouts: [], owning_layouts: [], owning_strings: false,
         slots: [], links: [], local_readers: [], local_callbacks: [], callback_owners: [], callback_helpers: "",
+        local_appends: [], append_captures: [], local_append_types: [],
         declarations: "", code: "", drops: "", catch_slot: 0,
         catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false, uses_int_snapshot: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,
         element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_mul: false, uses_div: false,
-        uses_string_equal: false, uses_print: false, uses_concat: false, uses_int_format: false, uses_prefix_suffix: false, uses_chars: false }
+        uses_string_equal: false, uses_print: false, uses_concat: false, uses_int_format: false, uses_prefix_suffix: false, uses_string_contains: false, uses_chars: false }
 }
 
 fn LinkedReadonlyExpression(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNullExpression {
@@ -125,6 +136,19 @@ fn RememberLinkedCall(calls: [LinkedNullFunction], dependency: LinkedNullFunctio
         if (old.unit == dependency.unit && old.node == dependency.node) { return result }
     }
     return result.push(dependency)
+}
+
+fn LinkedDirectCallExpression(&callee: LinkedNullFunction, &arguments: str): str {
+    return callee.symbol.clone() + "(" + arguments.clone() + ")"
+}
+
+fn EmitLinkedReadonlyPredicate(state: LinkedNullState, callee: LinkedNullFunction, id: int, &arguments: str): LinkedNullExpression {
+    name = "predicate" + str(id)
+    next = state
+    next.code += "    bool " + name.clone() + " = " + LinkedDirectCallExpression(callee, arguments) + ";\n"
+    ty = callee.result.clone()
+    next.links = RememberLinkedCall(next.links, callee)
+    return LinkedReadonlyExpression(next, ty, name)
 }
 
 struct LinkedCheckedCall {
@@ -166,18 +190,18 @@ fn EmptyLinkPlanDeclaration(): LinkPlanDeclaration {
     return LinkPlanDeclaration { unit: 0, node: 0, symbol: "", parameters: [], result: NullLinkPlanResult(), returns_result: false }
 }
 
-fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType): str! {
+fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): str! {
     name = ty.name.clone()
     path = "null"
     if (ty.unit > 0) {
-        path = json.encode(supplied[ty.unit - 1].path.clone())?
+        path = LinkPlanJsonText(supplied[ty.unit - 1].path.clone(), controls)?
         name = supplied[ty.unit - 1].named.parsed.arena.nodes[ty.node - 1].text.clone()
     }
     passing = "value"
     if (ty.view) { passing = "view" }
-    return ok("{\"kind\":" + json.encode(ty.kind.clone())? + ",\"source_name\":" + json.encode(name)?
-        + ",\"source_path\":" + path + ",\"node\":" + str(ty.node) + ",\"c_type\":" + json.encode(ty.c_type.clone())?
-        + ",\"passing\":" + json.encode(passing)? + "}")
+    return ok("{\"kind\":" + LinkPlanJsonText(ty.kind.clone(), controls)? + ",\"source_name\":" + LinkPlanJsonText(name, controls)?
+        + ",\"source_path\":" + path + ",\"node\":" + str(ty.node) + ",\"c_type\":" + LinkPlanJsonText(ty.c_type.clone(), controls)?
+        + ",\"passing\":" + LinkPlanJsonText(passing, controls)? + "}")
 }
 
 fn FsReadLinkPlan(symbol: str): LinkPlanDeclaration {
@@ -186,38 +210,44 @@ fn FsReadLinkPlan(symbol: str): LinkPlanDeclaration {
     return LinkPlanDeclaration { unit: 0, node: 1, symbol: symbol, parameters: [path], result: result, returns_result: true }
 }
 
-fn plannedDeclaration(&supplied: [SuppliedModule], &declaration: LinkPlanDeclaration): str! {
-    name = "read"
-    path = "std/fs.ku"
+fn plannedDeclaration(&supplied: [SuppliedModule], &declaration: LinkPlanDeclaration, &controls: str): str! {
+    name = ""
+    path = ""
     if (declaration.unit > 0) {
         name = supplied[declaration.unit - 1].named.parsed.arena.nodes[declaration.node - 1].text.clone()
         path = supplied[declaration.unit - 1].path.clone()
-    } else if (declaration.unit != 0 || declaration.node != 1 || declaration.symbol != "ku_linked_dep_fs_read") {
-        at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
-        RejectLayout("invalid_linked_builtin", "unsupported builtin declaration identity", at)?
+    } else {
+        builtin = ProjectionBuiltinLinkFor(declaration.node)
+        if (declaration.unit != 0 || builtin.name == "" || declaration.symbol != builtin.symbol) {
+            at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+            RejectLayout("invalid_linked_builtin", "unsupported builtin declaration identity", at)?
+        }
+        name = builtin.name
+        path = builtin.path
     }
-    text = "{\"source_path\":" + json.encode(path)? + ",\"node\":" + str(declaration.node)
-        + ",\"source_name\":" + json.encode(name)? + ",\"symbol\":" + json.encode(declaration.symbol.clone())?
+    text = "{\"source_path\":" + LinkPlanJsonText(path, controls)? + ",\"node\":" + str(declaration.node)
+        + ",\"source_name\":" + LinkPlanJsonText(name, controls)? + ",\"symbol\":" + LinkPlanJsonText(declaration.symbol.clone(), controls)?
         + ",\"signature\":{\"parameters\":["
     index = 0
     while (index < declaration.parameters.len()) {
         if (index > 0) { text += "," }
-        text += plannedType(supplied, declaration.parameters[index])?
+        text += plannedType(supplied, declaration.parameters[index], controls)?
         index = index + 1
     }
     wrapper = "false"
     if (declaration.returns_result) { wrapper = "true" }
-    return ok(text + "],\"result\":" + plannedType(supplied, declaration.result)?
+    return ok(text + "],\"result\":" + plannedType(supplied, declaration.result, controls)?
         + ",\"returns_result\":" + wrapper + "}}")
 }
 
 fn EmitLinkPlan(&supplied: [SuppliedModule], &mode: str, &entry: LinkPlanDeclaration, &links: [LinkPlanDeclaration]): str! {
-    text = "{\"schema\":\"ku-bootstrap-link-plan-v1\",\"mode\":" + json.encode(mode.clone())?
-        + ",\"export\":" + plannedDeclaration(supplied, entry)? + ",\"dependencies\":["
+    controls = LinkPlanJsonControls()?
+    text = "{\"schema\":\"ku-bootstrap-link-plan-v1\",\"mode\":" + LinkPlanJsonText(mode.clone(), controls)?
+        + ",\"export\":" + plannedDeclaration(supplied, entry, controls)? + ",\"dependencies\":["
     index = 0
     while (index < links.len()) {
         if (index > 0) { text += "," }
-        text += plannedDeclaration(supplied, links[index])?
+        text += plannedDeclaration(supplied, links[index], controls)?
         index = index + 1
     }
     return ok(text + "]}\n")
@@ -333,7 +363,7 @@ fn LinkedRecordFields(&layouts: [StructLayout], &managed: [StructLayout], &type:
 
 fn LinkedNullOwner(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Struct" || binding.declaration_kind == "CaughtError" || binding.declaration_kind == "OwnedStringArray"
-        || (binding.declaration_kind == "Builtin" && binding.name == "str")
+        || (binding.declaration_kind == "Builtin" && (binding.name == "str" || binding.name == "bytes"))
         || LinkedNullOwnedArray(binding) || LinkedNullIntArrayOwner(binding)
 }
 
@@ -367,6 +397,15 @@ fn LinkedNullBinding(&slots: [LinkedNullSlot], &name: str): int {
     while (index < slots.len()) {
         if (slots[index].binding == name) { return index + 1 }
         index = index + 1
+    }
+    return 0
+}
+
+fn LinkedLocalAppendIndex(&state: LinkedNullState, &name: str): int {
+    index = 0
+    while (index < state.local_appends.len()) {
+        if (state.local_appends[index].binding == name) { return index + 1 }
+        index += 1
     }
     return 0
 }
@@ -464,28 +503,6 @@ fn PreserveLinkedOwners(&before: [LinkedNullSlot], &after: [LinkedNullSlot], &st
 struct LinkedNullRegion {
     state: LinkedNullState
     terminal: bool
-}
-
-struct LinkedCatchParts {
-    protected: Node
-    binding: Node
-    recovery: Node
-}
-
-fn ReadLinkedCatchParts(&named: NamedModule, &node: Node): LinkedCatchParts! {
-    edge = node.first_edge
-    protected = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
-    handler = named.parsed.arena.nodes[named.parsed.arena.edges[edge + 1] - 1].clone()
-    if (protected.kind != "TryBody" || handler.kind != "Catch" || handler.edge_count != 2) {
-        RejectLayout("unsupported_linked_catch", "expected a protected body and named catch", DeclarationSpan(node))?
-    }
-    edge = handler.first_edge
-    binding = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
-    recovery = named.parsed.arena.nodes[named.parsed.arena.edges[edge + 1] - 1].clone()
-    if (binding.kind != "CatchBinding" || binding.text == "" || binding.edge_count != 0 || recovery.kind != "CatchBody") {
-        RejectLayout("unsupported_linked_catch", "expected a named catch and handler body", DeclarationSpan(handler))?
-    }
-    return ok(LinkedCatchParts { protected: protected, binding: binding, recovery: recovery })
 }
 
 fn LinkedCPrelude(&body: LinkedNullState, guards: str): str {

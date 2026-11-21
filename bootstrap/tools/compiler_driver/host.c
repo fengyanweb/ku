@@ -100,8 +100,10 @@ static int finish(KuResult_null result) {
 static int usage(void) {
     fputs("usage: ku-bootstrap check <file.ku>\n"
           "       ku-bootstrap check-project <modules.txt>\n"
-         "       ku-bootstrap emit <file.ku> <function>\n"
+          "       ku-bootstrap emit <file.ku> <function>\n"
           "       ku-bootstrap emit-project <modules.txt> <function>\n"
+          "       ku-bootstrap emit-unit <modules.txt> <function>\n"
+          "       ku-bootstrap emit-unit-plan <modules.txt> <function>\n"
           "       ku-bootstrap emit-program <modules.txt>\n", stderr);
     return 2;
 }
@@ -127,7 +129,8 @@ int wmain(int argc, wchar_t** argv) {
     if ((argc != 3 && argc != 4) ||
         (argc == 3 && wcscmp(argv[1], L"check") && wcscmp(argv[1], L"check-project") &&
          wcscmp(argv[1], L"emit-program")) ||
-        (argc == 4 && wcscmp(argv[1], L"emit") && wcscmp(argv[1], L"emit-project"))) return usage();
+        (argc == 4 && wcscmp(argv[1], L"emit") && wcscmp(argv[1], L"emit-project") &&
+         wcscmp(argv[1], L"emit-unit") && wcscmp(argv[1], L"emit-unit-plan"))) return usage();
 
     char command_bytes[ARG_BYTES + 1], path_bytes[ARG_BYTES + 1], symbol_bytes[ARG_BYTES + 1];
     KuString command = {0}, path = {0}, symbol = {0};
@@ -148,7 +151,8 @@ int main(int argc, char** argv) {
     if ((argc != 3 && argc != 4) ||
         (argc == 3 && strcmp(argv[1], "check") && strcmp(argv[1], "check-project") &&
          strcmp(argv[1], "emit-program")) ||
-        (argc == 4 && strcmp(argv[1], "emit") && strcmp(argv[1], "emit-project"))) return usage();
+        (argc == 4 && strcmp(argv[1], "emit") && strcmp(argv[1], "emit-project") &&
+         strcmp(argv[1], "emit-unit") && strcmp(argv[1], "emit-unit-plan"))) return usage();
 
     KuString command = {0}, path = {0}, symbol = {0};
     if (!argument_view(argv[1], &command) || !argument_view(argv[2], &path) ||

@@ -56,6 +56,10 @@ KU
   program emitter supports integer `println` expressions, bound scalar
   callees, and the supported `return ok(null)` or static failure. Compile
   the result directly with `cc -std=c11 -O2 app.c -o app`.
+- `emit-unit modules.txt Function` emits one supported C11 function and its
+  external declarations. `emit-unit-plan modules.txt Function` emits the
+  matching typed dependency plan. Select the source module by listing it
+  first. Resolve the complete set of units with `bootstrap/tools/link_c.py`.
 - Success returns zero. File, checker and emitter errors return one and
   report the existing diagnostic on standard error. Invalid command forms
   or arguments return two. Inputs must be nonempty UTF-8 and at most 512

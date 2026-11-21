@@ -63,9 +63,9 @@ fn FindExport(&declarations: [TopLevelName], &request: str, at: Span): int! {
     if (declarations.len() > 255) {
         RejectName("item_limit", "supplied module accepts at most 255 declarations", at)?
     }
-    if (request.byte_len() == 0 || !("ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(string.slice(request.clone(), 0, 1)?))) {
-        return ok(0)
-    }
+    if (request.byte_len() == 0) { return ok(0) }
+    initial = string.slice(request.clone(), 0, 1)?
+    if (!"ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(initial)) { return ok(0) }
     index = 0
     while (index < declarations.len()) {
         entry = declarations[index].clone()

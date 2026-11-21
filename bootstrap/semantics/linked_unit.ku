@@ -1,0 +1,16 @@
+import { SuppliedModule } from "./imports.ku"
+import { EmitLinkPlan, LinkPlanDeclaration } from "./link_plan_c.ku"
+import { EmitLinkedNullC, PrepareLinkedNullProject } from "./linked_null_c.ku"
+import { LinkedNullDependencyPlan } from "./linked_null_types_c.ku"
+
+fn EmitLinkedUnit(supplied: [SuppliedModule], &function: str, plan: bool): str! {
+    project = PrepareLinkedNullProject(supplied)?
+    generated = EmitLinkedNullC(project, function)?
+    if (!plan) { return ok(generated.source) }
+
+    links: [LinkPlanDeclaration] = []
+    for dependency in generated.links {
+        links = links.push(LinkedNullDependencyPlan(dependency)?)
+    }
+    return EmitLinkPlan(project.supplied, "linked-null", generated.entry_plan, links)
+}

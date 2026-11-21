@@ -1,26 +1,27 @@
 import { FinishLinkedFunctionC, GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
-import { ScalarCheckedMultiplyC } from "./scalar_int_emit.ku"
+import { ScalarCheckedMultiplyC, ScalarStringHelpers } from "./scalar_int_emit.ku"
 import { StructResultHeader, StructValueResultHeader } from "./struct_result_c.ku"
 import { EmitLinkedArrayBody } from "./struct_array_c.ku"
 import { ContainsType, LinkedFsReadReference } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
-import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
+import { LinkedFieldAppendArgument, LowerLinkedFieldAppend } from "./linked_array_fields_c.ku"
+import { LinkedIntSnapshotRuntime, ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
 import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
-import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
+import { LinkedBufferResult, LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
          LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullResultType, LinkedStringResult, ReadLinkedOwnedArray, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { LowerLinkedArguments, LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { LinkedCPrelude, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
+import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue } from "./linked_null_values_c.ku"
+import { LinkedCPrelude, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedOkAvailable, LinkedRecordFields, ReadLinkedNullBinding } from "./link_plan_c.ku"
 
 fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
-    if (callee.unit == 0) { return ok(LinkedFsReadReference(callee.symbol)) }
+    if (callee.unit == 0 && callee.node == 1) { return ok(LinkedFsReadReference(callee.symbol)) }
     text = "extern " + LinkedNullResultType(callee)? + " " + callee.symbol.clone() + "("
     if (callee.parameters.len() == 0) { text += "void" }
     index = 0
@@ -33,13 +34,13 @@ fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
 }
 
 fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlot],
-                            &payload: TypeNameBinding, checked: bool): str! {
+                            &locals: [LinkedLocalAppend], &payload: TypeNameBinding, checked: bool): str! {
     text = ""
     records: [str] = []
-    string_result = LinkedStringResult(payload)
+    string_result = LinkedBufferResult(payload)
     index = 0
     while (!string_result && index < links.len()) {
-        string_result = links[index].returns_result && LinkedStringResult(links[index].result)
+        string_result = links[index].returns_result && LinkedBufferResult(links[index].result)
         index = index + 1
     }
     if (string_result) { text = StructValueResultHeader("KuProjectionString") }
@@ -77,6 +78,13 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlo
         }
         text += LinkedNullPrototype(dependency)?
     }
+    // Local append thunks are private; their carriers belong in the
+    // prelude, even when no link dependency or exported result needs one.
+    if (!ContainsType(records, "int64_t")) {
+        for helper in locals.clone() {
+            if (LinkedIntResult(helper.function.result)) { return ok(text + StructValueResultHeader("int64_t")) }
+        }
+    }
     return ok(text)
 }
 
@@ -84,10 +92,16 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
     ops = GuardArithmetic(body.uses_add, body.uses_sub)
     if (body.uses_mul || body.uses_div) { ops += "#include <stdio.h>\n#include <stdlib.h>\n\n" }
     if (body.uses_mul) { ops += ScalarCheckedMultiplyC() }
+    if (body.uses_string_contains) {
+        ops += ScalarStringHelpers(false, false, true, false, false, false, false)
+        ops += "static bool ku_linked_string_contains(KuProjectionString hay, KuProjectionString needle) {\n"
+            + "    return ku_scalar_string_contains(hay.ptr, hay.len, needle.ptr, needle.len);\n}\n\n"
+    }
     header = LinkedCPrelude(body, ops + GuardStringEquality(body.uses_string_equal))
     declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
+    if (body.uses_int_snapshot) { declarations += LinkedIntSnapshotRuntime() }
     checked = !body.plain_value_result
-    return ok(declarations + EmitLinkedNullPrototypes(body.links, body.slots, result, checked)?)
+    return ok(declarations + EmitLinkedNullPrototypes(body.links, body.slots, body.local_appends, result, checked)?)
 }
 
 fn EmitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &payload: TypeNameBinding): str! {
@@ -98,7 +112,7 @@ fn EmitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &pa
     keep = LinkedNullResultCleanupReference(body.owning_layouts, payload)
     char_errors = ""
     if (body.uses_chars) { char_errors = ManagedSourceCharactersErrors() }
-    return ok(FinishLinkedFunctionC(header + body.callback_helpers.clone(), body, symbol, signature, result, keep, char_errors))
+    return ok(FinishLinkedFunctionC(header + body.callback_helpers.clone(), body, symbol, signature, result, keep, char_errors, ""))
 }
 
 fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
@@ -141,7 +155,8 @@ fn LowerLinkedTargetSet(&project: LinkedNullProject, state: LinkedNullState, &st
         root = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
         slot = LinkedNullBinding(state.slots, root.text)
         if (root.kind != "Variable" || root.edge_count != 0 || slot == 0 || state.slots[slot - 1].parameter ||
-            state.slots[slot - 1].value.borrowed || state.slots[slot - 1].value.ty.declaration_kind != "OwnedIntArray") {
+            state.slots[slot - 1].value.borrowed || ContainsIndex(state.append_captures, slot) ||
+            state.slots[slot - 1].value.ty.declaration_kind != "OwnedIntArray") {
             RejectLayout("linked_index_target", "assignment requires an owning local int array", DeclarationSpan(root))?
         }
         RequireLinkedMutableName(root.text, DeclarationSpan(root))?
@@ -155,13 +170,10 @@ fn LowerLinkedTargetSet(&project: LinkedNullProject, state: LinkedNullState, &st
         destination.state.code += "    " + destination.value.text + " = " + stored + ";\n"
         return ok(destination.state)
     }
-    if (depth != 0) {
-        RejectLayout("linked_member_target", "record field assignment requires an outer local", DeclarationSpan(target))?
-    }
-    return LowerLinkedLocalMemberSet(project, state, statement)
+    return LowerLinkedLocalMemberSet(project, state, statement, depth != 0)
 }
 
-fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, guarded: bool): LinkedNullState! {
     target_id = LinkedNullChild(project, 1, statement, 0)
     target = LinkedNullNode(project, 1, target_id)
     if (target.kind != "Field" || target.edge_count != 1) {
@@ -176,15 +188,21 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
 
     RequireLinkedMutableName(root.text, DeclarationSpan(root))?
 
+    rhs_id = LinkedNullChild(project, 1, statement, 1)
+    argument = LinkedFieldAppendArgument(project, target, root, rhs_id)
+    if (argument > 0) { return LowerLinkedFieldAppend(project, state, target_id, argument) }
     // Generate the RHS and finish its fallible work before selecting the
     // target in the resulting state. The old member still belongs to cleanup
     // if the RHS fails or consumes its record.
-    rhs = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 1), 0)?
+    rhs = LowerLinkedNullValue(project, state, rhs_id, 0)?
     replacement = rhs.value.clone()
     place = LowerLinkedNullRead(project, rhs.state, target_id, 0)?
     ty = place.value.ty.clone()
     string = LinkedStringResult(ty)
     copy = ty.declaration_kind == "Builtin" && (ty.name == "int" || ty.name == "bool")
+    if (guarded && !copy) {
+        RejectLayout("linked_member_target", "guarded record assignment requires a Copy int or bool field of a mutable local", DeclarationSpan(target))?
+    }
     if (!SameLinkedType(ty, replacement.ty) || (!copy && (!string || replacement.borrowed))) {
         RejectLayout("linked_member_rebind_type", "replacement requires a matching Copy field or separate str owner", DeclarationSpan(target))?
     }
@@ -250,7 +268,7 @@ fn putLinkedDestructuredField(&project: LinkedNullProject, state: LinkedNullStat
     } else {
         old = next.slots[target - 1].value.clone()
         if (target == field.slot || next.slots[target - 1].parameter || old.borrowed || !SameLinkedType(old.ty, field.ty) ||
-            LinkedLocalReadCaptures(next.local_readers, target)) {
+            LinkedLocalReadCaptures(next.local_readers, target) || ContainsIndex(next.append_captures, target)) {
             RejectLayout("linked_destructure_target", "replacement requires a distinct mutable local of the same type", DeclarationSpan(local))?
         }
         RequireLinkedMutableName(local.text, DeclarationSpan(local))?
@@ -332,7 +350,7 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
             RejectLayout("linked_tail_result", "forwarded Result must match the entry's declared payload", DeclarationSpan(call))?
         }
         call_id = LinkedNullChild(project, 1, statement, 0)
-        arguments = LowerLinkedArguments(project, state, call, target, call_id, 0)?
+        arguments = LowerLinkedArguments(project, state, call, target, call_id, 0, true)?
         arguments.state.code = arguments.state.code + "    result = " + LinkedNullCallSymbol(target) + "(" + arguments.args
             + ");\n" + arguments.handoff + "    goto cleanup;\n"
         return ok(arguments.state)
@@ -344,13 +362,14 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
     node = LinkedNullNode(project, 1, id)
     next = state
     if (LinkedNullHasResultValue(result)) {
-        value = LowerLinkedNullValue(project, next, id, 0)?
+        value = LowerLinkedExpectedValue(project, next, result, id, 0)?
         copy = LinkedIntResult(result)
-        if (!SameLinkedType(value.value.ty, result) || (!copy && (value.value.borrowed || value.value.slot == 0))) {
+        static_string = LinkedStringResult(result) && node.kind == "String" && node.edge_count == 0
+        if (!SameLinkedType(value.value.ty, result) || (!copy && !static_string && (value.value.borrowed || value.value.slot == 0))) {
             RejectLayout("linked_result_return", "return needs a matching Copy int or an initialized matching owner", DeclarationSpan(node))?
         }
         value.state.code = value.state.code + "    result.value = " + value.value.text.clone() + ";\n"
-        if (copy) { next = value.state }
+        if (copy || static_string) { next = value.state }
         else {
             owner = value.value.clone()
             next = MoveLinkedNullSlot(value.state, owner)?

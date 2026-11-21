@@ -77,7 +77,8 @@ fn ReadStruct(tokens: [Token]): DeclarationRead! {
     cursor = cursor + 1
     fields: [int] = []
     work = validation_index
-    while (tokens[cursor].kind != "RBrace" && tokens[cursor].kind != "Eof") {
+    reading_fields = tokens[cursor].kind != "RBrace" && tokens[cursor].kind != "Eof"
+    while (reading_fields) {
         work = work + 1
         if (work > 16384) {
             RejectAt(tokens[cursor].clone(), "work_limit", "stage-3 parser work budget exceeded")?
@@ -153,6 +154,7 @@ fn ReadStruct(tokens: [Token]): DeclarationRead! {
         field = arena_nodes.len()
         fields = fields.push(field)
         if (tokens[cursor].kind == "Comma") { cursor = cursor + 1 }
+        reading_fields = tokens[cursor].kind != "RBrace" && tokens[cursor].kind != "Eof"
     }
     end = tokens[cursor].clone()
     if (end.kind != "RBrace") {

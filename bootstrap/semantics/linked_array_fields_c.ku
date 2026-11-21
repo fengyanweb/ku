@@ -1,0 +1,139 @@
+import { FindLinkedLocalRead, LinkedLocalReadBinding } from "./call_contracts.ku"
+import { CheckLinkedLocalFunctionName, RejectLocalReader } from "./linked_parameters_c.ku"
+import { ProjectionCloneSource } from "./struct_projection_c.ku"
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan } from "./names.ku"
+import { RejectLayout } from "./struct_layouts.ku"
+import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullOwnedArray, LinkedNullReadableArray, LinkedNullState, LinkedViewPointee } from "./link_plan_c.ku"
+import { LinkedNullArrayElement, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { AppendLinkedArrayElement, LowerLinkedNullValue } from "./linked_null_values_c.ku"
+
+fn LinkedFieldAppendArgument(&project: LinkedNullProject, &target: Node, &root: Node, rhs: int): int {
+    call = LinkedNullNode(project, 1, rhs)
+    if (call.kind != "Call" || call.edge_count != 2) { return 0 }
+    method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (method.kind != "Field" || method.edge_count != 1 || method.text != "push") { return 0 }
+    field = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
+    if (field.kind != "Field" || field.edge_count != 1 || field.text != target.text) { return 0 }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, field, 0))
+    if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != root.text) { return 0 }
+    return LinkedNullChild(project, 1, call, 1)
+}
+
+fn LowerLinkedFieldAppend(&project: LinkedNullProject, state: LinkedNullState, target: int, argument: int): LinkedNullState! {
+    element = LowerLinkedNullValue(project, state, argument, 0)?
+    destination = LowerLinkedNullRead(project, element.state, target, 0)?
+    array = destination.value.clone()
+    item = element.value
+    // The field remains a member of the same live record on both success and
+    // failure. Append transfers only the separately owned element.
+    if (!LinkedNullOwnedArray(array.ty) || array.borrowed || array.member_path == ""
+        || item.borrowed || item.slot == 0 || item.member_path != ""
+        || !SameLinkedType(LinkedNullArrayElement(array.ty.clone()), item.ty)) {
+        RejectLayout("linked_field_append", "append requires an owned record array field and a separate owned element",
+                     DeclarationSpan(LinkedNullNode(project, 1, argument)))?
+    }
+    for existing in destination.state.local_append_types.clone() {
+        if (SameLinkedType(existing, array.ty)) { return ok(AppendLinkedArrayElement(destination.state, array, item)) }
+    }
+    destination.state.local_append_types = destination.state.local_append_types.push(array.ty.clone())
+    return ok(AppendLinkedArrayElement(destination.state, array, item))
+}
+
+fn LinkedAppendFailureRelay(&body: LinkedNullState): str {
+    text = "    failure->append_status = append_status;\n"
+    calls_append = body.local_appends.len() > 0
+    if (calls_append || body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0) {
+        text += "    failure->out_of_memory = out_of_memory;\n"
+    }
+    if (body.validated_arrays.len() > 0) {
+        message = "invalid struct array ownership"
+        if (body.uses_str_array) { message = "invalid array view" }
+        text += "    if (invalid_array) failure->array_error = \"" + message + "\\n\";\n"
+    }
+    if (calls_append) { text += "    if (captured_array_failure) failure->array_error = captured_array_failure;\n" }
+    if (calls_append || body.uses_add || body.uses_sub || body.uses_mul) { text += "    failure->overflow = overflow;\n" }
+    if (calls_append || body.uses_index) {
+        text += "    failure->index_failed = index_failed;\n    failure->index = failure_index;\n    failure->length = failure_length;\n"
+    }
+    return text
+}
+
+fn readLocalIndexShift(&project: LinkedNullProject, &index: Node, &name: str): int! {
+    argument = index.clone()
+    shift = 0
+    if (index.kind == "Binary" && index.text == "-" && index.edge_count == 2) {
+        argument = LinkedNullNode(project, 1, LinkedNullChild(project, 1, index, 0))
+        constant = LinkedNullNode(project, 1, LinkedNullChild(project, 1, index, 1))
+        if (constant.kind != "Int" || constant.edge_count != 0 || constant.int_value < 0) {
+            RejectLocalReader(constant, "the local read index can subtract only a nonnegative int literal")?
+        }
+        shift = constant.int_value
+    }
+    if (argument.kind != "Variable" || argument.edge_count != 0 || argument.text != name) {
+        RejectLocalReader(index, "the local read index must use the declared int parameter")?
+    }
+    return ok(shift)
+}
+
+fn RegisterLinkedLocalRead(&project: LinkedNullProject, state: LinkedNullState, &function: Node, id: int): LinkedNullState! {
+    if (function.edge_count != 3) { RejectLocalReader(function, "a local reader needs one parameter and one return")? }
+    CheckLinkedLocalFunctionName(project, state, function)?
+    parameter = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, 0))
+    exit = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, 2))
+    if (parameter.kind != "Parameter" || parameter.edge_count != 1 || parameter.int_value != 0 ||
+        exit.kind != "Return" || exit.edge_count != 1) {
+        RejectLocalReader(function, "expected one typed Copy parameter and a direct return from the same frame")?
+    }
+    input = LinkedNullType(project, 1, LinkedNullChild(project, 1, parameter, 0))?
+    if (input.declaration_kind != "Builtin" || input.name != "int") {
+        RejectLocalReader(parameter, "a local reader requires a Copy int index parameter")?
+    }
+    expression = LinkedNullChild(project, 1, exit, 0)
+    subject = ProjectionCloneSource(project.supplied[0].named.parsed.arena.nodes,
+        project.supplied[0].named.parsed.arena.edges, expression)
+    mapper = 0
+    if (subject == 0) {
+        call = LinkedNullNode(project, 1, expression)
+        if (call.kind != "Call" || call.edge_count != 2) {
+            RejectLocalReader(exit, "expected an array element clone or a direct readonly mapper")?
+        }
+        mapper = expression
+        subject = LinkedNullChild(project, 1, call, 1)
+    }
+    index = LinkedNullNode(project, 1, subject)
+    if (index.kind != "Index" || index.edge_count != 2) {
+        RejectLocalReader(index, "expected a local reader of an indexed array element")?
+    }
+    array = LinkedNullNode(project, 1, LinkedNullChild(project, 1, index, 0))
+    capture = LinkedNullBinding(state.slots, array.text)
+    if (array.kind != "Variable" || array.edge_count != 0 || array.text == parameter.text || capture == 0 ||
+        !state.slots[capture - 1].live || !LinkedNullReadableArray(state.slots[capture - 1].value.ty)) {
+        RejectLocalReader(array, "expected one initialized captured named array")?
+    }
+    element = LinkedNullArrayElement(state.slots[capture - 1].value.ty.clone())
+    result = LinkedNullType(project, 1, LinkedNullChild(project, 1, function, 1))?
+    if (result.declaration_kind != "Struct" || (mapper == 0 && !SameLinkedType(result, element))) {
+        RejectLocalReader(function, "local reader result must match the captured named array element")?
+    }
+    if (mapper != 0) {
+        call = LinkedNullNode(project, 1, mapper)
+        target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+        if (target.kind != "Variable" || target.edge_count != 0 || target.text == parameter.text ||
+            target.text == function.text || FindLinkedLocalRead(state.local_readers, target.text) != 0 ||
+            LinkedLocalAppendIndex(state, target.text) != 0) {
+            RejectLocalReader(target, "expected a statically bound readonly mapper")?
+        }
+        callee = ResolveLinkedCall(project, state.slots, call, target, false)?
+        view = callee.parameters[0].clone()
+        if (view.declaration_kind != "StructView" || !SameLinkedType(LinkedViewPointee(view), element) ||
+            !SameLinkedType(callee.result, result)) {
+            RejectLocalReader(call, "mapper must borrow one matching element and return the declared record")?
+        }
+    }
+    shift = readLocalIndexShift(project, LinkedNullNode(project, 1, LinkedNullChild(project, 1, index, 1)), parameter.text)?
+    state.local_readers = state.local_readers.push(LinkedLocalReadBinding {
+        name: function.text.clone(), node: id, captured_slot: capture, index_shift: shift })
+    return ok(state)
+}

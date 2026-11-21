@@ -351,3 +351,72 @@ fn ManagedStringAppendRuntime(): str {
 fn ManagedStringRuntime(): str {
     return ScalarCheckedMultiplyC() + ManagedStringAppendRuntime()
 }
+
+fn CheckedLinkedCallbackExpression(&carrier: str, &callback: str, &args: str): str {
+    expression = callback.clone() + ".entry ? " + callback.clone() + ".entry(" + callback.clone() + ".environment, " + args.clone() + ")"
+    return expression + " : (" + carrier.clone() + "){.error={"
+        + ".domain={(uint8_t*)\"bootstrap.callback\",sizeof(\"bootstrap.callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
+        + ".code={(uint8_t*)\"invalid_callback\",sizeof(\"invalid_callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
+        + ".message={(uint8_t*)\"callback entry is missing\",sizeof(\"callback entry is missing\")-1u,0u,KU_PROJECTION_STRING_STATIC}}}"
+}
+
+
+fn CheckedAppendFault(id: int): str {
+    return "    KuLocalAppendFailure fault" + str(id) + " = {.append_status = KU_STRUCT_ARRAY_OK};\n"
+}
+
+fn CheckedAppendInvocation(&symbol: str, &args: str, &environment: str, id: int): str {
+    invocation = symbol.clone() + "(" + environment.clone() + ", &fault" + str(id)
+    if (args != "") { invocation += ", " + args.clone() }
+    return invocation + ")"
+}
+
+fn CheckedAppendFaultHandoff(id: int): str {
+    fault = "fault" + str(id)
+    return "    if (" + fault.clone() + ".out_of_memory) { out_of_memory = true; goto cleanup; }\n"
+        + "    if (" + fault.clone() + ".array_error) { captured_array_failure = " + fault.clone() + ".array_error; goto cleanup; }\n"
+        + "    if (" + fault.clone() + ".append_status != KU_STRUCT_ARRAY_OK) { append_status = "
+        + fault.clone() + ".append_status; goto cleanup; }\n"
+        + "    if (" + fault.clone() + ".overflow) { overflow = true; goto cleanup; }\n"
+        + "    if (" + fault.clone() + ".index_failed) { index_failed = true; failure_index = " + fault.clone()
+        + ".index; failure_length = " + fault + ".length; goto cleanup; }\n"
+}
+
+fn EmitLinkedArrayIndexGuard(&offset: str, &index: str, &header: str): str {
+    return "    int64_t " + offset.clone() + " = " + index.clone() + ";\n"
+        + "    if (" + offset.clone() + " < 0 || (uint64_t)" + offset.clone() + " >= " + header.clone() + "->len) {\n"
+        + "        index_failed = true; failure_index = " + offset.clone() + "; failure_length = " + header.clone() + "->len; goto cleanup;\n    }\n"
+}
+
+fn EmitLinkedLogicalBranch(&result: str, &left: str, disjunction: bool): str {
+    negate = ""
+    if (disjunction) { negate = "!" }
+    return "    bool " + result.clone() + " = " + left.clone() + ";\n"
+        + "    if (" + negate + result.clone() + ") {\n"
+}
+
+fn LinkedIntSnapshotRuntime(): str {
+    return "
+enum { KU_INT_SNAPSHOT_OK, KU_INT_SNAPSHOT_INVALID, KU_INT_SNAPSHOT_OOM };
+
+static int ku_linked_int_snapshot(const KuArrayInt *source, KuArrayInt *target) {
+    if (!ku_linked_view_int_array_valid(source) || source->len > SIZE_MAX / sizeof(int64_t))
+        return KU_INT_SNAPSHOT_INVALID;
+    size_t count = source->len;
+    if (count) {
+        int64_t *copy = malloc(count * sizeof(*copy));
+        if (!copy) return KU_INT_SNAPSHOT_OOM;
+        memcpy(copy, source->data, count * sizeof(*copy));
+        *target = (KuArrayInt){ count, copy, count };
+    }
+    return KU_INT_SNAPSHOT_OK;
+}
+"
+}
+
+fn LinkedIntSnapshotCall(&source: str, &target: str): str {
+    status = "snapshot_" + target.clone()
+    return "    int " + status.clone() + " = ku_linked_int_snapshot(&(" + source.clone() + "), &" + target.clone() + ");\n"
+        + "    if (" + status.clone() + " != KU_INT_SNAPSHOT_OK) { invalid_array = " + status.clone()
+        + " == KU_INT_SNAPSHOT_INVALID; out_of_memory = " + status + " == KU_INT_SNAPSHOT_OOM; goto cleanup; }\n"
+}

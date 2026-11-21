@@ -159,14 +159,17 @@ fn ReadFunctionHeaderMode(&tokens: [Token], first: int, last_index: int, initial
     cursor = cursor + 1
     parameters: [int] = []
     parameter_count = 0
-    while (WindowKind(tokens, cursor, last_index) != "RParen") {
+    first_parameter_kind = WindowKind(tokens, cursor, last_index)
+    has_parameter = first_parameter_kind != "RParen"
+    while (has_parameter) {
         parse_steps = ChargeFunctionHeaderWork(parse_steps, 1, WindowToken(tokens, cursor, last_index))?
         if (parameter_count >= 32) {
             RejectAt(WindowToken(tokens, cursor, last_index), "parameter_limit", "stage-3 functions accept at most 32 parameters")?
         }
         parameter_start = WindowToken(tokens, cursor, last_index)
         parameter_mode = 0
-        if (WindowKind(tokens, cursor, last_index) == "Ampersand") {
+        parameter_kind = WindowKind(tokens, cursor, last_index)
+        if (parameter_kind == "Ampersand") {
             parameter_mode = 1
             cursor = cursor + 1
             parse_steps = ChargeFunctionHeaderWork(parse_steps, 1, parameter_start.clone())?
@@ -177,7 +180,8 @@ fn ReadFunctionHeaderMode(&tokens: [Token], first: int, last_index: int, initial
         }
         cursor = cursor + 1
         parameter_children: [int] = []
-        if (WindowKind(tokens, cursor, last_index) == "Colon") {
+        before_type = WindowKind(tokens, cursor, last_index)
+        if (before_type == "Colon") {
             type_start = cursor + 1
             parsed_type = ReadSignatureTypePrefix(tokens, type_start, last_index)?
             { parts, edges, root, consumed, work } = parsed_type
@@ -191,19 +195,27 @@ fn ReadFunctionHeaderMode(&tokens: [Token], first: int, last_index: int, initial
             parameter_span, parameter_children, parameter_token.clone(), arena)?
         parameters = parameters.push(parameter)
         parameter_count = parameter_count + 1
-        if (WindowKind(tokens, cursor, last_index) == "Comma") {
+        before_comma = WindowKind(tokens, cursor, last_index)
+        if (before_comma == "Comma") {
             cursor = cursor + 1
-            if (WindowKind(tokens, cursor, last_index) == "RParen") {
+            after_comma = WindowKind(tokens, cursor, last_index)
+            if (after_comma == "RParen") {
                 RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", parameter_error.clone())?
             }
-        } else if (WindowKind(tokens, cursor, last_index) != "RParen") {
-            RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", close_error.clone())?
+        } else {
+            before_close = WindowKind(tokens, cursor, last_index)
+            if (before_close != "RParen") {
+                RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", close_error.clone())?
+            }
         }
+        next_parameter_kind = WindowKind(tokens, cursor, last_index)
+        has_parameter = next_parameter_kind != "RParen"
     }
     cursor = cursor + 1
     return_type = 0
     has_return_type = false
-    if (WindowKind(tokens, cursor, last_index) == "Colon") {
+    before_return_type = WindowKind(tokens, cursor, last_index)
+    if (before_return_type == "Colon") {
         type_start = cursor + 1
         parsed_type = ReadSignatureTypePrefix(tokens, type_start, last_index)?
         { parts, edges, root, consumed, work } = parsed_type
@@ -212,7 +224,8 @@ fn ReadFunctionHeaderMode(&tokens: [Token], first: int, last_index: int, initial
         cursor = cursor + 1 + consumed
         { arena, root: return_type } = AppendFunctionHeaderType(parts, edges, root, WindowToken(tokens, cursor - 1, last_index), arena)?
     }
-    if (WindowKind(tokens, cursor, last_index) != "LBrace") {
+    before_body = WindowKind(tokens, cursor, last_index)
+    if (before_body != "LBrace") {
         RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "expected '{'")?
     }
     if (has_return_type) { parameters = parameters.push(return_type) }

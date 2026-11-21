@@ -1,5 +1,6 @@
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
+import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
@@ -35,6 +36,20 @@ fn ContainsType(&names: [str], &name: str): bool {
     return false
 }
 
+fn ContainsAllTypes(&members: [str], &possible: [str]): bool {
+    if (members.len() > possible.len()) { return false }
+    index = 0
+    while (index < members.len()) {
+        if (!ContainsType(possible, members[index])) { return false }
+        index = index + 1
+    }
+    return true
+}
+
+fn OnlyWholeMemberMoves(&members: [str]): bool {
+    return members.len() == 0 || (members.len() == 1 && members[0] == "")
+}
+
 fn StringField(&field: TypeNameBinding): bool {
     return field.declaration_kind == "Builtin" && field.name == "str"
 }
@@ -46,6 +61,48 @@ fn ContainsIndex(&ids: [int], id: int): bool {
         index = index + 1
     }
     return false
+}
+
+fn RequireProjectionBuiltin(&imports: [ImportBinding], &supplied: [SuppliedModule], &receiver: Node,
+                            &namespace: str, &provider: str, at: Span): null! {
+    found = false
+    if (receiver.kind == "Variable" && receiver.edge_count == 0) {
+        index = 0
+        while (index < imports.len()) {
+            if (imports[index].local_name == receiver.text && imports[index].source_name == namespace
+                && imports[index].module_index == 0) {
+                found = true
+                break
+            }
+            index = index + 1
+        }
+    }
+    if (!found) {
+        expected = "expected the bound standard string namespace"
+        if (namespace == "fs") { expected = "expected the bound standard filesystem namespace" }
+        RejectLayout("undefined_linked_dependency", expected, at.clone())?
+    }
+    index = 0
+    while (index < supplied.len()) {
+        if (supplied[index].path == provider) {
+            RejectLayout("linked_builtin_collision", "a source module occupies the builtin " + namespace.clone() + " provider path", at.clone())?
+        }
+        index = index + 1
+    }
+    return ok(null)
+}
+
+fn ProjectionPlaceRoot(&nodes: [Node], &edges: [int], id: int): str {
+    cursor = id
+    depth = 0
+    while (depth < 32) {
+        kind = nodes[cursor - 1].kind.clone()
+        if (kind == "Variable") { return nodes[cursor - 1].text.clone() }
+        if (kind != "Field" && kind != "OptionalField" && kind != "Index" && kind != "TryUnwrap") { return "" }
+        cursor = edges[nodes[cursor - 1].first_edge]
+        depth = depth + 1
+    }
+    return ""
 }
 
 fn ProjectionCloneSource(&nodes: [Node], &edges: [int], id: int): int {
@@ -244,4 +301,61 @@ fn LinkedFsReadReference(&symbol: str): str {
         + "    else out.error = (KuBootstrapError){ku_linked_from_fs_string(read.error.domain), "
         + "ku_linked_from_fs_string(read.error.code), ku_linked_from_fs_string(read.error.message)};\n"
         + "    return out;\n}\n"
+}
+
+struct ProjectionBuiltinLink {
+    name: str
+    namespace: str
+    path: str
+    symbol: str
+}
+
+fn ProjectionBuiltinLinkFor(id: int): ProjectionBuiltinLink {
+    if (id == 1) {
+        return ProjectionBuiltinLink { name: "read", namespace: "fs", path: "std/fs.ku", symbol: "ku_linked_dep_fs_read" }
+    }
+    if (id == 2) {
+        return ProjectionBuiltinLink { name: "slice", namespace: "string", path: "std/string.ku", symbol: "ku_linked_dep_string_slice" }
+    }
+    name = ""
+    if (id == 3) { name = "from_str" }
+    else if (id == 4) { name = "get" }
+    symbol = "ku_linked_dep_bytes_" + name.clone()
+    return ProjectionBuiltinLink { name: name, namespace: "bytes", path: "std/bytes.ku", symbol: symbol }
+}
+
+fn ProjectionBuiltinLinkId(&name: str, checked: bool): int {
+    if (!checked) { return 0 }
+    if (name == "read") { return 1 }
+    if (name == "slice") { return 2 }
+    if (name == "from_str") { return 3 }
+    return 0
+}
+
+fn ProjectionBytesGet(&target: Node, &receiver: TypeNameBinding, arguments: int, checked: bool): bool {
+    return checked && target.kind == "Field" && target.edge_count == 1 && target.text == "get" && arguments == 1
+        && receiver.declaration_kind == "Builtin" && receiver.name == "bytes"
+}
+
+fn ProjectionLocalFunction(&supplied: [SuppliedModule], unit: int, &name: str): int {
+    for entry in supplied[unit - 1].named.names.declarations.clone() {
+        if (entry.kind == "Function" && entry.name == name) { return entry.node }
+    }
+    return 0
+}
+
+fn ResolveProjectionDirectFunction(&supplied: [SuppliedModule], &imports: [ImportBinding], unit: int, &target: Node): [int]! {
+    if (target.kind == "Variable" && target.edge_count == 0) {
+        local = ProjectionLocalFunction(supplied, unit, target.text)
+        if (local > 0) { return ok([unit, local]) }
+        for binding in imports.clone() {
+            if (binding.local_name == target.text && binding.module_index > 0) {
+                if (supplied[binding.module_index - 1].named.parsed.arena.nodes[binding.target_node - 1].kind == "Function") {
+                    return ok([binding.module_index, binding.target_node])
+                }
+            }
+        }
+    }
+    RejectLayout("undefined_linked_dependency", "expected a bound direct function", DeclarationSpan(target))?
+    return ok([])
 }
