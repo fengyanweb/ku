@@ -380,9 +380,9 @@ fn LinkedBooleanWhileCondition(&state: LinkedNullState, &guard: Node): str {
     return slot.value.text
 }
 
-fn EmitLinkedPlainInvocation(output: LinkedNullExpression, &callee: LinkedNullFunction, &args: str, handoff: str): LinkedNullExpression {
+fn EmitLinkedPlainInvocation(output: LinkedNullExpression, &invoke: str, handoff: str): LinkedNullExpression {
     next = output
-    next.state.code += "    " + next.value.text.clone() + " = " + LinkedDirectCallExpression(callee, args) + ";\n" + handoff
+    next.state.code += "    " + next.value.text.clone() + " = " + invoke + ";\n" + handoff
     next.state.slots[next.value.slot - 1].live = true
     return next
 }
