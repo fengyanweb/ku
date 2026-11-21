@@ -229,10 +229,13 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             else if (kind == "TypeFunction") { next = LowerLinkedLocalAlias(project, next, statement)? }
             else { next = addLocal(project, next, statement, id)? }
         } else if (statement.kind == "Function" && depth == 0) {
-            if (statement.edge_count >= 7 && LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 4)).kind == "Parameter") {
+            nullary = statement.edge_count >= 2 &&
+                LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0)).kind == "TypeResult"
+            if (nullary ||
+                (statement.edge_count >= 7 && LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 4)).kind == "Parameter")) {
                 CheckLinkedLocalFunctionName(project, next, statement)?
                 thunk = ReadLinkedAppendThunk(project, next, statement, id)?
-                body = lowerLinkedRegion(project, statement, thunk.parameters.state.clone(), 6, thunk.parameters.result, 1)?
+                body = lowerLinkedRegion(project, statement, thunk.parameters.state.clone(), thunk.parameters.body_start, thunk.parameters.result, 1)?
                 next = FinishLinkedAppendThunk(next, thunk, body, statement)?
             } else if (statement.edge_count >= 4 && LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1)).kind == "Parameter") {
                 CheckLinkedLocalFunctionName(project, next, statement)?

@@ -3366,10 +3366,16 @@ fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [
         nodes = nodes.push(item)
         return ok(nodes.len() + cursor)
     }
+    fn Advance(): null! {
+        edges = edges.push(cursor)
+        cursor = cursor + 1
+        return ok(null)
+    }
     left = Append(first, second, 3, Location { line: 2 }, choices)?
     cursor = 8
     right = Append(third, fourth, 0 - 5, Location { line: 5 }, more)?
-    return ok(left * 1000 + right * 100 + nodes.len() + edges.len())
+    Advance()?
+    return ok(left * 1000 + right * 100 + nodes.len() + edges.len() + cursor)
 }
 "#;
     let file = cwd.join("append-thunk.ku");
@@ -3422,7 +3428,7 @@ int main(int argc, char **argv) {
     (void)argv;
     if (argc > 1) { (void)run(false, true); return 2; }
     KuBootstrapResult_int64_t first = run(false, false);
-    assert(first.ok && first.value == 9012 && !outstanding());
+    assert(first.ok && first.value == 9022 && !outstanding());
     KuBootstrapResult_int64_t next = run(true, false);
     assert(!next.ok && next.error.domain.len == 1 && *next.error.domain.ptr == 'C');
     assert(next.error.code.len == 1 && *next.error.code.ptr == 'C');
@@ -3433,7 +3439,7 @@ int main(int argc, char **argv) {
     ku_projection_string_drop(&next.error.message);
     assert(!outstanding());
     KuBootstrapResult_int64_t last = run(false, false);
-    assert(last.ok && last.value == 9012 && !outstanding());
+    assert(last.ok && last.value == 9022 && !outstanding());
     return 0;
 }
 "#
@@ -3461,6 +3467,12 @@ int main(int argc, char **argv) {
             "moved: [int] = edges\n        offset = moved.len()",
             "linked_callback_owner",
         ),
+        (
+            "Advance()?",
+            "wrong = Advance()?",
+            "linked_dependency_result",
+        ),
+        ("Advance()?", "Advance(9)?", "linked_local_append_arity"),
         (
             "return ok(left *",
             "alias = Append\n    return ok(left *",

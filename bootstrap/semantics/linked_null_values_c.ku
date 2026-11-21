@@ -182,6 +182,9 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
     }
     if (local > 0) {
         callee = state.local_appends[local - 1].function.clone()
+        if (owns_value && !LinkedNullHasResultValue(callee.result)) {
+            RejectLayout("linked_dependency_result", "expected a Result with a value payload", DeclarationSpan(unwrap))?
+        }
         if (call.edge_count != callee.parameters.len() + 1) {
             RejectLayout("linked_local_append_arity", "direct local append call requires its declared arguments", DeclarationSpan(call))?
         }

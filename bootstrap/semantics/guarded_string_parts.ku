@@ -366,7 +366,9 @@ fn CheckedAppendFault(id: int): str {
 }
 
 fn CheckedAppendInvocation(&symbol: str, &args: str, environment: int, id: int): str {
-    return symbol.clone() + "(&environment" + str(environment) + ", &fault" + str(id) + ", " + args.clone() + ")"
+    invocation = symbol.clone() + "(&environment" + str(environment) + ", &fault" + str(id)
+    if (args != "") { invocation += ", " + args.clone() }
+    return invocation + ")"
 }
 
 fn CheckedAppendFaultHandoff(id: int): str {

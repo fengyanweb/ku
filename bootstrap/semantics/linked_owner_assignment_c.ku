@@ -1,4 +1,5 @@
 import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
+import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule } from "./names.ku"
 import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
@@ -248,20 +249,24 @@ struct LinkedAppendThunk {
 fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
                          &function: Node, id: int): LinkedAppendThunk! {
     parameters = ReadLinkedNullParametersFrom(project, function, StartLinkedThunkFrame(parent))?
-    if (parameters.body_start != 6 || parameters.state.plain_value_result || !LinkedIntResult(parameters.result)) {
-        RejectLocalCapture(function, "a local append function requires five typed parameters and int!")?
+    arguments: [TypeNameBinding] = []
+    nullary = parameters.body_start == 1 && parameters.result.declaration_kind == "Builtin" && parameters.result.name == "null"
+    if (parameters.state.plain_value_result || (!nullary && (parameters.body_start != 6 || !LinkedIntResult(parameters.result)))) {
+        RejectLocalCapture(function, "a local append function requires null! without parameters or five typed parameters and int!")?
     }
-    slots = parameters.state.slots.clone()
-    span = slots[3].value.clone()
-    if (!LinkedStringResult(slots[0].value.ty) || !LinkedStringResult(slots[1].value.ty) ||
-        !LinkedIntResult(slots[2].value.ty) || span.ty.declaration_kind != "Struct" ||
-        LinkedNullDropC(parameters.state.layouts, parameters.state.owning_layouts, span.ty, span.text) != "" ||
-        !LinkedNullIntArrayOwner(slots[4].value.ty)) {
-        RejectLocalCapture(function, "a local append function requires str, str, int, a Copy-layout record and [int]")?
+    if (!nullary) {
+        slots = parameters.state.slots.clone()
+        span = slots[3].value.clone()
+        if (!LinkedStringResult(slots[0].value.ty) || !LinkedStringResult(slots[1].value.ty) ||
+            !LinkedIntResult(slots[2].value.ty) || span.ty.declaration_kind != "Struct" ||
+            LinkedNullDropC(parameters.state.layouts, parameters.state.owning_layouts, span.ty, span.text) != "" ||
+            !LinkedNullIntArrayOwner(slots[4].value.ty)) {
+            RejectLocalCapture(function, "a five-parameter local append function requires str, str, int, a Copy-layout record and [int]")?
+        }
+        for slot in slots { arguments = arguments.push(slot.value.ty) }
     }
-    signature = LinkedNullFunction { unit: 1, node: id, symbol: "ku_local_append_" + str(id), parameters: [
-        slots[0].value.ty.clone(), slots[1].value.ty.clone(), slots[2].value.ty.clone(),
-        slots[3].value.ty.clone(), slots[4].value.ty.clone()], result: parameters.result.clone(), returns_result: true }
+    signature = LinkedNullFunction { unit: 1, node: id, symbol: "ku_local_append_" + str(id), parameters: arguments,
+        result: parameters.result.clone(), returns_result: true }
     body = parameters.state
     environment = "ku_local_append_environment_" + str(id)
     body.code += "    " + environment.clone() + " *const capture = raw;\n"
@@ -331,9 +336,11 @@ fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
     if (parent.local_appends.len() == 0) {
         next.callback_helpers += "\ntypedef struct { int append_status; bool out_of_memory, overflow, index_failed; const char *array_error; int64_t index; size_t length; } KuLocalAppendFailure;\n"
     }
+    signature = "void *raw, KuLocalAppendFailure *failure"
+    if (thunk.parameters.body_start > 1) { signature += ", " + thunk.parameters.signature.clone() }
     next.callback_helpers += "\ntypedef struct {" + thunk.typedef_fields.clone() + " } " + thunk.environment.clone() + ";\nstatic "
-        + FinishLinkedFunctionC("", next, thunk.function.symbol, "void *raw, KuLocalAppendFailure *failure, " +
-            thunk.parameters.signature.clone(), LinkedCheckedResultCType(thunk.function.result)?, "", "", appendThunkFailureRelay(next))
+        + FinishLinkedFunctionC("", next, thunk.function.symbol, signature, LinkedCheckedResultCType(thunk.function.result)?,
+            "", "", appendThunkFailureRelay(next))
     next = RestoreLinkedThunkFrame(next, parent)
     for index in thunk.sources.clone() {
         if (!ContainsIndex(next.append_captures, index)) { next.append_captures = next.append_captures.push(index) }
