@@ -1628,7 +1628,8 @@ def run_structured_only(args, report):
             ku = install / ('ku.exe' if '-windows-' in target else 'ku')
             result = invoke([sys.executable, '-B', verification, '--repo', repo,
                              '--revision', verifier, '--ku', ku, '--cc', cc,
-                             '--output-dir', root / 'generations', '--temp-dir', root],
+                             '--output-dir', root / 'generations', '--temp-dir', root,
+                             '--stage3-application-checks'],
                             root, env, seconds=2400)
             if result.returncode:
                 raise RuntimeError('installed bootstrap generations failed: ' +
@@ -1636,6 +1637,8 @@ def run_structured_only(args, report):
             receipt = json.loads(output(result))
             if receipt.get('status') != 'passed' or receipt.get('source_commit') != verifier:
                 raise RuntimeError('installed bootstrap generations did not verify the same source')
+            if receipt.get('stage3_application_checks', {}).get('status') != 'passed':
+                raise RuntimeError('installed bootstrap Stage3 application checks did not pass')
             report['installed_bootstrap_generations'] = receipt
         else:
             installed_runner_embedded_entry_consumer(install, root, env, report, target)

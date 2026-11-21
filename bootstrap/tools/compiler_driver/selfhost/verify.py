@@ -5,12 +5,13 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
 
-from verify_generation import dynamic_imports
+from verify_generation import dynamic_imports, frozen_builtin
 
 
 TOOLS = Path(__file__).resolve().parent
@@ -166,6 +167,27 @@ def compare_units(first, second):
     return {"providers": len(earlier), "c_and_plans_identical": True, "objects_identical": objects_identical}
 
 
+def verify_stage3_applications(repo, source, binary, cc, caller):
+    driver = repo / "bootstrap/tools/compiler_driver/test_driver.py"
+    frozen_builtin(repo, source, driver, driver.read_bytes())
+    sys.path.insert(0, str(driver.parent))
+    try:
+        consumer = runpy.run_path(str(driver))
+        checks = {
+            "exercise_glob_import": (cc, caller),
+            "exercise_direct_owned_moves": (caller,),
+            "exercise_plain_null_entry": (cc, caller),
+        }
+        for name, arguments in checks.items():
+            try:
+                consumer[name](binary, *arguments)
+            except (AssertionError, OSError, subprocess.SubprocessError) as error:
+                raise ValueError(f"verified Stage3 {name} failed: {error}") from error
+        return dict.fromkeys(checks, "passed")
+    finally:
+        sys.path.pop(0)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=TOOLS.parents[3])
@@ -176,6 +198,8 @@ def main():
     parser.add_argument("--temp-dir", type=Path, help="existing directory for an isolated scratch subdirectory")
     parser.add_argument("--sanitizers", choices=("auto", "required", "off"), default="auto")
     parser.add_argument("--limit", type=int, default=768, help="maximum provider attempts per generation")
+    parser.add_argument("--stage3-application-checks", action="store_true",
+                        help="check full imports, ownership and a plain null entry after Stage3 verification")
     args = parser.parse_args()
     if not __debug__:
         parser.error("verification requires Python assertions")
@@ -213,6 +237,13 @@ def main():
                          f"PE SHA256 {stage2['sha256']}, {stage3['sha256']}")
     summary = {"status": "passed", **inputs, "stage1": stage1, "stage2": stage2, "stage3": stage3,
                "comparison": comparison}
+    if args.stage3_application_checks:
+        with tempfile.TemporaryDirectory(prefix=".stage3-applications-", dir=stage_parent) as temporary:
+            checks = verify_stage3_applications(repo, source, output / stage3["binary"], cc, Path(temporary))
+        summary["stage3_application_checks"] = {
+            "status": "passed", "source_commit": source, "stages": 3, "compiler_sha256": stage3["sha256"],
+            "checks": checks,
+        }
     write_json(output / "summary.json", summary)
     print(json.dumps(summary))
     return 0
