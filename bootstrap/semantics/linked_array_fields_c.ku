@@ -1,17 +1,16 @@
-import { FindLinkedLocalRead, LinkedLocalReadBinding } from "./call_contracts.ku"
-import { CheckLinkedLocalFunctionName, RejectLocalReader } from "./linked_parameters_c.ku"
+import { FindLinkedLocalRead, LinkedLocalReadBinding, RequireLinkedMutableName } from "./call_contracts.ku"
+import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, RejectLocalReader } from "./linked_parameters_c.ku"
 import { ProjectionCloneSource } from "./struct_projection_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullReadableArray,
-    LinkedNullState, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
-import { LinkedNullArrayElement, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, ReadLinkedOwnedArray,
-    ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
-import { LowerLinkedIntArrayLiteral, LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray,
+    LinkedNullReadableArray, LinkedNullState, LinkedNullValue, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
+import { LinkedNullArrayElement, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult,
+    ReadLinkedOwnedArray, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AppendLinkedArrayElement, LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { MoveLinkedNullSlot } from "./linked_member_ownership.ku"
-import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 
 fn LinkedFieldAppendArgument(&project: LinkedNullProject, &target: Node, &root: Node, rhs: int): int {
     call = LinkedNullNode(project, 1, rhs)
@@ -172,4 +171,69 @@ fn LowerLinkedArrayBinding(&project: LinkedNullProject, state: LinkedNullState, 
     local = AddLinkedNullSlot(project, state, statement.text.clone(), "l" + str(id), ty, false)?
     local.state.slots[local.value.slot - 1].live = true
     return ok(local.state)
+}
+
+fn linkedStringAppendRoot(&project: LinkedNullProject, &target: Node, depth: int): str! {
+    if (depth < 32) {
+        if (target.kind == "Variable" && target.edge_count == 0) { return ok(target.text.clone()) }
+        if (target.kind == "Field" && target.edge_count == 1) {
+            root = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+            return linkedStringAppendRoot(project, root, depth + 1)
+        }
+    }
+    RejectLayout("linked_append_target", "string append requires a named local or a direct field path", DeclarationSpan(target))?
+    return ok("")
+}
+
+fn takeLinkedStringAppendOperand(&project: LinkedNullProject, state: LinkedNullState,
+                                 &operand: LinkedNullValue, id: int): LinkedNullExpression! {
+    taken = AddLinkedNullSlot(project, state, "", "append_rhs" + str(id), operand.ty.clone(), false)?
+    taken.state.slots[taken.value.slot - 1].live = true
+    taken.state.code += "    " + taken.value.text.clone() + " = " + operand.text.clone() + ";\n"
+    taken.state = MoveLinkedNullSlot(taken.state, operand)?
+    return ok(taken)
+}
+
+fn LowerLinkedStringAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
+    target_id = LinkedNullChild(project, 1, statement, 0)
+    target = LinkedNullNode(project, 1, target_id)
+    name = linkedStringAppendRoot(project, target, 0)?
+    RequireLinkedMutableName(name, DeclarationSpan(target))?
+    field = target.kind == "Field"
+    slot = LinkedNullBinding(state.slots, name)
+    if (field && (slot == 0 || state.slots[slot - 1].parameter || state.slots[slot - 1].value.borrowed ||
+        state.slots[slot - 1].value.ty.declaration_kind != "Struct")) {
+        RejectLayout("linked_append_target", "string member append requires a mutable owned local record", DeclarationSpan(target))?
+    }
+
+    // Evaluate and consume the RHS before reading the destination. A move
+    // of the destination is rejected by the ordinary live member check.
+    rhs_id = LinkedNullChild(project, 1, statement, 1)
+    right = LowerLinkedNullValue(project, state, rhs_id, 0)?
+    if (field && LinkedStringResult(right.value.ty)) {
+        if (right.value.borrowed && right.value.member_path == "") {
+            RejectLayout("linked_view_escape", "string member append needs an owned RHS; clone a readonly value explicitly",
+                         right.value.ty.span.clone())?
+        }
+        rhs = LinkedNullNode(project, 1, rhs_id)
+        if (right.value.slot != 0 && (rhs.kind == "Variable" || rhs.kind == "Field")) {
+            operand = right.value.clone()
+            right = takeLinkedStringAppendOperand(project, right.state, operand, id)?
+        }
+    }
+    operand = right.value.clone()
+    left = LowerLinkedNullRead(project, right.state, target_id, 0)?
+    owner = left.value.clone()
+    if (owner.slot == 0 || !LinkedStringResult(owner.ty) || (field && (owner.slot != slot || owner.member_path == "")) ||
+        (!field && owner.borrowed)) {
+        RejectLayout("linked_append_target", "string append requires a live owning str", DeclarationSpan(target))?
+    }
+    if (operand.slot == owner.slot && operand.member_path == owner.member_path) {
+        RejectLayout("linked_append_target", "string append cannot move its own destination", DeclarationSpan(target))?
+    }
+    joined = EmitLinkedAddition(project, left.state, owner, operand, id, DeclarationSpan(statement))?
+    drop = LinkedNullDropC(joined.state.layouts, joined.state.owning_layouts, owner.ty, owner.text)
+    joined.state.code += drop + "    " + owner.text + " = " + joined.value.text.clone() + ";\n"
+    replacement = joined.value.clone()
+    return MoveLinkedNullSlot(joined.state, replacement)
 }

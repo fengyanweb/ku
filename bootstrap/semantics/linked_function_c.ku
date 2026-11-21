@@ -15,7 +15,7 @@ import { ContainsIndex } from "./struct_projection_c.ku"
 import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
 import { LinkedBufferResult, LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
          LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullResultType, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
-import { EmitLinkedAddition, LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { LinkedCPrelude, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedOkAvailable, LinkedRecordFields } from "./link_plan_c.ku"
@@ -186,29 +186,6 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     place.state.code += "    " + place.value.text + " = " + replacement.text.clone() + ";\n"
     if (string) { return MoveLinkedNullSlot(place.state, replacement) }
     return ok(place.state)
-}
-
-fn LowerLinkedStringAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
-    target_id = LinkedNullChild(project, 1, statement, 0)
-    target = LinkedNullNode(project, 1, target_id)
-    if (target.kind != "Variable" || target.edge_count != 0) {
-        RejectLayout("linked_append_target", "string append requires a named local", DeclarationSpan(target))?
-    }
-    RequireLinkedMutableName(target.text, DeclarationSpan(target))?
-    // Ku evaluates the right operand before reading the destination. If that
-    // operand consumed the destination, the normal live-binding check refuses it.
-    right = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 1), 0)?
-    operand = right.value.clone()
-    left = LowerLinkedNullRead(project, right.state, target_id, 0)?
-    owner = left.value.clone()
-    if (owner.slot == 0 || owner.borrowed || !LinkedStringResult(owner.ty)) {
-        RejectLayout("linked_append_target", "string append requires a live owning str", DeclarationSpan(target))?
-    }
-    joined = EmitLinkedAddition(project, left.state, owner, operand, id, DeclarationSpan(statement))?
-    drop = LinkedNullDropC(joined.state.layouts, joined.state.owning_layouts, owner.ty, owner.text)
-    joined.state.code += drop + "    " + owner.text + " = " + joined.value.text.clone() + ";\n"
-    replacement = joined.value.clone()
-    return MoveLinkedNullSlot(joined.state, replacement)
 }
 
 fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,
