@@ -245,51 +245,12 @@ fn native_task_matches_bounded_enum_results_with_lazy_arms() {
     let path = directory.path();
     fs::write(
         path.join("worker.ku"),
-        r#"
-import time from "std.time"
-enum Phase { Ready, Done }
-async fn Resolve(phase: Phase): Phase! {
-    println("resolve")
-    time.sleep(30)?
-    return ok(phase)
-}
-async fn Label(label: str): str! {
-    println(label)
-    time.sleep(30)?
-    return ok(label + "🙂")
-}
-async fn Broken(): str! {
-    println("error")
-    fail "declined"
-}
-"#,
+        include_str!("fixtures/native_task_enum_match/worker.ku"),
     )
     .unwrap();
     fs::write(
         path.join("main.ku"),
-        r#"
-import { Phase as Workflow, Resolve, Label, Broken } from "./worker"
-async fn Render(phase: Workflow): str! {
-    text = match (await Resolve(phase))? {
-        Workflow.Ready => (await Broken())?
-        Workflow.Done => (await Label("完成"))?
-    }
-    return ok(text)
-}
-async fn Keep(): bool! {
-    phase = (await Resolve(Workflow.Done))?
-    value = match phase { Workflow.Ready => 7, _ => 42 }
-    println(value)
-    return ok(phase == Workflow.Done)
-}
-async fn main(): null! {
-    println((await Render(Workflow.Done))?)
-    try { (await Render(Workflow.Ready))? }
-    catch (issue) { println(issue.message) }
-    println((await Keep())?)
-    return ok(null)
-}
-"#,
+        include_str!("fixtures/native_task_enum_match/main.ku"),
     )
     .unwrap();
     let normalized = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace("\r\n", "\n");
@@ -298,7 +259,7 @@ async fn main(): null! {
         cli.current_dir(path).args(args);
         run_bounded(&mut cli, BUILD_TIMEOUT, BUILD_LIMITS).unwrap()
     };
-    let expected = "resolve\n完成\n完成🙂\nresolve\nerror\ndeclined\nresolve\n42\ntrue\n";
+    let expected = include_str!("fixtures/native_task_enum_match/expected.txt");
     let interpreted = call(&["run", "main.ku"]);
     assert!(
         interpreted.status.success(),

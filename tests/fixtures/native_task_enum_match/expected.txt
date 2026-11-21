@@ -1,0 +1,9 @@
+resolve
+完成
+完成🙂
+resolve
+error
+declined
+resolve
+42
+true

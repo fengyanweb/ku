@@ -1,0 +1,16 @@
+import time from "std.time"
+enum Phase { Ready, Done }
+async fn Resolve(phase: Phase): Phase! {
+    println("resolve")
+    time.sleep(30)?
+    return ok(phase)
+}
+async fn Label(label: str): str! {
+    println(label)
+    time.sleep(30)?
+    return ok(label + "🙂")
+}
+async fn Broken(): str! {
+    println("error")
+    fail "declined"
+}
