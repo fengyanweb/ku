@@ -177,41 +177,10 @@ fn native_task_returns_nominal_unit_enums_after_wait() {
     let path = directory.path();
     fs::write(
         path.join("worker.ku"),
-        r#"
-import time from "std.time"
-enum Phase { Ready, Done }
-enum Review { Ready, Done }
-struct Reply { text: str }
-
-async fn Complete(phase: Phase): Phase! {
-    time.sleep(30)?
-    return ok(phase)
-}
-async fn Summarize(text: str): Reply! {
-    return ok(Reply { text: text })
-}
-async fn Decline(): Review! {
-    time.sleep(30)?
-    fail "not " + "approved"
-}
-"#,
+        include_str!("fixtures/native_task_enum_result/worker.ku"),
     )
     .unwrap();
-    let source = r#"
-import { Phase as Workflow, Complete, Summarize, Decline } from "./worker"
-async fn main(): null! {
-    first = (await Complete(Workflow.Ready))?
-    println(first == Workflow.Ready)
-    println(first != Workflow.Done)
-    reply = (await Summarize("摘要🙂"))?
-    println(reply.text)
-    try { (await Decline())? }
-    catch (issue) { println(issue.domain + "/" + issue.code + "/" + issue.message) }
-    last = (await Complete(Workflow.Done))?
-    println(last == Workflow.Done)
-    return ok(null)
-}
-"#;
+    let source = include_str!("fixtures/native_task_enum_result/main.ku");
     fs::write(path.join("main.ku"), source).unwrap();
     fs::write(
         path.join("taken.ku"),
@@ -229,7 +198,7 @@ async fn main(): null! {
         let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
         (output.status.success(), stdout, stderr)
     };
-    let expected = "true\ntrue\n摘要🙂\nku/fail/not approved\ntrue\n";
+    let expected = include_str!("fixtures/native_task_enum_result/expected.txt");
     let (passed, stdout, stderr) = call(&["run", "main.ku"]);
     assert!(passed, "{stderr}");
     assert_eq!(stdout, expected);

@@ -1,0 +1,13 @@
+import { Phase as Workflow, Complete, Summarize, Decline } from "./worker"
+async fn main(): null! {
+    first = (await Complete(Workflow.Ready))?
+    println(first == Workflow.Ready)
+    println(first != Workflow.Done)
+    reply = (await Summarize("摘要🙂"))?
+    println(reply.text)
+    try { (await Decline())? }
+    catch (issue) { println(issue.domain + "/" + issue.code + "/" + issue.message) }
+    last = (await Complete(Workflow.Done))?
+    println(last == Workflow.Done)
+    return ok(null)
+}

@@ -1,0 +1,16 @@
+import time from "std.time"
+enum Phase { Ready, Done }
+enum Review { Ready, Done }
+struct Reply { text: str }
+
+async fn Complete(phase: Phase): Phase! {
+    time.sleep(30)?
+    return ok(phase)
+}
+async fn Summarize(text: str): Reply! {
+    return ok(Reply { text: text })
+}
+async fn Decline(): Review! {
+    time.sleep(30)?
+    fail "not " + "approved"
+}
