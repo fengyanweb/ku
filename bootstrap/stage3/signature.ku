@@ -254,8 +254,8 @@ fn AppendReversedTypeEdges(input_edges: [int], &reversed: [int]): [int] {
     edges = input_edges
     index = reversed.len()
     while (index > 0) {
+        edges = edges.push(reversed[index - 1])
         index = index - 1
-        edges = edges.push(reversed[index])
     }
     return edges
 }
