@@ -208,7 +208,8 @@ fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,
     value = LowerLinkedNullValue(project, state, id, 0)?
     copy = result.declaration_kind == "Builtin" && (result.name == "bool" || result.name == "int")
     static_string = LinkedStringResult(result) && LinkedNullNode(project, 1, id).kind == "String"
-    if (!SameLinkedType(value.value.ty, result) || (!copy && !static_string && (value.value.borrowed || value.value.slot == 0))) {
+    if (!SameLinkedType(value.value.ty, result) || (!copy && !static_string &&
+        (value.value.slot == 0 || (value.value.borrowed && value.value.member_path == "")))) {
         RejectLayout("linked_value_return", "expected a value matching the declared result and ownership", DeclarationSpan(statement))?
     }
     value.state.code += "    result = " + value.value.text.clone() + ";\n"
@@ -339,7 +340,8 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
         value = LowerLinkedExpectedValue(project, next, result, id, 0)?
         copy = LinkedIntResult(result)
         static_string = LinkedStringResult(result) && node.kind == "String" && node.edge_count == 0
-        if (!SameLinkedType(value.value.ty, result) || (!copy && !static_string && (value.value.borrowed || value.value.slot == 0))) {
+        if (!SameLinkedType(value.value.ty, result) || (!copy && !static_string &&
+            (value.value.slot == 0 || (value.value.borrowed && value.value.member_path == "")))) {
             RejectLayout("linked_result_return", "return needs a matching Copy int or an initialized matching owner", DeclarationSpan(node))?
         }
         value.state.code = value.state.code + "    result.value = " + value.value.text.clone() + ";\n"
