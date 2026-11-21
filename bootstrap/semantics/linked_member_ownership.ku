@@ -8,7 +8,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { HasBoundArrayMembers } from "./struct_array_c.ku"
 import { EmitCheckedScalarArithmetic } from "./scalar_int_emit.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, SameLinkedType } from "./linked_null_types_c.ku"
 import { LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullReadableArray, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches, LinkedViewPointee, RememberLinkedCall } from "./link_plan_c.ku"
 
 fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &ty: TypeNameBinding, &name: str): str {
@@ -204,6 +204,21 @@ fn BindLinkedCatch(state: LinkedNullState, name: str, &binding: Node, &before: [
     cleared: [int] = []
     next.catch_moved = cleared
     return ok(next)
+}
+
+fn LinkedNullArrayLimitName(&project: LinkedNullProject, node_id: int): str {
+    node = LinkedNullNode(project, 1, node_id)
+    if (node.kind == "Binary" && node.text == "-" && node.edge_count == 2) {
+        amount = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 1))
+        if (amount.kind != "Int" || amount.edge_count != 0 || amount.int_value < 0) { return "" }
+        node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
+    }
+    if (node.kind != "Call" || node.edge_count != 1) { return "" }
+    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
+    if (target.kind != "Field" || target.edge_count != 1 || target.text != "len") { return "" }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+    if (receiver.kind != "Variable" || receiver.edge_count != 0) { return "" }
+    return receiver.text
 }
 
 fn LinkedCountBound(&project: LinkedNullProject, &state: LinkedNullState, id: int): bool! {
