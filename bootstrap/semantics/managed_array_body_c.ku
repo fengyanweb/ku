@@ -7,7 +7,7 @@ import { GuardRecordCarrierDrops } from "./guarded_struct_c.ku"
 import { LinkPlanDeclaration } from "./link_plan_c.ku"
 import { OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ContainsIndex, EmitLayout } from "./struct_projection_c.ku"
-import { LowerOwnedRecordCall, OwnedRecordCall } from "./struct_result_link_c.ku"
+import { LowerManagedCheckedCall, LowerOwnedRecordCall, ManagedRecordLink, OwnedRecordCall } from "./struct_result_link_c.ku"
 import { RecordResultCallId } from "./call_contracts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType } from "./guarded_struct_expr.ku"
 import { AddGuardCode, EmitManagedAssignment, EmitManagedStringAppend, JoinManagedCode, ManagedBlank, ManagedCode, ManagedExpression, ManagedType } from "./managed_array_values_c.ku"
@@ -23,13 +23,6 @@ struct ManagedBlock {
     bindings: [GuardBinding]
     error_exits: str
     record_links: [ManagedRecordLink]
-}
-
-struct ManagedRecordLink {
-    payload_layout: int
-    payload_type: str
-    prototype: str
-    plan: LinkPlanDeclaration
 }
 
 struct ManagedRecordFields {
@@ -162,6 +155,10 @@ fn emitManagedBlock(&named: NamedModule, &types: [TypeNameBinding], &imports: [I
             code = JoinManagedCode(code, read.code)
             record_links = record_links.push(read.link)
             cursor = read.next - 1
+        } else if ((checked || root.string_locals) && statement.kind == "ExprStmt") {
+            check = LowerManagedCheckedCall(named, types, layouts, locals.clone(), statement_id, indent)?
+            code = JoinManagedCode(code, check.code)
+            record_links = record_links.push(check.link)
         } else if (statement.kind == "Return") {
             if (root.string_locals) {
                 RejectLayout("unsupported_managed_return", "result loops require one return after the managed body", DeclarationSpan(statement))?

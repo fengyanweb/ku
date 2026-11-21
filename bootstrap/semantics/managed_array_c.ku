@@ -194,7 +194,7 @@ fn emitManagedFunction(&named: NamedModule, &types: [TypeNameBinding], &imports:
     declared_results: [int] = []
     declared_calls: [int] = []
     for link in body.record_links {
-        if (!ContainsIndex(declared_results, link.payload_layout)) {
+        if (link.payload_layout != 0 && !ContainsIndex(declared_results, link.payload_layout)) {
             order = orderLayout(layouts, link.payload_layout, DeclarationSpan(function))?
             declarations = appendLayouts(layouts, order, declarations)?
             result_headers += StructValueResultHeader(link.payload_type)

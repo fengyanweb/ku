@@ -1766,6 +1766,31 @@ fn DescribeEscaped(&characters: [str], valid: bool): Scanned! {
     }
     return ok(Scanned { text: escaped, count: count })
 }
+fn CheckLength(count: int): null! {
+    if (count > 2) { fail { domain: "test", code: "size", message: "too long" } }
+    return ok(null)
+}
+fn CheckOwner(value: str): null! {
+    return ok(null)
+}
+fn CheckArray(source: str): [SourceLength]! {
+    entries: [SourceLength] = []
+    characters: [str] = source.chars()
+    if (characters.len() != 0) { CheckLength(characters.len())? }
+    CheckLength(characters.len())?
+    return ok(entries)
+}
+fn CheckRecord(&characters: [str], checked: bool): Scanned! {
+    saved = characters[0].clone()
+    if (checked) { CheckLength(saved.len())? }
+    CheckLength(saved.len())?
+    return ok(Scanned { text: saved, count: 1 })
+}
+fn RejectCheckedOwner(source: str): [SourceLength]! {
+    entries: [SourceLength] = []
+    CheckOwner(source)?
+    return ok(entries)
+}
 "#,
     )
     .unwrap();
@@ -1973,6 +1998,35 @@ fn DescribeEscaped(&characters: [str], valid: bool): Scanned! {
     let invoke = cleanup.find("result.error.message = ku_str_").unwrap();
     assert!(compose < invoke);
     assert!(cleanup[compose..invoke].contains("ku_projection_string_drop(&saved_error"));
+
+    for (function, mode) in [("CheckArray", "managed"), ("CheckRecord", "struct-result")] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        fs::write(cwd.join("mode.txt"), mode).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let text = String::from_utf8(emitted.stdout).unwrap();
+        assert_eq!(text.matches("extern KuBootstrapResultNull ").count(), 1);
+        assert_eq!(text.matches(" = ku_result_dependency_").count(), 2);
+        assert_eq!(text.matches("result.error = dependency").count(), 2);
+        let cleanup = text.split_once("cleanup:\n").unwrap().1;
+        assert!(cleanup.contains("ku_projection_string_drop(&"));
+        fs::write(cwd.join("mode.txt"), format!("{mode}-plan")).unwrap();
+        let plan = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&plan);
+        assert_eq!(
+            String::from_utf8(plan.stdout)
+                .unwrap()
+                .matches(r#""source_name":"CheckLength""#)
+                .count(),
+            1
+        );
+    }
+
+    fs::write(cwd.join("mode.txt"), "managed").unwrap();
+    fs::write(cwd.join("function.txt"), "RejectCheckedOwner").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert!(!rejected.status.success() && rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("managed_checked_argument"));
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {

@@ -14,7 +14,7 @@ import { ManagedStringRuntime } from "./guarded_string_parts.ku"
 import { EmitManagedBlock, EmitRecordResultPrelude } from "./managed_array_body_c.ku"
 import { EmitOwnedStructOperations, EmitTryCloneString, StructArrayC } from "./struct_array_c.ku"
 import { LowerStructResultLink, ReadOwnedScalarLeaves, ResultLinkClonePrefix, WithoutOwnedBinding } from "./struct_result_link_c.ku"
-import { RecordResultCallId } from "./call_contracts.ku"
+import { RecordResultCallId, StructResultEdge } from "./call_contracts.ku"
 import { HasScalarBuiltin } from "./scalar_int_operands.ku"
 
 struct StructResultC {
@@ -50,18 +50,6 @@ struct StructResultBody {
 
 fn orderResultLayout(&layouts: [StructLayout], index: int, at: Span): CStructOrder! {
     return OrderCStructLayouts(layouts, layouts[index - 1].module_index, layouts[index - 1].node, at)
-}
-
-fn structResultEdge(&named: NamedModule, &function: Node): int! {
-    cursor = function.first_edge
-    end = cursor + function.edge_count
-    while (cursor < end && named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].kind == "Parameter") {
-        cursor = cursor + 1
-    }
-    if (cursor >= end - 1) {
-        RejectLayout("unsupported_struct_result_signature", "expected parameters, a struct! result and a body", DeclarationSpan(function))?
-    }
-    return ok(cursor)
 }
 
 fn appendStructResultLayouts(&order: CStructOrder, declared: [int]): [int]! {
@@ -239,7 +227,7 @@ fn emitStructResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports
             code = JoinManagedCode(code, returned)
             code.text = code.text + "    }\n"
         } else if (cursor == end - 2 && statement.kind == "ExprStmt") {
-            link = LowerStructResultLink(named, types, layouts, local, id)?
+            link = LowerStructResultLink(named, types, layouts, local, id, "    ", false)?
             local = link.remaining
             prototype = link.prototype
             dependency = link.symbol
@@ -273,10 +261,19 @@ fn emitOwnedResultBody(&named: NamedModule, &types: [TypeNameBinding], &imports:
         named.parsed.arena.nodes[named.parsed.arena.edges[end] - 1], "    ", true)?
     plan = prelude.plan
     for leaf in leaves.plan { plan = plan.push(leaf) }
+    prototype = prelude.prototype + leaves.declarations
+    declared: [int] = []
+    for link in block.record_links {
+        if (!ContainsIndex(declared, link.plan.node)) {
+            prototype += link.prototype
+            declared = declared.push(link.plan.node)
+            plan = plan.push(link.plan)
+        }
+    }
     declarations = prelude.declarations + block.declarations
     if (block.error_exits != "") { declarations = "    int record_error = 0;\n" + declarations }
     return ok(StructResultBody { code: JoinManagedCode(prelude.code, JoinManagedCode(block.code, result)),
-        prototype: prelude.prototype + leaves.declarations, dependency: "", declarations: declarations,
+        prototype: prototype, dependency: "", declarations: declarations,
         drops: block.drops + prelude.drops, clone_layouts: [], plan: plan, error_exits: block.error_exits })
 }
 
@@ -292,7 +289,7 @@ fn StructValueResultHeader(&value: str): str {
 fn emitStructResult(&named: NamedModule, &types: [TypeNameBinding], &imports: [ImportBinding],
                     &supplied: [SuppliedModule], &layouts: [StructLayout], id: int): StructResultC! {
     function = named.parsed.arena.nodes[id - 1].clone()
-    edge = structResultEdge(named, function)?
+    edge = StructResultEdge(named, function)?
     outer = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
     if (outer.kind != "TypeResult" || outer.edge_count != 1) {
         RejectLayout("unsupported_struct_result_signature", "expected an explicit struct! result", DeclarationSpan(outer))?

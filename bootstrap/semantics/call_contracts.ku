@@ -1,7 +1,8 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule, RejectName } from "./names.ku"
 import { ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
-import { RejectLayout } from "./struct_layouts.ku"
+import { TypeNameBinding } from "./type_names.ku"
+import { ExplicitType, RejectLayout } from "./struct_layouts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName } from "./guarded_struct_expr.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 
@@ -15,6 +16,34 @@ fn IsManagedMethod(&nodes: [Node], &edges: [int], &value: Node, &name: str, arit
     if (value.kind != "Call" || value.edge_count != arity + 1) { return false }
     method = nodes[edges[value.first_edge] - 1].clone()
     return method.kind == "Field" && method.text == name && method.edge_count == 1
+}
+
+fn StructResultEdge(&named: NamedModule, &function: Node): int! {
+    cursor = function.first_edge
+    end = cursor + function.edge_count
+    while (cursor < end && named.parsed.arena.nodes[named.parsed.arena.edges[cursor] - 1].kind == "Parameter") {
+        cursor = cursor + 1
+    }
+    if (cursor >= end - 1) {
+        RejectLayout("unsupported_struct_result_signature", "expected parameters, a struct! result and a body", DeclarationSpan(function))?
+    }
+    return ok(cursor)
+}
+
+fn CheckNullResultCallee(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
+                         &callee: Node, result_edge: int): null! {
+    if (result_edge >= callee.first_edge + callee.edge_count) {
+        RejectLayout("unsupported_struct_result_link", "checked call requires a declared null! result", DeclarationSpan(callee))?
+    }
+    signature = nodes[edges[result_edge] - 1].clone()
+    if (signature.kind != "TypeResult" || signature.edge_count != 1) {
+        RejectLayout("unsupported_struct_result_link", "checked call requires a declared null! result", DeclarationSpan(signature))?
+    }
+    bound = ExplicitType(types, edges[signature.first_edge], DeclarationSpan(signature))?
+    if (bound.declaration_kind != "Builtin" || bound.name != "null") {
+        RejectLayout("unsupported_struct_result_link", "checked dependency must return null!", bound.span)?
+    }
+    return ok(null)
 }
 
 fn RecordResultCallId(&named: NamedModule, statement_id: int): int {
