@@ -2,7 +2,7 @@ import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
 import { RejectAt, RejectAtPoint, RejectAtSpan } from "./support.ku"
-import { FunctionReturnStart, ReadTypeOpening, ReadTypeToken, ReadTypeTokenKind } from "./signature_tokens.ku"
+import { CheckTypeTokenBound, FunctionReturnStart, ReadTypeOpening, ReadTypeToken, ReadTypeTokenKind } from "./signature_tokens.ku"
 
 // Type parts form a bounded, append-only post-order plan. Child NodeIds refer
 // to earlier parts through the separate edge table, matching the final AST
@@ -163,18 +163,24 @@ fn ReadTypeAtomEnd(&tokens: [Token], start: int, window_end: int, type_last: int
     }
 
     cursor = start + 1
-    kind = ReadTypeTokenKind(tokens, cursor, window_end, type_last)?
-    if (!custom && kind == "Dot") {
-        RejectAt(ReadTypeToken(tokens, cursor, window_end, type_last)?, "unsupported_type", "dotted type names must start with a custom identifier")?
+    if (!custom) {
+        kind = ReadTypeTokenKind(tokens, cursor, window_end, type_last)?
+        if (kind == "Dot") {
+            RejectAt(ReadTypeToken(tokens, cursor, window_end, type_last)?, "unsupported_type", "dotted type names must start with a custom identifier")?
+        }
+        return ok(cursor)
     }
-    while (custom && kind == "Dot") {
+    while (cursor < window_end) {
+        kind = ReadTypeTokenKind(tokens, cursor, window_end, type_last)?
+        if (kind != "Dot") { return ok(cursor) }
         part_kind = ReadTypeTokenKind(tokens, cursor + 1, window_end, type_last)?
         if (part_kind != "Ident") {
             RejectAt(ReadTypeToken(tokens, cursor + 1, window_end, type_last)?, "unexpected_token", "expected type name after '.'")?
         }
         cursor = cursor + 2
-        kind = ReadTypeTokenKind(tokens, cursor, window_end, type_last)?
     }
+    // The window boundary acts as EOF, but its index still obeys the type bound.
+    CheckTypeTokenBound(tokens, cursor, window_end, type_last)?
     return ok(cursor)
 }
 
