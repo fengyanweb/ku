@@ -148,11 +148,13 @@ fn AppendScalarIntCallees(&plan: ScalarIntFunction, previous: [int]): [int] {
     reachable = previous
     clause = 0
     while (clause < plan.clauses.len()) {
+        instruction_count = plan.clauses[clause].instructions.len()
         step = 0
-        while (step < plan.clauses[clause].instructions.len()) {
+        while (step < instruction_count) {
             if (plan.clauses[clause].instructions[step].operation == "call") {
                 callee = plan.clauses[clause].instructions[step].operand
-                if (!ContainsScalarIntNode(reachable, callee)) { reachable = reachable.push(callee) }
+                already_queued = ContainsScalarIntNode(reachable, callee)
+                if (!already_queued) { reachable = reachable.push(callee) }
             }
             step = step + 1
         }
@@ -167,12 +169,18 @@ fn planScalarIntModule(&nodes: [Node], &edges: [int], &declarations: [TopLevelNa
     reachable = [entry]
     imports: [ScalarIntImport] = []
     plans: [ScalarIntFunction] = []
+    work_limit = nodes.len()
     index = 0
-    while (index < reachable.len()) {
+    while (index < work_limit) {
+        if (index >= reachable.len()) { return ok(plans) }
         plan = LowerScalarIntFunction(nodes, edges, declarations, bindings, imports, 0, reachable[index], can_convert, can_use_ok, can_print)?
         reachable = AppendScalarIntCallees(plan, reachable)
         plans = plans.push(plan)
         index = index + 1
+    }
+    if (index < reachable.len()) {
+        point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+        rejectScalarInt("project_work_limit", "scalar call graph exceeds the validated arena node count", point)?
     }
     return ok(plans)
 }
@@ -180,10 +188,12 @@ fn planScalarIntModule(&nodes: [Node], &edges: [int], &declarations: [TopLevelNa
 fn unresolvedIntCall(&plan: ScalarIntFunction, &completed: [int]): int {
     clause = 0
     while (clause < plan.clauses.len()) {
+        instruction_count = plan.clauses[clause].instructions.len()
         index = 0
-        while (index < plan.clauses[clause].instructions.len()) {
-            if (plan.clauses[clause].instructions[index].operation == "call" && !ContainsScalarIntNode(completed, plan.clauses[clause].instructions[index].operand)) {
-                return plan.clauses[clause].instructions[index].result_node
+        while (index < instruction_count) {
+            if (plan.clauses[clause].instructions[index].operation == "call") {
+                ready = ContainsScalarIntNode(completed, plan.clauses[clause].instructions[index].operand)
+                if (!ready) { return plan.clauses[clause].instructions[index].result_node }
             }
             index = index + 1
         }
