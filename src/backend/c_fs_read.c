@@ -1,3 +1,7 @@
+#if defined(_WIN32) && defined(_MSC_VER)
+#include <share.h>
+#endif
+
 static bool ku_fs_read_native_impl(const KuFsNativeChar*, KuString*, KuError*, KuFsAllocatorV1*);
 static bool ku_fs_read_impl(KuString path, KuString* value, KuError* error) {
   if (value) *value = (KuString){0};
@@ -9,7 +13,9 @@ static bool ku_fs_read_impl(KuString path, KuString* value, KuError* error) {
 }
 
 static bool ku_fs_read_native_impl(const KuFsNativeChar* native, KuString* value, KuError* error, KuFsAllocatorV1* allocator) {
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(_MSC_VER)
+  FILE* file = _wfsopen(native, L"rb", _SH_DENYNO);
+#elif defined(_WIN32)
   FILE* file = _wfopen(native, L"rb");
 #else
   FILE* file = fopen(native, "rb");
