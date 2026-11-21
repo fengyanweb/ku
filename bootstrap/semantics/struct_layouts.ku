@@ -53,10 +53,12 @@ fn ExplicitType(&bindings: [TypeNameBinding], use_node: int, at: Span): TypeName
     lo = 0
     hi = bindings.len()
     // BindTypeNames produces ascending AST IDs.
-    while (lo < hi) {
+    searching = lo < hi
+    while (searching) {
         middle = lo + (hi - lo) / 2
         if (bindings[middle].use_node < use_node) { lo = middle + 1 }
         else { hi = middle }
+        searching = lo < hi
     }
     if (lo >= bindings.len() || bindings[lo].use_node != use_node) {
         RejectLayout("unsupported_layout_type", "expected a bound explicit TypeName", at)?
