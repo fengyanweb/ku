@@ -106,18 +106,19 @@ fn scalarGuardSlotMove(&before: LinkedNullSlot, &after: LinkedNullSlot, &state: 
         && GuardOwnedDrops(state.layouts, layout, before.value.text) == ""
 }
 
-fn CheckLinkedGuardOwners(&outer: [LinkedNullSlot], &taken: LinkedNullState, &statement: Node): null! {
+fn MergeLinkedGuardOwners(state: LinkedNullState, &outer: [LinkedNullSlot], &statement: Node): LinkedNullState! {
+    next = state
     index = 0
     while (index < outer.len()) {
-        if (LinkedNullOwner(outer[index].value.ty) && !LinkedSlotOwnershipMatches(outer[index], taken.slots[index])
-            && !scalarGuardSlotMove(outer[index], taken.slots[index], taken)) {
-            RejectLayout("linked_control_move", "conditional code cannot consume an outer owner", DeclarationSpan(statement))?
+        if (LinkedNullOwner(outer[index].value.ty) && !LinkedSlotOwnershipMatches(outer[index], next.slots[index])
+            && !scalarGuardSlotMove(outer[index], next.slots[index], next)) {
+            // The no-else path leaves the incoming fields intact. The
+            // taken arm cleared any transferred fields before continuing.
+            next.slots[index].moved_members = joinedLinkedMemberMoves(outer[index], next.slots[index], statement)?
         }
         index = index + 1
     }
-    // On continuation the taken-arm liveness is already conservative. The
-    // untaken scalar record has no resources requiring divergent cleanup.
-    return ok(null)
+    return ok(next)
 }
 
 fn linkedMovedMembersContained(&members: [str], &possible: [str]): bool {

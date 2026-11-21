@@ -1257,6 +1257,16 @@ fn Branch(owner: Pair, transfer: bool): null! {
     Read(owner.right)?
     return ok(null)
 }
+fn BranchWithoutElse(owner: Pair, transfer: bool): null! {
+    if (transfer) { Consume(owner.left)? }
+    Read(owner.right)?
+    return ok(null)
+}
+fn RefuseWithoutElse(owner: Pair, transfer: bool): null! {
+    if (transfer) { Consume(owner.left)? }
+    Read(owner.left)?
+    return ok(null)
+}
 fn Refuse(owner: Pair, transfer: bool): null! {
     if (transfer) { Consume(owner.left)? }
     else { Keep()? }
@@ -1284,7 +1294,7 @@ KuBootstrapResultNull __KEEP__(void) {
     return (KuBootstrapResultNull){.ok = true};
 }
 KuBootstrapResultNull __READ__(const KuProjectionString *text) {
-    assert(route && text->ptr == right_owner && text->ptr[0] == 'R');
+    assert(text->ptr == right_owner && text->ptr[0] == 'R');
     assert(outstanding() == (route == 1 ? 1 : 2));
     read_sibling++;
     return (KuBootstrapResultNull){.ok = true};
@@ -1304,7 +1314,7 @@ int main(void) {
             {right_owner,1,1,KU_PROJECTION_STRING_OWNED}
         };
         KuBootstrapResultNull result = __ENTRY__(pair, scenario != 0);
-        assert(!outstanding() && route == (scenario == 0 ? 2 : 1));
+        assert(!outstanding() && route == (scenario == 0 ? __UNTAKEN_ROUTE__ : 1));
         assert(result.ok == !fail_call && read_sibling == (fail_call ? 0 : 1));
         if (fail_call) assert(result.error.code.len == 8 && !memcmp(result.error.code.ptr, "injected", 8));
     }
@@ -1316,42 +1326,54 @@ pub(super) fn assert_conditional_partial_members(seed: &Path, cwd: &Path) {
     fs::write(cwd.join("conditional-member.ku"), CONDITIONAL_MEMBER_SOURCE).unwrap();
     fs::write(cwd.join("modules.txt"), "conditional-member.ku\n").unwrap();
     fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
-    fs::write(cwd.join("function.txt"), "Branch").unwrap();
-    let emitted = execute(&mut Command::new(seed), cwd, 30);
-    assert_ok(&emitted);
-    let code = String::from_utf8(emitted.stdout).unwrap();
-    let signature = code
-        .lines()
-        .find_map(|line| line.strip_prefix("KuBootstrapResultNull ku_linked_null_"))
-        .unwrap();
-    let (entry, formal) = signature.split_once('(').unwrap();
-    let (pair, _) = formal.split_once(' ').unwrap();
-    let dependency = |expected| {
-        code.lines()
-            .filter_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
-            .filter_map(|line| line.split_once('('))
-            .find(|(_, args)| *args == expected)
-            .unwrap()
-            .0
-    };
-    let host = CONDITIONAL_MEMBER_HOST
-        .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
-        .replace("__PAIR__", pair)
-        .replace("__CONSUME__", dependency("KuProjectionString);"))
-        .replace("__KEEP__", dependency("void);"))
-        .replace("__READ__", dependency("const KuProjectionString*);"));
-    let c = cwd.join("conditional-member.c");
-    let exe = cwd.join(format!(
-        "conditional-member{}",
-        std::env::consts::EXE_SUFFIX
-    ));
-    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
-    compile_projection(&c, &exe, cwd);
-    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    for (branch, explicit_else) in [("Branch", true), ("BranchWithoutElse", false)] {
+        fs::write(cwd.join("function.txt"), branch).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        let signature = code
+            .lines()
+            .find_map(|line| line.strip_prefix("KuBootstrapResultNull ku_linked_null_"))
+            .unwrap();
+        let (entry, formal) = signature.split_once('(').unwrap();
+        let (pair, _) = formal.split_once(' ').unwrap();
+        let dependency = |expected| {
+            code.lines()
+                .filter_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
+                .filter_map(|line| line.split_once('('))
+                .find(|(_, args)| *args == expected)
+                .unwrap()
+                .0
+        };
+        let host = CONDITIONAL_MEMBER_HOST
+            .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
+            .replace("__PAIR__", pair)
+            .replace("__CONSUME__", dependency("KuProjectionString);"))
+            .replace(
+                "__KEEP__",
+                if explicit_else {
+                    dependency("void);")
+                } else {
+                    "unused_keep"
+                },
+            )
+            .replace("__UNTAKEN_ROUTE__", if explicit_else { "2" } else { "0" })
+            .replace("__READ__", dependency("const KuProjectionString*);"));
+        let c = cwd.join("conditional-member.c");
+        let exe = cwd.join(format!(
+            "conditional-member{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+        compile_projection(&c, &exe, cwd);
+        assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    }
 
-    fs::write(cwd.join("function.txt"), "Refuse").unwrap();
-    let rejected = execute(&mut Command::new(seed), cwd, 30);
-    assert_eq!(rejected.status.code(), Some(1));
-    assert!(rejected.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_moved_member"));
+    for negative in ["Refuse", "RefuseWithoutElse"] {
+        fs::write(cwd.join("function.txt"), negative).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_moved_member"));
+    }
 }

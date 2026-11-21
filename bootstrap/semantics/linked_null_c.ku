@@ -1,6 +1,6 @@
 import { AddLinkedNullSlot, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
 import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
-import { BindLinkedCatch, CheckLinkedCountedBoundWrites, CheckLinkedGuardOwners, DropLinkedNullScope, LinkedCountBound, LinkedCountdownIndex, MergeLinkedConditionalMembers, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedCountdownIndex, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedPlainReturn } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -72,8 +72,8 @@ fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statem
     if (split == statement.edge_count) {
         if (taken.terminal) { taken.state = RestoreLinkedNullSlots(taken.state, outer) }
         else {
-            CheckLinkedGuardOwners(outer, taken.state, statement)?
-            taken.state = DropLinkedNullScope(taken.state, outer.len())
+            merged = MergeLinkedGuardOwners(taken.state, outer, statement)?
+            taken.state = DropLinkedNullScope(merged, outer.len())
         }
         taken.state.code += "    }\n"
         return ok(LinkedNullRegion { state: taken.state, terminal: false })
