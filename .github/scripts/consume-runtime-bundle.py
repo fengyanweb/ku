@@ -1361,10 +1361,10 @@ def validate_installed_relative_program(install, project, env, target, files, ex
 
 
 def installed_committed_program_consumer(install, root, env, report, repo, commit, target, case, *,
-                                         native_c_abi=None):
+                                         sources=('main.ku',), native_c_abi=None):
     fixture = f'tests/fixtures/{case}'
     files = {}
-    for name in ('main.ku', 'expected.txt'):
+    for name in (*sources, 'expected.txt'):
         result = invoke(['git', 'show', f'{commit}:{fixture}/{name}'], repo, env)
         if result.returncode:
             raise RuntimeError(f'cannot read committed installed fixture: {fixture}/{name}')
@@ -1381,14 +1381,25 @@ def verify_callback_fields_c(source):
     code = source.replace(b'\r\n', b'\n')
     view = b'struct KuClosure_fn_view_str__to_str { KuString (*invoke)(void*, const KuString*);'
     owned = b'struct KuClosure_fn_str__to_int { int64_t (*invoke)(void*, KuString);'
+    checked = b'struct KuClosure_fn_view_str__to_result_str { KuResult_str (*invoke)(void*, const KuString*);'
     reader = b'struct KuStruct_Reader {\n  KuClosure_fn_view_str__to_str read;\n  KuClosure_fn_str__to_int consume;'
+    checked_reader = b'struct KuStruct_CheckedReader {\n  KuClosure_fn_view_str__to_result_str read;'
     index = code.find(reader)
     if (not 0 <= code.find(view) < index or not 0 <= code.find(owned) < index or
             b'ku_closure_clone_fn_view_str__to_str(value.read)' not in code):
         raise RuntimeError('installed callback fields require typed View and owned invoke ABIs and a cloned View field')
+    if not 0 <= code.find(b'typedef struct KuResult_str KuResult_str;') < code.find(checked) < code.find(checked_reader):
+        raise RuntimeError('installed checked callback field must return a typed Result through its View ABI')
     return {'view_parameter': 'const KuString*', 'owned_parameter': 'KuString',
             'value_fields_complete': True, 'view_field_retained_on_clone': True,
+            'checked_view_parameter': 'const KuString*', 'checked_result': 'KuResult_str',
             'sha256': hashlib.sha256(source).hexdigest()}
+
+
+def verify_enum_equality_c(source):
+    if b'.tag ==' not in source or b'.tag !=' not in source:
+        raise RuntimeError('installed native enum comparisons must compare the tag')
+    return {'compares_tags': True, 'sha256': hashlib.sha256(source).hexdigest()}
 
 
 def installed_forward_layout_consumer(install, root, env, report, target):
@@ -1667,6 +1678,9 @@ def run_structured_only(args, report):
                                                  'native_static_object_fields')
             installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
                                                  'native_callback_fields', native_c_abi=verify_callback_fields_c)
+            installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
+                                                 'native_payloadless_enum_equality', sources=('main.ku', 'phase.ku'),
+                                                 native_c_abi=verify_enum_equality_c)
             verification = repo / 'bootstrap/tools/compiler_driver/selfhost/verify.py'
             cc = env.get('KU_GNU_CC') if target == 'x86_64-pc-windows-gnu' else 'clang'
             if not cc:
