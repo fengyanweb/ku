@@ -13,8 +13,8 @@ import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { AppendLinkedCheckedInvocation, IsLinkedScopedCallback, LinkedCheckedCall, LinkedDirectCallExpression, LinkedScalarArrayLayout, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullHasResultValue, LinkedNullLiteralType,
-         LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LowerLinkedContextualArgument, SameLinkedType } from "./linked_null_types_c.ku"
-import { ReadLinkedLocalArrayItem, EmitLinkedAddition, IsLinkedLogicalNegation, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
+         LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LowerLinkedContextualArgument, LowerLinkedNullLeaf, SameLinkedType } from "./linked_null_types_c.ku"
+import { ReadLinkedLocalArrayItem, EmitLinkedAddition, IsLinkedLogicalNegation, LowerLinkedIntArrayLiteral, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalAppendArguments, ForwardLinkedCallback, LinkedCallableSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RestoreLinkedConcatPrefix, ValidateLinkedPayload } from "./linked_parameters_c.ku"
 
 

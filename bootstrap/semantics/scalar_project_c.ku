@@ -1,3 +1,11 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan } from "./names.ku"
+import { FindLinkedLocalRead } from "./call_contracts.ku"
+import { LinkedAbsoluteType, LinkedBuiltin, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
+import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
+import { CollectFields, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
+import { BuildProjectOwningLayouts, OrderCStructLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
+import { FindUnitEnumType, ReadUnitEnumVariant, SameBoundTypeIdentity, TypeNameBinding, UnitEnumTypeName } from "./type_names.ku"
 import { Span } from "../stage2/span.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
@@ -134,4 +142,121 @@ fn EmitScalarProjectLinkPlan(&supplied: [SuppliedModule], &function: str): str! 
     // Callees are validated and emitted as internal definitions in this C unit.
     export = scalarProjectLinkPlan(plans[0], generated.symbol)
     return EmitLinkPlan(supplied, "project-int", export, [])
+}
+
+fn LinkedNullLayout(&project: LinkedNullProject, &ty: TypeNameBinding, layouts: [StructLayout], depth: int): [StructLayout]! {
+    if (ty.declaration_kind != "Struct") {
+        LinkedNullCType(ty)?
+        return ok(layouts)
+    }
+    unit = ty.module_index
+    if (LayoutIndex(layouts, unit, ty.declaration_node) != 0) { return ok(layouts) }
+    if (depth >= 8) {
+        RejectLayout("linked_layout_depth", "linked structs require an acyclic layout of at most 8 levels", ty.span.clone())?
+    }
+    declaration = LinkedNullNode(project, unit, ty.declaration_node)
+    module_index = unit - 1
+    relocated: [StructFieldLayout] = []
+    ordered = layouts
+    for field in CollectFields(project.supplied[module_index].named.parsed.arena.nodes,
+                               project.supplied[module_index].named.parsed.arena.edges,
+                               project.binding.modules[module_index].types, declaration, false)? {
+        resolved = LinkedAbsoluteType(field.resolved, unit)
+        ordered = LinkedNullLayout(project, resolved, ordered, depth + 1)?
+        local = StructFieldLayout { name: field.name, ordinal: field.ordinal, node: field.node, resolved: resolved }
+        relocated = relocated.push(local)
+    }
+    ordered = ordered.push(StructLayout { name: ty.name.clone(), module_index: unit, node: ty.declaration_node, fields: relocated })
+    OrderCStructLayouts(ordered, unit, ty.declaration_node, ty.span.clone())?
+    return ok(ordered)
+}
+
+fn RegisterLinkedOwnedRecord(&project: LinkedNullProject, state: LinkedNullState, &element: TypeNameBinding): LinkedNullState! {
+    next = state
+    try {
+        next.layouts = LinkedNullLayout(project, element, next.layouts.clone(), 0)?
+        return ok(next)
+    } catch (err) {
+        // A cached owning child can reach the scalar layout order check
+        // before a new parent exposes the same array field to collection.
+        if (err.code != "unsupported_layout_type" && err.code != "unsupported_nested_layout") { fail err }
+    }
+    unit = element.module_index
+    node = element.declaration_node
+    layout = BuildProjectOwningLayouts(project.supplied, project.binding, unit, node, element.span.clone())?
+    order = OrderProjectOwningLayouts(layout, unit, node, element.span.clone())?
+    next.owning_strings = next.owning_strings || order.contains_string
+    count = order.entries.len()
+    index = 0
+    while (index < count) {
+        item = layout[order.entries[index].layout_index - 1].clone()
+        if (LayoutIndex(next.owning_layouts, item.module_index, item.node) == 0) {
+            next.owning_layouts = next.owning_layouts.push(item.clone())
+        }
+        if (LayoutIndex(next.layouts, item.module_index, item.node) == 0) {
+            next.layouts = next.layouts.push(item)
+        }
+        index = index + 1
+    }
+    return ok(next)
+}
+
+
+fn LinkedSlotPrefix(&slots: [LinkedNullSlot], length: int): [LinkedNullSlot] {
+    result: [LinkedNullSlot] = []
+    index = 0
+    while (index < length) {
+        result = result.push(slots[index].clone())
+        index = index + 1
+    }
+    return result
+}
+
+fn RegisterLinkedUnitEnum(state: LinkedNullState, ty: TypeNameBinding): LinkedNullState {
+    next = state
+    index = 0
+    while (index < next.unit_enums.len()) {
+        if (SameBoundTypeIdentity(next.unit_enums[index], ty)) { return next }
+        index = index + 1
+    }
+    next.unit_enums = next.unit_enums.push(ty)
+    return next
+}
+
+fn EmitLinkedUnitEnums(&types: [TypeNameBinding]): str {
+    text = ""
+    index = 0
+    while (index < types.len()) {
+        name = UnitEnumTypeName(types[index])
+        text += "typedef struct " + name.clone()
+            + " { int32_t tag; union { unsigned char empty; } payload; } " + name + ";\n"
+        index = index + 1
+    }
+    return text
+}
+
+struct LinkedEnumSelection {
+    ty: TypeNameBinding
+    index: int
+}
+
+fn FindLinkedEnumSelection(&project: LinkedNullProject, &state: LinkedNullState, &field: Node): LinkedEnumSelection! {
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, field, 0))
+    qualifier = receiver.clone()
+    if (receiver.kind == "Field" && receiver.edge_count == 1) {
+        qualifier = LinkedNullNode(project, 1, LinkedNullChild(project, 1, receiver, 0))
+    }
+    empty = LinkedBuiltin("", DeclarationSpan(field))
+    if (qualifier.kind != "Variable" || LinkedNullBinding(state.slots, qualifier.text) != 0 ||
+        LinkedLocalAppendIndex(state, qualifier.text) != 0 || FindLinkedLocalRead(state.local_readers, qualifier.text) != 0) {
+        return ok(LinkedEnumSelection { ty: empty, index: 0 })
+    }
+    if (receiver.kind == "Field") {
+        receiver.text = qualifier.text.clone() + "." + receiver.text
+        receiver.kind = "TypeName"
+    }
+    ty = FindUnitEnumType(project.supplied[0].named, project.binding.modules[0].imports, project.supplied, receiver)?
+    if (ty.declaration_kind != "UnitEnum") { return ok(LinkedEnumSelection { ty: empty, index: 0 }) }
+    ordinal = ReadUnitEnumVariant(project.supplied, ty, field.text, DeclarationSpan(field))?
+    return ok(LinkedEnumSelection { ty: ty, index: ordinal + 1 })
 }

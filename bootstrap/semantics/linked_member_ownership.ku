@@ -192,6 +192,10 @@ fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNu
     RequireLinkedMove(state, value)?
     next = state
     if (value.slot <= 0) { return ok(next) }
+    if (value.ty.declaration_kind == "UnitEnum") {
+        next.code += "    " + value.text.clone() + ".tag = -1;\n"
+        return ok(RecordLinkedMemberMove(next, value))
+    }
     drop = LinkedNullDropC(next.layouts, next.owning_layouts, value.ty, value.text)
     if (drop != "") {
         next.code = next.code + "    " + value.text.clone() + " = (" + LinkedNullCType(value.ty)? + "){0};\n"

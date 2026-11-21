@@ -51,6 +51,12 @@ declared View and return type must match. Passing the local to an owning
 parameter or returning it moves the callback. Other function value conversions
 and package imports remain outside this subset.
 
+The linked emitter can construct variants of a named enum whose variants
+all have no payload, and pass or return such a value by value. Named and
+namespace imports keep the enum's declaration identity across C units.
+Passing or returning an existing enum binding moves it. Enum matching, enum
+payloads, and enum containers remain outside the linked emitter subset.
+
 ## Check a set of relative modules
 
 Build `project_main.ku` with the output next to the entry source, then copy the

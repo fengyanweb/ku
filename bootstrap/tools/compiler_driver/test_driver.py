@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+from runpy import run_path
 import shutil
 import subprocess
 import sys
@@ -758,6 +759,87 @@ def exercise_static_reader_argument(compiler, cc, caller):
         assert diagnostic in rejected.stderr and not rejected.stdout, (source, rejected.stderr)
 
 
+def exercise_linked_unit_enum(compiler, cc, caller):
+    project = caller / "linked-unit-enum"
+    project.mkdir()
+    model = project / "model.ku"
+    source = """enum Phase {
+    Ready
+    Done
+}
+fn Pass(value: Phase): Phase { return value }
+fn Finished(): Phase { return Phase.Done }
+"""
+    model.write_text(source, encoding="utf-8")
+    main = project / "main.ku"
+    entry = '''import model from "./model.ku"
+import { Phase } from "./model.ku"
+fn Transfer(value: model.Phase): model.Phase { return model.Pass(value) }
+fn Admitted(): Phase { return Phase.Ready }
+fn RelayReady(): model.Phase {
+    value = model.Phase.Ready
+    return model.Pass(value)
+}
+'''
+    main.write_text(entry, encoding="utf-8")
+    manifest = project / "main.txt"
+    supplier = project / "model.txt"
+    manifest.write_text("main.ku\nmodel.ku\n", encoding="utf-8")
+    supplier.write_text("model.ku\nmain.ku\n", encoding="utf-8")
+    linker = Path(__file__).resolve().parents[1] / "link_c.py"
+    link_tools = run_path(str(linker))
+    units = []
+    exports = {}
+    for name, order in (("Transfer", manifest), ("Admitted", manifest), ("RelayReady", manifest),
+                        ("Pass", supplier), ("Finished", supplier)):
+        c_path, plan_path = project / f"{name}.c", project / f"{name}.json"
+        c_path.write_bytes(execute([compiler, "emit-unit", order, name], caller).stdout)
+        plan_path.write_bytes(execute([compiler, "emit-unit-plan", order, name], caller).stdout)
+        exports[name] = link_tools["Unit"].read(plan_path, c_path).export
+        units.extend(["--unit", plan_path, c_path])
+    transfer = exports["Transfer"]
+    result = transfer.signature.result
+    assert result.identity[:2] == ("unit_enum", "model.ku")
+    assert result.semantic() == transfer.signature.parameters[0].semantic()
+    assert result.semantic() == exports["Pass"].signature.result.semantic()
+    ready, relay, done = (link_tools["canonical_symbol"](exports[name].key)
+                          for name in ("Admitted", "RelayReady", "Finished"))
+    carrier = result.c_type
+    host = project / "host.c"
+    host.write_text(f"""\
+extern {carrier} {ready}(void);
+extern {carrier} {relay}(void);
+extern {carrier} {done}(void);
+int main(void) {{
+    {carrier} initial = {transfer.symbol}({ready}());
+    {carrier} final = {transfer.symbol}({done}());
+    return !(initial.tag == 0 && final.tag == 1 && {relay}().tag == 0);
+}}
+""", encoding="ascii")
+    output = project / ("phase.exe" if os.name == "nt" else "phase")
+    execute([sys.executable, "-B", linker, "--cc", cc, *units, "--entry",
+             transfer.key[0], str(transfer.key[1]), "--caller", host, "-o", output], caller)
+    execute([output], caller)
+    for model_source, function, diagnostic in [
+        (source, """fn Bad(value: model.Phase): model.Phase {
+    first = model.Pass(value)
+    return model.Pass(value)
+}
+""", b"unavailable_linked_binding"),
+        (source, "fn Bad(): model.Phase { return model.Phase.Missing }\n", b"linked_enum_variant"),
+        (source.replace("    Done", "    Done\n    Payload(value: int)"),
+         "fn Bad(): model.Phase { return model.Phase.Ready }\n", b"linked_enum_layout"),
+        (source.replace("    Done", "    Ready"),
+         "fn Bad(): model.Phase { return model.Phase.Ready }\n", b"duplicate unit enum variant"),
+        (source + "enum Other { Ready\n Done\n }\n",
+         "fn Bad(value: model.Other): model.Phase { return model.Pass(value) }\n", b"linked_argument_type"),
+    ]:
+        model.write_text(model_source, encoding="utf-8")
+        main.write_text(entry + function, encoding="utf-8")
+        rejected = execute([compiler, "emit-unit-plan", manifest, "Bad"], caller, 1)
+        assert not rejected.stdout and diagnostic in rejected.stderr, rejected.stderr
+
+
 def exercise_linked_reader_factory(compiler, cc, caller):
     project = caller / "linked-reader-factory"
     project.mkdir()
@@ -1352,6 +1434,7 @@ def exercise(ku, cc):
         exercise_linked_nullable_int(compiler, cc, caller)
         exercise_linked_owned_reader(compiler, cc, caller)
         exercise_static_reader_argument(compiler, cc, caller)
+        exercise_linked_unit_enum(compiler, cc, caller)
         exercise_linked_reader_factory(compiler, cc, caller)
         exercise_linked_owned_string_for(compiler, cc, caller)
         exercise_parameter_bindings(compiler, cc, caller)

@@ -70,6 +70,7 @@ struct LinkedNullState {
     plain_value_result: bool
     layouts: [StructLayout]
     owning_layouts: [StructLayout]
+    unit_enums: [TypeNameBinding]
     owning_strings: bool
     slots: [LinkedNullSlot]
     links: [LinkedNullFunction]
@@ -121,7 +122,7 @@ struct LinkedNullExpression {
 }
 
 fn NewLinkedNullState(): LinkedNullState {
-    return LinkedNullState { plain_value_result: false, layouts: [], owning_layouts: [], owning_strings: false,
+    return LinkedNullState { plain_value_result: false, layouts: [], owning_layouts: [], unit_enums: [], owning_strings: false,
         slots: [], links: [], local_readers: [], local_callbacks: [], callback_owners: [], callback_helpers: "", uses_scoped_reader: false,
         local_appends: [], append_captures: [], local_append_types: [],
         declarations: "", code: "", drops: "", catch_slot: 0,
@@ -367,6 +368,7 @@ fn LinkedRecordFields(&layouts: [StructLayout], &managed: [StructLayout], &type:
 
 fn LinkedNullOwner(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Struct" || binding.declaration_kind == "CaughtError" || binding.declaration_kind == "NullableRecordViewReader"
+        || binding.declaration_kind == "UnitEnum"
         || binding.declaration_kind == "Builtin" && (binding.name == "str" || binding.name == "bytes")
         || LinkedNullOwnedArray(binding) || LinkedScalarArrayOwner(binding)
 }
@@ -470,16 +472,6 @@ fn AppendLinkedCheckedInvocation(state: LinkedNullState, &carrier: str, &result:
     next = ExitLinkedFailure(next, "        ")
     next.code += "    }\n"
     return next
-}
-
-fn LinkedSlotPrefix(&slots: [LinkedNullSlot], length: int): [LinkedNullSlot] {
-    result: [LinkedNullSlot] = []
-    index = 0
-    while (index < length) {
-        result = result.push(slots[index].clone())
-        index = index + 1
-    }
-    return result
 }
 
 fn LinkedSlotOwnershipMatches(&before: LinkedNullSlot, &after: LinkedNullSlot): bool {

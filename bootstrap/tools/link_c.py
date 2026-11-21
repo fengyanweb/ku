@@ -33,6 +33,7 @@ CALLBACK_TYPES = {
 CALLBACK_IDENTITIES = {identity for identity, _ in CALLBACK_TYPES.values()}
 CALLBACK_PREFIXES = {identity: prefix for identity, prefix in CALLBACK_TYPES.values()}
 NOMINAL_CARRIER = re.compile(r"(?:KuBootstrapResult_)?(?:KuArray_)?(KuStruct_m[1-9][0-9]*_([1-9][0-9]*))\Z")
+UNIT_ENUM_CARRIER = re.compile(r"KuEnum_m[1-9][0-9]*_([1-9][0-9]*)\Z")
 CHECKED_INT_CALLBACK_PARAMETERS = {
     "IntResultAppendCallback": ("KuProjectionString", "KuProjectionString", "int64_t", 0, "KuArrayInt", 1),
     "IntResultArenaCallback": (0, 1, "bool"),
@@ -145,6 +146,13 @@ class TypeRef:
             identity = ("struct" if kind_name == "Struct" else "struct_array",
                         module_path(ref["source_path"], f"{where}.source_path"),
                         node_id(ref["node"], f"{where}.node"))
+        elif kind_name == "UnitEnum":
+            path = module_path(ref["source_path"], f"{where}.source_path")
+            node = node_id(ref["node"], f"{where}.node")
+            match = UNIT_ENUM_CARRIER.fullmatch(c_type)
+            if passing != "value" or checked_result or not match or int(match[1]) != node:
+                raise LinkError(f"{where} requires the plain by-value unit enum carrier for {label((path, node))}")
+            identity = ("unit_enum", path, node)
         elif kind_name in CALLBACK_TYPES:
             path = module_path(ref["source_path"], f"{where}.source_path")
             node = node_id(ref["node"], f"{where}.node")
@@ -405,6 +413,9 @@ def carrier_aliases(unit):
                     if int(match[2]) != node:
                         raise LinkError(f"{unit.plan}: C carrier for {label((path, node))} has the wrong declaration node")
                     nominal(match[1], path, node)
+            elif kind == "unit_enum":
+                path, node = identity
+                bind(ref.c_type, "KuEnum_" + canonical_symbol((path, node)))
             elif kind in CHECKED_INT_CALLBACK_ABI:
                 for local, (path, node) in zip(ref.callback_nominals, identity):
                     nominal(local, path, node)
@@ -433,9 +444,23 @@ def wrapper(unit, include_caller):
     callbacks = sorted({(ref.identity[0], ref.c_type, ref.callback_nominals) for decl in declarations
                         for ref in (*decl.signature.parameters, decl.signature.result)
                         if ref.identity[0] in CALLBACK_IDENTITIES})
+    unit_enums = sorted({ref.c_type for decl in declarations
+                         for ref in (*decl.signature.parameters, decl.signature.result)
+                         if ref.identity[0] == "unit_enum"})
     nullable_int = nullable_int or any(kind == "nullable_record_view_reader" for kind, _, _ in callbacks)
-    if callbacks or nullable_int:
+    if callbacks or nullable_int or unit_enums:
         lines.append('#include <stddef.h>')
+    if unit_enums:
+        lines.append("typedef struct { int32_t tag; union { unsigned char empty; } payload; } ku_bootstrap_enum_layout;")
+    for carrier in unit_enums:
+        lines.append(f'_Static_assert(sizeof({carrier}) == sizeof(ku_bootstrap_enum_layout) && '
+                     f'_Alignof({carrier}) == _Alignof(ku_bootstrap_enum_layout) && '
+                     f'offsetof({carrier}, tag) == offsetof(ku_bootstrap_enum_layout, tag) && '
+                     f'offsetof({carrier}, payload) == offsetof(ku_bootstrap_enum_layout, payload) && '
+                     f'_Generic((({carrier}){{0}}).tag, int32_t: 1, default: 0) && '
+                     f'_Generic((({carrier}){{0}}).payload.empty, unsigned char: 1, default: 0) && '
+                     f'sizeof((({carrier}){{0}}).payload) == sizeof(unsigned char), '
+                     f'"link-plan C unit enum has a different carrier");')
     if nullable_int:
         lines.extend(check_carrier_layout("KuBootstrapOptionalInt", "ku_bootstrap_optional_int_layout",
                                          (("is_null", "bool"), ("value", "int64_t")),

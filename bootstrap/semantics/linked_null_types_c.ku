@@ -1,14 +1,15 @@
+import { LinkedScalarLiteralC } from "./scalar_int_operands.ku"
 import { BoundArrayCPrefix, BoundArrayCType } from "./struct_array_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
 import { ProjectNamespaceModule, ResolveProjectNamespaceFunction, SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
-import { IsLinkedNullableIntType, LinkedCopyResult, LinkedNominalReaderPrefix, LinkedNullableReaderParameter, ResolveTypeName, RetagTypeNameBinding, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
-import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
+import { IsLinkedNullableIntType, LinkedCopyResult, LinkedNominalReaderPrefix, LinkedNullableReaderParameter, RequireUnitEnum, ResolveTypeName, RetagTypeNameBinding, SameBoundTypeIdentity, TypeNameBinding, UnitEnumTypeName } from "./type_names.ku"
+import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { CTypeName, ResolveProjectionDirectFunction, RequireProjectionBuiltin, ProjectionBuiltinLinkId, ProjectionBuiltinLinkFor, LinkedBufferResult, LinkedIntArrayCallbackNominal, LinkedIntAppendCallbackNominals } from "./struct_projection_c.ku"
-import { OrderCStructLayouts, OwningStructDropReference } from "./nested_struct_c.ku"
-import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, IntArrayLinkPlanType, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullState, LinkedReadonlyExpression, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, RememberLinkedCall, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { OwningStructDropReference } from "./nested_struct_c.ku"
+import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, IntArrayLinkPlanType, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullState, LinkedReadonlyExpression, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, ReadLinkedNullBinding, RememberLinkedCall, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -31,7 +32,7 @@ fn LinkedNullChild(&project: LinkedNullProject, unit: int, &parent: Node, index:
     return project.supplied[unit - 1].named.parsed.arena.edges[parent.first_edge + index]
 }
 
-fn absoluteType(binding: TypeNameBinding, unit: int): TypeNameBinding {
+fn LinkedAbsoluteType(binding: TypeNameBinding, unit: int): TypeNameBinding {
     resolved = binding
     if (resolved.declaration_kind == "Struct" && resolved.module_index == 0) {
         resolved.module_index = unit
@@ -46,7 +47,8 @@ fn LinkedNullType(&project: LinkedNullProject, unit: int, node: int): TypeNameBi
         return ok(RetagTypeNameBinding(LinkedBuiltin("int", at), "NullableInt"))
     }
     resolved = ExplicitType(project.binding.modules[unit - 1].types, node, at)?
-    return ok(absoluteType(resolved, unit))
+    if (resolved.declaration_kind == "Enum") { return RequireUnitEnum(project.supplied, resolved, unit) }
+    return ok(LinkedAbsoluteType(resolved, unit))
 }
 
 fn LinkedNullLiteralType(&project: LinkedNullProject, unit: int, &literal: Node, id: int): TypeNameBinding! {
@@ -55,7 +57,7 @@ fn LinkedNullLiteralType(&project: LinkedNullProject, unit: int, &literal: Node,
     if (binding.declaration_kind != "Struct") {
         RejectLayout("linked_literal_type", "expected the declaration of a concrete struct", DeclarationSpan(literal))?
     }
-    return ok(absoluteType(binding, unit))
+    return ok(LinkedAbsoluteType(binding, unit))
 }
 
 fn readIntCallback(&project: LinkedNullProject, unit: int, &node: Node, view: bool): TypeNameBinding! {
@@ -172,6 +174,7 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
     nominal_prefix = LinkedNominalReaderPrefix(binding.declaration_kind)
     if (nominal_prefix != "") { return ok(nominal_prefix + CTypeName(binding.module_index, binding.declaration_node)) }
     if (binding.declaration_kind == "OwnedStringArray") { return ok("KuGuardStringArray") }
+    if (binding.declaration_kind == "UnitEnum") { return ok(UnitEnumTypeName(binding)) }
     if (binding.declaration_kind == "NullableInt") { return ok("KuBootstrapOptionalInt") }
     if (binding.declaration_kind == "CaughtError") { return ok("KuBootstrapError") }
     if (binding.declaration_kind == "BuiltinArray") {
@@ -231,33 +234,6 @@ fn LinkedNullParameterPlan(&binding: TypeNameBinding, unit: int): LinkPlanType! 
     type = binding.clone()
     if (LinkedNullView(binding)) { type = LinkedViewPointee(type) }
     return ok(BoundLinkPlanType(type, unit, LinkedNullCType(binding)?, LinkedNullView(binding)))
-}
-
-fn LinkedNullLayout(&project: LinkedNullProject, &ty: TypeNameBinding, layouts: [StructLayout], depth: int): [StructLayout]! {
-    if (ty.declaration_kind != "Struct") {
-        LinkedNullCType(ty)?
-        return ok(layouts)
-    }
-    unit = ty.module_index
-    if (LayoutIndex(layouts, unit, ty.declaration_node) != 0) { return ok(layouts) }
-    if (depth >= 8) {
-        RejectLayout("linked_layout_depth", "linked structs require an acyclic layout of at most 8 levels", ty.span.clone())?
-    }
-    declaration = LinkedNullNode(project, unit, ty.declaration_node)
-    module_index = unit - 1
-    relocated: [StructFieldLayout] = []
-    ordered = layouts
-    for field in CollectFields(project.supplied[module_index].named.parsed.arena.nodes,
-                               project.supplied[module_index].named.parsed.arena.edges,
-                               project.binding.modules[module_index].types, declaration, false)? {
-        resolved = absoluteType(field.resolved, unit)
-        ordered = LinkedNullLayout(project, resolved, ordered, depth + 1)?
-        local = StructFieldLayout { name: field.name, ordinal: field.ordinal, node: field.node, resolved: resolved }
-        relocated = relocated.push(local)
-    }
-    ordered = ordered.push(StructLayout { name: ty.name.clone(), module_index: unit, node: ty.declaration_node, fields: relocated })
-    OrderCStructLayouts(ordered, unit, ty.declaration_node, ty.span.clone())?
-    return ok(ordered)
 }
 
 fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, allow_int: bool, allow_str: bool): TypeNameBinding! {
@@ -423,4 +399,13 @@ fn LinkedCheckedResultPlan(&result: TypeNameBinding, unit: int): LinkPlanType! {
 fn LinkedResultPlan(&result: TypeNameBinding, unit: int, checked: bool): LinkPlanType! {
     if (checked) { return LinkedCheckedResultPlan(result, unit) }
     return LinkedNullParameterPlan(result, unit)
+}
+
+fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpression! {
+    at = DeclarationSpan(node)
+    if (node.kind == "Variable" && node.edge_count == 0) { return ReadLinkedNullBinding(state, node) }
+    value = LinkedScalarLiteralC(node)?
+    if (value.kind != "") { return ok(LinkedReadonlyExpression(state, LinkedBuiltin(value.kind, at), value.text)) }
+    RejectLayout("unsupported_linked_operand", "expected a bound value, literal or checked direct call", at.clone())?
+    return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", at), ""))
 }

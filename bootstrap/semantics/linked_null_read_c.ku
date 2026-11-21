@@ -1,6 +1,6 @@
 import { ResolveLinkedCall } from "./scalar_result_null.ku"
 import { EmitLinkedArrayIndexGuard, EmitLinkedLogicalBranch } from "./guarded_string_parts.ku"
-import { AddLinkedNullSlot, CloneLinkedRecord, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, CloneLinkedRecord, ReadLinkedUnitEnum, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
 import { CheckLinkedAddition, EmitLinkedMultiplyDivide, LinkedMemberPath, LinkedMemberUnavailable, LinkedViewArgument, RequireLinkedReadonlyCall } from "./linked_member_ownership.ku"
 import { Span } from "../stage2/span.ku"
 import { LinkedLocalReadBinding } from "./call_contracts.ku"
@@ -9,11 +9,10 @@ import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout } from "./struct_layouts.ku"
 import { EmitLinkedReadonlyScalar, LinkedDirectCallExpression, LinkedErrorField, LinkedNullFunction, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, RememberLinkedCall } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
-import { LinkedScalarLiteralC } from "./scalar_int_operands.ku"
 import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
 import { GuardLinkedStringPredicate } from "./guarded_struct_c.ku"
 import { EmitLinkedIntAppend, EmitLinkedOwnedArrayClone, OwnedRecordArrayCloneLayout, OwnedRecordArrayCloneType } from "./struct_array_c.ku"
-import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedStringResult, LowerLinkedNullLeaf, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn LowerLinkedIntArrayLiteral(&project: LinkedNullProject, state: LinkedNullState, &literal: Node, id: int,
                                binding: str): LinkedNullExpression! {
@@ -50,7 +49,9 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
         return readLinkedIndex(project, state, node, id, depth)
     }
     if (node.kind == "Field" && node.edge_count == 1) {
-        return readLinkedField(project, state, node, depth)
+        variant = ReadLinkedUnitEnum(project, state, node, id)?
+        if (variant.value.slot > 0) { return ok(variant) }
+        return readLinkedField(project, variant.state, node, depth)
     }
     if (node.kind == "Binary" && node.edge_count == 2) {
         return readLinkedBinary(project, state, node, id, depth)
@@ -338,13 +339,4 @@ fn readLinkedBinary(&project: LinkedNullProject, state: LinkedNullState, &node: 
     }
     RejectLayout("linked_binary_type", "unsupported readonly scalar operation", DeclarationSpan(node))?
     return ok(LinkedReadonlyExpression(right.state, LinkedBuiltin("", DeclarationSpan(node)), ""))
-}
-
-fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpression! {
-    at = DeclarationSpan(node)
-    if (node.kind == "Variable" && node.edge_count == 0) { return ReadLinkedNullBinding(state, node) }
-    value = LinkedScalarLiteralC(node)?
-    if (value.kind != "") { return ok(LinkedReadonlyExpression(state, LinkedBuiltin(value.kind, at), value.text)) }
-    RejectLayout("unsupported_linked_operand", "expected a bound value, literal or checked direct call", at.clone())?
-    return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", at), ""))
 }

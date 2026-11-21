@@ -120,6 +120,72 @@ fn SameBoundTypeIdentity(&a: TypeNameBinding, &b: TypeNameBinding): bool {
         && ((a.declaration_kind != "Builtin" && a.declaration_kind != "BuiltinArray") || a.name == b.name)
 }
 
+fn rejectedUnitEnum(code: str, reason: str, at: Span): null! {
+    diagnostic = MakeDiagnostic("error", "bootstrap.semantics.types", code.clone(), reason, "<source>", at)
+    fail { domain: "bootstrap.semantics.types", code: code, message: DiagnosticCanonical(diagnostic) }
+}
+
+fn RequireUnitEnum(&supplied: [SuppliedModule], binding: TypeNameBinding, local_unit: int): TypeNameBinding! {
+    resolved = binding
+    if (resolved.module_index == 0) { resolved.module_index = local_unit }
+    unit = resolved.module_index - 1
+    declaration = ReadImportNode(supplied[unit].named.parsed.arena.nodes, resolved.declaration_node, resolved.span.clone())?
+    if (declaration.kind != "Enum" || declaration.edge_count == 0) {
+        rejectedUnitEnum("linked_enum_layout", "expected a nonempty enum declaration", resolved.span.clone())?
+    }
+    names: [str] = []
+    index = 0
+    while (index < declaration.edge_count) {
+        id = supplied[unit].named.parsed.arena.edges[declaration.first_edge + index]
+        variant = ReadImportNode(supplied[unit].named.parsed.arena.nodes, id, resolved.span.clone())?
+        if (variant.kind != "EnumVariant" || variant.edge_count != 0) {
+            rejectedUnitEnum("linked_enum_layout", "every variant of a linked enum must have no payload", DeclarationSpan(variant))?
+        }
+        prior = 0
+        while (prior < names.len()) {
+            if (names[prior] == variant.text) {
+                rejectedUnitEnum("linked_enum_layout", "duplicate unit enum variant", DeclarationSpan(variant))?
+            }
+            prior = prior + 1
+        }
+        names = names.push(variant.text)
+        index = index + 1
+    }
+    resolved.declaration_kind = "UnitEnum"
+    return ok(resolved)
+}
+
+fn UnitEnumTypeName(&binding: TypeNameBinding): str {
+    return "KuEnum_m" + str(binding.module_index) + "_" + str(binding.declaration_node)
+}
+
+fn FindUnitEnumType(&named: NamedModule, &imports: [ImportBinding], &supplied: [SuppliedModule],
+                    &qualifier: Node): TypeNameBinding! {
+    try {
+        resolved = ResolveTypeName(qualifier, 0, named.names.declarations, imports, supplied)?
+        if (resolved.declaration_kind == "Enum") { return RequireUnitEnum(supplied, resolved, 1) }
+        return ok(resolved)
+    } catch (err) {
+        if (err.code != "undefined_type") { fail err }
+    }
+    return ok(TypeNameBinding { use_node: 0, name: "", declaration_kind: "Unresolved",
+        module_index: 0, declaration_node: 0, span: DeclarationSpan(qualifier) })
+}
+
+fn ReadUnitEnumVariant(&supplied: [SuppliedModule], &binding: TypeNameBinding, &name: str, at: Span): int! {
+    unit = binding.module_index - 1
+    declaration = ReadImportNode(supplied[unit].named.parsed.arena.nodes, binding.declaration_node, at.clone())?
+    index = 0
+    while (index < declaration.edge_count) {
+        id = supplied[unit].named.parsed.arena.edges[declaration.first_edge + index]
+        variant = ReadImportNode(supplied[unit].named.parsed.arena.nodes, id, at.clone())?
+        if (variant.text == name) { return ok(index) }
+        index = index + 1
+    }
+    rejectedUnitEnum("linked_enum_variant", "unknown variant '" + name.clone() + "'", at)?
+    return ok(0)
+}
+
 // This linked carrier is defined only for the closed union of the two core
 // scalar types. Container layout and general union inference remain separate.
 fn IsLinkedNullableIntType(&named: NamedModule, &annotation: Node): bool {

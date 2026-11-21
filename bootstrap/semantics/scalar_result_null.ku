@@ -243,6 +243,7 @@ fn StartLinkedThunkFrame(&parent: LinkedNullState): LinkedNullState {
     body = NewLinkedNullState()
     body.layouts = parent.layouts.clone()
     body.owning_layouts = parent.owning_layouts.clone()
+    body.unit_enums = parent.unit_enums.clone()
     body.owning_strings = parent.owning_strings
     body.links = parent.links.clone()
     body.callback_helpers = parent.callback_helpers.clone()

@@ -132,6 +132,25 @@ class LinkTests(unittest.TestCase):
         cc.assert_not_called()
         self.assertEqual(self.output.read_bytes(), old)
 
+    def test_unit_enum_has_a_distinct_by_value_nominal_carrier(self):
+        unit_enum = {"kind": "UnitEnum", "source_name": "Phase", "source_path": "model.ku",
+                     "node": 3, "c_type": "KuEnum_m2_3", "passing": "value"}
+        reference = link_c.TypeRef.read(unit_enum, "parameter")
+        self.assertEqual(reference.identity, ("unit_enum", "model.ku", 3))
+        for edit in ({"c_type": "int32_t"}, {"c_type": "KuStruct_m2_3"},
+                     {"c_type": "KuEnum_m2_4"}, {"passing": "view", "c_type": "const KuEnum_m2_3*"}):
+            with self.subTest(edit=edit), self.assertRaisesRegex(link_c.LinkError, "unit enum carrier"):
+                link_c.TypeRef.read(dict(unit_enum, **edit), "parameter")
+        with self.assertRaisesRegex(link_c.LinkError, "unit enum carrier"):
+            link_c.TypeRef.read(unit_enum, "checked result", checked_result=True)
+        use = declaration("app.ku", 58, "ku_use", [unit_enum])
+        request = declaration("model.ku", 17, "ku_pass", [unit_enum])
+        definition = copy.deepcopy(request)
+        definition["signature"]["parameters"][0]["source_path"] = "other.ku"
+        original = self.unit("use-enum", plan(use, [request]), "/* no C before preflight */\n")
+        mismatch = self.unit("other-enum", plan(definition), "/* no C before preflight */\n")
+        self.assert_preflight_error([*original, *mismatch], "signature mismatch")
+
     def test_windows_gnu_stages_compiler_paths_away_from_unicode_output(self):
         destination = self.root / "调用目录 🙂"
         destination.mkdir()

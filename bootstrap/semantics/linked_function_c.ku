@@ -3,6 +3,7 @@ import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { NoLinkedRetention, LinkedOptionalReaderHeader } from "./linked_nullable_reader_c.ku"
 import { EmitLinkedOptionalIntReturn, LinkedNullCallSymbol, ResolveLinkedCall } from "./scalar_result_null.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
+import { EmitLinkedUnitEnums } from "./scalar_project_c.ku"
 import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult } from "./struct_projection_c.ku"
 import { LinkedCopyResult, LinkedPlainCopyResult, TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
@@ -104,7 +105,7 @@ fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunc
 }
 
 fn EmitLinkedNullDeclarations(&project: LinkedNullProject, &body: LinkedNullState, &result: TypeNameBinding): str! {
-    declarations = EmitLinkedBodyPrelude(body)?
+    declarations = EmitLinkedBodyPrelude(body)? + EmitLinkedUnitEnums(body.unit_enums)
     checked = !body.plain_value_result
     return ok(declarations + LinkedOptionalReaderHeader(body.slots, result)? + EmitLinkedNullPrototypes(project, body.links, body.slots, body.local_appends, result, checked)?)
 }

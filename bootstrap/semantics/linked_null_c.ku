@@ -1,3 +1,4 @@
+import { LinkedSlotPrefix } from "./scalar_project_c.ku"
 import { FinishLinkedOwnedReader, LinkedRetainedViewPlan, LinkedViewRetention, PlanLinkedRetainedView, ReadLinkedOwnedReader, RejectLinkedTerminalIteration } from "./linked_nullable_reader_c.ku"
 import { LinkedCharacterSource } from "./struct_string_calls.ku"
 import { LowerLinkedLocalAlias, RegisterLinkedLocalRead } from "./linked_array_fields_c.ku"
@@ -14,7 +15,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
-import { ExitLinkedFailure, LinkedFailureTarget, LinkedSlotPrefix, LinkedNullBinding, LinkedNullC, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
+import { ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullC, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedResultPlan, LinkedNullChild,
          LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
 import { LinkedChildKindIs } from "./link_plan_json_c.ku"
