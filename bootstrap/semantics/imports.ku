@@ -89,16 +89,16 @@ fn ResolveSuppliedExport(&supplied: NamedModule, &request: str, at: Span): int! 
 
 fn CheckImportName(&local_names: [TopLevelName], &bindings: [ImportBinding], current_import: int,
                    &request: str, &local: str, standard: bool, at: Span): null! {
-    index = 0
     conflict = false
     duplicate_alias = false
+    index = 0
     while (index < bindings.len()) {
-        binding = bindings[index].clone()
-        if (binding.import_node == current_import && binding.source_name == request) {
+        binding_group = bindings[index].import_node
+        if (binding_group == current_import && bindings[index].source_name == request) {
             RejectName("duplicate_import_name", "duplicate import name '" + request.clone() + "'", at.clone())?
         }
-        if (binding.local_name == local) {
-            if (binding.import_node == current_import) { duplicate_alias = true }
+        if (bindings[index].local_name == local) {
+            if (binding_group == current_import) { duplicate_alias = true }
             conflict = true
         }
         index = index + 1
@@ -156,10 +156,12 @@ fn CollectStandardBindings(&nodes: [Node], &edges: [int], &group: Node, import_i
             if (!IsStandardModule(request.text)) {
                 RejectName("unknown_std_module", "unknown std module '" + request.text.clone() + "'", position.clone())?
             }
-            for binding in standard {
-                if (binding.source_name == request.text) {
+            prior = 0
+            while (prior < standard.len()) {
+                if (standard[prior].source_name == request.text) {
                     RejectName("duplicate_std_module", "duplicate std module import '" + request.text.clone() + "'", position.clone())?
                 }
+                prior = prior + 1
             }
             standard = standard.push(StandardBinding(request.text, group.text.clone(), import_id, request_id, position))
             index = index + 1
