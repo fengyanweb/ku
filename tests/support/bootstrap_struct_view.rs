@@ -1377,3 +1377,85 @@ pub(super) fn assert_conditional_partial_members(seed: &Path, cwd: &Path) {
         assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_moved_member"));
     }
 }
+
+const STRING_PREFIX_SUFFIX_SOURCE: &str = r#"fn Mark(kind: int): null! { return ok(null) }
+fn Probe(&value: str, &pattern: str): null! {
+    if (value.starts_with(pattern)) { Mark(1)? }
+    if (value.ends_with(pattern)) { Mark(2)? }
+    return ok(null)
+}
+"#;
+
+const STRING_PREFIX_SUFFIX_HOST: &str = r#"
+static int observed;
+KuBootstrapResultNull __MARK__(int64_t kind) {
+    observed = observed * 10 + (int)kind;
+    return (KuBootstrapResultNull){.ok = true};
+}
+static void compare(const KuProjectionString *value, const KuProjectionString *pattern, int expected) {
+    KuProjectionString owner = *value, needle = *pattern;
+    observed = 0;
+    assert(__ENTRY__(value, pattern).ok && observed == expected);
+    assert(value->ptr == owner.ptr && value->len == owner.len && value->storage == owner.storage);
+    assert(pattern->ptr == needle.ptr && pattern->len == needle.len && pattern->storage == needle.storage);
+    assert(attempts == 1 && outstanding() == 1);
+}
+int main(void) {
+    (void)test_realloc;
+    const uint8_t input[] = {0xe4,0xb8,0xad,0,0xf0,0x9f,0x99,0x82};
+    uint8_t *data = malloc(sizeof input);
+    memcpy(data, input, sizeof input);
+    KuProjectionString value = {data,sizeof input,sizeof input,KU_PROJECTION_STRING_OWNED};
+    KuProjectionString empty = {0};
+    KuProjectionString prefix = {data,4,0,KU_PROJECTION_STRING_STATIC};
+    KuProjectionString suffix = {data + 3,5,0,KU_PROJECTION_STRING_STATIC};
+    uint8_t wrong_data[] = {0xe4,0xb8,0xad,1};
+    KuProjectionString wrong = {wrong_data,sizeof wrong_data,0,KU_PROJECTION_STRING_STATIC};
+    uint8_t longer_data[] = {0xe4,0xb8,0xad,0,0xf0,0x9f,0x99,0x82,'!'};
+    KuProjectionString longer = {longer_data,sizeof longer_data,0,KU_PROJECTION_STRING_STATIC};
+    compare(&value, &empty, 12);
+    compare(&value, &prefix, 1);
+    compare(&value, &suffix, 2);
+    compare(&value, &value, 12);
+    compare(&value, &wrong, 0);
+    compare(&value, &longer, 0);
+    compare(&empty, &prefix, 0);
+    compare(&empty, &empty, 12);
+    assert(!memcmp(data, input, sizeof input));
+    free(data);
+    assert(!outstanding());
+    return 0;
+}
+"#;
+
+pub(super) fn assert_string_prefix_suffix(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("prefix-suffix.ku"), STRING_PREFIX_SUFFIX_SOURCE).unwrap();
+    fs::write(cwd.join("modules.txt"), "prefix-suffix.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Probe").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let entry = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResultNull ku_linked_null_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let mark = code
+        .lines()
+        .find_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = STRING_PREFIX_SUFFIX_HOST
+        .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
+        .replace("__MARK__", mark);
+    let c = cwd.join("prefix-suffix.c");
+    let exe = cwd.join(format!("prefix-suffix{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+}

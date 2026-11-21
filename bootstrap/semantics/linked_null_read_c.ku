@@ -115,13 +115,13 @@ fn readLinkedMethod(&project: LinkedNullProject, state: LinkedNullState, &call: 
         if (target.text == "len") {
             RejectLayout("linked_array_length", "len requires a str or a supported array", at.clone())?
         }
-    } else if (call.edge_count == 2 && target.text == "ends_with") {
+    } else if (call.edge_count == 2 && (target.text == "starts_with" || target.text == "ends_with")) {
         left = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, target, 0), depth + 1)?
         right = LowerLinkedNullRead(project, left.state, LinkedNullChild(project, 1, call, 1), depth + 1)?
         if (LinkedStringResult(left.value.ty) && LinkedStringResult(right.value.ty)) {
-            right.state.uses_suffix = true
+            right.state.uses_prefix_suffix = true
             return ok(LinkedReadonlyExpression(right.state, LinkedBuiltin("bool", at),
-                "ku_scalar_ends_with(" + left.value.text + ", " + right.value.text + ")"))
+                "ku_scalar_string_matches(" + left.value.text + ", " + right.value.text + ", " + str(target.text == "ends_with") + ")"))
         }
         next = right.state
     }

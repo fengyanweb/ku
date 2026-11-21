@@ -195,10 +195,13 @@ fn ScalarCheckedMultiplyC(): str {
         + "    }\n    *out = a * b;\n    return true;\n}\n\n"
 }
 
-fn ScalarStringSuffixC(): str {
+fn ScalarStringPrefixSuffixC(): str {
     return "#include <string.h>\n\n"
-        + "static bool ku_scalar_ends_with(KuProjectionString value, KuProjectionString suffix) {\n"
-        + "    return suffix.len <= value.len && (!suffix.len || memcmp(value.ptr + (value.len - suffix.len), suffix.ptr, suffix.len) == 0);\n"
+        + "static bool ku_scalar_string_matches(KuProjectionString value, KuProjectionString pattern, bool suffix) {\n"
+        + "    if (pattern.len > value.len) return false;\n"
+        + "    if (!pattern.len) return true;\n"
+        + "    size_t offset = suffix ? value.len - pattern.len : 0;\n"
+        + "    return memcmp(value.ptr + offset, pattern.ptr, pattern.len) == 0;\n"
         + "}\n\n"
 }
 
