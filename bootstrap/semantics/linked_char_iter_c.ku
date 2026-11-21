@@ -35,7 +35,8 @@ struct LinkedLocalBody {
 fn ReadLinkedLocalThunk(&project: LinkedNullProject, &parent: LinkedNullState,
                         &function: Node, id: int): LinkedLocalBody! {
     body = StartLinkedThunkFrame(parent)
-    for index in [0, 1] {
+    parameter_indices: [int] = [0, 1]
+    for index in parameter_indices {
         parameter = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
         if (parameter.kind != "Parameter" || parameter.edge_count != 1 || parameter.int_value != 0 ||
             LinkedNullBinding(body.slots, parameter.text) > 0) {
@@ -56,7 +57,8 @@ fn ReadLinkedLocalThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     initializers = ""
     owners: [int] = []
     captures = ReadLinkedLocalCaptures(project, parent, function, id, 3)?
-    for index in captures.slots {
+    capture_slots = captures.slots
+    for index in capture_slots {
         outer = parent.slots[index - 1].clone()
         owned_array = LinkedNullOwnedArray(outer.value.ty)
         array_view = owned_array || outer.value.ty.declaration_kind == "StructArray"
