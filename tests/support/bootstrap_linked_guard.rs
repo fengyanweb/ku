@@ -2049,6 +2049,7 @@ static void check_no_owned_array(void) {
     if (outstanding() || seen != 1) _Exit(83);
 }
 int main(int argc, char **argv) {
+    (void)test_malloc;
     (void)argv;
     if (argc > 1) {
         assert(!atexit(check_no_owned_array));
