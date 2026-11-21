@@ -109,8 +109,15 @@ class TypeRef:
             identity = ("struct" if ref["kind"] == "Struct" else "struct_array",
                         module_path(ref["source_path"], f"{where}.source_path"),
                         node_id(ref["node"], f"{where}.node"))
+        elif ref["kind"] == "IntPairResultCallback":
+            path = module_path(ref["source_path"], f"{where}.source_path")
+            node = node_id(ref["node"], f"{where}.node")
+            if (passing != "value" or checked_result or
+                    not re.fullmatch(rf"KuBootstrapIntPairCallback_KuStruct_m[1-9][0-9]*_{node}", c_type)):
+                raise LinkError(f"{where} requires the typed int-pair callback carrier for its named Result")
+            identity = ("int_pair_result_callback", path, node)
         else:
-            raise LinkError(f"{where}.kind must be Builtin, BuiltinArray, Struct or StructArray")
+            raise LinkError(f"{where}.kind must be Builtin, BuiltinArray, Struct, StructArray or IntPairResultCallback")
         return TypeRef(identity, passing, c_type)
 
     def semantic(self):
@@ -140,6 +147,8 @@ class Signature:
         if type(sig["returns_result"]) is not bool:
             raise LinkError(f"{where} requires a by-value result and boolean returns_result")
         result = TypeRef.read(sig["result"], f"{where}.result", checked_result=sig["returns_result"])
+        if result.identity[0] == "int_pair_result_callback":
+            raise LinkError(f"{where} callback carrier cannot be a returned value")
         if result.passing != "value":
             raise LinkError(f"{where} requires a by-value result and boolean returns_result")
         return Signature(tuple(TypeRef.read(item, f"{where}.parameters[{i}]")
@@ -265,7 +274,24 @@ def checked_aliases(units):
 
 def wrapper(unit, include_caller):
     lines = ['#include "emitted.c"']
-    for i, decl in enumerate((unit.export, *unit.dependencies)):
+    declarations = (unit.export, *unit.dependencies)
+    callbacks = sorted({ref.c_type for decl in declarations for ref in decl.signature.parameters
+                        if ref.identity[0] == "int_pair_result_callback"})
+    if callbacks:
+        lines.append('#include <stddef.h>')
+    for i, carrier in enumerate(callbacks):
+        result = carrier.removeprefix("KuBootstrapIntPairCallback_")
+        entry = f"ku_bootstrap_callback_entry_{i}"
+        expected = f"ku_bootstrap_callback_layout_{i}"
+        lines.append(f"typedef KuBootstrapResult_{result} (*{entry})(void*, int64_t, int64_t);")
+        lines.append(f"typedef struct {{ {entry} entry; void *environment; }} {expected};")
+        lines.append(f'_Static_assert(_Generic((({carrier}){{0}}).entry, {entry}: 1, default: 0) && '
+                     f'_Generic((({carrier}){{0}}).environment, void*: 1, default: 0) && '
+                     f'sizeof({carrier}) == sizeof({expected}) && _Alignof({carrier}) == _Alignof({expected}) && '
+                     f'offsetof({carrier}, entry) == offsetof({expected}, entry) && '
+                     f'offsetof({carrier}, environment) == offsetof({expected}, environment), '
+                     '"link-plan C callback has a different carrier");')
+    for i, decl in enumerate(declarations):
         sig = decl.signature
         expected = f"ku_bootstrap_signature_{i}"
         lines.append(f"typedef {sig.result.c_type} (*{expected})({sig.c_parameters()});")

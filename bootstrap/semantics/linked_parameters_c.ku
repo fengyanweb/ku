@@ -230,6 +230,15 @@ fn RequireLinkedArrayValidation(state: LinkedNullState, ty: TypeNameBinding): Li
 fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, binding: str,
                      name: str, ty: TypeNameBinding, parameter: bool): LinkedNullExpression! {
     next = RegisterLinkedNullType(project, state, ty.clone())?
+    if (ty.declaration_kind == "IntPairResultCallback") {
+        if (!parameter) {
+            RejectLayout("linked_callback_escape", "a callback parameter can only be forwarded to a checked synchronous parameter", ty.span.clone())?
+        }
+        payload = ty.clone()
+        payload.declaration_kind = "Struct"
+        next = registerOwnedElement(project, next, payload)?
+        next.code += LinkedNullResultCleanupReference(next.owning_layouts, payload)
+    }
     view = LinkedNullView(ty)
     if (ty.declaration_kind == "StructArray") {
         next = RequireLinkedArrayValidation(next, ty.clone())

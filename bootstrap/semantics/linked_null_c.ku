@@ -3,7 +3,7 @@ import { AddLinkedNullSlot, LinkedCountedInitial, LinkedCountdownIndex, ReadLink
 import { OpenLinkedForLoop, CloseLinkedForLoop } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedLocalMemberSet, LowerLinkedOwnedDestructure,
-         LowerLinkedPlainReturn, LowerLinkedStringAppend } from "./linked_function_c.ku"
+         LowerLinkedPlainReturn, LowerLinkedStringAppend, LowerLinkedSuccess } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -15,7 +15,7 @@ import { LinkedReadonlyExpression, LinkedSlotPrefix, ExitLinkedFailure, LinkedFa
 import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedArrayLocal, LowerLinkedCopyRebind, LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { LowerLinkedArrayAppend, LowerLinkedSuccess,
+import { LowerLinkedArrayAppend,
          LowerLinkedNullValue, LowerLinkedOwnerRebind } from "./linked_null_values_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
 

@@ -6,9 +6,8 @@ import { SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
 import { ResolveTypeName, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
-import { ContainsType, CTypeName, LinkedFsReadReference } from "./struct_projection_c.ku"
+import { CTypeName } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
-import { StructValueResultHeader } from "./struct_result_c.ku"
 import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayLinkPlanType, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
@@ -58,8 +57,33 @@ fn LinkedNullLiteralType(&project: LinkedNullProject, unit: int, &literal: Node,
     return ok(absoluteType(binding, unit))
 }
 
+fn readIntPairResultCallback(&project: LinkedNullProject, unit: int, &node: Node, view: bool): TypeNameBinding! {
+    if (view || node.edge_count != 3) {
+        RejectLayout("linked_callback_type", "expected fn(int, int) with a checked named record result", DeclarationSpan(node))?
+    }
+    index = 0
+    while (index < 2) {
+        part = LinkedNullNode(project, unit, LinkedNullChild(project, unit, node, index))
+        if (part.kind != "TypeParameter" || part.edge_count != 1 || part.text != "") {
+            RejectLayout("linked_callback_type", "callback parameters must be Copy int values", DeclarationSpan(part))?
+        }
+        ty = LinkedNullType(project, unit, LinkedNullChild(project, unit, part, 0))?
+        if (!LinkedIntResult(ty)) {
+            RejectLayout("linked_callback_type", "callback parameters must be Copy int values", ty.span.clone())?
+        }
+        index = index + 1
+    }
+    result = ReadLinkedResult(project, unit, LinkedNullChild(project, unit, node, 2), true)?
+    if (result.declaration_kind != "Struct") {
+        RejectLayout("linked_callback_type", "callback must return a checked named record", result.span.clone())?
+    }
+    result.declaration_kind = "IntPairResultCallback"
+    return ok(result)
+}
+
 fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view: bool): TypeNameBinding! {
     node = LinkedNullNode(project, unit, id)
+    if (node.kind == "TypeFunction") { return readIntPairResultCallback(project, unit, node, view) }
     if (!view) {
         if (node.kind == "TypeArray") {
             owner = ReadLinkedOwnedArray(project, unit, id, true)?
@@ -122,6 +146,9 @@ fn LinkedNullHasResultValue(&binding: TypeNameBinding): bool {
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
+    if (binding.declaration_kind == "IntPairResultCallback") {
+        return ok("KuBootstrapIntPairCallback_" + CTypeName(binding.module_index, binding.declaration_node))
+    }
     if (binding.declaration_kind == "OwnedStringArray") { return ok("KuGuardStringArray") }
     if (binding.declaration_kind == "CaughtError") { return ok("KuBootstrapError") }
     if (binding.declaration_kind == "BuiltinArray") {
@@ -377,47 +404,6 @@ fn ResolveLinkedCall(&project: LinkedNullProject, &slots: [LinkedNullSlot], &cal
         RejectLayout("linked_dependency_arity", "argument count differs from the bound function declaration", DeclarationSpan(call))?
     }
     return ok(callee)
-}
-
-fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
-    if (callee.unit == 0) { return ok(LinkedFsReadReference(callee.symbol)) }
-    text = "extern " + LinkedNullResultType(callee)? + " " + callee.symbol.clone() + "("
-    if (callee.parameters.len() == 0) { text += "void" }
-    index = 0
-    while (index < callee.parameters.len()) {
-        if (index > 0) { text += ", " }
-        text += LinkedNullCType(callee.parameters[index])?
-        index = index + 1
-    }
-    return ok(text + ");\n")
-}
-
-fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &payload: TypeNameBinding, checked: bool): str! {
-    text = ""
-    records: [str] = []
-    string_result = LinkedStringResult(payload)
-    index = 0
-    while (!string_result && index < links.len()) {
-        string_result = links[index].returns_result && LinkedStringResult(links[index].result)
-        index = index + 1
-    }
-    if (string_result) { text = StructValueResultHeader("KuProjectionString") }
-    if (payload.declaration_kind == "Struct" || (checked && LinkedIntResult(payload))) {
-        root = LinkedNullCType(payload)?
-        text += StructValueResultHeader(root)
-        records = records.push(root)
-    }
-    for dependency in links.clone() {
-        if (dependency.returns_result && (dependency.result.declaration_kind == "Struct" || LinkedIntResult(dependency.result))) {
-            kind = LinkedNullCType(dependency.result)?
-            if (!ContainsType(records, kind)) {
-                text += StructValueResultHeader(kind)
-                records = records.push(kind)
-            }
-        }
-        text += LinkedNullPrototype(dependency)?
-    }
-    return ok(text)
 }
 
 fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {

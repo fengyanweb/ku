@@ -372,6 +372,9 @@ fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str):
     text = header
     text += EmitBoundStringOperations(body.uses_clone, body.uses_concat, body.uses_int_format, body.uses_prefix_suffix)
     definitions = EmitCombinedCLayouts(body.layouts, body.owning_layouts)?
+    if (definitions.array_types.len() > 0 && !text.contains("#include <stdlib.h>")) {
+        text += "#include <stdlib.h>\n"
+    }
     text += definitions.source
     text += EmitBoundArrayDeclarations(body.arrays, body.validated_arrays, definitions.array_types, body.uses_str_array)
     if (body.uses_chars) {

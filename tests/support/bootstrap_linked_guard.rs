@@ -2,6 +2,56 @@ use super::{assert_ok, compile_projection, execute, CHECKED_ARRAY_ALLOCATOR};
 use ku::{span::Span, stdlib::json, value::Value};
 use std::{fs, path::Path, process::Command};
 
+pub(super) fn assert_checked_callback_forwarding(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("callback-forward.ku"),
+        r#"struct Payload { values: [int] }
+struct Envelope { payload: Payload }
+struct Other { values: [int] }
+
+fn Take(callback: fn(int, int): Payload!): Envelope! {
+    values: [int] = []
+    payload = Payload { values: values }
+    return ok(Envelope { payload: payload })
+}
+fn Forward(callback: fn(int, int): Payload!): Envelope! { return Take(callback) }
+fn Wrong(callback: fn(int, int): Other!): Envelope! { return Take(callback) }
+fn Alias(callback: fn(int, int): Payload!): Envelope! {
+    alias = callback
+    return Take(alias)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "callback-forward.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Forward").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let document = String::from_utf8(emitted.stdout).unwrap();
+    assert_eq!(
+        document
+            .matches("\"kind\":\"IntPairResultCallback\"")
+            .count(),
+        2
+    );
+    assert_eq!(document.matches("\"source_name\":\"Payload\"").count(), 2);
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    assert!(String::from_utf8_lossy(&emitted.stdout).contains("(*entry)(void*, int64_t, int64_t)"));
+    for (name, code) in [
+        ("Wrong", "linked_callback_forward"),
+        ("Alias", "linked_callback_escape"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(code));
+    }
+}
+
 pub(super) fn assert_terminal_branch_ownership(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("guard-provider.ku"),

@@ -27,6 +27,13 @@ array carrier is passed by value, and a readonly View uses a const pointer.
 `BuiltinArray` describes View `[str]` parameters with the generated
 `KuGuardStringArray` carrier. A checked owning `[str]!` result uses
 `KuBootstrapResultStringArray`, including its Result wrapper.
+`IntPairResultCallback` describes a synchronous parameter of shape
+`fn(int, int): T!`. Its path and node identify the declared record `T`.
+The carrier contains a typed entry returning `T!` and a caller-owned opaque
+environment that must stay valid for the synchronous call. Linked lowering
+currently forwards an existing callback parameter to a matching parameter.
+It does not construct, invoke or return one. The linker checks the carrier's
+C member types and layout as well as the identity of `T`.
 Equivalent types can use different C aliases in
 separate units. Builtin carriers must agree, with aliases for the shared
 bootstrap string layout recognized across emitters. Each provided unit

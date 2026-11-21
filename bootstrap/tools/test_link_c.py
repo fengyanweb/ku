@@ -287,6 +287,57 @@ int main(void) {
             c_type="const ProviderArray*", passing="view"))
         self.assert_preflight_error([*units, *exported], "signature mismatch")
 
+    def test_typed_int_pair_callback_forwards_the_live_environment(self):
+        def callback(module):
+            return dict(view(f"KuBootstrapIntPairCallback_KuStruct_m{module}_9"),
+                        kind="IntPairResultCallback", passing="value")
+
+        layout = """#include <stdbool.h>
+#include <stdint.h>
+typedef struct { int64_t value; } TOKEN;
+typedef struct { bool ok; TOKEN value; int64_t error; } KuBootstrapResult_TOKEN;
+typedef struct {
+    KuBootstrapResult_TOKEN (*entry)(void*, int64_t, int64_t);
+    void *environment;
+} KuBootstrapIntPairCallback_TOKEN;
+"""
+        entry = declaration("app.ku", 58, "forward", [callback(1)])
+        requested = declaration(self.left_path, 17, "apply", [callback(1)])
+        supplied = declaration(self.left_path, 17, "invoke", [callback(4)])
+        units = self.unit("callback-entry", plan(entry, [requested]), (layout + """
+extern int64_t apply(KuBootstrapIntPairCallback_TOKEN);
+int64_t forward(KuBootstrapIntPairCallback_TOKEN function) { return apply(function); }
+""").replace("TOKEN", "KuStruct_m1_9"))
+        provider_source = (layout + """
+int64_t invoke(KuBootstrapIntPairCallback_TOKEN function) {
+    KuBootstrapResult_TOKEN result = function.entry(function.environment, 4, 7);
+    return result.ok ? result.value.value : result.error;
+}
+""").replace("TOKEN", "KuStruct_m4_9")
+        provider = self.unit("callback-provider", plan(supplied), provider_source)
+        self.caller.write_text("""
+static KuBootstrapResult_KuStruct_m1_9 check(void *environment, int64_t a, int64_t b) {
+    int64_t *owner = environment;
+    *owner += 1;
+    return (KuBootstrapResult_KuStruct_m1_9){true, {*owner + 2 * a - b}, 0};
+}
+int main(void) {
+    int64_t environment = 39;
+    const KuBootstrapIntPairCallback_KuStruct_m1_9 callback = {check, &environment};
+    return forward(callback) != 41 || environment != 40;
+}
+""", encoding="ascii")
+        self.assertEqual(link_c.main([*units, *provider, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+
+        def wrong_result(metadata):
+            metadata["export"]["signature"]["parameters"][0].update(source_path="other/point.ku")
+
+        self.change_plan(provider, wrong_result)
+        self.assert_preflight_error([*units, *provider], "signature mismatch")
+        with self.assertRaisesRegex(link_c.LinkError, "cannot be a returned value"):
+            link_c.Signature.read({"parameters": [], "result": callback(1), "returns_result": False}, "bad")
+
     def test_parameter_order_and_result_status_are_checked(self):
         wrong = copy.deepcopy(self.left)
         wrong["signature"]["parameters"].reverse()
