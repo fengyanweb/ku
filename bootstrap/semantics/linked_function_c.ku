@@ -3,7 +3,7 @@ import { ScalarCheckedMultiplyC, ScalarStringHelpers } from "./scalar_int_emit.k
 import { StructResultHeader, StructValueResultHeader } from "./struct_result_c.ku"
 import { EmitLinkedArrayBody, StructArrayStatuses } from "./struct_array_c.ku"
 import { CTypeName, ContainsType, LinkedFsReadReference } from "./struct_projection_c.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { LinkedFieldAppendArgument, LowerLinkedArrayBinding, LowerLinkedFieldAppend } from "./linked_array_fields_c.ku"
 import { LinkedIntSnapshotRuntime, ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
@@ -282,12 +282,13 @@ fn LowerLinkedOwnedDestructure(&project: LinkedNullProject, state: LinkedNullSta
             FindLinkedLocalRead(next.local_readers, local.text) != 0) {
             RejectLayout("linked_destructure_field", "expected a distinct named field and local", DeclarationSpan(binding))?
         }
-        ty = fields[ordinal - 1].resolved.clone()
-        if (ty.declaration_kind == "StructArray") { ty.declaration_kind = "OwnedStructArray" }
-        else if (ty.declaration_kind == "BuiltinArray" && ty.name == "int") { ty.declaration_kind = "OwnedIntArray" }
-        else if (ty.declaration_kind == "BuiltinArray") {
+        kind = fields[ordinal - 1].resolved.declaration_kind.clone()
+        if (kind == "StructArray") { kind = "OwnedStructArray" }
+        else if (kind == "BuiltinArray" && fields[ordinal - 1].resolved.name == "int") { kind = "OwnedIntArray" }
+        else if (kind == "BuiltinArray") {
             RejectLayout("linked_destructure_field_type", "unsupported owning array field", DeclarationSpan(binding))?
         }
+        ty = TypeNameBindingWithKind(fields[ordinal - 1].resolved, kind)
         member = LinkedNullValue { ty: ty, text: owner.text.clone() + ".f" + str(ordinal - 1),
             slot: owner.slot, borrowed: false, member_path: LinkedMemberPath(owner, ordinal) }
         next = putLinkedDestructuredField(project, next, local, local_id, member)?

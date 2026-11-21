@@ -15,6 +15,14 @@ struct TypeNameBinding {
     span: Span
 }
 
+fn TypeNameBindingWithKind(&binding: TypeNameBinding, kind: str): TypeNameBinding {
+    return TypeNameBinding {
+        use_node: binding.use_node, name: binding.name.clone(), declaration_kind: kind,
+        module_index: binding.module_index, declaration_node: binding.declaration_node,
+        span: binding.span.clone()
+    }
+}
+
 fn IsBuiltinType(&name: str): bool {
     return name == "int" || name == "float" || name == "bool" || name == "str" || name == "null"
 }
