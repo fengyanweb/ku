@@ -28,15 +28,21 @@ fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &
     }
     value = LowerLinkedNullValue(project, state, id, 0)?
     element = value.value
-    if (!value.state.slots[index - 1].live || !SameLinkedType(element.ty, LinkedNullArrayElement(array.ty.clone()))
-        || (element.borrowed && (copy || element.member_path == ""))
+    matches = false
+    if (value.state.slots[index - 1].live) {
+        expected = LinkedNullArrayElement(array.ty.clone())
+        matches = SameLinkedType(element.ty, expected)
+    }
+    if (!matches || (element.borrowed && (copy || element.member_path == ""))
         || (!copy && (element.slot == 0 || element.slot == index))) {
         RejectLayout("linked_move_append", "push requires one element of the declared type", element.ty.span.clone())?
     }
     if (!copy) {
-        if (element.member_path != "" &&
-            LinkedNullDropC(value.state.layouts, value.state.owning_layouts, element.ty, element.text) == "") {
-            RejectLayout("linked_move_append", "field transfer requires an owning element", element.ty.span.clone())?
+        if (element.member_path != "") {
+            drop = LinkedNullDropC(value.state.layouts, value.state.owning_layouts, element.ty, element.text)
+            if (drop == "") {
+                RejectLayout("linked_move_append", "field transfer requires an owning element", element.ty.span.clone())?
+            }
         }
         RequireLinkedMove(value.state, element)?
     }
