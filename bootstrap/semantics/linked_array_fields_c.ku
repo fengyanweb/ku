@@ -1,6 +1,7 @@
 import { FindLinkedLocalRead, LinkedLocalReadBinding, RequireLinkedMutableName } from "./call_contracts.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, CloneLinkedIntArray, CloneLinkedRecord, CloneLinkedStringSlot, LinkedCallableSlot, RejectLocalReader, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
+import { CloneLinkedStringArray } from "./struct_string_calls.ku"
 import { FinishLinkedReaderThunk, LinkedScopedCallbackFunction, SameLinkedCallbackSignature, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
 import { ContainsIndex, LinkedAppendFaultRelayCode, LinkedIntArrayCallbackFaultPending, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { Node } from "../stage2/ast.ku"
@@ -136,6 +137,9 @@ fn EmitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     ty = source.value.ty.clone()
     if (LinkedStringResult(ty)) { return CloneLinkedStringSlot(project, source, "t" + str(id)) }
     if (LinkedNullIntArrayOwner(ty)) { return CloneLinkedIntArray(project, source, "t" + str(id)) }
+    if (ty.name == "str" && (ty.declaration_kind == "OwnedStringArray" || ty.declaration_kind == "BuiltinArray")) {
+        return CloneLinkedStringArray(project, source, id)
+    }
     if (LinkedNullOwnedArray(ty) ||
         (ty.declaration_kind == "StructArray" && source.value.borrowed && source.value.slot > 0)) {
         return CloneLinkedRecordArray(project, source, id)

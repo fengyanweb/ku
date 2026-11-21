@@ -7,11 +7,11 @@ import { OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { BoundLinkPlanType, LinkedNullBinding, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { BoundLinkPlanType, LinkedNullArrayHeader, LinkedNullBinding, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
 import { LinkedMemberUnavailable } from "./linked_member_ownership.ku"
 import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 import { LinkedBuiltin, LinkedIntResult, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullView, LinkedStringResult, ResolveLinkedCall } from "./linked_null_types_c.ku"
-import { TypeNameBindingWithKind } from "./type_names.ku"
+import { RetagTypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { FinishLinkedFieldRead, LowerLinkedNullRead, ReadLinkedArrayElementAfterBase } from "./linked_null_read_c.ku"
 
 struct StructStringDependency {
@@ -331,4 +331,21 @@ fn LinkedFieldAppendArgument(&project: LinkedNullProject, &target: Node, &root: 
     receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, field, 0))
     if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != root.text) { return 0 }
     return LinkedNullChild(project, 1, call, 1)
+}
+
+fn CloneLinkedStringArray(&project: LinkedNullProject, source: LinkedNullExpression, id: int): LinkedNullExpression! {
+    value = source.value
+    if (value.slot == 0 || LinkedMemberUnavailable(source.state, value, true)) {
+        RejectLayout("linked_str_array_clone", "expected a live string array owner or View", value.ty.span.clone())?
+    }
+    header = LinkedNullArrayHeader(value.ty, value.text)
+    ty = RetagTypeNameBinding(value.ty, "OwnedStringArray")
+    output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
+    output.state.uses_clone = true
+    output.state.uses_str_snapshot = true
+    output.state.checks_str_item = true
+    output.state.slots[output.value.slot - 1].live = true
+    output.state.code += "    if (!ku_linked_str_array_clone_strings(" + header + ", &" + output.value.text.clone()
+        + ", &invalid_array)) { out_of_memory = !invalid_array; goto cleanup; }\n"
+    return ok(output)
 }

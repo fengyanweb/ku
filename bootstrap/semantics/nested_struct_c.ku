@@ -332,7 +332,7 @@ fn EmitProjectionCloneString(&symbol: str): str {
         "    *out = (KuProjectionString){ data, source.len, size, KU_PROJECTION_STRING_OWNED };\n    return true;\n}\n\n"
 }
 
-fn emitOwnedStringArrayClone(&prefix: str): str {
+fn EmitOwnedStringArrayClone(&prefix: str, &clone_string: str): str {
     return "static bool " + prefix.clone() + "_clone_strings(const KuGuardStringArray *source, KuGuardStringArray *out, bool *invalid) {\n"
         + "    size_t capacity = source->capacity ? source->capacity : source->len;\n"
         + "    if (source->len > capacity || capacity > SIZE_MAX / sizeof(*source->data) || (capacity && !source->data)) { *invalid = true; return false; }\n"
@@ -344,7 +344,7 @@ fn emitOwnedStringArrayClone(&prefix: str): str {
         + "        KuProjectionString string = source->data[out->len];\n"
         + "        if (string.len && !string.ptr) { *invalid = true; return false; }\n"
         + "        out->data[out->len] = (KuProjectionString){0};\n"
-        + "        if (!" + prefix.clone() + "_clone_string(string, &out->data[out->len])) return false;\n"
+        + "        if (!" + clone_string.clone() + "(string, &out->data[out->len])) return false;\n"
         + "        ++out->len;\n    }\n    return true;\n}\n\n"
 }
 
@@ -353,7 +353,8 @@ fn EmitLinkedStringArrayElementClone(&layouts: [StructLayout], index: int, &pref
     arrays = CollectOwnedMemberPaths(layouts, index, "", [], true)
     element = CTypeName(layouts[index - 1].module_index, layouts[index - 1].node)
     drop = OwningLayoutDropName(layouts[index - 1].module_index, layouts[index - 1].node)
-    text = EmitProjectionCloneString(prefix.clone() + "_clone_string") + emitOwnedStringArrayClone(prefix)
+    clone_string = prefix.clone() + "_clone_string"
+    text = EmitProjectionCloneString(clone_string) + EmitOwnedStringArrayClone(prefix, clone_string)
     text += "static bool " + prefix.clone() + "_clone_element(const " + element.clone()
         + " *source, " + element.clone() + " *out, bool *invalid) {\n    " + element + " copy = *source;\n"
     // No shallow owners may remain when cleanup becomes reachable.

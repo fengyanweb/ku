@@ -89,6 +89,7 @@ struct LinkedNullState {
     moved_error_fields: [str]
     uses_clone: bool
     uses_int_snapshot: bool
+    uses_str_snapshot: bool
     arrays: [TypeNameBinding]
     validated_arrays: [TypeNameBinding]
     owned_arrays: [TypeNameBinding]
@@ -123,7 +124,7 @@ fn NewLinkedNullState(): LinkedNullState {
         slots: [], links: [], local_readers: [], local_callbacks: [], callback_owners: [], callback_helpers: "", uses_scoped_reader: false,
         local_appends: [], append_captures: [], local_append_types: [],
         declarations: "", code: "", drops: "", catch_slot: 0,
-        catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false, uses_int_snapshot: false,
+        catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false, uses_int_snapshot: false, uses_str_snapshot: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,
         element_clones: [], uses_index: false, checks_str_item: false, uses_add: false, uses_sub: false, uses_mul: false, uses_div: false,
         uses_string_equal: false, uses_print: false, uses_concat: false, uses_replace: false, uses_int_format: false, uses_prefix_suffix: false, uses_string_contains: false, uses_chars: false }
