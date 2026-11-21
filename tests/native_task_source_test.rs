@@ -31,6 +31,55 @@ fn native(source: &str) -> String {
 }
 
 #[test]
+fn native_task_array_try_get_preserves_recoverable_module_and_method_reads() {
+    let source = r#"
+import array from "std.array"
+import time from "std.time"
+
+async fn Lookup(words: [str], index: int): str! {
+    time.sleep(1)?
+    return array.try_get(words, index)
+}
+
+async fn Local(array: [str]): str! {
+    return array.try_get(0)
+}
+
+async fn main(): null! {
+    println((await Lookup(["整理" + "🙂"], 0))?)
+    try { (await Lookup(["ignored"], -1))? }
+    catch (issue) { println(issue.domain + "/" + issue.code) }
+    println((await Local(["继续" + "🙂"]))?)
+    return ok(null)
+}
+"#;
+    ku::cli::run_source("task-array-try-get.ku", source).expect("interpreter Task array reads");
+    let generated = native(source);
+    let directory = TempDir::new("task-array-try-get");
+    let c_source = directory.path().join("native.c");
+    fs::write(&c_source, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &c_source, "task-array-try-get")
+    else {
+        return;
+    };
+    let result = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout).replace("\r\n", "\n"),
+        "整理🙂\narray/index_out_of_bounds\n继续🙂\n"
+    );
+}
+
+#[test]
 fn native_task_string_equality_reads_owners_and_preserves_effectful_operands() {
     use ku::ir::task::TaskOp;
 

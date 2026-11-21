@@ -1911,6 +1911,10 @@ impl<'a> FunctionLowerer<'a> {
         ))
     }
 
+    fn is_array_namespace(&self, object: &Expr) -> bool {
+        matches!(&object.kind, ExprKind::Variable(module) if module == "array" && self.local_binding(module).is_none())
+    }
+
     // Ordinary nested calls do not reserve the field-call branch's type,
     // timer and ownership temporaries on every recursive frame.
     #[inline(never)]
@@ -2151,13 +2155,18 @@ impl<'a> FunctionLowerer<'a> {
             return Ok(destination);
         }
         if name == "try_get" {
-            if args.len() != 1 {
-                return Err(unsupported(
+            return match (self.is_array_namespace(object), args) {
+                (true, [array, index]) => self.array_try_get_expression(array, index, span, depth),
+                (false, [index]) => self.array_try_get_expression(object, index, span, depth),
+                (true, _) => Err(unsupported(
+                    "array.try_get without an array and one index",
+                    span,
+                )),
+                (false, _) => Err(unsupported(
                     "try_get with other than one index argument",
                     span,
-                ));
-            }
-            return self.array_try_get_expression(object, &args[0], span, depth);
+                )),
+            };
         }
         if args.is_empty() && matches!(name, "len" | "is_empty" | "clone") {
             if let Some(destination) = self.array_method_expression(object, name)? {
