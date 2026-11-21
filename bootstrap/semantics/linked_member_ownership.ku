@@ -166,7 +166,8 @@ fn RecordLinkedMemberMove(state: LinkedNullState, &value: LinkedNullValue): Link
         next.slots[index].live = false
     } else {
         members = next.slots[index].moved_members.clone()
-        next.slots[index].moved_members = members.push(value.member_path.clone())
+        members = members.push(value.member_path.clone())
+        next.slots[index].moved_members = members
     }
     return next
 }
