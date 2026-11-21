@@ -730,7 +730,9 @@ fn Publish(&prefix: str, fail_read: bool): null! {
     .unwrap();
     fs::write(
         cwd.join("output-dependency.ku"),
-        "fn Load(fail_read: bool): str! { return ok(\"payload\") }\n",
+        r#"fn Load(fail_read: bool): str! { return ok("Ku🙂") }
+fn Borrow(&value: str): str! { return ok(value) }
+"#,
     )
     .unwrap();
     fs::write(
@@ -835,6 +837,41 @@ int main(int argc, char **argv) {
         String::from_utf8_lossy(&failed_output.stderr).trim(),
         "output write failed"
     );
+
+    fs::write(cwd.join("modules.txt"), "output-dependency.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Load").unwrap();
+    let static_output = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&static_output);
+    let code = String::from_utf8(static_output.stdout).unwrap();
+    let load = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_KuProjectionString "))
+        .and_then(|line| line.split_once('('))
+        .unwrap()
+        .0;
+    let host = r#"
+int main(void) {
+    (void)test_malloc; (void)test_realloc;
+    static const uint8_t expected[] = {0x4b,0x75,0xf0,0x9f,0x99,0x82};
+    KuBootstrapResult_KuProjectionString result = __LOAD__(false);
+    assert(result.ok && result.value.len == sizeof(expected));
+    assert(!memcmp(result.value.ptr, expected, sizeof(expected)));
+    assert(result.value.storage == KU_PROJECTION_STRING_STATIC && !result.value.capacity);
+    ku_projection_string_drop(&result.value);
+    assert(!outstanding() && !attempts);
+    return 0;
+}
+"#
+    .replace("__LOAD__", load);
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &program, cwd);
+    assert_ok(&execute(&mut Command::new(&program), cwd, 15));
+
+    fs::write(cwd.join("function.txt"), "Borrow").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_result_return"));
 }
 
 const TRY_SOURCE: &str = r#"import { Supply, Take, Observe } from "./try-provider.ku"

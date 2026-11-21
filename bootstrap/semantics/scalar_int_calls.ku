@@ -1,4 +1,4 @@
-import { Node } from "../stage2/ast.ku"
+import { FirstSubtreeNode, Node } from "../stage2/ast.ku"
 import { DeclarationSpan, TopLevelName } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { ScalarIntInstruction, ScalarIntParameter } from "./scalar_int_emit.ku"
@@ -20,7 +20,6 @@ struct ScalarIntImport {
 struct ScalarIntCall {
     target_node: int
     function_node: int
-    arguments: [int]
 }
 
 fn ScalarFunctionNode(&declarations: [TopLevelName], &name: str): int {
@@ -96,14 +95,7 @@ fn bindIntCall(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
     if (signature.result_type >= 2) {
         rejectScalarInt("unsupported_int_callee_result", "calls in an int expression must return int", DeclarationSpan(call))?
     }
-    arguments: [int] = []
-    index = 1
-    while (index < call.edge_count) {
-        argument = edges[call.first_edge + index]
-        arguments = arguments.push(argument)
-        index = index + 1
-    }
-    return ok(ScalarIntCall { target_node: target_node, function_node: function_key, arguments: arguments })
+    return ok(ScalarIntCall { target_node: target_node, function_node: function_key })
 }
 
 fn isIntCallTarget(&calls: [ScalarIntCall], node: int): bool {
@@ -118,16 +110,12 @@ fn isIntCallTarget(&calls: [ScalarIntCall], node: int): bool {
 fn LowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
                       &bindings: [TypeNameBinding], &parameters: [ScalarIntParameter],
                       &imports: [ScalarIntImport], local_base: int, result_node: int): [ScalarIntInstruction]! {
-    // BuildNameTable validated a contiguous post-order tree. The first child
-    // chain reaches its leftmost leaf, and every node in that range belongs
-    // to this expression. Neither a recursive stack nor a copied AST is needed.
-    cursor = result_node
-    while (nodes[cursor - 1].edge_count > 0) {
-        cursor = edges[nodes[cursor - 1].first_edge]
-    }
+    // Every node from the first leaf through result_node belongs to this expression.
+    start = FirstSubtreeNode(nodes, edges, result_node)
+    limit = result_node + 1
     calls: [ScalarIntCall] = []
-    probe = cursor
-    while (probe <= result_node) {
+    probe = start
+    while (probe < limit) {
         if (nodes[probe - 1].kind == "Call") {
             call = bindIntCall(nodes, edges, declarations, bindings, parameters, imports, local_base, nodes[probe - 1])?
             calls = calls.push(call)
@@ -136,29 +124,32 @@ fn LowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelNam
     }
     instructions: [ScalarIntInstruction] = []
     call_index = 0
-    while (cursor <= result_node) {
+    cursor = start
+    while (cursor < limit) {
         node = nodes[cursor - 1].clone()
         operation = ""
         operand = 0
         right_node = 0
         arguments: [int] = []
+        target = false
         if (node.kind == "Int" && node.edge_count == 0 && node.int_value >= 0) {
             operation = "constant"
             operand = node.int_value
         } else if (node.kind == "Variable" && node.edge_count == 0) {
             // The validated AST is a tree, so only the Call can consume this
             // particular identifier. It needs no value or C temporary.
-            if (isIntCallTarget(calls, cursor)) {
-                cursor = cursor + 1
-                continue
-            }
-            operation = "parameter"
-            operand = scalarParameterIndex(parameters, node.text)
-            if (operand < 0) {
-                rejectScalarInt("undefined_int_operand", "undefined int parameter '" + node.text.clone() + "'", DeclarationSpan(node))?
-            }
-            if (parameters[operand].string_mode != 0) {
-                rejectScalarInt("unsupported_int_operand_type", "expected an int operand, found str", DeclarationSpan(node))?
+            called = isIntCallTarget(calls, cursor)
+            if (called) { target = true }
+            else {
+                operation = "parameter"
+                parameter = scalarParameterIndex(parameters, node.text)
+                operand = parameter
+                if (operand < 0) {
+                    rejectScalarInt("undefined_int_operand", "undefined int parameter '" + node.text.clone() + "'", DeclarationSpan(node))?
+                }
+                if (parameters[operand].string_mode != 0) {
+                    rejectScalarInt("unsupported_int_operand_type", "expected an int operand, found str", DeclarationSpan(node))?
+                }
             }
         } else if (node.kind == "Unary" && node.edge_count == 1 && node.text == "-") {
             operation = "sub"
@@ -172,18 +163,25 @@ fn LowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelNam
             operand = edges[node.first_edge]
             right_node = edges[node.first_edge + 1]
         } else if (node.kind == "Call") {
-            call = calls[call_index].clone()
-            call_index = call_index + 1
             operation = "call"
-            operand = call.function_node
-            arguments = call.arguments
+            operand = calls[call_index].function_node
+            call_index = call_index + 1
+            // Materialize the argument IDs only when creating their instruction.
+            arity = node.edge_count - 1
+            argument = 0
+            while (argument < arity) {
+                arguments = arguments.push(edges[node.first_edge + argument + 1])
+                argument = argument + 1
+            }
         }
-        if (operation == "") {
-            rejectScalarInt("unsupported_int_expression", "expected an int literal, parameter, arithmetic, or direct int call", DeclarationSpan(node))?
+        if (!target) {
+            if (operation == "") {
+                rejectScalarInt("unsupported_int_expression", "expected an int literal, parameter, arithmetic, or direct int call", DeclarationSpan(node))?
+            }
+            instruction = ScalarIntInstruction { operation: operation, result_node: cursor, operand: operand,
+                                                right_node: right_node, arguments: arguments }
+            instructions = instructions.push(instruction)
         }
-        instruction = ScalarIntInstruction { operation: operation, result_node: cursor, operand: operand,
-                                            right_node: right_node, arguments: arguments }
-        instructions = instructions.push(instruction)
         cursor = cursor + 1
     }
     return ok(instructions)

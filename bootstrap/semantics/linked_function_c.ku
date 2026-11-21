@@ -346,11 +346,12 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
     if (LinkedNullHasResultValue(result)) {
         value = LowerLinkedExpectedValue(project, next, result, id, 0)?
         copy = LinkedIntResult(result)
-        if (!SameLinkedType(value.value.ty, result) || (!copy && (value.value.borrowed || value.value.slot == 0))) {
+        static_string = LinkedStringResult(result) && node.kind == "String" && node.edge_count == 0
+        if (!SameLinkedType(value.value.ty, result) || (!copy && !static_string && (value.value.borrowed || value.value.slot == 0))) {
             RejectLayout("linked_result_return", "return needs a matching Copy int or an initialized matching owner", DeclarationSpan(node))?
         }
         value.state.code = value.state.code + "    result.value = " + value.value.text.clone() + ";\n"
-        if (copy) { next = value.state }
+        if (copy || static_string) { next = value.state }
         else {
             owner = value.value.clone()
             next = MoveLinkedNullSlot(value.state, owner)?
