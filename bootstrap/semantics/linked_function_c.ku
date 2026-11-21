@@ -73,7 +73,7 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
 fn EmitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &payload: TypeNameBinding): str! {
     header = EmitLinkedNullDeclarations(body, payload)?
     result = ""
-    if (body.plain_array_result) { result = LinkedNullCType(payload)? }
+    if (body.plain_value_result) { result = LinkedNullCType(payload)? }
     else { result = LinkedCheckedResultCType(payload)? }
     keep = LinkedNullResultCleanupReference(body.owning_layouts, payload)
     char_errors = ""
@@ -81,14 +81,15 @@ fn EmitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &pa
     return ok(FinishLinkedFunctionC(header, body, symbol, signature, result, keep, char_errors))
 }
 
-fn LowerLinkedPlainArrayReturn(&project: LinkedNullProject, state: LinkedNullState,
-                               &statement: Node, &result: TypeNameBinding): LinkedNullState! {
+fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,
+                          &statement: Node, &result: TypeNameBinding): LinkedNullState! {
     if (statement.edge_count != 1) {
-        RejectLayout("linked_array_return", "expected one array value", DeclarationSpan(statement))?
+        RejectLayout("linked_value_return", "expected one value", DeclarationSpan(statement))?
     }
     value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
-    if (!SameLinkedType(value.value.ty, result) || value.value.borrowed || value.value.slot == 0) {
-        RejectLayout("linked_array_return", "expected an initialized array owner matching the declared result", DeclarationSpan(statement))?
+    copy = result.declaration_kind == "Builtin" && result.name == "bool"
+    if (!SameLinkedType(value.value.ty, result) || (!copy && (value.value.borrowed || value.value.slot == 0))) {
+        RejectLayout("linked_value_return", "expected a value matching the declared result and ownership", DeclarationSpan(statement))?
     }
     value.state.code += "    result = " + value.value.text.clone() + ";\n"
     owner = value.value.clone()

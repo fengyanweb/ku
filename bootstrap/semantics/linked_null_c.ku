@@ -1,7 +1,7 @@
 import { AddLinkedNullSlot, ReadLinkedNullParameters } from "./linked_parameters_c.ku"
 import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedGuardOwners, DropLinkedNullScope, LinkedCountBound, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
-import { EmitLinkedFunction, LowerLinkedPlainArrayReturn } from "./linked_function_c.ku"
+import { EmitLinkedFunction, LowerLinkedPlainReturn } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -259,12 +259,12 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
                 RejectLayout("unsupported_linked_terminal", "expected the terminal at the end of its block", DeclarationSpan(statement))?
             }
             if (statement.kind == "Fail") {
-                if (next.plain_array_result && next.catch_slot == 0) {
-                    RejectLayout("linked_array_failure", "a plain array result cannot propagate an Error", DeclarationSpan(statement))?
+                if (next.plain_value_result && next.catch_slot == 0) {
+                    RejectLayout("linked_value_failure", "a plain value result cannot propagate an Error", DeclarationSpan(statement))?
                 }
                 next = lowerLinkedFailure(project, next, statement)?
-            } else if (next.plain_array_result) {
-                next = LowerLinkedPlainArrayReturn(project, next, statement, result)?
+            } else if (next.plain_value_result) {
+                next = LowerLinkedPlainReturn(project, next, statement, result)?
             } else { next = LowerLinkedSuccess(project, next, statement, result)? }
             return ok(LinkedNullRegion { state: next, terminal: true })
         }
@@ -325,7 +325,7 @@ fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! 
     }
     symbol = "ku_linked_null_" + str(id)
     source = EmitLinkedFunction(region.state, symbol, parameters.signature, result)?
-    checked = !region.state.plain_array_result
+    checked = !region.state.plain_value_result
     plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: parameters.plan,
         result: LinkedResultPlan(result, 1, checked)?, returns_result: checked }
     return ok(LinkedNullC { symbol: symbol, links: region.state.links, source: source, entry_plan: plan })

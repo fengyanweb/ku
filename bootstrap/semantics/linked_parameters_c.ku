@@ -54,8 +54,12 @@ fn ReadLinkedNullParameters(&project: LinkedNullProject, &function: Node): Linke
     }
     result_id = LinkedNullChild(project, 1, function, index)
     declared = LinkedNullNode(project, 1, result_id)
-    state.plain_array_result = declared.kind == "TypeArray"
-    result = ReadLinkedResult(project, 1, result_id, !state.plain_array_result)?
+    plain_bool = declared.kind == "TypeName" && declared.text == "bool"
+    state.plain_value_result = declared.kind == "TypeArray" || plain_bool
+    result = ReadLinkedResult(project, 1, result_id, !state.plain_value_result)?
+    if (plain_bool && (result.declaration_kind != "Builtin" || result.name != "bool")) {
+        RejectLayout("linked_value_result", "a plain bool result must bind to the builtin type", result.span.clone())?
+    }
     if (index == 0) { signature = "void" }
     state.code = state.code + validation
     state = RegisterLinkedNullType(project, state, result.clone())?

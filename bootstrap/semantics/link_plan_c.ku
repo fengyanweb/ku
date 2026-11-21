@@ -52,7 +52,7 @@ struct LinkedNullSlot {
 }
 
 struct LinkedNullState {
-    plain_array_result: bool
+    plain_value_result: bool
     layouts: [StructLayout]
     owning_layouts: [StructLayout]
     owning_strings: bool
@@ -92,7 +92,7 @@ struct LinkedNullExpression {
 }
 
 fn NewLinkedNullState(): LinkedNullState {
-    return LinkedNullState { plain_array_result: false, layouts: [], owning_layouts: [], owning_strings: false,
+    return LinkedNullState { plain_value_result: false, layouts: [], owning_layouts: [], owning_strings: false,
         slots: [], links: [], declarations: "", code: "", drops: "", catch_slot: 0,
         catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,

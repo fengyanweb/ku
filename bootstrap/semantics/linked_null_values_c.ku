@@ -117,8 +117,8 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
 }
 
 fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap: Node, owns_value: bool, depth: int): LinkedCheckedCall! {
-    if (state.plain_array_result && state.catch_slot == 0) {
-        RejectLayout("linked_array_failure", "a checked call needs a catch before returning a plain array", DeclarationSpan(unwrap))?
+    if (state.plain_value_result && state.catch_slot == 0) {
+        RejectLayout("linked_value_failure", "a checked call needs a catch before returning a plain value", DeclarationSpan(unwrap))?
     }
     if (unwrap.kind != "TryUnwrap" || unwrap.edge_count != 1) {
         RejectLayout("unsupported_linked_try", "expected a direct checked call followed by ?", DeclarationSpan(unwrap))?

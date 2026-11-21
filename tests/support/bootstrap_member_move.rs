@@ -182,6 +182,10 @@ fn RefuseEscapingError(packet: Packet): [Row] {
     RejectUnchecked()?
     return packet.rows
 }
+fn Decide(&value: str): bool {
+    if (value == "ku") { return true }
+    return false
+}
 fn Duplicate(packet: Packet): [Row]! {
     rows = packet.rows
     return ok(packet.rows)
@@ -193,6 +197,7 @@ fn Duplicate(packet: Packet): [Row]! {
     assert_array_transfer(cwd, emit, "Take", true, "");
     assert_array_transfer(cwd, emit, "TakePlain", false, "");
     assert_array_transfer(cwd, emit, "Repack", true, ".f0");
+    assert_direct_bool(cwd, emit);
     fs::write(cwd.join("function.txt"), "TakeThroughPlain").unwrap();
     let forward = emit("linked-null-plan");
     assert_ok(&forward);
@@ -201,9 +206,9 @@ fn Duplicate(packet: Packet): [Row]! {
     assert!(plan.contains("\"returns_result\":false"));
     for (function, diagnostic) in [
         ("Refuse", "linked_result_return"),
-        ("RefusePlain", "linked_array_return"),
+        ("RefusePlain", "linked_value_return"),
         ("RefuseBorrowInField", "linked_literal_field_type"),
-        ("RefuseEscapingError", "linked_array_failure"),
+        ("RefuseEscapingError", "linked_value_failure"),
         ("Duplicate", "linked_moved_member"),
     ] {
         fs::write(cwd.join("function.txt"), function).unwrap();
@@ -211,6 +216,40 @@ fn Duplicate(packet: Packet): [Row]! {
         assert_eq!(rejected.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
     }
+}
+
+fn assert_direct_bool(cwd: &Path, emit: &impl Fn(&str) -> super::bounded_process::BoundedOutput) {
+    fs::write(cwd.join("function.txt"), "Decide").unwrap();
+    let plan = emit("linked-null-plan");
+    assert_ok(&plan);
+    let plan = String::from_utf8(plan.stdout).unwrap();
+    assert!(plan.contains("\"c_type\":\"bool\""));
+    assert!(plan.contains("\"returns_result\":false"));
+    let c = emit("linked-null");
+    assert_ok(&c);
+    let code = String::from_utf8(c.stdout).unwrap();
+    let symbol = code
+        .lines()
+        .find_map(|line| line.strip_prefix("bool ku_linked_null_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+int main(void) {
+    KuProjectionString match = {(uint8_t*)"ku",2,2,0};
+    KuProjectionString miss = {(uint8_t*)"no",2,2,0};
+    assert(__ENTRY__(&match) && !__ENTRY__(&miss));
+    assert(match.ptr[1] == 'u' && miss.ptr[1] == 'o');
+    return 0;
+}
+"#
+    .replace("__ENTRY__", &format!("ku_linked_null_{symbol}"));
+    let path = cwd.join("direct-bool.c");
+    let app = cwd.join(format!("direct-bool{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&path, format!("#include <assert.h>\n{code}{host}")).unwrap();
+    compile_projection(&path, &app, cwd);
+    assert_ok(&execute(&mut Command::new(&app), cwd, 15));
 }
 
 fn assert_array_transfer(
