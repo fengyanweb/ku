@@ -199,6 +199,9 @@ def verify_stage3_applications(repo, source, binary, cc, caller):
             "exercise_linked_owned_reader": (cc, caller),
             "exercise_linked_reader_factory": (cc, caller),
             "exercise_linked_unit_enum": (cc, caller),
+            "exercise_linked_unit_enum_branch": (cc, caller),
+            "exercise_linked_unit_enum_match": (cc, caller),
+            "exercise_linked_checked_enum_match": (cc, caller),
         }
         for name, arguments in checks.items():
             try:

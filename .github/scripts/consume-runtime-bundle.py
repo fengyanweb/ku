@@ -1416,6 +1416,13 @@ def verify_task_enum_parameter_c(source):
     return dict(detail, validates_enum_input=True)
 
 
+def verify_task_enum_result_c(source):
+    detail = verify_task_enum_record_c(source)
+    if b'KU_TASK_OUTCOME_KIND_ENUM_' not in source or b'KuTaskEnumOutcomeFits_' not in source:
+        raise RuntimeError('installed Task enum result must use its checked nominal outcome')
+    return dict(detail, nominal_enum_outcome=True)
+
+
 def installed_forward_layout_consumer(install, root, env, report, target):
     """Check owned forward layout binding through a relative import."""
     files = {
@@ -1701,6 +1708,12 @@ def run_structured_only(args, report):
             installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
                                                  'native_task_enum_parameter', sources=('main.ku', 'worker.ku'),
                                                  native_c_abi=verify_task_enum_parameter_c)
+            installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
+                                                 'native_task_enum_result', sources=('main.ku', 'worker.ku'),
+                                                 native_c_abi=verify_task_enum_result_c)
+            installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
+                                                 'native_task_enum_match', sources=('main.ku', 'worker.ku'),
+                                                 native_c_abi=verify_task_enum_result_c)
             verification = repo / 'bootstrap/tools/compiler_driver/selfhost/verify.py'
             cc = env.get('KU_GNU_CC') if target == 'x86_64-pc-windows-gnu' else 'clang'
             if not cc:
@@ -1710,7 +1723,7 @@ def run_structured_only(args, report):
             result = invoke([sys.executable, '-B', verification, '--repo', repo,
                              '--revision', verifier, '--ku', ku, '--cc', cc,
                              '--output-dir', root / 'generations', '--temp-dir', root,
-                             '--stage3-application-checks', *seed_options],
+                             '--limit', '784', '--stage3-application-checks', *seed_options],
                             root, env, seconds=2400)
             if result.returncode:
                 raise RuntimeError('installed bootstrap generations failed: ' +
