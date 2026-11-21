@@ -82,8 +82,11 @@ fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statem
 
 fn countedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &initial: Node, &step: Node): int! {
     guard = LinkedIncreasingGuard(project, loop)
-    if (guard.kind != "Binary" || guard.edge_count != 2 || guard.text != "<" ||
-        !LinkedCountBound(project, state, LinkedNullChild(project, 1, guard, 1))?) {
+    bounded = false
+    if (guard.kind == "Binary" && guard.edge_count == 2 && guard.text == "<") {
+        bounded = LinkedCountBound(project, state, LinkedNullChild(project, 1, guard, 1))?
+    }
+    if (!bounded) {
         RejectLayout("unsupported_linked_loop", "counted while requires a readonly array length or stable int bound", DeclarationSpan(guard))?
     }
     left = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
