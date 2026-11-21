@@ -246,6 +246,7 @@ static KuProjectionString ku_string_static(const uint8_t *input, size_t size) {
             rendered = consumer.execute([binary, "emit", file.name, "AddOne"], foreign)
             consumer.exercise_emitted(cc, rendered.stdout, foreign, "standalone-module", b"(41)", b"42")
             consumer.exercise_project(binary, cc, current, foreign)
+            consumer.exercise_parameter_bindings(binary, cc, foreign)
             consumer.exercise_owned_recovery(binary, cc, foreign)
             imports = dynamic_imports(binary)
             assert not any("libku" in line.lower() for line in imports)
