@@ -31,8 +31,9 @@ fn HasBoundArrayMembers(&layouts: [StructLayout], index: int): bool {
 
 fn collectOwnedFields(&layouts: [StructLayout], index: int, &prefix: str, paths: [str]): [str] {
     owned = paths
+    field_count = layouts[index - 1].fields.len()
     field_index = 0
-    while (field_index < layouts[index - 1].fields.len()) {
+    while (field_index < field_count) {
         field = layouts[index - 1].fields[field_index].resolved.clone()
         path = prefix.clone() + ".f" + str(field_index)
         if (field.declaration_kind == "Builtin" && field.name == "str") {
