@@ -105,7 +105,7 @@ fn readGuardSignature(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
         }
         view = parameter.int_value == 1
         ty = GuardParameterType(nodes, edges, types, layouts, edges[parameter.first_edge], view)?
-        if (ty.kind == "str" || (view && ty.kind != "struct" && ty.kind != "str_array")) {
+        if (ty.kind == "str" || view && ty.kind != "struct" && ty.kind != "str_array") {
             RejectLayout("unsupported_guarded_signature", "guarded C accepts value scalars, value or View structs, and View [str]", at.clone())?
         }
         string_array = string_array || ty.kind == "str_array"
@@ -138,8 +138,7 @@ fn readGuardSignature(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
         RejectLayout("unsupported_guarded_signature", "guarded C requires a str or bool result", DeclarationSpan(nodes[edges[cursor] - 1]))?
     }
     if (bindings.len() == 0) { declaration += "void" }
-    result_type = GuardCType(result, layouts)
-    return ok(GuardSignature { bindings: bindings, declaration: result_type + " " + declaration + ") {\n", definitions: definitions,
+    return ok(GuardSignature { bindings: bindings, declaration: GuardCType(result, layouts) + " " + declaration + ") {\n", definitions: definitions,
         drops: drops, body_start: cursor + 1, result_kind: result.kind, string_array: string_array })
 }
 
@@ -455,6 +454,7 @@ fn ScalarGuardSlotMove(&before: LinkedNullSlot, &after: LinkedNullSlot, &state: 
     if (ty.declaration_kind != "Struct" || before.value.borrowed || !before.live || after.live
         || before.moved_members.len() != 0 || after.moved_members.len() != 0) { return false }
     layout = LayoutIndex(state.layouts, ty.module_index, ty.declaration_node)
-    return layout > 0 && !HasBoundArrayMembers(state.layouts, layout)
-        && GuardOwnedDrops(state.layouts, layout, before.value.text) == ""
+    if (layout <= 0 || HasBoundArrayMembers(state.layouts, layout)) { return false }
+    drops = GuardOwnedDrops(state.layouts, layout, before.value.text)
+    return drops == ""
 }
