@@ -175,10 +175,15 @@ fn linkedCharacterSource(&project: LinkedNullProject, &state: LinkedNullState, &
             namespace = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
             if (namespace.kind == "Variable" && namespace.edge_count == 0 &&
                 LinkedNullBinding(state.slots, namespace.text) == 0) {
-                for binding in project.binding.modules[0].imports.clone() {
-                    if (binding.local_name == namespace.text && binding.module_index == 0 && binding.source_name == "string") {
+                count = project.binding.modules[0].imports.len()
+                index = 0
+                while (index < count) {
+                    if (project.binding.modules[0].imports[index].local_name == namespace.text &&
+                        project.binding.modules[0].imports[index].module_index == 0 &&
+                        project.binding.modules[0].imports[index].source_name == "string") {
                         return ok(LinkedNullChild(project, 1, call, 1))
                     }
+                    index = index + 1
                 }
             }
         }
