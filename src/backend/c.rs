@@ -11111,66 +11111,9 @@ fn emit_bytes_runtime(out: &mut COutput, program: &IrProgram, force: bool) {
     if !force && !program_uses_bytes(program) {
         return;
     }
+    out.push_str(include_str!("c_bytes_storage.c"));
     out.push_str(
         r#"
-#define KU_BYTES_MAX_LENGTH (64ULL * 1024ULL * 1024ULL)
-
-static KuError ku_bytes_error(const char* code, const char* message) {
-  return ku_error_make(
-      ku_string_static((const uint8_t*)"bytes", 5),
-      ku_string_static((const uint8_t*)code, strlen(code)),
-      ku_string_static((const uint8_t*)message, strlen(message)));
-}
-
-static int ku_bytes_try_copy(const uint8_t* data, size_t len, KuBytes* out) {
-  if (!out || (len != 0 && !data) || len > (size_t)KU_BYTES_MAX_LENGTH) return -1;
-  *out = (KuBytes){0};
-  if (len == 0) return 1;
-  uint8_t* copy = (uint8_t*)malloc(len);
-  if (!copy) return 0;
-  memcpy(copy, data, len);
-  *out = (KuBytes){ copy, len, len, KU_BYTES_OWNED };
-  return 1;
-}
-
-static KuBytes ku_move_bytes(KuBytes* value) {
-  if (!value) return (KuBytes){0};
-  KuBytes moved = *value;
-  *value = (KuBytes){0};
-  return moved;
-}
-
-static KuBytes ku_clone_bytes(KuBytes value) {
-  if (value.storage == KU_BYTES_STATIC) return value;
-  KuBytes copy = (KuBytes){0};
-  int copied = ku_bytes_try_copy(value.ptr, value.len, &copy);
-  if (copied != 1) {
-    fputs(copied == 0 ? "bytes clone allocation failed\n" : "invalid bytes clone source\n", stderr);
-    exit(1);
-  }
-  return copy;
-}
-
-static void ku_drop_bytes(KuBytes* value) {
-  if (!value) return;
-  if (value->storage == KU_BYTES_OWNED && value->ptr) free(value->ptr);
-  *value = (KuBytes){0};
-}
-
-static KuResult_bytes ku_bytes_from_str(KuString text) {
-  if ((text.len != 0 && !text.ptr) || text.len > (size_t)KU_BYTES_MAX_LENGTH) {
-    return (KuResult_bytes){ false, (KuBytes){0},
-      ku_bytes_error("too_large", "bytes input is invalid or exceeds 64 MiB") };
-  }
-  KuBytes value = (KuBytes){0};
-  int copied = ku_bytes_try_copy(text.ptr, text.len, &value);
-  if (copied != 1) {
-    return (KuResult_bytes){ false, (KuBytes){0},
-      ku_bytes_error("out_of_memory", "bytes allocation failed") };
-  }
-  return (KuResult_bytes){ true, value, (KuError){0} };
-}
-
 static int ku_bytes_utf8_valid(const uint8_t* data, size_t len) {
   if (len != 0 && !data) return 0;
   size_t i = 0;
@@ -11209,23 +11152,11 @@ static int ku_bytes_utf8_valid(const uint8_t* data, size_t len) {
   }
   return 1;
 }
-
-static int64_t ku_bytes_len(KuBytes value) {
-  if (value.len > (size_t)INT64_MAX) {
-    fputs("bytes length is outside Ku int range\n", stderr);
-    exit(1);
-  }
-  return (int64_t)value.len;
-}
-
-static KuResult_int ku_bytes_get(KuBytes value, int64_t index) {
-  if (index < 0 || (uint64_t)index >= (uint64_t)value.len || !value.ptr) {
-    return (KuResult_int){ false, 0,
-      ku_bytes_error("index_out_of_bounds", "bytes index is out of bounds") };
-  }
-  return (KuResult_int){ true, (int64_t)value.ptr[(size_t)index], (KuError){0} };
-}
-
+"#,
+    );
+    out.push_str(include_str!("c_bytes_index.c"));
+    out.push_str(
+        r#"
 static KuResult_str ku_bytes_to_str(KuBytes value) {
   if (!ku_bytes_utf8_valid(value.ptr, value.len)) {
     return (KuResult_str){ false, (KuString){0},
@@ -16366,30 +16297,7 @@ fn emit_string_slice_helper(out: &mut COutput, program: &IrProgram) -> KuResult<
     if !result_inners.contains(&IrType::Str) {
         return Ok(());
     }
-    out.push_str(
-        "static KuResult_str ku_string_slice(KuString s, int64_t start, int64_t end) {\n\
-        \x20 if (start < 0 || end < 0) {\n\
-        \x20   return (KuResult_str){ false, (KuString){0}, ku_error_make(ku_string_static((const uint8_t*)\"string\", 6), ku_string_static((const uint8_t*)\"slice_error\", 11), ku_string_static((const uint8_t*)\"string.slice indexes must be >= 0\", 33)) };\n\
-        \x20 }\n\
-        \x20 if (start > end) {\n\
-        \x20   return (KuResult_str){ false, (KuString){0}, ku_error_make(ku_string_static((const uint8_t*)\"string\", 6), ku_string_static((const uint8_t*)\"slice_error\", 11), ku_string_static((const uint8_t*)\"string.slice start must be <= end\", 33)) };\n\
-        \x20 }\n\
-        \x20 size_t clen = ku_string_char_len(s);\n\
-        \x20 if ((uint64_t)end > (uint64_t)clen) {\n\
-        \x20   char buf[96]; int n = snprintf(buf, sizeof(buf), \"string.slice end %lld out of bounds for length %zu\", (long long)end, clen);\n\
-        \x20   KuString msg = (KuString){0}; if (n > 0) { msg = ku_string_alloc((size_t)n); memcpy(msg.ptr, buf, (size_t)n); }\n\
-        \x20   return (KuResult_str){ false, (KuString){0}, ku_error_make(ku_string_static((const uint8_t*)\"string\", 6), ku_string_static((const uint8_t*)\"slice_error\", 11), msg) };\n\
-        \x20 }\n\
-        \x20 size_t bi = 0, ci = 0;\n\
-        \x20 while (bi < s.len && ci < (size_t)start) { bi++; while (bi < s.len && (s.ptr[bi] & 0xC0) == 0x80) bi++; ci++; }\n\
-        \x20 size_t bstart = bi;\n\
-        \x20 while (bi < s.len && ci < (size_t)end) { bi++; while (bi < s.len && (s.ptr[bi] & 0xC0) == 0x80) bi++; ci++; }\n\
-        \x20 size_t blen = bi - bstart;\n\
-        \x20 KuString outv = ku_string_alloc(blen);\n\
-        \x20 if (blen) memcpy(outv.ptr, s.ptr + bstart, blen);\n\
-        \x20 return (KuResult_str){ true, outv, (KuError){0} };\n\
-        }\n\n",
-    );
+    out.push_str(concat!(include_str!("c_string_slice.c"), "\n"));
     Ok(())
 }
 

@@ -240,6 +240,39 @@ fn main(): null {
 }
 
 #[test]
+fn borrow_checker_same_call_indexed_copy_preserves_argument_order() {
+    const COPY_INDEX_CALL_SOURCE: &str = r#"
+struct Item { label: str, count: int | null }
+fn Read(&items: [Item], count: int | null): int {
+    if (count != null) { panic("null lost") }
+    return items.len()
+}
+fn Forward(value: int, &numbers: [int]): int { return value + numbers[1] }
+fn Mark(&numbers: [int], index: int): int { return numbers[index] }
+fn main(): null {
+    numbers = [1, 2, 8, 3]
+    calls = 0
+    next = (): int => { calls += 1 return calls - 1 }
+    if (Mark(numbers, numbers[next()]) != 2) { panic("View before index") }
+    if (Forward(numbers[next()], numbers) != 4) { panic("index before View") }
+    if (calls != 2 || numbers[0] != 1) { panic("index evaluated more than once or owner consumed") }
+    items = [Item { label: "Ku", count: 0 }, Item { label: "data", count: null }]
+    if (Read(items, items[1].count) != 2 || items[0].label != "Ku") { panic("nested index") }
+    return null
+}
+"#;
+    accepts(COPY_INDEX_CALL_SOURCE);
+    run_source("borrow-copy-index.ku", COPY_INDEX_CALL_SOURCE)
+        .expect("indexed Copy reads preserve a shared View");
+
+    rejects(
+        r#"fn Take(&items: [str], owned: str) {} fn main() { items = ["Ku"] Take(items, items[0]) }"#,
+        "E0916",
+        "borrow conflicts with move or mutation",
+    );
+}
+
+#[test]
 fn borrow_checker_completed_read_temporaries_do_not_extend_argument_loans() {
     accepts("fn Read(&owner: str, values: [str]) {} fn main() { owner = \"owner\" payload = \"payload\" Read(owner, [payload.clone()]) println(owner) }");
     accepts("struct Error { domain: str, code: str, message: str } fn Escape(value: str): str { return value } fn main() { err = Error { domain: \"app\", code: \"bad\", message: \"message\" } println(\"ERR|\" + err.domain + \"|\" + err.code + \"|\" + Escape(err.message)) }");

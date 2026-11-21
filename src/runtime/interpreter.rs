@@ -387,6 +387,7 @@ pub struct Interpreter {
     call_depth: usize,
     pending_fail: Option<Value>,
     std_modules: HashSet<String>,
+    checked_index_reads: bool,
     execution_deadline: Option<HttpHandlerDeadline>,
     task_runtime: Option<TaskRuntime>,
     async_execution: bool,
@@ -402,6 +403,7 @@ struct InterpreterTemplate {
     enums: HashMap<String, HashMap<String, usize>>,
     base_dir: PathBuf,
     std_modules: HashSet<String>,
+    checked_index_reads: bool,
 }
 
 impl Interpreter {
@@ -415,6 +417,7 @@ impl Interpreter {
             call_depth: 0,
             pending_fail: None,
             std_modules: HashSet::new(),
+            checked_index_reads: false,
             execution_deadline: None,
             task_runtime: None,
             async_execution: false,
@@ -427,6 +430,14 @@ impl Interpreter {
     pub fn with_base_dir(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn with_checked_base_dir(base_dir: PathBuf) -> Self {
+        Self {
+            base_dir,
+            checked_index_reads: true,
             ..Self::new()
         }
     }
@@ -684,6 +695,7 @@ impl Interpreter {
             enums: self.enums.clone(),
             base_dir: self.base_dir.clone(),
             std_modules: self.std_modules.clone(),
+            checked_index_reads: self.checked_index_reads,
         }
     }
 
@@ -697,6 +709,7 @@ impl Interpreter {
             call_depth: 0,
             pending_fail: None,
             std_modules: template.std_modules,
+            checked_index_reads: template.checked_index_reads,
             execution_deadline: None,
             task_runtime: Some(runtime),
             async_execution: true,
@@ -1366,6 +1379,10 @@ impl Interpreter {
                 };
                 if borrowed_roots.contains(root)
                     && env.contains(root)
+                    // The checker already distinguishes Copy index reads from
+                    // moves. Looking up the index here would reorder evaluation
+                    // and could execute user code twice.
+                    && !(self.checked_index_reads && indexed_argument_place(arg))
                     && !env.with_value(root, arg.span, |value| {
                         value.with_read(arg.span, |value| {
                             Ok(plain_field_argument(value, arg)
@@ -5017,6 +5034,16 @@ fn plain_field_argument<'a>(root: &'a Value, expr: &Expr) -> Option<&'a Value> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn indexed_argument_place(mut expr: &Expr) -> bool {
+    loop {
+        match &expr.kind {
+            ExprKind::Index { .. } => return true,
+            ExprKind::Field { target, .. } => expr = target,
+            _ => return false,
+        }
     }
 }
 
