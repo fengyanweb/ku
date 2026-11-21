@@ -851,7 +851,7 @@ int main(int argc, char **argv) {
         .0;
     let host = r#"
 int main(void) {
-    (void)test_malloc; (void)test_realloc;
+    (void)test_malloc; (void)test_realloc; (void)test_free;
     static const uint8_t expected[] = {0x4b,0x75,0xf0,0x9f,0x99,0x82};
     KuBootstrapResult_KuProjectionString result = __LOAD__(false);
     assert(result.ok && result.value.len == sizeof(expected));
