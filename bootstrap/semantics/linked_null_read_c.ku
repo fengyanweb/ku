@@ -208,6 +208,18 @@ fn ReadLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalRea
     return ok(output)
 }
 
+fn LinkedFieldRoot(&project: LinkedNullProject, receiver: int): int {
+    cursor = receiver
+    depth = 0
+    while (depth < 32) {
+        node = LinkedNullNode(project, 1, cursor)
+        if (node.kind != "Field" || node.edge_count != 1) { return cursor }
+        cursor = LinkedNullChild(project, 1, node, 0)
+        depth = depth + 1
+    }
+    return cursor
+}
+
 fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: Node, depth: int): LinkedNullExpression! {
     receiver = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
     ty = receiver.value.ty.clone()

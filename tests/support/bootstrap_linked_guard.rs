@@ -696,6 +696,7 @@ int main(void) {
 
 pub(super) fn assert_captured_record_updates(seed: &Path, cwd: &Path) {
     let fixture = r#"struct Frame { label: str count: int }
+struct Nested { frame: Frame complete: bool }
 fn Run(first: str, second: str, reject: bool): int! {
     frame = Frame { label: first, count: 10 }
     items: [int] = []
@@ -710,7 +711,9 @@ fn Run(first: str, second: str, reject: bool): int! {
     frame = Frame { label: second, count: 20 }
     Record(3)?
     if (frame.label != "second") { fail { domain: "test", code: "owner", message: "wrong live record" } }
-    return ok(items[0] * 100 + items[1])
+    result = Nested { frame: Frame { label: "result", count: 0 }, complete: true }
+    if (result.complete) { result.frame.count = items[0] * 100 }
+    return ok(result.frame.count + items[1])
 }
 "#;
     let ku = cwd.join("record-capture.ku");

@@ -16,7 +16,7 @@ import { ContainsIndex } from "./struct_projection_c.ku"
 import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
          LinkedNullNode, LinkedNullProject,  LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
-import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { LinkedFieldRoot, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue, LowerLinkedScopedCallbackCall } from "./linked_null_values_c.ku"
 import { LinkedCPrelude, IsLinkedScopedCallback, LinkedScopedCallbackTypes, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedOkAvailable, LinkedRecordFields } from "./link_plan_c.ku"
@@ -171,10 +171,13 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     if (target.kind != "Field" || target.edge_count != 1) {
         RejectLayout("linked_member_target", "assignment requires a direct field of a mutable local record", DeclarationSpan(target))?
     }
-    root = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+    receiver = LinkedNullChild(project, 1, target, 0)
+    root_id = LinkedFieldRoot(project, receiver)
+    nested = receiver != root_id
+    root = LinkedNullNode(project, 1, root_id)
     slot = LinkedNullBinding(state.slots, root.text)
     capture = slot > 0 && state.slots[slot - 1].parameter && ContainsIndex(state.append_captures, slot)
-    if (root.kind != "Variable" || root.edge_count != 0 || slot == 0 || (state.slots[slot - 1].parameter && !capture) ||
+    if (root.kind != "Variable" || root.edge_count != 0 || slot == 0 || (state.slots[slot - 1].parameter && (!capture || nested)) ||
         state.slots[slot - 1].value.borrowed || state.slots[slot - 1].value.ty.declaration_kind != "Struct") {
         RejectLayout("linked_member_target", "assignment requires a direct field of a mutable local record", DeclarationSpan(root))?
     }
@@ -182,7 +185,8 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     RequireLinkedMutableName(root.text, DeclarationSpan(root))?
 
     rhs_id = LinkedNullChild(project, 1, statement, 1)
-    argument = LinkedFieldAppendArgument(project, target, root, rhs_id)
+    argument = 0
+    if (!nested) { argument = LinkedFieldAppendArgument(project, target, root, rhs_id) }
     if (capture && argument > 0) {
         RejectLayout("linked_member_target", "a local callback can only assign Copy fields of a captured record", DeclarationSpan(target))?
     }
@@ -199,8 +203,8 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     if (capture && !copy) {
         RejectLayout("linked_member_target", "a local callback can only assign Copy fields of a captured record", DeclarationSpan(target))?
     }
-    if (guarded && !copy) {
-        RejectLayout("linked_member_target", "guarded record assignment requires a Copy int or bool field of a mutable local", DeclarationSpan(target))?
+    if ((guarded || nested) && !copy) {
+        RejectLayout("linked_member_target", "guarded or nested assignment requires a Copy int or bool field of a mutable local", DeclarationSpan(target))?
     }
     if (!SameLinkedType(ty, replacement.ty) || (!copy && (!string || replacement.borrowed))) {
         RejectLayout("linked_member_rebind_type", "replacement requires a matching Copy field or separate str owner", DeclarationSpan(target))?
