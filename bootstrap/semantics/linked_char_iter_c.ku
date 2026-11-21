@@ -1,4 +1,5 @@
 import { LinkedCharacterSource, LinkedOwnedStringPredicate, MaterializeLinkedCharacters } from "./struct_string_calls.ku"
+import { LinkedWhileCondition } from "./project_struct_string_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
@@ -15,8 +16,8 @@ import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
-import { LinkedBooleanWhileCondition, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
-import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedRecordForLoop, ReadLinkedLocalCaptures, RejectLocalCapture } from "./linked_owner_assignment_c.ku"
+import { RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
+import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedRecordForLoop, ReadLinkedLocalCaptures, RejectLocalCapture, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
 
 struct LinkedLocalThunk {
     result: TypeNameBinding
@@ -283,20 +284,6 @@ fn OpenLinkedForLoop(&project: LinkedNullProject, state: LinkedNullState, &state
     return openLinkedCharacterLoop(project, state, statement, id, depth)
 }
 
-struct LinkedWhileCondition {
-    conjunction: int
-    local: str
-}
-
-fn ReadLinkedWhileCondition(&project: LinkedNullProject, &state: LinkedNullState, &statement: Node): LinkedWhileCondition {
-    id = LinkedNullChild(project, 1, statement, 0)
-    guard = LinkedNullNode(project, 1, id)
-    if (guard.kind == "Binary" && guard.text == "&&" && guard.edge_count == 2) {
-        return LinkedWhileCondition { conjunction: id, local: "" }
-    }
-    return LinkedWhileCondition { conjunction: 0, local: LinkedBooleanWhileCondition(state, guard) }
-}
-
 fn OpenLinkedConditionalWhile(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
                               condition: LinkedWhileCondition, depth: int): LinkedForLoop! {
     if (condition.conjunction == 0) { return OpenLinkedBooleanWhile(state, statement, condition.local, depth) }
@@ -371,4 +358,19 @@ fn LinkedCountdownIndex(&project: LinkedNullProject, &state: LinkedNullState, &l
     CheckLinkedUnitDecrement(project, step, cursor, at)?
     RejectLinkedLoopWrite(project, loop, cursor.text, "linked_loop_cursor_write", "countdown can change its cursor only at the end")?
     return ok(slot)
+}
+
+fn LowerLinkedCopyRebind(&project: LinkedNullProject, state: LinkedNullState, &assignment: Node, slot: int): LinkedNullState! {
+    destination = state.slots[slot - 1].value.clone()
+    live = state.slots[slot - 1].live
+    id = LinkedNullChild(project, 1, assignment, 0)
+    // A checked RHS branches to its existing Error continuation before
+    // returning a value; only the successful path may write the binding.
+    if (LinkedNullNode(project, 1, id).kind == "TryUnwrap") {
+        return StoreLinkedCopyAssignment(destination, live, LowerLinkedNullValue(project, state, id, 0)?, assignment)
+    }
+    if (destination.ty.name == "bool") {
+        return StoreLinkedCopyAssignment(destination, live, LowerLinkedPredicate(project, state, id)?, assignment)
+    }
+    return StoreLinkedCopyAssignment(destination, live, LowerLinkedNullRead(project, state, id, 0)?, assignment)
 }

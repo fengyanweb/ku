@@ -16,7 +16,7 @@ import { BindStructStringCall, ReadStructStringFold, StructStringDependency, Str
 import { TypeNameBinding } from "./type_names.ku"
 
 import { DropLinkedNullScope } from "./linked_member_ownership.ku"
-import { LinkedBuiltinNameAvailable } from "./link_plan_json_c.ku"
+import { LinkedBooleanWhileCondition, LinkedBuiltinNameAvailable } from "./link_plan_json_c.ku"
 import { LinkedNullState } from "./link_plan_c.ku"
 import { LinkedNullChild, LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
 import { LowerLinkedNullTry, LowerLinkedNullValue } from "./linked_null_values_c.ku"
@@ -360,4 +360,18 @@ fn EmitProjectStructStringC(&supplied: [SuppliedModule], &function: str): Projec
     }
     RejectLayout("unknown_struct_string_function", "undefined struct-to-string function '" + function.clone() + "'", start)?
     return ok(ProjectStructStringC { symbol: "", dependencies: [], source: "", entry_plan: EmptyLinkPlanDeclaration() })
+}
+
+struct LinkedWhileCondition {
+    conjunction: int
+    local: str
+}
+
+fn ReadLinkedWhileCondition(&project: LinkedNullProject, &state: LinkedNullState, &statement: Node): LinkedWhileCondition {
+    id = LinkedNullChild(project, 1, statement, 0)
+    guard = LinkedNullNode(project, 1, id)
+    if (guard.kind == "Binary" && guard.text == "&&" && guard.edge_count == 2) {
+        return LinkedWhileCondition { conjunction: id, local: "" }
+    }
+    return LinkedWhileCondition { conjunction: 0, local: LinkedBooleanWhileCondition(state, guard) }
 }

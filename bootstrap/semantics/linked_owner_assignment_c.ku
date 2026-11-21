@@ -6,7 +6,7 @@ import { RejectLayout } from "./struct_layouts.ku"
 import { LinkedAppendFailureRelay, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
 import { AppendLinkedArrayElement, LowerLinkedArrayBinding } from "./linked_array_fields_c.ku"
 import { LinkedLiveIntBinding, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
-import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
+import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
@@ -382,13 +382,13 @@ fn LowerLinkedTypedArrayLocal(&project: LinkedNullProject, state: LinkedNullStat
     return LowerLinkedArrayBinding(project, state, statement, id, value, value_id, ty)
 }
 
-fn StoreLinkedCopyAssignment(&destination: LinkedNullSlot, value: LinkedNullExpression, &assignment: Node): LinkedNullState! {
-    if (!destination.live || destination.value.borrowed || !SameLinkedType(destination.value.ty, value.value.ty)) {
+fn StoreLinkedCopyAssignment(&destination: LinkedNullValue, live: bool, value: LinkedNullExpression, &assignment: Node): LinkedNullState! {
+    if (!live || destination.borrowed || !SameLinkedType(destination.ty, value.value.ty)) {
         RejectLayout("linked_copy_assignment", "assignment requires a live Copy target and matching scalar expression",
                      DeclarationSpan(assignment))?
     }
     next = value.state
-    next.code += "    " + destination.value.text + " = " + value.value.text + ";\n"
+    next.code += "    " + destination.text + " = " + value.value.text + ";\n"
     return ok(next)
 }
 
