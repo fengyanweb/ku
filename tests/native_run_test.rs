@@ -8108,6 +8108,79 @@ fn native_struct_with_owned_field_does_not_leak_on_drop() {
 }
 
 #[test]
+fn native_payloadless_enum_equality_preserves_operand_order() {
+    let dir = unique_temp_dir("enum-equality");
+    fs::write(
+        dir.join("phase.ku"),
+        r#"enum Phase { Ready, Done }
+fn Pick(marker: str, done: bool): Phase {
+    println(marker)
+    if (done) { return Phase.Done }
+    return Phase.Ready
+}
+fn IsReady(&value: Phase): bool { return value == Phase.Ready }
+"#,
+    )
+    .expect("write imported enum definition");
+    fs::write(
+        dir.join("main.ku"),
+        r#"import { Phase, Pick, IsReady } from "./phase"
+fn main(): null! {
+    phase = Pick("initial", false)
+    println(IsReady(phase))
+    println(Pick("eq left", true) == Pick("eq right", true))
+    println(Pick("ne left", true) != Pick("ne right", false))
+    advance = fn(): Phase {
+        println("advance")
+        phase = Phase.Done
+        return Phase.Ready
+    }
+    println(phase == advance())
+    if (phase == Phase.Done) { println("guard") }
+    println(phase != Phase.Done)
+    return ok(null)
+}
+"#,
+    )
+    .expect("write imported enum comparisons");
+    let generated = native_emit_c(&dir, "main.ku");
+    assert!(generated.contains(".tag =="));
+    assert!(generated.contains(".tag !="));
+
+    if let Some(exe) = native_build(&dir, "main.ku", "enum-equality") {
+        let (stdout, code) = run_binary(&exe);
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            stdout.replace('\r', ""),
+            "initial\ntrue\neq left\neq right\ntrue\nne left\nne right\ntrue\nadvance\ntrue\nguard\nfalse\n"
+        );
+    }
+
+    for (case, source, expected) in [
+        (
+            "payload.ku",
+            "enum Choice { Ready, Full(value: str) }\nfn main() { println(Choice.Ready == Choice.Ready) }\n",
+            "native C prototype does not support enum equality yet",
+        ),
+        (
+            "different.ku",
+            "import { Phase } from \"./phase\"\nenum Other { Ready, Done }\nfn main() { println(Phase.Ready == Other.Ready) }\n",
+            "type error: cannot apply operator",
+        ),
+    ] {
+        fs::write(dir.join(case), source).expect("write unsupported enum comparison");
+        let mut command = Command::new(ku_binary());
+        command.current_dir(&dir).args(["build", "--native", case]);
+        let result = run_bounded(&mut command, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS)
+            .expect("bounded enum comparison rejection");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "unexpectedly compiled {case}");
+        assert!(stderr.contains(expected), "{case}: {stderr}");
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_enum_payload_is_moved_in_not_double_freed() {
     // The enum literal takes ownership of its payload argument. The construction
     // used to shallow-copy the argument (leaving the source binding/temp still

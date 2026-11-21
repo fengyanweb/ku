@@ -3120,6 +3120,22 @@ impl<'a> FunctionLowerer<'a> {
             .unwrap_or(IrType::Unknown)
     }
 
+    fn is_payloadless_enum(&self, ty: &IrType) -> bool {
+        let IrType::Named(name) = ty else {
+            return false;
+        };
+        let Some(name) = enum_type_name(name) else {
+            return false;
+        };
+        self.layouts.enums.iter().any(|layout| {
+            layout.name == name
+                && layout
+                    .variants
+                    .iter()
+                    .all(|variant| variant.fields.is_empty())
+        })
+    }
+
     fn object_record_field_read(&self, target: &IrExpr, name: &str) -> Option<IrExpr> {
         if !matches!(&target.ty,IrType::Named(marker) if matches!(marker.as_str(),"__ku_calendar_date"|"__ku_calendar_parts"|"__ku_http_client_config"))
         {
@@ -3867,8 +3883,8 @@ impl<'a> FunctionLowerer<'a> {
                 self.lower_logical_expr(left, *op, right)
             }
             ExprKind::Binary { left, op, right } => {
-                let null_compare = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual);
-                let mut left = if null_compare
+                let equality = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual);
+                let mut left = if equality
                     && matches!(right.kind, ExprKind::Literal(Literal::Null))
                     && matches!(left.kind, ExprKind::Variable(_))
                 {
@@ -3876,14 +3892,20 @@ impl<'a> FunctionLowerer<'a> {
                 } else {
                     self.lower_expr(left)?
                 };
+                let compare_enum_tags = equality && self.is_payloadless_enum(&left.ty);
+                let mut left_tag = None;
                 if !is_pure_append_argument(right, "") {
                     if left.ty == IrType::Str {
                         left = self.snapshot_receiver_before_effects(left, true)?;
+                    } else if compare_enum_tags && !ir_expr_is_borrowed(&left) {
+                        // An owned enum read takes its value here. Save only
+                        // the tag before a RHS call can rebind a captured slot.
+                        left_tag = Some(self.emit_temp(enum_tag_expr(left.clone()))?);
                     } else if !ir_type_is_owned(&left.ty) {
                         left = self.emit_temp(left)?;
                     }
                 }
-                let right = if null_compare
+                let right = if equality
                     && matches!(left.ty, IrType::Null)
                     && matches!(right.kind, ExprKind::Variable(_))
                 {
@@ -3891,7 +3913,7 @@ impl<'a> FunctionLowerer<'a> {
                 } else {
                     self.lower_expr(right)?
                 };
-                if null_compare {
+                if equality {
                     let operand = match (&left.ty, &right.ty) {
                         (IrType::Nullable(_), IrType::Null) => Some(left.clone()),
                         (IrType::Null, IrType::Nullable(_)) => Some(right.clone()),
@@ -3913,6 +3935,14 @@ impl<'a> FunctionLowerer<'a> {
                         });
                     }
                 }
+                let (left, right) = if compare_enum_tags && left.ty == right.ty {
+                    (
+                        left_tag.unwrap_or_else(|| enum_tag_expr(left)),
+                        enum_tag_expr(right),
+                    )
+                } else {
+                    (left, right)
+                };
                 let ty = binary_type(*op, &left.ty, &right.ty);
                 self.emit_temp(IrExpr {
                     kind: IrExprKind::Binary {
@@ -5684,11 +5714,7 @@ impl<'a> FunctionLowerer<'a> {
                     })?;
                 let mut condition = IrExpr {
                     kind: IrExprKind::Binary {
-                        left: Box::new(intrinsic_expr(
-                            "__ku_enum_tag",
-                            vec![value.clone()],
-                            IrType::Int,
-                        )),
+                        left: Box::new(enum_tag_expr(value.clone())),
                         op: BinaryOp::Equal,
                         right: Box::new(IrExpr {
                             kind: IrExprKind::Literal(variant_layout.tag.to_string()),
@@ -6424,6 +6450,10 @@ fn enum_ir_type(name: &str) -> IrType {
 
 fn enum_type_name(name: &str) -> Option<&str> {
     name.strip_prefix(ENUM_TYPE_PREFIX)
+}
+
+fn enum_tag_expr(value: IrExpr) -> IrExpr {
+    intrinsic_expr("__ku_enum_tag", vec![value], IrType::Int)
 }
 
 fn intrinsic_expr(name: impl Into<String>, args: Vec<IrExpr>, ty: IrType) -> IrExpr {
