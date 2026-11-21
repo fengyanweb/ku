@@ -247,7 +247,7 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
                     uses_string_format = uses_string_format || body.uses_string_format
                     uses_string_replace = uses_string_replace || body.uses_string_replace
                     uses_output = uses_output || body.uses_output
-                    text += body.source
+                    text = text + body.source
                     completed = completed.push(function_node)
                 } else {
                     blocked_at = blocked
@@ -268,11 +268,11 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
         round = round + 1
     }
     headers = ScalarIntegerHelpers(uses_add, uses_sub, uses_mul, uses_div, uses_rem)
-    if (uses_output) { headers += "#include <stdio.h>\n" }
-    if (returns_bool || uses_string_contains || returns_null_result) { headers += "#include <stdbool.h>\n" }
-    headers += ScalarStringHelpers(uses_string, uses_string_comparison, uses_string_contains,
+    if (uses_output) { headers = headers + "#include <stdio.h>\n" }
+    if (returns_bool || uses_string_contains || returns_null_result) { headers = headers + "#include <stdbool.h>\n" }
+    headers = headers + ScalarStringHelpers(uses_string, uses_string_comparison, uses_string_contains,
         uses_owned_string, uses_string_join, uses_string_format, returns_null_result)
-    if (uses_string_replace) { headers += ScalarStringReplaceHelpers() }
+    if (uses_string_replace) { headers = headers + ScalarStringReplaceHelpers() }
     return ok(ScalarIntC { symbol: symbol, source: headers + text })
 }
 
