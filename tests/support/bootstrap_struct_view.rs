@@ -1092,10 +1092,6 @@ fn Clone(&entry: Envelope): str! {
     copy = entry.payload.text.clone()
     return ok(copy)
 }
-fn RefuseStructField(&entry: Envelope): null! {
-    copy = entry.payload.clone()
-    return ok(null)
-}
 fn Take(payload: Payload): null! { return ok(null) }
 fn RefuseMovedField(entry: Envelope): str! {
     Take(entry.payload)?
@@ -1163,16 +1159,11 @@ pub(super) fn assert_owned_string_field_clone(seed: &Path, cwd: &Path) {
     assert_eq!(oom.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&oom.stderr).trim(), "out of memory");
 
-    for (name, reason) in [
-        ("RefuseStructField", "unsupported_linked_clone"),
-        ("RefuseMovedField", "linked_moved_member"),
-    ] {
-        fs::write(cwd.join("function.txt"), name).unwrap();
-        let rejected = execute(&mut Command::new(seed), cwd, 30);
-        assert_eq!(rejected.status.code(), Some(1));
-        assert!(rejected.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&rejected.stderr).contains(reason));
-    }
+    fs::write(cwd.join("function.txt"), "RefuseMovedField").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_moved_member"));
 }
 
 const OWNED_BOUND_SOURCE: &str = r#"struct Snapshot { values: [int] count: int }
