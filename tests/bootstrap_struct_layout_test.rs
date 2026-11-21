@@ -2408,7 +2408,8 @@ fn project_link_plan_uses_standard_json_string_quoting_in_the_interpreter() {
     fs::write(
         sandbox.0.join("quote-plan.ku"),
         r#"import { fs } from "std"
-import { EmitLinkPlan, FsReadLinkPlan } from "./semantics/link_plan_c.ku"
+import { FsReadLinkPlan } from "./semantics/link_plan_c.ku"
+import { EmitLinkPlan } from "./semantics/link_plan_json_c.ku"
 import { SuppliedModule } from "./semantics/imports.ku"
 
 fn main(): null! {

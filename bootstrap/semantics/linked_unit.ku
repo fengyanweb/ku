@@ -1,5 +1,6 @@
 import { SuppliedModule } from "./imports.ku"
-import { EmitLinkPlan, LinkPlanDeclaration } from "./link_plan_c.ku"
+import { LinkPlanDeclaration } from "./link_plan_c.ku"
+import { EmitLinkPlan } from "./link_plan_json_c.ku"
 import { EmitLinkedNullC, PrepareLinkedNullProject } from "./linked_null_c.ku"
 import { LinkedNullDependencyPlan } from "./linked_null_types_c.ku"
 

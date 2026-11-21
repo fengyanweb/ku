@@ -1,4 +1,3 @@
-import { LinkPlanJsonControls, LinkPlanJsonText } from "./project_paths.ku"
 import { LinkedLocalReadBinding, RejectMissingLinkedValue } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -7,7 +6,7 @@ import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
-import { ContainsIndex, ContainsType, CTypeName, ProjectionBuiltinLinkFor, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
+import { ContainsIndex, ContainsType, CTypeName, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 
 struct LinkPlanType {
@@ -196,67 +195,10 @@ fn EmptyLinkPlanDeclaration(): LinkPlanDeclaration {
     return LinkPlanDeclaration { unit: 0, node: 0, symbol: "", parameters: [], result: NullLinkPlanResult(), returns_result: false }
 }
 
-fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): str! {
-    name = ty.name.clone()
-    path = "null"
-    if (ty.unit > 0) {
-        path = LinkPlanJsonText(supplied[ty.unit - 1].path.clone(), controls)?
-        name = supplied[ty.unit - 1].named.parsed.arena.nodes[ty.node - 1].text.clone()
-    }
-    passing = "value"
-    if (ty.view) { passing = "view" }
-    return ok("{\"kind\":" + LinkPlanJsonText(ty.kind.clone(), controls)? + ",\"source_name\":" + LinkPlanJsonText(name, controls)?
-        + ",\"source_path\":" + path + ",\"node\":" + str(ty.node) + ",\"c_type\":" + LinkPlanJsonText(ty.c_type.clone(), controls)?
-        + ",\"passing\":" + LinkPlanJsonText(passing, controls)? + "}")
-}
-
 fn FsReadLinkPlan(symbol: str): LinkPlanDeclaration {
     path = BuiltinLinkPlanType("str", "const KuString*", true)
     result = BuiltinLinkPlanType("str", "KuResult_str", false)
     return LinkPlanDeclaration { unit: 0, node: 1, symbol: symbol, parameters: [path], result: result, returns_result: true }
-}
-
-fn plannedDeclaration(&supplied: [SuppliedModule], &declaration: LinkPlanDeclaration, &controls: str): str! {
-    name = ""
-    path = ""
-    if (declaration.unit > 0) {
-        name = supplied[declaration.unit - 1].named.parsed.arena.nodes[declaration.node - 1].text.clone()
-        path = supplied[declaration.unit - 1].path.clone()
-    } else {
-        builtin = ProjectionBuiltinLinkFor(declaration.node)
-        if (declaration.unit != 0 || builtin.name == "" || declaration.symbol != builtin.symbol) {
-            at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
-            RejectLayout("invalid_linked_builtin", "unsupported builtin declaration identity", at)?
-        }
-        name = builtin.name
-        path = builtin.path
-    }
-    text = "{\"source_path\":" + LinkPlanJsonText(path, controls)? + ",\"node\":" + str(declaration.node)
-        + ",\"source_name\":" + LinkPlanJsonText(name, controls)? + ",\"symbol\":" + LinkPlanJsonText(declaration.symbol.clone(), controls)?
-        + ",\"signature\":{\"parameters\":["
-    index = 0
-    while (index < declaration.parameters.len()) {
-        if (index > 0) { text += "," }
-        text += plannedType(supplied, declaration.parameters[index], controls)?
-        index = index + 1
-    }
-    wrapper = "false"
-    if (declaration.returns_result) { wrapper = "true" }
-    return ok(text + "],\"result\":" + plannedType(supplied, declaration.result, controls)?
-        + ",\"returns_result\":" + wrapper + "}}")
-}
-
-fn EmitLinkPlan(&supplied: [SuppliedModule], &mode: str, &entry: LinkPlanDeclaration, &links: [LinkPlanDeclaration]): str! {
-    controls = LinkPlanJsonControls()?
-    text = "{\"schema\":\"ku-bootstrap-link-plan-v1\",\"mode\":" + LinkPlanJsonText(mode.clone(), controls)?
-        + ",\"export\":" + plannedDeclaration(supplied, entry, controls)? + ",\"dependencies\":["
-    index = 0
-    while (index < links.len()) {
-        if (index > 0) { text += "," }
-        text += plannedDeclaration(supplied, links[index], controls)?
-        index = index + 1
-    }
-    return ok(text + "]}\n")
 }
 
 fn projectedStructType(module_index: int, node: int, view: bool): LinkPlanType {

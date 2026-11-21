@@ -12,7 +12,8 @@ import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
 import { LinkedNullProject, LinkedNullEntry, LinkedNullChild, LinkedNullNode,
     LinkedNullParameterType, LinkedNullDependency, LinkedNullDependencyPlan, LinkedNullLayout,
     LinkedNullCType, LinkedNullPrototype, LinkedNullParameterPlan } from "../semantics/linked_null_types_c.ku"
-import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration, LinkedNullFunction } from "../semantics/link_plan_c.ku"
+import { BuiltinLinkPlanType, LinkPlanDeclaration, LinkedNullFunction } from "../semantics/link_plan_c.ku"
+import { EmitLinkPlan } from "../semantics/link_plan_json_c.ku"
 import { TypeNameBinding } from "../semantics/type_names.ku"
 
 struct PathLinePlan {

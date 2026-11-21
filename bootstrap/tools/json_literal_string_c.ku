@@ -7,7 +7,8 @@ import { ManifestPaths, ReadProjectModulesAt } from "../semantics/project_manife
 import { RejectLayout } from "../semantics/struct_layouts.ku"
 import { LinkedNullChild, LinkedNullEntry, LinkedNullNode, LinkedNullProject,
     LinkedNullType, LinkedStringResult } from "../semantics/linked_null_types_c.ku"
-import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration } from "../semantics/link_plan_c.ku"
+import { BuiltinLinkPlanType, LinkPlanDeclaration } from "../semantics/link_plan_c.ku"
+import { EmitLinkPlan } from "../semantics/link_plan_json_c.ku"
 import { ScalarStringHelpers } from "../semantics/scalar_int_emit.ku"
 import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
 

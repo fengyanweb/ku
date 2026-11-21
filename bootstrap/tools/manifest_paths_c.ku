@@ -13,7 +13,8 @@ import { EmitCheckedStringArrayResultHeader } from "../semantics/struct_array_c.
 import { LinkedNullProject, LinkedNullEntry, LinkedNullChild, LinkedNullNode,
     LinkedNullParameterType, LinkedNullDependency, LinkedNullDependencyPlan, LinkedNullLayout,
     LinkedNullCType, LinkedNullPrototype, LinkedNullParameterPlan } from "../semantics/linked_null_types_c.ku"
-import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration, LinkPlanType, LinkedNullFunction } from "../semantics/link_plan_c.ku"
+import { BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, LinkedNullFunction } from "../semantics/link_plan_c.ku"
+import { EmitLinkPlan } from "../semantics/link_plan_json_c.ku"
 import { TypeNameBinding } from "../semantics/type_names.ku"
 import { ManifestError, ManifestScan, ManifestChild, ManifestShape, RequireManifest,
     ReadManifestScan } from "./manifest_paths_shape.ku"
