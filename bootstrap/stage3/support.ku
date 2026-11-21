@@ -297,7 +297,17 @@ fn AppendStage3Arena(parsed: ParseOutput, origin: Token, arena: Arena): Stage3Ar
         index = index + 1
     }
     if (parsed_root <= 0 || parsed_root > parsed_nodes.len()) {
-        RejectAt(origin, "invalid_node_id", "nested AST root is invalid")?
+        // This diagnostic only needs the coordinates. Keep the token owner
+        // on the same cleanup path as a successful merge.
+        point = Span {
+            line: origin.line,
+            column: origin.column,
+            offset: origin.offset,
+            end_line: origin.end_line,
+            end_column: origin.end_column,
+            end_offset: origin.end_offset
+        }
+        RejectAtSpan(point, "invalid_node_id", "nested AST root is invalid")?
     }
     root = node_base + parsed_root
     return ok(Stage3ArenaAppend { arena: Arena { nodes: arena_nodes, edges: arena_edges }, root: root })
