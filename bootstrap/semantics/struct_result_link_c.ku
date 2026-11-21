@@ -7,7 +7,7 @@ import { GuardParameterType } from "./guarded_struct_c.ku"
 import { BoundSameModuleFunction, ManagedClonedStringCall, ManagedDeferredMessageCalls, ManagedLiteralStringReturns, ManagedRecordStringMove } from "./guarded_string_parts.ku"
 import { AddGuardCode, ManagedBlank, ManagedCode } from "./managed_array_values_c.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
-import { LinkedNullFunction, BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 import { ScalarSymbol } from "./scalar_int_emit.ku"
 import { CheckNullResultCallee } from "./call_contracts.ku"
 
@@ -357,9 +357,4 @@ fn LowerStructResultLink(&named: NamedModule, &types: [TypeNameBinding], &layout
         parameters: parameters, result: NullLinkPlanResult(), returns_result: true }
     return ok(StructResultLink { symbol: symbol, prototype: prototype + ");\n\n", remaining: available, code: code,
         declarations: declarations, drops: drops, clone_layouts: clone_layouts, plan: plan })
-}
-
-fn SnapshotLinkedFunction(&callee: LinkedNullFunction): LinkedNullFunction {
-    return LinkedNullFunction { unit: callee.unit, node: callee.node, symbol: callee.symbol.clone(),
-        parameters: callee.parameters.clone(), result: callee.result.clone(), returns_result: callee.returns_result }
 }
