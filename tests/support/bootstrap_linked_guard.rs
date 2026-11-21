@@ -863,7 +863,10 @@ fn Run(payload: [int], label: str, marker: Marker, fatal: bool): int! {
     sum = 0
     fn Collect(items: [int], low: int, high: int, note: Marker): [int]! {
         if (low == 99) { sum = seen[0 - 1] }
-        if (note.reject) { fail { domain: "test", code: "reject", message: note.label } }
+        if (note.reject) {
+            message = note.label.clone()
+            fail { domain: "test", code: "reject", message: message }
+        }
         sum = sum + low + high
         seen = seen.push(note.score)
         return ok(items)
