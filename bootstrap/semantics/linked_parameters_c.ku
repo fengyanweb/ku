@@ -160,7 +160,9 @@ fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &el
         next.layouts = LinkedNullLayout(project, element, next.layouts.clone(), 0)?
         return ok(next)
     } catch (err) {
-        if (err.code != "unsupported_layout_type") { fail err }
+        // A cached owning child can reach the scalar layout order check
+        // before a new parent exposes the same array field to collection.
+        if (err.code != "unsupported_layout_type" && err.code != "unsupported_nested_layout") { fail err }
     }
     unit = element.module_index
     node = element.declaration_node
