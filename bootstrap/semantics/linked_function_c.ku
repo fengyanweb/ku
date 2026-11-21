@@ -187,7 +187,8 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
         RejectLayout("linked_member_target", "a local callback can only assign Copy fields of a captured record", DeclarationSpan(target))?
     }
     drop = ""
-    if ((owned && (string || ty.declaration_kind == "OwnedStringArray")) || (tracked && ty.declaration_kind == "Struct")) {
+    if ((owned && (string || ty.declaration_kind == "OwnedStringArray")) || (tracked &&
+        (ty.declaration_kind == "Struct" || LinkedNullOwnedArray(ty) || LinkedNullIntArrayOwner(ty)))) {
         drop = LinkedNullDropC(place.state.layouts, place.state.owning_layouts, ty, place.value.text)
     }
     if ((guarded || nested) && !copy && drop == "") {
