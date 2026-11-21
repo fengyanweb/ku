@@ -890,6 +890,93 @@ fn Refuse(token: Token): Token! {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_clone_moved"));
 }
 
+pub(super) fn assert_local_array_reader(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("local-reader.ku"),
+        r#"struct Item { label: str value: int }
+fn Inspect(first: Item, second: Item): Item! {
+    values: [Item] = []
+    values = values.push(first)
+    fn Read(index: int): Item { return values[index - 1].clone() }
+    saved = Read(1)
+    values = values.push(second)
+    current = Read(2)
+    if (saved.value != 11) { fail { domain: "test", code: "old", message: "old element changed" } }
+    return ok(current)
+}
+fn Escape(first: Item): Item! {
+    values: [Item] = []
+    values = values.push(first)
+    fn Read(index: int): Item { return values[index].clone() }
+    escaped = Read
+    return ok(escaped(0))
+}
+fn Moved(first: Item): Item! {
+    values: [Item] = []
+    values = values.push(first)
+    fn Read(index: int): Item { return values[index].clone() }
+    moved = values
+    return ok(Read(0))
+}
+fn MovedAfterRead(first: Item): Item! {
+    values: [Item] = []
+    values = values.push(first)
+    fn Read(index: int): Item { return values[index].clone() }
+    result = Read(0)
+    moved = values
+    return ok(result)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "local-reader.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Inspect").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, args) = signature.split_once('(').unwrap();
+    let (carrier, _) = args.split_once(" a0").unwrap();
+    assert!(!code.contains("extern "));
+    assert_eq!(code.matches("int64_t local_index").count(), 2);
+    let witness = r#"
+#include <assert.h>
+int main(void) {
+    uint8_t first[] = "old", second[] = "new";
+    RESULT result = ENTRY(
+        (ITEM){{first,3,0,KU_PROJECTION_STRING_STATIC},11},
+        (ITEM){{second,3,0,KU_PROJECTION_STRING_STATIC},22});
+    assert(result.ok && result.value.f1 == 22 && !memcmp(result.value.f0.ptr, second, 3));
+    ku_projection_string_drop(&result.value.f0);
+    return 0;
+}
+"#
+    .replace("RESULT", result)
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("ITEM", carrier);
+    let c = cwd.join("local-reader.c");
+    let exe = cwd.join(format!("local-reader{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("{code}{witness}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+
+    for (name, error) in [
+        ("Escape", "linked_local_callable_escape"),
+        ("Moved", "linked_local_reader_capture_move"),
+        ("MovedAfterRead", "linked_local_reader_capture_move"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(error));
+    }
+}
+
 pub(super) fn assert_linked_fs_read(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("module-reader.ku"),

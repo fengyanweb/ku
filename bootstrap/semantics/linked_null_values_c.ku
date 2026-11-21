@@ -1,15 +1,15 @@
 import { LinkedDirectCallExpression, LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MatchesLinkedFieldValue, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { Node } from "../stage2/ast.ku"
+import { FindLinkedLocalRead } from "./call_contracts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, RememberLinkedCall, LinkedNullBinding, LinkedOkAvailable, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
-import { EmitLinkedIntAppend, HasBoundArrayMembers, ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
-import { GuardOwnedDrops } from "./guarded_struct_c.ku"
+import { EmitLinkedIntAppend, ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
 import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { CloneLinkedLocalArrayItem, CloneLinkedRecord, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AddLinkedNullSlot, CloneLinkedStringSlot, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix } from "./linked_parameters_c.ku"
 
 fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int, depth: int): LinkedNullExpression! {
@@ -33,25 +33,7 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     if (subject.kind != "Index" && subject.kind != "Variable") {
         RejectLayout("unsupported_linked_clone", "struct clone needs a bound or indexed value", DeclarationSpan(subject))?
     }
-    if (LinkedMemberUnavailable(source.state, source.value, true)) {
-        RejectLayout("linked_clone_moved", "cloning a whole struct requires all fields to be available", DeclarationSpan(subject))?
-    }
-    layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
-    if (HasBoundArrayMembers(source.state.layouts, layout)) {
-        RejectLayout("linked_nested_array_clone", "a struct with nested owning arrays does not yet support clone", ty.span.clone())?
-    }
-    output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
-    if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
-        output.state.code += "    " + output.value.text.clone() + " = " + source.value.text + ";\n"
-    } else {
-        if (!ContainsIndex(output.state.element_clones, layout)) {
-            output.state.element_clones = output.state.element_clones.push(layout)
-        }
-        output.state.code += "    if (!ku_linked_element_" + str(layout) + "_clone_element(&"
-            + source.value.text + ", &" + output.value.text.clone() + ")) { out_of_memory = true; goto cleanup; }\n"
-    }
-    output.state.slots[output.value.slot - 1].live = true
-    return ok(output)
+    return CloneLinkedRecord(project, source, subject, id)
 }
 
 fn lowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &callee: LinkedNullFunction,
@@ -104,6 +86,17 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
     }
     if (target.kind == "Field" && target.text == "len" && target.edge_count == 1 && call.edge_count == 1) {
         return LowerLinkedNullRead(project, state, id, depth)
+    }
+    if (target.kind == "Variable" && target.edge_count == 0) {
+        local = FindLinkedLocalRead(state.local_readers, target.text)
+        if (local != 0) {
+            if (call.edge_count != 2 || LinkedNullBinding(state.slots, target.text) != 0) {
+                RejectLayout("linked_local_reader_call", "expected a direct local reader call with one int argument", DeclarationSpan(call))?
+            }
+            read = state.local_readers[local - 1].clone()
+            argument = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, call, 1), depth + 1)?
+            return CloneLinkedLocalArrayItem(project, read, argument, call, id)
+        }
     }
     callee = ResolveLinkedCall(project, state.slots, call, target, false)?
     arguments = lowerLinkedArguments(project, state, call, callee, id, depth)?

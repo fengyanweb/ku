@@ -1,14 +1,16 @@
 import { AddLinkedNullSlot, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
 import { CheckLinkedAddition, EmitLinkedMultiplyDivide, EmitLinkedReadonlyBoolCall, LinkedMemberPath, LinkedMemberUnavailable } from "./linked_member_ownership.ku"
 import { Span } from "../stage2/span.ku"
+import { LinkedLocalReadBinding } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
-import { FieldIndex, ReadLinkedErrorMember, RejectLayout } from "./struct_layouts.ku"
+import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout } from "./struct_layouts.ku"
 import { LinkedErrorField, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
-import { ProjectionStringLength } from "./struct_projection_c.ku"
-import { EmitLinkedIntAppend } from "./struct_array_c.ku"
+import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
+import { GuardOwnedDrops } from "./guarded_struct_c.ku"
+import { EmitLinkedIntAppend, HasBoundArrayMembers } from "./struct_array_c.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedStringResult, ReadLinkedOwnedArray, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
@@ -130,24 +132,72 @@ fn readLinkedMethod(&project: LinkedNullProject, state: LinkedNullState, &call: 
 fn readLinkedIndex(&project: LinkedNullProject, state: LinkedNullState, &node: Node, id: int, depth: int): LinkedNullExpression! {
     array = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
     index = LowerLinkedNullRead(project, array.state, LinkedNullChild(project, 1, node, 1), depth + 1)?
-    if (!LinkedNullReadableArray(array.value.ty) || index.value.ty.name != "int" ||
+    return readArrayItem(array.value, index, node, id)
+}
+
+fn readArrayItem(&array: LinkedNullValue, index: LinkedNullExpression, &node: Node, id: int): LinkedNullExpression! {
+    if (!LinkedNullReadableArray(array.ty) || index.value.ty.name != "int" ||
         index.value.ty.declaration_kind != "Builtin") {
         RejectLayout("linked_index_type", "expected a readonly struct array and int index", DeclarationSpan(node))?
     }
     offset = "i" + str(id)
-    header = LinkedNullArrayHeader(array.value.ty, array.value.text)
+    header = LinkedNullArrayHeader(array.ty, array.text)
     index.state.uses_index = true
     index.state.code = index.state.code + "    int64_t " + offset.clone() + " = " + index.value.text + ";\n"
         + "    if (" + offset.clone() + " < 0 || (uint64_t)" + offset.clone() + " >= " + header.clone() + "->len) {\n"
         + "        index_failed = true; failure_index = " + offset.clone() + "; failure_length = " + header.clone() + "->len; goto cleanup;\n    }\n"
-    item = LinkedReadonlyExpression(index.state, LinkedNullArrayElement(array.value.ty), header + "->data[" + offset + "]")
+    item = LinkedReadonlyExpression(index.state, LinkedNullArrayElement(array.ty.clone()), header + "->data[" + offset + "]")
     if (item.value.ty.declaration_kind == "Builtin" && item.value.ty.name == "str") {
         item.state.code += "    if (" + item.value.text.clone() + ".len && !" + item.value.text.clone()
             + ".ptr) { invalid_array = true; goto cleanup; }\n"
     }
     item.value.borrowed = LinkedNullOwner(item.value.ty)
-    item.value.slot = array.value.slot
+    item.value.slot = array.slot
     return ok(item)
+}
+
+fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, &at: Node,
+                     id: int): LinkedNullExpression! {
+    ty = source.value.ty.clone()
+    if (LinkedMemberUnavailable(source.state, source.value, true)) {
+        RejectLayout("linked_clone_moved", "cloning a whole struct requires all fields to be available", DeclarationSpan(at))?
+    }
+    layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
+    if (HasBoundArrayMembers(source.state.layouts, layout)) {
+        RejectLayout("linked_nested_array_clone", "a struct with nested owning arrays does not yet support clone", ty.span.clone())?
+    }
+    output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
+    if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
+        output.state.code += "    " + output.value.text.clone() + " = " + source.value.text + ";\n"
+    } else {
+        if (!ContainsIndex(output.state.element_clones, layout)) {
+            output.state.element_clones = output.state.element_clones.push(layout)
+        }
+        output.state.code += "    if (!ku_linked_element_" + str(layout) + "_clone_element(&"
+            + source.value.text + ", &" + output.value.text.clone() + ")) { out_of_memory = true; goto cleanup; }\n"
+    }
+    output.state.slots[output.value.slot - 1].live = true
+    return ok(output)
+}
+
+fn CloneLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalReadBinding, argument: LinkedNullExpression,
+                            &at: Node, id: int): LinkedNullExpression! {
+    array = argument.state.slots[reader.captured_slot - 1].value.clone()
+    if (LinkedMemberUnavailable(argument.state, array, true)) {
+        RejectLayout("linked_local_reader_capture", "the array captured by this declaration is no longer live", DeclarationSpan(at))?
+    }
+    if (argument.value.ty.declaration_kind != "Builtin" || argument.value.ty.name != "int") {
+        RejectLayout("linked_local_reader_argument", "a local reader requires an int index", DeclarationSpan(at))?
+    }
+    if (reader.index_shift != 0) {
+        shifted = "local_index" + str(reader.node) + "_" + str(id)
+        argument.state.uses_sub = true
+        argument.state.code += EmitCheckedScalarArithmetic("sub", argument.value.text,
+            "INT64_C(" + str(reader.index_shift) + ")", shifted)
+        argument.value.text = shifted
+    }
+    item = readArrayItem(array, argument, at, id)?
+    return CloneLinkedRecord(project, item, at, id)
 }
 
 fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: Node, depth: int): LinkedNullExpression! {

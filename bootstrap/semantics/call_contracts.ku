@@ -6,6 +6,38 @@ import { ExplicitType, RejectLayout } from "./struct_layouts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName } from "./guarded_struct_expr.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 
+struct LinkedLocalReadBinding {
+    name: str
+    node: int
+    captured_slot: int
+    index_shift: int
+}
+
+fn FindLinkedLocalRead(&bindings: [LinkedLocalReadBinding], &name: str): int {
+    index = 0
+    while (index < bindings.len()) {
+        if (bindings[index].name == name) { return index + 1 }
+        index = index + 1
+    }
+    return 0
+}
+
+fn LinkedLocalReadCaptures(&bindings: [LinkedLocalReadBinding], slot: int): bool {
+    index = 0
+    while (index < bindings.len()) {
+        if (bindings[index].captured_slot == slot) { return true }
+        index = index + 1
+    }
+    return false
+}
+
+fn RejectMissingLinkedValue(&bindings: [LinkedLocalReadBinding], &node: Node): null! {
+    if (FindLinkedLocalRead(bindings, node.text) != 0) {
+        RejectLayout("linked_local_callable_escape", "a local reader is only available as a direct call in its defining frame", DeclarationSpan(node))?
+    }
+    return RejectLayout("unavailable_linked_binding", "expected an initialized, unconsumed binding", DeclarationSpan(node))
+}
+
 struct InactiveMoveBranch { start: int, stop: int }
 
 fn ManagedMethodReceiver(&nodes: [Node], &edges: [int], &call: Node): int {

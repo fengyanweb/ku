@@ -1,4 +1,5 @@
 import { Node } from "../stage2/ast.ku"
+import { LinkedLocalReadCaptures } from "./call_contracts.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
 import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
@@ -188,6 +189,9 @@ fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNu
     }
     if (LinkedMemberUnavailable(state, value, true)) {
         RejectLayout("linked_moved_member", "owned field or parent already has a moved component", value.ty.span.clone())?
+    }
+    if (value.member_path == "" && LinkedLocalReadCaptures(state.local_readers, value.slot)) {
+        RejectLayout("linked_local_reader_capture_move", "cannot move an array captured by a local reader", value.ty.span.clone())?
     }
     next = state
     if (value.slot > 0 && LinkedNullDropC(next.layouts, next.owning_layouts, value.ty, value.text) != "") {

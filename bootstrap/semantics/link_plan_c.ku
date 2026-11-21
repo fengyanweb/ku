@@ -1,4 +1,5 @@
 import { json } from "std"
+import { LinkedLocalReadBinding, RejectMissingLinkedValue } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { GuardBoundType, GuardCType, GuardType } from "./guarded_struct_expr.ku"
@@ -59,6 +60,7 @@ struct LinkedNullState {
     owning_strings: bool
     slots: [LinkedNullSlot]
     links: [LinkedNullFunction]
+    local_readers: [LinkedLocalReadBinding]
     declarations: str
     code: str
     drops: str
@@ -94,7 +96,7 @@ struct LinkedNullExpression {
 
 fn NewLinkedNullState(): LinkedNullState {
     return LinkedNullState { plain_value_result: false, countdown_body: false, layouts: [], owning_layouts: [], owning_strings: false,
-        slots: [], links: [], declarations: "", code: "", drops: "", catch_slot: 0,
+        slots: [], links: [], local_readers: [], declarations: "", code: "", drops: "", catch_slot: 0,
         catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,
         element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_mul: false, uses_div: false,
@@ -385,7 +387,7 @@ fn LinkedErrorField(receiver: LinkedNullExpression, member: str, at: Span): Link
 fn ReadLinkedNullBinding(state: LinkedNullState, &node: Node): LinkedNullExpression! {
     index = LinkedNullBinding(state.slots, node.text)
     if (index == 0 || !state.slots[index - 1].live) {
-        RejectLayout("unavailable_linked_binding", "expected an initialized, unconsumed binding", DeclarationSpan(node))?
+        RejectMissingLinkedValue(state.local_readers, node)?
     }
     value = state.slots[index - 1].value.clone()
     return ok(LinkedNullExpression { state: state, value: value })

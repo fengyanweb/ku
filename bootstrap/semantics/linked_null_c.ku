@@ -1,4 +1,4 @@
-import { AddLinkedNullSlot, ReadLinkedNullParameters } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
 import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, CheckLinkedGuardOwners, DropLinkedNullScope, LinkedCountBound, LinkedCountdownIndex, MergeLinkedConditionalMembers, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedPlainReturn } from "./linked_function_c.ku"
@@ -294,6 +294,8 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             kind = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0)).kind
             if (kind == "TypeArray") { next = LowerLinkedArrayLocal(project, next, statement, id)? }
             else { next = addLocal(project, next, statement, id)? }
+        } else if (statement.kind == "Function" && depth == 0) {
+            next = RegisterLinkedLocalRead(project, next, statement, id)?
         } else if (statement.kind == "If" && statement.edge_count > 1) {
             branch = addGuardedRegion(project, next, statement, result, depth)?
             if (branch.terminal) {
