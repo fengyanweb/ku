@@ -1,4 +1,4 @@
-use ku::cli::check_source;
+use ku::cli::{check_source, run_source};
 
 #[path = "support/bounded_process.rs"]
 pub mod bounded_process;
@@ -215,7 +215,27 @@ fn borrow_checker_same_call_borrow_move_conflicts_are_order_independent() {
 fn borrow_checker_same_call_capture_mutation_and_copy_field() {
     rejects("fn main() { text = \"old\" change = () => { text = \"new\" return \"old\" } println(text.contains(change())) }", "E0916", "borrow conflicts with move or mutation");
     rejects("fn Both(&value: str, n: int) {} fn main() { text = \"Ku\" change = () => { text = \"new\" return 1 } Both(text, change()) }", "E0916", "borrow conflicts with move or mutation");
-    accepts("struct User { name: str, age: int } fn Both(&value: User, age: int) {} fn main() { user = User { name: \"Ku\", age: 1 } Both(user, user.age) }");
+    let source = r#"
+struct Profile { flags: int }
+struct User { name: str, profile: Profile, active: bool, score: int | null }
+fn Forward(&user: User, flags: int, score: int | null): int {
+    if (score != null) { panic("nullable Copy field lost its null value") }
+    return user.name.len() + flags
+}
+fn Reverse(flags: int, &name: str, active: bool): int {
+    if (!active) { panic("Copy field read after the View changed the value") }
+    return flags + name.len()
+}
+fn main(): null {
+    user = User { name: "Ku", profile: Profile { flags: 5 }, active: true, score: null }
+    if (Forward(user, user.profile.flags, user.score) != 7) { panic("View before Copy") }
+    if (Reverse(user.profile.flags, user.name, user.active) != 7) { panic("Copy before View") }
+    if (user.name != "Ku") { panic("Copy field arguments consumed their owner") }
+    return null
+}
+"#;
+    accepts(source);
+    run_source("borrow-copy-fields.ku", source).expect("Copy fields do not move a borrowed owner");
 }
 
 #[test]

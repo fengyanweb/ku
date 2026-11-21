@@ -1347,29 +1347,36 @@ impl Interpreter {
         leases: &mut Vec<BorrowLease>,
         values: &mut Vec<Value>,
     ) -> KuResult<()> {
-        // Reject either argument order before evaluating effects. Paths are
-        // deliberately conservative at the root, matching the checker contract.
+        // Reject either argument order before evaluating effects. A Copy field
+        // read does not move its enclosing owner, so only potential moves
+        // conflict with a View of the same root.
         if modes.contains(&ParamMode::View) && modes.contains(&ParamMode::Owned) {
-            let mut roots = HashMap::<String, u8>::new();
+            let borrowed_roots: HashSet<&str> = args
+                .iter()
+                .zip(modes)
+                .filter(|(_, mode)| **mode == ParamMode::View)
+                .filter_map(|(arg, _)| assignment_expr_root_name(arg))
+                .collect();
             for (index, arg) in args.iter().enumerate() {
-                if let Some(root) = assignment_expr_root(arg) {
-                    let mode = if modes.get(index) == Some(&ParamMode::View) {
-                        1
-                    } else {
-                        2
-                    };
-                    let previous = roots.entry(root.clone()).or_default();
-                    *previous |= mode;
-                    if *previous == 3
-                        && env.contains(&root)
-                        && env
-                            .with_value(&root, arg.span, |value| Ok(value.copy_value().is_none()))?
-                    {
-                        return Err(KuError::runtime(
-                            "borrow conflicts with move in the same call",
-                            arg.span,
-                        ));
-                    }
+                if modes.get(index) == Some(&ParamMode::View) {
+                    continue;
+                }
+                let Some(root) = assignment_expr_root_name(arg) else {
+                    continue;
+                };
+                if borrowed_roots.contains(root)
+                    && env.contains(root)
+                    && !env.with_value(root, arg.span, |value| {
+                        value.with_read(arg.span, |value| {
+                            Ok(plain_field_argument(value, arg)
+                                .is_some_and(|field| field.copy_value().is_some()))
+                        })
+                    })?
+                {
+                    return Err(KuError::runtime(
+                        "borrow conflicts with move in the same call",
+                        arg.span,
+                    ));
                 }
             }
         }
@@ -4987,11 +4994,28 @@ fn assignment_target_root(target: &AssignTarget) -> Option<String> {
 }
 
 fn assignment_expr_root(expr: &Expr) -> Option<String> {
+    assignment_expr_root_name(expr).map(str::to_owned)
+}
+
+fn assignment_expr_root_name(expr: &Expr) -> Option<&str> {
     match &expr.kind {
-        ExprKind::Variable(name) => Some(name.clone()),
+        ExprKind::Variable(name) => Some(name),
         ExprKind::Index { target, .. } | ExprKind::Field { target, .. } => {
-            assignment_expr_root(target)
+            assignment_expr_root_name(target)
         }
+        _ => None,
+    }
+}
+
+/// Inspect a named place without evaluating its expression or cloning its owner.
+/// Index expressions are left to the real argument evaluation.
+fn plain_field_argument<'a>(root: &'a Value, expr: &Expr) -> Option<&'a Value> {
+    match &expr.kind {
+        ExprKind::Variable(_) => Some(root),
+        ExprKind::Field { target, name } => match plain_field_argument(root, target)? {
+            Value::Struct { fields, .. } | Value::Object(fields) => fields.get(name),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -8085,6 +8109,42 @@ mod template_capture_tests {
 #[cfg(test)]
 mod collection_tests {
     use super::*;
+
+    #[test]
+    fn copy_field_does_not_hide_a_conflicting_owned_sibling() {
+        let span = Span::default();
+        let mut env = Env::new();
+        env.define_owned(
+            "person".into(),
+            Value::Object(HashMap::from([
+                ("number".into(), Value::Int(1)),
+                ("text".into(), Value::String("still owned".into())),
+            ])),
+            true,
+            span,
+        )
+        .unwrap();
+        let input = "Check(1 / 0, person.number, person, person.text)";
+        let call = Parser::new(Lexer::new(input).tokenize().unwrap())
+            .parse_expression_only()
+            .unwrap();
+        let ExprKind::Call { args, .. } = call.kind else {
+            panic!("expected call arguments");
+        };
+        let modes = [
+            ParamMode::Owned,
+            ParamMode::Owned,
+            ParamMode::View,
+            ParamMode::Owned,
+        ];
+        let mut leases = Vec::new();
+        let mut values = Vec::new();
+        let error = Interpreter::new()
+            .eval_call_arguments(&args, &modes, &mut env, 0, &mut leases, &mut values)
+            .unwrap_err();
+        assert_eq!(error.message, "borrow conflicts with move in the same call");
+        assert!(leases.is_empty() && values.is_empty());
+    }
 
     #[test]
     fn failed_pure_append_argument_leaves_the_receiver_unchanged() {
