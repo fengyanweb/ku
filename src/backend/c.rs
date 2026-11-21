@@ -3801,6 +3801,9 @@ fn c_move_place(expr: &IrExpr) -> KuResult<Option<String>> {
 
 fn c_value_expr(expr: &IrExpr) -> KuResult<String> {
     if let IrExprKind::Call { kind, args, .. } = &expr.kind {
+        if matches!(kind, IrCallKind::Intrinsic(name) if name.starts_with("__ku_enum_payload:")) {
+            return c_move_value(&expr.ty, &c_expr(expr)?);
+        }
         if is_c_owned_type(&expr.ty)
             && matches!(kind, IrCallKind::Intrinsic(name) if name == "__ku_nullable_get")
         {
@@ -17507,16 +17510,14 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
         let value = args
             .first()
             .ok_or_else(|| unsupported("enum payload access requires one argument"))?;
-        // Binding a payload in a `match` arm MOVES it out of the enum (Ku matches
-        // by value), so clear the enum's slot: the enum is deep-dropped afterwards
-        // and would otherwise free the same buffer the binding now owns.
-        let place = format!(
+        // Tag tests, deeper projections and guarded arm candidates must
+        // inspect this place without consuming it. Only c_value_expr moves.
+        return Ok(format!(
             "({}).payload.{}.{}",
             c_expr(value)?,
             c_ident(variant),
             c_ident(field)
-        );
-        return c_move_value(ty, &place);
+        ));
     }
     if let Some(method) = name.strip_prefix("array.") {
         let receiver = args

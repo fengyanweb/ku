@@ -5477,10 +5477,60 @@ impl<'a> FunctionLowerer<'a> {
             let mut binding_names = bindings.keys().cloned().collect::<Vec<_>>();
             binding_names.sort();
             let pattern_undo = self.push_pattern_bindings(bindings);
+            if let Some(guard) = &arm.guard {
+                let pending_floor = self.pending_borrow_temporaries.len();
+                let mut probes = Vec::new();
+                for name in &binding_names {
+                    let bound = &self.pattern_bindings[name];
+                    if !ir_type_is_owned(&bound.ty)
+                        || !crate::checker::expr_uses_name(guard, name, false)
+                    {
+                        continue;
+                    }
+                    // Guards may consume a binding. Give them the same
+                    // independent candidate as the interpreter while keeping
+                    // the scrutinee available for subsequent arms.
+                    let copy = intrinsic_expr("__ku_clone", vec![bound.clone()], bound.ty.clone());
+                    let probe = self.emit_temp(copy)?;
+                    self.pending_borrow_temporaries
+                        .push(PendingBorrowTemporary {
+                            owner: probe.clone(),
+                            error_block: self
+                                .try_handlers
+                                .last()
+                                .map(|handler| handler.error_block),
+                        });
+                    probes.push(probe.clone());
+                    self.pattern_bindings.insert(name.clone(), probe);
+                }
+                let guard = self.lower_expr(guard)?;
+                self.pending_borrow_temporaries.truncate(pending_floor);
+                let value_id = self.next_block("match_value")?;
+                let rejected_id = if probes.is_empty() {
+                    next_id
+                } else {
+                    self.next_block("match_guard_rejected")?
+                };
+                self.current.terminator = IrTerminator::Branch {
+                    condition: guard,
+                    then_block: value_id,
+                    else_block: rejected_id,
+                };
+                self.finish_current()?;
+                if rejected_id != next_id {
+                    self.start_block(rejected_id, "match_guard_rejected");
+                    for probe in probes.into_iter().rev() {
+                        self.emit_borrow_temporary_drop(probe)?;
+                    }
+                    self.current.terminator = IrTerminator::Jump(next_id);
+                    self.finish_current()?;
+                }
+                self.start_block(value_id, "match_value");
+            }
             // Materialize each binding that is a computed projection (an enum
             // payload access, which moves-and-clears the slot when its type is
-            // owned) into a single temp, so using the binding more than once reads
-            // that temp instead of re-moving the value out of the enum each time.
+            // owned) only after the guard accepts. Candidate temps from the
+            // guard already represent the selected arm's bindings.
             for name in binding_names {
                 let bound = self.pattern_bindings[&name].clone();
                 if matches!(
@@ -5491,17 +5541,6 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 let temp = self.emit_temp(bound)?;
                 self.pattern_bindings.insert(name, temp);
-            }
-            if let Some(guard) = &arm.guard {
-                let guard = self.lower_expr(guard)?;
-                let value_id = self.next_block("match_value")?;
-                self.current.terminator = IrTerminator::Branch {
-                    condition: guard,
-                    then_block: value_id,
-                    else_block: next_id,
-                };
-                self.finish_current()?;
-                self.start_block(value_id, "match_value");
             }
             let arm_value = self.lower_expr(&arm.value)?;
             if let Some(expected) = &result_ty {

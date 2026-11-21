@@ -9637,7 +9637,7 @@ fn assign_target_uses_name(target: &AssignTarget, name: &str, shadowed: bool) ->
     }
 }
 
-fn expr_uses_name(expr: &Expr, name: &str, shadowed: bool) -> bool {
+pub(crate) fn expr_uses_name(expr: &Expr, name: &str, shadowed: bool) -> bool {
     match &expr.kind {
         ExprKind::Literal(Literal::TemplateString(raw)) => {
             let mut used = false;
