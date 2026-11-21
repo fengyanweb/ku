@@ -1,4 +1,4 @@
-import { LinkedLiveIntBinding, LinkedMemberUnavailable, LinkedNullDropC, RejectLinkedLoopWrite } from "./linked_member_ownership.ku"
+import { LinkedLiveIntBinding, LinkedMemberUnavailable, LinkedNullDropC, RejectLinkedLoopWrite, RejectLinkedWriteRange } from "./linked_member_ownership.ku"
 import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { FindLinkedLocalRead, LinkedLocalReadBinding } from "./call_contracts.ku"
@@ -295,4 +295,34 @@ fn LinkedCountdownIndex(&project: LinkedNullProject, &state: LinkedNullState, &l
     }
     RejectLinkedLoopWrite(project, loop, cursor.text, "linked_loop_cursor_write", "countdown can change its cursor only at the end")?
     return ok(slot)
+}
+
+fn LinkedCountedInitial(&project: LinkedNullProject, &state: LinkedNullState, &region: Node,
+                        &loop: Node, start: int, index: int): Node! {
+    previous = LinkedNullChild(project, 1, region, index - 1)
+    initial = LinkedNullNode(project, 1, previous)
+    guard_id = LinkedNullChild(project, 1, loop, 0)
+    guard = LinkedNullNode(project, 1, guard_id)
+    if (guard.kind != "Binary" || guard.text != "<" || guard.edge_count != 2) { return ok(initial) }
+    bound = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 1))
+    if (LinkedLiveIntBinding(state, bound) == 0) { return ok(initial) }
+    cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
+    if (LinkedLiveIntBinding(state, cursor) == 0 || (initial.kind == "Assign" && initial.text == cursor.text)) {
+        return ok(initial)
+    }
+
+    // Only a preceding statement in the same lexical region can establish
+    // the cursor. Nested statements may invalidate it rather than supply it.
+    position = index - 2
+    while (position >= start) {
+        id = LinkedNullChild(project, 1, region, position)
+        candidate = LinkedNullNode(project, 1, id)
+        if (candidate.kind == "Assign" && candidate.edge_count == 1 && candidate.text == cursor.text) {
+            RejectLinkedWriteRange(project, id + 1, guard_id, cursor.text, "linked_loop_initial_write",
+                "a counted loop cannot use an earlier cursor initializer after an intervening write")?
+            return ok(candidate)
+        }
+        position = position - 1
+    }
+    return ok(initial)
 }

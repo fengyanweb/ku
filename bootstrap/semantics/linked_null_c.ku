@@ -1,4 +1,4 @@
-import { AddLinkedNullSlot, LinkedCountdownIndex, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, LinkedCountedInitial, LinkedCountdownIndex, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
 import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedPlainReturn } from "./linked_function_c.ku"
@@ -310,7 +310,7 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             stepped = lowerLinkedRegion(project, statement, opened.state, 1, result, depth + 1)?
             next = CloseLinkedCharacterLoop(stepped, opened.outer, opened.before, statement)?
         } else if (statement.kind == "While" && statement.edge_count >= 2 && index > start) {
-            initial = LinkedNullNode(project, 1, LinkedNullChild(project, 1, region, index - 1))
+            initial = LinkedCountedInitial(project, next, region, statement, start, index)?
             next = addCountedLoop(project, next, statement, initial, result, depth)?
         } else if ((statement.kind == "ExprStmt" || statement.kind == "Print") && statement.edge_count == 1) {
             next = LowerLinkedStatementCall(project, next, statement)?

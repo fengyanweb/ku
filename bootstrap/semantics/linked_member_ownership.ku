@@ -315,11 +315,8 @@ fn linkedCountedBoundWrite(&node: Node, &name: str): bool {
     return (node.kind == "Assign" || node.kind == "VarDecl") && node.text == name
 }
 
-fn RejectLinkedLoopWrite(&project: LinkedNullProject, &loop: Node, &name: str, code: str, message: str): null! {
-    // The checked AST is contiguous and in post-order. This region includes
-    // all nested writes before the terminal cursor update.
-    end = LinkedNullChild(project, 1, loop, loop.edge_count - 1)
-    index = LinkedNullChild(project, 1, loop, 0) + 1
+fn RejectLinkedWriteRange(&project: LinkedNullProject, start: int, end: int, &name: str, code: str, message: str): null! {
+    index = start
     while (index < end) {
         if (linkedCountedBoundWrite(project.supplied[0].named.parsed.arena.nodes[index - 1], name)) {
             RejectLayout(code.clone(), message.clone(), DeclarationSpan(project.supplied[0].named.parsed.arena.nodes[index - 1]))?
@@ -327,6 +324,14 @@ fn RejectLinkedLoopWrite(&project: LinkedNullProject, &loop: Node, &name: str, c
         index = index + 1
     }
     return ok(null)
+}
+
+fn RejectLinkedLoopWrite(&project: LinkedNullProject, &loop: Node, &name: str, code: str, message: str): null! {
+    // The checked AST is contiguous and in post-order. This region includes
+    // all nested writes before the terminal cursor update.
+    start = LinkedNullChild(project, 1, loop, 0) + 1
+    end = LinkedNullChild(project, 1, loop, loop.edge_count - 1)
+    return RejectLinkedWriteRange(project, start, end, name, code, message)
 }
 
 fn CheckLinkedCountedBoundWrites(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node): null! {

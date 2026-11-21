@@ -1256,6 +1256,16 @@ fn Count(&available: [int], skip: int): CountResult! {
     while (cursor < work_limit) { cursor = cursor + 1 }
     return ok(CountResult { value: cursor })
 }
+fn CountSeparated(&available: [int], skip: int): CountResult! {
+    cursor = 0
+    work_limit = available.len() - skip
+    observed = skip
+    while (cursor < work_limit) {
+        if (observed < 0) { fail { domain: "fixture", code: "negative", message: "negative skip" } }
+        cursor = cursor + 1
+    }
+    return ok(CountResult { value: cursor })
+}
 fn MutableBound(start: int): null! {
     work_limit = start
     cursor = 0
@@ -1279,21 +1289,22 @@ fn SameBinding(): null! {
     while (cursor < cursor) { cursor = cursor + 1 }
     return ok(null)
 }
+fn InterveningWrite(start: int): null! {
+    remaining = start
+    while (remaining > 0) {
+        cursor = 0
+        work_limit = start
+        if (remaining > 1) { cursor = cursor + 1 }
+        while (cursor < work_limit) { cursor = cursor + 1 }
+        remaining = remaining - 1
+    }
+    return ok(null)
+}
 "#,
     )
     .unwrap();
     fs::write(cwd.join("modules.txt"), "counted-int-bound.ku\n").unwrap();
-    fs::write(cwd.join("function.txt"), "Count").unwrap();
     fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
-    let emitted = execute(&mut Command::new(seed), cwd, 30);
-    assert_ok(&emitted);
-    let code = String::from_utf8(emitted.stdout).unwrap();
-    let definition = code
-        .lines()
-        .find(|line| line.contains(" ku_linked_null_"))
-        .unwrap();
-    let (result, entry) = definition.split_once(' ').unwrap();
-    let entry = entry.split_once('(').unwrap().0;
     let host = r#"
 int main(void) {
     int64_t data[] = {1, 2, 3};
@@ -1307,18 +1318,32 @@ int main(void) {
     assert(available.data == data && available.len == 3);
     return 0;
 }
-"#
-    .replace("__RESULT__", result)
-    .replace("__ENTRY__", entry);
+"#;
     let c = cwd.join("counted-int-bound.c");
     let app = cwd.join(format!("counted-int-bound{}", std::env::consts::EXE_SUFFIX));
-    fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
-    compile_projection(&c, &app, cwd);
-    assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+    for function in ["Count", "CountSeparated"] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        let definition = code
+            .lines()
+            .find(|line| line.contains(" ku_linked_null_"))
+            .unwrap();
+        let (result, entry) = definition.split_once(' ').unwrap();
+        let entry = entry.split_once('(').unwrap().0;
+        let caller = host
+            .replace("__RESULT__", result)
+            .replace("__ENTRY__", entry);
+        fs::write(&c, format!("#include <assert.h>\n{code}{caller}")).unwrap();
+        compile_projection(&c, &app, cwd);
+        assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+    }
     for (function, diagnostic) in [
         ("MutableBound", "linked_loop_bound_write"),
         ("MutableCursor", "linked_loop_cursor_write"),
         ("SameBinding", "linked_loop_bound_cursor"),
+        ("InterveningWrite", "linked_loop_initial_write"),
     ] {
         fs::write(cwd.join("function.txt"), function).unwrap();
         let rejected = execute(&mut Command::new(seed), cwd, 30);
