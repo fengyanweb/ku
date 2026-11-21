@@ -5,8 +5,8 @@ import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray,
-    LinkedNullReadableArray, LinkedNullState, LinkedNullValue, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
-import { LinkedNullArrayElement, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult,
+    LinkedNullReadableArray, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
+import { LinkedIntResult, LinkedNullArrayElement, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult,
     ReadLinkedOwnedArray, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead } from "./linked_null_read_c.ku"
@@ -26,12 +26,25 @@ fn LinkedFieldAppendArgument(&project: LinkedNullProject, &target: Node, &root: 
 
 fn LowerLinkedFieldAppend(&project: LinkedNullProject, state: LinkedNullState, target: int, argument: int): LinkedNullState! {
     element = LowerLinkedNullValue(project, state, argument, 0)?
+    copy_int = LinkedIntResult(element.value.ty) && !element.value.borrowed
+    if (copy_int) {
+        // A Copy expression can still name an lvalue. Read it before
+        // selecting and validating the destination, and before realloc.
+        item = "append_item" + str(argument)
+        element.state.code += "    int64_t " + item.clone() + " = " + element.value.text + ";\n"
+        element = LinkedReadonlyExpression(element.state, element.value.ty, item)
+    }
     destination = LowerLinkedNullRead(project, element.state, target, 0)?
     array = destination.value.clone()
     item = element.value
-    // The field remains a member of the same live record on both success and
-    // failure. Append transfers only the separately owned element.
-    if (!LinkedNullOwnedArray(array.ty) || array.borrowed || array.member_path == ""
+    // Keep the same field owner across the checked append. Only a record
+    // element transfers an owner; the int path passes its saved Copy value.
+    if (LinkedNullIntArrayOwner(array.ty)) {
+        if (array.borrowed || array.member_path == "" || !copy_int) {
+            RejectLayout("linked_field_append", "append requires an owned int array field and one Copy int",
+                         DeclarationSpan(LinkedNullNode(project, 1, argument)))?
+        }
+    } else if (!LinkedNullOwnedArray(array.ty) || array.borrowed || array.member_path == ""
         || item.borrowed || item.slot == 0 || item.member_path != ""
         || !SameLinkedType(LinkedNullArrayElement(array.ty.clone()), item.ty)) {
         RejectLayout("linked_field_append", "append requires an owned record array field and a separate owned element",
