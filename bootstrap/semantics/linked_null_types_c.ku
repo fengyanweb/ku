@@ -4,7 +4,7 @@ import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
-import { ResolveTypeName, RetagTypeNameBinding, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
+import { LinkedCopyResult, ResolveTypeName, RetagTypeNameBinding, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { CTypeName, ProjectionBuiltinLinkFor, ProjectionBuiltinLinkId, ProjectionBytesGet, LinkedBufferResult, LinkedIntArrayCallbackNominal, LinkedIntAppendCallbackNominals, RequireProjectionLocalFunction, ProjectionPlaceRoot, RequireProjectionBuiltin, ResolveProjectionDirectFunction } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningStructDropReference } from "./nested_struct_c.ku"
@@ -151,7 +151,7 @@ fn LinkedIntResult(&binding: TypeNameBinding): bool {
 
 fn LinkedNullHasResultValue(&binding: TypeNameBinding): bool {
     return LinkedNullOwnedArray(binding) || binding.declaration_kind == "Struct" || LinkedBufferResult(binding)
-        || LinkedIntResult(binding) || LinkedNullIntArrayOwner(binding) || binding.declaration_kind == "OwnedStringArray"
+        || LinkedCopyResult(binding) || LinkedNullIntArrayOwner(binding) || binding.declaration_kind == "OwnedStringArray"
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
@@ -287,7 +287,7 @@ fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bo
     }
     result = LinkedNullType(project, unit, payload_id)?
     if (!LinkedNullHasResultValue(result) && (result.declaration_kind != "Builtin" || result.name != "null")) {
-        RejectLayout("linked_dependency_result", "expected null!, str!, [str]!, a named record Result or a struct array Result", result.span.clone())?
+        RejectLayout("linked_dependency_result", "expected a checked null, bool, int, string, buffer, record or supported array", result.span.clone())?
     }
     return ok(result)
 }

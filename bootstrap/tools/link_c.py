@@ -112,6 +112,8 @@ class TypeRef:
         if kind_name == "Builtin":
             if ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0:
                 raise LinkError(f"{where} builtin must have a null path and node 0")
+            if name == "bool" and checked_result and c_type != "KuBootstrapResult_bool":
+                raise LinkError(f"{where} checked bool requires the KuBootstrapResult_bool carrier")
             identity = ("builtin", name)
         elif kind_name == "BuiltinArray":
             view_carrier = {"str": "KuGuardStringArray", "int": "KuArrayInt"}.get(name)

@@ -3,7 +3,7 @@ import { EmitLinkedBodyPrelude, HoldLinkedCopyOperand, LinkedFieldRoot, LinkedNu
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
 import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult } from "./struct_projection_c.ku"
-import { TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
+import { LinkedCopyResult, TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { CheckLinkedStringAppendTarget, FinishLinkedFieldAppend, FinishLinkedStringAppend } from "./linked_array_fields_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
@@ -33,7 +33,7 @@ fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunc
         index = index + 1
     }
     if (string_result) { text += StructValueResultHeader("KuProjectionString") }
-    if (payload.declaration_kind == "Struct" || (checked && (LinkedIntResult(payload) || LinkedNullIntArrayOwner(payload)))) {
+    if (payload.declaration_kind == "Struct" || (checked && (LinkedCopyResult(payload) || LinkedNullIntArrayOwner(payload)))) {
         root = LinkedNullCType(payload)?
         text += StructValueResultHeader(root)
         records = records.push(root)
@@ -74,7 +74,7 @@ fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunc
     link_index = 0
     while (link_index < links.len()) {
         if (links[link_index].returns_result && (links[link_index].result.declaration_kind == "Struct"
-            || LinkedIntResult(links[link_index].result) || LinkedNullIntArrayOwner(links[link_index].result))) {
+            || LinkedCopyResult(links[link_index].result) || LinkedNullIntArrayOwner(links[link_index].result))) {
             kind = LinkedNullCType(links[link_index].result)?
             if (!ContainsType(records, kind)) {
                 text += StructValueResultHeader(kind)
@@ -354,11 +354,11 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
     next = state
     if (LinkedNullHasResultValue(result)) {
         value = LowerLinkedExpectedValue(project, next, result, id, 0)?
-        copy = LinkedIntResult(result)
+        copy = LinkedCopyResult(result)
         static_string = LinkedStringResult(result) && node.kind == "String" && node.edge_count == 0
         if (!SameLinkedType(value.value.ty, result) || (!copy && !static_string &&
             (value.value.slot == 0 || (value.value.borrowed && value.value.member_path == "")))) {
-            RejectLayout("linked_result_return", "return needs a matching Copy int or an initialized matching owner", DeclarationSpan(node))?
+            RejectLayout("linked_result_return", "return needs a matching Copy value or an initialized matching owner", DeclarationSpan(node))?
         }
         value.state.code = value.state.code + "    result.value = " + value.value.text.clone() + ";\n"
         if (copy || static_string) { next = value.state }

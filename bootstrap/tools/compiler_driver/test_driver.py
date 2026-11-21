@@ -170,6 +170,84 @@ def exercise_project(compiler, cc, root, caller):
         assert not missing_unit.stdout and b"unresolved_import" in missing_unit.stderr
 
 
+def exercise_checked_bool(compiler, cc, caller):
+    source = caller / "boolean.ku"
+    source.write_text('''\
+fn Check(value: int): bool! {
+    if (value < 0) { fail { domain: "predicate", code: "range", message: "negative test" } }
+    return ok(value > 0)
+}
+fn UseGuard(value: int): int! {
+    if (Check(value)?) { return ok(41) }
+    return ok(27)
+}
+fn UseLocal(value: int): bool! {
+    checked = Check(value)?
+    return ok(checked)
+}
+fn InvalidGuard(value: int): null! {
+    if (UseGuard(value)?) { return ok(null) }
+    return ok(null)
+}
+''', encoding="utf-8")
+    manifest = caller / "boolean.txt"
+    manifest.write_text(source.name + "\n", encoding="utf-8")
+    linker = Path(__file__).resolve().parents[1] / "link_c.py"
+    link = [sys.executable, "-B", linker, "--cc", cc]
+    units = {}
+    declarations = {}
+    for name in ("Check", "UseGuard", "UseLocal"):
+        plan = caller / f"{name}.plan.json"
+        code = caller / f"{name}.c"
+        plan.write_bytes(execute([compiler, "emit-unit-plan", manifest, name], caller).stdout)
+        code.write_bytes(execute([compiler, "emit-unit", manifest, name], caller).stdout)
+        declarations[name] = json.loads(plan.read_bytes())["export"]
+        units[name] = ["--unit", plan, code]
+    for name in ("Check", "UseLocal"):
+        signature = declarations[name]["signature"]
+        assert signature["returns_result"] and signature["result"]["source_name"] == "bool"
+        assert signature["result"]["c_type"] == "KuBootstrapResult_bool"
+
+    for name, expected in [("UseGuard", (27, 41)), ("UseLocal", (0, 1))]:
+        entry = declarations[name]
+        symbol = entry["symbol"]
+        carrier = entry["signature"]["result"]["c_type"]
+        host = caller / "boolean-host.c"
+        host.write_text(f'''\
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void) {{
+    {carrier} failure = {symbol}(-1);
+    assert(!failure.ok);
+    assert(failure.error.domain.len == 9 && memcmp(failure.error.domain.ptr, "predicate", 9) == 0);
+    assert(failure.error.code.len == 5 && memcmp(failure.error.code.ptr, "range", 5) == 0);
+    assert(failure.error.message.len == 13 && memcmp(failure.error.message.ptr, "negative test", 13) == 0);
+    if (failure.error.domain.storage == 1u) free(failure.error.domain.ptr);
+    if (failure.error.code.storage == 1u) free(failure.error.code.ptr);
+    if (failure.error.message.storage == 1u) free(failure.error.message.ptr);
+    {carrier} first = {symbol}(0), second = {symbol}(1);
+    assert(first.ok && first.value == {expected[0]});
+    assert(second.ok && second.value == {expected[1]});
+    return 0;
+}}
+''', encoding="ascii")
+        binary = caller / ("linked-bool.exe" if os.name == "nt" else "linked-bool")
+        execute([*link, *units[name], *units["Check"], "--entry", entry["source_path"], str(entry["node"]),
+                 "--caller", host, "-o", binary], caller)
+        assert execute([binary], caller).stdout == b""
+
+    invalid = execute([compiler, "emit-unit", manifest, "InvalidGuard"], caller, 1)
+    assert not invalid.stdout and b"linked_guard_type" in invalid.stderr
+    _, plan, code = units["Check"]
+    wrong = json.loads(plan.read_bytes())
+    wrong["export"]["signature"]["result"]["c_type"] = "KuBootstrapResult_int64_t"
+    bad = caller / "wrong-bool.plan.json"
+    bad.write_text(json.dumps(wrong), encoding="utf-8")
+    rejected = execute([*link, "--unit", bad, code, "--check-only"], caller, 1)
+    assert b"checked bool requires the KuBootstrapResult_bool carrier" in rejected.stderr
+
+
 def exercise(ku, cc):
     here = Path(__file__).resolve().parent
     with tempfile.TemporaryDirectory(prefix="ku-bootstrap-argv-test-") as temp:
@@ -249,6 +327,7 @@ def exercise(ku, cc):
         emitted = execute([compiler, "emit", source.name, "AddOne"], caller).stdout
         exercise_emitted(cc, emitted, caller, "derived", b"(41)", b"42")
         exercise_project(compiler, cc, root, caller)
+        exercise_checked_bool(compiler, cc, caller)
         print("bootstrap argv, module checks, signature and standalone C verified")
 
 
