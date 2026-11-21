@@ -286,9 +286,9 @@ fn native_task_matches_bounded_enum_results_with_lazy_arms() {
 
     for (case, arm_cases, error) in [
         (
-            "guard",
-            "Phase.Ready if (true) => \"x\", Phase.Ready => \"y\", Phase.Done => \"z\"",
-            "guards in a native Task match",
+            "guarded_wildcard",
+            "_ if (true) => \"x\", _ => \"y\"",
+            "a guarded wildcard in a native Task match",
         ),
         (
             "binding",
@@ -312,6 +312,143 @@ fn native_task_matches_bounded_enum_results_with_lazy_arms() {
         let stderr = normalized(&rejected.stderr);
         assert!(stderr.contains(error), "{case}: {stderr}");
     }
+}
+
+#[test]
+fn native_task_guards_only_matching_enum_variants_and_falls_through() {
+    let directory = TempDir::new("task-guarded-enum-match");
+    let path = directory.path();
+    fs::write(
+        path.join("worker.ku"),
+        r#"
+import time from "std.time"
+enum Phase { Ready, Done }
+async fn Resolve(phase: Phase): Phase! {
+    println("resolve")
+    time.sleep(25)?
+    return ok(phase)
+}
+async fn Test(label: str, allowed: bool): bool! {
+    println(label)
+    time.sleep(25)?
+    return ok(allowed)
+}
+async fn Broken(): bool! {
+    println("guard error")
+    time.sleep(25)?
+    fail "approval failed"
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        path.join("main.ku"),
+        r#"
+import { Phase as Workflow, Resolve, Test, Broken } from "./worker"
+async fn Read(): str! {
+    label = "完成" + "🙂"
+    text = match (await Resolve(Workflow.Done))? {
+        Workflow.Ready if ((await Test("mismatch", true))?) => "wrong tag"
+        Workflow.Done if ((await Test(label.clone(), false))?) => "wrong guard"
+        Workflow.Done if (label.len() > 0 && (await Test("accepted", true))?) => label
+        Workflow.Done => "wrong fallback"
+        Workflow.Ready => "ready"
+    }
+    return ok(text)
+}
+async fn Facts(number: int | null): int! {
+    if (number != null) {
+        value = match Workflow.Done {
+            Workflow.Done if (number > 0 && (await Test("known", true))?) => number + 1
+            _ => number
+        }
+        return ok(value)
+    }
+    return ok(-1)
+}
+async fn Disjoint(phase: Workflow): str! {
+    label = "保留" + "🙂"
+    return ok(match phase {
+        Workflow.Done if ((await Test(label, false))?) => "wrong arm"
+        Workflow.Done => "fallback"
+        Workflow.Ready => label
+    })
+}
+async fn main(): null! {
+    println((await Read())?)
+    phase = (await Resolve(Workflow.Done))?
+    try {
+        text = match phase {
+            Workflow.Done if ((await Broken())?) => "wrong selected"
+            _ => "wrong fallback"
+        }
+        println(text)
+    } catch (issue) { println(issue.message) }
+    println(phase == Workflow.Done)
+    println((await Facts(1))?)
+    println((await Facts(0))?)
+    println((await Disjoint(Workflow.Ready))?)
+    println((await Disjoint(Workflow.Done))?)
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let normalized = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    let call = |args: &[&str]| {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_ku"));
+        cli.current_dir(path).args(args);
+        run_bounded(&mut cli, BUILD_TIMEOUT, BUILD_LIMITS).unwrap()
+    };
+    let expected = "resolve\n完成🙂\naccepted\n完成🙂\nresolve\nguard error\napproval failed\ntrue\nknown\n2\n0\n保留🙂\n保留🙂\nfallback\n";
+    let interpreted = call(&["run", "main.ku"]);
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        normalized(&interpreted.stderr)
+    );
+    assert_eq!(normalized(&interpreted.stdout), expected);
+    let filename = if cfg!(windows) { "app.exe" } else { "app" };
+    let built = call(&["build", "--release", "--offline", "main.ku", "-o", filename]);
+    let stderr = normalized(&built.stderr);
+    if !built.status.success() && stderr.contains("C compiler not found") {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none(), "{stderr}");
+        return;
+    }
+    assert!(built.status.success(), "{stderr}");
+    let result = run_bounded(
+        Command::new(path.join(filename)).current_dir(path),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(result.status.success(), "{}", normalized(&result.stderr));
+    assert_eq!(normalized(&result.stdout), expected);
+
+    fs::write(
+        path.join("moved.ku"),
+        r#"
+import { Phase, Test } from "./worker"
+async fn main(): null! {
+    label = "same" + " owner"
+    value = match Phase.Done {
+        Phase.Done if ((await Test(label, false))?) => "unselected"
+        Phase.Done => label
+        Phase.Ready => "different tag"
+    }
+    println(value)
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let rejected = call(&["build", "--native", "moved.ku"]);
+    let diagnostic = normalized(&rejected.stderr);
+    assert!(!rejected.status.success());
+    assert!(
+        diagnostic.contains("a slot that is not definitely initialized"),
+        "{diagnostic}"
+    );
 }
 
 #[test]

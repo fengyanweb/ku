@@ -89,7 +89,7 @@ Task 的 `http.request` 支持字面量和局部配置对象，字符串 header 
 
 所有变体都没有载荷的具名枚举可以作为 owned Task 实参，也可以通过 `Phase!` 这样的单层 Result 从子 Task 返回。具名 Task 结构体也可以携带这种枚举字段。相同枚举类型的值可以用 `==` 和 `!=` 比较，比较后两个操作数仍可读取。
 
-native Task 可以用 `match` 匹配无载荷枚举的无 guard 变体，也可以用末尾的 `_` 分支。各分支产生同一种 `int`、`bool`、`null` 或 owned `str`。匹配对象只求值一次，只有选中的分支会运行。该分支可以挂起，也可以通过 `?` 传播错误。
+native Task 可以用 `match` 匹配无载荷枚举的变体，也可以用末尾无 guard 的 `_` 分支。各分支产生同一种 `int`、`bool`、`null` 或 owned `str`。匹配对象只求值一次。变体的 tag 匹配后才求值布尔 guard。guard 为 false 时继续匹配同一变体的后续分支或末尾通配分支。guard 和选中的分支都可以挂起，也可以通过 `?` 传播错误。若后续分支仍要使用某个 owned 值，可给 guard 中的 owned 调用传入该值的 `.clone()`。
 
 Task 可以读取响应的 `body/status`，读取或写入 `response.headers[key]`，并将 owned 响应跨等待保存或返回。动态 header 的字符串类型、名称、值、数量、字节和传输字段仍由既有 HTTP 校验约束；分配计入 Task 预算。非法响应不会使后续合法请求失效。这不扩展为任意 Task 对象、结构体或嵌套容器。
 

@@ -89,7 +89,7 @@ Task `http.request` accepts inline and locally bound configuration objects, incl
 
 A declared enum whose variants have no payload can be passed as an owned Task argument or returned in a single-layer Result, such as `Phase!`. A named Task record can also carry such an enum as a field. Values of the same enum type support `==` and `!=`. Both operands remain readable after comparison.
 
-In a native Task, `match` can select an unguarded alternative of a payload-free enum or a final `_` arm. Each arm yields the same type among `int`, `bool`, `null` and owned `str`. The subject is evaluated once, and only the selected arm runs. That arm can suspend and propagate an error through `?`.
+In a native Task, `match` can select an alternative of a payload-free enum or a final unguarded `_` arm. Each arm yields the same type among `int`, `bool`, `null` and owned `str`. The subject is evaluated once. A variant's boolean guard runs after its tag matches. A false guard continues to the next matching alternative or the final wildcard. Both the guard and the selected arm can suspend and propagate an error through `?`. To retain an owned value for a later arm, pass `.clone()` to owning calls in the guard.
 
 Tasks can read response `body/status`, read or write `response.headers[key]`, and retain or return owned responses across suspension. Existing HTTP checks still govern string types, names, values, counts, bytes and transport-managed fields. Allocations use the Task budget. Invalid responses do not prevent subsequent valid requests. This does not add arbitrary Task objects, structs or nested containers.
 

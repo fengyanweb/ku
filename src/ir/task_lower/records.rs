@@ -253,12 +253,10 @@ impl FunctionLowerer<'_> {
             .iter()
             .map(|v| (v.name.as_str(), v.tag))
             .collect();
+        let variant_count = variants.len();
         let mut covered = std::collections::HashSet::new();
         let mut tags = Vec::with_capacity(arms.len());
         for (index, arm) in arms.iter().enumerate() {
-            if let Some(guard) = &arm.guard {
-                return Err(unsupported("guards in a native Task match", guard.span));
-            }
             let tag = match &arm.pattern {
                 MatchPattern::EnumVariant {
                     enum_name,
@@ -271,10 +269,19 @@ impl FunctionLowerer<'_> {
                         .ok_or_else(|| {
                             unsupported("an unknown Task enum match variant", arm.span)
                         })?;
-                    if !covered.insert(tag) {
+                    if covered.contains(&tag) {
                         return Err(unsupported("a repeated Task enum match variant", arm.span));
                     }
+                    if arm.guard.is_none() {
+                        covered.insert(tag);
+                    }
                     Some(tag)
+                }
+                MatchPattern::Wildcard if arm.guard.is_some() => {
+                    return Err(unsupported(
+                        "a guarded wildcard in a native Task match",
+                        arm.span,
+                    ));
                 }
                 MatchPattern::Wildcard if index + 1 == arms.len() => None,
                 _ => return Err(unsupported(
@@ -284,10 +291,9 @@ impl FunctionLowerer<'_> {
             };
             tags.push(tag);
         }
-        if tags.is_empty() || (tags.last() != Some(&None) && covered.len() != variants.len()) {
+        if tags.is_empty() || (tags.last() != Some(&None) && covered.len() != variant_count) {
             return Err(unsupported("a nonexhaustive Task enum match", span));
         }
-
         // A tag-only pattern never consumes a named enum. Anonymous
         // scrutinees can retire once the tag has been read.
         let tag = if arms.len() > 1 {
@@ -302,25 +308,20 @@ impl FunctionLowerer<'_> {
         if let [arm] = arms {
             return self.unit_enum_match_value(arm, depth);
         }
+        let tag = tag.expect("multiple arms read the subject tag");
+        if arms.iter().any(|arm| arm.guard.is_some()) {
+            return self.guarded_unit_enum_match(tag, arms, &tags, variant_count, depth);
+        }
         let join = self.state(TaskTerminator::Terminate)?;
         let before_facts = self.nullable_facts.clone();
         let mut common_facts = before_facts.clone();
-        let mut result: Option<SlotId> = None;
+        let mut result = None;
         for (index, (arm, expected_tag)) in arms.iter().zip(tags).enumerate() {
             // The last arm covers every remaining tag of the checked layout.
             // Earlier alternatives branch before any of their values run.
             let next = if index + 1 < arms.len() {
-                let alternative = self.constant(
-                    TaskConstant::Int(expected_tag.expect("nonfinal arm has a tag")),
-                    IrType::Int,
-                )?;
-                let condition = self.slot(value_slot(IrType::Bool))?;
-                self.emit(TaskOp::Binary {
-                    dst: condition,
-                    op: TaskBinaryOp::Equal,
-                    left: tag.expect("multiple arms read the subject tag"),
-                    right: alternative,
-                })?;
+                let condition =
+                    self.unit_enum_matches_tag(tag, expected_tag.expect("nonfinal arm has a tag"))?;
                 let selected = self.state(TaskTerminator::Terminate)?;
                 let next = self.state(TaskTerminator::Terminate)?;
                 self.terminate(TaskTerminator::Branch {
@@ -334,26 +335,7 @@ impl FunctionLowerer<'_> {
                 None
             };
             self.nullable_facts = before_facts.clone();
-            let source = self.unit_enum_match_value(arm, depth)?;
-            let ty = self.function.slots[source.0].ty.clone();
-            let dst = if let Some(dst) = result {
-                if ty != self.function.slots[dst.0].ty {
-                    return Err(unsupported(
-                        "mismatched Task match arm result types",
-                        arm.span,
-                    ));
-                }
-                dst
-            } else {
-                let dst = self.slot(ty.clone())?;
-                result = Some(dst);
-                dst
-            };
-            self.emit(if copy_value(&ty) {
-                TaskOp::Copy { dst, src: source }
-            } else {
-                TaskOp::Move { dst, src: source }
-            })?;
+            self.unit_enum_match_store(arm, depth, &mut result)?;
             common_facts.retain(|slot, fact| self.nullable_facts.get(slot) == Some(fact));
             self.terminate(TaskTerminator::Jump { target: join })?;
             self.current = next;
@@ -361,6 +343,139 @@ impl FunctionLowerer<'_> {
         self.current = Some(join);
         self.nullable_facts = common_facts;
         Ok(result.expect("a matched arm emits its result"))
+    }
+
+    fn guarded_unit_enum_match(
+        &mut self,
+        tag: SlotId,
+        arms: &[MatchArm],
+        tags: &[Option<i64>],
+        variant_count: usize,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        let fallback = (tags.last() == Some(&None)).then_some(arms.len() - 1);
+        let mut first = HashMap::new();
+        let mut following = vec![None; arms.len()];
+        for (index, tag) in tags.iter().enumerate().rev() {
+            if let Some(tag) = tag {
+                following[index] = first.insert(*tag, index).or(fallback);
+            }
+        }
+        let mut heads: Vec<_> = tags
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tag)| {
+                tag.filter(|tag| first[tag] == index)
+                    .map(|tag| (index, tag))
+            })
+            .collect();
+        let entries: Vec<_> = arms
+            .iter()
+            .map(|_| self.state(TaskTerminator::Terminate))
+            .collect::<KuResult<_>>()?;
+        let join = self.state(TaskTerminator::Terminate)?;
+        let before_facts = self.nullable_facts.clone();
+        let mut common_facts = before_facts.clone();
+        let mut incoming = vec![None; arms.len()];
+        for &(index, _) in &heads {
+            incoming[index] = Some(before_facts.clone());
+        }
+        // Dispatch on the tag once. A false guard can then enter only a
+        // continuation for that same tag, or the shared wildcard.
+        let landing = if heads.len() == variant_count {
+            heads.pop().expect("an enum match has alternatives").0
+        } else {
+            let fallback = fallback.expect("unlisted tags require a wildcard");
+            incoming[fallback] = Some(before_facts.clone());
+            fallback
+        };
+        for (index, expected_tag) in heads {
+            let condition = self.unit_enum_matches_tag(tag, expected_tag)?;
+            let next = self.state(TaskTerminator::Terminate)?;
+            self.terminate(TaskTerminator::Branch {
+                condition,
+                then_state: entries[index],
+                else_state: next,
+            })?;
+            self.current = Some(next);
+        }
+        self.terminate(TaskTerminator::Jump {
+            target: entries[landing],
+        })?;
+
+        let mut result = None;
+        for (index, arm) in arms.iter().enumerate() {
+            self.current = Some(entries[index]);
+            self.nullable_facts = incoming[index]
+                .take()
+                .unwrap_or_else(|| before_facts.clone());
+            if let Some(guard) = &arm.guard {
+                let condition = self.expression(guard, depth + 1)?;
+                if self.function.slots[condition.0].ty != value_slot(IrType::Bool) {
+                    return Err(unsupported("a non-bool Task match guard", guard.span));
+                }
+                self.end_nullable_view(condition)?;
+                let next = following[index].expect("a guard has a following match arm");
+                if let Some(facts) = incoming[next].as_mut() {
+                    facts.retain(|slot, fact| self.nullable_facts.get(slot) == Some(fact));
+                } else {
+                    incoming[next] = Some(self.nullable_facts.clone());
+                }
+                let selected = self.state(TaskTerminator::Terminate)?;
+                self.terminate(TaskTerminator::Branch {
+                    condition,
+                    then_state: selected,
+                    else_state: entries[next],
+                })?;
+                self.current = Some(selected);
+            }
+            self.unit_enum_match_store(arm, depth, &mut result)?;
+            common_facts.retain(|slot, fact| self.nullable_facts.get(slot) == Some(fact));
+            self.terminate(TaskTerminator::Jump { target: join })?;
+        }
+        self.current = Some(join);
+        self.nullable_facts = common_facts;
+        Ok(result.expect("a matched arm emits its result"))
+    }
+
+    fn unit_enum_matches_tag(&mut self, tag: SlotId, expected: i64) -> KuResult<SlotId> {
+        let alternative = self.constant(TaskConstant::Int(expected), IrType::Int)?;
+        let condition = self.slot(value_slot(IrType::Bool))?;
+        self.emit(TaskOp::Binary {
+            dst: condition,
+            op: TaskBinaryOp::Equal,
+            left: tag,
+            right: alternative,
+        })?;
+        Ok(condition)
+    }
+
+    fn unit_enum_match_store(
+        &mut self,
+        arm: &MatchArm,
+        depth: usize,
+        result: &mut Option<SlotId>,
+    ) -> KuResult<()> {
+        let source = self.unit_enum_match_value(arm, depth)?;
+        let ty = self.function.slots[source.0].ty.clone();
+        let dst = if let Some(dst) = *result {
+            if ty != self.function.slots[dst.0].ty {
+                return Err(unsupported(
+                    "mismatched Task match arm result types",
+                    arm.span,
+                ));
+            }
+            dst
+        } else {
+            let dst = self.slot(ty.clone())?;
+            *result = Some(dst);
+            dst
+        };
+        self.emit(if copy_value(&ty) {
+            TaskOp::Copy { dst, src: source }
+        } else {
+            TaskOp::Move { dst, src: source }
+        })
     }
 
     fn unit_enum_match_value(&mut self, arm: &MatchArm, depth: usize) -> KuResult<SlotId> {
