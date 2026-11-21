@@ -1451,6 +1451,7 @@ def installed_collection_and_copy_consumers(install, root, repo, env, report, ta
     cases = [
         ('array_store', 'tests/native_collection_test.rs', 'RECEIVER_ORDER_SOURCE', 'collection-order-ok\n'),
         ('copy_field_call', 'tests/borrow_checker_test.rs', 'COPY_FIELD_CALL_SOURCE', ''),
+        ('c_keyword_identifiers', 'tests/native_collection_test.rs', 'C_KEYWORD_SOURCE', 'Ku\n147\n'),
     ]
     for name, path, constant, expected in cases:
         fixture = (repo / path).read_text(encoding='utf-8')

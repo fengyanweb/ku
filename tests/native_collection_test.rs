@@ -228,9 +228,7 @@ fn main() {
     assert_eq!(stdout, "4\nbefore!suffix\nafter!\n");
 }
 
-#[test]
-fn native_identifiers_escape_c_keywords_and_preexisting_escape_prefix() {
-    let source = r#"
+const C_KEYWORD_SOURCE: &str = r#"
 struct Record { case: int, ku_c_name_case: int, EOF: int }
 
 fn Read(&case: str, info: Record): int {
@@ -245,8 +243,11 @@ fn main(): null {
     return null
 }
 "#;
-    run_source("native-c-keyword.ku", source).expect("valid Ku identifiers");
-    let Some(stdout) = native_stdout("c-keyword", source) else {
+
+#[test]
+fn native_identifiers_escape_c_keywords_and_preexisting_escape_prefix() {
+    run_source("native-c-keyword.ku", C_KEYWORD_SOURCE).expect("valid Ku identifiers");
+    let Some(stdout) = native_stdout("c-keyword", C_KEYWORD_SOURCE) else {
         return;
     };
     assert_eq!(stdout, "Ku\n147\n");
