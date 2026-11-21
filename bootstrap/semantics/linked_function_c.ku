@@ -6,13 +6,16 @@ import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan } from "./names.ku"
-import { RejectLayout } from "./struct_layouts.ku"
-import { LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
+import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
+import { ContainsIndex } from "./struct_projection_c.ku"
+import { FindLinkedLocalRead, LinkedLocalReadCaptures } from "./call_contracts.ku"
 import { EmitLinkedNullPrototypes, LinkedCheckedResultCType, LinkedNullChild, LinkedNullCType, LinkedNullProject,
          LinkedNullNode, LinkedNullResultCleanupReference, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { EmitLinkedAddition, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { LinkedCPrelude, LinkedNullBinding, LinkedNullState } from "./link_plan_c.ku"
+import { LinkedCPrelude, LinkedNullBinding, LinkedNullState, LinkedNullValue, LinkedRecordFields } from "./link_plan_c.ku"
 
 fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &signature: str,
                          &result_type: str, &payload_cleanup: str, char_errors: str): str {
@@ -154,5 +157,90 @@ fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,
         next = MoveLinkedNullSlot(next, owner)?
     }
     next.code += "    goto cleanup;\n"
+    return ok(next)
+}
+
+fn linkedDestructureConstant(&name: str): bool {
+    letter = false
+    for char in name.clone().chars() {
+        if ("ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(char.clone())) { letter = true }
+        else if (!"_0123456789".contains(char)) { return false }
+    }
+    return letter
+}
+
+fn putLinkedDestructuredField(&project: LinkedNullProject, state: LinkedNullState, &local: Node,
+                              id: int, &field: LinkedNullValue): LinkedNullState! {
+    target = LinkedNullBinding(state.slots, local.text)
+    next = state
+    if (target == 0) {
+        place = AddLinkedNullSlot(project, next, local.text.clone(), "d" + str(id), field.ty.clone(), false)?
+        target = place.value.slot
+        next = place.state
+    } else {
+        old = next.slots[target - 1].value.clone()
+        if (target == field.slot || next.slots[target - 1].parameter || old.borrowed || !SameLinkedType(old.ty, field.ty) ||
+            linkedDestructureConstant(local.text) || LinkedLocalReadCaptures(next.local_readers, target)) {
+            RejectLayout("linked_destructure_target", "replacement requires a distinct mutable local of the same type", DeclarationSpan(local))?
+        }
+        next.code += LinkedNullDropC(next.layouts, next.owning_layouts, old.ty, old.text)
+    }
+    next.code += "    " + next.slots[target - 1].value.text.clone() + " = " + field.text.clone() + ";\n"
+    next.slots[target - 1].live = true
+    next.slots[target - 1].moved_members = []
+    return MoveLinkedNullSlot(next, field)
+}
+
+fn LowerLinkedOwnedDestructure(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    count = statement.int_value
+    at = DeclarationSpan(statement)
+    if (count <= 0 || statement.edge_count != count + 1) {
+        RejectLayout("linked_destructure_shape", "expected an exact record pattern without rest", at.clone())?
+    }
+    input = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, count), 0)?
+    owner = input.value
+    next = input.state
+    if (owner.ty.declaration_kind != "Struct" || owner.slot == 0 || owner.borrowed || owner.member_path != "" ||
+        LinkedMemberUnavailable(next, owner, true)) {
+        RejectLayout("linked_destructure_source", "expected a complete owning record", at.clone())?
+    }
+    fields = LinkedRecordFields(next.layouts, next.owning_layouts, owner.ty)?
+    if (fields.len() != count) {
+        RejectLayout("linked_destructure_shape", "expected all fields of the record", at.clone())?
+    }
+
+    seen_fields: [int] = []
+    seen_locals: [int] = []
+    index = 0
+    while (index < count) {
+        binding = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, index))
+        if (binding.kind != "ObjectDestructureBinding" || binding.edge_count != 1) {
+            RejectLayout("linked_destructure_shape", "expected a field binding without a default", DeclarationSpan(binding))?
+        }
+        local_id = LinkedNullChild(project, 1, binding, 0)
+        local = LinkedNullNode(project, 1, local_id)
+        ordinal = FieldIndex(fields, binding.text)
+        target = LinkedNullBinding(next.slots, local.text)
+        if (ordinal == 0 || ContainsIndex(seen_fields, ordinal) || local.kind != "ObjectDestructureLocal" ||
+            local.text == "" || local.edge_count != 0 || ContainsIndex(seen_locals, target) ||
+            FindLinkedLocalRead(next.local_readers, local.text) != 0) {
+            RejectLayout("linked_destructure_field", "expected a distinct named field and local", DeclarationSpan(binding))?
+        }
+        ty = fields[ordinal - 1].resolved.clone()
+        if (ty.declaration_kind == "StructArray") { ty.declaration_kind = "OwnedStructArray" }
+        else if (ty.declaration_kind == "BuiltinArray" && ty.name == "int") { ty.declaration_kind = "OwnedIntArray" }
+        else if (ty.declaration_kind == "BuiltinArray") {
+            RejectLayout("linked_destructure_field_type", "unsupported owning array field", DeclarationSpan(binding))?
+        }
+        member = LinkedNullValue { ty: ty, text: owner.text.clone() + ".f" + str(ordinal - 1),
+            slot: owner.slot, borrowed: false, member_path: LinkedMemberPath(owner, ordinal) }
+        next = putLinkedDestructuredField(project, next, local, local_id, member)?
+        seen_fields = seen_fields.push(ordinal)
+        seen_locals = seen_locals.push(LinkedNullBinding(next.slots, local.text))
+        index = index + 1
+    }
+    // The fields that need destruction were zeroed by their moves. Copy
+    // fields do not carry resources, and the source no longer has a binding.
+    next.slots[owner.slot - 1].live = false
     return ok(next)
 }

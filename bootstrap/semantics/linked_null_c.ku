@@ -1,7 +1,8 @@
 import { AddLinkedNullSlot, LinkedCountedInitial, LinkedCountdownIndex, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
 import { OpenLinkedForLoop, CloseLinkedForLoop } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
-import { EmitLinkedFunction, LowerLinkedLocalMemberSet, LowerLinkedPlainReturn, LowerLinkedStringAppend } from "./linked_function_c.ku"
+import { EmitLinkedFunction, LowerLinkedLocalMemberSet, LowerLinkedOwnedDestructure,
+         LowerLinkedPlainReturn, LowerLinkedStringAppend } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -297,6 +298,8 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             next = LowerLinkedStringAppend(project, next, statement, id)?
         } else if (statement.kind == "AssignTarget" && statement.edge_count == 2 && depth == 0) {
             next = LowerLinkedLocalMemberSet(project, next, statement)?
+        } else if (statement.kind == "ObjectDestructureAssign") {
+            next = LowerLinkedOwnedDestructure(project, next, statement)?
         } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {
             kind = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0)).kind
             if (kind == "TypeArray") { next = LowerLinkedArrayLocal(project, next, statement, id)? }

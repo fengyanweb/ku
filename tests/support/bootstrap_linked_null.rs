@@ -890,6 +890,166 @@ fn Refuse(token: Token): Token! {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_clone_moved"));
 }
 
+pub(super) fn assert_owned_record_destructure(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("pattern-provider.ku"),
+        r#"struct Item { id: int label: str }
+struct Packet { entries: [Item] tags: [int] title: str }
+struct Reply { packet: Packet stamp: int }
+fn Prepare(input: Packet, reject: bool): Reply! {
+    if (reject) { fail { domain: "pattern", code: "rejected", message: input.title } }
+    return ok(Reply { packet: input, stamp: 27 })
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("pattern-consumer.ku"),
+        r#"import { Packet, Prepare } from "./pattern-provider.ku"
+fn Store(input: Packet, previous: Packet, reject: bool, grow: bool): Packet! {
+    packet = previous
+    { stamp: marker, packet } = Prepare(input, reject)?
+    { title: title, entries, tags } = packet
+    if (grow) { tags = tags.push(marker) }
+    return ok(Packet { title: title, tags: tags, entries: entries })
+}
+fn Borrowed(&packet: Packet): null! {
+    { title, entries, tags } = packet
+    return ok(null)
+}
+fn Repeated(packet: Packet): null! {
+    { title: field, entries, tags: field } = packet
+    return ok(null)
+}
+fn AfterMove(packet: Packet): Packet! {
+    { title, entries, tags } = packet
+    return ok(packet)
+}
+fn Defaulted(packet: Packet, backup: str): null! {
+    { title = backup, entries, tags } = packet
+    return ok(null)
+}
+fn Rest(packet: Packet): null! {
+    { title, ...remaining } = packet
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "pattern-consumer.ku\npattern-provider.ku\n",
+    )
+    .unwrap();
+    let NestedPlan {
+        entry,
+        entry_result,
+        dependency,
+        dependency_result,
+        code,
+    } = nested_plan(seed, cwd, "Store", "Struct");
+    let payload = entry_result.strip_prefix("KuBootstrapResult_").unwrap();
+    let host = r#"
+static int calls;
+static KuProjectionString string_owner(char ch) {
+    uint8_t *bytes = malloc(1);
+    bytes[0] = (uint8_t)ch;
+    return (KuProjectionString){bytes, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+static __PAYLOAD__ packet(char ch) {
+    __PAYLOAD__ value = {0};
+    value.f0.data = malloc(sizeof(*value.f0.data));
+    value.f0.len = value.f0.capacity = 1;
+    value.f0.data[0].f0 = 12;
+    value.f0.data[0].f1 = string_owner(ch);
+    value.f1.data = malloc(sizeof(*value.f1.data));
+    value.f1.len = value.f1.capacity = 1;
+    value.f1.data[0] = 41;
+    value.f2 = string_owner(ch);
+    return value;
+}
+__DEPENDENCY_RESULT__ __DEPENDENCY__(__PAYLOAD__ input, bool reject) {
+    ++calls;
+    __DEPENDENCY_RESULT__ transferred = {0};
+    if (reject) {
+        ku_projection_string_drop(&input.f0.data[0].f1);
+        free(input.f0.data);
+        free(input.f1.data);
+        transferred.error.message = input.f2;
+    } else {
+        transferred.ok = true;
+        transferred.value.f0 = input;
+        transferred.value.f1 = 27;
+    }
+    return transferred;
+}
+static void check_failed_allocation(void) {
+    if (outstanding() || calls != 1 || attempts != 9) _Exit(81);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    __PAYLOAD__ input = packet('x');
+    __PAYLOAD__ previous = packet('y');
+    if (argc == 2) {
+        assert(atexit(check_failed_allocation) == 0);
+        fail_after = 0;
+        (void)__ENTRY__(input, previous, false, true);
+        return 82;
+    }
+    __RESULT__ result = __ENTRY__(input, previous, false, false);
+    assert(result.ok && calls == 1 && attempts == 8 && outstanding() == 4);
+    assert(result.value.f0.data == input.f0.data && result.value.f0.data[0].f0 == 12);
+    assert(result.value.f0.data[0].f1.ptr == input.f0.data[0].f1.ptr);
+    assert(result.value.f1.data == input.f1.data && result.value.f1.data[0] == 41);
+    assert(result.value.f2.ptr == input.f2.ptr && *result.value.f2.ptr == 'x');
+    __DROP__(&result.value);
+    assert(outstanding() == 0);
+    input = packet('z');
+    previous = packet('w');
+    result = __ENTRY__(input, previous, true, true);
+    assert(!result.ok && result.error.message.ptr == input.f2.ptr);
+    assert(calls == 2 && attempts == 16 && outstanding() == 1);
+    ku_projection_string_drop(&result.error.message);
+    assert(outstanding() == 0);
+    return 0;
+}
+"#
+    .replace("__ENTRY__", &entry)
+    .replace("__RESULT__", &entry_result)
+    .replace("__DEPENDENCY_RESULT__", &dependency_result)
+    .replace("__DEPENDENCY__", &dependency)
+    .replace("__PAYLOAD__", payload)
+    .replace("__DROP__", &format!("ku_drop_{payload}"));
+    let c = cwd.join("owned-record-pattern.c");
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    let exe = cwd.join(format!(
+        "owned-record-pattern{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    let trapped = execute(Command::new(&exe).arg("allocation-failure"), cwd, 10);
+    assert_eq!(trapped.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&trapped.stderr).trim(),
+        "array allocation failed"
+    );
+    for (function, diagnostic) in [
+        ("Borrowed", "linked_destructure_source"),
+        ("Repeated", "linked_destructure_field"),
+        ("AfterMove", "unavailable_linked_binding"),
+        ("Defaulted", "linked_destructure_shape"),
+        ("Rest", "linked_destructure_shape"),
+    ] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(error.contains(diagnostic), "{diagnostic}, got {error}");
+    }
+}
+
 pub(super) fn assert_local_array_reader(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("local-reader.ku"),
