@@ -185,11 +185,13 @@ fn LinkedScopedCallbackTypes(&links: [LinkedNullFunction], &slots: [LinkedNullSl
 }
 
 fn RememberLinkedCall(calls: [LinkedNullFunction], dependency: LinkedNullFunction): [LinkedNullFunction] {
-    result = calls
-    for old in result {
-        if (old.unit == dependency.unit && old.node == dependency.node) { return result }
+    index = 0
+    while (index < calls.len()) {
+        if (calls[index].unit == dependency.unit && calls[index].node == dependency.node) { return calls }
+        index = index + 1
     }
-    return result.push(dependency)
+    calls = calls.push(dependency)
+    return calls
 }
 
 fn LinkedDirectCallExpression(&callee: LinkedNullFunction, &arguments: str): str {
@@ -522,7 +524,7 @@ fn LinkedScalarArrayOwner(&type: TypeNameBinding): bool {
 
 fn LinkedScalarArrayLayout(&type: TypeNameBinding): bool {
     return LinkedScalarArrayOwner(type)
-        || (type.declaration_kind == "BuiltinArray" && (type.name == "int" || type.name == "str"))
+        || type.declaration_kind == "BuiltinArray" && (type.name == "int" || type.name == "str")
 }
 
 fn LinkedIntArrayLayout(&type: TypeNameBinding): bool {
