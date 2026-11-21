@@ -1,5 +1,5 @@
 import { GuardExplicitType, GuardType } from "./guarded_struct_expr.ku"
-import { ManagedSourceCharactersRuntime } from "./guarded_string_parts.ku"
+import { ManagedSourceCharactersRuntime, ManagedStringArrayDrop } from "./guarded_string_parts.ku"
 import { LinkedNullIntArrayOwner, LinkedNullState } from "./link_plan_c.ku"
 import { EmitProjectionStringJoinHelpers, ScalarStringSuffixC } from "./scalar_int_emit.ku"
 import { Node } from "../stage2/ast.ku"
@@ -105,6 +105,10 @@ fn EmitStructArrayHeader(&element: str, &array: str): str { return ProjectionArr
 
 fn EmitStructArrayResultHeader(&array: str): str {
     return "typedef struct { bool ok; " + array.clone() + " value; KuBootstrapError error; } KuBootstrapResult_" + array.clone() + ";\n"
+}
+
+fn EmitCheckedStringArrayResultHeader(): str {
+    return "typedef struct { bool ok; KuGuardStringArray value; KuBootstrapError error; } KuBootstrapResultStringArray;\n\n"
 }
 
 fn EmitOwnedStructArrayDrop(&layouts: [StructLayout], root: int, &array: str, &prefix: str): str {
@@ -301,9 +305,14 @@ fn EmitBoundArrayDeclarations(&arrays: [TypeNameBinding], &validated: [TypeNameB
 }
 
 fn EmitBoundArrayResults(&layouts: [StructLayout], &owning_layouts: [StructLayout],
-                         &types: [TypeNameBinding]): str {
+                         &types: [TypeNameBinding], chars: bool): str {
     source = ""
     for owned in types.clone() {
+        if (owned.declaration_kind == "OwnedStringArray") {
+            source += EmitCheckedStringArrayResultHeader()
+            if (!chars) { source += ManagedStringArrayDrop() }
+            continue
+        }
         array_type = BoundArrayCType(owned)
         if (LinkedNullIntArrayOwner(owned)) {
             source += "static void ku_linked_view_int_array_drop(KuArrayInt *array) {\n"
@@ -370,7 +379,7 @@ fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str):
             !ContainsType(definitions.array_types, "KuGuardStringArray"))
     }
     text += EmitBoundElementClones(body.layouts, body.element_clones)
-    text += result_header + EmitBoundArrayResults(body.layouts, body.owning_layouts, body.owned_arrays)
+    text += result_header + EmitBoundArrayResults(body.layouts, body.owning_layouts, body.owned_arrays, body.uses_chars)
     append_types: [TypeNameBinding] = []
     for index in body.append_slots.clone() { append_types = append_types.push(body.slots[index - 1].value.ty.clone()) }
     return ok(text + EmitBoundArrayAppenders(append_types))

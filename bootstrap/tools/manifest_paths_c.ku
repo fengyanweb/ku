@@ -9,6 +9,7 @@ import { EmitNestedCLayouts, OrderCStructLayouts } from "../semantics/nested_str
 import { ScalarFunctionNode } from "../semantics/scalar_int_calls.ku"
 import { ScalarStringHelpers } from "../semantics/scalar_int_emit.ku"
 import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
+import { EmitCheckedStringArrayResultHeader } from "../semantics/struct_array_c.ku"
 import { LinkedNullProject, LinkedNullEntry, LinkedNullChild, LinkedNullNode,
     LinkedNullParameterType, LinkedNullDependency, LinkedNullDependencyPlan, LinkedNullLayout,
     LinkedNullCType, LinkedNullPrototype, LinkedNullParameterPlan } from "../semantics/linked_null_types_c.ku"
@@ -104,7 +105,7 @@ fn emitManifest(&scan: ManifestScan, &symbol: str, &record: str, layouts: str,
     code += "typedef KuString KuProjectionString;\ntypedef KuError KuBootstrapError;\ntypedef KuResult_null KuBootstrapResultNull;\n"
     code += "typedef struct KuResult_str { bool ok; KuString value; KuError error; } KuResult_str;\n"
     code += "typedef struct { size_t len; KuProjectionString* data; size_t capacity; } KuGuardStringArray;\n"
-    code += "typedef struct { bool ok; KuGuardStringArray value; KuBootstrapError error; } KuBootstrapResultStringArray;\n\n"
+    code += EmitCheckedStringArrayResultHeader()
     code += layouts + LinkedNullPrototype(reject)?
     code += "extern KuResult_str " + prepare.symbol.clone() + "(KuProjectionString, " + record.clone() + ");\n\n"
     code += "KuBootstrapResultStringArray " + symbol.clone() + "(KuProjectionString manifest, " + record.clone() + " at) {\n"

@@ -192,6 +192,12 @@ fn ManagedMoveStringSetup(&named: NamedModule, &locals: [GuardBinding], &node: N
         indent.clone() + source + " = (KuProjectionString){0};\n")
 }
 
+fn ManagedStringArrayDrop(): str {
+    return "static void ku_managed_source_drop(KuGuardStringArray *array) {\n"
+        + "    for (size_t i = 0; i < array->len; ++i) ku_projection_string_drop(&array->data[i]);\n"
+        + "    free(array->data);\n    *array = (KuGuardStringArray){0};\n}\n\n"
+}
+
 fn ManagedSourceCharactersRuntime(needs_header: bool): str {
     ascii = ""
     index = 0
@@ -203,9 +209,7 @@ fn ManagedSourceCharactersRuntime(needs_header: bool): str {
     text = "#include <string.h>\n"
     if (needs_header) { text += ProjectionArrayHeader("KuProjectionString", "KuGuardStringArray") }
     text += "enum { KU_SOURCE_OK, KU_SOURCE_INVALID, KU_SOURCE_TOOBIG, KU_SOURCE_ARRAY_OOM, KU_SOURCE_CHAR_OOM };\n\n"
-    text += "static void ku_managed_source_drop(KuGuardStringArray *array) {\n"
-    text += "    for (size_t i = 0; i < array->len; ++i) ku_projection_string_drop(&array->data[i]);\n"
-    text += "    free(array->data);\n    *array = (KuGuardStringArray){0};\n}\n\n"
+    text += ManagedStringArrayDrop()
     text += "static int ku_managed_source_chars(KuProjectionString input, KuGuardStringArray *out) {\n"
     text += "    static const uint8_t ascii[128] = {" + ascii + "};\n"
     text += "    if (!input.len) return KU_SOURCE_OK;\n"

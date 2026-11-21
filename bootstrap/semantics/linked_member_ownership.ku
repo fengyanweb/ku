@@ -46,6 +46,10 @@ fn LinkedViewArgument(&parameter: TypeNameBinding, &value: LinkedNullValue): str
         return ok("&(" + value.text.clone() + ")")
     }
     if (SameLinkedType(parameter, value.ty)) { return ok(value.text.clone()) }
+    if (parameter.declaration_kind == "BuiltinArray" && parameter.name == "str"
+        && value.ty.declaration_kind == "OwnedStringArray" && value.slot > 0 && !value.borrowed) {
+        return ok("&(" + value.text.clone() + ")")
+    }
     if (MatchesLinkedIntArrayOwner(parameter, value.ty)) { return ok("&(" + value.text.clone() + ")") }
     if (matchesLinkedStructArrayOwner(parameter, value.ty)) {
         return ok("&(" + value.text.clone() + ")")

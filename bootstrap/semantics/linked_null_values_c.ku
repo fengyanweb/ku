@@ -144,9 +144,12 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
 }
 
 fn validateLinkedPayload(state: LinkedNullState, &result: TypeNameBinding, &payload: str): LinkedNullState {
-    if (!LinkedNullOwnedArray(result)) { return state }
-    next = RequireLinkedArrayValidation(state, result.clone())
-    prefix = LinkedNullArrayPrefix(result)
+    next = state
+    prefix = "ku_linked_view_str_array"
+    if (LinkedNullOwnedArray(result)) {
+        next = RequireLinkedArrayValidation(next, result.clone())
+        prefix = LinkedNullArrayPrefix(result)
+    } else if (result.declaration_kind != "OwnedStringArray") { return next }
     next.code += "    if (!" + prefix + "_valid(&" + payload.clone() + ") || (uintmax_t)"
         + payload.clone() + ".len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
     return next

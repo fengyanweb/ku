@@ -122,6 +122,7 @@ fn LinkedStringResult(&binding: TypeNameBinding): bool {
 
 fn LinkedNullHasResultValue(&binding: TypeNameBinding): bool {
     return LinkedNullOwnedArray(binding) || binding.declaration_kind == "Struct" || LinkedStringResult(binding)
+        || binding.declaration_kind == "OwnedStringArray"
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
@@ -152,6 +153,9 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
 // Type-only layouts may be forwarded or returned exclusively on other
 // branches. Keep their internal cleanup references valid under strict C.
 fn LinkedNullResultCleanupReference(&owning_layouts: [StructLayout], &result: TypeNameBinding): str {
+    if (result.declaration_kind == "OwnedStringArray") {
+        return "    (void)ku_managed_source_drop;\n    (void)ku_linked_view_str_array_valid;\n"
+    }
     if (LinkedNullOwnedArray(result)) {
         return "    (void)" + LinkedNullArrayPrefix(result) + "_drop;\n"
     }
@@ -254,10 +258,19 @@ fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bo
     }
     payload_id = LinkedNullChild(project, unit, node, 0)
     payload = LinkedNullNode(project, unit, payload_id)
-    if (payload.kind == "TypeArray") { return ReadLinkedOwnedArray(project, unit, payload_id, false) }
+    if (payload.kind == "TypeArray") {
+        if (payload.edge_count == 1) {
+            element = LinkedNullType(project, unit, LinkedNullChild(project, unit, payload, 0))?
+            if (LinkedStringResult(element)) {
+                element.declaration_kind = "OwnedStringArray"
+                return ok(element)
+            }
+        }
+        return ReadLinkedOwnedArray(project, unit, payload_id, false)
+    }
     result = LinkedNullType(project, unit, payload_id)?
     if (!LinkedNullHasResultValue(result) && (result.declaration_kind != "Builtin" || result.name != "null")) {
-        RejectLayout("linked_dependency_result", "expected null!, str!, a named record Result or a struct array Result", result.span.clone())?
+        RejectLayout("linked_dependency_result", "expected null!, str!, [str]!, a named record Result or a struct array Result", result.span.clone())?
     }
     return ok(result)
 }
@@ -327,6 +340,7 @@ fn LinkedNullDependency(&project: LinkedNullProject, from_unit: int, &target: No
 }
 
 fn LinkedCheckedResultCType(&result: TypeNameBinding): str! {
+    if (result.declaration_kind == "OwnedStringArray") { return ok("KuBootstrapResultStringArray") }
     if (LinkedNullHasResultValue(result)) { return ok("KuBootstrapResult_" + LinkedNullCType(result)?) }
     return ok("KuBootstrapResultNull")
 }
@@ -340,6 +354,7 @@ fn LinkedCheckedResultPlan(&result: TypeNameBinding, unit: int): LinkPlanType! {
     if (!LinkedNullHasResultValue(result)) { return ok(NullLinkPlanResult()) }
     plan = BoundLinkPlanType(result, unit, LinkedCheckedResultCType(result)?, false)
     if (LinkedNullOwnedArray(result)) { plan.kind = "StructArray" }
+    if (result.declaration_kind == "OwnedStringArray") { plan.kind = "BuiltinArray" }
     return ok(plan)
 }
 

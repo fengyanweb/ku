@@ -789,6 +789,75 @@ int main(int argc, char** argv) {
     }
 }
 
+pub(super) fn assert_checked_string_array_borrow(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("paths-provider.ku"),
+        r#"fn ReadPaths(mode: int): [str]! { return ok([]) }
+fn Observe(&paths: [str], mode: int): null! { return ok(null) }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("paths-consumer.ku"),
+        r#"import { ReadPaths, Observe } from "./paths-provider.ku"
+fn TakePaths(mode: int): null! {
+    paths = ReadPaths(mode)?
+    Observe(paths, mode)?
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "paths-consumer.ku\npaths-provider.ku\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("function.txt"), "TakePaths").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let symbol = |prefix| {
+        code.lines()
+            .find_map(|line| Some(line.strip_prefix(prefix)?.split_once('(')?.0))
+            .expect("typed C symbol")
+    };
+    let witness = r#"
+static uint8_t *saved;
+static int visits;
+KuBootstrapResultStringArray __READ__(int64_t mode) {
+    if (mode == 2) return (KuBootstrapResultStringArray){0};
+    KuProjectionString *data = malloc(sizeof(*data));
+    saved = malloc(1);
+    *saved = 'x';
+    *data = (KuProjectionString){saved, 1, 1, KU_PROJECTION_STRING_OWNED};
+    return (KuBootstrapResultStringArray){.ok = true, .value = {1, data, 1}};
+}
+KuBootstrapResultNull __OBSERVE__(const KuGuardStringArray *paths, int64_t mode) {
+    assert(paths->len == 1 && paths->data[0].ptr == saved && *saved == 'x');
+    assert(outstanding() == 2);
+    ++visits;
+    return (KuBootstrapResultNull){.ok = (mode == 0)};
+}
+int main(void) {
+    (void)test_realloc;
+    assert(__ENTRY__(0).ok && !outstanding() && visits == 1);
+    assert(!__ENTRY__(1).ok && !outstanding() && visits == 2);
+    assert(!__ENTRY__(2).ok && !outstanding() && visits == 2);
+    return 0;
+}
+"#
+    .replace("__READ__", symbol("extern KuBootstrapResultStringArray "))
+    .replace("__OBSERVE__", symbol("extern KuBootstrapResultNull "))
+    .replace("__ENTRY__", symbol("KuBootstrapResultNull "));
+    let c = cwd.join("paths-consumer.c");
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{witness}")).unwrap();
+    let executable = cwd.join(format!("paths-consumer{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&c, &executable, cwd);
+    assert_ok(&execute(&mut Command::new(&executable), cwd, 15));
+}
+
 pub(super) fn assert_linked_fs_read(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("module-reader.ku"),

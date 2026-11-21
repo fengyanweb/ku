@@ -93,6 +93,12 @@ fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &el
 
 fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, ty: TypeNameBinding): LinkedNullState! {
     next = state
+    if (ty.declaration_kind == "OwnedStringArray") {
+        next.uses_str_array = true
+        next.owning_strings = true
+        if (LinkedNullArrayPosition(next.owned_arrays, ty) == 0) { next.owned_arrays = next.owned_arrays.push(ty) }
+        return ok(next)
+    }
     if (ty.declaration_kind == "BuiltinArray") {
         if (ty.name == "str") { next.uses_str_array = true }
         else { next = RequireLinkedArrayValidation(RegisterLinkedIntArray(next, ty.clone()), ty.clone()) }
