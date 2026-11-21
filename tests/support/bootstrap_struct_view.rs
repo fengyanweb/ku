@@ -592,6 +592,26 @@ fn Reuse(value: int): Index! {
     size = values.len()
     return ok(result)
 }
+struct Limit { count: int wrong: bool }
+fn Counted(&limit: Limit): Index! {
+    values: [int] = []
+    index = 0
+    while (index < limit.count) {
+        values = values.push(index)
+        index = index + 1
+    }
+    return ok(Index { values: values, size: index })
+}
+fn WrongBound(&limit: Limit): null! {
+    index = 0
+    while (index < limit.wrong) { index = index + 1 }
+    return ok(null)
+}
+fn WrongIncrement(&limit: Limit): null! {
+    index = 0
+    while (index < limit.count) { index = index + 2 }
+    return ok(null)
+}
 "#;
 
 const OWNED_INT_HOST: &str = r#"
@@ -669,6 +689,8 @@ pub(super) fn assert_owned_int_locals(seed: &Path, cwd: &Path) {
     for (name, reason) in [
         ("Wrong", "linked_view_escape"),
         ("Reuse", "unavailable_linked_binding"),
+        ("WrongBound", "unsupported_linked_loop"),
+        ("WrongIncrement", "unsupported_linked_loop"),
     ] {
         fs::write(cwd.join("function.txt"), name).unwrap();
         let rejected = execute(&mut Command::new(seed), cwd, 30);
@@ -676,4 +698,44 @@ pub(super) fn assert_owned_int_locals(seed: &Path, cwd: &Path) {
         assert!(rejected.stdout.is_empty());
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(reason));
     }
+
+    fs::write(cwd.join("function.txt"), "Counted").unwrap();
+    let counted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&counted);
+    let code = String::from_utf8(counted.stdout).unwrap();
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, params) = signature.split_once("(const ").unwrap();
+    let (limit, _) = params.split_once('*').unwrap();
+    let drop = code
+        .lines()
+        .find_map(|line| line.strip_prefix("static void ku_drop_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+int main(void) {
+    __LIMIT__ limit = {-1,false};
+    __RESULT__ result = __ENTRY__(&limit);
+    assert(result.ok && result.value.f0.len == 0 && result.value.f1 == 0);
+    __DROP__(&result.value);
+    limit.f0 = 3;
+    result = __ENTRY__(&limit);
+    assert(result.ok && result.value.f0.len == 3 && result.value.f1 == 3);
+    for (int64_t i = 0; i < 3; i++) assert(result.value.f0.data[i] == i);
+    assert(limit.f0 == 3 && !limit.f1);
+    __DROP__(&result.value);
+    return 0;
+}
+"#
+    .replace("__LIMIT__", limit)
+    .replace("__RESULT__", result)
+    .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
+    .replace("__DROP__", &format!("ku_drop_{drop}"));
+    fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
 }

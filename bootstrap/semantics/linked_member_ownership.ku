@@ -5,9 +5,9 @@ import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { OwningLayoutDropName } from "./nested_struct_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { HasBoundArrayMembers } from "./struct_array_c.ku"
-import { LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, SameLinkedType } from "./linked_null_types_c.ku"
-import { LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches, LinkedViewPointee } from "./link_plan_c.ku"
+import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { LinkedNullArrayElement, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullOwner, LinkedRecordFields, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches, LinkedViewPointee } from "./link_plan_c.ku"
 
 fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &ty: TypeNameBinding, &name: str): str {
     if (ty.declaration_kind == "OwnedStringArray") { return "    ku_managed_source_drop(&" + name.clone() + ");\n" }
@@ -165,4 +165,23 @@ fn BindLinkedCatch(state: LinkedNullState, name: str, &binding: Node, &before: [
     cleared: [int] = []
     next.catch_moved = cleared
     return ok(next)
+}
+
+fn LinkedCountBound(&project: LinkedNullProject, &state: LinkedNullState, id: int): bool! {
+    array = LinkedNullBinding(state.slots, LinkedNullArrayLimitName(project, id))
+    if (array > 0) {
+        kind = state.slots[array - 1].value.ty.declaration_kind.clone()
+        return ok(kind == "StructArray" || kind == "BuiltinArray")
+    }
+    member = LinkedNullNode(project, 1, id)
+    if (member.kind != "Field" || member.edge_count != 1) { return ok(false) }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, member, 0))
+    if (receiver.kind != "Variable" || receiver.edge_count != 0) { return ok(false) }
+    slot = LinkedNullBinding(state.slots, receiver.text)
+    if (slot == 0 || !state.slots[slot - 1].live) { return ok(false) }
+    binding = state.slots[slot - 1].value.ty.clone()
+    if (binding.declaration_kind != "Struct") { return ok(false) }
+    fields = LinkedRecordFields(state.layouts, state.owning_layouts, binding)?
+    field = FieldIndex(fields, member.text)
+    return ok(field > 0 && fields[field - 1].resolved.declaration_kind == "Builtin" && fields[field - 1].resolved.name == "int")
 }

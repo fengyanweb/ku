@@ -1,6 +1,6 @@
 import { ReadLinkedNullParameters } from "./linked_parameters_c.ku"
 import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
-import { BindLinkedCatch, CheckLinkedGuardOwners, DropLinkedNullScope, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { BindLinkedCatch, CheckLinkedGuardOwners, DropLinkedNullScope, LinkedCountBound, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedPlainArrayReturn } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -10,7 +10,7 @@ import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
 import { LinkedReadonlyExpression, LinkedSlotPrefix, ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
-import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
+import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, LowerLinkedArrayLocal, LowerLinkedNullRead,
          RegisterLinkedNullType } from "./linked_null_read_c.ku"
@@ -98,19 +98,11 @@ fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statem
     return ok(LinkedNullRegion { state: other.state, terminal: taken.terminal && other.terminal })
 }
 
-fn isReadonlyArrayLimit(&project: LinkedNullProject, &state: LinkedNullState, node_id: int): bool {
-    name = LinkedNullArrayLimitName(project, node_id)
-    slot = LinkedNullBinding(state.slots, name)
-    if (slot == 0) { return false }
-    kind = state.slots[slot - 1].value.ty.declaration_kind.clone()
-    return kind == "StructArray" || kind == "BuiltinArray"
-}
-
 fn countedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &initial: Node, &step: Node): int! {
     guard = LinkedNullNode(project, 1, LinkedNullChild(project, 1, loop, 0))
     if (guard.kind != "Binary" || guard.edge_count != 2 || guard.text != "<" ||
-        !isReadonlyArrayLimit(project, state, LinkedNullChild(project, 1, guard, 1))) {
-        RejectLayout("unsupported_linked_loop", "counted while requires a readonly array length bound", DeclarationSpan(guard))?
+        !LinkedCountBound(project, state, LinkedNullChild(project, 1, guard, 1))?) {
+        RejectLayout("unsupported_linked_loop", "counted while requires a readonly array length or direct int field bound", DeclarationSpan(guard))?
     }
     left = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
     slot = LinkedNullBinding(state.slots, left.text)
