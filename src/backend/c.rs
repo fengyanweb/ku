@@ -18157,6 +18157,7 @@ fn c_unary(op: UnaryOp) -> &'static str {
 }
 
 fn c_ident(name: &str) -> String {
+    const ESCAPE_PREFIX: &str = "ku_c_name_";
     let mut output = String::new();
     for (index, ch) in name.chars().enumerate() {
         if (index == 0 && (ch.is_ascii_alphabetic() || ch == '_'))
@@ -18168,10 +18169,28 @@ fn c_ident(name: &str) -> String {
         }
     }
     if output.is_empty() {
-        "_".to_string()
-    } else {
-        output
+        output.push('_');
     }
+    // Keep conflicting spellings out of C declarations, field selections and
+    // references. Escaping the prefix itself keeps the mapping one-to-one
+    // for otherwise valid C identifiers.
+    if output.starts_with(ESCAPE_PREFIX)
+        || matches!(
+            output.as_str(),
+            "auto" | "break" | "case" | "char" | "const" | "continue" | "default" | "do"
+                | "double" | "else" | "enum" | "extern" | "float" | "for" | "goto" | "if"
+                | "inline" | "int" | "long" | "register" | "restrict" | "return" | "short"
+                | "signed" | "sizeof" | "static" | "struct" | "switch" | "typedef" | "union"
+                | "unsigned" | "void" | "volatile" | "while" | "_Alignas" | "_Alignof"
+                | "_Atomic" | "_Bool" | "_Complex" | "_Generic" | "_Imaginary" | "_Noreturn"
+                | "_Static_assert" | "_Thread_local"
+                // Names supplied as macros by the runtime's standard headers.
+                | "bool" | "true" | "false" | "NULL" | "EOF" | "stdin" | "stdout" | "stderr"
+        )
+    {
+        output.insert_str(0, ESCAPE_PREFIX);
+    }
+    output
 }
 
 fn c_symbol(name: &str) -> String {

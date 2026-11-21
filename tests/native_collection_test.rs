@@ -229,6 +229,30 @@ fn main() {
 }
 
 #[test]
+fn native_identifiers_escape_c_keywords_and_preexisting_escape_prefix() {
+    let source = r#"
+struct Record { case: int, ku_c_name_case: int, EOF: int }
+
+fn Read(&case: str, info: Record): int {
+    println(case)
+    register = info.case * 10
+    return register + info.ku_c_name_case + info.EOF
+}
+
+fn main(): null {
+    info = Record { case: 4, ku_c_name_case: 7, EOF: 100 }
+    println(Read("Ku", info))
+    return null
+}
+"#;
+    run_source("native-c-keyword.ku", source).expect("valid Ku identifiers");
+    let Some(stdout) = native_stdout("c-keyword", source) else {
+        return;
+    };
+    assert_eq!(stdout, "Ku\n147\n");
+}
+
+#[test]
 fn native_collection_shared_http_identity_is_not_an_owned_clone() {
     let source = r#"
 import http from "std.http"
