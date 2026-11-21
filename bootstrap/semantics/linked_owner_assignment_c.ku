@@ -233,8 +233,9 @@ struct LinkedAppendBody {
 }
 
 fn IsLinkedAppendThunk(&project: LinkedNullProject, &function: Node): bool {
+    limit = function.edge_count - 1
     index = 0
-    while (index < function.edge_count - 1) {
+    while (index < limit) {
         node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
         if (node.kind != "Parameter") {
             if (node.kind != "TypeResult" || node.edge_count != 1) { return false }
@@ -245,7 +246,7 @@ fn IsLinkedAppendThunk(&project: LinkedNullProject, &function: Node): bool {
             }
             return payload.kind == "TypeName" && payload.text == "int"
         }
-        index += 1
+        index = index + 1
     }
     return false
 }

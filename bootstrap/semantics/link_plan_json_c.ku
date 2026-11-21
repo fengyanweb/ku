@@ -397,9 +397,10 @@ fn PublishLinkedCheckedValue(destination: LinkedNullExpression, payload: str): L
 
 fn LinkedFieldRoot(&project: LinkedNullProject, receiver: int): int {
     cursor = receiver
-    depth = 0
     indexed = false
-    while (depth < 32) {
+    limit = 32
+    depth = 0
+    while (depth < limit) {
         node = LinkedNullNode(project, 1, cursor)
         if (node.kind == "Index" && node.edge_count == 2 && !indexed) {
             indexed = true
