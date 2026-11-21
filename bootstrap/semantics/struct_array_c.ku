@@ -125,7 +125,7 @@ fn EmitLinkedStringArrayPrelude(&validated: [TypeNameBinding], needs_header: boo
         if (validated[index].declaration_kind == "BuiltinArray" && validated[index].name == "str") {
             return source + EmitStructArrayReadValidation("KuProjectionString", "KuGuardStringArray", "ku_linked_view_str_array")
         }
-        index += 1
+        index = index + 1
     }
     return source
 }

@@ -200,8 +200,9 @@ fn ManagedStringArrayDrop(): str {
 
 fn ManagedSourceCharactersRuntime(needs_header: bool): str {
     ascii = ""
+    ascii_count = 128
     index = 0
-    while (index < 128) {
+    while (index < ascii_count) {
         if (index > 0) { ascii += ", " }
         ascii += str(index)
         index = index + 1
