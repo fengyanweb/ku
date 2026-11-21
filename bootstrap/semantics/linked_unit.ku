@@ -6,11 +6,18 @@ import { LinkedNullDependencyPlan } from "./linked_null_types_c.ku"
 fn EmitLinkedUnit(supplied: [SuppliedModule], &function: str, plan: bool): str! {
     project = PrepareLinkedNullProject(supplied)?
     generated = EmitLinkedNullC(project, function)?
-    if (!plan) { return ok(generated.source) }
+    if (!plan) {
+        source = generated.source
+        return ok(source)
+    }
 
     links: [LinkPlanDeclaration] = []
-    for dependency in generated.links {
-        links = links.push(LinkedNullDependencyPlan(dependency)?)
+    dependencies = generated.links
+    count = dependencies.len()
+    index = 0
+    while (index < count) {
+        links = links.push(LinkedNullDependencyPlan(dependencies[index])?)
+        index = index + 1
     }
     return EmitLinkPlan(project.supplied, "linked-null", generated.entry_plan, links)
 }
