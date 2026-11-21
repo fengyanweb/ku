@@ -1,0 +1,449 @@
+import { Node } from "../stage2/ast.ku"
+import { EmitLinkedArrayBody, StructArrayStatuses } from "./struct_array_c.ku"
+import { FinishLinkedFunctionC, GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
+import { ScalarCheckedMultiplyC, ScalarStringHelpers } from "./scalar_int_emit.ku"
+import { ScalarStringReplaceHelpers } from "./scalar_string_replace.ku"
+import { StructResultHeader } from "./struct_result_c.ku"
+import { LinkedIntSnapshotRuntime } from "./guarded_string_parts.ku"
+import { LinkedBuiltin, LinkedCheckedResultCType, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullParameterPlan, LinkedNullProject, LinkedNullResultType, LinkedNullType, LinkedResultPlan, SameLinkedType } from "./linked_null_types_c.ku"
+import { Span } from "../stage2/span.ku"
+import { ImportBinding, SuppliedModule } from "./imports.ku"
+import { DeclarationSpan, TopLevelName } from "./names.ku"
+import { AppendLinkedCheckedInvocation, ExitLinkedFailure, FsReadLinkPlan, LinkedCPrelude, LinkedCheckedCall, LinkedDirectCallExpression, LinkedFailureTarget, LinkPlanDeclaration, LinkPlanNominalType, LinkPlanType, LinkedIntArrayCallbackFunction, LinkedNullArguments, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullSlot, LinkedNullState, LinkedReadonlyExpression, LinkedNullValue } from "./link_plan_c.ku"
+import { LinkPlanJsonControls, LinkPlanJsonText } from "./project_paths.ku"
+import { RejectLayout } from "./struct_layouts.ku"
+import { TypeNameBinding } from "./type_names.ku"
+import { ContainsType, LinkedFsReadReference, LinkedIntAppendCallbackDeclaration, LinkedIntAppendCallbackNominals, LinkedIntArrayCallbackDeclaration, LinkedIntArrayCallbackFaultPending, ProjectionBuiltinLinkFor } from "./struct_projection_c.ku"
+
+fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): str! {
+    name = ty.name.clone()
+    path = "null"
+    if (ty.unit > 0) {
+        path = LinkPlanJsonText(supplied[ty.unit - 1].path.clone(), controls)?
+        if (ty.nominals.len() == 0) {
+            name = supplied[ty.unit - 1].named.parsed.arena.nodes[ty.node - 1].text.clone()
+        }
+    }
+    passing = "value"
+    if (ty.view) { passing = "view" }
+    text = "{\"kind\":" + LinkPlanJsonText(ty.kind.clone(), controls)? + ",\"source_name\":" + LinkPlanJsonText(name, controls)?
+        + ",\"source_path\":" + path + ",\"node\":" + str(ty.node) + ",\"c_type\":" + LinkPlanJsonText(ty.c_type.clone(), controls)?
+        + ",\"passing\":" + LinkPlanJsonText(passing, controls)?
+    count = ty.nominals.len()
+    if (count > 0) {
+        text += ",\"nominals\":["
+        index = 0
+        while (index < count) {
+            nominal = ty.nominals[index].clone()
+            if (index != 0) { text += "," }
+            text += "{\"source_path\":" + LinkPlanJsonText(supplied[nominal.unit - 1].path.clone(), controls)?
+                + ",\"node\":" + str(nominal.node) + ",\"c_type\":" + LinkPlanJsonText(nominal.c_type, controls)? + "}"
+            index = index + 1
+        }
+        text += "]"
+    }
+    return ok(text + "}")
+}
+
+fn plannedDeclaration(&supplied: [SuppliedModule], &declaration: LinkPlanDeclaration, &controls: str): str! {
+    name = ""
+    path = ""
+    if (declaration.unit > 0) {
+        name = supplied[declaration.unit - 1].named.parsed.arena.nodes[declaration.node - 1].text.clone()
+        path = supplied[declaration.unit - 1].path.clone()
+    } else {
+        builtin = ProjectionBuiltinLinkFor(declaration.node)
+        if (declaration.unit != 0 || builtin.name == "" || declaration.symbol != builtin.symbol) {
+            at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+            RejectLayout("invalid_linked_builtin", "unsupported builtin declaration identity", at)?
+        }
+        name = builtin.name
+        path = builtin.path
+    }
+    text = "{\"source_path\":" + LinkPlanJsonText(path, controls)? + ",\"node\":" + str(declaration.node)
+        + ",\"source_name\":" + LinkPlanJsonText(name, controls)? + ",\"symbol\":" + LinkPlanJsonText(declaration.symbol.clone(), controls)?
+        + ",\"signature\":{\"parameters\":["
+    index = 0
+    while (index < declaration.parameters.len()) {
+        if (index > 0) { text += "," }
+        text += plannedType(supplied, declaration.parameters[index], controls)?
+        index = index + 1
+    }
+    wrapper = "false"
+    if (declaration.returns_result) { wrapper = "true" }
+    return ok(text + "],\"result\":" + plannedType(supplied, declaration.result, controls)?
+        + ",\"returns_result\":" + wrapper + "}}")
+}
+
+fn EmitLinkPlan(&supplied: [SuppliedModule], &mode: str, &entry: LinkPlanDeclaration, &links: [LinkPlanDeclaration]): str! {
+    controls = LinkPlanJsonControls()?
+    text = "{\"schema\":\"ku-bootstrap-link-plan-v1\",\"mode\":" + LinkPlanJsonText(mode.clone(), controls)?
+        + ",\"export\":" + plannedDeclaration(supplied, entry, controls)? + ",\"dependencies\":["
+    index = 0
+    while (index < links.len()) {
+        if (index > 0) { text += "," }
+        text += plannedDeclaration(supplied, links[index], controls)?
+        index = index + 1
+    }
+    return ok(text + "]}\n")
+}
+
+fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
+    if (callee.unit == 0 && callee.node == 1) { return ok(FsReadLinkPlan(callee.symbol.clone())) }
+    parameters: [LinkPlanType] = []
+    index = 0
+    while (index < callee.parameters.len()) {
+        ty = callee.parameters[index].clone()
+        parameters = parameters.push(LinkedNullParameterPlan(ty, callee.unit)?)
+        index = index + 1
+    }
+    result = LinkedResultPlan(callee.result, callee.unit, callee.returns_result)?
+    return ok(LinkPlanDeclaration { unit: callee.unit, node: callee.node, symbol: callee.symbol.clone(),
+        parameters: parameters, result: result, returns_result: callee.returns_result })
+}
+
+fn LinkedIntAppendCallbackFunction(&project: LinkedNullProject, unit: int, id: int): LinkedNullFunction! {
+    node = LinkedNullNode(project, unit, id)
+    ids = LinkedIntAppendCallbackNominals(project.supplied[unit - 1].named, node)?
+    first_record = LinkedNullType(project, unit, ids[0])?
+    second_record = LinkedNullType(project, unit, ids[1])?
+    if (first_record.declaration_kind != "Struct" || second_record.declaration_kind != "Struct") {
+        RejectLayout("linked_callback_type", "both scoped append record arguments must be nominal structs", DeclarationSpan(node))?
+    }
+    integer = LinkedBuiltin("int", DeclarationSpan(node))
+    if (node.edge_count == 4) {
+        boolean = LinkedBuiltin("bool", DeclarationSpan(node))
+        return ok(LinkedNullFunction { unit: unit, node: id, symbol: "",
+            parameters: [first_record, second_record, boolean], result: integer, returns_result: true })
+    }
+    string = LinkedBuiltin("str", DeclarationSpan(node))
+    array = integer.clone()
+    array.declaration_kind = "OwnedIntArray"
+    return ok(LinkedNullFunction { unit: unit, node: id, symbol: "",
+        parameters: [string.clone(), string, integer.clone(), first_record, array, second_record], result: integer, returns_result: true })
+}
+
+fn LinkedScopedCallbackFunction(&project: LinkedNullProject, &callback: TypeNameBinding): LinkedNullFunction! {
+    if (callback.declaration_kind == "IntArrayResultCallback") { return ok(LinkedIntArrayCallbackFunction(callback)) }
+    if (callback.declaration_kind == "IntRecordReaderCallback") {
+        result = callback.clone()
+        result.declaration_kind = "Struct"
+        argument = LinkedBuiltin("int", callback.span.clone())
+        return ok(LinkedNullFunction { unit: 1, node: 0, symbol: "", parameters: [argument], result: result, returns_result: false })
+    }
+    return LinkedIntAppendCallbackFunction(project, callback.module_index, callback.declaration_node)
+}
+
+fn LinkedScopedCallbackPrototype(&ty: TypeNameBinding, &signature: LinkedNullFunction, &name: str): str! {
+    if (ty.declaration_kind == "IntRecordReaderCallback") {
+        return ok("typedef struct { " + LinkedNullCType(signature.result)?
+            + " (*entry)(void*, KuLocalAppendFailure*, int64_t); void *environment; KuLocalAppendFailure *failure; } "
+            + name.clone() + ";\n")
+    }
+    if (ty.declaration_kind == "IntArrayResultCallback") {
+        return ok(LinkedIntArrayCallbackDeclaration(name, LinkedNullCType(signature.parameters[3])?))
+    }
+    arena = ty.declaration_kind == "IntResultArenaCallback"
+    first = 3
+    second = 5
+    if (arena) { first = 0; second = 1 }
+    return ok(LinkedIntAppendCallbackDeclaration(name, LinkedNullCType(signature.parameters[first])?, LinkedNullCType(signature.parameters[second])?, arena))
+}
+
+fn SameLinkedCallbackSignature(&left: LinkedNullFunction, &right: LinkedNullFunction): bool {
+    count = left.parameters.len()
+    if (count != right.parameters.len() || left.returns_result != right.returns_result ||
+        !SameLinkedType(left.result, right.result)) { return false }
+    index = 0
+    while (index < count) {
+        if (!SameLinkedType(left.parameters[index], right.parameters[index])) { return false }
+        index = index + 1
+    }
+    return true
+}
+
+fn CallbackPlanNominals(&project: LinkedNullProject, &ty: LinkPlanType): [LinkPlanNominalType]! {
+    if (ty.kind == "IntResultAppendCallback" || ty.kind == "IntResultArenaCallback") {
+        checked = LinkedIntAppendCallbackFunction(project, ty.unit, ty.node)?
+        first = 3
+        second = 5
+        if (ty.kind == "IntResultArenaCallback") { first = 0; second = 1 }
+        a = checked.parameters[first].clone()
+        b = checked.parameters[second].clone()
+        return ok([
+            LinkPlanNominalType { unit: a.module_index, node: a.declaration_node, c_type: LinkedNullCType(a)? },
+            LinkPlanNominalType { unit: b.module_index, node: b.declaration_node, c_type: LinkedNullCType(b)? }
+        ])
+    }
+    nominals: [LinkPlanNominalType] = []
+    count = ty.nominals.len()
+    index = 0
+    while (index < count) {
+        entry = ty.nominals[index].clone()
+        nominals = nominals.push(entry)
+        index = index + 1
+    }
+    return ok(nominals)
+}
+
+fn PrepareLinkedAppendCallbackPlan(&project: LinkedNullProject, declaration: LinkPlanDeclaration): LinkPlanDeclaration! {
+    parameters: [LinkPlanType] = []
+    count = declaration.parameters.len()
+    index = 0
+    while (index < count) {
+        nominals = CallbackPlanNominals(project, declaration.parameters[index])?
+        ty = LinkPlanType {
+            kind: declaration.parameters[index].kind.clone(),
+            name: declaration.parameters[index].name.clone(),
+            unit: declaration.parameters[index].unit,
+            node: declaration.parameters[index].node,
+            c_type: declaration.parameters[index].c_type.clone(),
+            view: declaration.parameters[index].view,
+            nominals: nominals
+        }
+        parameters = parameters.push(ty)
+        index = index + 1
+    }
+    return ok(LinkPlanDeclaration { unit: declaration.unit, node: declaration.node, symbol: declaration.symbol,
+        parameters: parameters, result: declaration.result, returns_result: declaration.returns_result })
+}
+
+fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
+    if (callee.unit == 0 && callee.node == 1) { return ok(LinkedFsReadReference(callee.symbol)) }
+    text = "extern " + LinkedNullResultType(callee)? + " " + callee.symbol.clone() + "("
+    if (callee.parameters.len() == 0) { text += "void" }
+    index = 0
+    while (index < callee.parameters.len()) {
+        if (index > 0) { text += ", " }
+        text += LinkedNullCType(callee.parameters[index])?
+        index = index + 1
+    }
+    return ok(text + ");\n")
+}
+
+fn CheckLinkedScopedCallback(state: LinkedNullState, &callback: str, unwrap: bool): LinkedNullState {
+    next = state
+    target = "result.error"
+    if (unwrap) { target = LinkedFailureTarget(next) }
+    next.code += "    if (!" + callback.clone() + ".entry || !" + callback.clone() + ".failure) {\n        "
+        + target + " = (KuBootstrapError){"
+        + ".domain={(uint8_t*)\"bootstrap.callback\",sizeof(\"bootstrap.callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
+        + ".code={(uint8_t*)\"invalid_callback\",sizeof(\"invalid_callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
+        + ".message={(uint8_t*)\"callback entry or failure relay is missing\",sizeof(\"callback entry or failure relay is missing\")-1u,0u,KU_PROJECTION_STRING_STATIC}};\n"
+    if (unwrap) { next = ExitLinkedFailure(next, "        ") }
+    else { next.code += "        goto cleanup;\n" }
+    next.code += "    }\n"
+    return next
+}
+
+fn EmitLinkedScopedCallbackCall(arguments: LinkedNullArguments, &callback: LinkedNullValue, result_type: TypeNameBinding,
+                                 id: int, unwrap: bool): LinkedCheckedCall! {
+    name = callback.text.clone()
+    pointer = name.clone() + ".failure"
+    invoke = name.clone() + ".entry(" + name + ".environment, " + pointer.clone() + ", " + arguments.args + ")"
+    relay = "    if (" + LinkedIntArrayCallbackFaultPending(pointer) + ") goto cleanup;\n"
+    result = "dependency" + str(id)
+    next = arguments.state
+    if (unwrap) {
+        next = AppendLinkedCheckedInvocation(next, LinkedCheckedResultCType(result_type)?, result, invoke, arguments.handoff + relay)
+    } else {
+        next.code += "    result = " + invoke + ";\n" + arguments.handoff + "    goto cleanup;\n"
+    }
+    return ok(LinkedCheckedCall { state: next, result: result_type, text: result, id: id })
+}
+
+fn HoldLinkedCopyOperand(value: LinkedNullExpression, target: int): LinkedNullExpression! {
+    ty = value.value.ty.clone()
+    if (ty.declaration_kind != "Builtin" || (ty.name != "int" && ty.name != "bool")) { return ok(value) }
+    carrier = LinkedNullCType(ty)?
+    name = "member_rhs" + str(target)
+    next = value.state
+    next.code += "    " + carrier + " " + name.clone() + " = " + value.value.text + ";\n"
+    return ok(LinkedReadonlyExpression(next, ty, name))
+}
+
+fn EmitLinkedBodyPrelude(&body: LinkedNullState): str! {
+    ops = GuardArithmetic(body.uses_add, body.uses_sub)
+    if (body.uses_mul || body.uses_div) { ops += "#include <stdio.h>\n#include <stdlib.h>\n\n" }
+    if (body.uses_mul) { ops += ScalarCheckedMultiplyC() }
+    if (body.uses_string_contains) {
+        ops += ScalarStringHelpers(false, false, true, false, false, false, false)
+        ops += "static bool ku_linked_string_contains(KuProjectionString hay, KuProjectionString needle) {\n"
+            + "    return ku_scalar_string_contains(hay.ptr, hay.len, needle.ptr, needle.len);\n}\n\n"
+    }
+    header = LinkedCPrelude(body, ops + GuardStringEquality(body.uses_string_equal))
+    declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
+    if ((body.local_appends.len() > 0 || body.uses_scoped_reader) && body.append_slots.len() == 0 && body.local_append_types.len() == 0) {
+        declarations += StructArrayStatuses()
+    }
+    if (body.uses_int_snapshot) { declarations += LinkedIntSnapshotRuntime() }
+    if (body.uses_replace) { declarations += "typedef KuProjectionString KuScalarString;\n" + ScalarStringReplaceHelpers() }
+    return ok(declarations)
+}
+
+fn StartLinkedThunkFrame(&parent: LinkedNullState): LinkedNullState {
+    // Retain shared C requirements and dependency identities, but start the
+    // private function with its own automatic storage and error cleanup.
+    body = parent.clone()
+    body.slots = []
+    body.declarations = ""
+    body.code = ""
+    body.drops = ""
+    body.plain_value_result = false
+    body.uses_replace = false
+    body.local_readers = []
+    body.local_callbacks = []
+    body.callback_owners = []
+    body.append_slots = []
+    body.local_appends = []
+    body.append_captures = []
+    body.catch_slot = 0
+    body.catch_edges = false
+    body.catch_moved = []
+    body.moved_error_fields = []
+    return body
+}
+
+fn RestoreLinkedThunkFrame(body: LinkedNullState, &parent: LinkedNullState): LinkedNullState {
+    // Dependencies, layouts and C helpers are translation-unit requirements.
+    // Bindings and failure cleanup below the thunk belong solely to it.
+    next = body
+    next.slots = parent.slots.clone()
+    next.code = parent.code.clone()
+    next.drops = parent.drops.clone()
+    next.local_readers = parent.local_readers.clone()
+    next.local_callbacks = parent.local_callbacks.clone()
+    next.callback_owners = parent.callback_owners.clone()
+    next.append_slots = parent.append_slots.clone()
+    next.local_appends = parent.local_appends.clone()
+    next.append_captures = parent.append_captures.clone()
+    next.declarations = parent.declarations.clone()
+    next.plain_value_result = parent.plain_value_result
+    next.uses_replace = parent.uses_replace
+    next.catch_slot = parent.catch_slot
+    next.catch_edges = parent.catch_edges
+    next.catch_moved = parent.catch_moved.clone()
+    next.moved_error_fields = parent.moved_error_fields.clone()
+    return next
+}
+
+
+fn LinkedAppendFailureRelay(&body: LinkedNullState): str {
+    text = ""
+    calls_append = body.local_appends.len() > 0 || body.uses_scoped_reader
+    if (calls_append || body.append_slots.len() > 0 || body.local_append_types.len() > 0) {
+        text = "    failure->append_status = append_status;\n"
+    }
+    if (calls_append || body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0) {
+        text += "    failure->out_of_memory = out_of_memory;\n"
+    }
+    if (body.validated_arrays.len() > 0 || body.checks_str_item) {
+        message = "invalid struct array ownership"
+        if (body.uses_str_array) { message = "invalid array view" }
+        text += "    if (invalid_array) failure->array_error = \"" + message + "\\n\";\n"
+    }
+    if (calls_append) { text += "    if (captured_array_failure) failure->array_error = captured_array_failure;\n" }
+    if (calls_append || body.uses_add || body.uses_sub || body.uses_mul) { text += "    failure->overflow = overflow;\n" }
+    if (calls_append || body.uses_index) {
+        text += "    failure->index_failed = index_failed;\n    failure->index = failure_index;\n    failure->length = failure_length;\n"
+    }
+    return text
+}
+
+fn FinishLinkedReaderThunk(next: LinkedNullState, &parent: LinkedNullState, &symbol: str,
+                          &result: str, &array: str): LinkedNullState {
+    body = next
+    parent_state = RestoreLinkedThunkFrame(body.clone(), parent)
+    // These statements use only array access, owned cloning, or a bound mapper.
+    // Other capabilities in the caller belong to the caller's cleanup.
+    body.uses_print = false
+    body.uses_chars = false
+    body.uses_str_view = false
+    body.uses_struct_view = false
+    body.uses_concat = false
+    body.uses_div = false
+    body.uses_scoped_reader = false
+    body.code = "    const " + array.clone() + " *const capture = raw;\n" + body.code
+    parent_state.callback_helpers += "static " + FinishLinkedFunctionC("", body, symbol,
+        "void *raw, KuLocalAppendFailure *failure, int64_t input", result, "", "", LinkedAppendFailureRelay(body))
+    parent_state.uses_scoped_reader = true
+    return parent_state
+}
+
+fn LinkedBooleanWhileCondition(&state: LinkedNullState, &guard: Node): str {
+    if (guard.kind != "Variable" || guard.edge_count != 0) { return "" }
+    index = LinkedNullBinding(state.slots, guard.text)
+    if (index == 0) { return "" }
+    slot = state.slots[index - 1].clone()
+    if (slot.parameter || !slot.live || slot.value.borrowed || slot.moved_members.len() != 0 ||
+        slot.value.ty.declaration_kind != "Builtin" || slot.value.ty.name != "bool") { return "" }
+    return slot.value.text
+}
+
+fn EmitLinkedPlainInvocation(output: LinkedNullExpression, &callee: LinkedNullFunction, &args: str, handoff: str): LinkedNullExpression {
+    next = output
+    next.state.code += "    " + next.value.text.clone() + " = " + LinkedDirectCallExpression(callee, args) + ";\n" + handoff
+    next.state.slots[next.value.slot - 1].live = true
+    return next
+}
+
+fn PublishLinkedCheckedValue(destination: LinkedNullExpression, payload: str): LinkedNullExpression! {
+    slot = destination
+    slot.state.code = slot.state.code + "    " + slot.value.text.clone() + " = " + payload.clone() + ";\n"
+        + "    " + payload + " = (" + LinkedNullCType(slot.value.ty)? + "){0};\n"
+    slot.state.slots[slot.value.slot - 1].live = true
+    return ok(slot)
+}
+
+fn LinkedFieldRoot(&project: LinkedNullProject, receiver: int): int {
+    cursor = receiver
+    indexed = false
+    limit = 32
+    depth = 0
+    while (depth < limit) {
+        node = LinkedNullNode(project, 1, cursor)
+        if (node.kind == "Index" && node.edge_count == 2 && !indexed) {
+            indexed = true
+        } else if (node.kind != "Field" || node.edge_count != 1) {
+            return cursor
+        }
+        cursor = LinkedNullChild(project, 1, node, 0)
+        depth = depth + 1
+    }
+    return cursor
+}
+
+fn RestoreLinkedAssignedMember(state: LinkedNullState, &value: LinkedNullValue): LinkedNullState {
+    next = state
+    slot = value.slot - 1
+    if (!ContainsType(next.slots[slot].moved_members, value.member_path)) { return next }
+    tracked = next.slots[slot].moved_members.clone()
+    kept: [str] = []
+    index = 0
+    while (index < tracked.len()) {
+        if (tracked[index] != value.member_path) { kept = kept.push(tracked[index].clone()) }
+        index = index + 1
+    }
+    next.slots[slot].moved_members = kept
+    return next
+}
+
+fn LinkedBuiltinNameAvailable(&names: [TopLevelName], &imports: [ImportBinding], &slots: [LinkedNullSlot], &name: str): bool {
+    if (LinkedNullBinding(slots, name) != 0) { return false }
+    index = 0
+    while (index < names.len()) {
+        if (names[index].name == name) { return false }
+        index = index + 1
+    }
+    input = 0
+    while (input < imports.len()) {
+        if (imports[input].local_name == name) { return false }
+        input = input + 1
+    }
+    return true
+}
+
+fn LinkedChildKindIs(&project: LinkedNullProject, &parent: Node, ordinal: int, &kind: str): bool {
+    child = LinkedNullNode(project, 1, LinkedNullChild(project, 1, parent, ordinal))
+    return child.kind == kind
+}

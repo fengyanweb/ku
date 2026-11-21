@@ -1,14 +1,19 @@
-import { LinkPlanJsonControls, LinkPlanJsonText } from "./project_paths.ku"
 import { LinkedLocalReadBinding, RejectMissingLinkedValue } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { GuardBoundType, GuardCType, GuardType } from "./guarded_struct_expr.ku"
-import { ImportBinding, SuppliedModule } from "./imports.ku"
-import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
+import { SuppliedModule } from "./imports.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
-import { ContainsIndex, ContainsType, CTypeName, ProjectionBuiltinLinkFor, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
+import { ContainsIndex, ContainsType, CTypeName, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
+
+struct LinkPlanNominalType {
+    unit: int
+    node: int
+    c_type: str
+}
 
 struct LinkPlanType {
     kind: str
@@ -17,6 +22,7 @@ struct LinkPlanType {
     node: int
     c_type: str
     view: bool
+    nominals: [LinkPlanNominalType]
 }
 
 struct LinkPlanDeclaration {
@@ -70,6 +76,7 @@ struct LinkedNullState {
     local_callbacks: [int]
     callback_owners: [int]
     callback_helpers: str
+    uses_scoped_reader: bool
     local_appends: [LinkedLocalAppend]
     append_captures: [int]
     local_append_types: [TypeNameBinding]
@@ -91,6 +98,7 @@ struct LinkedNullState {
     uses_struct_view: bool
     element_clones: [int]
     uses_index: bool
+    checks_str_item: bool
     uses_add: bool
     uses_sub: bool
     uses_mul: bool
@@ -98,6 +106,7 @@ struct LinkedNullState {
     uses_string_equal: bool
     uses_print: bool
     uses_concat: bool
+    uses_replace: bool
     uses_int_format: bool
     uses_prefix_suffix: bool
     uses_string_contains: bool
@@ -111,13 +120,13 @@ struct LinkedNullExpression {
 
 fn NewLinkedNullState(): LinkedNullState {
     return LinkedNullState { plain_value_result: false, layouts: [], owning_layouts: [], owning_strings: false,
-        slots: [], links: [], local_readers: [], local_callbacks: [], callback_owners: [], callback_helpers: "",
+        slots: [], links: [], local_readers: [], local_callbacks: [], callback_owners: [], callback_helpers: "", uses_scoped_reader: false,
         local_appends: [], append_captures: [], local_append_types: [],
         declarations: "", code: "", drops: "", catch_slot: 0,
         catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false, uses_int_snapshot: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,
-        element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_mul: false, uses_div: false,
-        uses_string_equal: false, uses_print: false, uses_concat: false, uses_int_format: false, uses_prefix_suffix: false, uses_string_contains: false, uses_chars: false }
+        element_clones: [], uses_index: false, checks_str_item: false, uses_add: false, uses_sub: false, uses_mul: false, uses_div: false,
+        uses_string_equal: false, uses_print: false, uses_concat: false, uses_replace: false, uses_int_format: false, uses_prefix_suffix: false, uses_string_contains: false, uses_chars: false }
 }
 
 fn LinkedReadonlyExpression(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNullExpression {
@@ -128,6 +137,50 @@ struct LinkedNullArguments {
     state: LinkedNullState
     args: str
     handoff: str
+}
+
+fn LinkedIntArrayCallbackCarrier(&ty: TypeNameBinding): str {
+    return "KuBootstrapIntArrayCallback_" + CTypeName(ty.module_index, ty.declaration_node)
+}
+
+fn LinkedIntArrayCallbackFunction(&ty: TypeNameBinding): LinkedNullFunction {
+    array = TypeNameBinding { use_node: 0, name: "int", declaration_kind: "OwnedIntArray",
+        module_index: 0, declaration_node: 0, span: ty.span.clone() }
+    integer = array.clone()
+    integer.declaration_kind = "Builtin"
+    nominal = ty.clone()
+    nominal.declaration_kind = "Struct"
+    return LinkedNullFunction { unit: 1, node: 0, symbol: "",
+        parameters: [array.clone(), integer.clone(), integer, nominal], result: array, returns_result: true }
+}
+
+fn IsLinkedScopedCallback(&ty: TypeNameBinding): bool {
+    return ty.declaration_kind == "IntArrayResultCallback" || ty.declaration_kind == "IntResultAppendCallback" ||
+        ty.declaration_kind == "IntResultArenaCallback" || ty.declaration_kind == "IntRecordReaderCallback"
+}
+
+fn LinkedScopedCallbackTypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlot]): [TypeNameBinding] {
+    types: [TypeNameBinding] = []
+    index = 0
+    while (index < slots.len()) {
+        if (IsLinkedScopedCallback(slots[index].value.ty)) {
+            types = types.push(slots[index].value.ty.clone())
+        }
+        index = index + 1
+    }
+    index = 0
+    while (index < links.len()) {
+        parameter_count = links[index].parameters.len()
+        param = 0
+        while (param < parameter_count) {
+            if (IsLinkedScopedCallback(links[index].parameters[param])) {
+                types = types.push(links[index].parameters[param].clone())
+            }
+            param = param + 1
+        }
+        index = index + 1
+    }
+    return types
 }
 
 fn RememberLinkedCall(calls: [LinkedNullFunction], dependency: LinkedNullFunction): [LinkedNullFunction] {
@@ -142,10 +195,12 @@ fn LinkedDirectCallExpression(&callee: LinkedNullFunction, &arguments: str): str
     return callee.symbol.clone() + "(" + arguments.clone() + ")"
 }
 
-fn EmitLinkedReadonlyPredicate(state: LinkedNullState, callee: LinkedNullFunction, id: int, &arguments: str): LinkedNullExpression {
+fn EmitLinkedReadonlyScalar(state: LinkedNullState, callee: LinkedNullFunction, id: int, &arguments: str): LinkedNullExpression {
     name = "predicate" + str(id)
     next = state
-    next.code += "    bool " + name.clone() + " = " + LinkedDirectCallExpression(callee, arguments) + ";\n"
+    carrier = "bool"
+    if (callee.result.name == "int") { carrier = "int64_t" }
+    next.code += "    " + carrier + " " + name.clone() + " = " + LinkedDirectCallExpression(callee, arguments) + ";\n"
     ty = callee.result.clone()
     next.links = RememberLinkedCall(next.links, callee)
     return LinkedReadonlyExpression(next, ty, name)
@@ -159,27 +214,31 @@ struct LinkedCheckedCall {
 }
 
 fn BoundLinkPlanType(&binding: TypeNameBinding, local_unit: int, c_type: str, view: bool): LinkPlanType {
+    return BoundLinkPlanTypeWithKind(binding, local_unit, c_type, view, binding.declaration_kind.clone())
+}
+
+fn BoundLinkPlanTypeWithKind(&binding: TypeNameBinding, local_unit: int, c_type: str, view: bool, kind: str): LinkPlanType {
     unit = binding.module_index
     if (unit == 0 && binding.declaration_kind == "Struct") { unit = local_unit }
-    return LinkPlanType { kind: binding.declaration_kind.clone(), name: binding.name.clone(),
-        unit: unit, node: binding.declaration_node, c_type: c_type, view: view }
+    return LinkPlanType { kind: kind, name: binding.name.clone(),
+        unit: unit, node: binding.declaration_node, c_type: c_type, view: view, nominals: [] }
 }
 
 fn BuiltinLinkPlanType(name: str, c_type: str, view: bool): LinkPlanType {
-    return LinkPlanType { kind: "Builtin", name: name, unit: 0, node: 0, c_type: c_type, view: view }
+    return LinkPlanType { kind: "Builtin", name: name, unit: 0, node: 0, c_type: c_type, view: view, nominals: [] }
 }
 
 fn StrArrayViewLinkPlanType(): LinkPlanType {
     layouts: [StructLayout] = []
     carrier = GuardCType(GuardType { kind: "str_array", layout: 0 }, layouts)
     return LinkPlanType { kind: "BuiltinArray", name: "str", unit: 0, node: 0,
-        c_type: "const " + carrier + "*", view: true }
+        c_type: "const " + carrier + "*", view: true, nominals: [] }
 }
 
 fn IntArrayLinkPlanType(view: bool): LinkPlanType {
     carrier = "KuArrayInt"
     if (view) { carrier = "const KuArrayInt*" }
-    return LinkPlanType { kind: "BuiltinArray", name: "int", unit: 0, node: 0, c_type: carrier, view: view }
+    return LinkPlanType { kind: "BuiltinArray", name: "int", unit: 0, node: 0, c_type: carrier, view: view, nominals: [] }
 }
 
 fn NullLinkPlanResult(): LinkPlanType {
@@ -190,67 +249,10 @@ fn EmptyLinkPlanDeclaration(): LinkPlanDeclaration {
     return LinkPlanDeclaration { unit: 0, node: 0, symbol: "", parameters: [], result: NullLinkPlanResult(), returns_result: false }
 }
 
-fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): str! {
-    name = ty.name.clone()
-    path = "null"
-    if (ty.unit > 0) {
-        path = LinkPlanJsonText(supplied[ty.unit - 1].path.clone(), controls)?
-        name = supplied[ty.unit - 1].named.parsed.arena.nodes[ty.node - 1].text.clone()
-    }
-    passing = "value"
-    if (ty.view) { passing = "view" }
-    return ok("{\"kind\":" + LinkPlanJsonText(ty.kind.clone(), controls)? + ",\"source_name\":" + LinkPlanJsonText(name, controls)?
-        + ",\"source_path\":" + path + ",\"node\":" + str(ty.node) + ",\"c_type\":" + LinkPlanJsonText(ty.c_type.clone(), controls)?
-        + ",\"passing\":" + LinkPlanJsonText(passing, controls)? + "}")
-}
-
 fn FsReadLinkPlan(symbol: str): LinkPlanDeclaration {
     path = BuiltinLinkPlanType("str", "const KuString*", true)
     result = BuiltinLinkPlanType("str", "KuResult_str", false)
     return LinkPlanDeclaration { unit: 0, node: 1, symbol: symbol, parameters: [path], result: result, returns_result: true }
-}
-
-fn plannedDeclaration(&supplied: [SuppliedModule], &declaration: LinkPlanDeclaration, &controls: str): str! {
-    name = ""
-    path = ""
-    if (declaration.unit > 0) {
-        name = supplied[declaration.unit - 1].named.parsed.arena.nodes[declaration.node - 1].text.clone()
-        path = supplied[declaration.unit - 1].path.clone()
-    } else {
-        builtin = ProjectionBuiltinLinkFor(declaration.node)
-        if (declaration.unit != 0 || builtin.name == "" || declaration.symbol != builtin.symbol) {
-            at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
-            RejectLayout("invalid_linked_builtin", "unsupported builtin declaration identity", at)?
-        }
-        name = builtin.name
-        path = builtin.path
-    }
-    text = "{\"source_path\":" + LinkPlanJsonText(path, controls)? + ",\"node\":" + str(declaration.node)
-        + ",\"source_name\":" + LinkPlanJsonText(name, controls)? + ",\"symbol\":" + LinkPlanJsonText(declaration.symbol.clone(), controls)?
-        + ",\"signature\":{\"parameters\":["
-    index = 0
-    while (index < declaration.parameters.len()) {
-        if (index > 0) { text += "," }
-        text += plannedType(supplied, declaration.parameters[index], controls)?
-        index = index + 1
-    }
-    wrapper = "false"
-    if (declaration.returns_result) { wrapper = "true" }
-    return ok(text + "],\"result\":" + plannedType(supplied, declaration.result, controls)?
-        + ",\"returns_result\":" + wrapper + "}}")
-}
-
-fn EmitLinkPlan(&supplied: [SuppliedModule], &mode: str, &entry: LinkPlanDeclaration, &links: [LinkPlanDeclaration]): str! {
-    controls = LinkPlanJsonControls()?
-    text = "{\"schema\":\"ku-bootstrap-link-plan-v1\",\"mode\":" + LinkPlanJsonText(mode.clone(), controls)?
-        + ",\"export\":" + plannedDeclaration(supplied, entry, controls)? + ",\"dependencies\":["
-    index = 0
-    while (index < links.len()) {
-        if (index > 0) { text += "," }
-        text += plannedDeclaration(supplied, links[index], controls)?
-        index = index + 1
-    }
-    return ok(text + "]}\n")
 }
 
 fn projectedStructType(module_index: int, node: int, view: bool): LinkPlanType {
@@ -258,7 +260,7 @@ fn projectedStructType(module_index: int, node: int, view: bool): LinkPlanType {
     if (unit == 0) { unit = 1 }
     c_type = CTypeName(module_index, node)
     if (view) { c_type = "const " + c_type + "*" }
-    return LinkPlanType { kind: "Struct", name: "", unit: unit, node: node, c_type: c_type, view: view }
+    return LinkPlanType { kind: "Struct", name: "", unit: unit, node: node, c_type: c_type, view: view, nominals: [] }
 }
 
 fn StructProjectionLinkPlan(&plan: StructReturnPlan): LinkPlanDeclaration {
@@ -346,10 +348,11 @@ fn LinkedNullArrayHeader(&type: TypeNameBinding, &value: str): str {
 }
 
 fn LinkedViewPointee(binding: TypeNameBinding): TypeNameBinding {
-    result = binding
-    if (result.declaration_kind == "StringView") { result.declaration_kind = "Builtin" }
-    if (result.declaration_kind == "StructView") { result.declaration_kind = "Struct" }
-    return result
+    kind = "Builtin"
+    if (binding.declaration_kind == "StructView") { kind = "Struct" }
+    else if (binding.declaration_kind != "StringView") { return binding }
+    return TypeNameBinding { use_node: binding.use_node, name: binding.name, declaration_kind: kind,
+                             module_index: binding.module_index, declaration_node: binding.declaration_node, span: binding.span }
 }
 
 fn LinkedRecordFields(&layouts: [StructLayout], &managed: [StructLayout], &type: TypeNameBinding): [StructFieldLayout]! {
@@ -378,8 +381,9 @@ fn ExitLinkedFailure(state: LinkedNullState, &indent: str): LinkedNullState {
     if (next.catch_slot > 0) {
         label = LinkedFailureTarget(next) + "_handler"
         next.catch_edges = true
+        limit = next.catch_slot - 1
         index = 0
-        while (index < next.catch_slot - 1) {
+        while (index < limit) {
             if ((!next.slots[index].live || next.slots[index].moved_members.len() > 0) && LinkedNullOwner(next.slots[index].value.ty)
                 && !ContainsIndex(next.catch_moved, index)) {
                 next.catch_moved = next.catch_moved.push(index)
@@ -388,6 +392,15 @@ fn ExitLinkedFailure(state: LinkedNullState, &indent: str): LinkedNullState {
         }
     }
     next.code += indent.clone() + "goto " + label + ";\n"
+    return next
+}
+
+fn BindLinkedLocalCallback(state: LinkedNullState, name: str, ty: TypeNameBinding, text: str): LinkedNullState {
+    next = state
+    index = next.slots.len() + 1
+    value = LinkedNullValue { ty: ty, text: text, slot: index, borrowed: true, member_path: "" }
+    next.slots = next.slots.push(LinkedNullSlot { binding: name, value: value, parameter: false, live: true, moved_members: [] })
+    next.local_callbacks = next.local_callbacks.push(index)
     return next
 }
 
@@ -405,20 +418,9 @@ fn LinkedLocalAppendIndex(&state: LinkedNullState, &name: str): int {
     index = 0
     while (index < state.local_appends.len()) {
         if (state.local_appends[index].binding == name) { return index + 1 }
-        index += 1
+        index = index + 1
     }
     return 0
-}
-
-fn LinkedOkAvailable(&names: [TopLevelName], &imports: [ImportBinding], &slots: [LinkedNullSlot]): bool {
-    if (LinkedNullBinding(slots, "ok") != 0) { return false }
-    for name in names.clone() {
-        if (name.name == "ok") { return false }
-    }
-    for binding in imports.clone() {
-        if (binding.local_name == "ok") { return false }
-    }
-    return true
 }
 
 fn LinkedErrorField(receiver: LinkedNullExpression, member: str, at: Span): LinkedNullExpression {
@@ -511,4 +513,8 @@ fn LinkedCPrelude(&body: LinkedNullState, guards: str): str {
         text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
     }
     return text
+}
+
+fn LinkedScalarArrayOwner(&type: TypeNameBinding): bool {
+    return LinkedNullIntArrayOwner(type) || type.declaration_kind == "OwnedStringArray"
 }

@@ -1,5 +1,5 @@
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
-import { HasBoundArrayMembers } from "./struct_array_c.ku"
+import { LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
 import { LinkedIntSnapshotCall } from "./guarded_string_parts.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC } from "./linked_member_ownership.ku"
 import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
@@ -11,10 +11,10 @@ import { FindLinkedLocalRead } from "./call_contracts.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
-import { LayoutIndex, RejectLayout } from "./struct_layouts.ku"
-import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
-import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterPlan,
-         LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { HasBoundArrayMembers, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
+import { IsLinkedScopedCallback, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedRecordFields, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterPlan,
+         LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 
 struct LinkedNullParameters {
     state: LinkedNullState
@@ -38,15 +38,17 @@ fn CheckLinkedLocalFunctionName(&project: LinkedNullProject, &state: LinkedNullS
         FindLinkedLocalRead(state.local_readers, function.text) != 0 || LinkedLocalAppendIndex(state, function.text) != 0) {
         RejectLocalReader(function, "a local function needs a distinct local name")?
     }
+    declaration_count = project.supplied[0].named.names.declarations.len()
     index = 0
-    while (index < project.supplied[0].named.names.declarations.len()) {
+    while (index < declaration_count) {
         if (project.supplied[0].named.names.declarations[index].name == function.text) {
             RejectLocalReader(function, "a local reader may not shadow a module declaration")?
         }
         index = index + 1
     }
+    import_count = project.binding.modules[0].imports.len()
     index = 0
-    while (index < project.binding.modules[0].imports.len()) {
+    while (index < import_count) {
         if (project.binding.modules[0].imports[index].local_name == function.text) {
             RejectLocalReader(function, "a local reader may not shadow an imported declaration")?
         }
@@ -75,41 +77,44 @@ fn ReadLinkedNullParametersFrom(&project: LinkedNullProject, &function: Node, se
     plan: [LinkPlanType] = []
     index = 0
     validation = ""
-    while (index < function.edge_count) {
+    reading = index < function.edge_count
+    while (reading) {
         node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
-        if (node.kind != "Parameter") { break }
-        if (node.edge_count != 1 || node.int_value < 0 || node.int_value > 1 || LinkedNullBinding(state.slots, node.text) != 0) {
-            RejectLayout("linked_entry_parameter", "expected distinct explicitly typed parameters", DeclarationSpan(node))?
-        }
-        view = node.int_value == 1
-        ty = LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, node, 0), view)?
-        name = "a" + str(index)
-        if (index != 0) { signature += ", " }
-        c_type = LinkedNullCType(ty)?
-        signature += c_type.clone() + " " + name.clone()
-        plan = plan.push(LinkedNullParameterPlan(ty, 1)?)
-        if (ty.declaration_kind == "StringView") {
-            validation += "    if (!" + name.clone() + " || (" + name.clone() + "->len && !" + name.clone()
-                + "->ptr)) { invalid_str = true; goto cleanup; }\n"
-        } else if (ty.declaration_kind == "StructView") {
-            validation += "    if (!" + name.clone() + ") { invalid_struct_view = true; goto cleanup; }\n"
-        } else if (LinkedNullIntArrayOwner(ty) || LinkedNullOwnedArray(ty)) {
-            state = RequireLinkedArrayValidation(state, ty.clone())
-            discard = ""
-            if (LinkedNullOwnedArray(ty)) {
-                // A malformed FFI header cannot be walked by the element destructor.
-                discard = name.clone() + " = (" + c_type + "){0}; "
+        if (node.kind == "Parameter") {
+            if (node.edge_count != 1 || node.int_value < 0 || node.int_value > 1 || LinkedNullBinding(state.slots, node.text) != 0) {
+                RejectLayout("linked_entry_parameter", "expected distinct explicitly typed parameters", DeclarationSpan(node))?
             }
-            validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(&" + name.clone() + ") || (uintmax_t)"
-                + name.clone() + ".len > (uintmax_t)INT64_MAX) { " + discard + "invalid_array = true; goto cleanup; }\n"
-        } else if (view) {
-            validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(" + name.clone() + ") || (uintmax_t)"
-                + name.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
-        }
-        slot = AddLinkedNullSlot(project, state, node.text, name.clone(), ty, true)?
-        state = slot.state
-        state.code = state.code + "    (void)" + name + ";\n"
-        index = index + 1
+            view = node.int_value == 1
+            ty = LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, node, 0), view)?
+            name = "a" + str(index)
+            if (index != 0) { signature += ", " }
+            c_type = LinkedNullCType(ty)?
+            signature += c_type.clone() + " " + name.clone()
+            plan = plan.push(LinkedNullParameterPlan(ty, 1)?)
+            if (ty.declaration_kind == "StringView") {
+                validation += "    if (!" + name.clone() + " || (" + name.clone() + "->len && !" + name.clone()
+                    + "->ptr)) { invalid_str = true; goto cleanup; }\n"
+            } else if (ty.declaration_kind == "StructView") {
+                validation += "    if (!" + name.clone() + ") { invalid_struct_view = true; goto cleanup; }\n"
+            } else if (LinkedNullIntArrayOwner(ty) || LinkedNullOwnedArray(ty) || ty.declaration_kind == "OwnedStringArray") {
+                state = RequireLinkedArrayValidation(state, ty.clone())
+                discard = ""
+                if (!LinkedNullIntArrayOwner(ty)) {
+                    // A malformed FFI header cannot be walked by the element destructor.
+                    discard = name.clone() + " = (" + c_type + "){0}; "
+                }
+                validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(&" + name.clone() + ") || (uintmax_t)"
+                    + name.clone() + ".len > (uintmax_t)INT64_MAX) { " + discard + "invalid_array = true; goto cleanup; }\n"
+            } else if (view) {
+                validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(" + name.clone() + ") || (uintmax_t)"
+                    + name.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
+            }
+            slot = AddLinkedNullSlot(project, state, node.text, name.clone(), ty, true)?
+            state = slot.state
+            state.code += "    (void)" + name + ";\n"
+            index = index + 1
+            reading = index < function.edge_count
+        } else { reading = false }
     }
     if (index >= function.edge_count - 1) {
         RejectLayout("linked_null_signature", "entry requires a declared null! result and a body", DeclarationSpan(function))?
@@ -158,6 +163,23 @@ fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &el
 
 fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, ty: TypeNameBinding): LinkedNullState! {
     next = state
+    if (IsLinkedScopedCallback(ty)) {
+        if (ty.declaration_kind == "IntArrayResultCallback" || ty.declaration_kind == "IntResultAppendCallback") {
+            carrier = LinkedBuiltin("int", ty.span.clone())
+            carrier.declaration_kind = "BuiltinArray"
+            next = RegisterLinkedIntArray(next, carrier)
+        }
+        signature = LinkedScopedCallbackFunction(project, ty)?
+        if (!signature.returns_result) { return registerOwnedElement(project, next, signature.result) }
+        index = 0
+        while (index < signature.parameters.len()) {
+            if (signature.parameters[index].declaration_kind == "Struct") {
+                next = registerOwnedElement(project, next, signature.parameters[index].clone())?
+            }
+            index = index + 1
+        }
+        return ok(next)
+    }
     if (ty.declaration_kind == "Builtin" && ty.name == "bytes") { next.owning_strings = true }
     if (ty.declaration_kind == "OwnedStringArray") {
         next.uses_str_array = true
@@ -198,7 +220,7 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
 fn ValidateLinkedPayload(state: LinkedNullState, &result: TypeNameBinding, &payload: str): LinkedNullState {
     next = state
     prefix = "ku_linked_view_str_array"
-    if (LinkedNullOwnedArray(result)) {
+    if (LinkedNullOwnedArray(result) || LinkedNullIntArrayOwner(result)) {
         prefix = LinkedNullArrayPrefix(result)
     } else if (result.declaration_kind != "OwnedStringArray") { return next }
     next = RequireLinkedArrayValidation(next, result.clone())
@@ -223,10 +245,12 @@ fn RequireLinkedArrayValidation(state: LinkedNullState, ty: TypeNameBinding): Li
 fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, binding: str,
                      name: str, ty: TypeNameBinding, parameter: bool): LinkedNullExpression! {
     next = RegisterLinkedNullType(project, state, ty.clone())?
-    if (ty.declaration_kind == "IntPairResultCallback") {
+    if (ty.declaration_kind == "IntPairResultCallback" || IsLinkedScopedCallback(ty)) {
         if (!parameter) {
             RejectLayout("linked_callback_escape", "a callback parameter can only be forwarded to a checked synchronous parameter", ty.span.clone())?
         }
+    }
+    if (ty.declaration_kind == "IntPairResultCallback") {
         payload = ty.clone()
         payload.declaration_kind = "Struct"
         next = registerOwnedElement(project, next, payload)?
@@ -261,7 +285,7 @@ fn CloneLinkedIntArray(&project: LinkedNullProject, input: LinkedNullExpression,
     output.state = RequireLinkedArrayValidation(output.state, source.ty.clone())
     output.state.uses_int_snapshot = true
     output.state.slots[output.value.slot - 1].live = true
-    output.state.code += LinkedIntSnapshotCall(source.text, output.value.text)
+    output.state.code += LinkedIntSnapshotCall(source.text, output.value.text, output.value.text)
     return ok(output)
 }
 
@@ -347,11 +371,28 @@ fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, 
         RejectLayout("linked_clone_moved", "cloning a whole struct requires all fields to be available", DeclarationSpan(at))?
     }
     layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
-    if (HasBoundArrayMembers(source.state.layouts, layout)) {
-        RejectLayout("linked_nested_array_clone", "a struct with nested owning arrays does not yet support clone", ty.span.clone())?
-    }
+    arrays = HasBoundArrayMembers(source.state.layouts, layout)
     output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
-    if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
+    if (arrays) {
+        fields = LinkedRecordFields(output.state.layouts, output.state.owning_layouts, output.value.ty)?
+        index = 0
+        while (index < fields.len()) {
+            field = fields[index].resolved.clone()
+            suffix = ".f" + str(index)
+            origin = source.value.text.clone() + suffix.clone()
+            target = output.value.text.clone() + suffix
+            if (field.declaration_kind == "BuiltinArray" && field.name == "int") {
+                output.state = RegisterLinkedNullType(project, output.state, field)?
+                output.state.uses_int_snapshot = true
+                output.state.code += LinkedIntSnapshotCall(origin, target, "t" + str(id) + "_" + str(index))
+            } else if (field.declaration_kind == "Builtin" && (field.name == "int" || field.name == "bool")) {
+                output.state.code += "    " + target + " = " + origin + ";\n"
+            } else {
+                RejectLayout("linked_nested_array_clone", "record snapshot requires immediate [int] or Copy int and bool fields", field.span.clone())?
+            }
+            index += 1
+        }
+    } else if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
         output.state.code += "    " + output.value.text.clone() + " = " + source.value.text + ";\n"
     } else {
         if (!ContainsIndex(output.state.element_clones, layout)) {

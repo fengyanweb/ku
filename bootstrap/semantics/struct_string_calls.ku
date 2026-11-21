@@ -7,7 +7,12 @@ import { OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { BoundLinkPlanType, LinkedNullBinding, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { LinkedMemberUnavailable } from "./linked_member_ownership.ku"
+import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullView, LinkedStringResult, ResolveLinkedCall } from "./linked_null_types_c.ku"
+import { TypeNameBindingWithKind } from "./type_names.ku"
+import { FinishLinkedFieldRead, LowerLinkedNullRead, ReadLinkedArrayElementAfterBase } from "./linked_null_read_c.ku"
 
 struct StructStringDependency {
     symbol: str
@@ -208,4 +213,122 @@ fn ReadStructStringFold(&supplied: [SuppliedModule], &project: ProjectBindings, 
     separator = foldSeparator(arena, foldChild(arena, iteration, 1), initial.text, first.text)?
     call = foldElementCall(supplied, project, layouts, arena, iteration, param.text, initial.text, first.text, root)?
     return ok(StructStringFold { initial: ScalarStringLiteral(value)?, separator: separator, dependency: call })
+}
+
+fn LinkedCharacterSource(&project: LinkedNullProject, &state: LinkedNullState, id: int, method: bool): int {
+    call = LinkedNullNode(project, 1, id)
+    if (call.kind != "Call" || call.edge_count == 0) { return 0 }
+    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (target.kind != "Field" || target.text != "chars" || target.edge_count != 1) { return 0 }
+    receiver_id = LinkedNullChild(project, 1, target, 0)
+    receiver = LinkedNullNode(project, 1, receiver_id)
+    local = receiver.kind == "Variable" && LinkedNullBinding(state.slots, receiver.text) != 0
+    if (call.edge_count == 1 && method && (local || receiver.kind != "Variable")) { return receiver_id }
+    if (call.edge_count == 2 && receiver.kind == "Variable" && !local) {
+        count = project.binding.modules[0].imports.len()
+        index = 0
+        while (index < count) {
+            if (project.binding.modules[0].imports[index].local_name == receiver.text &&
+                project.binding.modules[0].imports[index].module_index == 0 &&
+                project.binding.modules[0].imports[index].source_name == "string") {
+                return LinkedNullChild(project, 1, call, 1)
+            }
+            index = index + 1
+        }
+    }
+    return 0
+}
+
+fn MaterializeLinkedCharacters(&project: LinkedNullProject, input: LinkedNullExpression, name: str, binding: str): LinkedNullExpression! {
+    if (!LinkedStringResult(input.value.ty)) {
+        RejectLayout("linked_chars_type", "string.chars requires a str input", input.value.ty.span.clone())?
+    }
+    ty = TypeNameBindingWithKind(LinkedBuiltin("str", input.value.ty.span.clone()), "OwnedStringArray")
+    output = AddLinkedNullSlot(project, input.state, binding, name, ty, false)?
+    output.state.uses_chars = true
+    output.state.slots[output.value.slot - 1].live = true
+    output.state.code += "    source_status = ku_managed_source_chars(" + input.value.text + ", &" + output.value.text.clone() + ");\n"
+        + "    if (source_status != KU_SOURCE_OK) goto cleanup;\n"
+    return ok(output)
+}
+
+fn LinkedStringReplaceApplies(&project: LinkedNullProject, &state: LinkedNullState, &target: Node): bool {
+    if (!state.plain_value_result || target.kind != "Field" || target.text != "replace" || target.edge_count != 1) {
+        return false
+    }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+    if (receiver.kind != "Variable") { return false }
+    slot = LinkedNullBinding(state.slots, receiver.text)
+    return slot > 0 && LinkedStringResult(state.slots[slot - 1].value.ty)
+}
+
+struct LinkedMemberPlace {
+    place: LinkedNullExpression
+    array_owner: int
+}
+
+fn ReadLinkedMemberPlace(&project: LinkedNullProject, state: LinkedNullState, &node: Node): LinkedMemberPlace! {
+    id = LinkedNullChild(project, 1, node, 0)
+    base = LinkedNullNode(project, 1, id)
+    if (base.kind == "Index" && base.edge_count == 2) {
+        array = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, base, 0), 2)?
+        owner = 0
+        if (LinkedNullOwnedArray(array.value.ty) && !array.value.borrowed &&
+            !LinkedMemberUnavailable(array.state, array.value, true)) {
+            owner = array.value.slot
+        }
+        item = ReadLinkedArrayElementAfterBase(project, array, base, id, 1)?
+        return ok(LinkedMemberPlace { place: FinishLinkedFieldRead(project, item, node, true)?, array_owner: owner })
+    }
+    receiver = LowerLinkedNullRead(project, state, id, 1)?
+    return ok(LinkedMemberPlace { place: FinishLinkedFieldRead(project, receiver, node, true)?, array_owner: 0 })
+}
+
+fn LowerLinkedStringReplace(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
+                            &target: Node, id: int, depth: int): LinkedNullExpression! {
+    if (call.edge_count != 3) {
+        RejectLayout("linked_replace_shape", "string.replace requires a string receiver and two arguments", DeclarationSpan(call))?
+    }
+    first = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, target, 0), depth + 1)?
+    second = LowerLinkedNullRead(project, first.state, LinkedNullChild(project, 1, call, 1), depth + 1)?
+    third = LowerLinkedNullRead(project, second.state, LinkedNullChild(project, 1, call, 2), depth + 1)?
+    if (!LinkedStringResult(first.value.ty) || !LinkedStringResult(second.value.ty) || !LinkedStringResult(third.value.ty)) {
+        RejectLayout("linked_replace_type", "string.replace requires three string values", DeclarationSpan(call))?
+    }
+    output = AddLinkedNullSlot(project, third.state, "", "t" + str(id), LinkedBuiltin("str", DeclarationSpan(call)), false)?
+    output.state.uses_replace = true
+    output.state.code += "    string_failure = ku_scalar_string_replace(" + first.value.text + ", "
+        + second.value.text + ", " + third.value.text + ", &" + output.value.text.clone() + ");\n"
+        + "    if (string_failure) goto cleanup;\n"
+    output.state.slots[output.value.slot - 1].live = true
+    return ok(output)
+}
+
+fn LinkedOwnedStringPredicate(&project: LinkedNullProject, &state: LinkedNullState, &call: Node): bool! {
+    if (call.kind != "Call" || call.edge_count < 2 || call.edge_count > 9) { return ok(false) }
+    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (target.kind != "Variable" || target.edge_count != 0) { return ok(false) }
+    callee = ResolveLinkedCall(project, state.slots, call, target, false)?
+    if (callee.returns_result || callee.result.declaration_kind != "Builtin" || callee.result.name != "bool") {
+        return ok(false)
+    }
+    owns_string = false
+    for parameter in callee.parameters {
+        if (LinkedStringResult(parameter)) { owns_string = true }
+        else if (!LinkedNullView(parameter) && !LinkedIntResult(parameter) &&
+            !(parameter.declaration_kind == "Builtin" && parameter.name == "bool")) { return ok(false) }
+    }
+    return ok(owns_string)
+}
+
+fn LinkedFieldAppendArgument(&project: LinkedNullProject, &target: Node, &root: Node, rhs: int): int {
+    call = LinkedNullNode(project, 1, rhs)
+    if (call.kind != "Call" || call.edge_count != 2) { return 0 }
+    method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (method.kind != "Field" || method.edge_count != 1 || method.text != "push") { return 0 }
+    field = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
+    if (field.kind != "Field" || field.edge_count != 1 || field.text != target.text) { return 0 }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, field, 0))
+    if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != root.text) { return 0 }
+    return LinkedNullChild(project, 1, call, 1)
 }

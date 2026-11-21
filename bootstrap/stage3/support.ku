@@ -28,8 +28,13 @@ fn WindowKind(&tokens: [Token], index: int, end: int): str {
     return tokens[index].kind.clone()
 }
 
+fn WindowKindIs(&tokens: [Token], index: int, end: int, &kind: str): bool {
+    if (index >= end) { return kind == "Eof" }
+    return tokens[index].kind == kind
+}
+
 fn AfterOptionalSemicolon(&tokens: [Token], index: int, end: int): int {
-    if (WindowKind(tokens, index, end) == "Semicolon") { return index + 1 }
+    if (WindowKindIs(tokens, index, end, "Semicolon")) { return index + 1 }
     return index
 }
 
@@ -71,11 +76,11 @@ fn ParseExpressionAt(source: str, origin: Token, boundary: Token): ParseOutput! 
     })?)
 }
 
-fn CanEndExpression(kind: str): bool {
+fn CanEndExpression(&kind: str): bool {
     return kind == "Ident" || kind == "Int" || kind == "Float" || kind == "String" || kind == "TemplateString" || kind == "True" || kind == "False" || kind == "Null" || kind == "RParen" || kind == "RBracket" || kind == "RBrace" || kind == "Question"
 }
 
-fn CanStartStatement(kind: str): bool {
+fn CanStartStatement(&kind: str): bool {
     return kind == "Ident" || kind == "Int" || kind == "Float" || kind == "String" || kind == "TemplateString" || kind == "True" || kind == "False" || kind == "Null" || kind == "Bang" || kind == "Return" || kind == "Let" || kind == "If" || kind == "While" || kind == "For" || kind == "Break" || kind == "Continue" || kind == "Try" || kind == "Async" || kind == "Fn" || kind == "Fail" || kind == "Panic" || kind == "Print" || kind == "Await"
 }
 
@@ -83,7 +88,7 @@ fn CanStartStatement(kind: str): bool {
 // closes immediately before an assignment. Parsing the pattern itself
 // diagnoses the spelling and type of each delimiter.
 fn ObjectDestructureClose(&tokens: [Token], first: int, window_end: int): int {
-    if (WindowKind(tokens, first, window_end) != "LBrace") { return 0 }
+    if (!WindowKindIs(tokens, first, window_end, "LBrace")) { return 0 }
     cursor = first
     depth = 0
     while (cursor < window_end) {
@@ -93,7 +98,7 @@ fn ObjectDestructureClose(&tokens: [Token], first: int, window_end: int): int {
         } else if (kind == "RBrace" || kind == "RParen" || kind == "RBracket") {
             depth = depth - 1
             if (depth == 0) {
-                if (WindowKind(tokens, cursor + 1, window_end) == "Equal") { return cursor }
+                if (WindowKindIs(tokens, cursor + 1, window_end, "Equal")) { return cursor }
                 return 0
             }
         } else if (kind == "Eof") {
@@ -127,7 +132,7 @@ fn EmptyExpressionBoundary(): ExpressionBoundary {
 }
 
 fn PushExpressionBoundary(state: ExpressionBoundary, token: Token, previous_can_end: bool, named_struct_open: bool): ExpressionBoundary! {
-    complete = state.paren_depth == 0 && state.bracket_depth == 0 && state.brace_depth == 0 && ((token.kind == "Semicolon" || token.kind == "RBrace" || token.kind == "Eof") || (previous_can_end && CanStartStatement(token.kind.clone())))
+    complete = state.paren_depth == 0 && state.bracket_depth == 0 && state.brace_depth == 0 && ((token.kind == "Semicolon" || token.kind == "RBrace" || token.kind == "Eof") || (previous_can_end && CanStartStatement(token.kind)))
     paren_depth = state.paren_depth
     bracket_depth = state.bracket_depth
     brace_depth = state.brace_depth

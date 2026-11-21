@@ -15,6 +15,14 @@ struct TypeNameBinding {
     span: Span
 }
 
+fn TypeNameBindingWithKind(&binding: TypeNameBinding, kind: str): TypeNameBinding {
+    return TypeNameBinding {
+        use_node: binding.use_node, name: binding.name.clone(), declaration_kind: kind,
+        module_index: binding.module_index, declaration_node: binding.declaration_node,
+        span: binding.span.clone()
+    }
+}
+
 fn IsBuiltinType(&name: str): bool {
     return name == "int" || name == "float" || name == "bool" || name == "str" || name == "null"
 }
@@ -97,4 +105,23 @@ fn SameBoundTypeIdentity(&a: TypeNameBinding, &b: TypeNameBinding): bool {
     return a.declaration_kind == b.declaration_kind && a.module_index == b.module_index
         && a.declaration_node == b.declaration_node
         && ((a.declaration_kind != "Builtin" && a.declaration_kind != "BuiltinArray") || a.name == b.name)
+}
+
+fn LinkedCopyResult(&binding: TypeNameBinding): bool {
+    return binding.declaration_kind == "Builtin" && (binding.name == "int" || binding.name == "bool")
+}
+
+fn RetagTypeNameBinding(binding: TypeNameBinding, kind: str): TypeNameBinding {
+    return TypeNameBinding {
+        use_node: binding.use_node, name: binding.name, declaration_kind: kind,
+        module_index: binding.module_index, declaration_node: binding.declaration_node, span: binding.span
+    }
+}
+
+fn IsLinkedDescendant(&path: str, &parent: str): bool {
+    if (path.byte_len() <= parent.byte_len() || !path.starts_with(parent)) { return false }
+    // A decimal ordinal can be the prefix of a different sibling ordinal.
+    prefix = parent + "."
+    if (path.starts_with(prefix)) { return true }
+    return false
 }

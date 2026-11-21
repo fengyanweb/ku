@@ -1,9 +1,10 @@
+import { LinkedCharacterSource } from "./struct_string_calls.ku"
 import { RegisterLinkedLocalRead } from "./linked_array_fields_c.ku"
 import { RequireLinkedMutableName } from "./call_contracts.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, ReadLinkedNullParameters } from "./linked_parameters_c.ku"
-import { OpenLinkedForLoop, OpenLinkedConditionalWhile, ReadLinkedWhileCondition, CloseLinkedForLoop, LinkedCountdownIndex, LinkedCountedInitial, ValidLinkedCountedStart, ReadLinkedLocalThunk, FinishLinkedLocalThunk, LowerLinkedLocalAlias, LowerLinkedPredicate } from "./linked_char_iter_c.ku"
+import { OpenLinkedForLoop, OpenLinkedConditionalWhile, ReadLinkedWhileCondition, CloseLinkedForLoop, LinkedCountdownIndex, LinkedCountedInitial, ValidLinkedCountedStart, ReadLinkedLocalThunk, FinishLinkedLocalThunk, LowerLinkedLocalAlias, LowerLinkedPredicate, LowerLinkedCharacterLocal } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
-import { EmitLinkedFunction, LowerLinkedArrayLocal, LowerLinkedTargetSet, LowerLinkedOwnedDestructure,
+import { EmitLinkedFunction, LowerLinkedTargetSet, LowerLinkedOwnedDestructure,
          LowerLinkedPlainReturn, LowerLinkedStringAppend, LowerLinkedSuccess } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -15,9 +16,10 @@ import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
 import { ExitLinkedFailure, LinkedFailureTarget, LinkedSlotPrefix, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedResultPlan, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
+import { LinkedChildKindIs } from "./link_plan_json_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { FinishLinkedAppendThunk, IsLinkedAppendThunk, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, ReadLinkedAppendThunk, ReadLinkedCatchParts, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
+import { FinishLinkedAppendThunk, IsLinkedAppendThunk, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, LowerLinkedTypedArrayLocal, ReadLinkedAppendThunk, ReadLinkedCatchParts, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 
@@ -47,38 +49,45 @@ fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statem
     then_region = statement.clone()
     then_region.edge_count = split
     taken = lowerLinkedRegion(project, then_region, guard.state, 1, result, depth + 1)?
+    then_terminal = taken.terminal
+    next = taken.state
     if (split == statement.edge_count) {
-        if (taken.terminal) { taken.state = RestoreLinkedNullSlots(taken.state, outer) }
+        if (then_terminal) { next = RestoreLinkedNullSlots(next, outer) }
         else {
-            merged = MergeLinkedGuardOwners(taken.state, outer, statement)?
-            taken.state = DropLinkedNullScope(merged, outer.len())
+            next = MergeLinkedGuardOwners(next, outer, statement)?
+            next = DropLinkedNullScope(next, outer.len())
         }
-        taken.state.code += "    }\n"
-        return ok(LinkedNullRegion { state: taken.state, terminal: false })
+        next.code += "    }\n"
+        return ok(LinkedNullRegion { state: next, terminal: false })
     }
 
     after_then: [LinkedNullSlot] = []
-    if (!taken.terminal) {
-        after_then = LinkedSlotPrefix(taken.state.slots, outer.len())
-        taken.state = DropLinkedNullScope(taken.state, outer.len())
+    if (!then_terminal) {
+        after_then = LinkedSlotPrefix(next.slots, outer.len())
+        next = DropLinkedNullScope(next, outer.len())
     }
-    taken.state = RestoreLinkedNullSlots(taken.state, outer)
-    taken.state.code += "    } else {\n"
-    other = lowerLinkedRegion(project, statement, taken.state, split, result, depth + 1)?
-    if (!other.terminal) {
-        if (!taken.terminal) { other.state = MergeLinkedConditionalMembers(other.state, after_then, statement)? }
-        other.state = DropLinkedNullScope(other.state, outer.len())
-    } else if (!taken.terminal) {
-        other.state = RestoreLinkedNullSlots(other.state, after_then)
+    next = RestoreLinkedNullSlots(next, outer)
+    next.code += "    } else {\n"
+    other = lowerLinkedRegion(project, statement, next, split, result, depth + 1)?
+    else_terminal = other.terminal
+    next = other.state
+    if (!else_terminal) {
+        if (!then_terminal) { next = MergeLinkedConditionalMembers(next, after_then, statement)? }
+        next = DropLinkedNullScope(next, outer.len())
+    } else if (!then_terminal) {
+        next = RestoreLinkedNullSlots(next, after_then)
     }
-    other.state.code += "    }\n"
-    return ok(LinkedNullRegion { state: other.state, terminal: taken.terminal && other.terminal })
+    next.code += "    }\n"
+    return ok(LinkedNullRegion { state: next, terminal: then_terminal && else_terminal })
 }
 
 fn countedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &initial: Node, &step: Node): int! {
     guard = LinkedIncreasingGuard(project, loop)
-    if (guard.kind != "Binary" || guard.edge_count != 2 || guard.text != "<" ||
-        !LinkedCountBound(project, state, LinkedNullChild(project, 1, guard, 1))?) {
+    bounded = false
+    if (guard.kind == "Binary" && guard.edge_count == 2 && guard.text == "<") {
+        bounded = LinkedCountBound(project, state, LinkedNullChild(project, 1, guard, 1))?
+    }
+    if (!bounded) {
         RejectLayout("unsupported_linked_loop", "counted while requires a readonly array length or stable int bound", DeclarationSpan(guard))?
     }
     left = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
@@ -118,12 +127,13 @@ fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statemen
     next = state
     next.code = next.code + "    while (true) {\n"
     guard = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, statement, 0), 0)?
-    if (countdown == 0) { CheckLinkedCountedBoundWrites(project, guard.state, statement)? }
-    guard.state.code = guard.state.code + "    if (!(" + guard.value.text + ")) break;\n"
-    locals = guard.state.slots.len()
+    next = guard.state
+    if (countdown == 0) { CheckLinkedCountedBoundWrites(project, next, statement)? }
+    next.code += "    if (!(" + guard.value.text + ")) break;\n"
+    locals = next.slots.len()
     body = statement.clone()
     body.edge_count = body.edge_count - 1
-    lowered = lowerLinkedRegion(project, body, guard.state, 1, result, depth + 1)?
+    lowered = lowerLinkedRegion(project, body, next, 1, result, depth + 1)?
     if (lowered.terminal) {
         update = "increment"
         if (countdown != 0) { update = "decrement" }
@@ -132,8 +142,9 @@ fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statemen
     PreserveLinkedOwners(outer, lowered.state.slots, statement)?
     next = DropLinkedNullScope(lowered.state, locals)
     advanced = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, step, 0), 0)?
-    advanced.state.code = advanced.state.code + "    " + advanced.state.slots[cursor - 1].value.text.clone() + " = " + advanced.value.text + ";\n    }\n"
-    return ok(advanced.state)
+    next = advanced.state
+    next.code += "    " + next.slots[cursor - 1].value.text.clone() + " = " + advanced.value.text + ";\n    }\n"
+    return ok(next)
 }
 
 fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
@@ -157,8 +168,8 @@ fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &stat
     next = state
     destination = target.clone()
     if (plan.scratch) {
-        ty = LinkedBuiltin("Error", DeclarationSpan(literal))
-        ty.declaration_kind = "CaughtError"
+        ty = TypeNameBinding { use_node: 0, name: "Error", declaration_kind: "CaughtError",
+            module_index: 0, declaration_node: 0, span: DeclarationSpan(literal) }
         scratch = AddLinkedNullSlot(project, next, "", "error" + str(id), ty, false)?
         next = scratch.state
         destination = scratch.value.text
@@ -192,7 +203,7 @@ fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &stat
 }
 
 fn lowerLinkedCatch(&project: LinkedNullProject, state: LinkedNullState, &node: Node, id: int,
-                    &result: TypeNameBinding, depth: int): LinkedNullRegion! {
+                    &result: TypeNameBinding, depth: int, last: bool): LinkedNullRegion! {
     if (state.catch_slot != 0 || node.edge_count != 2 || depth >= 8) {
         RejectLayout("unsupported_linked_catch", "expected one terminal try with a named catch", DeclarationSpan(node))?
     }
@@ -208,10 +219,18 @@ fn lowerLinkedCatch(&project: LinkedNullProject, state: LinkedNullState, &node: 
     }
     resumed = BindLinkedCatch(body.state, clauses.binding.text.clone(), clauses.binding, outer)?
     handled = lowerLinkedRegion(project, clauses.recovery, resumed, 0, result, depth + 1)?
-    if (!handled.terminal) {
+    if (handled.terminal) {
+        if (!last) {
+            RejectLayout("unsupported_linked_terminal", "expected the terminal at the end of its block", DeclarationSpan(node))?
+        }
+        return ok(handled)
+    }
+    if (last) {
         RejectLayout("unsupported_linked_catch", "the handler must return or fail", DeclarationSpan(clauses.recovery))?
     }
-    return ok(handled)
+    // The protected path has already returned or failed. Drop the
+    // catch binding and its locals before continuing in the outer scope.
+    return ok(LinkedNullRegion { state: DropLinkedNullScope(handled.state, outer.len()), terminal: false })
 }
 
 fn lowerLinkedCopyRebind(&project: LinkedNullProject, state: LinkedNullState, &assignment: Node, slot: int): LinkedNullState! {
@@ -222,12 +241,10 @@ fn lowerLinkedCopyRebind(&project: LinkedNullProject, state: LinkedNullState, &a
     if (LinkedNullNode(project, 1, id).kind == "TryUnwrap") {
         return StoreLinkedCopyAssignment(destination, LowerLinkedNullValue(project, state, id, 0)?, assignment)
     }
+    if (destination.value.ty.name == "bool") {
+        return StoreLinkedCopyAssignment(destination, LowerLinkedPredicate(project, state, id)?, assignment)
+    }
     return StoreLinkedCopyAssignment(destination, LowerLinkedNullRead(project, state, id, 0)?, assignment)
-}
-
-fn linkedChildKindIs(&project: LinkedNullProject, &parent: Node, ordinal: int, &kind: str): bool {
-    child = LinkedNullNode(project, 1, LinkedNullChild(project, 1, parent, ordinal))
-    return child.kind == kind
 }
 
 fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNullState, start: int,
@@ -252,10 +269,11 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             } else { next = LowerLinkedSuccess(project, next, statement, result)? }
             return ok(LinkedNullRegion { state: next, terminal: true })
         }
-        if (statement.kind == "Try" && index == limit - 1) {
-            return lowerLinkedCatch(project, next, statement, id, result, depth)
-        }
-        if (statement.kind == "Assign" && statement.edge_count == 1) {
+        if (statement.kind == "Try") {
+            caught = lowerLinkedCatch(project, next, statement, id, result, depth, index == limit - 1)?
+            if (caught.terminal) { return ok(caught) }
+            next = caught.state
+        } else if (statement.kind == "Assign" && statement.edge_count == 1) {
             slot = LinkedNullBinding(next.slots, statement.text)
             if (slot != 0) { RequireLinkedMutableName(statement.text, DeclarationSpan(statement))? }
             if (ContainsIndex(next.callback_owners, slot)) {
@@ -279,7 +297,11 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             next = LowerLinkedOwnedDestructure(project, next, statement)?
         } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {
             type_node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
-            if (type_node.kind == "TypeArray") { next = LowerLinkedArrayLocal(project, next, statement, id)? }
+            if (type_node.kind == "TypeArray") {
+                source = LinkedCharacterSource(project, next, LinkedNullChild(project, 1, statement, 1), true)
+                if (source == 0) { next = LowerLinkedTypedArrayLocal(project, next, statement, id)? }
+                else { next = LowerLinkedCharacterLocal(project, next, statement, id, source)? }
+            }
             else if (type_node.kind == "TypeFunction") { next = LowerLinkedLocalAlias(project, next, statement)? }
             else { next = LowerLinkedLocal(project, next, statement, id)? }
         } else if (statement.kind == "Function" && depth == 0) {
@@ -289,7 +311,7 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
                 thunk = prepared.thunk
                 body = lowerLinkedRegion(project, statement, prepared.state, thunk.body_start, thunk.result, 1)?
                 next = FinishLinkedAppendThunk(next, thunk, body, statement, id)?
-            } else if (statement.edge_count >= 4 && linkedChildKindIs(project, statement, 1, "Parameter")) {
+            } else if (statement.edge_count >= 4 && LinkedChildKindIs(project, statement, 1, "Parameter")) {
                 CheckLinkedLocalFunctionName(project, next, statement)?
                 prepared = ReadLinkedLocalThunk(project, next, statement, id)?
                 thunk = prepared.thunk
@@ -351,7 +373,7 @@ fn EmitLinkedNullC(&project: LinkedNullProject, &entry_name: str): LinkedNullC! 
         RejectLayout("unsupported_linked_terminal", "expected a final return or Error fail", DeclarationSpan(function))?
     }
     symbol = "ku_linked_null_" + str(id)
-    source = EmitLinkedFunction(region.state, symbol, parameters.signature, result)?
+    source = EmitLinkedFunction(project, region.state, symbol, parameters.signature, result)?
     checked = !region.state.plain_value_result
     plan = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol.clone(), parameters: parameters.plan,
         result: LinkedResultPlan(result, 1, checked)?, returns_result: checked }

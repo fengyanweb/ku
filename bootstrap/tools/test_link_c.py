@@ -358,6 +358,272 @@ int main(void) {
         with self.assertRaisesRegex(link_c.LinkError, "cannot be a returned value"):
             link_c.Signature.read({"parameters": [], "result": callback(1), "returns_result": False}, "bad")
 
+    def test_int_append_callback_checks_both_nominal_arguments_in_order(self):
+        def callback(unit, node):
+            return dict(view(f"KuBootstrapIntAppendCallback_m{unit}_{node}", f"consumer{unit}.ku"),
+                        kind="IntResultAppendCallback", passing="value", node=node, nominals=[
+                            {"source_path": "positions.ku", "node": 5, "c_type": f"KuStruct_m{unit}_5"},
+                            {"source_path": "tokens.ku", "node": 9, "c_type": f"KuStruct_m{unit}_9"},
+                        ])
+
+        code = """#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+typedef struct { size_t len; int64_t *data; size_t capacity; } KuArrayInt;
+typedef struct { bool ok; int64_t value; } KuBootstrapResult_int64_t;
+typedef struct { size_t length; } KuProjectionString;
+typedef struct {
+    int append_status;
+    bool out_of_memory, overflow, index_failed;
+    const char *array_error;
+    int64_t index;
+    size_t length;
+} KuLocalAppendFailure;
+typedef struct { int64_t value; } POSITION;
+typedef struct { int64_t value; } TOKEN;
+typedef struct {
+    KuBootstrapResult_int64_t (*entry)(void *, KuLocalAppendFailure *, KuProjectionString,
+        KuProjectionString, int64_t, POSITION, KuArrayInt, TOKEN);
+    void *environment;
+    KuLocalAppendFailure *failure;
+} CALLBACK;
+"""
+        entry = declaration("app.ku", 58, "forward", [callback(1, 41)])
+        requested = declaration(self.left_path, 17, "apply", [callback(1, 41)])
+        supplied = declaration(self.left_path, 17, "invoke", [callback(4, 72)])
+        units = self.unit("append-callback-entry", plan(entry, [requested]), (code + """
+extern int64_t apply(CALLBACK);
+int64_t forward(CALLBACK f) { return apply(f); }
+""").replace("CALLBACK", "KuBootstrapIntAppendCallback_m1_41")
+    .replace("POSITION", "KuStruct_m1_5").replace("TOKEN", "KuStruct_m1_9"))
+        provider_code = (code + """
+int64_t invoke(CALLBACK f) {
+    KuBootstrapResult_int64_t result = f.entry(f.environment, f.failure,
+        (KuProjectionString){2}, (KuProjectionString){3}, 4,
+        (POSITION){5}, (KuArrayInt){0}, (TOKEN){7});
+    return result.ok ? result.value : -1;
+}
+""").replace("CALLBACK", "KuBootstrapIntAppendCallback_m4_72")
+        provider_code = provider_code.replace("POSITION", "KuStruct_m4_5").replace("TOKEN", "KuStruct_m4_9")
+        provider = self.unit("append-callback-provider", plan(supplied), provider_code)
+        self.caller.write_text("""
+static KuBootstrapResult_int64_t count(void *raw, KuLocalAppendFailure *failure,
+    KuProjectionString a, KuProjectionString b, int64_t c,
+    KuStruct_m1_5 span, KuArrayInt data, KuStruct_m1_9 token) {
+    (void)failure;
+    int64_t *calls = raw;
+    ++*calls;
+    return (KuBootstrapResult_int64_t){true,
+        (int64_t)(a.length + b.length + data.len) + c + 10 * span.value + token.value};
+}
+int main(void) {
+    int64_t calls = 0;
+    KuLocalAppendFailure failure = {0};
+    KuBootstrapIntAppendCallback_m1_41 f = {count, &calls, &failure};
+    return forward(f) != 66 || calls != 1;
+}
+""", encoding="ascii")
+        self.assertEqual(link_c.main([*units, *provider, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+        original = self.output.read_bytes()
+        wrong_c = provider_code.replace(
+            "int64_t, KuStruct_m4_5, KuArrayInt, KuStruct_m4_9",
+            "int64_t, KuStruct_m4_5, KuArrayInt, KuStruct_m4_5")
+        self.assertNotEqual(wrong_c, provider_code)
+        wrong = self.unit("append-callback-wrong-carrier", plan(supplied), wrong_c)
+        self.assertEqual(link_c.main([*units, *wrong, *self.build_args]), 1)
+        self.assertEqual(self.output.read_bytes(), original)
+        self.change_plan(provider, lambda m: m["export"]["signature"]["parameters"][0]["nominals"].reverse())
+        self.assert_preflight_error([*units, *provider], "signature mismatch")
+
+    def test_int_arena_callback_preserves_by_value_positions_and_boolean(self):
+        callback = dict(view("KuBootstrapIntArenaCallback_m1_45", "app.ku"),
+                        kind="IntResultArenaCallback", passing="value", node=45, nominals=[
+                            {"source_path": "input.ku", "node": 7, "c_type": "KuStruct_m2_7"},
+                            {"source_path": "marks.ku", "node": 8, "c_type": "KuStruct_m3_8"},
+                        ])
+        alternate = dict(callback, source_path="caller.ku", node=25, c_type="KuBootstrapIntArenaCallback_m4_25")
+        self.assertEqual(link_c.TypeRef.read(callback, "callback").semantic(),
+                         link_c.TypeRef.read(alternate, "callback").semantic())
+        alternate["nominals"] = list(reversed(callback["nominals"]))
+        self.assertNotEqual(link_c.TypeRef.read(callback, "callback").semantic(),
+                            link_c.TypeRef.read(alternate, "callback").semantic())
+        code = """#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+typedef struct { bool ok; int64_t value; } KuBootstrapResult_int64_t;
+typedef struct {
+    int append_status;
+    bool out_of_memory, overflow, index_failed;
+    const char *array_error;
+    int64_t index;
+    size_t length;
+} KuLocalAppendFailure;
+typedef struct { int64_t value; } KuStruct_m2_7;
+typedef struct { int64_t value; } KuStruct_m3_8;
+typedef struct {
+    KuBootstrapResult_int64_t (*entry)(void *, KuLocalAppendFailure *, KuStruct_m2_7, KuStruct_m3_8, bool);
+    void *environment;
+    KuLocalAppendFailure *failure;
+} KuBootstrapIntArenaCallback_m1_45;
+int64_t invoke(KuBootstrapIntArenaCallback_m1_45 f) {
+    KuBootstrapResult_int64_t value = f.entry(f.environment, f.failure, (KuStruct_m2_7){4},
+                                             (KuStruct_m3_8){2}, true);
+    return value.ok ? value.value : -1;
+}
+"""
+        export = declaration("app.ku", 58, "invoke", [callback])
+        unit = self.unit("arena-callback", plan(export), code)
+        self.caller.write_text("""
+static KuBootstrapResult_int64_t count(void *raw, KuLocalAppendFailure *failure,
+    KuStruct_m2_7 first, KuStruct_m3_8 second, bool plus) {
+    (void)failure;
+    int64_t *factor = raw;
+    return (KuBootstrapResult_int64_t){true, (*factor * first.value + second.value) * (plus ? 1 : -1)};
+}
+int main(void) {
+    int64_t factor = 10;
+    KuLocalAppendFailure failure = {0};
+    return invoke((KuBootstrapIntArenaCallback_m1_45){count, &factor, &failure}) != 42;
+}
+""", encoding="ascii")
+        self.assertEqual(link_c.main([*unit, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+
+    def test_int_reader_callback_checks_the_plain_nominal_result(self):
+        callback = dict(view("KuBootstrapIntReaderCallback_KuStruct_m2_9"),
+                        kind="IntRecordReaderCallback", passing="value")
+        unit_ref = link_c.TypeRef.read(callback, "reader").semantic()
+        foreign = dict(callback, c_type="KuBootstrapIntReaderCallback_KuStruct_m5_9")
+        self.assertEqual(link_c.TypeRef.read(foreign, "reader").semantic(), unit_ref)
+        foreign["source_path"] = "other.ku"
+        self.assertNotEqual(link_c.TypeRef.read(foreign, "reader").semantic(), unit_ref)
+        code = """#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+typedef struct {
+    int append_status;
+    bool out_of_memory, overflow, index_failed;
+    const char *array_error;
+    int64_t index;
+    size_t length;
+} KuLocalAppendFailure;
+typedef struct { int64_t value; } KuStruct_m2_9;
+typedef struct { int64_t value; } Other;
+typedef struct {
+    KuStruct_m2_9 (*entry)(void *, KuLocalAppendFailure *, int64_t);
+    void *environment;
+    KuLocalAppendFailure *failure;
+} KuBootstrapIntReaderCallback_KuStruct_m2_9;
+int64_t invoke(KuBootstrapIntReaderCallback_KuStruct_m2_9 f) {
+    return f.entry(f.environment, f.failure, 12).value;
+}
+"""
+        export = declaration("app.ku", 58, "invoke", [callback])
+        unit = self.unit("record-reader", plan(export), code)
+        self.caller.write_text("""
+static KuStruct_m2_9 read_value(void *raw, KuLocalAppendFailure *failure, int64_t index) {
+    (void)failure;
+    return (KuStruct_m2_9){*(int64_t *)raw + index};
+}
+int main(void) {
+    int64_t base = 30;
+    KuLocalAppendFailure failure = {0};
+    return invoke((KuBootstrapIntReaderCallback_KuStruct_m2_9){read_value, &base, &failure}) != 42;
+}
+""", encoding="ascii")
+        self.assertEqual(link_c.main([*unit, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+        valid = self.output.read_bytes()
+        wrong = self.unit("record-reader-wrong-result", plan(export),
+                          code.replace("KuStruct_m2_9 (*entry)", "Other (*entry)"))
+        self.assertEqual(link_c.main([*wrong, *self.build_args]), 1)
+        self.assertEqual(self.output.read_bytes(), valid)
+
+    def test_typed_int_array_callback_checks_nominal_argument_and_failure_record(self):
+        def callback(module):
+            return dict(view(f"KuBootstrapIntArrayCallback_KuStruct_m{module}_9"),
+                        kind="IntArrayResultCallback", passing="value")
+
+        code = """#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+typedef struct { size_t len; int64_t *data; size_t capacity; } KuArrayInt;
+typedef struct { bool ok; KuArrayInt value; } KuBootstrapResult_KuArrayInt;
+typedef struct {
+    int append_status;
+    bool out_of_memory, overflow, index_failed;
+    const char *array_error;
+    int64_t index;
+    size_t length;
+} KuLocalAppendFailure;
+typedef struct { int64_t value; } TOKEN;
+typedef struct {
+    KuBootstrapResult_KuArrayInt (*entry)(void *, KuLocalAppendFailure *, KuArrayInt, int64_t, int64_t, TOKEN);
+    void *environment;
+    KuLocalAppendFailure *failure;
+} KuBootstrapIntArrayCallback_TOKEN;
+"""
+        entry = declaration("app.ku", 58, "forward_array", [callback(1)])
+        requested = declaration(self.left_path, 17, "apply_array", [callback(1)])
+        supplied = declaration(self.left_path, 17, "invoke_array", [callback(4)])
+        units = self.unit("array-callback-entry", plan(entry, [requested]), (code + """
+extern int64_t apply_array(KuBootstrapIntArrayCallback_TOKEN);
+int64_t forward_array(KuBootstrapIntArrayCallback_TOKEN f) { return apply_array(f); }
+""").replace("TOKEN", "KuStruct_m1_9"))
+        provider_code = (code + """
+int64_t invoke_array(KuBootstrapIntArrayCallback_TOKEN f) {
+    int64_t *data = malloc(sizeof(*data));
+    if (!data) return -2;
+    data[0] = 12;
+    KuBootstrapResult_KuArrayInt result = f.entry(f.environment, f.failure,
+        (KuArrayInt){1, data, 1}, 3, 10, (TOKEN){16});
+    if (f.failure->index_failed) return -1;
+    if (!result.ok) return -3;
+    int64_t total = result.value.data[0];
+    free(result.value.data);
+    return total;
+}
+""").replace("TOKEN", "KuStruct_m4_9")
+        provider = self.unit("array-callback-provider", plan(supplied), provider_code)
+        self.caller.write_text("""
+static KuBootstrapResult_KuArrayInt update(void *environment, KuLocalAppendFailure *failure, KuArrayInt input,
+                                          int64_t a, int64_t b, KuStruct_m1_9 token) {
+    int64_t *calls = environment;
+    ++*calls;
+    if (*calls > 1) {
+        free(input.data);
+        failure->index_failed = true;
+        failure->index = a;
+        return (KuBootstrapResult_KuArrayInt){0};
+    }
+    input.data[0] += a + b + token.value;
+    return (KuBootstrapResult_KuArrayInt){true, input};
+}
+int main(void) {
+    int64_t calls = 0;
+    KuLocalAppendFailure failure = {0};
+    KuBootstrapIntArrayCallback_KuStruct_m1_9 callback = {update, &calls, &failure};
+    if (forward_array(callback) != 41 || calls != 1 || failure.index_failed) return 1;
+    return forward_array(callback) != -1 || calls != 2 || !failure.index_failed || failure.index != 3;
+}
+""", encoding="ascii")
+        self.assertEqual(link_c.main([*units, *provider, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+
+        wrong_plan = copy.deepcopy(supplied)
+        wrong_plan["signature"]["parameters"][0].update(source_path="other/point.ku")
+        wrong = self.unit("array-callback-other-type", plan(wrong_plan), provider_code)
+        self.assert_preflight_error([*units, *wrong], "signature mismatch")
+        wrong = self.unit("array-callback-wrong-failure", plan(supplied),
+                          provider_code.replace("int64_t index;", "uint64_t index;"))
+        with contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(link_c.main([*units, *wrong, *self.build_args]), 1)
+        self.assertIn("C compiler exited", error.getvalue())
+        with self.assertRaisesRegex(link_c.LinkError, "cannot be a returned value"):
+            link_c.Signature.read({"parameters": [], "result": callback(1), "returns_result": False}, "bad")
+
     def test_parameter_order_and_result_status_are_checked(self):
         wrong = copy.deepcopy(self.left)
         wrong["signature"]["parameters"].reverse()
@@ -379,16 +645,149 @@ int main(void) {
         self.change_plan(self.left_args, lambda p: p["export"]["signature"]["parameters"][1].update(c_type="int32_t"))
         self.assert_preflight_error([*self.entry_args, *self.left_args, *self.right_args], "signature mismatch")
 
-    def test_builtin_string_array_requires_its_view_carrier(self):
+    def test_builtin_string_array_checks_view_owned_and_result_carriers(self):
         array = {"kind": "BuiltinArray", "source_name": "str", "source_path": None,
                  "node": 0, "passing": "view", "c_type": "const KuGuardStringArray*"}
         identity = link_c.TypeRef.read(array, "array").semantic()
         self.assertNotEqual(identity, link_c.TypeRef.read(builtin("str", "KuProjectionString"), "str").semantic())
+        owned = dict(array, passing="value", c_type="KuGuardStringArray")
+        self.assertNotEqual(identity, link_c.TypeRef.read(owned, "array").semantic())
+        checked = dict(owned, c_type="KuBootstrapResultStringArray")
+        link_c.TypeRef.read(checked, "array", checked_result=True)
+        for carrier, checked_result in ((owned, True), (checked, False)):
+            with self.assertRaisesRegex(link_c.LinkError, "builtin array requires"):
+                link_c.TypeRef.read(carrier, "array", checked_result=checked_result)
         for change in ({"source_name": "int"}, {"source_path": "types.ku"},
-                       {"passing": "value", "c_type": "KuGuardStringArray"},
+                       {"passing": "value", "c_type": "KuArrayInt"},
                        {"c_type": "const OtherArray*"}):
-            with self.assertRaisesRegex(link_c.LinkError, r"checked View \[str\] carrier"):
+            with self.assertRaisesRegex(link_c.LinkError, "builtin array requires"):
                 link_c.TypeRef.read(dict(array, **change), "array")
+
+    def test_checked_string_slice_uses_the_native_builtin(self):
+        self.compiler()
+        input_type = dict(builtin("str", "const KuProjectionString*"), passing="view")
+        parameters = [input_type, builtin(), builtin()]
+        result_type = builtin("str", "KuBootstrapResult_KuProjectionString")
+        dependency = declaration("std/string.ku", 2, "ku_slice", parameters)
+        dependency["signature"].update(result=result_type, returns_result=True)
+        entry = declaration("app.ku", 58, "select", parameters)
+        entry["signature"].update(result=result_type, returns_result=True)
+        units = self.unit("string-slice", plan(entry, [dependency]), """
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+typedef struct { uint8_t *ptr; size_t len; size_t capacity; uint8_t storage; } KuProjectionString;
+typedef struct { KuProjectionString domain, code, message; } KuBootstrapError;
+typedef struct { bool ok; KuProjectionString value; KuBootstrapError error; } KuBootstrapResult_KuProjectionString;
+extern KuBootstrapResult_KuProjectionString ku_slice(const KuProjectionString *, int64_t, int64_t);
+KuBootstrapResult_KuProjectionString select(const KuProjectionString *input, int64_t start, int64_t end) {
+    return ku_slice(input, start, end);
+}
+""")
+        self.caller.write_text("""
+#include <assert.h>
+static bool text_equal(KuProjectionString value, const char *expected) {
+    return value.len == strlen(expected) && !memcmp(value.ptr, expected, value.len);
+}
+static void reject(const KuProjectionString *input, int64_t start, int64_t end, const char *message) {
+    KuBootstrapResult_KuProjectionString result = select(input, start, end);
+    assert(!result.ok && !result.value.ptr && !result.value.len);
+    assert(text_equal(result.error.domain, "string") && text_equal(result.error.code, "slice_error"));
+    assert(text_equal(result.error.message, message));
+    if (result.error.message.storage == 1) free(result.error.message.ptr);
+}
+int main(void) {
+    const uint8_t bytes[] = {'A', 0xe4,0xb8,0xad, 0xf0,0x9f,0x99,0x82, 0, 0xc3,0xa9};
+    uint8_t *data = malloc(sizeof bytes);
+    assert(data);
+    memcpy(data, bytes, sizeof bytes);
+    const KuProjectionString input = {data, sizeof bytes, sizeof bytes, 1};
+    KuBootstrapResult_KuProjectionString result = select(&input, 1, 4);
+    assert(result.ok && result.value.len == 8 && result.value.capacity == 8 && result.value.storage == 1);
+    assert(result.value.ptr != data + 1 && !memcmp(input.ptr, bytes, sizeof bytes));
+    KuBootstrapResult_KuProjectionString empty = select(&input, 5, 5);
+    assert(empty.ok && !empty.value.ptr && !empty.value.len && !empty.value.capacity && !empty.value.storage);
+    reject(&input, 2, -1, "string.slice indexes must be >= 0");
+    reject(&input, 7, 6, "string.slice start must be <= end");
+    reject(&input, 1, INT64_MAX, "string.slice end 9223372036854775807 out of bounds for length 5");
+    free(data);
+    assert(!memcmp(result.value.ptr, bytes + 1, 8));
+    free(result.value.ptr);
+
+    uint8_t raw_bytes[] = {0x80, 'x'};
+    const KuProjectionString raw = {raw_bytes, sizeof raw_bytes, 0, 0};
+    result = select(&raw, 0, 1);
+    assert(result.ok && result.value.len == 1 && result.value.ptr[0] == raw_bytes[0]);
+    free(result.value.ptr);
+    return 0;
+}
+""", encoding="ascii")
+        feature = ["--builtin", "string.slice"]
+        self.assert_preflight_error(units, "missing provider for std/string.ku#2")
+        self.assertEqual(link_c.main([*units, *feature, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+        self.change_plan(units, lambda p: p["dependencies"][0]["signature"]["parameters"][0]
+                         .update(c_type="KuProjectionString", passing="value"))
+        self.assert_preflight_error([*units, *feature], "signature mismatch for std/string.ku#2")
+
+    def test_builtin_bytes_preserves_raw_data_and_has_a_distinct_plan_type(self):
+        view_type = "const KuProjectionString*"
+        text = dict(builtin("str", view_type), passing="view")
+        data = dict(builtin("bytes", view_type), passing="view")
+        take = declaration("std/bytes.ku", 3, "take_bytes", [text])
+        take["signature"].update(result=builtin("bytes", "KuBootstrapResult_KuProjectionString"),
+                                 returns_result=True)
+        at = declaration("std/bytes.ku", 4, "byte_at", [data, builtin()])
+        at["signature"].update(result=builtin("int", "KuBootstrapResult_int64_t"), returns_result=True)
+        entry = declaration("app.ku", 58, "verify_bytes", [])
+        units = self.unit("raw-bytes", plan(entry, [take, at]), """
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+typedef struct { uint8_t *ptr; size_t len, capacity; uint8_t storage; } KuProjectionString;
+typedef struct { KuProjectionString domain, code, message; } KuBootstrapError;
+typedef struct { bool ok; KuProjectionString value; KuBootstrapError error; } KuBootstrapResult_KuProjectionString;
+typedef struct { bool ok; int64_t value; KuBootstrapError error; } KuBootstrapResult_int64_t;
+extern KuBootstrapResult_KuProjectionString take_bytes(const KuProjectionString *);
+extern KuBootstrapResult_int64_t byte_at(const KuProjectionString *, int64_t);
+static void reject(const KuProjectionString *data, int64_t index) {
+    KuBootstrapResult_int64_t result = byte_at(data, index);
+    assert(!result.ok && result.error.domain.len == 5 && !memcmp(result.error.domain.ptr, "bytes", 5));
+    assert(result.error.code.len == 19 && !memcmp(result.error.code.ptr, "index_out_of_bounds", 19));
+}
+int64_t verify_bytes(void) {
+    const uint8_t source[] = {'K', 0, 0xe4, 0xb8, 0xad, 0xf0, 0x9f, 0x99, 0x82};
+    uint8_t *input = malloc(sizeof source);
+    assert(input);
+    memcpy(input, source, sizeof source);
+    const KuProjectionString text = {input, sizeof source, sizeof source, 1};
+    KuBootstrapResult_KuProjectionString result = take_bytes(&text);
+    assert(result.ok && result.value.ptr != input && result.value.len == sizeof source);
+    assert(result.value.capacity == sizeof source && result.value.storage == 1);
+    free(input);
+    for (size_t index = 0; index < sizeof source; index++) {
+        KuBootstrapResult_int64_t value = byte_at(&result.value, (int64_t)index);
+        assert(value.ok && value.value == source[index]);
+    }
+    reject(&result.value, -1);
+    reject(&result.value, sizeof source);
+    free(result.value.ptr);
+    return 0;
+}
+""")
+        self.caller.write_text("int main(void) { return verify_bytes() != 0; }\n", encoding="ascii")
+        features = ["--builtin", "bytes.from_str", "--builtin", "bytes.get"]
+        self.assert_preflight_error(units, "missing provider for std/bytes.ku#3")
+        self.assertEqual(link_c.main([*units, *features, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+        self.change_plan(units, lambda p: p["dependencies"][1]["signature"]["parameters"][0]
+                         .update(source_name="str"))
+        self.assert_preflight_error([*units, *features], "signature mismatch for std/bytes.ku#4")
 
     def test_checked_owned_string_array_result_across_two_c_units(self):
         result = dict(builtin("str", "KuBootstrapResultStringArray"), kind="BuiltinArray")
@@ -442,9 +841,9 @@ int main(void) {
         args = ["--entry", "consumer.ku", "3", "--caller", str(self.caller), "-o", str(self.output)]
         self.assertEqual(link_c.main([*units, *args]), 0)
         self.assertEqual(subprocess.run([self.output], timeout=15).returncode, 0)
-        with self.assertRaisesRegex(link_c.LinkError, r"checked owned \[str\]! result carrier"):
+        with self.assertRaisesRegex(link_c.LinkError, "builtin array requires"):
             link_c.Signature.read(dict(provider["signature"], returns_result=False), "plain result")
-        with self.assertRaisesRegex(link_c.LinkError, r"checked owned \[str\]! result carrier"):
+        with self.assertRaisesRegex(link_c.LinkError, "builtin array requires"):
             link_c.Signature.read(dict(provider["signature"], parameters=[result]), "owned parameter")
 
     def test_missing_entry_and_ambiguous_local_symbol_are_rejected(self):

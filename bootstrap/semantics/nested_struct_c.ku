@@ -33,10 +33,12 @@ fn isLayoutDependency(&field: TypeNameBinding, owning: bool): bool {
 fn reachableLayouts(&layouts: [StructLayout], root: int, owning: bool): [int]! {
     reachable = [root]
     index = 0
-    while (index < reachable.len()) {
+    pending = index < reachable.len()
+    while (pending) {
         item = reachable[index] - 1
+        field_count = layouts[item].fields.len()
         field_index = 0
-        while (field_index < layouts[item].fields.len()) {
+        while (field_index < field_count) {
             field = layouts[item].fields[field_index].resolved.clone()
             if (isLayoutDependency(field, owning)) {
                 child = dependencyIndex(layouts, field)?
@@ -48,6 +50,7 @@ fn reachableLayouts(&layouts: [StructLayout], root: int, owning: bool): [int]! {
             field_index = field_index + 1
         }
         index = index + 1
+        pending = index < reachable.len()
     }
     return ok(reachable)
 }
@@ -65,8 +68,9 @@ fn measureLayout(&layouts: [StructLayout], &entries: [CStructMetrics], index: in
     depth = 1
     leaves = 0
     contains_string = false
+    field_count = layouts[index - 1].fields.len()
     field_index = 0
-    while (field_index < layouts[index - 1].fields.len()) {
+    while (field_index < field_count) {
         field = layouts[index - 1].fields[field_index].resolved.clone()
         field_leaves = 1
         if (isLayoutDependency(field, owning)) {
@@ -101,11 +105,13 @@ fn rejectLayoutCycle(&layouts: [StructLayout], &completed: [CStructMetrics], fir
     // these edges until one repeats to report an actual cycle edge.
     path: [int] = []
     index = first
-    while (path.len() < layouts.len()) {
+    pending = path.len() < layouts.len()
+    while (pending) {
         path = path.push(index)
         next = 0
+        field_count = layouts[index - 1].fields.len()
         cursor = 0
-        while (next == 0 && cursor < layouts[index - 1].fields.len()) {
+        while (next == 0 && cursor < field_count) {
             field = layouts[index - 1].fields[cursor].resolved.clone()
             if (isLayoutDependency(field, owning)) {
                 child = dependencyIndex(layouts, field)?
@@ -124,6 +130,7 @@ fn rejectLayoutCycle(&layouts: [StructLayout], &completed: [CStructMetrics], fir
             RejectLayout("invalid_nested_layout_order", "unfinished layout has no dependency", at.clone())?
         }
         index = next
+        pending = path.len() < layouts.len()
     }
     RejectLayout("invalid_nested_layout_order", "unfinished layout has no bounded order", at)?
     return ok(null)
@@ -140,7 +147,8 @@ fn orderCLayouts(&layouts: [StructLayout], module_index: int, node: int, at: Spa
     reachable = reachableLayouts(layouts, root, owning)?
     entries: [CStructMetrics] = []
     contains_string = false
-    while (entries.len() < reachable.len()) {
+    pending = entries.len() < reachable.len()
+    while (pending) {
         before = entries.len()
         blocked = 0
         index = 0
@@ -160,6 +168,7 @@ fn orderCLayouts(&layouts: [StructLayout], module_index: int, node: int, at: Spa
         if (entries.len() == before) {
             rejectLayoutCycle(layouts, entries, blocked, at.clone(), owning)?
         }
+        pending = entries.len() < reachable.len()
     }
     return ok(CStructOrder { entries: entries, contains_string: contains_string })
 }
@@ -236,13 +245,24 @@ fn OwningLayoutDropName(module_index: int, declaration: int): str {
     return "ku_drop_" + CTypeName(module_index, declaration)
 }
 
+fn emitOwningStringArrayDrop(&target: str): str {
+    // A malformed foreign header cannot establish an initialized prefix.
+    // Leave its untrusted buffer alone and still drop the other fields.
+    return "    {\n        KuGuardStringArray *array = &" + target.clone() + ";\n"
+        + "        size_t capacity = array->capacity ? array->capacity : array->len;\n"
+        + "        if (array->len <= capacity && capacity <= SIZE_MAX / sizeof(*array->data) && (array->data || !capacity)) {\n"
+        + "            for (size_t i = array->len; i != 0; --i) ku_projection_string_drop(&array->data[i - 1]);\n"
+        + "            free(array->data);\n        }\n    }\n"
+}
+
 fn emitOwningLayoutDrop(&layout: StructLayout, public: bool): str {
     storage = "static "
     if (public) { storage = "" }
     type_name = CTypeName(layout.module_index, layout.node)
     text = storage + "void " + OwningLayoutDropName(layout.module_index, layout.node) + "(" + type_name.clone() + " *value) {\n"
     cursor = layout.fields.len()
-    while (cursor > 0) {
+    has_field = cursor > 0
+    while (has_field) {
         cursor = cursor - 1
         field = layout.fields[cursor].resolved.clone()
         target = "value->f" + str(cursor)
@@ -251,18 +271,115 @@ fn emitOwningLayoutDrop(&layout: StructLayout, public: bool): str {
         } else if (field.declaration_kind == "Struct") {
             text += "    " + OwningLayoutDropName(field.module_index, field.declaration_node) + "(&" + target + ");\n"
         } else if (field.declaration_kind == "StructArray" || field.declaration_kind == "BuiltinArray") {
-            if (field.declaration_kind == "StructArray") {
-                child_drop = OwningLayoutDropName(field.module_index, field.declaration_node)
-                text += "    for (size_t i = " + target.clone() + ".len; i != 0; --i) " +
-                    child_drop + "(&" + target.clone() + ".data[i - 1]);\n"
-            } else if (field.name == "str") {
-                text += "    for (size_t i = " + target.clone() + ".len; i != 0; --i) " +
-                    "ku_projection_string_drop(&" + target.clone() + ".data[i - 1]);\n"
+            if (field.declaration_kind == "BuiltinArray" && field.name == "str") {
+                text += emitOwningStringArrayDrop(target)
+            } else {
+                if (field.declaration_kind == "StructArray") {
+                    child_drop = OwningLayoutDropName(field.module_index, field.declaration_node)
+                    text += "    for (size_t i = " + target.clone() + ".len; i != 0; --i) " +
+                        child_drop + "(&" + target.clone() + ".data[i - 1]);\n"
+                }
+                text += "    free(" + target + ".data);\n"
             }
-            text += "    free(" + target + ".data);\n"
         }
+        has_field = cursor > 0
     }
     return text + "    *value = (" + type_name + "){0};\n}\n\n"
+}
+
+fn CanCloneNestedStringArrays(&layouts: [StructLayout], index: int): bool {
+    if (index == 0) { return false }
+    field_count = layouts[index - 1].fields.len()
+    field_index = 0
+    while (field_index < field_count) {
+        field = layouts[index - 1].fields[field_index].resolved.clone()
+        if (field.declaration_kind == "StructArray"
+            || (field.declaration_kind == "BuiltinArray" && field.name != "str")) { return false }
+        if (field.declaration_kind == "Struct"
+            && !CanCloneNestedStringArrays(layouts, LayoutIndex(layouts, field.module_index, field.declaration_node))) {
+            return false
+        }
+        field_index = field_index + 1
+    }
+    return true
+}
+
+fn CollectOwnedMemberPaths(&layouts: [StructLayout], index: int, &prefix: str, paths: [str], arrays: bool): [str] {
+    owned = paths
+    field_count = layouts[index - 1].fields.len()
+    field_index = 0
+    while (field_index < field_count) {
+        field = layouts[index - 1].fields[field_index].resolved.clone()
+        path = prefix.clone() + ".f" + str(field_index)
+        if ((!arrays && StringField(field)) || (arrays && field.declaration_kind == "BuiltinArray" && field.name == "str")) {
+            owned = owned.push(path)
+        } else if (field.declaration_kind == "Struct") {
+            child = LayoutIndex(layouts, field.module_index, field.declaration_node)
+            // The validated layout graph is acyclic and at most eight levels.
+            owned = CollectOwnedMemberPaths(layouts, child, path, owned, arrays)
+        }
+        field_index = field_index + 1
+    }
+    return owned
+}
+
+fn EmitProjectionCloneString(&symbol: str): str {
+    return "static bool " + symbol.clone() + "(KuProjectionString source, KuProjectionString *out) {\n" +
+        "    if (source.storage == KU_PROJECTION_STRING_STATIC) { *out = source; return true; }\n" +
+        "    if (!source.ptr) return true;\n" +
+        "    size_t size = source.len ? source.len : 1;\n    uint8_t *data = malloc(size);\n    if (!data) return false;\n" +
+        "    if (source.len) memcpy(data, source.ptr, source.len);\n" +
+        "    *out = (KuProjectionString){ data, source.len, size, KU_PROJECTION_STRING_OWNED };\n    return true;\n}\n\n"
+}
+
+fn emitOwnedStringArrayClone(&prefix: str): str {
+    return "static bool " + prefix.clone() + "_clone_strings(const KuGuardStringArray *source, KuGuardStringArray *out, bool *invalid) {\n"
+        + "    size_t capacity = source->capacity ? source->capacity : source->len;\n"
+        + "    if (source->len > capacity || capacity > SIZE_MAX / sizeof(*source->data) || (capacity && !source->data)) { *invalid = true; return false; }\n"
+        + "    if (!source->len) return true;\n"
+        + "    out->data = malloc(source->len * sizeof(*out->data));\n"
+        + "    if (!out->data) return false;\n"
+        + "    out->capacity = source->len;\n"
+        + "    while (out->len < source->len) {\n"
+        + "        KuProjectionString string = source->data[out->len];\n"
+        + "        if (string.len && !string.ptr) { *invalid = true; return false; }\n"
+        + "        out->data[out->len] = (KuProjectionString){0};\n"
+        + "        if (!" + prefix.clone() + "_clone_string(string, &out->data[out->len])) return false;\n"
+        + "        ++out->len;\n    }\n    return true;\n}\n\n"
+}
+
+fn EmitLinkedStringArrayElementClone(&layouts: [StructLayout], index: int, &prefix: str): str {
+    strings = CollectOwnedMemberPaths(layouts, index, "", [], false)
+    arrays = CollectOwnedMemberPaths(layouts, index, "", [], true)
+    element = CTypeName(layouts[index - 1].module_index, layouts[index - 1].node)
+    drop = OwningLayoutDropName(layouts[index - 1].module_index, layouts[index - 1].node)
+    text = EmitProjectionCloneString(prefix.clone() + "_clone_string") + emitOwnedStringArrayClone(prefix)
+    text += "static bool " + prefix.clone() + "_clone_element(const " + element.clone()
+        + " *source, " + element.clone() + " *out, bool *invalid) {\n    " + element + " copy = *source;\n"
+    // No shallow owners may remain when cleanup becomes reachable.
+    field = 0
+    while (field < strings.len()) {
+        text += "    copy" + strings[field].clone() + " = (KuProjectionString){0};\n"
+        field = field + 1
+    }
+    field = 0
+    while (field < arrays.len()) {
+        text += "    copy" + arrays[field].clone() + " = (KuGuardStringArray){0};\n"
+        field = field + 1
+    }
+    field = 0
+    while (field < strings.len()) {
+        path = strings[field].clone()
+        text += "    if (!" + prefix.clone() + "_clone_string((*source)" + path.clone() + ", &copy" + path + ")) goto discard;\n"
+        field = field + 1
+    }
+    field = 0
+    while (field < arrays.len()) {
+        path = arrays[field].clone()
+        text += "    if (!" + prefix.clone() + "_clone_strings(&(*source)" + path.clone() + ", &copy" + path + ", invalid)) goto discard;\n"
+        field = field + 1
+    }
+    return text + "    *out = copy;\n    return true;\ndiscard:\n    " + drop + "(&copy);\n    return false;\n}\n\n"
 }
 
 struct OwningLayoutDefinitions {
@@ -275,9 +392,12 @@ struct OwningLayoutDefinitions {
 fn EmitOwningLayoutDefinitions(&ordered: [StructLayout], unit: int, declaration: int): OwningLayoutDefinitions! {
     text = ""
     arrays: [str] = []
-    for layout in ordered.clone() {
-        for member in layout.fields {
-            field = member.resolved
+    layout_index = 0
+    while (layout_index < ordered.len()) {
+        field_count = ordered[layout_index].fields.len()
+        field_index = 0
+        while (field_index < field_count) {
+            field = ordered[layout_index].fields[field_index].resolved.clone()
             array = ""
             element = ""
             if (field.declaration_kind == "StructArray") {
@@ -296,9 +416,12 @@ fn EmitOwningLayoutDefinitions(&ordered: [StructLayout], unit: int, declaration:
                 text += ProjectionArrayHeader(element, array)
                 arrays = arrays.push(array)
             }
+            field_index = field_index + 1
         }
-        text += EmitOwningLayout(layout)?
-        text += emitOwningLayoutDrop(layout, layout.module_index == unit && layout.node == declaration)
+        text += EmitOwningLayout(ordered[layout_index])?
+        text += emitOwningLayoutDrop(ordered[layout_index],
+            ordered[layout_index].module_index == unit && ordered[layout_index].node == declaration)
+        layout_index = layout_index + 1
     }
     return ok(OwningLayoutDefinitions { source: text, array_types: arrays })
 }
@@ -318,10 +441,23 @@ fn EmitProjectOwningLayoutsC(&layouts: [StructLayout], unit: int, declaration: i
 
 fn EmitCombinedCLayouts(&layouts: [StructLayout], &owning: [StructLayout]): OwningLayoutDefinitions! {
     definitions = EmitOwningLayoutDefinitions(owning, 0, 0)?
-    for layout in layouts.clone() {
-        if (LayoutIndex(owning, layout.module_index, layout.node) == 0) {
-            definitions.source += EmitLayout(layout, true, true)?
+    index = 0
+    while (index < layouts.len()) {
+        existing = LayoutIndex(owning, layouts[index].module_index, layouts[index].node)
+        if (existing == 0) {
+            definitions.source += EmitLayout(layouts[index], true, true)?
         }
+        index = index + 1
     }
     return ok(definitions)
+}
+
+fn OwningStructDropReference(&owning_layouts: [StructLayout], &result: TypeNameBinding): str {
+    if (result.declaration_kind == "Struct") {
+        layout = LayoutIndex(owning_layouts, result.module_index, result.declaration_node)
+        if (layout > 0) {
+            return "    (void)" + OwningLayoutDropName(result.module_index, result.declaration_node) + ";\n"
+        }
+    }
+    return ""
 }

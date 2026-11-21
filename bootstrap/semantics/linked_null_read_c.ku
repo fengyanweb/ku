@@ -1,18 +1,18 @@
 import { EmitLinkedArrayIndexGuard, EmitLinkedLogicalBranch } from "./guarded_string_parts.ku"
 import { AddLinkedNullSlot, CloneLinkedRecord, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
-import { CheckLinkedAddition, EmitLinkedMultiplyDivide, LinkedMemberPath, LinkedMemberUnavailable, LinkedViewArgument, RequireLinkedReadonlyPredicate } from "./linked_member_ownership.ku"
+import { CheckLinkedAddition, EmitLinkedMultiplyDivide, LinkedMemberPath, LinkedMemberUnavailable, LinkedViewArgument, RequireLinkedReadonlyCall } from "./linked_member_ownership.ku"
 import { Span } from "../stage2/span.ku"
 import { LinkedLocalReadBinding } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout } from "./struct_layouts.ku"
-import { EmitLinkedReadonlyPredicate, LinkedDirectCallExpression, LinkedErrorField, LinkedNullFunction, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, RememberLinkedCall } from "./link_plan_c.ku"
+import { EmitLinkedReadonlyScalar, LinkedDirectCallExpression, LinkedErrorField, LinkedNullFunction, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, RememberLinkedCall } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
 import { GuardLinkedStringPredicate } from "./guarded_struct_c.ku"
 import { EmitLinkedIntAppend, EmitLinkedOwnedArrayClone, OwnedRecordArrayCloneLayout } from "./struct_array_c.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn LowerLinkedIntArrayLiteral(&project: LinkedNullProject, state: LinkedNullState, &literal: Node, id: int,
                                binding: str): LinkedNullExpression! {
@@ -68,7 +68,7 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
         }
         if (node.edge_count >= 2 && node.edge_count <= 9 && target.kind == "Variable" && target.edge_count == 0) {
             callee = ResolveLinkedCall(project, state.slots, node, target, false)?
-            return readLinkedPredicate(project, state, node, callee, id, depth)
+            return readLinkedScalarCall(project, state, node, callee, id, depth)
         }
     }
     if (node.edge_count == 0 && (node.kind == "Variable" || node.kind == "Int" ||
@@ -79,9 +79,9 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
     return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", DeclarationSpan(node)), ""))
 }
 
-fn readLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
+fn readLinkedScalarCall(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
                       callee: LinkedNullFunction, id: int, depth: int): LinkedNullExpression! {
-    RequireLinkedReadonlyPredicate(callee, DeclarationSpan(call))?
+    RequireLinkedReadonlyCall(callee, DeclarationSpan(call))?
     next = state
     args = ""
     index = 0
@@ -95,7 +95,7 @@ fn readLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, &cal
         next = input.state
         index += 1
     }
-    return ok(EmitLinkedReadonlyPredicate(next, callee, id, args))
+    return ok(EmitLinkedReadonlyScalar(next, callee, id, args))
 }
 
 fn readLinkedMethod(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &target: Node, id: int, depth: int): LinkedNullExpression! {
@@ -135,6 +135,11 @@ fn readLinkedMethod(&project: LinkedNullProject, state: LinkedNullState, &call: 
 
 fn readLinkedIndex(&project: LinkedNullProject, state: LinkedNullState, &node: Node, id: int, depth: int): LinkedNullExpression! {
     array = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
+    return ReadLinkedArrayElementAfterBase(project, array, node, id, depth)
+}
+
+fn ReadLinkedArrayElementAfterBase(&project: LinkedNullProject, array: LinkedNullExpression,
+                                  &node: Node, id: int, depth: int): LinkedNullExpression! {
     index = LowerLinkedNullRead(project, array.state, LinkedNullChild(project, 1, node, 1), depth + 1)?
     return readArrayItem(array.value, index, node, id)
 }
@@ -151,6 +156,7 @@ fn readArrayItem(&array: LinkedNullValue, input: LinkedNullExpression, &node: No
     index.state.code += EmitLinkedArrayIndexGuard(offset, index.value.text, header)
     item = LinkedReadonlyExpression(index.state, LinkedNullArrayElement(array.ty.clone()), header + "->data[" + offset + "]")
     if (item.value.ty.declaration_kind == "Builtin" && item.value.ty.name == "str") {
+        item.state.checks_str_item = true
         item.state.code += "    if (" + item.value.text.clone() + ".len && !" + item.value.text.clone()
             + ".ptr) { invalid_array = true; goto cleanup; }\n"
     }
@@ -165,11 +171,10 @@ fn CloneLinkedRecordArray(&project: LinkedNullProject, source: LinkedNullExpress
     if (value.borrowed || LinkedMemberUnavailable(source.state, value, true) || layout == 0) {
         RejectLayout("unsupported_linked_array_clone", "expected a live owned array of cloneable records with owned fields", value.ty.span.clone())?
     }
-    prefix = LinkedNullArrayPrefix(value.ty)
     output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), value.ty.clone(), false)?
     next = RequireLinkedArrayValidation(output.state, value.ty)
     if (!ContainsIndex(next.element_clones, layout)) { next.element_clones = next.element_clones.push(layout) }
-    next.code += EmitLinkedOwnedArrayClone(value.text, output.value.text, prefix, layout)
+    next.code += EmitLinkedOwnedArrayClone(next.layouts, value.text, output.value.text, output.value.ty, layout)
     next.slots[output.value.slot - 1].live = true
     output.state = next
     return ok(output)
@@ -210,6 +215,11 @@ fn ReadLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalRea
 
 fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: Node, depth: int): LinkedNullExpression! {
     receiver = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
+    return FinishLinkedFieldRead(project, receiver, node, false)
+}
+
+fn FinishLinkedFieldRead(&project: LinkedNullProject, receiver: LinkedNullExpression, &node: Node,
+                         place: bool): LinkedNullExpression! {
     ty = receiver.value.ty.clone()
     if (ty.declaration_kind == "CaughtError") {
         at = DeclarationSpan(node)
@@ -229,7 +239,9 @@ fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: N
     field = LinkedReadonlyExpression(receiver.state, field_type, member)
     field.value.slot = receiver.value.slot
     field.value.member_path = LinkedMemberPath(receiver.value, ordinal)
-    if (LinkedMemberUnavailable(field.state, field.value, false)) {
+    // A target may replace a field that was moved. Resolving its receiver
+    // still requires every enclosing part on that path to be live.
+    if ((!place || field.value.member_path == "") && LinkedMemberUnavailable(field.state, field.value, false)) {
         RejectLayout("linked_moved_member", "cannot read a field already moved from its parent", DeclarationSpan(node))?
     }
     if (field.value.ty.declaration_kind == "StructArray" || field.value.ty.declaration_kind == "BuiltinArray") {

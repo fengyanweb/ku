@@ -1,6 +1,7 @@
 import { Span } from "../stage2/span.ku"
 import { SuppliedModule } from "./imports.ku"
-import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
+import { BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
+import { EmitLinkPlan } from "./link_plan_json_c.ku"
 import { BindProjectModules, ProjectModuleBindings } from "./project_bindings.ku"
 import { EmitScalarIntModule, LowerScalarIntFunction, ScalarIntC, AppendScalarIntCallees } from "./scalar_int_c.ku"
 import { ScalarFunctionNode, ScalarIntCalleeSignature, ScalarIntImport } from "./scalar_int_calls.ku"

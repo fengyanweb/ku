@@ -22,6 +22,20 @@ IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z_0-9]*\Z")
 VIEW_TYPE = re.compile(r"const [A-Za-z_][A-Za-z_0-9]* ?\*\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 BOOTSTRAP_STRING_TYPES = {"KuProjectionString", "KuBootstrapString", "KuScalarString"}
+CALLBACK_TYPES = {
+    "IntPairResultCallback": ("int_pair_result_callback", "KuBootstrapIntPairCallback_"),
+    "IntArrayResultCallback": ("int_array_result_callback", "KuBootstrapIntArrayCallback_"),
+    "IntResultAppendCallback": ("int_result_append_callback", "KuBootstrapIntAppendCallback_"),
+    "IntResultArenaCallback": ("int_result_arena_callback", "KuBootstrapIntArenaCallback_"),
+    "IntRecordReaderCallback": ("int_record_reader_callback", "KuBootstrapIntReaderCallback_"),
+}
+CALLBACK_IDENTITIES = {identity for identity, _ in CALLBACK_TYPES.values()}
+CHECKED_INT_CALLBACK_PARAMETERS = {
+    "IntResultAppendCallback": ("KuProjectionString", "KuProjectionString", "int64_t", 0, "KuArrayInt", 1),
+    "IntResultArenaCallback": (0, 1, "bool"),
+}
+CHECKED_INT_CALLBACK_ABI = {CALLBACK_TYPES[kind][0]: parameters
+                           for kind, parameters in CHECKED_INT_CALLBACK_PARAMETERS.items()}
 
 
 class LinkError(ValueError):
@@ -75,9 +89,15 @@ class TypeRef:
     identity: tuple
     passing: str
     c_type: str
+    callback_nominals: tuple[str, ...] = ()
 
     def read(value, where, checked_result=False):
-        ref = record(value, "kind source_name source_path node c_type passing", where)
+        fields = "kind source_name source_path node c_type passing"
+        candidate_kind = value.get("kind") if isinstance(value, dict) else None
+        if isinstance(candidate_kind, str) and candidate_kind in CHECKED_INT_CALLBACK_PARAMETERS:
+            fields += " nominals"
+        ref = record(value, fields, where)
+        kind_name = text(ref["kind"], f"{where}.kind")
         name = text(ref["source_name"], f"{where}.source_name")
         passing = ref["passing"]
         c_type = text(ref["c_type"], f"{where}.c_type")
@@ -89,36 +109,60 @@ class TypeRef:
             raise LinkError(f"{where}.passing must be value or view")
         if not valid:
             raise LinkError(f"{where}.c_type is not a supported {passing} C carrier")
-        if ref["kind"] == "Builtin":
+        if kind_name == "Builtin":
             if ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0:
                 raise LinkError(f"{where} builtin must have a null path and node 0")
+            if name == "bool" and checked_result and c_type != "KuBootstrapResult_bool":
+                raise LinkError(f"{where} checked bool requires the KuBootstrapResult_bool carrier")
             identity = ("builtin", name)
-        elif ref["kind"] == "BuiltinArray":
+        elif kind_name == "BuiltinArray":
             view_carrier = {"str": "KuGuardStringArray", "int": "KuArrayInt"}.get(name)
             view = (passing == "view" and view_carrier is not None and
                     c_type[len("const "):-1].rstrip() == view_carrier)
-            owned = (name == "str" and checked_result and passing == "value" and
-                     c_type == "KuBootstrapResultStringArray")
-            owned_int = (name == "int" and not checked_result and passing == "value" and
-                         c_type == "KuArrayInt")
+            string_array = "KuBootstrapResultStringArray" if checked_result else "KuGuardStringArray"
+            owned = name == "str" and passing == "value" and c_type == string_array
+            int_array = "KuBootstrapResult_KuArrayInt" if checked_result else "KuArrayInt"
+            owned_int = name == "int" and passing == "value" and c_type == int_array
             if (ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0
                     or not (view or owned or owned_int)):
                 raise LinkError(f"{where} builtin array requires the checked View [str] carrier, "
-                                "the View or owned [int] carrier, or the checked owned [str]! result carrier")
+                                "the checked owned [str]! result carrier, or a matching View, owned, "
+                                "or checked owned [int] carrier")
             identity = ("builtin_array", name)
-        elif ref["kind"] in ("Struct", "StructArray"):
-            identity = ("struct" if ref["kind"] == "Struct" else "struct_array",
+        elif kind_name in ("Struct", "StructArray"):
+            identity = ("struct" if kind_name == "Struct" else "struct_array",
                         module_path(ref["source_path"], f"{where}.source_path"),
                         node_id(ref["node"], f"{where}.node"))
-        elif ref["kind"] == "IntPairResultCallback":
+        elif kind_name in CALLBACK_TYPES:
             path = module_path(ref["source_path"], f"{where}.source_path")
             node = node_id(ref["node"], f"{where}.node")
+            kind, prefix = CALLBACK_TYPES[kind_name]
+            if kind_name in CHECKED_INT_CALLBACK_PARAMETERS:
+                if (passing != "value" or checked_result or
+                        not re.fullmatch(rf"{prefix}m[1-9][0-9]*_{node}", c_type)):
+                    raise LinkError(f"{where} requires the typed carrier for {kind_name}")
+                nominals = array(ref["nominals"], f"{where}.nominals")
+                if len(nominals) != 2:
+                    raise LinkError(f"{where} requires two ordered nominal callback arguments")
+                keys = []
+                carriers = []
+                for index, value in enumerate(nominals):
+                    field = f"{where}.nominals[{index}]"
+                    nominal = record(value, "source_path node c_type", field)
+                    nominal_path = module_path(nominal["source_path"], f"{field}.source_path")
+                    nominal_node = node_id(nominal["node"], f"{field}.node")
+                    nominal_c = text(nominal["c_type"], f"{field}.c_type")
+                    if not re.fullmatch(rf"KuStruct_m[1-9][0-9]*_{nominal_node}", nominal_c):
+                        raise LinkError(f"{field} requires its nominal C carrier")
+                    keys.append((nominal_path, nominal_node))
+                    carriers.append(nominal_c)
+                return TypeRef((kind, *keys), passing, c_type, tuple(carriers))
             if (passing != "value" or checked_result or
-                    not re.fullmatch(rf"KuBootstrapIntPairCallback_KuStruct_m[1-9][0-9]*_{node}", c_type)):
-                raise LinkError(f"{where} requires the typed int-pair callback carrier for its named Result")
-            identity = ("int_pair_result_callback", path, node)
+                    not re.fullmatch(rf"{prefix}KuStruct_m[1-9][0-9]*_{node}", c_type)):
+                raise LinkError(f"{where} requires the typed carrier for {kind_name}")
+            identity = (kind, path, node)
         else:
-            raise LinkError(f"{where}.kind must be Builtin, BuiltinArray, Struct, StructArray or IntPairResultCallback")
+            raise LinkError(f"{where}.kind is not a supported link-plan type")
         return TypeRef(identity, passing, c_type)
 
     def semantic(self):
@@ -148,7 +192,7 @@ class Signature:
         if type(sig["returns_result"]) is not bool:
             raise LinkError(f"{where} requires a by-value result and boolean returns_result")
         result = TypeRef.read(sig["result"], f"{where}.result", checked_result=sig["returns_result"])
-        if result.identity[0] == "int_pair_result_callback":
+        if result.identity[0] in CALLBACK_IDENTITIES:
             raise LinkError(f"{where} callback carrier cannot be a returned value")
         if result.passing != "value":
             raise LinkError(f"{where} requires a by-value result and boolean returns_result")
@@ -307,25 +351,50 @@ def checked_aliases(units):
     return result
 
 
+def check_carrier_layout(carrier, expected, fields):
+    members = " ".join(f"{c_type} {name};" for name, c_type in fields)
+    checks = [f"sizeof({carrier}) == sizeof({expected})", f"_Alignof({carrier}) == _Alignof({expected})"]
+    for name, c_type in fields:
+        checks.append(f"_Generic((({carrier}){{0}}).{name}, {c_type}: 1, default: 0)")
+        checks.append(f"offsetof({carrier}, {name}) == offsetof({expected}, {name})")
+    return [f"typedef struct {{ {members} }} {expected};",
+            f'_Static_assert({" && ".join(checks)}, "link-plan C callback has a different carrier");']
+
+
 def wrapper(unit, include_caller):
     lines = ['#include "emitted.c"']
     declarations = (unit.export, *unit.dependencies)
-    callbacks = sorted({ref.c_type for decl in declarations for ref in decl.signature.parameters
-                        if ref.identity[0] == "int_pair_result_callback"})
+    callbacks = sorted({(ref.identity[0], ref.c_type, ref.callback_nominals) for decl in declarations
+                        for ref in decl.signature.parameters if ref.identity[0] in CALLBACK_IDENTITIES})
     if callbacks:
         lines.append('#include <stddef.h>')
-    for i, carrier in enumerate(callbacks):
-        result = carrier.removeprefix("KuBootstrapIntPairCallback_")
+    if any(kind != "int_pair_result_callback" for kind, _, _ in callbacks):
+        lines.extend(check_carrier_layout("KuLocalAppendFailure", "ku_bootstrap_callback_failure_layout", (
+            ("append_status", "int"), ("out_of_memory", "bool"), ("overflow", "bool"), ("index_failed", "bool"),
+            ("array_error", "const char *"), ("index", "int64_t"), ("length", "size_t"),
+        )))
+    for i, (kind, carrier, nominals) in enumerate(callbacks):
         entry = f"ku_bootstrap_callback_entry_{i}"
         expected = f"ku_bootstrap_callback_layout_{i}"
-        lines.append(f"typedef KuBootstrapResult_{result} (*{entry})(void*, int64_t, int64_t);")
-        lines.append(f"typedef struct {{ {entry} entry; void *environment; }} {expected};")
-        lines.append(f'_Static_assert(_Generic((({carrier}){{0}}).entry, {entry}: 1, default: 0) && '
-                     f'_Generic((({carrier}){{0}}).environment, void*: 1, default: 0) && '
-                     f'sizeof({carrier}) == sizeof({expected}) && _Alignof({carrier}) == _Alignof({expected}) && '
-                     f'offsetof({carrier}, entry) == offsetof({expected}, entry) && '
-                     f'offsetof({carrier}, environment) == offsetof({expected}, environment), '
-                     '"link-plan C callback has a different carrier");')
+        fields = [("entry", entry), ("environment", "void *")]
+        if kind == "int_array_result_callback":
+            nominal = carrier.removeprefix(CALLBACK_TYPES["IntArrayResultCallback"][1])
+            lines.append(f"typedef KuBootstrapResult_KuArrayInt (*{entry})(void*, KuLocalAppendFailure*, "
+                         f"KuArrayInt, int64_t, int64_t, {nominal});")
+            fields.append(("failure", "KuLocalAppendFailure *"))
+        elif kind in CHECKED_INT_CALLBACK_ABI:
+            params = [nominals[field] if isinstance(field, int) else field for field in CHECKED_INT_CALLBACK_ABI[kind]]
+            lines.append(f"typedef KuBootstrapResult_int64_t (*{entry})(void*, KuLocalAppendFailure*, "
+                         f"{', '.join(params)});")
+            fields.append(("failure", "KuLocalAppendFailure *"))
+        elif kind == "int_record_reader_callback":
+            result = carrier.removeprefix(CALLBACK_TYPES["IntRecordReaderCallback"][1])
+            lines.append(f"typedef {result} (*{entry})(void*, KuLocalAppendFailure*, int64_t);")
+            fields.append(("failure", "KuLocalAppendFailure *"))
+        else:
+            result = carrier.removeprefix(CALLBACK_TYPES["IntPairResultCallback"][1])
+            lines.append(f"typedef KuBootstrapResult_{result} (*{entry})(void*, int64_t, int64_t);")
+        lines.extend(check_carrier_layout(carrier, expected, fields))
     for i, decl in enumerate(declarations):
         sig = decl.signature
         expected = f"ku_bootstrap_signature_{i}"

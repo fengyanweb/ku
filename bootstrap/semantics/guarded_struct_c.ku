@@ -5,9 +5,9 @@ import { ScalarStringLiteral, HasScalarBuiltin } from "./scalar_int_operands.ku"
 import { EmitScalarStringAssignment, ScalarStringJoinHelpers } from "./scalar_int_emit.ku"
 import { LowerProjectedStringParts } from "./guarded_string_parts.ku"
 import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
-import { ExplicitType, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { ExplicitType, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { OrderCStructLayouts } from "./nested_struct_c.ku"
-import { EmitTryCloneString, HasBoundArrayMembers } from "./struct_array_c.ku"
+import { EmitTryCloneString } from "./struct_array_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardExplicitType, GuardExpression, GuardType } from "./guarded_struct_expr.ku"
 
@@ -394,8 +394,8 @@ fn EmitGuardedStructC(&named: NamedModule, &types: [TypeNameBinding], &layouts: 
 fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &signature: str,
                          &result_type: str, &payload_cleanup: str, char_errors: str, &after_cleanup: str): str {
     text = header
-    calls_append = body.local_appends.len() > 0
-    array_checks = body.validated_arrays.len() > 0
+    calls_append = body.local_appends.len() > 0 || body.uses_scoped_reader
+    array_checks = body.validated_arrays.len() > 0 || body.checks_str_item
     arithmetic = calls_append || body.uses_add || body.uses_sub || body.uses_mul || body.uses_div
     appends = calls_append || body.append_slots.len() > 0 || body.local_append_types.len() > 0
     index_checks = calls_append || body.uses_index
@@ -413,7 +413,7 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
     if (arithmetic) { text += "    bool overflow = false;\n" }
     if (body.uses_div) { text += "    bool division_by_zero = false;\n" }
     if (index_checks) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
-    if (body.uses_concat) { text += "    const char* string_failure = NULL;\n" }
+    if (body.uses_concat || body.uses_replace) { text += "    const char* string_failure = NULL;\n" }
     if (body.uses_chars) { text += "    int source_status = KU_SOURCE_OK;\n" }
     text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
     if (after_cleanup != "") { return text + after_cleanup.clone() + "    return result;\n}\n" }
@@ -436,7 +436,7 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
     }
     if (body.uses_str_view) { text += "    if (invalid_str) { fputs(\"invalid str view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_struct_view) { text += "    if (invalid_struct_view) { fputs(\"invalid struct view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_concat) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_concat || body.uses_replace) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_chars) { text += char_errors }
     if (body.uses_div) { text += "    if (division_by_zero) { fputs(\"division by zero\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }

@@ -11,9 +11,10 @@ import { ScalarStringHelpers } from "../semantics/scalar_int_emit.ku"
 import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
 import { EmitCheckedStringArrayResultHeader } from "../semantics/struct_array_c.ku"
 import { LinkedNullProject, LinkedNullEntry, LinkedNullChild, LinkedNullNode,
-    LinkedNullParameterType, LinkedNullDependency, LinkedNullDependencyPlan, LinkedNullLayout,
-    LinkedNullCType, LinkedNullPrototype, LinkedNullParameterPlan } from "../semantics/linked_null_types_c.ku"
-import { BuiltinLinkPlanType, EmitLinkPlan, LinkPlanDeclaration, LinkPlanType, LinkedNullFunction } from "../semantics/link_plan_c.ku"
+    LinkedNullParameterType, LinkedNullDependency, LinkedNullLayout,
+    LinkedNullCType, LinkedNullParameterPlan } from "../semantics/linked_null_types_c.ku"
+import { BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, LinkedNullFunction } from "../semantics/link_plan_c.ku"
+import { EmitLinkPlan, LinkedNullDependencyPlan, LinkedNullPrototype } from "../semantics/link_plan_json_c.ku"
 import { TypeNameBinding } from "../semantics/type_names.ku"
 import { ManifestError, ManifestScan, ManifestChild, ManifestShape, RequireManifest,
     ReadManifestScan } from "./manifest_paths_shape.ku"
@@ -188,7 +189,7 @@ fn EmitManifestPathsC(&supplied: [SuppliedModule], &name: str): ManifestPathsC! 
     symbol = "ku_manifest_paths_" + str(id)
     source = emitManifest(scan, symbol, LinkedNullCType(context)?, EmitNestedCLayouts(needed, order)?, prepare, reject)?
     result_type = LinkPlanType { kind: "BuiltinArray", name: "str", unit: 0, node: 0,
-        c_type: "KuBootstrapResultStringArray", view: false }
+        c_type: "KuBootstrapResultStringArray", view: false, nominals: [] }
     export = LinkPlanDeclaration { unit: 1, node: id, symbol: symbol,
         parameters: [LinkedNullParameterPlan(input, 1)?, LinkedNullParameterPlan(context, 1)?],
         result: result_type, returns_result: true }

@@ -1,13 +1,13 @@
 import { GuardExplicitType, GuardType } from "./guarded_struct_expr.ku"
 import { ManagedSourceCharactersRuntime, ManagedStringArrayDrop } from "./guarded_string_parts.ku"
 import { LinkedNullIntArrayOwner, LinkedNullState } from "./link_plan_c.ku"
-import { EmitProjectionStringJoinHelpers, ScalarStringPrefixSuffixC } from "./scalar_int_emit.ku"
+import { EmitCheckedRecordArrayClone, EmitProjectionStringJoinHelpers, ScalarStringPrefixSuffixC } from "./scalar_int_emit.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
-import { OrderCStructLayouts, EmitCombinedCLayouts, EmitNestedCLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
+import { CanCloneNestedStringArrays, CollectOwnedMemberPaths, EmitCombinedCLayouts, EmitLinkedStringArrayElementClone, EmitNestedCLayouts, EmitProjectionCloneString, OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { ContainsType, CTypeName, ProjectionArrayHeader, ProjectionIsStringArray } from "./struct_projection_c.ku"
-import { ExplicitType, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { ExplicitType, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 
 struct StructArrayC {
@@ -17,44 +17,12 @@ struct StructArrayC {
     source: str
 }
 
-fn HasBoundArrayMembers(&layouts: [StructLayout], index: int): bool {
-    for member in layouts[index - 1].fields.clone() {
-        field = member.resolved
-        if (field.declaration_kind == "BuiltinArray" || field.declaration_kind == "StructArray") { return true }
-        // Layout validation already bounded the acyclic by-value graph.
-        if (field.declaration_kind == "Struct" && HasBoundArrayMembers(layouts, LayoutIndex(layouts, field.module_index, field.declaration_node))) {
-            return true
-        }
-    }
-    return false
-}
-
 fn collectOwnedFields(&layouts: [StructLayout], index: int, &prefix: str, paths: [str]): [str] {
-    owned = paths
-    field_index = 0
-    while (field_index < layouts[index - 1].fields.len()) {
-        field = layouts[index - 1].fields[field_index].resolved.clone()
-        path = prefix.clone() + ".f" + str(field_index)
-        if (field.declaration_kind == "Builtin" && field.name == "str") {
-            owned = owned.push(path)
-        } else if (field.declaration_kind == "Struct") {
-            child = LayoutIndex(layouts, field.module_index, field.declaration_node)
-            // The checked layout order establishes an acyclic, eight-level
-            // bound before walking this graph.
-            owned = collectOwnedFields(layouts, child, path, owned)
-        }
-        field_index = field_index + 1
-    }
-    return owned
+    return CollectOwnedMemberPaths(layouts, index, prefix, paths, false)
 }
 
 fn EmitTryCloneString(&symbol: str): str {
-    return "static bool " + symbol.clone() + "(KuProjectionString source, KuProjectionString *out) {\n" +
-        "    if (source.storage == KU_PROJECTION_STRING_STATIC) { *out = source; return true; }\n" +
-        "    if (!source.ptr) return true;\n" +
-        "    size_t size = source.len ? source.len : 1;\n    uint8_t *data = malloc(size);\n    if (!data) return false;\n" +
-        "    if (source.len) memcpy(data, source.ptr, source.len);\n" +
-        "    *out = (KuProjectionString){ data, source.len, size, KU_PROJECTION_STRING_OWNED };\n    return true;\n}\n\n"
+    return EmitProjectionCloneString(symbol)
 }
 
 fn emitOwnedStructElement(&element: str, &prefix: str, &fields: [str], private_drop: bool): str {
@@ -125,7 +93,7 @@ fn EmitLinkedStringArrayPrelude(&validated: [TypeNameBinding], needs_header: boo
         if (validated[index].declaration_kind == "BuiltinArray" && validated[index].name == "str") {
             return source + EmitStructArrayReadValidation("KuProjectionString", "KuGuardStringArray", "ku_linked_view_str_array")
         }
-        index += 1
+        index = index + 1
     }
     return source
 }
@@ -300,14 +268,18 @@ fn BoundArrayCPrefix(&binding: TypeNameBinding): str {
 fn EmitBoundArrayDeclarations(&arrays: [TypeNameBinding], &validated: [TypeNameBinding],
                             &defined: [str], str_array: bool): str {
     source = ""
-    for array in arrays.clone() {
+    index = 0
+    while (index < arrays.len()) {
+        array = arrays[index].clone()
         element = CTypeName(array.module_index, array.declaration_node)
         if (array.declaration_kind == "BuiltinArray" && array.name == "int") { element = "int64_t" }
         array_type = BoundArrayCType(array)
         if (!ContainsType(defined, array_type)) { source += EmitStructArrayHeader(element, array_type) }
-        if (BoundArrayTypePosition(validated, array) > 0) {
+        validation = BoundArrayTypePosition(validated, array)
+        if (validation > 0) {
             source += EmitStructArrayReadValidation(element, array_type, BoundArrayCPrefix(array))
         }
+        index = index + 1
     }
     if (str_array) {
         source += EmitLinkedStringArrayPrelude(validated, !ContainsType(defined, "KuGuardStringArray"))
@@ -318,24 +290,26 @@ fn EmitBoundArrayDeclarations(&arrays: [TypeNameBinding], &validated: [TypeNameB
 fn EmitBoundArrayResults(&layouts: [StructLayout], &owning_layouts: [StructLayout],
                          &types: [TypeNameBinding], chars: bool): str {
     source = ""
-    for owned in types.clone() {
+    index = 0
+    while (index < types.len()) {
+        owned = types[index].clone()
         if (owned.declaration_kind == "OwnedStringArray") {
             source += EmitCheckedStringArrayResultHeader()
             if (!chars) { source += ManagedStringArrayDrop() }
-            continue
-        }
-        array_type = BoundArrayCType(owned)
-        if (LinkedNullIntArrayOwner(owned)) {
+        } else if (LinkedNullIntArrayOwner(owned)) {
             source += "static void ku_linked_view_int_array_drop(KuArrayInt *array) {\n"
                 + "    free(array->data);\n    *array = (KuArrayInt){0};\n}\n\n"
-            continue
+        } else {
+            array_type = BoundArrayCType(owned)
+            layout = LayoutIndex(layouts, owned.module_index, owned.declaration_node)
+            source += EmitStructArrayResultHeader(array_type)
+            prefix = BoundArrayCPrefix(owned)
+            managed = LayoutIndex(owning_layouts, owned.module_index, owned.declaration_node)
+            if (managed != 0) {
+                source += EmitStructArrayDropUsing(array_type, prefix, OwningLayoutDropName(owned.module_index, owned.declaration_node), true)
+            } else { source += EmitOwnedStructArrayDrop(layouts, layout, array_type, prefix) }
         }
-        layout = LayoutIndex(layouts, owned.module_index, owned.declaration_node)
-        source += EmitStructArrayResultHeader(array_type)
-        prefix = BoundArrayCPrefix(owned)
-        if (LayoutIndex(owning_layouts, owned.module_index, owned.declaration_node) != 0) {
-            source += EmitStructArrayDropUsing(array_type, prefix, OwningLayoutDropName(owned.module_index, owned.declaration_node), true)
-        } else { source += EmitOwnedStructArrayDrop(layouts, layout, array_type, prefix) }
+        index = index + 1
     }
     return source
 }
@@ -350,8 +324,16 @@ fn EmitBoundStringOperations(clone: bool, concat: bool, format: bool, prefix_suf
 
 fn EmitBoundElementClones(&layouts: [StructLayout], &requested: [int]): str {
     text = ""
-    for layout in requested.clone() {
-        text += EmitOwnedStructOperations(layouts, layout, "ku_linked_element_" + str(layout), true)
+    index = 0
+    while (index < requested.len()) {
+        layout = requested[index]
+        prefix = "ku_linked_element_" + str(layout)
+        if (HasBoundArrayMembers(layouts, layout)) {
+            text += EmitLinkedStringArrayElementClone(layouts, layout, prefix)
+        } else {
+            text += EmitOwnedStructOperations(layouts, layout, prefix, true)
+        }
+        index = index + 1
     }
     return text
 }
@@ -360,7 +342,9 @@ fn EmitBoundArrayAppenders(&types: [TypeNameBinding]): str {
     if (types.len() == 0) { return "" }
     text = StructArrayStatuses()
     seen: [str] = []
-    for ty in types.clone() {
+    index = 0
+    while (index < types.len()) {
+        ty = types[index].clone()
         array = BoundArrayCType(ty)
         if (!ContainsType(seen, array)) {
             element = "int64_t"
@@ -369,6 +353,7 @@ fn EmitBoundArrayAppenders(&types: [TypeNameBinding]): str {
             text += EmitOwnedStructArrayAppend(element, array, BoundArrayCPrefix(ty))
             seen = seen.push(array)
         }
+        index = index + 1
     }
     return text
 }
@@ -382,23 +367,17 @@ fn EmitLinkedIntAppend(&array: str, &value: str): str {
 
 fn OwnedRecordArrayCloneLayout(&layouts: [StructLayout], &array: TypeNameBinding): int {
     index = LayoutIndex(layouts, array.module_index, array.declaration_node)
-    if (index == 0 || HasBoundArrayMembers(layouts, index)) { return 0 }
+    if (index == 0) { return 0 }
+    if (HasBoundArrayMembers(layouts, index)) {
+        if (CanCloneNestedStringArrays(layouts, index)) { return index }
+        return 0
+    }
     if (collectOwnedFields(layouts, index, "", []).len() == 0) { return 0 }
     return index
 }
 
-fn EmitLinkedOwnedArrayClone(&source: str, &target: str, &prefix: str, layout: int): str {
-    // The common drop owns only the destination's initialized prefix.
-    text = "    if (!" + prefix.clone() + "_valid(&" + source.clone() + ")) { invalid_array = true; goto cleanup; }\n"
-    text += "    if (" + source.clone() + ".len) {\n"
-        + "        " + target.clone() + ".data = malloc(" + source.clone() + ".len * sizeof(*" + target.clone() + ".data));\n"
-        + "        if (!" + target.clone() + ".data) { out_of_memory = true; goto cleanup; }\n"
-    text += "        " + target.clone() + ".capacity = " + source.clone() + ".len;\n"
-        + "        while (" + target.clone() + ".len < " + source.clone() + ".len) {\n"
-    text += "            if (!ku_linked_element_" + str(layout) + "_clone_element(&" + source.clone()
-        + ".data[" + target.clone() + ".len], &" + target.clone()
-        + ".data[" + target.clone() + ".len])) { out_of_memory = true; goto cleanup; }\n"
-    return text + "            ++" + target.clone() + ".len;\n        }\n    }\n"
+fn EmitLinkedOwnedArrayClone(&layouts: [StructLayout], &source: str, &target: str, &array: TypeNameBinding, layout: int): str {
+    return EmitCheckedRecordArrayClone(source, target, BoundArrayCPrefix(array), layout, HasBoundArrayMembers(layouts, layout))
 }
 
 fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str): str! {
@@ -416,8 +395,22 @@ fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str):
     }
     text += EmitBoundElementClones(body.layouts, body.element_clones)
     text += result_header + EmitBoundArrayResults(body.layouts, body.owning_layouts, body.owned_arrays, body.uses_chars)
-    append_types = body.local_append_types.clone()
-    for index in body.append_slots.clone() { append_types = append_types.push(body.slots[index - 1].value.ty.clone()) }
+    append_types: [TypeNameBinding] = []
+    local_count = body.local_append_types.len()
+    index = 0
+    while (index < local_count) {
+        type = body.local_append_types[index].clone()
+        append_types = append_types.push(type)
+        index = index + 1
+    }
+    slot_count = body.append_slots.len()
+    index = 0
+    while (index < slot_count) {
+        slot = body.append_slots[index]
+        type = body.slots[slot - 1].value.ty.clone()
+        append_types = append_types.push(type)
+        index = index + 1
+    }
     return ok(text + EmitBoundArrayAppenders(append_types))
 }
 

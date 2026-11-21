@@ -7,7 +7,7 @@ import { CheckTypeArenaCapacity } from "./signature.ku"
 import { AppendStatementLinks, BuildCatchClause, BuildControlStatement, ControlBodyStart, FunctionEofKind, LocalFunctionNodeKind, PrepareBodyAttachment, ReadControlBodyStart } from "./statement_links.ku"
 import { LocalFunctionScope, ReadLocalFunctionHeader } from "./function_header.ku"
 import { ReadSimpleBodyStatement } from "./simple_statements.ku"
-import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, IsControlStatement, ReadCatchBinding, RejectBodyEof, RejectBodyEdgeId, RejectNestedNodeId, ReadElsePhase, CheckStrayClause, RejectStatementLimit, RejectStatementDepth, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow } from "./body_support.ku"
+import { StatementLink, ControlFrame, NewControlFrame, NextBodyWork, IsControlStatement, ReadCatchBinding, RejectBodyEof, RejectBodyEdgeId, RejectNestedNodeId, ReadElsePhase, IsLocalFunctionAssignment, CheckStrayClause, RejectStatementLimit, RejectStatementDepth, RejectTrailingDeclaration, FinishFunctionBodyOutput, ValidateFunctionBodyWindow } from "./body_support.ku"
 
 // Read the remainder of one bounded ordinary-function window, starting at the
 // first token after its opening brace. The standalone entry validates its
@@ -127,7 +127,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
             if (control_depth == 0) {
                 function_end = block_end
                 reading_body = false
-            } else if (current.kind == "If" && current.phase == 0 && WindowKind(tokens, cursor, last_index) == "Else") {
+            } else if (HasUnopenedElse(tokens, cursor, last_index, current)) {
                 cursor = cursor + 1
                 // Phase 2 leaves the nested If for the next iteration.
                 current.phase = ReadElsePhase(WindowToken(tokens, cursor, last_index))?
@@ -194,60 +194,60 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
                 RejectStatementLimit(token.clone())?
             }
             statement_start_index = cursor
-            statement_start = token
             statement_count = statement_count + 1
-            control_kind = statement_start.kind.clone()
+            control_kind = token.kind.clone()
             function_start = cursor
             declared_type = 0
-            if (control_kind == "Ident"
-                && WindowKind(tokens, cursor + 1, last_index) == "Equal"
-                && WindowKind(tokens, cursor + 2, last_index) == "Fn") {
+            open_control = true
+            if (IsLocalFunctionAssignment(tokens, cursor, last_index, control_kind)) {
                 function_start = cursor + 2
             } else if (!IsControlStatement(control_kind)) {
-                parsed = ReadSimpleBodyStatement(tokens, cursor, last_index, token_base, parse_steps, statement_start, false,
+                parsed = ReadSimpleBodyStatement(tokens, cursor, last_index, token_base, parse_steps, token, false,
                                                 parse_expression.clone(), AddArena.clone(), AddNode.clone(), ReadNode.clone(), ReadSpan.clone())?
                 cursor = parsed.cursor
                 parse_steps = parsed.work
                 if (parsed.initializer_type == 0) {
                     RecordStatement(parsed.node)?
-                    continue
+                    open_control = false
+                } else {
+                    function_start = cursor
+                    declared_type = parsed.initializer_type
                 }
-                statement_start = WindowToken(tokens, statement_start_index, last_index)
-                function_start = cursor
-                declared_type = parsed.initializer_type
             }
-            if (control_depth >= 32) {
-                RejectStatementDepth(statement_start.clone())?
-            }
-            opened = ControlBodyStart { binding: "", condition: 0, next: cursor, work: parse_steps, inline_statement: 0 }
-            if (control_kind == "Fn" || control_kind == "Async" || control_kind == "Ident") {
-                local = ReadLocalFunctionHeader(tokens, statement_start_index, function_start, last_index,
-                                                parse_steps, arena_nodes.len(), statement_count, declared_type)?
-                AddArena(local.output, statement_start.clone(), true)?
-                local_headers = local_headers.push(local.scope)
-                statement_count = 0
-                opened = ControlBodyStart { binding: local.name, condition: local_headers.len(),
-                                            next: local.body_open + 1, work: local.work, inline_statement: 0 }
-                control_kind = LocalFunctionNodeKind(control_kind)
-            } else {
-                opened = ReadControlBodyStart(tokens, control_kind, statement_start_index, last_index, token_base, parse_steps,
-                                             statement_count, control_depth > 0 && current.phase == 2,
-                                             parse_expression.clone(), AddArena.clone(), AddNode.clone(), ReadNode.clone(), ReadSpan.clone())?
-            }
-            if (opened.inline_statement != 0) {
-                statement_count = statement_count + 1
-                RecordStatement(opened.inline_statement)?
-            } else {
-                if (control_depth > 0) {
-                    parent_frame = current.clone()
-                    control_frames = control_frames.push(parent_frame)
-                    frame_top = control_frames.len()
+            if (open_control) {
+                if (control_depth >= 32) {
+                    RejectStatementDepth(WindowToken(tokens, statement_start_index, last_index))?
                 }
-                current = NewControlFrame(control_kind, opened.binding, statement_start_index, opened.condition, frame_top)
-                control_depth = control_depth + 1
+                opened = ControlBodyStart { binding: "", condition: 0, next: cursor, work: parse_steps, inline_statement: 0 }
+                if (control_kind == "Fn" || control_kind == "Async" || control_kind == "Ident") {
+                    local = ReadLocalFunctionHeader(tokens, statement_start_index, function_start, last_index,
+                                                    parse_steps, arena_nodes.len(), statement_count, declared_type)?
+                    AddArena(local.output, WindowToken(tokens, statement_start_index, last_index), true)?
+                    local_headers = local_headers.push(local.scope)
+                    statement_count = 0
+                    opened = ControlBodyStart { binding: local.name, condition: local_headers.len(),
+                                                next: local.body_open + 1, work: local.work, inline_statement: 0 }
+                    control_kind = LocalFunctionNodeKind(control_kind)
+                } else {
+                    opened = ReadControlBodyStart(tokens, control_kind, statement_start_index, last_index, token_base, parse_steps,
+                                                 statement_count, control_depth > 0 && current.phase == 2,
+                                                 parse_expression.clone(), AddArena.clone(), AddNode.clone(), ReadNode.clone(), ReadSpan.clone())?
+                }
+                if (opened.inline_statement != 0) {
+                    statement_count = statement_count + 1
+                    RecordStatement(opened.inline_statement)?
+                } else {
+                    if (control_depth > 0) {
+                        parent_frame = current.clone()
+                        control_frames = control_frames.push(parent_frame)
+                        frame_top = control_frames.len()
+                    }
+                    current = NewControlFrame(control_kind, opened.binding, statement_start_index, opened.condition, frame_top)
+                    control_depth = control_depth + 1
+                }
+                cursor = opened.next
+                parse_steps = opened.work
             }
-            cursor = opened.next
-            parse_steps = opened.work
         }
     }
     if (cursor != last_index) {
@@ -255,4 +255,10 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
     }
     statements = AppendStatementList([], root_top, root_count, body_open.clone())?
     return FinishFunctionBodyOutput(arena_nodes.clone(), arena_edges.clone(), parse_steps, body_open, function_end, statements)
+}
+
+fn HasUnopenedElse(&tokens: [Token], next: int, last: int, &frame: ControlFrame): bool {
+    if (frame.kind != "If" || frame.phase != 0) { return false }
+    following = WindowKind(tokens, next, last)
+    return following == "Else"
 }

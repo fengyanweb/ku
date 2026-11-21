@@ -135,13 +135,35 @@ fn readLimit(&project: LinkedNullProject, &branch: Node, &locals: ManifestLocals
 }
 
 fn readDuplicate(&project: LinkedNullProject, &loop: Node, &locals: ManifestLocals): ManifestError! {
-    ManifestShape(loop, "For", 2)?
-    variable(ManifestChild(project, loop, 0), locals.paths)?
+    indexed = loop.kind == "While"
+    if (indexed) {
+        ManifestShape(loop, "While", 3)?
+        limit = ManifestChild(project, loop, 0)
+        binary(limit, "<")?
+        variable(ManifestChild(project, limit, 0), locals.existing)?
+        method(project, ManifestChild(project, limit, 1), locals.paths, "len", 0)?
+        step = ManifestChild(project, loop, 2)
+        ownAssignment(step, locals.existing)?
+        advance = ManifestChild(project, step, 0)
+        binary(advance, "+")?
+        variable(ManifestChild(project, advance, 0), locals.existing)?
+        one = ManifestChild(project, advance, 1)
+        ManifestShape(one, "Int", 0)?
+        RequireManifest(one.int_value == 1, one, "duplicate scan must advance by one")?
+    } else {
+        ManifestShape(loop, "For", 2)?
+        variable(ManifestChild(project, loop, 0), locals.paths)?
+    }
     branch = ManifestChild(project, loop, 1)
     oneBranch(branch)?
     equality = ManifestChild(project, branch, 0)
     binary(equality, "==")?
-    variable(ManifestChild(project, equality, 0), locals.existing)?
+    left = ManifestChild(project, equality, 0)
+    if (indexed) {
+        ManifestShape(left, "Index", 2)?
+        variable(ManifestChild(project, left, 0), locals.paths)?
+        variable(ManifestChild(project, left, 1), locals.existing)?
+    } else { variable(left, locals.existing)? }
     variable(ManifestChild(project, equality, 1), locals.line)?
     return errorCall(project, ManifestChild(project, branch, 1), locals, true, true)
 }
@@ -235,12 +257,21 @@ fn ReadManifestScan(&project: LinkedNullProject, &entry: Node, &input: str, &at:
     ManifestShape(arms, "If", 6)?
     RequireManifest(arms.int_value == 2, arms, "expected two scanning and three line flush statements")?
     accepting = ManifestChild(project, arms, 4)
-    ManifestShape(accepting, "If", 4)?
-    RequireManifest(accepting.int_value == 3, accepting, "expected limit, duplicate check and append with no else")?
+    parts = accepting.int_value
+    RequireManifest(parts == 3 || parts == 4, accepting, "expected limit, duplicate check and append with no else")?
+    ManifestShape(accepting, "If", parts + 1)?
     duplicate_loop = ManifestChild(project, accepting, 2)
-    ManifestShape(duplicate_loop, "For", 2)?
+    existing = duplicate_loop.text.clone()
+    if (parts == 4) {
+        ManifestShape(duplicate_loop, "Assign", 1)?
+        zero = ManifestChild(project, duplicate_loop, 0)
+        ManifestShape(zero, "Int", 0)?
+        RequireManifest(zero.int_value == 0, zero, "duplicate scan must start at zero")?
+        duplicate_loop = ManifestChild(project, accepting, 3)
+        ManifestShape(duplicate_loop, "While", 3)?
+    } else { ManifestShape(duplicate_loop, "For", 2)? }
     local = ManifestLocals { input: input.clone(), at: at.clone(), paths: declaration.text, line: initial.text,
-        character: loop.text.clone(), existing: duplicate_loop.text.clone() }
+        character: loop.text.clone(), existing: existing }
     names = [local.input.clone(), local.at.clone(), local.paths.clone(), local.line.clone(),
         local.character.clone(), local.existing.clone()]
     requireNamespaces(project, names, entry)?
@@ -269,7 +300,7 @@ fn ReadManifestScan(&project: LinkedNullProject, &entry: Node, &input: str, &at:
     line = readLimit(project, ManifestChild(project, arms, 2), local, local.line, "byte_len", ">", 1, 513, true)?
     count = readLimit(project, ManifestChild(project, accepting, 1), local, local.paths, "len", "==", 1, 64, true)?
     duplicate = readDuplicate(project, duplicate_loop, local)?
-    readAppend(project, ManifestChild(project, accepting, 3), local)?
+    readAppend(project, ManifestChild(project, accepting, parts), local)?
     empty = readLimit(project, ManifestChild(project, entry, 7), local, local.paths, "len", "==", 0, 0, false)?
     checkReturn(project, ManifestChild(project, entry, 8), local.paths)?
     requireUnshadowed(prepared, names)?

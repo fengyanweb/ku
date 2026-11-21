@@ -4,7 +4,7 @@ import { Arena, Node, ParseOutput } from "../stage2/ast.ku"
 import { MakeExpressionNode } from "../stage2/expression_support.ku"
 import { NextBodyWork, ReadExpressionEnd } from "./body_support.ku"
 import { TypePart, ReadSignatureTypePrefix, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
-import { AppendStage3Node, RejectAt, RejectAtSpan, Stage3ArenaAppend, WindowKind, WindowToken } from "./support.ku"
+import { AppendStage3Node, RejectAt, RejectAtSpan, Stage3ArenaAppend, WindowKind, WindowKindIs, WindowToken } from "./support.ku"
 
 struct FunctionHeader {
     name: str
@@ -40,14 +40,14 @@ fn ReadTypedInitializer(&tokens: [Token], first: int, last: int, token_base: int
                         add_arena: fn(ParseOutput, Token, bool): int!,
                         add_node: fn(str, str, int, Span, [int], Token): int!,
                         read_span: fn(int): Span): TypedInitializerRead! {
-    arrow = WindowKind(tokens, first, last) == "LParen" && WindowKind(tokens, first + 1, last) == "RParen"
-        && WindowKind(tokens, first + 2, last) == "Arrow"
+    arrow = WindowKindIs(tokens, first, last, "LParen") && WindowKindIs(tokens, first + 1, last, "RParen")
+        && WindowKindIs(tokens, first + 2, last, "Arrow")
     start = first
     work = initial_work
     if (arrow) {
         start = first + 3
         work = NextBodyWork(work, 3, WindowToken(tokens, first, last))?
-        if (WindowKind(tokens, start, last) == "LBrace") {
+        if (WindowKindIs(tokens, start, last, "LBrace")) {
             RejectAt(WindowToken(tokens, start, last), "unsupported_expression", "stage-3 arrow initializer requires an expression body")?
         }
     }

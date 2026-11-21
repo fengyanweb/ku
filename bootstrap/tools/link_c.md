@@ -24,8 +24,9 @@ identity and Result representation. A struct identity comes from its module
 path and declaration node. A `StructArray` identifies its element by that
 pair and keeps its array shape distinct from the element itself. An owned
 array carrier is passed by value, and a readonly View uses a const pointer.
-`BuiltinArray` describes View `[str]` parameters with the generated
-`KuGuardStringArray` carrier. A checked owning `[str]!` result uses
+`BuiltinArray` describes `[str]` parameters and returns with the generated
+`KuGuardStringArray` carrier. An owning parameter or plain result uses that
+carrier by value. A checked owning `[str]!` result uses
 `KuBootstrapResultStringArray`, including its Result wrapper.
 `IntPairResultCallback` describes a synchronous parameter of shape
 `fn(int, int): T!`. Its path and node identify the declared record `T`.
@@ -58,6 +59,14 @@ operation. The linker validates its `(&str) -> str!` signature and bundles
 the existing native filesystem code and ABI header in the temporary build.
 Pass this option explicitly for units that depend on `fs.read`. The file
 read uses the supplied path and keeps the native limit and error contract.
+
+Use `--builtin string.slice` for the checked `std/string.ku#2` dependency.
+The linker validates `(&str, int, int) -> str!`. The provider uses the
+native C slice implementation, takes Unicode scalar indexes, and returns
+independently owned nonempty slices. The input remains owned by the caller.
+The private linker View does not change which borrowed source expressions Ku
+accepts for `string.slice`. Use both builtin options if a program depends on
+both operations.
 
 `json_literal_string_c.ku` emits a standalone checked string provider from
 the bound zero-argument function named in `function.txt`. It reads the

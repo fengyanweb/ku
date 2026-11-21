@@ -53,10 +53,12 @@ fn ExplicitType(&bindings: [TypeNameBinding], use_node: int, at: Span): TypeName
     lo = 0
     hi = bindings.len()
     // BindTypeNames produces ascending AST IDs.
-    while (lo < hi) {
+    searching = lo < hi
+    while (searching) {
         middle = lo + (hi - lo) / 2
         if (bindings[middle].use_node < use_node) { lo = middle + 1 }
         else { hi = middle }
+        searching = lo < hi
     }
     if (lo >= bindings.len() || bindings[lo].use_node != use_node) {
         RejectLayout("unsupported_layout_type", "expected a bound explicit TypeName", at)?
@@ -98,16 +100,14 @@ fn owningFieldType(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding], 
         RejectLayout("unsupported_layout_type", "an array field must declare one element type", at.clone())?
     }
     element = ExplicitType(bindings, edges[nodes[id - 1].first_edge], at.clone())?
+    kind = "BuiltinArray"
     if (element.declaration_kind == "Struct") {
-        element.declaration_kind = "StructArray"
-    } else if (element.declaration_kind == "Builtin" && (element.name == "int" || element.name == "str")) {
-        element.declaration_kind = "BuiltinArray"
-    } else {
+        kind = "StructArray"
+    } else if (!(element.declaration_kind == "Builtin" && (element.name == "int" || element.name == "str"))) {
         RejectLayout("unsupported_layout_type", "owning C layout supports [int], [str] or an array of bound structs", at.clone())?
     }
-    element.use_node = id
-    element.span = at
-    return ok(element)
+    return ok(TypeNameBinding { use_node: id, name: element.name, declaration_kind: kind,
+                                module_index: element.module_index, declaration_node: element.declaration_node, span: at })
 }
 
 fn collectFields(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
@@ -425,4 +425,21 @@ fn ReadLinkedErrorInitializer(&named: NamedModule, &literal: Node): LinkedErrorI
         index = index + 1
     }
     return ok(LinkedErrorInitializer { fields: fields, scratch: scratch })
+}
+
+fn HasBoundArrayMembers(&layouts: [StructLayout], index: int): bool {
+    count = layouts[index - 1].fields.len()
+    member = 0
+    while (member < count) {
+        if (layouts[index - 1].fields[member].resolved.declaration_kind == "BuiltinArray" ||
+            layouts[index - 1].fields[member].resolved.declaration_kind == "StructArray") { return true }
+        // Layout validation already bounded the acyclic by-value graph.
+        if (layouts[index - 1].fields[member].resolved.declaration_kind == "Struct") {
+            unit = layouts[index - 1].fields[member].resolved.module_index
+            node = layouts[index - 1].fields[member].resolved.declaration_node
+            if (HasBoundArrayMembers(layouts, LayoutIndex(layouts, unit, node))) { return true }
+        }
+        member = member + 1
+    }
+    return false
 }
