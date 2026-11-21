@@ -3,10 +3,9 @@ import { LinkedLocalReadCaptures } from "./call_contracts.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
 import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
-import { GuardOwnedDrops } from "./guarded_struct_c.ku"
+import { GuardOwnedDrops, ScalarGuardSlotMove } from "./guarded_struct_c.ku"
 import { OwningLayoutDropName } from "./nested_struct_c.ku"
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
-import { HasBoundArrayMembers } from "./struct_array_c.ku"
 import { EmitCheckedScalarArithmetic } from "./scalar_int_emit.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, SameLinkedType } from "./linked_null_types_c.ku"
@@ -97,24 +96,16 @@ fn MatchesLinkedFieldValue(&target: TypeNameBinding, &origin: TypeNameBinding): 
     return SameLinkedType(target, origin) || MatchesLinkedIntArrayOwner(target, origin)
 }
 
-fn scalarGuardSlotMove(&before: LinkedNullSlot, &after: LinkedNullSlot, &state: LinkedNullState): bool {
-    ty = before.value.ty.clone()
-    if (ty.declaration_kind != "Struct" || before.value.borrowed || !before.live || after.live
-        || before.moved_members.len() != 0 || after.moved_members.len() != 0) { return false }
-    layout = LayoutIndex(state.layouts, ty.module_index, ty.declaration_node)
-    return layout > 0 && !HasBoundArrayMembers(state.layouts, layout)
-        && GuardOwnedDrops(state.layouts, layout, before.value.text) == ""
-}
-
 fn MergeLinkedGuardOwners(state: LinkedNullState, &outer: [LinkedNullSlot], &statement: Node): LinkedNullState! {
     next = state
     index = 0
     while (index < outer.len()) {
         if (LinkedNullOwner(outer[index].value.ty) && !LinkedSlotOwnershipMatches(outer[index], next.slots[index])
-            && !scalarGuardSlotMove(outer[index], next.slots[index], next)) {
+            && !ScalarGuardSlotMove(outer[index], next.slots[index], next)) {
             // The no-else path leaves the incoming fields intact. The
             // taken arm cleared any transferred fields before continuing.
             next.slots[index].moved_members = joinedLinkedMemberMoves(outer[index], next.slots[index], statement)?
+            next.slots[index].live = outer[index].live || next.slots[index].live
         }
         index = index + 1
     }
@@ -132,6 +123,12 @@ fn linkedMovedMembersContained(&members: [str], &possible: [str]): bool {
 }
 
 fn joinedLinkedMemberMoves(&first: LinkedNullSlot, &second: LinkedNullSlot, &statement: Node): [str]! {
+    if (first.value.ty.declaration_kind == "Builtin" && first.value.ty.name == "str" &&
+        SameLinkedType(first.value.ty, second.value.ty) && !first.value.borrowed && !second.value.borrowed) {
+        // A whole str may have been handed off. Both runtime carriers remain
+        // safe to drop because the arm transferring it zeros the source.
+        return ok([""])
+    }
     if (first.live && second.live && !first.value.borrowed && !second.value.borrowed
         && first.value.ty.declaration_kind == "Struct" && SameLinkedType(first.value.ty, second.value.ty)) {
         if (linkedMovedMembersContained(first.moved_members, second.moved_members)) { return ok(second.moved_members.clone()) }
@@ -149,6 +146,7 @@ fn MergeLinkedConditionalMembers(state: LinkedNullState, &first: [LinkedNullSlot
             // Only availability merges. Actual moves zero their field in the
             // arm that executes, so cleanup still visits this live parent.
             next.slots[index].moved_members = joinedLinkedMemberMoves(first[index], next.slots[index], statement)?
+            next.slots[index].live = first[index].live || next.slots[index].live
         }
         index = index + 1
     }

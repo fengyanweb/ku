@@ -388,7 +388,7 @@ fn LinkedErrorField(receiver: LinkedNullExpression, member: str, at: Span): Link
 
 fn ReadLinkedNullBinding(state: LinkedNullState, &node: Node): LinkedNullExpression! {
     index = LinkedNullBinding(state.slots, node.text)
-    if (index == 0 || !state.slots[index - 1].live) {
+    if (index == 0 || !state.slots[index - 1].live || ContainsType(state.slots[index - 1].moved_members, "")) {
         RejectMissingLinkedValue(state.local_readers, node)?
     }
     value = state.slots[index - 1].value.clone()

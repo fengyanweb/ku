@@ -896,12 +896,23 @@ fn Append(first: bool): str! {
 }
 fn Consume(value: str): null! { return ok(null) }
 fn Keep(value: str): str! { return ok(value) }
-fn WrongElse(first: bool): str! {
+fn KeepRight(first: bool): str! {
     left = Supply(1)?
     right = Supply(1)?
     if (first) { Consume(left)? }
     else { right = Supply(3)? }
     return ok(right)
+}
+fn Rebound(first: bool): str! {
+    owner = Supply(1)?
+    if (first) { Consume(owner)? }
+    owner = Supply(2)?
+    return ok(owner)
+}
+fn ReadMaybeMoved(first: bool): int! {
+    owner = Supply(1)?
+    if (first) { Consume(owner)? }
+    return ok(owner.len())
 }
 struct Bundle { left: str right: str }
 fn WrongMembers(bundle: Bundle, first: bool): null! {
@@ -1022,18 +1033,98 @@ pub(super) fn assert_checked_string_rebind(seed: &Path, cwd: &Path) {
         compile_projection(&source, &exe, cwd);
         assert_ok(&execute(&mut Command::new(exe), cwd, 15));
     }
-    for name in ["WrongElse", "WrongMembers"] {
+    fs::write(cwd.join("function.txt"), "KeepRight").unwrap();
+    assert_ok(&execute(&mut Command::new(seed), cwd, 30));
+    for (name, diagnostic) in [
+        ("WrongMembers", "linked_control_move"),
+        ("ReadMaybeMoved", "unavailable_linked_binding"),
+    ] {
         fs::write(cwd.join("function.txt"), name).unwrap();
         let wrong = execute(&mut Command::new(seed), cwd, 30);
         assert_eq!(wrong.status.code(), Some(1));
         assert!(wrong.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&wrong.stderr).contains("linked_control_move"));
+        assert!(String::from_utf8_lossy(&wrong.stderr).contains(diagnostic));
     }
     fs::write(cwd.join("function.txt"), "CatchMoved").unwrap();
     let moved = execute(&mut Command::new(seed), cwd, 30);
     assert_eq!(moved.status.code(), Some(1));
     assert!(moved.stdout.is_empty());
     assert!(String::from_utf8_lossy(&moved.stderr).contains("unavailable_linked_binding"));
+
+    fs::write(cwd.join("function.txt"), "Rebound").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let symbol = |prefix: &str, suffix: &str| {
+        code.lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap()
+            .split_once(suffix)
+            .unwrap()
+            .0
+    };
+    let host = r#"
+static bool consume_fails, supply_fails;
+static unsigned calls;
+KuBootstrapResult_KuProjectionString __SUPPLY__(int64_t stage) {
+    KuBootstrapResult_KuProjectionString result = {0};
+    ++calls;
+    uint8_t *data = malloc(1);
+    *data = (uint8_t)stage;
+    KuProjectionString text = {data,1,1,KU_PROJECTION_STRING_OWNED};
+    if (stage == 2 && supply_fails) { result.error.message = text; return result; }
+    result.ok = true;
+    result.value = text;
+    return result;
+}
+KuBootstrapResultNull __CONSUME__(KuProjectionString text) {
+    assert(outstanding() == 1 && text.len == 1 && *text.ptr == 1);
+    if (consume_fails) return (KuBootstrapResultNull){.error={.message=text}};
+    ku_projection_string_drop(&text);
+    return (KuBootstrapResultNull){.ok=true};
+}
+int main(void) {
+    (void)test_realloc;
+    for (int first = 0; first <= 1; ++first) {
+        calls = 0;
+        KuBootstrapResult_KuProjectionString output = __ENTRY__(first != 0);
+        assert(output.ok && calls == 2 && outstanding() == 1 && *output.value.ptr == 2);
+        ku_projection_string_drop(&output.value);
+        assert(!outstanding());
+    }
+    calls = 0;
+    consume_fails = true;
+    KuBootstrapResult_KuProjectionString output = __ENTRY__(true);
+    assert(!output.ok && calls == 1 && outstanding() == 1 && *output.error.message.ptr == 1);
+    ku_projection_string_drop(&output.error.message);
+    assert(!outstanding());
+    calls = 0;
+    consume_fails = false;
+    supply_fails = true;
+    output = __ENTRY__(false);
+    assert(!output.ok && calls == 2 && outstanding() == 1 && *output.error.message.ptr == 2);
+    ku_projection_string_drop(&output.error.message);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace(
+        "__SUPPLY__",
+        symbol("extern KuBootstrapResult_KuProjectionString ", "("),
+    )
+    .replace("__CONSUME__", symbol("extern KuBootstrapResultNull ", "("))
+    .replace(
+        "__ENTRY__",
+        symbol("KuBootstrapResult_KuProjectionString ", "("),
+    );
+    let source = cwd.join("joined-string-owner.c");
+    let binary = cwd.join(format!(
+        "joined-string-owner{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(binary), cwd, 15));
 }
 
 const ADD_CALL_SOURCE: &str = r#"import { Decorate, Suffix } from "./plus-provider.ku"

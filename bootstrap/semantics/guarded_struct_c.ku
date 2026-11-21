@@ -7,11 +7,11 @@ import { LowerProjectedStringParts } from "./guarded_string_parts.ku"
 import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { OrderCStructLayouts } from "./nested_struct_c.ku"
-import { EmitTryCloneString } from "./struct_array_c.ku"
+import { EmitTryCloneString, HasBoundArrayMembers } from "./struct_array_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardExplicitType, GuardExpression, GuardType } from "./guarded_struct_expr.ku"
 
-import { LinkedNullState } from "./link_plan_c.ku"
+import { LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
 
 struct GuardedStructC {
     symbol: str
@@ -423,4 +423,13 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
             + "(long long)failure_index, failure_length); exit(EXIT_FAILURE); }\n"
     }
     return text + "    return result;\n}\n"
+}
+
+fn ScalarGuardSlotMove(&before: LinkedNullSlot, &after: LinkedNullSlot, &state: LinkedNullState): bool {
+    ty = before.value.ty.clone()
+    if (ty.declaration_kind != "Struct" || before.value.borrowed || !before.live || after.live
+        || before.moved_members.len() != 0 || after.moved_members.len() != 0) { return false }
+    layout = LayoutIndex(state.layouts, ty.module_index, ty.declaration_node)
+    return layout > 0 && !HasBoundArrayMembers(state.layouts, layout)
+        && GuardOwnedDrops(state.layouts, layout, before.value.text) == ""
 }

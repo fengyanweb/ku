@@ -197,8 +197,8 @@ pub(super) fn assert_readonly_preflight(seed: &Path, cwd: &Path) {
          "linked_view_escape"),
         ("struct Token { kind: str }\nfn Start(&tokens: [Token]): null! { i = 0 while (i < tokens.len()) { i = i + 2 } return ok(null) }",
          "unsupported_linked_loop"),
-        ("fn Target(msg: str): null! { return ok(null) }\nfn Start(msg: str, flag: bool): null! { if (flag) { Target(msg)? } return ok(null) }",
-         "linked_control_move"),
+        ("fn Target(msg: str): null! { return ok(null) }\nfn Start(msg: str, flag: bool): int! { if (flag) { Target(msg)? } return ok(msg.len()) }",
+         "unavailable_linked_binding"),
     ] {
         fs::write(cwd.join("bad-window.ku"), source).unwrap();
         let failure = emit("linked-null");

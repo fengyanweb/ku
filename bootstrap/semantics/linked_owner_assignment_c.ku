@@ -44,9 +44,11 @@ fn LowerLinkedOwnerRebind(&project: LinkedNullProject, state: LinkedNullState, &
     value.state.slots[index - 1].live = true
     moved = value.value.clone()
     next = MoveLinkedNullSlot(value.state, moved)?
-    if (record) {
+    if (record || LinkedStringResult(target.ty)) {
         cleared: [str] = []
         next.slots[index - 1].moved_members = cleared
+    }
+    if (record) {
         // A nominal struct with only Copy fields still moves in Ku.
         next.slots[moved.slot - 1].live = false
     }
