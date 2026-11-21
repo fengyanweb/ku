@@ -15,6 +15,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import socket
@@ -1002,7 +1003,7 @@ def stage_committed_ku_sources(repo, commit, env, project, directories, *, file_
         mode, kind, oid = description.split(' ')
         relative = EXPORT.checked_relative(name)
         if (mode != '100644' or kind != 'blob' or relative.casefold() in names or
-                len(names) >= file_limit):
+                (file_limit is not None and len(names) >= file_limit)):
             raise ValueError('invalid committed Ku source: ' + relative)
         names.add(relative.casefold())
         blob = invoke(['git', 'cat-file', 'blob', oid], repo, env)
@@ -1102,27 +1103,73 @@ def installed_declaration_inventory_consumer(install, root, env, report, repo, c
     detail['status'] = 'passed'
 
 
-BOOTSTRAP_LAUNCHERS = {
-    'stage1/main.ku', 'stage2/main.ku', 'stage3/main.ku',
-    'semantics/main.ku', 'semantics/project_main.ku', 'semantics/projection_main.ku',
-}
+BOOTSTRAP_MANIFEST_LIMIT = 64
+BOOTSTRAP_LEGACY_PROJECTION = 'semantics/projection_main.ku'
+# Recognize imports in the staged compiler source without treating text
+# inside comments or string/template literals as a module dependency.
+BOOTSTRAP_IMPORT_TOKENS = re.compile(
+    r"""(?P<comment>//[^\r\n]*|/\*.*?\*/)|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"""
+    r"`(?:\\.|[^`\\])*`|\bimport\b", re.DOTALL)
+BOOTSTRAP_IMPORT_DECL = re.compile(
+    r"""\s*(?:(?:\{[^}]*\}\s*|[^\W\d]\w*\s+)from\s*)?(?:"([^"\\\r\n]*)"|'([^'\\\r\n]*)')""")
 
 
-def bootstrap_compiler_manifests(compiler_modules):
-    limit = 64
-    if len(compiler_modules) <= limit:
-        return [compiler_modules]
+def bootstrap_import_dependencies(module, source, available):
+    source = BOOTSTRAP_IMPORT_TOKENS.sub(
+        lambda token: ' ' if token.group('comment') else token.group(), source)
+    dependencies = set()
+    for token in BOOTSTRAP_IMPORT_TOKENS.finditer(source):
+        if token.group() != 'import':
+            continue
+        declaration = BOOTSTRAP_IMPORT_DECL.match(source, token.end())
+        if declaration is None:
+            raise ValueError(f'cannot read staged bootstrap import in {module}')
+        path = declaration[1] if declaration[1] is not None else declaration[2]
+        if path == 'std' or path.startswith('std.'):
+            continue
+        if not path.startswith(('./', '../')) or '' in path.split('/'):
+            raise ValueError(f'invalid staged bootstrap import in {module}: {path!r}')
+        basename = path.rsplit('/', 1)[-1]
+        if basename != '.' and '.' not in basename[1:]:
+            path += '.ku'
+        target = EXPORT.checked_relative(posixpath.normpath(posixpath.join(posixpath.dirname(module), path)))
+        if target not in available:
+            raise ValueError(f'missing staged bootstrap dependency in {module}: {target}')
+        dependencies.add(target)
+    return dependencies
 
-    # Each launcher is run as an independent tool and is not imported by
-    # another launcher. Keep all shared modules in each manifest so any new
-    # import between launchers fails the real binder rather than being skipped.
-    entrypoints = sorted(module for module in compiler_modules if module in BOOTSTRAP_LAUNCHERS)
-    shared = [module for module in compiler_modules if module not in BOOTSTRAP_LAUNCHERS]
-    capacity = limit - len(shared)
-    if capacity < 1:
-        raise RuntimeError('bootstrap shared source graph no longer fits with an entrypoint')
-    return [shared + entrypoints[begin:begin + capacity]
-            for begin in range(0, len(entrypoints), capacity)]
+
+def bootstrap_compiler_manifests(directory, compiler_modules):
+    available = set(compiler_modules)
+    direct = {module: bootstrap_import_dependencies(
+        module, (directory / module).read_text(encoding='utf-8'), available)
+        for module in compiler_modules}
+
+    closures = {}
+    for module in compiler_modules:
+        closure, pending = set(), [module]
+        while pending:
+            dependency = pending.pop()
+            if dependency not in closure:
+                closure.add(dependency)
+                pending.extend(direct[dependency] - closure)
+        closures[module] = closure
+
+    manifests, installed_checks = [], {}
+    for module, closure in sorted(closures.items(), key=lambda item: (-len(item[1]), item[0])):
+        if len(closure) > BOOTSTRAP_MANIFEST_LIMIT:
+            if module != BOOTSTRAP_LEGACY_PROJECTION:
+                raise ValueError(f'bootstrap closure for {module} has {len(closure)} modules, '
+                                 f'exceeding the {BOOTSTRAP_MANIFEST_LIMIT}-module manifest limit')
+            installed_checks[module] = len(closure)
+            continue
+        for manifest in manifests:
+            if len(manifest | closure) <= BOOTSTRAP_MANIFEST_LIMIT:
+                manifest.update(closure)
+                break
+        else:
+            manifests.append(set(closure))
+    return [sorted(manifest) for manifest in manifests], installed_checks
 
 
 def installed_bootstrap_module_consumer(install, root, env, report, repo, commit, target):
@@ -1133,11 +1180,16 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
     deployment.mkdir()
     hashes = stage_committed_ku_sources(repo, commit, env, compiler, (
         'bootstrap/stage1', 'bootstrap/stage2', 'bootstrap/stage3', 'bootstrap/semantics',
-    ), file_limit=64 + len(BOOTSTRAP_LAUNCHERS))
+        'bootstrap/tools/compiler_driver',
+    ), file_limit=None)
     inventory_hashes = stage_committed_ku_sources(repo, commit, env, compiler, ('bootstrap/tools/declarations',))
     detail['compiler_source_tree_sha256'] = hashlib.sha256(EXPORT.json_bytes(sorted(hashes))).hexdigest()
     modules = ('stage2/context.ku', 'stage2/span.ku', 'stage1/token.ku')
     compiler_modules = [name.removeprefix('bootstrap/') for name, _ in hashes]
+    compiler_manifests, installed_checks = bootstrap_compiler_manifests(compiler / 'bootstrap', compiler_modules)
+    binder_modules = {module for project in compiler_manifests for module in project}
+    if binder_modules | set(installed_checks) != set(compiler_modules):
+        raise RuntimeError('bootstrap compiler manifests omitted committed source modules')
     inventory_sources = [name.removeprefix('bootstrap/') for name, _ in inventory_hashes]
     inventory_modules = [name for name in compiler_modules if name.startswith(('stage1/', 'stage2/', 'stage3/'))]
     inventory_modules.extend(inventory_sources)
@@ -1153,6 +1205,14 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
     name = 'ku-check-project' + ('.exe' if os.name == 'nt' else '')
     program = entry_directory / name
     ku = install / ('ku.exe' if os.name == 'nt' else 'ku')
+    detail['installed_ku_checks'] = checks = []
+    for module, count in installed_checks.items():
+        result = invoke([ku, 'check', module], compiler / 'bootstrap', env)
+        evidence = {'module': module, 'closure_modules': count, 'exit': result.returncode}
+        checks.append(evidence)
+        if result.returncode or result.stderr or output(result) != f'check ok: {module}\n':
+            raise RuntimeError(f'installed Ku could not check oversized bootstrap closure {module}: ' +
+                               (output(result) + result.stderr.decode('utf-8', errors='replace'))[-4096:])
     built = invoke([ku, 'build', '--release', '--verbose', 'project_main.ku', '-o', program], entry_directory, env)
     if built.returncode:
         raise RuntimeError('installed bootstrap module compiler failed: ' +
@@ -1188,9 +1248,8 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
         if failure.returncode != 1 or failure.stdout or '|unresolved_import|' not in diagnostic:
             raise RuntimeError('relocated bootstrap tool lost its missing dependency diagnostic')
 
-        # The compiler, independent launchers and declaration inventory are
-        # checked through the shipped binder after its SDK and build sources
-        # have been removed.
+        # Bounded compiler closures and the declaration inventory run
+        # through the shipped binder with the SDK and build sources removed.
         def bind_project(label, project_modules):
             ordered = sorted(project_modules)
             manifest.write_bytes(('\n'.join(ordered) + '\n').encode('utf-8'))
@@ -1209,9 +1268,6 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
                 'rows_sha256': hashlib.sha256(('\n'.join(project_rows) + '\n').encode('utf-8')).hexdigest(),
             }
 
-        compiler_manifests = bootstrap_compiler_manifests(compiler_modules)
-        if {module for project in compiler_manifests for module in project} != set(compiler_modules):
-            raise RuntimeError('bootstrap compiler manifests omitted committed source modules')
         compiler_rows = []
         manifest_results = []
         for index, project in enumerate(compiler_manifests, start=1):
@@ -1220,7 +1276,8 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
             manifest_results.append(bound_summary(project, result))
         if len(compiler_manifests) > 1:
             compiler_rows = sorted(set(compiler_rows))
-        detail['complete_project'] = bound_summary(compiler_modules, compiler_rows)
+        detail['complete_project'] = bound_summary(binder_modules, compiler_rows)
+        detail['complete_project']['source_modules'] = len(compiler_modules)
         if len(compiler_manifests) > 1:
             detail['complete_project']['manifests'] = manifest_results
         inventory = bind_project('the declaration inventory', inventory_modules)

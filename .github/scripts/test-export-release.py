@@ -268,6 +268,83 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.original = b'{"status":"last valid report"}\n'
         self.path.write_bytes(self.original)
 
+    def test_bootstrap_real_manifests_cover_each_committed_module(self):
+        repo = Path(__file__).resolve().parents[2]
+        committed = subprocess.check_output([
+            'git', 'ls-tree', '-r', '--name-only', 'HEAD', '--',
+            'bootstrap/stage1', 'bootstrap/stage2', 'bootstrap/stage3', 'bootstrap/semantics',
+            'bootstrap/tools/compiler_driver',
+        ], cwd=repo, text=True)
+        modules = {name.removeprefix('bootstrap/') for name in committed.splitlines() if name.endswith('.ku')}
+        directory = repo / 'bootstrap'
+        manifests, checked = self.consumer.bootstrap_compiler_manifests(directory, sorted(modules))
+        self.assertIn('tools/compiler_driver/driver.ku', {name for group in manifests for name in group})
+        self.assertEqual({name for group in manifests for name in group} | checked.keys(), modules)
+        self.assertLessEqual(set(checked), {self.consumer.BOOTSTRAP_LEGACY_PROJECTION})
+        self.assertTrue(all(size > 64 for size in checked.values()))
+        self.assertTrue(all(0 < len(group) <= 64 for group in manifests))
+        for group in manifests:
+            for name in group:
+                imports = self.consumer.bootstrap_import_dependencies(
+                    name, (directory / name).read_text(encoding='utf-8'), modules)
+                self.assertLessEqual(imports, set(group))
+
+    def test_bootstrap_imports_resolve_dependencies_without_matching_literals_or_comments(self):
+        imports = self.consumer.bootstrap_import_dependencies
+        source = (
+            '// import { Missing } from "./line.ku"\n'
+            '/* import { Missing } from "./block.ku" */\n'
+            'import { A as Alias, /* ignored closing brace } */ B\n'
+            '} from "../中文"\n'
+            'import "std.string"\n'
+            'import reader from "./.reader"\n'
+            'fn Main() { print(\'import "./quoted.ku"\'); print(`import "./template.ku"`) }\n'
+        )
+        available = {'中文.ku', 'stage/.reader.ku'}
+        self.assertEqual(imports('stage/main.ku', source, available), available)
+        with self.assertRaisesRegex(ValueError, 'missing staged bootstrap dependency.*stage/Reader'):
+            imports('stage/main.ku', 'import { A } from "./Reader"', {'stage/reader.ku'})
+        with self.assertRaisesRegex(ValueError, 'unsafe archive path'):
+            imports('stage/main.ku', 'import { A } from "../../outside.ku"', set())
+
+    def test_only_oversized_legacy_bootstrap_projection_uses_installed_check(self):
+        directory = self.root / 'bootstrap'
+        directory.mkdir()
+        leaves = [f'leaf{i}.ku' for i in range(64)]
+        for path in leaves:
+            (directory / path).write_text('', encoding='utf-8')
+        source = ''.join(f'import {{ N }} from "../{path}"\n' for path in leaves)
+        (directory / 'semantics').mkdir()
+        legacy = self.consumer.BOOTSTRAP_LEGACY_PROJECTION
+        (directory / legacy).write_text(source, encoding='utf-8')
+        groups, checked = self.consumer.bootstrap_compiler_manifests(directory, leaves + [legacy])
+        self.assertEqual((groups, checked), ([sorted(leaves)], {legacy: 65}))
+        other = 'semantics/other.ku'
+        (directory / other).write_text(source, encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'other.ku has 65 modules'):
+            self.consumer.bootstrap_compiler_manifests(directory, leaves + [legacy, other])
+
+    def test_bootstrap_staging_without_file_cap_keeps_its_byte_bound(self):
+        def git_result(command, *args):
+            if command[1] == 'ls-tree':
+                entries = ''.join(f'100644 blob id\tbootstrap/{i}.ku\0' for i in range(71))
+                data = entries.encode()
+            else:
+                data = b'fn Value(): int { return 1 }\n'
+            return subprocess.CompletedProcess(command, 0, data, b'')
+
+        stage = self.consumer.stage_committed_ku_sources
+        with mock.patch.object(self.consumer, 'invoke', side_effect=git_result):
+            with self.assertRaisesRegex(ValueError, 'invalid committed Ku source'):
+                stage(self.root, 'commit', {}, self.root / 'bounded', ('bootstrap',))
+            accepted = stage(self.root, 'commit', {}, self.root / 'independent', ('bootstrap',), file_limit=None)
+        self.assertEqual(len(accepted), 71)
+        with mock.patch.object(self.consumer, 'invoke', side_effect=[
+            subprocess.CompletedProcess([], 0, b'100644 blob id\tbootstrap/large.ku\0', b''),
+            subprocess.CompletedProcess([], 0, b'x' * (1024 * 1024 + 1), b''),
+        ]), self.assertRaisesRegex(ValueError, 'source tree exceeds its fixture bound'):
+            stage(self.root, 'commit', {}, self.root / 'bytes', ('bootstrap',), file_limit=None)
+
     def test_interrupted_build_requires_verified_cli_and_exact_executed_test(self):
         install = self.root / '安装 SDK'
         install.mkdir()
