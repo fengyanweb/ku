@@ -326,8 +326,7 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
     depth = 0
     index = 0
     while (index < plan.clauses.len()) {
-        clause = plan.clauses[index].clone()
-        control = clause.control.clone()
+        control = plan.clauses[index].control.clone()
         if (control == "else" || control == "end") { depth = depth - 1 }
         indent = "    "
         padding = depth
@@ -336,7 +335,7 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
             padding = padding - 1
         }
         if (control == "if") {
-            text += indent + "if (0 != (" + clause.condition + ")) {\n"
+            text += indent + "if (0 != (" + plan.clauses[index].condition + ")) {\n"
             depth = depth + 1
         } else if (control == "else") {
             text += indent + "} else {\n"
@@ -344,39 +343,41 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         } else if (control == "end") {
             text += indent + "}\n"
         } else {
-            guarded = clause.condition != ""
+            guarded = plan.clauses[index].condition != ""
             if (guarded) {
-                text += "    if (0 != (" + clause.condition + ")) {\n"
+                text += "    if (0 != (" + plan.clauses[index].condition + ")) {\n"
                 indent = "        "
             }
             result_node = 0
+            instruction_count = plan.clauses[index].instructions.len()
             step = 0
-            while (step < clause.instructions.len()) {
-                instruction = clause.instructions[step].clone()
-                if (instruction.operation == "println") {
-                    text += indent.clone() + "(void)printf(\"%lld\\n\", (long long)t" + str(instruction.operand) + ");\n"
+            while (step < instruction_count) {
+                operation = plan.clauses[index].instructions[step].operation.clone()
+                operand = plan.clauses[index].instructions[step].operand
+                if (operation == "println") {
+                    text += indent.clone() + "(void)printf(\"%lld\\n\", (long long)t" + str(operand) + ");\n"
                     text += indent.clone() + "(void)fflush(stdout);\n"
                 } else {
                     expression = ""
-                    if (instruction.operation == "constant") {
-                        expression = "INT64_C(" + str(instruction.operand) + ")"
-                    } else if (instruction.operation == "parameter") {
-                        expression = "a" + str(instruction.operand)
-                    } else if (instruction.operation == "call") {
+                    if (operation == "constant") {
+                        expression = "INT64_C(" + str(operand) + ")"
+                    } else if (operation == "parameter") {
+                        expression = "a" + str(operand)
+                    } else if (operation == "call") {
                         // Evaluated arguments already have temporaries. C call
                         // argument evaluation order cannot reorder the computations.
-                        expression = emitIntCall(instruction)
+                        expression = emitIntCall(plan.clauses[index].instructions[step])
                     } else {
-                        uses_add = uses_add || instruction.operation == "add"
-                        uses_sub = uses_sub || instruction.operation == "sub"
-                        uses_mul = uses_mul || instruction.operation == "mul"
-                        uses_div = uses_div || instruction.operation == "div"
-                        uses_rem = uses_rem || instruction.operation == "rem"
+                        uses_add = uses_add || operation == "add"
+                        uses_sub = uses_sub || operation == "sub"
+                        uses_mul = uses_mul || operation == "mul"
+                        uses_div = uses_div || operation == "div"
+                        uses_rem = uses_rem || operation == "rem"
                         left = "INT64_C(0)"
-                        if (instruction.operand != 0) { left = "t" + str(instruction.operand) }
-                        expression = "ku_scalar_" + instruction.operation + "(" + left + ", t" + str(instruction.right_node) + ")"
+                        if (operand != 0) { left = "t" + str(operand) }
+                        expression = "ku_scalar_" + operation + "(" + left + ", t" + str(plan.clauses[index].instructions[step].right_node) + ")"
                     }
-                    result_node = instruction.result_node
+                    result_node = plan.clauses[index].instructions[step].result_node
                     text += indent.clone() + "int64_t t" + str(result_node) + " = " + expression + ";\n"
                 }
                 step = step + 1
@@ -384,10 +385,10 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
             if (control == "output") {
                 uses_output = true
             } else {
-                result = clause.scalar_result
+                result = plan.clauses[index].scalar_result.clone()
                 if (plan.result_type == 1) { result = "t" + str(result_node) }
-                if (clause.string_parts.len() != 0) {
-                    assignment = EmitScalarStringAssignment(clause.string_parts, indent)
+                if (plan.clauses[index].string_parts.len() != 0) {
+                    assignment = EmitScalarStringAssignment(plan.clauses[index].string_parts, indent)
                     text += assignment.source
                     uses_format = uses_format || assignment.uses_format
                     if (guarded) { text += indent + "goto cleanup;\n" }
