@@ -1409,6 +1409,13 @@ def verify_task_enum_record_c(source):
     return {'timer_pending_path': True, 'compares_tags': True, 'sha256': hashlib.sha256(source).hexdigest()}
 
 
+def verify_task_enum_parameter_c(source):
+    detail = verify_task_enum_record_c(source)
+    if b'(uint32_t)arg_0->tag >= UINT32_C(2)' not in source:
+        raise RuntimeError('installed Task enum input must validate its declared tags')
+    return dict(detail, validates_enum_input=True)
+
+
 def installed_forward_layout_consumer(install, root, env, report, target):
     """Check owned forward layout binding through a relative import."""
     files = {
@@ -1691,6 +1698,9 @@ def run_structured_only(args, report):
             installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
                                                  'native_task_enum_record', sources=('main.ku', 'worker.ku'),
                                                  native_c_abi=verify_task_enum_record_c)
+            installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
+                                                 'native_task_enum_parameter', sources=('main.ku', 'worker.ku'),
+                                                 native_c_abi=verify_task_enum_parameter_c)
             verification = repo / 'bootstrap/tools/compiler_driver/selfhost/verify.py'
             cc = env.get('KU_GNU_CC') if target == 'x86_64-pc-windows-gnu' else 'clang'
             if not cc:
