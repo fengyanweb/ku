@@ -345,10 +345,11 @@ fn LinkedNullArrayHeader(&type: TypeNameBinding, &value: str): str {
 }
 
 fn LinkedViewPointee(binding: TypeNameBinding): TypeNameBinding {
-    result = binding
-    if (result.declaration_kind == "StringView") { result.declaration_kind = "Builtin" }
-    if (result.declaration_kind == "StructView") { result.declaration_kind = "Struct" }
-    return result
+    kind = "Builtin"
+    if (binding.declaration_kind == "StructView") { kind = "Struct" }
+    else if (binding.declaration_kind != "StringView") { return binding }
+    return TypeNameBinding { use_node: binding.use_node, name: binding.name, declaration_kind: kind,
+                             module_index: binding.module_index, declaration_node: binding.declaration_node, span: binding.span }
 }
 
 fn LinkedRecordFields(&layouts: [StructLayout], &managed: [StructLayout], &type: TypeNameBinding): [StructFieldLayout]! {
