@@ -213,8 +213,8 @@ fn directMoveEvent(&transfers: [int], id: int): bool {
 }
 
 fn checkDirectMoveExpression(&nodes: [Node], &edges: [int], &transfers: [int], flow: DirectMoveFlow,
-                             id: int, depth: int): DirectMoveFlow! {
-    if (depth >= 32) { return ok(flow) }
+                             id: int, depth: int, scope_start: int): DirectMoveFlow! {
+    if (depth >= 32 || scope_start == 1) { return ok(flow) }
     state = flow
     item = nodes[id - 1].clone()
     if (item.kind == "Variable" || item.kind == "Field") {
@@ -222,6 +222,7 @@ fn checkDirectMoveExpression(&nodes: [Node], &edges: [int], &transfers: [int], f
         if (state.moved.len() > 0 || transferred) {
             place = DirectMovePath(nodes, edges, state.bindings, id)
             if (place.binding != 0) {
+                if (nodes[place.binding - 1].offset < scope_start) { return ok(state) }
                 CheckDirectMoveRead(nodes, state.moved, place, id)?
                 if (transferred && (item.kind == "Variable" || ProvesDirectFieldTransfer(nodes, edges, place.binding, item))) {
                     binding = place.binding - 1
@@ -239,13 +240,13 @@ fn checkDirectMoveExpression(&nodes: [Node], &edges: [int], &transfers: [int], f
     if (item.kind == "Call" && start < stop) {
         callee = nodes[edges[start] - 1].clone()
         if (callee.kind == "Field") {
-            state = checkDirectMoveExpression(nodes, edges, transfers, state, edges[callee.first_edge], depth + 1)?
+            state = checkDirectMoveExpression(nodes, edges, transfers, state, edges[callee.first_edge], depth + 1, scope_start)?
             start = start + 1
         }
     }
     scanning = start < stop
     while (scanning) {
-        state = checkDirectMoveExpression(nodes, edges, transfers, state, edges[start], depth + 1)?
+        state = checkDirectMoveExpression(nodes, edges, transfers, state, edges[start], depth + 1, scope_start)?
         start = start + 1
         scanning = start < stop
     }
@@ -260,7 +261,7 @@ fn joinedDirectMoveFlow(bindings: [int], yes: DirectMoveFlow, no: DirectMoveFlow
 }
 
 fn checkDirectMoveBlock(&nodes: [Node], &edges: [int], &transfers: [int], flow: DirectMoveFlow,
-                        first: int, end: int, depth: int): DirectMoveFlow! {
+                        first: int, end: int, depth: int, scope_start: int): DirectMoveFlow! {
     if (depth >= 32) { return ok(flow) }
     next = flow
     cursor = first
@@ -270,28 +271,37 @@ fn checkDirectMoveBlock(&nodes: [Node], &edges: [int], &transfers: [int], flow: 
         start = item.first_edge
         stop = start + item.edge_count
         if (item.kind == "If") {
-            next = checkDirectMoveExpression(nodes, edges, transfers, next, edges[start], 0)?
+            next = checkDirectMoveExpression(nodes, edges, transfers, next, edges[start], 0, scope_start)?
             outer = next.bindings.clone()
             split = start + 1 + item.int_value
             before = DirectMoveFlow { bindings: next.bindings.clone(), moved: next.moved.clone(), terminal: false }
-            yes = checkDirectMoveBlock(nodes, edges, transfers, before, start + 1, split, depth + 1)?
-            no = checkDirectMoveBlock(nodes, edges, transfers, next, split, stop, depth + 1)?
+            yes = checkDirectMoveBlock(nodes, edges, transfers, before, start + 1, split, depth + 1, scope_start)?
+            no = checkDirectMoveBlock(nodes, edges, transfers, next, split, stop, depth + 1, scope_start)?
             next = joinedDirectMoveFlow(outer, yes, no)
+        } else if (item.kind == "For") {
+            // Resolve visible names, but start a fresh ownership state for this
+            // iteration. The iterable is the first edge, before the iterator is
+            // in scope. Leave it, the iterator and outer transfers unproved.
+            bindings = next.bindings.clone()
+            bindings = bindings.push(id)
+            moved: [DirectMovePlace] = []
+            iteration = DirectMoveFlow { bindings: bindings, moved: moved, terminal: false }
+            checkDirectMoveBlock(nodes, edges, transfers, iteration, start + 1, stop, depth + 1, item.offset + 1)?
         } else if (item.kind == "VarDecl" || item.kind == "Assign") {
-            next = checkDirectMoveExpression(nodes, edges, transfers, next, edges[stop - 1], 0)?
+            next = checkDirectMoveExpression(nodes, edges, transfers, next, edges[stop - 1], 0, scope_start)?
             binding = FindDirectMoveBinding(nodes, next.bindings, item.text)
             if (item.kind == "VarDecl" || binding == 0) { next.bindings = next.bindings.push(id) }
             else {
                 place = DirectMovePlace { binding: binding, path: "" }
                 next.moved = ResetDirectMove(next.moved, place)
             }
-        } else if (item.kind == "AssignTarget") {
-            next = checkDirectMoveExpression(nodes, edges, transfers, next, edges[start + 1], 0)?
+        } else if (item.kind == "AssignTarget" && scope_start != 1) {
+            next = checkDirectMoveExpression(nodes, edges, transfers, next, edges[start + 1], 0, scope_start)?
             target = DirectMovePath(nodes, edges, next.bindings, edges[start])
             if (target.binding != 0) { next.moved = ResetDirectMove(next.moved, target) }
-            else { next = checkDirectMoveExpression(nodes, edges, transfers, next, edges[start], 0)? }
+            else { next = checkDirectMoveExpression(nodes, edges, transfers, next, edges[start], 0, scope_start)? }
         } else {
-            next = checkDirectMoveExpression(nodes, edges, transfers, next, id, 0)?
+            next = checkDirectMoveExpression(nodes, edges, transfers, next, id, 0, scope_start)?
             next.terminal = item.kind == "Return" || item.kind == "Fail" || item.kind == "Panic"
         }
         cursor = cursor + 1
@@ -300,12 +310,17 @@ fn checkDirectMoveBlock(&nodes: [Node], &edges: [int], &transfers: [int], flow: 
 }
 
 fn CheckDirectOwnedMoves(&nodes: [Node], &edges: [int], &transfers: [int], first: int, function: int): null! {
-    // These forms need a backedge, recovery or capture proof. Leave them to the
-    // lowering checks until their checked front-end ownership flow is available.
+    // Only one For may use the iteration-local proof. More loop regions,
+    // early loop exits, recovery and captures keep their existing lowering gates.
     cursor = first
+    has_for = false
     while (cursor < function) {
         kind = nodes[cursor - 1].kind.clone()
-        if (kind == "For" || kind == "While" || kind == "Try" || kind == "FunctionExpr" || IsNamedFunction(kind) ||
+        if (kind == "For") {
+            if (has_for) { return ok(null) }
+            has_for = true
+        }
+        if (kind == "While" || kind == "Break" || kind == "Continue" || kind == "Try" || kind == "FunctionExpr" || IsNamedFunction(kind) ||
             kind == "CompoundAssign" || kind == "ObjectDestructureAssign" || kind == "Match") { return ok(null) }
         cursor = cursor + 1
     }
@@ -321,6 +336,11 @@ fn CheckDirectOwnedMoves(&nodes: [Node], &edges: [int], &transfers: [int], first
     }
     moved: [DirectMovePlace] = []
     flow = DirectMoveFlow { bindings: bindings, moved: moved, terminal: false }
-    checkDirectMoveBlock(nodes, edges, transfers, flow, start, stop, 0)?
+    // An enclosing function with a loop supplies lexical bindings only.
+    // Zero checks every binding; one disables ownership checks. Body offsets
+    // after a For header always exceed both sentinel values.
+    scope_start = 0
+    if (has_for) { scope_start = 1 }
+    checkDirectMoveBlock(nodes, edges, transfers, flow, start, stop, 0, scope_start)?
     return ok(null)
 }

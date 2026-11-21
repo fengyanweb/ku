@@ -9,9 +9,10 @@ struct SuppliedModule {
     named: NamedModule
 }
 
-// File imports use one-based IDs in the two retained arenas. A compiler
-// namespace has no supplied module or declaration, so those IDs are zero.
-// A shorthand std import uses its import node as the request node.
+// File imports use one-based module and declaration IDs. An import of a
+// file with no exports keeps its module ID and has no local name or target.
+// A standard namespace has neither ID. Shorthand imports use their import
+// node as the request node.
 struct ImportBinding {
     local_name: str
     source_name: str
@@ -59,13 +60,19 @@ fn isExportKind(&kind: str): bool {
     return IsNamedFunction(kind) || kind == "Struct" || kind == "Enum"
 }
 
+fn isExportName(&name: str): bool! {
+    if (name.byte_len() == 0) { return ok(false) }
+    initial = string.slice(name.clone(), 0, 1)?
+    if (!"ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(initial)) { return ok(false) }
+    return ok(true)
+}
+
 fn FindExport(&declarations: [TopLevelName], &request: str, at: Span): int! {
     if (declarations.len() > 255) {
         RejectName("item_limit", "supplied module accepts at most 255 declarations", at)?
     }
-    if (request.byte_len() == 0) { return ok(0) }
-    initial = string.slice(request.clone(), 0, 1)?
-    if (!"ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(initial)) { return ok(0) }
+    public_name = isExportName(request)?
+    if (!public_name) { return ok(0) }
     index = 0
     while (index < declarations.len()) {
         entry = declarations[index].clone()
@@ -188,6 +195,35 @@ fn CollectStandardBindings(&nodes: [Node], &edges: [int], &group: Node, import_i
     return ok([StandardBinding(name, group.text.clone(), import_id, request_id, position)])
 }
 
+fn CollectGlobBindings(&nodes: [Node], &declarations: [TopLevelName], &group: Node,
+                       import_id: int, module_index: int): [ImportBinding]! {
+    at = DeclarationSpan(group)
+    bindings: [ImportBinding] = []
+    index = 0
+    declaration_count = declarations.len()
+    while (index < declaration_count) {
+        declaration = declarations[index].clone()
+        public_name = isExportName(declaration.name)?
+        if (public_name && isExportKind(declaration.kind)) {
+            target = ReadImportNode(nodes, declaration.node, at.clone())?
+            if (target.text != declaration.name || target.kind != declaration.kind) {
+                RejectName("invalid_module_tree", "supplied export does not match its declaration", at.clone())?
+            }
+            binding = ImportBinding { local_name: declaration.name.clone(), source_name: declaration.name,
+                path: group.text.clone(), import_node: import_id, request_node: import_id,
+                module_index: module_index, target_node: declaration.node, span: at.clone() }
+            bindings = bindings.push(binding)
+        }
+        index = index + 1
+    }
+    if (bindings.len() == 0) {
+        bindings = bindings.push(ImportBinding { local_name: "", source_name: "", path: group.text.clone(),
+            import_node: import_id, request_node: import_id, module_index: module_index,
+            target_node: 0, span: at })
+    }
+    return ok(bindings)
+}
+
 fn CollectImportBindings(&nodes: [Node], &edges: [int], &imports: [int], &local_names: [TopLevelName],
                          &supplied: [SuppliedModule], &importer_path: str): [ImportBinding]! {
     start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
@@ -213,50 +249,66 @@ fn CollectImportBindings(&nodes: [Node], &edges: [int], &imports: [int], &local_
                 bindings = bindings.push(standard)
             }
         } else {
-            if (group.edge_count == 0 || !(group.text.starts_with("./") || group.text.starts_with("../"))) {
-                RejectName("unsupported_import_kind", "supplied module binding accepts only named relative imports", group_span.clone())?
+            if (!(group.text.starts_with("./") || group.text.starts_with("../"))) {
+                RejectName("unsupported_import_kind", "supplied file imports must use a relative path", group_span.clone())?
             }
-            first = ReadImportNode(nodes, edges[group.first_edge], group_span.clone())?
-            if (first.kind != "ImportName") {
-                RejectName("unsupported_import_kind", "supplied module binding accepts only named relative imports", group_span.clone())?
+            if (group.edge_count > 0) {
+                first = ReadImportNode(nodes, edges[group.first_edge], group_span.clone())?
+                if (first.kind != "ImportName") {
+                    RejectName("unsupported_import_kind", "supplied file imports support named or full imports", group_span.clone())?
+                }
             }
             lookup_path = group.text.clone()
             if (importer_path.len() != 0) {
                 lookup_path = ResolveProjectImport(importer_path, group.text, group_span.clone())?
             }
             module_index = FindModule(supplied, lookup_path, group_span.clone())?
-            index = 0
-            while (index < group.edge_count) {
-                request_node = edges[group.first_edge + index]
-                request = ReadImportNode(nodes, request_node, group_span.clone())?
-                at = DeclarationSpan(request)
-                CheckImportEdges(request, edges.len(), at.clone())?
-                if (request.kind != "ImportName" || request.edge_count > 1) {
-                    RejectName("invalid_module_tree", "expected a named import with at most one alias", at.clone())?
-                }
-                local = request.text.clone()
-                if (request.edge_count == 1) {
-                    alias = ReadImportNode(nodes, edges[request.first_edge], at.clone())?
-                    if (alias.kind != "ImportAlias" || alias.edge_count != 0) {
-                        RejectName("invalid_module_tree", "expected an import alias leaf", at.clone())?
+            if (group.edge_count == 0) {
+                for binding in CollectGlobBindings(supplied[module_index - 1].named.parsed.arena.nodes,
+                                                   supplied[module_index - 1].named.names.declarations,
+                                                   group, import_id, module_index)? {
+                    if (bindings.len() >= 255) {
+                        RejectName("import_limit", "supplied import pass accepts at most 255 imported bindings", group_span.clone())?
                     }
-                    local = alias.text
+                    if (binding.target_node != 0) {
+                        CheckImportName(local_names, bindings, import_id, binding.source_name, binding.local_name, false, group_span.clone())?
+                    }
+                    bindings = bindings.push(binding)
                 }
-                if (bindings.len() >= 255) {
-                    RejectName("import_limit", "supplied import pass accepts at most 255 imported bindings", at.clone())?
+            } else {
+                index = 0
+                while (index < group.edge_count) {
+                    request_node = edges[group.first_edge + index]
+                    request = ReadImportNode(nodes, request_node, group_span.clone())?
+                    at = DeclarationSpan(request)
+                    CheckImportEdges(request, edges.len(), at.clone())?
+                    if (request.kind != "ImportName" || request.edge_count > 1) {
+                        RejectName("invalid_module_tree", "expected a named import with at most one alias", at.clone())?
+                    }
+                    local = request.text.clone()
+                    if (request.edge_count == 1) {
+                        alias = ReadImportNode(nodes, edges[request.first_edge], at.clone())?
+                        if (alias.kind != "ImportAlias" || alias.edge_count != 0) {
+                            RejectName("invalid_module_tree", "expected an import alias leaf", at.clone())?
+                        }
+                        local = alias.text
+                    }
+                    if (bindings.len() >= 255) {
+                        RejectName("import_limit", "supplied import pass accepts at most 255 imported bindings", at.clone())?
+                    }
+                    CheckImportName(local_names, bindings, import_id, request.text, local, false, at.clone())?
+                    target_node = ResolveSuppliedExport(supplied[module_index - 1].named, request.text, at.clone())?
+                    if (target_node == 0) {
+                        RejectName("missing_export", "'" + request.text.clone() + "' is not exported by '" + group.text.clone() + "'", at.clone())?
+                    }
+                    binding = ImportBinding {
+                        local_name: local, source_name: request.text, path: group.text.clone(),
+                        import_node: import_id, request_node: request_node, module_index: module_index,
+                        target_node: target_node, span: at
+                    }
+                    bindings = bindings.push(binding)
+                    index = index + 1
                 }
-                CheckImportName(local_names, bindings, import_id, request.text, local, false, at.clone())?
-                target_node = ResolveSuppliedExport(supplied[module_index - 1].named, request.text, at.clone())?
-                if (target_node == 0) {
-                    RejectName("missing_export", "'" + request.text.clone() + "' is not exported by '" + group.text.clone() + "'", at.clone())?
-                }
-                binding = ImportBinding {
-                    local_name: local, source_name: request.text, path: group.text.clone(),
-                    import_node: import_id, request_node: request_node, module_index: module_index,
-                    target_node: target_node, span: at
-                }
-                bindings = bindings.push(binding)
-                index = index + 1
             }
         }
         group_index = group_index + 1

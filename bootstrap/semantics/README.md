@@ -36,8 +36,10 @@ Each resulting binding identifies the requesting node and the exported
 declaration's node in the supplied module. An absent module and a missing or
 private export produce different positioned errors.
 
-This pass takes explicit module inputs. It leaves glob, namespace, standard
-library and package imports to a later stage.
+This pass takes explicit module inputs. A full relative import
+(`import "./library.ku"`) brings the supplier's public declarations into
+scope and adds a project dependency even when the supplier has no exports.
+User file namespace and package imports remain outside this pass.
 
 ## Check a set of relative modules
 
@@ -56,7 +58,8 @@ Use `ku build --release project_main.ku -o ku-check-project` from this tool's
 directory. With the resulting executable beside `modules.txt`, run it to print
 the validated dependencies in dependency order and the imported declaration and
 explicit type bindings. The tool reads the files named in the manifest and
-resolves named relative imports against that set. It binds standard library
+resolves named relative imports, aliases and full relative imports against
+that set. It binds standard library
 namespaces from `import { fs, string } from "std"`, `import "std.fs"` or
 `import fs from "std.fs"`. A `STD` row gives the importing path, namespace,
 import node and request node. These namespaces have no file dependency and

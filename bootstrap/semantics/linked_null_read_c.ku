@@ -8,7 +8,7 @@ import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout } from "./struct_layouts.ku"
 import { EmitLinkedReadonlyScalar, LinkedDirectCallExpression, LinkedErrorField, LinkedNullFunction, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, RememberLinkedCall } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
-import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
+import { LinkedScalarLiteralC } from "./scalar_int_operands.ku"
 import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
 import { GuardLinkedStringPredicate } from "./guarded_struct_c.ku"
 import { EmitLinkedIntAppend, EmitLinkedOwnedArrayClone, OwnedRecordArrayCloneLayout, OwnedRecordArrayCloneType } from "./struct_array_c.ku"
@@ -342,7 +342,7 @@ fn readLinkedBinary(&project: LinkedNullProject, state: LinkedNullState, &node: 
 fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpression! {
     at = DeclarationSpan(node)
     if (node.kind == "Variable" && node.edge_count == 0) { return ReadLinkedNullBinding(state, node) }
-    value = ScalarValueLiteralC(node)?
+    value = LinkedScalarLiteralC(node)?
     if (value.kind != "") { return ok(LinkedReadonlyExpression(state, LinkedBuiltin(value.kind, at), value.text)) }
     RejectLayout("unsupported_linked_operand", "expected a bound value, literal or checked direct call", at.clone())?
     return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", at), ""))

@@ -117,6 +117,10 @@ class TypeRef:
                 raise LinkError(f"{where} builtin must have a null path and node 0")
             if name == "bool" and checked_result and c_type != "KuBootstrapResult_bool":
                 raise LinkError(f"{where} checked bool requires the KuBootstrapResult_bool carrier")
+            if name == "null":
+                carrier = "KuBootstrapResultNull" if checked_result else "uint8_t"
+                if passing != "value" or c_type != carrier:
+                    raise LinkError(f"{where} null requires the by-value {carrier} carrier")
             identity = ("builtin", name)
         elif kind_name == "NullableInt":
             if (name != "int" or ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0
@@ -479,10 +483,17 @@ def wrapper(unit, include_caller):
 
 
 def program_caller(entry):
-    """Provide a C process entry for one checked linked Ku application."""
-    application_result = TypeRef(("builtin", "null"), "value", "KuBootstrapResultNull")
-    if entry.signature != Signature((), application_result, True):
-        raise LinkError("--program requires a zero-argument linked null! entry")
+    """Provide a C process entry for a plain or checked Ku application."""
+    plain = TypeRef(("builtin", "null"), "value", "uint8_t")
+    if entry.signature == Signature((), plain, False):
+        return f'''int main(void) {{
+    (void){entry.symbol}();
+    return 0;
+}}
+'''.encode("ascii")
+    checked = TypeRef(("builtin", "null"), "value", "KuBootstrapResultNull")
+    if entry.signature != Signature((), checked, True):
+        raise LinkError("--program requires a zero-argument linked null or null! entry")
     return f'''#include <stdio.h>
 
 int main(void) {{
@@ -606,7 +617,7 @@ def main(argv=None):
     parser.add_argument("--entry", nargs=2, metavar=("MODULE", "NODE"))
     host = parser.add_mutually_exclusive_group()
     host.add_argument("--caller", type=Path)
-    host.add_argument("--program", action="store_true", help="add a process entry for a checked linked null! function")
+    host.add_argument("--program", action="store_true", help="add a process entry for a linked null or null! function")
     parser.add_argument("-o", "--output", type=Path)
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--cc", default=os.environ.get("CC", "cc"))

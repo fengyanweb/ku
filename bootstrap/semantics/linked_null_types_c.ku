@@ -191,8 +191,9 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
         if (LinkedBufferResult(binding)) { return ok("KuProjectionString") }
         if (binding.name == "int") { return ok("int64_t") }
         if (binding.name == "bool") { return ok("bool") }
+        if (binding.name == "null") { return ok("uint8_t") }
     }
-    RejectLayout("unsupported_linked_type", "expected a known struct, str, int or bool", binding.span.clone())?
+    RejectLayout("unsupported_linked_type", "expected a known struct, str, int, bool or null", binding.span.clone())?
     return ok("")
 }
 

@@ -10,7 +10,7 @@ import { Span } from "../stage2/span.ku"
 import { FindLinkedLocalRead } from "./call_contracts.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { DeclarationSpan } from "./names.ku"
-import { LinkedCopyResult, TypeNameBinding } from "./type_names.ku"
+import { LinkedCopyResult, LinkedPlainCopyResult, TypeNameBinding } from "./type_names.ku"
 import { HasBoundArrayMembers, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { IsLinkedScopedCallback, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedRecordFields, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
 import { BoundArrayTypePosition, RegisterLinkedElementClone } from "./struct_array_c.ku"
@@ -118,16 +118,16 @@ fn ReadLinkedNullParametersFrom(&project: LinkedNullProject, &function: Node, se
         } else { reading = false }
     }
     if (index >= function.edge_count - 1) {
-        RejectLayout("linked_null_signature", "entry requires a declared null! result and a body", DeclarationSpan(function))?
+        RejectLayout("linked_null_signature", "entry requires a declared result and a body", DeclarationSpan(function))?
     }
     result_id = LinkedNullChild(project, 1, function, index)
     declared = LinkedNullNode(project, 1, result_id)
     plain_named = declared.kind == "TypeName"
     state.plain_value_result = declared.kind == "TypeArray" || declared.kind == "TypeUnion" || declared.kind == "TypeFunction" || plain_named
     result = ReadLinkedResult(project, 1, result_id, !state.plain_value_result)?
-    copy = result.declaration_kind == "Builtin" && (result.name == "bool" || result.name == "int")
+    copy = LinkedPlainCopyResult(result)
     if (plain_named && !copy && !LinkedStringResult(result) && result.declaration_kind != "Struct") {
-        RejectLayout("linked_value_result", "a plain named result requires builtin int, bool, str or a bound struct", result.span.clone())?
+        RejectLayout("linked_value_result", "a plain named result requires builtin int, bool, str, null or a bound struct", result.span.clone())?
     }
     if (index == 0) { signature = "void" }
     state.code = state.code + validation

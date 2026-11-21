@@ -124,6 +124,10 @@ fn LinkedCopyResult(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Builtin" && (binding.name == "int" || binding.name == "bool")
 }
 
+fn LinkedPlainCopyResult(&binding: TypeNameBinding): bool {
+    return LinkedCopyResult(binding) || (binding.declaration_kind == "Builtin" && binding.name == "null")
+}
+
 fn RetagTypeNameBinding(binding: TypeNameBinding, kind: str): TypeNameBinding {
     return TypeNameBinding {
         use_node: binding.use_node, name: binding.name, declaration_kind: kind,

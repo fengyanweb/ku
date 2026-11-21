@@ -170,6 +170,63 @@ def exercise_project(compiler, cc, root, caller):
         assert not missing_unit.stdout and b"unresolved_import" in missing_unit.stderr
 
 
+def exercise_glob_import(compiler, cc, caller):
+    project = caller / "full-import"
+    source, library = project / "src", project / "lib"
+    source.mkdir(parents=True)
+    library.mkdir()
+    manifest = project / "modules.txt"
+    manifest.write_text("src/main.ku\nlib/numbers.ku\nlib/private.ku\n", encoding="utf-8")
+    main = source / "main.ku"
+    private = library / "private.ku"
+    private_source = "fn hidden(): int { return 8 }\n"
+    private.write_text(private_source, encoding="utf-8")
+    (library / "numbers.ku").write_text(
+        "struct Counter { value: int }\n"
+        "fn increment(value: int): int { return value + 1 }\n"
+        "fn Step(value: int): int { return increment(increment(value)) }\n",
+        encoding="utf-8",
+    )
+    valid = (
+        'import "../lib/numbers"\n'
+        'import "../lib/private.ku"\n'
+        "struct Packet { item: Counter }\n"
+        "fn Answer(): int { return Step(40) }\n"
+        "fn main(): null! { println(str(Answer())); return ok(null) }\n"
+    )
+    main.write_text(valid, encoding="utf-8")
+    assert execute([compiler, "check-project", manifest], caller).stdout == b""
+    emitted = execute([compiler, "emit-project", manifest, "Answer"], caller).stdout
+    exercise_emitted(cc, emitted, caller, "full-import-answer", b"()", b"42")
+    plan = execute([compiler, "emit-unit-plan", manifest, "Answer"], caller)
+    dependency, = json.loads(plan.stdout)["dependencies"]
+    assert dependency["source_path"] == "lib/numbers.ku"
+    assert dependency["source_name"] == "Step"
+    build_program = Path(__file__).resolve().parents[1] / "build_program.py"
+    binary = caller / ("full-import-app.exe" if os.name == "nt" else "full-import-app")
+    execute([sys.executable, "-B", build_program, manifest, "--compiler", compiler,
+             "--cc", cc, "-o", binary], caller)
+    assert execute([binary], caller).stdout.replace(b"\r\n", b"\n") == b"42\n"
+
+    for replacement, code in [
+        ("Step()", b"call_arity"),
+        ('Step("40")', b"call_argument_type"),
+    ]:
+        main.write_text(valid.replace("Step(40)", replacement), encoding="utf-8")
+        rejected = execute([compiler, "check-project", manifest], caller, 1).stderr
+        assert b"src/main.ku:" in rejected and code in rejected, rejected
+    main.write_text(valid.replace("Step(40)", "increment(40)"), encoding="utf-8")
+    rejected = execute([compiler, "emit-project", manifest, "Answer"], caller, 1)
+    assert b"increment" in rejected.stderr and not rejected.stdout, rejected.stderr
+    main.write_text(valid + "fn Step(value: int): int { return value }\n", encoding="utf-8")
+    rejected = execute([compiler, "check-project", manifest], caller, 1).stderr
+    assert b"src/main.ku:" in rejected and b"import_name_conflict" in rejected, rejected
+    main.write_text(valid, encoding="utf-8")
+    private.write_text('import "../src/main"\n' + private_source, encoding="utf-8")
+    rejected = execute([compiler, "check-project", manifest], caller, 1).stderr
+    assert b"cyclic_import" in rejected, rejected
+
+
 def exercise_checked_bool(compiler, cc, caller):
     source = caller / "boolean.ku"
     source.write_text('''\
@@ -669,6 +726,7 @@ def exercise_direct_owned_moves(compiler, caller):
                 'fn main(): null! { return Visit(false) }\n')
     pair = 'pair = Pair { left: "l", right: "r" }; Take(pair.left)?; '
     object_field = 'item = { text: "text", other: "another" }; Take(item.text)?; '
+    loop = simple % 'values = [1, 2]; %s'
     cases = [
         (simple % 'word = "first"; Take(word)?; Read(word)?', b"'word'"),
         (simple % (pair + 'Read(pair.left)?'), b"'pair.left'"),
@@ -688,6 +746,13 @@ def exercise_direct_owned_moves(compiler, caller):
         (branches % 'if (flag) { Take(word)?; return ok(null) }; Read(word)?', b""),
         (simple % (pair + 'Read(pair.right)?; pair.left = "new"; Read(pair.left)?'), b""),
         (simple % (pair + 'Inspect(pair)?'), b""),
+        (loop % 'for tick in values { word = "item"; Take(word)?; Read(word)? }', b"'word'"),
+        (loop % 'for tick in values { word = "item"; Take(word)?; println(str(tick)) }', b""),
+        (loop % 'for tick in values { word = "item"; Take(word)?; word = "new"; Read(word)?; println(str(tick)) }', b""),
+        (loop % ('word = "outside"; for tick in values { Read(word)?; '
+                 'if (tick == 1) { word: str = "inner"; Take(word)? }; Read(word)? }; Read(word)?'), b""),
+        (loop % ('word = "outside"; reader = fn(): null! { Read(word)?; return ok(null) }; '
+                 'for tick in values { local = "item"; Take(local)?; reader()? }; Read(word)?'), b""),
     ]
     manifest.write_text("source.ku\n", encoding="ascii")
     for body, diagnostic in cases:
@@ -738,6 +803,50 @@ fn main(): null! {
     binary = project / ("partial-record-view.exe" if os.name == "nt" else "partial-record-view")
     execute([sys.executable, "-B", builder, "--compiler", compiler, "--cc", cc, manifest, "-o", binary], caller)
     assert execute([binary], caller).stdout.splitlines() == [b"old", b"old", b"replaced", b"replaced"]
+
+
+def exercise_plain_null_entry(compiler, cc, caller):
+    project = caller / "plain-null-entry"
+    project.mkdir()
+    (project / "main.ku").write_text('''\
+import { Note, Find } from "./helpers"
+fn main(): null {
+    done = Note("noted")
+    println(str(Find(true)))
+    println(str(Find(false)))
+    return done
+}
+''', encoding="utf-8")
+    (project / "helpers.ku").write_text('''\
+fn Note(text: str): null { println(text); return null }
+fn Find(present: bool): int | null { if (!present) { return null }; return 0 }
+''', encoding="utf-8")
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\nhelpers.ku\n", encoding="utf-8")
+    root = Path(__file__).resolve().parents[1]
+    execute([compiler, "check-project", manifest], caller)
+    plan = json.loads(execute([compiler, "emit-unit-plan", manifest, "main"], caller).stdout)
+    signature = plan["export"]["signature"]
+    assert signature["parameters"] == [] and not signature["returns_result"]
+    assert signature["result"]["source_name"] == "null" and signature["result"]["c_type"] == "uint8_t"
+    dependencies = {decl["source_name"]: decl["signature"] for decl in plan["dependencies"]}
+    assert not dependencies["Note"]["returns_result"] and dependencies["Note"]["result"] == signature["result"]
+    assert not dependencies["Find"]["returns_result"] and dependencies["Find"]["result"]["kind"] == "NullableInt"
+
+    binary = project / ("plain-null-entry.exe" if os.name == "nt" else "plain-null-entry")
+    execute([sys.executable, "-B", root / "build_program.py", "--compiler", compiler,
+             "--cc", cc, manifest, "-o", binary], caller)
+    assert execute([binary], caller).stdout.splitlines() == [b"noted", b"0", b"null"]
+
+    # A plain result and a checked result share the Ku name null, but their
+    # C carriers differ. Reject a receipt with those carriers mixed up.
+    signature["result"]["c_type"] = "KuBootstrapResultNull"
+    invalid = project / "invalid-plan.json"
+    invalid.write_text(json.dumps(plan), encoding="utf-8")
+    emitted = project / "main.c"
+    emitted.write_bytes(execute([compiler, "emit-unit", manifest, "main"], caller).stdout)
+    failed = execute([sys.executable, "-B", root / "link_c.py", "--unit", invalid, emitted, "--check-only"], caller, 1)
+    assert not failed.stdout and b"null requires the by-value uint8_t carrier" in failed.stderr
 
 
 def exercise_parameter_bindings(compiler, cc, caller):
@@ -963,8 +1072,10 @@ def exercise(ku, cc):
         emitted = execute([compiler, "emit", source.name, "AddOne"], caller).stdout
         exercise_emitted(cc, emitted, caller, "derived", b"(41)", b"42")
         exercise_project(compiler, cc, root, caller)
+        exercise_glob_import(compiler, cc, caller)
         exercise_linked_program(compiler, cc, caller)
         exercise_partial_record_view(compiler, cc, caller)
+        exercise_plain_null_entry(compiler, cc, caller)
         exercise_checked_bool(compiler, cc, caller)
         exercise_linked_nullable_int(compiler, cc, caller)
         exercise_linked_owned_reader(compiler, cc, caller)

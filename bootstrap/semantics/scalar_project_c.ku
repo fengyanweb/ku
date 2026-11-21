@@ -21,7 +21,7 @@ fn linkedImports(&current: ProjectModuleBindings, &supplied: [SuppliedModule],
     index = 0
     while (index < current.imports.len()) {
         link = current.imports[index].clone()
-        if (link.module_index > 0) {
+        if (link.module_index > 0 && link.target_node > 0) {
             module_slot = link.module_index - 1
             if (supplied[module_slot].named.parsed.arena.nodes[link.target_node - 1].kind == "Function") {
                 signature = ScalarIntCalleeSignature(supplied[module_slot].named.parsed.arena.nodes,

@@ -39,6 +39,13 @@ fn ScalarValueLiteralC(&node: Node): ScalarLiteral! {
     return ok(ScalarLiteral { kind: "", text: "" })
 }
 
+fn LinkedScalarLiteralC(&node: Node): ScalarLiteral! {
+    if (node.kind == "Null" && node.edge_count == 0) {
+        return ok(ScalarLiteral { kind: "null", text: "UINT8_C(0)" })
+    }
+    return ScalarValueLiteralC(node)
+}
+
 // Decimal source bytes never enter a C identifier or an unescaped literal.
 // Three-digit C octal escapes preserve all UTF-8 bytes and embedded zeros.
 fn ScalarStringLiteral(&node: Node): str! {

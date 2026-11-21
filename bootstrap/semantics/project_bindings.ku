@@ -171,7 +171,7 @@ fn directSignatures(&named: NamedModule, &imports: [ImportBinding], &supplied: [
     index = 0
     while (index < imports.len()) {
         module_index = imports[index].module_index
-        if (module_index > 0) {
+        if (module_index > 0 && imports[index].target_node > 0) {
             source = ReadImportNode(supplied[module_index - 1].named.parsed.arena.nodes,
                                     imports[index].target_node, imports[index].span.clone())?
             if (IsNamedFunction(source.kind)) {

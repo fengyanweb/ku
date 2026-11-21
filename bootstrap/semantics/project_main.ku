@@ -18,7 +18,7 @@ fn main(): null! {
         for binding in entry.imports {
             if (binding.module_index == 0) {
                 println("STD|" + display_path.clone() + "|" + binding.local_name + "|" + str(binding.import_node) + "|" + str(binding.request_node))
-            } else {
+            } else if (binding.target_node > 0) {
                 target = EscapeCanonical(paths[binding.module_index - 1].clone())
                 println("IMPORT|" + display_path.clone() + "|" + binding.local_name + "|" + target + "|" + binding.source_name + "|" + str(binding.target_node))
             }

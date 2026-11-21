@@ -40,8 +40,8 @@ KU
 - `check-project modules.txt` reads the existing manifest format. Each line
   lists a normalized project-relative `.ku` file. The compiler reads these
   files relative to the manifest's directory, even when invoked elsewhere.
-  It resolves relative imports, aliases, explicit types and supported direct
-  call contracts across those modules. The manifest accepts up to 64 modules
+  It resolves named and full relative imports, aliases, explicit types and
+  supported direct call contracts across those modules. The manifest accepts up to 64 modules
   and 32,768 UTF-8 bytes. The path rules are lexical. Symlinks follow normal
   filesystem behavior.
 - `emit` selects one supported integer function and writes its C11 source
@@ -71,9 +71,10 @@ KU
 ## Build a typed application
 
 List the entry module first in `modules.txt` and include its imported project
-modules. Define `fn main(): null!` in the entry module. Use the standalone
-compiler and your target C compiler to build the reachable units and link
-the program.
+modules. Define `fn main(): null` or `fn main(): null!` in the entry module.
+Use the standalone compiler and your target C compiler to build and link the
+reachable units. A checked `null!` entry reports an Error and exits with
+status 1 when the function fails.
 
 ```sh
 python3 -B bootstrap/tools/build_program.py \

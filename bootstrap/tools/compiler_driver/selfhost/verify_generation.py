@@ -241,6 +241,7 @@ static KuProjectionString ku_string_static(const uint8_t *input, size_t size) {
             consumer.exercise_project(binary, cc, current, foreign)
             consumer.exercise_linked_program(binary, cc, foreign)
             consumer.exercise_partial_record_view(binary, cc, foreign)
+            consumer.exercise_plain_null_entry(binary, cc, foreign)
             consumer.exercise_parameter_bindings(binary, cc, foreign)
             consumer.exercise_direct_owned_moves(binary, foreign)
             consumer.exercise_owned_recovery(binary, cc, foreign)

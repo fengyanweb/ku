@@ -4,7 +4,7 @@ import { NoLinkedRetention, LinkedOptionalReaderHeader } from "./linked_nullable
 import { EmitLinkedOptionalIntReturn, LinkedNullCallSymbol } from "./scalar_result_null.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
 import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult } from "./struct_projection_c.ku"
-import { LinkedCopyResult, TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
+import { LinkedCopyResult, LinkedPlainCopyResult, TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { CheckLinkedStringAppendTarget, FinishLinkedFieldAppend, FinishLinkedStringAppend } from "./linked_array_fields_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
@@ -223,7 +223,7 @@ fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,
     id = LinkedNullChild(project, 1, statement, 0)
     value = LowerLinkedNullValue(project, state, id, 0)?
     if (result.declaration_kind == "NullableInt") { return EmitLinkedOptionalIntReturn(value, statement) }
-    copy = result.declaration_kind == "Builtin" && (result.name == "bool" || result.name == "int")
+    copy = LinkedPlainCopyResult(result)
     static_string = false
     if (LinkedStringResult(result)) {
         source = LinkedNullNode(project, 1, id)
