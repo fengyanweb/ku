@@ -20,6 +20,9 @@ use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
+#[path = "cli_build_interrupt.rs"]
+mod build_interrupt;
 #[path = "cli_gnu_workspace.rs"]
 mod gnu_workspace;
 #[path = "cli_calendar.rs"]
@@ -113,6 +116,13 @@ pub(crate) fn run_build_process_bounded(
     let started = Instant::now();
     let deadline = started.checked_add(timeout).unwrap_or(started);
     loop {
+        if let Err(error) = check_build_interruption() {
+            let cleanup = merge_build_cleanup(
+                process_tree.terminate(&mut child),
+                reap_build_process(&mut child),
+            );
+            return Err(with_build_cleanup_error(error, cleanup));
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 if let Err(detail) = process_tree.terminate_descendants() {
@@ -282,6 +292,16 @@ pub(crate) fn run_build_process_capture_stdout(
     let started = Instant::now();
     let deadline = started.checked_add(timeout).unwrap_or(started);
     loop {
+        if let Err(error) = check_build_interruption() {
+            let cleanup = merge_build_cleanup(
+                merge_build_cleanup(
+                    process_tree.terminate(&mut child),
+                    reap_build_process(&mut child),
+                ),
+                receive_bounded_build_output(&capture_rx).map(|_| ()),
+            );
+            return Err(with_build_cleanup_error(error, cleanup));
+        }
         if output_limit_exceeded.load(Ordering::Acquire) {
             let cleanup = merge_build_cleanup(
                 merge_build_cleanup(
@@ -440,6 +460,7 @@ fn terminate_direct_build_child(child: &mut std::process::Child) -> Result<(), S
 fn spawn_contained_build_process(
     command: &mut Command,
 ) -> io::Result<(std::process::Child, BuildProcessTree)> {
+    check_build_interruption()?;
     #[cfg(all(test, windows))]
     let delay_before_job_attach = command.get_envs().any(|(name, value)| {
         name == "KU_TEST_DELAY_BUILD_JOB_ATTACH" && value.is_some_and(|value| value == "1")
@@ -864,6 +885,43 @@ impl BuildProcessTree {
     }
 }
 const HELP: &str = crate::cli_contract::TOP_LEVEL_HELP;
+
+fn check_build_interruption() -> io::Result<()> {
+    #[cfg(unix)]
+    if build_interrupt::received() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "ku build interrupted",
+        ));
+    }
+    Ok(())
+}
+
+/// Runs the CLI in its own executable. Library callers keep their own signal policy.
+#[doc(hidden)]
+pub fn run_cli_process(args: Vec<String>) -> Result<(), KuError> {
+    #[cfg(unix)]
+    if args.get(1).is_some_and(|command| command == "build") {
+        let handlers = build_interrupt::BuildInterruptHandlers::install().map_err(|error| {
+            KuError::message(format!(
+                "failed to set up build interruption handling: {error}"
+            ))
+        })?;
+        let result = run_cli(args);
+        drop(handlers);
+        let signal = build_interrupt::received();
+        if signal != 0 {
+            if let Err(error) = &result {
+                if error.message.contains(BUILD_PROCESS_CLEANUP_UNCONFIRMED) {
+                    let _ = writeln!(io::stderr().lock(), "{error}");
+                }
+            }
+            build_interrupt::exit_with_signal(signal);
+        }
+        return result;
+    }
+    run_cli(args)
+}
 
 pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
     let hint = crate::cli_contract::error_hint(&args);
@@ -1774,6 +1832,7 @@ fn acquire_build_file_lock_until(
 ) -> Result<BuildFileLock, KuError> {
     let file = package::open_validated_package_operation_lock_file(path)?;
     loop {
+        check_build_interruption().map_err(|error| KuError::message(error.to_string()))?;
         let result = match mode {
             BuildLockMode::Shared => file.try_lock_shared(),
             BuildLockMode::Exclusive => file.try_lock(),
@@ -6885,6 +6944,7 @@ fn install_verified_link_output(
     // outputs use hard-link create-if-absent before unlinking the staging name.
     // Never delete a previous output as a fallback: a failed install must leave
     // the last verified artifact intact.
+    check_build_interruption().map_err(|error| KuError::message(error.to_string()))?;
     replace_link_output_atomically(
         &verified.path,
         &staging.output,
