@@ -944,3 +944,99 @@ pub(super) fn assert_counted_branch_owners(seed: &Path, cwd: &Path) {
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_control_move"));
 }
+
+const READONLY_BOOL_SOURCE: &str = r#"struct Entry { kind: str }
+fn Named(&kind: str): bool { return kind == "Function" }
+fn Mark(value: int): null! { return ok(null) }
+fn Read(&entry: Entry, inspect: bool, skip: bool): null! {
+    if (inspect && !Named(entry.kind)) { Mark(1)? }
+    if (skip || Named(entry.kind)) { Mark(2)? }
+    return ok(null)
+}
+fn Own(kind: str): bool { return kind == "Function" }
+fn RefuseOwned(kind: str): null! {
+    if (Own(kind)) { return ok(null) }
+    return ok(null)
+}
+fn Measure(&kind: str): int { return 1 }
+fn RefuseNonBool(&entry: Entry): null! {
+    if (Measure(entry.kind)) { return ok(null) }
+    return ok(null)
+}
+"#;
+
+const READONLY_BOOL_HOST: &str = r#"
+static const KuProjectionString *expected;
+static int trail;
+bool __NAMED__(const KuProjectionString *kind) {
+    assert(kind == expected && kind->ptr && kind->len > 0);
+    trail = trail * 10 + 3;
+    return kind->ptr[0] == 'F';
+}
+KuBootstrapResultNull __MARK__(int64_t value) {
+    assert(value == 1 || value == 2);
+    trail = trail * 10 + (int)value;
+    return (KuBootstrapResultNull){.ok = true};
+}
+int main(void) {
+    uint8_t other[] = "Other", fn[] = "Function";
+    __RECORD__ entry = {{other,5,0,KU_PROJECTION_STRING_STATIC}};
+    expected = &entry.f0;
+    assert(__ENTRY__(&entry, false, true).ok && trail == 2);
+    trail = 0;
+    assert(__ENTRY__(&entry, true, false).ok && trail == 313);
+    trail = 0;
+    entry.f0.ptr = fn;
+    entry.f0.len = 8;
+    assert(__ENTRY__(&entry, true, false).ok && trail == 332);
+    assert(entry.f0.ptr == fn && entry.f0.len == 8);
+    return 0;
+}
+"#;
+
+pub(super) fn assert_lazy_readonly_bool_call(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("readonly-bool.ku"), READONLY_BOOL_SOURCE).unwrap();
+    fs::write(cwd.join("modules.txt"), "readonly-bool.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Read").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (entry, params) = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResultNull ku_linked_null_"))
+        .unwrap()
+        .split_once("(const ")
+        .unwrap();
+    let (record, _) = params.split_once('*').unwrap();
+    let dependency = |prefix| {
+        code.lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap()
+            .split_once('(')
+            .unwrap()
+            .0
+    };
+    let host = READONLY_BOOL_HOST
+        .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
+        .replace("__RECORD__", record)
+        .replace("__NAMED__", dependency("extern bool "))
+        .replace("__MARK__", dependency("extern KuBootstrapResultNull "));
+    let c = cwd.join("readonly-bool.c");
+    let exe = cwd.join(format!("readonly-bool{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+
+    for (name, reason) in [
+        ("RefuseOwned", "matching str View or scalar Copy argument"),
+        ("RefuseNonBool", "requires a plain bool result"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(stderr.contains("linked_readonly_call") && stderr.contains(reason));
+    }
+}

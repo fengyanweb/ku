@@ -1,4 +1,4 @@
-import { LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MatchesLinkedFieldValue, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { LinkedDirectCallExpression, LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MatchesLinkedFieldValue, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { Node } from "../stage2/ast.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -111,7 +111,7 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
     callee = ResolveLinkedCall(project, state.slots, call, target, false)?
     arguments = lowerLinkedArguments(project, state, call, callee, id, depth)?
     output = AddLinkedNullSlot(project, arguments.state, "", "t" + str(id), callee.result, false)?
-    output.state.code = output.state.code + "    " + output.value.text.clone() + " = " + callee.symbol + "(" + arguments.args + ");\n" + arguments.handoff
+    output.state.code = output.state.code + "    " + output.value.text.clone() + " = " + LinkedDirectCallExpression(callee, arguments.args) + ";\n" + arguments.handoff
     output.state.slots[output.value.slot - 1].live = true
     return ok(output)
 }
