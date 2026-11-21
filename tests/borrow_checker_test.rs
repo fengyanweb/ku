@@ -215,7 +215,7 @@ fn borrow_checker_same_call_borrow_move_conflicts_are_order_independent() {
 fn borrow_checker_same_call_capture_mutation_and_copy_field() {
     rejects("fn main() { text = \"old\" change = () => { text = \"new\" return \"old\" } println(text.contains(change())) }", "E0916", "borrow conflicts with move or mutation");
     rejects("fn Both(&value: str, n: int) {} fn main() { text = \"Ku\" change = () => { text = \"new\" return 1 } Both(text, change()) }", "E0916", "borrow conflicts with move or mutation");
-    let source = r#"
+    const COPY_FIELD_CALL_SOURCE: &str = r#"
 struct Profile { flags: int }
 struct User { name: str, profile: Profile, active: bool, score: int | null }
 fn Forward(&user: User, flags: int, score: int | null): int {
@@ -234,8 +234,9 @@ fn main(): null {
     return null
 }
 "#;
-    accepts(source);
-    run_source("borrow-copy-fields.ku", source).expect("Copy fields do not move a borrowed owner");
+    accepts(COPY_FIELD_CALL_SOURCE);
+    run_source("borrow-copy-fields.ku", COPY_FIELD_CALL_SOURCE)
+        .expect("Copy fields do not move a borrowed owner");
 }
 
 #[test]
