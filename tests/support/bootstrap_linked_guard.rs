@@ -665,9 +665,9 @@ int main(void) {
     ku_linked_view_int_array_drop(&output.value);
     output = ENTRY(array(1), array(99), true);
     assert(!output.ok && !output.value.data && output.error.code.len == 6 && !memcmp(output.error.code.ptr, "reject", 6));
-    ku_projection_string_drop(&output.error.domain);
-    ku_projection_string_drop(&output.error.code);
-    ku_projection_string_drop(&output.error.message);
+    assert(output.error.domain.storage == KU_PROJECTION_STRING_STATIC);
+    assert(output.error.code.storage == KU_PROJECTION_STRING_STATIC);
+    assert(output.error.message.storage == KU_PROJECTION_STRING_STATIC);
     return 0;
 }
 "#
