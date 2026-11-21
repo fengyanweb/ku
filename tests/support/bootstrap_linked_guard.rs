@@ -854,9 +854,10 @@ int main(void) {
     }
     KuProjectionString result = __CALL__;
     assert(result.len == 7);
-    if (__OWNED__) { assert(result.ptr == data && outstanding() == 1); }
-    else { assert(result.storage == KU_PROJECTION_STRING_STATIC && outstanding() == 0); }
-    ku_projection_string_drop(&result);
+    if (__OWNED__) {
+        assert(result.storage == KU_PROJECTION_STRING_OWNED && result.ptr == data && outstanding() == 1);
+        free(result.ptr);
+    } else { assert(result.storage == KU_PROJECTION_STRING_STATIC && outstanding() == 0); }
     assert(outstanding() == 0);
     return 0;
 }
