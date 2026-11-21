@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Validate a same-source Stage1 → Stage2 → Stage3 chain from an installed Ku."""
+import argparse
+from hashlib import sha256
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+from verify_generation import dynamic_imports
+
+
+TOOLS = Path(__file__).resolve().parent
+EXE = ".exe" if os.name == "nt" else ""
+
+
+def digest(path):
+    return sha256(path.read_bytes()).hexdigest()
+
+
+def executable(name):
+    path = shutil.which(name)
+    if not path:
+        raise ValueError(f"executable not found: {name}")
+    return Path(path).absolute()
+
+
+def read_json(path):
+    return json.loads(path.read_bytes())
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+
+def file_tail(path, max_bytes):
+    with path.open("rb") as stream:
+        length = stream.seek(0, os.SEEK_END)
+        stream.seek(max(0, length - max_bytes))
+        return stream.read(max_bytes).decode("utf-8", errors="replace").strip()
+
+
+def run_tool(directory, script, arguments, scratch):
+    environment = dict(os.environ, TMPDIR=str(scratch), TEMP=str(scratch), TMP=str(scratch))
+    stdout = directory / (script.stem + ".stdout")
+    stderr = directory / (script.stem + ".stderr")
+    with stdout.open("xb") as output, stderr.open("xb") as errors:
+        command = [sys.executable, "-B", script, *arguments, "--temp-dir", scratch]
+        result = subprocess.run(command, cwd=directory, env=environment, stdout=output, stderr=errors)
+    if result.returncode:
+        message = [f"{script.name} exited {result.returncode}"]
+        for label, path, size in (("stderr", stderr, 2304), ("stdout", stdout, 768)):
+            detail = file_tail(path, size)
+            if detail:
+                message.append(f"{label} tail:\n{detail}")
+        raise ValueError("\n".join(message))
+
+
+def run_stage(output, name, input_sha, action):
+    stage = output / name
+    stage.mkdir(exist_ok=True)
+    checkpoint = stage / "complete.json"
+    if checkpoint.is_file():
+        record = read_json(checkpoint)
+        if record["input_sha256"] != input_sha:
+            raise ValueError(f"{name} checkpoint belongs to a different producer")
+        for relative, expected in record["files"].items():
+            path = (output / relative).resolve(strict=True)
+            if not path.is_relative_to(stage) or digest(path) != expected:
+                raise ValueError(f"{name} checkpoint has a changed artifact: {relative}")
+        return record["receipt"]
+
+    attempt = Path(tempfile.mkdtemp(prefix="attempt-", dir=stage))
+    summary, files = action(attempt)
+    record = {"input_sha256": input_sha, "receipt": summary,
+              "files": {path.relative_to(output).as_posix(): digest(path) for path in files}}
+    temporary = attempt / "complete.json"
+    write_json(temporary, record)
+    temporary.replace(checkpoint)
+    return summary
+
+
+def bootstrap_chain(repo, source, ku, cc, output, scratch, limit, sanitizers):
+    common = [repo, source, "--cc", cc]
+    installed_sha = digest(ku)
+
+    def build_seed(attempt):
+        binary = attempt / ("ku-bootstrap-stage1" + EXE)
+        identity = attempt / "build-identity.json"
+        run_tool(attempt, TOOLS / "rebuild_stage1.py", [*common, ku, binary], scratch)
+        seed = read_json(identity)
+        imports = dynamic_imports(binary)
+        if (seed["commit"] != source or seed["seed_sha256"] != installed_sha or seed["sha256"] != digest(binary) or
+                any("libku" in item.lower() for item in imports)):
+            raise ValueError(f"Stage1 identity or imports do not match: {identity}")
+        return {"binary": binary.relative_to(output).as_posix(), "sha256": seed["sha256"],
+                "archive_sha256": seed["archive_sha256"], "dynamic_imports": imports}, [binary, identity]
+
+    def build_generation(attempt, producer):
+        units = attempt / "units"
+        ledger = units / "ledger.json"
+        verified = attempt / "verified"
+        run_tool(attempt, TOOLS / "resolve_units.py",
+                 [*common, "--producer", output / producer["binary"], "--limit", str(limit), "--output-dir", units],
+                 scratch)
+        run_tool(attempt, TOOLS / "verify_generation.py",
+                 [*common, "--exact-ledger", ledger, "--output-dir", verified, "--sanitizers", sanitizers], scratch)
+        binary = verified / ("ku-bootstrap" + EXE)
+        identity = verified / "build-identity.json"
+        receipt = verified / "verification.json"
+        measured = read_json(receipt)
+        image = read_json(identity)
+        if (image["commit"] != source or image["producer_sha256"] != producer["sha256"] or
+                image["sha256"] != digest(binary) or image["ledger_sha256"] != digest(ledger) or
+                measured["source_commit"] != source or measured["ledger_sha256"] != image["ledger_sha256"] or
+                measured["profiles"]["strict_o2"]["sha256"] != image["sha256"]):
+            raise ValueError(f"linked compiler does not match the frozen inputs: {identity}")
+        summary = {"binary": binary.relative_to(output).as_posix(), "sha256": image["sha256"],
+                   "ledger": ledger.relative_to(output).as_posix(), "ledger_sha256": image["ledger_sha256"],
+                   "units": measured["input_units"], "builtins": measured["builtins"],
+                   "profiles": measured["profiles"], "sanitizers": measured["sanitizers"]}
+        return summary, [binary, identity, ledger, receipt]
+
+    stage1 = run_stage(output, "stage1", installed_sha, build_seed)
+    stage2 = run_stage(output, "stage2", stage1["sha256"], lambda path: build_generation(path, stage1))
+    stage3 = run_stage(output, "stage3", stage2["sha256"], lambda path: build_generation(path, stage2))
+    return stage1, stage2, stage3
+
+
+def compare_units(first, second):
+    def fingerprints(ledger):
+        result = {}
+        for unit in read_json(ledger)["providers"]:
+            for field in ("c", "plan"):
+                path = ledger.with_name(unit[field])
+                if digest(path) != unit[field + "_sha256"]:
+                    raise ValueError(f"changed provider artifact: {path}")
+            result[tuple(unit["key"])] = unit["c_sha256"], unit["plan_sha256"], unit["object_sha256"]
+        return result
+
+    earlier, later = fingerprints(first), fingerprints(second)
+    if earlier.keys() != later.keys():
+        raise ValueError("Stage2 and Stage3 selected different provider identities")
+    for key, details in earlier.items():
+        if details[:2] != later[key][:2]:
+            raise ValueError(f"Stage2 and Stage3 emitted different C or typed plans for {key!r}")
+    return {"providers": len(earlier), "c_and_plans_identical": True, "objects_identical": earlier == later}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, default=TOOLS.parents[3])
+    parser.add_argument("--revision", default="HEAD")
+    parser.add_argument("--ku", required=True, help="installed Ku CLI")
+    parser.add_argument("--cc", required=True, help="matching target C11 compiler executable")
+    parser.add_argument("--output-dir", required=True, type=Path, help="private directory for receipts and resume")
+    parser.add_argument("--temp-dir", type=Path, help="existing directory for an isolated scratch subdirectory")
+    parser.add_argument("--sanitizers", choices=("auto", "required", "off"), default="auto")
+    parser.add_argument("--limit", type=int, default=768, help="maximum provider attempts per generation")
+    args = parser.parse_args()
+    if not __debug__:
+        parser.error("verification requires Python assertions")
+    if args.limit < 1:
+        parser.error("--limit must be positive")
+
+    repo = args.repo.resolve(strict=True)
+    source = subprocess.check_output(["git", "rev-parse", "--verify", args.revision + "^{commit}"],
+                                     cwd=repo, text=True).strip()
+    ku, cc = executable(args.ku), executable(args.cc)
+    target = subprocess.check_output([cc, "-dumpmachine"], text=True, timeout=20).strip()
+    version = subprocess.check_output([cc, "--version"], timeout=20)
+    output = args.output_dir.resolve()
+    output.mkdir(parents=True, exist_ok=True, mode=0o700)
+    inputs = {"source_commit": source, "ku_sha256": digest(ku), "c_compiler": str(cc),
+              "c_target": target, "c_version_sha256": sha256(version).hexdigest(), "sanitizers": args.sanitizers,
+              "provider_limit": args.limit}
+    snapshot = output / "inputs.json"
+    if snapshot.is_file():
+        if read_json(snapshot) != inputs:
+            raise ValueError("the output directory belongs to a different source, installed CLI, toolchain or policy")
+    else:
+        if any(output.iterdir()):
+            raise ValueError("choose an empty output directory or a matching self-host run")
+        write_json(snapshot, inputs)
+    stage_parent = args.temp_dir.resolve(strict=True) if args.temp_dir else output
+    with tempfile.TemporaryDirectory(prefix=".scratch-", dir=stage_parent) as temporary:
+        stage1, stage2, stage3 = bootstrap_chain(repo, source, ku, cc, output, Path(temporary), args.limit,
+                                                args.sanitizers)
+    comparison = compare_units(output / stage2["ledger"], output / stage3["ledger"])
+    summary = {"status": "passed", **inputs, "stage1": stage1, "stage2": stage2, "stage3": stage3,
+               "comparison": comparison}
+    write_json(output / "summary.json", summary)
+    print(json.dumps(summary))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        sys.exit(f"self-host verification: {error}")

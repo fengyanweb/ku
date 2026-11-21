@@ -79,3 +79,19 @@ execution require verification on their respective Windows toolchains.
 python3 -B bootstrap/tools/compiler_driver/test_driver.py \
     --ku "$(command -v ku)" --cc cc
 ```
+
+## Verify a same-source bootstrap
+
+Use an installed Ku CLI and a C compiler for the current target. Pass a private
+output directory for the executables, C units, plans, and verification receipts.
+
+```sh
+python3 -B bootstrap/tools/compiler_driver/selfhost/verify.py \
+    --ku "$(command -v ku)" --cc clang --output-dir /tmp/ku-bootstrap-verify
+```
+
+On Windows, use the selected x64 Clang or MinGW compiler and the installed
+`ku.exe`. The verifier builds Stage1, uses it to build and run Stage2, and uses
+Stage2 to build and run Stage3 from the same Git commit. It checks C and type-plan
+identity across the two generations. Repeat the command with the same source,
+installed CLI and compiler to reuse verified checkpoints.

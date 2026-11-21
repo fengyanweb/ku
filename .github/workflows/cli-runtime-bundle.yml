@@ -28,6 +28,11 @@ on:
         required: false
         default: false
         type: boolean
+      bootstrap_generations:
+        description: Verify installed same-source Stage1, Stage2 and Stage3 only
+        required: false
+        default: false
+        type: boolean
       installed_tasks_only:
         description: Verify the installed HTTP + PostgreSQL task-list example
         required: false
@@ -73,6 +78,11 @@ on:
         type: boolean
       installed_structured_only:
         description: Verify the installed structured Task example on native and Runner
+        required: false
+        default: false
+        type: boolean
+      bootstrap_generations:
+        description: Verify installed same-source Stage1, Stage2 and Stage3 only
         required: false
         default: false
         type: boolean
@@ -153,6 +163,7 @@ jobs:
         env:
           KU_INSTALLED_PG_ONLY: ${{ inputs.installed_pg_only }}
           KU_INSTALLED_STRUCTURED_ONLY: ${{ inputs.installed_structured_only }}
+          KU_BOOTSTRAP_GENERATIONS: ${{ inputs.bootstrap_generations }}
           KU_INSTALLED_TASKS_ONLY: ${{ inputs.installed_tasks_only }}
           KU_INSTALLED_TYPED_PG: ${{ inputs.installed_typed_pg }}
           KU_INSTALLED_ASYNC_PG: ${{ inputs.installed_async_pg }}
@@ -161,6 +172,9 @@ jobs:
           KU_SELECTED_CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           KU_EARLY_LOADER_PROBE: ${{ inputs.early_loader_probe }}
         run: |
+          if ($env:KU_BOOTSTRAP_GENERATIONS -eq 'true' -and $env:KU_INSTALLED_STRUCTURED_ONLY -ne 'true') {
+            throw 'bootstrap_generations requires installed_structured_only for the source-free installer'
+          }
           if ($env:KU_INSTALLED_PG_ONLY -eq 'true' -and
               ($env:KU_SELECTED_PLATFORM_SET -ne 'windows-gnu' -or
                -not [string]::IsNullOrEmpty($env:KU_SELECTED_CANDIDATE_TAG))) {
@@ -439,13 +453,21 @@ jobs:
           if ($installed.installed_native_task_http_client.status -ne 'passed') { throw 'This SDK must execute standalone Task HTTP without a server or Runner' }
           if ($installed.installed_native_http_relay.status -ne 'passed') { throw 'This SDK must actually execute the source-free inbound HTTP to outbound HTTP relay contract' }
       - name: Run the same installed structured Task example using both backends
-        if: inputs.installed_structured_only
+        if: inputs.installed_structured_only && !inputs.bootstrap_generations
         shell: pwsh
         run: |
           $archive = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/cli-bundle-assets" -Filter '*.tar.gz' -File)
           if ($archive.Count -ne 1) { throw 'Expected exactly one same-batch installer' }
           & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --structured-only --archive $archive[0].FullName --manifest ($archive[0].FullName + '.manifest.json') --repo . --output "$env:RUNNER_TEMP/cli-structured-evidence.json" --installer-run $env:INSTALLER_RUN_ID --expected-sdk-commit $env:SDK_SOURCE_COMMIT
           if ($LASTEXITCODE) { throw 'Installed structured Task example failed' }
+      - name: Run the installed same-source bootstrap generations
+        if: inputs.installed_structured_only && inputs.bootstrap_generations
+        shell: pwsh
+        run: |
+          $archive = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/cli-bundle-assets" -Filter '*.tar.gz' -File)
+          if ($archive.Count -ne 1) { throw 'Expected exactly one same-batch installer' }
+          & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --structured-only --bootstrap-generations --archive $archive[0].FullName --manifest ($archive[0].FullName + '.manifest.json') --repo . --output "$env:RUNNER_TEMP/cli-structured-evidence.json" --installer-run $env:INSTALLER_RUN_ID --expected-sdk-commit $env:SDK_SOURCE_COMMIT
+          if ($LASTEXITCODE) { throw 'Installed Stage1, Stage2 or Stage3 verification failed' }
       - name: Prepare the existing PostgreSQL fixture tools on Linux
         if: runner.os == 'Linux' && !inputs.installed_structured_only
         shell: bash

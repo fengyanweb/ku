@@ -1587,15 +1587,17 @@ def run_structured_only(args, report):
     verifier = checked(['git', 'rev-parse', 'HEAD'], repo, env).strip()
     if verifier != metadata['commit']:
         raise ValueError('structured Task example and SDK must come from the same commit')
-    example = 'examples/native_task_structured_http.ku'
-    source = EXPORT.canonical_example((repo / example).read_bytes())
-    committed = checked(['git', 'show', f'{verifier}:{example}'], repo, env).encode('utf-8')
-    if source != committed:
-        raise ValueError('structured Task example differs from the selected commit')
-    report.update(schema='ku-structured-task-consumer-v1', target=target,
-                  sdk_source_commit=metadata['commit'], verification_code_commit=verifier,
-                  example_sha256=hashlib.sha256(source).hexdigest(),
-                  archive_sha256=metadata['sha256'], installer_run_id=args.installer_run)
+    schema = 'ku-bootstrap-generations-consumer-v1' if args.bootstrap_generations else 'ku-structured-task-consumer-v1'
+    report.update(schema=schema, target=target, sdk_source_commit=metadata['commit'],
+                  verification_code_commit=verifier, archive_sha256=metadata['sha256'],
+                  installer_run_id=args.installer_run)
+    if not args.bootstrap_generations:
+        example = 'examples/native_task_structured_http.ku'
+        source = EXPORT.canonical_example((repo / example).read_bytes())
+        committed = checked(['git', 'show', f'{verifier}:{example}'], repo, env).encode('utf-8')
+        if source != committed:
+            raise ValueError('structured Task example differs from the selected commit')
+        report['example_sha256'] = hashlib.sha256(source).hexdigest()
     with tempfile.TemporaryDirectory(prefix='ku-structured-task-consumer-') as temporary:
         root = Path(temporary).resolve()
         install = root / '安装 SDK'
@@ -1603,38 +1605,58 @@ def run_structured_only(args, report):
         EXPORT.verify_archive(archive, metadata['files'], install)
         manifest = EXPORT.RUNTIME_BUNDLE.verify(install, metadata['version'], metadata['commit'], target)
         report.update(bundle_id=manifest['bundle_id'], sdk_source_sha256=manifest['build_source_sha256'])
-        installed_runner_embedded_entry_consumer(install, root, env, report, target)
-        if target == 'x86_64-unknown-linux-gnu':
-            installed_build_interrupt_consumer(install, root, repo, env, manifest, report)
-        for backend in ('c', 'runner'):
-            installed_native_http_client_consumer(install, root, env, report, args.output, target,
-                                                  structured_task=True, backend=backend)
-        native = report['installed_native_task_structured_http']
-        runner = report['installed_native_task_structured_http_runner']
-        if any(check['status'] != 'passed' for check in (native, runner)):
-            raise RuntimeError('both installed structured Task backends must pass')
-        if any(native[key] != runner[key] for key in ('run_stdout', 'requests')):
-            raise RuntimeError('installed structured Task backends disagreed on output or request order')
-        installed_declaration_inventory_consumer(install, root, env, report, repo, verifier, target)
-        installed_bootstrap_module_consumer(install, root, env, report, repo, verifier, target)
-        driver_test = repo / 'bootstrap/tools/compiler_driver/test_driver.py'
-        driver_cc = env.get('KU_GNU_CC') if target == 'x86_64-pc-windows-gnu' else 'clang'
-        if not driver_cc:
-            raise RuntimeError('bootstrap driver verification requires the selected GNU C compiler')
-        driver_ku = install / ('ku.exe' if '-windows-' in target else 'ku')
-        result = invoke([sys.executable, '-B', driver_test, '--ku', driver_ku, '--cc', driver_cc],
-                        root, env, seconds=300)
-        if result.returncode or result.stderr or output(result) != 'bootstrap argv, module checks, signature and standalone C verified\n':
-            raise RuntimeError('installed bootstrap command driver failed: ' +
-                               (output(result) + result.stderr.decode('utf-8', errors='replace'))[-4096:])
-        report['installed_bootstrap_cli'] = {'status': 'passed', 'sha256': EXPORT.file_hash(driver_test)}
-        installed_forward_layout_consumer(install, root, env, report, target)
-        installed_native_only_bytes_consumer(install, root, env, report, target)
-        installed_task_error_consumer(install, root, env, report, target)
-        installed_task_optional_consumer(install, root, env, report, target)
-        installed_pattern_capture_consumer(install, root, env, report, target)
-        installed_collection_and_copy_consumers(install, root, repo, env, report, target)
-    report.update(status='passed', backend_equivalence=True, owned_temp_removed=not root.exists())
+        if args.bootstrap_generations:
+            verification = repo / 'bootstrap/tools/compiler_driver/selfhost/verify.py'
+            cc = env.get('KU_GNU_CC') if target == 'x86_64-pc-windows-gnu' else 'clang'
+            if not cc:
+                raise RuntimeError('bootstrap generations require the selected GNU C compiler')
+            ku = install / ('ku.exe' if '-windows-' in target else 'ku')
+            result = invoke([sys.executable, '-B', verification, '--repo', repo,
+                             '--revision', verifier, '--ku', ku, '--cc', cc,
+                             '--output-dir', root / 'generations', '--temp-dir', root],
+                            root, env, seconds=2400)
+            if result.returncode:
+                raise RuntimeError('installed bootstrap generations failed: ' +
+                                   (output(result) + result.stderr.decode('utf-8', errors='replace'))[-4096:])
+            receipt = json.loads(output(result))
+            if receipt.get('status') != 'passed' or receipt.get('source_commit') != verifier:
+                raise RuntimeError('installed bootstrap generations did not verify the same source')
+            report['installed_bootstrap_generations'] = receipt
+        else:
+            installed_runner_embedded_entry_consumer(install, root, env, report, target)
+            if target == 'x86_64-unknown-linux-gnu':
+                installed_build_interrupt_consumer(install, root, repo, env, manifest, report)
+            for backend in ('c', 'runner'):
+                installed_native_http_client_consumer(install, root, env, report, args.output, target,
+                                                      structured_task=True, backend=backend)
+            native = report['installed_native_task_structured_http']
+            runner = report['installed_native_task_structured_http_runner']
+            if any(check['status'] != 'passed' for check in (native, runner)):
+                raise RuntimeError('both installed structured Task backends must pass')
+            if any(native[key] != runner[key] for key in ('run_stdout', 'requests')):
+                raise RuntimeError('installed structured Task backends disagreed on output or request order')
+            installed_declaration_inventory_consumer(install, root, env, report, repo, verifier, target)
+            installed_bootstrap_module_consumer(install, root, env, report, repo, verifier, target)
+            driver_test = repo / 'bootstrap/tools/compiler_driver/test_driver.py'
+            driver_cc = env.get('KU_GNU_CC') if target == 'x86_64-pc-windows-gnu' else 'clang'
+            if not driver_cc:
+                raise RuntimeError('bootstrap driver verification requires the selected GNU C compiler')
+            driver_ku = install / ('ku.exe' if '-windows-' in target else 'ku')
+            result = invoke([sys.executable, '-B', driver_test, '--ku', driver_ku, '--cc', driver_cc],
+                            root, env, seconds=300)
+            if result.returncode or result.stderr or output(result) != 'bootstrap argv, module checks, signature and standalone C verified\n':
+                raise RuntimeError('installed bootstrap command driver failed: ' +
+                                   (output(result) + result.stderr.decode('utf-8', errors='replace'))[-4096:])
+            report['installed_bootstrap_cli'] = {'status': 'passed', 'sha256': EXPORT.file_hash(driver_test)}
+            installed_forward_layout_consumer(install, root, env, report, target)
+            installed_native_only_bytes_consumer(install, root, env, report, target)
+            installed_task_error_consumer(install, root, env, report, target)
+            installed_task_optional_consumer(install, root, env, report, target)
+            installed_pattern_capture_consumer(install, root, env, report, target)
+            installed_collection_and_copy_consumers(install, root, repo, env, report, target)
+    if not args.bootstrap_generations:
+        report['backend_equivalence'] = True
+    report.update(status='passed', owned_temp_removed=not root.exists())
 
 
 def installed_native_http_relay_consumer(install, root, env, report, report_path, target, *, checkout_hidden=False):
@@ -2660,6 +2682,7 @@ def main():
     parser.add_argument("--hide-checkout", action="store_true")
     parser.add_argument("--readonly-only", action="store_true")
     parser.add_argument("--structured-only", action="store_true")
+    parser.add_argument("--bootstrap-generations", action="store_true")
     parser.add_argument("--installer-run")
     parser.add_argument("--expected-sdk-commit")
     args = parser.parse_args()
@@ -2670,6 +2693,8 @@ def main():
         parser.error('--archive and --manifest are required outside the early native probe')
     if args.structured_only and (args.readonly_only or args.hide_checkout or not args.expected_sdk_commit):
         parser.error('--structured-only requires --expected-sdk-commit and cannot run other verification modes')
+    if args.bootstrap_generations and not args.structured_only:
+        parser.error('--bootstrap-generations requires --structured-only for the source-free installer')
     args.output = args.output.resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     report = {"status": "running"}
