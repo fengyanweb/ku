@@ -5,8 +5,8 @@ import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { ResolveTypeName, TypeNameBinding } from "./type_names.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { BindManagedLocal, CheckManagedDeclaration, IsManagedLocalArrayClone, ManagedAppendDrop, ManagedCloneBoundString, ManagedCloneStringSetup, ManagedSourceCharsSetup, ManagedStringLeaf, ManagedStringLeafSetup, RequireNewManagedOwner } from "./guarded_string_parts.ku"
-import { IsManagedMethod, ManagedLiteralConcat, ManagedLiteralConcatSetup, ManagedMethodReceiver } from "./call_contracts.ku"
+import { BindManagedLocal, CheckManagedDeclaration, IsManagedLocalArrayClone, ManagedAppendDrop, ManagedCloneBoundString, ManagedCloneStringSetup, ManagedConcatenate, ManagedConcatenates, ManagedIsStringMove, ManagedMoveStringSetup, ManagedSourceCharsSetup, ManagedStringLeaf, ManagedStringLeafSetup, RequireNewManagedOwner } from "./guarded_string_parts.ku"
+import { IsManagedMethod, ManagedMethodReceiver } from "./call_contracts.ku"
 import { StructArrayC } from "./struct_array_c.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardBoundType, GuardCType, GuardExpression, GuardLeaf, GuardOwnedExpression, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 
@@ -193,14 +193,19 @@ fn ownedStringSetup(&named: NamedModule, &locals: [GuardBinding], &layouts: [Str
         code.text = ManagedStringLeafSetup(named.parsed.arena.nodes, named.parsed.arena.edges, locals, node, node_id, symbol, target, indent)?
         return ok(code)
     }
+    if (node.kind == "Variable") {
+        code = ManagedBlank()
+        code.text = ManagedMoveStringSetup(named, locals, node, root.function_id, target, indent)?
+        return ok(code)
+    }
     if (node.kind == "String") {
         value = ManagedExpression(named, locals, layouts, root, node_id, indent)?
         return ok(ManagedCode { text: indent.clone() + target.clone() + " = " + value.value + ";\n",
             uses_add: false, uses_sub: false, uses_eq: false, uses_string_append: false })
     }
-    if (root.string_locals && ManagedLiteralConcat(named.parsed.arena.nodes, named.parsed.arena.edges, node)) {
+    if (root.string_locals && ManagedConcatenates(named.parsed.arena.nodes, named.parsed.arena.edges, node)) {
         code = ManagedBlank()
-        code.text = ManagedLiteralConcatSetup(named, locals, node, root.function_id, target, indent)?
+        code.text = ManagedConcatenate(named, locals, node, node_id, root.function_id, target, indent)?
         code.uses_string_append = true
         return ok(code)
     }
@@ -276,18 +281,19 @@ fn EmitManagedAssignment(&named: NamedModule, &types: [TypeNameBinding], &import
     local_clone = root.source_strings && IsManagedLocalArrayClone(named.parsed.arena.nodes, named.parsed.arena.edges, locals, node_id)
     subject = ProjectionCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, node_id)
     named_clone = root.string_locals && subject != 0 && named.parsed.arena.nodes[subject - 1].kind == "Variable"
-    concat = root.string_locals && ManagedLiteralConcat(named.parsed.arena.nodes, named.parsed.arena.edges, node)
-    fallible = local_clone || named_clone || concat || symbol != ""
+    concat = root.string_locals && ManagedConcatenates(named.parsed.arena.nodes, named.parsed.arena.edges, node)
+    prepare = local_clone || named_clone || concat || symbol != "" ||
+        (root.string_locals && ManagedIsStringMove(locals, node, found))
     literal = (root.string_locals || root.source_strings) && node.kind == "String"
-    if ((literal || fallible) && found != 0 && statement.kind == "Assign") {
+    if ((literal || prepare) && found != 0 && statement.kind == "Assign") {
         previous = locals[found - 1].clone()
         if (previous.ty.kind == "str" && !previous.parameter && !previous.view) {
             target = GuardBindingName(previous)
             drop = indent.clone() + "ku_projection_string_drop(&" + target.clone() + ");\n"
             update = ManagedBlank()
-            if (fallible) {
-                // Until the checked clone succeeds, the previous owner still
-                // belongs to the existing scope and fatal cleanup path.
+            if (prepare) {
+                // Evaluate before replacing the existing owner. It stays
+                // in scope if preparation can fail.
                 temporary = "replaced" + str(statement_id)
                 update = ownedStringSetup(named, locals, layouts, root, node_id, temporary, indent, symbol)?
                 update.text = indent.clone() + "KuProjectionString " + temporary.clone() + " = {0};\n" +
@@ -299,7 +305,7 @@ fn EmitManagedAssignment(&named: NamedModule, &types: [TypeNameBinding], &import
             return ok(ManagedAssignment { code: update, binding: previous, introduces: false })
         }
     }
-    if (literal || fallible || (root.string_locals && subject != 0)) {
+    if (literal || prepare || (root.string_locals && subject != 0)) {
         ty = GuardType { kind: "str", layout: 0 }
         RequireNewManagedOwner(found, statement)?
         CheckManagedDeclaration(declared, ty, found, statement)?

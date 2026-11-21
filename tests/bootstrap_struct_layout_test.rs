@@ -1791,6 +1791,20 @@ fn RejectCheckedOwner(source: str): [SourceLength]! {
     CheckOwner(source)?
     return ok(entries)
 }
+fn JoinClones(&characters: [str], left: str, right: str): Scanned! {
+    saved = characters[0].clone()
+    pair = left.clone() + right.clone()
+    saved = pair
+    width = saved.byte_len()
+    return ok(Scanned { text: saved, count: width })
+}
+fn RejectMoveReuse(&characters: [str], left: str, right: str): Scanned! {
+    saved = characters[0].clone()
+    pair = left.clone() + right.clone()
+    saved = pair
+    width = pair.byte_len()
+    return ok(Scanned { text: saved, count: width })
+}
 "#,
     )
     .unwrap();
@@ -2027,6 +2041,36 @@ fn RejectCheckedOwner(source: str): [SourceLength]! {
     let rejected = execute(&mut Command::new(seed), cwd, 30);
     assert!(!rejected.status.success() && rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("managed_checked_argument"));
+
+    fs::write(cwd.join("mode.txt"), "struct-result").unwrap();
+    fs::write(cwd.join("function.txt"), "JoinClones").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let left = text
+        .find("if (!ku_result_clone_string(a1, &concat_left")
+        .unwrap();
+    let right = text
+        .find("!ku_result_clone_string(a2, &concat_right")
+        .unwrap();
+    let join = text.find("!ku_managed_string_append(&concat_left").unwrap();
+    assert!(left < right && right < join);
+    let failure = text[join..].split_once("goto cleanup;").unwrap().0;
+    assert!(failure.contains("drop(&concat_left") && failure.contains("drop(&concat_right"));
+    let (target, cleanup) = text[join..].split_once("cleanup:\n").unwrap();
+    let moved = target.split_once("KuProjectionString replaced").unwrap().1;
+    let source = moved.lines().nth(1).unwrap().split_once(" = ").unwrap().1;
+    assert!(moved.lines().nth(2).unwrap().contains(&format!(
+        "{} = (KuProjectionString){{0}};",
+        source.trim_end_matches(';')
+    )));
+    assert!(cleanup.contains("ku_projection_string_drop(&a1)"));
+    assert!(cleanup.contains("ku_projection_string_drop(&a2)"));
+
+    fs::write(cwd.join("function.txt"), "RejectMoveReuse").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert!(!rejected.status.success() && rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("managed_call_move"));
 }
 
 fn assert_guarded_predicate(seed: &Path, cwd: &Path) {

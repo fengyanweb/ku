@@ -1,6 +1,6 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
-import { ManagedConsumedString } from "./call_contracts.ku"
+import { ManagedConsumedString, ManagedLiteralConcat, ManagedLiteralConcatSetup } from "./call_contracts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 import { ScalarStringPart } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
@@ -136,13 +136,60 @@ fn ManagedStringLeafSetup(&nodes: [Node], &edges: [int], &locals: [GuardBinding]
         indent.clone() + target.clone() + " = " + symbol.clone() + "(" + temporary + ");\n")
 }
 
-fn ManagedCloneBoundString(&locals: [GuardBinding], &source: Node, &target: str, &indent: str): str! {
+fn managedStringOwnerName(&locals: [GuardBinding], &source: Node): str! {
     binding = GuardBindingIndex(locals, source.text)
     if (binding == 0 || locals[binding - 1].ty.kind != "str" || locals[binding - 1].view) {
         RejectLayout("managed_string_leaf_argument", "expected a clone of a bound owned str", DeclarationSpan(source))?
     }
-    return ok(indent.clone() + "if (!ku_result_clone_string(" + GuardBindingName(locals[binding - 1]) + ", &" + target.clone() +
+    return ok(GuardBindingName(locals[binding - 1]))
+}
+
+fn ManagedCloneBoundString(&locals: [GuardBinding], &source: Node, &target: str, &indent: str): str! {
+    return ok(indent.clone() + "if (!ku_result_clone_string(" + managedStringOwnerName(locals, source)? + ", &" + target.clone() +
         ")) { out_of_memory = true; goto cleanup; }\n")
+}
+
+fn ManagedConcatenates(&nodes: [Node], &edges: [int], &expression: Node): bool {
+    if (ManagedLiteralConcat(nodes, edges, expression)) { return true }
+    if (expression.kind != "Binary" || expression.text != "+" || expression.edge_count != 2) { return false }
+    left = ProjectionCloneSource(nodes, edges, edges[expression.first_edge])
+    right = ProjectionCloneSource(nodes, edges, edges[expression.first_edge + 1])
+    return left != 0 && right != 0 && nodes[left - 1].kind == "Variable" && nodes[right - 1].kind == "Variable"
+}
+
+fn ManagedConcatenate(&named: NamedModule, &locals: [GuardBinding], &expression: Node, id: int,
+                      caller_id: int, &target: str, &indent: str): str! {
+    if (ManagedLiteralConcat(named.parsed.arena.nodes, named.parsed.arena.edges, expression)) {
+        return ManagedLiteralConcatSetup(named, locals, expression, caller_id, target, indent)
+    }
+    left = ProjectionCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.edges[expression.first_edge])
+    right = ProjectionCloneSource(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.edges[expression.first_edge + 1])
+    left_source = managedStringOwnerName(locals, named.parsed.arena.nodes[left - 1])?
+    right_source = managedStringOwnerName(locals, named.parsed.arena.nodes[right - 1])?
+    a = "concat_left" + str(id)
+    b = "concat_right" + str(id)
+    text = indent.clone() + "KuProjectionString " + a.clone() + " = {0}, " + b.clone() + " = {0};\n"
+    text += indent.clone() + "if (!ku_result_clone_string(" + left_source + ", &" + a.clone() + ") ||\n"
+    text += indent.clone() + "    !ku_result_clone_string(" + right_source + ", &" + b.clone() + ") ||\n"
+    text += indent.clone() + "    !ku_managed_string_append(&" + a.clone() + ", " + b.clone() + ", &string_too_large)) {\n"
+    text += indent.clone() + "    ku_projection_string_drop(&" + a.clone() + ");\n"
+    text += indent.clone() + "    ku_projection_string_drop(&" + b.clone() + ");\n"
+    text += indent.clone() + "    out_of_memory = !string_too_large; goto cleanup;\n" + indent.clone() + "}\n"
+    text += indent.clone() + "ku_projection_string_drop(&" + b + ");\n"
+    return ok(text + indent.clone() + target.clone() + " = " + a + ";\n")
+}
+
+fn ManagedIsStringMove(&locals: [GuardBinding], &node: Node, found: int): bool {
+    return node.kind == "Variable" && found != 0 && locals[found - 1].ty.kind == "str" &&
+        locals[found - 1].name != node.text
+}
+
+fn ManagedMoveStringSetup(&named: NamedModule, &locals: [GuardBinding], &node: Node,
+                          caller_id: int, &target: str, &indent: str): str! {
+    binding = ManagedConsumedString(named, locals, node, caller_id)?
+    source = GuardBindingName(binding)
+    return ok(indent.clone() + target.clone() + " = " + source.clone() + ";\n" +
+        indent.clone() + source + " = (KuProjectionString){0};\n")
 }
 
 fn ManagedSourceCharactersRuntime(needs_header: bool): str {
