@@ -9,7 +9,7 @@ import { CheckLinkedStringAppendTarget, FinishLinkedFieldAppend, FinishLinkedStr
 import { LinkedIntSnapshotRuntime, ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
-import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
 import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
@@ -313,8 +313,7 @@ fn LowerLinkedOwnedDestructure(&project: LinkedNullProject, state: LinkedNullSta
     }
     // The fields that need destruction were zeroed by their moves. Copy
     // fields do not carry resources, and the source no longer has a binding.
-    next.slots[owner.slot - 1].live = false
-    return ok(next)
+    return ok(RecordLinkedMemberMove(next, owner))
 }
 
 fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, &result: TypeNameBinding): LinkedNullState! {
