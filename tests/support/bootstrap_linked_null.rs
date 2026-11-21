@@ -1683,3 +1683,115 @@ int main(void) {
         fs::remove_file(cwd.join(name)).unwrap();
     }
 }
+
+const RECORD_RESULT_LITERAL: &str = r#"struct Item { name: str }
+fn Make(index: int, fail_at: int): Item! { return ok(Item { name: "" }) }
+
+fn Build(fail_at: int): [Item]! {
+    return ok([Make(1, fail_at)?, Make(2, fail_at)?, Make(3, fail_at)?, Make(4, fail_at)?,
+        Make(5, fail_at)?, Make(6, fail_at)?, Make(7, fail_at)?, Make(8, fail_at)?,
+        Make(9, fail_at)?, Make(10, fail_at)?])
+}
+
+fn Empty(): [Item]! { return ok([]) }
+fn Borrowed(&item: Item): [Item]! { return ok([item]) }
+"#;
+
+const RECORD_RESULT_LITERAL_HOST: &str = r#"
+static size_t calls;
+static uint8_t *owners[10];
+
+__ITEM_RESULT__ __MAKE__(int64_t index, int64_t fail_at) {
+    assert(index == (int64_t)++calls && calls <= 10);
+    __ITEM_RESULT__ result = {0};
+    if (index == fail_at) {
+        result.error.code = (KuProjectionString){(uint8_t*)"stop", 4, 0, KU_PROJECTION_STRING_STATIC};
+        return result;
+    }
+    uint8_t *owner = malloc(1);
+    assert(owner);
+    *owner = (uint8_t)index;
+    owners[calls - 1] = owner;
+    result.value.f0 = (KuProjectionString){owner, 1, 1, KU_PROJECTION_STRING_OWNED};
+    result.ok = true;
+    return result;
+}
+
+static void check_growth_cleanup(void) {
+    if (calls != 9 || attempts != 11 || outstanding()) _Exit(86);
+}
+
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc == 2) {
+        fail_after = 10;
+        assert(atexit(check_growth_cleanup) == 0);
+        (void)__ENTRY__(0);
+        return 87;
+    }
+    __ENTRY_RESULT__ result = __ENTRY__(0);
+    assert(result.ok && result.value.len == 10 && calls == 10);
+    assert(attempts == 12 && outstanding() == 11);
+    for (size_t i = 0; i < result.value.len; ++i) {
+        assert(result.value.data[i].f0.ptr == owners[i]);
+        assert(*result.value.data[i].f0.ptr == i + 1);
+    }
+    __DROP__(&result.value);
+    assert(!outstanding());
+
+    attempts = 0;
+    calls = 0;
+    result = __ENTRY__(2);
+    assert(!result.ok && !result.value.data && !result.value.len);
+    assert(result.error.code.len == 4 && !memcmp(result.error.code.ptr, "stop", 4));
+    assert(calls == 2 && attempts == 2 && !outstanding());
+    return 0;
+}
+"#;
+
+pub(super) fn assert_owned_record_result_literal(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("record-result-literal.ku"), RECORD_RESULT_LITERAL).unwrap();
+    fs::write(cwd.join("modules.txt"), "record-result-literal.ku\n").unwrap();
+    let NestedPlan {
+        entry,
+        entry_result,
+        dependency,
+        dependency_result,
+        code,
+    } = nested_plan(seed, cwd, "Build", "Struct");
+    let item = dependency_result
+        .strip_prefix("KuBootstrapResult_")
+        .unwrap();
+    let host = RECORD_RESULT_LITERAL_HOST
+        .replace("__ENTRY__", &entry)
+        .replace("__MAKE__", &dependency)
+        .replace("__ENTRY_RESULT__", &entry_result)
+        .replace("__ITEM_RESULT__", &dependency_result)
+        .replace("__DROP__", &format!("ku_linked_view_{item}_drop"));
+    let path = cwd.join("record-result-literal.c");
+    let binary = cwd.join(format!(
+        "record-result-literal{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&path, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&path, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(&binary), cwd, 10));
+    let trapped = execute(Command::new(&binary).arg("growth-failure"), cwd, 10);
+    assert_eq!(trapped.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&trapped.stderr).trim(),
+        "array allocation failed"
+    );
+
+    fs::write(cwd.join("function.txt"), "Empty").unwrap();
+    let empty = execute(&mut Command::new(seed), cwd, 10);
+    assert_ok(&empty);
+    let empty = String::from_utf8(empty.stdout).unwrap();
+    assert!(!empty.contains("_append_move(") && !empty.contains("realloc("));
+
+    fs::write(cwd.join("function.txt"), "Borrowed").unwrap();
+    let borrowed = execute(&mut Command::new(seed), cwd, 10);
+    assert_eq!(borrowed.status.code(), Some(1));
+    assert!(borrowed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&borrowed.stderr).contains("linked_record_array_literal"));
+}

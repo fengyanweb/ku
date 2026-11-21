@@ -15,7 +15,7 @@ import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName 
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
          LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullResultType, LinkedStringResult, ReadLinkedOwnedArray, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { LowerLinkedArguments, LowerLinkedNullValue } from "./linked_null_values_c.ku"
+import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { LinkedCPrelude, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedOkAvailable, LinkedRecordFields, ReadLinkedNullBinding } from "./link_plan_c.ku"
 
@@ -344,7 +344,7 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
     node = LinkedNullNode(project, 1, id)
     next = state
     if (LinkedNullHasResultValue(result)) {
-        value = LowerLinkedNullValue(project, next, id, 0)?
+        value = LowerLinkedExpectedValue(project, next, result, id, 0)?
         copy = LinkedIntResult(result)
         if (!SameLinkedType(value.value.ty, result) || (!copy && (value.value.borrowed || value.value.slot == 0))) {
             RejectLayout("linked_result_return", "return needs a matching Copy int or an initialized matching owner", DeclarationSpan(node))?

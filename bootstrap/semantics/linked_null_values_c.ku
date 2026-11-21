@@ -259,8 +259,8 @@ fn AppendLinkedArrayElement(state: LinkedNullState, &array: LinkedNullValue, &va
     return next
 }
 
-fn lowerLinkedFieldValue(&project: LinkedNullProject, state: LinkedNullState, &target: TypeNameBinding, id: int, depth: int): LinkedNullExpression! {
-    record = target.declaration_kind == "StructArray"
+fn LowerLinkedExpectedValue(&project: LinkedNullProject, state: LinkedNullState, &target: TypeNameBinding, id: int, depth: int): LinkedNullExpression! {
+    record = target.declaration_kind == "StructArray" || LinkedNullOwnedArray(target)
     scalar = target.declaration_kind == "BuiltinArray" && (target.name == "int" || target.name == "str")
     if (depth >= 32 || (!record && !scalar)) {
         return LowerLinkedNullValue(project, state, id, depth)
@@ -306,7 +306,7 @@ fn lowerLinkedLiteral(&project: LinkedNullProject, state: LinkedNullState, &node
         if (field.kind != "StructLiteralField" || field.edge_count != 1 || ordinal == 0 || ContainsIndex(seen, ordinal)) {
             RejectLayout("invalid_linked_literal_field", "expected each declared struct field once", DeclarationSpan(field))?
         }
-        value = lowerLinkedFieldValue(project, next.clone(), fields[ordinal - 1].resolved, LinkedNullChild(project, 1, field, 0), depth + 1)?
+        value = LowerLinkedExpectedValue(project, next.clone(), fields[ordinal - 1].resolved, LinkedNullChild(project, 1, field, 0), depth + 1)?
         string_array = fields[ordinal - 1].resolved.declaration_kind == "BuiltinArray"
             && fields[ordinal - 1].resolved.name == "str" && value.value.ty.declaration_kind == "OwnedStringArray"
         if (!string_array && !MatchesLinkedFieldValue(fields[ordinal - 1].resolved, value.value.ty)) {
