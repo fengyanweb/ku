@@ -132,22 +132,29 @@ fn LowerScalarProgramEntry(&nodes: [Node], &edges: [int], &declarations: [TopLev
                            &bindings: [TypeNameBinding], &imports: [ScalarIntImport],
                            entry: int, can_print: bool, can_use_ok: bool): ScalarIntFunction! {
     function = nodes[entry - 1].clone()
-    cursor = function.first_edge
-    end = cursor + function.edge_count
-    if (function.edge_count < 2 || ScalarReturnType(nodes, edges, bindings, edges[cursor]) != 4) {
+    start = function.first_edge
+    end = start + function.edge_count
+    if (function.edge_count < 2) {
         RejectScalarInt("unsupported_program_entry", "expected an explicit zero-argument main(): null!", DeclarationSpan(function))?
     }
-    cursor = cursor + 1
+    result_type = ScalarReturnType(nodes, edges, bindings, edges[start])
+    if (result_type != 4) {
+        RejectScalarInt("unsupported_program_entry", "expected an explicit zero-argument main(): null!", DeclarationSpan(function))?
+    }
+    first_body = start + 1
     parameters: [ScalarIntParameter] = []
-    if (HasScalarControlBody(nodes, edges, cursor, end, true)) {
+    control = HasScalarControlBody(nodes, edges, first_body, end, true)
+    if (control) {
         body = LowerScalarControlBody(nodes, edges, declarations, bindings, imports, parameters,
-            0, cursor, end, entry, can_print, can_use_ok)?
+            0, first_body, end, entry, can_print, can_use_ok)?
         return ok(ScalarIntFunction { function_node: entry, parameters: parameters, clauses: body.clauses, result_type: 4,
             uses_string_comparison: body.uses_string_comparison, uses_string_contains: body.uses_string_contains,
             uses_string_join: false, uses_string_replace: false, owned_string_body: "" })
     }
     instructions: [ScalarIntInstruction] = []
-    while (cursor < end - 1) {
+    last = end - 1
+    cursor = first_body
+    while (cursor < last) {
         statement_id = edges[cursor]
         statement = nodes[statement_id - 1].clone()
         argument = programOutputArgument(nodes, edges, statement, can_print)?
