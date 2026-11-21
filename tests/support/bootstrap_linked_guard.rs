@@ -975,7 +975,6 @@ fn Read(value: int): int! {
 }
 fn Wrong(): int! { return ok("wrong") }
 fn Indexed(&items: [int], slot: int): int { return items[slot] }
-fn WrongPlain(): int { return "wrong" }
 "#,
     )
     .unwrap();
@@ -1057,10 +1056,16 @@ int main(int argc, char **argv) {
     let bounds = execute(Command::new(&exe).arg("bounds"), cwd, 15);
     assert_eq!(bounds.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&bounds.stderr).contains("index 3 out of bounds"));
+    fs::write(
+        cwd.join("wrong-plain.ku"),
+        "fn WrongPlain(): int { return \"wrong\" }\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "wrong-plain.ku\n").unwrap();
     fs::write(cwd.join("function.txt"), "WrongPlain").unwrap();
     let rejected = execute(&mut Command::new(seed), cwd, 30);
     assert_eq!(rejected.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_value_return"));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("return_type"));
 }
 
 pub(super) fn assert_checked_str_predicate(seed: &Path, cwd: &Path) {
