@@ -8892,7 +8892,7 @@ fn run_program_with_stack(program: Program, base_dir: PathBuf) -> Result<(), KuE
         .name("ku-interpreter".to_string())
         .stack_size(INTERPRETER_STACK_SIZE)
         .spawn(move || {
-            let mut interpreter = Interpreter::with_base_dir(base_dir);
+            let mut interpreter = Interpreter::with_checked_base_dir(base_dir);
             interpreter.run(program)
         })
         .map_err(|err| KuError::message(format!("failed to start interpreter: {err}")))?
