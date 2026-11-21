@@ -67,7 +67,7 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
     if (body.uses_mul) { ops += ScalarCheckedMultiplyC() }
     header = LinkedCPrelude(body, ops + GuardStringEquality(body.uses_string_equal))
     declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
-    return ok(declarations + EmitLinkedNullPrototypes(body.links, result)?)
+    return ok(declarations + EmitLinkedNullPrototypes(body.links, result, !body.plain_value_result)?)
 }
 
 fn EmitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &payload: TypeNameBinding): str! {

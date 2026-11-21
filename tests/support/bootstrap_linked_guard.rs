@@ -953,6 +953,66 @@ pub(super) fn assert_decorated_caught_error(seed: &Path, cwd: &Path) {
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("linked_error_member_moved"));
 }
 
+pub(super) fn assert_checked_copy_int(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("checked-int.ku"),
+        r#"fn Copy(value: int, zero: bool, deny: bool): int! {
+    if (deny) { fail { domain: "test", code: "denied", message: "int" } }
+    if (zero) { return ok(0) }
+    return ok(value)
+}
+fn Read(value: int): int! {
+    out = Copy(value, false, false)?
+    return ok(out)
+}
+fn Wrong(): int! { return ok("wrong") }
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "checked-int.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Copy").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let text = String::from_utf8(emitted.stdout).unwrap();
+    let entry = text
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+#include <assert.h>
+int main(void) {
+    KuBootstrapResult_int64_t zero = ENTRY(INT64_MIN, true, false);
+    KuBootstrapResult_int64_t value = ENTRY(INT64_MIN, false, false);
+    KuBootstrapResult_int64_t failure = ENTRY(INT64_MAX, false, true);
+    assert(zero.ok && zero.value == 0);
+    assert(value.ok && value.value == INT64_MIN);
+    assert(!failure.ok && failure.error.code.len == 6 && failure.error.code.ptr[0] == 'd');
+    return 0;
+}
+"#
+    .replace("ENTRY", entry);
+    let c = cwd.join("checked-int.c");
+    let exe = cwd.join(format!("checked-int{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("{text}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    fs::write(cwd.join("function.txt"), "Read").unwrap();
+    let forwarded = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&forwarded);
+    let text = String::from_utf8(forwarded.stdout).unwrap();
+    assert_eq!(text.matches("} KuBootstrapResult_int64_t;").count(), 1);
+    assert!(text.contains("extern KuBootstrapResult_int64_t"));
+    fs::write(cwd.join("function.txt"), "Wrong").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_result_return"));
+}
+
 pub(super) fn assert_checked_str_predicate(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("predicate.ku"),

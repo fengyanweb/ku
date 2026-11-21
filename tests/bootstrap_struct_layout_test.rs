@@ -4405,6 +4405,7 @@ int main(int argc, char **argv) {
     linked_guard::assert_ignored_result_cleanup(&compiler, &cwd);
     linked_guard::assert_checked_string_rebind(&compiler, &cwd);
     linked_guard::assert_checked_str_predicate(&compiler, &cwd);
+    linked_guard::assert_checked_copy_int(&compiler, &cwd);
     struct_view::assert_named_struct_view(&compiler, &cwd);
     member_move::assert_owned_member_transfer(&compiler, &cwd);
     linked_guard::assert_linked_call_addition(&compiler, &cwd);

@@ -112,9 +112,13 @@ fn LinkedStringResult(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Builtin" && binding.name == "str"
 }
 
+fn LinkedIntResult(&binding: TypeNameBinding): bool {
+    return binding.declaration_kind == "Builtin" && binding.name == "int"
+}
+
 fn LinkedNullHasResultValue(&binding: TypeNameBinding): bool {
     return LinkedNullOwnedArray(binding) || binding.declaration_kind == "Struct" || LinkedStringResult(binding)
-        || binding.declaration_kind == "OwnedStringArray"
+        || LinkedIntResult(binding) || binding.declaration_kind == "OwnedStringArray"
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
@@ -388,7 +392,7 @@ fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
     return ok(text + ");\n")
 }
 
-fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &payload: TypeNameBinding): str! {
+fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &payload: TypeNameBinding, checked: bool): str! {
     text = ""
     records: [str] = []
     string_result = LinkedStringResult(payload)
@@ -398,13 +402,13 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &payload: TypeNameBind
         index = index + 1
     }
     if (string_result) { text = StructValueResultHeader("KuProjectionString") }
-    if (payload.declaration_kind == "Struct") {
+    if (payload.declaration_kind == "Struct" || (checked && LinkedIntResult(payload))) {
         root = LinkedNullCType(payload)?
         text += StructValueResultHeader(root)
         records = records.push(root)
     }
     for dependency in links.clone() {
-        if (dependency.returns_result && dependency.result.declaration_kind == "Struct") {
+        if (dependency.returns_result && (dependency.result.declaration_kind == "Struct" || LinkedIntResult(dependency.result))) {
             kind = LinkedNullCType(dependency.result)?
             if (!ContainsType(records, kind)) {
                 text += StructValueResultHeader(kind)

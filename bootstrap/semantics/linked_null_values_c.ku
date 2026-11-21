@@ -7,7 +7,7 @@ import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, RememberLinkedCall, LinkedNullBinding, LinkedOkAvailable, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitLinkedIntAppend, ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
-import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
+import { LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { CloneLinkedLocalArrayItem, CloneLinkedRecord, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AddLinkedNullSlot, CloneLinkedStringSlot, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix } from "./linked_parameters_c.ku"
@@ -121,7 +121,7 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
     target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
     callee = ResolveLinkedCall(project, state.slots, call, target, true)?
     if (owns_value && !LinkedNullHasResultValue(callee.result)) {
-        RejectLayout("linked_dependency_result", "expected an owning Result for a value", DeclarationSpan(unwrap))?
+        RejectLayout("linked_dependency_result", "expected a Result with a value payload", DeclarationSpan(unwrap))?
     }
     arguments = lowerLinkedArguments(project, state, call, callee, id, depth)?
     result = "dependency" + str(id)
@@ -267,12 +267,16 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
     next = state
     if (LinkedNullHasResultValue(result)) {
         value = LowerLinkedNullValue(project, next, id, 0)?
-        if (!SameLinkedType(value.value.ty, result) || value.value.borrowed || value.value.slot == 0) {
-            RejectLayout("linked_result_return", "return requires an initialized matching owner", DeclarationSpan(node))?
+        copy = LinkedIntResult(result)
+        if (!SameLinkedType(value.value.ty, result) || (!copy && (value.value.borrowed || value.value.slot == 0))) {
+            RejectLayout("linked_result_return", "return needs a matching Copy int or an initialized matching owner", DeclarationSpan(node))?
         }
         value.state.code = value.state.code + "    result.value = " + value.value.text.clone() + ";\n"
-        owner = value.value.clone()
-        next = MoveLinkedNullSlot(value.state, owner)?
+        if (copy) { next = value.state }
+        else {
+            owner = value.value.clone()
+            next = MoveLinkedNullSlot(value.state, owner)?
+        }
     } else if (node.kind != "Null" || node.edge_count != 0) {
         RejectLayout("unsupported_linked_success", "expected builtin ok with literal null", DeclarationSpan(call))?
     }
