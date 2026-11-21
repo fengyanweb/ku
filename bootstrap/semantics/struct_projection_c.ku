@@ -69,13 +69,13 @@ fn RequireProjectionBuiltin(&imports: [ImportBinding], &supplied: [SuppliedModul
     found = false
     if (receiver.kind == "Variable" && receiver.edge_count == 0) {
         index = 0
-        while (index < imports.len()) {
+        while (!found && index < imports.len()) {
             if (imports[index].local_name == receiver.text && imports[index].source_name == namespace
                 && imports[index].module_index == 0) {
                 found = true
-                break
+            } else {
+                index = index + 1
             }
-            index = index + 1
         }
     }
     if (!found) {
