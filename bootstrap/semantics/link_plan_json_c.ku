@@ -13,7 +13,7 @@ fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): 
     path = "null"
     if (ty.unit > 0) {
         path = LinkPlanJsonText(supplied[ty.unit - 1].path.clone(), controls)?
-        if (ty.kind != "IntResultAppendCallback") {
+        if (ty.nominals.len() == 0) {
             name = supplied[ty.unit - 1].named.parsed.arena.nodes[ty.node - 1].text.clone()
         }
     }
@@ -22,7 +22,7 @@ fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): 
     text = "{\"kind\":" + LinkPlanJsonText(ty.kind.clone(), controls)? + ",\"source_name\":" + LinkPlanJsonText(name, controls)?
         + ",\"source_path\":" + path + ",\"node\":" + str(ty.node) + ",\"c_type\":" + LinkPlanJsonText(ty.c_type.clone(), controls)?
         + ",\"passing\":" + LinkPlanJsonText(passing, controls)?
-    if (ty.kind == "IntResultAppendCallback") {
+    if (ty.nominals.len() > 0) {
         text += ",\"nominals\":["
         index = 0
         while (index < ty.nominals.len()) {
@@ -102,8 +102,13 @@ fn LinkedIntAppendCallbackFunction(&project: LinkedNullProject, unit: int, id: i
     if (first_record.declaration_kind != "Struct" || second_record.declaration_kind != "Struct") {
         RejectLayout("linked_callback_type", "both scoped append record arguments must be nominal structs", DeclarationSpan(node))?
     }
-    string = LinkedBuiltin("str", DeclarationSpan(node))
     integer = LinkedBuiltin("int", DeclarationSpan(node))
+    if (node.edge_count == 4) {
+        boolean = LinkedBuiltin("bool", DeclarationSpan(node))
+        return ok(LinkedNullFunction { unit: unit, node: id, symbol: "",
+            parameters: [first_record, second_record, boolean], result: integer, returns_result: true })
+    }
+    string = LinkedBuiltin("str", DeclarationSpan(node))
     array = integer.clone()
     array.declaration_kind = "OwnedIntArray"
     return ok(LinkedNullFunction { unit: unit, node: id, symbol: "",
@@ -130,10 +135,13 @@ fn PrepareLinkedAppendCallbackPlan(&project: LinkedNullProject, declaration: Lin
     index = 0
     while (index < declaration.parameters.len()) {
         ty = declaration.parameters[index].clone()
-        if (ty.kind == "IntResultAppendCallback") {
+        if (ty.kind == "IntResultAppendCallback" || ty.kind == "IntResultArenaCallback") {
             checked = LinkedIntAppendCallbackFunction(project, ty.unit, ty.node)?
-            a = checked.parameters[3].clone()
-            b = checked.parameters[5].clone()
+            first = 3
+            second = 5
+            if (ty.kind == "IntResultArenaCallback") { first = 0; second = 1 }
+            a = checked.parameters[first].clone()
+            b = checked.parameters[second].clone()
             nominals: [LinkPlanNominalType] = [
                 LinkPlanNominalType { unit: a.module_index, node: a.declaration_node, c_type: LinkedNullCType(a)? },
                 LinkPlanNominalType { unit: b.module_index, node: b.declaration_node, c_type: LinkedNullCType(b)? }

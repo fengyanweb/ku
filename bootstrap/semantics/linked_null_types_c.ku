@@ -8,7 +8,7 @@ import { ResolveTypeName, SameBoundTypeIdentity, TypeNameBinding } from "./type_
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { CTypeName, ProjectionBuiltinLinkFor, ProjectionBuiltinLinkId, ProjectionBytesGet, LinkedBufferResult, LinkedIntArrayCallbackNominal, LinkedIntAppendCallbackNominals, RequireProjectionLocalFunction, ProjectionPlaceRoot, RequireProjectionBuiltin, ResolveProjectionDirectFunction } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningStructDropReference } from "./nested_struct_c.ku"
-import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, IntArrayLinkPlanType, LinkedIntArrayCallbackCarrier, LinkedIntAppendCallbackBinding, LinkedIntAppendCallbackCarrier, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, IntArrayLinkPlanType, LinkedIntArrayCallbackCarrier, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -83,9 +83,12 @@ fn readIntPairResultCallback(&project: LinkedNullProject, unit: int, &node: Node
 
 fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view: bool): TypeNameBinding! {
     node = LinkedNullNode(project, unit, id)
-    if (!view && node.kind == "TypeFunction" && node.edge_count == 7) {
+    if (!view && node.kind == "TypeFunction" && (node.edge_count == 7 || node.edge_count == 4)) {
         LinkedIntAppendCallbackNominals(project.supplied[unit - 1].named, node)?
-        return ok(LinkedIntAppendCallbackBinding(unit, id, DeclarationSpan(node)))
+        kind = "IntResultAppendCallback"
+        if (node.edge_count == 4) { kind = "IntResultArenaCallback" }
+        return ok(TypeNameBinding { use_node: id, name: "fn", declaration_kind: kind,
+            module_index: unit, declaration_node: id, span: DeclarationSpan(node) })
     }
     if (!view && node.kind == "TypeFunction" && node.edge_count == 5) {
         nominal = LinkedIntArrayCallbackNominal(project.supplied[unit - 1].named, node)?
@@ -158,7 +161,11 @@ fn LinkedNullHasResultValue(&binding: TypeNameBinding): bool {
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
-    if (binding.declaration_kind == "IntResultAppendCallback") { return ok(LinkedIntAppendCallbackCarrier(binding)) }
+    if (binding.declaration_kind == "IntResultAppendCallback" || binding.declaration_kind == "IntResultArenaCallback") {
+        prefix = "KuBootstrapIntAppendCallback_m"
+        if (binding.declaration_kind == "IntResultArenaCallback") { prefix = "KuBootstrapIntArenaCallback_m" }
+        return ok(prefix + str(binding.module_index) + "_" + str(binding.declaration_node))
+    }
     if (binding.declaration_kind == "IntArrayResultCallback") { return ok(LinkedIntArrayCallbackCarrier(binding)) }
     if (binding.declaration_kind == "IntPairResultCallback") {
         return ok("KuBootstrapIntPairCallback_" + CTypeName(binding.module_index, binding.declaration_node))

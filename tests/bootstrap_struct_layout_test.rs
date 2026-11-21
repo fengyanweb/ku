@@ -4503,6 +4503,7 @@ int main(int argc, char **argv) {
     linked_guard::assert_int_array_record_snapshot(&compiler, &cwd);
     linked_guard::assert_scoped_int_array_callback(&compiler, python, &cwd);
     linked_guard::assert_two_nominal_callback(&compiler, python, &cwd);
+    linked_guard::assert_arena_callback(&compiler, python, &cwd);
     linked_guard::assert_empty_owned_int_argument(&compiler, &cwd);
     linked_guard::assert_named_array_parameter_move(&compiler, &cwd);
     linked_guard::assert_owned_local_member_set(&compiler, &cwd);

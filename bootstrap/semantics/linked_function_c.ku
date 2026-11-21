@@ -52,7 +52,11 @@ fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunc
             if (callbacks[index].declaration_kind == "IntArrayResultCallback") {
                 text += LinkedIntArrayCallbackDeclaration(kind, LinkedNullCType(signature.parameters[3])?)
             } else {
-                text += LinkedIntAppendCallbackDeclaration(kind, LinkedNullCType(signature.parameters[3])?, LinkedNullCType(signature.parameters[5])?)
+                arena = callbacks[index].declaration_kind == "IntResultArenaCallback"
+                first = 3
+                second = 5
+                if (arena) { first = 0; second = 1 }
+                text += LinkedIntAppendCallbackDeclaration(kind, LinkedNullCType(signature.parameters[first])?, LinkedNullCType(signature.parameters[second])?, arena)
             }
             records = records.push(kind)
         }

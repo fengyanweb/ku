@@ -140,15 +140,6 @@ fn LinkedIntArrayCallbackCarrier(&ty: TypeNameBinding): str {
     return "KuBootstrapIntArrayCallback_" + CTypeName(ty.module_index, ty.declaration_node)
 }
 
-fn LinkedIntAppendCallbackBinding(unit: int, node: int, at: Span): TypeNameBinding {
-    return TypeNameBinding { use_node: node, name: "fn", declaration_kind: "IntResultAppendCallback",
-        module_index: unit, declaration_node: node, span: at }
-}
-
-fn LinkedIntAppendCallbackCarrier(&ty: TypeNameBinding): str {
-    return "KuBootstrapIntAppendCallback_m" + str(ty.module_index) + "_" + str(ty.declaration_node)
-}
-
 fn LinkedIntArrayCallbackFunction(&ty: TypeNameBinding): LinkedNullFunction {
     array = TypeNameBinding { use_node: 0, name: "int", declaration_kind: "OwnedIntArray",
         module_index: 0, declaration_node: 0, span: ty.span.clone() }
@@ -161,7 +152,8 @@ fn LinkedIntArrayCallbackFunction(&ty: TypeNameBinding): LinkedNullFunction {
 }
 
 fn IsLinkedScopedCallback(&ty: TypeNameBinding): bool {
-    return ty.declaration_kind == "IntArrayResultCallback" || ty.declaration_kind == "IntResultAppendCallback"
+    return ty.declaration_kind == "IntArrayResultCallback" || ty.declaration_kind == "IntResultAppendCallback" ||
+        ty.declaration_kind == "IntResultArenaCallback"
 }
 
 fn LinkedScopedCallbackTypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlot]): [TypeNameBinding] {

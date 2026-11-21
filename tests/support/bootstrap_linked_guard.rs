@@ -1007,8 +1007,6 @@ int main(int argc, char **argv) {
 }
 
 pub(super) fn assert_two_nominal_callback(seed: &Path, python: &str, cwd: &Path) {
-    let caller = "append-callback-caller.ku";
-    let receiver = "append-callback-receiver.ku";
     let source = r#"import { Place, Note, Relay } from "./append-callback-receiver.ku"
 fn Run(note: Note): int! {
     nodes: [int] = []
@@ -1027,10 +1025,7 @@ fn Run(note: Note): int! {
     return ok(nodes[0] + result)
 }
 "#;
-    fs::write(cwd.join(caller), source).unwrap();
-    fs::write(
-        cwd.join(receiver),
-        r#"struct Place { offset: int }
+    let provider = r#"struct Place { offset: int }
 struct OtherPlace { offset: int }
 struct Note { label: str score: int reject: bool fatal: bool }
 fn Apply(action: fn(str, str, int, Place, [int], Note): int!, note: Note): int! {
@@ -1045,9 +1040,82 @@ fn Apply(action: fn(str, str, int, Place, [int], Note): int!, note: Note): int! 
 fn Relay(action: fn(str, str, int, Place, [int], Note): int!, note: Note): int! {
     return Apply(action.clone(), note)
 }
-"#,
-    )
-    .unwrap();
+"#;
+    let mismatched_nominal = source
+        .replace("Place, Note", "Place, OtherPlace, Note")
+        .replace("place: Place", "place: OtherPlace");
+    assert_nominal_int_callback(
+        seed,
+        python,
+        cwd,
+        (source, provider),
+        &mismatched_nominal,
+        "KuBootstrapIntAppendCallback_m",
+    );
+}
+
+pub(super) fn assert_arena_callback(seed: &Path, python: &str, cwd: &Path) {
+    let source = r#"import { Parcel, Note, Relay } from "./append-callback-receiver.ku"
+fn Run(note: Note): int! {
+    nodes: [int] = []
+    fn Build(packet: Parcel, tag: Note, combine: bool): int! {
+        if (tag.reject) {
+            message = tag.label.clone()
+            fail { domain: "test", code: "reject", message: message }
+        }
+        total = packet.count
+        if (combine) { total = total + tag.score }
+        if (tag.fatal) { total = nodes[0 - 1] }
+        nodes = nodes.push(total)
+        return ok(total)
+    }
+    result = Relay(Build.clone(), note)?
+    return ok(nodes[0] + result)
+}
+"#;
+    let provider = r#"struct Parcel { payload: str count: int }
+struct OtherParcel { payload: str count: int }
+struct Note { label: str score: int reject: bool fatal: bool }
+fn Apply(action: fn(Parcel, Note, bool): int!, note: Note): int! {
+    try {
+        begin = "first".clone()
+        first = action(Parcel { payload: begin, count: 31 },
+                       Note { label: "begin", score: 1, reject: false, fatal: false }, false)?
+        tail = "second".clone()
+        return action(Parcel { payload: tail, count: first + 2 }, note, true)
+    } catch(err) {
+        return ok(0)
+    }
+}
+fn Relay(action: fn(Parcel, Note, bool): int!, note: Note): int! {
+    return Apply(action.clone(), note)
+}
+"#;
+    let mismatched_nominal = source
+        .replace("Parcel, Note", "Parcel, OtherParcel, Note")
+        .replace("packet: Parcel", "packet: OtherParcel");
+    assert_nominal_int_callback(
+        seed,
+        python,
+        cwd,
+        (source, provider),
+        &mismatched_nominal,
+        "KuBootstrapIntArenaCallback_m",
+    );
+}
+
+fn assert_nominal_int_callback(
+    seed: &Path,
+    python: &str,
+    cwd: &Path,
+    sources: (&str, &str),
+    mismatched_nominal: &str,
+    carrier_prefix: &str,
+) {
+    let caller = "append-callback-caller.ku";
+    let receiver = "append-callback-receiver.ku";
+    fs::write(cwd.join(caller), sources.0).unwrap();
+    fs::write(cwd.join(receiver), sources.1).unwrap();
     let cc =
         std::env::var("CC").unwrap_or_else(|_| if cfg!(windows) { "clang" } else { "cc" }.into());
     let mut link = Command::new(python);
@@ -1067,7 +1135,7 @@ fn Relay(action: fn(str, str, int, Place, [int], Note): int!, note: Note): int! 
         let emitted = execute(&mut Command::new(seed), cwd, 30);
         assert_ok(&emitted);
         let code = String::from_utf8(emitted.stdout).unwrap();
-        assert!(code.contains("KuBootstrapIntAppendCallback_m"));
+        assert!(code.contains(carrier_prefix));
         if name == "Run" {
             let (symbol, parameters) = code
                 .lines()
@@ -1128,13 +1196,7 @@ int main(int argc, char **argv) {
     let fatal = execute(Command::new(exe).arg("invalid-index"), cwd, 10);
     assert_eq!(fatal.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&fatal.stderr).contains("index -1 out of bounds for length 1"));
-    fs::write(
-        cwd.join(caller),
-        source
-            .replace("Place, Note", "Place, OtherPlace, Note")
-            .replace("place: Place", "place: OtherPlace"),
-    )
-    .unwrap();
+    fs::write(cwd.join(caller), mismatched_nominal).unwrap();
     fs::write(cwd.join("modules.txt"), format!("{caller}\n{receiver}\n")).unwrap();
     fs::write(cwd.join("function.txt"), "Run").unwrap();
     fs::write(cwd.join("mode.txt"), "linked-null").unwrap();

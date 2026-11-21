@@ -394,14 +394,21 @@ fn LinkedIntArrayCallbackNominal(&named: NamedModule, &node: Node): int! {
 
 fn LinkedIntAppendCallbackNominals(&named: NamedModule, &node: Node): [int]! {
     nominals: [int] = []
+    count = node.edge_count - 1
+    arena = count == 3
     index = 0
-    while (index < 6) {
+    while (index < count) {
         part = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge + index] - 1].clone()
         if (part.kind != "TypeParameter" || part.edge_count != 1 || part.text != "") {
             RejectLayout("linked_callback_type", "scoped append callback arguments must be by-value", DeclarationSpan(part))?
         }
         ty = named.parsed.arena.edges[part.first_edge]
-        if (index == 3 || index == 5) { nominals = nominals.push(ty) }
+        if (arena) {
+            if (index < 2) { nominals = nominals.push(ty) }
+            else if (!linkedCallbackBuiltinType(named, ty, false, "bool")) {
+                RejectLayout("linked_callback_type", "scoped arena callback needs two records and a bool", DeclarationSpan(part))?
+            }
+        } else if (index == 3 || index == 5) { nominals = nominals.push(ty) }
         else {
             name = "int"
             if (index < 2) { name = "str" }
@@ -411,7 +418,7 @@ fn LinkedIntAppendCallbackNominals(&named: NamedModule, &node: Node): [int]! {
         }
         index += 1
     }
-    result = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge + 6] - 1].clone()
+    result = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge + count] - 1].clone()
     if (result.kind != "TypeResult" || result.edge_count != 1 ||
         !linkedCallbackBuiltinType(named, named.parsed.arena.edges[result.first_edge], false, "int")) {
         RejectLayout("linked_callback_type", "scoped append callback must return int!", DeclarationSpan(result))?
@@ -437,9 +444,11 @@ fn LinkedIntArrayCallbackDeclaration(&name: str, &nominal: str): str {
         + nominal.clone() + "); void *environment; KuLocalAppendFailure *failure; } " + name.clone() + ";\n"
 }
 
-fn LinkedIntAppendCallbackDeclaration(&name: str, &first: str, &second: str): str {
-    return "typedef struct { KuBootstrapResult_int64_t (*entry)(void*, KuLocalAppendFailure*, KuProjectionString, KuProjectionString, int64_t, "
-        + first.clone() + ", KuArrayInt, " + second.clone() + "); void *environment; KuLocalAppendFailure *failure; } " + name.clone() + ";\n"
+fn LinkedIntAppendCallbackDeclaration(&name: str, &first: str, &second: str, arena: bool): str {
+    params = "KuProjectionString, KuProjectionString, int64_t, " + first.clone() + ", KuArrayInt, " + second.clone()
+    if (arena) { params = first.clone() + ", " + second.clone() + ", bool" }
+    return "typedef struct { KuBootstrapResult_int64_t (*entry)(void*, KuLocalAppendFailure*, "
+        + params + "); void *environment; KuLocalAppendFailure *failure; } " + name.clone() + ";\n"
 }
 
 fn LinkedIntArrayCallbackFaultPending(&pointer: str): str {

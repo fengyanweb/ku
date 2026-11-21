@@ -162,9 +162,11 @@ fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &el
 fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, ty: TypeNameBinding): LinkedNullState! {
     next = state
     if (IsLinkedScopedCallback(ty)) {
-        carrier = LinkedBuiltin("int", ty.span.clone())
-        carrier.declaration_kind = "BuiltinArray"
-        next = RegisterLinkedIntArray(next, carrier)
+        if (ty.declaration_kind != "IntResultArenaCallback") {
+            carrier = LinkedBuiltin("int", ty.span.clone())
+            carrier.declaration_kind = "BuiltinArray"
+            next = RegisterLinkedIntArray(next, carrier)
+        }
         signature = LinkedScopedCallbackFunction(project, ty)?
         index = 0
         while (index < signature.parameters.len()) {
