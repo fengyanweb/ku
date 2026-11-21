@@ -327,7 +327,7 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
             padding = padding - 1
         }
         if (control == "if") {
-            text += indent + "if (" + clause.condition + ") {\n"
+            text += indent + "if (0 != (" + clause.condition + ")) {\n"
             depth = depth + 1
             continue
         } else if (control == "else") {
@@ -340,7 +340,7 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         }
         guarded = clause.condition != ""
         if (guarded) {
-            text += "    if (" + clause.condition + ") {\n"
+            text += "    if (0 != (" + clause.condition + ")) {\n"
             indent = "        "
         }
         result_node = 0
