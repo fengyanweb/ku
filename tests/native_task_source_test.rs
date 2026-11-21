@@ -117,27 +117,10 @@ fn native_task_moves_a_nominal_unit_enum_into_a_waiting_child() {
     let path = directory.path();
     fs::write(
         path.join("worker.ku"),
-        r#"
-import time from "std.time"
-enum Phase { Ready, Done }
-async fn Approve(phase: Phase, label: str): bool! {
-    time.sleep(30)?
-    println(label)
-    if (phase == Phase.Done) { return ok(true) }
-    return ok(false)
-}
-"#,
+        include_str!("fixtures/native_task_enum_parameter/worker.ku"),
     )
     .unwrap();
-    let source = r#"
-import { Phase, Approve } from "./worker"
-async fn main(): null! {
-    phase = Phase.Ready
-    println((await Approve(phase, "准备🙂"))?)
-    println((await Approve(Phase.Done, "完成🙂"))?)
-    return ok(null)
-}
-"#;
+    let source = include_str!("fixtures/native_task_enum_parameter/main.ku");
     fs::write(path.join("main.ku"), source).unwrap();
     fs::write(
         path.join("moved.ku"),
@@ -156,7 +139,7 @@ async fn main(): null! {
         (output.status.success(), stdout, stderr)
     };
     let (passed, stdout, stderr) = result(&["run", "main.ku"]);
-    let expected = "准备🙂\nfalse\n完成🙂\ntrue\n";
+    let expected = include_str!("fixtures/native_task_enum_parameter/expected.txt");
     assert!(passed, "{stderr}");
     assert_eq!(stdout, expected);
     let (accepted_move, _, stderr) = result(&["build", "--native", "moved.ku"]);

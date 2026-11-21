@@ -1,0 +1,7 @@
+import { Phase, Approve } from "./worker"
+async fn main(): null! {
+    phase = Phase.Ready
+    println((await Approve(phase, "准备🙂"))?)
+    println((await Approve(Phase.Done, "完成🙂"))?)
+    return ok(null)
+}

@@ -1,0 +1,8 @@
+import time from "std.time"
+enum Phase { Ready, Done }
+async fn Approve(phase: Phase, label: str): bool! {
+    time.sleep(30)?
+    println(label)
+    if (phase == Phase.Done) { return ok(true) }
+    return ok(false)
+}
