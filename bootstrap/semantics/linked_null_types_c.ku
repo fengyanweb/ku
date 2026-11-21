@@ -6,7 +6,7 @@ import { SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
 import { ResolveTypeName, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
-import { CTypeName } from "./struct_projection_c.ku"
+import { CTypeName, ProjectionPlaceRoot, RequireProjectionBuiltin } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayLinkPlanType, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
@@ -307,45 +307,37 @@ fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bo
     return ok(result)
 }
 
-fn linkedFsRead(&project: LinkedNullProject, unit: int, &target: Node): LinkedNullFunction! {
+fn linkedCheckedBuiltin(&project: LinkedNullProject, unit: int, &target: Node): LinkedNullFunction! {
+    filesystem = target.text == "read"
+    namespace = "string"
+    provider = "std/string.ku"
+    if (filesystem) {
+        namespace = "fs"
+        provider = "std/fs.ku"
+    }
     at = DeclarationSpan(target)
     receiver = LinkedNullNode(project, unit, LinkedNullChild(project, unit, target, 0))
-    found = false
-    if (receiver.kind == "Variable" && receiver.edge_count == 0) {
-        index = 0
-        while (index < project.binding.modules[unit - 1].imports.len()) {
-            binding = project.binding.modules[unit - 1].imports[index].clone()
-            if (binding.local_name == receiver.text && binding.source_name == "fs" && binding.module_index == 0) {
-                found = true
-                break
-            }
-            index = index + 1
-        }
+    RequireProjectionBuiltin(project.binding.modules[unit - 1].imports, project.supplied, receiver, namespace, provider, at.clone())?
+    input = LinkedBuiltin("str", at.clone())
+    input.declaration_kind = "StringView"
+    if (filesystem) {
+        return ok(LinkedNullFunction { unit: 0, node: 1, symbol: "ku_linked_dep_fs_read", parameters: [input],
+            result: LinkedBuiltin("str", at), returns_result: true })
     }
-    if (!found) {
-        RejectLayout("undefined_linked_dependency", "expected the bound standard filesystem namespace", at.clone())?
-    }
-    index = 0
-    while (index < project.supplied.len()) {
-        if (project.supplied[index].path == "std/fs.ku") {
-            RejectLayout("linked_builtin_collision", "a source module occupies the builtin fs provider path", at.clone())?
-        }
-        index = index + 1
-    }
-    path = LinkedBuiltin("str", at.clone())
-    path.declaration_kind = "StringView"
-    return ok(LinkedNullFunction { unit: 0, node: 1, symbol: "ku_linked_dep_fs_read", parameters: [path],
-        result: LinkedBuiltin("str", at), returns_result: true })
+    index_type = LinkedBuiltin("int", at.clone())
+    return ok(LinkedNullFunction { unit: 0, node: 2, symbol: "ku_linked_dep_string_slice",
+        parameters: [input, index_type.clone(), index_type], result: LinkedBuiltin("str", at), returns_result: true })
 }
 
 fn LinkedNullCallSymbol(&callee: LinkedNullFunction): str {
-    if (callee.unit == 0) { return "ku_linked_fs_read" }
+    if (callee.unit == 0 && callee.node == 1) { return "ku_linked_fs_read" }
     return callee.symbol.clone()
 }
 
 fn LinkedNullDependency(&project: LinkedNullProject, from_unit: int, &target: Node, checked: bool): LinkedNullFunction! {
-    if (checked && target.kind == "Field" && target.text == "read" && target.edge_count == 1) {
-        return linkedFsRead(project, from_unit, target)
+    if (checked && target.kind == "Field" && target.edge_count == 1
+        && (target.text == "read" || target.text == "slice")) {
+        return linkedCheckedBuiltin(project, from_unit, target)
     }
     identity = linkedDirectFunction(project, from_unit, target)?
     unit = identity[0]
@@ -411,11 +403,21 @@ fn ResolveLinkedCall(&project: LinkedNullProject, &slots: [LinkedNullSlot], &cal
     if (callee.parameters.len() != call.edge_count - 1) {
         RejectLayout("linked_dependency_arity", "argument count differs from the bound function declaration", DeclarationSpan(call))?
     }
+    if (callee.unit == 0 && callee.node == 2) {
+        input = LinkedNullChild(project, 1, call, 1)
+        root = ProjectionPlaceRoot(project.supplied[0].named.parsed.arena.nodes,
+                                   project.supplied[0].named.parsed.arena.edges, input)
+        slot = LinkedNullBinding(slots, root)
+        if (slot != 0 && slots[slot - 1].value.borrowed) {
+            RejectLayout("linked_slice_borrow", "string.slice requires an owned source value; clone the View explicitly",
+                         DeclarationSpan(LinkedNullNode(project, 1, input)))?
+        }
+    }
     return ok(callee)
 }
 
 fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
-    if (callee.unit == 0) { return ok(FsReadLinkPlan(callee.symbol.clone())) }
+    if (callee.unit == 0 && callee.node == 1) { return ok(FsReadLinkPlan(callee.symbol.clone())) }
     parameters: [LinkPlanType] = []
     index = 0
     while (index < callee.parameters.len()) {

@@ -16366,30 +16366,7 @@ fn emit_string_slice_helper(out: &mut COutput, program: &IrProgram) -> KuResult<
     if !result_inners.contains(&IrType::Str) {
         return Ok(());
     }
-    out.push_str(
-        "static KuResult_str ku_string_slice(KuString s, int64_t start, int64_t end) {\n\
-        \x20 if (start < 0 || end < 0) {\n\
-        \x20   return (KuResult_str){ false, (KuString){0}, ku_error_make(ku_string_static((const uint8_t*)\"string\", 6), ku_string_static((const uint8_t*)\"slice_error\", 11), ku_string_static((const uint8_t*)\"string.slice indexes must be >= 0\", 33)) };\n\
-        \x20 }\n\
-        \x20 if (start > end) {\n\
-        \x20   return (KuResult_str){ false, (KuString){0}, ku_error_make(ku_string_static((const uint8_t*)\"string\", 6), ku_string_static((const uint8_t*)\"slice_error\", 11), ku_string_static((const uint8_t*)\"string.slice start must be <= end\", 33)) };\n\
-        \x20 }\n\
-        \x20 size_t clen = ku_string_char_len(s);\n\
-        \x20 if ((uint64_t)end > (uint64_t)clen) {\n\
-        \x20   char buf[96]; int n = snprintf(buf, sizeof(buf), \"string.slice end %lld out of bounds for length %zu\", (long long)end, clen);\n\
-        \x20   KuString msg = (KuString){0}; if (n > 0) { msg = ku_string_alloc((size_t)n); memcpy(msg.ptr, buf, (size_t)n); }\n\
-        \x20   return (KuResult_str){ false, (KuString){0}, ku_error_make(ku_string_static((const uint8_t*)\"string\", 6), ku_string_static((const uint8_t*)\"slice_error\", 11), msg) };\n\
-        \x20 }\n\
-        \x20 size_t bi = 0, ci = 0;\n\
-        \x20 while (bi < s.len && ci < (size_t)start) { bi++; while (bi < s.len && (s.ptr[bi] & 0xC0) == 0x80) bi++; ci++; }\n\
-        \x20 size_t bstart = bi;\n\
-        \x20 while (bi < s.len && ci < (size_t)end) { bi++; while (bi < s.len && (s.ptr[bi] & 0xC0) == 0x80) bi++; ci++; }\n\
-        \x20 size_t blen = bi - bstart;\n\
-        \x20 KuString outv = ku_string_alloc(blen);\n\
-        \x20 if (blen) memcpy(outv.ptr, s.ptr + bstart, blen);\n\
-        \x20 return (KuResult_str){ true, outv, (KuError){0} };\n\
-        }\n\n",
-    );
+    out.push_str(concat!(include_str!("c_string_slice.c"), "\n"));
     Ok(())
 }
 

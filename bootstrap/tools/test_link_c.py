@@ -370,6 +370,75 @@ int main(void) {
             with self.assertRaisesRegex(link_c.LinkError, r"checked View \[str\] carrier"):
                 link_c.TypeRef.read(dict(array, **change), "array")
 
+    def test_checked_string_slice_uses_the_native_builtin(self):
+        self.compiler()
+        input_type = dict(builtin("str", "const KuProjectionString*"), passing="view")
+        parameters = [input_type, builtin(), builtin()]
+        result_type = builtin("str", "KuBootstrapResult_KuProjectionString")
+        dependency = declaration("std/string.ku", 2, "ku_slice", parameters)
+        dependency["signature"].update(result=result_type, returns_result=True)
+        entry = declaration("app.ku", 58, "select", parameters)
+        entry["signature"].update(result=result_type, returns_result=True)
+        units = self.unit("string-slice", plan(entry, [dependency]), """
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+typedef struct { uint8_t *ptr; size_t len; size_t capacity; uint8_t storage; } KuProjectionString;
+typedef struct { KuProjectionString domain, code, message; } KuBootstrapError;
+typedef struct { bool ok; KuProjectionString value; KuBootstrapError error; } KuBootstrapResult_KuProjectionString;
+extern KuBootstrapResult_KuProjectionString ku_slice(const KuProjectionString *, int64_t, int64_t);
+KuBootstrapResult_KuProjectionString select(const KuProjectionString *input, int64_t start, int64_t end) {
+    return ku_slice(input, start, end);
+}
+""")
+        self.caller.write_text("""
+#include <assert.h>
+static bool text_equal(KuProjectionString value, const char *expected) {
+    return value.len == strlen(expected) && !memcmp(value.ptr, expected, value.len);
+}
+static void reject(const KuProjectionString *input, int64_t start, int64_t end, const char *message) {
+    KuBootstrapResult_KuProjectionString result = select(input, start, end);
+    assert(!result.ok && !result.value.ptr && !result.value.len);
+    assert(text_equal(result.error.domain, "string") && text_equal(result.error.code, "slice_error"));
+    assert(text_equal(result.error.message, message));
+    if (result.error.message.storage == 1) free(result.error.message.ptr);
+}
+int main(void) {
+    const uint8_t bytes[] = {'A', 0xe4,0xb8,0xad, 0xf0,0x9f,0x99,0x82, 0, 0xc3,0xa9};
+    uint8_t *data = malloc(sizeof bytes);
+    assert(data);
+    memcpy(data, bytes, sizeof bytes);
+    const KuProjectionString input = {data, sizeof bytes, sizeof bytes, 1};
+    KuBootstrapResult_KuProjectionString result = select(&input, 1, 4);
+    assert(result.ok && result.value.len == 8 && result.value.capacity == 8 && result.value.storage == 1);
+    assert(result.value.ptr != data + 1 && !memcmp(input.ptr, bytes, sizeof bytes));
+    KuBootstrapResult_KuProjectionString empty = select(&input, 5, 5);
+    assert(empty.ok && !empty.value.ptr && !empty.value.len && !empty.value.capacity && !empty.value.storage);
+    reject(&input, 2, -1, "string.slice indexes must be >= 0");
+    reject(&input, 7, 6, "string.slice start must be <= end");
+    reject(&input, 1, INT64_MAX, "string.slice end 9223372036854775807 out of bounds for length 5");
+    free(data);
+    assert(!memcmp(result.value.ptr, bytes + 1, 8));
+    free(result.value.ptr);
+
+    uint8_t raw_bytes[] = {0x80, 'x'};
+    const KuProjectionString raw = {raw_bytes, sizeof raw_bytes, 0, 0};
+    result = select(&raw, 0, 1);
+    assert(result.ok && result.value.len == 1 && result.value.ptr[0] == raw_bytes[0]);
+    free(result.value.ptr);
+    return 0;
+}
+""", encoding="ascii")
+        feature = ["--builtin", "string.slice"]
+        self.assert_preflight_error(units, "missing provider for std/string.ku#2")
+        self.assertEqual(link_c.main([*units, *feature, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+        self.change_plan(units, lambda p: p["dependencies"][0]["signature"]["parameters"][0]
+                         .update(c_type="KuProjectionString", passing="value"))
+        self.assert_preflight_error([*units, *feature], "signature mismatch for std/string.ku#2")
+
     def test_checked_owned_string_array_result_across_two_c_units(self):
         result = dict(builtin("str", "KuBootstrapResultStringArray"), kind="BuiltinArray")
         provider = declaration("parts.ku", 8, "parts", [builtin()])

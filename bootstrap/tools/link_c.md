@@ -59,6 +59,14 @@ the existing native filesystem code and ABI header in the temporary build.
 Pass this option explicitly for units that depend on `fs.read`. The file
 read uses the supplied path and keeps the native limit and error contract.
 
+Use `--builtin string.slice` for the checked `std/string.ku#2` dependency.
+The linker validates `(&str, int, int) -> str!`. The provider uses the
+native C slice implementation, takes Unicode scalar indexes, and returns
+independently owned nonempty slices. The input remains owned by the caller.
+The private linker View does not change which borrowed source expressions Ku
+accepts for `string.slice`. Use both builtin options if a program depends on
+both operations.
+
 `json_literal_string_c.ku` emits a standalone checked string provider from
 the bound zero-argument function named in `function.txt`. It reads the
 project-relative paths in `modules.txt` and uses the first path as the input

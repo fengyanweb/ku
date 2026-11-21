@@ -192,6 +192,9 @@ fn plannedDeclaration(&supplied: [SuppliedModule], &declaration: LinkPlanDeclara
     if (declaration.unit > 0) {
         name = supplied[declaration.unit - 1].named.parsed.arena.nodes[declaration.node - 1].text.clone()
         path = supplied[declaration.unit - 1].path.clone()
+    } else if (declaration.unit == 0 && declaration.node == 2 && declaration.symbol == "ku_linked_dep_string_slice") {
+        name = "slice"
+        path = "std/string.ku"
     } else if (declaration.unit != 0 || declaration.node != 1 || declaration.symbol != "ku_linked_dep_fs_read") {
         at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
         RejectLayout("invalid_linked_builtin", "unsupported builtin declaration identity", at)?

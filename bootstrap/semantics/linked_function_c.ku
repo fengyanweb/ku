@@ -20,7 +20,7 @@ import { LinkedCPrelude, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArr
          LinkedOkAvailable, LinkedRecordFields, ReadLinkedNullBinding } from "./link_plan_c.ku"
 
 fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
-    if (callee.unit == 0) { return ok(LinkedFsReadReference(callee.symbol)) }
+    if (callee.unit == 0 && callee.node == 1) { return ok(LinkedFsReadReference(callee.symbol)) }
     text = "extern " + LinkedNullResultType(callee)? + " " + callee.symbol.clone() + "("
     if (callee.parameters.len() == 0) { text += "void" }
     index = 0
