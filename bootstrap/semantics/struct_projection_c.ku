@@ -417,7 +417,7 @@ fn LinkedIntAppendCallbackNominals(&named: NamedModule, &node: Node): [int]! {
                 RejectLayout("linked_callback_type", "scoped append callback needs str, str, int, a record, [int] and a record", DeclarationSpan(part))?
             }
         }
-        index += 1
+        index = index + 1
     }
     result = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge + count] - 1].clone()
     if (result.kind != "TypeResult" || result.edge_count != 1 ||
