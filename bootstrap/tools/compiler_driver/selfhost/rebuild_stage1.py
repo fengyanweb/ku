@@ -63,8 +63,11 @@ def main():
     parser.add_argument("ku", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--cc", help="target C11 compiler executable (default: clang)")
+    parser.add_argument("--gnu-stage1-clang", help="compile only the Windows GNU Stage1 host with this Clang")
     parser.add_argument("--temp-dir", type=Path, default="/private/tmp" if sys.platform == "darwin" else None)
     args = parser.parse_args()
+    if args.gnu_stage1_clang and os.name != "nt":
+        parser.error("--gnu-stage1-clang requires the x64 Windows GNU host")
     repo = args.repo.resolve(strict=True)
     temp_dir = args.temp_dir.resolve(strict=True) if args.temp_dir is not None else None
     source = subprocess.check_output(
@@ -81,7 +84,8 @@ def main():
     c_target = subprocess.check_output([cc, "-dumpmachine"], text=True, timeout=20).strip()
     output.parent.mkdir(parents=True, exist_ok=True)
     identity = output.parent / "build-identity.json"
-    if output.exists() or identity.exists():
+    host_receipt = output.with_suffix(".gnu-host.json")
+    if output.exists() or identity.exists() or (args.gnu_stage1_clang and host_receipt.exists()):
         parser.error("choose a fresh output directory")
     with tempfile.TemporaryDirectory(prefix="ku-long-stage1-sources-", dir=temp_dir) as temporary:
         location = Path(temporary)
@@ -90,12 +94,17 @@ def main():
         environment = dict(os.environ, KU_CC=cc) if args.cc is not None else None
         # The builder owns the per-command deadlines and process-tree
         # cleanup. The outer verification job also bounds the entire chain.
-        subprocess.run([sys.executable, "-B", builder, "--ku", ku, "--cc", cc, "-o", output],
-                       cwd=location, env=environment, check=True)
-    identity.write_text(json.dumps({"commit": source, "seed": str(ku), "seed_sha256": digest(ku),
-                                    "sha256": digest(output), "source_snapshot_sha256": source_snapshot,
-                                    "c_compiler": cc, "c_target": c_target},
-                                   indent=2) + "\n")
+        command = [sys.executable, "-B", builder, "--ku", ku, "--cc", cc, "-o", output]
+        if args.gnu_stage1_clang:
+            command.extend(["--gnu-stage1-clang", args.gnu_stage1_clang])
+        subprocess.run(command, cwd=location, env=environment, check=True)
+    result = {"commit": source, "seed": str(ku), "seed_sha256": digest(ku),
+              "sha256": digest(output), "source_snapshot_sha256": source_snapshot,
+              "c_compiler": cc, "c_target": c_target}
+    if args.gnu_stage1_clang:
+        result["gnu_host"] = json.loads(host_receipt.read_bytes())
+        host_receipt.unlink()
+    identity.write_text(json.dumps(result, indent=2) + "\n")
     print(output)
 
 

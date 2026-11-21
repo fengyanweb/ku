@@ -1639,6 +1639,8 @@ def run_structured_only(args, report):
     env.pop('KU_RUNNER_RUSTC', None)
     env.pop('RUSTUP_TOOLCHAIN', None)
     target = metadata['target']
+    if args.gnu_stage1_clang and target != 'x86_64-pc-windows-gnu':
+        raise ValueError('--gnu-stage1-clang requires the Windows GNU SDK archive')
     verifier = checked(['git', 'rev-parse', 'HEAD'], repo, env).strip()
     if verifier != metadata['commit']:
         raise ValueError('structured Task example and SDK must come from the same commit')
@@ -1670,10 +1672,11 @@ def run_structured_only(args, report):
             if not cc:
                 raise RuntimeError('bootstrap generations require the selected GNU C compiler')
             ku = install / ('ku.exe' if '-windows-' in target else 'ku')
+            seed_options = ['--gnu-stage1-clang', args.gnu_stage1_clang] if args.gnu_stage1_clang else []
             result = invoke([sys.executable, '-B', verification, '--repo', repo,
                              '--revision', verifier, '--ku', ku, '--cc', cc,
                              '--output-dir', root / 'generations', '--temp-dir', root,
-                             '--stage3-application-checks'],
+                             '--stage3-application-checks', *seed_options],
                             root, env, seconds=2400)
             if result.returncode:
                 raise RuntimeError('installed bootstrap generations failed: ' +
@@ -2745,6 +2748,7 @@ def main():
     parser.add_argument("--readonly-only", action="store_true")
     parser.add_argument("--structured-only", action="store_true")
     parser.add_argument("--bootstrap-generations", action="store_true")
+    parser.add_argument("--gnu-stage1-clang", help="compile only the Windows GNU Stage1 host with this Clang")
     parser.add_argument("--installer-run")
     parser.add_argument("--expected-sdk-commit")
     args = parser.parse_args()
@@ -2757,6 +2761,8 @@ def main():
         parser.error('--structured-only requires --expected-sdk-commit and cannot run other verification modes')
     if args.bootstrap_generations and not args.structured_only:
         parser.error('--bootstrap-generations requires --structured-only for the source-free installer')
+    if args.gnu_stage1_clang and (os.name != 'nt' or not args.bootstrap_generations):
+        parser.error('--gnu-stage1-clang requires Windows GNU with --bootstrap-generations')
     args.output = args.output.resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     report = {"status": "running"}

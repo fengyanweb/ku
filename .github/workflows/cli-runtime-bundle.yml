@@ -86,6 +86,11 @@ on:
         required: false
         default: false
         type: boolean
+      bootstrap_gnu_stage1_clang:
+        description: Validate Clang for Stage1 host compilation with the existing MinGW GCC linker
+        required: false
+        default: false
+        type: boolean
       installed_tasks_only:
         description: Verify the installed HTTP + PostgreSQL task-list example
         required: false
@@ -164,6 +169,7 @@ jobs:
           KU_INSTALLED_PG_ONLY: ${{ inputs.installed_pg_only }}
           KU_INSTALLED_STRUCTURED_ONLY: ${{ inputs.installed_structured_only }}
           KU_BOOTSTRAP_GENERATIONS: ${{ inputs.bootstrap_generations }}
+          KU_BOOTSTRAP_GNU_STAGE1_CLANG: ${{ inputs.bootstrap_gnu_stage1_clang }}
           KU_INSTALLED_TASKS_ONLY: ${{ inputs.installed_tasks_only }}
           KU_INSTALLED_TYPED_PG: ${{ inputs.installed_typed_pg }}
           KU_INSTALLED_ASYNC_PG: ${{ inputs.installed_async_pg }}
@@ -174,6 +180,10 @@ jobs:
         run: |
           if ($env:KU_BOOTSTRAP_GENERATIONS -eq 'true' -and $env:KU_INSTALLED_STRUCTURED_ONLY -ne 'true') {
             throw 'bootstrap_generations requires installed_structured_only for the source-free installer'
+          }
+          if ($env:KU_BOOTSTRAP_GNU_STAGE1_CLANG -eq 'true' -and
+              ($env:KU_BOOTSTRAP_GENERATIONS -ne 'true' -or $env:KU_SELECTED_PLATFORM_SET -ne 'windows-gnu')) {
+            throw 'bootstrap_gnu_stage1_clang requires bootstrap_generations and platform_set=windows-gnu'
           }
           if ($env:KU_INSTALLED_PG_ONLY -eq 'true' -and
               ($env:KU_SELECTED_PLATFORM_SET -ne 'windows-gnu' -or
@@ -463,10 +473,18 @@ jobs:
       - name: Verify the installed Object field example and bootstrap generations
         if: inputs.installed_structured_only && inputs.bootstrap_generations
         shell: pwsh
+        env:
+          KU_BOOTSTRAP_GNU_STAGE1_CLANG: ${{ inputs.bootstrap_gnu_stage1_clang }}
         run: |
           $archive = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/cli-bundle-assets" -Filter '*.tar.gz' -File)
           if ($archive.Count -ne 1) { throw 'Expected exactly one same-batch installer' }
-          & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --structured-only --bootstrap-generations --archive $archive[0].FullName --manifest ($archive[0].FullName + '.manifest.json') --repo . --output "$env:RUNNER_TEMP/cli-structured-evidence.json" --installer-run $env:INSTALLER_RUN_ID --expected-sdk-commit $env:SDK_SOURCE_COMMIT
+          $seedOptions = @()
+          if ($env:KU_BOOTSTRAP_GNU_STAGE1_CLANG -eq 'true') {
+            $clang = Join-Path $env:ProgramFiles 'LLVM/bin/clang.exe'
+            if (-not (Test-Path -LiteralPath $clang -PathType Leaf)) { throw 'The runner LLVM Clang is missing' }
+            $seedOptions = @('--gnu-stage1-clang', $clang)
+          }
+          & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --structured-only --bootstrap-generations --archive $archive[0].FullName --manifest ($archive[0].FullName + '.manifest.json') --repo . --output "$env:RUNNER_TEMP/cli-structured-evidence.json" --installer-run $env:INSTALLER_RUN_ID --expected-sdk-commit $env:SDK_SOURCE_COMMIT @seedOptions
           if ($LASTEXITCODE) { throw 'Installed Object or bootstrap generation verification failed' }
       - name: Prepare the existing PostgreSQL fixture tools on Linux
         if: runner.os == 'Linux' && !inputs.installed_structured_only

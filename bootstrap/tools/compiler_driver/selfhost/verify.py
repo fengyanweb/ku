@@ -84,14 +84,15 @@ def run_stage(output, name, input_sha, action):
     return summary
 
 
-def bootstrap_chain(repo, source, ku, cc, output, scratch, limit, sanitizers):
+def bootstrap_chain(repo, source, ku, cc, output, scratch, limit, sanitizers, gnu_stage1=None):
     common = [repo, source, "--cc", cc]
     installed_sha = digest(ku)
+    seed_options = ["--gnu-stage1-clang", gnu_stage1["clang"]["path"]] if gnu_stage1 else []
 
     def build_seed(attempt):
         binary = attempt / ("ku-bootstrap-stage1" + EXE)
         identity = attempt / "build-identity.json"
-        run_tool(attempt, TOOLS / "rebuild_stage1.py", [*common, ku, binary], scratch)
+        run_tool(attempt, TOOLS / "rebuild_stage1.py", [*common, ku, binary, *seed_options], scratch)
         seed = read_json(identity)
         imports = dynamic_imports(binary)
         if (seed["commit"] != source or seed["seed_sha256"] != installed_sha or seed["sha256"] != digest(binary) or
@@ -101,8 +102,17 @@ def bootstrap_chain(repo, source, ku, cc, output, scratch, limit, sanitizers):
                   "source_snapshot_sha256": seed["source_snapshot_sha256"], "dynamic_imports": imports}
         if os.name == "nt":
             sys.path.insert(0, str(repo / "bootstrap/tools/compiler_driver"))
-            from build import windows_stack_reserve
+            from build import gnu_stage1_commands, require_static_gnu_imports, windows_stack_reserve
             result["stack"] = windows_stack_reserve(binary)
+            if gnu_stage1:
+                host = seed["gnu_host"]
+                compile_command, link_command = gnu_stage1_commands(gnu_stage1, "host.c", "ku-bootstrap.exe")
+                if (host["toolchain"] != gnu_stage1 or seed["c_target"] != gnu_stage1["gcc"]["target"] or
+                        host["compile_argv"] != compile_command or host["link_argv"] != link_command or
+                        host["probe"]["status"] != "passed"):
+                    raise ValueError("Stage1 Clang/MinGW receipt does not match the frozen inputs")
+                require_static_gnu_imports(imports, "Stage1 host")
+                result["gnu_host"] = host
         return result, [binary, identity]
 
     def build_generation(attempt, producer):
@@ -130,7 +140,11 @@ def bootstrap_chain(repo, source, ku, cc, output, scratch, limit, sanitizers):
                    "profiles": measured["profiles"], "sanitizers": measured["sanitizers"]}
         return summary, [binary, identity, ledger, receipt]
 
-    stage1 = run_stage(output, "stage1", installed_sha, build_seed)
+    seed_input_sha = installed_sha
+    if gnu_stage1:
+        seed_inputs = {"installed_sha256": installed_sha, "gnu_stage1_host": gnu_stage1}
+        seed_input_sha = sha256(json.dumps(seed_inputs, sort_keys=True).encode()).hexdigest()
+    stage1 = run_stage(output, "stage1", seed_input_sha, build_seed)
     stage2 = run_stage(output, "stage2", stage1["sha256"], lambda path: build_generation(path, stage1))
     stage3 = run_stage(output, "stage3", stage2["sha256"], lambda path: build_generation(path, stage2))
     return stage1, stage2, stage3
@@ -199,6 +213,7 @@ def main():
     parser.add_argument("--revision", default="HEAD")
     parser.add_argument("--ku", required=True, help="installed Ku CLI")
     parser.add_argument("--cc", required=True, help="matching target C11 compiler executable")
+    parser.add_argument("--gnu-stage1-clang", help="compile only the Windows GNU Stage1 host with this Clang")
     parser.add_argument("--output-dir", required=True, type=Path, help="private directory for receipts and resume")
     parser.add_argument("--temp-dir", type=Path, help="existing directory for an isolated scratch subdirectory")
     parser.add_argument("--sanitizers", choices=("auto", "required", "off"), default="auto")
@@ -210,6 +225,8 @@ def main():
         parser.error("verification requires Python assertions")
     if args.limit < 1:
         parser.error("--limit must be positive")
+    if args.gnu_stage1_clang and os.name != "nt":
+        parser.error("--gnu-stage1-clang requires the x64 Windows GNU host")
 
     repo = args.repo.resolve(strict=True)
     source = subprocess.check_output(["git", "rev-parse", "--verify", args.revision + "^{commit}"],
@@ -222,6 +239,12 @@ def main():
     inputs = {"source_commit": source, "ku_sha256": digest(ku), "c_compiler": str(cc),
               "c_target": target, "c_version_sha256": sha256(version).hexdigest(), "sanitizers": args.sanitizers,
               "provider_limit": args.limit}
+    gnu_stage1 = None
+    if args.gnu_stage1_clang:
+        sys.path.insert(0, str(TOOLS.parent))
+        from build import gnu_stage1_toolchain
+        gnu_stage1 = gnu_stage1_toolchain(args.gnu_stage1_clang, cc, repo)
+        inputs["gnu_stage1_host"] = gnu_stage1
     snapshot = output / "inputs.json"
     if snapshot.is_file():
         if read_json(snapshot) != inputs:
@@ -233,7 +256,7 @@ def main():
     stage_parent = args.temp_dir.resolve(strict=True) if args.temp_dir else output
     with tempfile.TemporaryDirectory(prefix=".scratch-", dir=stage_parent) as temporary:
         stage1, stage2, stage3 = bootstrap_chain(repo, source, ku, cc, output, Path(temporary), args.limit,
-                                                args.sanitizers)
+                                                args.sanitizers, gnu_stage1)
     comparison = compare_units(output / stage2["ledger"], output / stage3["ledger"])
     comparison["strict_o2_identical"] = stage2["sha256"] == stage3["sha256"]
     windows_coff = "-windows-msvc" in target or target.endswith(("-mingw32", "-mingw64", "-windows-gnu"))
