@@ -3771,6 +3771,111 @@ int main(int argc, char **argv) {
     }
 }
 
+pub(super) fn assert_owned_int_member_append(seed: &Path, cwd: &Path) {
+    let fixture = r#"struct Bag { items: [int] }
+fn Append(input: Bag, enabled: bool): int! {
+    bag = input
+    if (enabled) { bag.items = bag.items.push(bag.items[0] + 5) }
+    return ok(bag.items.len() * 100 + bag.items[bag.items.len() - 1])
+}
+fn Count(values: [int]): int! { return ok(values.len()) }
+fn Moved(input: Bag): int! {
+    bag = input
+    count = Count(bag.items)?
+    bag.items = bag.items.push(1)
+    return ok(count)
+}
+fn Borrowed(&bag: Bag): null! {
+    bag.items = bag.items.push(1)
+    return ok(null)
+}
+fn Wrong(input: Bag): null! {
+    bag = input
+    bag.items = bag.items.push("wrong")
+    return ok(null)
+}
+fn Indexed(input: [Bag]): null! {
+    bags: [Bag] = input
+    bags[0].items = bags[0].items.push(1)
+    return ok(null)
+}
+"#;
+    fs::write(cwd.join("int-member-append.ku"), fixture).unwrap();
+    fs::write(cwd.join("modules.txt"), "int-member-append.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Append\n").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (entry, parameters) = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t "))
+        .and_then(|line| line.split_once('('))
+        .unwrap();
+    let bag = parameters.split_once(" a0,").unwrap().0;
+    let snapshot = code.find("int64_t append_item").unwrap();
+    let after_snapshot = &code[snapshot..];
+    let target_check = after_snapshot
+        .find("if (!ku_linked_view_int_array_valid")
+        .unwrap();
+    let append_call = after_snapshot
+        .find("append_status = ku_linked_view_int_array_append_move")
+        .unwrap();
+    assert!(target_check < append_call);
+
+    let host = r#"
+static void verify_failed_growth(void) {
+    if (attempts != 2 || outstanding()) _Exit(94);
+}
+static __BAG__ full_bag(void) {
+    int64_t *value = malloc(sizeof(*value));
+    assert(value);
+    *value = 10;
+    return (__BAG__){.f0 = {.len = 1, .data = value, .capacity = 1}};
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    __BAG__ first = full_bag();
+    if (argc > 1) {
+        fail_after = 0;
+        assert(atexit(verify_failed_growth) == 0);
+        (void)__ENTRY__(first, true);
+        return 95;
+    }
+    KuBootstrapResult_int64_t kept = __ENTRY__(first, false);
+    assert(kept.ok && kept.value == 110 && attempts == 1 && !outstanding());
+    KuBootstrapResult_int64_t appended = __ENTRY__(full_bag(), true);
+    assert(appended.ok && appended.value == 215 && attempts == 3 && !outstanding());
+    return 0;
+}
+"#
+    .replace("__BAG__", bag)
+    .replace("__ENTRY__", entry);
+    let source = cwd.join("int-member-append.c");
+    let binary = cwd.join(format!("int-member-append{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(&binary), cwd, 15));
+    let failed = execute(Command::new(&binary).arg("oom"), cwd, 15);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stderr).trim(),
+        "array allocation failed"
+    );
+    for (name, diagnostic) in [
+        ("Moved", "linked_moved_member"),
+        ("Borrowed", "linked_member_target"),
+        ("Wrong", "linked_field_append"),
+        ("Indexed", "linked_member_target"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}
+
 pub(super) fn assert_owned_string_member_append(seed: &Path, cwd: &Path) {
     let fixture = r#"struct Entry { text: str, suffix: str }
 struct Document { header: str, inner: Entry }
