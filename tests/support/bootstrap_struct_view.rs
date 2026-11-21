@@ -1063,11 +1063,12 @@ fn Four(&a: Entry, &b: Entry, &c: Entry, &d: Entry): bool {
 fn ReadFour(enabled: bool, &entries: [Entry]): bool {
     return enabled && Four(entries[0], entries[1], entries[2], entries[3])
 }
-fn Contains(&ids: [int], id: int): bool {
-    return ids.len() > 0 && ids[0] == id
+fn Find(&ids: [int], id: int): int {
+    if (ids.len() > 0 && ids[0] == id) { return id }
+    return 0
 }
 fn ReadMixed(enabled: bool, &ids: [int], id: int): bool {
-    return enabled && Contains(ids, id)
+    return enabled && Find(ids, id) == id
 }
 fn OwnFirst(a: Entry, &b: Entry, &c: Entry, &d: Entry): bool {
     return a.kind == b.kind && c.kind != d.kind
@@ -1216,10 +1217,10 @@ int main(int argc, char **argv) {
     let host = r#"
 static const KuArrayInt *expected;
 static unsigned calls;
-bool PROVIDER(const KuArrayInt *ids, int64_t id) {
+int64_t PROVIDER(const KuArrayInt *ids, int64_t id) {
     assert(ids == expected && ids->len == 2 && id == 23);
     ++calls;
-    return ids->data[1] == id;
+    return ids->data[1];
 }
 int main(void) {
     int64_t values[] = {17, 23};
@@ -1235,7 +1236,7 @@ int main(void) {
         "ENTRY",
         &format!("ku_linked_null_{}", symbol("bool ku_linked_null_")),
     )
-    .replace("PROVIDER", symbol("extern bool "));
+    .replace("PROVIDER", symbol("extern int64_t "));
     let c = cwd.join("readonly-mixed.c");
     let exe = cwd.join(format!("readonly-mixed{}", std::env::consts::EXE_SUFFIX));
     fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
@@ -1250,8 +1251,8 @@ int main(void) {
         ),
         (
             "RefuseNonBool",
-            "linked_readonly_call",
-            "requires a plain bool result",
+            "linked_guard_type",
+            "expected a readonly bool condition",
         ),
         (
             "RefuseOwnedFour",

@@ -62,9 +62,10 @@ fn MatchesLinkedIntArrayOwner(&target: TypeNameBinding, &origin: TypeNameBinding
     return target.declaration_kind == "BuiltinArray" && target.name == "int" && LinkedNullIntArrayOwner(origin)
 }
 
-fn RequireLinkedReadonlyPredicate(&callee: LinkedNullFunction, &at: Span): null! {
-    if (callee.result.declaration_kind != "Builtin" || callee.result.name != "bool") {
-        RejectLayout("linked_readonly_call", "readonly direct call requires a plain bool result", at.clone())?
+fn RequireLinkedReadonlyCall(&callee: LinkedNullFunction, &at: Span): null! {
+    if (callee.returns_result || callee.result.declaration_kind != "Builtin" ||
+        (callee.result.name != "int" && callee.result.name != "bool")) {
+        RejectLayout("linked_readonly_call", "readonly direct call requires a plain int or bool result", at.clone())?
     }
     for parameter in callee.parameters.clone() {
         scalar = parameter.declaration_kind == "Builtin" && (parameter.name == "int" || parameter.name == "bool")

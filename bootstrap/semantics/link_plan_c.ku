@@ -142,10 +142,12 @@ fn LinkedDirectCallExpression(&callee: LinkedNullFunction, &arguments: str): str
     return callee.symbol.clone() + "(" + arguments.clone() + ")"
 }
 
-fn EmitLinkedReadonlyPredicate(state: LinkedNullState, callee: LinkedNullFunction, id: int, &arguments: str): LinkedNullExpression {
+fn EmitLinkedReadonlyScalar(state: LinkedNullState, callee: LinkedNullFunction, id: int, &arguments: str): LinkedNullExpression {
     name = "predicate" + str(id)
     next = state
-    next.code += "    bool " + name.clone() + " = " + LinkedDirectCallExpression(callee, arguments) + ";\n"
+    carrier = "bool"
+    if (callee.result.name == "int") { carrier = "int64_t" }
+    next.code += "    " + carrier + " " + name.clone() + " = " + LinkedDirectCallExpression(callee, arguments) + ";\n"
     ty = callee.result.clone()
     next.links = RememberLinkedCall(next.links, callee)
     return LinkedReadonlyExpression(next, ty, name)

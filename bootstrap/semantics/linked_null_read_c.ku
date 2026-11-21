@@ -1,12 +1,12 @@
 import { EmitLinkedArrayIndexGuard, EmitLinkedLogicalBranch } from "./guarded_string_parts.ku"
 import { AddLinkedNullSlot, CloneLinkedRecord, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
-import { CheckLinkedAddition, EmitLinkedMultiplyDivide, LinkedMemberPath, LinkedMemberUnavailable, LinkedViewArgument, RequireLinkedReadonlyPredicate } from "./linked_member_ownership.ku"
+import { CheckLinkedAddition, EmitLinkedMultiplyDivide, LinkedMemberPath, LinkedMemberUnavailable, LinkedViewArgument, RequireLinkedReadonlyCall } from "./linked_member_ownership.ku"
 import { Span } from "../stage2/span.ku"
 import { LinkedLocalReadBinding } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout } from "./struct_layouts.ku"
-import { EmitLinkedReadonlyPredicate, LinkedDirectCallExpression, LinkedErrorField, LinkedNullFunction, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, RememberLinkedCall } from "./link_plan_c.ku"
+import { EmitLinkedReadonlyScalar, LinkedDirectCallExpression, LinkedErrorField, LinkedNullFunction, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, RememberLinkedCall } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
@@ -68,7 +68,7 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
         }
         if (node.edge_count >= 2 && node.edge_count <= 9 && target.kind == "Variable" && target.edge_count == 0) {
             callee = ResolveLinkedCall(project, state.slots, node, target, false)?
-            return readLinkedPredicate(project, state, node, callee, id, depth)
+            return readLinkedScalarCall(project, state, node, callee, id, depth)
         }
     }
     if (node.edge_count == 0 && (node.kind == "Variable" || node.kind == "Int" ||
@@ -79,9 +79,9 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
     return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", DeclarationSpan(node)), ""))
 }
 
-fn readLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
+fn readLinkedScalarCall(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
                       callee: LinkedNullFunction, id: int, depth: int): LinkedNullExpression! {
-    RequireLinkedReadonlyPredicate(callee, DeclarationSpan(call))?
+    RequireLinkedReadonlyCall(callee, DeclarationSpan(call))?
     next = state
     args = ""
     index = 0
@@ -95,7 +95,7 @@ fn readLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, &cal
         next = input.state
         index += 1
     }
-    return ok(EmitLinkedReadonlyPredicate(next, callee, id, args))
+    return ok(EmitLinkedReadonlyScalar(next, callee, id, args))
 }
 
 fn readLinkedMethod(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &target: Node, id: int, depth: int): LinkedNullExpression! {
