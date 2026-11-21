@@ -6,7 +6,7 @@ import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { CanCloneNestedStringArrays, CollectOwnedMemberPaths, EmitCombinedCLayouts, EmitLinkedStringArrayElementClone, EmitNestedCLayouts, EmitOwnedStringArrayClone, EmitProjectionCloneString, OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
-import { ContainsType, CTypeName, ProjectionArrayHeader, ProjectionIsStringArray } from "./struct_projection_c.ku"
+import { ContainsIndex, ContainsType, CTypeName, ProjectionArrayHeader, ProjectionIsStringArray } from "./struct_projection_c.ku"
 import { ExplicitType, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { RetagTypeNameBinding, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 
@@ -320,6 +320,12 @@ fn EmitBoundStringOperations(clone: bool, concat: bool, format: bool, prefix_suf
     if (concat) { text += EmitProjectionStringJoinHelpers(format) }
     if (prefix_suffix) { text += ScalarStringPrefixSuffixC() }
     return text
+}
+
+fn RegisterLinkedElementClone(state: LinkedNullState, layout: int): LinkedNullState {
+    next = state
+    if (!ContainsIndex(next.element_clones, layout)) { next.element_clones = next.element_clones.push(layout) }
+    return next
 }
 
 fn EmitBoundElementClones(&layouts: [StructLayout], &requested: [int]): str {

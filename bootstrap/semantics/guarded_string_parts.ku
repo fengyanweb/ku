@@ -414,3 +414,11 @@ fn LinkedIntSnapshotCall(&source: str, &target: str, &name: str): str {
         + "    if (" + status.clone() + " != KU_INT_SNAPSHOT_OK) { invalid_array = " + status.clone()
         + " == KU_INT_SNAPSHOT_INVALID; out_of_memory = " + status + " == KU_INT_SNAPSHOT_OOM; goto cleanup; }\n"
 }
+
+fn LinkedRecordCloneCall(layout: int, arrays: bool, &source: str, &target: str): str {
+    call = "    if (!ku_linked_element_" + str(layout) + "_clone_element(&" + source.clone() + ", &" + target.clone()
+    if (arrays) {
+        return call + ", &invalid_struct_view)) { out_of_memory = !invalid_struct_view; goto cleanup; }\n"
+    }
+    return call + ")) { out_of_memory = true; goto cleanup; }\n"
+}

@@ -1,6 +1,6 @@
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
-import { LinkedIntSnapshotCall } from "./guarded_string_parts.ku"
+import { LinkedIntSnapshotCall, LinkedRecordCloneCall } from "./guarded_string_parts.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC } from "./linked_member_ownership.ku"
 import { BuildProjectOwningLayouts, CanCloneNestedStringArrays, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
 import { EmitScalarIntString } from "./scalar_int_emit.ku"
@@ -13,6 +13,7 @@ import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { HasBoundArrayMembers, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { IsLinkedScopedCallback, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedRecordFields, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
+import { RegisterLinkedElementClone } from "./struct_array_c.ku"
 import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterPlan,
          LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 
@@ -395,11 +396,9 @@ fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, 
     } else if (!arrays && GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
         output.state.code += "    " + output.value.text.clone() + " = " + source.value.text + ";\n"
     } else {
-        if (!ContainsIndex(output.state.element_clones, layout)) {
-            output.state.element_clones = output.state.element_clones.push(layout)
-        }
-        output.state.code += "    if (!ku_linked_element_" + str(layout) + "_clone_element(&"
-            + source.value.text + ", &" + output.value.text.clone() + ")) { out_of_memory = true; goto cleanup; }\n"
+        output.state = RegisterLinkedElementClone(output.state, layout)
+        if (arrays) { output.state.uses_struct_view = true }
+        output.state.code += LinkedRecordCloneCall(layout, arrays, source.value.text, output.value.text)
     }
     output.state.slots[output.value.slot - 1].live = true
     return ok(output)
