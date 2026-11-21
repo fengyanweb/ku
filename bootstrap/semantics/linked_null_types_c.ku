@@ -86,9 +86,7 @@ fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view
     if (node.kind == "TypeFunction") { return readIntPairResultCallback(project, unit, node, view) }
     if (!view) {
         if (node.kind == "TypeArray") {
-            owner = ReadLinkedOwnedArray(project, unit, id, true)?
-            if (LinkedNullIntArrayOwner(owner)) { return ok(owner) }
-            RejectLayout("linked_array_value_parameter", "linked array parameters by value require [int]", DeclarationSpan(node))?
+            return ReadLinkedOwnedArray(project, unit, id, true)
         }
         return LinkedNullType(project, unit, id)
     }
@@ -195,6 +193,11 @@ fn LinkedNullView(&binding: TypeNameBinding): bool {
 
 fn LinkedNullParameterPlan(&binding: TypeNameBinding, unit: int): LinkPlanType! {
     if (LinkedNullIntArrayOwner(binding)) { return ok(IntArrayLinkPlanType(false)) }
+    if (LinkedNullOwnedArray(binding)) {
+        plan = BoundLinkPlanType(binding, unit, LinkedNullCType(binding)?, false)
+        plan.kind = "StructArray"
+        return ok(plan)
+    }
     if (binding.declaration_kind == "BuiltinArray") {
         if (binding.name == "int") { return ok(IntArrayLinkPlanType(true)) }
         return ok(StrArrayViewLinkPlanType())

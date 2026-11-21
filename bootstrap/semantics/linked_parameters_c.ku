@@ -123,10 +123,15 @@ fn ReadLinkedNullParameters(&project: LinkedNullProject, &function: Node): Linke
                 + "->ptr)) { invalid_str = true; goto cleanup; }\n"
         } else if (ty.declaration_kind == "StructView") {
             validation += "    if (!" + name.clone() + ") { invalid_struct_view = true; goto cleanup; }\n"
-        } else if (LinkedNullIntArrayOwner(ty)) {
+        } else if (LinkedNullIntArrayOwner(ty) || LinkedNullOwnedArray(ty)) {
             state = RequireLinkedArrayValidation(state, ty.clone())
+            discard = ""
+            if (LinkedNullOwnedArray(ty)) {
+                // A malformed FFI header cannot be walked by the element destructor.
+                discard = name.clone() + " = (" + c_type + "){0}; "
+            }
             validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(&" + name.clone() + ") || (uintmax_t)"
-                + name.clone() + ".len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
+                + name.clone() + ".len > (uintmax_t)INT64_MAX) { " + discard + "invalid_array = true; goto cleanup; }\n"
         } else if (view) {
             validation += "    if (!" + LinkedNullArrayPrefix(ty) + "_valid(" + name.clone() + ") || (uintmax_t)"
                 + name.clone() + "->len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"

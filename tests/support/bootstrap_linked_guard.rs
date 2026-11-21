@@ -2,6 +2,84 @@ use super::{assert_ok, compile_projection, execute, CHECKED_ARRAY_ALLOCATOR};
 use ku::{span::Span, stdlib::json, value::Value};
 use std::{fs, path::Path, process::Command};
 
+pub(super) fn assert_named_array_parameter_move(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("array-parameter.ku"),
+        r#"struct Item { text: str }
+fn Transfer(input: [Item]): [Item]! {
+    local: [Item] = input
+    return ok(local)
+}
+fn Consumed(input: [Item]): int! {
+    local: [Item] = input
+    return ok(input.len())
+}
+fn Borrowed(&input: [Item]): [Item]! {
+    local: [Item] = input
+    return ok(local)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "array-parameter.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Transfer").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let entry = code
+        .lines()
+        .find(|line| line.starts_with("KuBootstrapResult_KuArray_"))
+        .unwrap();
+    let (signature, parameter) = entry.split_once('(').unwrap();
+    let (result, symbol) = signature.split_once(' ').unwrap();
+    let array = parameter.strip_suffix(" a0) {").unwrap();
+    let element = array.strip_prefix("KuArray_").unwrap();
+    let host = r#"
+#include <assert.h>
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) { (void)ENTRY((ARRAY){2, NULL, 1}); return 2; }
+    ELEMENT *item = calloc(1, sizeof(*item));
+    uint8_t *text = malloc(1);
+    assert(item && text);
+    *text = 42;
+    item->f0 = (KuProjectionString){text, 1, 1, KU_PROJECTION_STRING_OWNED};
+    RESULT output = ENTRY((ARRAY){1, item, 1});
+    assert(output.ok && output.value.len == 1 && output.value.data == item);
+    assert(output.value.data[0].f0.ptr == text && *text == 42);
+    DROP(&output.value);
+    return 0;
+}
+"#
+    .replace("ENTRY", symbol)
+    .replace("RESULT", result)
+    .replace("ARRAY", array)
+    .replace("ELEMENT", element)
+    .replace("DROP", &format!("ku_linked_view_{element}_drop"));
+    let source = cwd.join("array-parameter.c");
+    let program = cwd.join(format!("array-parameter{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{code}{host}")).unwrap();
+    compile_projection(&source, &program, cwd);
+    assert_ok(&execute(&mut Command::new(&program), cwd, 10));
+    let malformed = execute(Command::new(program).arg("malformed"), cwd, 10);
+    assert_eq!(malformed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&malformed.stderr).trim(),
+        "invalid struct array ownership"
+    );
+    for (name, error) in [
+        ("Consumed", "unavailable_linked_binding"),
+        ("Borrowed", "expected a matching named array owner"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(error));
+    }
+}
+
 pub(super) fn assert_checked_callback_forwarding(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("callback-forward.ku"),

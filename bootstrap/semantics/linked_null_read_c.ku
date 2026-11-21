@@ -11,26 +11,7 @@ import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { EmitLinkedIntAppend, HasBoundArrayMembers } from "./struct_array_c.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedStringResult, ReadLinkedOwnedArray, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
-
-fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
-    ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0), true)?
-    value_id = LinkedNullChild(project, 1, statement, 1)
-    value = LinkedNullNode(project, 1, value_id)
-    if (value.kind != "Array" || LinkedNullBinding(state.slots, statement.text) != 0) {
-        RejectLayout("linked_array_local", "expected a new typed array owner initialized empty", DeclarationSpan(statement))?
-    }
-    if (value.edge_count != 0) {
-        if (!LinkedNullIntArrayOwner(ty)) {
-            RejectLayout("linked_array_local", "a nonempty literal requires an int array", DeclarationSpan(value))?
-        }
-        literal = LowerLinkedIntArrayLiteral(project, state, value, value_id, statement.text.clone())?
-        return ok(literal.state)
-    }
-    local = AddLinkedNullSlot(project, state, statement.text.clone(), "l" + str(id), ty, false)?
-    local.state.slots[local.value.slot - 1].live = true
-    return ok(local.state)
-}
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn LowerLinkedIntArrayLiteral(&project: LinkedNullProject, state: LinkedNullState, &literal: Node, id: int,
                                binding: str): LinkedNullExpression! {
