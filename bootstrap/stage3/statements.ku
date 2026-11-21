@@ -127,7 +127,7 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
             if (control_depth == 0) {
                 function_end = block_end
                 reading_body = false
-            } else if (current.kind == "If" && current.phase == 0 && WindowKind(tokens, cursor, last_index) == "Else") {
+            } else if (HasUnopenedElse(tokens, cursor, last_index, current)) {
                 cursor = cursor + 1
                 // Phase 2 leaves the nested If for the next iteration.
                 current.phase = ReadElsePhase(WindowToken(tokens, cursor, last_index))?
@@ -255,4 +255,10 @@ fn ReadFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, toke
     }
     statements = AppendStatementList([], root_top, root_count, body_open.clone())?
     return FinishFunctionBodyOutput(arena_nodes.clone(), arena_edges.clone(), parse_steps, body_open, function_end, statements)
+}
+
+fn HasUnopenedElse(&tokens: [Token], next: int, last: int, &frame: ControlFrame): bool {
+    if (frame.kind != "If" || frame.phase != 0) { return false }
+    following = WindowKind(tokens, next, last)
+    return following == "Else"
 }
