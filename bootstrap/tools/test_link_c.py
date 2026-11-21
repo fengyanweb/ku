@@ -335,6 +335,13 @@ int64_t invoke(KuBootstrapIntPairCallback_TOKEN function) {
 }
 """).replace("TOKEN", "KuStruct_m4_9")
         provider = self.unit("callback-provider", plan(supplied), provider_source)
+        caller_unit = link_c.Unit.read(*map(Path, units[1:]))
+        provider_unit = link_c.Unit.read(*map(Path, provider[1:]))
+        caller_aliases = link_c.carrier_aliases(caller_unit)
+        provider_aliases = link_c.carrier_aliases(provider_unit)
+        self.assertEqual(caller_aliases["KuBootstrapResult_KuStruct_m1_9"],
+                         provider_aliases["KuBootstrapResult_KuStruct_m4_9"])
+        self.assertNotIn("KuBootstrapIntPairCallback_KuStruct_m1_9", caller_aliases)
         self.caller.write_text("""
 static KuBootstrapResult_KuStruct_m1_9 check(void *environment, int64_t a, int64_t b) {
     int64_t *owner = environment;

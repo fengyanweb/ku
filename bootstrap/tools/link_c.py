@@ -30,6 +30,8 @@ CALLBACK_TYPES = {
     "IntRecordReaderCallback": ("int_record_reader_callback", "KuBootstrapIntReaderCallback_"),
 }
 CALLBACK_IDENTITIES = {identity for identity, _ in CALLBACK_TYPES.values()}
+CALLBACK_PREFIXES = {identity: prefix for identity, prefix in CALLBACK_TYPES.values()}
+NOMINAL_CARRIER = re.compile(r"(?:KuBootstrapResult_)?(?:KuArray_)?(KuStruct_m[1-9][0-9]*_([1-9][0-9]*))\Z")
 CHECKED_INT_CALLBACK_PARAMETERS = {
     "IntResultAppendCallback": ("KuProjectionString", "KuProjectionString", "int64_t", 0, "KuArrayInt", 1),
     "IntResultArenaCallback": (0, 1, "bool"),
@@ -351,6 +353,44 @@ def checked_aliases(units):
     return result
 
 
+def carrier_aliases(unit):
+    """Give the same Ku nominal type the same C identity in each linked unit."""
+    aliases = {}
+    used = set(re.findall(rb"[A-Za-z_][A-Za-z_0-9]*", unit.code))
+
+    def bind(local, stable):
+        if local.encode("ascii") not in used:
+            return
+        if local in aliases and aliases[local] != stable:
+            raise LinkError(f"{unit.plan}: conflicting C carrier {local}")
+        aliases[local] = stable
+
+    def nominal(local, path, node):
+        canonical = "KuStruct_" + canonical_symbol((path, node))
+        for prefix in ("", "KuArray_", "KuBootstrapResult_", "KuBootstrapResult_KuArray_"):
+            bind(prefix + local, prefix + canonical)
+
+    for declaration in (unit.export, *unit.dependencies):
+        for ref in (*declaration.signature.parameters, declaration.signature.result):
+            kind, *identity = ref.identity
+            if kind in ("struct", "struct_array"):
+                carrier = ref.c_type if ref.passing == "value" else ref.c_type[6:-1].rstrip()
+                match = NOMINAL_CARRIER.fullmatch(carrier)
+                if match:
+                    path, node = identity
+                    if int(match[2]) != node:
+                        raise LinkError(f"{unit.plan}: C carrier for {label((path, node))} has the wrong declaration node")
+                    nominal(match[1], path, node)
+            elif kind in CHECKED_INT_CALLBACK_ABI:
+                for local, (path, node) in zip(ref.callback_nominals, identity):
+                    nominal(local, path, node)
+            elif kind in CALLBACK_PREFIXES:
+                path, node = identity
+                prefix = CALLBACK_PREFIXES[kind]
+                nominal(ref.c_type.removeprefix(prefix), path, node)
+    return aliases
+
+
 def check_carrier_layout(carrier, expected, fields):
     members = " ".join(f"{c_type} {name};" for name, c_type in fields)
     checks = [f"sizeof({carrier}) == sizeof({expected})", f"_Alignof({carrier}) == _Alignof({expected})"]
@@ -477,7 +517,12 @@ def link(units, aliases, output, entry, caller, cc, cflags, ldflags, timeout, bu
             source.write_text(wrapper(unit, include_caller), encoding="ascii")
             obj = work / ("unit.obj" if msvc else "unit.o")
             define = "/D" if msvc else "-D"
-            macros = [f"{define}{local}={canonical}" for local, canonical in sorted(aliases[unit.export.key].items())
+            renames = dict(aliases[unit.export.key])
+            for local, canonical in carrier_aliases(unit).items():
+                if local in renames and renames[local] != canonical:
+                    raise LinkError(f"{unit.plan}: conflicting C identifier {local}")
+                renames[local] = canonical
+            macros = [f"{define}{local}={canonical}" for local, canonical in sorted(renames.items())
                       if local != canonical]
             compile_args = ["/c", source, f"/Fo{obj}"] if msvc else ["-c", source, "-o", obj]
             run_cc([cc, *flags, *cflags, *macros, *compile_args], timeout)
