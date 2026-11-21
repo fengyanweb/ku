@@ -36,6 +36,10 @@ fn LowerLinkedIntArrayLiteral(&project: LinkedNullProject, state: LinkedNullStat
     return ok(LinkedNullExpression { state: next, value: output.value })
 }
 
+fn IsLinkedLogicalNegation(&node: Node): bool {
+    return node.kind == "Unary" && node.edge_count == 1 && node.text == "!"
+}
+
 fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: int, depth: int): LinkedNullExpression! {
     node = LinkedNullNode(project, 1, id)
     if (depth >= 32) {
@@ -50,7 +54,7 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
     if (node.kind == "Binary" && node.edge_count == 2) {
         return readLinkedBinary(project, state, node, id, depth)
     }
-    if (node.kind == "Unary" && node.edge_count == 1 && node.text == "!") {
+    if (IsLinkedLogicalNegation(node)) {
         operand = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
         if (operand.value.ty.declaration_kind != "Builtin" || operand.value.ty.name != "bool") {
             RejectLayout("linked_unary_type", "logical negation requires bool", DeclarationSpan(node))?

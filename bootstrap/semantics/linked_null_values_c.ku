@@ -5,12 +5,12 @@ import { FindLinkedLocalRead } from "./call_contracts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
-import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
-import { LinkedDirectCallExpression, ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
+import { ContainsIndex } from "./struct_projection_c.ku"
+import { LinkedDirectCallExpression, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
 import { LinkedCallArgument, LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { CloneLinkedLocalArrayItem, CloneLinkedRecord, CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { CloneLinkedLocalArrayItem, CloneLinkedRecord, CloneLinkedRecordArray, EmitLinkedAddition, IsLinkedLogicalNegation, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalAppendArguments, CloneLinkedIntArray, ForwardLinkedCallback, LinkedCallableSlot, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix, ValidateLinkedPayload } from "./linked_parameters_c.ku"
 
 fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int, depth: int): LinkedNullExpression! {
@@ -350,8 +350,7 @@ fn LowerLinkedNullValue(&project: LinkedNullProject, state: LinkedNullState, id:
         previous = kept.value
         return EmitLinkedAddition(project, kept.state, previous, value, id, at)
     }
-    if (node.kind == "Binary" || node.kind == "Index" || node.kind == "Field" ||
-        (node.kind == "Unary" && node.text == "!" && node.edge_count == 1)) {
+    if (node.kind == "Binary" || node.kind == "Index" || node.kind == "Field" || IsLinkedLogicalNegation(node)) {
         return LowerLinkedNullRead(project, state, id, depth)
     }
     return LowerLinkedNullLeaf(state, node)

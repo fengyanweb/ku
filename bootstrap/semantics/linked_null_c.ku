@@ -12,7 +12,7 @@ import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
 import { ExitLinkedFailure, LinkedFailureTarget, LinkedSlotPrefix, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
-import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
+import { LinkedBuiltin, LinkedResultPlan, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
@@ -224,6 +224,11 @@ fn lowerLinkedCopyRebind(&project: LinkedNullProject, state: LinkedNullState, &a
     return StoreLinkedCopyAssignment(destination, LowerLinkedNullRead(project, state, id, 0)?, assignment)
 }
 
+fn linkedChildKindIs(&project: LinkedNullProject, &parent: Node, ordinal: int, &kind: str): bool {
+    child = LinkedNullNode(project, 1, LinkedNullChild(project, 1, parent, ordinal))
+    return child.kind == kind
+}
+
 fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNullState, start: int,
                      &result: TypeNameBinding, depth: int): LinkedNullRegion! {
     next = state
@@ -272,23 +277,22 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
         } else if (statement.kind == "ObjectDestructureAssign") {
             next = LowerLinkedOwnedDestructure(project, next, statement)?
         } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {
-            kind = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0)).kind
-            if (kind == "TypeArray") { next = LowerLinkedArrayLocal(project, next, statement, id)? }
-            else if (kind == "TypeFunction") { next = LowerLinkedLocalAlias(project, next, statement)? }
+            type_node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+            if (type_node.kind == "TypeArray") { next = LowerLinkedArrayLocal(project, next, statement, id)? }
+            else if (type_node.kind == "TypeFunction") { next = LowerLinkedLocalAlias(project, next, statement)? }
             else { next = LowerLinkedLocal(project, next, statement, id)? }
         } else if (statement.kind == "Function" && depth == 0) {
-            nullary = statement.edge_count >= 2 &&
-                LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0)).kind == "TypeResult"
+            nullary = statement.edge_count >= 2 && linkedChildKindIs(project, statement, 0, "TypeResult")
             checked_record = statement.edge_count >= 3 &&
-                LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0)).kind == "Parameter" &&
-                LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1)).kind == "TypeResult"
+                linkedChildKindIs(project, statement, 0, "Parameter") &&
+                linkedChildKindIs(project, statement, 1, "TypeResult")
             if (nullary || checked_record ||
-                (statement.edge_count >= 7 && LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 4)).kind == "Parameter")) {
+                (statement.edge_count >= 7 && linkedChildKindIs(project, statement, 4, "Parameter"))) {
                 CheckLinkedLocalFunctionName(project, next, statement)?
                 thunk = ReadLinkedAppendThunk(project, next, statement, id)?
                 body = lowerLinkedRegion(project, statement, thunk.parameters.state.clone(), thunk.parameters.body_start, thunk.parameters.result, 1)?
                 next = FinishLinkedAppendThunk(next, thunk, body, statement)?
-            } else if (statement.edge_count >= 4 && LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1)).kind == "Parameter") {
+            } else if (statement.edge_count >= 4 && linkedChildKindIs(project, statement, 1, "Parameter")) {
                 CheckLinkedLocalFunctionName(project, next, statement)?
                 thunk = ReadLinkedLocalThunk(project, next, statement, id)?
                 body = lowerLinkedRegion(project, statement, thunk.state.clone(), 3, thunk.result, 1)?
