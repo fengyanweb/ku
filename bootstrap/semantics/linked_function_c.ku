@@ -103,7 +103,7 @@ fn EmitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &pa
     keep = LinkedNullResultCleanupReference(body.owning_layouts, payload)
     char_errors = ""
     if (body.uses_chars) { char_errors = ManagedSourceCharactersErrors() }
-    return ok(FinishLinkedFunctionC(header + body.callback_helpers.clone(), body, symbol, signature, result, keep, char_errors))
+    return ok(FinishLinkedFunctionC(header + body.callback_helpers.clone(), body, symbol, signature, result, keep, char_errors, ""))
 }
 
 fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
@@ -146,7 +146,8 @@ fn LowerLinkedTargetSet(&project: LinkedNullProject, state: LinkedNullState, &st
         root = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
         slot = LinkedNullBinding(state.slots, root.text)
         if (root.kind != "Variable" || root.edge_count != 0 || slot == 0 || state.slots[slot - 1].parameter ||
-            state.slots[slot - 1].value.borrowed || state.slots[slot - 1].value.ty.declaration_kind != "OwnedIntArray") {
+            state.slots[slot - 1].value.borrowed || ContainsIndex(state.append_captures, slot) ||
+            state.slots[slot - 1].value.ty.declaration_kind != "OwnedIntArray") {
             RejectLayout("linked_index_target", "assignment requires an owning local int array", DeclarationSpan(root))?
         }
         RequireLinkedMutableName(root.text, DeclarationSpan(root))?
@@ -255,7 +256,7 @@ fn putLinkedDestructuredField(&project: LinkedNullProject, state: LinkedNullStat
     } else {
         old = next.slots[target - 1].value.clone()
         if (target == field.slot || next.slots[target - 1].parameter || old.borrowed || !SameLinkedType(old.ty, field.ty) ||
-            LinkedLocalReadCaptures(next.local_readers, target)) {
+            LinkedLocalReadCaptures(next.local_readers, target) || ContainsIndex(next.append_captures, target)) {
             RejectLayout("linked_destructure_target", "replacement requires a distinct mutable local of the same type", DeclarationSpan(local))?
         }
         RequireLinkedMutableName(local.text, DeclarationSpan(local))?
@@ -337,7 +338,7 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
             RejectLayout("linked_tail_result", "forwarded Result must match the entry's declared payload", DeclarationSpan(call))?
         }
         call_id = LinkedNullChild(project, 1, statement, 0)
-        arguments = LowerLinkedArguments(project, state, call, target, call_id, 0)?
+        arguments = LowerLinkedArguments(project, state, call, target, call_id, 0, true)?
         arguments.state.code = arguments.state.code + "    result = " + LinkedNullCallSymbol(target) + "(" + arguments.args
             + ");\n" + arguments.handoff + "    goto cleanup;\n"
         return ok(arguments.state)

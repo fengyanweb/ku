@@ -1,6 +1,6 @@
 import { RequireLinkedMutableName } from "./call_contracts.ku"
-import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, LinkedCountedInitial, LinkedCountdownIndex, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
-import { OpenLinkedForLoop, CloseLinkedForLoop, ValidLinkedCountedStart, ReadLinkedLocalThunk, FinishLinkedLocalThunk, LowerLinkedLocalAlias, LowerLinkedPredicate } from "./linked_char_iter_c.ku"
+import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, LinkedCountdownIndex, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
+import { OpenLinkedForLoop, CloseLinkedForLoop, LinkedCountedInitial, ValidLinkedCountedStart, ReadLinkedLocalThunk, FinishLinkedLocalThunk, LowerLinkedLocalAlias, LowerLinkedPredicate } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedArrayLocal, LowerLinkedTargetSet, LowerLinkedOwnedDestructure,
          LowerLinkedPlainReturn, LowerLinkedStringAppend, LowerLinkedSuccess } from "./linked_function_c.ku"
@@ -10,13 +10,13 @@ import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
-import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
-import { LinkedSlotPrefix, ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
+import { RejectLayout } from "./struct_layouts.ku"
+import { LinkedSlotPrefix, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject, LinkedNullType, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedCopyRebind, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { LinkedBooleanWhileCondition, LowerLinkedArrayAppend, LowerLinkedOwnerRebind, OpenLinkedBooleanWhile } from "./linked_owner_assignment_c.ku"
+import { FinishLinkedAppendThunk, LinkedBooleanWhileCondition, LowerLinkedArrayAppend, LowerLinkedFailure, LowerLinkedOwnerRebind, OpenLinkedBooleanWhile, ReadLinkedAppendThunk, ReadLinkedCatchParts } from "./linked_owner_assignment_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 
@@ -154,61 +154,6 @@ fn addLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Nod
     return MoveLinkedNullSlot(slot.state, value.value)
 }
 
-fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
-    if (statement.kind != "Fail" || statement.edge_count != 1) {
-        RejectLayout("unsupported_linked_terminal", "expected a final Error fail or return ok(null)", DeclarationSpan(statement))?
-    }
-    id = LinkedNullChild(project, 1, statement, 0)
-    literal = LinkedNullNode(project, 1, id)
-    target = LinkedFailureTarget(state)
-    if (literal.kind == "Variable" && literal.edge_count == 0) {
-        error = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
-        if (error.value.ty.declaration_kind != "CaughtError") {
-            RejectLayout("unsupported_linked_error", "expected a caught Error owner", DeclarationSpan(literal))?
-        }
-        error.state.code += "    " + target + " = " + error.value.text.clone() + ";\n"
-        owner = error.value.clone()
-        moved = MoveLinkedNullSlot(error.state, owner)?
-        return ok(ExitLinkedFailure(moved, "    "))
-    }
-    plan = ReadLinkedErrorInitializer(project.supplied[0].named, literal)?
-    next = state
-    destination = target.clone()
-    if (plan.scratch) {
-        ty = LinkedBuiltin("Error", DeclarationSpan(literal))
-        ty.declaration_kind = "CaughtError"
-        scratch = AddLinkedNullSlot(project, next, "", "error" + str(id), ty, false)?
-        next = scratch.state
-        destination = scratch.value.text
-    }
-    for field in plan.fields {
-        value = LowerLinkedNullValue(project, next, field.expression, 0)?
-        if (value.value.ty.declaration_kind != "Builtin" || value.value.ty.name != "str") {
-            RejectLayout("unsupported_linked_error_field", "error fields require str", value.value.ty.span.clone())?
-        }
-        value.state.code += "    " + destination.clone() + "." + field.name + " = " + value.value.text.clone() + ";\n"
-        owner = value.value
-        if (owner.borrowed) {
-            if (owner.slot == 0 || value.state.catch_slot != 0
-                || value.state.slots[owner.slot - 1].value.ty.declaration_kind != "CaughtError") {
-                RejectLayout("linked_error_field_owner", "error fields require an owned str or a terminal caught field", owner.ty.span.clone())?
-            }
-            value.state.code += "    " + owner.text.clone() + " = (KuProjectionString){0};\n"
-            value.state.moved_error_fields = value.state.moved_error_fields.push(owner.text)
-            next = value.state
-        } else {
-            next = MoveLinkedNullSlot(value.state, owner)?
-        }
-    }
-    if (plan.scratch) {
-        next.code += "    " + target + " = " + destination.clone() + ";\n"
-            + "    " + destination + " = (KuBootstrapError){0};\n"
-        cleared: [str] = []
-        next.moved_error_fields = cleared
-    }
-    return ok(ExitLinkedFailure(next, "    "))
-}
-
 fn lowerLinkedCatch(&project: LinkedNullProject, state: LinkedNullState, &node: Node, id: int,
                     &result: TypeNameBinding, depth: int): LinkedNullRegion! {
     if (state.catch_slot != 0 || node.edge_count != 2 || depth >= 8) {
@@ -247,7 +192,7 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
                 if (next.plain_value_result && next.catch_slot == 0) {
                     RejectLayout("linked_value_failure", "a plain value result cannot propagate an Error", DeclarationSpan(statement))?
                 }
-                next = lowerLinkedFailure(project, next, statement)?
+                next = LowerLinkedFailure(project, next, statement)?
             } else if (next.plain_value_result) {
                 next = LowerLinkedPlainReturn(project, next, statement, result)?
             } else { next = LowerLinkedSuccess(project, next, statement, result)? }
@@ -284,7 +229,12 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             else if (kind == "TypeFunction") { next = LowerLinkedLocalAlias(project, next, statement)? }
             else { next = addLocal(project, next, statement, id)? }
         } else if (statement.kind == "Function" && depth == 0) {
-            if (statement.edge_count >= 4 && LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1)).kind == "Parameter") {
+            if (statement.edge_count >= 7 && LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 4)).kind == "Parameter") {
+                CheckLinkedLocalFunctionName(project, next, statement)?
+                thunk = ReadLinkedAppendThunk(project, next, statement, id)?
+                body = lowerLinkedRegion(project, statement, thunk.parameters.state.clone(), 6, thunk.parameters.result, 1)?
+                next = FinishLinkedAppendThunk(next, thunk, body, statement)?
+            } else if (statement.edge_count >= 4 && LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1)).kind == "Parameter") {
                 CheckLinkedLocalFunctionName(project, next, statement)?
                 thunk = ReadLinkedLocalThunk(project, next, statement, id)?
                 body = lowerLinkedRegion(project, statement, thunk.state.clone(), 3, thunk.result, 1)?

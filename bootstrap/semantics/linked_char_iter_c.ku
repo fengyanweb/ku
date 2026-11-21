@@ -1,5 +1,5 @@
 import { Node } from "../stage2/ast.ku"
-import { DeclarationSpan, IsNamedFunction } from "./names.ku"
+import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkedNullValue,
     LinkedReadonlyExpression, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
@@ -7,51 +7,14 @@ import { LinkedBuiltin, LinkedCheckedResultCType, LinkedIntResult, LinkedNullChi
     LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedStringResult,
     ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
-import { DropLinkedNullScope, LinkedLiveIntBinding } from "./linked_member_ownership.ku"
+import { DropLinkedNullScope, LinkedIncreasingGuard, LinkedLiveIntBinding, RejectLinkedWriteRange } from "./linked_member_ownership.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
-import { LinkedForLoop, OpenLinkedFreshRecordFor } from "./linked_owner_assignment_c.ku"
-
-fn rejectLocalCapture(&node: Node, message: str): null! {
-    return RejectLayout("unsupported_linked_local_capture", message, DeclarationSpan(node))
-}
-
-// The validated arena stores this function's subtree contiguously. A second
-// function or a declaration that could shadow an outer slot needs its own
-// binding rules before this restricted same-frame lowering can accept it.
-fn readLinkedLocalCaptures(&project: LinkedNullProject, &state: LinkedNullState,
-                           &function: Node, id: int): [int]! {
-    first = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, 0))
-    second = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, 1))
-    cursor = LinkedNullChild(project, 1, function, 3)
-    while (project.supplied[0].named.parsed.arena.nodes[cursor - 1].edge_count > 0) {
-        cursor = project.supplied[0].named.parsed.arena.edges[
-            project.supplied[0].named.parsed.arena.nodes[cursor - 1].first_edge]
-    }
-    slots: [int] = []
-    while (cursor < id) {
-        node = LinkedNullNode(project, 1, cursor)
-        use = node.kind == "Variable" || node.kind == "Assign"
-        if (IsNamedFunction(node.kind) || node.kind == "FunctionExpr" || (use && node.text == function.text)) {
-            rejectLocalCapture(node, "a local callback cannot define or reference a nested callable")?
-        }
-        declares = node.kind == "VarDecl" || node.kind == "For" || node.kind == "CatchBinding" ||
-            node.kind == "ObjectDestructureLocal" || node.kind == "ObjectDestructureRest"
-        if ((use || declares) && node.text != first.text && node.text != second.text) {
-            slot = LinkedNullBinding(state.slots, node.text)
-            if (slot > 0 && declares) {
-                rejectLocalCapture(node, "a local callback binding cannot shadow an outer capture")?
-            }
-            if (slot > 0 && !ContainsIndex(slots, slot)) { slots = slots.push(slot) }
-        }
-        cursor = cursor + 1
-    }
-    return ok(slots)
-}
+import { LinkedForLoop, OpenLinkedFreshRecordFor, ReadLinkedLocalCaptures, RejectLocalCapture, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./linked_owner_assignment_c.ku"
 
 struct LinkedLocalThunk {
     state: LinkedNullState
@@ -64,49 +27,34 @@ struct LinkedLocalThunk {
 
 fn ReadLinkedLocalThunk(&project: LinkedNullProject, &parent: LinkedNullState,
                         &function: Node, id: int): LinkedLocalThunk! {
-    // Retain shared C requirements and dependency identities, but start the
-    // private function with its own automatic storage and error cleanup.
-    body = parent.clone()
-    body.slots = []
-    body.declarations = ""
-    body.code = ""
-    body.drops = ""
-    body.plain_value_result = false
-    body.local_readers = []
-    body.local_callbacks = []
-    body.callback_owners = []
-    body.append_slots = []
-    body.catch_slot = 0
-    body.catch_edges = false
-    body.catch_moved = []
-    body.moved_error_fields = []
+    body = StartLinkedThunkFrame(parent)
     for index in [0, 1] {
         parameter = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
         if (parameter.kind != "Parameter" || parameter.edge_count != 1 || parameter.int_value != 0 ||
             LinkedNullBinding(body.slots, parameter.text) > 0) {
-            rejectLocalCapture(parameter, "a local callback needs two distinct typed Copy int parameters")?
+            RejectLocalCapture(parameter, "a local callback needs two distinct typed Copy int parameters")?
         }
         ty = LinkedNullType(project, 1, LinkedNullChild(project, 1, parameter, 0))?
-        if (!LinkedIntResult(ty)) { rejectLocalCapture(parameter, "a local callback requires Copy int parameters")? }
+        if (!LinkedIntResult(ty)) { RejectLocalCapture(parameter, "a local callback requires Copy int parameters")? }
         bound = AddLinkedNullSlot(project, body, parameter.text, "a" + str(index), ty, true)?
         body = bound.state
         body.code += "    (void)" + bound.value.text + ";\n"
     }
     result = ReadLinkedResult(project, 1, LinkedNullChild(project, 1, function, 2), true)?
-    if (result.declaration_kind != "Struct") { rejectLocalCapture(function, "a local callback requires a checked named result")? }
+    if (result.declaration_kind != "Struct") { RejectLocalCapture(function, "a local callback requires a checked named result")? }
     body = RegisterLinkedNullType(project, body, result.clone())?
     environment = "ku_local_environment_" + str(id)
     body.code += "    " + environment.clone() + " *capture = raw;\n    (void)capture;\n"
     fields = ""
     initializers = ""
     owners: [int] = []
-    for index in readLinkedLocalCaptures(project, parent, function, id)? {
+    for index in ReadLinkedLocalCaptures(project, parent, function, id, 3)? {
         outer = parent.slots[index - 1].clone()
         owned_array = LinkedNullOwnedArray(outer.value.ty)
         array_view = owned_array || outer.value.ty.declaration_kind == "StructArray"
         copy = outer.value.ty.declaration_kind == "Builtin" && (outer.value.ty.name == "int" || outer.value.ty.name == "bool")
         if (!outer.live || outer.moved_members.len() > 0 || (!copy && !array_view)) {
-            rejectLocalCapture(function, "local capture requires a live Copy scalar or readonly named array owner")?
+            RejectLocalCapture(function, "local capture requires a live Copy scalar or readonly named array owner")?
         }
         ty = outer.value.ty.clone()
         if (array_view) { ty.declaration_kind = "StructArray" }
@@ -149,7 +97,7 @@ fn bindLinkedLocalCallback(state: LinkedNullState, name: str, ty: TypeNameBindin
 fn FinishLinkedLocalThunk(&parent: LinkedNullState, &thunk: LinkedLocalThunk,
                           lowered: LinkedNullRegion, &function: Node, id: int): LinkedNullState! {
     if (!lowered.terminal || lowered.state.append_slots.len() > 0) {
-        rejectLocalCapture(function, "a local callback requires a checked exit and cannot append to an array")?
+        RejectLocalCapture(function, "a local callback requires a checked exit and cannot append to an array")?
     }
     next = lowered.state
     symbol = "ku_local_callback_" + str(id)
@@ -158,22 +106,9 @@ fn FinishLinkedLocalThunk(&parent: LinkedNullState, &thunk: LinkedLocalThunk,
     char_errors = ""
     if (next.uses_chars) { char_errors = ManagedSourceCharactersErrors() }
     next.callback_helpers += "\ntypedef struct {" + thunk.fields.clone() + " } " + thunk.environment.clone() + ";\nstatic "
-        + FinishLinkedFunctionC("", next, symbol, "void *raw, int64_t a0, int64_t a1", type, keep, char_errors)
+        + FinishLinkedFunctionC("", next, symbol, "void *raw, int64_t a0, int64_t a1", type, keep, char_errors, "")
 
-    // Dependencies, layouts and C helpers are translation-unit requirements.
-    // Bindings and failure cleanup below the thunk belong solely to it.
-    next.slots = parent.slots.clone()
-    next.code = parent.code.clone()
-    next.drops = parent.drops.clone()
-    next.local_readers = parent.local_readers.clone()
-    next.local_callbacks = parent.local_callbacks.clone()
-    next.callback_owners = parent.callback_owners.clone()
-    next.append_slots = parent.append_slots.clone()
-    next.plain_value_result = parent.plain_value_result
-    next.catch_slot = parent.catch_slot
-    next.catch_edges = parent.catch_edges
-    next.catch_moved = parent.catch_moved.clone()
-    next.moved_error_fields = parent.moved_error_fields.clone()
+    next = RestoreLinkedThunkFrame(next, parent)
     for owner in thunk.owners.clone() {
         if (!ContainsIndex(next.callback_owners, owner)) { next.callback_owners = next.callback_owners.push(owner) }
     }
@@ -197,7 +132,7 @@ fn LowerLinkedLocalAlias(&project: LinkedNullProject, state: LinkedNullState, &s
     if (source.kind != "Variable" || !ContainsIndex(state.local_callbacks, index) ||
         !state.slots[index - 1].live || !SameLinkedType(ty, state.slots[index - 1].value.ty) ||
         LinkedNullBinding(state.slots, statement.text) > 0) {
-        rejectLocalCapture(statement, "a local callback alias requires a live local thunk with the declared checked signature")?
+        RejectLocalCapture(statement, "a local callback alias requires a live local thunk with the declared checked signature")?
     }
     descriptor = state.slots[index - 1].value.text.clone()
     return ok(bindLinkedLocalCallback(state, statement.text.clone(), ty, descriptor))
@@ -374,4 +309,34 @@ fn ValidLinkedCountedStart(&project: LinkedNullProject, &state: LinkedNullState,
     }
     input = LinkedLiveIntBinding(state, initial)
     return input > 0 && input != slot
+}
+
+fn LinkedCountedInitial(&project: LinkedNullProject, &state: LinkedNullState, &region: Node,
+                        &loop: Node, start: int, index: int): Node! {
+    previous = LinkedNullChild(project, 1, region, index - 1)
+    initial = LinkedNullNode(project, 1, previous)
+    guard_id = LinkedNullChild(project, 1, loop, 0)
+    guard = LinkedIncreasingGuard(project, loop)
+    if (guard.kind != "Binary" || guard.text != "<" || guard.edge_count != 2) { return ok(initial) }
+    bound = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 1))
+    if (LinkedLiveIntBinding(state, bound) == 0) { return ok(initial) }
+    cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
+    if (LinkedLiveIntBinding(state, cursor) == 0 || (initial.kind == "Assign" && initial.text == cursor.text)) {
+        return ok(initial)
+    }
+
+    // Only a preceding statement in the same lexical region can establish
+    // the cursor. Nested statements may invalidate it rather than supply it.
+    position = index - 2
+    while (position >= start) {
+        id = LinkedNullChild(project, 1, region, position)
+        candidate = LinkedNullNode(project, 1, id)
+        if (candidate.kind == "Assign" && candidate.edge_count == 1 && candidate.text == cursor.text) {
+            RejectLinkedWriteRange(project, id + 1, guard_id, cursor.text, "linked_loop_initial_write",
+                "a counted loop cannot use an earlier cursor initializer after an intervening write")?
+            return ok(candidate)
+        }
+        position = position - 1
+    }
+    return ok(initial)
 }

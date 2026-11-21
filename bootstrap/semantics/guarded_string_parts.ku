@@ -351,3 +351,31 @@ fn ManagedStringAppendRuntime(): str {
 fn ManagedStringRuntime(): str {
     return ScalarCheckedMultiplyC() + ManagedStringAppendRuntime()
 }
+
+fn CheckedLinkedCallbackExpression(&carrier: str, &callback: str, &args: str): str {
+    expression = callback.clone() + ".entry ? " + callback.clone() + ".entry(" + callback.clone() + ".environment, " + args.clone() + ")"
+    return expression + " : (" + carrier.clone() + "){.error={"
+        + ".domain={(uint8_t*)\"bootstrap.callback\",sizeof(\"bootstrap.callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
+        + ".code={(uint8_t*)\"invalid_callback\",sizeof(\"invalid_callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
+        + ".message={(uint8_t*)\"callback entry is missing\",sizeof(\"callback entry is missing\")-1u,0u,KU_PROJECTION_STRING_STATIC}}}"
+}
+
+
+fn CheckedAppendFault(id: int): str {
+    return "    KuLocalAppendFailure fault" + str(id) + " = {.append_status = KU_STRUCT_ARRAY_OK};\n"
+}
+
+fn CheckedAppendInvocation(&symbol: str, &args: str, environment: int, id: int): str {
+    return symbol.clone() + "(&environment" + str(environment) + ", &fault" + str(id) + ", " + args.clone() + ")"
+}
+
+fn CheckedAppendFaultHandoff(id: int): str {
+    fault = "fault" + str(id)
+    return "    if (" + fault.clone() + ".out_of_memory) { out_of_memory = true; goto cleanup; }\n"
+        + "    if (" + fault.clone() + ".array_error) { captured_array_failure = " + fault.clone() + ".array_error; goto cleanup; }\n"
+        + "    if (" + fault.clone() + ".append_status != KU_STRUCT_ARRAY_OK) { append_status = "
+        + fault.clone() + ".append_status; goto cleanup; }\n"
+        + "    if (" + fault.clone() + ".overflow) { overflow = true; goto cleanup; }\n"
+        + "    if (" + fault.clone() + ".index_failed) { index_failed = true; failure_index = " + fault.clone()
+        + ".index; failure_length = " + fault + ".length; goto cleanup; }\n"
+}

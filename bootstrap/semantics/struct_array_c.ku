@@ -416,7 +416,7 @@ fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str):
     }
     text += EmitBoundElementClones(body.layouts, body.element_clones)
     text += result_header + EmitBoundArrayResults(body.layouts, body.owning_layouts, body.owned_arrays, body.uses_chars)
-    append_types: [TypeNameBinding] = []
+    append_types = body.local_append_types.clone()
     for index in body.append_slots.clone() { append_types = append_types.push(body.slots[index - 1].value.ty.clone()) }
     return ok(text + EmitBoundArrayAppenders(append_types))
 }

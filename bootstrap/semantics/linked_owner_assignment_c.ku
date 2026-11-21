@@ -1,10 +1,12 @@
+import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
 import { Node } from "../stage2/ast.ku"
-import { DeclarationSpan } from "./names.ku"
-import { RejectLayout } from "./struct_layouts.ku"
+import { DeclarationSpan, IsNamedFunction, NamedModule } from "./names.ku"
+import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
-import { LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
-import { LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
+import { ExitLinkedFailure, LinkedFailureTarget, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
+import { LinkedBuiltin, LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { AddLinkedNullSlot, LinkedNullParameters, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
+import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
 import { AppendLinkedArrayElement, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
@@ -15,7 +17,12 @@ fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &
         RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(statement))?
     }
     id = ReadOwnedArrayPushArgument(project.supplied[0].named, statement)?
-    if (id == 0) { return LowerLinkedOwnerRebind(project, state, statement) }
+    if (id == 0) {
+        if (ContainsIndex(state.append_captures, index)) {
+            RejectLayout("linked_capture_rebind", "a local append capture can only be assigned its own push result", DeclarationSpan(statement))?
+        }
+        return LowerLinkedOwnerRebind(project, state, statement)
+    }
     value = LowerLinkedNullValue(project, state, id, 0)?
     if (!value.state.slots[index - 1].live || !SameLinkedType(value.value.ty, LinkedNullArrayElement(array.value.ty.clone()))
         || value.value.borrowed || (!copy && (value.value.slot == 0 || value.value.member_path != ""))) {
@@ -118,4 +125,278 @@ fn OpenLinkedBooleanWhile(state: LinkedNullState, &statement: Node, condition: s
     next.code += "    while (" + condition + ") {
 "
     return ok(LinkedForLoop { state: next, outer: outer, before: before })
+}
+
+struct LinkedCatchParts {
+    protected: Node
+    binding: Node
+    recovery: Node
+}
+
+fn ReadLinkedCatchParts(&named: NamedModule, &node: Node): LinkedCatchParts! {
+    edge = node.first_edge
+    protected = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
+    handler = named.parsed.arena.nodes[named.parsed.arena.edges[edge + 1] - 1].clone()
+    if (protected.kind != "TryBody" || handler.kind != "Catch" || handler.edge_count != 2) {
+        RejectLayout("unsupported_linked_catch", "expected a protected body and named catch", DeclarationSpan(node))?
+    }
+    edge = handler.first_edge
+    binding = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
+    recovery = named.parsed.arena.nodes[named.parsed.arena.edges[edge + 1] - 1].clone()
+    if (binding.kind != "CatchBinding" || binding.text == "" || binding.edge_count != 0 || recovery.kind != "CatchBody") {
+        RejectLayout("unsupported_linked_catch", "expected a named catch and handler body", DeclarationSpan(handler))?
+    }
+    return ok(LinkedCatchParts { protected: protected, binding: binding, recovery: recovery })
+}
+
+
+fn RejectLocalCapture(&node: Node, message: str): null! {
+    return RejectLayout("unsupported_linked_local_capture", message, DeclarationSpan(node))
+}
+
+// The validated arena stores this function's subtree contiguously. A second
+// function or a declaration that could shadow an outer slot needs its own
+// binding rules before this restricted same-frame lowering can accept it.
+fn ReadLinkedLocalCaptures(&project: LinkedNullProject, &state: LinkedNullState,
+                           &function: Node, id: int, body_start: int): [int]! {
+    names: [str] = []
+    index = 0
+    while (index < body_start - 1) {
+        parameter = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
+        names = names.push(parameter.text)
+        index += 1
+    }
+    cursor = LinkedNullChild(project, 1, function, body_start)
+    while (project.supplied[0].named.parsed.arena.nodes[cursor - 1].edge_count > 0) {
+        cursor = project.supplied[0].named.parsed.arena.edges[
+            project.supplied[0].named.parsed.arena.nodes[cursor - 1].first_edge]
+    }
+    slots: [int] = []
+    while (cursor < id) {
+        node = LinkedNullNode(project, 1, cursor)
+        use = node.kind == "Variable" || node.kind == "Assign"
+        if (IsNamedFunction(node.kind) || node.kind == "FunctionExpr" || (use && node.text == function.text)) {
+            RejectLocalCapture(node, "a local callback cannot define or reference a nested callable")?
+        }
+        declares = node.kind == "VarDecl" || node.kind == "For" || node.kind == "CatchBinding" ||
+            node.kind == "ObjectDestructureLocal" || node.kind == "ObjectDestructureRest"
+        if ((use || declares) && !ContainsType(names, node.text)) {
+            slot = LinkedNullBinding(state.slots, node.text)
+            if (slot > 0 && declares) {
+                RejectLocalCapture(node, "a local callback binding cannot shadow an outer capture")?
+            }
+            if (slot > 0 && !ContainsIndex(slots, slot)) { slots = slots.push(slot) }
+        }
+        cursor = cursor + 1
+    }
+    return ok(slots)
+}
+
+fn StartLinkedThunkFrame(&parent: LinkedNullState): LinkedNullState {
+    // Retain shared C requirements and dependency identities, but start the
+    // private function with its own automatic storage and error cleanup.
+    body = parent.clone()
+    body.slots = []
+    body.declarations = ""
+    body.code = ""
+    body.drops = ""
+    body.plain_value_result = false
+    body.local_readers = []
+    body.local_callbacks = []
+    body.callback_owners = []
+    body.append_slots = []
+    body.local_appends = []
+    body.append_captures = []
+    body.catch_slot = 0
+    body.catch_edges = false
+    body.catch_moved = []
+    body.moved_error_fields = []
+    return body
+}
+
+fn RestoreLinkedThunkFrame(body: LinkedNullState, &parent: LinkedNullState): LinkedNullState {
+    // Dependencies, layouts and C helpers are translation-unit requirements.
+    // Bindings and failure cleanup below the thunk belong solely to it.
+    next = body
+    next.slots = parent.slots.clone()
+    next.code = parent.code.clone()
+    next.drops = parent.drops.clone()
+    next.local_readers = parent.local_readers.clone()
+    next.local_callbacks = parent.local_callbacks.clone()
+    next.callback_owners = parent.callback_owners.clone()
+    next.append_slots = parent.append_slots.clone()
+    next.local_appends = parent.local_appends.clone()
+    next.append_captures = parent.append_captures.clone()
+    next.declarations = parent.declarations.clone()
+    next.plain_value_result = parent.plain_value_result
+    next.catch_slot = parent.catch_slot
+    next.catch_edges = parent.catch_edges
+    next.catch_moved = parent.catch_moved.clone()
+    next.moved_error_fields = parent.moved_error_fields.clone()
+    return next
+}
+
+struct LinkedAppendThunk {
+    parameters: LinkedNullParameters
+    function: LinkedNullFunction
+    sources: [int]
+    environment: str
+    typedef_fields: str
+    initializers: str
+}
+
+fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
+                         &function: Node, id: int): LinkedAppendThunk! {
+    parameters = ReadLinkedNullParametersFrom(project, function, StartLinkedThunkFrame(parent))?
+    if (parameters.body_start != 6 || parameters.state.plain_value_result || !LinkedIntResult(parameters.result)) {
+        RejectLocalCapture(function, "a local append function requires five typed parameters and int!")?
+    }
+    slots = parameters.state.slots.clone()
+    span = slots[3].value.clone()
+    if (!LinkedStringResult(slots[0].value.ty) || !LinkedStringResult(slots[1].value.ty) ||
+        !LinkedIntResult(slots[2].value.ty) || span.ty.declaration_kind != "Struct" ||
+        LinkedNullDropC(parameters.state.layouts, parameters.state.owning_layouts, span.ty, span.text) != "" ||
+        !LinkedNullIntArrayOwner(slots[4].value.ty)) {
+        RejectLocalCapture(function, "a local append function requires str, str, int, a Copy-layout record and [int]")?
+    }
+    signature = LinkedNullFunction { unit: 1, node: id, symbol: "ku_local_append_" + str(id), parameters: [
+        slots[0].value.ty.clone(), slots[1].value.ty.clone(), slots[2].value.ty.clone(),
+        slots[3].value.ty.clone(), slots[4].value.ty.clone()], result: parameters.result.clone(), returns_result: true }
+    body = parameters.state
+    environment = "ku_local_append_environment_" + str(id)
+    body.code += "    " + environment.clone() + " *const capture = raw;\n"
+    fields = ""
+    initializers = ""
+    sources: [int] = []
+    for index in ReadLinkedLocalCaptures(project, parent, function, id, parameters.body_start)? {
+        outer = parent.slots[index - 1].clone()
+        ty = outer.value.ty.clone()
+        array = LinkedNullOwnedArray(ty) || LinkedNullIntArrayOwner(ty)
+        scalar = ty.declaration_kind == "Builtin" && (ty.name == "int" || ty.name == "bool")
+        if (!outer.live || outer.value.borrowed || outer.moved_members.len() > 0 ||
+            ContainsIndex(parent.callback_owners, index) || (!scalar && !array)) {
+            RejectLocalCapture(function, "a local append capture requires a live scalar or an exclusive array owner")?
+        }
+        field = "c" + str(index)
+        fields += " " + LinkedNullCType(ty)? + " *" + field.clone() + ";"
+        initializers += " ." + field.clone() + " = &(" + outer.value.text + "),"
+        outer.value.text = "(*capture->" + field + ")"
+        outer.value.slot = body.slots.len() + 1
+        // These are references to automatic storage in the caller. Only
+        // that caller drops its arrays, including any successfully appended
+        // prefix. The entry cannot move their headers or replace the owner.
+        outer.parameter = true
+        if (array) {
+            body.append_captures = body.append_captures.push(outer.value.slot)
+            sources = sources.push(index)
+        }
+        body.slots = body.slots.push(outer)
+    }
+    if (sources.len() == 0) {
+        RejectLocalCapture(function, "a local append function requires an exclusive array capture")?
+    }
+    parameters.state = body
+    return ok(LinkedAppendThunk { parameters: parameters, function: signature, sources: sources,
+        environment: environment, typedef_fields: fields, initializers: initializers })
+}
+
+fn appendThunkFailureRelay(&body: LinkedNullState): str {
+    text = "    failure->append_status = append_status;\n"
+    if (body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0) {
+        text += "    failure->out_of_memory = out_of_memory;\n"
+    }
+    if (body.validated_arrays.len() > 0) {
+        message = "invalid struct array ownership"
+        if (body.uses_str_array) { message = "invalid array view" }
+        text += "    if (invalid_array) failure->array_error = \"" + message + "\\n\";\n"
+    }
+    if (body.uses_add || body.uses_sub || body.uses_mul) { text += "    failure->overflow = overflow;\n" }
+    if (body.uses_index) {
+        text += "    failure->index_failed = index_failed;\n    failure->index = failure_index;\n    failure->length = failure_length;\n"
+    }
+    return text
+}
+
+fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
+                           lowered: LinkedNullRegion, &function: Node): LinkedNullState! {
+    next = lowered.state
+    if (!lowered.terminal || next.append_slots.len() == 0 || next.uses_print || next.uses_chars ||
+        next.uses_str_view || next.uses_struct_view || next.uses_concat || next.uses_div) {
+        RejectLocalCapture(function, "a local append function needs checked exits and append-only captured array effects")?
+    }
+    for index in next.append_slots.clone() {
+        ty = next.slots[index - 1].value.ty.clone()
+        next.local_append_types = next.local_append_types.push(ty)
+    }
+    if (parent.local_appends.len() == 0) {
+        next.callback_helpers += "\ntypedef struct { int append_status; bool out_of_memory, overflow, index_failed; const char *array_error; int64_t index; size_t length; } KuLocalAppendFailure;\n"
+    }
+    next.callback_helpers += "\ntypedef struct {" + thunk.typedef_fields.clone() + " } " + thunk.environment.clone() + ";\nstatic "
+        + FinishLinkedFunctionC("", next, thunk.function.symbol, "void *raw, KuLocalAppendFailure *failure, " +
+            thunk.parameters.signature.clone(), LinkedCheckedResultCType(thunk.function.result)?, "", "", appendThunkFailureRelay(next))
+    next = RestoreLinkedThunkFrame(next, parent)
+    for index in thunk.sources.clone() {
+        if (!ContainsIndex(next.append_captures, index)) { next.append_captures = next.append_captures.push(index) }
+    }
+    next.local_appends = next.local_appends.push(LinkedLocalAppend { binding: function.text.clone(), function: thunk.function.clone() })
+    frame = "environment" + str(thunk.function.node)
+    next.declarations += "    " + thunk.environment.clone() + " " + frame.clone() + " = {0};\n"
+    next.code += "    " + frame.clone() + " = (" + thunk.environment.clone() + "){" + thunk.initializers.clone() + " };\n"
+        + "    (void)" + frame + "; (void)" + thunk.function.symbol.clone() + ";\n"
+    return ok(next)
+}
+
+fn LowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    if (statement.kind != "Fail" || statement.edge_count != 1) {
+        RejectLayout("unsupported_linked_terminal", "expected a final Error fail or return ok(null)", DeclarationSpan(statement))?
+    }
+    id = LinkedNullChild(project, 1, statement, 0)
+    literal = LinkedNullNode(project, 1, id)
+    target = LinkedFailureTarget(state)
+    if (literal.kind == "Variable" && literal.edge_count == 0) {
+        error = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
+        if (error.value.ty.declaration_kind != "CaughtError") {
+            RejectLayout("unsupported_linked_error", "expected a caught Error owner", DeclarationSpan(literal))?
+        }
+        error.state.code += "    " + target + " = " + error.value.text.clone() + ";\n"
+        owner = error.value.clone()
+        moved = MoveLinkedNullSlot(error.state, owner)?
+        return ok(ExitLinkedFailure(moved, "    "))
+    }
+    plan = ReadLinkedErrorInitializer(project.supplied[0].named, literal)?
+    next = state
+    destination = target.clone()
+    if (plan.scratch) {
+        ty = LinkedBuiltin("Error", DeclarationSpan(literal))
+        ty.declaration_kind = "CaughtError"
+        scratch = AddLinkedNullSlot(project, next, "", "error" + str(id), ty, false)?
+        next = scratch.state
+        destination = scratch.value.text
+    }
+    for field in plan.fields {
+        value = LowerLinkedNullValue(project, next, field.expression, 0)?
+        if (value.value.ty.declaration_kind != "Builtin" || value.value.ty.name != "str") {
+            RejectLayout("unsupported_linked_error_field", "error fields require str", value.value.ty.span.clone())?
+        }
+        value.state.code += "    " + destination.clone() + "." + field.name + " = " + value.value.text.clone() + ";\n"
+        owner = value.value
+        if (owner.borrowed) {
+            if (owner.slot == 0 || value.state.catch_slot != 0
+                || value.state.slots[owner.slot - 1].value.ty.declaration_kind != "CaughtError") {
+                RejectLayout("linked_error_field_owner", "error fields require an owned str or a terminal caught field", owner.ty.span.clone())?
+            }
+            value.state.code += "    " + owner.text.clone() + " = (KuProjectionString){0};\n"
+            value.state.moved_error_fields = value.state.moved_error_fields.push(owner.text)
+            next = value.state
+        } else {
+            next = MoveLinkedNullSlot(value.state, owner)?
+        }
+    }
+    if (plan.scratch) {
+        next.code += "    " + target + " = " + destination.clone() + ";\n"
+            + "    " + destination + " = (KuBootstrapError){0};\n"
+        cleared: [str] = []
+        next.moved_error_fields = cleared
+    }
+    return ok(ExitLinkedFailure(next, "    "))
 }

@@ -1,4 +1,4 @@
-import { LinkedIncreasingGuard, LinkedLiveIntBinding, LinkedMemberUnavailable, LinkedNullDropC, RejectLinkedLoopWrite, RejectLinkedWriteRange } from "./linked_member_ownership.ku"
+import { LinkedLiveIntBinding, LinkedMemberUnavailable, LinkedNullDropC, RejectLinkedLoopWrite } from "./linked_member_ownership.ku"
 import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
 import { EmitScalarIntString } from "./scalar_int_emit.ku"
 import { HasScalarBuiltin } from "./scalar_int_operands.ku"
@@ -8,7 +8,7 @@ import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { LayoutIndex, RejectLayout } from "./struct_layouts.ku"
-import { LinkedNullBinding, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
+import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullParameterPlan,
          LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 
@@ -31,7 +31,7 @@ fn rejectLocalReader(&node: Node, message: str): null! {
 
 fn CheckLinkedLocalFunctionName(&project: LinkedNullProject, &state: LinkedNullState, &function: Node): null! {
     if (function.text == "ok" || LinkedNullBinding(state.slots, function.text) != 0 ||
-        FindLinkedLocalRead(state.local_readers, function.text) != 0) {
+        FindLinkedLocalRead(state.local_readers, function.text) != 0 || LinkedLocalAppendIndex(state, function.text) != 0) {
         rejectLocalReader(function, "a local function needs a distinct local name")?
     }
     index = 0
@@ -106,7 +106,11 @@ fn RegisterLinkedLocalRead(&project: LinkedNullProject, state: LinkedNullState, 
 }
 
 fn ReadLinkedNullParameters(&project: LinkedNullProject, &function: Node): LinkedNullParameters! {
-    state = NewLinkedNullState()
+    return ReadLinkedNullParametersFrom(project, function, NewLinkedNullState())
+}
+
+fn ReadLinkedNullParametersFrom(&project: LinkedNullProject, &function: Node, seed: LinkedNullState): LinkedNullParameters! {
+    state = seed
     signature = ""
     plan: [LinkPlanType] = []
     index = 0
@@ -231,6 +235,18 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
     return ok(next)
 }
 
+fn ValidateLinkedPayload(state: LinkedNullState, &result: TypeNameBinding, &payload: str): LinkedNullState {
+    next = state
+    prefix = "ku_linked_view_str_array"
+    if (LinkedNullOwnedArray(result)) {
+        prefix = LinkedNullArrayPrefix(result)
+    } else if (result.declaration_kind != "OwnedStringArray") { return next }
+    next = RequireLinkedArrayValidation(next, result.clone())
+    next.code += "    if (!" + prefix + "_valid(&" + payload.clone() + ") || (uintmax_t)"
+        + payload.clone() + ".len > (uintmax_t)INT64_MAX) { invalid_array = true; goto cleanup; }\n"
+    return next
+}
+
 fn RequireLinkedArrayValidation(state: LinkedNullState, ty: TypeNameBinding): LinkedNullState {
     next = state
     carrier = ty
@@ -283,14 +299,6 @@ fn CloneLinkedStringSlot(&project: LinkedNullProject, source: LinkedNullExpressi
     output.state.uses_clone = true
     output.state.slots[output.value.slot - 1].live = true
     return ok(output)
-}
-
-fn CheckedLinkedCallbackExpression(&carrier: str, &callback: str, &args: str): str {
-    expression = callback.clone() + ".entry ? " + callback.clone() + ".entry(" + callback.clone() + ".environment, " + args.clone() + ")"
-    return expression + " : (" + carrier.clone() + "){.error={"
-        + ".domain={(uint8_t*)\"bootstrap.callback\",sizeof(\"bootstrap.callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
-        + ".code={(uint8_t*)\"invalid_callback\",sizeof(\"invalid_callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
-        + ".message={(uint8_t*)\"callback entry is missing\",sizeof(\"callback entry is missing\")-1u,0u,KU_PROJECTION_STRING_STATIC}}}"
 }
 
 fn RestoreLinkedConcatPrefix(&project: LinkedNullProject, state: LinkedNullState, &left: LinkedNullValue,
@@ -353,32 +361,18 @@ fn LinkedCountdownIndex(&project: LinkedNullProject, &state: LinkedNullState, &l
     return ok(slot)
 }
 
-fn LinkedCountedInitial(&project: LinkedNullProject, &state: LinkedNullState, &region: Node,
-                        &loop: Node, start: int, index: int): Node! {
-    previous = LinkedNullChild(project, 1, region, index - 1)
-    initial = LinkedNullNode(project, 1, previous)
-    guard_id = LinkedNullChild(project, 1, loop, 0)
-    guard = LinkedIncreasingGuard(project, loop)
-    if (guard.kind != "Binary" || guard.text != "<" || guard.edge_count != 2) { return ok(initial) }
-    bound = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 1))
-    if (LinkedLiveIntBinding(state, bound) == 0) { return ok(initial) }
-    cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
-    if (LinkedLiveIntBinding(state, cursor) == 0 || (initial.kind == "Assign" && initial.text == cursor.text)) {
-        return ok(initial)
+fn ForwardLinkedCallback(&project: LinkedNullProject, &state: LinkedNullState, id: int,
+                         &parameter: TypeNameBinding): str! {
+    source = ProjectionCloneSource(project.supplied[0].named.parsed.arena.nodes,
+        project.supplied[0].named.parsed.arena.edges, id)
+    node = LinkedNullNode(project, 1, id)
+    if (source != 0) { node = LinkedNullNode(project, 1, source) }
+    slot = LinkedNullBinding(state.slots, node.text)
+    if (node.kind != "Variable" || node.edge_count != 0 || !LinkedCallableSlot(state, slot) ||
+        !SameLinkedType(state.slots[slot - 1].value.ty, parameter)) {
+        RejectLayout("linked_callback_forward", "expected a live callback parameter with the same checked signature", DeclarationSpan(node))?
     }
-
-    // Only a preceding statement in the same lexical region can establish
-    // the cursor. Nested statements may invalidate it rather than supply it.
-    position = index - 2
-    while (position >= start) {
-        id = LinkedNullChild(project, 1, region, position)
-        candidate = LinkedNullNode(project, 1, id)
-        if (candidate.kind == "Assign" && candidate.edge_count == 1 && candidate.text == cursor.text) {
-            RejectLinkedWriteRange(project, id + 1, guard_id, cursor.text, "linked_loop_initial_write",
-                "a counted loop cannot use an earlier cursor initializer after an intervening write")?
-            return ok(candidate)
-        }
-        position = position - 1
-    }
-    return ok(initial)
+    // Even an explicit clone keeps the same environment. Both descriptors
+    // are borrowed from the invoking frame for this synchronous call.
+    return ok(state.slots[slot - 1].value.text.clone())
 }

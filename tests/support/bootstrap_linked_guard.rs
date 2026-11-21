@@ -3349,3 +3349,133 @@ pub(super) fn assert_record_field_string_rebind(seed: &Path, cwd: &Path) {
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("|linked_rebind_type|"));
 }
+
+pub(super) fn assert_local_append_thunk(seed: &Path, cwd: &Path) {
+    let body = r#"struct Location { line: int }
+struct Entry { kind: str, text: str, score: int, location: Location, first: int }
+
+fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [int], reject: bool): int! {
+    nodes: [Entry] = []
+    edges: [int] = []
+    cursor = 7
+    fn Append(kind: str, text: str, score: int, location: Location, children: [int]): int! {
+        if (reject && score < 0) { fail { domain: kind.clone(), code: kind, message: text } }
+        offset = edges.len()
+        for edge in children { edges = edges.push(edge) }
+        item = Entry { kind: kind, text: text, score: score + cursor, location: location, first: offset }
+        nodes = nodes.push(item)
+        return ok(nodes.len() + cursor)
+    }
+    left = Append(first, second, 3, Location { line: 2 }, choices)?
+    cursor = 8
+    right = Append(third, fourth, 0 - 5, Location { line: 5 }, more)?
+    return ok(left * 1000 + right * 100 + nodes.len() + edges.len())
+}
+"#;
+    let file = cwd.join("append-thunk.ku");
+    fs::write(&file, body).unwrap();
+    fs::write(cwd.join("modules.txt"), "append-thunk.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Run").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let positive = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&positive);
+    let code = String::from_utf8(positive.stdout).unwrap();
+    let entry = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t ku_linked_null_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    assert!(code.contains("_append_move(&(*capture->"));
+    assert!(code.contains("&environment"));
+    assert!(!code.contains("memcpy(copy, (*capture"));
+    let host = r#"
+static int before_call;
+static void after_growth_failure(void) {
+    assert(attempts == before_call + 5);
+    assert(!outstanding());
+    fputs("allocator: cleared both scopes\n", stderr);
+}
+
+static KuProjectionString owned(uint8_t marker) {
+    uint8_t *data = malloc(1);
+    *data = marker;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+static KuArrayInt children(size_t len, int64_t first) {
+    int64_t *data = malloc(len * sizeof(*data));
+    for (size_t i = 0; i < len; ++i) data[i] = first + (int64_t)i;
+    return (KuArrayInt){len, data, len};
+}
+static KuBootstrapResult_int64_t run(bool reject, bool fatal) {
+    KuProjectionString a = owned('A'), b = owned('B'), c = owned('C'), d = owned('D');
+    KuArrayInt left = children(7, 1), right = children(3, 8);
+    before_call = attempts;
+    if (fatal) {
+        fail_after = 4;
+        assert(atexit(after_growth_failure) == 0);
+    }
+    return ENTRY(a, b, c, d, left, right, reject);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) { (void)run(false, true); return 2; }
+    KuBootstrapResult_int64_t first = run(false, false);
+    assert(first.ok && first.value == 9012 && !outstanding());
+    KuBootstrapResult_int64_t next = run(true, false);
+    assert(!next.ok && next.error.domain.len == 1 && *next.error.domain.ptr == 'C');
+    assert(next.error.code.len == 1 && *next.error.code.ptr == 'C');
+    assert(next.error.message.len == 1 && *next.error.message.ptr == 'D');
+    assert(outstanding() == 3);
+    ku_projection_string_drop(&next.error.domain);
+    ku_projection_string_drop(&next.error.code);
+    ku_projection_string_drop(&next.error.message);
+    assert(!outstanding());
+    KuBootstrapResult_int64_t last = run(false, false);
+    assert(last.ok && last.value == 9012 && !outstanding());
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"));
+    let source = cwd.join("append-thunk.c");
+    let program = cwd.join(format!("append-thunk{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &program, cwd);
+    assert_ok(&execute(&mut Command::new(&program), cwd, 10));
+    let failed = execute(Command::new(program).arg("fail-second-growth"), cwd, 10);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stderr).trim(),
+        "array allocation failed\nallocator: cleared both scopes"
+    );
+
+    for (from, to, diagnostic) in [
+        (
+            "edges = edges.push(edge)",
+            "edges = []",
+            "linked_capture_rebind",
+        ),
+        (
+            "offset = edges.len()",
+            "moved: [int] = edges\n        offset = moved.len()",
+            "linked_callback_owner",
+        ),
+        (
+            "return ok(left *",
+            "alias = Append\n    return ok(left *",
+            "unavailable_linked_binding",
+        ),
+    ] {
+        assert!(body.contains(from));
+        fs::write(&file, body.replace(from, to)).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains(diagnostic),
+            "{}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+}
