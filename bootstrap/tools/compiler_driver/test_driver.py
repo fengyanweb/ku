@@ -678,20 +678,28 @@ def exercise_static_reader_argument(compiler, cc, caller):
     main.write_text(header + (
         "fn Named(&row: Row): int | null { return Apply(Pick, row) }\n"
         "fn Qualified(&row: Row): int | null { return Apply(picker.Pick, row) }\n"
+        "fn Declared(&row: Row): int | null {\n"
+        "    reader: fn(&Row): int | null = picker.Pick\n"
+        "    if (row.line == 1) { return null }\n"
+        "    return Apply(reader, row)\n"
+        "}\n"
         "fn main(): null! {\n"
         "    miss = Row { line: 1 }\n"
         "    zero = Row { line: 0 }\n"
         "    hit = Row { line: 7 }\n"
         "    println(str(Named(miss)))\n"
         "    println(str(Qualified(miss)))\n"
+        "    println(str(Declared(miss)))\n"
         "    println(str(Named(zero)))\n"
         "    println(str(Qualified(zero)))\n"
+        "    println(str(Declared(zero)))\n"
         "    println(str(Named(hit)))\n"
         "    println(str(Qualified(hit)))\n"
+        "    println(str(Declared(hit)))\n"
         "    return ok(null)\n"
         "}\n"
     ), encoding="utf-8")
-    for function in ("Named", "Qualified"):
+    for function in ("Named", "Qualified", "Declared"):
         plan = execute([compiler, "emit-unit-plan", manifest, function], caller)
         dependencies = {item["source_name"]: item for item in json.loads(plan.stdout)["dependencies"]}
         assert dependencies.keys() == {"Apply", "Pick"}
@@ -699,10 +707,12 @@ def exercise_static_reader_argument(compiler, cc, caller):
         assert provider_view["source_path"] == "reader.ku" and provider_view["passing"] == "view"
         code = execute([compiler, "emit-unit", manifest, function], caller).stdout
         assert b"static KuBootstrapOptionalInt ku_static_reader_" in code and b".capture={0}" in code
+        if function == "Declared":
+            assert re.search(rb"ku_projection_string_drop\(&l[0-9]+\.capture\)", code), code
     builder = Path(__file__).resolve().parents[1] / "build_program.py"
     binary = caller / ("static-reader.exe" if os.name == "nt" else "static-reader")
     execute([sys.executable, "-B", builder, manifest, "--compiler", compiler, "--cc", cc, "-o", binary], caller)
-    assert execute([binary], caller).stdout.replace(b"\r\n", b"\n") == b"null\nnull\n0\n0\n7\n7\n"
+    assert execute([binary], caller).stdout.replace(b"\r\n", b"\n") == b"null\n" * 3 + b"0\n" * 3 + b"7\n" * 3
 
     (project / "other.ku").write_text(provider, encoding="utf-8")
     manifest.write_text("main.ku\nreader.ku\nother.ku\n", encoding="utf-8")
@@ -714,6 +724,11 @@ def exercise_static_reader_argument(compiler, cc, caller):
         ("fn Bad(Pick: fn(&Row): int | null, &row: Row): int | null {\n"
          "    first = Apply(Pick, row)\n"
          "    return Apply(Pick, row)\n"
+         "}", b"unavailable_linked_binding"),
+        ("fn Bad(&row: Row): int | null {\n"
+         "    reader: fn(&Row): int | null = picker.Pick\n"
+         "    first = Apply(reader, row)\n"
+         "    return Apply(reader, row)\n"
          "}", b"unavailable_linked_binding"),
         ("fn Bad(prefix: str): fn(&Row): int | null {\n"
          "    nested = fn(&row: Row) {\n"

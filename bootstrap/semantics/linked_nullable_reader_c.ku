@@ -5,10 +5,10 @@ import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan, IsNamedFunction } from "./names.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
 import { AddLinkedNullSlot, CloneLinkedStringSlot, LinkedCallableSlot, RegisterLinkedNullType, ValidateLinkedPayload } from "./linked_parameters_c.ku"
-import { LinkedBuiltin, LinkedIntResult, LinkedNullCType, LinkedNullChild, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullCType, LinkedNullChild, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedStringResult, LowerLinkedContextualArgument, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { LinkedCheckedCall, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullRegion, LinkedNullSlot, LinkedRecordFields, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { RestoreLinkedThunkFrame } from "./link_plan_json_c.ku"
-import { LinkedOptionalIntHeader, StartLinkedThunkFrame, ResolveLinkedCall } from "./scalar_result_null.ku"
+import { HasLinkedContextualArgument, LinkedOptionalIntHeader, StartLinkedThunkFrame, ResolveLinkedCall } from "./scalar_result_null.ku"
 import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex, ContainsType, CTypeName, LinkedIntArrayCallbackFaultPending } from "./struct_projection_c.ku"
 import { RetagTypeNameBinding, TypeNameBinding } from "./type_names.ku"
@@ -362,6 +362,20 @@ fn RetainLinkedField(&project: LinkedNullProject, source: LinkedNullExpression, 
     snapshot = CloneLinkedStringSlot(project, source, "retained" + str(id))?
     snapshot.state = RecordLinkedMemberMove(snapshot.state, field)
     return ok(snapshot)
+}
+
+fn LowerLinkedStaticReaderLocal(&project: LinkedNullProject, state: LinkedNullState,
+                                &statement: Node, declared: TypeNameBinding): LinkedNullState! {
+    source = LinkedNullChild(project, 1, statement, 1)
+    eligible = HasLinkedContextualArgument(project, state, declared, source, 0)?
+    if (!eligible) {
+        RejectLocalCapture(statement, "an owned reader declaration requires a matching static function")?
+    }
+    initializer = LowerLinkedContextualArgument(project, state, declared, source)?
+    slot = AddLinkedNullSlot(project, initializer.state, statement.text.clone(), "l" + str(source), declared, false)?
+    slot.state.code += "    " + slot.value.text.clone() + " = " + initializer.value.text.clone() + ";\n"
+    slot.state.slots[slot.value.slot - 1].live = true
+    return MoveLinkedNullSlot(slot.state, initializer.value)
 }
 
 fn CheckLinkedLocalInitializer(&project: LinkedNullProject, &statement: Node, &ty: TypeNameBinding): null! {

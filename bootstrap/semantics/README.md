@@ -45,9 +45,11 @@ builder resolve direct calls such as `lib.Step(value)` to the supplier's
 function declaration. A type annotation such as `&value: lib.Counter` and
 a literal such as `lib.Counter { value: 8 }` use the same declaration as a
 named import of `Counter`. A named or namespace-qualified function can be
-passed directly to a matching `fn(&Row): int | null` parameter from a module
-function when its declared View and return type match. Other function value
-conversions and package imports remain outside this subset.
+used directly as a matching `fn(&Row): int | null` argument or initializer
+for an explicitly typed owning local in a module function. Its declared View
+and return type must match. Passing the local to an owning parameter moves the
+callback. Other function value conversions and package imports remain outside
+this subset.
 
 ## Check a set of relative modules
 

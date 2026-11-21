@@ -1,4 +1,4 @@
-import { FindLinkedLocalRead, LinkedLocalReadBinding, RequireLinkedMutableName } from "./call_contracts.ku"
+import { FindLinkedLocalRead, LinkedLocalReadBinding, RejectLocalCapture, RequireLinkedMutableName } from "./call_contracts.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, CloneLinkedRecord, CloneLinkedStringSlot, LinkedCallableSlot, LinkedFieldAppendPlace, RejectLocalReader, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
 import { CloneLinkedIntArray, CloneLinkedStringArray, RequireLinkedStringFieldAppend } from "./struct_string_calls.ku"
@@ -9,13 +9,31 @@ import { Node } from "../stage2/ast.ku"
 import { SameRecordArrayElement, TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { IsLinkedScopedCallback,
+import { BindLinkedLocalCallback, IsLinkedScopedCallback,
     LinkedLocalAppendIndex, LinkedNullArguments, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray,
     LinkedNullReadableArray, LinkedIntArrayLayout, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
-import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult,
+import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedStringResult,
     SameLinkedType } from "./linked_null_types_c.ku"
+import { LowerLinkedStaticReaderLocal } from "./linked_nullable_reader_c.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
 import { CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead, ReadLinkedLocalArrayItem } from "./linked_null_read_c.ku"
+
+fn LowerLinkedLocalAlias(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    ty = LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, statement, 0), false)?
+    existing = LinkedNullBinding(state.slots, statement.text)
+    if (ty.declaration_kind == "NullableRecordViewReader" && existing == 0) {
+        return LowerLinkedStaticReaderLocal(project, state, statement, ty)
+    }
+    source = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
+    index = LinkedNullBinding(state.slots, source.text)
+    if (source.kind != "Variable" || !ContainsIndex(state.local_callbacks, index) ||
+        !state.slots[index - 1].live || !SameLinkedType(ty, state.slots[index - 1].value.ty) ||
+        existing > 0) {
+        RejectLocalCapture(statement, "a local callback alias requires a live local thunk with the declared checked signature")?
+    }
+    descriptor = state.slots[index - 1].value.text.clone()
+    return ok(BindLinkedLocalCallback(state, statement.text.clone(), ty, descriptor))
+}
 
 fn readLocalIndexShift(&project: LinkedNullProject, &index: Node, &name: str): int! {
     argument = index.clone()

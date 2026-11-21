@@ -7,8 +7,7 @@ import { RejectLayout } from "./struct_layouts.ku"
 import { BindLinkedLocalCallback, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState,
     LinkedReadonlyExpression, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedIntResult, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullNode,
-    LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedStringResult,
-    ReadLinkedOwnedArray, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
+    LinkedNullProject, LinkedNullType, LinkedStringResult, ReadLinkedOwnedArray, ReadLinkedResult } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, CheckLinkedUnitDecrement, RegisterLinkedNullType } from "./linked_parameters_c.ku"
 import { DropLinkedNullScope, LinkedIncreasingGuard, LinkedLiveIntBinding, RejectLinkedLoopWrite, RejectLinkedWriteRange } from "./linked_member_ownership.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
@@ -131,19 +130,6 @@ fn FinishLinkedLocalThunk(&parent: LinkedNullState, &thunk: LinkedLocalThunk,
         + "    " + descriptor.clone() + " = (" + carrier + "){" + symbol + ", &" + frame + "};\n"
         + "    (void)" + descriptor.clone() + ";\n"
     return ok(BindLinkedLocalCallback(next, function.text.clone(), callback, descriptor))
-}
-
-fn LowerLinkedLocalAlias(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
-    ty = LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, statement, 0), false)?
-    source = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
-    index = LinkedNullBinding(state.slots, source.text)
-    if (source.kind != "Variable" || !ContainsIndex(state.local_callbacks, index) ||
-        !state.slots[index - 1].live || !SameLinkedType(ty, state.slots[index - 1].value.ty) ||
-        LinkedNullBinding(state.slots, statement.text) > 0) {
-        RejectLocalCapture(statement, "a local callback alias requires a live local thunk with the declared checked signature")?
-    }
-    descriptor = state.slots[index - 1].value.text.clone()
-    return ok(BindLinkedLocalCallback(state, statement.text.clone(), ty, descriptor))
 }
 
 fn LowerLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, id: int): LinkedNullExpression! {
