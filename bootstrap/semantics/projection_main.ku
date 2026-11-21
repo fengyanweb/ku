@@ -16,7 +16,7 @@ import { BindStructReturn, BuildStructLayouts } from "./struct_layouts.ku"
 import { EmitStructConstructorC } from "./struct_literal_c.ku"
 import { EmitStructProjectionC } from "./struct_projection_c.ku"
 import { EmitStructResultC } from "./struct_result_c.ku"
-import { StructStringDependencyPlan } from "./struct_string_calls.ku"
+import { StructStringDependency } from "./struct_string_calls.ku"
 import { BindImportedTypeNames, BindTypeNames } from "./type_names.ku"
 
 fn selectedFunction(): str! {
@@ -70,6 +70,11 @@ fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &
     return ok(null)
 }
 
+fn structStringDependencyPlan(&dependency: StructStringDependency): LinkPlanDeclaration {
+    return LinkPlanDeclaration { unit: dependency.module_index, node: dependency.declaration, symbol: dependency.symbol.clone(),
+        parameters: [dependency.argument_plan.clone()], result: dependency.result_plan.clone(), returns_result: false }
+}
+
 fn emitLinkedString(&supplied: [SuppliedModule], &function: str, plan: bool): null! {
     generated = EmitProjectStructStringC(supplied, function)?
     if (!plan) {
@@ -78,7 +83,7 @@ fn emitLinkedString(&supplied: [SuppliedModule], &function: str, plan: bool): nu
     }
     links: [LinkPlanDeclaration] = []
     for dependency in generated.dependencies {
-        links = links.push(StructStringDependencyPlan(dependency))
+        links = links.push(structStringDependencyPlan(dependency))
     }
     print(EmitLinkPlan(supplied, "linked-str", generated.entry_plan, links)?)
     return ok(null)

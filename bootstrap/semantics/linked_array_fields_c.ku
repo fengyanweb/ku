@@ -1,7 +1,7 @@
 import { FindLinkedLocalRead, LinkedLocalReadBinding, RequireLinkedMutableName } from "./call_contracts.ku"
-import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, CloneLinkedIntArray, CloneLinkedRecord, CloneLinkedStringSlot, LinkedCallableSlot, RejectLocalReader, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, CloneLinkedRecord, CloneLinkedStringSlot, LinkedCallableSlot, LinkedFieldAppendPlace, RejectLocalReader, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
-import { CloneLinkedStringArray, LinkedFieldAppendPlace, RequireLinkedStringFieldAppend } from "./struct_string_calls.ku"
+import { CloneLinkedIntArray, CloneLinkedStringArray, RequireLinkedStringFieldAppend } from "./struct_string_calls.ku"
 import { FinishLinkedReaderThunk, LinkedScopedCallbackFunction, SameLinkedCallbackSignature, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
 import { ContainsIndex, LinkedAppendFaultRelayCode, LinkedIntArrayCallbackFaultPending, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { Node } from "../stage2/ast.ku"
@@ -10,7 +10,7 @@ import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { IsLinkedScopedCallback,
     LinkedLocalAppendIndex, LinkedNullArguments, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray,
-    LinkedNullReadableArray, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
+    LinkedNullReadableArray, LinkedIntArrayLayout, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult,
     ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
@@ -136,7 +136,7 @@ fn EmitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     source = LowerLinkedNullRead(project, state, subject_id, depth + 1)?
     ty = source.value.ty.clone()
     if (LinkedStringResult(ty)) { return CloneLinkedStringSlot(project, source, "t" + str(id)) }
-    if (LinkedNullIntArrayOwner(ty)) { return CloneLinkedIntArray(project, source, "t" + str(id)) }
+    if (LinkedIntArrayLayout(ty)) { return CloneLinkedIntArray(project, source, "t" + str(id)) }
     if (ty.name == "str" && (ty.declaration_kind == "OwnedStringArray" || ty.declaration_kind == "BuiltinArray")) {
         return CloneLinkedStringArray(project, source, id)
     }

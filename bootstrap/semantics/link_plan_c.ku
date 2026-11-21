@@ -525,6 +525,10 @@ fn LinkedScalarArrayLayout(&type: TypeNameBinding): bool {
         || (type.declaration_kind == "BuiltinArray" && (type.name == "int" || type.name == "str"))
 }
 
+fn LinkedIntArrayLayout(&type: TypeNameBinding): bool {
+    return type.name == "int" && LinkedScalarArrayLayout(type)
+}
+
 struct LinkedNullC {
     symbol: str
     links: [LinkedNullFunction]

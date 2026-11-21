@@ -1,3 +1,4 @@
+import { LinkedIntSnapshotCall } from "./guarded_string_parts.ku"
 import { Arena, Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
@@ -7,9 +8,9 @@ import { OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { BoundLinkPlanType, LinkedNullArrayHeader, LinkedNullBinding, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullState, LinkedNullValue, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { BoundLinkPlanType, LinkedNullArrayHeader, LinkedNullBinding, LinkedNullExpression, LinkedNullOwnedArray, LinkedIntArrayLayout, LinkedNullState, LinkedNullValue, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
 import { LinkedMemberUnavailable, RequireLinkedMove } from "./linked_member_ownership.ku"
-import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
 import { LinkedBuiltin, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullView, LinkedStringResult, ResolveLinkedCall } from "./linked_null_types_c.ku"
 import { LinkedCopyResult, NamedFieldPushArgument, RetagTypeNameBinding, TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { FinishLinkedFieldRead, LowerLinkedNullRead, ReadLinkedArrayElementAfterBase } from "./linked_null_read_c.ku"
@@ -28,11 +29,6 @@ struct StructStringTarget {
     unit: int
     node: int
     source_name: str
-}
-
-fn StructStringDependencyPlan(&dependency: StructStringDependency): LinkPlanDeclaration {
-    return LinkPlanDeclaration { unit: dependency.module_index, node: dependency.declaration, symbol: dependency.symbol.clone(),
-        parameters: [dependency.argument_plan.clone()], result: dependency.result_plan.clone(), returns_result: false }
 }
 
 fn importedFunctionIndex(&project: ProjectBindings, &name: str): int {
@@ -284,17 +280,6 @@ fn ReadLinkedMemberPlace(&project: LinkedNullProject, state: LinkedNullState, &n
     return ok(LinkedMemberPlace { place: FinishLinkedFieldRead(project, receiver, node, true)?, array_owner: 0 })
 }
 
-fn LinkedStringArrayAssignmentPlace(place: LinkedNullExpression, owned: bool): LinkedNullExpression {
-    target = place
-    if (owned && target.value.ty.declaration_kind == "BuiltinArray" && target.value.ty.name == "str") {
-        // The field reader produced the address of this checked owner field.
-        target.value.ty.declaration_kind = "OwnedStringArray"
-        target.value.text = "(*" + target.value.text.clone() + ")"
-        target.value.borrowed = false
-    }
-    return target
-}
-
 fn LowerLinkedStringReplace(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
                             &target: Node, id: int, depth: int): LinkedNullExpression! {
     if (call.edge_count != 3) {
@@ -346,16 +331,30 @@ fn LinkedFieldAppendArgument(&project: LinkedNullProject, target: int, rhs: int)
         project.supplied[0].named.parsed.arena.edges, target, rhs)
 }
 
-fn LinkedFieldAppendPlace(field: LinkedNullExpression): LinkedNullExpression {
-    owned = field.value.member_path != ""
-    return LinkedStringArrayAssignmentPlace(field, owned)
-}
-
 fn RequireLinkedStringFieldAppend(&state: LinkedNullState, &array: LinkedNullValue, &item: LinkedNullValue): null! {
     if (!LinkedStringResult(item.ty) || item.slot == 0 || item.slot == array.slot || LinkedMemberUnavailable(state, array, true)) {
         RejectLayout("linked_field_append", "append requires a live owned string array field and a separate owned str", item.ty.span.clone())?
     }
     return RequireLinkedMove(state, item)
+}
+
+fn CloneLinkedIntArray(&project: LinkedNullProject, input: LinkedNullExpression, name: str): LinkedNullExpression! {
+    source = input.value
+    state = input.state
+    if (source.slot == 0 || !LinkedIntArrayLayout(source.ty)
+        || LinkedMemberUnavailable(state, source, true)) {
+        RejectLayout("linked_int_array_clone", "expected a live int array owner or View", source.ty.span.clone())?
+    }
+    ty = RetagTypeNameBinding(source.ty, "OwnedIntArray")
+    output = AddLinkedNullSlot(project, state, "", name, ty.clone(), false)?
+    output.state = RequireLinkedArrayValidation(output.state, ty)
+    output.state.uses_int_snapshot = true
+    output.state.slots[output.value.slot - 1].live = true
+    // The snapshot formatter takes a C lvalue. Its enclosing & cancels
+    // this indirection for Views, leaving header validation to the helper.
+    if (source.borrowed) { source.text = "*(" + source.text + ")" }
+    output.state.code += LinkedIntSnapshotCall(source.text, output.value.text, output.value.text)
+    return ok(output)
 }
 
 fn CloneLinkedStringArray(&project: LinkedNullProject, source: LinkedNullExpression, id: int): LinkedNullExpression! {

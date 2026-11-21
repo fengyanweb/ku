@@ -276,18 +276,20 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
     return ok(LinkedNullExpression { state: next, value: value })
 }
 
-fn CloneLinkedIntArray(&project: LinkedNullProject, input: LinkedNullExpression, name: str): LinkedNullExpression! {
-    source = input.value
-    state = input.state
-    if (source.borrowed || LinkedMemberUnavailable(state, source, true)) {
-        RejectLayout("linked_int_array_clone", "expected a live owned int array", source.ty.span.clone())?
+fn LinkedStringArrayAssignmentPlace(place: LinkedNullExpression, owned: bool): LinkedNullExpression {
+    target = place
+    if (owned && target.value.ty.declaration_kind == "BuiltinArray" && target.value.ty.name == "str") {
+        // The field reader produced the address of this checked owner field.
+        target.value.ty.declaration_kind = "OwnedStringArray"
+        target.value.text = "(*" + target.value.text.clone() + ")"
+        target.value.borrowed = false
     }
-    output = AddLinkedNullSlot(project, state, "", name, source.ty.clone(), false)?
-    output.state = RequireLinkedArrayValidation(output.state, source.ty.clone())
-    output.state.uses_int_snapshot = true
-    output.state.slots[output.value.slot - 1].live = true
-    output.state.code += LinkedIntSnapshotCall(source.text, output.value.text, output.value.text)
-    return ok(output)
+    return target
+}
+
+fn LinkedFieldAppendPlace(field: LinkedNullExpression): LinkedNullExpression {
+    owned = field.value.member_path != ""
+    return LinkedStringArrayAssignmentPlace(field, owned)
 }
 
 fn CloneLinkedStringSlot(&project: LinkedNullProject, source: LinkedNullExpression, name: str): LinkedNullExpression! {
