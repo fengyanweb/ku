@@ -15,7 +15,7 @@ import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName 
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
          LinkedNullNode, LinkedNullProject,  LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { LinkedFieldAppendArgument, ReadLinkedMemberPlace } from "./struct_string_calls.ku"
+import { LinkedFieldAppendArgument, LinkedStringArrayAssignmentPlace, ReadLinkedMemberPlace } from "./struct_string_calls.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue, LowerLinkedScopedCallbackCall } from "./linked_null_values_c.ku"
 import { IsLinkedScopedCallback, LinkedScopedCallbackTypes, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedRecordFields } from "./link_plan_c.ku"
@@ -177,18 +177,18 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     if (nested) { rhs = HoldLinkedCopyOperand(rhs, target_id)? }
     replacement = rhs.value.clone()
     selected = ReadLinkedMemberPlace(project, rhs.state, target)?
-    array_owner = selected.array_owner
     place = selected.place
+    tracked = place.value.slot == slot && place.value.member_path != ""
+    owned = tracked || selected.array_owner == slot
+    place = LinkedStringArrayAssignmentPlace(place, owned)
     ty = place.value.ty.clone()
     string = LinkedStringResult(ty)
     copy = ty.declaration_kind == "Builtin" && (ty.name == "int" || ty.name == "bool")
     if (capture && !copy) {
         RejectLayout("linked_member_target", "a local callback can only assign Copy fields of a captured record", DeclarationSpan(target))?
     }
-    tracked = place.value.slot == slot && place.value.member_path != ""
-    indexed_string = string && array_owner == slot
     drop = ""
-    if (indexed_string || (tracked && (string || ty.declaration_kind == "Struct"))) {
+    if ((owned && (string || ty.declaration_kind == "OwnedStringArray")) || (tracked && ty.declaration_kind == "Struct")) {
         drop = LinkedNullDropC(place.state.layouts, place.state.owning_layouts, ty, place.value.text)
     }
     if ((guarded || nested) && !copy && drop == "") {

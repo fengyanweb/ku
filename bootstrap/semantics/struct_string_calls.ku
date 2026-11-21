@@ -284,6 +284,17 @@ fn ReadLinkedMemberPlace(&project: LinkedNullProject, state: LinkedNullState, &n
     return ok(LinkedMemberPlace { place: FinishLinkedFieldRead(project, receiver, node, true)?, array_owner: 0 })
 }
 
+fn LinkedStringArrayAssignmentPlace(place: LinkedNullExpression, owned: bool): LinkedNullExpression {
+    target = place
+    if (owned && target.value.ty.declaration_kind == "BuiltinArray" && target.value.ty.name == "str") {
+        // The field reader produced the address of this checked owner field.
+        target.value.ty.declaration_kind = "OwnedStringArray"
+        target.value.text = "(*" + target.value.text.clone() + ")"
+        target.value.borrowed = false
+    }
+    return target
+}
+
 fn LowerLinkedStringReplace(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
                             &target: Node, id: int, depth: int): LinkedNullExpression! {
     if (call.edge_count != 3) {
