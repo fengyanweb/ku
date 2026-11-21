@@ -2,7 +2,7 @@ import { RequireLinkedMutableName } from "./call_contracts.ku"
 import { AddLinkedNullSlot, LinkedCountedInitial, LinkedCountdownIndex, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
 import { OpenLinkedForLoop, CloseLinkedForLoop } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
-import { EmitLinkedFunction, LowerLinkedArrayLocal, LowerLinkedLocalMemberSet, LowerLinkedOwnedDestructure,
+import { EmitLinkedFunction, LowerLinkedArrayLocal, LowerLinkedTargetSet, LowerLinkedOwnedDestructure,
          LowerLinkedPlainReturn, LowerLinkedStringAppend, LowerLinkedSuccess } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -299,8 +299,8 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             }
         } else if (statement.kind == "CompoundAssign" && statement.text == "+" && statement.edge_count == 2) {
             next = LowerLinkedStringAppend(project, next, statement, id)?
-        } else if (statement.kind == "AssignTarget" && statement.edge_count == 2 && depth == 0) {
-            next = LowerLinkedLocalMemberSet(project, next, statement)?
+        } else if (statement.kind == "AssignTarget" && statement.edge_count == 2) {
+            next = LowerLinkedTargetSet(project, next, statement, id, depth)?
         } else if (statement.kind == "ObjectDestructureAssign") {
             next = LowerLinkedOwnedDestructure(project, next, statement)?
         } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {

@@ -11,6 +11,8 @@ import { EmitTryCloneString } from "./struct_array_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardExplicitType, GuardExpression, GuardType } from "./guarded_struct_expr.ku"
 
+import { LinkedNullState } from "./link_plan_c.ku"
+
 struct GuardedStructC {
     symbol: str
     source: str
@@ -373,4 +375,52 @@ fn EmitGuardedStructC(&named: NamedModule, &types: [TypeNameBinding], &layouts: 
     start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
     RejectLayout("unknown_guarded_function", "undefined guarded function '" + function_name.clone() + "'", start)?
     return ok(GuardedStructC { symbol: "", source: "" })
+}
+
+fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &signature: str,
+                         &result_type: str, &payload_cleanup: str, char_errors: str): str {
+    text = header
+    array_checks = body.validated_arrays.len() > 0
+    arithmetic = body.uses_add || body.uses_sub || body.uses_mul || body.uses_div
+    text += "\n" + result_type.clone() + " " + symbol.clone() + "(" + signature.clone() + ") {\n"
+    text += "    " + result_type.clone() + " result = {0};\n"
+    text += payload_cleanup.clone()
+    if (body.append_slots.len() > 0) { text += "    int append_status = KU_STRUCT_ARRAY_OK;\n" }
+    allocation = body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0
+    if (allocation) { text += "    bool out_of_memory = false;\n" }
+    if (array_checks) { text += "    bool invalid_array = false;\n" }
+    if (body.uses_print) { text += "    bool output_failed = false;\n" }
+    if (body.uses_str_view) { text += "    bool invalid_str = false;\n" }
+    if (body.uses_struct_view) { text += "    bool invalid_struct_view = false;\n" }
+    if (arithmetic) { text += "    bool overflow = false;\n" }
+    if (body.uses_div) { text += "    bool division_by_zero = false;\n" }
+    if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
+    if (body.uses_concat) { text += "    const char* string_failure = NULL;\n" }
+    if (body.uses_chars) { text += "    int source_status = KU_SOURCE_OK;\n" }
+    text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
+    if (body.uses_print) { text += "    if (output_failed) { fputs(\"output write failed\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (allocation) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (array_checks) {
+        message = "invalid struct array ownership"
+        if (body.uses_str_array) { message = "invalid array view" }
+        text += "    if (invalid_array) { fputs(\"" + message + "\\n\", stderr); exit(EXIT_FAILURE); }\n"
+    }
+    if (body.append_slots.len() > 0) {
+        text += "    if (append_status != KU_STRUCT_ARRAY_OK) {\n"
+            + "        const char *message = \"invalid struct array ownership\\n\";\n"
+            + "        if (append_status == KU_STRUCT_ARRAY_CAPACITY) message = \"array allocation is too large\\n\";\n"
+            + "        if (append_status == KU_STRUCT_ARRAY_OOM) message = \"array allocation failed\\n\";\n"
+            + "        fputs(message, stderr); exit(EXIT_FAILURE);\n    }\n"
+    }
+    if (body.uses_str_view) { text += "    if (invalid_str) { fputs(\"invalid str view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_struct_view) { text += "    if (invalid_struct_view) { fputs(\"invalid struct view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_concat) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_chars) { text += char_errors }
+    if (body.uses_div) { text += "    if (division_by_zero) { fputs(\"division by zero\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_index) {
+        text += "    if (index_failed) { fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", "
+            + "(long long)failure_index, failure_length); exit(EXIT_FAILURE); }\n"
+    }
+    return text + "    return result;\n}\n"
 }

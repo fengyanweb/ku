@@ -1805,6 +1805,7 @@ fn Update(input: Entry, text: str): Entry! {
     slot.number = 42
     return ok(slot)
 }
+
 fn Refuse(input: Entry): Entry! {
     input.label = "new"
     return ok(input)
@@ -1876,4 +1877,94 @@ int main(int argc, char **argv) {
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_member_target"));
+}
+
+pub(super) fn assert_owned_int_array_store(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("int-array-store.ku"),
+        r#"fn Replacement(input: int): int! { return ok(input) }
+fn Store(index: int, divisor: int, input: int): [int]! {
+    values: [int] = [5, 9]
+    limit = 1
+    step = 0
+    while (step < limit) {
+        values[index / divisor] = Replacement(input)?
+        step = step + 1
+    }
+    return ok(values)
+}
+fn Refuse(&values: [int]): null! {
+    values[0] = 1
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "int-array-store.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Store").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let definition = code
+        .lines()
+        .find(|line| line.contains(" ku_linked_null_"))
+        .unwrap();
+    let (result, entry) = definition.split_once(' ').unwrap();
+    let entry = entry.split_once('(').unwrap().0;
+    let (dependency_type, dependency) = code
+        .lines()
+        .find_map(|line| line.strip_prefix("extern "))
+        .unwrap()
+        .split_once(' ')
+        .unwrap();
+    let dependency = dependency.split_once('(').unwrap().0;
+    let host = r#"
+static size_t seen;
+DEPENDENCY_TYPE DEPENDENCY(int64_t input) {
+    ++seen;
+    if (input < 0) return (DEPENDENCY_TYPE){.error={.code={(uint8_t*)"rhs",3,0,KU_PROJECTION_STRING_STATIC}}};
+    return (DEPENDENCY_TYPE){.ok=true,.value=input};
+}
+static void check_no_owned_array(void) {
+    if (outstanding() || seen != 1) _Exit(83);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) {
+        assert(!atexit(check_no_owned_array));
+        (void) ENTRY(2, 1, 7);
+        return 9;
+    }
+    RESULT result = ENTRY(1, 1, 7);
+    assert(result.ok && result.value.len == 2 && result.value.data[0] == 5 && result.value.data[1] == 7);
+    assert(seen == 1 && outstanding() == 1);
+    free(result.value.data);
+    result = ENTRY(1, 0, -1);
+    assert(!result.ok && result.error.code.len == 3 && !memcmp(result.error.code.ptr, "rhs", 3));
+    assert(seen == 2 && outstanding() == 0);
+    return 0;
+}
+"#
+    .replace("DEPENDENCY_TYPE", dependency_type)
+    .replace("DEPENDENCY", dependency)
+    .replace("ENTRY", entry)
+    .replace("RESULT", result);
+    let path = cwd.join("owned-int-array-store.c");
+    let binary = cwd.join(format!(
+        "owned-int-array-store{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&path, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&path, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(&binary), cwd, 10));
+    let invalid = execute(Command::new(binary).arg("out-of-bounds"), cwd, 10);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("index_out_of_bounds"));
+
+    fs::write(cwd.join("function.txt"), "Refuse").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_index_target"));
 }

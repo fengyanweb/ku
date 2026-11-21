@@ -1,4 +1,4 @@
-import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
+import { FinishLinkedFunctionC, GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { ScalarCheckedMultiplyC } from "./scalar_int_emit.ku"
 import { StructResultHeader, StructValueResultHeader } from "./struct_result_c.ku"
 import { EmitLinkedArrayBody } from "./struct_array_c.ku"
@@ -18,54 +18,6 @@ import { EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead } f
 import { LowerLinkedArguments, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { LinkedCPrelude, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedOkAvailable, LinkedRecordFields, ReadLinkedNullBinding } from "./link_plan_c.ku"
-
-fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &signature: str,
-                         &result_type: str, &payload_cleanup: str, char_errors: str): str {
-    text = header
-    array_checks = body.validated_arrays.len() > 0
-    arithmetic = body.uses_add || body.uses_sub || body.uses_mul || body.uses_div
-    text += "\n" + result_type.clone() + " " + symbol.clone() + "(" + signature.clone() + ") {\n"
-    text += "    " + result_type.clone() + " result = {0};\n"
-    text += payload_cleanup.clone()
-    if (body.append_slots.len() > 0) { text += "    int append_status = KU_STRUCT_ARRAY_OK;\n" }
-    allocation = body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0
-    if (allocation) { text += "    bool out_of_memory = false;\n" }
-    if (array_checks) { text += "    bool invalid_array = false;\n" }
-    if (body.uses_print) { text += "    bool output_failed = false;\n" }
-    if (body.uses_str_view) { text += "    bool invalid_str = false;\n" }
-    if (body.uses_struct_view) { text += "    bool invalid_struct_view = false;\n" }
-    if (arithmetic) { text += "    bool overflow = false;\n" }
-    if (body.uses_div) { text += "    bool division_by_zero = false;\n" }
-    if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
-    if (body.uses_concat) { text += "    const char* string_failure = NULL;\n" }
-    if (body.uses_chars) { text += "    int source_status = KU_SOURCE_OK;\n" }
-    text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
-    if (body.uses_print) { text += "    if (output_failed) { fputs(\"output write failed\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (allocation) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (array_checks) {
-        message = "invalid struct array ownership"
-        if (body.uses_str_array) { message = "invalid array view" }
-        text += "    if (invalid_array) { fputs(\"" + message + "\\n\", stderr); exit(EXIT_FAILURE); }\n"
-    }
-    if (body.append_slots.len() > 0) {
-        text += "    if (append_status != KU_STRUCT_ARRAY_OK) {\n"
-            + "        const char *message = \"invalid struct array ownership\\n\";\n"
-            + "        if (append_status == KU_STRUCT_ARRAY_CAPACITY) message = \"array allocation is too large\\n\";\n"
-            + "        if (append_status == KU_STRUCT_ARRAY_OOM) message = \"array allocation failed\\n\";\n"
-            + "        fputs(message, stderr); exit(EXIT_FAILURE);\n    }\n"
-    }
-    if (body.uses_str_view) { text += "    if (invalid_str) { fputs(\"invalid str view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_struct_view) { text += "    if (invalid_struct_view) { fputs(\"invalid struct view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_concat) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_chars) { text += char_errors }
-    if (body.uses_div) { text += "    if (division_by_zero) { fputs(\"division by zero\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_index) {
-        text += "    if (index_failed) { fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", "
-            + "(long long)failure_index, failure_length); exit(EXIT_FAILURE); }\n"
-    }
-    return text + "    return result;\n}\n"
-}
 
 fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
     if (callee.unit == 0) { return ok(LinkedFsReadReference(callee.symbol)) }
@@ -179,6 +131,34 @@ fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &s
     local = AddLinkedNullSlot(project, state, statement.text.clone(), "l" + str(id), ty, false)?
     local.state.slots[local.value.slot - 1].live = true
     return ok(local.state)
+}
+
+fn LowerLinkedTargetSet(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
+                       id: int, depth: int): LinkedNullState! {
+    target_id = LinkedNullChild(project, 1, statement, 0)
+    target = LinkedNullNode(project, 1, target_id)
+    if (target.kind == "Index" && target.edge_count == 2) {
+        root = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+        slot = LinkedNullBinding(state.slots, root.text)
+        if (root.kind != "Variable" || root.edge_count != 0 || slot == 0 || state.slots[slot - 1].parameter ||
+            state.slots[slot - 1].value.borrowed || state.slots[slot - 1].value.ty.declaration_kind != "OwnedIntArray") {
+            RejectLayout("linked_index_target", "assignment requires an owning local int array", DeclarationSpan(root))?
+        }
+        RequireLinkedMutableName(root.text, DeclarationSpan(root))?
+        rhs = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 1), 0)?
+        if (rhs.value.ty.declaration_kind != "Builtin" || rhs.value.ty.name != "int") {
+            RejectLayout("linked_index_value", "assignment requires an int value", DeclarationSpan(statement))?
+        }
+        stored = "stored" + str(id)
+        rhs.state.code += "    int64_t " + stored.clone() + " = " + rhs.value.text + ";\n"
+        destination = LowerLinkedNullRead(project, rhs.state, target_id, 0)?
+        destination.state.code += "    " + destination.value.text + " = " + stored + ";\n"
+        return ok(destination.state)
+    }
+    if (depth != 0) {
+        RejectLayout("linked_member_target", "record field assignment requires an outer local", DeclarationSpan(target))?
+    }
+    return LowerLinkedLocalMemberSet(project, state, statement)
 }
 
 fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
