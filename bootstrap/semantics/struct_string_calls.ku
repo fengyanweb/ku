@@ -9,7 +9,7 @@ import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { BoundLinkPlanType, LinkedNullBinding, LinkedNullExpression, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
 import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
-import { LinkedBuiltin, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedStringResult } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullView, LinkedStringResult, ResolveLinkedCall } from "./linked_null_types_c.ku"
 import { TypeNameBindingWithKind } from "./type_names.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 
@@ -278,4 +278,21 @@ fn LowerLinkedStringReplace(&project: LinkedNullProject, state: LinkedNullState,
         + "    if (string_failure) goto cleanup;\n"
     output.state.slots[output.value.slot - 1].live = true
     return ok(output)
+}
+
+fn LinkedOwnedStringPredicate(&project: LinkedNullProject, &state: LinkedNullState, &call: Node): bool! {
+    if (call.kind != "Call" || call.edge_count < 2 || call.edge_count > 9) { return ok(false) }
+    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (target.kind != "Variable" || target.edge_count != 0) { return ok(false) }
+    callee = ResolveLinkedCall(project, state.slots, call, target, false)?
+    if (callee.returns_result || callee.result.declaration_kind != "Builtin" || callee.result.name != "bool") {
+        return ok(false)
+    }
+    owns_string = false
+    for parameter in callee.parameters {
+        if (LinkedStringResult(parameter)) { owns_string = true }
+        else if (!LinkedNullView(parameter) && !LinkedIntResult(parameter) &&
+            !(parameter.declaration_kind == "Builtin" && parameter.name == "bool")) { return ok(false) }
+    }
+    return ok(owns_string)
 }

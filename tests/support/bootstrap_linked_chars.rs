@@ -132,6 +132,105 @@ pub(super) fn assert_owned_characters(seed: &Path, cwd: &Path) {
 
     assert_character_values(seed, cwd);
     assert_owned_character_comparison(seed, cwd);
+    assert_owned_predicate_arguments(seed, cwd);
+}
+
+fn assert_owned_predicate_arguments(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("iterate.ku"),
+        r#"fn Match(left: str, right: str): bool { return left.len() == right.len() }
+fn Observe(value: bool): null! { return ok(null) }
+fn Choose(&left: str, &right: str, active: bool): null! {
+    selected = false
+    if (active) {
+        if (Match(left.clone(), right.clone())) { selected = true }
+    }
+    Observe(selected)?
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("function.txt"), "Choose").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let source = String::from_utf8(emitted.stdout).unwrap();
+    let symbol = |prefix| {
+        source
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix)?.split_once('('))
+            .unwrap()
+            .0
+    };
+    let driver = r#"
+static bool matched;
+static unsigned calls;
+static unsigned observations;
+static KuProjectionString left_input;
+static KuProjectionString right_input;
+bool MATCH(KuProjectionString left, KuProjectionString right) {
+    assert(left.len == 1 && left.ptr[0] == 'x');
+    assert(right.ptr[0] == 'y');
+    const bool result = left.len == right.len;
+    ku_projection_string_drop(&left);
+    ku_projection_string_drop(&right);
+    ++calls;
+    return result;
+}
+KuBootstrapResultNull OBSERVE(bool value) {
+    assert(outstanding() == 2);
+    matched = value;
+    ++observations;
+    return (KuBootstrapResultNull){.ok = true};
+}
+static void after_oom(void) {
+    if (outstanding() != 2 || calls || observations != 1 || attempts != 4) _Exit(82);
+    ku_projection_string_drop(&left_input);
+    ku_projection_string_drop(&right_input);
+    if (outstanding()) _Exit(83);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    (void)test_realloc;
+    left_input = (KuProjectionString){malloc(1), 1, 1, KU_PROJECTION_STRING_OWNED};
+    right_input = (KuProjectionString){malloc(2), 1, 2, KU_PROJECTION_STRING_OWNED};
+    assert(left_input.ptr && right_input.ptr);
+    left_input.ptr[0] = 'x';
+    memcpy(right_input.ptr, "yz", 2);
+    assert(ENTRY(&left_input, &right_input, false).ok);
+    assert(!calls && attempts == 2 && observations == 1 && !matched);
+    if (argc > 1) {
+        assert(!atexit(after_oom));
+        fail_after = 1;
+    }
+    assert(ENTRY(&left_input, &right_input, true).ok);
+    assert(calls == 1 && attempts == 4 && observations == 2 && matched);
+    right_input.len = 2;
+    assert(ENTRY(&left_input, &right_input, true).ok);
+    assert(calls == 2 && attempts == 6 && observations == 3 && !matched);
+    ku_projection_string_drop(&left_input);
+    ku_projection_string_drop(&right_input);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("MATCH", symbol("extern bool "))
+    .replace("OBSERVE", symbol("extern KuBootstrapResultNull "))
+    .replace("ENTRY", symbol("KuBootstrapResultNull "));
+    let path = cwd.join("owned-predicate-arguments.c");
+    let binary = cwd.join(format!(
+        "owned-predicate-arguments{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&path, format!("{CHECKED_ARRAY_ALLOCATOR}{source}{driver}")).unwrap();
+    compile_projection(&path, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(&binary), cwd, 10));
+    let failed = execute(Command::new(binary).arg("second-argument-oom"), cwd, 10);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stderr).trim(),
+        "out of memory"
+    );
 }
 
 fn assert_owned_character_comparison(seed: &Path, cwd: &Path) {

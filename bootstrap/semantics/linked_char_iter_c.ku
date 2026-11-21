@@ -1,4 +1,4 @@
-import { LinkedCharacterSource, MaterializeLinkedCharacters } from "./struct_string_calls.ku"
+import { LinkedCharacterSource, LinkedOwnedStringPredicate, MaterializeLinkedCharacters } from "./struct_string_calls.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
@@ -143,6 +143,13 @@ fn LowerLinkedLocalAlias(&project: LinkedNullProject, state: LinkedNullState, &s
 
 fn LowerLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, id: int): LinkedNullExpression! {
     node = LinkedNullNode(project, 1, id)
+    if (LinkedOwnedStringPredicate(project, state, node)?) {
+        before = state.slots.len()
+        value = LowerLinkedNullValue(project, state, id, 0)?
+        result = value.value
+        done = DropLinkedNullScope(value.state, before)
+        return ok(LinkedReadonlyExpression(done, result.ty, result.text))
+    }
     equality = node.text == "==" || node.text == "!="
     if (node.kind != "Binary" || node.edge_count != 2 || !equality) {
         return LowerLinkedNullRead(project, state, id, 0)
