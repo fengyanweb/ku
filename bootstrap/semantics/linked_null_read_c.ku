@@ -11,8 +11,8 @@ import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
 import { GuardLinkedStringPredicate } from "./guarded_struct_c.ku"
-import { EmitLinkedIntAppend, EmitLinkedOwnedArrayClone, OwnedRecordArrayCloneLayout } from "./struct_array_c.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+import { EmitLinkedIntAppend, EmitLinkedOwnedArrayClone, OwnedRecordArrayCloneLayout, OwnedRecordArrayCloneType } from "./struct_array_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn LowerLinkedIntArrayLiteral(&project: LinkedNullProject, state: LinkedNullState, &literal: Node, id: int,
                                binding: str): LinkedNullExpression! {
@@ -93,7 +93,7 @@ fn readLinkedScalarCall(&project: LinkedNullProject, state: LinkedNullState, &ca
         if (index > 0) { args += ", " }
         args += LinkedViewArgument(callee.parameters[index], input.value)?
         next = input.state
-        index += 1
+        index = index + 1
     }
     return ok(EmitLinkedReadonlyScalar(next, callee, id, args))
 }
@@ -168,25 +168,27 @@ fn readArrayItem(&array: LinkedNullValue, input: LinkedNullExpression, &node: No
 fn CloneLinkedRecordArray(&project: LinkedNullProject, source: LinkedNullExpression, id: int): LinkedNullExpression! {
     value = source.value
     layout = OwnedRecordArrayCloneLayout(source.state.layouts, value.ty)
-    if (value.borrowed || LinkedMemberUnavailable(source.state, value, true) || layout == 0) {
-        RejectLayout("unsupported_linked_array_clone", "expected a live owned array of cloneable records with owned fields", value.ty.span.clone())?
+    if (value.borrowed && value.ty.declaration_kind != "StructArray" ||
+        LinkedMemberUnavailable(source.state, value, true) || layout == 0) {
+        RejectLayout("unsupported_linked_array_clone", "expected a live array of cloneable records with owned fields", value.ty.span.clone())?
     }
-    output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), value.ty.clone(), false)?
+    output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), OwnedRecordArrayCloneType(value.ty), false)?
     next = RequireLinkedArrayValidation(output.state, value.ty)
     if (!ContainsIndex(next.element_clones, layout)) { next.element_clones = next.element_clones.push(layout) }
-    next.code += EmitLinkedOwnedArrayClone(next.layouts, value.text, output.value.text, output.value.ty, layout)
+    next.code += EmitLinkedOwnedArrayClone(next.layouts, value.text, output.value.text, output.value.ty, layout, value.borrowed)
     next.slots[output.value.slot - 1].live = true
     output.state = next
     return ok(output)
 }
 
-fn ReadLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalReadBinding, argument: LinkedNullExpression,
+fn ReadLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalReadBinding, input: LinkedNullExpression,
                            &at: Node, id: int): LinkedNullExpression! {
+    argument = input
     array = argument.state.slots[reader.captured_slot - 1].value.clone()
     if (LinkedMemberUnavailable(argument.state, array, true)) {
         RejectLayout("linked_local_reader_capture", "the array captured by this declaration is no longer live", DeclarationSpan(at))?
     }
-    if (argument.value.ty.declaration_kind != "Builtin" || argument.value.ty.name != "int") {
+    if (!LinkedIntResult(argument.value.ty)) {
         RejectLayout("linked_local_reader_argument", "a local reader requires an int index", DeclarationSpan(at))?
     }
     if (reader.index_shift != 0) {

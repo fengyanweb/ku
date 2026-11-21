@@ -1,14 +1,14 @@
 import { GuardExplicitType, GuardType } from "./guarded_struct_expr.ku"
 import { ManagedSourceCharactersRuntime, ManagedStringArrayDrop } from "./guarded_string_parts.ku"
 import { LinkedNullIntArrayOwner, LinkedNullState } from "./link_plan_c.ku"
-import { EmitCheckedRecordArrayClone, EmitProjectionStringJoinHelpers, ScalarStringPrefixSuffixC } from "./scalar_int_emit.ku"
+import { EmitCheckedRecordArrayClone, EmitOwnedStringArrayClone, EmitProjectionCloneString, EmitProjectionStringJoinHelpers, ScalarStringPrefixSuffixC } from "./scalar_int_emit.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
-import { CanCloneNestedStringArrays, CollectOwnedMemberPaths, EmitCombinedCLayouts, EmitLinkedStringArrayElementClone, EmitNestedCLayouts, EmitProjectionCloneString, OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
-import { ContainsType, CTypeName, ProjectionArrayHeader, ProjectionIsStringArray } from "./struct_projection_c.ku"
+import { CanCloneManagedRecord, CollectOwnedMemberPaths, EmitCombinedCLayouts, EmitLinkedManagedElementClone, EmitNestedCLayouts, OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
+import { ContainsIndex, ContainsType, CTypeName, ProjectionArrayHeader, ProjectionIsStringArray } from "./struct_projection_c.ku"
 import { ExplicitType, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
+import { RetagTypeNameBinding, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 
 struct StructArrayC {
     element_type: str
@@ -322,6 +322,12 @@ fn EmitBoundStringOperations(clone: bool, concat: bool, format: bool, prefix_suf
     return text
 }
 
+fn RegisterLinkedElementClone(state: LinkedNullState, layout: int): LinkedNullState {
+    next = state
+    if (!ContainsIndex(next.element_clones, layout)) { next.element_clones = next.element_clones.push(layout) }
+    return next
+}
+
 fn EmitBoundElementClones(&layouts: [StructLayout], &requested: [int]): str {
     text = ""
     index = 0
@@ -329,7 +335,7 @@ fn EmitBoundElementClones(&layouts: [StructLayout], &requested: [int]): str {
         layout = requested[index]
         prefix = "ku_linked_element_" + str(layout)
         if (HasBoundArrayMembers(layouts, layout)) {
-            text += EmitLinkedStringArrayElementClone(layouts, layout, prefix)
+            text += EmitLinkedManagedElementClone(layouts, layout, prefix)
         } else {
             text += EmitOwnedStructOperations(layouts, layout, prefix, true)
         }
@@ -369,15 +375,26 @@ fn OwnedRecordArrayCloneLayout(&layouts: [StructLayout], &array: TypeNameBinding
     index = LayoutIndex(layouts, array.module_index, array.declaration_node)
     if (index == 0) { return 0 }
     if (HasBoundArrayMembers(layouts, index)) {
-        if (CanCloneNestedStringArrays(layouts, index)) { return index }
+        if (CanCloneManagedRecord(layouts, index)) { return index }
         return 0
     }
-    if (collectOwnedFields(layouts, index, "", []).len() == 0) { return 0 }
+    empty_paths: [str] = []
+    owned_paths = collectOwnedFields(layouts, index, "", empty_paths)
+    if (owned_paths.len() == 0) { return 0 }
     return index
 }
 
-fn EmitLinkedOwnedArrayClone(&layouts: [StructLayout], &source: str, &target: str, &array: TypeNameBinding, layout: int): str {
-    return EmitCheckedRecordArrayClone(source, target, BoundArrayCPrefix(array), layout, HasBoundArrayMembers(layouts, layout))
+fn OwnedRecordArrayCloneType(&array: TypeNameBinding): TypeNameBinding {
+    return RetagTypeNameBinding(array.clone(), "OwnedStructArray")
+}
+
+fn EmitLinkedOwnedArrayClone(&layouts: [StructLayout], &source: str, &target: str, &array: TypeNameBinding, layout: int, view: bool): str {
+    prefix = BoundArrayCPrefix(array)
+    nested = HasBoundArrayMembers(layouts, layout)
+    if (view) {
+        return EmitCheckedRecordArrayClone("(*" + source.clone() + ")", target, prefix, layout, nested)
+    }
+    return EmitCheckedRecordArrayClone(source, target, prefix, layout, nested)
 }
 
 fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str): str! {
@@ -393,6 +410,7 @@ fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str):
         text += "#include <stdio.h>\n" + ManagedSourceCharactersRuntime(!body.uses_str_array &&
             !ContainsType(definitions.array_types, "KuGuardStringArray"))
     }
+    if (body.uses_str_snapshot) { text += EmitOwnedStringArrayClone("ku_linked_str_array", "ku_linked_clone_string") }
     text += EmitBoundElementClones(body.layouts, body.element_clones)
     text += result_header + EmitBoundArrayResults(body.layouts, body.owning_layouts, body.owned_arrays, body.uses_chars)
     append_types: [TypeNameBinding] = []

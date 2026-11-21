@@ -125,3 +125,36 @@ fn IsLinkedDescendant(&path: str, &parent: str): bool {
     if (path.starts_with(prefix)) { return true }
     return false
 }
+
+fn SameRecordArrayElement(&array: TypeNameBinding, &element: TypeNameBinding): bool {
+    // The caller has established that the array owns this nominal element.
+    return element.declaration_kind == "Struct" && array.module_index == element.module_index
+        && array.declaration_node == element.declaration_node
+}
+
+fn sameNamedFieldPlace(&nodes: [Node], &edges: [int], left: int, right: int): bool {
+    source = left
+    target = right
+    limit = 32
+    depth = 0
+    while (depth < limit) {
+        a = nodes[source - 1].clone()
+        b = nodes[target - 1].clone()
+        if (a.kind != b.kind || a.edge_count != b.edge_count || a.text != b.text) { return false }
+        if (a.kind == "Variable") { return a.edge_count == 0 }
+        if (a.kind != "Field" || a.edge_count != 1) { return false }
+        source = edges[a.first_edge]
+        target = edges[b.first_edge]
+        depth = depth + 1
+    }
+    return false
+}
+
+fn NamedFieldPushArgument(&nodes: [Node], &edges: [int], target: int, rhs: int): int {
+    call = nodes[rhs - 1].clone()
+    if (call.kind != "Call" || call.edge_count != 2) { return 0 }
+    method = nodes[edges[call.first_edge] - 1].clone()
+    if (method.kind != "Field" || method.edge_count != 1 || method.text != "push") { return 0 }
+    if (!sameNamedFieldPlace(nodes, edges, target, edges[method.first_edge])) { return 0 }
+    return edges[call.first_edge + 1]
+}

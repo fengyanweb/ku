@@ -1,3 +1,4 @@
+import "std.string"
 import { Span } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
@@ -5,6 +6,10 @@ import { TypeNameBinding } from "./type_names.ku"
 import { ExplicitType, RejectLayout } from "./struct_layouts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName } from "./guarded_struct_expr.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
+
+fn RejectLocalCapture(&node: Node, message: str): null! {
+    return RejectLayout("unsupported_linked_local_capture", message, DeclarationSpan(node))
+}
 
 struct LinkedLocalReadBinding {
     name: str
@@ -176,8 +181,9 @@ fn ManagedLiteralConcatSetup(&named: NamedModule, &locals: [GuardBinding], &expr
 
 fn linkedConstantBinding(&name: str): bool {
     letter = false
-    for char in name.clone().chars() {
-        if ("ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(char.clone())) { letter = true }
+    for char in string.chars(name.clone()) {
+        candidate = char.clone()
+        if ("ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(candidate)) { letter = true }
         else if (!"_0123456789".contains(char)) { return false }
     }
     return letter

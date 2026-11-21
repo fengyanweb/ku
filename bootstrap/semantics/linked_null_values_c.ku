@@ -9,11 +9,12 @@ import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { AppendLinkedCheckedInvocation, IsLinkedScopedCallback, LinkedCheckedCall, LinkedScalarArrayOwner, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
+import { AppendLinkedCheckedInvocation, IsLinkedScopedCallback, LinkedCheckedCall, LinkedDirectCallExpression, LinkedScalarArrayLayout, LinkedScalarArrayOwner, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
 import { LinkedCallArgument, LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { ReadLinkedLocalArrayItem, EmitLinkedAddition, IsLinkedLogicalNegation, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalAppendArguments, ForwardLinkedCallback, LinkedCallableSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix, ValidateLinkedPayload } from "./linked_parameters_c.ku"
+
 
 fn lowerLinkedArgument(&project: LinkedNullProject, state: LinkedNullState, &parameter: TypeNameBinding,
                        id: int, depth: int): LinkedNullExpression! {
@@ -42,10 +43,7 @@ fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
         if (args != "") { args += ", " }
         if (callee.parameters[index].declaration_kind == "IntPairResultCallback") {
             args += ForwardLinkedCallback(project, next, argument_id, callee.parameters[index])?
-            index = index + 1
-            continue
-        }
-        if (IsLinkedScopedCallback(callee.parameters[index])) {
+        } else if (IsLinkedScopedCallback(callee.parameters[index])) {
             parameter = callee.parameters[index].clone()
             next = RegisterLinkedNullType(project, next, parameter.clone())?
             prepared = PrepareLinkedScopedCallbackArgument(project, next, argument_id, parameter,
@@ -53,29 +51,27 @@ fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
             next = prepared.state
             args += prepared.args
             fault_relays += prepared.handoff
-            index += 1
-            continue
-        }
-        argument = lowerLinkedArgument(project, next.clone(), callee.parameters[index], argument_id, depth + 1)?
-        if (LinkedNullView(callee.parameters[index])) {
-            args += LinkedViewArgument(callee.parameters[index], argument.value)?
-            if (argument.value.slot > 0) { loans = loans.push(argument.value.clone()) }
-            next = argument.state
-            index = index + 1
-            continue
-        }
-        if (!SameLinkedType(callee.parameters[index], argument.value.ty)) {
-            RejectLayout("linked_argument_type", "argument type differs from the bound function parameter", argument.value.ty.span.clone())?
-        }
-        // Pending argument slots own their values until the actual call. A
-        // later argument can fail while computing a nested call or a clone.
-        ty = argument.value.ty.clone()
-        pending = AddLinkedNullSlot(project, argument.state, "", "p" + str(id) + "_" + str(index), ty, false)?
-        pending.state.code = pending.state.code + "    " + pending.value.text.clone() + " = " + argument.value.text.clone() + ";\n"
-        next = MoveLinkedNullSlot(pending.state, argument.value)?
-        args += pending.value.text.clone()
-        if (LinkedNullOwner(pending.value.ty)) {
-            handoff += "    " + pending.value.text + " = (" + LinkedNullCType(pending.value.ty)? + "){0};\n"
+        } else {
+            argument = lowerLinkedArgument(project, next, callee.parameters[index], argument_id, depth + 1)?
+            if (LinkedNullView(callee.parameters[index])) {
+                args += LinkedViewArgument(callee.parameters[index], argument.value)?
+                if (argument.value.slot > 0) { loans = loans.push(argument.value.clone()) }
+                next = argument.state
+            } else {
+                if (!SameLinkedType(callee.parameters[index], argument.value.ty)) {
+                    RejectLayout("linked_argument_type", "argument type differs from the bound function parameter", argument.value.ty.span.clone())?
+                }
+                // Pending argument slots own their values until the actual call. A
+                // later argument can fail while computing a nested call or a clone.
+                ty = argument.value.ty.clone()
+                pending = AddLinkedNullSlot(project, argument.state, "", "p" + str(id) + "_" + str(index), ty, false)?
+                pending.state.code = pending.state.code + "    " + pending.value.text.clone() + " = " + argument.value.text.clone() + ";\n"
+                next = MoveLinkedNullSlot(pending.state, argument.value)?
+                args += pending.value.text.clone()
+                if (LinkedNullOwner(pending.value.ty)) {
+                    handoff += "    " + pending.value.text + " = (" + LinkedNullCType(pending.value.ty)? + "){0};\n"
+                }
+            }
         }
         index = index + 1
     }
@@ -137,9 +133,9 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
     }
     callee = ResolveLinkedCall(project, state.slots, call, target, false)?
     arguments = LowerLinkedArguments(project, state, call, callee, id, depth, true)?
+    invoke = LinkedDirectCallExpression(callee, arguments.args)
     output = AddLinkedNullSlot(project, arguments.state, "", "t" + str(id), callee.result, false)?
-    args = arguments.args
-    return ok(EmitLinkedPlainInvocation(output, callee, args, arguments.handoff))
+    return ok(EmitLinkedPlainInvocation(output, invoke, arguments.handoff))
 }
 
 fn emitCheckedCallback(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
@@ -152,8 +148,10 @@ fn emitCheckedCallback(&project: LinkedNullProject, state: LinkedNullState, &cal
     payload.declaration_kind = "Struct"
     next = state
     args = ""
-    index = 1
-    while (index < 3) {
+    limit = call.edge_count
+    first = 1
+    index = first
+    while (index < limit) {
         argument = LowerLinkedNullValue(project, next, LinkedNullChild(project, 1, call, index), depth + 1)?
         if (!LinkedIntResult(argument.value.ty)) {
             RejectLayout("linked_callback_argument", "checked callback arguments must be Copy int values", argument.value.ty.span.clone())?
@@ -164,7 +162,7 @@ fn emitCheckedCallback(&project: LinkedNullProject, state: LinkedNullState, &cal
         next.code += "    int64_t " + name.clone() + " = " + argument.value.text + ";\n"
         if (index > 1) { args += ", " }
         args += name
-        index += 1
+        index = index + 1
     }
     result = "dependency" + str(id)
     carrier = LinkedCheckedResultCType(payload)?
@@ -258,7 +256,7 @@ fn emitCheckedValue(&project: LinkedNullProject, state: LinkedNullState, &unwrap
 
 fn LowerLinkedExpectedValue(&project: LinkedNullProject, state: LinkedNullState, &target: TypeNameBinding, id: int, depth: int): LinkedNullExpression! {
     record = target.declaration_kind == "StructArray" || LinkedNullOwnedArray(target)
-    scalar = target.declaration_kind == "BuiltinArray" && (target.name == "int" || target.name == "str")
+    scalar = LinkedScalarArrayLayout(target)
     if (depth >= 32 || (!record && !scalar)) {
         return LowerLinkedNullValue(project, state, id, depth)
     }
@@ -303,7 +301,7 @@ fn lowerLinkedLiteral(&project: LinkedNullProject, state: LinkedNullState, &node
         if (field.kind != "StructLiteralField" || field.edge_count != 1 || ordinal == 0 || ContainsIndex(seen, ordinal)) {
             RejectLayout("invalid_linked_literal_field", "expected each declared struct field once", DeclarationSpan(field))?
         }
-        value = LowerLinkedExpectedValue(project, next.clone(), fields[ordinal - 1].resolved, LinkedNullChild(project, 1, field, 0), depth + 1)?
+        value = LowerLinkedExpectedValue(project, next, fields[ordinal - 1].resolved, LinkedNullChild(project, 1, field, 0), depth + 1)?
         string_array = fields[ordinal - 1].resolved.declaration_kind == "BuiltinArray"
             && fields[ordinal - 1].resolved.name == "str" && value.value.ty.declaration_kind == "OwnedStringArray"
         if (!string_array && !MatchesLinkedFieldValue(fields[ordinal - 1].resolved, value.value.ty)) {

@@ -1,4 +1,6 @@
-import { LinkedCharacterSource, LinkedOwnedStringPredicate, MaterializeLinkedCharacters } from "./struct_string_calls.ku"
+import { RejectLocalCapture } from "./call_contracts.ku"
+import { CloneLinkedIntArray, LinkedCharacterSource, LinkedOwnedStringPredicate, MaterializeLinkedCharacters } from "./struct_string_calls.ku"
+import { LinkedWhileCondition } from "./project_struct_string_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
@@ -7,7 +9,7 @@ import { BindLinkedLocalCallback, LinkedNullBinding, LinkedNullExpression, Linke
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedIntResult, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullNode,
     LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedStringResult,
     ReadLinkedOwnedArray, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, CheckLinkedUnitDecrement, CloneLinkedIntArray, RegisterLinkedNullType } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, CheckLinkedUnitDecrement, RegisterLinkedNullType } from "./linked_parameters_c.ku"
 import { DropLinkedNullScope, LinkedIncreasingGuard, LinkedLiveIntBinding, RejectLinkedLoopWrite, RejectLinkedWriteRange } from "./linked_member_ownership.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
@@ -15,8 +17,9 @@ import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
-import { LinkedBooleanWhileCondition, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
-import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedFreshRecordFor, ReadLinkedLocalCaptures, RejectLocalCapture } from "./linked_owner_assignment_c.ku"
+import { RestoreLinkedThunkFrame } from "./link_plan_json_c.ku"
+import { StartLinkedThunkFrame } from "./scalar_result_null.ku"
+import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedRecordForLoop, ReadLinkedLocalCaptures, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
 
 struct LinkedLocalThunk {
     result: TypeNameBinding
@@ -34,7 +37,8 @@ struct LinkedLocalBody {
 fn ReadLinkedLocalThunk(&project: LinkedNullProject, &parent: LinkedNullState,
                         &function: Node, id: int): LinkedLocalBody! {
     body = StartLinkedThunkFrame(parent)
-    for index in [0, 1] {
+    parameter_indices: [int] = [0, 1]
+    for index in parameter_indices {
         parameter = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
         if (parameter.kind != "Parameter" || parameter.edge_count != 1 || parameter.int_value != 0 ||
             LinkedNullBinding(body.slots, parameter.text) > 0) {
@@ -55,7 +59,8 @@ fn ReadLinkedLocalThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     initializers = ""
     owners: [int] = []
     captures = ReadLinkedLocalCaptures(project, parent, function, id, 3)?
-    for index in captures.slots {
+    capture_slots = captures.slots
+    for index in capture_slots {
         outer = parent.slots[index - 1].clone()
         owned_array = LinkedNullOwnedArray(outer.value.ty)
         array_view = owned_array || outer.value.ty.declaration_kind == "StructArray"
@@ -261,13 +266,16 @@ fn OpenLinkedForLoop(&project: LinkedNullProject, state: LinkedNullState, &state
     if (statement.edge_count != 0) {
         source_id = LinkedNullChild(project, 1, statement, 0)
         source = LinkedNullNode(project, 1, source_id)
-        if (source.kind == "TryUnwrap" || (source.kind == "Call" && ProjectionCloneSource(
+        if (source.kind == "Field" || source.kind == "TryUnwrap" || (source.kind == "Call" && ProjectionCloneSource(
             project.supplied[0].named.parsed.arena.nodes, project.supplied[0].named.parsed.arena.edges, source_id) != 0)) {
-            return OpenLinkedFreshRecordFor(project, state, statement, source_id, id, depth)
+            return OpenLinkedRecordForLoop(project, state, statement, source_id, id, depth)
         }
         if (source.kind == "Variable" && source.edge_count == 0) {
             slot = LinkedNullBinding(state.slots, source.text)
             if (slot != 0) {
+                if (LinkedNullOwnedArray(state.slots[slot - 1].value.ty)) {
+                    return OpenLinkedRecordForLoop(project, state, statement, source_id, id, depth)
+                }
                 if (LinkedNullIntArrayOwner(state.slots[slot - 1].value.ty)) {
                     return openLinkedIntLoop(project, state, statement, slot, id, depth)
                 }
@@ -278,20 +286,6 @@ fn OpenLinkedForLoop(&project: LinkedNullProject, state: LinkedNullState, &state
         }
     }
     return openLinkedCharacterLoop(project, state, statement, id, depth)
-}
-
-struct LinkedWhileCondition {
-    conjunction: int
-    local: str
-}
-
-fn ReadLinkedWhileCondition(&project: LinkedNullProject, &state: LinkedNullState, &statement: Node): LinkedWhileCondition {
-    id = LinkedNullChild(project, 1, statement, 0)
-    guard = LinkedNullNode(project, 1, id)
-    if (guard.kind == "Binary" && guard.text == "&&" && guard.edge_count == 2) {
-        return LinkedWhileCondition { conjunction: id, local: "" }
-    }
-    return LinkedWhileCondition { conjunction: 0, local: LinkedBooleanWhileCondition(state, guard) }
 }
 
 fn OpenLinkedConditionalWhile(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
@@ -320,19 +314,6 @@ fn CloseLinkedForLoop(loop: LinkedNullRegion, &outer: [LinkedNullSlot], before: 
     }
     state.code += "    }\n"
     return ok(DropLinkedNullScope(state, before))
-}
-
-fn ValidLinkedCountedStart(&project: LinkedNullProject, &state: LinkedNullState, id: int, slot: int, named_bound: bool): bool {
-    initial = LinkedNullNode(project, 1, id)
-    if (initial.kind == "Int" && initial.edge_count == 0 && initial.int_value == 0) { return true }
-    if (!named_bound) { return false }
-    if (initial.kind == "Binary" && initial.text == "+" && initial.edge_count == 2) {
-        offset = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 1))
-        if (offset.kind != "Int" || offset.edge_count != 0 || offset.int_value < 0) { return false }
-        initial = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 0))
-    }
-    input = LinkedLiveIntBinding(state, initial)
-    return input > 0 && input != slot
 }
 
 fn LinkedCountedInitial(&project: LinkedNullProject, &state: LinkedNullState, &region: Node,
@@ -381,4 +362,20 @@ fn LinkedCountdownIndex(&project: LinkedNullProject, &state: LinkedNullState, &l
     CheckLinkedUnitDecrement(project, step, cursor, at)?
     RejectLinkedLoopWrite(project, loop, cursor.text, "linked_loop_cursor_write", "countdown can change its cursor only at the end")?
     return ok(slot)
+}
+
+fn LowerLinkedCopyRebind(&project: LinkedNullProject, state: LinkedNullState, &assignment: Node, slot: int): LinkedNullState! {
+    destination = state.slots[slot - 1].value.clone()
+    live = state.slots[slot - 1].live
+    id = LinkedNullChild(project, 1, assignment, 0)
+    rhs = LinkedNullNode(project, 1, id)
+    // A checked RHS branches to its existing Error continuation before
+    // returning a value; only the successful path may write the binding.
+    if (rhs.kind == "TryUnwrap") {
+        return StoreLinkedCopyAssignment(destination, live, LowerLinkedNullValue(project, state, id, 0)?, assignment)
+    }
+    if (destination.ty.name == "bool") {
+        return StoreLinkedCopyAssignment(destination, live, LowerLinkedPredicate(project, state, id)?, assignment)
+    }
+    return StoreLinkedCopyAssignment(destination, live, LowerLinkedNullRead(project, state, id, 0)?, assignment)
 }

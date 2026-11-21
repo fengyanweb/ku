@@ -1,16 +1,19 @@
+import { RejectLocalCapture } from "./call_contracts.ku"
 import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
-import { DeclarationSpan, IsNamedFunction, NamedModule } from "./names.ku"
+import { DeclarationSpan, IsNamedFunction } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { LinkedAppendFailureRelay, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
+import { LinkedAppendFailureRelay, RestoreLinkedThunkFrame } from "./link_plan_json_c.ku"
+import { StartLinkedThunkFrame } from "./scalar_result_null.ku"
 import { AppendLinkedArrayElement, LowerLinkedArrayBinding } from "./linked_array_fields_c.ku"
-import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
-import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
+import { LinkedLiveIntBinding, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
+import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
+import { CloneLinkedRecordArray } from "./linked_null_read_c.ku"
 import { LowerLinkedExpectedValue, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
 fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, index: int): LinkedNullState! {
@@ -33,8 +36,8 @@ fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &
         expected = LinkedNullArrayElement(array.ty.clone())
         matches = SameLinkedType(element.ty, expected)
     }
-    if (!matches || (element.borrowed && (copy || element.member_path == ""))
-        || (!copy && (element.slot == 0 || element.slot == index))) {
+    if (!matches || element.borrowed && (copy || element.member_path == "")
+        || !copy && (element.slot == 0 || element.slot == index)) {
         RejectLayout("linked_move_append", "push requires one element of the declared type", element.ty.span.clone())?
     }
     if (!copy) {
@@ -93,7 +96,7 @@ struct LinkedForLoop {
     before: int
 }
 
-fn OpenLinkedFreshRecordFor(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
+fn OpenLinkedRecordForLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
                             source: int, id: int, depth: int): LinkedForLoop! {
     at = DeclarationSpan(statement)
     if (depth >= 32 || LinkedNullBinding(state.slots, statement.text) != 0) {
@@ -102,9 +105,15 @@ fn OpenLinkedFreshRecordFor(&project: LinkedNullProject, state: LinkedNullState,
     before = state.slots.len()
     input = LowerLinkedNullValue(project, state, source, 0)?
     owner = input.value.clone()
-    if (!LinkedNullOwnedArray(owner.ty) || owner.borrowed || owner.slot <= before || owner.member_path != ""
-        || input.state.slots[owner.slot - 1].binding != "" || LinkedMemberUnavailable(input.state, owner, true)) {
-        RejectLayout("linked_record_for_source", "expected a fresh owned record array", at)?
+    if (!LinkedNullOwnedArray(owner.ty) || owner.borrowed || owner.slot == 0 ||
+        LinkedMemberUnavailable(input.state, owner, true)) {
+        RejectLayout("linked_record_for_source", "expected a live owned record array", at)?
+    }
+    if (owner.slot <= before || owner.member_path != "" || input.state.slots[owner.slot - 1].binding != "") {
+        // The language keeps a named source usable after iteration. Move
+        // elements out of its independent snapshot, as for a fresh result.
+        input = CloneLinkedRecordArray(project, input, id)?
+        owner = input.value.clone()
     }
 
     // The checked call or clone has already admitted this private header.
@@ -136,33 +145,6 @@ fn OpenLinkedBooleanWhile(state: LinkedNullState, &statement: Node, condition: s
     return ok(LinkedForLoop { state: next, outer: outer, before: before })
 }
 
-struct LinkedCatchParts {
-    protected: Node
-    binding: Node
-    recovery: Node
-}
-
-fn ReadLinkedCatchParts(&named: NamedModule, &node: Node): LinkedCatchParts! {
-    edge = node.first_edge
-    protected = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
-    handler = named.parsed.arena.nodes[named.parsed.arena.edges[edge + 1] - 1].clone()
-    if (protected.kind != "TryBody" || handler.kind != "Catch" || handler.edge_count != 2) {
-        RejectLayout("unsupported_linked_catch", "expected a protected body and named catch", DeclarationSpan(node))?
-    }
-    edge = handler.first_edge
-    binding = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
-    recovery = named.parsed.arena.nodes[named.parsed.arena.edges[edge + 1] - 1].clone()
-    if (binding.kind != "CatchBinding" || binding.text == "" || binding.edge_count != 0 || recovery.kind != "CatchBody") {
-        RejectLayout("unsupported_linked_catch", "expected a named catch and handler body", DeclarationSpan(handler))?
-    }
-    return ok(LinkedCatchParts { protected: protected, binding: binding, recovery: recovery })
-}
-
-
-fn RejectLocalCapture(&node: Node, message: str): null! {
-    return RejectLayout("unsupported_linked_local_capture", message, DeclarationSpan(node))
-}
-
 struct LinkedLocalCaptures {
     slots: [int]
     calls: [int]
@@ -174,20 +156,26 @@ struct LinkedLocalCaptures {
 fn ReadLinkedLocalCaptures(&project: LinkedNullProject, &state: LinkedNullState,
                            &function: Node, id: int, body_start: int): LinkedLocalCaptures! {
     names: [str] = []
+    limit = body_start - 1
     index = 0
-    while (index < body_start - 1) {
+    while (index < limit) {
         parameter = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
         names = names.push(parameter.text)
-        index += 1
+        index = index + 1
     }
-    cursor = LinkedNullChild(project, 1, function, body_start)
-    while (project.supplied[0].named.parsed.arena.nodes[cursor - 1].edge_count > 0) {
-        cursor = project.supplied[0].named.parsed.arena.edges[
-            project.supplied[0].named.parsed.arena.nodes[cursor - 1].first_edge]
+    start = LinkedNullChild(project, 1, function, body_start)
+    descending = true
+    while (descending) {
+        descending = project.supplied[0].named.parsed.arena.nodes[start - 1].edge_count > 0
+        if (descending) {
+            start = project.supplied[0].named.parsed.arena.edges[
+                project.supplied[0].named.parsed.arena.nodes[start - 1].first_edge]
+        }
     }
     slots: [int] = []
     calls: [int] = []
     has_local_calls = state.local_appends.len() > 0
+    cursor = start
     while (cursor < id) {
         node = LinkedNullNode(project, 1, cursor)
         if (has_local_calls && node.kind == "Call" && node.edge_count > 0) {
@@ -262,8 +250,8 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     record_input = one_input && slots[0].value.ty.declaration_kind == "Struct"
     copy_input = one_input && LinkedIntResult(slots[0].value.ty)
     int_result = LinkedIntResult(parameters.result) || LinkedNullIntArrayOwner(parameters.result)
-    if (parameters.state.plain_value_result || (!nullary && !record_input && !copy_input &&
-        (!int_result || slots.len() == 0 || slots.len() > 8))) {
+    if (parameters.state.plain_value_result || !nullary && !record_input && !copy_input &&
+        (!int_result || slots.len() == 0 || slots.len() > 8)) {
         RejectLocalCapture(function, "a local append function requires int! or [int]! with one to eight arguments, or null! with zero arguments, one int or one owned record")?
     }
     // Direct synchronous calls use the ordinary owning argument slots.
@@ -284,7 +272,8 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     initializers = ""
     sources: [int] = []
     captures = ReadLinkedLocalCaptures(project, parent, function, id, parameters.body_start)?
-    for index in captures.slots {
+    captured_slots = captures.slots
+    for index in captured_slots {
         outer = parent.slots[index - 1].clone()
         ty = outer.value.ty.clone()
         array = LinkedNullOwnedArray(ty) || LinkedNullIntArrayOwner(ty)
@@ -314,7 +303,8 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     }
     // Only previously declared local callees are available. Forward their
     // original environment address, never a rebuilt copy of its owners.
-    for index in captures.calls {
+    captured_calls = captures.calls
+    for index in captured_calls {
         callee = parent.local_appends[index - 1].clone()
         suffix = str(callee.function.node)
         field = "f" + suffix.clone()
@@ -337,9 +327,13 @@ fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
         next.uses_str_view || next.uses_struct_view || next.uses_concat || next.uses_div) {
         RejectLocalCapture(function, "a local append function needs checked exits and append-only captured array effects")?
     }
-    for index in next.append_slots.clone() {
+    count = next.append_slots.len()
+    cursor = 0
+    while (cursor < count) {
+        index = next.append_slots[cursor]
         ty = next.slots[index - 1].value.ty.clone()
         next.local_append_types = next.local_append_types.push(ty)
+        cursor = cursor + 1
     }
     signature = "void *raw, KuLocalAppendFailure *failure"
     if (thunk.body_start > 1) { signature += ", " + thunk.signature.clone() }
@@ -348,8 +342,12 @@ fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
         + FinishLinkedFunctionC("", next, symbol, signature, LinkedCheckedResultCType(thunk.result)?,
             "", "", LinkedAppendFailureRelay(next))
     next = RestoreLinkedThunkFrame(next, parent)
-    for index in thunk.sources.clone() {
+    source_count = thunk.sources.len()
+    cursor = 0
+    while (cursor < source_count) {
+        index = thunk.sources[cursor]
         if (!ContainsIndex(next.append_captures, index)) { next.append_captures = next.append_captures.push(index) }
+        cursor = cursor + 1
     }
     frame = "environment" + str(id)
     callee = LinkedNullFunction { unit: 1, node: id, symbol: symbol.clone(), parameters: thunk.arguments.clone(),
@@ -398,12 +396,25 @@ fn LowerLinkedTypedArrayLocal(&project: LinkedNullProject, state: LinkedNullStat
     return LowerLinkedArrayBinding(project, state, statement, id, value, value_id, ty)
 }
 
-fn StoreLinkedCopyAssignment(&destination: LinkedNullSlot, value: LinkedNullExpression, &assignment: Node): LinkedNullState! {
-    if (!destination.live || destination.value.borrowed || !SameLinkedType(destination.value.ty, value.value.ty)) {
+fn StoreLinkedCopyAssignment(&destination: LinkedNullValue, live: bool, value: LinkedNullExpression, &assignment: Node): LinkedNullState! {
+    if (!live || destination.borrowed || !SameLinkedType(destination.ty, value.value.ty)) {
         RejectLayout("linked_copy_assignment", "assignment requires a live Copy target and matching scalar expression",
                      DeclarationSpan(assignment))?
     }
     next = value.state
-    next.code += "    " + destination.value.text + " = " + value.value.text + ";\n"
+    next.code += "    " + destination.text + " = " + value.value.text + ";\n"
     return ok(next)
+}
+
+fn ValidLinkedCountedStart(&project: LinkedNullProject, &state: LinkedNullState, id: int, slot: int, named_bound: bool): bool {
+    initial = LinkedNullNode(project, 1, id)
+    if (initial.kind == "Int" && initial.edge_count == 0 && initial.int_value == 0) { return true }
+    if (!named_bound) { return false }
+    if (initial.kind == "Binary" && initial.text == "+" && initial.edge_count == 2) {
+        offset = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 1))
+        if (offset.kind != "Int" || offset.edge_count != 0 || offset.int_value < 0) { return false }
+        initial = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 0))
+    }
+    input = LinkedLiveIntBinding(state, initial)
+    return input > 0 && input != slot
 }

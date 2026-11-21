@@ -437,6 +437,77 @@ fn EmitCheckedRecordArrayClone(&source: str, &target: str, &prefix: str, layout:
     return text + "            ++" + target.clone() + ".len;\n        }\n    }\n"
 }
 
+fn EmitProjectionCloneString(&symbol: str): str {
+    return "static bool " + symbol.clone() + "(KuProjectionString source, KuProjectionString *out) {\n" +
+        "    if (source.storage == KU_PROJECTION_STRING_STATIC) { *out = source; return true; }\n" +
+        "    if (!source.ptr) return true;\n" +
+        "    size_t size = source.len ? source.len : 1;\n    uint8_t *data = malloc(size);\n    if (!data) return false;\n" +
+        "    if (source.len) memcpy(data, source.ptr, source.len);\n" +
+        "    *out = (KuProjectionString){ data, source.len, size, KU_PROJECTION_STRING_OWNED };\n    return true;\n}\n\n"
+}
+
+fn EmitOwnedStringArrayClone(&prefix: str, &clone_string: str): str {
+    return "static bool " + prefix.clone() + "_clone_strings(const KuGuardStringArray *source, KuGuardStringArray *out, bool *invalid) {\n"
+        + "    size_t capacity = source->capacity ? source->capacity : source->len;\n"
+        + "    if (source->len > capacity || capacity > SIZE_MAX / sizeof(*source->data) || (capacity && !source->data)) { *invalid = true; return false; }\n"
+        + "    if (!source->len) return true;\n"
+        + "    out->data = malloc(source->len * sizeof(*out->data));\n"
+        + "    if (!out->data) return false;\n"
+        + "    out->capacity = source->len;\n"
+        + "    while (out->len < source->len) {\n"
+        + "        KuProjectionString string = source->data[out->len];\n"
+        + "        if (string.len && !string.ptr) { *invalid = true; return false; }\n"
+        + "        out->data[out->len] = (KuProjectionString){0};\n"
+        + "        if (!" + clone_string.clone() + "(string, &out->data[out->len])) return false;\n"
+        + "        ++out->len;\n    }\n    return true;\n}\n\n"
+}
+
+fn EmitOwningStringArrayDrop(&target: str): str {
+    // A malformed foreign header cannot establish an initialized prefix.
+    // Leave its untrusted buffer alone and still drop the other fields.
+    return "    {\n        KuGuardStringArray *array = &" + target.clone() + ";\n"
+        + "        size_t capacity = array->capacity ? array->capacity : array->len;\n"
+        + "        if (array->len <= capacity && capacity <= SIZE_MAX / sizeof(*array->data) && (array->data || !capacity)) {\n"
+        + "            for (size_t i = array->len; i != 0; --i) ku_projection_string_drop(&array->data[i - 1]);\n"
+        + "            free(array->data);\n        }\n    }\n"
+}
+
+fn EmitLinkedFlatRecordArrayClone(&symbol: str, &array_type: str, &element_type: str, &drop: str,
+                                  &clone_string: str, &fields: [str]): str {
+    text = "static bool " + symbol.clone() + "(const " + array_type.clone() + " *source, " + array_type.clone() + " *out, bool *invalid) {\n"
+        + "    if (!source) { *invalid = true; return false; }\n"
+        + "    size_t capacity = source->capacity ? source->capacity : source->len;\n"
+        + "    if (source->len > capacity || capacity > SIZE_MAX / sizeof(*source->data) || (capacity && !source->data)) { *invalid = true; return false; }\n"
+        + "    if (!source->len) return true;\n"
+        + "    out->data = malloc(source->len * sizeof(*out->data));\n"
+        + "    if (!out->data) return false;\n"
+        + "    out->capacity = source->len;\n"
+        + "    while (out->len < source->len) {\n"
+    text += "        const " + element_type.clone() + " *item = &source->data[out->len];\n"
+        + "        " + element_type.clone() + " copy = *item;\n"
+    // The shallow shell must contain no borrowed owners when the first clone can fail.
+    count = fields.len()
+    index = 0
+    while (index < count) {
+        text += "        copy" + fields[index].clone() + " = (KuProjectionString){0};\n"
+        index = index + 1
+    }
+    index = 0
+    while (index < count) {
+        path = fields[index].clone()
+        original = "(*item)" + path.clone()
+        text += "        if (" + original.clone() + ".len && !" + original.clone() + ".ptr) { *invalid = true; goto discard; }\n"
+        text += "        if (!" + clone_string.clone() + "(" + original + ", &copy" + path + ")) goto discard;\n"
+        index = index + 1
+    }
+    // Only complete elements enter the prefix owned by the caller's cleanup.
+    text += "        out->data[out->len++] = copy;\n"
+    if (count > 0) {
+        text += "        continue;\ndiscard:\n        " + drop.clone() + "(&copy);\n        return false;\n"
+    }
+    return text + "    }\n    return true;\n}\n\n"
+}
+
 fn EmitStaticJsonString(&symbol: str, &literal: str, length: int, escaped: bool): str {
     text = "#include <stdbool.h>\n#include <stdint.h>\n" + ScalarStringHelpers(true, false, false, false, false, false, true)
     text += "typedef struct KuResult_str { bool ok; KuString value; KuError error; } KuResult_str;\n"

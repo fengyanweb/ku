@@ -281,29 +281,6 @@ fn EmitLinkedBodyPrelude(&body: LinkedNullState): str! {
     return ok(declarations)
 }
 
-fn StartLinkedThunkFrame(&parent: LinkedNullState): LinkedNullState {
-    // Retain shared C requirements and dependency identities, but start the
-    // private function with its own automatic storage and error cleanup.
-    body = parent.clone()
-    body.slots = []
-    body.declarations = ""
-    body.code = ""
-    body.drops = ""
-    body.plain_value_result = false
-    body.uses_replace = false
-    body.local_readers = []
-    body.local_callbacks = []
-    body.callback_owners = []
-    body.append_slots = []
-    body.local_appends = []
-    body.append_captures = []
-    body.catch_slot = 0
-    body.catch_edges = false
-    body.catch_moved = []
-    body.moved_error_fields = []
-    return body
-}
-
 fn RestoreLinkedThunkFrame(body: LinkedNullState, &parent: LinkedNullState): LinkedNullState {
     // Dependencies, layouts and C helpers are translation-unit requirements.
     // Bindings and failure cleanup below the thunk belong solely to it.
@@ -353,9 +330,14 @@ fn LinkedAppendFailureRelay(&body: LinkedNullState): str {
 fn FinishLinkedReaderThunk(next: LinkedNullState, &parent: LinkedNullState, &symbol: str,
                           &result: str, &array: str): LinkedNullState {
     body = next
-    parent_state = RestoreLinkedThunkFrame(body.clone(), parent)
-    // These statements use only array access, owned cloning, or a bound mapper.
-    // Other capabilities in the caller belong to the caller's cleanup.
+    // Render the reader with only the cleanup flags it can use; carry the
+    // translation-unit features back to the parent before exposing the helper.
+    parent_print = body.uses_print
+    chars = body.uses_chars
+    str_view = body.uses_str_view
+    struct_view = body.uses_struct_view
+    concat = body.uses_concat
+    div = body.uses_div
     body.uses_print = false
     body.uses_chars = false
     body.uses_str_view = false
@@ -364,25 +346,37 @@ fn FinishLinkedReaderThunk(next: LinkedNullState, &parent: LinkedNullState, &sym
     body.uses_div = false
     body.uses_scoped_reader = false
     body.code = "    const " + array.clone() + " *const capture = raw;\n" + body.code
-    parent_state.callback_helpers += "static " + FinishLinkedFunctionC("", body, symbol,
-        "void *raw, KuLocalAppendFailure *failure, int64_t input", result, "", "", LinkedAppendFailureRelay(body))
+    failure = LinkedAppendFailureRelay(body)
+    source = FinishLinkedFunctionC("", body, symbol,
+        "void *raw, KuLocalAppendFailure *failure, int64_t input", result, "", "", failure)
+    body.uses_print = parent_print
+    body.uses_chars = chars
+    body.uses_str_view = str_view
+    body.uses_struct_view = struct_view
+    body.uses_concat = concat
+    body.uses_div = div
+    parent_state = RestoreLinkedThunkFrame(body, parent)
+    parent_state.callback_helpers += "static " + source
     parent_state.uses_scoped_reader = true
     return parent_state
+}
+
+fn linkedBooleanWhileSlotText(&slot: LinkedNullSlot): str {
+    if (slot.parameter || !slot.live || slot.value.borrowed || slot.moved_members.len() != 0 ||
+        slot.value.ty.declaration_kind != "Builtin" || slot.value.ty.name != "bool") { return "" }
+    return slot.value.text.clone()
 }
 
 fn LinkedBooleanWhileCondition(&state: LinkedNullState, &guard: Node): str {
     if (guard.kind != "Variable" || guard.edge_count != 0) { return "" }
     index = LinkedNullBinding(state.slots, guard.text)
     if (index == 0) { return "" }
-    slot = state.slots[index - 1].clone()
-    if (slot.parameter || !slot.live || slot.value.borrowed || slot.moved_members.len() != 0 ||
-        slot.value.ty.declaration_kind != "Builtin" || slot.value.ty.name != "bool") { return "" }
-    return slot.value.text
+    return linkedBooleanWhileSlotText(state.slots[index - 1])
 }
 
-fn EmitLinkedPlainInvocation(output: LinkedNullExpression, &callee: LinkedNullFunction, &args: str, handoff: str): LinkedNullExpression {
+fn EmitLinkedPlainInvocation(output: LinkedNullExpression, &invoke: str, handoff: str): LinkedNullExpression {
     next = output
-    next.state.code += "    " + next.value.text.clone() + " = " + LinkedDirectCallExpression(callee, args) + ";\n" + handoff
+    next.state.code += "    " + next.value.text.clone() + " = " + invoke + ";\n" + handoff
     next.state.slots[next.value.slot - 1].live = true
     return next
 }

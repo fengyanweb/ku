@@ -9,7 +9,7 @@ import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
 import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
-import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, LinkedStringArrayAssignmentPlace } from "./linked_parameters_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
@@ -164,12 +164,11 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     RequireLinkedMutableName(root.text, DeclarationSpan(root))?
 
     rhs_id = LinkedNullChild(project, 1, statement, 1)
-    argument = 0
-    if (!nested) { argument = LinkedFieldAppendArgument(project, target, root, rhs_id) }
+    argument = LinkedFieldAppendArgument(project, target_id, rhs_id)
     if (capture && argument > 0) {
         RejectLayout("linked_member_target", "a local callback can only assign Copy fields of a captured record", DeclarationSpan(target))?
     }
-    if (argument > 0) { return LowerLinkedFieldAppend(project, state, target_id, argument) }
+    if (argument > 0) { return LowerLinkedFieldAppend(project, state, target_id, argument, nested) }
     // Generate the RHS and finish its fallible work before selecting the
     // target in the resulting state. The old member still belongs to cleanup
     // if the RHS fails or consumes its record.
@@ -177,18 +176,19 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     if (nested) { rhs = HoldLinkedCopyOperand(rhs, target_id)? }
     replacement = rhs.value.clone()
     selected = ReadLinkedMemberPlace(project, rhs.state, target)?
-    array_owner = selected.array_owner
     place = selected.place
+    tracked = place.value.slot == slot && place.value.member_path != ""
+    owned = tracked || selected.array_owner == slot
+    place = LinkedStringArrayAssignmentPlace(place, owned)
     ty = place.value.ty.clone()
     string = LinkedStringResult(ty)
     copy = ty.declaration_kind == "Builtin" && (ty.name == "int" || ty.name == "bool")
     if (capture && !copy) {
         RejectLayout("linked_member_target", "a local callback can only assign Copy fields of a captured record", DeclarationSpan(target))?
     }
-    tracked = place.value.slot == slot && place.value.member_path != ""
-    indexed_string = string && array_owner == slot
     drop = ""
-    if (indexed_string || (tracked && (string || ty.declaration_kind == "Struct"))) {
+    if ((owned && (string || ty.declaration_kind == "OwnedStringArray")) || (tracked &&
+        (ty.declaration_kind == "Struct" || LinkedNullOwnedArray(ty) || LinkedNullIntArrayOwner(ty)))) {
         drop = LinkedNullDropC(place.state.layouts, place.state.owning_layouts, ty, place.value.text)
     }
     if ((guarded || nested) && !copy && drop == "") {
@@ -257,7 +257,8 @@ fn putLinkedDestructuredField(&project: LinkedNullProject, state: LinkedNullStat
     }
     next.code += "    " + next.slots[target - 1].value.text.clone() + " = " + field.text.clone() + ";\n"
     next.slots[target - 1].live = true
-    next.slots[target - 1].moved_members = []
+    no_moved_members: [str] = []
+    next.slots[target - 1].moved_members = no_moved_members
     return MoveLinkedNullSlot(next, field)
 }
 
@@ -373,8 +374,8 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
     return ok(next)
 }
 
-fn LowerLinkedFieldAppend(&project: LinkedNullProject, state: LinkedNullState, target: int, argument: int): LinkedNullState! {
-    return FinishLinkedFieldAppend(project, LowerLinkedNullValue(project, state, argument, 0)?, target, argument)
+fn LowerLinkedFieldAppend(&project: LinkedNullProject, state: LinkedNullState, target: int, argument: int, nested: bool): LinkedNullState! {
+    return FinishLinkedFieldAppend(project, LowerLinkedNullValue(project, state, argument, 0)?, target, argument, nested)
 }
 
 fn LowerLinkedStringAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {

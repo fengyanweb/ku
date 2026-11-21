@@ -1,8 +1,8 @@
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
-import { LinkedIntSnapshotCall } from "./guarded_string_parts.ku"
+import { LinkedIntSnapshotCall, LinkedRecordCloneCall } from "./guarded_string_parts.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC } from "./linked_member_ownership.ku"
-import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
+import { BuildProjectOwningLayouts, CanCloneManagedRecord, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
 import { EmitScalarIntString } from "./scalar_int_emit.ku"
 import { HasScalarBuiltin } from "./scalar_int_operands.ku"
 import { Node } from "../stage2/ast.ku"
@@ -10,9 +10,10 @@ import { Span } from "../stage2/span.ku"
 import { FindLinkedLocalRead } from "./call_contracts.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { DeclarationSpan } from "./names.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { LinkedCopyResult, TypeNameBinding } from "./type_names.ku"
 import { HasBoundArrayMembers, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { IsLinkedScopedCallback, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedRecordFields, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
+import { RegisterLinkedElementClone } from "./struct_array_c.ku"
 import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterPlan,
          LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 
@@ -149,14 +150,17 @@ fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &el
     layout = BuildProjectOwningLayouts(project.supplied, project.binding, unit, node, element.span.clone())?
     order = OrderProjectOwningLayouts(layout, unit, node, element.span.clone())?
     next.owning_strings = next.owning_strings || order.contains_string
-    for entry in order.entries {
-        item = layout[entry.layout_index - 1].clone()
+    count = order.entries.len()
+    index = 0
+    while (index < count) {
+        item = layout[order.entries[index].layout_index - 1].clone()
         if (LayoutIndex(next.owning_layouts, item.module_index, item.node) == 0) {
             next.owning_layouts = next.owning_layouts.push(item.clone())
         }
         if (LayoutIndex(next.layouts, item.module_index, item.node) == 0) {
             next.layouts = next.layouts.push(item)
         }
+        index = index + 1
     }
     return ok(next)
 }
@@ -275,18 +279,20 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
     return ok(LinkedNullExpression { state: next, value: value })
 }
 
-fn CloneLinkedIntArray(&project: LinkedNullProject, input: LinkedNullExpression, name: str): LinkedNullExpression! {
-    source = input.value
-    state = input.state
-    if (source.borrowed || LinkedMemberUnavailable(state, source, true)) {
-        RejectLayout("linked_int_array_clone", "expected a live owned int array", source.ty.span.clone())?
+fn LinkedStringArrayAssignmentPlace(place: LinkedNullExpression, owned: bool): LinkedNullExpression {
+    target = place
+    if (owned && target.value.ty.declaration_kind == "BuiltinArray" && target.value.ty.name == "str") {
+        // The field reader produced the address of this checked owner field.
+        target.value.ty.declaration_kind = "OwnedStringArray"
+        target.value.text = "(*" + target.value.text.clone() + ")"
+        target.value.borrowed = false
     }
-    output = AddLinkedNullSlot(project, state, "", name, source.ty.clone(), false)?
-    output.state = RequireLinkedArrayValidation(output.state, source.ty.clone())
-    output.state.uses_int_snapshot = true
-    output.state.slots[output.value.slot - 1].live = true
-    output.state.code += LinkedIntSnapshotCall(source.text, output.value.text, output.value.text)
-    return ok(output)
+    return target
+}
+
+fn LinkedFieldAppendPlace(field: LinkedNullExpression): LinkedNullExpression {
+    owned = field.value.member_path != ""
+    return LinkedStringArrayAssignmentPlace(field, owned)
 }
 
 fn CloneLinkedStringSlot(&project: LinkedNullProject, source: LinkedNullExpression, name: str): LinkedNullExpression! {
@@ -372,35 +378,46 @@ fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, 
     }
     layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
     arrays = HasBoundArrayMembers(source.state.layouts, layout)
+    text = source.value.text
     output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
-    if (arrays) {
-        fields = LinkedRecordFields(output.state.layouts, output.state.owning_layouts, output.value.ty)?
+    value = output.value
+    next = output.state
+    next.slots[value.slot - 1].live = true
+    direct = false
+    if (!arrays) {
+        drops = GuardOwnedDrops(next.layouts, layout, text)
+        direct = drops == ""
+    }
+    if (arrays && !CanCloneManagedRecord(next.layouts, layout)) {
+        fields = LinkedRecordFields(next.layouts, next.owning_layouts, value.ty)?
+        count = fields.len()
         index = 0
-        while (index < fields.len()) {
+        while (index < count) {
             field = fields[index].resolved.clone()
             suffix = ".f" + str(index)
-            origin = source.value.text.clone() + suffix.clone()
-            target = output.value.text.clone() + suffix
-            if (field.declaration_kind == "BuiltinArray" && field.name == "int") {
-                output.state = RegisterLinkedNullType(project, output.state, field)?
-                output.state.uses_int_snapshot = true
-                output.state.code += LinkedIntSnapshotCall(origin, target, "t" + str(id) + "_" + str(index))
-            } else if (field.declaration_kind == "Builtin" && (field.name == "int" || field.name == "bool")) {
-                output.state.code += "    " + target + " = " + origin + ";\n"
-            } else {
+            origin = text.clone() + suffix.clone()
+            target = value.text.clone() + suffix
+            integer_array = field.declaration_kind == "BuiltinArray" && field.name == "int"
+            if (!integer_array && !LinkedCopyResult(field)) {
                 RejectLayout("linked_nested_array_clone", "record snapshot requires immediate [int] or Copy int and bool fields", field.span.clone())?
             }
-            index += 1
+            next = RegisterLinkedNullType(project, next, field)?
+            if (integer_array) {
+                next.uses_int_snapshot = true
+                next.code += LinkedIntSnapshotCall(origin, target, "t" + str(id) + "_" + str(index))
+            } else {
+                next.code += "    " + target + " = " + origin + ";\n"
+            }
+            index = index + 1
         }
-    } else if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
-        output.state.code += "    " + output.value.text.clone() + " = " + source.value.text + ";\n"
-    } else {
-        if (!ContainsIndex(output.state.element_clones, layout)) {
-            output.state.element_clones = output.state.element_clones.push(layout)
-        }
-        output.state.code += "    if (!ku_linked_element_" + str(layout) + "_clone_element(&"
-            + source.value.text + ", &" + output.value.text.clone() + ")) { out_of_memory = true; goto cleanup; }\n"
+        return ok(LinkedNullExpression { state: next, value: value })
     }
-    output.state.slots[output.value.slot - 1].live = true
-    return ok(output)
+    if (direct) {
+        next.code += "    " + value.text.clone() + " = " + text + ";\n"
+        return ok(LinkedNullExpression { state: next, value: value })
+    }
+    next = RegisterLinkedElementClone(next, layout)
+    if (arrays) { next.uses_struct_view = true }
+    next.code += LinkedRecordCloneCall(layout, arrays, text, value.text)
+    return ok(LinkedNullExpression { state: next, value: value })
 }

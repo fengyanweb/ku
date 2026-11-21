@@ -4,7 +4,7 @@ import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ScalarStringLiteral, HasScalarBuiltin } from "./scalar_int_operands.ku"
 import { EmitScalarStringAssignment, ScalarStringJoinHelpers } from "./scalar_int_emit.ku"
 import { LowerProjectedStringParts } from "./guarded_string_parts.ku"
-import { ContainsIndex, EmitLayout, ProjectionHeaders } from "./struct_projection_c.ku"
+import { ContainsIndex, EmitLayout, ProjectionHeaders, StringField } from "./struct_projection_c.ku"
 import { ExplicitType, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { OrderCStructLayouts } from "./nested_struct_c.ku"
 import { EmitTryCloneString } from "./struct_array_c.ku"
@@ -40,11 +40,12 @@ struct GuardBlock {
 
 fn guardOwnedDropsAt(&layouts: [StructLayout], index: int, &base: str, &indent: str): str {
     drops = ""
+    field_count = layouts[index - 1].fields.len()
     cursor = 0
-    while (cursor < layouts[index - 1].fields.len()) {
+    while (cursor < field_count) {
         field = layouts[index - 1].fields[cursor].resolved.clone()
         name = base.clone() + ".f" + str(cursor)
-        if (field.declaration_kind == "Builtin" && field.name == "str") {
+        if (StringField(field)) {
             drops += indent.clone() + "ku_projection_string_drop(&" + name + ");\n"
         } else if (field.declaration_kind == "Struct") {
             child = LayoutIndex(layouts, field.module_index, field.declaration_node)
@@ -104,7 +105,7 @@ fn readGuardSignature(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
         }
         view = parameter.int_value == 1
         ty = GuardParameterType(nodes, edges, types, layouts, edges[parameter.first_edge], view)?
-        if (ty.kind == "str" || (view && ty.kind != "struct" && ty.kind != "str_array")) {
+        if (ty.kind == "str" || view && ty.kind != "struct" && ty.kind != "str_array") {
             RejectLayout("unsupported_guarded_signature", "guarded C accepts value scalars, value or View structs, and View [str]", at.clone())?
         }
         string_array = string_array || ty.kind == "str_array"
@@ -137,8 +138,7 @@ fn readGuardSignature(&nodes: [Node], &edges: [int], &types: [TypeNameBinding],
         RejectLayout("unsupported_guarded_signature", "guarded C requires a str or bool result", DeclarationSpan(nodes[edges[cursor] - 1]))?
     }
     if (bindings.len() == 0) { declaration += "void" }
-    result_type = GuardCType(result, layouts)
-    return ok(GuardSignature { bindings: bindings, declaration: result_type + " " + declaration + ") {\n", definitions: definitions,
+    return ok(GuardSignature { bindings: bindings, declaration: GuardCType(result, layouts) + " " + declaration + ") {\n", definitions: definitions,
         drops: drops, body_start: cursor + 1, result_kind: result.kind, string_array: string_array })
 }
 
@@ -291,8 +291,10 @@ fn GuardLinkedStringPredicate(&method: str, &left: LinkedNullValue, right: Linke
             "ku_linked_string_contains(" + left.text.clone() + ", " + needle + ")")
     }
     next.uses_prefix_suffix = true
+    suffix = "false)"
+    if (method == "ends_with") { suffix = "true)" }
     return LinkedReadonlyExpression(next, result,
-        "ku_scalar_string_matches(" + left.text.clone() + ", " + needle + ", " + str(method == "ends_with") + ")")
+        "ku_scalar_string_matches(" + left.text.clone() + ", " + needle + ", " + suffix)
 }
 
 fn GuardStringEquality(needed: bool): str {
@@ -452,6 +454,7 @@ fn ScalarGuardSlotMove(&before: LinkedNullSlot, &after: LinkedNullSlot, &state: 
     if (ty.declaration_kind != "Struct" || before.value.borrowed || !before.live || after.live
         || before.moved_members.len() != 0 || after.moved_members.len() != 0) { return false }
     layout = LayoutIndex(state.layouts, ty.module_index, ty.declaration_node)
-    return layout > 0 && !HasBoundArrayMembers(state.layouts, layout)
-        && GuardOwnedDrops(state.layouts, layout, before.value.text) == ""
+    if (layout <= 0 || HasBoundArrayMembers(state.layouts, layout)) { return false }
+    drops = GuardOwnedDrops(state.layouts, layout, before.value.text)
+    return drops == ""
 }

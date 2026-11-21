@@ -89,6 +89,7 @@ struct LinkedNullState {
     moved_error_fields: [str]
     uses_clone: bool
     uses_int_snapshot: bool
+    uses_str_snapshot: bool
     arrays: [TypeNameBinding]
     validated_arrays: [TypeNameBinding]
     owned_arrays: [TypeNameBinding]
@@ -123,7 +124,7 @@ fn NewLinkedNullState(): LinkedNullState {
         slots: [], links: [], local_readers: [], local_callbacks: [], callback_owners: [], callback_helpers: "", uses_scoped_reader: false,
         local_appends: [], append_captures: [], local_append_types: [],
         declarations: "", code: "", drops: "", catch_slot: 0,
-        catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false, uses_int_snapshot: false,
+        catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false, uses_int_snapshot: false, uses_str_snapshot: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,
         element_clones: [], uses_index: false, checks_str_item: false, uses_add: false, uses_sub: false, uses_mul: false, uses_div: false,
         uses_string_equal: false, uses_print: false, uses_concat: false, uses_replace: false, uses_int_format: false, uses_prefix_suffix: false, uses_string_contains: false, uses_chars: false }
@@ -185,10 +186,13 @@ fn LinkedScopedCallbackTypes(&links: [LinkedNullFunction], &slots: [LinkedNullSl
 
 fn RememberLinkedCall(calls: [LinkedNullFunction], dependency: LinkedNullFunction): [LinkedNullFunction] {
     result = calls
-    for old in result {
-        if (old.unit == dependency.unit && old.node == dependency.node) { return result }
+    index = 0
+    while (index < result.len()) {
+        if (result[index].unit == dependency.unit && result[index].node == dependency.node) { return result }
+        index = index + 1
     }
-    return result.push(dependency)
+    result = result.push(dependency)
+    return result
 }
 
 fn LinkedDirectCallExpression(&callee: LinkedNullFunction, &arguments: str): str {
@@ -326,7 +330,7 @@ fn LinkedNullIntArrayOwner(&binding: TypeNameBinding): bool {
 
 fn LinkedNullReadableArray(&type: TypeNameBinding): bool {
     return type.declaration_kind == "StructArray" || type.declaration_kind == "BuiltinArray"
-        || type.declaration_kind == "OwnedStringArray" || LinkedNullOwnedArray(type) || LinkedNullIntArrayOwner(type)
+        || LinkedNullOwnedArray(type) || LinkedScalarArrayOwner(type)
 }
 
 fn RegisterLinkedIntArray(state: LinkedNullState, ty: TypeNameBinding): LinkedNullState {
@@ -517,4 +521,20 @@ fn LinkedCPrelude(&body: LinkedNullState, guards: str): str {
 
 fn LinkedScalarArrayOwner(&type: TypeNameBinding): bool {
     return LinkedNullIntArrayOwner(type) || type.declaration_kind == "OwnedStringArray"
+}
+
+fn LinkedScalarArrayLayout(&type: TypeNameBinding): bool {
+    return LinkedScalarArrayOwner(type)
+        || type.declaration_kind == "BuiltinArray" && (type.name == "int" || type.name == "str")
+}
+
+fn LinkedIntArrayLayout(&type: TypeNameBinding): bool {
+    return type.name == "int" && LinkedScalarArrayLayout(type)
+}
+
+struct LinkedNullC {
+    symbol: str
+    links: [LinkedNullFunction]
+    source: str
+    entry_plan: LinkPlanDeclaration
 }
