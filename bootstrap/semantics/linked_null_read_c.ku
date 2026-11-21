@@ -12,7 +12,7 @@ import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
 import { GuardLinkedStringPredicate } from "./guarded_struct_c.ku"
 import { EmitLinkedIntAppend, EmitLinkedOwnedArrayClone, OwnedRecordArrayCloneLayout, OwnedRecordArrayCloneType } from "./struct_array_c.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn LowerLinkedIntArrayLiteral(&project: LinkedNullProject, state: LinkedNullState, &literal: Node, id: int,
                                binding: str): LinkedNullExpression! {
@@ -181,13 +181,14 @@ fn CloneLinkedRecordArray(&project: LinkedNullProject, source: LinkedNullExpress
     return ok(output)
 }
 
-fn ReadLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalReadBinding, argument: LinkedNullExpression,
+fn ReadLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalReadBinding, input: LinkedNullExpression,
                            &at: Node, id: int): LinkedNullExpression! {
+    argument = input
     array = argument.state.slots[reader.captured_slot - 1].value.clone()
     if (LinkedMemberUnavailable(argument.state, array, true)) {
         RejectLayout("linked_local_reader_capture", "the array captured by this declaration is no longer live", DeclarationSpan(at))?
     }
-    if (argument.value.ty.declaration_kind != "Builtin" || argument.value.ty.name != "int") {
+    if (!LinkedIntResult(argument.value.ty)) {
         RejectLayout("linked_local_reader_argument", "a local reader requires an int index", DeclarationSpan(at))?
     }
     if (reader.index_shift != 0) {
