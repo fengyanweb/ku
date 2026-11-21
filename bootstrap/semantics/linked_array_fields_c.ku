@@ -71,7 +71,7 @@ fn RegisterLinkedLocalRead(&project: LinkedNullProject, state: LinkedNullState, 
     }
     element = LinkedNullArrayElement(state.slots[capture - 1].value.ty.clone())
     result = LinkedNullType(project, 1, LinkedNullChild(project, 1, function, 1))?
-    if (result.declaration_kind != "Struct" || (mapper == 0 && !SameLinkedType(result, element))) {
+    if (result.declaration_kind != "Struct" || mapper == 0 && !SameLinkedType(result, element)) {
         RejectLocalReader(function, "local reader result must match the captured named array element")?
     }
     if (mapper != 0) {
@@ -260,7 +260,7 @@ fn FinishLinkedStringAppend(&project: LinkedNullProject, input: LinkedNullExpres
     operand = right.value.clone()
     left = LowerLinkedNullRead(project, right.state, target_id, 0)?
     owner = left.value.clone()
-    if (owner.slot == 0 || !LinkedStringResult(owner.ty) || (field && (owner.slot != slot || owner.member_path == "")) ||
+    if (owner.slot == 0 || !LinkedStringResult(owner.ty) || field && (owner.slot != slot || owner.member_path == "") ||
         (!field && owner.borrowed)) {
         RejectLayout("linked_append_target", "string append requires a live owning str", DeclarationSpan(target))?
     }
