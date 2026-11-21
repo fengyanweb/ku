@@ -96,11 +96,9 @@ fn ReadImport(tokens: [Token]): ImportRead! {
             RejectAt(tokens[cursor].clone(), "unexpected_token", "expected imported name inside '{ }'")?
         }
         reading_names = true
-        while (reading_names) {
-            work = work + 1
-            if (work > 64) {
-                RejectAt(tokens[cursor].clone(), "import_name_limit", "stage-3 named imports accept at most 64 names")?
-            }
+        name_limit = 64
+        name_count = 0
+        while (name_count < name_limit && reading_names) {
             source = tokens[cursor].clone()
             if (source.kind != "Ident") {
                 RejectAt(source.clone(), "unexpected_token", "expected imported name")?
@@ -124,7 +122,12 @@ fn ReadImport(tokens: [Token]): ImportRead! {
             } else {
                 reading_names = false
             }
+            name_count = name_count + 1
         }
+        if (reading_names) {
+            RejectAt(tokens[cursor].clone(), "import_name_limit", "stage-3 named imports accept at most 64 names")?
+        }
+        work = name_count
         if (tokens[cursor].kind != "RBrace") {
             RejectAt(tokens[cursor].clone(), "unexpected_token", "expected '}' after imported names")?
         }
