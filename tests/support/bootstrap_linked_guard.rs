@@ -3577,6 +3577,100 @@ int main(int argc, char **argv) {
     }
 }
 
+pub(super) fn assert_owned_string_member_append(seed: &Path, cwd: &Path) {
+    let fixture = r#"struct Entry { text: str, suffix: str }
+struct Document { header: str, inner: Entry }
+fn Append(): str! {
+    doc = Document { header: str(10), inner: Entry { text: str(20), suffix: str(30) } }
+    doc.header += "/"
+    doc.inner.text += doc.inner.suffix
+    return ok(doc.header + doc.inner.text)
+}
+fn SelfMove(input: Document): null! {
+    doc = input
+    doc.inner.text += doc.inner.text
+    return ok(null)
+}
+fn MovedSibling(input: Document): str! {
+    doc = input
+    doc.inner.text += doc.inner.suffix
+    return ok(doc.inner.suffix.clone())
+}
+fn Borrowed(&doc: Document): null! {
+    doc.inner.text += "/"
+    return ok(null)
+}
+fn Indexed(input: [Document]): null! {
+    docs: [Document] = input
+    docs[0].inner.text += "/"
+    return ok(null)
+}
+"#;
+    fs::write(cwd.join("string-member-append.ku"), fixture).unwrap();
+    fs::write(cwd.join("modules.txt"), "string-member-append.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Append\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null\n").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let entry = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_KuProjectionString "))
+        .and_then(|line| line.split_once('('))
+        .unwrap()
+        .0;
+    let host = r#"
+static int expected_attempts;
+static void verify_oom(void) {
+    if (outstanding() || attempts != expected_attempts) _Exit(94);
+}
+int main(int argc, char **argv) {
+    (void)test_realloc;
+    if (argc == 2) {
+        expected_attempts = argv[1][0] - '0';
+        fail_after = expected_attempts - 1;
+        assert(atexit(verify_oom) == 0);
+        (void)__ENTRY__();
+        return 95;
+    }
+    KuBootstrapResult_KuProjectionString result = __ENTRY__();
+    assert(result.ok && result.value.len == 7 && !memcmp(result.value.ptr, "10/2030", 7));
+    ku_projection_string_drop(&result.value);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("__ENTRY__", entry);
+    let source = cwd.join("string-member-append.c");
+    let program = cwd.join(format!(
+        "string-member-append{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &program, cwd);
+    assert_ok(&execute(&mut Command::new(&program), cwd, 15));
+    for point in ["4", "5"] {
+        let failed = execute(Command::new(&program).arg(point), cwd, 15);
+        assert_eq!(failed.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&failed.stderr).trim(),
+            "out of memory"
+        );
+    }
+    for (name, code) in [
+        ("SelfMove", "linked_moved_member"),
+        ("MovedSibling", "linked_moved_member"),
+        ("Borrowed", "linked_append_target"),
+        ("Indexed", "linked_append_target"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(code));
+    }
+}
+
 pub(super) fn assert_local_append_thunk(seed: &Path, cwd: &Path) {
     let body = r#"struct Location { line: int }
 struct Entry { kind: str, text: str, score: int, location: Location, first: int }
