@@ -1,4 +1,4 @@
-import { FindLinkedEnumSelection, RegisterLinkedOwnedRecord, RegisterLinkedUnitEnum } from "./scalar_project_c.ku"
+import { FindLinkedEnumSelection, RegisterLinkedOwnedRecord } from "./scalar_project_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
 import { LinkedIntSnapshotCall, LinkedRecordCloneCall } from "./guarded_string_parts.ku"
@@ -11,10 +11,10 @@ import { Span } from "../stage2/span.ku"
 import { FindLinkedLocalRead } from "./call_contracts.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { DeclarationSpan } from "./names.ku"
-import { LinkedCopyResult, LinkedPlainCopyResult, TypeNameBinding } from "./type_names.ku"
+import { BoundArrayTypePosition, LinkedCopyResult, LinkedPlainCopyResult, TypeNameBinding } from "./type_names.ku"
 import { HasBoundArrayMembers, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
-import { IsLinkedScopedCallback, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
-import { BoundArrayTypePosition, RegisterLinkedElementClone } from "./struct_array_c.ku"
+import { IsLinkedScopedCallback, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedCarrier } from "./link_plan_c.ku"
+import { RegisterLinkedElementClone } from "./struct_array_c.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterPlan,
          LinkedNullParameterType, LinkedNullProject, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 
@@ -138,12 +138,12 @@ fn ReadLinkedNullParametersFrom(&project: LinkedNullProject, &function: Node, se
 
 fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, ty: TypeNameBinding): LinkedNullState! {
     next = state
-    if (ty.declaration_kind == "UnitEnum") { return ok(RegisterLinkedUnitEnum(next, ty)) }
+    if (ty.declaration_kind == "UnitEnum") { return ok(RegisterLinkedCarrier(next, ty)) }
     if (IsLinkedScopedCallback(ty)) {
         if (ty.declaration_kind == "IntArrayResultCallback" || ty.declaration_kind == "IntResultAppendCallback") {
             carrier = LinkedBuiltin("int", ty.span.clone())
             carrier.declaration_kind = "BuiltinArray"
-            next = RegisterLinkedIntArray(next, carrier)
+            next = RegisterLinkedCarrier(next, carrier)
         }
         signature = LinkedScopedCallbackFunction(project, ty)?
         if (!signature.returns_result) { return RegisterLinkedOwnedRecord(project, next, signature.result) }
@@ -168,12 +168,12 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
             next.uses_str_array = true
             next = RequireLinkedArrayValidation(next, ty.clone())
         }
-        else { next = RequireLinkedArrayValidation(RegisterLinkedIntArray(next, ty.clone()), ty.clone()) }
+        else { next = RequireLinkedArrayValidation(RegisterLinkedCarrier(next, ty.clone()), ty.clone()) }
     }
     if (LinkedNullIntArrayOwner(ty)) {
         carrier = ty.clone()
         carrier.declaration_kind = "BuiltinArray"
-        next = RegisterLinkedIntArray(next, carrier)
+        next = RegisterLinkedCarrier(next, carrier)
         if (BoundArrayTypePosition(next.owned_arrays, ty) == 0) { next.owned_arrays = next.owned_arrays.push(ty.clone()) }
     }
     if (ty.declaration_kind == "StringView") { next.uses_str_view = true }
@@ -186,7 +186,7 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
         }
         carrier = ty.clone()
         carrier.declaration_kind = "StructArray"
-        if (BoundArrayTypePosition(next.arrays, carrier) == 0) { next.arrays = next.arrays.push(carrier) }
+        next = RegisterLinkedCarrier(next, carrier)
     } else if (ty.declaration_kind == "Struct" || ty.declaration_kind == "StructView" || ty.declaration_kind == "NullableRecordViewReader") {
         next = RegisterLinkedOwnedRecord(project, next, LinkedViewPointee(ty))?
     }

@@ -5,7 +5,7 @@ import { LinkedAbsoluteType, LinkedBuiltin, LinkedNullChild, LinkedNullCType, Li
 import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
 import { CollectFields, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { BuildProjectOwningLayouts, OrderCStructLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
-import { FindUnitEnumType, ReadUnitEnumVariant, SameBoundTypeIdentity, TypeNameBinding, UnitEnumTypeName } from "./type_names.ku"
+import { FindUnitEnumType, ReadUnitEnumVariant, TypeNameBinding } from "./type_names.ku"
 import { Span } from "../stage2/span.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
@@ -210,29 +210,6 @@ fn LinkedSlotPrefix(&slots: [LinkedNullSlot], length: int): [LinkedNullSlot] {
         index = index + 1
     }
     return result
-}
-
-fn RegisterLinkedUnitEnum(state: LinkedNullState, ty: TypeNameBinding): LinkedNullState {
-    next = state
-    index = 0
-    while (index < next.unit_enums.len()) {
-        if (SameBoundTypeIdentity(next.unit_enums[index], ty)) { return next }
-        index = index + 1
-    }
-    next.unit_enums = next.unit_enums.push(ty)
-    return next
-}
-
-fn EmitLinkedUnitEnums(&types: [TypeNameBinding]): str {
-    text = ""
-    index = 0
-    while (index < types.len()) {
-        name = UnitEnumTypeName(types[index])
-        text += "typedef struct " + name.clone()
-            + " { int32_t tag; union { unsigned char empty; } payload; } " + name + ";\n"
-        index = index + 1
-    }
-    return text
 }
 
 struct LinkedEnumSelection {

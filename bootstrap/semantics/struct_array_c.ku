@@ -8,7 +8,7 @@ import { DeclarationSpan, NamedModule } from "./names.ku"
 import { CanCloneManagedRecord, CollectOwnedMemberPaths, EmitCombinedCLayouts, EmitLinkedManagedElementClone, EmitNestedCLayouts, OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { ContainsIndex, ContainsType, CTypeName, ProjectionArrayHeader, ProjectionIsStringArray } from "./struct_projection_c.ku"
 import { ExplicitType, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { RetagTypeNameBinding, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
+import { BoundArrayTypePosition, EmitUnitEnumHeader, RetagTypeNameBinding, TypeNameBinding } from "./type_names.ku"
 
 struct StructArrayC {
     element_type: str
@@ -242,15 +242,6 @@ fn EmitReturnedStructArrayC(&named: NamedModule, &bindings: [TypeNameBinding], &
     return ok(StructArrayC { element_type: "", array_type: "", prefix: "", source: "" })
 }
 
-fn BoundArrayTypePosition(&arrays: [TypeNameBinding], &type_name: TypeNameBinding): int {
-    index = 0
-    while (index < arrays.len()) {
-        if (SameBoundTypeIdentity(arrays[index], type_name)) { return index + 1 }
-        index = index + 1
-    }
-    return 0
-}
-
 fn BoundArrayCType(&binding: TypeNameBinding): str {
     if (binding.declaration_kind == "OwnedStringArray") { return "KuGuardStringArray" }
     if ((binding.declaration_kind == "BuiltinArray" && binding.name == "int") || LinkedNullIntArrayOwner(binding)) { return "KuArrayInt" }
@@ -267,19 +258,23 @@ fn BoundArrayCPrefix(&binding: TypeNameBinding): str {
     return "ku_linked_view_" + CTypeName(binding.module_index, binding.declaration_node)
 }
 
-fn EmitBoundArrayDeclarations(&arrays: [TypeNameBinding], &validated: [TypeNameBinding],
+fn EmitBoundCarrierDeclarations(&types: [TypeNameBinding], &validated: [TypeNameBinding],
                             &defined: [str], str_array: bool): str {
     source = ""
     index = 0
-    while (index < arrays.len()) {
-        array = arrays[index].clone()
-        element = CTypeName(array.module_index, array.declaration_node)
-        if (array.declaration_kind == "BuiltinArray" && array.name == "int") { element = "int64_t" }
-        array_type = BoundArrayCType(array)
-        if (!ContainsType(defined, array_type)) { source += EmitStructArrayHeader(element, array_type) }
-        validation = BoundArrayTypePosition(validated, array)
-        if (validation > 0) {
-            source += EmitStructArrayReadValidation(element, array_type, BoundArrayCPrefix(array))
+    while (index < types.len()) {
+        carrier = types[index].clone()
+        if (carrier.declaration_kind == "UnitEnum") {
+            source += EmitUnitEnumHeader(carrier)
+        } else {
+            element = CTypeName(carrier.module_index, carrier.declaration_node)
+            if (carrier.declaration_kind == "BuiltinArray" && carrier.name == "int") { element = "int64_t" }
+            array_type = BoundArrayCType(carrier)
+            if (!ContainsType(defined, array_type)) { source += EmitStructArrayHeader(element, array_type) }
+            validation = BoundArrayTypePosition(validated, carrier)
+            if (validation > 0) {
+                source += EmitStructArrayReadValidation(element, array_type, BoundArrayCPrefix(carrier))
+            }
         }
         index = index + 1
     }
@@ -407,7 +402,7 @@ fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str):
         text += "#include <stdlib.h>\n"
     }
     text += definitions.source
-    text += EmitBoundArrayDeclarations(body.arrays, body.validated_arrays, definitions.array_types, body.uses_str_array)
+    text += EmitBoundCarrierDeclarations(body.carriers, body.validated_arrays, definitions.array_types, body.uses_str_array)
     if (body.uses_chars) {
         text += "#include <stdio.h>\n" + ManagedSourceCharactersRuntime(!body.uses_str_array &&
             !ContainsType(definitions.array_types, "KuGuardStringArray"))

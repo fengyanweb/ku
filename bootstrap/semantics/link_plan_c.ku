@@ -70,7 +70,6 @@ struct LinkedNullState {
     plain_value_result: bool
     layouts: [StructLayout]
     owning_layouts: [StructLayout]
-    unit_enums: [TypeNameBinding]
     owning_strings: bool
     slots: [LinkedNullSlot]
     links: [LinkedNullFunction]
@@ -92,7 +91,7 @@ struct LinkedNullState {
     uses_clone: bool
     uses_int_snapshot: bool
     uses_str_snapshot: bool
-    arrays: [TypeNameBinding]
+    carriers: [TypeNameBinding]
     validated_arrays: [TypeNameBinding]
     owned_arrays: [TypeNameBinding]
     append_slots: [int]
@@ -122,12 +121,12 @@ struct LinkedNullExpression {
 }
 
 fn NewLinkedNullState(): LinkedNullState {
-    return LinkedNullState { plain_value_result: false, layouts: [], owning_layouts: [], unit_enums: [], owning_strings: false,
+    return LinkedNullState { plain_value_result: false, layouts: [], owning_layouts: [], owning_strings: false,
         slots: [], links: [], local_readers: [], local_callbacks: [], callback_owners: [], callback_helpers: "", uses_scoped_reader: false,
         local_appends: [], append_captures: [], local_append_types: [],
         declarations: "", code: "", drops: "", catch_slot: 0,
         catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false, uses_int_snapshot: false, uses_str_snapshot: false,
-        arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,
+        carriers: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,
         element_clones: [], uses_index: false, checks_str_item: false, uses_add: false, uses_sub: false, uses_mul: false, uses_div: false,
         uses_string_equal: false, uses_print: false, uses_concat: false, uses_replace: false, uses_int_format: false, uses_prefix_suffix: false, uses_string_contains: false, uses_chars: false }
 }
@@ -331,15 +330,24 @@ fn LinkedNullReadableArray(&type: TypeNameBinding): bool {
         || LinkedNullOwnedArray(type) || LinkedScalarArrayOwner(type)
 }
 
-fn RegisterLinkedIntArray(state: LinkedNullState, ty: TypeNameBinding): LinkedNullState {
+fn RegisterLinkedCarrier(state: LinkedNullState, ty: TypeNameBinding): LinkedNullState {
     next = state
     index = 0
-    while (index < next.arrays.len()) {
-        if (SameBoundTypeIdentity(next.arrays[index], ty)) { return next }
+    while (index < next.carriers.len()) {
+        if (SameBoundTypeIdentity(next.carriers[index], ty)) { return next }
         index = index + 1
     }
-    next.arrays = next.arrays.push(ty)
+    next.carriers = next.carriers.push(ty)
     return next
+}
+
+fn HasLinkedArrayCarrier(&types: [TypeNameBinding]): bool {
+    index = 0
+    while (index < types.len()) {
+        if (types[index].declaration_kind != "UnitEnum") { return true }
+        index = index + 1
+    }
+    return false
 }
 
 fn LinkedNullArrayHeader(&type: TypeNameBinding, &value: str): str {
@@ -502,7 +510,7 @@ struct LinkedNullRegion {
 
 fn LinkedCPrelude(&body: LinkedNullState, guards: str): str {
     text = ProjectionHeaders(true, body.drops.contains("ku_projection_string_drop") || body.owning_strings) + guards
-    if (body.arrays.len() > 0 || body.element_clones.len() > 0 || body.uses_str_array || body.uses_str_view || body.uses_struct_view || body.uses_print) {
+    if (HasLinkedArrayCarrier(body.carriers) || body.element_clones.len() > 0 || body.uses_str_array || body.uses_str_view || body.uses_struct_view || body.uses_print) {
         text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
     }
     return text

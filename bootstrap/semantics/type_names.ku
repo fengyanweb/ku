@@ -159,6 +159,21 @@ fn UnitEnumTypeName(&binding: TypeNameBinding): str {
     return "KuEnum_m" + str(binding.module_index) + "_" + str(binding.declaration_node)
 }
 
+fn EmitUnitEnumHeader(&binding: TypeNameBinding): str {
+    name = UnitEnumTypeName(binding)
+    return "typedef struct " + name.clone()
+        + " { int32_t tag; union { unsigned char empty; } payload; } " + name + ";\n"
+}
+
+fn BoundArrayTypePosition(&arrays: [TypeNameBinding], &type_name: TypeNameBinding): int {
+    index = 0
+    while (index < arrays.len()) {
+        if (SameBoundTypeIdentity(arrays[index], type_name)) { return index + 1 }
+        index = index + 1
+    }
+    return 0
+}
+
 fn FindUnitEnumType(&named: NamedModule, &imports: [ImportBinding], &supplied: [SuppliedModule],
                     &qualifier: Node): TypeNameBinding! {
     try {
