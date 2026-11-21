@@ -5,7 +5,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
-import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
@@ -50,6 +50,19 @@ fn forwardLinkedCallback(&project: LinkedNullProject, &state: LinkedNullState, i
     return ok(state.slots[slot - 1].value.text.clone())
 }
 
+fn lowerLinkedArgument(&project: LinkedNullProject, state: LinkedNullState, &parameter: TypeNameBinding,
+                       id: int, depth: int): LinkedNullExpression! {
+    if (depth < 32 && LinkedNullIntArrayOwner(parameter)) {
+        argument = LinkedNullNode(project, 1, id)
+        if (argument.kind == "Array" && argument.edge_count == 0) {
+            // The ordinary pending argument slot acquires the zero descriptor.
+            // There is no buffer to allocate or temporary owner to transfer.
+            return ok(LinkedReadonlyExpression(state, parameter.clone(), "(KuArrayInt){0}"))
+        }
+    }
+    return LowerLinkedNullValue(project, state, id, depth)
+}
+
 fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &callee: LinkedNullFunction,
                          id: int, depth: int): LinkedNullArguments! {
     next = state
@@ -66,7 +79,7 @@ fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
             index = index + 1
             continue
         }
-        argument = LowerLinkedNullValue(project, next.clone(), argument_id, depth + 1)?
+        argument = lowerLinkedArgument(project, next.clone(), callee.parameters[index], argument_id, depth + 1)?
         if (LinkedNullView(callee.parameters[index])) {
             args += LinkedViewArgument(callee.parameters[index], argument.value)?
             if (argument.value.slot > 0) { loans = loans.push(argument.value.clone()) }

@@ -476,6 +476,112 @@ int main(void) {
     assert_ok(&execute(&mut Command::new(exe), cwd, 10));
 }
 
+pub(super) fn assert_empty_owned_int_argument(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("empty-argument.ku"),
+        r#"fn Left(text: str): str! { return ok(text) }
+fn Right(failing: bool): str! {
+    if (failing) { fail { domain: "witness", code: "right", message: "right failed" } }
+    late = "late"
+    return ok(late)
+}
+fn Take(left: str, children: [int], right: str): null! { return ok(null) }
+fn Use(owner: str, failing: bool): null! { return Take(Left(owner)?, [], Right(failing)?) }
+fn Nonempty(left: str, right: str): null! { return Take(left, [1], right) }
+fn View(&children: [int]): null! { return ok(null) }
+fn ViewEmpty(): null! { return View([]) }
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "empty-argument.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emit = |name| {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        execute(&mut Command::new(seed), cwd, 30)
+    };
+    let projected = emit("Use");
+    assert_ok(&projected);
+    let code = String::from_utf8(projected.stdout).unwrap();
+    assert!(code.contains(" = (KuArrayInt){0};"));
+    assert!(!code.contains("array_append_move("));
+    let entry = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResultNull ku_linked_null_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let provider = |result: &str, signature: &str| {
+        code.lines()
+            .filter_map(|line| line.strip_prefix(&format!("extern {result} ")))
+            .find_map(|line| line.strip_suffix(signature))
+            .expect("matching generated dependency")
+    };
+    let string_result = "KuBootstrapResult_KuProjectionString";
+    let host = r#"
+static int order;
+static KuProjectionString owned(uint8_t value) {
+    uint8_t *data = malloc(1);
+    assert(data);
+    *data = value;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+KuBootstrapResult_KuProjectionString LEFT(KuProjectionString value) {
+    assert(order == 0 && *value.ptr == 'l');
+    order = 1;
+    return (KuBootstrapResult_KuProjectionString){.ok = true, .value = value};
+}
+KuBootstrapResult_KuProjectionString RIGHT(bool failing) {
+    assert(order == 1);
+    order = 2;
+    if (failing) return (KuBootstrapResult_KuProjectionString){
+        .error.code = {(uint8_t*)"right", 5, 0, KU_PROJECTION_STRING_STATIC}};
+    return (KuBootstrapResult_KuProjectionString){.ok = true, .value = owned('r')};
+}
+KuBootstrapResultNull TAKE(KuProjectionString left, KuArrayInt empty, KuProjectionString right) {
+    assert(order == 2 && *left.ptr == 'l' && *right.ptr == 'r');
+    assert(!empty.len && !empty.data && !empty.capacity);
+    order = 3;
+    ku_projection_string_drop(&left);
+    ku_projection_string_drop(&right);
+    return (KuBootstrapResultNull){.ok = true};
+}
+int main(void) {
+    (void)test_realloc;
+    KuBootstrapResultNull result = ENTRY(owned('l'), false);
+    assert(result.ok && order == 3 && attempts == 2 && !outstanding());
+    order = 0;
+    result = ENTRY(owned('l'), true);
+    assert(!result.ok && order == 2 && attempts == 3 && !outstanding());
+    assert(result.error.code.len == 5 && !memcmp(result.error.code.ptr, "right", 5));
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("LEFT", provider(string_result, "(KuProjectionString);"))
+    .replace("RIGHT", provider(string_result, "(bool);"))
+    .replace(
+        "TAKE",
+        provider(
+            "KuBootstrapResultNull",
+            "(KuProjectionString, KuArrayInt, KuProjectionString);",
+        ),
+    );
+    let source = cwd.join("empty-argument.c");
+    let exe = cwd.join(format!("empty-argument{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 10));
+
+    let nonempty = emit("Nonempty");
+    assert_ok(&nonempty);
+    assert!(String::from_utf8_lossy(&nonempty.stdout).contains("array_append_move("));
+    let borrowed = emit("ViewEmpty");
+    assert_eq!(borrowed.status.code(), Some(1));
+    assert!(borrowed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&borrowed.stderr).contains("unsupported_linked_operand"));
+}
+
 pub(super) fn assert_terminal_branch_ownership(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("guard-provider.ku"),
