@@ -1,0 +1,20 @@
+fn Take(value: str): null! { println(value); return ok(null) }
+fn StoreWithSameLocalName(): null! {
+    item = { text: "before" }
+    key = "text"
+    item[key] = 3
+    println(item["text"]?.as_int()?)
+    return ok(null)
+}
+fn main(): null! {
+    StoreWithSameLocalName()?
+    item = { text: "清单" + "🙂", sibling: "independent", zero: 0, empty: "", absent: null }
+    Take(item.text)?
+    Take(item.text)?
+    println(item.text)
+    println(item.sibling)
+    println(item.zero)
+    println(item.empty)
+    println(item.absent)
+    return ok(null)
+}

@@ -4448,6 +4448,21 @@ impl<'a> FunctionLowerer<'a> {
                         IrType::Named("__ku_http_headers".into()),
                     ));
                 }
+                if matches!(&target.ty, IrType::Named(ty) if ty == "__ku_object") {
+                    if let Some(ty) = self.native_fields.ordinary_object_type(expr) {
+                        let ty = lower_type(ty, self.layouts);
+                        let key = IrExpr {
+                            kind: IrExprKind::Literal(format!("{name:?}")),
+                            ty: IrType::Str,
+                        };
+                        let value = self.emit_temp(intrinsic_expr(
+                            "__ku_object_required_field",
+                            vec![target, key],
+                            IrType::Named("__ku_value".into()),
+                        ))?;
+                        return self.convert_native_object_value(value, ty);
+                    }
+                }
                 let ty = self.field_type(&target.ty, name);
                 if let Some(read) = self.object_record_field_read(&target, name) {
                     return self.emit_temp(read);
@@ -5956,7 +5971,7 @@ pub(crate) fn ir_expr_needs_sync_guard(expr: &IrExpr) -> bool {
     }
     if matches!(&expr.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), .. }
         if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response" | "__ku_http_response_from_object_owned" | "__ku_http_response_from_object_view" | "__ku_http_response_from_value_owned" | "__ku_http_response_from_value_view" | "__ku_http_response_headers_read" | "__ku_http_headers_get" | "__ku_http_response_headers_prepare" | "__ku_http_client_config_field_int" | "__ku_http_client_config_field_str" | "__ku_http_response_public_value" | "http.get" | "http.post" | "http.request" | "http.client"
-            | "__ku_object_take_required" | "__ku_object_pattern_convert"
+            | "__ku_object_take_required" | "__ku_object_pattern_convert" | "__ku_object_required_field"
             | "__ku_object_optional_field" | "__ku_value_optional_field"
             | "__ku_object_optional_field_view" | "__ku_value_optional_field_view"
             | "time.from_unix" | "time.from_millis" | "time.add" | "time.sub" | "time.diff"))

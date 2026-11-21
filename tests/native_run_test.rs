@@ -3340,6 +3340,51 @@ int main(void) {
 }
 
 #[test]
+fn native_static_object_field_read_copies_the_owned_value() {
+    let dir = unique_temp_dir("static-object-field-read");
+    fs::write(
+        dir.join("main.ku"),
+        include_str!("fixtures/native_static_object_fields/main.ku"),
+    )
+    .expect("write static object field source");
+    fs::write(
+        dir.join("changed.ku"),
+        r#"fn Take(value: str): null! { println(value); return ok(null) }
+fn main(): null! {
+    item = { text: "before" }
+    key = "text"
+    item[key] = 3
+    Take(item.text)?
+    return ok(null)
+}
+"#,
+    )
+    .expect("write object field with an unknown stored type");
+
+    let c = native_emit_c(&dir, "main.ku");
+    assert!(c.contains("__ku_object_required_field(item,"));
+    assert!(!c.contains("(item).text"));
+    let mut changed = Command::new(ku_binary());
+    changed
+        .current_dir(&dir)
+        .args(["build", "--native", "changed.ku"]);
+    let changed = run_bounded(&mut changed, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS)
+        .expect("native rejection of object with an unknown stored type");
+    assert!(!changed.status.success());
+    assert!(String::from_utf8_lossy(&changed.stderr).contains("does not support type unknown"));
+
+    if let Some(exe) = native_build(&dir, "main.ku", "static-object-field") {
+        let (stdout, code) = run_binary(&exe);
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            stdout.replace('\r', ""),
+            include_str!("fixtures/native_static_object_fields/expected.txt").replace('\r', "")
+        );
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_dynamic_object_store_bracket_and_dot_are_owned_and_readable() {
     let dir = unique_temp_dir("object-store");
     fs::write(

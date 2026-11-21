@@ -1,4 +1,4 @@
-import { LinkedLocalCaptures, ReadLinkedParameterCaptures } from "./linked_nullable_reader_c.ku"
+import { CheckLinkedLocalInitializer, LinkedLocalCaptures, ReadLinkedParameterCaptures, RetainLinkedField } from "./linked_nullable_reader_c.ku"
 import { RejectLocalCapture } from "./call_contracts.ku"
 import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
@@ -310,19 +310,17 @@ fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
     return ok(next)
 }
 
-fn LowerLinkedLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
+fn LowerLinkedLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int,
+                    retained: bool): LinkedNullState! {
     if (LinkedNullBinding(state.slots, statement.text) != 0) {
         RejectLayout("linked_binding_shadowed", "expected a new initialized local binding", DeclarationSpan(statement))?
     }
     initializer = statement.edge_count - 1
-    value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, initializer), 0)?
+    source = LinkedNullChild(project, 1, statement, initializer)
+    value = LowerLinkedNullValue(project, state, source, 0)?
+    if (retained) { value = RetainLinkedField(project, value, source)? }
     ty = value.value.ty.clone()
-    if (initializer == 1) {
-        declared = LinkedNullType(project, 1, LinkedNullChild(project, 1, statement, 0))?
-        if (!SameLinkedType(declared, ty)) {
-            RejectLayout("linked_local_type", "initializer must match the declared local type", ty.span.clone())?
-        }
-    }
+    CheckLinkedLocalInitializer(project, statement, ty)?
     slot = AddLinkedNullSlot(project, value.state, statement.text.clone(), "l" + str(id), ty, false)?
     slot.state.code = slot.state.code + "    " + slot.value.text.clone() + " = " + value.value.text.clone() + ";\n"
     slot.state.slots[slot.value.slot - 1].live = true

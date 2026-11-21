@@ -70,6 +70,13 @@ annotation must match one of its types. A mismatch points at the argument.
 Arguments that need inference or contextual types remain deferred. Named async
 functions use the same declaration and direct-call checks. The scalar C emitter
 requires synchronous functions.
+For an explicit `str` value parameter of a resolved direct call, `check` and
+`check-project` track transfers from locals and direct `str` fields of a struct
+declared in the same module. Field checking uses the receiver's explicit type
+or named struct initializer. Branches that can continue contribute their moves
+to the following statements. Rebinding a variable or field initializes that
+place again.
+Loop, recovery, and capture ownership checks continue in the emitter.
 For explicit scalar result types and scalar unions, literal returns use the
 same check. Control blocks share the surrounding function's result type.
 Nested functions and function expressions use their own annotations.

@@ -110,7 +110,7 @@ fn writesParameter(&nodes: [Node], &edges: [int], &statement: Node, &name: str):
     return false
 }
 
-fn parameterEnd(&nodes: [Node], &edges: [int], start: int, stop: int): int {
+fn ParameterEnd(&nodes: [Node], &edges: [int], start: int, stop: int): int {
     cursor = start
     while (cursor < stop && nodes[edges[cursor] - 1].kind == "Parameter") { cursor = cursor + 1 }
     return cursor
@@ -157,7 +157,7 @@ fn checkParameterBlock(&nodes: [Node], &edges: [int], start: int, stop: int, &na
                 function = nodes[nested - 1].clone()
                 args = function.first_edge
                 body_stop = args + function.edge_count
-                body_start = parameterEnd(nodes, edges, args, body_stop)
+                body_start = ParameterEnd(nodes, edges, args, body_stop)
                 captures = function.text != name
                 while (args < body_start && captures) {
                     captures = nodes[edges[args] - 1].text != name
@@ -180,7 +180,7 @@ fn checkParameterBlock(&nodes: [Node], &edges: [int], start: int, stop: int, &na
 fn CheckParameterWrites(&nodes: [Node], &edges: [int], &function: Node): null! {
     start = function.first_edge
     stop = start + function.edge_count
-    body = parameterEnd(nodes, edges, start, stop)
+    body = ParameterEnd(nodes, edges, start, stop)
     cursor = start
     while (cursor < body) {
         checkParameterBlock(nodes, edges, body, stop, nodes[edges[cursor] - 1].text, true, false)?
@@ -280,4 +280,124 @@ fn FormatNames(&declarations: [TopLevelName], import_count: int): str {
 fn NamesCanonical(&table: ModuleNameTable): str {
     import_count = table.imports.len()
     return FormatNames(table.declarations, import_count)
+}
+
+struct DirectMovePlace {
+    binding: int
+    path: str
+}
+
+struct DirectMoveFlow {
+    bindings: [int]
+    moved: [DirectMovePlace]
+    terminal: bool
+}
+
+fn FindDirectMoveBinding(&nodes: [Node], &bindings: [int], &name: str): int {
+    found = 0
+    index = 0
+    while (index < bindings.len()) {
+        id = bindings[index]
+        if (nodes[id - 1].text == name) { found = id }
+        index = index + 1
+    }
+    return found
+}
+
+fn DirectMovePath(&nodes: [Node], &edges: [int], &bindings: [int], id: int): DirectMovePlace {
+    path = ""
+    current = id
+    reading = nodes[current - 1].kind == "Field"
+    while (reading) {
+        path = "." + nodes[current - 1].text.clone() + path
+        current = edges[nodes[current - 1].first_edge]
+        reading = nodes[current - 1].kind == "Field"
+    }
+    binding = 0
+    if (nodes[current - 1].kind == "Variable") { binding = FindDirectMoveBinding(nodes, bindings, nodes[current - 1].text) }
+    return DirectMovePlace { binding: binding, path: path }
+}
+
+fn directStructOrigin(&nodes: [Node], &edges: [int], binding: int): int {
+    owner = nodes[binding - 1].clone()
+    if (owner.edge_count == 0) { return 0 }
+    origin = edges[owner.first_edge]
+    kind = nodes[origin - 1].kind.clone()
+    if ((owner.kind == "Parameter" || owner.kind == "VarDecl") && kind == "TypeName") { return origin }
+    if (owner.kind == "Assign" && kind == "StructLiteral") { return origin }
+    return 0
+}
+
+fn hasDirectOwnedStringField(&nodes: [Node], &edges: [int], &record: Node, &name: str): bool {
+    count = record.edge_count
+    index = 0
+    while (index < count) {
+        field = nodes[edges[record.first_edge + index] - 1].clone()
+        if (field.kind == "StructField" && field.text == name && field.edge_count == 1) {
+            annotation = nodes[edges[field.first_edge] - 1].clone()
+            return annotation.kind == "TypeName" && annotation.text == "str"
+        }
+        index = index + 1
+    }
+    return false
+}
+
+fn ProvesDirectFieldTransfer(&nodes: [Node], &edges: [int], binding: int, &field: Node): bool {
+    // Only a direct, declared struct field denotes storage which the call
+    // consumes. Object/map lookup reads can produce independent values.
+    if (field.kind != "Field" || field.edge_count != 1 || nodes[edges[field.first_edge] - 1].kind != "Variable") { return false }
+    origin = directStructOrigin(nodes, edges, binding)
+    if (origin == 0) { return false }
+    root = nodes[nodes.len() - 1].clone()
+    count = root.edge_count
+    index = 0
+    while (index < count) {
+        record = nodes[edges[root.first_edge + index] - 1].clone()
+        if (record.kind == "Struct" && record.text == nodes[origin - 1].text) {
+            return hasDirectOwnedStringField(nodes, edges, record, field.text)
+        }
+        index = index + 1
+    }
+    return false
+}
+
+fn DirectMoveContains(&parent: str, &path: str): bool {
+    if (parent == "" || parent == path) { return true }
+    prefix = parent + "."
+    if (path.starts_with(prefix)) { return true }
+    return false
+}
+
+fn CheckDirectMoveRead(&nodes: [Node], &moved: [DirectMovePlace], &place: DirectMovePlace, id: int): null! {
+    index = 0
+    while (index < moved.len()) {
+        if (moved[index].binding == place.binding && DirectMoveContains(moved[index].path, place.path)) {
+            name = nodes[place.binding - 1].text.clone() + place.path.clone()
+            RejectName("read_after_owned_transfer", "use of moved value '" + name + "'", DeclarationSpan(nodes[id - 1]))?
+        }
+        index = index + 1
+    }
+    return ok(null)
+}
+
+fn ResetDirectMove(moved: [DirectMovePlace], &place: DirectMovePlace): [DirectMovePlace] {
+    kept: [DirectMovePlace] = []
+    for old in moved {
+        if (old.binding != place.binding || !DirectMoveContains(place.path, old.path)) { kept = kept.push(old) }
+    }
+    return kept
+}
+
+fn JoinDirectMoves(left: [DirectMovePlace], right: [DirectMovePlace]): [DirectMovePlace] {
+    joined = left
+    for place in right {
+        duplicate = false
+        index = 0
+        while (!duplicate && index < joined.len()) {
+            duplicate = joined[index].binding == place.binding && joined[index].path == place.path
+            index = index + 1
+        }
+        if (!duplicate) { joined = joined.push(place) }
+    }
+    return joined
 }

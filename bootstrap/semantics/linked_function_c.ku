@@ -1,6 +1,6 @@
 import { EmitLinkedBodyPrelude, HoldLinkedCopyOperand, LinkedBuiltinNameAvailable, LinkedFieldRoot, LinkedNullPrototype, LinkedScopedCallbackFunction, LinkedScopedCallbackPrototype, RestoreLinkedAssignedMember } from "./link_plan_json_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
-import { LinkedOptionalReaderHeader } from "./linked_nullable_reader_c.ku"
+import { NoLinkedRetention, LinkedOptionalReaderHeader } from "./linked_nullable_reader_c.ku"
 import { EmitLinkedOptionalIntReturn, LinkedNullCallSymbol } from "./scalar_result_null.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
 import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult } from "./struct_projection_c.ku"
@@ -347,7 +347,7 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
         if (!SameLinkedType(target.result, result)) {
             RejectLayout("linked_tail_result", "forwarded Result must match the entry's declared payload", DeclarationSpan(call))?
         }
-        arguments = LowerLinkedArguments(project, state, call, target, call_id, 0, true)?
+        arguments = LowerLinkedArguments(project, state, call, target, call_id, 0, true, NoLinkedRetention())?
         arguments.state.code = arguments.state.code + "    result = " + LinkedNullCallSymbol(target) + "(" + arguments.args
             + ");\n" + arguments.handoff + "    goto cleanup;\n"
         return ok(arguments.state)

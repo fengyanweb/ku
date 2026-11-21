@@ -1,7 +1,7 @@
 import "std.string"
 import { Span } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
-import { DeclarationSpan, NamedModule } from "./names.ku"
+import { CheckDirectMoveRead, DeclarationSpan, DirectMoveFlow, DirectMovePath, DirectMovePlace, FindDirectMoveBinding, IsNamedFunction, JoinDirectMoves, NamedModule, ParameterEnd, ProvesDirectFieldTransfer, RejectName, ResetDirectMove } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { ExplicitType, RejectLayout } from "./struct_layouts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName } from "./guarded_struct_expr.ku"
@@ -201,4 +201,126 @@ fn RequireLinkedMutableBinding(&name: str, source_parameter: bool, &at: Span): n
         RejectLayout("linked_immutable_binding", "cannot assign to immutable parameter '" + name.clone() + "'", at.clone())?
     }
     return RequireLinkedMutableName(name, at)
+}
+
+fn directMoveEvent(&transfers: [int], id: int): bool {
+    index = 0
+    while (index < transfers.len()) {
+        if (transfers[index] == id) { return true }
+        index = index + 1
+    }
+    return false
+}
+
+fn checkDirectMoveExpression(&nodes: [Node], &edges: [int], &transfers: [int], flow: DirectMoveFlow,
+                             id: int, depth: int): DirectMoveFlow! {
+    if (depth >= 32) { return ok(flow) }
+    state = flow
+    item = nodes[id - 1].clone()
+    if (item.kind == "Variable" || item.kind == "Field") {
+        transferred = directMoveEvent(transfers, id)
+        if (state.moved.len() > 0 || transferred) {
+            place = DirectMovePath(nodes, edges, state.bindings, id)
+            if (place.binding != 0) {
+                CheckDirectMoveRead(nodes, state.moved, place, id)?
+                if (transferred && (item.kind == "Variable" || ProvesDirectFieldTransfer(nodes, edges, place.binding, item))) {
+                    binding = place.binding - 1
+                    if (nodes[binding].kind == "Parameter" && nodes[binding].int_value == 1) {
+                        RejectName("owned_transfer_from_view", "cannot transfer an owning string from a View", DeclarationSpan(item))?
+                    }
+                    state.moved = state.moved.push(place)
+                }
+                return ok(state)
+            }
+        }
+    }
+    start = item.first_edge
+    stop = start + item.edge_count
+    if (item.kind == "Call" && start < stop) {
+        callee = nodes[edges[start] - 1].clone()
+        if (callee.kind == "Field") {
+            state = checkDirectMoveExpression(nodes, edges, transfers, state, edges[callee.first_edge], depth + 1)?
+            start = start + 1
+        }
+    }
+    scanning = start < stop
+    while (scanning) {
+        state = checkDirectMoveExpression(nodes, edges, transfers, state, edges[start], depth + 1)?
+        start = start + 1
+        scanning = start < stop
+    }
+    return ok(state)
+}
+
+fn joinedDirectMoveFlow(bindings: [int], yes: DirectMoveFlow, no: DirectMoveFlow): DirectMoveFlow {
+    if (yes.terminal) { return DirectMoveFlow { bindings: bindings, moved: no.moved, terminal: no.terminal } }
+    if (no.terminal) { return DirectMoveFlow { bindings: bindings, moved: yes.moved, terminal: false } }
+    moved = JoinDirectMoves(yes.moved, no.moved)
+    return DirectMoveFlow { bindings: bindings, moved: moved, terminal: false }
+}
+
+fn checkDirectMoveBlock(&nodes: [Node], &edges: [int], &transfers: [int], flow: DirectMoveFlow,
+                        first: int, end: int, depth: int): DirectMoveFlow! {
+    if (depth >= 32) { return ok(flow) }
+    next = flow
+    cursor = first
+    while (cursor < end && !next.terminal) {
+        id = edges[cursor]
+        item = nodes[id - 1].clone()
+        start = item.first_edge
+        stop = start + item.edge_count
+        if (item.kind == "If") {
+            next = checkDirectMoveExpression(nodes, edges, transfers, next, edges[start], 0)?
+            outer = next.bindings.clone()
+            split = start + 1 + item.int_value
+            before = DirectMoveFlow { bindings: next.bindings.clone(), moved: next.moved.clone(), terminal: false }
+            yes = checkDirectMoveBlock(nodes, edges, transfers, before, start + 1, split, depth + 1)?
+            no = checkDirectMoveBlock(nodes, edges, transfers, next, split, stop, depth + 1)?
+            next = joinedDirectMoveFlow(outer, yes, no)
+        } else if (item.kind == "VarDecl" || item.kind == "Assign") {
+            next = checkDirectMoveExpression(nodes, edges, transfers, next, edges[stop - 1], 0)?
+            binding = FindDirectMoveBinding(nodes, next.bindings, item.text)
+            if (item.kind == "VarDecl" || binding == 0) { next.bindings = next.bindings.push(id) }
+            else {
+                place = DirectMovePlace { binding: binding, path: "" }
+                next.moved = ResetDirectMove(next.moved, place)
+            }
+        } else if (item.kind == "AssignTarget") {
+            next = checkDirectMoveExpression(nodes, edges, transfers, next, edges[start + 1], 0)?
+            target = DirectMovePath(nodes, edges, next.bindings, edges[start])
+            if (target.binding != 0) { next.moved = ResetDirectMove(next.moved, target) }
+            else { next = checkDirectMoveExpression(nodes, edges, transfers, next, edges[start], 0)? }
+        } else {
+            next = checkDirectMoveExpression(nodes, edges, transfers, next, id, 0)?
+            next.terminal = item.kind == "Return" || item.kind == "Fail" || item.kind == "Panic"
+        }
+        cursor = cursor + 1
+    }
+    return ok(next)
+}
+
+fn CheckDirectOwnedMoves(&nodes: [Node], &edges: [int], &transfers: [int], first: int, function: int): null! {
+    // These forms need a backedge, recovery or capture proof. Leave them to the
+    // lowering checks until their checked front-end ownership flow is available.
+    cursor = first
+    while (cursor < function) {
+        kind = nodes[cursor - 1].kind.clone()
+        if (kind == "For" || kind == "While" || kind == "Try" || kind == "FunctionExpr" || IsNamedFunction(kind) ||
+            kind == "CompoundAssign" || kind == "ObjectDestructureAssign" || kind == "Match") { return ok(null) }
+        cursor = cursor + 1
+    }
+    cursor = nodes[function - 1].first_edge
+    stop = cursor + nodes[function - 1].edge_count
+    start = ParameterEnd(nodes, edges, cursor, stop)
+    bindings: [int] = []
+    reading_parameters = cursor < start
+    while (reading_parameters) {
+        bindings = bindings.push(edges[cursor])
+        cursor = cursor + 1
+        reading_parameters = cursor < start
+    }
+    moved: [DirectMovePlace] = []
+    flow = DirectMoveFlow { bindings: bindings, moved: moved, terminal: false }
+    checkDirectMoveBlock(nodes, edges, transfers, flow, start, stop, 0)?
+    return ok(null)
 }

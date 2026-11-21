@@ -3,13 +3,13 @@ import { RejectLocalCapture } from "./call_contracts.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan, IsNamedFunction } from "./names.ku"
-import { LinkedMemberUnavailable, LinkedViewArgument, MoveLinkedNullSlot, RequireLinkedMove } from "./linked_member_ownership.ku"
-import { AddLinkedNullSlot, LinkedCallableSlot } from "./linked_parameters_c.ku"
-import { LinkedBuiltin, LinkedIntResult, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullParameterType, LinkedNullProject, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
+import { AddLinkedNullSlot, CloneLinkedStringSlot, LinkedCallableSlot, RegisterLinkedNullType, ValidateLinkedPayload } from "./linked_parameters_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullCType, LinkedNullChild, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedStringResult, ReadLinkedResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedCheckedCall, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullRegion, LinkedNullSlot, LinkedRecordFields, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { RestoreLinkedThunkFrame } from "./link_plan_json_c.ku"
 import { LinkedOptionalIntHeader, StartLinkedThunkFrame } from "./scalar_result_null.ku"
-import { RejectLayout } from "./struct_layouts.ku"
+import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex, ContainsType, CTypeName, LinkedIntArrayCallbackFaultPending } from "./struct_projection_c.ku"
 import { RetagTypeNameBinding, TypeNameBinding } from "./type_names.ku"
 
@@ -236,4 +236,158 @@ fn LinkedCallArgument(&project: LinkedNullProject, &call: Node, &callee: LinkedN
         return LinkedNullChild(project, 1, LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0)), 0)
     }
     return LinkedNullChild(project, 1, call, index + 1)
+}
+
+fn directCheckedStatementCall(&project: LinkedNullProject, &statement: Node): int {
+    if (statement.kind != "ExprStmt" || statement.edge_count != 1) { return 0 }
+    unwrap = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+    if (unwrap.kind != "TryUnwrap" || unwrap.edge_count != 1) { return 0 }
+    id = LinkedNullChild(project, 1, unwrap, 0)
+    call = LinkedNullNode(project, 1, id)
+    if (call.kind == "Call" && call.edge_count == 2) { return id }
+    return 0
+}
+
+fn retainedFieldSite(&project: LinkedNullProject, &state: LinkedNullState, &statement: Node): int {
+    if ((statement.kind == "Assign" || statement.kind == "VarDecl")
+        && LinkedNullBinding(state.slots, statement.text) == 0) {
+        return LinkedNullChild(project, 1, statement, statement.edge_count - 1)
+    }
+    id = directCheckedStatementCall(project, statement)
+    if (id == 0) { return 0 }
+    call = LinkedNullNode(project, 1, id)
+    field = LinkedNullChild(project, 1, call, 1)
+    argument = LinkedNullNode(project, 1, field)
+    if (argument.kind != "Field") { return 0 }
+    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (target.kind != "Variable" || LinkedLocalAppendIndex(state, target.text) != 0) { return 0 }
+    try {
+        callee = ResolveLinkedCall(project, state.slots, call, target, true)?
+        if (LinkedStringResult(callee.parameters[0])) { return field }
+        return 0
+    } catch (err) { return 0 }
+}
+
+fn readonlyOutputBetweenMoveAndView(&project: LinkedNullProject, &statement: Node): bool {
+    if (statement.edge_count != 1) { return false }
+    value = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+    if (statement.kind == "ExprStmt" && value.kind == "Call" && value.edge_count == 2) {
+        name = LinkedNullNode(project, 1, LinkedNullChild(project, 1, value, 0))
+        if (name.kind != "Variable" || name.text != "println") { return false }
+        printed = LinkedNullNode(project, 1, LinkedNullChild(project, 1, value, 1))
+        return printed.kind == "Variable" || printed.kind == "String"
+    }
+    return statement.kind == "Print" && (value.kind == "Variable" || value.kind == "String")
+}
+
+// At entry depth, an existing record binding cannot be shadowed between the
+// field use and a later direct call if only simple output intervenes. Stop on
+// writes, nested regions and other calls instead of retaining their fields.
+struct LinkedRetainedViewPlan {
+    field: int
+    end: int
+}
+
+struct LinkedViewRetention {
+    field: int
+    whole_view: bool
+}
+
+fn NoLinkedRetention(): LinkedViewRetention {
+    return LinkedViewRetention { field: 0, whole_view: false }
+}
+
+fn RejectLinkedTerminalIteration(&body: Node, countdown: int): null! {
+    update = "increment"
+    if (countdown != 0) { update = "decrement" }
+    return RejectLayout("unsupported_linked_loop_body", "a counted iteration must reach its checked " + update, DeclarationSpan(body))
+}
+
+fn isOwnedLinkedStringField(&state: LinkedNullState, &owner: TypeNameBinding, &expression: Node): bool {
+    try {
+        fields = LinkedRecordFields(state.layouts, state.owning_layouts, owner)?
+        ordinal = FieldIndex(fields, expression.text)
+        return ordinal > 0 && LinkedStringResult(fields[ordinal - 1].resolved)
+    } catch (err) { return false }
+}
+
+fn PlanLinkedRetainedView(&project: LinkedNullProject, &state: LinkedNullState, &region: Node,
+                         &statement: Node, index: int): LinkedRetainedViewPlan {
+    none = LinkedRetainedViewPlan { field: 0, end: index }
+    field = retainedFieldSite(project, state, statement)
+    if (field == 0) { return none }
+    expression = LinkedNullNode(project, 1, field)
+    if (expression.kind != "Field" || expression.edge_count != 1) { return none }
+    root = LinkedNullNode(project, 1, LinkedNullChild(project, 1, expression, 0))
+    if (root.kind != "Variable" || root.edge_count != 0) { return none }
+    slot = LinkedNullBinding(state.slots, root.text)
+    if (slot == 0 || !state.slots[slot - 1].live || state.slots[slot - 1].parameter
+        || state.slots[slot - 1].value.borrowed || state.slots[slot - 1].moved_members.len() != 0) { return none }
+    owner = state.slots[slot - 1].value.ty.clone()
+    if (owner.declaration_kind != "Struct" || !isOwnedLinkedStringField(state, owner, expression)) { return none }
+    limit = region.edge_count
+    start = index + 1
+    cursor = start
+    while (cursor < limit) {
+        candidate = LinkedNullNode(project, 1, LinkedNullChild(project, 1, region, cursor))
+        view = directCheckedStatementCall(project, candidate)
+        if (view != 0) {
+            call = LinkedNullNode(project, 1, view)
+            argument = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 1))
+            target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+            if (argument.kind != "Variable" || argument.text != root.text || target.kind != "Variable"
+                || target.text == statement.text || LinkedLocalAppendIndex(state, target.text) != 0) { return none }
+            try {
+                callee = ResolveLinkedCall(project, state.slots, call, target, true)?
+                parameter = callee.parameters[0].clone()
+                if (parameter.declaration_kind == "StructView" && parameter.module_index == owner.module_index
+                    && parameter.declaration_node == owner.declaration_node) {
+                    return LinkedRetainedViewPlan { field: field, end: cursor }
+                }
+                return none
+            } catch (err) { return none }
+        }
+        if (!readonlyOutputBetweenMoveAndView(project, candidate)) { return none }
+        cursor = cursor + 1
+    }
+    return none
+}
+
+fn RetainLinkedField(&project: LinkedNullProject, source: LinkedNullExpression, id: int): LinkedNullExpression! {
+    if (!LinkedStringResult(source.value.ty) || source.value.member_path == "") {
+        RejectLayout("linked_view_move", "expected the proven owned string member for the later View", source.value.ty.span.clone())?
+    }
+    RequireLinkedMove(source.state, source.value)?
+    field = source.value.clone()
+    snapshot = CloneLinkedStringSlot(project, source, "retained" + str(id))?
+    snapshot.state = RecordLinkedMemberMove(snapshot.state, field)
+    return ok(snapshot)
+}
+
+fn CheckLinkedLocalInitializer(&project: LinkedNullProject, &statement: Node, &ty: TypeNameBinding): null! {
+    if (statement.edge_count == 2) {
+        declared = LinkedNullType(project, 1, LinkedNullChild(project, 1, statement, 0))?
+        if (!SameLinkedType(declared, ty)) {
+            RejectLayout("linked_local_type", "initializer must match the declared local type", ty.span.clone())?
+        }
+    }
+    return ok(null)
+}
+
+fn LinkedRetainedViewUnavailable(&state: LinkedNullState, &value: LinkedNullValue, admit: bool): bool {
+    if (admit && value.slot > 0 && value.member_path == ""
+        && state.slots[value.slot - 1].live && state.slots[value.slot - 1].moved_members.len() == 1) { return false }
+    return LinkedMemberUnavailable(state, value, true)
+}
+
+fn FinishLinkedCheckedStatement(&project: LinkedNullProject, call: LinkedCheckedCall): LinkedNullState! {
+    next = call.state
+    if (!LinkedNullHasResultValue(call.result)) { return ok(next) }
+    payload = call.text + ".value"
+    next = RegisterLinkedNullType(project, next, call.result.clone())?
+    next = ValidateLinkedPayload(next, call.result, payload)
+    drop = LinkedNullDropC(next.layouts, next.owning_layouts, call.result, payload)
+    next.owning_strings = next.owning_strings || drop.contains("ku_projection_string_drop")
+    next.code += drop
+    return ok(next)
 }

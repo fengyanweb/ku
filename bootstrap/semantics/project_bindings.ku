@@ -1,3 +1,4 @@
+import { CheckDirectOwnedMoves } from "./call_contracts.ku"
 import { EscapeCanonical } from "../stage1/token.ku"
 import { FirstSubtreeNode, Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -105,6 +106,7 @@ struct DirectSignature {
 
 struct ScalarAnnotation {
     scalars: [str]
+    owns_string: bool
 }
 
 fn scalarType(&name: str): bool {
@@ -124,18 +126,21 @@ fn scalarAnnotation(&nodes: [Node], &edges: [int], &annotation: Node): ScalarAnn
         while (cursor < stop) {
             item = edges[cursor] - 1
             if (nodes[item].kind != "TypeName" || !scalarType(nodes[item].text)) {
-                return ScalarAnnotation { scalars: [] }
+                return ScalarAnnotation { scalars: [], owns_string: false }
             }
             scalars = scalars.push(nodes[item].text.clone())
             cursor = cursor + 1
         }
     }
-    return ScalarAnnotation { scalars: scalars }
+    return ScalarAnnotation { scalars: scalars, owns_string: false }
 }
 
 fn parameterAnnotation(&nodes: [Node], &edges: [int], &parameter: Node): ScalarAnnotation {
-    if (parameter.edge_count != 1) { return ScalarAnnotation { scalars: [] } }
-    return scalarAnnotation(nodes, edges, nodes[edges[parameter.first_edge] - 1])
+    if (parameter.edge_count != 1) { return ScalarAnnotation { scalars: [], owns_string: false } }
+    type = nodes[edges[parameter.first_edge] - 1].clone()
+    annotation = scalarAnnotation(nodes, edges, type)
+    annotation.owns_string = parameter.int_value == 0 && type.kind == "TypeName" && type.text == "str"
+    return annotation
 }
 
 fn directSignature(&nodes: [Node], &edges: [int], &function: Node, name: str): DirectSignature {
@@ -254,6 +259,7 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
         index = index + 1
     }
 
+    transfers: [int] = []
     index = start
     while (index < function) {
         if (nodes[index - 1].kind == "Call" && nodes[index - 1].edge_count > 0) {
@@ -274,6 +280,10 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
                         while (argument < count) {
                             node = edges[nodes[index - 1].first_edge + argument + 1]
                             checkLiteralType(signatures[binding].parameters[argument], nodes, edges, nodes[node - 1], "call_argument_type")?
+                            if (signatures[binding].parameters[argument].owns_string &&
+                                (nodes[node - 1].kind == "Variable" || nodes[node - 1].kind == "Field")) {
+                                transfers = transfers.push(node)
+                            }
                             argument = argument + 1
                         }
                     }
@@ -282,6 +292,7 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
         }
         index = index + 1
     }
+    if (transfers.len() != 0) { CheckDirectOwnedMoves(nodes, edges, transfers, start, function)? }
     return ok(null)
 }
 

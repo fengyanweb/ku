@@ -1,4 +1,4 @@
-import { FinishLinkedOwnedReader, ReadLinkedOwnedReader } from "./linked_nullable_reader_c.ku"
+import { FinishLinkedOwnedReader, LinkedRetainedViewPlan, LinkedViewRetention, PlanLinkedRetainedView, ReadLinkedOwnedReader, RejectLinkedTerminalIteration } from "./linked_nullable_reader_c.ku"
 import { LinkedCharacterSource } from "./struct_string_calls.ku"
 import { RegisterLinkedLocalRead } from "./linked_array_fields_c.ku"
 import { RequireLinkedMutableBinding } from "./call_contracts.ku"
@@ -19,7 +19,7 @@ import { LinkedBuiltin, LinkedResultPlan, LinkedNullChild,
          LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
 import { LinkedChildKindIs } from "./link_plan_json_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
+import { LowerLinkedNullValue, LowerLinkedRetainedTry } from "./linked_null_values_c.ku"
 import { CheckLinkedCountedIndex, FinishLinkedAppendThunk, IsLinkedAppendThunk, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, LowerLinkedTypedArrayLocal, ReadLinkedAppendThunk } from "./linked_owner_assignment_c.ku"
 import { ReadLinkedCatchParts } from "./scalar_result_null.ku"
 import { LowerLinkedStatementCall, ReadLinkedWhileCondition } from "./project_struct_string_c.ku"
@@ -98,11 +98,7 @@ fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statemen
     body = statement.clone()
     body.edge_count = body.edge_count - 1
     lowered = lowerLinkedRegion(project, body, next, 1, result, depth + 1)?
-    if (lowered.terminal) {
-        update = "increment"
-        if (countdown != 0) { update = "decrement" }
-        RejectLayout("unsupported_linked_loop_body", "a counted iteration must reach its checked " + update, DeclarationSpan(body))?
-    }
+    if (lowered.terminal) { RejectLinkedTerminalIteration(body, countdown)? }
     PreserveLinkedOwners(outer, lowered.state.slots, statement)?
     next = DropLinkedNullScope(lowered.state, locals)
     advanced = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, step, 0), 0)?
@@ -197,128 +193,160 @@ fn lowerLinkedCatch(&project: LinkedNullProject, state: LinkedNullState, &node: 
     return ok(LinkedNullRegion { state: DropLinkedNullScope(handled.state, outer.len()), terminal: false })
 }
 
+fn LowerLinkedRetainedPair(&project: LinkedNullProject, state: LinkedNullState, &region: Node,
+                           &statement: Node, id: int, index: int, &plan: LinkedRetainedViewPlan): LinkedNullState! {
+    next = state
+    if (statement.kind == "Assign" || statement.kind == "VarDecl") {
+        next = LowerLinkedLocal(project, next, statement, id, true)?
+    } else {
+        move = LinkedViewRetention { field: plan.field, whole_view: false }
+        next = LowerLinkedRetainedTry(project, next, statement, move)?
+    }
+    limit = plan.end
+    start = index + 1
+    cursor = start
+    while (cursor < limit) {
+        output = LinkedNullNode(project, 1, LinkedNullChild(project, 1, region, cursor))
+        next = LowerLinkedStatementCall(project, next, output)?
+        cursor = cursor + 1
+    }
+    call = LinkedNullNode(project, 1, LinkedNullChild(project, 1, region, limit))
+    view = LinkedViewRetention { field: 0, whole_view: true }
+    return LowerLinkedRetainedTry(project, next, call, view)
+}
+
 fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNullState, start: int,
                      &result: TypeNameBinding, depth: int): LinkedNullRegion! {
     next = state
     index = start
     limit = region.edge_count
+    next_statement = start
     while (index < limit) {
         id = LinkedNullChild(project, 1, region, index)
         statement = LinkedNullNode(project, 1, id)
-        if (statement.kind == "Return" || statement.kind == "Fail") {
-            if (index != limit - 1) {
-                RejectLayout("unsupported_linked_terminal", "expected the terminal at the end of its block", DeclarationSpan(statement))?
-            }
-            if (statement.kind == "Fail") {
-                if (next.plain_value_result && next.catch_slot == 0) {
-                    RejectLayout("linked_value_failure", "a plain value result cannot propagate an Error", DeclarationSpan(statement))?
-                }
-                next = lowerLinkedFailure(project, next, statement)?
-            } else if (next.plain_value_result) {
-                if (result.declaration_kind == "NullableInt" && statement.edge_count == 1 && LinkedChildKindIs(project, statement, 0, "Null")) {
-                    next.code += "    result = (KuBootstrapOptionalInt){true, 0};\n    goto cleanup;\n"
-                } else { next = LowerLinkedPlainReturn(project, next, statement, result)? }
-            } else { next = LowerLinkedSuccess(project, next, statement, result)? }
-            return ok(LinkedNullRegion { state: next, terminal: true })
+        plan = LinkedRetainedViewPlan { field: 0, end: index }
+        if (depth == 0 && index >= next_statement) {
+            plan = PlanLinkedRetainedView(project, next, region, statement, index)
         }
-        if (statement.kind == "Try") {
-            caught = lowerLinkedCatch(project, next, statement, id, result, depth, index == limit - 1)?
-            if (caught.terminal) { return ok(caught) }
-            next = caught.state
-        } else if (statement.kind == "Assign" && statement.edge_count == 1) {
-            slot = LinkedNullBinding(next.slots, statement.text)
-            if (slot != 0) {
-                RequireLinkedMutableBinding(statement.text, next.slots[slot - 1].source_parameter, DeclarationSpan(statement))?
-            }
-            if (ContainsIndex(next.callback_owners, slot)) {
-                RejectLayout("linked_callback_owner", "a captured array must remain readable by its local callback", DeclarationSpan(statement))?
-            }
-            if (slot == 0 && depth == 0 && result.declaration_kind == "NullableRecordViewReader" && LinkedChildKindIs(project, statement, 0, "FunctionExpr")) {
-                end = LinkedNullChild(project, 1, region, limit - 1)
-                prepared = ReadLinkedOwnedReader(project, next, statement, result, id, end)?
-                function_id = prepared.function
-                capture = prepared.capture
-                body_start = prepared.start
-                reader_result = prepared.result
-                function = LinkedNullNode(project, 1, function_id)
-                body = lowerLinkedRegion(project, function, prepared.state, body_start, reader_result, 1)?
-                next = FinishLinkedOwnedReader(project, next, body, statement, result, capture, function_id)?
-            } else if (slot == 0) { next = LowerLinkedLocal(project, next, statement, id)? }
-            else if (LinkedNullIntArrayOwner(next.slots[slot - 1].value.ty) || LinkedNullOwnedArray(next.slots[slot - 1].value.ty)
-                || next.slots[slot - 1].value.ty.declaration_kind == "OwnedStringArray") {
-                next = LowerLinkedArrayAppend(project, next, statement, slot)?
-            } else if (next.slots[slot - 1].value.ty.declaration_kind == "Builtin"
-                && (next.slots[slot - 1].value.ty.name == "int" || next.slots[slot - 1].value.ty.name == "bool")) {
-                next = LowerLinkedCopyRebind(project, next, statement, slot)?
-            } else {
-                next = LowerLinkedOwnerRebind(project, next, statement)?
-            }
-        } else if (statement.kind == "CompoundAssign" && statement.text == "+" && statement.edge_count == 2) {
-            target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
-            if (target.kind == "Variable") {
-                slot = LinkedNullBinding(next.slots, target.text)
-                if (slot > 0 && next.slots[slot - 1].source_parameter) {
-                    RequireLinkedMutableBinding(target.text, true, DeclarationSpan(statement))?
-                }
-            }
-            next = LowerLinkedStringAppend(project, next, statement, id)?
-        } else if (statement.kind == "AssignTarget" && statement.edge_count == 2) {
-            next = LowerLinkedTargetSet(project, next, statement, id, depth)?
-        } else if (statement.kind == "ObjectDestructureAssign") {
-            next = LowerLinkedOwnedDestructure(project, next, statement)?
-        } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {
-            type_node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
-            if (type_node.kind == "TypeArray") {
-                source = LinkedCharacterSource(project, next, LinkedNullChild(project, 1, statement, 1), true)
-                if (source == 0) { next = LowerLinkedTypedArrayLocal(project, next, statement, id)? }
-                else { next = LowerLinkedCharacterLocal(project, next, statement, id, source)? }
-            }
-            else if (type_node.kind == "TypeFunction") { next = LowerLinkedLocalAlias(project, next, statement)? }
-            else { next = LowerLinkedLocal(project, next, statement, id)? }
-        } else if (statement.kind == "Function" && depth == 0) {
-            if (IsLinkedAppendThunk(project, statement)) {
-                CheckLinkedLocalFunctionName(project, next, statement)?
-                prepared = ReadLinkedAppendThunk(project, next, statement, id)?
-                thunk = prepared.thunk
-                body = lowerLinkedRegion(project, statement, prepared.state, thunk.body_start, thunk.result, 1)?
-                next = FinishLinkedAppendThunk(next, thunk, body, statement, id)?
-            } else if (statement.edge_count >= 4 && LinkedChildKindIs(project, statement, 1, "Parameter")) {
-                CheckLinkedLocalFunctionName(project, next, statement)?
-                prepared = ReadLinkedLocalThunk(project, next, statement, id)?
-                thunk = prepared.thunk
-                body = lowerLinkedRegion(project, statement, prepared.state, 3, thunk.result, 1)?
-                next = FinishLinkedLocalThunk(next, thunk, body, statement, id)?
-            } else { next = RegisterLinkedLocalRead(project, next, statement, id)? }
-        } else if (statement.kind == "If" && statement.edge_count > 1) {
-            branch = addGuardedRegion(project, next, statement, result, depth)?
-            if (branch.terminal) {
+        if (plan.field != 0) {
+            next = LowerLinkedRetainedPair(project, next, region, statement, id, index, plan)?
+            next_statement = plan.end + 1
+        } else if (index >= next_statement) {
+            if (statement.kind == "Return" || statement.kind == "Fail") {
                 if (index != limit - 1) {
                     RejectLayout("unsupported_linked_terminal", "expected the terminal at the end of its block", DeclarationSpan(statement))?
                 }
-                return ok(branch)
+                if (statement.kind == "Fail") {
+                    if (next.plain_value_result && next.catch_slot == 0) {
+                        RejectLayout("linked_value_failure", "a plain value result cannot propagate an Error", DeclarationSpan(statement))?
+                    }
+                    next = lowerLinkedFailure(project, next, statement)?
+                } else if (next.plain_value_result) {
+                    if (result.declaration_kind == "NullableInt" && statement.edge_count == 1 && LinkedChildKindIs(project, statement, 0, "Null")) {
+                        next.code += "    result = (KuBootstrapOptionalInt){true, 0};\n    goto cleanup;\n"
+                    } else { next = LowerLinkedPlainReturn(project, next, statement, result)? }
+                } else { next = LowerLinkedSuccess(project, next, statement, result)? }
+                return ok(LinkedNullRegion { state: next, terminal: true })
             }
-            next = branch.state
-        } else if (statement.kind == "For") {
-            opened = OpenLinkedForLoop(project, next, statement, id, depth)?
-            stepped = lowerLinkedRegion(project, statement, opened.state, 1, result, depth + 1)?
-            next = CloseLinkedForLoop(stepped, opened.outer, opened.before, statement)?
-        } else if (statement.kind == "While" && statement.edge_count >= 2) {
-            condition = ReadLinkedWhileCondition(project, next, statement)
-            if (condition.local != "" || condition.conjunction != 0) {
-                opened = OpenLinkedConditionalWhile(project, next, statement, condition, depth)?
-                loop = lowerLinkedRegion(project, statement, opened.state, 1, result, depth + 1)?
-                next = CloseLinkedForLoop(loop, opened.outer, opened.before, statement)?
-            } else {
-                if (index <= start) {
-                    RejectLayout("unsupported_linked_statement", "expected a fresh local, guarded statement, counted while or checked call", DeclarationSpan(statement))?
+            if (statement.kind == "Try") {
+                caught = lowerLinkedCatch(project, next, statement, id, result, depth, index == limit - 1)?
+                if (caught.terminal) { return ok(caught) }
+                next = caught.state
+            } else if (statement.kind == "Assign" && statement.edge_count == 1) {
+                slot = LinkedNullBinding(next.slots, statement.text)
+                if (slot != 0) {
+                    RequireLinkedMutableBinding(statement.text, next.slots[slot - 1].source_parameter, DeclarationSpan(statement))?
                 }
-                initial = LinkedCountedInitial(project, next, region, statement, start, index)?
-                next = addCountedLoop(project, next, statement, initial, result, depth)?
+                if (ContainsIndex(next.callback_owners, slot)) {
+                    RejectLayout("linked_callback_owner", "a captured array must remain readable by its local callback", DeclarationSpan(statement))?
+                }
+                if (slot == 0 && depth == 0 && result.declaration_kind == "NullableRecordViewReader" && LinkedChildKindIs(project, statement, 0, "FunctionExpr")) {
+                    end = LinkedNullChild(project, 1, region, limit - 1)
+                    prepared = ReadLinkedOwnedReader(project, next, statement, result, id, end)?
+                    function_id = prepared.function
+                    capture = prepared.capture
+                    body_start = prepared.start
+                    reader_result = prepared.result
+                    function = LinkedNullNode(project, 1, function_id)
+                    body = lowerLinkedRegion(project, function, prepared.state, body_start, reader_result, 1)?
+                    next = FinishLinkedOwnedReader(project, next, body, statement, result, capture, function_id)?
+                } else if (slot == 0) { next = LowerLinkedLocal(project, next, statement, id, false)? }
+                else if (LinkedNullIntArrayOwner(next.slots[slot - 1].value.ty) || LinkedNullOwnedArray(next.slots[slot - 1].value.ty)
+                    || next.slots[slot - 1].value.ty.declaration_kind == "OwnedStringArray") {
+                    next = LowerLinkedArrayAppend(project, next, statement, slot)?
+                } else if (next.slots[slot - 1].value.ty.declaration_kind == "Builtin"
+                    && (next.slots[slot - 1].value.ty.name == "int" || next.slots[slot - 1].value.ty.name == "bool")) {
+                    next = LowerLinkedCopyRebind(project, next, statement, slot)?
+                } else {
+                    next = LowerLinkedOwnerRebind(project, next, statement)?
+                }
+            } else if (statement.kind == "CompoundAssign" && statement.text == "+" && statement.edge_count == 2) {
+                target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+                if (target.kind == "Variable") {
+                    slot = LinkedNullBinding(next.slots, target.text)
+                    if (slot > 0 && next.slots[slot - 1].source_parameter) {
+                        RequireLinkedMutableBinding(target.text, true, DeclarationSpan(statement))?
+                    }
+                }
+                next = LowerLinkedStringAppend(project, next, statement, id)?
+            } else if (statement.kind == "AssignTarget" && statement.edge_count == 2) {
+                next = LowerLinkedTargetSet(project, next, statement, id, depth)?
+            } else if (statement.kind == "ObjectDestructureAssign") {
+                next = LowerLinkedOwnedDestructure(project, next, statement)?
+            } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {
+                type_node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+                if (type_node.kind == "TypeArray") {
+                    source = LinkedCharacterSource(project, next, LinkedNullChild(project, 1, statement, 1), true)
+                    if (source == 0) { next = LowerLinkedTypedArrayLocal(project, next, statement, id)? }
+                    else { next = LowerLinkedCharacterLocal(project, next, statement, id, source)? }
+                }
+                else if (type_node.kind == "TypeFunction") { next = LowerLinkedLocalAlias(project, next, statement)? }
+                else { next = LowerLinkedLocal(project, next, statement, id, false)? }
+            } else if (statement.kind == "Function" && depth == 0) {
+                if (IsLinkedAppendThunk(project, statement)) {
+                    CheckLinkedLocalFunctionName(project, next, statement)?
+                    prepared = ReadLinkedAppendThunk(project, next, statement, id)?
+                    thunk = prepared.thunk
+                    body = lowerLinkedRegion(project, statement, prepared.state, thunk.body_start, thunk.result, 1)?
+                    next = FinishLinkedAppendThunk(next, thunk, body, statement, id)?
+                } else if (statement.edge_count >= 4 && LinkedChildKindIs(project, statement, 1, "Parameter")) {
+                    CheckLinkedLocalFunctionName(project, next, statement)?
+                    prepared = ReadLinkedLocalThunk(project, next, statement, id)?
+                    thunk = prepared.thunk
+                    body = lowerLinkedRegion(project, statement, prepared.state, 3, thunk.result, 1)?
+                    next = FinishLinkedLocalThunk(next, thunk, body, statement, id)?
+                } else { next = RegisterLinkedLocalRead(project, next, statement, id)? }
+            } else if (statement.kind == "If" && statement.edge_count > 1) {
+                branch = addGuardedRegion(project, next, statement, result, depth)?
+                if (branch.terminal) {
+                    if (index != limit - 1) {
+                        RejectLayout("unsupported_linked_terminal", "expected the terminal at the end of its block", DeclarationSpan(statement))?
+                    }
+                    return ok(branch)
+                }
+                next = branch.state
+            } else if (statement.kind == "For") {
+                opened = OpenLinkedForLoop(project, next, statement, id, depth)?
+                stepped = lowerLinkedRegion(project, statement, opened.state, 1, result, depth + 1)?
+                next = CloseLinkedForLoop(stepped, opened.outer, opened.before, statement)?
+            } else if (statement.kind == "While" && statement.edge_count >= 2) {
+                condition = ReadLinkedWhileCondition(project, next, statement)
+                if (condition.local != "" || condition.conjunction != 0) {
+                    opened = OpenLinkedConditionalWhile(project, next, statement, condition, depth)?
+                    loop = lowerLinkedRegion(project, statement, opened.state, 1, result, depth + 1)?
+                    next = CloseLinkedForLoop(loop, opened.outer, opened.before, statement)?
+                } else {
+                    if (index <= start) {
+                        RejectLayout("unsupported_linked_statement", "expected a fresh local, guarded statement, counted while or checked call", DeclarationSpan(statement))?
+                    }
+                    initial = LinkedCountedInitial(project, next, region, statement, start, index)?
+                    next = addCountedLoop(project, next, statement, initial, result, depth)?
+                }
+            } else if ((statement.kind == "ExprStmt" || statement.kind == "Print") && statement.edge_count == 1) {
+                next = LowerLinkedStatementCall(project, next, statement)?
+            } else {
+                RejectLayout("unsupported_linked_statement", "expected a fresh local, guarded statement, counted while or checked call", DeclarationSpan(statement))?
             }
-        } else if ((statement.kind == "ExprStmt" || statement.kind == "Print") && statement.edge_count == 1) {
-            next = LowerLinkedStatementCall(project, next, statement)?
-        } else {
-            RejectLayout("unsupported_linked_statement", "expected a fresh local, guarded statement, counted while or checked call", DeclarationSpan(statement))?
         }
         index = index + 1
     }

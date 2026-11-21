@@ -29,7 +29,7 @@ on:
         default: false
         type: boolean
       bootstrap_generations:
-        description: Verify installed same-source Stage1, Stage2 and Stage3 only
+        description: Verify the installed Object field example and same-source Stage1, Stage2 and Stage3
         required: false
         default: false
         type: boolean
@@ -82,7 +82,7 @@ on:
         default: false
         type: boolean
       bootstrap_generations:
-        description: Verify installed same-source Stage1, Stage2 and Stage3 only
+        description: Verify the installed Object field example and same-source Stage1, Stage2 and Stage3
         required: false
         default: false
         type: boolean
@@ -460,14 +460,14 @@ jobs:
           if ($archive.Count -ne 1) { throw 'Expected exactly one same-batch installer' }
           & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --structured-only --archive $archive[0].FullName --manifest ($archive[0].FullName + '.manifest.json') --repo . --output "$env:RUNNER_TEMP/cli-structured-evidence.json" --installer-run $env:INSTALLER_RUN_ID --expected-sdk-commit $env:SDK_SOURCE_COMMIT
           if ($LASTEXITCODE) { throw 'Installed structured Task example failed' }
-      - name: Run the installed same-source bootstrap generations
+      - name: Verify the installed Object field example and bootstrap generations
         if: inputs.installed_structured_only && inputs.bootstrap_generations
         shell: pwsh
         run: |
           $archive = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/cli-bundle-assets" -Filter '*.tar.gz' -File)
           if ($archive.Count -ne 1) { throw 'Expected exactly one same-batch installer' }
           & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --structured-only --bootstrap-generations --archive $archive[0].FullName --manifest ($archive[0].FullName + '.manifest.json') --repo . --output "$env:RUNNER_TEMP/cli-structured-evidence.json" --installer-run $env:INSTALLER_RUN_ID --expected-sdk-commit $env:SDK_SOURCE_COMMIT
-          if ($LASTEXITCODE) { throw 'Installed Stage1, Stage2 or Stage3 verification failed' }
+          if ($LASTEXITCODE) { throw 'Installed Object or bootstrap generation verification failed' }
       - name: Prepare the existing PostgreSQL fixture tools on Linux
         if: runner.os == 'Linux' && !inputs.installed_structured_only
         shell: bash

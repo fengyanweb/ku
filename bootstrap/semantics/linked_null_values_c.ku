@@ -2,10 +2,10 @@ import { LinkedCharacterSource, LinkedStringReplaceApplies, LowerLinkedStringRep
 import { AppendLinkedArrayElement, EmitLinkedClone, PrepareLinkedScopedCallbackArgument } from "./linked_array_fields_c.ku"
 import { CheckLinkedScopedCallback, EmitLinkedPlainInvocation, EmitLinkedScopedCallbackCall, LinkedScopedCallbackFunction, PublishLinkedCheckedValue } from "./link_plan_json_c.ku"
 import { CheckedAppendFault, CheckedAppendFaultHandoff, CheckedAppendInvocation, CheckedLinkedCallbackExpression } from "./guarded_string_parts.ku"
-import { LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MatchesLinkedFieldValue, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { LinkedViewArgument, MatchesLinkedFieldValue, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { Node } from "../stage2/ast.ku"
 import { FindLinkedLocalRead } from "./call_contracts.ku"
-import { InvokeLinkedReader, LinkedCallArgument, LinkedReaderCallable } from "./linked_nullable_reader_c.ku"
+import { FinishLinkedCheckedStatement, InvokeLinkedReader, LinkedCallArgument, LinkedReaderCallable, LinkedRetainedViewUnavailable, LinkedViewRetention, NoLinkedRetention, RetainLinkedField } from "./linked_nullable_reader_c.ku"
 import { LinkedNullCallSymbol } from "./scalar_result_null.ku"
 import { IsLinkedReaderParameter, TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -32,7 +32,7 @@ fn lowerLinkedArgument(&project: LinkedNullProject, state: LinkedNullState, &par
 }
 
 fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &callee: LinkedNullFunction,
-                         id: int, depth: int, external: bool): LinkedNullArguments! {
+                         id: int, depth: int, external: bool, &retention: LinkedViewRetention): LinkedNullArguments! {
     next = state
     if (external) { next.links = RememberLinkedCall(next.links, callee.clone()) }
     args = ""
@@ -55,6 +55,9 @@ fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
             fault_relays += prepared.handoff
         } else {
             argument = lowerLinkedArgument(project, next, callee.parameters[index], argument_id, depth + 1)?
+            if (argument_id == retention.field) {
+                argument = RetainLinkedField(project, argument, argument_id)?
+            }
             if (LinkedNullView(callee.parameters[index])) {
                 args += LinkedViewArgument(callee.parameters[index], argument.value)?
                 if (argument.value.slot > 0) { loans = loans.push(argument.value.clone()) }
@@ -80,7 +83,7 @@ fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
     // Evaluating a later argument may move an earlier lent binding. The
     // final direct call cannot outlive a moved source, including nested calls.
     for loan in loans {
-        if (LinkedMemberUnavailable(next, loan, true)) {
+        if (LinkedRetainedViewUnavailable(next, loan, retention.whole_view)) {
             RejectLayout("linked_view_move", "a later argument consumes an earlier View source", DeclarationSpan(call))?
         }
     }
@@ -134,7 +137,7 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
         return LowerLinkedIntString(project, input, call, id)
     }
     callee = ResolveLinkedCall(project, state.slots, call, target, false)?
-    arguments = LowerLinkedArguments(project, state, call, callee, id, depth, true)?
+    arguments = LowerLinkedArguments(project, state, call, callee, id, depth, true, NoLinkedRetention())?
     invoke = LinkedDirectCallExpression(callee, arguments.args)
     output = AddLinkedNullSlot(project, arguments.state, "", "t" + str(id), callee.result, false)?
     return ok(EmitLinkedPlainInvocation(output, invoke, arguments.handoff))
@@ -180,11 +183,11 @@ fn LowerLinkedScopedCallbackCall(&project: LinkedNullProject, state: LinkedNullS
         RejectLayout("linked_callback_call", "expected the declared arguments of a live checked callback", DeclarationSpan(call))?
     }
     next = CheckLinkedScopedCallback(state, callback.text, unwrap)
-    arguments = LowerLinkedArguments(project, next, call, checked, id, depth, false)?
+    arguments = LowerLinkedArguments(project, next, call, checked, id, depth, false, NoLinkedRetention())?
     return EmitLinkedScopedCallbackCall(arguments, callback, checked.result, id, unwrap)
 }
 
-fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap: Node, owns_value: bool, depth: int): LinkedCheckedCall! {
+fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap: Node, owns_value: bool, depth: int, &retention: LinkedViewRetention): LinkedCheckedCall! {
     if (state.plain_value_result && state.catch_slot == 0) {
         RejectLayout("linked_value_failure", "a checked call needs a catch before returning a plain value", DeclarationSpan(unwrap))?
     }
@@ -212,7 +215,7 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
         callee = state.local_appends[local - 1].function.clone()
         environment = state.local_appends[local - 1].environment.clone()
         CheckLinkedLocalAppendArguments(callee, call, unwrap, owns_value)?
-        arguments = LowerLinkedArguments(project, state, call, callee, id, depth, false)?
+        arguments = LowerLinkedArguments(project, state, call, callee, id, depth, false, NoLinkedRetention())?
         result = "dependency" + str(id)
         arguments.state.code += CheckedAppendFault(id)
         next = AppendLinkedCheckedInvocation(arguments.state, LinkedNullResultType(callee)?, result,
@@ -224,7 +227,7 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
     if (owns_value && !LinkedNullHasResultValue(callee.result)) {
         RejectLayout("linked_dependency_result", "expected a Result with a value payload", DeclarationSpan(unwrap))?
     }
-    arguments = LowerLinkedArguments(project, state, call, callee, id, depth, true)?
+    arguments = LowerLinkedArguments(project, state, call, callee, id, depth, true, retention)?
     result = "dependency" + str(id)
     carrier = LinkedNullResultType(callee)?
     symbol = LinkedNullCallSymbol(callee)
@@ -235,20 +238,18 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
 }
 
 fn LowerLinkedNullTry(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    return LowerLinkedRetainedTry(project, state, statement, NoLinkedRetention())
+}
+
+fn LowerLinkedRetainedTry(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
+                            &retention: LinkedViewRetention): LinkedNullState! {
     unwrap = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
-    call = emitCheckedCall(project, state, unwrap, false, 0)?
-    if (!LinkedNullHasResultValue(call.result)) { return ok(call.state) }
-    payload = call.text + ".value"
-    next = RegisterLinkedNullType(project, call.state, call.result.clone())?
-    next = ValidateLinkedPayload(next, call.result, payload)
-    drop = LinkedNullDropC(next.layouts, next.owning_layouts, call.result, payload)
-    next.owning_strings = next.owning_strings || drop.contains("ku_projection_string_drop")
-    next.code += drop
-    return ok(next)
+    call = emitCheckedCall(project, state, unwrap, false, 0, retention)?
+    return FinishLinkedCheckedStatement(project, call)
 }
 
 fn emitCheckedValue(&project: LinkedNullProject, state: LinkedNullState, &unwrap: Node, depth: int): LinkedNullExpression! {
-    call = emitCheckedCall(project, state, unwrap, true, depth)?
+    call = emitCheckedCall(project, state, unwrap, true, depth, NoLinkedRetention())?
     slot = AddLinkedNullSlot(project, call.state, "", "t" + str(call.id), call.result, false)?
     payload = call.text + ".value"
     ty = slot.value.ty.clone()

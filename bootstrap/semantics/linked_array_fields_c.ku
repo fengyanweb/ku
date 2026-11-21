@@ -131,8 +131,9 @@ fn EmitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     subject_id = LinkedNullChild(project, 1, target, 0)
     subject = LinkedNullNode(project, 1, subject_id)
     field = subject.kind == "Field" && subject.edge_count == 1
-    if (!field && subject.kind != "Index" && (subject.kind != "Variable" || subject.edge_count != 0)) {
-        RejectLayout("unsupported_linked_clone", "expected a bound variable, indexed element or field for clone", DeclarationSpan(subject))?
+    leaf = (subject.kind == "Variable" || subject.kind == "String") && subject.edge_count == 0
+    if (!leaf && !field && subject.kind != "Index") {
+        RejectLayout("unsupported_linked_clone", "expected a variable, string literal, indexed element or field for clone", DeclarationSpan(subject))?
     }
     source = LowerLinkedNullRead(project, state, subject_id, depth + 1)?
     ty = source.value.ty.clone()

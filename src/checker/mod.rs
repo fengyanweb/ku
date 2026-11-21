@@ -551,6 +551,26 @@ struct EnumType {
 pub(crate) struct NativeFieldFacts {
     pub(crate) destructured: HashMap<usize, TypeName>,
     pub(crate) optional: HashMap<usize, TypeName>,
+    ordinary_objects: HashMap<usize, (usize, TypeName)>,
+    literal_object_bindings: HashMap<BindingId, usize>,
+    invalidated_object_literals: HashSet<usize>,
+}
+
+impl NativeFieldFacts {
+    pub(crate) fn ordinary_object_type(&self, expr: &Expr) -> Option<&TypeName> {
+        let (literal, ty) = self
+            .ordinary_objects
+            .get(&(std::ptr::from_ref(expr) as usize))?;
+        (!self.invalidated_object_literals.contains(literal)).then_some(ty)
+    }
+
+    fn invalidate_object_binding(&mut self, binding: BindingId) {
+        if let Some(literal) = self.literal_object_bindings.remove(&binding) {
+            // A checker replay (for example on a loop back edge) may assign the
+            // same declaration a new binding ID. Retain the invalidation by site.
+            self.invalidated_object_literals.insert(literal);
+        }
+    }
 }
 
 fn native_field_type(ty: &Type) -> Option<TypeName> {
@@ -732,6 +752,60 @@ impl Checker {
                 facts.optional.remove(&id);
             }
         }
+    }
+
+    fn record_native_object_literal_binding(&mut self, name: &str, value: &Expr) {
+        if let Some(facts) = &mut self.native_field_facts {
+            if matches!(value.kind, ExprKind::ObjectLiteral { .. }) {
+                if let Some(binding) = self.scopes.last().and_then(|scope| scope.get(name)) {
+                    if matches!(binding.ty, Type::Object(_)) {
+                        facts
+                            .literal_object_bindings
+                            .insert(binding.binding_id, std::ptr::from_ref(value) as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    fn invalidate_native_object_binding(&mut self, name: &str) {
+        if let Some(facts) = self
+            .native_field_facts
+            .as_mut()
+            .filter(|facts| !facts.literal_object_bindings.is_empty())
+        {
+            if let Some(binding) = self.scopes.iter().rev().find_map(|scope| scope.get(name)) {
+                facts.invalidate_object_binding(binding.binding_id);
+            }
+        }
+    }
+
+    fn record_native_object_field_type(&mut self, expr: &Expr, target: &Expr, ty: &Type) {
+        let Some(facts) = &mut self.native_field_facts else {
+            return;
+        };
+        let ExprKind::Variable(name) = &target.kind else {
+            return;
+        };
+        let id = std::ptr::from_ref(expr) as usize;
+        if let Some(binding) = self.scopes.iter().rev().find_map(|scope| scope.get(name)) {
+            // Bracket writes can change the tag without changing the checker's
+            // structural type. Trust only literal bindings confined to plain field
+            // reads. Binding IDs keep writes to shadowing locals independent.
+            if matches!(
+                ty,
+                Type::Int | Type::Float | Type::Bool | Type::String | Type::Null
+            ) {
+                if let (Some(&literal), Some(ty)) = (
+                    facts.literal_object_bindings.get(&binding.binding_id),
+                    native_field_type(ty),
+                ) {
+                    facts.ordinary_objects.insert(id, (literal, ty));
+                    return;
+                }
+            }
+        }
+        facts.ordinary_objects.remove(&id);
     }
 
     fn check_program(&mut self, program: &Program) -> KuResult<()> {
@@ -1260,6 +1334,7 @@ impl Checker {
                     *mutable && !is_constant_name(name),
                     *span,
                 )?;
+                self.record_native_object_literal_binding(name, value);
                 self.set_closure_provenance(name, closure_provenance, *span)
             }
             Stmt::Assign { name, value, span } => {
@@ -1285,6 +1360,7 @@ impl Checker {
                 };
                 if !self.contains(name) {
                     self.define(name.clone(), actual, !is_constant_name(name), *span)?;
+                    self.record_native_object_literal_binding(name, value);
                     return self.set_closure_provenance(name, closure_provenance, *span);
                 }
                 self.reject_readonly_capture_assignment(name, *span)?;
@@ -1957,7 +2033,7 @@ impl Checker {
     }
 
     fn check_expr(&mut self, expr: &Expr) -> KuResult<Type> {
-        self.check_expr_with_field_receiver(expr, None)
+        self.check_expr_with_field_receiver(expr, None, false)
     }
 
     fn optional_field_type(&self, target: &Type, name: &str, span: Span) -> KuResult<Type> {
@@ -1997,6 +2073,7 @@ impl Checker {
         &mut self,
         expr: &Expr,
         checked_receiver: Option<&Type>,
+        plain_field_base: bool,
     ) -> KuResult<Type> {
         self.completed_expression_provenance = None;
         let mut evaluated_provenance = None;
@@ -2020,6 +2097,9 @@ impl Checker {
                 }
                 ExprKind::Literal(Literal::Null) => Ok(Type::Null),
                 ExprKind::Variable(name) => {
+                    if !plain_field_base {
+                        self.invalidate_native_object_binding(name);
+                    }
                     if self.contains(name) {
                         return self.get(name, expr.span).map(|v| v.ty);
                     }
@@ -2263,7 +2343,7 @@ impl Checker {
                             return Ok(ty);
                         }
                         let callee_root = expr_root_name(callee).map(str::to_string);
-                        let callee_type = self.check_expr_with_field_receiver(callee, checked_receiver.as_ref())?;
+                        let callee_type = self.check_expr_with_field_receiver(callee, checked_receiver.as_ref(), false)?;
                         let captured = self.expression_closure_provenance(callee);
                         if let Type::FunctionValue {
                             params,
@@ -2433,7 +2513,7 @@ impl Checker {
                     }
                     let target_type = match checked_receiver {
                         Some(ty) => ty.clone(),
-                        None => self.check_expr(target)?,
+                        None => self.check_expr_with_field_receiver(target, None, true)?,
                     };
                     // Reading a field whose place — or an ancestor of it — was moved
                     // out is a use-after-move. Only the exact path or an ancestor
@@ -2460,9 +2540,13 @@ impl Checker {
                                 )
                             })
                         }
-                        Type::Object(fields) => fields.get(name).cloned().ok_or_else(|| {
-                            KuError::runtime(format!("object has no field '{name}'"), expr.span)
-                        }),
+                        Type::Object(fields) => {
+                            let ty = fields.get(name).cloned().ok_or_else(|| {
+                                KuError::runtime(format!("object has no field '{name}'"), expr.span)
+                            })?;
+                            self.record_native_object_field_type(expr, target, &ty);
+                            Ok(ty)
+                        }
                         Type::StringMap => Ok(Type::String),
                         Type::DynamicObject => Ok(Type::Unknown),
                         Type::Enum(enum_name) => {
@@ -2993,6 +3077,11 @@ impl Checker {
     }
 
     fn check_assign_target(&mut self, target: &AssignTarget, span: Span) -> KuResult<Type> {
+        if self.native_field_facts.is_some() {
+            if let Some(name) = assign_target_root_name(target) {
+                self.invalidate_native_object_binding(name);
+            }
+        }
         match target {
             AssignTarget::Variable(name) => {
                 let binding = self.get(name, span)?;
@@ -5313,6 +5402,9 @@ impl Checker {
                     for var in scope.values_mut() {
                         if captured_ids.contains(&var.binding_id) {
                             var.captured = true;
+                            if let Some(facts) = &mut self.native_field_facts {
+                                facts.invalidate_object_binding(var.binding_id);
+                            }
                         }
                     }
                 }
@@ -5335,6 +5427,9 @@ impl Checker {
                     for name in &captured {
                         if let Some(var) = scope.get_mut(name) {
                             var.captured = true;
+                            if let Some(facts) = &mut self.native_field_facts {
+                                facts.invalidate_object_binding(var.binding_id);
+                            }
                         }
                     }
                 }
@@ -7936,6 +8031,9 @@ impl Checker {
     fn mark_initialized(&mut self, name: &str) {
         for scope in self.scopes.iter_mut().rev() {
             if let Some(var) = scope.get_mut(name) {
+                if let Some(facts) = &mut self.native_field_facts {
+                    facts.invalidate_object_binding(var.binding_id);
+                }
                 // Reassigning the whole variable re-initializes every path.
                 var.reinit(&[]);
                 var.narrowed_type = None;

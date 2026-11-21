@@ -1336,6 +1336,20 @@ def validate_installed_relative_program(install, project, env, target, files, ex
             'native_sources_removed': all(not (project / name).exists() for name in files)}
 
 
+def installed_static_object_fields_consumer(install, root, env, report, repo, commit, target):
+    fixture = 'tests/fixtures/native_static_object_fields'
+    files = {}
+    for name in ('main.ku', 'expected.txt'):
+        result = invoke(['git', 'show', f'{commit}:{fixture}/{name}'], repo, env)
+        if result.returncode:
+            raise RuntimeError(f'cannot read committed static Object fixture: {fixture}/{name}')
+        files[name] = EXPORT.canonical_example(result.stdout).decode('utf-8')
+    expected = files.pop('expected.txt')
+    detail = validate_installed_relative_program(install, root / 'static-object-fields', env, target, files, expected)
+    report['installed_native_static_object_fields'] = dict(
+        detail, fixture_sha256=hashlib.sha256(EXPORT.json_bytes({**files, 'expected.txt': expected})).hexdigest())
+
+
 def installed_forward_layout_consumer(install, root, env, report, target):
     """Check owned forward layout binding through a relative import."""
     files = {
@@ -1606,6 +1620,7 @@ def run_structured_only(args, report):
         manifest = EXPORT.RUNTIME_BUNDLE.verify(install, metadata['version'], metadata['commit'], target)
         report.update(bundle_id=manifest['bundle_id'], sdk_source_sha256=manifest['build_source_sha256'])
         if args.bootstrap_generations:
+            installed_static_object_fields_consumer(install, root, env, report, repo, verifier, target)
             verification = repo / 'bootstrap/tools/compiler_driver/selfhost/verify.py'
             cc = env.get('KU_GNU_CC') if target == 'x86_64-pc-windows-gnu' else 'clang'
             if not cc:

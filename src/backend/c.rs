@@ -5456,6 +5456,24 @@ fn emit_object_result_helpers(out: &mut COutput, program: &IrProgram, force: boo
     if !force && !program_uses_object(program) {
         return Ok(());
     }
+    if program_uses_intrinsic(program, "__ku_object_required_field") {
+        out.push_str(
+            r#"static KuValue __ku_object_required_field(KuObject* object, KuString key) {
+  const KuValue* found = ku_object_get(object, key);
+  KuValue owned = ku_v_null();
+  if (!found) {
+    static const uint8_t message[] = "object has no key";
+    __ku_sync_raise_http_json(message, sizeof(message) - 1u);
+  } else if (!ku_value_try_clone(*found, &owned)) {
+    static const uint8_t message[] = "object allocation failed";
+    __ku_sync_raise_http_json(message, sizeof(message) - 1u);
+  }
+  return owned;
+}
+
+"#,
+        );
+    }
     if [
         "__ku_object_optional_field",
         "__ku_object_optional_field_view",
@@ -17343,21 +17361,24 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
             c_value_expr(&args[2])?
         ));
     }
-    if matches!(name, "__ku_object_has_key" | "__ku_object_take_required") {
+    if matches!(
+        name,
+        "__ku_object_has_key" | "__ku_object_take_required" | "__ku_object_required_field"
+    ) {
         let [object, key] = args else {
-            return Err(unsupported("object pattern requires an object and key"));
+            return Err(unsupported("object lookup requires an object and key"));
         };
         if !matches!(&object.ty, IrType::Named(name) if c_object_type_name(name))
             || key.ty != IrType::Str
         {
-            return Err(unsupported("object pattern has incompatible input types"));
+            return Err(unsupported("object lookup has incompatible input types"));
         }
         let object = c_expr(object)?;
         let key = c_expr(key)?;
         return Ok(if name == "__ku_object_has_key" {
             format!("(ku_object_get({object}, {key}) != NULL)")
         } else {
-            format!("__ku_object_take_required({object}, {key})")
+            format!("{name}({object}, {key})")
         });
     }
     if name == "__ku_object_pattern_box" {

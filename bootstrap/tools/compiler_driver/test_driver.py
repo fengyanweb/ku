@@ -602,8 +602,9 @@ def exercise_linked_program(compiler, cc, caller):
     project.mkdir()
     main = project / "main.ku"
     provider = project / "读取.ku"
-    main.write_text('import { Location, ReadSource } from "./读取"\n'
+    main.write_text('import { CloneLabel, Location, ReadSource } from "./读取"\n'
                     'fn main(): null! { source = ReadSource("input.txt")?; println(source);\n'
+                    '    println(CloneLabel());\n'
                     '    line = Location(0, true); if (line != null) { println(str(line)) }\n'
                     '    println(str(Location(0, false))); return ok(null) }\n',
                     encoding="utf-8")
@@ -611,6 +612,7 @@ def exercise_linked_program(compiler, cc, caller):
                         'fn Clean(&text: str): str { return string.trim(text) }\n'
                         'fn ReadSource(path: str): str! { raw = fs.read(path)?; result = Clean(raw);'
                         ' raw = "released"; return ok(result) }\n'
+                        'fn CloneLabel(): str { return "前缀🙂".clone() }\n'
                         'fn Location(line: int, present: bool): int | null { println("lookup");\n'
                         '    if (!present) { return null }; return line }\n', encoding="utf-8")
     manifest = project / "modules.txt"
@@ -645,11 +647,97 @@ def exercise_linked_program(compiler, cc, caller):
                           ("\u0085　\u00a0", "\n")):
         input_file.write_bytes(raw.encode("utf-8"))
         success = execute([binary], caller)
-        assert success.stdout.replace(b"\r\n", b"\n") == (expected + "lookup\n0\nlookup\nnull\n").encode("utf-8")
+        assert success.stdout.replace(b"\r\n", b"\n") == (expected + "前缀🙂\nlookup\n0\nlookup\nnull\n").encode("utf-8")
         assert not success.stderr
     input_file.unlink()
     missing = execute([binary], caller, 1)
     assert not missing.stdout and b"failed to read file" in missing.stderr
+
+
+def exercise_direct_owned_moves(compiler, caller):
+    project = caller / "direct-owned-moves"
+    project.mkdir()
+    source = project / "source.ku"
+    provider = project / "provider.ku"
+    manifest = project / "modules.txt"
+    prelude = ('struct Pair { left: str right: str }\n'
+               'fn Take(value: str): null! { println(value); return ok(null) }\n'
+               'fn Read(&value: str): null! { println(value); return ok(null) }\n'
+               'fn Inspect(&value: Pair): null! { println(value.left); return ok(null) }\n')
+    simple = 'fn main(): null! { %s; return ok(null) }\n'
+    branches = ('fn Visit(flag: bool): null! { word = "first"; %s; return ok(null) }\n'
+                'fn main(): null! { return Visit(false) }\n')
+    pair = 'pair = Pair { left: "l", right: "r" }; Take(pair.left)?; '
+    object_field = 'item = { text: "text", other: "another" }; Take(item.text)?; '
+    cases = [
+        (simple % 'word = "first"; Take(word)?; Read(word)?', b"'word'"),
+        (simple % (pair + 'Read(pair.left)?'), b"'pair.left'"),
+        (simple % ('pair = Pair { left: "old", right: "r" }; '
+                   + pair + 'Read(pair.left)?'), b"'pair.left'"),
+        (simple % ('item: Pair = Pair { left: "l", right: "r" }; Take(item.left)?; Read(item.left)?'), b"'item.left'"),
+        ('fn Use(value: Pair): null! { Take(value.left)?; Read(value.left)?; return ok(null) }\n'
+         + simple % 'println("main")', b"'value.left'"),
+        (branches % 'if (flag) { Take(word)? }; Read(word)?', b"'word'"),
+        (simple % (object_field + 'println(item.text)'), b""),
+        (simple % (object_field + 'Take(item.text)?'), b""),
+        (simple % 'word = "first"; Read(word)?; Read(word)?', b""),
+        (simple % 'word = "first"; Take(word.clone())?; Read(word)?', b""),
+        (simple % 'word = "first"; Take(word)?; word = "new"; Read(word)?', b""),
+        (branches % 'Take(word)?; if (flag) { word: str = "shadow"; Read(word)? }', b""),
+        (branches % 'if (flag) { Take(word)? } else { Read(word)? }', b""),
+        (branches % 'if (flag) { Take(word)?; return ok(null) }; Read(word)?', b""),
+        (simple % (pair + 'Read(pair.right)?; pair.left = "new"; Read(pair.left)?'), b""),
+        (simple % (pair + 'Inspect(pair)?'), b""),
+    ]
+    manifest.write_text("source.ku\n", encoding="ascii")
+    for body, diagnostic in cases:
+        source.write_text(prelude + body, encoding="ascii")
+        for command, argument in [("check", source), ("check-project", manifest)]:
+            result = execute([compiler, command, argument], caller, int(bool(diagnostic)))
+            assert not result.stdout
+            if diagnostic:
+                assert b"read_after_owned_transfer" in result.stderr and diagnostic in result.stderr
+            else:
+                assert not result.stderr
+
+    source.write_text(prelude + 'fn Use(&value: Pair): null! { Take(value.left)?; return ok(null) }\n'
+                      + simple % 'println("main")', encoding="ascii")
+    for command, argument in [("check", source), ("check-project", manifest)]:
+        result = execute([compiler, command, argument], caller, 1)
+        assert b"owned_transfer_from_view" in result.stderr
+
+    provider.write_text('fn Take(value: str): null! { println(value); return ok(null) }\n', encoding="ascii")
+    source.write_text('import { Take as Sink } from "./provider.ku"\n'
+                      + simple % 'word = "first"; Sink(word)?; println(word)', encoding="ascii")
+    manifest.write_text("source.ku\nprovider.ku\n", encoding="ascii")
+    result = execute([compiler, "check-project", manifest], caller, 1)
+    assert b"read_after_owned_transfer" in result.stderr and b"'word'" in result.stderr
+
+
+def exercise_partial_record_view(compiler, cc, caller):
+    project = caller / "partial-record-view"
+    project.mkdir()
+    (project / "main.ku").write_text('''\
+struct Pair { left: str right: str }
+fn Take(value: str): null! { println(value); return ok(null) }
+fn Inspect(&value: Pair): null! { println(value.left); return ok(null) }
+fn main(): null! {
+    pair = Pair { left: "old", right: "sibling" }
+    Take(pair.left)?
+    Inspect(pair)?
+    pair.left = "replaced"
+    moved = pair.left
+    println(moved)
+    Inspect(pair)?
+    return ok(null)
+}
+''', encoding="utf-8")
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\n", encoding="utf-8")
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    binary = project / ("partial-record-view.exe" if os.name == "nt" else "partial-record-view")
+    execute([sys.executable, "-B", builder, "--compiler", compiler, "--cc", cc, manifest, "-o", binary], caller)
+    assert execute([binary], caller).stdout.splitlines() == [b"old", b"old", b"replaced", b"replaced"]
 
 
 def exercise_parameter_bindings(compiler, cc, caller):
@@ -876,12 +964,14 @@ def exercise(ku, cc):
         exercise_emitted(cc, emitted, caller, "derived", b"(41)", b"42")
         exercise_project(compiler, cc, root, caller)
         exercise_linked_program(compiler, cc, caller)
+        exercise_partial_record_view(compiler, cc, caller)
         exercise_checked_bool(compiler, cc, caller)
         exercise_linked_nullable_int(compiler, cc, caller)
         exercise_linked_owned_reader(compiler, cc, caller)
         exercise_linked_reader_factory(compiler, cc, caller)
         exercise_linked_owned_string_for(compiler, cc, caller)
         exercise_parameter_bindings(compiler, cc, caller)
+        exercise_direct_owned_moves(compiler, caller)
         exercise_owned_recovery(compiler, cc, caller)
         print("bootstrap argv, module checks, signature and standalone C verified")
 
