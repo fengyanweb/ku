@@ -2482,7 +2482,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let direct_body_while_source =
         "fn f() { before; while (looping) { if (ready) { inner; } } after; }";
 
-    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { Node, Arena, AstCanonical, ParseOutput } from \"../stage2/ast.ku\"\nimport { ParseModule, ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ModuleFunctionEnd, ReadFunction } from \"./functions.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
+    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { Node, Arena, AstCanonical, ParseOutput } from \"../stage2/ast.ku\"\nimport { ParseModule, ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ModuleFunctionEnd, ReadFunction } from \"./functions.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { ParseTypeWindow, ReadSignatureTypePrefix } from \"./signature.ku\"\n\n".to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
@@ -2596,6 +2596,21 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         "    ExpectEmptyImportWindowError()?\n    direct_tokens = Scan(\"int\")?\n    direct = ParseTypeWindow(direct_tokens.clone())?\n    if (direct.work != 4) {{ panic(\"type-window validation work was not counted\") }}\n    empty_window: [Token] = []\n    ExpectTypeWindowError(empty_window, \"type window must contain one final non-type boundary token|1:1@0..1:1@0\")?\n    missing_boundary: [Token] = [direct_tokens[0].clone()]\n    ExpectTypeWindowError(missing_boundary, \"type window is missing its final non-type boundary|1:1@0..1:4@3\")?\n    early_boundary = direct_tokens.push(direct_tokens[direct_tokens.len() - 1].clone())\n    ExpectTypeWindowError(early_boundary, \"type window boundary must be final|1:4@3..1:4@3\")?\n    too_many_type_tokens = Scan({})?\n    ExpectTypeWindowError(too_many_type_tokens, \"type window accepts at most 512 tokens|1:1@0..1:2@1\")?\n",
         ku_string(&over_type_window_source)
     ));
+    body.push_str(
+        r#"    delimited = Scan("int;")?
+    type_tokens = [delimited[0].clone(), delimited[1].clone()]
+    typed = ParseTypeWindow(type_tokens.clone())?
+    if (typed.root != direct.root || typed.consumed != direct.consumed || typed.work != direct.work) {
+        panic("a punctuation boundary changed the admitted type plan")
+    }
+    missing_physical_eof = false
+    try { ReadSignatureTypePrefix(type_tokens, 0, 1)? } catch(error) {
+        missing_physical_eof = error.code == "invalid_token_stream"
+            && error.message == "error|bootstrap.parser.stage3|invalid_token_stream|<source>|type inspection escaped its bounded token window|1:1@0..1:1@0"
+    }
+    if (!missing_physical_eof) { panic("a public type prefix requires a physical EOF") }
+"#,
+    );
     body.push_str(&format!(
         "    empty_struct_window: [Token] = []\n    ExpectStructWindowError(empty_struct_window, \"struct window must start with struct and end with EOF|1:1@0..1:1@0\")?\n    direct_struct_tokens = Scan({})?\n    missing_struct_eof: [Token] = [direct_struct_tokens[0].clone(), direct_struct_tokens[1].clone(), direct_struct_tokens[2].clone(), direct_struct_tokens[3].clone()]\n    ExpectStructWindowError(missing_struct_eof, {})?\n    early_struct_eof: [Token] = [direct_struct_tokens[0].clone(), direct_struct_tokens[1].clone(), direct_struct_tokens[2].clone(), direct_struct_tokens[4].clone(), direct_struct_tokens[3].clone(), direct_struct_tokens[4].clone()]\n    ExpectStructWindowError(early_struct_eof, {})?\n    wrong_struct_start = Scan({})?\n    ExpectStructWindowError(wrong_struct_start, {})?\n    trailing_struct_tokens = Scan({})?\n    ExpectStructWindowError(trailing_struct_tokens, {})?\n    struct_window_over = Scan({})?\n    ExpectStructWindowError(struct_window_over, \"struct window accepts at most 512 tokens|1:1@0..1:1@0\")?\n",
         ku_string(direct_struct_source),

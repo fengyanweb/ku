@@ -307,6 +307,10 @@ fn ReadSignatureTypePrefix(&tokens: [Token], start: int, window_end: int): Signa
     if (start < 0 || start > window_end || window_end >= tokens.len() || tokens.len() > 4096 || tokens[tokens.len() - 1].kind != "Eof") {
         RejectAtPoint("invalid_token_stream", "type inspection escaped its bounded token window")?
     }
+    return readAdmittedTypePrefix(tokens, start, window_end)
+}
+
+fn readAdmittedTypePrefix(&tokens: [Token], start: int, window_end: int): SignatureType! {
     // A type may use 511 source tokens and its boundary, independently of
     // the size of the enclosing declaration or module.
     type_last = start + 511
@@ -468,10 +472,9 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
         RejectAt(tokens[0].clone(), "invalid_token_stream", "type window accepts at most 512 tokens")?
     }
     last_index = tokens.len() - 1
-    terminal = tokens[last_index].clone()
-    kind = terminal.kind.clone()
+    kind = tokens[last_index].kind.clone()
     if (kind == "LBracket" || kind == "RBracket" || kind == "Ident" || kind == "Null" || kind == "Dot" || kind == "Bang" || kind == "Pipe" || kind == "Fn" || kind == "Async") {
-        RejectAt(terminal.clone(), "invalid_token_stream", "type window is missing its final non-type boundary")?
+        RejectAt(tokens[last_index].clone(), "invalid_token_stream", "type window is missing its final non-type boundary")?
     }
     index = 0
     while (index < last_index) {
@@ -480,21 +483,11 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
         }
         index = index + 1
     }
-    window: [Token] = tokens
-    if (kind != "Eof") {
-        delimited: [Token] = []
-        index = 0
-        while (index < last_index) {
-            delimited = delimited.push(window[index].clone())
-            index = index + 1
-        }
-        terminal.kind = "Eof"
-        window = delimited.push(terminal)
-    }
-    parsed = ReadSignatureTypeAt(window, 0)?
+    // Every read at last_index uses the synthetic EOF at the same span.
+    parsed = readAdmittedTypePrefix(tokens, 0, last_index)?
     if (parsed.consumed != last_index) {
-        RejectAt(window[parsed.consumed].clone(), "invalid_token_stream", "type window boundary must be final")?
+        RejectAt(tokens[parsed.consumed].clone(), "invalid_token_stream", "type window boundary must be final")?
     }
-    parsed.work = parsed.work - window.len()
+    parsed.work = parsed.work - tokens.len()
     return ok(parsed)
 }
