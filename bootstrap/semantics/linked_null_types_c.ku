@@ -300,9 +300,9 @@ fn linkedBuiltinDependency(&project: LinkedNullProject, unit: int, &target: Node
         RequireProjectionBuiltin(project.binding.modules[unit - 1].imports, project.supplied, receiver,
             operation.namespace, operation.path, at.clone())?
     }
-    input = LinkedBuiltin("str", at.clone())
-    input.declaration_kind = "StringView"
-    if (id >= 4) { input.name = "bytes" }
+    input_name = "str"
+    if (id >= 4) { input_name = "bytes" }
+    input = RetagTypeNameBinding(LinkedBuiltin(input_name, at.clone()), "StringView")
     index_type = LinkedBuiltin("int", at.clone())
     parameters: [TypeNameBinding] = [input]
     if (id == 2) { parameters = parameters.push(index_type.clone()) }
