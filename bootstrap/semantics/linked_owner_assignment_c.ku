@@ -104,8 +104,7 @@ fn OpenLinkedFreshRecordFor(&project: LinkedNullProject, state: LinkedNullState,
     return ok(LinkedForLoop { state: item.state, outer: outer, before: before })
 }
 
-fn LinkedBooleanWhileCondition(&project: LinkedNullProject, &state: LinkedNullState, &statement: Node): str {
-    guard = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+fn LinkedBooleanWhileCondition(&state: LinkedNullState, &guard: Node): str {
     if (guard.kind != "Variable" || guard.edge_count != 0) { return "" }
     index = LinkedNullBinding(state.slots, guard.text)
     if (index == 0) { return "" }

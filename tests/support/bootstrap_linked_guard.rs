@@ -1652,6 +1652,20 @@ fn Nested(begin: bool): int! {
     return ok(step)
 }
 
+fn Conjunction(start: int, score: int): int! {
+    step = start
+    count = 0
+    while (step != 0 && score / step > 0) {
+        count = count + 1
+        step = step - 1
+    }
+    return ok(count)
+}
+fn NonBooleanConjunction(input: int): int! {
+    count = 0
+    while (input && true) { count = count + 1 }
+    return ok(count)
+}
 fn ForbiddenParameter(active: bool): int! {
     step = 0
     while (active) { step = step + 1 }
@@ -1676,12 +1690,16 @@ fn ForbiddenMove(begin: bool, parcel: Parcel): null! {
     fs::write(cwd.join("modules.txt"), "local-bool-while.ku\n").unwrap();
     fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
 
-    for name in ["Count", "TakeNow", "Nested"] {
+    for name in ["Count", "TakeNow", "Nested", "Conjunction"] {
         fs::write(cwd.join("function.txt"), name).unwrap();
         let emitted = execute(&mut Command::new(seed), cwd, 30);
         assert_ok(&emitted);
         let code = String::from_utf8(emitted.stdout).unwrap();
-        assert!(code.contains("while (l") && !code.contains("while (true)"));
+        if name == "Conjunction" {
+            assert!(code.contains("while (true)"));
+        } else {
+            assert!(code.contains("while (l") && !code.contains("while (true)"));
+        }
         let entry = code
             .lines()
             .find(|line| {
@@ -1760,6 +1778,13 @@ int main(void) {
     assert(!output.ok && calls == 2 && outstanding() == 1 && output.error.message.ptr == bytes);
     ku_projection_string_drop(&output.error.message);
     assert(!outstanding());
+#elif __CONJUNCTION__
+    KuBootstrapResult_int64_t output = __ENTRY__(0, 0);
+    assert(output.ok && output.value == 0);
+    output = __ENTRY__(4, 1);
+    assert(output.ok && output.value == 0);
+    output = __ENTRY__(4, 4);
+    assert(output.ok && output.value == 4);
 #else
     KuBootstrapResult_int64_t output = __ENTRY__(false);
     assert(output.ok && output.value == 0);
@@ -1774,7 +1799,11 @@ int main(void) {
         .replace("__PROVIDER__", provider)
         .replace("__RECORD__", record)
         .replace("__COUNT__", if name == "Count" { "1" } else { "0" })
-        .replace("__TAKE__", if name == "TakeNow" { "1" } else { "0" });
+        .replace("__TAKE__", if name == "TakeNow" { "1" } else { "0" })
+        .replace(
+            "__CONJUNCTION__",
+            if name == "Conjunction" { "1" } else { "0" },
+        );
         let source = cwd.join("local-bool-while.c");
         let exe = cwd.join(format!("local-bool-while{}", std::env::consts::EXE_SUFFIX));
         fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
@@ -1786,6 +1815,7 @@ int main(void) {
         ("ForbiddenParameter", "unsupported_linked_loop"),
         ("ForbiddenExpression", "unsupported_linked_loop"),
         ("ForbiddenMove", "linked_control_move"),
+        ("NonBooleanConjunction", "linked_binary_type"),
     ] {
         fs::write(cwd.join("function.txt"), name).unwrap();
         let rejected = execute(&mut Command::new(seed), cwd, 30);
