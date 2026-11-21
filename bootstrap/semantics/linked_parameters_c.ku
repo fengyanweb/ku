@@ -177,7 +177,7 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
             if (signature.parameters[index].declaration_kind == "Struct") {
                 next = registerOwnedElement(project, next, signature.parameters[index].clone())?
             }
-            index += 1
+            index = index + 1
         }
         return ok(next)
     }
