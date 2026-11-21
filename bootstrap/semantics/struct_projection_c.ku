@@ -94,8 +94,9 @@ fn RequireProjectionBuiltin(&imports: [ImportBinding], &supplied: [SuppliedModul
 
 fn ProjectionPlaceRoot(&nodes: [Node], &edges: [int], id: int): str {
     cursor = id
+    limit = 32
     depth = 0
-    while (depth < 32) {
+    while (depth < limit) {
         kind = nodes[cursor - 1].kind.clone()
         if (kind == "Variable") { return nodes[cursor - 1].text.clone() }
         if (kind != "Field" && kind != "OptionalField" && kind != "Index" && kind != "TryUnwrap") { return "" }
