@@ -520,6 +520,11 @@ fn LinkedScalarArrayOwner(&type: TypeNameBinding): bool {
     return LinkedNullIntArrayOwner(type) || type.declaration_kind == "OwnedStringArray"
 }
 
+fn LinkedScalarArrayLayout(&type: TypeNameBinding): bool {
+    return LinkedScalarArrayOwner(type)
+        || (type.declaration_kind == "BuiltinArray" && (type.name == "int" || type.name == "str"))
+}
+
 struct LinkedNullC {
     symbol: str
     links: [LinkedNullFunction]

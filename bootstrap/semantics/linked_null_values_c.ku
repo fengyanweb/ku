@@ -9,7 +9,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { AppendLinkedCheckedInvocation, IsLinkedScopedCallback, LinkedCheckedCall, LinkedDirectCallExpression, LinkedScalarArrayOwner, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
+import { AppendLinkedCheckedInvocation, IsLinkedScopedCallback, LinkedCheckedCall, LinkedDirectCallExpression, LinkedScalarArrayLayout, LinkedScalarArrayOwner, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
 import { LinkedCallArgument, LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { ReadLinkedLocalArrayItem, EmitLinkedAddition, IsLinkedLogicalNegation, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
@@ -258,7 +258,7 @@ fn emitCheckedValue(&project: LinkedNullProject, state: LinkedNullState, &unwrap
 
 fn LowerLinkedExpectedValue(&project: LinkedNullProject, state: LinkedNullState, &target: TypeNameBinding, id: int, depth: int): LinkedNullExpression! {
     record = target.declaration_kind == "StructArray" || LinkedNullOwnedArray(target)
-    scalar = target.declaration_kind == "BuiltinArray" && (target.name == "int" || target.name == "str")
+    scalar = LinkedScalarArrayLayout(target)
     if (depth >= 32 || (!record && !scalar)) {
         return LowerLinkedNullValue(project, state, id, depth)
     }
