@@ -588,6 +588,10 @@ fn WrongLiteral(value: int): Index! {
     values = [value, true]
     return ok(Index { values: values, size: 2 })
 }
+fn Carry(values: [int], extra: int): [int] {
+    values = values.push(extra)
+    return values
+}
 fn Arithmetic(left: int, divisor: int, factor: int): Index! {
     values = [left]
     quotient = values[0] / divisor
@@ -758,6 +762,47 @@ int main(void) {
     assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
     assert_counted_array_member(seed, cwd, &c, &exe);
     assert_linked_math_ownership(seed, cwd, &c, &exe);
+    assert_int_array_value_abi(seed, cwd, &c, &exe);
+}
+
+fn assert_int_array_value_abi(seed: &Path, cwd: &Path, c: &Path, exe: &Path) {
+    fs::write(cwd.join("function.txt"), "Carry").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+    let typed = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&typed);
+    let typed = String::from_utf8(typed.stdout).unwrap();
+    assert_eq!(
+        typed
+            .matches("\"c_type\":\"KuArrayInt\",\"passing\":\"value\"")
+            .count(),
+        2
+    );
+    assert!(typed.contains("\"returns_result\":false"));
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let symbol = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuArrayInt ku_linked_null_"))
+        .unwrap();
+    let (symbol, _) = symbol.split_once('(').unwrap();
+    let host = r#"
+int main(void) {
+    int64_t *data = malloc(2 * sizeof(*data));
+    assert(data);
+    data[0] = 8;
+    const KuArrayInt result = __ENTRY__((KuArrayInt){1,data,2}, 9);
+    assert(result.len == 2 && result.data == data && result.capacity == 2);
+    assert(result.data[0] == 8 && result.data[1] == 9);
+    free(result.data);
+    return 0;
+}
+"#
+    .replace("__ENTRY__", &format!("ku_linked_null_{symbol}"));
+    fs::write(c, format!("#include <assert.h>\n{code}{host}")).unwrap();
+    compile_projection(c, exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 15));
 }
 
 fn assert_counted_array_member(seed: &Path, cwd: &Path, c: &Path, exe: &Path) {

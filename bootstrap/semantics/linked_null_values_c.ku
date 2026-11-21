@@ -8,7 +8,7 @@ import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall
 import { EmitLinkedIntAppend, HasBoundArrayMembers, ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
-         LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
+         LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AddLinkedNullSlot, CloneLinkedStringSlot, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix } from "./linked_parameters_c.ku"
 
@@ -294,6 +294,7 @@ fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &
         RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(statement))?
     }
     id = ReadOwnedArrayPushArgument(project.supplied[0].named, statement)?
+    if (id == 0) { return LowerLinkedOwnerRebind(project, state, statement) }
     value = LowerLinkedNullValue(project, state, id, 0)?
     if (!value.state.slots[index - 1].live || !SameLinkedType(value.value.ty, LinkedNullArrayElement(array.value.ty.clone()))
         || value.value.borrowed || (!copy && value.value.slot == 0)) {
@@ -314,20 +315,21 @@ fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &
     return ok(value.state)
 }
 
-fn LowerLinkedStringRebind(&project: LinkedNullProject, state: LinkedNullState, &assignment: Node): LinkedNullState! {
+fn LowerLinkedOwnerRebind(&project: LinkedNullProject, state: LinkedNullState, &assignment: Node): LinkedNullState! {
     index = LinkedNullBinding(state.slots, assignment.text)
     if (index == 0) {
-        RejectLayout("linked_rebind_target", "expected a declared local str owner", DeclarationSpan(assignment))?
+        RejectLayout("linked_rebind_target", "expected a declared local owner", DeclarationSpan(assignment))?
     }
     target = state.slots[index - 1].value.clone()
     value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, assignment, 0), 0)?
-    if (target.borrowed || target.ty.name != "str" || target.ty.declaration_kind != "Builtin"
+    owner = LinkedStringResult(target.ty) || LinkedNullOwnedArray(target.ty) || LinkedNullIntArrayOwner(target.ty)
+    if (target.borrowed || !owner
         || !SameLinkedType(target.ty, value.value.ty) || value.value.borrowed
         || value.value.slot == index) {
-        RejectLayout("linked_rebind_type", "replacement requires a separate str owner of the declared type", DeclarationSpan(assignment))?
+        RejectLayout("linked_rebind_type", "replacement requires a separate owner of the declared type", DeclarationSpan(assignment))?
     }
-    value.state.code += "    ku_projection_string_drop(&" + target.text.clone() + ");\n"
-        + "    " + target.text + " = " + value.value.text.clone() + ";\n"
+    drop = LinkedNullDropC(value.state.layouts, value.state.owning_layouts, target.ty, target.text)
+    value.state.code += drop + "    " + target.text + " = " + value.value.text.clone() + ";\n"
     value.state.slots[index - 1].live = true
     moved = value.value.clone()
     return MoveLinkedNullSlot(value.state, moved)

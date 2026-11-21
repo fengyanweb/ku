@@ -9,7 +9,7 @@ import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayo
 import { ContainsType, CTypeName, LinkedFsReadReference } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
-import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayViewLinkPlanType, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayLinkPlanType, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -59,8 +59,15 @@ fn LinkedNullLiteralType(&project: LinkedNullProject, unit: int, &literal: Node,
 }
 
 fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view: bool): TypeNameBinding! {
-    if (!view) { return LinkedNullType(project, unit, id) }
     node = LinkedNullNode(project, unit, id)
+    if (!view) {
+        if (node.kind == "TypeArray") {
+            owner = ReadLinkedOwnedArray(project, unit, id, true)?
+            if (LinkedNullIntArrayOwner(owner)) { return ok(owner) }
+            RejectLayout("linked_array_value_parameter", "linked array parameters by value require [int]", DeclarationSpan(node))?
+        }
+        return LinkedNullType(project, unit, id)
+    }
     if (node.kind == "TypeArray" && node.edge_count == 1) {
         ty = LinkedNullType(project, unit, LinkedNullChild(project, unit, node, 0))?
         if (ty.declaration_kind == "Struct") {
@@ -156,8 +163,9 @@ fn LinkedNullView(&binding: TypeNameBinding): bool {
 }
 
 fn LinkedNullParameterPlan(&binding: TypeNameBinding, unit: int): LinkPlanType! {
+    if (LinkedNullIntArrayOwner(binding)) { return ok(IntArrayLinkPlanType(false)) }
     if (binding.declaration_kind == "BuiltinArray") {
-        if (binding.name == "int") { return ok(IntArrayViewLinkPlanType()) }
+        if (binding.name == "int") { return ok(IntArrayLinkPlanType(true)) }
         return ok(StrArrayViewLinkPlanType())
     }
     if (binding.declaration_kind == "StringView") {
@@ -215,13 +223,13 @@ fn linkedDirectFunction(&project: LinkedNullProject, unit: int, &target: Node): 
     return ok([])
 }
 
-fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, for_local: bool): TypeNameBinding! {
+fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, allow_int: bool): TypeNameBinding! {
     array = LinkedNullNode(project, unit, id)
     if (array.kind != "TypeArray" || array.edge_count != 1) {
         RejectLayout("linked_owned_array_type", "expected an explicitly typed array of named records", DeclarationSpan(array))?
     }
     element = LinkedNullType(project, unit, LinkedNullChild(project, unit, array, 0))?
-    if (for_local && element.declaration_kind == "Builtin" && element.name == "int") {
+    if (allow_int && element.declaration_kind == "Builtin" && element.name == "int") {
         element.declaration_kind = "OwnedIntArray"
         return ok(element)
     }
@@ -235,7 +243,7 @@ fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, for_loc
 fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bool): TypeNameBinding! {
     node = LinkedNullNode(project, unit, id)
     if (!checked) {
-        if (node.kind == "TypeArray") { return ReadLinkedOwnedArray(project, unit, id, false) }
+        if (node.kind == "TypeArray") { return ReadLinkedOwnedArray(project, unit, id, true) }
         return LinkedNullType(project, unit, id)
     }
     if (node.kind != "TypeResult" || node.edge_count != 1) {
@@ -345,6 +353,7 @@ fn LinkedCheckedResultPlan(&result: TypeNameBinding, unit: int): LinkPlanType! {
 
 fn LinkedResultPlan(&result: TypeNameBinding, unit: int, checked: bool): LinkPlanType! {
     if (checked) { return LinkedCheckedResultPlan(result, unit) }
+    if (LinkedNullIntArrayOwner(result)) { return ok(IntArrayLinkPlanType(false)) }
     plan = BoundLinkPlanType(result, unit, LinkedNullCType(result)?, false)
     if (LinkedNullOwnedArray(result)) { plan.kind = "StructArray" }
     return ok(plan)

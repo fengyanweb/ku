@@ -139,8 +139,13 @@ class LinkTests(unittest.TestCase):
                             link_c.TypeRef.read(strings, "view").semantic())
         with self.assertRaises(link_c.LinkError):
             link_c.TypeRef.read(dict(integer, c_type=strings["c_type"]), "view")
+        owned = dict(integer, c_type="KuArrayInt", passing="value")
+        self.assertNotEqual(link_c.TypeRef.read(integer, "view").semantic(),
+                            link_c.TypeRef.read(owned, "value").semantic())
         with self.assertRaises(link_c.LinkError):
-            link_c.TypeRef.read(dict(integer, c_type="KuArrayInt", passing="value"), "value")
+            link_c.TypeRef.read(owned, "checked", checked_result=True)
+        with self.assertRaises(link_c.LinkError):
+            link_c.TypeRef.read(dict(owned, c_type="KuGuardStringArray"), "value")
 
     def test_fs_read_provider_links_and_preserves_bytes_and_errors(self):
         path_type = dict(builtin("str", "const KuString*"), passing="view")

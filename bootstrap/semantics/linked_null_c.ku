@@ -14,7 +14,7 @@ import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayPrefix, LinkedNullCType
          LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedArrayLocal, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedArrayAppend, LowerLinkedSuccess,
-         LowerLinkedNullValue, LowerLinkedStringRebind } from "./linked_null_values_c.ku"
+         LowerLinkedNullValue, LowerLinkedOwnerRebind } from "./linked_null_values_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
 
 struct LinkedNullC {
@@ -277,7 +277,7 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             else if (LinkedNullIntArrayOwner(next.slots[slot - 1].value.ty) || LinkedNullOwnedArray(next.slots[slot - 1].value.ty)) {
                 next = LowerLinkedArrayAppend(project, next, statement, slot)?
             }
-            else { next = LowerLinkedStringRebind(project, next, statement)? }
+            else { next = LowerLinkedOwnerRebind(project, next, statement)? }
         } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {
             kind = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0)).kind
             if (kind == "TypeArray") { next = LowerLinkedArrayLocal(project, next, statement, id)? }

@@ -388,12 +388,11 @@ fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str):
 fn ReadOwnedArrayPushArgument(&named: NamedModule, &statement: Node): int! {
     edges = statement.first_edge
     call = named.parsed.arena.nodes[named.parsed.arena.edges[edges] - 1].clone()
-    if (call.kind != "Call" || call.edge_count != 2) {
-        RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(statement))?
-    }
+    if (call.kind != "Call" || call.edge_count == 0) { return ok(0) }
     method = named.parsed.arena.nodes[named.parsed.arena.edges[call.first_edge] - 1].clone()
-    if (method.kind != "Field" || method.text != "push" || method.edge_count != 1) {
-        RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(method))?
+    if (method.kind != "Field" || method.text != "push") { return ok(0) }
+    if (call.edge_count != 2 || method.edge_count != 1) {
+        RejectLayout("linked_move_append", "push requires a receiver and one element", DeclarationSpan(call))?
     }
     receiver = named.parsed.arena.nodes[named.parsed.arena.edges[method.first_edge] - 1].clone()
     if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != statement.text) {

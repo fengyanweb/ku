@@ -125,19 +125,6 @@ struct LinkedCheckedCall {
     id: int
 }
 
-fn CheckLinkedAddition(&state: LinkedNullState, &left: LinkedNullValue, &right: LinkedNullValue, &at: Span): null! {
-    if (left.ty.declaration_kind != "Builtin" || !SameBoundTypeIdentity(left.ty, right.ty)) {
-        RejectLayout("linked_binary_type", "addition requires matching scalar operands", at.clone())?
-    }
-    if (left.slot > 0 && !state.slots[left.slot - 1].live) {
-        RejectLayout("linked_addition_moved_operand", "right operand consumed the left operand's binding", at.clone())?
-    }
-    if (left.ty.name != "int" && left.ty.name != "str") {
-        RejectLayout("linked_binary_type", "addition requires int or str", at.clone())?
-    }
-    return ok(null)
-}
-
 fn BoundLinkPlanType(&binding: TypeNameBinding, local_unit: int, c_type: str, view: bool): LinkPlanType {
     unit = binding.module_index
     if (unit == 0 && binding.declaration_kind == "Struct") { unit = local_unit }
@@ -156,8 +143,10 @@ fn StrArrayViewLinkPlanType(): LinkPlanType {
         c_type: "const " + carrier + "*", view: true }
 }
 
-fn IntArrayViewLinkPlanType(): LinkPlanType {
-    return LinkPlanType { kind: "BuiltinArray", name: "int", unit: 0, node: 0, c_type: "const KuArrayInt*", view: true }
+fn IntArrayLinkPlanType(view: bool): LinkPlanType {
+    carrier = "KuArrayInt"
+    if (view) { carrier = "const KuArrayInt*" }
+    return LinkPlanType { kind: "BuiltinArray", name: "int", unit: 0, node: 0, c_type: carrier, view: view }
 }
 
 fn NullLinkPlanResult(): LinkPlanType {
