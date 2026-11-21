@@ -252,6 +252,8 @@ def exercise_owned_recovery(compiler, cc, caller):
     (caller / "owners.ku").write_text('''\
 struct Slot { name: str, live: bool }
 struct Pool { slots: [Slot], note: str }
+struct Detail { texts: [str], ready: bool }
+struct Frame { body: Detail, key: str }
 fn Replace(): int! {
     slots: [Slot] = [Slot { name: "old", live: true }]
     pool = Pool { slots: slots, note: "active" }
@@ -268,11 +270,23 @@ fn Recover(abort: bool): int! {
     }
     return ok(29)
 }
+fn CloneNested(): int! {
+    texts: [str] = []
+    text = "item" + str(8)
+    texts = texts.push(text)
+    source = Frame { body: Detail { texts: texts, ready: true }, key: "key" }
+    copy = source.clone()
+    source.key = "changed"
+    if (copy.body.ready && copy.body.texts[0] == "item8" && copy.key == "key" && source.key == "changed") {
+        return ok(38)
+    }
+    return ok(0)
+}
 ''', encoding="utf-8")
     manifest = caller / "owners.txt"
     manifest.write_text("owners.ku\n", encoding="utf-8")
     linker = Path(__file__).resolve().parents[1] / "link_c.py"
-    cases = {"Replace": [("", 15)], "Recover": [("false", 11), ("true", 29)]}
+    cases = {"Replace": [("", 15)], "Recover": [("false", 11), ("true", 29)], "CloneNested": [("", 38)]}
     for name, expected in cases.items():
         plan = caller / f"{name}.plan.json"
         code = caller / f"{name}.c"

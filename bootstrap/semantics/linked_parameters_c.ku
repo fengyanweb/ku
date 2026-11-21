@@ -376,8 +376,9 @@ fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, 
     output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
     if (arrays && !CanCloneNestedStringArrays(output.state.layouts, layout)) {
         fields = LinkedRecordFields(output.state.layouts, output.state.owning_layouts, output.value.ty)?
+        count = fields.len()
         index = 0
-        while (index < fields.len()) {
+        while (index < count) {
             field = fields[index].resolved.clone()
             suffix = ".f" + str(index)
             origin = source.value.text.clone() + suffix.clone()
@@ -391,7 +392,7 @@ fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, 
             } else {
                 RejectLayout("linked_nested_array_clone", "record snapshot requires immediate [int] or Copy int and bool fields", field.span)?
             }
-            index += 1
+            index = index + 1
         }
     } else if (!arrays && GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
         output.state.code += "    " + output.value.text.clone() + " = " + source.value.text + ";\n"
