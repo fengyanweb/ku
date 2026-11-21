@@ -96,8 +96,13 @@ def bootstrap_chain(repo, source, ku, cc, output, scratch, limit, sanitizers):
         if (seed["commit"] != source or seed["seed_sha256"] != installed_sha or seed["sha256"] != digest(binary) or
                 any("libku" in item.lower() for item in imports)):
             raise ValueError(f"Stage1 identity or imports do not match: {identity}")
-        return {"binary": binary.relative_to(output).as_posix(), "sha256": seed["sha256"],
-                "archive_sha256": seed["archive_sha256"], "dynamic_imports": imports}, [binary, identity]
+        result = {"binary": binary.relative_to(output).as_posix(), "sha256": seed["sha256"],
+                  "archive_sha256": seed["archive_sha256"], "dynamic_imports": imports}
+        if os.name == "nt":
+            sys.path.insert(0, str(repo / "bootstrap/tools/compiler_driver"))
+            from build import windows_stack_reserve
+            result["stack"] = windows_stack_reserve(binary)
+        return result, [binary, identity]
 
     def build_generation(attempt, producer):
         units = attempt / "units"

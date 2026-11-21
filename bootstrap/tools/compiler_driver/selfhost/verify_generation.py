@@ -13,18 +13,6 @@ import sys
 import tempfile
 
 
-def host_link_flags(target):
-    if os.name != "nt":
-        return []
-    target = target.lower()
-    if target.startswith("x86_64-") and "-windows-msvc" in target:
-        return ["-Xlinker", "/ENTRY:wmainCRTStartup", "-Xlinker", "/SUBSYSTEM:CONSOLE",
-                "-Xlinker", "/DEFAULTLIB:kernel32.lib"]
-    if target.startswith("x86_64-") and target.endswith(("-mingw32", "-mingw64", "-windows-gnu")):
-        return ["-municode", "-static", "-lkernel32"]
-    raise ValueError(f"expected an x64 Windows clang or MinGW compiler, got {target!r}")
-
-
 def dynamic_imports(binary):
     if sys.platform == "darwin":
         return subprocess.check_output(["otool", "-L", binary], cwd=binary.parent, text=True).splitlines()[1:]
@@ -99,7 +87,13 @@ def main():
     cc = str(Path(cc).absolute())
     target = subprocess.check_output([cc, "-dumpmachine"], text=True, timeout=20).strip()
     extension = ".exe" if os.name == "nt" else ""
-    host_flags = host_link_flags(target)
+    driver = repo / "bootstrap/tools/compiler_driver"
+    sys.path.insert(0, str(driver))
+    host_flags = []
+    if os.name == "nt":
+        from build import windows_host_link_flags, windows_stack_reserve
+
+        host_flags = windows_host_link_flags(target)
     sys.path.insert(0, str(repo / "bootstrap/tools"))
     import link_c
 
@@ -168,8 +162,6 @@ def main():
     assert [value.semantic() for value in entry.signature.parameters] == [(("builtin", "str"), "view", "bootstrap string")] * 3
     assert entry.signature.returns_result and entry.signature.result.identity == ("builtin", "null")
 
-    driver = repo / "bootstrap/tools/compiler_driver"
-    sys.path.insert(0, str(driver))
     spec = spec_from_file_location("ku_compiler_driver_test", driver / "test_driver.py")
     consumer = module_from_spec(spec)
     spec.loader.exec_module(consumer)
@@ -236,6 +228,7 @@ static KuProjectionString ku_string_static(const uint8_t *input, size_t size) {
             link_c.link(units, aliases, binary, entry.key, caller.read_bytes(), cc,
                         ["-Wall", "-Wextra", "-Werror", "-pedantic-errors", *flags],
                         [*flags, *host_flags], 60, builtin_headers)
+            stack = windows_stack_reserve(binary) if os.name == "nt" else None
             current = root / f"{name}-fixture"
             current.mkdir()
             foreign = current / "不同 工作目录🙂"
@@ -251,6 +244,8 @@ static KuProjectionString ku_string_static(const uint8_t *input, size_t size) {
             imports = dynamic_imports(binary)
             assert not any("libku" in line.lower() for line in imports)
             binaries[name] = {"sha256": sha256(binary.read_bytes()).hexdigest(), "dynamic_imports": imports}
+            if stack is not None:
+                binaries[name]["stack"] = stack
         args.output_dir.mkdir()
         output_binary = args.output_dir / ("ku-bootstrap" + extension)
         shutil.copy2(root / ("strict_o2" + extension), output_binary)

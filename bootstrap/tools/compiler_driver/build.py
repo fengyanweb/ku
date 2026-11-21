@@ -9,9 +9,46 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
+
+
+# Keep the standalone compiler's reservation equal to the Rust CLI worker.
+WINDOWS_COMPILER_STACK_BYTES = 8 * 1024 * 1024
+
+
+def windows_host_link_flags(target):
+    target = target.lower()
+    if target.startswith("x86_64-") and "-windows-msvc" in target:
+        return ["-Xlinker", "/ENTRY:wmainCRTStartup", "-Xlinker", "/SUBSYSTEM:CONSOLE",
+                "-Xlinker", "/DEFAULTLIB:kernel32.lib",
+                "-Xlinker", f"/STACK:{WINDOWS_COMPILER_STACK_BYTES}"]
+    if target.startswith("x86_64-") and target.endswith(("-mingw32", "-mingw64", "-windows-gnu")):
+        return ["-municode", "-static", f"-Wl,--stack,{WINDOWS_COMPILER_STACK_BYTES}", "-lkernel32"]
+    raise ValueError(f"expected an x64 Windows clang or MinGW compiler, got {target!r}")
+
+
+def windows_stack_reserve(binary):
+    with binary.open("rb") as stream:
+        dos = stream.read(64)
+        if len(dos) != 64 or dos[:2] != b"MZ":
+            raise ValueError(f"invalid Windows executable header: {binary}")
+        offset, = struct.unpack_from("<I", dos, 60)
+        if not 64 <= offset <= 1024 * 1024:
+            raise ValueError(f"invalid PE header offset: {binary}")
+        stream.seek(offset)
+        pe = stream.read(24 + 88)
+    if (len(pe) != 24 + 88 or pe[:4] != b"PE\0\0" or
+            struct.unpack_from("<H", pe, 4)[0] != 0x8664 or
+            struct.unpack_from("<H", pe, 20)[0] < 88 or
+            struct.unpack_from("<H", pe, 24)[0] != 0x20B):
+        raise ValueError(f"invalid x64 PE32+ header: {binary}")
+    reserve, commit = struct.unpack_from("<QQ", pe, 24 + 72)
+    if reserve != WINDOWS_COMPILER_STACK_BYTES or not 0 < commit < reserve:
+        raise ValueError(f"unexpected bootstrap stack reserve/commit {reserve}/{commit}: {binary}")
+    return {"reserved_bytes": reserve, "initial_commit_bytes": commit}
 
 
 def executable(name):
@@ -71,25 +108,22 @@ def link_c(cc, source, name, cwd, *, bootstrap_host=False):
         if bootstrap_host:
             target = run_windows([cc, "-dumpmachine"], cwd, capture_stdout=True)
             target = target.decode("ascii").strip().lower()
-            if target.startswith("x86_64-") and "-windows-msvc" in target:
-                libraries = ["-Xlinker", "/ENTRY:wmainCRTStartup", "-Xlinker",
-                             "/SUBSYSTEM:CONSOLE", "-Xlinker", "/DEFAULTLIB:kernel32.lib"]
-            elif target.startswith("x86_64-") and target.endswith(
-                ("-mingw32", "-mingw64", "-windows-gnu")
-            ):
+            libraries = windows_host_link_flags(target)
+            if "-municode" in libraries:
                 # Keep the existing C and linker options while separating
                 # compilation from linking in the bounded stage logs.
                 obj = Path(source).with_suffix(".o")
                 print("compiling the MinGW bootstrap host", flush=True)
                 run([*command, "-municode", "-static", "-c", source, "-o", obj], cwd)
                 print("linking the MinGW bootstrap host", flush=True)
-                run([cc, "-municode", "-static", obj, "-o", name, "-lkernel32"], cwd)
+                run([cc, obj, "-o", name, *libraries], cwd)
+                windows_stack_reserve(cwd / name)
                 return
-            else:
-                raise ValueError(f"expected an x64 Windows clang or MinGW compiler, got {target!r}")
     elif bootstrap_host:
         command.append("-pthread")
     run([*command, source, "-o", name, *libraries], cwd)
+    if os.name == "nt" and bootstrap_host:
+        windows_stack_reserve(cwd / name)
 
 
 @contextmanager
