@@ -19,32 +19,37 @@ struct ScalarIntC {
 }
 
 fn requireInt(&bindings: [TypeNameBinding], use_node: int, &ty: Node): null! {
-    if (scalarType(bindings, use_node, ty) != 1) {
+    provided = scalarType(bindings, use_node, ty)
+    if (provided != 1) {
         rejectScalarInt("unsupported_int_type", "expected a bound builtin int type", DeclarationSpan(ty))?
     }
     return ok(null)
 }
 
-fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
-                          &bindings: [TypeNameBinding], &imports: [ScalarIntImport],
-                          local_base: int, function_id: int, can_convert: bool, can_use_ok: bool,
-                          can_print: bool): ScalarIntFunction! {
-    function = nodes[function_id - 1].clone()
-    cursor = function.first_edge
-    end = cursor + function.edge_count
+struct ScalarParameterHeader {
+    parameters: [ScalarIntParameter]
+    cursor: int
+    has_string: bool
+}
+
+fn ReadScalarParameters(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
+                        start: int, end: int): ScalarParameterHeader! {
     parameters: [ScalarIntParameter] = []
     has_string = false
+    cursor = start
     while (cursor < end && nodes[edges[cursor] - 1].kind == "Parameter") {
         parameter = nodes[edges[cursor] - 1].clone()
         if (parameter.edge_count != 1 || parameter.int_value < 0 || parameter.int_value > 1) {
             rejectScalarInt("unsupported_int_signature", "expected an explicitly typed int, str or &str parameter", DeclarationSpan(parameter))?
         }
-        if (scalarParameterIndex(parameters, parameter.text) >= 0) {
+        existing_parameter = scalarParameterIndex(parameters, parameter.text)
+        if (existing_parameter >= 0) {
             rejectScalarInt("duplicate_int_parameter", "duplicate function parameter '" + parameter.text.clone() + "'", DeclarationSpan(parameter))?
         }
         type_id = edges[parameter.first_edge]
         string_mode = 0
-        if (scalarType(bindings, type_id, nodes[type_id - 1]) == 2) {
+        parameter_type = scalarType(bindings, type_id, nodes[type_id - 1])
+        if (parameter_type == 2) {
             string_mode = parameter.int_value + 1
             has_string = true
         } else {
@@ -56,6 +61,17 @@ fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLeve
         parameters = parameters.push(ScalarIntParameter { name: parameter.text, string_mode: string_mode })
         cursor = cursor + 1
     }
+    return ok(ScalarParameterHeader { parameters: parameters, cursor: cursor, has_string: has_string })
+}
+
+fn LowerScalarIntFunction(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
+                          &bindings: [TypeNameBinding], &imports: [ScalarIntImport],
+                          local_base: int, function_id: int, can_convert: bool, can_use_ok: bool,
+                          can_print: bool): ScalarIntFunction! {
+    function = nodes[function_id - 1].clone()
+    parameter_start = function.first_edge
+    end = parameter_start + function.edge_count
+    {parameters, cursor, has_string} = ReadScalarParameters(nodes, edges, bindings, parameter_start, end)?
     if (end - cursor < 2) {
         rejectScalarInt("unsupported_int_body", "expected an explicit scalar result type and a final return", DeclarationSpan(function))?
     }
