@@ -9,33 +9,24 @@ import { ReadFunctionBodySpan } from "./statements.ku"
 // Find the exclusive end of one module-level function, including its
 // nested blocks. An unfinished declaration stops at the scanner EOF.
 fn ModuleFunctionEnd(&tokens: [Token], first: int, &eof: Token): int! {
-    window_cursor = first
+    window_limit = tokens.len()
     function_depth = 0
     seen_body = false
-    collecting_function = true
-    window_is_eof = false
-    while (collecting_function) {
-        if (window_cursor >= tokens.len()) {
-            RejectAt(eof.clone(), "invalid_token_stream", "function inspection escaped the token stream")?
-        }
+    window_cursor = first
+    while (window_cursor < window_limit) {
         kind = tokens[window_cursor].kind.clone()
-        window_is_eof = kind == "Eof"
-        window_is_lbrace = kind == "LBrace"
-        window_is_rbrace = kind == "RBrace"
-        window_cursor = window_cursor + 1
-        if (window_is_eof) {
-            collecting_function = false
-        } else if (window_is_lbrace) {
+        if (kind == "Eof") { return ok(window_cursor) }
+        if (kind == "LBrace") {
             seen_body = true
             function_depth = function_depth + 1
-        } else if (seen_body && window_is_rbrace) {
+        } else if (seen_body && kind == "RBrace") {
             function_depth = function_depth - 1
-            if (function_depth == 0) { collecting_function = false }
+            if (function_depth == 0) { return ok(window_cursor + 1) }
         }
+        window_cursor = window_cursor + 1
     }
-    function_end = window_cursor
-    if (window_is_eof) { function_end = function_end - 1 }
-    return ok(function_end)
+    RejectAt(eof.clone(), "invalid_token_stream", "function inspection escaped the token stream")?
+    return ok(window_cursor)
 }
 
 // Read one named function declaration followed by exactly one EOF sentinel.

@@ -2409,7 +2409,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let direct_body_while_source =
         "fn f() { before; while (looping) { if (ready) { inner; } } after; }";
 
-    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { Node, Arena, AstCanonical, ParseOutput } from \"../stage2/ast.ku\"\nimport { ParseModule, ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ReadFunction } from \"./functions.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
+    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { Node, Arena, AstCanonical, ParseOutput } from \"../stage2/ast.ku\"\nimport { ParseModule, ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ModuleFunctionEnd, ReadFunction } from \"./functions.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
@@ -2558,6 +2558,26 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
     ));
     body.push_str(
         "    callback_function_tokens = Scan(\"fn f() { x }\")?\n    ExpectFunctionCallbackOutputError(callback_function_tokens)?\n",
+    );
+    body.push_str(
+        r#"    inspection_tokens = Scan("fn a() { if (true) {} } fn b() {}")?
+    inspection_eof = inspection_tokens[inspection_tokens.len() - 1].clone()
+    first_end = ModuleFunctionEnd(inspection_tokens, 0, inspection_eof)?
+    second_end = ModuleFunctionEnd(inspection_tokens, first_end, inspection_eof)?
+    if (inspection_tokens[first_end].kind != "Fn" || inspection_tokens[second_end].kind != "Eof") {
+        panic("module function inspection did not stop at the matching brace")
+    }
+    exhausted_tokens: [Token] = [inspection_tokens[0].clone()]
+    inspection_failed = false
+    try { ModuleFunctionEnd(exhausted_tokens, 0, inspection_eof)? } catch(err) {
+        inspection_failed = true
+        expected = "error|bootstrap.parser.stage3|invalid_token_stream|<source>|function inspection escaped the token stream|1:34@33..1:34@33"
+        if (err.domain != "bootstrap.parser.stage3" || err.code != "invalid_token_stream" || err.message != expected) {
+            panic("wrong exhausted module function inspection diagnostic: " + err.message)
+        }
+    }
+    if (!inspection_failed) { panic("unterminated module token stream unexpectedly returned a function boundary") }
+"#,
     );
     body.push_str(&format!(
         "    AssertCase({}, {})?\n",
