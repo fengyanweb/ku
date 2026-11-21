@@ -281,29 +281,6 @@ fn EmitLinkedBodyPrelude(&body: LinkedNullState): str! {
     return ok(declarations)
 }
 
-fn StartLinkedThunkFrame(&parent: LinkedNullState): LinkedNullState {
-    // Retain shared C requirements and dependency identities, but start the
-    // private function with its own automatic storage and error cleanup.
-    body = parent.clone()
-    body.slots = []
-    body.declarations = ""
-    body.code = ""
-    body.drops = ""
-    body.plain_value_result = false
-    body.uses_replace = false
-    body.local_readers = []
-    body.local_callbacks = []
-    body.callback_owners = []
-    body.append_slots = []
-    body.local_appends = []
-    body.append_captures = []
-    body.catch_slot = 0
-    body.catch_edges = false
-    body.catch_moved = []
-    body.moved_error_fields = []
-    return body
-}
-
 fn RestoreLinkedThunkFrame(body: LinkedNullState, &parent: LinkedNullState): LinkedNullState {
     // Dependencies, layouts and C helpers are translation-unit requirements.
     // Bindings and failure cleanup below the thunk belong solely to it.

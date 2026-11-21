@@ -3,7 +3,8 @@ import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { LinkedAppendFailureRelay, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
+import { LinkedAppendFailureRelay, RestoreLinkedThunkFrame } from "./link_plan_json_c.ku"
+import { StartLinkedThunkFrame } from "./scalar_result_null.ku"
 import { AppendLinkedArrayElement, LowerLinkedArrayBinding } from "./linked_array_fields_c.ku"
 import { LinkedLiveIntBinding, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
 import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
@@ -34,8 +35,8 @@ fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &
         expected = LinkedNullArrayElement(array.ty.clone())
         matches = SameLinkedType(element.ty, expected)
     }
-    if (!matches || (element.borrowed && (copy || element.member_path == ""))
-        || (!copy && (element.slot == 0 || element.slot == index))) {
+    if (!matches || element.borrowed && (copy || element.member_path == "")
+        || !copy && (element.slot == 0 || element.slot == index)) {
         RejectLayout("linked_move_append", "push requires one element of the declared type", element.ty.span.clone())?
     }
     if (!copy) {
@@ -246,8 +247,8 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     record_input = one_input && slots[0].value.ty.declaration_kind == "Struct"
     copy_input = one_input && LinkedIntResult(slots[0].value.ty)
     int_result = LinkedIntResult(parameters.result) || LinkedNullIntArrayOwner(parameters.result)
-    if (parameters.state.plain_value_result || (!nullary && !record_input && !copy_input &&
-        (!int_result || slots.len() == 0 || slots.len() > 8))) {
+    if (parameters.state.plain_value_result || !nullary && !record_input && !copy_input &&
+        (!int_result || slots.len() == 0 || slots.len() > 8)) {
         RejectLocalCapture(function, "a local append function requires int! or [int]! with one to eight arguments, or null! with zero arguments, one int or one owned record")?
     }
     // Direct synchronous calls use the ordinary owning argument slots.

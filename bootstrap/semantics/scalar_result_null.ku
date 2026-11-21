@@ -1,6 +1,7 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
+import { LinkedNullState, NewLinkedNullState } from "./link_plan_c.ku"
 import { ContainsType } from "./struct_projection_c.ku"
 import { RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { ScalarIntParameter } from "./scalar_int_emit.ku"
@@ -221,6 +222,43 @@ struct LinkedCatchParts {
     protected: Node
     binding: Node
     recovery: Node
+}
+
+fn StartLinkedThunkFrame(&parent: LinkedNullState): LinkedNullState {
+    // Keep the accumulated C requirements and bound identities. The new
+    // frame starts with independent locals, code and failure bookkeeping.
+    body = NewLinkedNullState()
+    body.layouts = parent.layouts.clone()
+    body.owning_layouts = parent.owning_layouts.clone()
+    body.owning_strings = parent.owning_strings
+    body.links = parent.links.clone()
+    body.callback_helpers = parent.callback_helpers.clone()
+    body.uses_scoped_reader = parent.uses_scoped_reader
+    body.local_append_types = parent.local_append_types.clone()
+    body.uses_clone = parent.uses_clone
+    body.uses_int_snapshot = parent.uses_int_snapshot
+    body.uses_str_snapshot = parent.uses_str_snapshot
+    body.arrays = parent.arrays.clone()
+    body.validated_arrays = parent.validated_arrays.clone()
+    body.owned_arrays = parent.owned_arrays.clone()
+    body.uses_str_array = parent.uses_str_array
+    body.uses_str_view = parent.uses_str_view
+    body.uses_struct_view = parent.uses_struct_view
+    body.element_clones = parent.element_clones.clone()
+    body.uses_index = parent.uses_index
+    body.checks_str_item = parent.checks_str_item
+    body.uses_add = parent.uses_add
+    body.uses_sub = parent.uses_sub
+    body.uses_mul = parent.uses_mul
+    body.uses_div = parent.uses_div
+    body.uses_string_equal = parent.uses_string_equal
+    body.uses_print = parent.uses_print
+    body.uses_concat = parent.uses_concat
+    body.uses_int_format = parent.uses_int_format
+    body.uses_prefix_suffix = parent.uses_prefix_suffix
+    body.uses_string_contains = parent.uses_string_contains
+    body.uses_chars = parent.uses_chars
+    return body
 }
 
 fn ReadLinkedCatchParts(&named: NamedModule, &node: Node): LinkedCatchParts! {
