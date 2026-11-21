@@ -282,11 +282,27 @@ fn CloneNested(): int! {
     }
     return ok(0)
 }
+fn CloneRows(): int! {
+    name = "task" + str(6)
+    rows: [Slot] = [Slot { name: name, live: true }]
+    source = Pool { slots: rows, note: "active" }
+    copy = source.clone()
+    source.slots[0].name = "finished"
+    if (copy.slots[0].name == "task6" && copy.slots[0].live && source.slots[0].name == "finished") {
+        return ok(56)
+    }
+    return ok(0)
+}
 ''', encoding="utf-8")
     manifest = caller / "owners.txt"
     manifest.write_text("owners.ku\n", encoding="utf-8")
     linker = Path(__file__).resolve().parents[1] / "link_c.py"
-    cases = {"Replace": [("", 15)], "Recover": [("false", 11), ("true", 29)], "CloneNested": [("", 38)]}
+    cases = {
+        "Replace": [("", 15)],
+        "Recover": [("false", 11), ("true", 29)],
+        "CloneNested": [("", 38)],
+        "CloneRows": [("", 56)],
+    }
     for name, expected in cases.items():
         plan = caller / f"{name}.plan.json"
         code = caller / f"{name}.c"

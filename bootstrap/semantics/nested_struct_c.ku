@@ -3,7 +3,8 @@ import { SuppliedModule } from "./imports.ku"
 import { DeclarationSpan } from "./names.ku"
 import { ProjectBindings } from "./project_bindings.ku"
 import { IsBuiltinType, TypeNameBinding } from "./type_names.ku"
-import { CollectOwningFields, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
+import { CollectOwningFields, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
+import { EmitLinkedFlatRecordArrayClone } from "./scalar_int_emit.ku"
 import { ContainsIndex, ContainsType, CTypeName, EmitLayout, EmitOwningLayout, ProjectionArrayHeader, ProjectionHeaders, StringField, StructArrayTypeName } from "./struct_projection_c.ku"
 
 struct CStructMetrics {
@@ -241,22 +242,6 @@ fn OrderProjectOwningLayouts(&layouts: [StructLayout], unit: int, declaration: i
     return orderCLayouts(layouts, unit, declaration, at, true)
 }
 
-fn SnapshotOwningLayoutCache(&layouts: [StructLayout]): [StructLayout] {
-    snapshot: [StructLayout] = []
-    count = layouts.len()
-    index = 0
-    while (index < count) {
-        name = layouts[index].name.clone()
-        unit = layouts[index].module_index
-        declaration = layouts[index].node
-        fields = layouts[index].fields.clone()
-        item = StructLayout { name: name, module_index: unit, node: declaration, fields: fields }
-        snapshot = snapshot.push(item)
-        index = index + 1
-    }
-    return snapshot
-}
-
 fn OwningLayoutDropName(module_index: int, declaration: int): str {
     return "ku_drop_" + CTypeName(module_index, declaration)
 }
@@ -309,8 +294,11 @@ fn CanCloneNestedStringArrays(&layouts: [StructLayout], index: int): bool {
     field_index = 0
     while (field_index < field_count) {
         field = layouts[index - 1].fields[field_index].resolved.clone()
-        if (field.declaration_kind == "StructArray"
-            || (field.declaration_kind == "BuiltinArray" && field.name != "str")) { return false }
+        if (field.declaration_kind == "BuiltinArray" && field.name != "str") { return false }
+        if (field.declaration_kind == "StructArray") {
+            child = LayoutIndex(layouts, field.module_index, field.declaration_node)
+            if (child == 0 || HasBoundArrayMembers(layouts, child)) { return false }
+        }
         if (field.declaration_kind == "Struct"
             && !CanCloneNestedStringArrays(layouts, LayoutIndex(layouts, field.module_index, field.declaration_node))) {
             return false
@@ -364,13 +352,60 @@ fn EmitOwnedStringArrayClone(&prefix: str, &clone_string: str): str {
         + "        ++out->len;\n    }\n    return true;\n}\n\n"
 }
 
-fn EmitLinkedStringArrayElementClone(&layouts: [StructLayout], index: int, &prefix: str): str {
+struct OwnedRecordArrayMember {
+    path: str
+    layout: int
+    array_type: str
+}
+
+fn collectOwnedRecordArrays(&layouts: [StructLayout], index: int, &prefix: str,
+                            collected: [OwnedRecordArrayMember]): [OwnedRecordArrayMember] {
+    members = collected
+    count = layouts[index - 1].fields.len()
+    field_index = 0
+    while (field_index < count) {
+        field = layouts[index - 1].fields[field_index].resolved.clone()
+        if (field.declaration_kind == "StructArray" || field.declaration_kind == "Struct") {
+            child = LayoutIndex(layouts, field.module_index, field.declaration_node)
+            path = prefix.clone() + ".f" + str(field_index)
+            if (field.declaration_kind == "StructArray") {
+                header = StructArrayTypeName(field)
+                members = members.push(OwnedRecordArrayMember { path: path, layout: child, array_type: header })
+            } else {
+                members = collectOwnedRecordArrays(layouts, child, path, members)
+            }
+        }
+        field_index = field_index + 1
+    }
+    return members
+}
+
+fn EmitLinkedManagedElementClone(&layouts: [StructLayout], index: int, &prefix: str): str {
     strings = CollectOwnedMemberPaths(layouts, index, "", [], false)
     arrays = CollectOwnedMemberPaths(layouts, index, "", [], true)
+    empty: [OwnedRecordArrayMember] = []
+    records = collectOwnedRecordArrays(layouts, index, "", empty)
     element = CTypeName(layouts[index - 1].module_index, layouts[index - 1].node)
     drop = OwningLayoutDropName(layouts[index - 1].module_index, layouts[index - 1].node)
     clone_string = prefix.clone() + "_clone_string"
-    text = EmitProjectionCloneString(clone_string) + EmitOwnedStringArrayClone(prefix, clone_string)
+    needs_string = strings.len() > 0 || arrays.len() > 0
+    record_helpers = ""
+    count = records.len()
+    field = 0
+    while (field < count) {
+        child = records[field].layout
+        child_type = CTypeName(layouts[child - 1].module_index, layouts[child - 1].node)
+        child_drop = OwningLayoutDropName(layouts[child - 1].module_index, layouts[child - 1].node)
+        leaves = CollectOwnedMemberPaths(layouts, child, "", [], false)
+        needs_string = needs_string || leaves.len() > 0
+        helper = prefix.clone() + "_clone_records_" + str(field)
+        record_helpers += EmitLinkedFlatRecordArrayClone(helper, records[field].array_type, child_type, child_drop, clone_string, leaves)
+        field = field + 1
+    }
+    text = ""
+    if (needs_string) { text += EmitProjectionCloneString(clone_string) }
+    if (arrays.len() > 0) { text += EmitOwnedStringArrayClone(prefix, clone_string) }
+    text += record_helpers
     text += "static bool " + prefix.clone() + "_clone_element(const " + element.clone()
         + " *source, " + element.clone() + " *out, bool *invalid) {\n    " + element + " copy = *source;\n"
     // No shallow owners may remain when cleanup becomes reachable.
@@ -385,6 +420,11 @@ fn EmitLinkedStringArrayElementClone(&layouts: [StructLayout], index: int, &pref
         field = field + 1
     }
     field = 0
+    while (field < count) {
+        text += "    copy" + records[field].path.clone() + " = (" + records[field].array_type.clone() + "){0};\n"
+        field = field + 1
+    }
+    field = 0
     while (field < strings.len()) {
         path = strings[field].clone()
         text += "    if (!" + prefix.clone() + "_clone_string((*source)" + path.clone() + ", &copy" + path + ")) goto discard;\n"
@@ -394,6 +434,13 @@ fn EmitLinkedStringArrayElementClone(&layouts: [StructLayout], index: int, &pref
     while (field < arrays.len()) {
         path = arrays[field].clone()
         text += "    if (!" + prefix.clone() + "_clone_strings(&(*source)" + path.clone() + ", &copy" + path + ", invalid)) goto discard;\n"
+        field = field + 1
+    }
+    field = 0
+    while (field < count) {
+        path = records[field].path.clone()
+        text += "    if (!" + prefix.clone() + "_clone_records_" + str(field) + "(&(*source)"
+            + path.clone() + ", &copy" + path + ", invalid)) goto discard;\n"
         field = field + 1
     }
     return text + "    *out = copy;\n    return true;\ndiscard:\n    " + drop + "(&copy);\n    return false;\n}\n\n"
