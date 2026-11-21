@@ -518,3 +518,10 @@ fn LinkedCPrelude(&body: LinkedNullState, guards: str): str {
 fn LinkedScalarArrayOwner(&type: TypeNameBinding): bool {
     return LinkedNullIntArrayOwner(type) || type.declaration_kind == "OwnedStringArray"
 }
+
+struct LinkedNullC {
+    symbol: str
+    links: [LinkedNullFunction]
+    source: str
+    entry_plan: LinkPlanDeclaration
+}

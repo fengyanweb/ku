@@ -1,16 +1,17 @@
 import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
-import { DeclarationSpan, IsNamedFunction, NamedModule } from "./names.ku"
+import { DeclarationSpan, IsNamedFunction } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { LinkedAppendFailureRelay, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
 import { AppendLinkedArrayElement, LowerLinkedArrayBinding } from "./linked_array_fields_c.ku"
-import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
+import { LinkedLiveIntBinding, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
 import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
+import { CloneLinkedRecordArray } from "./linked_null_read_c.ku"
 import { LowerLinkedExpectedValue, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
 fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, index: int): LinkedNullState! {
@@ -93,7 +94,7 @@ struct LinkedForLoop {
     before: int
 }
 
-fn OpenLinkedFreshRecordFor(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
+fn OpenLinkedRecordForLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
                             source: int, id: int, depth: int): LinkedForLoop! {
     at = DeclarationSpan(statement)
     if (depth >= 32 || LinkedNullBinding(state.slots, statement.text) != 0) {
@@ -102,9 +103,15 @@ fn OpenLinkedFreshRecordFor(&project: LinkedNullProject, state: LinkedNullState,
     before = state.slots.len()
     input = LowerLinkedNullValue(project, state, source, 0)?
     owner = input.value.clone()
-    if (!LinkedNullOwnedArray(owner.ty) || owner.borrowed || owner.slot <= before || owner.member_path != ""
-        || input.state.slots[owner.slot - 1].binding != "" || LinkedMemberUnavailable(input.state, owner, true)) {
-        RejectLayout("linked_record_for_source", "expected a fresh owned record array", at)?
+    if (!LinkedNullOwnedArray(owner.ty) || owner.borrowed || owner.slot == 0 ||
+        LinkedMemberUnavailable(input.state, owner, true)) {
+        RejectLayout("linked_record_for_source", "expected a live owned record array", at)?
+    }
+    if (owner.slot <= before || owner.member_path != "" || input.state.slots[owner.slot - 1].binding != "") {
+        // The language keeps a named source usable after iteration. Move
+        // elements out of its independent snapshot, as for a fresh result.
+        input = CloneLinkedRecordArray(project, input, id)?
+        owner = input.value.clone()
     }
 
     // The checked call or clone has already admitted this private header.
@@ -135,29 +142,6 @@ fn OpenLinkedBooleanWhile(state: LinkedNullState, &statement: Node, condition: s
 "
     return ok(LinkedForLoop { state: next, outer: outer, before: before })
 }
-
-struct LinkedCatchParts {
-    protected: Node
-    binding: Node
-    recovery: Node
-}
-
-fn ReadLinkedCatchParts(&named: NamedModule, &node: Node): LinkedCatchParts! {
-    edge = node.first_edge
-    protected = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
-    handler = named.parsed.arena.nodes[named.parsed.arena.edges[edge + 1] - 1].clone()
-    if (protected.kind != "TryBody" || handler.kind != "Catch" || handler.edge_count != 2) {
-        RejectLayout("unsupported_linked_catch", "expected a protected body and named catch", DeclarationSpan(node))?
-    }
-    edge = handler.first_edge
-    binding = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
-    recovery = named.parsed.arena.nodes[named.parsed.arena.edges[edge + 1] - 1].clone()
-    if (binding.kind != "CatchBinding" || binding.text == "" || binding.edge_count != 0 || recovery.kind != "CatchBody") {
-        RejectLayout("unsupported_linked_catch", "expected a named catch and handler body", DeclarationSpan(handler))?
-    }
-    return ok(LinkedCatchParts { protected: protected, binding: binding, recovery: recovery })
-}
-
 
 fn RejectLocalCapture(&node: Node, message: str): null! {
     return RejectLayout("unsupported_linked_local_capture", message, DeclarationSpan(node))
@@ -406,4 +390,17 @@ fn StoreLinkedCopyAssignment(&destination: LinkedNullSlot, value: LinkedNullExpr
     next = value.state
     next.code += "    " + destination.value.text + " = " + value.value.text + ";\n"
     return ok(next)
+}
+
+fn ValidLinkedCountedStart(&project: LinkedNullProject, &state: LinkedNullState, id: int, slot: int, named_bound: bool): bool {
+    initial = LinkedNullNode(project, 1, id)
+    if (initial.kind == "Int" && initial.edge_count == 0 && initial.int_value == 0) { return true }
+    if (!named_bound) { return false }
+    if (initial.kind == "Binary" && initial.text == "+" && initial.edge_count == 2) {
+        offset = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 1))
+        if (offset.kind != "Int" || offset.edge_count != 0 || offset.int_value < 0) { return false }
+        initial = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 0))
+    }
+    input = LinkedLiveIntBinding(state, initial)
+    return input > 0 && input != slot
 }

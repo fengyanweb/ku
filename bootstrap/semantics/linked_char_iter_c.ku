@@ -16,7 +16,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { LinkedBooleanWhileCondition, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
-import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedFreshRecordFor, ReadLinkedLocalCaptures, RejectLocalCapture } from "./linked_owner_assignment_c.ku"
+import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedRecordForLoop, ReadLinkedLocalCaptures, RejectLocalCapture } from "./linked_owner_assignment_c.ku"
 
 struct LinkedLocalThunk {
     result: TypeNameBinding
@@ -261,13 +261,16 @@ fn OpenLinkedForLoop(&project: LinkedNullProject, state: LinkedNullState, &state
     if (statement.edge_count != 0) {
         source_id = LinkedNullChild(project, 1, statement, 0)
         source = LinkedNullNode(project, 1, source_id)
-        if (source.kind == "TryUnwrap" || (source.kind == "Call" && ProjectionCloneSource(
+        if (source.kind == "Field" || source.kind == "TryUnwrap" || (source.kind == "Call" && ProjectionCloneSource(
             project.supplied[0].named.parsed.arena.nodes, project.supplied[0].named.parsed.arena.edges, source_id) != 0)) {
-            return OpenLinkedFreshRecordFor(project, state, statement, source_id, id, depth)
+            return OpenLinkedRecordForLoop(project, state, statement, source_id, id, depth)
         }
         if (source.kind == "Variable" && source.edge_count == 0) {
             slot = LinkedNullBinding(state.slots, source.text)
             if (slot != 0) {
+                if (LinkedNullOwnedArray(state.slots[slot - 1].value.ty)) {
+                    return OpenLinkedRecordForLoop(project, state, statement, source_id, id, depth)
+                }
                 if (LinkedNullIntArrayOwner(state.slots[slot - 1].value.ty)) {
                     return openLinkedIntLoop(project, state, statement, slot, id, depth)
                 }
@@ -320,19 +323,6 @@ fn CloseLinkedForLoop(loop: LinkedNullRegion, &outer: [LinkedNullSlot], before: 
     }
     state.code += "    }\n"
     return ok(DropLinkedNullScope(state, before))
-}
-
-fn ValidLinkedCountedStart(&project: LinkedNullProject, &state: LinkedNullState, id: int, slot: int, named_bound: bool): bool {
-    initial = LinkedNullNode(project, 1, id)
-    if (initial.kind == "Int" && initial.edge_count == 0 && initial.int_value == 0) { return true }
-    if (!named_bound) { return false }
-    if (initial.kind == "Binary" && initial.text == "+" && initial.edge_count == 2) {
-        offset = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 1))
-        if (offset.kind != "Int" || offset.edge_count != 0 || offset.int_value < 0) { return false }
-        initial = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 0))
-    }
-    input = LinkedLiveIntBinding(state, initial)
-    return input > 0 && input != slot
 }
 
 fn LinkedCountedInitial(&project: LinkedNullProject, &state: LinkedNullState, &region: Node,

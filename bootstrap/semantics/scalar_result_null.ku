@@ -1,5 +1,5 @@
 import { Node } from "../stage2/ast.ku"
-import { DeclarationSpan } from "./names.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
 import { ContainsType } from "./struct_projection_c.ku"
 import { RejectLayout, StructLayout } from "./struct_layouts.ku"
@@ -215,4 +215,26 @@ fn LowerManagedRecordError(&nodes: [Node], &edges: [int], &bindings: [GuardBindi
     }
     prep.setup = prep.setup + indent.clone() + "goto cleanup;\n"
     return ok(ManagedErrorEmission { prep: prep, declarations: declarations, after_cleanup: finish })
+}
+
+struct LinkedCatchParts {
+    protected: Node
+    binding: Node
+    recovery: Node
+}
+
+fn ReadLinkedCatchParts(&named: NamedModule, &node: Node): LinkedCatchParts! {
+    edge = node.first_edge
+    protected = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
+    handler = named.parsed.arena.nodes[named.parsed.arena.edges[edge + 1] - 1].clone()
+    if (protected.kind != "TryBody" || handler.kind != "Catch" || handler.edge_count != 2) {
+        RejectLayout("unsupported_linked_catch", "expected a protected body and named catch", DeclarationSpan(node))?
+    }
+    edge = handler.first_edge
+    binding = named.parsed.arena.nodes[named.parsed.arena.edges[edge] - 1].clone()
+    recovery = named.parsed.arena.nodes[named.parsed.arena.edges[edge + 1] - 1].clone()
+    if (binding.kind != "CatchBinding" || binding.text == "" || binding.edge_count != 0 || recovery.kind != "CatchBody") {
+        RejectLayout("unsupported_linked_catch", "expected a named catch and handler body", DeclarationSpan(handler))?
+    }
+    return ok(LinkedCatchParts { protected: protected, binding: binding, recovery: recovery })
 }
