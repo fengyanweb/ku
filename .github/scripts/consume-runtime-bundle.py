@@ -1447,6 +1447,17 @@ def installed_build_interrupt_consumer(install, root, repo, env, manifest, repor
     detail['status'] = 'passed'
 
 
+def installed_array_store_consumer(install, root, repo, env, report, target):
+    fixture = (repo / 'tests/native_collection_test.rs').read_text(encoding='utf-8')
+    case = re.search(r'const RECEIVER_ORDER_SOURCE: &str = r#"\n(.*?)\n"#;', fixture, re.S)
+    if case is None:
+        raise RuntimeError('installed array store fixture is missing')
+    source = case[1] + '\n'
+    detail = validate_installed_relative_program(install, root / 'array-store-project', env, target,
+                                                 {'main.ku': source}, 'collection-order-ok\n')
+    report['installed_array_store'] = dict(detail, source_sha256=hashlib.sha256(source.encode('utf-8')).hexdigest())
+
+
 def run_structured_only(args, report):
     """Check the structured Task and declaration examples from a verified installed archive."""
     repo = args.repo.resolve()
@@ -1509,6 +1520,7 @@ def run_structured_only(args, report):
         installed_task_error_consumer(install, root, env, report, target)
         installed_task_optional_consumer(install, root, env, report, target)
         installed_pattern_capture_consumer(install, root, env, report, target)
+        installed_array_store_consumer(install, root, repo, env, report, target)
     report.update(status='passed', backend_equivalence=True, owned_temp_removed=not root.exists())
 
 
