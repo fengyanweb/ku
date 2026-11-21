@@ -1203,3 +1203,85 @@ int main(void) {
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
     }
 }
+
+pub(super) fn assert_named_counted_bound(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("counted-int-bound.ku"),
+        r#"struct CountResult { value: int }
+fn Count(&available: [int], skip: int): CountResult! {
+    work_limit = available.len() - skip
+    cursor = 0
+    while (cursor < work_limit) { cursor = cursor + 1 }
+    return ok(CountResult { value: cursor })
+}
+fn MutableBound(start: int): null! {
+    work_limit = start
+    cursor = 0
+    while (cursor < work_limit) {
+        if (cursor == 1) { work_limit = work_limit + 1 }
+        cursor = cursor + 1
+    }
+    return ok(null)
+}
+fn MutableCursor(start: int): null! {
+    work_limit = start
+    cursor = 0
+    while (cursor < work_limit) {
+        if (cursor == 1) { cursor = cursor - 1 }
+        cursor = cursor + 1
+    }
+    return ok(null)
+}
+fn SameBinding(): null! {
+    cursor = 0
+    while (cursor < cursor) { cursor = cursor + 1 }
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "counted-int-bound.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Count").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let definition = code
+        .lines()
+        .find(|line| line.contains(" ku_linked_null_"))
+        .unwrap();
+    let (result, entry) = definition.split_once(' ').unwrap();
+    let entry = entry.split_once('(').unwrap().0;
+    let host = r#"
+int main(void) {
+    int64_t data[] = {1, 2, 3};
+    KuArrayInt available = {3, data, 3};
+    __RESULT__ result = __ENTRY__(&available, 1);
+    assert(result.ok && result.value.f0 == 2);
+    result = __ENTRY__(&available, 3);
+    assert(result.ok && result.value.f0 == 0);
+    result = __ENTRY__(&available, INT64_MAX);
+    assert(result.ok && result.value.f0 == 0);
+    assert(available.data == data && available.len == 3);
+    return 0;
+}
+"#
+    .replace("__RESULT__", result)
+    .replace("__ENTRY__", entry);
+    let c = cwd.join("counted-int-bound.c");
+    let app = cwd.join(format!("counted-int-bound{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
+    compile_projection(&c, &app, cwd);
+    assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+    for (function, diagnostic) in [
+        ("MutableBound", "linked_loop_bound_write"),
+        ("MutableCursor", "linked_loop_cursor_write"),
+        ("SameBinding", "linked_loop_bound_cursor"),
+    ] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}

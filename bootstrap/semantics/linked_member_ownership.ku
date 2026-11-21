@@ -260,12 +260,22 @@ fn LinkedNullArrayLimitName(&project: LinkedNullProject, node_id: int): str {
     return receiver.text
 }
 
+fn LinkedLiveIntBinding(&state: LinkedNullState, &node: Node): int {
+    if (node.kind != "Variable" || node.edge_count != 0) { return 0 }
+    slot = LinkedNullBinding(state.slots, node.text)
+    if (slot == 0 || !state.slots[slot - 1].live || state.slots[slot - 1].value.borrowed) { return 0 }
+    ty = state.slots[slot - 1].value.ty.clone()
+    if (ty.declaration_kind == "Builtin" && ty.name == "int") { return slot }
+    return 0
+}
+
 fn LinkedCountBound(&project: LinkedNullProject, &state: LinkedNullState, id: int): bool! {
+    member = LinkedNullNode(project, 1, id)
+    if (LinkedLiveIntBinding(state, member) != 0) { return ok(true) }
     array = LinkedNullBinding(state.slots, LinkedNullArrayLimitName(project, id))
     if (array > 0) {
         return ok(LinkedNullReadableArray(state.slots[array - 1].value.ty))
     }
-    member = LinkedNullNode(project, 1, id)
     array_member = false
     if (member.kind == "Call" && member.edge_count == 1) {
         method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, member, 0))
@@ -305,7 +315,7 @@ fn linkedCountedBoundWrite(&node: Node, &name: str): bool {
     return (node.kind == "Assign" || node.kind == "VarDecl") && node.text == name
 }
 
-fn rejectLinkedLoopWrite(&project: LinkedNullProject, &loop: Node, &name: str, code: str, message: str): null! {
+fn RejectLinkedLoopWrite(&project: LinkedNullProject, &loop: Node, &name: str, code: str, message: str): null! {
     // The checked AST is contiguous and in post-order. This region includes
     // all nested writes before the terminal cursor update.
     end = LinkedNullChild(project, 1, loop, loop.edge_count - 1)
@@ -322,41 +332,26 @@ fn rejectLinkedLoopWrite(&project: LinkedNullProject, &loop: Node, &name: str, c
 fn CheckLinkedCountedBoundWrites(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node): null! {
     guard_id = LinkedNullChild(project, 1, loop, 0)
     guard = LinkedNullNode(project, 1, guard_id)
-    name = LinkedNullArrayLimitName(project, LinkedNullChild(project, 1, guard, 1))
+    bound_id = LinkedNullChild(project, 1, guard, 1)
+    bound = LinkedNullNode(project, 1, bound_id)
+    if (LinkedLiveIntBinding(state, bound) != 0) {
+        cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
+        if (cursor.text == bound.text) {
+            RejectLayout("linked_loop_bound_cursor", "counted cursor and named int bound must be distinct", DeclarationSpan(guard))?
+        }
+        // A stable signed upper bound and a strictly smaller cursor make the
+        // terminal unit increment finite and safe on every reached iteration.
+        RejectLinkedLoopWrite(project, loop, bound.text, "linked_loop_bound_write", "a counted loop cannot rebind its named int bound")?
+        return RejectLinkedLoopWrite(project, loop, cursor.text, "linked_loop_cursor_write", "a counted loop can change its cursor only at the end")
+    }
+    name = LinkedNullArrayLimitName(project, bound_id)
     slot = LinkedNullBinding(state.slots, name)
     if (slot == 0) { return ok(null) }
     ty = state.slots[slot - 1].value.ty.clone()
     if (!LinkedNullOwnedArray(ty) && !LinkedNullIntArrayOwner(ty)) { return ok(null) }
 
-    return rejectLinkedLoopWrite(project, loop, name, "linked_loop_bound_write",
+    return RejectLinkedLoopWrite(project, loop, name, "linked_loop_bound_write",
         "a counted loop cannot rebind its owned array length source")
-}
-
-fn LinkedCountdownIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &step: Node): int! {
-    guard = LinkedNullNode(project, 1, LinkedNullChild(project, 1, loop, 0))
-    if (guard.kind != "Binary" || guard.text != ">" || guard.edge_count != 2) { return ok(0) }
-    zero = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 1))
-    if (zero.kind != "Int" || zero.int_value != 0 || zero.edge_count != 0) { return ok(0) }
-    cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
-    slot = LinkedNullBinding(state.slots, cursor.text)
-    at = DeclarationSpan(step)
-    if (cursor.kind != "Variable" || cursor.edge_count != 0 || slot == 0 || !state.slots[slot - 1].live
-        || state.slots[slot - 1].value.ty.declaration_kind != "Builtin" || state.slots[slot - 1].value.ty.name != "int"
-        || step.kind != "Assign" || step.edge_count != 1 || step.text != cursor.text) {
-        RejectLayout("unsupported_linked_countdown", "countdown requires a live int cursor and its final assignment", at.clone())?
-    }
-    changed = LinkedNullNode(project, 1, LinkedNullChild(project, 1, step, 0))
-    if (changed.kind != "Binary" || changed.text != "-" || changed.edge_count != 2) {
-        RejectLayout("unsupported_linked_countdown", "countdown must end with a unit decrement", at.clone())?
-    }
-    previous = LinkedNullNode(project, 1, LinkedNullChild(project, 1, changed, 0))
-    one = LinkedNullNode(project, 1, LinkedNullChild(project, 1, changed, 1))
-    if (previous.kind != "Variable" || previous.edge_count != 0 || previous.text != cursor.text
-        || one.kind != "Int" || one.edge_count != 0 || one.int_value != 1) {
-        RejectLayout("unsupported_linked_countdown", "countdown must end with a unit decrement", at.clone())?
-    }
-    rejectLinkedLoopWrite(project, loop, cursor.text, "linked_loop_cursor_write", "countdown can change its cursor only at the end")?
-    return ok(slot)
 }
 
 fn EmitLinkedMultiplyDivide(state: LinkedNullState, &node: Node, id: int,

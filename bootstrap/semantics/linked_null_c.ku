@@ -1,6 +1,6 @@
-import { AddLinkedNullSlot, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, LinkedCountdownIndex, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
 import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
-import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedCountdownIndex, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedPlainReturn } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -101,11 +101,11 @@ fn countedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Nod
     guard = LinkedNullNode(project, 1, LinkedNullChild(project, 1, loop, 0))
     if (guard.kind != "Binary" || guard.edge_count != 2 || guard.text != "<" ||
         !LinkedCountBound(project, state, LinkedNullChild(project, 1, guard, 1))?) {
-        RejectLayout("unsupported_linked_loop", "counted while requires a readonly array length or direct int field bound", DeclarationSpan(guard))?
+        RejectLayout("unsupported_linked_loop", "counted while requires a readonly array length or stable int bound", DeclarationSpan(guard))?
     }
     left = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
-    slot = LinkedNullBinding(state.slots, left.text)
-    if (left.kind != "Variable" || left.edge_count != 0 || slot == 0 || state.slots[slot - 1].value.ty.name != "int" ||
+    slot = LinkedLiveIntBinding(state, left)
+    if (slot == 0 ||
         initial.kind != "Assign" || initial.edge_count != 1 || initial.text != left.text ||
         step.kind != "Assign" || step.edge_count != 1 || step.text != left.text) {
         RejectLayout("unsupported_linked_loop", "counted while requires one distinct int cursor", DeclarationSpan(loop))?
