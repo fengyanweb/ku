@@ -55,6 +55,7 @@ struct LinkedNullSlot {
     binding: str
     value: LinkedNullValue
     parameter: bool
+    source_parameter: bool
     live: bool
     moved_members: [str]
 }
@@ -369,9 +370,9 @@ fn LinkedRecordFields(&layouts: [StructLayout], &managed: [StructLayout], &type:
 }
 
 fn LinkedNullOwner(&binding: TypeNameBinding): bool {
-    return binding.declaration_kind == "Struct" || binding.declaration_kind == "CaughtError" || binding.declaration_kind == "OwnedStringArray"
-        || (binding.declaration_kind == "Builtin" && (binding.name == "str" || binding.name == "bytes"))
-        || LinkedNullOwnedArray(binding) || LinkedNullIntArrayOwner(binding)
+    return binding.declaration_kind == "Struct" || binding.declaration_kind == "CaughtError"
+        || binding.declaration_kind == "Builtin" && (binding.name == "str" || binding.name == "bytes")
+        || LinkedNullOwnedArray(binding) || LinkedScalarArrayOwner(binding)
 }
 
 fn LinkedFailureTarget(&state: LinkedNullState): str {
@@ -403,7 +404,7 @@ fn BindLinkedLocalCallback(state: LinkedNullState, name: str, ty: TypeNameBindin
     next = state
     index = next.slots.len() + 1
     value = LinkedNullValue { ty: ty, text: text, slot: index, borrowed: true, member_path: "" }
-    next.slots = next.slots.push(LinkedNullSlot { binding: name, value: value, parameter: false, live: true, moved_members: [] })
+    next.slots = next.slots.push(LinkedNullSlot { binding: name, value: value, parameter: false, source_parameter: false, live: true, moved_members: [] })
     next.local_callbacks = next.local_callbacks.push(index)
     return next
 }

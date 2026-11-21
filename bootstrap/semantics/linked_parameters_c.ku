@@ -273,7 +273,8 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
         value.text = "(*" + name.clone() + ")"
         next.code += LinkedNullResultCleanupReference(next.owning_layouts, value.ty)
     }
-    next.slots = next.slots.push(LinkedNullSlot { binding: binding, value: value.clone(), parameter: parameter, live: parameter, moved_members: [] })
+    next.slots = next.slots.push(LinkedNullSlot { binding: binding, value: value.clone(), parameter: parameter,
+        source_parameter: parameter, live: parameter, moved_members: [] })
     if (!parameter) { next.declarations = next.declarations + "    " + kind + " " + name + " = {0};\n" }
     if (!view) { next.drops = LinkedNullDropC(next.layouts, next.owning_layouts, value.ty, value.text) + next.drops }
     return ok(LinkedNullExpression { state: next, value: value })

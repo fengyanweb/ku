@@ -248,6 +248,56 @@ int main(void) {{
     assert b"checked bool requires the KuBootstrapResult_bool carrier" in rejected.stderr
 
 
+def exercise_parameter_bindings(compiler, cc, caller):
+    source = caller / "parameter-binding.ku"
+    manifest = caller / "parameter-binding.txt"
+    manifest.write_text(source.name + "\n", encoding="utf-8")
+    direct = [
+        "fn Check(value: int): null! { value = value + 1; return ok(null) }",
+        "fn Check(value: [int]): null! { value = value.push(42); return ok(null) }",
+        'fn Check(value: str): null! { value += "suffix"; return ok(null) }',
+    ]
+    nested = [
+        "fn Check(value: int): null! { local = value; while (value > 0) { value = value - 1 }; return ok(null) }",
+        'fn Check(value: str): null! { if (true) { value += "suffix" }; return ok(null) }',
+    ]
+    diagnostic = b"cannot assign to immutable parameter 'value'"
+    for body in direct + nested:
+        source.write_text(body + "\n", encoding="utf-8")
+        for command, entry in (("emit-unit", "Check"), ("emit-unit-plan", "Check")):
+            result = execute([compiler, command, manifest, entry], caller, 1)
+            assert not result.stdout and diagnostic in result.stderr, result.stderr
+        if body in direct:
+            for command, path in (("check", source), ("check-project", manifest)):
+                result = execute([compiler, command, path], caller, 1)
+                assert not result.stdout and diagnostic in result.stderr, result.stderr
+    source.write_text('''\
+fn Check(value: int): int! {
+    local = value
+    while (local > 0) { local = local - 1 }
+    return ok(local)
+}
+''', encoding="utf-8")
+    execute([compiler, "check-project", manifest], caller)
+    plan = caller / "parameter-binding.json"
+    code = caller / "parameter-binding.c"
+    plan.write_bytes(execute([compiler, "emit-unit-plan", manifest, "Check"], caller).stdout)
+    code.write_bytes(execute([compiler, "emit-unit", manifest, "Check"], caller).stdout)
+    entry = json.loads(plan.read_bytes())["export"]
+    host = caller / "parameter-binding-host.c"
+    host.write_text(f'''
+int main(void) {{
+    KuBootstrapResult_int64_t result = {entry["symbol"]}(3);
+    return !(result.ok && result.value == 0);
+}}
+''', encoding="ascii")
+    linker = Path(__file__).resolve().parents[1] / "link_c.py"
+    program = caller / ("parameter-binding.exe" if os.name == "nt" else "parameter-binding")
+    execute([sys.executable, "-B", linker, "--cc", cc, "--unit", plan, code,
+             "--entry", entry["source_path"], str(entry["node"]), "--caller", host, "-o", program], caller)
+    execute([program], caller)
+
+
 def exercise_owned_recovery(compiler, cc, caller):
     (caller / "owners.ku").write_text('''\
 struct Slot { name: str, live: bool }
@@ -405,6 +455,7 @@ def exercise(ku, cc):
         exercise_emitted(cc, emitted, caller, "derived", b"(41)", b"42")
         exercise_project(compiler, cc, root, caller)
         exercise_checked_bool(compiler, cc, caller)
+        exercise_parameter_bindings(compiler, cc, caller)
         exercise_owned_recovery(compiler, cc, caller)
         print("bootstrap argv, module checks, signature and standalone C verified")
 

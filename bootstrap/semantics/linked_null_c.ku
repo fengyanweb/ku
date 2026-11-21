@@ -1,6 +1,6 @@
 import { LinkedCharacterSource } from "./struct_string_calls.ku"
 import { RegisterLinkedLocalRead } from "./linked_array_fields_c.ku"
-import { RequireLinkedMutableName } from "./call_contracts.ku"
+import { RequireLinkedMutableBinding } from "./call_contracts.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, ReadLinkedNullParameters } from "./linked_parameters_c.ku"
 import { OpenLinkedForLoop, OpenLinkedConditionalWhile, CloseLinkedForLoop, LinkedCountdownIndex, LinkedCountedInitial, ReadLinkedLocalThunk, FinishLinkedLocalThunk, LowerLinkedLocalAlias, LowerLinkedCopyRebind, LowerLinkedPredicate, LowerLinkedCharacterLocal } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
@@ -117,7 +117,7 @@ fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statemen
     countdown = LinkedCountdownIndex(project, state, statement, step)?
     cursor = countdown
     if (cursor == 0) { cursor = countedIndex(project, state, statement, initial, step)? }
-    RequireLinkedMutableName(state.slots[cursor - 1].binding, DeclarationSpan(step))?
+    RequireLinkedMutableBinding(state.slots[cursor - 1].binding, state.slots[cursor - 1].source_parameter, DeclarationSpan(step))?
     outer = state.slots.clone()
     next = state
     next.code = next.code + "    while (true) {\n"
@@ -256,7 +256,9 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             next = caught.state
         } else if (statement.kind == "Assign" && statement.edge_count == 1) {
             slot = LinkedNullBinding(next.slots, statement.text)
-            if (slot != 0) { RequireLinkedMutableName(statement.text, DeclarationSpan(statement))? }
+            if (slot != 0) {
+                RequireLinkedMutableBinding(statement.text, next.slots[slot - 1].source_parameter, DeclarationSpan(statement))?
+            }
             if (ContainsIndex(next.callback_owners, slot)) {
                 RejectLayout("linked_callback_owner", "a captured array must remain readable by its local callback", DeclarationSpan(statement))?
             }
@@ -271,6 +273,13 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
                 next = LowerLinkedOwnerRebind(project, next, statement)?
             }
         } else if (statement.kind == "CompoundAssign" && statement.text == "+" && statement.edge_count == 2) {
+            target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+            if (target.kind == "Variable") {
+                slot = LinkedNullBinding(next.slots, target.text)
+                if (slot > 0 && next.slots[slot - 1].source_parameter) {
+                    RequireLinkedMutableBinding(target.text, true, DeclarationSpan(statement))?
+                }
+            }
             next = LowerLinkedStringAppend(project, next, statement, id)?
         } else if (statement.kind == "AssignTarget" && statement.edge_count == 2) {
             next = LowerLinkedTargetSet(project, next, statement, id, depth)?
