@@ -67,6 +67,8 @@ Ordinary native C programs do not use `libku.rlib`. TLS, calendar and HTTP stati
 
 Synchronous native C supports object destructuring, `?.field` and capturing a `for` iteration binding. Destructuring transfers field ownership and applies defaults only to missing keys. Optional access evaluates its receiver once and preserves null. Each iteration creates a fresh captured binding. Task object operations, parameters, results, captures and finally blocks retain their documented limits. Recursive layouts and unknown callable ABIs produce explicit build errors.
 
+Synchronous native code can read a known scalar field from a local object literal and update it with a scalar expression of the same type, as in `item.title = replacement`. The object stays within the function and accesses use fixed field names. A string read yields an owned value that remains valid after the field is overwritten. See [the local object field example](../tests/fixtures/native_static_object_fields/main.ku).
+
 The source default does not imply that every interpreter feature or performance goal is complete. Capability, ownership, platform, installation and real-project acceptance retain their own evidence requirements, as do separate performance changes. Existing `ku run` and direct `.ku` execution behavior remains unchanged.
 
 ## HTTP clients and routes

@@ -573,6 +573,13 @@ impl NativeFieldFacts {
     }
 }
 
+fn is_native_object_scalar(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Int | Type::Float | Type::Bool | Type::String | Type::Null
+    )
+}
+
 fn native_field_type(ty: &Type) -> Option<TypeName> {
     Some(match ty {
         Type::Int => TypeName::Int,
@@ -791,11 +798,8 @@ impl Checker {
         if let Some(binding) = self.scopes.iter().rev().find_map(|scope| scope.get(name)) {
             // Bracket writes can change the tag without changing the checker's
             // structural type. Trust only literal bindings confined to plain field
-            // reads and same-type literal stores. Binding IDs distinguish shadowing.
-            if matches!(
-                ty,
-                Type::Int | Type::Float | Type::Bool | Type::String | Type::Null
-            ) {
+            // reads and same-type scalar stores. Binding IDs distinguish shadowing.
+            if is_native_object_scalar(ty) {
                 if let (Some(&literal), Some(ty)) = (
                     facts.literal_object_bindings.get(&binding.binding_id),
                     native_field_type(ty),
@@ -1402,17 +1406,8 @@ impl Checker {
                 } else {
                     None
                 };
-                let literal_type = match &value.kind {
-                    ExprKind::Literal(
-                        Literal::Int(_)
-                        | Literal::Float(_)
-                        | Literal::Bool(_)
-                        | Literal::String(_)
-                        | Literal::Null,
-                    ) => Some(&actual),
-                    _ => None,
-                };
-                let expected = self.check_assign_target(target, *span, literal_type)?;
+                let scalar_type = is_native_object_scalar(&actual).then_some(&actual);
+                let expected = self.check_assign_target(target, *span, scalar_type)?;
                 if !type_matches(&expected, &actual) {
                     return Err(type_error(*span, &expected, &actual));
                 }
@@ -3090,13 +3085,13 @@ impl Checker {
         &mut self,
         target: &AssignTarget,
         span: Span,
-        literal_type: Option<&Type>,
+        scalar_type: Option<&Type>,
     ) -> KuResult<Type> {
         // This exemption only covers one fixed field on the original binding.
-        // A key expression, nested destination or effectful RHS keeps the
-        // conservative invalidation, regardless of its inferred type.
-        let direct_literal_field = self.native_field_facts.is_some()
-            && literal_type.is_some()
+        // The RHS was checked first, so any escape or capture has already
+        // invalidated the binding. The new value must keep the exact scalar tag.
+        let direct_scalar_field = self.native_field_facts.is_some()
+            && scalar_type.is_some()
             && matches!(target, AssignTarget::Field { target, .. }
                 if matches!(target.kind, ExprKind::Variable(_)));
         let expected = match target {
@@ -3146,7 +3141,7 @@ impl Checker {
                 }
             }
             AssignTarget::Field { target, name } => {
-                match self.check_expr_with_field_receiver(target, None, direct_literal_field)? {
+                match self.check_expr_with_field_receiver(target, None, direct_scalar_field)? {
                     Type::Struct(struct_name) => {
                         let Some(struct_type) = self.structs.get(&struct_name) else {
                             return Err(KuError::runtime(
@@ -3174,7 +3169,7 @@ impl Checker {
             }
         }?;
         if self.native_field_facts.is_some()
-            && (!direct_literal_field || literal_type != Some(&expected))
+            && (!direct_scalar_field || scalar_type != Some(&expected))
         {
             if let Some(name) = assign_target_root_name(target) {
                 self.invalidate_native_object_binding(name);

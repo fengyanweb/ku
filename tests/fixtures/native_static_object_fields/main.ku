@@ -1,4 +1,12 @@
 fn Take(value: str): null! { println(value); return ok(null) }
+fn MakeTitle(value: str): str {
+    println("prepare title")
+    return "标题 " + value
+}
+fn Done(): bool {
+    println("prepare flag")
+    return true
+}
 fn StoreWithSameLocalName(): null! {
     item = { text: "before" }
     key = "text"
@@ -8,19 +16,23 @@ fn StoreWithSameLocalName(): null! {
 }
 fn main(): null! {
     StoreWithSameLocalName()?
-    item = { text: "清单" + "🙂", sibling: "independent", done: false, zero: 0, empty: "", absent: null }
+    item = { text: "清单" + "🙂", sibling: "before", done: false, zero: 0, empty: "", absent: null }
     Take(item.text)?
     Take(item.text)?
     println(item.text)
+    item.sibling = "independent"
     println(item.sibling)
     println(item.zero)
     println(item.empty)
     println(item.absent)
     previous = item.text
-    item.text = "完成🙂"
-    item.done = true
+    readPrevious = fn(): str { return previous.clone() }
+    replacement = MakeTitle("完成🙂")
+    item.text = replacement
+    item.done = Done()
     Take(item.text)?
-    println(previous)
+    println(item.text.len())
+    println(readPrevious())
     println(item.done)
     return ok(null)
 }

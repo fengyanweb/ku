@@ -3377,7 +3377,7 @@ fn main(): null! {
     for (scenario, statements, diagnostic) in [
         (
             "wrong-type",
-            "item.text = false",
+            "replacement = false; item.text = replacement",
             "type error: expected str but got bool",
         ),
         (
@@ -3396,8 +3396,13 @@ fn main(): null! {
             "does not support type unknown",
         ),
         (
-            "computed-value",
-            "item.text = \"after\" + \"🙂\"",
+            "rhs-mutates-captured-receiver",
+            "replace = fn(): str { item[\"text\"] = 3; return \"after\" }; item.text = replace()",
+            "does not support type unknown",
+        ),
+        (
+            "rhs-reads-unproved-field",
+            "source = { text: \"before\" }; key = \"text\"; source[key] = 3; item.text = source.text",
             "does not support type unknown",
         ),
     ] {
