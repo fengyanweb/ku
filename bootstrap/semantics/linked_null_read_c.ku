@@ -116,7 +116,8 @@ fn readLinkedIndex(&project: LinkedNullProject, state: LinkedNullState, &node: N
     return readArrayItem(array.value, index, node, id)
 }
 
-fn readArrayItem(&array: LinkedNullValue, index: LinkedNullExpression, &node: Node, id: int): LinkedNullExpression! {
+fn readArrayItem(&array: LinkedNullValue, input: LinkedNullExpression, &node: Node, id: int): LinkedNullExpression! {
+    index = input
     if (!LinkedNullReadableArray(array.ty) || index.value.ty.name != "int" ||
         index.value.ty.declaration_kind != "Builtin") {
         RejectLayout("linked_index_type", "expected a readonly struct array and int index", DeclarationSpan(node))?

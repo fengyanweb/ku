@@ -4097,6 +4097,31 @@ fn bootstrap_links_owned_array_results_and_cleans_up_checked_locals() {
         &cwd,
         180,
     ));
+    fs::write(
+        semantics.join("indexed-read.ku"),
+        "fn Read(&values: [int], position: int): int! { return ok(values[position]) }\n",
+    )
+    .unwrap();
+    fs::write(semantics.join("modules.txt"), "indexed-read.ku\n").unwrap();
+    fs::write(semantics.join("function.txt"), "Read\n").unwrap();
+    fs::write(semantics.join("mode.txt"), "linked-null\n").unwrap();
+    let interpreted = execute(
+        Command::new(&ku)
+            .args(["run", "--offline"])
+            .arg(semantics.join("projection_main.ku")),
+        &cwd,
+        30,
+    );
+    assert_ok(&interpreted);
+    let native = execute(&mut Command::new(&built), &cwd, 30);
+    assert_ok(&native);
+    let interpreted = String::from_utf8(interpreted.stdout).unwrap();
+    let native = String::from_utf8(native.stdout).unwrap();
+    assert!(native.contains("index_failed"));
+    assert_eq!(
+        interpreted.replace("\r\n", "\n"),
+        native.replace("\r\n", "\n")
+    );
     let compiler = cwd.join(format!("ku-project{suffix}"));
     fs::rename(built, &compiler).unwrap();
     fs::remove_dir_all(&copied).unwrap();
