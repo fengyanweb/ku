@@ -219,9 +219,12 @@ fn collectProjectLayout(&supplied: [SuppliedModule], &project: ProjectBindings, 
         relocated = relocated.push(member)
     }
     layout_index = layouts.len()
-    result = layouts.push(StructLayout { name: node.text, module_index: unit, node: id, fields: relocated })
+    count = relocated.len()
+    item = StructLayout { name: node.text, module_index: unit, node: id, fields: relocated }
+    result = layouts
+    result = result.push(item)
     cursor = 0
-    while (cursor < result[layout_index].fields.len()) {
+    while (cursor < count) {
         field = result[layout_index].fields[cursor].resolved.clone()
         if (isLayoutDependency(field, true)) {
             result = collectProjectLayout(supplied, project, field.module_index, field.declaration_node,
