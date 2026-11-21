@@ -382,3 +382,11 @@ fn EmitLinkedPlainInvocation(output: LinkedNullExpression, &callee: LinkedNullFu
     next.state.slots[next.value.slot - 1].live = true
     return next
 }
+
+fn PublishLinkedCheckedValue(destination: LinkedNullExpression, payload: str): LinkedNullExpression! {
+    slot = destination
+    slot.state.code = slot.state.code + "    " + slot.value.text.clone() + " = " + payload.clone() + ";\n"
+        + "    " + payload + " = (" + LinkedNullCType(slot.value.ty)? + "){0};\n"
+    slot.state.slots[slot.value.slot - 1].live = true
+    return ok(slot)
+}

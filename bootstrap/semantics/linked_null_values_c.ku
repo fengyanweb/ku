@@ -1,6 +1,6 @@
 import { LinkedCharacterSource, MaterializeLinkedCharacters } from "./struct_string_calls.ku"
 import { AppendLinkedArrayElement, EmitLinkedClone, InvokeLinkedReader, PrepareLinkedScopedCallbackArgument } from "./linked_array_fields_c.ku"
-import { CheckLinkedScopedCallback, EmitLinkedPlainInvocation, EmitLinkedScopedCallbackCall, LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
+import { CheckLinkedScopedCallback, EmitLinkedPlainInvocation, EmitLinkedScopedCallbackCall, LinkedScopedCallbackFunction, PublishLinkedCheckedValue } from "./link_plan_json_c.ku"
 import { CheckedAppendFault, CheckedAppendFaultHandoff, CheckedAppendInvocation, CheckedLinkedCallbackExpression } from "./guarded_string_parts.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MatchesLinkedFieldValue, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { Node } from "../stage2/ast.ku"
@@ -250,10 +250,7 @@ fn emitCheckedValue(&project: LinkedNullProject, state: LinkedNullState, &unwrap
     payload = call.text + ".value"
     ty = slot.value.ty.clone()
     slot.state = ValidateLinkedPayload(slot.state, ty, payload)
-    slot.state.code = slot.state.code + "    " + slot.value.text.clone() + " = " + payload.clone() + ";\n"
-        + "    " + payload + " = (" + LinkedNullCType(slot.value.ty)? + "){0};\n"
-    slot.state.slots[slot.value.slot - 1].live = true
-    return ok(slot)
+    return PublishLinkedCheckedValue(slot, payload)
 }
 
 fn LowerLinkedExpectedValue(&project: LinkedNullProject, state: LinkedNullState, &target: TypeNameBinding, id: int, depth: int): LinkedNullExpression! {
