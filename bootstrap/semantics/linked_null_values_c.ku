@@ -4,7 +4,7 @@ import { FindLinkedLocalRead } from "./call_contracts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
-import { ContainsIndex } from "./struct_projection_c.ku"
+import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
@@ -37,12 +37,19 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     return CloneLinkedRecord(project, source, subject, id)
 }
 
-fn forwardLinkedCallback(&state: LinkedNullState, &node: Node, &parameter: TypeNameBinding): str! {
+fn forwardLinkedCallback(&project: LinkedNullProject, &state: LinkedNullState, id: int,
+                         &parameter: TypeNameBinding): str! {
+    source = ProjectionCloneSource(project.supplied[0].named.parsed.arena.nodes,
+        project.supplied[0].named.parsed.arena.edges, id)
+    node = LinkedNullNode(project, 1, id)
+    if (source != 0) { node = LinkedNullNode(project, 1, source) }
     slot = LinkedNullBinding(state.slots, node.text)
     if (node.kind != "Variable" || node.edge_count != 0 || slot == 0 || !state.slots[slot - 1].parameter ||
         !state.slots[slot - 1].live || !SameLinkedType(state.slots[slot - 1].value.ty, parameter)) {
         RejectLayout("linked_callback_forward", "expected a live callback parameter with the same checked signature", DeclarationSpan(node))?
     }
+    // Even an explicit clone keeps the same environment. Both descriptors
+    // are borrowed from the invoking frame for this synchronous call.
     return ok(state.slots[slot - 1].value.text.clone())
 }
 
@@ -58,8 +65,7 @@ fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
         argument_id = LinkedNullChild(project, 1, call, index + 1)
         if (args != "") { args += ", " }
         if (callee.parameters[index].declaration_kind == "IntPairResultCallback") {
-            node = LinkedNullNode(project, 1, argument_id)
-            args += forwardLinkedCallback(next, node, callee.parameters[index])?
+            args += forwardLinkedCallback(project, next, argument_id, callee.parameters[index])?
             index = index + 1
             continue
         }

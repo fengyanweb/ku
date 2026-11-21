@@ -160,9 +160,14 @@ fn Take(callback: fn(int, int): Payload!): Envelope! {
     return ok(Envelope { payload: payload })
 }
 fn Forward(callback: fn(int, int): Payload!): Envelope! { return Take(callback) }
+fn ForwardCloned(callback: fn(int, int): Payload!): Envelope! { return Take(callback.clone()) }
 fn Wrong(callback: fn(int, int): Other!): Envelope! { return Take(callback) }
 fn Alias(callback: fn(int, int): Payload!): Envelope! {
     alias = callback
+    return Take(alias)
+}
+fn StoreClone(callback: fn(int, int): Payload!): Envelope! {
+    alias = callback.clone()
     return Take(alias)
 }
 fn First(): int { return 3 }
@@ -194,10 +199,28 @@ fn WrongArity(callback: fn(int, int): Reply!): Reply! {
     fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
     let emitted = execute(&mut Command::new(seed), cwd, 30);
     assert_ok(&emitted);
-    assert!(String::from_utf8_lossy(&emitted.stdout).contains("(*entry)(void*, int64_t, int64_t)"));
+    let forwarded = String::from_utf8(emitted.stdout).unwrap();
+    assert!(forwarded.contains("(*entry)(void*, int64_t, int64_t)"));
+    fs::write(cwd.join("function.txt"), "ForwardCloned").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let cloned = String::from_utf8(emitted.stdout).unwrap();
+    let symbol = |code: &str| {
+        code.lines()
+            .find(|line| line.starts_with("KuBootstrapResult_KuStruct_"))
+            .and_then(|line| line.split_once('('))
+            .and_then(|(head, _)| head.split_once(' '))
+            .map(|(_, name)| name.to_owned())
+            .expect("generated forwarding entry")
+    };
+    assert_eq!(
+        cloned.replace(&symbol(&cloned), &symbol(&forwarded)),
+        forwarded
+    );
     for (name, code) in [
         ("Wrong", "linked_callback_forward"),
         ("Alias", "linked_callback_escape"),
+        ("StoreClone", "unsupported_linked_clone"),
         ("WrongArity", "linked_callback_call"),
     ] {
         fs::write(cwd.join("function.txt"), name).unwrap();
