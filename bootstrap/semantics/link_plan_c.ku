@@ -290,7 +290,7 @@ fn LinkedNullIntArrayOwner(&binding: TypeNameBinding): bool {
 
 fn LinkedNullReadableArray(&type: TypeNameBinding): bool {
     return type.declaration_kind == "StructArray" || type.declaration_kind == "BuiltinArray"
-        || LinkedNullOwnedArray(type) || LinkedNullIntArrayOwner(type)
+        || type.declaration_kind == "OwnedStringArray" || LinkedNullOwnedArray(type) || LinkedNullIntArrayOwner(type)
 }
 
 fn RegisterLinkedIntArray(state: LinkedNullState, ty: TypeNameBinding): LinkedNullState {
@@ -305,7 +305,9 @@ fn RegisterLinkedIntArray(state: LinkedNullState, ty: TypeNameBinding): LinkedNu
 }
 
 fn LinkedNullArrayHeader(&type: TypeNameBinding, &value: str): str {
-    if (LinkedNullOwnedArray(type) || LinkedNullIntArrayOwner(type)) { return "(&" + value.clone() + ")" }
+    if (LinkedNullOwnedArray(type) || LinkedNullIntArrayOwner(type) || type.declaration_kind == "OwnedStringArray") {
+        return "(&" + value.clone() + ")"
+    }
     return value.clone()
 }
 

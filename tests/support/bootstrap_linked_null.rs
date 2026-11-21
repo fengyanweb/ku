@@ -923,6 +923,99 @@ fn RefuseScalarField(&envelope: Envelope): int! {
     }
 }
 
+pub(super) fn assert_checked_local_string_array(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("local-strings.ku"),
+        r#"struct Texts { words: [str] }
+fn Collect(left: str, right: str, empty: bool): Texts! {
+    if (empty) { return ok(Texts { words: [] }) }
+    words: [str] = []
+    words = words.push(left)
+    words = words.push(right)
+    return ok(Texts { words: words })
+}
+fn RejectBorrowed(&value: str): Texts! {
+    words: [str] = []
+    words = words.push(value)
+    return ok(Texts { words: words })
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "local-strings.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Collect").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, entry) = code
+        .lines()
+        .find_map(|line| {
+            if !line.starts_with("KuBootstrapResult_KuStruct_") {
+                return None;
+            }
+            line.split_once('(')?.0.split_once(' ')
+        })
+        .expect("checked record entry");
+    assert!(!code.contains("ku_linked_clone_string"));
+    let host = r#"
+static KuProjectionString owner(uint8_t byte) {
+    uint8_t *data = malloc(1);
+    *data = byte;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+static void check_failed_append(void) {
+    if (attempts != 3 || outstanding()) _Exit(81);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    KuProjectionString left = owner('L'), right = owner('R');
+    if (argc == 2) {
+        assert(atexit(check_failed_append) == 0);
+        fail_after = 0;
+        (void)__ENTRY__(left, right, false);
+        return 82;
+    }
+    int before = attempts;
+    __RESULT__ result = __ENTRY__(left, right, false);
+    assert(result.ok && attempts == before + 1);
+    KuGuardStringArray words = result.value.f0;
+    assert(words.len == 2 && words.data[0].ptr == left.ptr && words.data[1].ptr == right.ptr);
+    assert(*words.data[0].ptr == 'L' && *words.data[1].ptr == 'R');
+    assert(outstanding() == 3);
+    ku_managed_source_drop(&words);
+    assert(!outstanding());
+
+    left = owner('L'); right = owner('R'); before = attempts;
+    fail_after = 0;
+    result = __ENTRY__(left, right, true);
+    assert(result.ok && !result.value.f0.len && !result.value.f0.capacity && !result.value.f0.data);
+    assert(attempts == before && !outstanding());
+
+    return 0;
+}
+"#
+    .replace("__RESULT__", result)
+    .replace("__ENTRY__", entry);
+    let source = cwd.join("local-strings.c");
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    let executable = cwd.join(format!("local-strings{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&source, &executable, cwd);
+    assert_ok(&execute(&mut Command::new(&executable), cwd, 15));
+    let exhausted = execute(Command::new(&executable).arg("append-failure"), cwd, 15);
+    assert_eq!(exhausted.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&exhausted.stderr).trim(),
+        "array allocation failed"
+    );
+
+    fs::write(cwd.join("function.txt"), "RejectBorrowed").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_move_append"));
+}
+
 pub(super) fn assert_named_record_rebind(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("rebind-provider.ku"),

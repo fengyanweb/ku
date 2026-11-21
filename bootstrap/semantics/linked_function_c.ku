@@ -102,7 +102,7 @@ fn EmitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &pa
 }
 
 fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
-    ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0), true)?
+    ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0), true, true)?
     value_id = LinkedNullChild(project, 1, statement, 1)
     value = LinkedNullNode(project, 1, value_id)
     if (LinkedNullBinding(state.slots, statement.text) != 0) {

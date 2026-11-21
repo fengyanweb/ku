@@ -4396,6 +4396,7 @@ int main(int argc, char **argv) {
     assert!(String::from_utf8_lossy(&bounds.stderr).contains("index 0 out of bounds for length 0"));
     linked_null::assert_nested_array_result_cleanup(&compiler, &cwd);
     linked_null::assert_checked_string_array_borrow(&compiler, &cwd);
+    linked_null::assert_checked_local_string_array(&compiler, &cwd);
     linked_null::assert_short_circuit_reads(&compiler, &cwd);
     linked_null::assert_named_record_clone(&compiler, &cwd);
     linked_null::assert_named_record_rebind(&compiler, &cwd);

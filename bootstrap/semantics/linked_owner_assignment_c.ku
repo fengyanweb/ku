@@ -10,14 +10,14 @@ import { AppendLinkedArrayElement, LowerLinkedNullValue } from "./linked_null_va
 fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, index: int): LinkedNullState! {
     array = state.slots[index - 1].clone()
     copy = LinkedNullIntArrayOwner(array.value.ty)
-    if (!array.live || (!copy && !LinkedNullOwnedArray(array.value.ty))) {
+    if (!array.live || (!copy && !LinkedNullOwnedArray(array.value.ty) && array.value.ty.declaration_kind != "OwnedStringArray")) {
         RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(statement))?
     }
     id = ReadOwnedArrayPushArgument(project.supplied[0].named, statement)?
     if (id == 0) { return LowerLinkedOwnerRebind(project, state, statement) }
     value = LowerLinkedNullValue(project, state, id, 0)?
     if (!value.state.slots[index - 1].live || !SameLinkedType(value.value.ty, LinkedNullArrayElement(array.value.ty.clone()))
-        || value.value.borrowed || (!copy && value.value.slot == 0)) {
+        || value.value.borrowed || (!copy && (value.value.slot == 0 || value.value.member_path != ""))) {
         RejectLayout("linked_move_append", "push requires one element of the declared type", value.value.ty.span.clone())?
     }
     element = value.value
@@ -33,6 +33,7 @@ fn LowerLinkedOwnerRebind(&project: LinkedNullProject, state: LinkedNullState, &
     value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, assignment, 0), 0)?
     record = target.ty.declaration_kind == "Struct"
     owner = record || LinkedStringResult(target.ty) || LinkedNullOwnedArray(target.ty) || LinkedNullIntArrayOwner(target.ty)
+        || target.ty.declaration_kind == "OwnedStringArray"
     if (target.borrowed || !owner
         || !SameLinkedType(target.ty, value.value.ty) || value.value.borrowed
         || value.value.slot == index || (record && (value.value.slot == 0 || value.value.member_path != ""))) {

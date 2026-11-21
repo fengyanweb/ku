@@ -289,7 +289,8 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             slot = LinkedNullBinding(next.slots, statement.text)
             if (slot != 0) { RequireLinkedMutableName(statement.text, DeclarationSpan(statement))? }
             if (slot == 0) { next = addLocal(project, next, statement, id)? }
-            else if (LinkedNullIntArrayOwner(next.slots[slot - 1].value.ty) || LinkedNullOwnedArray(next.slots[slot - 1].value.ty)) {
+            else if (LinkedNullIntArrayOwner(next.slots[slot - 1].value.ty) || LinkedNullOwnedArray(next.slots[slot - 1].value.ty)
+                || next.slots[slot - 1].value.ty.declaration_kind == "OwnedStringArray") {
                 next = LowerLinkedArrayAppend(project, next, statement, slot)?
             } else if (next.slots[slot - 1].value.ty.declaration_kind == "Builtin"
                 && (next.slots[slot - 1].value.ty.name == "int" || next.slots[slot - 1].value.ty.name == "bool")) {

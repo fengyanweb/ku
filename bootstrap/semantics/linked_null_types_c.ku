@@ -86,7 +86,7 @@ fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view
     if (node.kind == "TypeFunction") { return readIntPairResultCallback(project, unit, node, view) }
     if (!view) {
         if (node.kind == "TypeArray") {
-            return ReadLinkedOwnedArray(project, unit, id, true)
+            return ReadLinkedOwnedArray(project, unit, id, true, false)
         }
         return LinkedNullType(project, unit, id)
     }
@@ -117,7 +117,8 @@ fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view
 
 fn LinkedNullArrayElement(binding: TypeNameBinding): TypeNameBinding {
     result = binding
-    if (result.declaration_kind == "BuiltinArray" || LinkedNullIntArrayOwner(result)) { result.declaration_kind = "Builtin" }
+    if (result.declaration_kind == "BuiltinArray" || result.declaration_kind == "OwnedStringArray" ||
+        LinkedNullIntArrayOwner(result)) { result.declaration_kind = "Builtin" }
     else { result.declaration_kind = "Struct" }
     return result
 }
@@ -257,7 +258,7 @@ fn linkedDirectFunction(&project: LinkedNullProject, unit: int, &target: Node): 
     return ok([])
 }
 
-fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, allow_int: bool): TypeNameBinding! {
+fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, allow_int: bool, allow_str: bool): TypeNameBinding! {
     array = LinkedNullNode(project, unit, id)
     if (array.kind != "TypeArray" || array.edge_count != 1) {
         RejectLayout("linked_owned_array_type", "expected an explicitly typed array of named records", DeclarationSpan(array))?
@@ -265,6 +266,10 @@ fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, allow_i
     element = LinkedNullType(project, unit, LinkedNullChild(project, unit, array, 0))?
     if (allow_int && element.declaration_kind == "Builtin" && element.name == "int") {
         element.declaration_kind = "OwnedIntArray"
+        return ok(element)
+    }
+    if (allow_str && LinkedStringResult(element)) {
+        element.declaration_kind = "OwnedStringArray"
         return ok(element)
     }
     if (element.declaration_kind != "Struct") {
@@ -277,7 +282,7 @@ fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, allow_i
 fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bool): TypeNameBinding! {
     node = LinkedNullNode(project, unit, id)
     if (!checked) {
-        if (node.kind == "TypeArray") { return ReadLinkedOwnedArray(project, unit, id, true) }
+        if (node.kind == "TypeArray") { return ReadLinkedOwnedArray(project, unit, id, true, false) }
         return LinkedNullType(project, unit, id)
     }
     if (node.kind != "TypeResult" || node.edge_count != 1) {
@@ -293,7 +298,7 @@ fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bo
                 return ok(element)
             }
         }
-        return ReadLinkedOwnedArray(project, unit, payload_id, false)
+        return ReadLinkedOwnedArray(project, unit, payload_id, false, false)
     }
     result = LinkedNullType(project, unit, payload_id)?
     if (!LinkedNullHasResultValue(result) && (result.declaration_kind != "Builtin" || result.name != "null")) {

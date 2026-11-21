@@ -282,11 +282,13 @@ fn BoundArrayTypePosition(&arrays: [TypeNameBinding], &type_name: TypeNameBindin
 }
 
 fn BoundArrayCType(&binding: TypeNameBinding): str {
+    if (binding.declaration_kind == "OwnedStringArray") { return "KuGuardStringArray" }
     if ((binding.declaration_kind == "BuiltinArray" && binding.name == "int") || LinkedNullIntArrayOwner(binding)) { return "KuArrayInt" }
     return "KuArray_" + CTypeName(binding.module_index, binding.declaration_node)
 }
 
 fn BoundArrayCPrefix(&binding: TypeNameBinding): str {
+    if (binding.declaration_kind == "OwnedStringArray") { return "ku_linked_view_str_array" }
     if (LinkedNullIntArrayOwner(binding)) { return "ku_linked_view_int_array" }
     if (binding.declaration_kind == "BuiltinArray") {
         if (binding.name == "int") { return "ku_linked_view_int_array" }
@@ -362,7 +364,8 @@ fn EmitBoundArrayAppenders(&types: [TypeNameBinding]): str {
         array = BoundArrayCType(ty)
         if (!ContainsType(seen, array)) {
             element = "int64_t"
-            if (!LinkedNullIntArrayOwner(ty)) { element = CTypeName(ty.module_index, ty.declaration_node) }
+            if (ty.declaration_kind == "OwnedStringArray") { element = "KuProjectionString" }
+            else if (!LinkedNullIntArrayOwner(ty)) { element = CTypeName(ty.module_index, ty.declaration_node) }
             text += EmitOwnedStructArrayAppend(element, array, BoundArrayCPrefix(ty))
             seen = seen.push(array)
         }

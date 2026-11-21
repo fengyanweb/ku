@@ -198,11 +198,11 @@ fn scalarAnnotation(&nodes: [Node], &edges: [int], &annotation: Node): ScalarAnn
         cursor = annotation.first_edge
         stop = cursor + annotation.edge_count
         while (cursor < stop) {
-            item = nodes[edges[cursor] - 1].clone()
-            if (item.kind != "TypeName" || !scalarType(item.text)) {
+            item = edges[cursor] - 1
+            if (nodes[item].kind != "TypeName" || !scalarType(nodes[item].text)) {
                 return ScalarAnnotation { scalars: [] }
             }
-            scalars = scalars.push(item.text)
+            scalars = scalars.push(nodes[item].text.clone())
             cursor = cursor + 1
         }
     }
