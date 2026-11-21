@@ -33,10 +33,12 @@ fn isLayoutDependency(&field: TypeNameBinding, owning: bool): bool {
 fn reachableLayouts(&layouts: [StructLayout], root: int, owning: bool): [int]! {
     reachable = [root]
     index = 0
-    while (index < reachable.len()) {
+    pending = index < reachable.len()
+    while (pending) {
         item = reachable[index] - 1
+        field_count = layouts[item].fields.len()
         field_index = 0
-        while (field_index < layouts[item].fields.len()) {
+        while (field_index < field_count) {
             field = layouts[item].fields[field_index].resolved.clone()
             if (isLayoutDependency(field, owning)) {
                 child = dependencyIndex(layouts, field)?
@@ -48,6 +50,7 @@ fn reachableLayouts(&layouts: [StructLayout], root: int, owning: bool): [int]! {
             field_index = field_index + 1
         }
         index = index + 1
+        pending = index < reachable.len()
     }
     return ok(reachable)
 }
@@ -65,8 +68,9 @@ fn measureLayout(&layouts: [StructLayout], &entries: [CStructMetrics], index: in
     depth = 1
     leaves = 0
     contains_string = false
+    field_count = layouts[index - 1].fields.len()
     field_index = 0
-    while (field_index < layouts[index - 1].fields.len()) {
+    while (field_index < field_count) {
         field = layouts[index - 1].fields[field_index].resolved.clone()
         field_leaves = 1
         if (isLayoutDependency(field, owning)) {
@@ -101,11 +105,13 @@ fn rejectLayoutCycle(&layouts: [StructLayout], &completed: [CStructMetrics], fir
     // these edges until one repeats to report an actual cycle edge.
     path: [int] = []
     index = first
-    while (path.len() < layouts.len()) {
+    pending = path.len() < layouts.len()
+    while (pending) {
         path = path.push(index)
         next = 0
+        field_count = layouts[index - 1].fields.len()
         cursor = 0
-        while (next == 0 && cursor < layouts[index - 1].fields.len()) {
+        while (next == 0 && cursor < field_count) {
             field = layouts[index - 1].fields[cursor].resolved.clone()
             if (isLayoutDependency(field, owning)) {
                 child = dependencyIndex(layouts, field)?
@@ -124,6 +130,7 @@ fn rejectLayoutCycle(&layouts: [StructLayout], &completed: [CStructMetrics], fir
             RejectLayout("invalid_nested_layout_order", "unfinished layout has no dependency", at.clone())?
         }
         index = next
+        pending = path.len() < layouts.len()
     }
     RejectLayout("invalid_nested_layout_order", "unfinished layout has no bounded order", at)?
     return ok(null)
@@ -140,7 +147,8 @@ fn orderCLayouts(&layouts: [StructLayout], module_index: int, node: int, at: Spa
     reachable = reachableLayouts(layouts, root, owning)?
     entries: [CStructMetrics] = []
     contains_string = false
-    while (entries.len() < reachable.len()) {
+    pending = entries.len() < reachable.len()
+    while (pending) {
         before = entries.len()
         blocked = 0
         index = 0
@@ -160,6 +168,7 @@ fn orderCLayouts(&layouts: [StructLayout], module_index: int, node: int, at: Spa
         if (entries.len() == before) {
             rejectLayoutCycle(layouts, entries, blocked, at.clone(), owning)?
         }
+        pending = entries.len() < reachable.len()
     }
     return ok(CStructOrder { entries: entries, contains_string: contains_string })
 }
