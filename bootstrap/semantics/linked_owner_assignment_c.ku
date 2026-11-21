@@ -3,7 +3,8 @@ import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { AppendLinkedArrayElement, LinkedAppendFailureRelay } from "./linked_array_fields_c.ku"
+import { LinkedAppendFailureRelay, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
+import { AppendLinkedArrayElement } from "./linked_array_fields_c.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
 import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
@@ -201,50 +202,6 @@ fn ReadLinkedLocalCaptures(&project: LinkedNullProject, &state: LinkedNullState,
     return ok(LinkedLocalCaptures { slots: slots, calls: calls })
 }
 
-fn StartLinkedThunkFrame(&parent: LinkedNullState): LinkedNullState {
-    // Retain shared C requirements and dependency identities, but start the
-    // private function with its own automatic storage and error cleanup.
-    body = parent.clone()
-    body.slots = []
-    body.declarations = ""
-    body.code = ""
-    body.drops = ""
-    body.plain_value_result = false
-    body.local_readers = []
-    body.local_callbacks = []
-    body.callback_owners = []
-    body.append_slots = []
-    body.local_appends = []
-    body.append_captures = []
-    body.catch_slot = 0
-    body.catch_edges = false
-    body.catch_moved = []
-    body.moved_error_fields = []
-    return body
-}
-
-fn RestoreLinkedThunkFrame(body: LinkedNullState, &parent: LinkedNullState): LinkedNullState {
-    // Dependencies, layouts and C helpers are translation-unit requirements.
-    // Bindings and failure cleanup below the thunk belong solely to it.
-    next = body
-    next.slots = parent.slots.clone()
-    next.code = parent.code.clone()
-    next.drops = parent.drops.clone()
-    next.local_readers = parent.local_readers.clone()
-    next.local_callbacks = parent.local_callbacks.clone()
-    next.callback_owners = parent.callback_owners.clone()
-    next.append_slots = parent.append_slots.clone()
-    next.local_appends = parent.local_appends.clone()
-    next.append_captures = parent.append_captures.clone()
-    next.declarations = parent.declarations.clone()
-    next.plain_value_result = parent.plain_value_result
-    next.catch_slot = parent.catch_slot
-    next.catch_edges = parent.catch_edges
-    next.catch_moved = parent.catch_moved.clone()
-    next.moved_error_fields = parent.moved_error_fields.clone()
-    return next
-}
-
 struct LinkedAppendThunk {
     body_start: int
     signature: str
@@ -417,4 +374,16 @@ fn StoreLinkedCopyAssignment(&destination: LinkedNullSlot, value: LinkedNullExpr
     next = value.state
     next.code += "    " + destination.value.text + " = " + value.value.text + ";\n"
     return ok(next)
+}
+
+fn LinkedFieldAppendArgument(&project: LinkedNullProject, &target: Node, &root: Node, rhs: int): int {
+    call = LinkedNullNode(project, 1, rhs)
+    if (call.kind != "Call" || call.edge_count != 2) { return 0 }
+    method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (method.kind != "Field" || method.edge_count != 1 || method.text != "push") { return 0 }
+    field = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
+    if (field.kind != "Field" || field.edge_count != 1 || field.text != target.text) { return 0 }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, field, 0))
+    if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != root.text) { return 0 }
+    return LinkedNullChild(project, 1, call, 1)
 }

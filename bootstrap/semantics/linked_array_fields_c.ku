@@ -1,53 +1,19 @@
 import { FindLinkedLocalRead, LinkedLocalReadBinding, RequireLinkedMutableName } from "./call_contracts.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, CloneLinkedIntArray, CloneLinkedRecord, CloneLinkedStringSlot, LinkedCallableSlot, RejectLocalReader, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
-import { LinkedScopedCallbackFunction, SameLinkedCallbackSignature } from "./link_plan_json_c.ku"
+import { FinishLinkedReaderThunk, LinkedScopedCallbackFunction, SameLinkedCallbackSignature, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
 import { ContainsIndex, LinkedAppendFaultRelayCode, LinkedIntArrayCallbackFaultPending, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { IsLinkedScopedCallback,
-    LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray,
+    LinkedLocalAppendIndex, LinkedNullArguments, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray,
     LinkedNullReadableArray, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
-import { LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult,
+import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult,
     ReadLinkedOwnedArray, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
-import { LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
-import { CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead } from "./linked_null_read_c.ku"
-
-fn LinkedFieldAppendArgument(&project: LinkedNullProject, &target: Node, &root: Node, rhs: int): int {
-    call = LinkedNullNode(project, 1, rhs)
-    if (call.kind != "Call" || call.edge_count != 2) { return 0 }
-    method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
-    if (method.kind != "Field" || method.edge_count != 1 || method.text != "push") { return 0 }
-    field = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
-    if (field.kind != "Field" || field.edge_count != 1 || field.text != target.text) { return 0 }
-    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, field, 0))
-    if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != root.text) { return 0 }
-    return LinkedNullChild(project, 1, call, 1)
-}
-
-fn LinkedAppendFailureRelay(&body: LinkedNullState): str {
-    text = ""
-    calls_append = body.local_appends.len() > 0
-    if (calls_append || body.append_slots.len() > 0 || body.local_append_types.len() > 0) {
-        text = "    failure->append_status = append_status;\n"
-    }
-    if (calls_append || body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0) {
-        text += "    failure->out_of_memory = out_of_memory;\n"
-    }
-    if (body.validated_arrays.len() > 0) {
-        message = "invalid struct array ownership"
-        if (body.uses_str_array) { message = "invalid array view" }
-        text += "    if (invalid_array) failure->array_error = \"" + message + "\\n\";\n"
-    }
-    if (calls_append) { text += "    if (captured_array_failure) failure->array_error = captured_array_failure;\n" }
-    if (calls_append || body.uses_add || body.uses_sub || body.uses_mul) { text += "    failure->overflow = overflow;\n" }
-    if (calls_append || body.uses_index) {
-        text += "    failure->index_failed = index_failed;\n    failure->index = failure_index;\n    failure->length = failure_length;\n"
-    }
-    return text
-}
+import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead, ReadLinkedLocalArrayItem } from "./linked_null_read_c.ku"
 
 fn readLocalIndexShift(&project: LinkedNullProject, &index: Node, &name: str): int! {
     argument = index.clone()
@@ -298,14 +264,8 @@ fn FinishLinkedStringAppend(&project: LinkedNullProject, input: LinkedNullExpres
     return MoveLinkedNullSlot(joined.state, replacement)
 }
 
-struct LinkedScopedCallbackArgument {
-    text: str
-    setup: str
-    relay: str
-}
-
-fn PrepareLinkedScopedCallbackArgument(&project: LinkedNullProject, &state: LinkedNullState, id: int,
-                                       &parameter: TypeNameBinding, fault: str): LinkedScopedCallbackArgument! {
+fn PrepareLinkedScopedCallbackArgument(&project: LinkedNullProject, state: LinkedNullState, id: int,
+                                       &parameter: TypeNameBinding, fault: str): LinkedNullArguments! {
     source = ProjectionCloneSource(project.supplied[0].named.parsed.arena.nodes, project.supplied[0].named.parsed.arena.edges, id)
     node = LinkedNullNode(project, 1, id)
     if (source != 0) { node = LinkedNullNode(project, 1, source) }
@@ -327,7 +287,10 @@ fn PrepareLinkedScopedCallbackArgument(&project: LinkedNullProject, &state: Link
         if (carrier != LinkedNullCType(value.ty)?) {
             text = "(" + carrier + "){" + name.clone() + ".entry, " + name.clone() + ".environment, " + name + ".failure}"
         }
-        return ok(LinkedScopedCallbackArgument { text: text, setup: "", relay: relay })
+        return ok(LinkedNullArguments { state: state, args: text, handoff: relay })
+    }
+    if (!expected.returns_result) {
+        return prepareLinkedReaderArgument(project, state, node, expected.result, carrier, fault)
     }
     index = LinkedLocalAppendIndex(state, node.text)
     if (index == 0) {
@@ -340,15 +303,60 @@ fn PrepareLinkedScopedCallbackArgument(&project: LinkedNullProject, &state: Link
     text = "(" + carrier + "){" + local.function.symbol + ", " + local.environment
         + ", &" + fault.clone() + "}"
     setup = "    KuLocalAppendFailure " + fault.clone() + " = {0};\n"
-    return ok(LinkedScopedCallbackArgument { text: text, setup: setup, relay: LinkedAppendFaultRelayCode(fault) })
+    state.code += setup
+    return ok(LinkedNullArguments { state: state, args: text, handoff: LinkedAppendFaultRelayCode(fault) })
 }
 
-fn LinkedBooleanWhileCondition(&state: LinkedNullState, &guard: Node): str {
-    if (guard.kind != "Variable" || guard.edge_count != 0) { return "" }
-    index = LinkedNullBinding(state.slots, guard.text)
-    if (index == 0) { return "" }
-    slot = state.slots[index - 1].clone()
-    if (slot.parameter || !slot.live || slot.value.borrowed || slot.moved_members.len() != 0 ||
-        slot.value.ty.declaration_kind != "Builtin" || slot.value.ty.name != "bool") { return "" }
-    return slot.value.text
+fn prepareLinkedReaderArgument(&project: LinkedNullProject, state: LinkedNullState, &node: Node,
+                               &result: TypeNameBinding, &carrier: str, fault: str): LinkedNullArguments! {
+    index = FindLinkedLocalRead(state.local_readers, node.text)
+    if (index == 0) {
+        RejectLayout("linked_callback_forward", "expected a same-frame indexed reader", DeclarationSpan(node))?
+    }
+    reader = state.local_readers[index - 1].clone()
+    source = state.slots[reader.captured_slot - 1].clone()
+    if (!LinkedNullOwnedArray(source.value.ty) || source.value.borrowed || LinkedMemberUnavailable(state, source.value, true)) {
+        RejectLayout("linked_callback_forward", "reader must retain a live local record array", DeclarationSpan(node))?
+    }
+    slot = source.clone()
+    slot.value.slot = 1
+    slot.value.text = "(*capture)"
+    slot.parameter = true
+    frame = StartLinkedThunkFrame(state)
+    frame.slots = frame.slots.push(slot)
+    reader.captured_slot = 1
+    input = LinkedReadonlyExpression(frame, LinkedBuiltin("int", DeclarationSpan(node)), "input")
+    value = ReadLinkedLocalArrayItem(project, reader, input, node, reader.node)?
+    if (!SameLinkedType(value.value.ty, result) || value.value.borrowed || value.value.slot == 0) {
+        RejectLayout("linked_callback_forward", "local reader must match the declared nominal result", DeclarationSpan(node))?
+    }
+    value.state.code += "    result = " + value.value.text.clone() + ";\n"
+    owner = value.value.clone()
+    body = MoveLinkedNullSlot(value.state, owner)?
+    body.code += "    goto cleanup;\n"
+    symbol = "ku_local_read_" + fault.clone()
+    next = FinishLinkedReaderThunk(body, state, symbol, LinkedNullCType(result)?, LinkedNullCType(source.value.ty)?)
+    next.code += "    KuLocalAppendFailure " + fault.clone() + " = {0};\n"
+    text = "(" + carrier.clone() + "){" + symbol + ", &(" + source.value.text + "), &" + fault.clone() + "}"
+    return ok(LinkedNullArguments { state: next, args: text, handoff: LinkedAppendFaultRelayCode(fault) })
+}
+
+fn InvokeLinkedReader(&project: LinkedNullProject, argument: LinkedNullExpression, &callback: LinkedNullValue,
+                      &call: Node, id: int): LinkedNullExpression! {
+    if (!LinkedIntResult(argument.value.ty)) {
+        RejectLayout("linked_callback_argument", "reader callback requires a Copy int index", DeclarationSpan(call))?
+    }
+    result = callback.ty.clone()
+    result.declaration_kind = "Struct"
+    output = AddLinkedNullSlot(project, argument.state, "", "t" + str(id), result, false)?
+    name = callback.text.clone()
+    output.state.uses_scoped_reader = true
+    output.state.code += "    if (!" + name.clone() + ".entry || !" + name.clone() + ".failure) {\n"
+        + "        if (" + name.clone() + ".failure) " + name.clone() + ".failure->array_error = \"invalid scoped reader callback\\n\";\n"
+        + "        else captured_array_failure = \"invalid scoped reader callback\\n\";\n        goto cleanup;\n    }\n"
+        + "    " + output.value.text.clone() + " = " + name.clone() + ".entry(" + name.clone() + ".environment, "
+        + name.clone() + ".failure, " + argument.value.text + ");\n"
+        + "    if (" + LinkedIntArrayCallbackFaultPending(name + ".failure") + ") goto cleanup;\n"
+    output.state.slots[output.value.slot - 1].live = true
+    return ok(output)
 }

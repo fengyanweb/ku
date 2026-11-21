@@ -1,4 +1,3 @@
-import { LinkedBooleanWhileCondition } from "./linked_array_fields_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
@@ -15,7 +14,8 @@ import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
-import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedFreshRecordFor, ReadLinkedLocalCaptures, RejectLocalCapture, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./linked_owner_assignment_c.ku"
+import { LinkedBooleanWhileCondition, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
+import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedFreshRecordFor, ReadLinkedLocalCaptures, RejectLocalCapture } from "./linked_owner_assignment_c.ku"
 
 struct LinkedLocalThunk {
     result: TypeNameBinding

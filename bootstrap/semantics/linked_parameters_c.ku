@@ -162,12 +162,13 @@ fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &el
 fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, ty: TypeNameBinding): LinkedNullState! {
     next = state
     if (IsLinkedScopedCallback(ty)) {
-        if (ty.declaration_kind != "IntResultArenaCallback") {
+        if (ty.declaration_kind == "IntArrayResultCallback" || ty.declaration_kind == "IntResultAppendCallback") {
             carrier = LinkedBuiltin("int", ty.span.clone())
             carrier.declaration_kind = "BuiltinArray"
             next = RegisterLinkedIntArray(next, carrier)
         }
         signature = LinkedScopedCallbackFunction(project, ty)?
+        if (!signature.returns_result) { return registerOwnedElement(project, next, signature.result) }
         index = 0
         while (index < signature.parameters.len()) {
             if (signature.parameters[index].declaration_kind == "Struct") {

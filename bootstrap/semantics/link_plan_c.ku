@@ -76,6 +76,7 @@ struct LinkedNullState {
     local_callbacks: [int]
     callback_owners: [int]
     callback_helpers: str
+    uses_scoped_reader: bool
     local_appends: [LinkedLocalAppend]
     append_captures: [int]
     local_append_types: [TypeNameBinding]
@@ -117,7 +118,7 @@ struct LinkedNullExpression {
 
 fn NewLinkedNullState(): LinkedNullState {
     return LinkedNullState { plain_value_result: false, layouts: [], owning_layouts: [], owning_strings: false,
-        slots: [], links: [], local_readers: [], local_callbacks: [], callback_owners: [], callback_helpers: "",
+        slots: [], links: [], local_readers: [], local_callbacks: [], callback_owners: [], callback_helpers: "", uses_scoped_reader: false,
         local_appends: [], append_captures: [], local_append_types: [],
         declarations: "", code: "", drops: "", catch_slot: 0,
         catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false, uses_int_snapshot: false,
@@ -153,7 +154,7 @@ fn LinkedIntArrayCallbackFunction(&ty: TypeNameBinding): LinkedNullFunction {
 
 fn IsLinkedScopedCallback(&ty: TypeNameBinding): bool {
     return ty.declaration_kind == "IntArrayResultCallback" || ty.declaration_kind == "IntResultAppendCallback" ||
-        ty.declaration_kind == "IntResultArenaCallback"
+        ty.declaration_kind == "IntResultArenaCallback" || ty.declaration_kind == "IntRecordReaderCallback"
 }
 
 fn LinkedScopedCallbackTypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlot]): [TypeNameBinding] {

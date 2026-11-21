@@ -1,10 +1,11 @@
-import { EmitLinkedBodyPrelude, HoldLinkedCopyOperand, LinkedNullPrototype, LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
+import { LinkedFieldAppendArgument } from "./linked_owner_assignment_c.ku"
+import { EmitLinkedBodyPrelude, HoldLinkedCopyOperand, LinkedNullPrototype, LinkedScopedCallbackFunction, LinkedScopedCallbackPrototype } from "./link_plan_json_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
-import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult, LinkedIntAppendCallbackDeclaration, LinkedIntArrayCallbackDeclaration } from "./struct_projection_c.ku"
+import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult } from "./struct_projection_c.ku"
 import { TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
-import { CheckLinkedStringAppendTarget, FinishLinkedFieldAppend, FinishLinkedStringAppend, LinkedFieldAppendArgument, LowerLinkedArrayBinding } from "./linked_array_fields_c.ku"
+import { CheckLinkedStringAppendTarget, FinishLinkedFieldAppend, FinishLinkedStringAppend, LowerLinkedArrayBinding } from "./linked_array_fields_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
@@ -43,19 +44,11 @@ fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunc
         if (!ContainsType(records, kind)) {
             signature = LinkedScopedCallbackFunction(project, callbacks[index])?
             result = LinkedNullCType(signature.result)?
-            if (!ContainsType(records, result)) {
+            if (signature.returns_result && !ContainsType(records, result)) {
                 text += StructValueResultHeader(result)
                 records = records.push(result)
             }
-            if (callbacks[index].declaration_kind == "IntArrayResultCallback") {
-                text += LinkedIntArrayCallbackDeclaration(kind, LinkedNullCType(signature.parameters[3])?)
-            } else {
-                arena = callbacks[index].declaration_kind == "IntResultArenaCallback"
-                first = 3
-                second = 5
-                if (arena) { first = 0; second = 1 }
-                text += LinkedIntAppendCallbackDeclaration(kind, LinkedNullCType(signature.parameters[first])?, LinkedNullCType(signature.parameters[second])?, arena)
-            }
+            text += LinkedScopedCallbackPrototype(callbacks[index], signature, kind)?
             records = records.push(kind)
         }
         index = index + 1

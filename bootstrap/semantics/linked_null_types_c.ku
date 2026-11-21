@@ -57,12 +57,13 @@ fn LinkedNullLiteralType(&project: LinkedNullProject, unit: int, &literal: Node,
     return ok(absoluteType(binding, unit))
 }
 
-fn readIntPairResultCallback(&project: LinkedNullProject, unit: int, &node: Node, view: bool): TypeNameBinding! {
-    if (view || node.edge_count != 3) {
-        RejectLayout("linked_callback_type", "expected fn(int, int) with a checked named record result", DeclarationSpan(node))?
+fn readIntCallback(&project: LinkedNullProject, unit: int, &node: Node, view: bool): TypeNameBinding! {
+    count = node.edge_count - 1
+    if (view || (count != 1 && count != 2)) {
+        RejectLayout("linked_callback_type", "expected one int with a plain record or two ints with a checked record", DeclarationSpan(node))?
     }
     index = 0
-    while (index < 2) {
+    while (index < count) {
         part = LinkedNullNode(project, unit, LinkedNullChild(project, unit, node, index))
         if (part.kind != "TypeParameter" || part.edge_count != 1 || part.text != "") {
             RejectLayout("linked_callback_type", "callback parameters must be Copy int values", DeclarationSpan(part))?
@@ -73,11 +74,12 @@ fn readIntPairResultCallback(&project: LinkedNullProject, unit: int, &node: Node
         }
         index = index + 1
     }
-    result = ReadLinkedResult(project, unit, LinkedNullChild(project, unit, node, 2), true)?
+    result = ReadLinkedResult(project, unit, LinkedNullChild(project, unit, node, count), count == 2)?
     if (result.declaration_kind != "Struct") {
-        RejectLayout("linked_callback_type", "callback must return a checked named record", result.span.clone())?
+        RejectLayout("linked_callback_type", "callback result must be a named record with the declared result mode", result.span.clone())?
     }
     result.declaration_kind = "IntPairResultCallback"
+    if (count == 1) { result.declaration_kind = "IntRecordReaderCallback" }
     return ok(result)
 }
 
@@ -99,7 +101,7 @@ fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view
         ty.declaration_kind = "IntArrayResultCallback"
         return ok(ty)
     }
-    if (node.kind == "TypeFunction") { return readIntPairResultCallback(project, unit, node, view) }
+    if (node.kind == "TypeFunction") { return readIntCallback(project, unit, node, view) }
     if (!view) {
         if (node.kind == "TypeArray") {
             return ReadLinkedOwnedArray(project, unit, id, true, true)
@@ -167,6 +169,9 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
         return ok(prefix + str(binding.module_index) + "_" + str(binding.declaration_node))
     }
     if (binding.declaration_kind == "IntArrayResultCallback") { return ok(LinkedIntArrayCallbackCarrier(binding)) }
+    if (binding.declaration_kind == "IntRecordReaderCallback") {
+        return ok("KuBootstrapIntReaderCallback_" + CTypeName(binding.module_index, binding.declaration_node))
+    }
     if (binding.declaration_kind == "IntPairResultCallback") {
         return ok("KuBootstrapIntPairCallback_" + CTypeName(binding.module_index, binding.declaration_node))
     }

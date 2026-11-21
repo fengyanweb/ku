@@ -1211,6 +1211,134 @@ int main(int argc, char **argv) {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_callback_forward"));
 }
 
+pub(super) fn assert_scoped_record_reader(seed: &Path, python: &str, cwd: &Path) {
+    let caller = "reader-caller.ku";
+    let receiver = "reader-receiver.ku";
+    let source = r#"import { Item, Marker, Measure, Relay } from "./reader-receiver.ku"
+fn Run(first: Item, second: Item, requested: int): int! {
+    items: [Item] = []
+    items = items.push(first)
+    items = items.push(second)
+    fn Read(index: int): Item { return items[index - 1].clone() }
+    fn ReadMarker(index: int): Marker { return Measure(items[index - 1]) }
+    result = Relay(Read.clone(), ReadMarker.clone(), requested)?
+    return ok(result + items[0].units)
+}
+"#;
+    let provider = r#"struct Item { text: str units: int }
+struct OtherItem { text: str units: int }
+struct Marker { amount: int }
+fn Measure(&item: Item): Marker { return Marker { amount: item.units } }
+fn Apply(read: fn(int): Item, marker: fn(int): Marker, index: int): int! {
+    item = read(1)
+    coordinate = marker(index)
+    return ok(item.text.len() + item.units + coordinate.amount)
+}
+fn Relay(read: fn(int): Item, marker: fn(int): Marker, index: int): int! {
+    return Apply(read.clone(), marker.clone(), index)
+}
+"#;
+    fs::write(cwd.join(caller), source).unwrap();
+    fs::write(cwd.join(receiver), provider).unwrap();
+    let cc =
+        std::env::var("CC").unwrap_or_else(|_| if cfg!(windows) { "clang" } else { "cc" }.into());
+    let mut link = Command::new(python);
+    link.arg("-B")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/tools/link_c.py"))
+        .args(["--cc", &cc]);
+    let mut entry = String::new();
+    let mut carrier = String::new();
+    for (name, manifest) in [
+        ("Run", format!("{caller}\n{receiver}\n")),
+        ("Relay", format!("{receiver}\n")),
+        ("Apply", format!("{receiver}\n")),
+        ("Measure", format!("{receiver}\n")),
+    ] {
+        fs::write(cwd.join("modules.txt"), manifest).unwrap();
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        if name != "Measure" {
+            assert!(code.contains("KuBootstrapIntReaderCallback_KuStruct_m"));
+        }
+        if name == "Run" {
+            let (symbol, parameters) = code
+                .lines()
+                .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t ku_linked_null_"))
+                .unwrap()
+                .split_once('(')
+                .unwrap();
+            entry = format!("ku_linked_null_{symbol}");
+            carrier = parameters.split(' ').next().unwrap().to_owned();
+            assert!(code.contains("const KuArray_KuStruct_m"));
+            assert_eq!(code.matches("static \nKuStruct_m").count(), 2);
+        }
+        let c = cwd.join(format!("reader-{name}.c"));
+        let plan = cwd.join(format!("reader-{name}.plan.json"));
+        fs::write(&c, code).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+        let description = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&description);
+        fs::write(&plan, description.stdout).unwrap();
+        link.arg("--unit").args([plan, c]);
+    }
+    let host = r#"
+#include <assert.h>
+#include <string.h>
+static ITEM input(int value) {
+    uint8_t *text = malloc(1);
+    assert(text);
+    text[0] = 'x';
+    return (ITEM){{text, 1, 1, KU_PROJECTION_STRING_OWNED}, value};
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) { (void)ENTRY(input(5), input(7), 0); return 2; }
+    KuBootstrapResult_int64_t result = ENTRY(input(5), input(7), 2);
+    assert(result.ok && result.value == 18);
+    result = ENTRY(input(5), input(7), 1);
+    assert(result.ok && result.value == 16);
+    return 0;
+}
+"#
+    .replace("ENTRY", &entry)
+    .replace("ITEM", &carrier);
+    let host_path = cwd.join("reader-host.c");
+    let exe = cwd.join(format!("record-reader{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&host_path, host).unwrap();
+    link.args([
+        "--entry",
+        caller,
+        entry.strip_prefix("ku_linked_null_").unwrap(),
+    ])
+    .arg("--caller")
+    .arg(host_path)
+    .arg("-o")
+    .arg(&exe);
+    assert_ok(&execute(&mut link, cwd, 45));
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    let fatal = execute(Command::new(exe).arg("invalid-index"), cwd, 10);
+    assert_eq!(fatal.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&fatal.stderr).contains("index -1 out of bounds for length 2"));
+    let wrong = provider.replace(
+        "read: fn(int): Item, marker",
+        "read: fn(int): OtherItem, marker",
+    );
+    fs::write(cwd.join(receiver), wrong).unwrap();
+    fs::write(cwd.join("modules.txt"), format!("{caller}\n{receiver}\n")).unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Run").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("local reader must match the declared nominal result")
+    );
+}
+
 pub(super) fn assert_terminal_branch_ownership(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("guard-provider.ku"),
