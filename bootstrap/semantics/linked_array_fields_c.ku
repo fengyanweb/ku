@@ -4,10 +4,14 @@ import { ProjectionCloneSource } from "./struct_projection_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullOwnedArray, LinkedNullReadableArray, LinkedNullState, LinkedViewPointee } from "./link_plan_c.ku"
-import { LinkedNullArrayElement, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
-import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullReadableArray,
+    LinkedNullState, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
+import { LinkedNullArrayElement, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, ReadLinkedOwnedArray,
+    ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+import { LowerLinkedIntArrayLiteral, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AppendLinkedArrayElement, LowerLinkedNullValue } from "./linked_null_values_c.ku"
+import { MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 
 fn LinkedFieldAppendArgument(&project: LinkedNullProject, &target: Node, &root: Node, rhs: int): int {
     call = LinkedNullNode(project, 1, rhs)
@@ -136,4 +140,36 @@ fn RegisterLinkedLocalRead(&project: LinkedNullProject, state: LinkedNullState, 
     state.local_readers = state.local_readers.push(LinkedLocalReadBinding {
         name: function.text.clone(), node: id, captured_slot: capture, index_shift: shift })
     return ok(state)
+}
+
+fn LowerLinkedArrayBinding(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
+    ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0), true, true)?
+    value_id = LinkedNullChild(project, 1, statement, 1)
+    value = LinkedNullNode(project, 1, value_id)
+    if (LinkedNullBinding(state.slots, statement.text) != 0) {
+        RejectLayout("linked_array_local", "expected a new typed array owner", DeclarationSpan(statement))?
+    }
+    if (value.kind == "Variable" && value.edge_count == 0) {
+        input = ReadLinkedNullBinding(state, value)?
+        if (!SameLinkedType(input.value.ty, ty) || input.value.borrowed) {
+            RejectLayout("linked_array_local", "expected a matching named array owner", DeclarationSpan(value))?
+        }
+        local = AddLinkedNullSlot(project, input.state, statement.text.clone(), "l" + str(id), ty, false)?
+        local.state.code += "    " + local.value.text + " = " + input.value.text.clone() + ";\n"
+        local.state.slots[local.value.slot - 1].live = true
+        return MoveLinkedNullSlot(local.state, input.value)
+    }
+    if (value.kind != "Array") {
+        RejectLayout("linked_array_local", "expected an array literal or a matching named owner", DeclarationSpan(value))?
+    }
+    if (value.edge_count != 0) {
+        if (!LinkedNullIntArrayOwner(ty)) {
+            RejectLayout("linked_array_local", "a nonempty literal requires an int array", DeclarationSpan(value))?
+        }
+        literal = LowerLinkedIntArrayLiteral(project, state, value, value_id, statement.text.clone())?
+        return ok(literal.state)
+    }
+    local = AddLinkedNullSlot(project, state, statement.text.clone(), "l" + str(id), ty, false)?
+    local.state.slots[local.value.slot - 1].live = true
+    return ok(local.state)
 }

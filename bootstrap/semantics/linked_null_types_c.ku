@@ -185,8 +185,11 @@ fn LinkedNullResultCleanupReference(&owning_layouts: [StructLayout], &result: Ty
     if (LinkedNullOwnedArray(result)) {
         return "    (void)" + LinkedNullArrayPrefix(result) + "_drop;\n"
     }
-    if (result.declaration_kind == "Struct" && LayoutIndex(owning_layouts, result.module_index, result.declaration_node) > 0) {
-        return "    (void)" + OwningLayoutDropName(result.module_index, result.declaration_node) + ";\n"
+    if (result.declaration_kind == "Struct") {
+        layout = LayoutIndex(owning_layouts, result.module_index, result.declaration_node)
+        if (layout > 0) {
+            return "    (void)" + OwningLayoutDropName(result.module_index, result.declaration_node) + ";\n"
+        }
     }
     return ""
 }

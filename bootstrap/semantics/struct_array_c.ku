@@ -1,7 +1,7 @@
 import { GuardExplicitType, GuardType } from "./guarded_struct_expr.ku"
 import { ManagedSourceCharactersRuntime, ManagedStringArrayDrop } from "./guarded_string_parts.ku"
 import { LinkedNullIntArrayOwner, LinkedNullState } from "./link_plan_c.ku"
-import { EmitProjectionStringJoinHelpers, ScalarStringPrefixSuffixC } from "./scalar_int_emit.ku"
+import { EmitCheckedRecordArrayClone, EmitProjectionStringJoinHelpers, ScalarStringPrefixSuffixC } from "./scalar_int_emit.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
@@ -360,7 +360,9 @@ fn EmitBoundArrayAppenders(&types: [TypeNameBinding]): str {
     if (types.len() == 0) { return "" }
     text = StructArrayStatuses()
     seen: [str] = []
-    for ty in types.clone() {
+    index = 0
+    while (index < types.len()) {
+        ty = types[index].clone()
         array = BoundArrayCType(ty)
         if (!ContainsType(seen, array)) {
             element = "int64_t"
@@ -369,6 +371,7 @@ fn EmitBoundArrayAppenders(&types: [TypeNameBinding]): str {
             text += EmitOwnedStructArrayAppend(element, array, BoundArrayCPrefix(ty))
             seen = seen.push(array)
         }
+        index = index + 1
     }
     return text
 }
@@ -388,17 +391,7 @@ fn OwnedRecordArrayCloneLayout(&layouts: [StructLayout], &array: TypeNameBinding
 }
 
 fn EmitLinkedOwnedArrayClone(&source: str, &target: str, &prefix: str, layout: int): str {
-    // The common drop owns only the destination's initialized prefix.
-    text = "    if (!" + prefix.clone() + "_valid(&" + source.clone() + ")) { invalid_array = true; goto cleanup; }\n"
-    text += "    if (" + source.clone() + ".len) {\n"
-        + "        " + target.clone() + ".data = malloc(" + source.clone() + ".len * sizeof(*" + target.clone() + ".data));\n"
-        + "        if (!" + target.clone() + ".data) { out_of_memory = true; goto cleanup; }\n"
-    text += "        " + target.clone() + ".capacity = " + source.clone() + ".len;\n"
-        + "        while (" + target.clone() + ".len < " + source.clone() + ".len) {\n"
-    text += "            if (!ku_linked_element_" + str(layout) + "_clone_element(&" + source.clone()
-        + ".data[" + target.clone() + ".len], &" + target.clone()
-        + ".data[" + target.clone() + ".len])) { out_of_memory = true; goto cleanup; }\n"
-    return text + "            ++" + target.clone() + ".len;\n        }\n    }\n"
+    return EmitCheckedRecordArrayClone(source, target, prefix, layout)
 }
 
 fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str): str! {
@@ -416,8 +409,22 @@ fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str):
     }
     text += EmitBoundElementClones(body.layouts, body.element_clones)
     text += result_header + EmitBoundArrayResults(body.layouts, body.owning_layouts, body.owned_arrays, body.uses_chars)
-    append_types = body.local_append_types.clone()
-    for index in body.append_slots.clone() { append_types = append_types.push(body.slots[index - 1].value.ty.clone()) }
+    append_types: [TypeNameBinding] = []
+    local_count = body.local_append_types.len()
+    index = 0
+    while (index < local_count) {
+        type = body.local_append_types[index].clone()
+        append_types = append_types.push(type)
+        index = index + 1
+    }
+    slot_count = body.append_slots.len()
+    index = 0
+    while (index < slot_count) {
+        slot = body.append_slots[index]
+        type = body.slots[slot - 1].value.ty.clone()
+        append_types = append_types.push(type)
+        index = index + 1
+    }
     return ok(text + EmitBoundArrayAppenders(append_types))
 }
 
