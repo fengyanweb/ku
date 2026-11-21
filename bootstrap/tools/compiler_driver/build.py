@@ -77,8 +77,14 @@ def link_c(cc, source, name, cwd, *, bootstrap_host=False):
             elif target.startswith("x86_64-") and target.endswith(
                 ("-mingw32", "-mingw64", "-windows-gnu")
             ):
-                command.extend(["-municode", "-static"])
-                libraries = ["-lkernel32"]
+                # Keep the existing C and linker options while separating
+                # compilation from linking in the bounded stage logs.
+                obj = Path(source).with_suffix(".o")
+                print("compiling the MinGW bootstrap host", flush=True)
+                run([*command, "-municode", "-static", "-c", source, "-o", obj], cwd)
+                print("linking the MinGW bootstrap host", flush=True)
+                run([cc, "-municode", "-static", obj, "-o", name, "-lkernel32"], cwd)
+                return
             else:
                 raise ValueError(f"expected an x64 Windows clang or MinGW compiler, got {target!r}")
     elif bootstrap_host:

@@ -58,8 +58,10 @@ def main():
                     destination.write_bytes(opened.extractfile(member).read())
         builder = location / "bootstrap/tools/compiler_driver/build.py"
         environment = dict(os.environ, KU_CC=cc) if args.cc is not None else None
+        # The builder owns the per-command deadlines and process-tree
+        # cleanup. The outer verification job also bounds the entire chain.
         subprocess.run([sys.executable, "-B", builder, "--ku", ku, "--cc", cc, "-o", output],
-                       cwd=location, env=environment, check=True, timeout=210)
+                       cwd=location, env=environment, check=True)
     identity.write_text(json.dumps({"commit": source, "seed": str(ku), "seed_sha256": digest(ku),
                                     "sha256": digest(output), "archive_sha256": sha256(archive).hexdigest(),
                                     "c_compiler": cc, "c_target": c_target},
