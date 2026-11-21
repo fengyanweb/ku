@@ -1437,6 +1437,90 @@ int main(int argc, char **argv) {
         assert!(rejected.stdout.is_empty());
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(reason));
     }
+    assert_nested_string_array_snapshot(seed, cwd);
+}
+
+fn assert_nested_string_array_snapshot(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("nested-string-snapshot.ku"),
+        r#"struct State { moved: [str] }
+struct Slot { name: str state: State }
+fn Snapshot(input: [Slot]): [Slot]! {
+    snapshot = input.clone()
+    return ok(snapshot)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "nested-string-snapshot.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Snapshot").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let output = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&output);
+    let code = String::from_utf8(output.stdout).unwrap();
+    let (result, declaration) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, _) = declaration.split_once('(').unwrap();
+    let array = result.strip_prefix("KuBootstrapResult_").unwrap();
+    let element = array.strip_prefix("KuArray_").unwrap();
+    let witness = r#"
+static void clean(void) { assert(!outstanding()); }
+static KuProjectionString owned(uint8_t byte) {
+    uint8_t *data = malloc(1);
+    assert(data);
+    *data = byte;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+int main(int argc, char **argv) {
+    (void)test_realloc;
+    ARRAY input = {1, malloc(sizeof(ELEMENT)), 1};
+    assert(input.data && atexit(clean) == 0);
+    input.data[0] = (ELEMENT){0};
+    input.data[0].f0 = owned('N');
+    KuProjectionString external[1] = {0};
+    if (argc == 2 && strcmp(argv[1], "malformed") == 0) {
+        input.data[0].f1.f0 = (KuGuardStringArray){2, external, 1};
+    } else {
+        KuProjectionString *data = malloc(2 * sizeof(*data));
+        assert(data);
+        data[0] = owned('A');
+        data[1] = owned('B');
+        input.data[0].f1.f0 = (KuGuardStringArray){2, data, 2};
+        if (argc == 2) fail_after = 4;
+    }
+    RESULT result = ENTRY(input);
+    if (argc == 2) return 90;
+    assert(result.ok && result.value.len == 1 && outstanding() == 5);
+    ELEMENT *snapshot = result.value.data;
+    assert(*snapshot->f0.ptr == 'N' && snapshot->f1.f0.len == 2);
+    assert(*snapshot->f1.f0.data[0].ptr == 'A' && *snapshot->f1.f0.data[1].ptr == 'B');
+    DROP(&result.value);
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("RESULT", result)
+    .replace("ARRAY", array)
+    .replace("ELEMENT", element)
+    .replace("DROP", &format!("ku_linked_view_{element}_drop"));
+    let c = cwd.join("nested-string-snapshot.c");
+    let exe = cwd.join(format!(
+        "nested-string-snapshot{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{witness}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    for (case, expected) in [
+        ("partial", "out of memory"),
+        ("malformed", "invalid struct array ownership"),
+    ] {
+        let failed = execute(Command::new(&exe).arg(case), cwd, 10);
+        assert_eq!(failed.status.code(), Some(1));
+        assert_eq!(String::from_utf8_lossy(&failed.stderr).trim(), expected);
+    }
 }
 
 pub(super) fn assert_owned_string_field_clone(seed: &Path, cwd: &Path) {
