@@ -491,7 +491,7 @@ fn ReadLinkedCatchParts(&named: NamedModule, &node: Node): LinkedCatchParts! {
 
 fn LinkedCPrelude(&body: LinkedNullState, guards: str): str {
     text = ProjectionHeaders(true, body.drops.contains("ku_projection_string_drop") || body.owning_strings) + guards
-    if (body.arrays.len() > 0 || body.uses_str_array || body.uses_str_view || body.uses_struct_view || body.uses_print) {
+    if (body.arrays.len() > 0 || body.element_clones.len() > 0 || body.uses_str_array || body.uses_str_view || body.uses_struct_view || body.uses_print) {
         text += "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
     }
     return text

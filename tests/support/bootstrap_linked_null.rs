@@ -858,6 +858,38 @@ int main(void) {
     assert_ok(&execute(&mut Command::new(&executable), cwd, 15));
 }
 
+pub(super) fn assert_named_record_clone(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("named-clone.ku"),
+        r#"struct Token { kind: str lexeme: str line: int }
+fn Copy(token: Token): Token! { return ok(token.clone()) }
+fn Refuse(token: Token): Token! {
+    moved = token.kind
+    return ok(token.clone())
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "named-clone.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Copy").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let body = code.split_once(" a0) {").unwrap().1;
+    assert!(body.contains("_clone_element(&a0, &t"));
+    assert!(body.contains("result.value = t"));
+    let cleanup = body.split_once("cleanup:\n").unwrap().1;
+    assert!(cleanup.contains("ku_projection_string_drop(&a0.f0)"));
+    assert!(cleanup.contains("ku_projection_string_drop(&a0.f1)"));
+
+    fs::write(cwd.join("function.txt"), "Refuse").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_clone_moved"));
+}
+
 pub(super) fn assert_linked_fs_read(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("module-reader.ku"),

@@ -40,6 +40,12 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     if (ty.declaration_kind != "Struct") {
         RejectLayout("unsupported_linked_clone", "expected str or a finite struct for clone", DeclarationSpan(subject))?
     }
+    if (subject.kind != "Index" && subject.kind != "Variable") {
+        RejectLayout("unsupported_linked_clone", "struct clone needs a bound or indexed value", DeclarationSpan(subject))?
+    }
+    if (LinkedMemberUnavailable(source.state, source.value, true)) {
+        RejectLayout("linked_clone_moved", "cloning a whole struct requires all fields to be available", DeclarationSpan(subject))?
+    }
     layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
     if (HasBoundArrayMembers(source.state.layouts, layout)) {
         RejectLayout("linked_nested_array_clone", "a struct with nested owning arrays does not yet support clone", ty.span.clone())?
@@ -48,9 +54,6 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
         output.state.code += "    " + output.value.text.clone() + " = " + source.value.text + ";\n"
     } else {
-        if (subject.kind != "Index") {
-            RejectLayout("unsupported_linked_clone", "an owning struct binding requires field-wise clone lowering", DeclarationSpan(subject))?
-        }
         if (!ContainsIndex(output.state.element_clones, layout)) {
             output.state.element_clones = output.state.element_clones.push(layout)
         }
