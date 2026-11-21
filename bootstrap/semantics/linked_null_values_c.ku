@@ -10,17 +10,7 @@ import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
 import { EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { AddLinkedNullSlot, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
-
-fn cloneLinkedString(&project: LinkedNullProject, source: LinkedNullExpression, id: int): LinkedNullExpression! {
-    ty = source.value.ty.clone()
-    output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
-    output.state.code = output.state.code + "    if (!ku_linked_clone_string(" + source.value.text + ", &" + output.value.text.clone()
-        + ")) { out_of_memory = true; goto cleanup; }\n"
-    output.state.uses_clone = true
-    output.state.slots[output.value.slot - 1].live = true
-    return ok(output)
-}
+import { AddLinkedNullSlot, CloneLinkedStringSlot, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix } from "./linked_parameters_c.ku"
 
 fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int, depth: int): LinkedNullExpression! {
     subject_id = LinkedNullChild(project, 1, target, 0)
@@ -32,7 +22,7 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     source = LowerLinkedNullRead(project, state, subject_id, depth + 1)?
     ty = source.value.ty.clone()
     if (ty.declaration_kind == "Builtin" && ty.name == "str") {
-        return cloneLinkedString(project, source, id)
+        return CloneLinkedStringSlot(project, source, "t" + str(id))
     }
     if (field) {
         RejectLayout("unsupported_linked_clone", "field clone requires a bound str", DeclarationSpan(subject))?
@@ -237,9 +227,17 @@ fn LowerLinkedNullValue(&project: LinkedNullProject, state: LinkedNullState, id:
             value = right.value
             return EmitLinkedAddition(project, right.state, left.value, value, id, at)
         }
+        before = ""
+        if (left.value.slot > 0) {
+            before = left.state.code
+            left.state.code = ""
+        }
         right = LowerLinkedNullValue(project, left.state, rhs, depth + 1)?
         value = right.value
-        return EmitLinkedAddition(project, right.state, left.value, value, id, at)
+        if (left.value.slot == 0) { return EmitLinkedAddition(project, right.state, left.value, value, id, at) }
+        kept = RestoreLinkedConcatPrefix(project, right.state, left.value, before, id)?
+        previous = kept.value
+        return EmitLinkedAddition(project, kept.state, previous, value, id, at)
     }
     if (node.kind == "Binary" || node.kind == "Index" || node.kind == "Field") {
         return LowerLinkedNullRead(project, state, id, depth)

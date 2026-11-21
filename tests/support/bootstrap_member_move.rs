@@ -10,12 +10,13 @@ struct Packet { pair: Pair spare: str }
 fn Mix(first: str, second: str): str { return first + second }
 fn Checked(second: str, bad: bool): str! { return ok(second) }
 fn Observe(&first: str, second: str): null! { return ok(null) }
+fn Take(first: str): str { return first }
 "#,
     )
     .unwrap();
     fs::write(
         cwd.join("member-move-source.ku"),
-        r#"import { Packet, Mix, Checked, Observe } from "./member-move-providers.ku"
+        r#"import { Packet, Mix, Checked, Observe, Take } from "./member-move-providers.ku"
 fn MoveMembers(packet: Packet, bad: bool): str! {
     return ok(Mix(packet.pair.first, Checked(packet.pair.second, bad)?))
 }
@@ -26,6 +27,7 @@ fn InvalidateLoan(packet: Packet): null! {
     Observe(packet.pair.first, packet.pair.first)?
     return ok(null)
 }
+fn Concat(packet: Packet): str! { return ok(packet.pair.first + Take(packet.pair.first)) }
 "#,
     )
     .unwrap();
@@ -157,6 +159,7 @@ int main(void) {
         assert!(rejected.stdout.is_empty());
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
     }
+    assert_snapshot_before_consuming_rhs(cwd, &emit);
     assert_owned_array_member(cwd, &emit);
     assert_owned_int_array_member(cwd, &emit);
 }
@@ -233,6 +236,105 @@ int main(void) {
         assert_eq!(rejected.status.code(), Some(1));
         assert!(rejected.stdout.is_empty());
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}
+
+fn assert_snapshot_before_consuming_rhs(
+    cwd: &Path,
+    emit: &impl Fn(&str) -> super::bounded_process::BoundedOutput,
+) {
+    fs::write(cwd.join("function.txt"), "Concat").unwrap();
+    let typed = emit("linked-null-plan");
+    assert_ok(&typed);
+    let Some(Value::Result { ok: true, value }) = json::eval(
+        "decode",
+        &[Value::String(String::from_utf8(typed.stdout).unwrap())],
+        Span::default(),
+    )
+    .unwrap() else {
+        panic!("expected a concat plan")
+    };
+    let Value::Object(root) = *value else {
+        panic!("expected plan object")
+    };
+    let Value::Object(entry) = &root["export"] else {
+        panic!("expected export")
+    };
+    let Value::Object(signature) = &entry["signature"] else {
+        panic!("expected signature")
+    };
+    let Value::Array(parameters) = &signature["parameters"] else {
+        panic!("expected parameters")
+    };
+    let Value::Object(parameter) = &parameters[0] else {
+        panic!("expected parameter type")
+    };
+    let Value::String(packet) = &parameter["c_type"] else {
+        panic!("expected C parameter type")
+    };
+    let Value::String(symbol) = &entry["symbol"] else {
+        panic!("expected export symbol")
+    };
+    let Value::Array(dependencies) = &root["dependencies"] else {
+        panic!("expected dependencies")
+    };
+    let [Value::Object(provider)] = dependencies.as_slice() else {
+        panic!("expected one owned provider")
+    };
+    let Value::String(take) = &provider["symbol"] else {
+        panic!("expected provider symbol")
+    };
+    let driver = r#"
+static uint8_t *original;
+static unsigned calls, expected_calls;
+static void check_cleanup(void) {
+    if (outstanding() || calls != expected_calls) _Exit(90);
+}
+KuProjectionString __TAKE__(KuProjectionString value) {
+    assert(value.ptr == original && value.len == 5);
+    ++calls;
+    return value;
+}
+int main(int argc, char **argv) {
+    (void)test_realloc;
+    __PACKET__ packet = {0};
+    original = malloc(5);
+    memcpy(original, "first", 5);
+    packet.f0.f0 = (KuProjectionString){original,5,5,KU_PROJECTION_STRING_OWNED};
+    assert(atexit(check_cleanup) == 0);
+    expected_calls = 1;
+    if (argc > 1) {
+        fail_after = argv[1][0] == '0' ? 0 : 1;
+        expected_calls = (unsigned)fail_after;
+    }
+    KuBootstrapResult_KuProjectionString result = __ENTRY__(packet);
+    assert(argc == 1 && result.ok && result.value.len == 10);
+    assert(memcmp(result.value.ptr, "firstfirst", result.value.len) == 0);
+    ku_projection_string_drop(&result.value);
+    return 0;
+}
+"#
+    .replace("__PACKET__", packet)
+    .replace("__ENTRY__", symbol)
+    .replace("__TAKE__", take);
+    let c = emit("linked-null");
+    assert_ok(&c);
+    let path = cwd.join("concat-operand.c");
+    let app = cwd.join(format!("concat-operand{}", std::env::consts::EXE_SUFFIX));
+    fs::write(
+        &path,
+        format!(
+            "{CHECKED_ARRAY_ALLOCATOR}{}{driver}",
+            String::from_utf8(c.stdout).unwrap()
+        ),
+    )
+    .unwrap();
+    compile_projection(&path, &app, cwd);
+    assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+    for phase in ["0", "1"] {
+        let failed = execute(Command::new(&app).arg(phase), cwd, 15);
+        assert_eq!(failed.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("out of memory"));
     }
 }
 
