@@ -1,11 +1,11 @@
 import { FindLinkedLocalRead, LinkedLocalReadBinding, RequireLinkedMutableName } from "./call_contracts.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, CloneLinkedIntArray, CloneLinkedRecord, CloneLinkedStringSlot, LinkedCallableSlot, RejectLocalReader, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
-import { CloneLinkedStringArray } from "./struct_string_calls.ku"
+import { CloneLinkedStringArray, LinkedFieldAppendPlace, RequireLinkedStringFieldAppend } from "./struct_string_calls.ku"
 import { FinishLinkedReaderThunk, LinkedScopedCallbackFunction, SameLinkedCallbackSignature, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
 import { ContainsIndex, LinkedAppendFaultRelayCode, LinkedIntArrayCallbackFaultPending, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { Node } from "../stage2/ast.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { SameRecordArrayElement, TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { IsLinkedScopedCallback,
@@ -170,7 +170,7 @@ fn AppendLinkedArrayElement(state: LinkedNullState, &array: LinkedNullValue, &va
     return RecordLinkedMemberMove(next, value)
 }
 
-fn FinishLinkedFieldAppend(&project: LinkedNullProject, input: LinkedNullExpression, target: int, argument: int): LinkedNullState! {
+fn FinishLinkedFieldAppend(&project: LinkedNullProject, input: LinkedNullExpression, target: int, argument: int, nested: bool): LinkedNullState! {
     element = input
     copy_int = LinkedIntResult(element.value.ty) && !element.value.borrowed
     if (copy_int) {
@@ -180,27 +180,31 @@ fn FinishLinkedFieldAppend(&project: LinkedNullProject, input: LinkedNullExpress
         element.state.code += "    int64_t " + item.clone() + " = " + element.value.text + ";\n"
         element = LinkedReadonlyExpression(element.state, element.value.ty, item)
     }
-    destination = LowerLinkedNullRead(project, element.state, target, 0)?
+    destination = LinkedFieldAppendPlace(LowerLinkedNullRead(project, element.state, target, 0)?)
     array = destination.value.clone()
     item = element.value
-    // Keep the same field owner across the checked append. Only a record
-    // element transfers an owner; the int path passes its saved Copy value.
-    if (LinkedNullIntArrayOwner(array.ty)) {
+    // Do not grow or transfer ownership before the checked RHS and place.
+    if (array.ty.declaration_kind == "OwnedStringArray") {
+        RequireLinkedStringFieldAppend(destination.state, array, item)?
+    } else if (nested) {
+        RejectLayout("linked_field_append", "nested append requires an owned string array field", array.ty.span.clone())?
+    } else if (LinkedNullIntArrayOwner(array.ty)) {
         if (array.borrowed || array.member_path == "" || !copy_int) {
             RejectLayout("linked_field_append", "append requires an owned int array field and one Copy int",
                          DeclarationSpan(LinkedNullNode(project, 1, argument)))?
         }
     } else if (!LinkedNullOwnedArray(array.ty) || array.borrowed || array.member_path == ""
         || item.borrowed || item.slot == 0 || item.member_path != ""
-        || !SameLinkedType(LinkedNullArrayElement(array.ty.clone()), item.ty)) {
+        || !SameRecordArrayElement(array.ty, item.ty)) {
         RejectLayout("linked_field_append", "append requires an owned record array field and a separate owned element",
                      DeclarationSpan(LinkedNullNode(project, 1, argument)))?
     }
     for existing in destination.state.local_append_types.clone() {
         if (SameLinkedType(existing, array.ty)) { return ok(AppendLinkedArrayElement(destination.state, array, item)) }
     }
-    destination.state.local_append_types = destination.state.local_append_types.push(array.ty.clone())
-    return ok(AppendLinkedArrayElement(destination.state, array, item))
+    next = destination.state
+    next.local_append_types = next.local_append_types.push(array.ty.clone())
+    return ok(AppendLinkedArrayElement(next, array, item))
 }
 
 fn linkedStringAppendRoot(&project: LinkedNullProject, &target: Node, depth: int): str! {

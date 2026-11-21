@@ -7,11 +7,11 @@ import { OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { BoundLinkPlanType, LinkedNullArrayHeader, LinkedNullBinding, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
-import { LinkedMemberUnavailable } from "./linked_member_ownership.ku"
+import { BoundLinkPlanType, LinkedNullArrayHeader, LinkedNullBinding, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullState, LinkedNullValue, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { LinkedMemberUnavailable, RequireLinkedMove } from "./linked_member_ownership.ku"
 import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 import { LinkedBuiltin, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullView, LinkedStringResult, ResolveLinkedCall } from "./linked_null_types_c.ku"
-import { LinkedCopyResult, RetagTypeNameBinding, TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
+import { LinkedCopyResult, NamedFieldPushArgument, RetagTypeNameBinding, TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { FinishLinkedFieldRead, LowerLinkedNullRead, ReadLinkedArrayElementAfterBase } from "./linked_null_read_c.ku"
 
 struct StructStringDependency {
@@ -341,16 +341,21 @@ fn LinkedOwnedStringPredicate(&project: LinkedNullProject, &state: LinkedNullSta
     return ok(owns_string)
 }
 
-fn LinkedFieldAppendArgument(&project: LinkedNullProject, &target: Node, &root: Node, rhs: int): int {
-    call = LinkedNullNode(project, 1, rhs)
-    if (call.kind != "Call" || call.edge_count != 2) { return 0 }
-    method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
-    if (method.kind != "Field" || method.edge_count != 1 || method.text != "push") { return 0 }
-    field = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
-    if (field.kind != "Field" || field.edge_count != 1 || field.text != target.text) { return 0 }
-    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, field, 0))
-    if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != root.text) { return 0 }
-    return LinkedNullChild(project, 1, call, 1)
+fn LinkedFieldAppendArgument(&project: LinkedNullProject, target: int, rhs: int): int {
+    return NamedFieldPushArgument(project.supplied[0].named.parsed.arena.nodes,
+        project.supplied[0].named.parsed.arena.edges, target, rhs)
+}
+
+fn LinkedFieldAppendPlace(field: LinkedNullExpression): LinkedNullExpression {
+    owned = field.value.member_path != ""
+    return LinkedStringArrayAssignmentPlace(field, owned)
+}
+
+fn RequireLinkedStringFieldAppend(&state: LinkedNullState, &array: LinkedNullValue, &item: LinkedNullValue): null! {
+    if (!LinkedStringResult(item.ty) || item.slot == 0 || item.slot == array.slot || LinkedMemberUnavailable(state, array, true)) {
+        RejectLayout("linked_field_append", "append requires a live owned string array field and a separate owned str", item.ty.span.clone())?
+    }
+    return RequireLinkedMove(state, item)
 }
 
 fn CloneLinkedStringArray(&project: LinkedNullProject, source: LinkedNullExpression, id: int): LinkedNullExpression! {

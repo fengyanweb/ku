@@ -164,12 +164,11 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     RequireLinkedMutableName(root.text, DeclarationSpan(root))?
 
     rhs_id = LinkedNullChild(project, 1, statement, 1)
-    argument = 0
-    if (!nested) { argument = LinkedFieldAppendArgument(project, target, root, rhs_id) }
+    argument = LinkedFieldAppendArgument(project, target_id, rhs_id)
     if (capture && argument > 0) {
         RejectLayout("linked_member_target", "a local callback can only assign Copy fields of a captured record", DeclarationSpan(target))?
     }
-    if (argument > 0) { return LowerLinkedFieldAppend(project, state, target_id, argument) }
+    if (argument > 0) { return LowerLinkedFieldAppend(project, state, target_id, argument, nested) }
     // Generate the RHS and finish its fallible work before selecting the
     // target in the resulting state. The old member still belongs to cleanup
     // if the RHS fails or consumes its record.
@@ -373,8 +372,8 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
     return ok(next)
 }
 
-fn LowerLinkedFieldAppend(&project: LinkedNullProject, state: LinkedNullState, target: int, argument: int): LinkedNullState! {
-    return FinishLinkedFieldAppend(project, LowerLinkedNullValue(project, state, argument, 0)?, target, argument)
+fn LowerLinkedFieldAppend(&project: LinkedNullProject, state: LinkedNullState, target: int, argument: int, nested: bool): LinkedNullState! {
+    return FinishLinkedFieldAppend(project, LowerLinkedNullValue(project, state, argument, 0)?, target, argument, nested)
 }
 
 fn LowerLinkedStringAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
