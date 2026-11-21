@@ -4442,6 +4442,7 @@ int main(int argc, char **argv) {
     linked_guard::assert_record_field_string_rebind(&compiler, &cwd);
     linked_guard::assert_checked_str_predicate(&compiler, &cwd);
     linked_guard::assert_checked_copy_int(&compiler, &cwd);
+    linked_guard::assert_local_string_lengths(&compiler, &cwd);
     linked_guard::assert_checked_callback_forwarding(&compiler, &cwd);
     linked_guard::assert_local_callback_thunk(&compiler, python, &cwd);
     linked_guard::assert_local_append_thunk(&compiler, &cwd);

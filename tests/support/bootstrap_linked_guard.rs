@@ -2165,6 +2165,85 @@ pub(super) fn assert_decorated_caught_error(seed: &Path, cwd: &Path) {
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("linked_error_member_moved"));
 }
 
+pub(super) fn assert_local_string_lengths(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("local-string-lengths.ku"),
+        r#"struct Measurement { scalars: int bytes: int }
+fn Read(source: str): Measurement! {
+    scalars = source.len()
+    octets = source.byte_len()
+    return ok(Measurement { scalars: scalars, bytes: octets })
+}
+fn ReadView(&source: str): Measurement! {
+    scalars = source.len()
+    octets = source.byte_len()
+    return ok(Measurement { scalars: scalars, bytes: octets })
+}
+fn Refuse(source: int): int! {
+    local = source.byte_len()
+    return ok(local)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "local-string-lengths.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    for name in ["Read", "ReadView"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        let (result, signature) = code
+            .lines()
+            .find_map(|line| line.split_once(" ku_linked_null_"))
+            .unwrap();
+        let entry = signature.split_once('(').unwrap().0;
+        let host = r#"
+#include <assert.h>
+#include <string.h>
+static void visit(const uint8_t *text, size_t len, int64_t scalars) {
+    size_t cap = len ? len : 1;
+    uint8_t *bytes = malloc(cap);
+    assert(bytes);
+    memcpy(bytes,text,len);
+    KuProjectionString value = {bytes,len,cap,KU_PROJECTION_STRING_OWNED};
+#if __VIEW__
+    __RESULT__ result = __ENTRY__(&value);
+    assert(value.ptr == bytes && !memcmp(value.ptr,text,len));
+    free(bytes);
+#else
+    __RESULT__ result = __ENTRY__(value);
+#endif
+    assert(result.ok && result.value.f0 == scalars && result.value.f1 == (int64_t)len);
+}
+int main(void) {
+    static const uint8_t ascii[] = {0x61,0x62,0x63};
+    static const uint8_t mixed[] = {0x61,0xe4,0xb8,0xad,0xf0,0x9f,0x99,0x82};
+    visit(ascii,0,0);
+    visit(ascii,sizeof(ascii),3);
+    visit(mixed,sizeof(mixed),3);
+    return 0;
+}
+"#
+        .replace("__RESULT__", result)
+        .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
+        .replace("__VIEW__", if name == "ReadView" { "1" } else { "0" });
+        let source = cwd.join("local-string-lengths.c");
+        let exe = cwd.join(format!(
+            "local-string-lengths{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        fs::write(&source, format!("{code}{host}")).unwrap();
+        compile_projection(&source, &exe, cwd);
+        assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    }
+    fs::write(cwd.join("function.txt"), "Refuse").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unsupported_linked_read"));
+}
+
 pub(super) fn assert_checked_copy_int(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("checked-int.ku"),

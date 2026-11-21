@@ -103,8 +103,14 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
     if (target.kind == "Field" && target.text == "clone" && target.edge_count == 1 && call.edge_count == 1) {
         return emitLinkedClone(project, state, target, id, depth)
     }
-    if (target.kind == "Field" && target.text == "len" && target.edge_count == 1 && call.edge_count == 1) {
-        return LowerLinkedNullRead(project, state, id, depth)
+    if (target.kind == "Field" && target.edge_count == 1 && call.edge_count == 1) {
+        if (target.text == "len") { return LowerLinkedNullRead(project, state, id, depth) }
+        if (target.text == "byte_len") {
+            receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+            if (receiver.kind == "Variable" && LinkedNullBinding(state.slots, receiver.text) > 0) {
+                return LowerLinkedNullRead(project, state, id, depth)
+            }
+        }
     }
     if (target.kind == "Variable" && target.edge_count == 0) {
         local = FindLinkedLocalRead(state.local_readers, target.text)
