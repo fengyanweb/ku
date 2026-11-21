@@ -262,6 +262,33 @@ fn CheckLinkedAddition(&state: LinkedNullState, &left: LinkedNullValue, &right: 
     return ok(null)
 }
 
+fn linkedCountedBoundWrite(&node: Node, &name: str): bool {
+    return (node.kind == "Assign" || node.kind == "VarDecl") && node.text == name
+}
+
+fn CheckLinkedCountedBoundWrites(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node): null! {
+    guard_id = LinkedNullChild(project, 1, loop, 0)
+    guard = LinkedNullNode(project, 1, guard_id)
+    name = LinkedNullArrayLimitName(project, LinkedNullChild(project, 1, guard, 1))
+    slot = LinkedNullBinding(state.slots, name)
+    if (slot == 0) { return ok(null) }
+    ty = state.slots[slot - 1].value.ty.clone()
+    if (!LinkedNullOwnedArray(ty) && !LinkedNullIntArrayOwner(ty)) { return ok(null) }
+
+    // The validated source tree is contiguous and in post-order. The nodes
+    // between the condition and the final increment include nested body writes.
+    end = LinkedNullChild(project, 1, loop, loop.edge_count - 1)
+    index = guard_id + 1
+    while (index < end) {
+        if (linkedCountedBoundWrite(project.supplied[0].named.parsed.arena.nodes[index - 1], name)) {
+            RejectLayout("linked_loop_bound_write", "a counted loop cannot rebind its owned array length source",
+                         DeclarationSpan(project.supplied[0].named.parsed.arena.nodes[index - 1]))?
+        }
+        index = index + 1
+    }
+    return ok(null)
+}
+
 fn EmitLinkedMultiplyDivide(state: LinkedNullState, &node: Node, id: int,
                             &left: LinkedNullValue, &right: LinkedNullValue): LinkedNullExpression {
     next = state

@@ -1174,3 +1174,75 @@ pub(super) fn assert_owned_string_field_clone(seed: &Path, cwd: &Path) {
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(reason));
     }
 }
+
+const OWNED_BOUND_SOURCE: &str = r#"struct Snapshot { values: [int] count: int }
+fn Stable(): Snapshot! {
+    bound: [int] = [4, 0, 9]
+    sampled: [int] = []
+    i = 0
+    while (i < bound.len()) {
+        sampled = sampled.push(bound[i])
+        i = i + 1
+    }
+    return ok(Snapshot { values: sampled, count: i })
+}
+fn Grow(): null! {
+    bound: [int] = [1]
+    i = 0
+    while (i < bound.len()) {
+        if (i >= 0) { bound = bound.push(0) }
+        i = i + 1
+    }
+    return ok(null)
+}
+"#;
+
+const OWNED_BOUND_HOST: &str = r#"
+int main(void) {
+    (void)test_malloc;
+    __RESULT__ result = __STABLE__();
+    assert(result.ok && result.value.f0.len == 3 && result.value.f1 == 3);
+    assert(result.value.f0.data[0] == 4 && result.value.f0.data[1] == 0 && result.value.f0.data[2] == 9);
+    assert(outstanding() == 1 && attempts == 2);
+    __DROP__(&result.value);
+    assert(!outstanding());
+    return 0;
+}
+"#;
+
+pub(super) fn assert_stable_owned_count_bound(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("owned-bound.ku"), OWNED_BOUND_SOURCE).unwrap();
+    fs::write(cwd.join("modules.txt"), "owned-bound.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Stable").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, _) = signature.split_once('(').unwrap();
+    let drop = code
+        .lines()
+        .find_map(|line| line.strip_prefix("static void ku_drop_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = OWNED_BOUND_HOST
+        .replace("__STABLE__", &format!("ku_linked_null_{entry}"))
+        .replace("__RESULT__", result)
+        .replace("__DROP__", &format!("ku_drop_{drop}"));
+    let c = cwd.join("owned-bound.c");
+    let exe = cwd.join(format!("owned-bound{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+
+    fs::write(cwd.join("function.txt"), "Grow").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_loop_bound_write"));
+}
