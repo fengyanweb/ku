@@ -117,12 +117,12 @@ fn TypePartToNode(part: TypePart, first_edge: int): Node {
 }
 
 fn CheckTypeDepth(depth: int, token: Token): null! {
-    if (depth > 32) { RejectAt(token, "type_depth_exceeded", "stage-3 type nesting exceeds 32 levels")? }
+    if (depth > 32) { return RejectAt(token, "type_depth_exceeded", "stage-3 type nesting exceeds 32 levels") }
     return ok(null)
 }
 
 fn CheckUnionWidth(count: int, token: Token): null! {
-    if (count > 64) { RejectAt(token, "type_union_limit", "stage-3 union types accept at most 64 members")? }
+    if (count > 64) { return RejectAt(token, "type_union_limit", "stage-3 union types accept at most 64 members") }
     return ok(null)
 }
 
