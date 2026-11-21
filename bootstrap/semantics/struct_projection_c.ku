@@ -3,6 +3,7 @@ import { Span } from "../stage2/span.ku"
 import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
+import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
 
 fn InvalidPlan(message: str): null! {
@@ -339,10 +340,7 @@ fn ProjectionBytesGet(&target: Node, &receiver: TypeNameBinding, arguments: int,
 }
 
 fn ProjectionLocalFunction(&supplied: [SuppliedModule], unit: int, &name: str): int {
-    for entry in supplied[unit - 1].named.names.declarations.clone() {
-        if (entry.kind == "Function" && entry.name == name) { return entry.node }
-    }
-    return 0
+    return ScalarFunctionNode(supplied[unit - 1].named.names.declarations, name)
 }
 
 fn ResolveProjectionDirectFunction(&supplied: [SuppliedModule], &imports: [ImportBinding], unit: int, &target: Node): [int]! {
