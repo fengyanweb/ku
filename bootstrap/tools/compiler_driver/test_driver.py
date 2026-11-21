@@ -122,14 +122,20 @@ def exercise_project(compiler, cc, root, caller):
     for input_path, name in [(relative, "Answer"), (library_manifest, "Increment")]:
         plan = caller / f"{name}.plan.json"
         document = execute([compiler, "emit-unit-plan", input_path, name], caller)
-        assert not document.stderr
+        assert not document.stderr, (
+            f"{compiler.name} emit-unit-plan {name} wrote: "
+            + document.stderr[:1000].decode(errors="replace")
+        )
         plan.write_bytes(document.stdout)
         parsed = json.loads(document.stdout)
         assert parsed["export"]["source_name"] == name
         plans.append(parsed)
         code = caller / f"{name}.c"
         record = execute([compiler, "emit-unit", input_path, name], caller)
-        assert not record.stderr
+        assert not record.stderr, (
+            f"{compiler.name} emit-unit {name} wrote: "
+            + record.stderr[:1000].decode(errors="replace")
+        )
         code.write_bytes(record.stdout)
         units.extend(["--unit", plan, code])
 
