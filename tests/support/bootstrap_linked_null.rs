@@ -787,6 +787,39 @@ int main(int argc, char** argv) {
             String::from_utf8_lossy(&failure.stderr).contains("index 1 out of bounds for length 0")
         );
     }
+
+    let entry = cwd.join("logic-entry.ku");
+    fs::write(cwd.join("modules.txt"), "logic-entry.ku\n").unwrap();
+    fs::write(
+        &entry,
+        "fn Observe(plain: bool): bool { checked = !plain; return !(!checked) }\n",
+    )
+    .unwrap();
+    let output = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&output);
+    let code = String::from_utf8(output.stdout).unwrap();
+    let name = code
+        .lines()
+        .find_map(|line| Some(line.strip_prefix("bool ")?.split_once('(')?.0))
+        .expect("linked bool entry");
+    let c = cwd.join("logic-value.c");
+    let exe = cwd.join(format!("logic-value{}", std::env::consts::EXE_SUFFIX));
+    let witness = format!(
+        "\n#include <assert.h>\nint main(void) {{ assert({name}(false) && !{name}(true)); return 0; }}\n"
+    );
+    fs::write(&c, format!("{code}{witness}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 10));
+
+    fs::write(
+        entry,
+        "fn Observe(plain: int): bool { checked = !plain; return checked }\n",
+    )
+    .unwrap();
+    let invalid = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(invalid.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("linked_unary_type"));
 }
 
 pub(super) fn assert_checked_string_array_borrow(seed: &Path, cwd: &Path) {

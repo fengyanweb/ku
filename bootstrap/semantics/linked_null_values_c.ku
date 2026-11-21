@@ -350,7 +350,8 @@ fn LowerLinkedNullValue(&project: LinkedNullProject, state: LinkedNullState, id:
         previous = kept.value
         return EmitLinkedAddition(project, kept.state, previous, value, id, at)
     }
-    if (node.kind == "Binary" || node.kind == "Index" || node.kind == "Field") {
+    if (node.kind == "Binary" || node.kind == "Index" || node.kind == "Field" ||
+        (node.kind == "Unary" && node.text == "!" && node.edge_count == 1)) {
         return LowerLinkedNullRead(project, state, id, depth)
     }
     return LowerLinkedNullLeaf(state, node)
