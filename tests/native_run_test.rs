@@ -7875,45 +7875,12 @@ fn native_guarded_match_preserves_nested_owned_payload_until_selection() {
     let dir = unique_temp_dir("match-owned-guard");
     fs::write(
         dir.join("summary.ku"),
-        r#"
-enum Title { Content(value: str) Missing }
-enum Entry { Wrapped(value: Title) Empty }
-
-fn Probe(title: str, mode: int): bool! {
-    println("probe: " + title)
-    if (mode == 2) { fail { domain: "guard", code: "rejected", message: "bad title" } }
-    return ok(mode == 1)
-}
-
-fn Summary(entry: Entry, mode: int): str! {
-    return ok(match entry {
-        Entry.Wrapped(Title.Content(title)) if (title.starts_with("Review")) => "selected: " + title
-        Entry.Wrapped(Title.Content(title)) if (Probe(title, mode)?) => "accepted"
-        Entry.Wrapped(Title.Content(title)) => title
-        Entry.Wrapped(Title.Missing) => "(untitled)"
-        Entry.Wrapped(_) => "(unexpected)"
-        Entry.Empty => "(empty)"
-    })
-}
-"#,
+        include_str!("fixtures/native_guarded_match/summary.ku"),
     )
     .unwrap();
     fs::write(
         dir.join("main.ku"),
-        r#"
-import { Entry, Title, Summary } from "./summary.ku"
-
-fn main(): null! {
-    println(Summary(Entry.Wrapped(Title.Content("整理" + "🙂")), 0)?)
-    println(Summary(Entry.Wrapped(Title.Content("Review" + "🙂")), 0)?)
-    println(Summary(Entry.Wrapped(Title.Content("承認" + "🙂")), 1)?)
-    try { Summary(Entry.Wrapped(Title.Content("故障" + "🙂")), 2)? }
-    catch (error) { println(error.domain + "/" + error.code + "/" + error.message) }
-    println(Summary(Entry.Wrapped(Title.Missing), 0)?)
-    println(Summary(Entry.Wrapped(Title.Content("继续" + "🙂")), 0)?)
-    return ok(null)
-}
-"#,
+        include_str!("fixtures/native_guarded_match/main.ku"),
     )
     .unwrap();
     let Some(exe) = native_build(&dir, "main.ku", "guardmatch") else {
@@ -7922,9 +7889,8 @@ fn main(): null! {
     let (stdout, code) = run_binary(&exe);
     assert_eq!(code, Some(0));
     assert_eq!(
-        stdout.replace('\r', ""),
-        "probe: 整理🙂\n整理🙂\nselected: Review🙂\nprobe: 承認🙂\naccepted\n\
-         probe: 故障🙂\nguard/rejected/bad title\n(untitled)\nprobe: 继续🙂\n继续🙂\n"
+        stdout.replace("\r\n", "\n"),
+        include_str!("fixtures/native_guarded_match/expected.txt").replace("\r\n", "\n")
     );
     fs::remove_dir_all(&dir).ok();
 }

@@ -1,0 +1,19 @@
+enum Title { Content(value: str) Missing }
+enum Entry { Wrapped(value: Title) Empty }
+
+fn Probe(title: str, mode: int): bool! {
+    println("probe: " + title)
+    if (mode == 2) { fail { domain: "guard", code: "rejected", message: "bad title" } }
+    return ok(mode == 1)
+}
+
+fn Summary(entry: Entry, mode: int): str! {
+    return ok(match entry {
+        Entry.Wrapped(Title.Content(title)) if (title.starts_with("Review")) => "selected: " + title
+        Entry.Wrapped(Title.Content(title)) if (Probe(title, mode)?) => "accepted"
+        Entry.Wrapped(Title.Content(title)) => title
+        Entry.Wrapped(Title.Missing) => "(untitled)"
+        Entry.Wrapped(_) => "(unexpected)"
+        Entry.Empty => "(empty)"
+    })
+}
