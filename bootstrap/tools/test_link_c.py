@@ -490,6 +490,56 @@ int main(void) {
         self.assertEqual(link_c.main([*unit, *self.build_args]), 0)
         subprocess.run([self.output], check=True, timeout=5)
 
+    def test_int_reader_callback_checks_the_plain_nominal_result(self):
+        callback = dict(view("KuBootstrapIntReaderCallback_KuStruct_m2_9"),
+                        kind="IntRecordReaderCallback", passing="value")
+        unit_ref = link_c.TypeRef.read(callback, "reader").semantic()
+        foreign = dict(callback, c_type="KuBootstrapIntReaderCallback_KuStruct_m5_9")
+        self.assertEqual(link_c.TypeRef.read(foreign, "reader").semantic(), unit_ref)
+        foreign["source_path"] = "other.ku"
+        self.assertNotEqual(link_c.TypeRef.read(foreign, "reader").semantic(), unit_ref)
+        code = """#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+typedef struct {
+    int append_status;
+    bool out_of_memory, overflow, index_failed;
+    const char *array_error;
+    int64_t index;
+    size_t length;
+} KuLocalAppendFailure;
+typedef struct { int64_t value; } KuStruct_m2_9;
+typedef struct { int64_t value; } Other;
+typedef struct {
+    KuStruct_m2_9 (*entry)(void *, KuLocalAppendFailure *, int64_t);
+    void *environment;
+    KuLocalAppendFailure *failure;
+} KuBootstrapIntReaderCallback_KuStruct_m2_9;
+int64_t invoke(KuBootstrapIntReaderCallback_KuStruct_m2_9 f) {
+    return f.entry(f.environment, f.failure, 12).value;
+}
+"""
+        export = declaration("app.ku", 58, "invoke", [callback])
+        unit = self.unit("record-reader", plan(export), code)
+        self.caller.write_text("""
+static KuStruct_m2_9 read_value(void *raw, KuLocalAppendFailure *failure, int64_t index) {
+    (void)failure;
+    return (KuStruct_m2_9){*(int64_t *)raw + index};
+}
+int main(void) {
+    int64_t base = 30;
+    KuLocalAppendFailure failure = {0};
+    return invoke((KuBootstrapIntReaderCallback_KuStruct_m2_9){read_value, &base, &failure}) != 42;
+}
+""", encoding="ascii")
+        self.assertEqual(link_c.main([*unit, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+        valid = self.output.read_bytes()
+        wrong = self.unit("record-reader-wrong-result", plan(export),
+                          code.replace("KuStruct_m2_9 (*entry)", "Other (*entry)"))
+        self.assertEqual(link_c.main([*wrong, *self.build_args]), 1)
+        self.assertEqual(self.output.read_bytes(), valid)
+
     def test_typed_int_array_callback_checks_nominal_argument_and_failure_record(self):
         def callback(module):
             return dict(view(f"KuBootstrapIntArrayCallback_KuStruct_m{module}_9"),

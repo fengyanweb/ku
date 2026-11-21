@@ -27,6 +27,7 @@ CALLBACK_TYPES = {
     "IntArrayResultCallback": ("int_array_result_callback", "KuBootstrapIntArrayCallback_"),
     "IntResultAppendCallback": ("int_result_append_callback", "KuBootstrapIntAppendCallback_"),
     "IntResultArenaCallback": ("int_result_arena_callback", "KuBootstrapIntArenaCallback_"),
+    "IntRecordReaderCallback": ("int_record_reader_callback", "KuBootstrapIntReaderCallback_"),
 }
 CALLBACK_IDENTITIES = {identity for identity, _ in CALLBACK_TYPES.values()}
 CHECKED_INT_CALLBACK_PARAMETERS = {
@@ -365,7 +366,7 @@ def wrapper(unit, include_caller):
                         for ref in decl.signature.parameters if ref.identity[0] in CALLBACK_IDENTITIES})
     if callbacks:
         lines.append('#include <stddef.h>')
-    if any(kind == "int_array_result_callback" or kind in CHECKED_INT_CALLBACK_ABI for kind, _, _ in callbacks):
+    if any(kind != "int_pair_result_callback" for kind, _, _ in callbacks):
         lines.extend(check_carrier_layout("KuLocalAppendFailure", "ku_bootstrap_callback_failure_layout", (
             ("append_status", "int"), ("out_of_memory", "bool"), ("overflow", "bool"), ("index_failed", "bool"),
             ("array_error", "const char *"), ("index", "int64_t"), ("length", "size_t"),
@@ -383,6 +384,10 @@ def wrapper(unit, include_caller):
             params = [nominals[field] if isinstance(field, int) else field for field in CHECKED_INT_CALLBACK_ABI[kind]]
             lines.append(f"typedef KuBootstrapResult_int64_t (*{entry})(void*, KuLocalAppendFailure*, "
                          f"{', '.join(params)});")
+            fields.append(("failure", "KuLocalAppendFailure *"))
+        elif kind == "int_record_reader_callback":
+            result = carrier.removeprefix(CALLBACK_TYPES["IntRecordReaderCallback"][1])
+            lines.append(f"typedef {result} (*{entry})(void*, KuLocalAppendFailure*, int64_t);")
             fields.append(("failure", "KuLocalAppendFailure *"))
         else:
             result = carrier.removeprefix(CALLBACK_TYPES["IntPairResultCallback"][1])
