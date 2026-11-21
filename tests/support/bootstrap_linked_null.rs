@@ -933,6 +933,38 @@ fn Rest(packet: Packet): null! {
     { title, ...remaining } = packet
     return ok(null)
 }
+struct Counter { number: int }
+struct CounterBox { value: Counter }
+fn CursorChange(): null! {
+    bound = 2
+    cursor = 0
+    while (cursor < bound) {
+        replacement = Counter { number: 0 }
+        { number: cursor } = replacement
+        cursor = cursor + 1
+    }
+    return ok(null)
+}
+fn BoundChange(): null! {
+    bound = 2
+    cursor = 0
+    while (cursor < bound) {
+        replacement = Counter { number: 0 }
+        { number: bound } = replacement
+        cursor = cursor + 1
+    }
+    return ok(null)
+}
+fn RecordBoundChange(): null! {
+    bound = Counter { number: 2 }
+    cursor = 0
+    while (cursor < bound.number) {
+        replacement = CounterBox { value: Counter { number: 0 } }
+        { value: bound } = replacement
+        cursor = cursor + 1
+    }
+    return ok(null)
+}
 "#,
     )
     .unwrap();
@@ -1040,6 +1072,9 @@ int main(int argc, char **argv) {
         ("AfterMove", "unavailable_linked_binding"),
         ("Defaulted", "linked_destructure_shape"),
         ("Rest", "linked_destructure_shape"),
+        ("CursorChange", "linked_loop_cursor_write"),
+        ("BoundChange", "linked_loop_bound_write"),
+        ("RecordBoundChange", "linked_loop_bound_write"),
     ] {
         fs::write(cwd.join("function.txt"), function).unwrap();
         let rejected = execute(&mut Command::new(seed), cwd, 30);

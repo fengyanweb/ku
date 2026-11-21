@@ -269,20 +269,25 @@ fn LinkedLiveIntBinding(&state: LinkedNullState, &node: Node): int {
     return 0
 }
 
+fn linkedCountedMember(&project: LinkedNullProject, candidate: Node): Node {
+    if (candidate.kind == "Call" && candidate.edge_count == 1) {
+        method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, candidate, 0))
+        if (method.kind == "Field" && method.text == "len" && method.edge_count == 1) {
+            return LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
+        }
+    }
+    return candidate
+}
+
 fn LinkedCountBound(&project: LinkedNullProject, &state: LinkedNullState, id: int): bool! {
-    member = LinkedNullNode(project, 1, id)
-    if (LinkedLiveIntBinding(state, member) != 0) { return ok(true) }
+    bound = LinkedNullNode(project, 1, id)
+    if (LinkedLiveIntBinding(state, bound) != 0) { return ok(true) }
     array = LinkedNullBinding(state.slots, LinkedNullArrayLimitName(project, id))
     if (array > 0) {
         return ok(LinkedNullReadableArray(state.slots[array - 1].value.ty))
     }
-    array_member = false
-    if (member.kind == "Call" && member.edge_count == 1) {
-        method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, member, 0))
-        if (method.kind != "Field" || method.text != "len" || method.edge_count != 1) { return ok(false) }
-        member = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
-        array_member = true
-    }
+    array_member = bound.kind == "Call"
+    member = linkedCountedMember(project, bound)
     if (member.kind != "Field" || member.edge_count != 1) { return ok(false) }
     receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, member, 0))
     if (receiver.kind != "Variable" || receiver.edge_count != 0) { return ok(false) }
@@ -312,7 +317,7 @@ fn CheckLinkedAddition(&state: LinkedNullState, &left: LinkedNullValue, &right: 
 }
 
 fn linkedCountedBoundWrite(&node: Node, &name: str): bool {
-    return (node.kind == "Assign" || node.kind == "VarDecl") && node.text == name
+    return (node.kind == "Assign" || node.kind == "VarDecl" || node.kind == "ObjectDestructureLocal") && node.text == name
 }
 
 fn RejectLinkedWriteRange(&project: LinkedNullProject, start: int, end: int, &name: str, code: str, message: str): null! {
@@ -358,6 +363,14 @@ fn CheckLinkedCountedBoundWrites(&project: LinkedNullProject, &state: LinkedNull
         return RejectLinkedLoopWrite(project, loop, bound.text, "linked_loop_bound_write", "a counted loop cannot rebind its named int bound")
     }
     name = LinkedNullArrayLimitName(project, bound_id)
+    if (name == "") {
+        // The counted header already validated the member and its receiver.
+        member = linkedCountedMember(project, bound)
+        if (member.kind != "Field") { return ok(null) }
+        receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, member, 0))
+        return RejectLinkedLoopWrite(project, loop, receiver.text, "linked_loop_bound_write",
+            "a counted loop cannot rebind the record supplying its bound")
+    }
     slot = LinkedNullBinding(state.slots, name)
     if (slot == 0) { return ok(null) }
     ty = state.slots[slot - 1].value.ty.clone()
