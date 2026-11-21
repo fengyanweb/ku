@@ -1066,7 +1066,7 @@ fn Choose(input: Pair, label: str, refuse: bool): Pair! {
 struct Count { value: int }
 struct CountBox { entry: Count }
 struct Other { first: str second: str }
-struct Bundle { pair: Pair; tail: str }
+struct Bundle { pair: Pair tail: str }
 fn Replace(previous: Pair, input: Pair, refuse: bool): Pair! {
     local = previous
     kept = local.first
