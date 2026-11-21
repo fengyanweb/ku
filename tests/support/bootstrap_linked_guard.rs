@@ -3533,7 +3533,10 @@ int main(int argc, char **argv) {
 "#
     .replace("__ENTRY__", entry);
     let source = cwd.join("field-append-owning.c");
-    let binary = cwd.join(format!("field-append-owning{}", std::env::consts::EXE_SUFFIX));
+    let binary = cwd.join(format!(
+        "field-append-owning{}",
+        std::env::consts::EXE_SUFFIX
+    ));
     fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
     compile_projection(&source, &binary, cwd);
     assert_ok(&execute(&mut Command::new(&binary), cwd, 15));
