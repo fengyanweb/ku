@@ -93,10 +93,13 @@ fn scalarProjectPlans(&supplied: [SuppliedModule], &function: str, program: bool
     modules = scalarModules(supplied, binding)
     reachable = [entry]
     plans: [ScalarIntFunction] = []
+    // BindProjectModules limits the supplied module count and each parsed arena
+    // has at most 4096 nodes. Each (module, node) key is queued at most once.
+    work_limit = supplied.len() * 4096
     index = 0
-    while (index < reachable.len()) {
+    while (index < work_limit) {
+        if (index >= reachable.len()) { return ok(plans) }
         key = reachable[index]
-        // Every input was validated as a post-order arena of at most 4096 nodes.
         // Keys combine the module ordinal and one-based node ID, without collisions.
         module_slot = (key - 1) / 4096
         base = module_slot * 4096
@@ -105,6 +108,10 @@ fn scalarProjectPlans(&supplied: [SuppliedModule], &function: str, program: bool
         reachable = AppendScalarIntCallees(plan, reachable)
         plans = plans.push(plan)
         index = index + 1
+    }
+    if (index < reachable.len()) {
+        start = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+        RejectScalarInt("project_work_limit", "scalar call graph exceeds the validated project node count", start)?
     }
     return ok(plans)
 }
