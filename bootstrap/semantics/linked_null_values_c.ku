@@ -9,8 +9,8 @@ import { EmitLinkedIntAppend, HasBoundArrayMembers, ReadOwnedArrayPushArgument }
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf,
-         LowerLinkedNullRead, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_null_read_c.ku"
+import { EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { AddLinkedNullSlot, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
 
 fn cloneLinkedString(&project: LinkedNullProject, source: LinkedNullExpression, id: int): LinkedNullExpression! {
     ty = source.value.ty.clone()

@@ -1,4 +1,4 @@
-import { ReadLinkedNullParameters } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, ReadLinkedNullParameters } from "./linked_parameters_c.ku"
 import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedGuardOwners, DropLinkedNullScope, LinkedCountBound, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedPlainArrayReturn } from "./linked_function_c.ku"
@@ -12,8 +12,7 @@ import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
 import { LinkedReadonlyExpression, LinkedSlotPrefix, ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, LowerLinkedArrayLocal, LowerLinkedNullRead,
-         RegisterLinkedNullType } from "./linked_null_read_c.ku"
+import { LowerLinkedArrayLocal, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedArrayAppend, LowerLinkedSuccess,
          LowerLinkedNullValue, LowerLinkedStringRebind } from "./linked_null_values_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
