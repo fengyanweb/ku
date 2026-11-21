@@ -113,3 +113,11 @@ fn RetagTypeNameBinding(binding: TypeNameBinding, kind: str): TypeNameBinding {
         module_index: binding.module_index, declaration_node: binding.declaration_node, span: binding.span
     }
 }
+
+fn IsLinkedDescendant(&path: str, &parent: str): bool {
+    if (path.byte_len() <= parent.byte_len() || !path.starts_with(parent)) { return false }
+    // A decimal ordinal can be the prefix of a different sibling ordinal.
+    prefix = parent + "."
+    if (path.starts_with(prefix)) { return true }
+    return false
+}

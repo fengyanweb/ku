@@ -2,10 +2,10 @@ import { Node } from "../stage2/ast.ku"
 import { LinkedLocalReadCaptures } from "./call_contracts.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
-import { ContainsIndex, ContainsType, ContainsAllTypes, OnlyWholeMemberMoves } from "./struct_projection_c.ku"
+import { ContainsIndex, ContainsAllTypes, OnlyWholeMemberMoves } from "./struct_projection_c.ku"
 import { GuardOwnedDrops, ScalarGuardSlotMove } from "./guarded_struct_c.ku"
 import { OwningLayoutDropName } from "./nested_struct_c.ku"
-import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
+import { IsLinkedDescendant, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { EmitCheckedScalarArithmetic } from "./scalar_int_emit.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
@@ -141,14 +141,6 @@ fn LinkedMemberPath(&receiver: LinkedNullValue, ordinal: int): str {
     return receiver.member_path.clone() + "." + str(ordinal)
 }
 
-fn isLinkedDescendant(&path: str, &parent: str): bool {
-    if (path.byte_len() <= parent.byte_len() || !path.starts_with(parent)) { return false }
-    // A decimal ordinal can be the prefix of a different sibling ordinal.
-    prefix = parent + "."
-    if (path.starts_with(prefix)) { return true }
-    return false
-}
-
 // Selection may walk through a partially moved parent to reach an intact
 // sibling. An argument that uses the whole selection needs every descendant.
 fn LinkedMemberUnavailable(&state: LinkedNullState, &value: LinkedNullValue, whole: bool): bool {
@@ -159,9 +151,9 @@ fn LinkedMemberUnavailable(&state: LinkedNullState, &value: LinkedNullValue, who
     index = 0
     while (index < count) {
         if (state.slots[slot].moved_members[index] == value.member_path
-            || isLinkedDescendant(value.member_path, state.slots[slot].moved_members[index])) { return true }
+            || IsLinkedDescendant(value.member_path, state.slots[slot].moved_members[index])) { return true }
         if (whole && (value.member_path == ""
-            || isLinkedDescendant(state.slots[slot].moved_members[index], value.member_path))) { return true }
+            || IsLinkedDescendant(state.slots[slot].moved_members[index], value.member_path))) { return true }
         index = index + 1
     }
     return false
@@ -208,14 +200,17 @@ fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNu
 fn dropLinkedScope(state: LinkedNullState, outer: int, unwind: bool): LinkedNullState {
     next = state
     index = next.slots.len()
-    while (index > outer) {
+    dropping = index > outer
+    while (dropping) {
         index = index - 1
-        slot = next.slots[index].clone()
-        if ((slot.live || unwind) && !slot.value.borrowed && LinkedNullOwner(slot.value.ty)) {
-            next.code = next.code + LinkedNullDropC(next.layouts, next.owning_layouts, slot.value.ty, slot.value.text)
+        if ((next.slots[index].live || unwind) && !next.slots[index].value.borrowed &&
+            LinkedNullOwner(next.slots[index].value.ty)) {
+            next.code += LinkedNullDropC(next.layouts, next.owning_layouts,
+                next.slots[index].value.ty, next.slots[index].value.text)
         }
         next.slots[index].binding = ""
         next.slots[index].live = false
+        dropping = index > outer
     }
     return next
 }
