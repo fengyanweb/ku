@@ -14,7 +14,7 @@ import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
 import { ExitLinkedFailure, LinkedFailureTarget, LinkedSlotPrefix, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
-import { LowerLinkedCopyRebind, LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { LowerLinkedNullRead, StoreLinkedCopyAssignment } from "./linked_null_read_c.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { FinishLinkedAppendThunk, LinkedBooleanWhileCondition, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, OpenLinkedBooleanWhile, ReadLinkedAppendThunk, ReadLinkedCatchParts } from "./linked_owner_assignment_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
@@ -213,6 +213,17 @@ fn lowerLinkedCatch(&project: LinkedNullProject, state: LinkedNullState, &node: 
     return ok(handled)
 }
 
+fn lowerLinkedCopyRebind(&project: LinkedNullProject, state: LinkedNullState, &assignment: Node, slot: int): LinkedNullState! {
+    destination = state.slots[slot - 1].clone()
+    id = LinkedNullChild(project, 1, assignment, 0)
+    // A checked RHS branches to its existing Error continuation before
+    // returning a value; only the successful path may write the binding.
+    if (LinkedNullNode(project, 1, id).kind == "TryUnwrap") {
+        return StoreLinkedCopyAssignment(destination, LowerLinkedNullValue(project, state, id, 0)?, assignment)
+    }
+    return StoreLinkedCopyAssignment(destination, LowerLinkedNullRead(project, state, id, 0)?, assignment)
+}
+
 fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNullState, start: int,
                      &result: TypeNameBinding, depth: int): LinkedNullRegion! {
     next = state
@@ -249,7 +260,7 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
                 next = LowerLinkedArrayAppend(project, next, statement, slot)?
             } else if (next.slots[slot - 1].value.ty.declaration_kind == "Builtin"
                 && (next.slots[slot - 1].value.ty.name == "int" || next.slots[slot - 1].value.ty.name == "bool")) {
-                next = LowerLinkedCopyRebind(project, next, statement, slot)?
+                next = lowerLinkedCopyRebind(project, next, statement, slot)?
             } else {
                 next = LowerLinkedOwnerRebind(project, next, statement)?
             }

@@ -5,7 +5,7 @@ import { LinkedLocalReadBinding } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout } from "./struct_layouts.ku"
-import { LinkedErrorField, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { LinkedErrorField, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
@@ -327,13 +327,12 @@ fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpressio
     return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", at), ""))
 }
 
-fn LowerLinkedCopyRebind(&project: LinkedNullProject, state: LinkedNullState, &assignment: Node, index: int): LinkedNullState! {
-    destination = state.slots[index - 1].clone()
-    value = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, assignment, 0), 0)?
+fn StoreLinkedCopyAssignment(&destination: LinkedNullSlot, value: LinkedNullExpression, &assignment: Node): LinkedNullState! {
     if (!destination.live || destination.value.borrowed || !SameLinkedType(destination.value.ty, value.value.ty)) {
         RejectLayout("linked_copy_assignment", "assignment requires a live Copy target and matching scalar expression",
                      DeclarationSpan(assignment))?
     }
-    value.state.code += "    " + destination.value.text + " = " + value.value.text + ";\n"
-    return ok(value.state)
+    next = value.state
+    next.code += "    " + destination.value.text + " = " + value.value.text + ";\n"
+    return ok(next)
 }

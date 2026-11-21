@@ -2256,6 +2256,15 @@ fn Read(value: int): int! {
     out = Copy(value, false, false)?
     return ok(out)
 }
+fn Rebind(value: int, zero: bool, deny: bool): int! {
+    out = 17
+    try {
+        out = Copy(value, zero, deny)?
+        return ok(out)
+    } catch (error) {
+        return ok(out)
+    }
+}
 fn Wrong(): int! { return ok("wrong") }
 fn Indexed(&items: [int], slot: int): int { return items[slot] }
 "#,
@@ -2298,6 +2307,53 @@ int main(void) {
     let text = String::from_utf8(forwarded.stdout).unwrap();
     assert_eq!(text.matches("} KuBootstrapResult_int64_t;").count(), 1);
     assert!(text.contains("extern KuBootstrapResult_int64_t"));
+    fs::write(cwd.join("function.txt"), "Rebind").unwrap();
+    let rebound = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&rebound);
+    let text = String::from_utf8(rebound.stdout).unwrap();
+    let entry = text
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t ku_linked_null_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let provider = text
+        .lines()
+        .find_map(|line| line.strip_prefix("extern KuBootstrapResult_int64_t "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+#include <assert.h>
+static int calls;
+KuBootstrapResult_int64_t PROVIDER(int64_t value, bool zero, bool deny) {
+    ++calls;
+    if (deny) return (KuBootstrapResult_int64_t){0};
+    return (KuBootstrapResult_int64_t){.ok = true, .value = zero ? 0 : value};
+}
+int main(void) {
+    KuBootstrapResult_int64_t retained = ENTRY(98, false, true);
+    KuBootstrapResult_int64_t zero = ENTRY(98, true, false);
+    KuBootstrapResult_int64_t stored = ENTRY(98, false, false);
+    assert(retained.ok && retained.value == 17);
+    assert(zero.ok && zero.value == 0 && stored.ok && stored.value == 98);
+    assert(calls == 3);
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("PROVIDER", provider);
+    let c = cwd.join("checked-int-rebind.c");
+    let exe = cwd.join(format!(
+        "checked-int-rebind{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&c, format!("{text}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+
     fs::write(cwd.join("function.txt"), "Wrong").unwrap();
     let rejected = execute(&mut Command::new(seed), cwd, 30);
     assert_eq!(rejected.status.code(), Some(1));
@@ -3512,6 +3568,7 @@ fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [
     }
     fn Close(token: ClosingToken): null! {
         Advance()?
+        added = 0
         added = Append(token.kind, token.lexeme, token.score, Location { line: 5 }, [cursor, cursor, cursor])?
         edges = edges.push(added)
         cursor = added
@@ -3627,13 +3684,13 @@ int main(int argc, char **argv) {
         ),
         ("Advance()?", "Advance(9)?", "linked_local_append_arity"),
         (
-            "Advance()?\n        added",
-            "alias = Advance\n        Advance()?\n        added",
+            "Advance()?\n        added = 0",
+            "alias = Advance\n        Advance()?\n        added = 0",
             "unavailable_linked_binding",
         ),
         (
-            "Advance()?\n        added",
-            "Close(token)?\n        Advance()?\n        added",
+            "Advance()?\n        added = 0",
+            "Close(token)?\n        Advance()?\n        added = 0",
             "unsupported_linked_local_capture",
         ),
         (
