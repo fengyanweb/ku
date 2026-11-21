@@ -141,14 +141,28 @@ fn LinkedMemberPath(&receiver: LinkedNullValue, ordinal: int): str {
     return receiver.member_path.clone() + "." + str(ordinal)
 }
 
+fn isLinkedDescendant(&path: str, &parent: str): bool {
+    if (path.byte_len() <= parent.byte_len() || !path.starts_with(parent)) { return false }
+    // A decimal ordinal can be the prefix of a different sibling ordinal.
+    prefix = parent + "."
+    if (path.starts_with(prefix)) { return true }
+    return false
+}
+
 // Selection may walk through a partially moved parent to reach an intact
 // sibling. An argument that uses the whole selection needs every descendant.
 fn LinkedMemberUnavailable(&state: LinkedNullState, &value: LinkedNullValue, whole: bool): bool {
     if (value.slot == 0) { return false }
-    if (!state.slots[value.slot - 1].live) { return true }
-    for moved in state.slots[value.slot - 1].moved_members.clone() {
-        if (moved == value.member_path || value.member_path.starts_with(moved.clone() + ".")) { return true }
-        if (whole && (value.member_path == "" || moved.starts_with(value.member_path.clone() + "."))) { return true }
+    slot = value.slot - 1
+    if (!state.slots[slot].live) { return true }
+    count = state.slots[slot].moved_members.len()
+    index = 0
+    while (index < count) {
+        if (state.slots[slot].moved_members[index] == value.member_path
+            || isLinkedDescendant(value.member_path, state.slots[slot].moved_members[index])) { return true }
+        if (whole && (value.member_path == ""
+            || isLinkedDescendant(state.slots[slot].moved_members[index], value.member_path))) { return true }
+        index = index + 1
     }
     return false
 }
