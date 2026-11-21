@@ -13,13 +13,6 @@ const t = translate(lang);
   <section class="donation shell">
     <h1>{t.supportKu}</h1>
     <p>{t.donateDescription}</p>
-    <section class="donation-channel" aria-labelledby="afdian-title">
-      <h2 id="afdian-title">{t.afdianTitle}</h2>
-      <p>{t.afdianDescription}</p>
-      <a class="button button-primary" href="https://afdian.com/a/ku-lang">
-        {t.afdianAction}
-      </a>
-    </section>
     <section class="donation-channel" aria-labelledby="wechat-title">
       <h2 id="wechat-title">{t.wechatTitle}</h2>
       <figure>
@@ -57,10 +50,6 @@ const t = translate(lang);
   .donation-channel h2 {
     font-size: 1.4rem;
     margin-bottom: 1rem;
-  }
-  .donation-channel .button {
-    max-width: 100%;
-    overflow-wrap: anywhere;
   }
   figure {
     margin: 1.5rem auto 0;

@@ -71,6 +71,6 @@ ku build --backend c --release hello.ku -o hello
 
 ## 赞赏支持
 
-欢迎通过[爱发电](https://afdian.com/a/ku-lang)或微信赞赏支持 Ku 的开发与文档维护。赞赏完全自愿，不影响使用。
+欢迎通过微信赞赏支持 Ku 的开发与文档维护。赞赏完全自愿，不影响使用。
 
 <a href="web/public/images/wechat-donation.png"><img src="web/public/images/wechat-donation.png" alt="Ku 项目微信赞赏码" width="220"></a>

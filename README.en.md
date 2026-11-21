@@ -70,6 +70,6 @@ Report problems through [GitHub Issues](https://github.com/fengyanweb/ku/issues)
 
 ## Support Ku
 
-You can support Ku development and documentation through [Afdian](https://afdian.com/a/ku-lang) or WeChat. Support is voluntary and does not affect access to Ku.
+You can support Ku development and documentation through WeChat. Support is voluntary and does not affect access to Ku.
 
 <a href="web/public/images/wechat-donation.png"><img src="web/public/images/wechat-donation.png" alt="WeChat appreciation QR code for Ku" width="220"></a>
