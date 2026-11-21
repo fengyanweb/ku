@@ -278,6 +278,14 @@ fn CloneLinkedStringSlot(&project: LinkedNullProject, source: LinkedNullExpressi
     return ok(output)
 }
 
+fn CheckedLinkedCallbackExpression(&carrier: str, &callback: str, &args: str): str {
+    expression = callback.clone() + ".entry ? " + callback.clone() + ".entry(" + callback.clone() + ".environment, " + args.clone() + ")"
+    return expression + " : (" + carrier.clone() + "){.error={"
+        + ".domain={(uint8_t*)\"bootstrap.callback\",sizeof(\"bootstrap.callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
+        + ".code={(uint8_t*)\"invalid_callback\",sizeof(\"invalid_callback\")-1u,0u,KU_PROJECTION_STRING_STATIC},"
+        + ".message={(uint8_t*)\"callback entry is missing\",sizeof(\"callback entry is missing\")-1u,0u,KU_PROJECTION_STRING_STATIC}}}"
+}
+
 fn RestoreLinkedConcatPrefix(&project: LinkedNullProject, state: LinkedNullState, &left: LinkedNullValue,
                               before: str, id: int): LinkedNullExpression! {
     next = state

@@ -152,6 +152,7 @@ pub(super) fn assert_checked_callback_forwarding(seed: &Path, cwd: &Path) {
         r#"struct Payload { values: [int] }
 struct Envelope { payload: Payload }
 struct Other { values: [int] }
+struct Reply { text: str }
 
 fn Take(callback: fn(int, int): Payload!): Envelope! {
     values: [int] = []
@@ -163,6 +164,16 @@ fn Wrong(callback: fn(int, int): Other!): Envelope! { return Take(callback) }
 fn Alias(callback: fn(int, int): Payload!): Envelope! {
     alias = callback
     return Take(alias)
+}
+fn First(): int { return 3 }
+fn Second(): int { return 7 }
+fn Invoke(callback: fn(int, int): Reply!, retained: str): Reply! {
+    reply = callback(First(), Second())?
+    return ok(reply)
+}
+fn WrongArity(callback: fn(int, int): Reply!): Reply! {
+    reply = callback(0)?
+    return ok(reply)
 }
 "#,
     )
@@ -187,6 +198,7 @@ fn Alias(callback: fn(int, int): Payload!): Envelope! {
     for (name, code) in [
         ("Wrong", "linked_callback_forward"),
         ("Alias", "linked_callback_escape"),
+        ("WrongArity", "linked_callback_call"),
     ] {
         fs::write(cwd.join("function.txt"), name).unwrap();
         let rejected = execute(&mut Command::new(seed), cwd, 30);
@@ -194,6 +206,112 @@ fn Alias(callback: fn(int, int): Payload!): Envelope! {
         assert!(rejected.stdout.is_empty());
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(code));
     }
+
+    fs::write(cwd.join("function.txt"), "Invoke").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let document = String::from_utf8(emitted.stdout).unwrap();
+    let Some(Value::Result { ok: true, value }) =
+        json::eval("decode", &[Value::String(document)], Span::default()).unwrap()
+    else {
+        panic!("expected the callback consumer link plan");
+    };
+    let Value::Object(plan) = *value else {
+        panic!("expected a link plan object");
+    };
+    let Value::Array(dependencies) = &plan["dependencies"] else {
+        panic!("expected the argument dependencies");
+    };
+    let dependency_symbol = |name: &str| {
+        dependencies
+            .iter()
+            .find_map(|value| match value {
+                Value::Object(fields)
+                    if matches!(&fields["source_name"], Value::String(source) if source.as_str() == name) =>
+                {
+                    match &fields["symbol"] {
+                        Value::String(symbol) => Some(symbol.as_str()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("known callback argument dependency")
+    };
+
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (head, parameters) = code
+        .lines()
+        .find(|line| line.starts_with("KuBootstrapResult_KuStruct_"))
+        .and_then(|line| line.split_once('('))
+        .unwrap();
+    let (result, entry) = head.split_once(' ').unwrap();
+    let (callback, _) = parameters.split_once(" a0,").unwrap();
+    let host = r#"
+static unsigned order;
+typedef struct { unsigned calls; bool fail; uint8_t *message; } Probe;
+int64_t FIRST(void) { assert(order == 0); order = 1; return 3; }
+int64_t SECOND(void) { assert(order == 1); order = 2; return 7; }
+static KuProjectionString owner(uint8_t byte) {
+    uint8_t *data = malloc(1);
+    assert(data);
+    *data = byte;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+static RESULT dynamic(void *environment, int64_t left, int64_t right) {
+    Probe *probe = environment;
+    assert(order == 2 && left == 3 && right == 7);
+    order = 3;
+    ++probe->calls;
+    if (probe->fail) {
+        RESULT value = {.error={owner('d'), owner('e'), owner('m')}};
+        probe->message = value.error.message.ptr;
+        return value;
+    }
+    return (RESULT){.ok=true, .value={owner('r')}};
+}
+int main(void) {
+    (void)test_realloc;
+    Probe probe = {0};
+    CALLBACK callback = {dynamic, &probe};
+    RESULT result = ENTRY(callback, owner('k'));
+    assert(result.ok && order == 3 && probe.calls == 1 && outstanding() == 1);
+    assert(*result.value.f0.ptr == 'r');
+    ku_projection_string_drop(&result.value.f0);
+    assert(!outstanding());
+
+    order = 0;
+    probe.fail = true;
+    result = ENTRY(callback, owner('k'));
+    assert(!result.ok && order == 3 && probe.calls == 2 && outstanding() == 3);
+    assert(result.error.message.ptr == probe.message && *result.error.message.ptr == 'm');
+    ku_projection_string_drop(&result.error.domain);
+    ku_projection_string_drop(&result.error.code);
+    ku_projection_string_drop(&result.error.message);
+    assert(!outstanding());
+
+    order = 0;
+    result = ENTRY((CALLBACK){0}, owner('k'));
+    assert(!result.ok && order == 2 && probe.calls == 2 && !outstanding());
+    assert(result.error.code.len == 16 && !memcmp(result.error.code.ptr, "invalid_callback", 16));
+    assert(result.error.domain.storage == KU_PROJECTION_STRING_STATIC);
+    return 0;
+}
+"#
+    .replace("FIRST", dependency_symbol("First"))
+    .replace("SECOND", dependency_symbol("Second"))
+    .replace("RESULT", result)
+    .replace("CALLBACK", callback)
+    .replace("ENTRY", entry);
+    let source = cwd.join("callback-invoke.c");
+    let program = cwd.join(format!("callback-invoke{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &program, cwd);
+    assert_ok(&execute(&mut Command::new(&program), cwd, 10));
 }
 
 pub(super) fn assert_terminal_branch_ownership(seed: &Path, cwd: &Path) {

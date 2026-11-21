@@ -7,10 +7,10 @@ import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
-import { LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
+import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { CloneLinkedLocalArrayItem, CloneLinkedRecord, CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { AddLinkedNullSlot, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, CheckedLinkedCallbackExpression, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix } from "./linked_parameters_c.ku"
 
 fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int, depth: int): LinkedNullExpression! {
     subject_id = LinkedNullChild(project, 1, target, 0)
@@ -127,6 +127,36 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
     return ok(output)
 }
 
+fn emitCheckedCallback(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
+                       slot: int, id: int, depth: int): LinkedCheckedCall! {
+    if (!state.slots[slot - 1].parameter || !state.slots[slot - 1].live || call.edge_count != 3) {
+        RejectLayout("linked_callback_call", "expected a live checked callback parameter with two int arguments", DeclarationSpan(call))?
+    }
+    callback = state.slots[slot - 1].value.clone()
+    payload = callback.ty
+    payload.declaration_kind = "Struct"
+    next = state
+    args = ""
+    index = 1
+    while (index < 3) {
+        argument = LowerLinkedNullValue(project, next, LinkedNullChild(project, 1, call, index), depth + 1)?
+        if (!LinkedIntResult(argument.value.ty)) {
+            RejectLayout("linked_callback_argument", "checked callback arguments must be Copy int values", argument.value.ty.span.clone())?
+        }
+        name = "callback_arg" + str(id) + "_" + str(index)
+        next = argument.state
+        // Materialize the first int before evaluating the second expression.
+        next.code += "    int64_t " + name.clone() + " = " + argument.value.text + ";\n"
+        if (index > 1) { args += ", " }
+        args += name
+        index += 1
+    }
+    result = "dependency" + str(id)
+    carrier = LinkedCheckedResultCType(payload)?
+    next = AppendLinkedCheckedInvocation(next, carrier, result, CheckedLinkedCallbackExpression(carrier, callback.text, args), "")
+    return ok(LinkedCheckedCall { state: next, result: payload, text: result, id: id })
+}
+
 fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap: Node, owns_value: bool, depth: int): LinkedCheckedCall! {
     if (state.plain_value_result && state.catch_slot == 0) {
         RejectLayout("linked_value_failure", "a checked call needs a catch before returning a plain value", DeclarationSpan(unwrap))?
@@ -140,6 +170,12 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
         RejectLayout("unsupported_linked_try", "expected a direct checked dependency call", DeclarationSpan(call))?
     }
     target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (target.kind == "Variable" && target.edge_count == 0) {
+        slot = LinkedNullBinding(state.slots, target.text)
+        if (slot != 0 && state.slots[slot - 1].value.ty.declaration_kind == "IntPairResultCallback") {
+            return emitCheckedCallback(project, state, call, slot, id, depth)
+        }
+    }
     callee = ResolveLinkedCall(project, state.slots, call, target, true)?
     if (owns_value && !LinkedNullHasResultValue(callee.result)) {
         RejectLayout("linked_dependency_result", "expected a Result with a value payload", DeclarationSpan(unwrap))?
@@ -150,7 +186,7 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
     symbol = LinkedNullCallSymbol(callee)
     args = arguments.args
     handoff = arguments.handoff
-    next = AppendLinkedCheckedInvocation(arguments.state, carrier, result, symbol, args, handoff)
+    next = AppendLinkedCheckedInvocation(arguments.state, carrier, result, symbol + "(" + args + ")", handoff)
     return ok(LinkedCheckedCall { state: next, result: callee.result, text: result, id: id })
 }
 

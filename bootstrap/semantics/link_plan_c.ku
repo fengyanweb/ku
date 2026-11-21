@@ -412,12 +412,11 @@ fn RestoreLinkedNullSlots(state: LinkedNullState, &outer: [LinkedNullSlot]): Lin
     return next
 }
 
-fn AppendLinkedCheckedInvocation(state: LinkedNullState, &carrier: str, &result: str, &symbol: str,
-                                 &args: str, &handoff: str): LinkedNullState {
+fn AppendLinkedCheckedInvocation(state: LinkedNullState, &carrier: str, &result: str,
+                                 &expression: str, &handoff: str): LinkedNullState {
     next = state
     failure = LinkedFailureTarget(next)
-    next.code = next.code + "    " + carrier.clone() + " " + result.clone() + " = " + symbol.clone()
-        + "(" + args.clone() + ");\n" + handoff.clone()
+    next.code = next.code + "    " + carrier.clone() + " " + result.clone() + " = " + expression.clone() + ";\n" + handoff.clone()
         + "    if (!" + result.clone() + ".ok) {\n        " + failure + " = " + result.clone() + ".error;\n"
         + "        " + result.clone() + ".error = (KuBootstrapError){0};\n"
     next = ExitLinkedFailure(next, "        ")
