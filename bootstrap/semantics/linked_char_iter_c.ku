@@ -148,7 +148,9 @@ fn LowerLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, id:
         return LowerLinkedNullRead(project, state, id, 0)
     }
     left_id = LinkedNullChild(project, 1, node, 0)
-    if (LinkedNullNode(project, 1, left_id).kind != "TryUnwrap") {
+    checked = LinkedNullNode(project, 1, left_id).kind == "TryUnwrap"
+    if (!checked && ProjectionCloneSource(project.supplied[0].named.parsed.arena.nodes,
+        project.supplied[0].named.parsed.arena.edges, left_id) == 0) {
         return LowerLinkedNullRead(project, state, id, 0)
     }
     before = state.slots.len()
@@ -156,6 +158,9 @@ fn LowerLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, id:
     right = LowerLinkedNullRead(project, left.state, LinkedNullChild(project, 1, node, 1), 0)?
     at = DeclarationSpan(node)
     if (!LinkedStringResult(left.value.ty) || !LinkedStringResult(right.value.ty)) {
+        if (!checked) {
+            RejectLayout("linked_cloned_comparison", "expected a cloned str and a readonly str", at.clone())?
+        }
         RejectLayout("linked_checked_comparison", "expected a checked str and a readonly str", at.clone())?
     }
     compare = "ku_guard_string_equal(" + left.value.text + ", " + right.value.text + ")"

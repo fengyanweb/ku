@@ -131,6 +131,95 @@ pub(super) fn assert_owned_characters(seed: &Path, cwd: &Path) {
         .contains("|unsupported_linked_for|"));
 
     assert_character_values(seed, cwd);
+    assert_owned_character_comparison(seed, cwd);
+}
+
+fn assert_owned_character_comparison(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("iterate.ku"),
+        r#"fn Observe(value: bool): null! { return ok(null) }
+fn Assign(values: [str], &expected: str, active: bool): null! {
+    same = false
+    if (active) { same = values[0].clone() == expected }
+    Observe(same)?
+    return ok(null)
+}
+fn Guard(values: [str], &expected: str, active: bool): null! {
+    if (!active) { Observe(false)? return ok(null) }
+    if (values[0].clone() != expected) { Observe(false)? return ok(null) }
+    Observe(true)?
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    for function in ["Assign", "Guard"] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let source = String::from_utf8(emitted.stdout).unwrap();
+        let symbol = |prefix| {
+            source
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix)?.split_once('('))
+                .unwrap()
+                .0
+        };
+        let driver = r#"
+static bool matched;
+static unsigned calls;
+KuBootstrapResultNull OBSERVE(bool value) {
+    matched = value;
+    ++calls;
+    return (KuBootstrapResultNull){.ok = true};
+}
+static KuGuardStringArray owned_item(void) {
+    KuProjectionString *items = malloc(sizeof(*items));
+    uint8_t *data = malloc(3);
+    assert(items && data);
+    memcpy(data, "cat", 3);
+    items[0] = (KuProjectionString){data, 3, 3, KU_PROJECTION_STRING_OWNED};
+    return (KuGuardStringArray){1, items, 1};
+}
+static void after_oom(void) {
+    if (outstanding() || attempts != 3 || calls != 1) _Exit(82);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    (void)test_realloc;
+    KuProjectionString expected = {(uint8_t*)"cat", 3, 0, KU_PROJECTION_STRING_STATIC};
+    assert(ENTRY((KuGuardStringArray){0}, &expected, false).ok);
+    assert(!matched && calls == 1 && !attempts && !outstanding());
+    KuGuardStringArray first = owned_item();
+    if (argc > 1) {
+        assert(!atexit(after_oom));
+        fail_after = 0;
+    }
+    assert(ENTRY(first, &expected, true).ok);
+    assert(matched && calls == 2 && attempts == 3 && !outstanding());
+    expected.ptr = (uint8_t*)"dog";
+    assert(ENTRY(owned_item(), &expected, true).ok);
+    assert(!matched && calls == 3 && attempts == 6 && !outstanding());
+    return 0;
+}
+"#
+        .replace("OBSERVE", symbol("extern KuBootstrapResultNull "))
+        .replace("ENTRY", symbol("KuBootstrapResultNull "));
+        let path = cwd.join("owned-character-comparison.c");
+        let binary = cwd.join(format!(
+            "owned-character-comparison{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        fs::write(&path, format!("{CHECKED_ARRAY_ALLOCATOR}{source}{driver}")).unwrap();
+        compile_projection(&path, &binary, cwd);
+        assert_ok(&execute(&mut Command::new(&binary), cwd, 10));
+        let failed = execute(Command::new(binary).arg("clone-oom"), cwd, 10);
+        assert_eq!(failed.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&failed.stderr).trim(),
+            "out of memory"
+        );
+    }
 }
 
 fn assert_character_values(seed: &Path, cwd: &Path) {

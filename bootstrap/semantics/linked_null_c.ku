@@ -229,6 +229,9 @@ fn lowerLinkedCopyRebind(&project: LinkedNullProject, state: LinkedNullState, &a
     if (LinkedNullNode(project, 1, id).kind == "TryUnwrap") {
         return StoreLinkedCopyAssignment(destination, LowerLinkedNullValue(project, state, id, 0)?, assignment)
     }
+    if (destination.value.ty.name == "bool") {
+        return StoreLinkedCopyAssignment(destination, LowerLinkedPredicate(project, state, id)?, assignment)
+    }
     return StoreLinkedCopyAssignment(destination, LowerLinkedNullRead(project, state, id, 0)?, assignment)
 }
 
