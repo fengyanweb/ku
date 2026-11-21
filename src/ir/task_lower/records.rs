@@ -1,5 +1,6 @@
 //! Explicitly bounded layouts reused by the native Task frame and adapter.
 use super::*;
+use crate::ast::{MatchArm, MatchPattern};
 
 pub(super) fn record_name(name: &str) -> String {
     format!("__ku_task_record_{name}")
@@ -187,12 +188,7 @@ impl FunctionLowerer<'_> {
         depth: usize,
     ) -> KuResult<SlotId> {
         let ty = self.function.slots[left.0].ty.clone();
-        let left_tag = self.slot(value_slot(IrType::Int))?;
-        self.emit(TaskOp::Unary {
-            dst: left_tag,
-            op: TaskUnaryOp::EnumTag,
-            src: left,
-        })?;
+        let left_tag = self.unit_enum_tag(left)?;
         let right_value = self.expression(right, depth + 1)?;
         if self.function.slots[right_value.0].ty != ty {
             return Err(unsupported(
@@ -200,12 +196,7 @@ impl FunctionLowerer<'_> {
                 right.span,
             ));
         }
-        let right_tag = self.slot(value_slot(IrType::Int))?;
-        self.emit(TaskOp::Unary {
-            dst: right_tag,
-            op: TaskUnaryOp::EnumTag,
-            src: right_value,
-        })?;
+        let right_tag = self.unit_enum_tag(right_value)?;
         let dst = self.slot(value_slot(IrType::Bool))?;
         self.emit(TaskOp::Binary {
             dst,
@@ -218,6 +209,175 @@ impl FunctionLowerer<'_> {
             right: right_tag,
         })?;
         Ok(dst)
+    }
+
+    fn unit_enum_tag(&mut self, source: SlotId) -> KuResult<SlotId> {
+        let tag = self.slot(value_slot(IrType::Int))?;
+        self.emit(TaskOp::Unary {
+            dst: tag,
+            op: TaskUnaryOp::EnumTag,
+            src: source,
+        })?;
+        Ok(tag)
+    }
+
+    #[inline(never)]
+    pub(super) fn unit_enum_match(
+        &mut self,
+        value: &Expr,
+        arms: &[MatchArm],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        let source = self.expression(value, depth + 1)?;
+        let TaskSlotType::Value {
+            ty,
+            borrowed: false,
+        } = &self.function.slots[source.0].ty
+        else {
+            return Err(unsupported(
+                "match without an owned Task enum subject",
+                value.span,
+            ));
+        };
+        let layout = task::unit_enum_layout(self.layouts, ty).ok_or_else(|| {
+            unsupported(
+                "match on a type other than a payload-free Task enum",
+                value.span,
+            )
+        })?;
+        self.budget.analysis(layout.variants.len(), span)?;
+        self.budget.analysis(arms.len(), span)?;
+        let variants: HashMap<_, _> = layout
+            .variants
+            .iter()
+            .map(|v| (v.name.as_str(), v.tag))
+            .collect();
+        let mut covered = std::collections::HashSet::new();
+        let mut tags = Vec::with_capacity(arms.len());
+        for (index, arm) in arms.iter().enumerate() {
+            if let Some(guard) = &arm.guard {
+                return Err(unsupported("guards in a native Task match", guard.span));
+            }
+            let tag = match &arm.pattern {
+                MatchPattern::EnumVariant {
+                    enum_name,
+                    variant,
+                    fields,
+                } if enum_name == &layout.name && fields.is_empty() => {
+                    let tag = variants
+                        .get(variant.as_str())
+                        .and_then(|tag| i64::try_from(*tag).ok())
+                        .ok_or_else(|| {
+                            unsupported("an unknown Task enum match variant", arm.span)
+                        })?;
+                    if !covered.insert(tag) {
+                        return Err(unsupported("a repeated Task enum match variant", arm.span));
+                    }
+                    Some(tag)
+                }
+                MatchPattern::Wildcard if index + 1 == arms.len() => None,
+                _ => return Err(unsupported(
+                    "Task match patterns other than same-enum unit variants or a final wildcard",
+                    arm.span,
+                )),
+            };
+            tags.push(tag);
+        }
+        if tags.is_empty() || (tags.last() != Some(&None) && covered.len() != variants.len()) {
+            return Err(unsupported("a nonexhaustive Task enum match", span));
+        }
+
+        // A tag-only pattern never consumes a named enum. Anonymous
+        // scrutinees can retire once the tag has been read.
+        let tag = if arms.len() > 1 {
+            Some(self.unit_enum_tag(source)?)
+        } else {
+            self.emit(TaskOp::Read { slot: source })?;
+            None
+        };
+        if !self.stable_slots[source.0] {
+            self.emit(TaskOp::Drop { slot: source })?;
+        }
+        if let [arm] = arms {
+            return self.unit_enum_match_value(arm, depth);
+        }
+        let join = self.state(TaskTerminator::Terminate)?;
+        let before_facts = self.nullable_facts.clone();
+        let mut common_facts = before_facts.clone();
+        let mut result: Option<SlotId> = None;
+        for (index, (arm, expected_tag)) in arms.iter().zip(tags).enumerate() {
+            // The last arm covers every remaining tag of the checked layout.
+            // Earlier alternatives branch before any of their values run.
+            let next = if index + 1 < arms.len() {
+                let alternative = self.constant(
+                    TaskConstant::Int(expected_tag.expect("nonfinal arm has a tag")),
+                    IrType::Int,
+                )?;
+                let condition = self.slot(value_slot(IrType::Bool))?;
+                self.emit(TaskOp::Binary {
+                    dst: condition,
+                    op: TaskBinaryOp::Equal,
+                    left: tag.expect("multiple arms read the subject tag"),
+                    right: alternative,
+                })?;
+                let selected = self.state(TaskTerminator::Terminate)?;
+                let next = self.state(TaskTerminator::Terminate)?;
+                self.terminate(TaskTerminator::Branch {
+                    condition,
+                    then_state: selected,
+                    else_state: next,
+                })?;
+                self.current = Some(selected);
+                Some(next)
+            } else {
+                None
+            };
+            self.nullable_facts = before_facts.clone();
+            let source = self.unit_enum_match_value(arm, depth)?;
+            let ty = self.function.slots[source.0].ty.clone();
+            let dst = if let Some(dst) = result {
+                if ty != self.function.slots[dst.0].ty {
+                    return Err(unsupported(
+                        "mismatched Task match arm result types",
+                        arm.span,
+                    ));
+                }
+                dst
+            } else {
+                let dst = self.slot(ty.clone())?;
+                result = Some(dst);
+                dst
+            };
+            self.emit(if copy_value(&ty) {
+                TaskOp::Copy { dst, src: source }
+            } else {
+                TaskOp::Move { dst, src: source }
+            })?;
+            common_facts.retain(|slot, fact| self.nullable_facts.get(slot) == Some(fact));
+            self.terminate(TaskTerminator::Jump { target: join })?;
+            self.current = next;
+        }
+        self.current = Some(join);
+        self.nullable_facts = common_facts;
+        Ok(result.expect("a matched arm emits its result"))
+    }
+
+    fn unit_enum_match_value(&mut self, arm: &MatchArm, depth: usize) -> KuResult<SlotId> {
+        let source = self.expression(&arm.value, depth + 1)?;
+        if !matches!(
+            &self.function.slots[source.0].ty,
+            TaskSlotType::Value {
+                ty: IrType::Int | IrType::Bool | IrType::Null | IrType::Str,
+                borrowed: false,
+            }
+        ) {
+            return Err(unsupported(
+                "Task match arm result types other than int, bool, null or owned str",
+                arm.value.span,
+            ));
+        }
+        Ok(source)
     }
 }
 

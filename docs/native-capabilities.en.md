@@ -89,6 +89,8 @@ Task `http.request` accepts inline and locally bound configuration objects, incl
 
 A declared enum whose variants have no payload can be passed as an owned Task argument or returned in a single-layer Result, such as `Phase!`. A named Task record can also carry such an enum as a field. Values of the same enum type support `==` and `!=`. Both operands remain readable after comparison.
 
+In a native Task, `match` can select an unguarded alternative of a payload-free enum or a final `_` arm. Each arm yields the same type among `int`, `bool`, `null` and owned `str`. The subject is evaluated once, and only the selected arm runs. That arm can suspend and propagate an error through `?`.
+
 Tasks can read response `body/status`, read or write `response.headers[key]`, and retain or return owned responses across suspension. Existing HTTP checks still govern string types, names, values, counts, bytes and transport-managed fields. Allocations use the Task budget. Invalid responses do not prevent subsequent valid requests. This does not add arbitrary Task objects, structs or nested containers.
 
 See [native_task_http_client.ku](../examples/native_task_http_client.ku) for a Task client and [native_http_relay.ku](../examples/native_http_relay.ku) for the end-to-end service. Provide a local upstream at `127.0.0.1:8080/hello`, then build and run the service. `/info` uses a read-only handler; `/relay` fetches the upstream through a Task and returns dynamic headers.

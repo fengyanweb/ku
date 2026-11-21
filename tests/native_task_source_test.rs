@@ -240,6 +240,120 @@ fn native_task_returns_nominal_unit_enums_after_wait() {
 }
 
 #[test]
+fn native_task_matches_bounded_enum_results_with_lazy_arms() {
+    let directory = TempDir::new("task-enum-match");
+    let path = directory.path();
+    fs::write(
+        path.join("worker.ku"),
+        r#"
+import time from "std.time"
+enum Phase { Ready, Done }
+async fn Resolve(phase: Phase): Phase! {
+    println("resolve")
+    time.sleep(30)?
+    return ok(phase)
+}
+async fn Label(label: str): str! {
+    println(label)
+    time.sleep(30)?
+    return ok(label + "🙂")
+}
+async fn Broken(): str! {
+    println("error")
+    fail "declined"
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        path.join("main.ku"),
+        r#"
+import { Phase as Workflow, Resolve, Label, Broken } from "./worker"
+async fn Render(phase: Workflow): str! {
+    text = match (await Resolve(phase))? {
+        Workflow.Ready => (await Broken())?
+        Workflow.Done => (await Label("完成"))?
+    }
+    return ok(text)
+}
+async fn Keep(): bool! {
+    phase = (await Resolve(Workflow.Done))?
+    value = match phase { Workflow.Ready => 7, _ => 42 }
+    println(value)
+    return ok(phase == Workflow.Done)
+}
+async fn main(): null! {
+    println((await Render(Workflow.Done))?)
+    try { (await Render(Workflow.Ready))? }
+    catch (issue) { println(issue.message) }
+    println((await Keep())?)
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let normalized = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    let call = |args: &[&str]| {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_ku"));
+        cli.current_dir(path).args(args);
+        run_bounded(&mut cli, BUILD_TIMEOUT, BUILD_LIMITS).unwrap()
+    };
+    let expected = "resolve\n完成\n完成🙂\nresolve\nerror\ndeclined\nresolve\n42\ntrue\n";
+    let interpreted = call(&["run", "main.ku"]);
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        normalized(&interpreted.stderr)
+    );
+    assert_eq!(normalized(&interpreted.stdout), expected);
+    let filename = if cfg!(windows) { "app.exe" } else { "app" };
+    let built = call(&["build", "--release", "--offline", "main.ku", "-o", filename]);
+    let stderr = normalized(&built.stderr);
+    if !built.status.success() && stderr.contains("C compiler not found") {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none(), "{stderr}");
+        return;
+    }
+    assert!(built.status.success(), "{stderr}");
+    let result = run_bounded(
+        Command::new(path.join(filename)).current_dir(path),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(result.status.success(), "{}", normalized(&result.stderr));
+    assert_eq!(normalized(&result.stdout), expected);
+
+    for (case, arm_cases, error) in [
+        (
+            "guard",
+            "Phase.Ready if (true) => \"x\", Phase.Ready => \"y\", Phase.Done => \"z\"",
+            "guards in a native Task match",
+        ),
+        (
+            "binding",
+            "Phase.Ready => \"x\", remaining => \"y\"",
+            "Task match patterns other than",
+        ),
+        (
+            "payload",
+            "Phase.Ready(attached) => \"x\", Phase.Done => \"y\"",
+            "expects 0 fields but got 1",
+        ),
+        (
+            "mixed",
+            "Phase.Ready => \"x\", Phase.Done => false",
+            "type error: expected str",
+        ),
+    ] {
+        fs::write(path.join(format!("{case}.ku")), format!("enum Phase {{ Ready, Done }}\nasync fn main(): null! {{ println(match Phase.Done {{ {arm_cases} }}) return ok(null) }}\n")).unwrap();
+        let rejected = call(&["build", "--native", &format!("{case}.ku")]);
+        assert!(!rejected.status.success(), "{case}");
+        let stderr = normalized(&rejected.stderr);
+        assert!(stderr.contains(error), "{case}: {stderr}");
+    }
+}
+
+#[test]
 fn native_task_keeps_unused_enum_declarations_out_and_rejects_payload_layouts() {
     let scalar = "async fn main(): null! { println(17) return ok(null) }";
     let unused = format!("enum Unused {{ First, Payload(message: str) }}\n{scalar}");

@@ -1263,7 +1263,7 @@ Result.Ok(value) => str(value)
 
 Task 或含 Task 的模式绑定在 guard 求值时只是非 owning 的候选绑定，不能在 guard 中 move/await（E0805）；guard 为 false 时，不取消该候选 Task，也不消费后续 arm 所需的 payload。只有选中 arm 后才真正转移对应 payload，guard 自己创建并 await 的独立 Task 不受这条限制。
 
-匹配 Task 或含 Task 的值会消费原 scrutinee。选中 arm 返回的 Task 可以继续转移；arm 内未消费的 Task binding，以及 `_` 等模式留下的残余 Task，必须在 match 表达式返回前完成有界清理，并沿用该次退出的同一绝对清理截止时间。这是解释器 Task 合同，首片 native async 子集仍拒绝 match 和 Task 容器。
+匹配 Task 或含 Task 的值会消费原 scrutinee。选中 arm 返回的 Task 可以继续转移。arm 内未消费的 Task binding，以及 `_` 等模式留下的残余 Task，必须在 match 表达式返回前完成有界清理，并沿用该次退出的同一绝对清理截止时间。这类 Task 值匹配由解释器支持。native Task 支持的无载荷枚举匹配见 [native 能力矩阵](native-capabilities.md)。
 
 穷尽性规则：
 

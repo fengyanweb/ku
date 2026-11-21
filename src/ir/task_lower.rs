@@ -1453,6 +1453,9 @@ impl<'a> FunctionLowerer<'a> {
                 self.current = Some(ok);
                 Ok(destination)
             }
+            ExprKind::Match { value, arms } => {
+                self.unit_enum_match(value, arms, expression.span, depth)
+            }
             _ => Err(unsupported(
                 "this expression in the bounded primitive Task subset",
                 expression.span,
