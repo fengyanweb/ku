@@ -112,7 +112,7 @@ fn ObjectDestructureClose(&tokens: [Token], first: int, window_end: int): int {
 fn EndsAtExpressionSeparator(&tokens: [Token], cursor: int, window_end: int, &context: str, &kind: str,
                            previous_can_end: bool, named_struct_open: bool): bool {
     if (context == "print_argument") { return kind == "RParen" || kind == "Comma" }
-    if (context == "destructure_default") { return kind == "Comma" || kind == "RBrace" }
+    if (context == "destructure_default" || context == "match_arm") { return kind == "Comma" || kind == "RBrace" }
     inline_if = context == "inline_if_value" || context == "inline_if_target"
     if (inline_if && kind == "Else") { return true }
     return (context == "value" || context == "assignment_target" || inline_if) && previous_can_end &&

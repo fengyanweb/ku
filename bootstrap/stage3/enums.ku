@@ -2,7 +2,8 @@ import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { ReadSignatureTypeAt, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
-import { RejectAt, RejectAtPoint, RejectAtSpan } from "./support.ku"
+import { NextBodyWork, ReadExpressionEnd } from "./body_support.ku"
+import { AfterOptionalSemicolon, CanStartStatement, RejectAt, RejectAtPoint, RejectAtSpan, WindowKindIs, WindowToken } from "./support.ku"
 import { DeclarationRead, ReadStruct } from "./structs.ku"
 
 // Read exactly one production enum declaration followed by exactly one EOF.
@@ -242,4 +243,105 @@ fn ReadBracedDeclaration(tokens: [Token]): DeclarationRead! {
         RejectAtSpan(point, "invalid_token_stream", "braced declaration window must start with struct or enum")?
     }
     return ReadEnum(tokens)
+}
+
+struct ReturnMatchRead {
+    node: int
+    cursor: int
+    work: int
+}
+
+// A complete return value can use an unguarded match with a unit-variant
+// pattern or a final wildcard. Ordinary expressions still use Stage 2.
+fn ReadReturnMatch(&tokens: [Token], first: int, last: int, token_base: int,
+                      initial_work: int,
+                      parse: fn(int, int): ParseOutput!, append: fn(ParseOutput, Token, bool): int!,
+                      add: fn(str, str, int, Span, [int], Token): int!,
+                      read_span: fn(int): Span): ReturnMatchRead! {
+    limit = tokens.len()
+    if (first < 0 || first >= last || last >= limit || limit > 4096
+        || token_base < 0 || token_base > 4096 || last > 4096 - token_base) {
+        RejectAtPoint("invalid_token_stream", "return match requires a bounded token window")?
+    }
+    start = WindowToken(tokens, first, last)
+    if (start.kind != "Match") {
+        RejectAt(start.clone(), "unexpected_token", "expected 'match' after 'return'")?
+    }
+    subject_start = first + 1
+    body = ReadExpressionEnd(tokens, subject_start, last, "for_header")?
+    if (body == subject_start || !WindowKindIs(tokens, body, last, "LBrace")) {
+        RejectAt(WindowToken(tokens, body, last), "unexpected_token", "expected a match value followed by '{'")?
+    }
+    work = NextBodyWork(initial_work, body - first + 1, start.clone())?
+    subject = append(parse(token_base + subject_start, token_base + body)?,
+                     WindowToken(tokens, subject_start, last), false)?
+    children = [subject]
+    cursor = body + 1
+    if (WindowKindIs(tokens, cursor, last, "RBrace")) {
+        RejectAt(WindowToken(tokens, cursor, last), "unexpected_token", "expected a match arm")?
+    }
+    reading = !WindowKindIs(tokens, cursor, last, "RBrace")
+    while (reading) {
+        arm_start = WindowToken(tokens, cursor, last)
+        if (arm_start.kind == "Eof") {
+            RejectAt(arm_start.clone(), "unexpected_eof", "expected '}' after match arms")?
+        }
+        wildcard = arm_start.kind == "Ident" && arm_start.lexeme == "_"
+        pattern_end = cursor + 1
+        if (!wildcard) {
+            if (arm_start.kind != "Ident" || !WindowKindIs(tokens, pattern_end, last, "Dot")
+                || !WindowKindIs(tokens, pattern_end + 1, last, "Ident")) {
+                RejectAt(arm_start.clone(), "unsupported_match_pattern", "expected an enum variant or '_'")?
+            }
+            pattern_end = pattern_end + 2
+            if (WindowKindIs(tokens, pattern_end, last, "Dot")) {
+                pattern_end = pattern_end + 1
+                if (!WindowKindIs(tokens, pattern_end, last, "Ident")) {
+                    RejectAt(WindowToken(tokens, pattern_end, last), "unexpected_token", "expected enum variant in match pattern")?
+                }
+                pattern_end = pattern_end + 1
+            }
+        }
+        marker = WindowToken(tokens, pattern_end, last)
+        if (marker.kind == "If" || marker.kind == "LParen") {
+            RejectAt(marker.clone(), "unsupported_match_pattern", "stage-3 return match does not support guards or payload patterns")?
+        }
+        if (marker.kind != "Arrow") {
+            RejectAt(marker, "unexpected_token", "expected '=>' after match pattern")?
+        }
+        value_start = pattern_end + 1
+        value_end = ReadExpressionEnd(tokens, value_start, last, "match_arm")?
+        if (value_end == value_start) {
+            RejectAt(WindowToken(tokens, value_start, last), "unexpected_token", "expected match arm expression")?
+        }
+        after_arm = value_end
+        if (WindowKindIs(tokens, after_arm, last, "Comma")) { after_arm = after_arm + 1 }
+        after_arm = AfterOptionalSemicolon(tokens, after_arm, last)
+        work = NextBodyWork(work, after_arm - cursor, arm_start.clone())?
+        pattern = 0
+        if (wildcard) {
+            pattern = add("MatchWildcard", "", 0, SpanFromToken(arm_start.clone()), [], arm_start.clone())?
+        } else {
+            pattern = append(parse(token_base + cursor, token_base + pattern_end)?, arm_start.clone(), false)?
+        }
+        value = append(parse(token_base + value_start, token_base + value_end)?,
+                       WindowToken(tokens, value_start, last), false)?
+        span = SpanMerge(SpanFromToken(arm_start.clone()), read_span(value))
+        arm = add("MatchArm", "", 0, span, [pattern, value], arm_start)?
+        children = children.push(arm)
+        cursor = after_arm
+        reading = !WindowKindIs(tokens, cursor, last, "RBrace")
+        if (wildcard && reading) {
+            RejectAt(WindowToken(tokens, cursor, last), "unreachable_match_arm", "match arm after catch-all pattern is unreachable")?
+        }
+    }
+    work = NextBodyWork(work, 1, WindowToken(tokens, cursor, last))?
+    finish = SpanFromToken(WindowToken(tokens, cursor, last))
+    next = WindowToken(tokens, cursor + 1, last)
+    if (next.kind != "Semicolon" && next.kind != "RBrace" && next.kind != "Eof"
+        && next.kind != "Else" && !CanStartStatement(next.kind)) {
+        RejectAt(next, "unsupported_expression", "stage-3 match must be the complete return value")?
+    }
+    value = add("Match", "", 0, SpanMerge(SpanFromToken(start.clone()), finish.clone()), children, start)?
+    return ok(ReturnMatchRead { node: value, cursor: AfterOptionalSemicolon(tokens, cursor + 1, last), work: work })
 }

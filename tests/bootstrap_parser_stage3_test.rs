@@ -10,7 +10,7 @@ pub mod bounded_process;
 use bounded_process::{run_bounded, OutputLimits};
 use ku::ast::{
     AssignTarget, BinaryOp, EnumDecl, Expr, ExprKind, FnDecl, ImportDecl, ImportKind, Item,
-    Literal, ModuleDecl, Param, ParamMode, Stmt, StructDecl, TypeName, UnaryOp,
+    Literal, MatchPattern, ModuleDecl, Param, ParamMode, Stmt, StructDecl, TypeName, UnaryOp,
 };
 use ku::lexer::Lexer;
 use ku::parser::Parser;
@@ -335,6 +335,61 @@ fn push_node(
 }
 
 fn project_expr(source: &str, expr: &Expr, arena: &mut ProjectedArena) -> usize {
+    if let ExprKind::Match { value, arms } = &expr.kind {
+        let tokens = Lexer::new(source).lex().expect("match pattern tokens");
+        let mut children = vec![project_expr(source, value, arena)];
+        for arm in arms {
+            assert!(arm.guard.is_none(), "only unguarded matches are projected");
+            let pattern_start = tokens
+                .iter()
+                .position(|token| token.span.start == arm.span.start)
+                .expect("match pattern's first token");
+            let mut token = &tokens[pattern_start];
+            let pattern = match &arm.pattern {
+                MatchPattern::Wildcard => {
+                    push_node(arena, "MatchWildcard", String::new(), 0, token.span, &[])
+                }
+                MatchPattern::EnumVariant {
+                    enum_name,
+                    variant,
+                    fields,
+                } if fields.is_empty() => {
+                    let mut names = enum_name
+                        .split('.')
+                        .chain(std::iter::once(variant.as_str()));
+                    let first = names.next().expect("enum name");
+                    assert_eq!(token.kind, TokenKind::Ident(first.into()));
+                    let start = token.span.start;
+                    let mut target = push_node(arena, "Variable", first.into(), 0, token.span, &[]);
+                    for (index, name) in names.enumerate() {
+                        assert_eq!(tokens[pattern_start + index * 2 + 1].kind, TokenKind::Dot);
+                        token = &tokens[pattern_start + index * 2 + 2];
+                        assert_eq!(token.kind, TokenKind::Ident(name.into()));
+                        target = push_node(
+                            arena,
+                            "Field",
+                            name.into(),
+                            0,
+                            Span::new(start, token.span.end),
+                            &[target],
+                        );
+                    }
+                    target
+                }
+                pattern => panic!("unsupported pattern in stage-3 match fixture: {pattern:?}"),
+            };
+            let value = project_expr(source, &arm.value, arena);
+            children.push(push_node(
+                arena,
+                "MatchArm",
+                String::new(),
+                0,
+                arm.span,
+                &[pattern, value],
+            ));
+        }
+        return push_node(arena, "Match", String::new(), 0, expr.span, &children);
+    }
     if let ExprKind::Function {
         params,
         return_type,
@@ -1840,6 +1895,8 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "fn main() { before = 0 if (left) {} middle = 1 if (right) {} after = 2 }",
         "fn main() { if (outer) { before = 0 if (inner) {} after = 1 } else { fallback = 2 } }",
         "fn main() {\r\n  if (\"中😀\" == \"中😀\") {}\r\n}",
+        "// 分类😀\r\nenum TokenKind { Ident, Number, Eof }\r\nfn Classify(kind: TokenKind): int {\r\n    return match kind {\r\n        TokenKind.Ident => 1\r\n        TokenKind.Number => 2,\r\n        TokenKind.Eof => 0;\r\n    };\r\n}",
+        "fn Classify(kind: lexer.TokenKind): int { return match Next(kind) { lexer.TokenKind.Ident => Selected(1), _ => Selected(0) } }",
         IF_GOLDEN_SOURCE,
         WHILE_GOLDEN_SOURCE,
     ];
@@ -3869,12 +3926,48 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             "unsupported_statement",
             "stage-3 finally is not supported",
         ),
+        (
+            "fn f() { return match value { Kind.Ident if true => 1 } }",
+            TokenKind::If,
+            "unsupported_match_pattern",
+            "stage-3 return match does not support guards or payload patterns",
+        ),
+        (
+            "fn f() { return match value { Kind.Ident 1 } }",
+            TokenKind::Int(1),
+            "unexpected_token",
+            "expected '=>' after match pattern",
+        ),
+        (
+            "fn f() { return match value { _ => 1, Kind.Ident => 2 } }",
+            TokenKind::Ident("Kind".into()),
+            "unreachable_match_arm",
+            "match arm after catch-all pattern is unreachable",
+        ),
+        (
+            "fn f() { return match value { _ => 1 } + 2 }",
+            TokenKind::Plus,
+            "unsupported_expression",
+            "stage-3 match must be the complete return value",
+        ),
     ] {
+        // In the wildcard reachability case the token's spelling matters:
+        // several earlier identifiers belong to the same token kind.
+        let position = if code == "unreachable_match_arm" {
+            let tokens = Lexer::new(source).lex().expect("match diagnostic tokens");
+            let index = tokens
+                .iter()
+                .position(|item| item.kind == token)
+                .expect("next enum arm token");
+            diagnostic_at(source, index, detail)
+        } else {
+            diagnostic_for_kind(source, token, detail)
+        };
         body.push_str(&format!(
             "    ExpectError({}, {}, {})?\n",
             ku_string(source),
             ku_string(code),
-            ku_string(&diagnostic_for_kind(source, token, detail))
+            ku_string(&position)
         ));
     }
     for source in [

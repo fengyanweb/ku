@@ -4,6 +4,7 @@ import { Node, ParseOutput } from "../stage2/ast.ku"
 import { ExpressionSpan } from "../stage2/expression_support.ku"
 import { NextBodyWork, ReadExpressionEnd, AssignmentOperator, ReadBodyExpression, RejectLetStatement,
          SignatureTypeOutput } from "./body_support.ku"
+import { ReadReturnMatch } from "./enums.ku"
 import { ReadTypedInitializer } from "./function_header.ku"
 import { ReadSignatureTypePrefix } from "./signature.ku"
 import { AfterOptionalSemicolon, ObjectDestructureClose, RejectAt, RejectAtSpan, SpanFromNode, WindowKind, WindowKindIs, WindowToken } from "./support.ku"
@@ -77,6 +78,13 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         kind = statement_start.kind.clone()
         requires_value = kind == "Fail"
         cursor = cursor + 1
+        if (!requires_value && WindowKindIs(tokens, cursor, last_index, "Match")) {
+            matched = ReadReturnMatch(tokens, cursor, last_index, token_base, parse_steps,
+                                      parse_expression, add_arena, add_node.clone(), read_span.clone())?
+            span = SpanMerge(SpanFromToken(statement_start.clone()), read_span(matched.node))
+            statement = add_node("Return", "", 0, span, [matched.node], statement_start)?
+            return ok(SimpleStatementRead { node: statement, cursor: matched.cursor, work: matched.work, initializer_type: 0 })
+        }
         children: [int] = []
         end_span = SpanFromToken(statement_start.clone())
         if (!requires_value && WindowKindIs(tokens, cursor, last_index, "Semicolon")) {
