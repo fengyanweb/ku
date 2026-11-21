@@ -35,8 +35,11 @@ fn LowerLinkedOwnerRebind(&project: LinkedNullProject, state: LinkedNullState, &
     record = target.ty.declaration_kind == "Struct"
     owner = record || LinkedStringResult(target.ty) || LinkedNullOwnedArray(target.ty) || LinkedNullIntArrayOwner(target.ty)
         || target.ty.declaration_kind == "OwnedStringArray"
-    if (target.borrowed || !owner
-        || !SameLinkedType(target.ty, value.value.ty) || value.value.borrowed
+    // A str selected from an owned record has a tracked field path.
+    // A View or an indexed borrowed element cannot supply that ownership.
+    owned_string_field = LinkedStringResult(target.ty) && value.value.member_path != ""
+    if (target.borrowed || !owner || !SameLinkedType(target.ty, value.value.ty)
+        || (value.value.borrowed && !owned_string_field)
         || value.value.slot == index || (record && (value.value.slot == 0 || value.value.member_path != ""))) {
         RejectLayout("linked_rebind_type", "replacement requires a separate owner of the declared type", DeclarationSpan(assignment))?
     }

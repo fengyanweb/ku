@@ -2461,3 +2461,153 @@ int main(int argc, char **argv) {
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_index_target"));
 }
+
+const FIELD_REBIND_SOURCE: &str = r#"struct Alias { text: str remaining: str }
+fn Acquire(): Alias! { return ok(Alias { text: "new", remaining: "keep" }) }
+fn Inspect(&remaining: str): null! { return ok(null) }
+
+fn ReplaceField(old: str, use_alias: bool): str! {
+    local = old
+    if (use_alias) {
+        alias = Acquire()?
+        local = alias.text
+        Inspect(alias.remaining)?
+    }
+    return ok(local)
+}
+
+fn BorrowField(&alias: Alias, old: str): str! {
+    local = old
+    local = alias.text
+    return ok(local)
+}
+"#;
+
+const FIELD_REBIND_DRIVER: &str = r#"
+static uintptr_t prior, text, remaining;
+static bool fail_acquire, fail_inspect;
+static unsigned acquired, inspected;
+
+static KuProjectionString owned(char value, uintptr_t *identity) {
+    uint8_t *data = malloc(1);
+    assert(data);
+    *data = (uint8_t)value;
+    *identity = (uintptr_t)data;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+
+static bool retains(uintptr_t identity) {
+    for (size_t i = 0; i < sizeof(live)/sizeof(live[0]); ++i)
+        if (live[i] && (uintptr_t)live[i] == identity) return true;
+    return false;
+}
+
+__RESULT__ __ACQUIRE__(void) {
+    ++acquired;
+    assert(retains(prior));
+    if (fail_acquire) {
+        __RESULT__ error = {0};
+        error.error.code = (KuProjectionString){
+            (uint8_t*)"acquire", 7, 0, KU_PROJECTION_STRING_STATIC
+        };
+        return error;
+    }
+    __ELEMENT__ value = {0};
+    value.f0 = owned('n', &text);
+    value.f1 = owned('k', &remaining);
+    return (__RESULT__){.ok = true, .value = value};
+}
+
+KuBootstrapResultNull __INSPECT__(const KuProjectionString *field) {
+    ++inspected;
+    assert((uintptr_t)field->ptr == remaining && field->ptr[0] == 'k');
+    assert(!retains(prior) && retains(text) && retains(remaining));
+    if (fail_inspect) {
+        KuBootstrapResultNull error = {0};
+        error.error.code = (KuProjectionString){
+            (uint8_t*)"inspect", 7, 0, KU_PROJECTION_STRING_STATIC
+        };
+        return error;
+    }
+    return (KuBootstrapResultNull){.ok = true};
+}
+
+int main(void) {
+    (void)test_realloc;
+    KuBootstrapResult_KuProjectionString result = __ENTRY__(owned('o', &prior), false);
+    assert(result.ok && (uintptr_t)result.value.ptr == prior && acquired == 0 && inspected == 0);
+    assert(attempts == 1 && outstanding() == 1);
+    test_free(result.value.ptr);
+    assert(!outstanding());
+
+    attempts = 0;
+    result = __ENTRY__(owned('o', &prior), true);
+    assert(result.ok && (uintptr_t)result.value.ptr == text && result.value.ptr[0] == 'n');
+    assert(acquired == 1 && inspected == 1 && attempts == 3 && outstanding() == 1);
+    test_free(result.value.ptr);
+    assert(!outstanding());
+
+    attempts = 0;
+    fail_acquire = true;
+    result = __ENTRY__(owned('o', &prior), true);
+    assert(!result.ok && result.error.code.len == 7 && !memcmp(result.error.code.ptr, "acquire", 7));
+    assert(acquired == 2 && inspected == 1 && attempts == 1 && !outstanding());
+
+    attempts = 0;
+    fail_acquire = false;
+    fail_inspect = true;
+    result = __ENTRY__(owned('o', &prior), true);
+    assert(!result.ok && result.error.code.len == 7 && !memcmp(result.error.code.ptr, "inspect", 7));
+    assert(acquired == 3 && inspected == 2 && attempts == 3 && !outstanding());
+    return 0;
+}
+"#;
+
+pub(super) fn assert_record_field_string_rebind(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("record-field-rebind.ku"), FIELD_REBIND_SOURCE).unwrap();
+    fs::write(cwd.join("modules.txt"), "record-field-rebind.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "ReplaceField\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null\n").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let source = String::from_utf8(emitted.stdout).unwrap();
+    let symbol = |prefix: &str| {
+        source
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix)?.split_once('('))
+            .map(|(name, _)| name)
+            .expect("generated typed function")
+    };
+    let carrier = source
+        .lines()
+        .find_map(|line| {
+            let carrier = line.strip_prefix("extern ")?.split_once(' ')?.0;
+            carrier
+                .starts_with("KuBootstrapResult_KuStruct_")
+                .then_some(carrier)
+        })
+        .expect("owning record Result declaration");
+    let host = FIELD_REBIND_DRIVER
+        .replace("__RESULT__", carrier)
+        .replace(
+            "__ELEMENT__",
+            carrier.strip_prefix("KuBootstrapResult_").unwrap(),
+        )
+        .replace("__ACQUIRE__", symbol(&format!("extern {carrier} ")))
+        .replace("__INSPECT__", symbol("extern KuBootstrapResultNull "))
+        .replace("__ENTRY__", symbol("KuBootstrapResult_KuProjectionString "));
+    let path = cwd.join("record-field-rebind.c");
+    let binary = cwd.join(format!(
+        "record-field-rebind{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&path, format!("{CHECKED_ARRAY_ALLOCATOR}{source}{host}")).unwrap();
+    compile_projection(&path, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(&binary), cwd, 10));
+
+    fs::write(cwd.join("function.txt"), "BorrowField\n").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("|linked_rebind_type|"));
+}

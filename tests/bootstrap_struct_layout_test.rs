@@ -4410,6 +4410,7 @@ int main(int argc, char **argv) {
     linked_guard::assert_terminal_try_unwind(&compiler, &cwd);
     linked_guard::assert_ignored_result_cleanup(&compiler, &cwd);
     linked_guard::assert_checked_string_rebind(&compiler, &cwd);
+    linked_guard::assert_record_field_string_rebind(&compiler, &cwd);
     linked_guard::assert_checked_str_predicate(&compiler, &cwd);
     linked_guard::assert_checked_copy_int(&compiler, &cwd);
     linked_guard::assert_checked_callback_forwarding(&compiler, &cwd);
