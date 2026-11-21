@@ -316,9 +316,20 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
     return ok(null)
 }
 
-fn checkReturnsInStatement(&nodes: [Node], &edges: [int], &result: ScalarAnnotation, &statement: Node): null! {
+fn checkReturnsInStatement(&nodes: [Node], &edges: [int], &result: ScalarAnnotation,
+                           &statement: Node, checked: bool): null! {
     if (statement.kind == "Return" && statement.edge_count == 1) {
         value = edges[statement.first_edge]
+        if (checked) {
+            call = value - 1
+            if (nodes[call].kind != "Call" || nodes[call].edge_count != 2) { return ok(null) }
+            first = nodes[call].first_edge
+            callee = edges[first] - 1
+            if (nodes[callee].kind != "Variable" || nodes[callee].edge_count != 0 || nodes[callee].text != "ok") {
+                return ok(null)
+            }
+            value = edges[first + 1]
+        }
         return checkLiteralType(result, nodes, edges, nodes[value - 1], "return_type")
     }
     // These blocks share the current function's result type. Declaration,
@@ -330,14 +341,14 @@ fn checkReturnsInStatement(&nodes: [Node], &edges: [int], &result: ScalarAnnotat
         stop = start + statement.edge_count
         cursor = start
         while (cursor < stop) {
-            checkReturnsInStatement(nodes, edges, result, nodes[edges[cursor] - 1])?
+            checkReturnsInStatement(nodes, edges, result, nodes[edges[cursor] - 1], checked)?
             cursor = cursor + 1
         }
     }
     return ok(null)
 }
 
-fn checkLiteralReturns(&nodes: [Node], &edges: [int], &function: Node): null! {
+fn checkLiteralReturns(&nodes: [Node], &edges: [int], &function: Node, can_use_ok: bool): null! {
     start = function.first_edge
     stop = start + function.edge_count
     cursor = start
@@ -347,12 +358,19 @@ fn checkLiteralReturns(&nodes: [Node], &edges: [int], &function: Node): null! {
     if (cursor == stop) { return ok(null) }
     // Return annotations follow the parameters. An omitted annotation
     // begins directly with a statement and yields the empty scalar set.
-    annotation = scalarAnnotation(nodes, edges, nodes[edges[cursor] - 1])
+    type_node = edges[cursor] - 1
+    checked = nodes[type_node].kind == "TypeResult"
+    if (checked) {
+        if (!can_use_ok || nodes[type_node].edge_count != 1) { return ok(null) }
+        type_node = edges[nodes[type_node].first_edge] - 1
+        if (nodes[type_node].kind != "TypeName") { return ok(null) }
+    }
+    annotation = scalarAnnotation(nodes, edges, nodes[type_node])
     if (annotation.scalars.len() == 0) { return ok(null) }
     first_statement = cursor + 1
     body_cursor = first_statement
     while (body_cursor < stop) {
-        checkReturnsInStatement(nodes, edges, annotation, nodes[edges[body_cursor] - 1])?
+        checkReturnsInStatement(nodes, edges, annotation, nodes[edges[body_cursor] - 1], checked)?
         body_cursor = body_cursor + 1
     }
     return ok(null)
@@ -378,12 +396,30 @@ fn CheckDirectCallContracts(&named: NamedModule, &imports: [ImportBinding], &sup
 
 fn CheckFunctionContracts(&named: NamedModule): null! {
     node_count = named.parsed.arena.nodes.len()
+    // A local may also shadow ok in a nested capturing function. Until
+    // lexical binding is available here, only inspect the builtin when no
+    // declaration in the module can replace it.
+    can_use_ok = true
+    probe = 0
+    while (probe < node_count) {
+        if (named.parsed.arena.nodes[probe].text == "ok") {
+            if (couldBindLocal(named.parsed.arena.nodes[probe].kind)
+                || named.parsed.arena.nodes[probe].kind == "ImportName"
+                || named.parsed.arena.nodes[probe].kind == "ImportAlias"
+                || named.parsed.arena.nodes[probe].kind == "ImportNamespace"
+                || named.parsed.arena.nodes[probe].kind == "Struct"
+                || named.parsed.arena.nodes[probe].kind == "Enum") {
+                can_use_ok = false
+            }
+        }
+        probe = probe + 1
+    }
     index = 0
     while (index < node_count) {
         // The kind and function check only borrow the original AST node.
         is_named = IsNamedFunction(named.parsed.arena.nodes[index].kind)
         if (is_named || named.parsed.arena.nodes[index].kind == "FunctionExpr") {
-            checkLiteralReturns(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.nodes[index])?
+            checkLiteralReturns(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.nodes[index], can_use_ok)?
             CheckParameterWrites(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.nodes[index])?
         }
         index = index + 1

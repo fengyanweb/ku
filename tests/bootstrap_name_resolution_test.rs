@@ -425,6 +425,12 @@ fn main() { println(Run(Options { transform: Count })) }
 
     let return_contract = r#"
 fn Failed(): int! { fail "recoverable" }
+fn Phase(ready: bool): int! {
+    if (ready) { return ok(2) }
+    return ok(-7)
+}
+fn Empty(): str! { return ok("") }
+fn Quiet(): bool! { return ok(false) }
 fn Decide(ready: bool): int | null {
     fn Display(): str { return "selected" }
     if (ready) { println(Display()); return 0 }
@@ -445,6 +451,10 @@ fn main(): null! { println(Decide(true)); return ok(null) }
         ),
         ("return null", "return false", "false", r"int \p null"),
         ("return \"selected\"", "return 3", "3", "str"),
+        ("ok(2)", "ok(\"two\")", "\"two\"", "int"),
+        ("ok(-7)", "ok(-1.5)", "-1.5", "int"),
+        ("ok(\"\")", "ok(0)", "0", "str"),
+        ("ok(false)", "ok(null)", "null", "bool"),
     ] {
         let program = return_contract.replace(original, replacement);
         fs::write(&main, &program).unwrap();
@@ -465,6 +475,40 @@ fn main(): null! { println(Decide(true)); return ok(null) }
         assert!(diagnostic
             .trim_end()
             .ends_with(&format!("@{}", offset + literal.len())));
+    }
+
+    let provider = project.join("result-provider.ku");
+    fs::write(
+        &provider,
+        "fn Convert(text: str): int! { return ok(text.len()) }\n",
+    )
+    .unwrap();
+    for (manifest_text, program) in [
+        (
+            "main.ku\n",
+            r#"
+fn Convert(text: str): int! { return ok(text.len()) }
+fn Capture(): int! {
+    ok = Convert
+    fn Inner(): int! { return ok("nested") }
+    return Inner()
+}
+fn main() {}
+"#,
+        ),
+        (
+            "main.ku\nresult-provider.ku\n",
+            r#"
+import { Convert as ok } from "./result-provider.ku"
+fn Imported(): int! { return ok("imported") }
+fn main() {}
+"#,
+        ),
+    ] {
+        fs::write(&manifest, manifest_text).unwrap();
+        fs::write(&main, program).unwrap();
+        assert_success(&run(Command::new(ku).arg("check").arg(&main), cwd, 20));
+        assert_success(&run(&mut Command::new(executable), cwd, 20));
     }
 }
 
