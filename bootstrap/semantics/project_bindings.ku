@@ -32,26 +32,31 @@ fn resolveProjectModule(&entry: SuppliedModule, &supplied: [SuppliedModule]): Pr
 }
 
 fn projectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
-    done: [bool] = []
-    while (done.len() < modules.len()) { done = done.push(false) }
+    module_count = modules.len()
+    done: [int] = []
+    init = 0
+    while (init < module_count) {
+        done = done.push(0)
+        init = init + 1
+    }
     order: [int] = []
-    while (order.len() < modules.len()) {
-        index = 0
-        next = -1
+    placed = 0
+    while (placed < module_count) {
+        next = 0 - 1
         blocked_path = ""
         blocked_at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
-        while (index < modules.len() && next < 0) {
-            if (!done[index]) {
+        index = 0
+        while (index < module_count && next < 0) {
+            if (done[index] == 0) {
                 ready = true
-                edge = 0
                 edge_count = modules[index].imports.len()
-                while (edge < edge_count) {
+                edge = 0
+                while (edge < edge_count && ready) {
                     dependency = modules[index].imports[edge].module_index
-                    if (dependency > 0 && !done[dependency - 1]) {
+                    if (dependency > 0 && done[dependency - 1] == 0) {
                         ready = false
                         blocked_at = modules[index].imports[edge].span.clone()
                         blocked_path = modules[index].path.clone()
-                        break
                     }
                     edge = edge + 1
                 }
@@ -62,8 +67,9 @@ fn projectImportOrder(&modules: [ProjectModuleBindings]): [int]! {
         if (next < 0) {
             RejectName("cyclic_import", "no remaining project module has resolved dependencies, including '" + blocked_path + "'", blocked_at)?
         }
-        done[next] = true
+        done[next] = 1
         order = order.push(next)
+        placed = placed + 1
     }
     return ok(order)
 }
