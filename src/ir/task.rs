@@ -673,6 +673,10 @@ pub(crate) fn unit_enum_name(ty: &IrType) -> Option<&str> {
     }
 }
 
+fn unit_enum_result(ty: &IrType) -> bool {
+    matches!(ty, IrType::Result(inner) if unit_enum_name(inner).is_some())
+}
+
 pub(crate) fn unit_enum_layout<'a>(
     layouts: &'a super::IrLayoutTable,
     ty: &IrType,
@@ -741,7 +745,7 @@ fn parameter_type(ty: &IrType) -> bool {
         || nullable_leaf(ty)
         || error_type(ty)
         || flat_array(ty)
-        || result_type(ty)
+        || (result_type(ty) && !unit_enum_result(ty))
         || http_type(ty)
         || pg_capture_type(ty)
         || record_type(ty)
@@ -750,6 +754,7 @@ fn parameter_type(ty: &IrType) -> bool {
 }
 fn value_type(ty: &IrType) -> bool {
     parameter_type(ty)
+        || unit_enum_result(ty)
         || pg_params_array(ty)
         || local_bytes_type(ty)
         || local_net_type(ty)
@@ -787,7 +792,7 @@ pub(crate) fn http_type(ty: &IrType) -> bool {
 }
 
 fn result_type(ty: &IrType) -> bool {
-    matches!(ty, IrType::Result(inner) if primitive(inner) || nullable_leaf(inner) || flat_array(inner) || http_response_type(inner) || record_type(inner) || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
+    matches!(ty, IrType::Result(inner) if primitive(inner) || nullable_leaf(inner) || flat_array(inner) || http_response_type(inner) || record_type(inner) || unit_enum_name(inner).is_some() || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
 }
 
 fn copy_type(ty: &IrType) -> bool {
@@ -1674,7 +1679,8 @@ fn validate_shape(
                         || !(primitive(source)
                             || flat_array(source)
                             || http_response_type(source)
-                            || record_type(source))
+                            || record_type(source)
+                            || unit_enum_name(source).is_some())
                         || !matches!(destination, IrType::Result(inner) if inner.as_ref() == source)
                         || (source_borrowed && !copy_type(source))
                     {

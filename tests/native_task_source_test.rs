@@ -172,6 +172,105 @@ fn native_task_moves_a_nominal_unit_enum_into_a_waiting_child() {
 }
 
 #[test]
+fn native_task_returns_nominal_unit_enums_after_wait() {
+    let directory = TempDir::new("task-enum-result");
+    let path = directory.path();
+    fs::write(
+        path.join("worker.ku"),
+        r#"
+import time from "std.time"
+enum Phase { Ready, Done }
+enum Review { Ready, Done }
+struct Reply { text: str }
+
+async fn Complete(phase: Phase): Phase! {
+    time.sleep(30)?
+    return ok(phase)
+}
+async fn Summarize(text: str): Reply! {
+    return ok(Reply { text: text })
+}
+async fn Decline(): Review! {
+    time.sleep(30)?
+    fail "not " + "approved"
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"
+import { Phase as Workflow, Complete, Summarize, Decline } from "./worker"
+async fn main(): null! {
+    first = (await Complete(Workflow.Ready))?
+    println(first == Workflow.Ready)
+    println(first != Workflow.Done)
+    reply = (await Summarize("摘要🙂"))?
+    println(reply.text)
+    try { (await Decline())? }
+    catch (issue) { println(issue.domain + "/" + issue.code + "/" + issue.message) }
+    last = (await Complete(Workflow.Done))?
+    println(last == Workflow.Done)
+    return ok(null)
+}
+"#;
+    fs::write(path.join("main.ku"), source).unwrap();
+    fs::write(
+        path.join("taken.ku"),
+        source.replace(
+            "    first = (await Complete(Workflow.Ready))?",
+            "    value = await Complete(Workflow.Ready)\n    first = value?\n    second = value?",
+        ),
+    )
+    .unwrap();
+    let call = |args: &[&str]| {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_ku"));
+        cli.current_dir(path).args(args);
+        let output = run_bounded(&mut cli, BUILD_TIMEOUT, BUILD_LIMITS).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+        (output.status.success(), stdout, stderr)
+    };
+    let expected = "true\ntrue\n摘要🙂\nku/fail/not approved\ntrue\n";
+    let (passed, stdout, stderr) = call(&["run", "main.ku"]);
+    assert!(passed, "{stderr}");
+    assert_eq!(stdout, expected);
+    let (accepted, _, stderr) = call(&["build", "--native", "taken.ku"]);
+    assert!(!accepted);
+    assert!(stderr.contains("use of moved value 'value'"), "{stderr}");
+    let (emitted, _, stderr) = call(&["build", "--native", "main.ku"]);
+    assert!(emitted, "{stderr}");
+    let generated = fs::read_to_string(path.join("main.c")).unwrap();
+    for (suffix, kind) in [("Reply", 9), ("Phase", 10), ("Review", 11)] {
+        let ending = format!("_{suffix}={kind}u }};");
+        assert!(generated.lines().any(|line| {
+            line.starts_with("enum { KU_TASK_OUTCOME_KIND_") && line.ends_with(&ending)
+        }));
+    }
+
+    let filename = if cfg!(windows) { "app.exe" } else { "app" };
+    let (built, _, stderr) = call(&["build", "--release", "--offline", "main.ku", "-o", filename]);
+    if !built && stderr.contains("C compiler not found") {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none(), "{stderr}");
+        return;
+    }
+    assert!(built, "{stderr}");
+    let result = run_bounded(
+        Command::new(path.join(filename)).current_dir(path),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout).replace("\r\n", "\n"),
+        expected
+    );
+}
+
+#[test]
 fn native_task_keeps_unused_enum_declarations_out_and_rejects_payload_layouts() {
     let scalar = "async fn main(): null! { println(17) return ok(null) }";
     let unused = format!("enum Unused {{ First, Payload(message: str) }}\n{scalar}");

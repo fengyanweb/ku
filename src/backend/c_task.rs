@@ -3135,7 +3135,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     let suffix = c_type_suffix(inner)?;
                     out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  KuTaskAdapterOutcomeV1 received={{0}};\n  uint32_t awaited=ku_task_host_await((KuTaskAdapterHostV1*)clock->host,&{},&received);\n  if (awaited==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (awaited!=KU_TASK_CONTROL_OK) {{ ku_task_outcome_drop(&received); frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",cleanup.0,self.place(*task)));
                     self.set_init(out, *task, false);
-                    if let Some(kind) = super::task_adapter::outcome_record_kind_symbol(inner) {
+                    if let Some(kind) = super::task_adapter::outcome_nominal_kind_symbol(inner) {
                         out.push_str(&format!("  if (received.result_kind!={kind}) {{ ku_task_outcome_drop(&received); frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n"));
                     }
                     out.push_str("  if (received.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE) {\n    frame->header.has_exit_deadline=received.has_cleanup_deadline;\n    frame->header.exit_deadline=received.cleanup_deadline;\n");
@@ -4701,7 +4701,7 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
 }
 
 fn require_result_type(ty: &IrType) -> KuResult<()> {
-    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner) || crate::ir::task::http_response_type(inner) || crate::ir::task::record_type(inner) || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
+    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner) || crate::ir::task::http_response_type(inner) || crate::ir::task::record_type(inner) || crate::ir::task::unit_enum_name(inner).is_some() || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
     {
         Ok(())
     } else {

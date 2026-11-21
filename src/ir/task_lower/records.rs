@@ -105,25 +105,47 @@ pub(super) fn retain_used_enums(layouts: &mut super::super::IrLayoutTable, tasks
     if layouts.enums.is_empty() {
         return;
     }
+    fn name(ty: &IrType) -> Option<&str> {
+        task::unit_enum_name(match ty {
+            IrType::Result(inner) => inner,
+            ty => ty,
+        })
+    }
     let mut used = std::collections::HashSet::new();
     for layout in &layouts.structs {
-        used.extend(
-            layout
-                .fields
-                .iter()
-                .filter_map(|field| task::unit_enum_name(&field.ty)),
-        );
+        used.extend(layout.fields.iter().filter_map(|field| name(&field.ty)));
     }
     for function in &tasks.functions {
+        used.extend(name(&function.result));
         for slot in &function.slots {
-            if let TaskSlotType::Value { ty, .. } = &slot.ty {
-                used.extend(task::unit_enum_name(ty));
+            match &slot.ty {
+                TaskSlotType::Value { ty, .. } | TaskSlotType::Task { result: ty } => {
+                    used.extend(name(ty));
+                }
+                TaskSlotType::Callable { parameters, result } => {
+                    used.extend(parameters.iter().filter_map(name));
+                    used.extend(name(result));
+                }
             }
         }
     }
     layouts
         .enums
         .retain(|layout| used.contains(layout.name.as_str()));
+}
+
+pub(super) fn unit_enum_type(
+    ty: &TypeName,
+    layouts: &super::super::IrLayoutTable,
+) -> Option<IrType> {
+    let TypeName::Custom(name) = ty else {
+        return None;
+    };
+    layouts
+        .enums
+        .iter()
+        .any(|decl| &decl.name == name)
+        .then(|| super::super::enum_ir_type(name))
 }
 
 impl FunctionLowerer<'_> {

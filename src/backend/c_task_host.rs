@@ -20,13 +20,26 @@ fn record_field(name: &str) -> String {
     format!("record_{}", c_ident(name))
 }
 
-pub(super) fn record_kind_symbol(ty: &IrType) -> Option<String> {
-    record_name(ty).map(|name| format!("KU_TASK_OUTCOME_KIND_{}", c_ident(name)))
+fn enum_name(ty: &IrType) -> Option<&str> {
+    crate::ir::task::unit_enum_name(match ty {
+        IrType::Result(inner) => inner,
+        ty => ty,
+    })
+}
+
+pub(super) fn nominal_kind_symbol(ty: &IrType) -> Option<String> {
+    if let Some(name) = record_name(ty) {
+        return Some(format!("KU_TASK_OUTCOME_KIND_{}", c_ident(name)));
+    }
+    enum_name(ty).map(|name| format!("KU_TASK_OUTCOME_KIND_ENUM_{}", c_ident(name)))
 }
 
 pub(super) fn field(ty: &IrType) -> KuResult<Cow<'static, str>> {
     if let Some(name) = record_name(ty) {
         return Ok(Cow::Owned(record_field(name)));
+    }
+    if let Some(name) = enum_name(ty) {
+        return Ok(Cow::Owned(format!("enum_{}", c_ident(name))));
     }
     let primitive = match ty {
         IrType::Result(inner) => return field(inner),
@@ -46,16 +59,20 @@ pub(super) fn field(ty: &IrType) -> KuResult<Cow<'static, str>> {
     Ok(Cow::Borrowed(primitive))
 }
 
-pub(super) struct OutcomeRecords<'a> {
+pub(super) struct OutcomeKinds<'a> {
     results: Vec<&'a IrType>,
 }
 
-impl<'a> OutcomeRecords<'a> {
+impl<'a> OutcomeKinds<'a> {
     pub(super) fn new(tasks: &'a TaskProgram) -> Self {
         let mut results = Vec::new();
-        for function in &tasks.functions {
-            let result = &function.result;
-            if record_name(result).is_some() && !results.contains(&result) {
+        // Keep existing custom record kind numbers even when an enum-returning
+        // function precedes a record-returning function.
+        let declarations = tasks.functions.iter().map(|function| &function.result);
+        let records = declarations.clone().filter(|ty| record_name(ty).is_some());
+        let enums = declarations.filter(|ty| enum_name(ty).is_some());
+        for result in records.chain(enums) {
+            if !results.contains(&result) {
                 results.push(result);
             }
         }
@@ -67,14 +84,14 @@ impl<'a> OutcomeRecords<'a> {
     }
 
     pub(super) fn kind(&self, ty: &IrType) -> KuResult<u32> {
-        if let Some(name) = record_name(ty) {
+        if record_name(ty).is_some() || enum_name(ty).is_some() {
             let index = self
                 .results
                 .iter()
-                .position(|result| record_name(result) == Some(name))
-                .ok_or_else(|| unsupported("Task record outcome has no registered kind"))?;
+                .position(|result| *result == ty)
+                .ok_or_else(|| unsupported("Task nominal outcome has no registered kind"))?;
             return u32::try_from(index + 9)
-                .map_err(|_| unsupported("too many Task record outcome kinds"));
+                .map_err(|_| unsupported("too many Task nominal outcome kinds"));
         }
         primitive_kind(ty)
     }
@@ -95,19 +112,27 @@ impl<'a> OutcomeRecords<'a> {
         let mut empty = String::new();
         let mut drop = String::new();
         let mut failure = String::new();
-        out.push_str("#define KU_TASK_RECORD_OUTCOMES 1\n");
+        let has_records = self.results.iter().any(|ty| record_name(ty).is_some());
+        if has_records {
+            out.push_str("#define KU_TASK_RECORD_OUTCOMES 1\n");
+        }
         for result in &self.results {
             out.check()?;
             let IrType::Result(inner) = result else {
-                return Err(unsupported("Task record outcome must be a Result"));
+                return Err(unsupported("Task nominal outcome must be a Result"));
             };
             let field = field(result)?;
             let c_ty = c_type(result)?;
             let suffix = super::super::c_type_suffix(inner)?;
             let kind = self.kind(result)?;
-            let kind_symbol = record_kind_symbol(result)
-                .ok_or_else(|| unsupported("Task record outcome has no kind symbol"))?;
+            let kind_symbol = nominal_kind_symbol(result)
+                .ok_or_else(|| unsupported("Task nominal outcome has no kind symbol"))?;
             out.push_str(&format!("enum {{ {kind_symbol}={kind}u }};\n"));
+            if enum_name(result).is_some() {
+                out.push_str(&format!(
+                    "typedef char KuTaskEnumOutcomeFits_{suffix}[\n  sizeof({c_ty}) <= sizeof(KuResult_str)\n  && KU_TASK_FRAME_ALIGNOF({c_ty}) <= KU_TASK_FRAME_ALIGNOF(KuResult_str) ? 1 : -1];\n"
+                ));
+            }
             members.push_str(&format!("          {c_ty} {field};\n"));
             let payload_empty =
                 empty_expr(layouts, inner, &format!("output->value.{field}.value"))?;
@@ -127,7 +152,11 @@ impl<'a> OutcomeRecords<'a> {
                 .replace("@RECORD_OUTCOME_FAILURE@", &failure)
                 .replace(
                     "@RECORD_OUTCOME_LAYOUT@",
-                    " && !defined(KU_TASK_RECORD_OUTCOMES)",
+                    if has_records {
+                        " && !defined(KU_TASK_RECORD_OUTCOMES)"
+                    } else {
+                        ""
+                    },
                 ),
         );
         out.check()
@@ -232,7 +261,7 @@ pub(super) fn emit(
         || function.slots.iter().any(|slot|matches!(&slot.ty,crate::ir::task::TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty)))) {
         out.push_str("#define KU_TASK_HTTP_TYPES 1\n");
     }
-    OutcomeRecords::new(tasks).emit(out, layouts)?;
+    OutcomeKinds::new(tasks).emit(out, layouts)?;
     if tasks.functions.iter().any(|function|crate::ir::task::http_type(&function.result)
         || function.slots.iter().any(|slot|matches!(&slot.ty,crate::ir::task::TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty)))) {
         out.push_str(include_str!("c_task_http_headers.c"));

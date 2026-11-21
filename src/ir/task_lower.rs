@@ -559,9 +559,12 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
                 function.span,
             ));
         };
-        let result = IrType::Result(Box::new(records::payload(inner, &layouts).ok_or_else(
-            || unsupported(&format!("async Result payload {inner:?}"), function.span),
-        )?));
+        let payload = records::unit_enum_type(inner, &layouts)
+            .or_else(|| records::payload(inner, &layouts))
+            .ok_or_else(|| {
+                unsupported(&format!("async Result payload {inner:?}"), function.span)
+            })?;
+        let result = IrType::Result(Box::new(payload));
         let mut parameters = Vec::new();
         for parameter in &function.params {
             if parameter.mode != ParamMode::Owned {
@@ -572,11 +575,10 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
                 .ty
                 .as_ref()
                 .ok_or_else(|| unsupported("untyped async parameters", parameter.span))?;
-            let parameter_type = match annotation {
-                TypeName::Custom(name) if layouts.enums.iter().any(|decl| &decl.name == name) => {
-                    value_slot(super::enum_ir_type(name))
-                }
-                _ => local_type(annotation, parameter.span, &layouts)?,
+            let parameter_type = if let Some(ty) = records::unit_enum_type(annotation, &layouts) {
+                value_slot(ty)
+            } else {
+                local_type(annotation, parameter.span, &layouts)?
             };
             parameters.push(parameter_type);
         }
@@ -2792,6 +2794,7 @@ impl<'a> FunctionLowerer<'a> {
             && !task::flat_array(ty)
             && !task::http_response_type(ty)
             && !task::record_type(ty)
+            && task::unit_enum_name(ty).is_none()
         {
             return Err(unsupported(&format!("Result payload {ty}"), span));
         }

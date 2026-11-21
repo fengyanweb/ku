@@ -30,8 +30,8 @@ pub(super) fn outcome_field(ty: &IrType) -> KuResult<std::borrow::Cow<'static, s
     host::field(ty)
 }
 
-pub(super) fn outcome_record_kind_symbol(ty: &IrType) -> Option<String> {
-    host::record_kind_symbol(ty)
+pub(super) fn outcome_nominal_kind_symbol(ty: &IrType) -> Option<String> {
+    host::nominal_kind_symbol(ty)
 }
 
 pub(super) fn outcome_empty_expr(
@@ -79,7 +79,7 @@ pub(super) fn emit_adapters_with_layouts(
     }) {
         out.push_str(FINALLY_CLOCK);
     }
-    let kinds = host::OutcomeRecords::new(tasks);
+    let kinds = host::OutcomeKinds::new(tasks);
     for function in &tasks.functions {
         out.check()?;
         emit_function(out, function, layouts, &kinds)?;
@@ -91,7 +91,7 @@ pub(super) fn emit_adapters_with_layouts(
 fn emit_value_dispatch(
     out: &mut COutput,
     tasks: &TaskProgram,
-    kinds: &host::OutcomeRecords<'_>,
+    kinds: &host::OutcomeKinds<'_>,
 ) -> KuResult<()> {
     out.push_str(&"static uint32_t ku_task_value_check(KuTaskValueV1* value) {\n  if (!ku_task_frame_storage_valid(value,sizeof(*value),sizeof(*value),KU_TASK_FRAME_ALIGNOF(KuTaskValueV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  if (value->result_kind<1u || value->result_kind>@MAX_KINDS@u) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  if (value->tag==KU_TASK_VALUE_INLINE_FAILED) return !value->owner.lease.control && !value->ticket.driver ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_INVALID_STATE;\n  if (value->tag!=KU_TASK_VALUE_LIVE) return KU_TASK_DRIVER_INVALID_STATE;\n  uint32_t checked=ku_task_control_check_lease(&value->owner.lease);\n  if (checked!=KU_TASK_CONTROL_OK) return checked;\n  KuTaskControlV1* control=value->owner.lease.control;\n  switch(value->function_id) {\n".replace("@MAX_KINDS@", &kinds.max_kind().to_string()));
     for function in &tasks.functions {
@@ -737,14 +737,17 @@ fn emit_function(
     out: &mut COutput,
     function: &TaskFunction,
     layouts: &IrLayoutTable,
-    kinds: &host::OutcomeRecords<'_>,
+    kinds: &host::OutcomeKinds<'_>,
 ) -> KuResult<()> {
     let IrType::Result(inner) = &function.result else {
         return Err(unsupported(
             "native task adapter requires a supported Result",
         ));
     };
-    if !supported_type(&function.result) && !task_record_type(inner) {
+    if !supported_type(&function.result)
+        && !task_record_type(inner)
+        && crate::ir::task::unit_enum_name(inner).is_none()
+    {
         return Err(unsupported(
             "native task adapter requires a supported Result",
         ));
