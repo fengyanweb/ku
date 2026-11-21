@@ -550,9 +550,63 @@ int main(void) {
     compile_projection(&c, &exe, cwd);
     assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
 
+    fs::write(cwd.join("function.txt"), "ConditionalArrayMove").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (entry, arguments) = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResultNull ku_linked_null_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap();
+    let record = arguments.split_once(' ').unwrap().0;
+    let take = code
+        .lines()
+        .find_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+static int visits;
+KuBootstrapResultNull __TAKE__(__RECORD__ value) {
+    ++visits;
+    assert(value.f0.f0 == 47 && value.f1.len == 2 && outstanding() == 1);
+    assert(value.f1.data[0] == 7);
+    bool accept = value.f1.data[1] == 8;
+    free(value.f1.data);
+    if (accept) return (KuBootstrapResultNull){.ok = true};
+    static uint8_t code[] = "refused";
+    return (KuBootstrapResultNull){
+        .error.code = {code, sizeof(code) - 1, 0, KU_PROJECTION_STRING_STATIC}
+    };
+}
+static __RECORD__ value(int64_t last) {
+    int64_t *data = malloc(2 * sizeof(*data));
+    data[0] = 7;
+    data[1] = last;
+    return (__RECORD__){{47},{2,data,2}};
+}
+int main(void) {
+    (void)test_realloc;
+    assert(__ENTRY__(value(8), false).ok && visits == 0 && !outstanding());
+    assert(__ENTRY__(value(8), true).ok && visits == 1 && !outstanding());
+    KuBootstrapResultNull failed = __ENTRY__(value(9), true);
+    assert(!failed.ok && visits == 2 && !outstanding() && attempts == 3);
+    assert(failed.error.code.len == 7 && !memcmp(failed.error.code.ptr, "refused", 7));
+    return 0;
+}
+"#
+    .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
+    .replace("__TAKE__", take)
+    .replace("__RECORD__", record);
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+
     for (name, reason) in [
         ("ReuseAfterMove", "unavailable_linked_binding"),
-        ("ConditionalArrayMove", "linked_control_move"),
         ("DifferentMembers", "linked_control_move"),
     ] {
         fs::write(cwd.join("function.txt"), name).unwrap();
