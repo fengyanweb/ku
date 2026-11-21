@@ -28,7 +28,8 @@ fn ScalarReturnType(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding],
     ty = nodes[type_id - 1].clone()
     if (ty.kind == "TypeResult" && ty.edge_count == 1) {
         inner_id = edges[ty.first_edge]
-        if (ScalarType(bindings, inner_id, nodes[inner_id - 1]) == 4) { return 4 }
+        inner = ScalarType(bindings, inner_id, nodes[inner_id - 1])
+        if (inner == 4) { return 4 }
     }
     plain = ScalarType(bindings, type_id, ty)
     if (plain < 4) { return plain }

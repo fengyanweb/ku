@@ -37,21 +37,23 @@ fn ScalarIntCalleeSignature(&nodes: [Node], &edges: [int], &bindings: [TypeNameB
     function = nodes[function_node - 1].clone()
     arity = 0
     has_string = false
-    while (arity < function.edge_count && nodes[edges[function.first_edge + arity] - 1].kind == "Parameter") {
+    parameter_limit = function.edge_count
+    while (arity < parameter_limit) {
         parameter = nodes[edges[function.first_edge + arity] - 1].clone()
+        if (parameter.kind != "Parameter") {
+            result_type = scalarReturnType(nodes, edges, bindings, edges[function.first_edge + arity])
+            return ScalarIntSignature { arity: arity, has_string_parameter: has_string, result_type: result_type }
+        }
         if (parameter.edge_count == 1) {
             type_node = edges[parameter.first_edge]
-            if (scalarType(bindings, type_node, nodes[type_node - 1]) == 2) {
+            parameter_type = scalarType(bindings, type_node, nodes[type_node - 1])
+            if (parameter_type == 2) {
                 has_string = true
             }
         }
         arity = arity + 1
     }
-    result_type = 0
-    if (arity < function.edge_count) {
-        result_type = scalarReturnType(nodes, edges, bindings, edges[function.first_edge + arity])
-    }
-    return ScalarIntSignature { arity: arity, has_string_parameter: has_string, result_type: result_type }
+    return ScalarIntSignature { arity: arity, has_string_parameter: has_string, result_type: 0 }
 }
 
 fn linkIntCallee(&imports: [ScalarIntImport], &target: Node): ScalarIntImport! {
@@ -73,7 +75,11 @@ fn bindIntCall(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
     }
     target_node = edges[call.first_edge]
     target = nodes[target_node - 1].clone()
-    if (target.kind != "Variable" || target.edge_count != 0 || scalarParameterIndex(parameters, target.text) >= 0) {
+    if (target.kind != "Variable" || target.edge_count != 0) {
+        rejectScalarInt("unsupported_int_callee", "expected an unshadowed function name", DeclarationSpan(target))?
+    }
+    shadow = scalarParameterIndex(parameters, target.text)
+    if (shadow >= 0) {
         rejectScalarInt("unsupported_int_callee", "expected an unshadowed function name", DeclarationSpan(target))?
     }
     function_node = ScalarFunctionNode(declarations, target.text)
