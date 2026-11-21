@@ -195,8 +195,9 @@ fn scalarAnnotation(&nodes: [Node], &edges: [int], &annotation: Node): ScalarAnn
     if (annotation.kind == "TypeName" && scalarType(annotation.text)) {
         scalars = scalars.push(annotation.text.clone())
     } else if (annotation.kind == "TypeUnion") {
-        cursor = annotation.first_edge
-        stop = cursor + annotation.edge_count
+        start = annotation.first_edge
+        stop = start + annotation.edge_count
+        cursor = start
         while (cursor < stop) {
             item = edges[cursor] - 1
             if (nodes[item].kind != "TypeName" || !scalarType(nodes[item].text)) {
@@ -329,9 +330,12 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
     shadowed: [str] = []
     index = start
     while (index < function) {
-        if (couldBindLocal(nodes[index - 1].kind) && directSignatureIndex(signatures, nodes[index - 1].text) >= 0
-            && !containsName(shadowed, nodes[index - 1].text)) {
-            shadowed = shadowed.push(nodes[index - 1].text.clone())
+        if (couldBindLocal(nodes[index - 1].kind)) {
+            candidate = directSignatureIndex(signatures, nodes[index - 1].text)
+            if (candidate >= 0) {
+                present = containsName(shadowed, nodes[index - 1].text)
+                if (!present) { shadowed = shadowed.push(nodes[index - 1].text.clone()) }
+            }
         }
         index = index + 1
     }
@@ -340,20 +344,23 @@ fn checkFunctionCalls(&nodes: [Node], &edges: [int], &signatures: [DirectSignatu
     while (index < function) {
         if (nodes[index - 1].kind == "Call" && nodes[index - 1].edge_count > 0) {
             target = edges[nodes[index - 1].first_edge]
-            if (nodes[target - 1].kind == "Variable" && !containsName(shadowed, nodes[target - 1].text)) {
-                signature = directSignatureIndex(signatures, nodes[target - 1].text)
-                if (signature >= 0) {
-                    arity = signatures[signature].parameters.len()
-                    count = nodes[index - 1].edge_count - 1
-                    if (count != arity) {
-                        RejectName("call_arity", "function '" + nodes[target - 1].text.clone() + "' expects "
-                                   + str(arity) + " arguments but got " + str(count), DeclarationSpan(nodes[index - 1]))?
-                    }
-                    argument = 0
-                    while (argument < count) {
-                        node = edges[nodes[index - 1].first_edge + argument + 1]
-                        checkLiteralType(signatures[signature].parameters[argument], nodes, edges, nodes[node - 1], "call_argument_type")?
-                        argument = argument + 1
+            if (nodes[target - 1].kind == "Variable") {
+                present = containsName(shadowed, nodes[target - 1].text)
+                if (!present) {
+                    signature = directSignatureIndex(signatures, nodes[target - 1].text)
+                    if (signature >= 0) {
+                        arity = signatures[signature].parameters.len()
+                        count = nodes[index - 1].edge_count - 1
+                        if (count != arity) {
+                            RejectName("call_arity", "function '" + nodes[target - 1].text.clone() + "' expects "
+                                       + str(arity) + " arguments but got " + str(count), DeclarationSpan(nodes[index - 1]))?
+                        }
+                        argument = 0
+                        while (argument < count) {
+                            node = edges[nodes[index - 1].first_edge + argument + 1]
+                            checkLiteralType(signatures[signature].parameters[argument], nodes, edges, nodes[node - 1], "call_argument_type")?
+                            argument = argument + 1
+                        }
                     }
                 }
             }
