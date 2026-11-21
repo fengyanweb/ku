@@ -241,6 +241,22 @@ fn OrderProjectOwningLayouts(&layouts: [StructLayout], unit: int, declaration: i
     return orderCLayouts(layouts, unit, declaration, at, true)
 }
 
+fn SnapshotOwningLayoutCache(&layouts: [StructLayout]): [StructLayout] {
+    snapshot: [StructLayout] = []
+    count = layouts.len()
+    index = 0
+    while (index < count) {
+        name = layouts[index].name.clone()
+        unit = layouts[index].module_index
+        declaration = layouts[index].node
+        fields = layouts[index].fields.clone()
+        item = StructLayout { name: name, module_index: unit, node: declaration, fields: fields }
+        snapshot = snapshot.push(item)
+        index = index + 1
+    }
+    return snapshot
+}
+
 fn OwningLayoutDropName(module_index: int, declaration: int): str {
     return "ku_drop_" + CTypeName(module_index, declaration)
 }
