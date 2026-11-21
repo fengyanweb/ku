@@ -248,6 +248,53 @@ int main(void) {{
     assert b"checked bool requires the KuBootstrapResult_bool carrier" in rejected.stderr
 
 
+def exercise_owned_recovery(compiler, cc, caller):
+    (caller / "owners.ku").write_text('''\
+struct Slot { name: str, live: bool }
+struct Pool { slots: [Slot], note: str }
+fn Replace(): int! {
+    slots: [Slot] = [Slot { name: "old", live: true }]
+    pool = Pool { slots: slots, note: "active" }
+    pool.slots[0].name = "new value"
+    if (pool.slots[0].name == "new value" && pool.note == "active" && pool.slots[0].live) { return ok(15) }
+    return ok(0)
+}
+fn Recover(abort: bool): int! {
+    try {
+        if (abort) { fail { domain: "fixture", code: "recover", message: "leave catch" } }
+        return ok(11)
+    } catch (err) {
+        if (err.code != "recover") { fail err }
+    }
+    return ok(29)
+}
+''', encoding="utf-8")
+    manifest = caller / "owners.txt"
+    manifest.write_text("owners.ku\n", encoding="utf-8")
+    linker = Path(__file__).resolve().parents[1] / "link_c.py"
+    cases = {"Replace": [("", 15)], "Recover": [("false", 11), ("true", 29)]}
+    for name, expected in cases.items():
+        plan = caller / f"{name}.plan.json"
+        code = caller / f"{name}.c"
+        plan.write_bytes(execute([compiler, "emit-unit-plan", manifest, name], caller).stdout)
+        code.write_bytes(execute([compiler, "emit-unit", manifest, name], caller).stdout)
+        entry = json.loads(plan.read_bytes())["export"]
+        signature = entry["signature"]
+        assert signature["returns_result"] and signature["result"]["source_name"] == "int"
+        checks = []
+        for i, (args, value) in enumerate(expected):
+            checks.append(
+                f'    KuBootstrapResult_int64_t r{i} = {entry["symbol"]}({args});\n'
+                f"    assert(r{i}.ok && r{i}.value == {value});\n")
+        host = caller / "owners-host.c"
+        host.write_text("#include <assert.h>\nint main(void) {\n" +
+                        "".join(checks) + "    return 0;\n}\n", encoding="ascii")
+        binary = caller / ("linked-owners.exe" if os.name == "nt" else "linked-owners")
+        execute([sys.executable, "-B", linker, "--cc", cc, "--unit", plan, code,
+                 "--entry", entry["source_path"], str(entry["node"]), "--caller", host, "-o", binary], caller)
+        assert execute([binary], caller).stdout == b""
+
+
 def exercise(ku, cc):
     here = Path(__file__).resolve().parent
     with tempfile.TemporaryDirectory(prefix="ku-bootstrap-argv-test-") as temp:
@@ -328,6 +375,7 @@ def exercise(ku, cc):
         exercise_emitted(cc, emitted, caller, "derived", b"(41)", b"42")
         exercise_project(compiler, cc, root, caller)
         exercise_checked_bool(compiler, cc, caller)
+        exercise_owned_recovery(compiler, cc, caller)
         print("bootstrap argv, module checks, signature and standalone C verified")
 
 
