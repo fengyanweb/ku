@@ -30,9 +30,13 @@ fn ReadTokenWindow(&tokens: [Token], start: int, end: int, work_cost: int,
         RejectAtPoint("invalid_token_stream", "token stream must contain exactly one final EOF")?
     }
     if (start > end || start < 0 || end > tokens.len() - 1) {
-        diagnostic_index = tokens.len() - 1
-        if (start >= 0 && start < tokens.len()) { diagnostic_index = start }
-        RejectAt(tokens[diagnostic_index].clone(), "invalid_expression_range", "statement expression token range is invalid")?
+        code = "invalid_expression_range"
+        message = "statement expression token range is invalid"
+        if (start >= 0 && start < tokens.len()) {
+            RejectAt(tokens[start].clone(), code, message)?
+        } else {
+            RejectAt(tokens[tokens.len() - 1].clone(), code, message)?
+        }
     }
     if (work_cost > work_remaining) {
         if (compiler_input) {
