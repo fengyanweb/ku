@@ -6,7 +6,7 @@ import { NextBodyWork, ReadExpressionEnd, AssignmentOperator, ReadBodyExpression
          SignatureTypeOutput } from "./body_support.ku"
 import { ReadTypedInitializer } from "./function_header.ku"
 import { ReadSignatureTypePrefix } from "./signature.ku"
-import { AfterOptionalSemicolon, ObjectDestructureClose, RejectAt, RejectAtSpan, SpanFromNode, WindowKind, WindowToken } from "./support.ku"
+import { AfterOptionalSemicolon, ObjectDestructureClose, RejectAt, RejectAtSpan, SpanFromNode, WindowKind, WindowKindIs, WindowToken } from "./support.ku"
 
 struct SimpleStatementRead {
     node: int
@@ -49,7 +49,7 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         cursor = cursor + 1
     } else if (statement_start.kind == "Print") {
         cursor = cursor + 1
-        wrapped = WindowKind(tokens, cursor, last_index) == "LParen"
+        wrapped = WindowKindIs(tokens, cursor, last_index, "LParen")
         context = value_context
         if (wrapped) { cursor = cursor + 1 context = "print_argument" }
         origin = WindowToken(tokens, cursor, last_index)
@@ -79,9 +79,9 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         cursor = cursor + 1
         children: [int] = []
         end_span = SpanFromToken(statement_start.clone())
-        if (!requires_value && WindowKind(tokens, cursor, last_index) == "Semicolon") {
+        if (!requires_value && WindowKindIs(tokens, cursor, last_index, "Semicolon")) {
             end_span = SpanFromToken(WindowToken(tokens, cursor, last_index))
-        } else if (requires_value || WindowKind(tokens, cursor, last_index) != "RBrace") {
+        } else if (requires_value || !WindowKindIs(tokens, cursor, last_index, "RBrace")) {
             expression_end = ReadExpressionEnd(tokens, cursor, last_index, value_context)?
             value_origin = WindowToken(tokens, cursor, last_index)
             value_parsed = parse_expression(token_base + cursor, token_base + expression_end)?
@@ -92,7 +92,7 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
             cursor = expression_end
         }
         statement = add_node(kind, "", 0, SpanMerge(SpanFromToken(statement_start.clone()), end_span), children, statement_start.clone())?
-    } else if (statement_start.kind == "Ident" && WindowKind(tokens, cursor + 1, last_index) == "Colon") {
+    } else if (statement_start.kind == "Ident" && WindowKindIs(tokens, cursor + 1, last_index, "Colon")) {
         name = statement_start.lexeme.clone()
         cursor = cursor + 2
         parsed_type = ReadSignatureTypePrefix(tokens, cursor, last_index)?
@@ -101,14 +101,14 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         type_output = SignatureTypeOutput(parsed_type, WindowToken(tokens, cursor, last_index))?
         type_node = add_arena(type_output, WindowToken(tokens, cursor, last_index), false)?
         cursor = cursor + type_consumed
-        if (WindowKind(tokens, cursor, last_index) != "Equal") {
+        if (!WindowKindIs(tokens, cursor, last_index, "Equal")) {
             declared = read_node(type_node)
             statement = defaultDeclaration(declared, type_node, statement_start, add_node)?
             return ok(SimpleStatementRead { node: statement, cursor: AfterOptionalSemicolon(tokens, cursor, last_index),
                                             work: parse_steps, initializer_type: 0 })
         }
         cursor = cursor + 1
-        if (WindowKind(tokens, cursor, last_index) == "Fn") {
+        if (WindowKindIs(tokens, cursor, last_index, "Fn")) {
             // The body reader owns nested function frames. The declared
             // type is already attached, and the cursor stays on the Fn.
             return ok(SimpleStatementRead { node: 0, cursor: cursor, work: parse_steps, initializer_type: type_node })
@@ -144,7 +144,7 @@ fn ReadSimpleBodyStatement(&tokens: [Token], first: int, last_index: int, token_
         statement = read.node
         cursor = read.cursor
     }
-    if (WindowKind(tokens, cursor, last_index) == "Semicolon") { cursor = cursor + 1 }
+    if (WindowKindIs(tokens, cursor, last_index, "Semicolon")) { cursor = cursor + 1 }
     return ok(SimpleStatementRead { node: statement, cursor: cursor, work: parse_steps, initializer_type: 0 })
 }
 
@@ -205,7 +205,7 @@ fn readObjectDestructureField(
     work = initial_work
     local = field.lexeme.clone()
     span = SpanFromToken(field.clone())
-    if (WindowKind(tokens, next, last_index) == "Colon") {
+    if (WindowKindIs(tokens, next, last_index, "Colon")) {
         alias = WindowToken(tokens, next + 1, last_index)
         expectPatternToken(alias, "Ident", "expected local binding name after ':'")?
         local = alias.lexeme
@@ -214,7 +214,7 @@ fn readObjectDestructureField(
     }
     binding = patternBinding("ObjectDestructureLocal", local, span.clone(), field.clone(), add_node.clone())?
     children: [int] = [binding]
-    if (WindowKind(tokens, next, last_index) == "Equal") {
+    if (WindowKindIs(tokens, next, last_index, "Equal")) {
         start = next + 1
         origin = WindowToken(tokens, start, last_index)
         end = ReadExpressionEnd(tokens, start, last_index, "destructure_default")?
@@ -237,7 +237,7 @@ fn readObjectDestructure(
     work = initial_work
     fields: [str] = []
     children: [int] = []
-    while (WindowKind(tokens, cursor, last_index) != "RBrace") {
+    while (!WindowKindIs(tokens, cursor, last_index, "RBrace")) {
         field = WindowToken(tokens, cursor, last_index)
         work = NextBodyWork(work, 1, field.clone())?
         cursor = cursor + 1
@@ -247,9 +247,9 @@ fn readObjectDestructure(
             rest = patternBinding("ObjectDestructureRest", local.lexeme.clone(), SpanFromToken(local.clone()), local, add_node.clone())?
             children = children.push(rest)
             cursor = cursor + 1
-            if (WindowKind(tokens, cursor, last_index) == "Comma") {
+            if (WindowKindIs(tokens, cursor, last_index, "Comma")) {
                 cursor = cursor + 1
-                if (WindowKind(tokens, cursor, last_index) != "RBrace") {
+                if (!WindowKindIs(tokens, cursor, last_index, "RBrace")) {
                     RejectAt(WindowToken(tokens, cursor, last_index), "unexpected_token", "object destructuring rest binding must be last")?
                 }
             }
@@ -265,7 +265,7 @@ fn readObjectDestructure(
         work = binding.work
         cursor = binding.cursor
         children = children.push(binding.node)
-        if (WindowKind(tokens, cursor, last_index) != "Comma") { break }
+        if (!WindowKindIs(tokens, cursor, last_index, "Comma")) { break }
         cursor = cursor + 1
     }
     expectPatternToken(WindowToken(tokens, cursor, last_index), "RBrace", "expected '}' after object destructuring pattern")?

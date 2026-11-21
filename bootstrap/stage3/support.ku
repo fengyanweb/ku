@@ -28,8 +28,13 @@ fn WindowKind(&tokens: [Token], index: int, end: int): str {
     return tokens[index].kind.clone()
 }
 
+fn WindowKindIs(&tokens: [Token], index: int, end: int, &kind: str): bool {
+    if (index >= end) { return kind == "Eof" }
+    return tokens[index].kind == kind
+}
+
 fn AfterOptionalSemicolon(&tokens: [Token], index: int, end: int): int {
-    if (WindowKind(tokens, index, end) == "Semicolon") { return index + 1 }
+    if (WindowKindIs(tokens, index, end, "Semicolon")) { return index + 1 }
     return index
 }
 
@@ -83,7 +88,7 @@ fn CanStartStatement(kind: str): bool {
 // closes immediately before an assignment. Parsing the pattern itself
 // diagnoses the spelling and type of each delimiter.
 fn ObjectDestructureClose(&tokens: [Token], first: int, window_end: int): int {
-    if (WindowKind(tokens, first, window_end) != "LBrace") { return 0 }
+    if (!WindowKindIs(tokens, first, window_end, "LBrace")) { return 0 }
     cursor = first
     depth = 0
     while (cursor < window_end) {
@@ -93,7 +98,7 @@ fn ObjectDestructureClose(&tokens: [Token], first: int, window_end: int): int {
         } else if (kind == "RBrace" || kind == "RParen" || kind == "RBracket") {
             depth = depth - 1
             if (depth == 0) {
-                if (WindowKind(tokens, cursor + 1, window_end) == "Equal") { return cursor }
+                if (WindowKindIs(tokens, cursor + 1, window_end, "Equal")) { return cursor }
                 return 0
             }
         } else if (kind == "Eof") {

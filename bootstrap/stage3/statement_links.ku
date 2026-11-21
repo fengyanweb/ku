@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { Arena, Node, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
-import { AfterOptionalSemicolon, RejectAt, WindowKind, WindowToken } from "./support.ku"
+import { AfterOptionalSemicolon, RejectAt, WindowKind, WindowKindIs, WindowToken } from "./support.ku"
 import { ControlFrame, RejectFinally, StatementLink, RejectBodyWorkLimit, RejectStatementLink, RejectStatementNode, RejectStatementLength,
          RejectBodyNodeLimit, RejectBodyEdgeLimit, RejectNestedRoot, ExpectTryToken, NextBodyWork,
          IsControlStatement, ReadExpressionEnd, RejectStatementLimit, RejectWhileBody } from "./body_support.ku"
@@ -53,18 +53,18 @@ fn ReadControlHeader(&tokens: [Token], start: int, window_end: int, initial_work
         name = WindowToken(tokens, cursor, window_end)
         if (name.kind != "Ident") { RejectAt(name.clone(), "unexpected_token", "expected loop variable after 'for'")? }
         cursor = cursor + 1
-        if (WindowKind(tokens, cursor, window_end) != "In") { RejectAt(WindowToken(tokens, cursor, window_end), "unexpected_token", "expected 'in' after loop variable")? }
+        if (!WindowKindIs(tokens, cursor, window_end, "In")) { RejectAt(WindowToken(tokens, cursor, window_end), "unexpected_token", "expected 'in' after loop variable")? }
         expression_start = cursor + 1
         expression_end = ReadExpressionEnd(tokens, expression_start, window_end, "for_header")?
         work = NextBodyWork(initial_work, expression_end - start, name.clone())?
-        if (WindowKind(tokens, expression_end, window_end) != "LBrace") {
+        if (!WindowKindIs(tokens, expression_end, window_end, "LBrace")) {
             RejectAt(WindowToken(tokens, expression_end, window_end), "unsupported_statement", "stage-3 for bodies must use braces")?
         }
         return ok(ControlHeader { binding: name.lexeme, expression_start: expression_start, expression_end: expression_end, body_open: expression_end, work: work })
     }
 
     is_while = kind == "While"
-    if (WindowKind(tokens, cursor, window_end) != "LParen") {
+    if (!WindowKindIs(tokens, cursor, window_end, "LParen")) {
         RejectControlOpen(is_while, WindowToken(tokens, cursor, window_end))?
     }
     cursor = cursor + 1
@@ -109,7 +109,7 @@ fn ReadControlBodyStart(&tokens: [Token], &kind: str, start: int, last: int, tok
     origin = WindowToken(tokens, header.expression_start, last)
     parsed = parse_expression(token_base + header.expression_start, token_base + header.expression_end)?
     condition = add_arena(parsed, origin, false)?
-    if (WindowKind(tokens, header.body_open, last) == "LBrace") {
+    if (WindowKindIs(tokens, header.body_open, last, "LBrace")) {
         return ok(ControlBodyStart { binding: header.binding, condition: condition,
                                      next: header.body_open + 1, work: header.work, inline_statement: 0 })
     }
