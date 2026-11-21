@@ -610,6 +610,15 @@ fn Counted(&limit: Limit): Index! {
     }
     return ok(Index { values: values, size: index })
 }
+fn CountedMember(&limit: Index): Index! {
+    values: [int] = []
+    index = 0
+    while (index < limit.values.len()) {
+        values = values.push(index)
+        index = index + 1
+    }
+    return ok(Index { values: values, size: index })
+}
 fn WrongBound(&limit: Limit): null! {
     index = 0
     while (index < limit.wrong) { index = index + 1 }
@@ -747,7 +756,39 @@ int main(void) {
     fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
     compile_projection(&c, &exe, cwd);
     assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    assert_counted_array_member(seed, cwd, &c, &exe);
     assert_linked_math_ownership(seed, cwd, &c, &exe);
+}
+
+fn assert_counted_array_member(seed: &Path, cwd: &Path, c: &Path, exe: &Path) {
+    fs::write(cwd.join("function.txt"), "CountedMember").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, params) = signature.split_once("(const ").unwrap();
+    let (limit, _) = params.split_once('*').unwrap();
+    let host = r#"
+int main(void) {
+    int64_t input[] = {8,7,6};
+    __LIMIT__ limit = {{3,input,3},0};
+    __RESULT__ result = __ENTRY__(&limit);
+    assert(result.ok && result.value.f1 == 3 && result.value.f0.len == 3);
+    assert(result.value.f0.data[0] == 0 && result.value.f0.data[1] == 1 && result.value.f0.data[2] == 2);
+    assert(limit.f0.data == input && limit.f0.len == 3 && input[0] == 8 && input[2] == 6);
+    free(result.value.f0.data);
+    return 0;
+}
+"#
+    .replace("__LIMIT__", limit)
+    .replace("__RESULT__", result)
+    .replace("__ENTRY__", &format!("ku_linked_null_{entry}"));
+    fs::write(c, format!("#include <assert.h>\n{code}{host}")).unwrap();
+    compile_projection(c, exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 15));
 }
 
 fn assert_linked_math_ownership(seed: &Path, cwd: &Path, c: &Path, exe: &Path) {
