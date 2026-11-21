@@ -188,6 +188,37 @@ fn main() {}
         assert!(stderr.trim_end().ends_with(position), "{stderr}");
     }
 
+    // A directory dot and a leading basename dot do not supply an extension.
+    fs::create_dir(project.join("pkg.v1")).unwrap();
+    fs::write(
+        project.join("pkg.v1/.资料.ku"),
+        "fn Read(): int { return 1 }\n",
+    )
+    .unwrap();
+    fs::write(&manifest, "relative.ku\npkg.v1/.资料.ku\n").unwrap();
+    for path in ["./pkg.v1/.资料", "./pkg.v1/.资料.ku"] {
+        fs::write(
+            project.join("relative.ku"),
+            format!("import {{ Read }} from \"{path}\"\n"),
+        )
+        .unwrap();
+        let ran = run(&mut Command::new(&executable), &cwd, 20);
+        assert_success(&ran);
+        assert!(String::from_utf8_lossy(&ran.stdout)
+            .contains("IMPORT|relative.ku|Read|pkg.v1/.资料.ku|Read|"));
+    }
+    fs::write(
+        project.join("relative.ku"),
+        "import { Read } from \"./pkg.v1/.资料.\"\n",
+    )
+    .unwrap();
+    let rejected = run(&mut Command::new(&executable), &cwd, 20);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains(
+        "|project_path|<source>|project paths must name a .ku file within 512 UTF-8 bytes|"
+    ));
+
     fs::write(
         project.join("left.ku"),
         "import { Right } from \"./right.ku\"\nstruct Left { other: Right }\n",
