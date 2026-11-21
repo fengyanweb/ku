@@ -97,6 +97,9 @@ def main():
         if "-windows-msvc" in target:
             reproducible_cflags.append("-mno-incremental-linker-compatible")
             host_flags.extend(["-Xlinker", "/Brepro"])
+        elif target.endswith(("-mingw32", "-mingw64", "-windows-gnu")):
+            # The GNU object files already agree. Freeze the PE linker timestamp.
+            host_flags.append("-Wl,--no-insert-timestamp")
     sys.path.insert(0, str(repo / "bootstrap/tools"))
     import link_c
 

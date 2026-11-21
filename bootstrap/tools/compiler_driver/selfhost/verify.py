@@ -207,7 +207,8 @@ def main():
                                                 args.sanitizers)
     comparison = compare_units(output / stage2["ledger"], output / stage3["ledger"])
     comparison["strict_o2_identical"] = stage2["sha256"] == stage3["sha256"]
-    if "-windows-msvc" in target and not (comparison["objects_identical"] and comparison["strict_o2_identical"]):
+    windows_coff = "-windows-msvc" in target or target.endswith(("-mingw32", "-mingw64", "-windows-gnu"))
+    if windows_coff and not (comparison["objects_identical"] and comparison["strict_o2_identical"]):
         raise ValueError(f"reproducible COFF/PE raw comparison failed: {comparison}; "
                          f"PE SHA256 {stage2['sha256']}, {stage3['sha256']}")
     summary = {"status": "passed", **inputs, "stage1": stage1, "stage2": stage2, "stage3": stage3,
