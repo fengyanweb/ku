@@ -136,7 +136,7 @@ fn LowerLinkedLocalAlias(&project: LinkedNullProject, state: LinkedNullState, &s
         RejectLocalCapture(statement, "a local callback alias requires a live local thunk with the declared checked signature")?
     }
     descriptor = state.slots[index - 1].value.text.clone()
-    return ok(bindLinkedLocalCallback(state, statement.text.clone(), ty, descriptor))
+    return ok(BindLinkedLocalCallback(state, statement.text.clone(), ty, descriptor))
 }
 
 fn LowerLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, id: int): LinkedNullExpression! {
