@@ -129,6 +129,111 @@ pub(super) fn assert_owned_characters(seed: &Path, cwd: &Path) {
     assert!(String::from_utf8(rejected.stderr)
         .unwrap()
         .contains("|unsupported_linked_for|"));
+
+    assert_character_values(seed, cwd);
+}
+
+fn assert_character_values(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("iterate.ku"),
+        r#"import { string } from "std"
+fn Typed(source: str): [str]! {
+    characters: [str] = source.chars()
+    return ok(characters)
+}
+fn Borrowed(&source: str): [str]! {
+    characters = string.chars(source.clone())
+    return ok(characters)
+}
+fn Wrong(source: str): null! {
+    characters: [int] = source.chars()
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+
+    for (function, borrowed) in [("Typed", false), ("Borrowed", true)] {
+        fs::write(cwd.join("function.txt"), function).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let source = String::from_utf8(emitted.stdout).unwrap();
+        assert_eq!(
+            source
+                .matches("source_status = ku_managed_source_chars(")
+                .count(),
+            1
+        );
+        let entry = source
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("KuBootstrapResultStringArray ")?
+                    .split_once('(')
+            })
+            .unwrap()
+            .0;
+        let driver = r#"
+static void after_oom(void) {
+    if (outstanding() || attempts != 4) _Exit(82);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    (void)test_realloc;
+    KuProjectionString value = {0};
+    KuBootstrapResultStringArray empty = ENTRY(ARG);
+    assert(empty.ok && !empty.value.len && !outstanding() && !attempts);
+    const uint8_t bytes[] = {'a', 0xe4, 0xb8, 0xad, 0xf0, 0x9f, 0x99, 0x82, 0, '/'};
+    const size_t lengths[] = {1, 3, 4, 1, 1};
+    uint8_t *data = malloc(sizeof(bytes));
+    assert(data);
+    memcpy(data, bytes, sizeof(bytes));
+    value = (KuProjectionString){data, sizeof(bytes), sizeof(bytes), KU_PROJECTION_STRING_OWNED};
+    if (argc > 1) {
+        assert(!atexit(after_oom));
+        fail_after = 2;
+    }
+    KuBootstrapResultStringArray result = ENTRY(ARG);
+    if (BORROWED) ku_projection_string_drop(&value);
+    assert(result.ok && result.value.len == 5);
+    size_t offset = 0;
+    for (size_t i = 0; i < result.value.len; ++i) {
+        assert(result.value.data[i].len == lengths[i]);
+        assert(!memcmp(result.value.data[i].ptr, bytes + offset, lengths[i]));
+        offset += lengths[i];
+    }
+    assert(offset == sizeof(bytes));
+    ku_managed_source_drop(&result.value);
+    assert(!outstanding());
+    return 0;
+}
+"#
+        .replace("ENTRY", entry)
+        .replace("ARG", if borrowed { "&value" } else { "value" })
+        .replace("BORROWED", if borrowed { "1" } else { "0" });
+        let path = cwd.join("character-values.c");
+        let binary = cwd.join(format!("character-values{}", std::env::consts::EXE_SUFFIX));
+        fs::write(
+            &path,
+            format!("{CHECKED_ARRAY_ALLOCATOR}{EXTRA_ALLOCATOR}{source}{driver}"),
+        )
+        .unwrap();
+        compile_projection(&path, &binary, cwd);
+        assert_ok(&execute(&mut Command::new(&binary), cwd, 10));
+        if !borrowed {
+            let failed = execute(Command::new(&binary).arg("partial-char"), cwd, 10);
+            assert_eq!(failed.status.code(), Some(1));
+            assert_eq!(
+                String::from_utf8_lossy(&failed.stderr).trim(),
+                "out of memory"
+            );
+        }
+    }
+
+    fs::write(cwd.join("function.txt"), "Wrong").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("|linked_local_type|"));
 }
 
 pub(super) fn assert_owned_copy_ints(seed: &Path, cwd: &Path) {
