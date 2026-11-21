@@ -1,6 +1,6 @@
 import { EmitLinkedArrayIndexGuard, EmitLinkedLogicalBranch } from "./guarded_string_parts.ku"
 import { AddLinkedNullSlot, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
-import { CheckLinkedAddition, EmitLinkedMultiplyDivide, EmitLinkedReadonlyBoolCall, LinkedMemberPath, LinkedMemberUnavailable, LinkedViewArgument, RequireLinkedNominalPredicate } from "./linked_member_ownership.ku"
+import { CheckLinkedAddition, EmitLinkedMultiplyDivide, LinkedMemberPath, LinkedMemberUnavailable, LinkedViewArgument, RequireLinkedReadonlyPredicate } from "./linked_member_ownership.ku"
 import { Span } from "../stage2/span.ku"
 import { LinkedLocalReadBinding } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
@@ -64,9 +64,7 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
         }
         if (node.edge_count >= 2 && node.edge_count <= 9 && target.kind == "Variable" && target.edge_count == 0) {
             callee = ResolveLinkedCall(project, state.slots, node, target, false)?
-            if (node.edge_count > 2) { return readLinkedNominalPredicate(project, state, node, callee, id, depth) }
-            input = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 1), depth + 1)?
-            return EmitLinkedReadonlyBoolCall(input, callee, id, DeclarationSpan(node))
+            return readLinkedPredicate(project, state, node, callee, id, depth)
         }
     }
     if (node.edge_count == 0 && (node.kind == "Variable" || node.kind == "Int" ||
@@ -77,9 +75,9 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
     return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", DeclarationSpan(node)), ""))
 }
 
-fn readLinkedNominalPredicate(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
-                             callee: LinkedNullFunction, id: int, depth: int): LinkedNullExpression! {
-    RequireLinkedNominalPredicate(callee, DeclarationSpan(call))?
+fn readLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
+                      callee: LinkedNullFunction, id: int, depth: int): LinkedNullExpression! {
+    RequireLinkedReadonlyPredicate(callee, DeclarationSpan(call))?
     next = state
     args = ""
     index = 0

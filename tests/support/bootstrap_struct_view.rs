@@ -1063,6 +1063,12 @@ fn Four(&a: Entry, &b: Entry, &c: Entry, &d: Entry): bool {
 fn ReadFour(enabled: bool, &entries: [Entry]): bool {
     return enabled && Four(entries[0], entries[1], entries[2], entries[3])
 }
+fn Contains(&ids: [int], id: int): bool {
+    return ids.len() > 0 && ids[0] == id
+}
+fn ReadMixed(enabled: bool, &ids: [int], id: int): bool {
+    return enabled && Contains(ids, id)
+}
 fn OwnFirst(a: Entry, &b: Entry, &c: Entry, &d: Entry): bool {
     return a.kind == b.kind && c.kind != d.kind
 }
@@ -1195,11 +1201,52 @@ int main(int argc, char **argv) {
     assert_eq!(bounds.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&bounds.stderr).contains("index 2 out of bounds for length 2"));
 
+    fs::write(cwd.join("function.txt"), "ReadMixed").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let symbol = |prefix| {
+        code.lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap()
+            .split_once('(')
+            .unwrap()
+            .0
+    };
+    let host = r#"
+static const KuArrayInt *expected;
+static unsigned calls;
+bool PROVIDER(const KuArrayInt *ids, int64_t id) {
+    assert(ids == expected && ids->len == 2 && id == 23);
+    ++calls;
+    return ids->data[1] == id;
+}
+int main(void) {
+    int64_t values[] = {17, 23};
+    KuArrayInt ids = {2, values, 2};
+    expected = &ids;
+    assert(!ENTRY(false, &ids, 23) && calls == 0);
+    assert(ENTRY(true, &ids, 23) && calls == 1);
+    assert(ids.data == values && values[1] == 23);
+    return 0;
+}
+"#
+    .replace(
+        "ENTRY",
+        &format!("ku_linked_null_{}", symbol("bool ku_linked_null_")),
+    )
+    .replace("PROVIDER", symbol("extern bool "));
+    let c = cwd.join("readonly-mixed.c");
+    let exe = cwd.join(format!("readonly-mixed{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+
     for (name, diagnostic, reason) in [
         (
             "RefuseOwned",
             "linked_readonly_call",
-            "matching str View or scalar Copy argument",
+            "requires View or scalar Copy arguments",
         ),
         (
             "RefuseNonBool",
@@ -1209,7 +1256,7 @@ int main(int argc, char **argv) {
         (
             "RefuseOwnedFour",
             "linked_readonly_call",
-            "requires nominal record Views",
+            "requires View or scalar Copy arguments",
         ),
         (
             "RefuseMovedFour",
