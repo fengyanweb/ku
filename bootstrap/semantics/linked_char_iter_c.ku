@@ -228,18 +228,19 @@ fn openLinkedCharacterLoop(&project: LinkedNullProject, state: LinkedNullState, 
 }
 
 fn openLinkedIntLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
-                      &source: LinkedNullSlot, id: int, depth: int): LinkedForLoop! {
+                      slot: int, id: int, depth: int): LinkedForLoop! {
     at = DeclarationSpan(statement)
     if (depth >= 32 || LinkedNullBinding(state.slots, statement.text) != 0) {
         RejectLayout("linked_int_for_scope", "integer-array iteration needs a fresh local binding within the control bound", at.clone())?
     }
-    if (!source.live || source.value.borrowed) {
+    if (!state.slots[slot - 1].live || state.slots[slot - 1].value.borrowed) {
         RejectLayout("linked_int_for_source", "iteration requires an initialized owned [int] array", at.clone())?
     }
     before = state.slots.len()
     suffix = str(id) + "_ints"
     // The source binding can grow or be replaced in the loop body.
-    input = LinkedNullExpression { state: state, value: source.value.clone() }
+    value = state.slots[slot - 1].value.clone()
+    input = LinkedNullExpression { state: state, value: value }
     snapshot = CloneLinkedIntArray(project, input, "a" + suffix.clone())?
     array = snapshot.value.text.clone()
     outer = snapshot.state.slots.clone()
@@ -263,9 +264,10 @@ fn OpenLinkedForLoop(&project: LinkedNullProject, state: LinkedNullState, &state
         if (source.kind == "Variable" && source.edge_count == 0) {
             slot = LinkedNullBinding(state.slots, source.text)
             if (slot != 0) {
-                input = state.slots[slot - 1].clone()
-                if (LinkedNullIntArrayOwner(input.value.ty)) { return openLinkedIntLoop(project, state, statement, input, id, depth) }
-                if (input.value.ty.declaration_kind == "BuiltinArray" && input.value.ty.name == "int") {
+                if (LinkedNullIntArrayOwner(state.slots[slot - 1].value.ty)) {
+                    return openLinkedIntLoop(project, state, statement, slot, id, depth)
+                }
+                if (state.slots[slot - 1].value.ty.declaration_kind == "BuiltinArray" && state.slots[slot - 1].value.ty.name == "int") {
                     RejectLayout("linked_int_for_borrowed", "borrowed integer arrays cannot be iterated as owners", DeclarationSpan(source))?
                 }
             }
