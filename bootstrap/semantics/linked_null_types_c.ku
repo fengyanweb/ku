@@ -6,9 +6,9 @@ import { SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
 import { ResolveTypeName, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
-import { CTypeName, ProjectionBuiltinLinkFor, ProjectionBuiltinLinkId, ProjectionBytesGet, ProjectionLocalFunction, ProjectionPlaceRoot, RequireProjectionBuiltin, ResolveProjectionDirectFunction } from "./struct_projection_c.ku"
-import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
-import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayLinkPlanType, LinkedNullBinding, LinkedNullExpression, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullState, LinkedReadonlyExpression, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { CTypeName, ProjectionBuiltinLinkFor, ProjectionBuiltinLinkId, ProjectionBytesGet, LinkedBufferResult, LinkedIntArrayCallbackNominal, RequireProjectionLocalFunction, ProjectionPlaceRoot, RequireProjectionBuiltin, ResolveProjectionDirectFunction } from "./struct_projection_c.ku"
+import { OrderCStructLayouts, OwningStructDropReference } from "./nested_struct_c.ku"
+import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayLinkPlanType, LinkedIntArrayCallbackCarrier, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -83,6 +83,15 @@ fn readIntPairResultCallback(&project: LinkedNullProject, unit: int, &node: Node
 
 fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view: bool): TypeNameBinding! {
     node = LinkedNullNode(project, unit, id)
+    if (!view && node.kind == "TypeFunction" && node.edge_count == 5) {
+        nominal = LinkedIntArrayCallbackNominal(project.supplied[unit - 1].named, node)?
+        ty = LinkedNullType(project, unit, nominal)?
+        if (ty.declaration_kind != "Struct") {
+            RejectLayout("linked_callback_type", "expected a by-value nominal record", ty.span.clone())?
+        }
+        ty.declaration_kind = "IntArrayResultCallback"
+        return ok(ty)
+    }
     if (node.kind == "TypeFunction") { return readIntPairResultCallback(project, unit, node, view) }
     if (!view) {
         if (node.kind == "TypeArray") {
@@ -135,10 +144,6 @@ fn LinkedStringResult(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Builtin" && binding.name == "str"
 }
 
-fn LinkedBufferResult(&binding: TypeNameBinding): bool {
-    return binding.declaration_kind == "Builtin" && (binding.name == "str" || binding.name == "bytes")
-}
-
 fn LinkedIntResult(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Builtin" && binding.name == "int"
 }
@@ -149,6 +154,7 @@ fn LinkedNullHasResultValue(&binding: TypeNameBinding): bool {
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
+    if (binding.declaration_kind == "IntArrayResultCallback") { return ok(LinkedIntArrayCallbackCarrier(binding)) }
     if (binding.declaration_kind == "IntPairResultCallback") {
         return ok("KuBootstrapIntPairCallback_" + CTypeName(binding.module_index, binding.declaration_node))
     }
@@ -185,13 +191,7 @@ fn LinkedNullResultCleanupReference(&owning_layouts: [StructLayout], &result: Ty
     if (LinkedNullOwnedArray(result)) {
         return "    (void)" + LinkedNullArrayPrefix(result) + "_drop;\n"
     }
-    if (result.declaration_kind == "Struct") {
-        layout = LayoutIndex(owning_layouts, result.module_index, result.declaration_node)
-        if (layout > 0) {
-            return "    (void)" + OwningLayoutDropName(result.module_index, result.declaration_node) + ";\n"
-        }
-    }
-    return ""
+    return OwningStructDropReference(owning_layouts, result)
 }
 
 fn LinkedNullView(&binding: TypeNameBinding): bool {
@@ -424,15 +424,6 @@ fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
         parameters: parameters, result: result, returns_result: callee.returns_result })
 }
 
-fn LinkedArrayZeroArgument(state: LinkedNullState, &type: TypeNameBinding): LinkedNullExpression! {
-    return ok(LinkedReadonlyExpression(state, type.clone(), "(" + LinkedNullCType(type)? + "){0}"))
-}
-
 fn LinkedNullEntry(&project: LinkedNullProject, &name: str): int! {
-    entry = ProjectionLocalFunction(project.supplied, 1, name)
-    if (entry == 0) {
-        point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
-        RejectLayout("unknown_linked_null_entry", "expected a selected null! function", point)?
-    }
-    return ok(entry)
+    return RequireProjectionLocalFunction(project.supplied, name)
 }

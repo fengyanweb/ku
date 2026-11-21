@@ -852,6 +852,154 @@ int main(int argc, char **argv) {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_nested_array_clone"));
 }
 
+pub(super) fn assert_scoped_int_array_callback(seed: &Path, python: &str, cwd: &Path) {
+    let caller = "array-callback-caller.ku";
+    let receiver = "array-callback-receiver.ku";
+    fs::write(
+        cwd.join(caller),
+        r#"import { Marker, Relay } from "./array-callback-receiver.ku"
+fn Run(payload: [int], label: str, marker: Marker, fatal: bool): int! {
+    seen: [int] = []
+    sum = 0
+    fn Collect(items: [int], low: int, high: int, note: Marker): [int]! {
+        if (low == 99) { sum = seen[0 - 1] }
+        if (note.reject) { fail { domain: "test", code: "reject", message: note.label } }
+        sum = sum + low + high
+        seen = seen.push(note.score)
+        return ok(items)
+    }
+    result = Relay(Collect.clone(), payload, label, marker, fatal)?
+    return ok(sum * 100 + result[0])
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join(receiver),
+        r#"struct Marker { label: str score: int reject: bool }
+fn Apply(action: fn([int], int, int, Marker): [int]!, data: [int], label: str, note: Marker, fatal: bool): [int]! {
+    first = action(data, 1, 2, Marker { label: label, score: 1, reject: false })?
+    if (fatal) { return ok(action(first, 99, 0, note)?) }
+    return ok(action(first, 4, 5, note)?)
+}
+fn Relay(action: fn([int], int, int, Marker): [int]!, data: [int], label: str, note: Marker, fatal: bool): [int]! {
+    return Apply(action.clone(), data, label, note, fatal)
+}
+fn Wrong(action: fn(&[int], int, int, Marker): [int]!): null! { return ok(null) }
+fn Escape(action: fn([int], int, int, Marker): [int]!): null! {
+    escaped = action
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let cc =
+        std::env::var("CC").unwrap_or_else(|_| if cfg!(windows) { "clang" } else { "cc" }.into());
+    let mut link = Command::new(python);
+    link.arg("-B")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/tools/link_c.py"))
+        .args(["--cc", &cc]);
+    let invoke = |name, mode| {
+        fs::write(cwd.join("mode.txt"), mode).unwrap();
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        execute(&mut Command::new(seed), cwd, 30)
+    };
+    let mut entry = String::new();
+    let mut marker = String::new();
+    for (name, manifest) in [
+        ("Run", format!("{caller}\n{receiver}\n")),
+        ("Relay", format!("{receiver}\n")),
+        ("Apply", format!("{receiver}\n")),
+    ] {
+        fs::write(cwd.join("modules.txt"), manifest).unwrap();
+        let emitted = invoke(name, "linked-null");
+        assert_ok(&emitted);
+        let source = String::from_utf8(emitted.stdout).unwrap();
+        assert!(source.contains("KuBootstrapIntArrayCallback_KuStruct_"));
+        if name == "Run" {
+            let (symbol, parameters) = source
+                .lines()
+                .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t "))
+                .unwrap()
+                .split_once('(')
+                .unwrap();
+            entry = symbol.to_owned();
+            marker = parameters
+                .split(", ")
+                .nth(2)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap()
+                .to_owned();
+        }
+        let c = cwd.join(format!("{name}.c"));
+        let plan = cwd.join(format!("{name}.plan.json"));
+        fs::write(c.clone(), source).unwrap();
+        let described = invoke(name, "linked-null-plan");
+        assert_ok(&described);
+        fs::write(&plan, described.stdout).unwrap();
+        link.arg("--unit").args([plan, c]);
+    }
+    let host = r#"
+#include <assert.h>
+#include <string.h>
+static KuProjectionString owned(const char *text) {
+    size_t len = strlen(text);
+    uint8_t *data = malloc(len);
+    assert(data);
+    memcpy(data, text, len);
+    return (KuProjectionString){data, len, len, KU_PROJECTION_STRING_OWNED};
+}
+static KuBootstrapResult_int64_t sample(bool reject, bool fatal) {
+    int64_t *item = malloc(sizeof(*item));
+    assert(item);
+    *item = 42;
+    return ENTRY((KuArrayInt){1, item, 1}, owned("first"), (MARKER){owned("second"), 2, reject}, fatal);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) { (void)sample(false, true); return 2; }
+    KuBootstrapResult_int64_t result = sample(false, false);
+    assert(result.ok && result.value == 1242);
+    result = sample(true, false);
+    assert(!result.ok && result.error.code.len == 6 && !memcmp(result.error.code.ptr, "reject", 6));
+    assert(result.error.message.len == 6 && !memcmp(result.error.message.ptr, "second", 6));
+    assert(result.error.message.storage == KU_PROJECTION_STRING_OWNED);
+    free(result.error.message.ptr);
+    return 0;
+}
+"#
+    .replace("ENTRY", &entry)
+    .replace("MARKER", &marker);
+    let host_path = cwd.join("array-callback-host.c");
+    let exe = cwd.join(format!("array-callback{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&host_path, host).unwrap();
+    link.args([
+        "--entry",
+        caller,
+        entry.strip_prefix("ku_linked_null_").unwrap(),
+    ])
+    .arg("--caller")
+    .arg(host_path)
+    .arg("-o")
+    .arg(&exe);
+    assert_ok(&execute(&mut link, cwd, 45));
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    let fatal = execute(Command::new(exe).arg("invalid-index"), cwd, 10);
+    assert_eq!(fatal.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&fatal.stderr).contains("index -1 out of bounds for length 1"));
+    for (name, error) in [
+        ("Wrong", "linked_callback_type"),
+        ("Escape", "linked_callback_escape"),
+    ] {
+        let rejected = invoke(name, "linked-null");
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(error));
+    }
+}
+
 pub(super) fn assert_terminal_branch_ownership(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("guard-provider.ku"),

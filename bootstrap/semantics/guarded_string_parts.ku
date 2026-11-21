@@ -5,7 +5,7 @@ import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, Gua
 import { ScalarCheckedMultiplyC, ScalarStringPart } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { ContainsType, ProjectionArrayHeader, ProjectionCloneSource } from "./struct_projection_c.ku"
+import { ContainsType, LinkedAppendFaultRelayCode, ProjectionArrayHeader, ProjectionCloneSource } from "./struct_projection_c.ku"
 
 fn collectProjectedParts(&nodes: [Node], &edges: [int], &bindings: [GuardBinding], &layouts: [StructLayout],
                          id: int, depth: int, can_convert: bool, collected: [ScalarStringPart]): [ScalarStringPart]! {
@@ -373,14 +373,7 @@ fn CheckedAppendInvocation(&symbol: str, &args: str, &environment: str, id: int)
 }
 
 fn CheckedAppendFaultHandoff(id: int): str {
-    fault = "fault" + str(id)
-    return "    if (" + fault.clone() + ".out_of_memory) { out_of_memory = true; goto cleanup; }\n"
-        + "    if (" + fault.clone() + ".array_error) { captured_array_failure = " + fault.clone() + ".array_error; goto cleanup; }\n"
-        + "    if (" + fault.clone() + ".append_status != KU_STRUCT_ARRAY_OK) { append_status = "
-        + fault.clone() + ".append_status; goto cleanup; }\n"
-        + "    if (" + fault.clone() + ".overflow) { overflow = true; goto cleanup; }\n"
-        + "    if (" + fault.clone() + ".index_failed) { index_failed = true; failure_index = " + fault.clone()
-        + ".index; failure_length = " + fault + ".length; goto cleanup; }\n"
+    return LinkedAppendFaultRelayCode("fault" + str(id))
 }
 
 fn EmitLinkedArrayIndexGuard(&offset: str, &index: str, &header: str): str {

@@ -13,8 +13,8 @@ import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedRecordFields, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
-import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterPlan,
-         LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterPlan,
+         LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 
 struct LinkedNullParameters {
     state: LinkedNullState
@@ -160,6 +160,13 @@ fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &el
 
 fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, ty: TypeNameBinding): LinkedNullState! {
     next = state
+    if (ty.declaration_kind == "IntArrayResultCallback") {
+        carrier = LinkedBuiltin("int", ty.span.clone())
+        carrier.declaration_kind = "BuiltinArray"
+        nominal = ty.clone()
+        nominal.declaration_kind = "Struct"
+        return registerOwnedElement(project, RegisterLinkedIntArray(next, carrier), nominal)
+    }
     if (ty.declaration_kind == "Builtin" && ty.name == "bytes") { next.owning_strings = true }
     if (ty.declaration_kind == "OwnedStringArray") {
         next.uses_str_array = true
@@ -225,10 +232,12 @@ fn RequireLinkedArrayValidation(state: LinkedNullState, ty: TypeNameBinding): Li
 fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, binding: str,
                      name: str, ty: TypeNameBinding, parameter: bool): LinkedNullExpression! {
     next = RegisterLinkedNullType(project, state, ty.clone())?
-    if (ty.declaration_kind == "IntPairResultCallback") {
+    if (ty.declaration_kind == "IntPairResultCallback" || ty.declaration_kind == "IntArrayResultCallback") {
         if (!parameter) {
             RejectLayout("linked_callback_escape", "a callback parameter can only be forwarded to a checked synchronous parameter", ty.span.clone())?
         }
+    }
+    if (ty.declaration_kind == "IntPairResultCallback") {
         payload = ty.clone()
         payload.declaration_kind = "Struct"
         next = registerOwnedElement(project, next, payload)?
@@ -381,14 +390,4 @@ fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, 
     }
     output.state.slots[output.value.slot - 1].live = true
     return ok(output)
-}
-
-fn LinkedBooleanWhileCondition(&state: LinkedNullState, &guard: Node): str {
-    if (guard.kind != "Variable" || guard.edge_count != 0) { return "" }
-    index = LinkedNullBinding(state.slots, guard.text)
-    if (index == 0) { return "" }
-    slot = state.slots[index - 1].clone()
-    if (slot.parameter || !slot.live || slot.value.borrowed || slot.moved_members.len() != 0 ||
-        slot.value.ty.declaration_kind != "Builtin" || slot.value.ty.name != "bool") { return "" }
-    return slot.value.text
 }

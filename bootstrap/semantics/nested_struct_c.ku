@@ -336,3 +336,13 @@ fn EmitCombinedCLayouts(&layouts: [StructLayout], &owning: [StructLayout]): Owni
     }
     return ok(definitions)
 }
+
+fn OwningStructDropReference(&owning_layouts: [StructLayout], &result: TypeNameBinding): str {
+    if (result.declaration_kind == "Struct") {
+        layout = LayoutIndex(owning_layouts, result.module_index, result.declaration_node)
+        if (layout > 0) {
+            return "    (void)" + OwningLayoutDropName(result.module_index, result.declaration_node) + ";\n"
+        }
+    }
+    return ""
+}

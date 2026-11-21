@@ -2,7 +2,7 @@ import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { TypeNameBinding } from "./type_names.ku"
-import { DeclarationSpan } from "./names.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
 
 fn InvalidPlan(message: str): null! {
@@ -358,4 +358,74 @@ fn ResolveProjectionDirectFunction(&supplied: [SuppliedModule], &imports: [Impor
     }
     RejectLayout("undefined_linked_dependency", "expected a bound direct function", DeclarationSpan(target))?
     return ok([])
+}
+
+fn linkedCallbackIntType(&named: NamedModule, id: int, array: bool): bool {
+    node = named.parsed.arena.nodes[id - 1].clone()
+    if (array) {
+        if (node.kind != "TypeArray" || node.edge_count != 1) { return false }
+        node = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge] - 1].clone()
+    }
+    return node.kind == "TypeName" && node.edge_count == 0 && node.text == "int"
+}
+
+fn LinkedIntArrayCallbackNominal(&named: NamedModule, &node: Node): int! {
+    nominal = 0
+    index = 0
+    while (index < 4) {
+        part = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge + index] - 1].clone()
+        if (part.kind != "TypeParameter" || part.edge_count != 1 || part.text != "") {
+            RejectLayout("linked_callback_type", "scoped array callback arguments must be by-value", DeclarationSpan(part))?
+        }
+        ty = named.parsed.arena.edges[part.first_edge]
+        if (index == 3) { nominal = ty }
+        else if (!linkedCallbackIntType(named, ty, index == 0)) {
+            RejectLayout("linked_callback_type", "scoped array callback needs [int], int, int and a named record", DeclarationSpan(part))?
+        }
+        index += 1
+    }
+    result = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge + 4] - 1].clone()
+    if (result.kind != "TypeResult" || result.edge_count != 1 ||
+        !linkedCallbackIntType(named, named.parsed.arena.edges[result.first_edge], true)) {
+        RejectLayout("linked_callback_type", "scoped array callback must return [int]!", DeclarationSpan(result))?
+    }
+    return ok(nominal)
+}
+
+fn RequireProjectionLocalFunction(&supplied: [SuppliedModule], &name: str): int! {
+    entry = ProjectionLocalFunction(supplied, 1, name)
+    if (entry == 0) {
+        point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+        RejectLayout("unknown_linked_null_entry", "expected a selected null! function", point)?
+    }
+    return ok(entry)
+}
+
+fn LinkedAppendFailureDeclaration(): str {
+    return "\ntypedef struct { int append_status; bool out_of_memory, overflow, index_failed; const char *array_error; int64_t index; size_t length; } KuLocalAppendFailure;\n"
+}
+
+fn LinkedIntArrayCallbackDeclaration(&name: str, &nominal: str): str {
+    return "typedef struct { KuBootstrapResult_KuArrayInt (*entry)(void*, KuLocalAppendFailure*, KuArrayInt, int64_t, int64_t, "
+        + nominal.clone() + "); void *environment; KuLocalAppendFailure *failure; } " + name.clone() + ";\n"
+}
+
+fn LinkedIntArrayCallbackFaultPending(&pointer: str): str {
+    p = "(" + pointer.clone() + ")"
+    return p.clone() + " && (" + p.clone() + "->out_of_memory || " + p.clone() + "->array_error || "
+        + p.clone() + "->append_status || " + p.clone() + "->overflow || " + p + "->index_failed)"
+}
+
+fn LinkedAppendFaultRelayCode(&fault: str): str {
+    return "    if (" + fault.clone() + ".out_of_memory) { out_of_memory = true; goto cleanup; }\n"
+        + "    if (" + fault.clone() + ".array_error) { captured_array_failure = " + fault.clone() + ".array_error; goto cleanup; }\n"
+        + "    if (" + fault.clone() + ".append_status != KU_STRUCT_ARRAY_OK) { append_status = "
+        + fault.clone() + ".append_status; goto cleanup; }\n"
+        + "    if (" + fault.clone() + ".overflow) { overflow = true; goto cleanup; }\n"
+        + "    if (" + fault.clone() + ".index_failed) { index_failed = true; failure_index = " + fault.clone()
+        + ".index; failure_length = " + fault.clone() + ".length; goto cleanup; }\n"
+}
+
+fn LinkedBufferResult(&binding: TypeNameBinding): bool {
+    return binding.declaration_kind == "Builtin" && (binding.name == "str" || binding.name == "bytes")
 }

@@ -129,6 +129,44 @@ struct LinkedNullArguments {
     handoff: str
 }
 
+fn LinkedIntArrayCallbackCarrier(&ty: TypeNameBinding): str {
+    return "KuBootstrapIntArrayCallback_" + CTypeName(ty.module_index, ty.declaration_node)
+}
+
+fn LinkedIntArrayCallbackFunction(&ty: TypeNameBinding): LinkedNullFunction {
+    array = TypeNameBinding { use_node: 0, name: "int", declaration_kind: "OwnedIntArray",
+        module_index: 0, declaration_node: 0, span: ty.span.clone() }
+    integer = array.clone()
+    integer.declaration_kind = "Builtin"
+    nominal = ty.clone()
+    nominal.declaration_kind = "Struct"
+    return LinkedNullFunction { unit: 1, node: 0, symbol: "",
+        parameters: [array.clone(), integer.clone(), integer, nominal], result: array, returns_result: true }
+}
+
+fn LinkedIntArrayCallbackTypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlot]): [TypeNameBinding] {
+    types: [TypeNameBinding] = []
+    index = 0
+    while (index < slots.len()) {
+        if (slots[index].value.ty.declaration_kind == "IntArrayResultCallback") {
+            types = types.push(slots[index].value.ty.clone())
+        }
+        index += 1
+    }
+    index = 0
+    while (index < links.len()) {
+        param = 0
+        while (param < links[index].parameters.len()) {
+            if (links[index].parameters[param].declaration_kind == "IntArrayResultCallback") {
+                types = types.push(links[index].parameters[param].clone())
+            }
+            param += 1
+        }
+        index += 1
+    }
+    return types
+}
+
 fn RememberLinkedCall(calls: [LinkedNullFunction], dependency: LinkedNullFunction): [LinkedNullFunction] {
     result = calls
     for old in result {

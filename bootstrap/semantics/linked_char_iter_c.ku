@@ -1,12 +1,13 @@
+import { LinkedBooleanWhileCondition } from "./linked_array_fields_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { BindLinkedLocalCallback, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkedNullValue,
     LinkedReadonlyExpression, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
-import { LinkedBuiltin, LinkedCheckedResultCType, LinkedIntResult, LinkedNullChild, LinkedNullCType, LinkedNullNode,
-    LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedStringResult,
+import { LinkedBuiltin, LinkedCheckedResultCType, LinkedIntResult, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullNode,
+    LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedStringResult,
     ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, CheckLinkedUnitDecrement, CloneLinkedIntArray, LinkedBooleanWhileCondition, RegisterLinkedNullType } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, CheckLinkedUnitDecrement, CloneLinkedIntArray, RegisterLinkedNullType } from "./linked_parameters_c.ku"
 import { DropLinkedNullScope, LinkedIncreasingGuard, LinkedLiveIntBinding, RejectLinkedLoopWrite, RejectLinkedWriteRange } from "./linked_member_ownership.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"

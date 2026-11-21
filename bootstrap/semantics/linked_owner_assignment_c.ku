@@ -3,14 +3,14 @@ import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { LinkedAppendFailureRelay } from "./linked_array_fields_c.ku"
+import { AppendLinkedArrayElement, LinkedAppendFailureRelay } from "./linked_array_fields_c.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
 import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
-import { AppendLinkedArrayElement, LowerLinkedNullValue } from "./linked_null_values_c.ku"
+import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
 fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, index: int): LinkedNullState! {
     array = state.slots[index - 1].clone()
@@ -368,9 +368,6 @@ fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
     for index in next.append_slots.clone() {
         ty = next.slots[index - 1].value.ty.clone()
         next.local_append_types = next.local_append_types.push(ty)
-    }
-    if (parent.local_appends.len() == 0) {
-        next.callback_helpers += "\ntypedef struct { int append_status; bool out_of_memory, overflow, index_failed; const char *array_error; int64_t index; size_t length; } KuLocalAppendFailure;\n"
     }
     signature = "void *raw, KuLocalAppendFailure *failure"
     if (thunk.body_start > 1) { signature += ", " + thunk.signature.clone() }

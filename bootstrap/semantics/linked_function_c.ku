@@ -2,10 +2,10 @@ import { FinishLinkedFunctionC, GuardArithmetic, GuardStringEquality } from "./g
 import { ScalarCheckedMultiplyC, ScalarStringHelpers } from "./scalar_int_emit.ku"
 import { StructResultHeader, StructValueResultHeader } from "./struct_result_c.ku"
 import { EmitLinkedArrayBody, StructArrayStatuses } from "./struct_array_c.ku"
-import { CTypeName, ContainsType, LinkedFsReadReference } from "./struct_projection_c.ku"
+import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult, LinkedFsReadReference, LinkedIntArrayCallbackDeclaration } from "./struct_projection_c.ku"
 import { TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
-import { LinkedFieldAppendArgument, LowerLinkedArrayBinding, LowerLinkedFieldAppend } from "./linked_array_fields_c.ku"
+import { CheckLinkedStringAppendTarget, FinishLinkedFieldAppend, FinishLinkedStringAppend, LinkedFieldAppendArgument, LowerLinkedArrayBinding } from "./linked_array_fields_c.ku"
 import { LinkedIntSnapshotRuntime, ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
@@ -13,11 +13,11 @@ import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedN
 import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
-import { LinkedBufferResult, LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
-         LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullResultType, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
+         LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { LinkedCPrelude, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
+import { LinkedCPrelude, LinkedIntArrayCallbackCarrier, LinkedIntArrayCallbackTypes, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedOkAvailable, LinkedRecordFields } from "./link_plan_c.ku"
 
 fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
@@ -37,17 +37,32 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlo
                             &locals: [LinkedLocalAppend], &payload: TypeNameBinding, checked: bool): str! {
     text = ""
     records: [str] = []
+    callbacks = LinkedIntArrayCallbackTypes(links, slots)
+    if (callbacks.len() > 0 || locals.len() > 0) { text += LinkedAppendFailureDeclaration() }
     string_result = LinkedBufferResult(payload)
     index = 0
     while (!string_result && index < links.len()) {
         string_result = links[index].returns_result && LinkedBufferResult(links[index].result)
         index = index + 1
     }
-    if (string_result) { text = StructValueResultHeader("KuProjectionString") }
+    if (string_result) { text += StructValueResultHeader("KuProjectionString") }
     if (payload.declaration_kind == "Struct" || (checked && (LinkedIntResult(payload) || LinkedNullIntArrayOwner(payload)))) {
         root = LinkedNullCType(payload)?
         text += StructValueResultHeader(root)
         records = records.push(root)
+    }
+    if (callbacks.len() > 0 && !ContainsType(records, "KuArrayInt")) {
+        text += StructValueResultHeader("KuArrayInt")
+        records = records.push("KuArrayInt")
+    }
+    index = 0
+    while (index < callbacks.len()) {
+        kind = LinkedIntArrayCallbackCarrier(callbacks[index])
+        if (!ContainsType(records, kind)) {
+            text += LinkedIntArrayCallbackDeclaration(kind, CTypeName(callbacks[index].module_index, callbacks[index].declaration_node))
+            records = records.push(kind)
+        }
+        index += 1
     }
     index = 0
     while (index < slots.len()) {
@@ -347,4 +362,18 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
     }
     next.code = next.code + "    result.ok = true;\n    goto cleanup;\n"
     return ok(next)
+}
+
+fn LowerLinkedFieldAppend(&project: LinkedNullProject, state: LinkedNullState, target: int, argument: int): LinkedNullState! {
+    return FinishLinkedFieldAppend(project, LowerLinkedNullValue(project, state, argument, 0)?, target, argument)
+}
+
+fn LowerLinkedStringAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
+    target_id = LinkedNullChild(project, 1, statement, 0)
+    target = LinkedNullNode(project, 1, target_id)
+    slot = CheckLinkedStringAppendTarget(project, state, target)?
+    // Keep RHS evaluation after target admission and before reading the destination.
+    rhs_id = LinkedNullChild(project, 1, statement, 1)
+    right = LowerLinkedNullValue(project, state, rhs_id, 0)?
+    return FinishLinkedStringAppend(project, right, target_id, rhs_id, slot, target.kind == "Field", statement, id)
 }

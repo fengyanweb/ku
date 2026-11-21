@@ -12,7 +12,7 @@ import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
 import { GuardLinkedStringPredicate } from "./guarded_struct_c.ku"
 import { EmitLinkedIntAppend, EmitLinkedOwnedArrayClone, OwnedRecordArrayCloneLayout } from "./struct_array_c.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn LowerLinkedIntArrayLiteral(&project: LinkedNullProject, state: LinkedNullState, &literal: Node, id: int,
                                binding: str): LinkedNullExpression! {
