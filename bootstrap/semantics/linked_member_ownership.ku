@@ -190,7 +190,9 @@ fn RequireLinkedMove(&state: LinkedNullState, &value: LinkedNullValue): null! {
 fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNullState! {
     RequireLinkedMove(state, value)?
     next = state
-    if (value.slot > 0 && LinkedNullDropC(next.layouts, next.owning_layouts, value.ty, value.text) != "") {
+    if (value.slot <= 0) { return ok(next) }
+    drop = LinkedNullDropC(next.layouts, next.owning_layouts, value.ty, value.text)
+    if (drop != "") {
         next.code = next.code + "    " + value.text.clone() + " = (" + LinkedNullCType(value.ty)? + "){0};\n"
         next = RecordLinkedMemberMove(next, value)
     }
