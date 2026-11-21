@@ -2,7 +2,7 @@ import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { ReadSignatureTypeAt, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
-import { RejectAt, RejectAtPoint } from "./support.ku"
+import { RejectAt, RejectAtPoint, RejectAtSpan } from "./support.ku"
 import { DeclarationRead, ReadStruct } from "./structs.ku"
 
 // Read exactly one production enum declaration followed by exactly one EOF.
@@ -232,7 +232,15 @@ fn ReadBracedDeclaration(tokens: [Token]): DeclarationRead! {
     start = tokens[0].clone()
     if (start.kind == "Struct") { return ReadStruct(tokens) }
     if (start.kind != "Enum") {
-        RejectAt(start, "invalid_token_stream", "braced declaration window must start with struct or enum")?
+        point = Span {
+            line: start.line,
+            column: start.column,
+            offset: start.offset,
+            end_line: start.end_line,
+            end_column: start.end_column,
+            end_offset: start.end_offset
+        }
+        RejectAtSpan(point, "invalid_token_stream", "braced declaration window must start with struct or enum")?
     }
     return ReadEnum(tokens)
 }
