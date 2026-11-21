@@ -253,7 +253,7 @@ fn RestoreLinkedThunkFrame(body: LinkedNullState, &parent: LinkedNullState): Lin
 
 struct LinkedAppendThunk {
     parameters: LinkedNullParameters
-    function: LinkedNullFunction
+    arguments: [TypeNameBinding]
     sources: [int]
     environment: str
     typedef_fields: str
@@ -282,8 +282,6 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
         }
     }
     for slot in slots { arguments = arguments.push(slot.value.ty) }
-    signature = LinkedNullFunction { unit: 1, node: id, symbol: "ku_local_append_" + str(id), parameters: arguments,
-        result: parameters.result.clone(), returns_result: true }
     body = parameters.state
     environment = "ku_local_append_environment_" + str(id)
     body.code += "    " + environment.clone() + " *const capture = raw;\n"
@@ -330,7 +328,7 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
         body.local_appends = body.local_appends.push(callee)
     }
     parameters.state = body
-    return ok(LinkedAppendThunk { parameters: parameters, function: signature, sources: sources,
+    return ok(LinkedAppendThunk { parameters: parameters, arguments: arguments, sources: sources,
         environment: environment, typedef_fields: fields, initializers: initializers })
 }
 
@@ -354,7 +352,7 @@ fn appendThunkFailureRelay(&body: LinkedNullState): str {
 }
 
 fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
-                           lowered: LinkedNullRegion, &function: Node): LinkedNullState! {
+                           lowered: LinkedNullRegion, &function: Node, id: int): LinkedNullState! {
     next = lowered.state
     if (!lowered.terminal || next.append_slots.len() == 0 || next.uses_print || next.uses_chars ||
         next.uses_str_view || next.uses_struct_view || next.uses_concat || next.uses_div) {
@@ -369,19 +367,22 @@ fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
     }
     signature = "void *raw, KuLocalAppendFailure *failure"
     if (thunk.parameters.body_start > 1) { signature += ", " + thunk.parameters.signature.clone() }
+    symbol = "ku_local_append_" + str(id)
     next.callback_helpers += "\ntypedef struct {" + thunk.typedef_fields.clone() + " } " + thunk.environment.clone() + ";\nstatic "
-        + FinishLinkedFunctionC("", next, thunk.function.symbol, signature, LinkedCheckedResultCType(thunk.function.result)?,
+        + FinishLinkedFunctionC("", next, symbol, signature, LinkedCheckedResultCType(thunk.parameters.result)?,
             "", "", appendThunkFailureRelay(next))
     next = RestoreLinkedThunkFrame(next, parent)
     for index in thunk.sources.clone() {
         if (!ContainsIndex(next.append_captures, index)) { next.append_captures = next.append_captures.push(index) }
     }
-    frame = "environment" + str(thunk.function.node)
+    frame = "environment" + str(id)
+    callee = LinkedNullFunction { unit: 1, node: id, symbol: symbol.clone(), parameters: thunk.arguments.clone(),
+        result: thunk.parameters.result.clone(), returns_result: true }
     next.local_appends = next.local_appends.push(LinkedLocalAppend { binding: function.text.clone(),
-        function: thunk.function.clone(), environment: "&" + frame.clone() })
+        function: callee, environment: "&" + frame.clone() })
     next.declarations += "    " + thunk.environment.clone() + " " + frame.clone() + " = {0};\n"
     next.code += "    " + frame.clone() + " = (" + thunk.environment.clone() + "){" + thunk.initializers.clone() + " };\n"
-        + "    (void)" + frame + "; (void)" + thunk.function.symbol.clone() + ";\n"
+        + "    (void)" + frame + "; (void)" + symbol + ";\n"
     return ok(next)
 }
 
