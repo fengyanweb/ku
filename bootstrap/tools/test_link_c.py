@@ -443,15 +443,22 @@ int main(void) {
         self.change_plan(self.left_args, lambda p: p["export"]["signature"]["parameters"][1].update(c_type="int32_t"))
         self.assert_preflight_error([*self.entry_args, *self.left_args, *self.right_args], "signature mismatch")
 
-    def test_builtin_string_array_requires_its_view_carrier(self):
+    def test_builtin_string_array_checks_view_owned_and_result_carriers(self):
         array = {"kind": "BuiltinArray", "source_name": "str", "source_path": None,
                  "node": 0, "passing": "view", "c_type": "const KuGuardStringArray*"}
         identity = link_c.TypeRef.read(array, "array").semantic()
         self.assertNotEqual(identity, link_c.TypeRef.read(builtin("str", "KuProjectionString"), "str").semantic())
+        owned = dict(array, passing="value", c_type="KuGuardStringArray")
+        self.assertNotEqual(identity, link_c.TypeRef.read(owned, "array").semantic())
+        checked = dict(owned, c_type="KuBootstrapResultStringArray")
+        link_c.TypeRef.read(checked, "array", checked_result=True)
+        for carrier, checked_result in ((owned, True), (checked, False)):
+            with self.assertRaisesRegex(link_c.LinkError, "matching readonly or owned C carrier"):
+                link_c.TypeRef.read(carrier, "array", checked_result=checked_result)
         for change in ({"source_name": "int"}, {"source_path": "types.ku"},
-                       {"passing": "value", "c_type": "KuGuardStringArray"},
+                       {"passing": "value", "c_type": "KuArrayInt"},
                        {"c_type": "const OtherArray*"}):
-            with self.assertRaisesRegex(link_c.LinkError, r"checked View \[str\] carrier"):
+            with self.assertRaisesRegex(link_c.LinkError, "matching readonly or owned C carrier"):
                 link_c.TypeRef.read(dict(array, **change), "array")
 
     def test_checked_string_slice_uses_the_native_builtin(self):
@@ -632,9 +639,9 @@ int main(void) {
         args = ["--entry", "consumer.ku", "3", "--caller", str(self.caller), "-o", str(self.output)]
         self.assertEqual(link_c.main([*units, *args]), 0)
         self.assertEqual(subprocess.run([self.output], timeout=15).returncode, 0)
-        with self.assertRaisesRegex(link_c.LinkError, r"checked owned \[str\]! result carrier"):
+        with self.assertRaisesRegex(link_c.LinkError, "matching readonly or owned C carrier"):
             link_c.Signature.read(dict(provider["signature"], returns_result=False), "plain result")
-        with self.assertRaisesRegex(link_c.LinkError, r"checked owned \[str\]! result carrier"):
+        with self.assertRaisesRegex(link_c.LinkError, "matching readonly or owned C carrier"):
             link_c.Signature.read(dict(provider["signature"], parameters=[result]), "owned parameter")
 
     def test_missing_entry_and_ambiguous_local_symbol_are_rejected(self):

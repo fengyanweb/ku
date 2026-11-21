@@ -24,8 +24,9 @@ identity and Result representation. A struct identity comes from its module
 path and declaration node. A `StructArray` identifies its element by that
 pair and keeps its array shape distinct from the element itself. An owned
 array carrier is passed by value, and a readonly View uses a const pointer.
-`BuiltinArray` describes View `[str]` parameters with the generated
-`KuGuardStringArray` carrier. A checked owning `[str]!` result uses
+`BuiltinArray` describes `[str]` parameters and returns with the generated
+`KuGuardStringArray` carrier. An owning parameter or plain result uses that
+carrier by value. A checked owning `[str]!` result uses
 `KuBootstrapResultStringArray`, including its Result wrapper.
 `IntPairResultCallback` describes a synchronous parameter of shape
 `fn(int, int): T!`. Its path and node identify the declared record `T`.

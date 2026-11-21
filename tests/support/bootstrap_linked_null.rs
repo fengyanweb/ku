@@ -891,6 +891,50 @@ int main(void) {
     assert_ok(&execute(&mut Command::new(&executable), cwd, 15));
 }
 
+pub(super) fn assert_plain_owned_string_array(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("plain-string-provider.ku"),
+        "fn Take(input: [str]): [str] { return input }\n",
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("plain-strings.ku"),
+        r#"import { Take } from "./plain-string-provider.ku"
+fn Forward(input: [str]): [str] { return Take(input) }
+fn Empty(): [str] { return Take([]) }
+fn Reject(&input: [str]): [str] { return input }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("modules.txt"),
+        "plain-strings.ku\nplain-string-provider.ku\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+    fs::write(cwd.join("function.txt"), "Forward").unwrap();
+    let planned = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&planned);
+    let plan = String::from_utf8(planned.stdout).unwrap();
+    let owned = r#""kind":"BuiltinArray","source_name":"str","source_path":null,"node":0,"c_type":"KuGuardStringArray","passing":"value""#;
+    assert_eq!(plan.matches(owned).count(), 4);
+
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Empty").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    assert!(code.contains("extern KuGuardStringArray ku_value_dependency_"));
+    assert!(code.contains(" = (KuGuardStringArray){0};"));
+    assert!(!code.contains("malloc("));
+
+    fs::write(cwd.join("function.txt"), "Reject").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_value_return"));
+}
+
 pub(super) fn assert_named_record_clone(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("named-clone.ku"),

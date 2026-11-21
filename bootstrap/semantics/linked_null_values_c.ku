@@ -6,9 +6,9 @@ import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { LinkedDirectCallExpression, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
+import { LinkedDirectCallExpression, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedScalarArrayOwner, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
-import { LinkedCallArgument, LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
+import { LinkedArrayZeroArgument, LinkedCallArgument, LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { ReadLinkedLocalArrayItem, CloneLinkedRecordArray, EmitLinkedAddition, IsLinkedLogicalNegation, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalAppendArguments, CloneLinkedIntArray, CloneLinkedRecord, ForwardLinkedCallback, LinkedCallableSlot, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix, ValidateLinkedPayload } from "./linked_parameters_c.ku"
@@ -37,12 +37,12 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
 
 fn lowerLinkedArgument(&project: LinkedNullProject, state: LinkedNullState, &parameter: TypeNameBinding,
                        id: int, depth: int): LinkedNullExpression! {
-    if (depth < 32 && LinkedNullIntArrayOwner(parameter)) {
+    if (depth < 32 && LinkedScalarArrayOwner(parameter)) {
         argument = LinkedNullNode(project, 1, id)
         if (argument.kind == "Array" && argument.edge_count == 0) {
             // The ordinary pending argument slot acquires the zero descriptor.
             // There is no buffer to allocate or temporary owner to transfer.
-            return ok(LinkedReadonlyExpression(state, parameter.clone(), "(KuArrayInt){0}"))
+            return LinkedArrayZeroArgument(state, parameter)
         }
     }
     return LowerLinkedNullValue(project, state, id, depth)

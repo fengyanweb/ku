@@ -460,3 +460,7 @@ fn LinkedCPrelude(&body: LinkedNullState, guards: str): str {
     }
     return text
 }
+
+fn LinkedScalarArrayOwner(&type: TypeNameBinding): bool {
+    return LinkedNullIntArrayOwner(type) || type.declaration_kind == "OwnedStringArray"
+}

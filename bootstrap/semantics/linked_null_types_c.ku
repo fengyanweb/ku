@@ -8,7 +8,7 @@ import { ResolveTypeName, SameBoundTypeIdentity, TypeNameBinding } from "./type_
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { CTypeName, ProjectionBuiltinLinkFor, ProjectionBuiltinLinkId, ProjectionBytesGet, ProjectionLocalFunction, ProjectionPlaceRoot, RequireProjectionBuiltin, ResolveProjectionDirectFunction } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
-import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayLinkPlanType, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayLinkPlanType, LinkedNullBinding, LinkedNullExpression, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullState, LinkedReadonlyExpression, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -86,7 +86,7 @@ fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view
     if (node.kind == "TypeFunction") { return readIntPairResultCallback(project, unit, node, view) }
     if (!view) {
         if (node.kind == "TypeArray") {
-            return ReadLinkedOwnedArray(project, unit, id, true, false)
+            return ReadLinkedOwnedArray(project, unit, id, true, true)
         }
         return LinkedNullType(project, unit, id)
     }
@@ -200,7 +200,9 @@ fn LinkedNullView(&binding: TypeNameBinding): bool {
 }
 
 fn LinkedNullParameterPlan(&binding: TypeNameBinding, unit: int): LinkPlanType! {
-    if (LinkedNullIntArrayOwner(binding)) { return ok(IntArrayLinkPlanType(false)) }
+    if (LinkedNullIntArrayOwner(binding) || binding.declaration_kind == "OwnedStringArray") {
+        return ok(BoundLinkPlanTypeWithKind(binding, unit, LinkedNullCType(binding)?, false, "BuiltinArray"))
+    }
     if (LinkedNullOwnedArray(binding)) {
         return ok(BoundLinkPlanTypeWithKind(binding, unit, LinkedNullCType(binding)?, false, "StructArray"))
     }
@@ -265,7 +267,7 @@ fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, allow_i
 fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bool): TypeNameBinding! {
     node = LinkedNullNode(project, unit, id)
     if (!checked) {
-        if (node.kind == "TypeArray") { return ReadLinkedOwnedArray(project, unit, id, true, false) }
+        if (node.kind == "TypeArray") { return ReadLinkedOwnedArray(project, unit, id, true, true) }
         return LinkedNullType(project, unit, id)
     }
     if (node.kind != "TypeResult" || node.edge_count != 1) {
@@ -362,10 +364,7 @@ fn LinkedCheckedResultPlan(&result: TypeNameBinding, unit: int): LinkPlanType! {
 
 fn LinkedResultPlan(&result: TypeNameBinding, unit: int, checked: bool): LinkPlanType! {
     if (checked) { return LinkedCheckedResultPlan(result, unit) }
-    if (LinkedNullIntArrayOwner(result)) { return ok(IntArrayLinkPlanType(false)) }
-    carrier = LinkedNullCType(result)?
-    if (LinkedNullOwnedArray(result)) { return ok(BoundLinkPlanTypeWithKind(result, unit, carrier, false, "StructArray")) }
-    return ok(BoundLinkPlanType(result, unit, carrier, false))
+    return LinkedNullParameterPlan(result, unit)
 }
 
 fn ResolveLinkedCall(&project: LinkedNullProject, &slots: [LinkedNullSlot], &call: Node, &target: Node, checked: bool): LinkedNullFunction! {
@@ -423,6 +422,10 @@ fn LinkedNullDependencyPlan(&callee: LinkedNullFunction): LinkPlanDeclaration! {
     result = LinkedResultPlan(callee.result, callee.unit, callee.returns_result)?
     return ok(LinkPlanDeclaration { unit: callee.unit, node: callee.node, symbol: callee.symbol.clone(),
         parameters: parameters, result: result, returns_result: callee.returns_result })
+}
+
+fn LinkedArrayZeroArgument(state: LinkedNullState, &type: TypeNameBinding): LinkedNullExpression! {
+    return ok(LinkedReadonlyExpression(state, type.clone(), "(" + LinkedNullCType(type)? + "){0}"))
 }
 
 fn LinkedNullEntry(&project: LinkedNullProject, &name: str): int! {

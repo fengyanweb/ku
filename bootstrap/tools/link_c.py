@@ -102,8 +102,8 @@ class TypeRef:
             view_carrier = {"str": "KuGuardStringArray", "int": "KuArrayInt"}.get(name)
             view = (passing == "view" and view_carrier is not None and
                     c_type[len("const "):-1].rstrip() == view_carrier)
-            owned = (name == "str" and checked_result and passing == "value" and
-                     c_type == "KuBootstrapResultStringArray")
+            string_array = "KuBootstrapResultStringArray" if checked_result else "KuGuardStringArray"
+            owned = name == "str" and passing == "value" and c_type == string_array
             int_array = "KuBootstrapResult_KuArrayInt" if checked_result else "KuArrayInt"
             owned_int = name == "int" and passing == "value" and c_type == int_array
             if (ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0
