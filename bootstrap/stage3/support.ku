@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
-import { Span, SpanFromToken } from "../stage2/span.ku"
+import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { MakeDiagnostic, DiagnosticCanonical } from "../stage2/diagnostic.ku"
-import { Node, ParseOutput } from "../stage2/ast.ku"
+import { Arena, Node, ParseOutput } from "../stage2/ast.ku"
 import { ParseWithContext } from "../stage2/parser.ku"
 import { ParseContext } from "../stage2/context.ku"
 
@@ -214,4 +214,97 @@ fn CheckFunctionBodySpan(&tokens: [Token], body_start: int, last_index: int, tok
         RejectAtPoint("invalid_token_stream", "function body interval lies outside the scanner window")?
     }
     return ok(null)
+}
+
+struct Stage3ArenaAppend {
+    arena: Arena
+    root: int
+}
+
+// Take the arena only after the original node arguments have been evaluated.
+// Callers propagate every Error, so both owners can be released on failure.
+fn AppendStage3Node(kind: str, text: str, int_value: int, span: Span, children: [int], error_token: Token, arena: Arena): Stage3ArenaAppend! {
+    { nodes: arena_nodes, edges: arena_edges } = arena
+    if (arena_nodes.len() >= 4096) {
+        RejectAt(error_token.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")?
+    }
+    if (children.len() > 8192 - arena_edges.len()) {
+        RejectAt(error_token.clone(), "edge_limit", "stage-3 parser accepts at most 8192 AST edges")?
+    }
+    first_edge = arena_edges.len()
+    for child in children {
+        if (child <= 0 || child > arena_nodes.len()) {
+            RejectAt(error_token.clone(), "invalid_node_id", "AST edge references an invalid NodeId")?
+        }
+        arena_edges = arena_edges.push(child)
+    }
+    node = Node {
+        kind: kind,
+        text: text,
+        int_value: int_value,
+        line: span.line,
+        column: span.column,
+        offset: span.offset,
+        end_line: span.end_line,
+        end_column: span.end_column,
+        end_offset: span.end_offset,
+        first_edge: first_edge,
+        edge_count: arena_edges.len() - first_edge
+    }
+    arena_nodes = arena_nodes.push(node)
+    root = arena_nodes.len()
+    return ok(Stage3ArenaAppend { arena: Arena { nodes: arena_nodes, edges: arena_edges }, root: root })
+}
+
+fn AppendStage3Arena(parsed: ParseOutput, origin: Token, arena: Arena): Stage3ArenaAppend! {
+    { root: parsed_root, arena: parsed_arena } = parsed
+    { nodes: parsed_nodes, edges: parsed_edges } = parsed_arena
+    { nodes: arena_nodes, edges: arena_edges } = arena
+    if (parsed_nodes.len() > 4096 - arena_nodes.len()) {
+        RejectAt(origin.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")?
+    }
+    if (parsed_edges.len() > 8192 - arena_edges.len()) {
+        RejectAt(origin.clone(), "edge_limit", "stage-3 parser accepts at most 8192 AST edges")?
+    }
+    node_base = arena_nodes.len()
+    index = 0
+    while (index < parsed_nodes.len()) {
+        input = parsed_nodes[index].clone()
+        first_edge = arena_edges.len()
+        edge_index = 0
+        while (edge_index < input.edge_count) {
+            child = parsed_edges[input.first_edge + edge_index]
+            if (child <= 0 || child > parsed_nodes.len()) {
+                RejectAt(origin.clone(), "invalid_node_id", "nested AST contains an invalid NodeId")?
+            }
+            arena_edges = arena_edges.push(node_base + child)
+            edge_index = edge_index + 1
+        }
+        relocated = Node {
+            kind: input.kind,
+            text: input.text,
+            int_value: input.int_value,
+            line: input.line,
+            column: input.column,
+            offset: input.offset,
+            end_line: input.end_line,
+            end_column: input.end_column,
+            end_offset: input.end_offset,
+            first_edge: first_edge,
+            edge_count: arena_edges.len() - first_edge
+        }
+        arena_nodes = arena_nodes.push(relocated)
+        index = index + 1
+    }
+    if (parsed_root <= 0 || parsed_root > parsed_nodes.len()) {
+        RejectAt(origin, "invalid_node_id", "nested AST root is invalid")?
+    }
+    root = node_base + parsed_root
+    return ok(Stage3ArenaAppend { arena: Arena { nodes: arena_nodes, edges: arena_edges }, root: root })
+}
+
+fn ReadStage3ProgramSpan(&nodes: [Node], &items: [int]): Span {
+    first = nodes[items[0] - 1].clone()
+    last = nodes[items[items.len() - 1] - 1].clone()
+    return SpanMerge(SpanFromNode(first), SpanFromNode(last))
 }
