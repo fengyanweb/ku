@@ -4440,6 +4440,7 @@ int main(int argc, char **argv) {
     linked_guard::assert_conditional_whole_record_move(&compiler, &cwd);
     linked_guard::assert_local_bool_while(&compiler, &cwd);
     linked_guard::assert_record_field_string_rebind(&compiler, &cwd);
+    linked_guard::assert_guarded_record_field_append(&compiler, &cwd);
     linked_guard::assert_checked_str_predicate(&compiler, &cwd);
     linked_guard::assert_checked_copy_int(&compiler, &cwd);
     linked_guard::assert_local_string_lengths(&compiler, &cwd);

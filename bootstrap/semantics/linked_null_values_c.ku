@@ -239,7 +239,9 @@ fn emitCheckedValue(&project: LinkedNullProject, state: LinkedNullState, &unwrap
 
 fn AppendLinkedArrayElement(state: LinkedNullState, &array: LinkedNullValue, &value: LinkedNullValue): LinkedNullState {
     next = RequireLinkedArrayValidation(state, array.ty.clone())
-    if (!ContainsIndex(next.append_slots, array.slot)) { next.append_slots = next.append_slots.push(array.slot) }
+    if (array.member_path == "" && !ContainsIndex(next.append_slots, array.slot)) {
+        next.append_slots = next.append_slots.push(array.slot)
+    }
     if (LinkedNullIntArrayOwner(array.ty)) {
         next.code += EmitLinkedIntAppend(array.text, value.text)
         return next

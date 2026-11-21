@@ -1,0 +1,39 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan } from "./names.ku"
+import { RejectLayout } from "./struct_layouts.ku"
+import { LinkedNullOwnedArray, LinkedNullState } from "./link_plan_c.ku"
+import { LinkedNullArrayElement, LinkedNullChild, LinkedNullNode, LinkedNullProject, SameLinkedType } from "./linked_null_types_c.ku"
+import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { AppendLinkedArrayElement, LowerLinkedNullValue } from "./linked_null_values_c.ku"
+
+fn LinkedFieldAppendArgument(&project: LinkedNullProject, &target: Node, &root: Node, rhs: int): int {
+    call = LinkedNullNode(project, 1, rhs)
+    if (call.kind != "Call" || call.edge_count != 2) { return 0 }
+    method = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (method.kind != "Field" || method.edge_count != 1 || method.text != "push") { return 0 }
+    field = LinkedNullNode(project, 1, LinkedNullChild(project, 1, method, 0))
+    if (field.kind != "Field" || field.edge_count != 1 || field.text != target.text) { return 0 }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, field, 0))
+    if (receiver.kind != "Variable" || receiver.edge_count != 0 || receiver.text != root.text) { return 0 }
+    return LinkedNullChild(project, 1, call, 1)
+}
+
+fn LowerLinkedFieldAppend(&project: LinkedNullProject, state: LinkedNullState, target: int, argument: int): LinkedNullState! {
+    element = LowerLinkedNullValue(project, state, argument, 0)?
+    destination = LowerLinkedNullRead(project, element.state, target, 0)?
+    array = destination.value.clone()
+    item = element.value
+    // The field remains a member of the same live record on both success and
+    // failure. Append transfers only the separately owned element.
+    if (!LinkedNullOwnedArray(array.ty) || array.borrowed || array.member_path == ""
+        || item.borrowed || item.slot == 0 || item.member_path != ""
+        || !SameLinkedType(LinkedNullArrayElement(array.ty.clone()), item.ty)) {
+        RejectLayout("linked_field_append", "append requires an owned record array field and a separate owned element",
+                     DeclarationSpan(LinkedNullNode(project, 1, argument)))?
+    }
+    for existing in destination.state.local_append_types.clone() {
+        if (SameLinkedType(existing, array.ty)) { return ok(AppendLinkedArrayElement(destination.state, array, item)) }
+    }
+    destination.state.local_append_types = destination.state.local_append_types.push(array.ty.clone())
+    return ok(AppendLinkedArrayElement(destination.state, array, item))
+}

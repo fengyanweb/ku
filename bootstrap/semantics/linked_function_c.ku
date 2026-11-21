@@ -5,6 +5,7 @@ import { EmitLinkedArrayBody } from "./struct_array_c.ku"
 import { ContainsType, LinkedFsReadReference } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
+import { LinkedFieldAppendArgument, LowerLinkedFieldAppend } from "./linked_array_fields_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
@@ -179,10 +180,13 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
 
     RequireLinkedMutableName(root.text, DeclarationSpan(root))?
 
+    rhs_id = LinkedNullChild(project, 1, statement, 1)
+    argument = LinkedFieldAppendArgument(project, target, root, rhs_id)
+    if (argument > 0) { return LowerLinkedFieldAppend(project, state, target_id, argument) }
     // Generate the RHS and finish its fallible work before selecting the
     // target in the resulting state. The old member still belongs to cleanup
     // if the RHS fails or consumes its record.
-    rhs = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 1), 0)?
+    rhs = LowerLinkedNullValue(project, state, rhs_id, 0)?
     replacement = rhs.value.clone()
     place = LowerLinkedNullRead(project, rhs.state, target_id, 0)?
     ty = place.value.ty.clone()

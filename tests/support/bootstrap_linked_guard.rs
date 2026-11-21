@@ -3429,6 +3429,65 @@ pub(super) fn assert_record_field_string_rebind(seed: &Path, cwd: &Path) {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("|linked_rebind_type|"));
 }
 
+pub(super) fn assert_guarded_record_field_append(seed: &Path, cwd: &Path) {
+    let fixture = r#"struct Item { text: str }
+struct Bag { items: [Item] }
+fn Append(include: bool): int! {
+    items: [Item] = []
+    bag = Bag { items: items }
+    if (include) {
+        bag.items = bag.items.push(Item { text: str(8) })
+    }
+    return ok(bag.items.len())
+}
+"#;
+    fs::write(cwd.join("field-append.ku"), fixture).unwrap();
+    fs::write(cwd.join("modules.txt"), "field-append.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Append").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let entry = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t "))
+        .and_then(|line| line.split_once('('))
+        .unwrap()
+        .0;
+    let host = r#"
+static int fail_on;
+static void verify_oom(void) {
+    if (outstanding() || attempts != fail_on) _Exit(94);
+}
+int main(int argc, char **argv) {
+    (void)test_realloc;
+    if (argc == 2) {
+        fail_on = argv[1][0] - '0';
+        fail_after = fail_on - 1;
+        assert(atexit(verify_oom) == 0);
+        (void)__ENTRY__(true);
+        return 95;
+    }
+    KuBootstrapResult_int64_t result = __ENTRY__(false);
+    assert(result.ok && result.value == 0 && !outstanding() && !attempts);
+    result = __ENTRY__(true);
+    assert(result.ok && result.value == 1 && !outstanding() && attempts == 2);
+    return 0;
+}
+"#
+    .replace("__ENTRY__", entry);
+    let source = cwd.join("field-append-owning.c");
+    let binary = cwd.join(format!("field-append-owning{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(&binary), cwd, 15));
+    for (point, expected) in [("1", "out of memory"), ("2", "array allocation failed")] {
+        let failed = execute(Command::new(&binary).arg(point), cwd, 15);
+        assert_eq!(failed.status.code(), Some(1));
+        assert_eq!(String::from_utf8_lossy(&failed.stderr).trim(), expected);
+    }
+}
+
 pub(super) fn assert_local_append_thunk(seed: &Path, cwd: &Path) {
     let body = r#"struct Location { line: int }
 struct Entry { kind: str, text: str, score: int, location: Location, first: int }

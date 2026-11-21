@@ -397,7 +397,7 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
     calls_append = body.local_appends.len() > 0
     array_checks = body.validated_arrays.len() > 0
     arithmetic = calls_append || body.uses_add || body.uses_sub || body.uses_mul || body.uses_div
-    appends = calls_append || body.append_slots.len() > 0
+    appends = calls_append || body.append_slots.len() > 0 || body.local_append_types.len() > 0
     index_checks = calls_append || body.uses_index
     text += "\n" + result_type.clone() + " " + symbol.clone() + "(" + signature.clone() + ") {\n"
     text += "    " + result_type.clone() + " result = {0};\n"
