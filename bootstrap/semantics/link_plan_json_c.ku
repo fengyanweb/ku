@@ -441,3 +441,8 @@ fn LinkedBuiltinNameAvailable(&names: [TopLevelName], &imports: [ImportBinding],
     }
     return true
 }
+
+fn LinkedChildKindIs(&project: LinkedNullProject, &parent: Node, ordinal: int, &kind: str): bool {
+    child = LinkedNullNode(project, 1, LinkedNullChild(project, 1, parent, ordinal))
+    return child.kind == kind
+}
