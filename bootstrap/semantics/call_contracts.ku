@@ -7,6 +7,10 @@ import { ExplicitType, RejectLayout } from "./struct_layouts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName } from "./guarded_struct_expr.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 
+fn RejectLocalCapture(&node: Node, message: str): null! {
+    return RejectLayout("unsupported_linked_local_capture", message, DeclarationSpan(node))
+}
+
 struct LinkedLocalReadBinding {
     name: str
     node: int

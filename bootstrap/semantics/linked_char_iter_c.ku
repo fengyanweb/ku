@@ -1,3 +1,4 @@
+import { RejectLocalCapture } from "./call_contracts.ku"
 import { CloneLinkedIntArray, LinkedCharacterSource, LinkedOwnedStringPredicate, MaterializeLinkedCharacters } from "./struct_string_calls.ku"
 import { LinkedWhileCondition } from "./project_struct_string_c.ku"
 import { Node } from "../stage2/ast.ku"
@@ -18,7 +19,7 @@ import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { RestoreLinkedThunkFrame } from "./link_plan_json_c.ku"
 import { StartLinkedThunkFrame } from "./scalar_result_null.ku"
-import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedRecordForLoop, ReadLinkedLocalCaptures, RejectLocalCapture, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
+import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedRecordForLoop, ReadLinkedLocalCaptures, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
 
 struct LinkedLocalThunk {
     result: TypeNameBinding

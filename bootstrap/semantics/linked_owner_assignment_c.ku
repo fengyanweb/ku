@@ -1,3 +1,4 @@
+import { RejectLocalCapture } from "./call_contracts.ku"
 import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
@@ -144,10 +145,6 @@ fn OpenLinkedBooleanWhile(state: LinkedNullState, &statement: Node, condition: s
     return ok(LinkedForLoop { state: next, outer: outer, before: before })
 }
 
-fn RejectLocalCapture(&node: Node, message: str): null! {
-    return RejectLayout("unsupported_linked_local_capture", message, DeclarationSpan(node))
-}
-
 struct LinkedLocalCaptures {
     slots: [int]
     calls: [int]
@@ -159,20 +156,26 @@ struct LinkedLocalCaptures {
 fn ReadLinkedLocalCaptures(&project: LinkedNullProject, &state: LinkedNullState,
                            &function: Node, id: int, body_start: int): LinkedLocalCaptures! {
     names: [str] = []
+    limit = body_start - 1
     index = 0
-    while (index < body_start - 1) {
+    while (index < limit) {
         parameter = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
         names = names.push(parameter.text)
-        index += 1
+        index = index + 1
     }
-    cursor = LinkedNullChild(project, 1, function, body_start)
-    while (project.supplied[0].named.parsed.arena.nodes[cursor - 1].edge_count > 0) {
-        cursor = project.supplied[0].named.parsed.arena.edges[
-            project.supplied[0].named.parsed.arena.nodes[cursor - 1].first_edge]
+    start = LinkedNullChild(project, 1, function, body_start)
+    descending = true
+    while (descending) {
+        descending = project.supplied[0].named.parsed.arena.nodes[start - 1].edge_count > 0
+        if (descending) {
+            start = project.supplied[0].named.parsed.arena.edges[
+                project.supplied[0].named.parsed.arena.nodes[start - 1].first_edge]
+        }
     }
     slots: [int] = []
     calls: [int] = []
     has_local_calls = state.local_appends.len() > 0
+    cursor = start
     while (cursor < id) {
         node = LinkedNullNode(project, 1, cursor)
         if (has_local_calls && node.kind == "Call" && node.edge_count > 0) {
