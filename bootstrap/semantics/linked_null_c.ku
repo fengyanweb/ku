@@ -7,7 +7,7 @@ import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, ReadLinkedNullParamete
 import { OpenLinkedForLoop, OpenLinkedConditionalWhile, CloseLinkedForLoop, LinkedCountdownIndex, LinkedCountedInitial, ReadLinkedLocalThunk, FinishLinkedLocalThunk, LowerLinkedCopyRebind, LowerLinkedPredicate, LowerLinkedCharacterLocal } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedTargetSet, LowerLinkedOwnedDestructure,
-         LowerLinkedPlainReturn, LowerLinkedStringAppend, LowerLinkedSuccess } from "./linked_function_c.ku"
+         LowerLinkedReturn, LowerLinkedStringAppend } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -242,11 +242,7 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
                         RejectLayout("linked_value_failure", "a plain value result cannot propagate an Error", DeclarationSpan(statement))?
                     }
                     next = lowerLinkedFailure(project, next, statement)?
-                } else if (next.plain_value_result) {
-                    if (result.declaration_kind == "NullableInt" && statement.edge_count == 1 && LinkedChildKindIs(project, statement, 0, "Null")) {
-                        next.code += "    result = (KuBootstrapOptionalInt){true, 0};\n    goto cleanup;\n"
-                    } else { next = LowerLinkedPlainReturn(project, next, statement, result)? }
-                } else { next = LowerLinkedSuccess(project, next, statement, result)? }
+                } else { next = LowerLinkedReturn(project, next, statement, result)? }
                 return ok(LinkedNullRegion { state: next, terminal: true })
             }
             if (statement.kind == "Try") {

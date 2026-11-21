@@ -135,16 +135,21 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     return ok(place.state)
 }
 
-fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,
-                          &statement: Node, &result: TypeNameBinding): LinkedNullState! {
+fn LowerLinkedReturn(&project: LinkedNullProject, state: LinkedNullState,
+                     &statement: Node, &result: TypeNameBinding): LinkedNullState! {
+    checked = !state.plain_value_result
     if (statement.edge_count != 1) {
-        RejectLayout("linked_value_return", "expected one value", DeclarationSpan(statement))?
+        if (checked) {
+            RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(statement))?
+        } else {
+            RejectLayout("linked_value_return", "expected one value", DeclarationSpan(statement))?
+        }
     }
     id = LinkedNullChild(project, 1, statement, 0)
     if (LinkedChildKindIs(project, statement, 0, "Match")) {
         match_node = LinkedNullNode(project, 1, id)
         if (!LinkedIntResult(result)) {
-            RejectLayout("linked_match_result", "expected a plain int result for return match", DeclarationSpan(match_node))?
+            RejectLayout("linked_match_result", "expected an int or int! result for return match", DeclarationSpan(match_node))?
         }
         subject = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, match_node, 0), 0)?
         plan = PlanLinkedUnitMatch(project, subject.state, match_node, subject.value.ty)?
@@ -158,18 +163,31 @@ fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,
             if (selected > 0) { label = "case " + str(selected - 1) }
             next.code += "    " + label + ": {\n"
             arm = LinkedNullNode(project, 1, LinkedNullChild(project, 1, match_node, index + 1))
-            value = LowerLinkedNullValue(project, next, LinkedNullChild(project, 1, arm, 1), 0)?
-            if (!LinkedIntResult(value.value.ty)) {
-                RejectLayout("linked_match_arm_result", "expected an int match arm value", DeclarationSpan(arm))?
+            arm_id = LinkedNullChild(project, 1, arm, 1)
+            if (checked) {
+                next = LowerLinkedSuccess(project, next, arm_id, result)?
+            } else {
+                value = LowerLinkedNullValue(project, next, arm_id, 0)?
+                if (!LinkedIntResult(value.value.ty)) {
+                    RejectLayout("linked_match_arm_result", "expected an int match arm value", DeclarationSpan(arm))?
+                }
+                value.state.code += "    result = " + value.value.text + ";\n    goto cleanup;\n"
+                next = value.state
             }
-            value.state.code += "    result = " + value.value.text + ";\n    goto cleanup;\n    }\n"
-            next = RestoreLinkedNullSlots(value.state, outer)
+            next.code += "    }\n"
+            next = RestoreLinkedNullSlots(next, outer)
             index = index + 1
         }
         if (!ContainsIndex(plan, 0)) {
             next.code += "    default: { extern void abort(void); abort(); }\n"
         }
         next.code += "    }\n"
+        return ok(next)
+    }
+    if (checked) { return LowerLinkedSuccess(project, state, id, result) }
+    if (result.declaration_kind == "NullableInt" && LinkedChildKindIs(project, statement, 0, "Null")) {
+        next = state
+        next.code += "    result = (KuBootstrapOptionalInt){true, 0};\n    goto cleanup;\n"
         return ok(next)
     }
     value = LowerLinkedReturnValue(project, state, result, id)?
@@ -272,18 +290,14 @@ fn LowerLinkedOwnedDestructure(&project: LinkedNullProject, state: LinkedNullSta
     return ok(RecordLinkedMemberMove(next, owner))
 }
 
-fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, &result: TypeNameBinding): LinkedNullState! {
-    if (statement.edge_count != 1) {
-        RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(statement))?
-    }
-    call = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, call_id: int, &result: TypeNameBinding): LinkedNullState! {
+    call = LinkedNullNode(project, 1, call_id)
     if (call.kind != "Call" || call.edge_count < 1) {
         RejectLayout("unsupported_linked_success", "expected return ok or a bound Result call", DeclarationSpan(call))?
     }
     callee = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
     if ((callee.kind == "Variable" && callee.edge_count == 0 && callee.text != "ok")
         || (callee.kind == "Field" && callee.edge_count == 1)) {
-        call_id = LinkedNullChild(project, 1, statement, 0)
         if (callee.kind == "Variable") {
             slot = LinkedNullBinding(state.slots, callee.text)
             if (slot > 0 && IsLinkedScopedCallback(state.slots[slot - 1].value.ty)) {

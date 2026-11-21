@@ -953,6 +953,69 @@ fn main(): null! {
         assert error in rejected.stderr and not rejected.stdout, rejected.stderr
 
 
+def exercise_linked_checked_enum_match(compiler, cc, caller):
+    project = caller / "linked-checked-enum-match"
+    project.mkdir()
+    (project / "model.ku").write_text("""enum ElseForm { NestedIf\n Braced\n Invalid }
+fn ReadBraced(offset: int, source: str): int! {
+    println("brace " + str(offset))
+    if (offset < 0) {
+        fail { domain: "bootstrap.parser", code: "missing_body", message: source + " missing body @" + str(offset) }
+    }
+    return ok(offset)
+}
+fn RejectElse(offset: int, source: str): int! {
+    println("reject " + str(offset))
+    fail { domain: "bootstrap.parser", code: "unsupported_statement", message: source + " unexpected else @" + str(offset) }
+}
+""", encoding="utf-8")
+    header = 'import model from "./model.ku"\n'
+    main = project / "main.ku"
+    main.write_text(header + """fn ReadElsePhase(form: model.ElseForm, offset: int, source: str): int! {
+    return match form {
+        model.ElseForm.NestedIf => ok(2)
+        model.ElseForm.Braced => ok(model.ReadBraced(offset, source)?)
+        model.ElseForm.Invalid => model.RejectElse(offset, source)
+    }
+}
+fn Observe(form: model.ElseForm, offset: int, source: str): null! {
+    try {
+        println(str(ReadElsePhase(form, offset, source)?))
+        return ok(null)
+    } catch (err) {
+        println(err.domain)
+        println(err.code)
+        println(err.message)
+        return ok(null)
+    }
+}
+fn main(): null! {
+    prefix = "file"
+    println(str(ReadElsePhase(model.ElseForm.NestedIf, 0 - 99, prefix + " A")?))
+    println(str(ReadElsePhase(model.ElseForm.Braced, 4, prefix + " B")?))
+    Observe(model.ElseForm.Braced, 0 - 1, prefix + " C")?
+    Observe(model.ElseForm.Invalid, 7, prefix + " D")?
+    println(str(ReadElsePhase(model.ElseForm.Braced, 9, prefix + " E")?))
+    return ok(null)
+}
+""", encoding="utf-8")
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\nmodel.ku\n", encoding="utf-8")
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    output = project / ("checked-match.exe" if os.name == "nt" else "checked-match")
+    execute([sys.executable, "-B", builder, manifest, "--compiler", compiler, "--cc", cc, "-o", output], caller)
+    assert execute([output], caller).stdout.replace(b"\r\n", b"\n") == (
+        b"2\nbrace 4\n4\nbrace -1\nbootstrap.parser\nmissing_body\nfile C missing body @-1\n"
+        b"reject 7\nbootstrap.parser\nunsupported_statement\nfile D unexpected else @7\nbrace 9\n9\n"
+    )
+    for arm, error in [("2", b"unsupported_linked_success"), ("ok(false)", b"linked_result_return")]:
+        main.write_text(header + "fn Bad(form: model.ElseForm): int! {\n"
+                        "    return match form { model.ElseForm.NestedIf => " + arm + ", _ => ok(1) }\n}\n",
+                        encoding="utf-8")
+        rejected = execute([compiler, "emit-unit-plan", manifest, "Bad"], caller, 1)
+        assert error in rejected.stderr and not rejected.stdout, rejected.stderr
+
+
 def exercise_linked_reader_factory(compiler, cc, caller):
     project = caller / "linked-reader-factory"
     project.mkdir()
@@ -1550,6 +1613,7 @@ def exercise(ku, cc):
         exercise_linked_unit_enum(compiler, cc, caller)
         exercise_linked_unit_enum_branch(compiler, cc, caller)
         exercise_linked_unit_enum_match(compiler, cc, caller)
+        exercise_linked_checked_enum_match(compiler, cc, caller)
         exercise_linked_reader_factory(compiler, cc, caller)
         exercise_linked_owned_string_for(compiler, cc, caller)
         exercise_parameter_bindings(compiler, cc, caller)
