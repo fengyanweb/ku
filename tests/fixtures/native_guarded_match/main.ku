@@ -1,0 +1,12 @@
+import { Entry, Title, Summary } from "./summary.ku"
+
+fn main(): null! {
+    println(Summary(Entry.Wrapped(Title.Content("整理" + "🙂")), 0)?)
+    println(Summary(Entry.Wrapped(Title.Content("Review" + "🙂")), 0)?)
+    println(Summary(Entry.Wrapped(Title.Content("承認" + "🙂")), 1)?)
+    try { Summary(Entry.Wrapped(Title.Content("故障" + "🙂")), 2)? }
+    catch (error) { println(error.domain + "/" + error.code + "/" + error.message) }
+    println(Summary(Entry.Wrapped(Title.Missing), 0)?)
+    println(Summary(Entry.Wrapped(Title.Content("继续" + "🙂")), 0)?)
+    return ok(null)
+}

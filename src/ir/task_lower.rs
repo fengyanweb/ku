@@ -304,7 +304,12 @@ pub(crate) fn lower_bound_service_handlers_with_layouts(
     program: &Program,
     bindings: &[super::MixedAsyncHandler],
 ) -> KuResult<NativeTaskProgram> {
-    let supported = |name: &str| matches!(name, "time" | "fs" | "net" | "bytes" | "http" | "json");
+    let supported = |name: &str| {
+        matches!(
+            name,
+            "time" | "fs" | "net" | "bytes" | "http" | "json" | "array"
+        )
+    };
     let mut filtered = Program {
         items: program
             .items
@@ -399,6 +404,16 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
     for item in &program.items {
         budget.analysis(1, Span::default())?;
         match item {
+            // Array intrinsics are also visible without an import. Accept the
+            // explicit standard module forms without changing dispatch or scope.
+            Item::Module(module) if module.name == "std:array" => continue,
+            Item::Import(import)
+                if import.path == "std.array"
+                    && (matches!(&import.kind, ImportKind::Glob)
+                        || matches!(&import.kind, ImportKind::Namespace(name) if name == "array")) =>
+            {
+                continue;
+            }
             Item::Module(module) if module.name == "std:json" => {
                 std_json = true;
                 continue;
@@ -426,7 +441,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
             Item::Import(import)
                 if import.path == "std"
                     && matches!(&import.kind,ImportKind::Named(names)
-                if names.iter().all(|name|name.alias.is_none() && matches!(name.source.as_str(),"time"|"fs"|"net"|"bytes"|"http"|"json"))) =>
+                if names.iter().all(|name|name.alias.is_none() && matches!(name.source.as_str(),"time"|"fs"|"net"|"bytes"|"http"|"json"|"array"))) =>
             {
                 if let ImportKind::Named(names) = &import.kind {
                     for name in names {
@@ -1896,6 +1911,10 @@ impl<'a> FunctionLowerer<'a> {
         ))
     }
 
+    fn is_array_namespace(&self, object: &Expr) -> bool {
+        matches!(&object.kind, ExprKind::Variable(module) if module == "array" && self.local_binding(module).is_none())
+    }
+
     // Ordinary nested calls do not reserve the field-call branch's type,
     // timer and ownership temporaries on every recursive frame.
     #[inline(never)]
@@ -2136,13 +2155,18 @@ impl<'a> FunctionLowerer<'a> {
             return Ok(destination);
         }
         if name == "try_get" {
-            if args.len() != 1 {
-                return Err(unsupported(
+            return match (self.is_array_namespace(object), args) {
+                (true, [array, index]) => self.array_try_get_expression(array, index, span, depth),
+                (false, [index]) => self.array_try_get_expression(object, index, span, depth),
+                (true, _) => Err(unsupported(
+                    "array.try_get without an array and one index",
+                    span,
+                )),
+                (false, _) => Err(unsupported(
                     "try_get with other than one index argument",
                     span,
-                ));
-            }
-            return self.array_try_get_expression(object, &args[0], span, depth);
+                )),
+            };
         }
         if args.is_empty() && matches!(name, "len" | "is_empty" | "clone") {
             if let Some(destination) = self.array_method_expression(object, name)? {

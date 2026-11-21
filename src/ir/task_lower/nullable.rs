@@ -233,7 +233,7 @@ impl FunctionLowerer<'_> {
         if !matches!(name, "concat" | "first" | "last" | "clone") {
             return Ok(None);
         }
-        let module = matches!(&object.kind, ExprKind::Variable(module) if module == "array" && self.local_binding(module).is_none());
+        let module = self.is_array_namespace(object);
         let (input, extra) = if module {
             let Some((input, extra)) = args.split_first() else {
                 return Err(unsupported("array arguments", span));

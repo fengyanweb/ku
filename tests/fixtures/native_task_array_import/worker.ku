@@ -1,0 +1,22 @@
+
+import array from "std.array"
+import time from "std.time"
+
+struct Reply { text: str | null }
+
+async fn Pick(items: [str]): Reply! {
+    words = items
+    first = array.first(words)
+    words = []
+    time.sleep(1)?
+    return ok(Reply { text: first })
+}
+
+async fn Local(array: [str]): Reply! {
+    return ok(Reply { text: array.first() })
+}
+
+async fn Lookup(items: [str], index: int): str! {
+    time.sleep(1)?
+    return array.try_get(items, index)
+}
