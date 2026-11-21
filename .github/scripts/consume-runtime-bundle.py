@@ -1288,6 +1288,27 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
     detail['status'] = 'passed'
 
 
+def read_installed_native_c(project, program, result):
+    prefix = 'native c ok: '
+    paths = [line[len(prefix):] for line in output(result).splitlines() if line.startswith(prefix)]
+    if len(paths) != 1:
+        raise RuntimeError(project.name + ' expected one generated C artifact')
+    project = project.resolve(strict=True)
+    cache = (project / '.ku' / 'build' / 'release' / 'c').resolve(strict=True)
+    if not cache.is_relative_to(project):
+        raise RuntimeError(project.name + ' native C cache escaped the fixture')
+    matches = list(cache.glob('*/' + program.with_suffix('.c').name))
+    if len(matches) != 1:
+        raise RuntimeError(project.name + ' expected one generated C file in the native cache')
+    generated = matches[0].resolve(strict=True)
+    # Windows can report a verbatim path for the very same cached file.
+    # Use its identity to check the report and read only from the fixture cache.
+    if (not generated.is_relative_to(cache) or generated.suffix != '.c' or not generated.is_file() or
+            not generated.samefile(project.parent / paths[0])):
+        raise RuntimeError(project.name + ' generated C report does not match its native cache')
+    return generated.read_bytes()
+
+
 def validate_installed_relative_program(install, project, env, target, files, expected, *,
                                         native_only_diagnostic=None, native_c_abi=None):
     project.mkdir()
@@ -1313,14 +1334,7 @@ def validate_installed_relative_program(install, project, env, target, files, ex
         assert_build_backend(result, backend, 'release')
         programs[backend] = program
         if backend == 'c' and native_c_abi is not None:
-            prefix = 'native c ok: '
-            paths = [line[len(prefix):] for line in output(result).splitlines() if line.startswith(prefix)]
-            if len(paths) != 1:
-                raise RuntimeError(project.name + ' expected one generated C artifact')
-            generated = (cwd / paths[0]).resolve(strict=True)
-            if not generated.is_relative_to(cwd.resolve()) or generated.suffix != '.c':
-                raise RuntimeError(project.name + ' generated C escaped the consumer workspace')
-            evidence['native_c_abi'] = native_c_abi(generated.read_bytes())
+            evidence['native_c_abi'] = native_c_abi(read_installed_native_c(project, program, result))
     for mode, command, selected_env in (
         ('interpreter', [ku, 'run', entry], env),
         ('runner', [programs['runner']], env),
