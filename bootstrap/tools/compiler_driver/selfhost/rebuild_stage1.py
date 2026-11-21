@@ -38,7 +38,7 @@ def main():
     if cc is None:
         parser.error(f"C compiler not found: {args.cc or 'clang'}")
     cc = str(Path(cc).absolute())
-    target = subprocess.check_output([cc, "-dumpmachine"], text=True, timeout=20).strip()
+    c_target = subprocess.check_output([cc, "-dumpmachine"], text=True, timeout=20).strip()
     output.parent.mkdir(parents=True, exist_ok=True)
     identity = output.parent / "build-identity.json"
     if output.exists() or identity.exists():
@@ -53,16 +53,16 @@ def main():
                 if relative.is_absolute() or ".." in relative.parts or member.issym() or member.islnk():
                     raise ValueError(f"unexpected snapshot path: {relative}")
                 if member.isfile():
-                    target = location / relative
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(opened.extractfile(member).read())
+                    destination = location / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(opened.extractfile(member).read())
         builder = location / "bootstrap/tools/compiler_driver/build.py"
         environment = dict(os.environ, KU_CC=cc) if args.cc is not None else None
         subprocess.run([sys.executable, "-B", builder, "--ku", ku, "--cc", cc, "-o", output],
                        cwd=location, env=environment, check=True, timeout=210)
     identity.write_text(json.dumps({"commit": source, "seed": str(ku), "seed_sha256": digest(ku),
                                     "sha256": digest(output), "archive_sha256": sha256(archive).hexdigest(),
-                                    "c_compiler": cc, "c_target": target},
+                                    "c_compiler": cc, "c_target": c_target},
                                    indent=2) + "\n")
     print(output)
 
