@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
-import { RejectAt, RejectAtPoint } from "./support.ku"
+import { RejectAt, RejectAtPoint, RejectAtSpan } from "./support.ku"
 import { FunctionReturnStart, ReadTypeOpening, ReadTypeToken, ReadTypeTokenKind } from "./signature_tokens.ku"
 
 // Type parts form a bounded, append-only post-order plan. Child NodeIds refer
@@ -91,7 +91,11 @@ fn TypeUnionPart(first: Span, last: Span, first_edge: int, edge_count: int, dept
 fn CheckTypeArenaCapacity(node_count: int, edge_count: int, additional_edges: int, error_token: Token): null! {
     if (node_count >= 4096) { RejectAt(error_token.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")? }
     if (additional_edges < 0 || edge_count < 0 || edge_count > 8192 || additional_edges > 8192 - edge_count) {
-        RejectAt(error_token, "edge_limit", "stage-3 parser accepts at most 8192 AST edges")?
+        point = Span {
+            line: error_token.line, column: error_token.column, offset: error_token.offset,
+            end_line: error_token.end_line, end_column: error_token.end_column, end_offset: error_token.end_offset
+        }
+        RejectAtSpan(point, "edge_limit", "stage-3 parser accepts at most 8192 AST edges")?
     }
     return ok(null)
 }
