@@ -18,5 +18,5 @@ static KuResult_str ku_string_slice(KuString s, int64_t start, int64_t end) {
   size_t blen = bi - bstart;
   KuString outv = ku_string_alloc(blen);
   if (blen) memcpy(outv.ptr, s.ptr + bstart, blen);
-  return (KuResult_str){ true, outv, (KuError){0} };
+  return (KuResult_str){ .ok = true, .value = outv };
 }
