@@ -6,6 +6,7 @@ pub(super) fn assert_named_array_parameter_move(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("array-parameter.ku"),
         r#"struct Item { text: str }
+struct Bundle { item: Item retained: str }
 fn Transfer(input: [Item]): [Item]! {
     local: [Item] = input
     return ok(local)
@@ -24,6 +25,22 @@ fn Snapshot(input: [Item]): [Item]! {
         fail { domain: "clone", code: "length", message: "array length changed" }
     }
     return ok(copy)
+}
+fn MoveField(input: Bundle, reject: bool): [Item]! {
+    local = input
+    items: [Item] = []
+    items = items.push(local.item)
+    if (local.retained != "keep" || reject) {
+        fail { domain: "array", code: "rejected", message: "discard the array" }
+    }
+    return ok(items)
+}
+fn MoveTwice(input: Bundle): [Item]! {
+    local = input
+    items: [Item] = []
+    items = items.push(local.item)
+    items = items.push(local.item)
+    return ok(items)
 }
 "#,
     )
@@ -144,6 +161,60 @@ int main(int argc, char **argv) {
         String::from_utf8(failed.stderr).unwrap().trim(),
         "out of memory"
     );
+
+    fs::write(cwd.join("function.txt"), "MoveField").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let definition = code.lines().find(|line| line.starts_with(result)).unwrap();
+    let (symbol, signature) = definition
+        .trim_start_matches(result)
+        .trim_start()
+        .split_once('(')
+        .unwrap();
+    let bundle = signature.split_once(" a0,").unwrap().0;
+    let host = r#"
+static KuProjectionString owner(const char *text) {
+    size_t length = strlen(text);
+    uint8_t *bytes = malloc(length);
+    memcpy(bytes, text, length);
+    return (KuProjectionString){bytes, length, length, KU_PROJECTION_STRING_OWNED};
+}
+static void check_cleanup(void) { if (outstanding()) _Exit(82); }
+int main(int argc, char **argv) {
+    (void)argv;
+    assert(atexit(check_cleanup) == 0);
+    KuProjectionString payload = owner("Ku");
+    BUNDLE input = {.f0 = {payload}, .f1 = owner("keep")};
+    if (argc > 1) fail_after = 0;
+    RESULT output = MOVE_FIELD(input, false);
+    assert(output.ok && output.value.len == 1 && output.value.data[0].f0.ptr == payload.ptr);
+    assert(outstanding() == 2);
+    DROP(&output.value);
+    output = MOVE_FIELD((BUNDLE){.f0 = {owner("Ku")}, .f1 = owner("keep")}, true);
+    assert(!output.ok && output.error.code.len == 8 && outstanding() == 0);
+    return 0;
+}
+"#
+    .replace("MOVE_FIELD", symbol)
+    .replace("RESULT", result)
+    .replace("BUNDLE", bundle)
+    .replace("DROP", &format!("ku_linked_view_{element}_drop"));
+    let source = cwd.join("array-move-field.c");
+    let program = cwd.join(format!("array-move-field{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &program, cwd);
+    assert_ok(&execute(&mut Command::new(&program), cwd, 10));
+    let failed = execute(Command::new(program).arg("grow"), cwd, 10);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stderr).trim(),
+        "array allocation failed"
+    );
+    fs::write(cwd.join("function.txt"), "MoveTwice").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_moved_member"));
 }
 
 pub(super) fn assert_checked_callback_forwarding(seed: &Path, cwd: &Path) {
@@ -1333,10 +1404,8 @@ int main(int argc, char **argv) {
     let rejected = execute(&mut Command::new(seed), cwd, 30);
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&rejected.stderr)
-            .contains("local reader must match the declared nominal result")
-    );
+    assert!(String::from_utf8_lossy(&rejected.stderr)
+        .contains("local reader must match the declared nominal result"));
 }
 
 pub(super) fn assert_terminal_branch_ownership(seed: &Path, cwd: &Path) {

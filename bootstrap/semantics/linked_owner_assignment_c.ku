@@ -5,7 +5,7 @@ import { DeclarationSpan, IsNamedFunction, NamedModule } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { LinkedAppendFailureRelay, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./link_plan_json_c.ku"
 import { AppendLinkedArrayElement } from "./linked_array_fields_c.ku"
-import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
+import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
 import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
@@ -14,9 +14,9 @@ import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
 fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, index: int): LinkedNullState! {
-    array = state.slots[index - 1].clone()
-    copy = LinkedNullIntArrayOwner(array.value.ty)
-    if (!array.live || (!copy && !LinkedNullOwnedArray(array.value.ty) && array.value.ty.declaration_kind != "OwnedStringArray")) {
+    array = state.slots[index - 1].value.clone()
+    copy = LinkedNullIntArrayOwner(array.ty)
+    if (!state.slots[index - 1].live || (!copy && !LinkedNullOwnedArray(array.ty) && array.ty.declaration_kind != "OwnedStringArray")) {
         RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(statement))?
     }
     id = ReadOwnedArrayPushArgument(project.supplied[0].named, statement)?
@@ -27,12 +27,14 @@ fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &
         return LowerLinkedOwnerRebind(project, state, statement)
     }
     value = LowerLinkedNullValue(project, state, id, 0)?
-    if (!value.state.slots[index - 1].live || !SameLinkedType(value.value.ty, LinkedNullArrayElement(array.value.ty.clone()))
-        || value.value.borrowed || (!copy && (value.value.slot == 0 || value.value.member_path != ""))) {
-        RejectLayout("linked_move_append", "push requires one element of the declared type", value.value.ty.span.clone())?
-    }
     element = value.value
-    return ok(AppendLinkedArrayElement(value.state, array.value, element))
+    if (!value.state.slots[index - 1].live || !SameLinkedType(element.ty, LinkedNullArrayElement(array.ty.clone()))
+        || (element.borrowed && (copy || element.member_path == ""))
+        || (!copy && (element.slot == 0 || element.slot == index))) {
+        RejectLayout("linked_move_append", "push requires one element of the declared type", element.ty.span.clone())?
+    }
+    if (!copy) { RequireLinkedMove(value.state, element)? }
+    return ok(AppendLinkedArrayElement(value.state, array, element))
 }
 
 fn LowerLinkedOwnerRebind(&project: LinkedNullProject, state: LinkedNullState, &assignment: Node): LinkedNullState! {

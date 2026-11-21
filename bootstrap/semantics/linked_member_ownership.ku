@@ -179,7 +179,7 @@ fn RecordLinkedMemberMove(state: LinkedNullState, &value: LinkedNullValue): Link
     return next
 }
 
-fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNullState! {
+fn RequireLinkedMove(&state: LinkedNullState, &value: LinkedNullValue): null! {
     if (LinkedNullOwner(value.ty) && (ContainsIndex(state.callback_owners, value.slot) || ContainsIndex(state.append_captures, value.slot))) {
         RejectLayout("linked_callback_owner", "cannot move an owner captured by a local callback", value.ty.span.clone())?
     }
@@ -192,6 +192,11 @@ fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNu
     if (value.member_path == "" && LinkedLocalReadCaptures(state.local_readers, value.slot)) {
         RejectLayout("linked_local_reader_capture_move", "cannot move an array captured by a local reader", value.ty.span.clone())?
     }
+    return ok(null)
+}
+
+fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNullState! {
+    RequireLinkedMove(state, value)?
     next = state
     if (value.slot > 0 && LinkedNullDropC(next.layouts, next.owning_layouts, value.ty, value.text) != "") {
         next.code = next.code + "    " + value.text.clone() + " = (" + LinkedNullCType(value.ty)? + "){0};\n"

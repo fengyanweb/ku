@@ -12,7 +12,7 @@ import { IsLinkedScopedCallback,
     LinkedNullReadableArray, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression, LinkedViewPointee, ReadLinkedNullBinding } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult,
     ReadLinkedOwnedArray, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
-import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
 import { CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead, ReadLinkedLocalArrayItem } from "./linked_null_read_c.ku"
 
 fn readLocalIndexShift(&project: LinkedNullProject, &index: Node, &name: str): int! {
@@ -161,8 +161,7 @@ fn AppendLinkedArrayElement(state: LinkedNullState, &array: LinkedNullValue, &va
         + ", &" + value.text.clone() + ");\n    if (append_status != KU_STRUCT_ARRAY_OK) goto cleanup;\n"
     // The C helper clears the element only after transfer. Cleanup keeps
     // ownership of the separate element and the initialized array prefix.
-    next.slots[value.slot - 1].live = false
-    return next
+    return RecordLinkedMemberMove(next, value)
 }
 
 fn FinishLinkedFieldAppend(&project: LinkedNullProject, input: LinkedNullExpression, target: int, argument: int): LinkedNullState! {
