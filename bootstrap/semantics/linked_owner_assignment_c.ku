@@ -33,7 +33,13 @@ fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &
         || (!copy && (element.slot == 0 || element.slot == index))) {
         RejectLayout("linked_move_append", "push requires one element of the declared type", element.ty.span.clone())?
     }
-    if (!copy) { RequireLinkedMove(value.state, element)? }
+    if (!copy) {
+        if (element.member_path != "" &&
+            LinkedNullDropC(value.state.layouts, value.state.owning_layouts, element.ty, element.text) == "") {
+            RejectLayout("linked_move_append", "field transfer requires an owning element", element.ty.span.clone())?
+        }
+        RequireLinkedMove(value.state, element)?
+    }
     return ok(AppendLinkedArrayElement(value.state, array, element))
 }
 
