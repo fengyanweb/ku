@@ -186,6 +186,15 @@ fn EmitCheckedScalarArithmetic(&operation: str, &left: str, &right: str, &output
         + ", &" + output.clone() + ")) { overflow = true; goto cleanup; }\n"
 }
 
+fn ScalarCheckedMultiplyC(): str {
+    return "static bool ku_guard_try_mul(int64_t a, int64_t b, int64_t *out) {\n"
+        + "    if (a > 0) {\n"
+        + "        if ((b > 0 && a > INT64_MAX / b) || (b < 0 && b < INT64_MIN / a)) return false;\n"
+        + "    } else if (a < 0) {\n"
+        + "        if ((b > 0 && a < INT64_MIN / b) || (b < 0 && a < INT64_MAX / b)) return false;\n"
+        + "    }\n    *out = a * b;\n    return true;\n}\n\n"
+}
+
 fn ScalarStringSuffixC(): str {
     return "#include <string.h>\n\n"
         + "static bool ku_scalar_ends_with(KuProjectionString value, KuProjectionString suffix) {\n"

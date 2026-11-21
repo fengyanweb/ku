@@ -5,9 +5,10 @@ import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { OwningLayoutDropName } from "./nested_struct_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { HasBoundArrayMembers } from "./struct_array_c.ku"
+import { EmitCheckedScalarArithmetic } from "./scalar_int_emit.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { LinkedNullArrayElement, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, SameLinkedType } from "./linked_null_types_c.ku"
-import { LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullReadableArray, LinkedRecordFields, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches, LinkedViewPointee } from "./link_plan_c.ku"
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullReadableArray, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches, LinkedViewPointee } from "./link_plan_c.ku"
 
 fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &ty: TypeNameBinding, &name: str): str {
     if (ty.declaration_kind == "OwnedStringArray") { return "    ku_managed_source_drop(&" + name.clone() + ");\n" }
@@ -192,4 +193,23 @@ fn LinkedCountBound(&project: LinkedNullProject, &state: LinkedNullState, id: in
     fields = LinkedRecordFields(state.layouts, state.owning_layouts, binding)?
     field = FieldIndex(fields, member.text)
     return ok(field > 0 && fields[field - 1].resolved.declaration_kind == "Builtin" && fields[field - 1].resolved.name == "int")
+}
+
+fn EmitLinkedMultiplyDivide(state: LinkedNullState, &node: Node, id: int,
+                            &left: LinkedNullValue, &right: LinkedNullValue): LinkedNullExpression {
+    next = state
+    out = "t" + str(id)
+    if (node.text == "*") {
+        next.uses_mul = true
+        next.code += EmitCheckedScalarArithmetic("mul", left.text, right.text, out)
+    } else {
+        next.uses_div = true
+        next.code += "    int64_t " + out.clone() + ";\n    {\n"
+            + "        const int64_t dividend = " + left.text.clone() + ";\n"
+            + "        const int64_t divisor = " + right.text.clone() + ";\n"
+            + "        if (divisor == 0) { division_by_zero = true; goto cleanup; }\n"
+            + "        if (dividend == INT64_MIN && divisor == -1) { overflow = true; goto cleanup; }\n"
+            + "        " + out.clone() + " = dividend / divisor;\n    }\n"
+    }
+    return LinkedReadonlyExpression(next, LinkedBuiltin("int", DeclarationSpan(node)), out)
 }

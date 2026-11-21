@@ -2,7 +2,7 @@ import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ManagedConsumedString, ManagedLiteralConcat, ManagedLiteralConcatSetup } from "./call_contracts.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
-import { ScalarStringPart } from "./scalar_int_emit.ku"
+import { ScalarCheckedMultiplyC, ScalarStringPart } from "./scalar_int_emit.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { ContainsType, ProjectionArrayHeader, ProjectionCloneSource } from "./struct_projection_c.ku"
@@ -345,10 +345,5 @@ fn ManagedStringAppendRuntime(): str {
 }
 
 fn ManagedStringRuntime(): str {
-    return "static bool ku_guard_try_mul(int64_t a, int64_t b, int64_t *out) {\n" +
-        "    if (a > 0) {\n" +
-        "        if ((b > 0 && a > INT64_MAX / b) || (b < 0 && b < INT64_MIN / a)) return false;\n" +
-        "    } else if (a < 0) {\n" +
-        "        if ((b > 0 && a < INT64_MIN / b) || (b < 0 && a < INT64_MAX / b)) return false;\n" +
-        "    }\n    *out = a * b;\n    return true;\n}\n\n" + ManagedStringAppendRuntime()
+    return ScalarCheckedMultiplyC() + ManagedStringAppendRuntime()
 }

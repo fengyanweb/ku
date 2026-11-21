@@ -588,6 +588,12 @@ fn WrongLiteral(value: int): Index! {
     values = [value, true]
     return ok(Index { values: values, size: 2 })
 }
+fn Arithmetic(left: int, divisor: int, factor: int): Index! {
+    values = [left]
+    quotient = values[0] / divisor
+    product = quotient * factor
+    return ok(Index { values: values, size: product })
+}
 fn Reuse(value: int): Index! {
     values: [int] = []
     result = Index { values: values, size: 0 }
@@ -741,6 +747,53 @@ int main(void) {
     fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
     compile_projection(&c, &exe, cwd);
     assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    assert_linked_math_ownership(seed, cwd, &c, &exe);
+}
+
+fn assert_linked_math_ownership(seed: &Path, cwd: &Path, c: &Path, exe: &Path) {
+    fs::write(cwd.join("function.txt"), "Arithmetic").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, _) = signature.split_once('(').unwrap();
+    let host = r#"
+static void require_released(void) {
+    if (outstanding() || attempts != 1) _Exit(91);
+}
+int main(int argc, char **argv) {
+    (void)test_malloc;
+    assert(atexit(require_released) == 0);
+    if (argc == 2) {
+        if (!strcmp(argv[1], "zero")) (void)__ENTRY__(3, 0, 1);
+        else if (!strcmp(argv[1], "div")) (void)__ENTRY__(INT64_MIN, -1, 1);
+        else (void)__ENTRY__(INT64_MAX, 1, 2);
+        return 90;
+    }
+    __RESULT__ result = __ENTRY__(-7, 3, 3);
+    assert(result.ok && result.value.f0.len == 1 && result.value.f0.data[0] == -7);
+    assert(result.value.f1 == -6);
+    free(result.value.f0.data);
+    return 0;
+}
+"#
+    .replace("__RESULT__", result)
+    .replace("__ENTRY__", &format!("ku_linked_null_{entry}"));
+    fs::write(c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(c, exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    for (case, diagnostic) in [
+        ("zero", "division by zero"),
+        ("div", "integer overflow"),
+        ("mul", "integer overflow"),
+    ] {
+        let error = execute(Command::new(exe).arg(case), cwd, 15);
+        assert_eq!(error.status.code(), Some(1));
+        assert_eq!(String::from_utf8_lossy(&error.stderr).trim(), diagnostic);
+    }
 }
 
 const COUNTED_BODY_SOURCE: &str = r#"struct Bound { count: int }

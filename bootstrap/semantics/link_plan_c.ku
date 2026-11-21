@@ -77,6 +77,8 @@ struct LinkedNullState {
     uses_index: bool
     uses_add: bool
     uses_sub: bool
+    uses_mul: bool
+    uses_div: bool
     uses_string_equal: bool
     uses_print: bool
     uses_concat: bool
@@ -94,7 +96,8 @@ fn NewLinkedNullState(): LinkedNullState {
         slots: [], links: [], declarations: "", code: "", drops: "", catch_slot: 0,
         catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,
-        element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_string_equal: false, uses_print: false, uses_concat: false, uses_suffix: false, uses_chars: false }
+        element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_mul: false, uses_div: false,
+        uses_string_equal: false, uses_print: false, uses_concat: false, uses_suffix: false, uses_chars: false }
 }
 
 fn LinkedReadonlyExpression(state: LinkedNullState, ty: TypeNameBinding, text: str): LinkedNullExpression {

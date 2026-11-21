@@ -1,4 +1,5 @@
 import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
+import { ScalarCheckedMultiplyC } from "./scalar_int_emit.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { EmitLinkedArrayBody } from "./struct_array_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
@@ -16,6 +17,7 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
                          &result_type: str, &payload_cleanup: str, char_errors: str): str {
     text = header
     array_checks = body.validated_arrays.len() > 0 || body.uses_str_array
+    arithmetic = body.uses_add || body.uses_sub || body.uses_mul || body.uses_div
     text += "\n" + result_type.clone() + " " + symbol.clone() + "(" + signature.clone() + ") {\n"
     text += "    " + result_type.clone() + " result = {0};\n"
     text += payload_cleanup.clone()
@@ -26,7 +28,8 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
     if (body.uses_print) { text += "    bool output_failed = false;\n" }
     if (body.uses_str_view) { text += "    bool invalid_str = false;\n" }
     if (body.uses_struct_view) { text += "    bool invalid_struct_view = false;\n" }
-    if (body.uses_add || body.uses_sub) { text += "    bool overflow = false;\n" }
+    if (arithmetic) { text += "    bool overflow = false;\n" }
+    if (body.uses_div) { text += "    bool division_by_zero = false;\n" }
     if (body.uses_index) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
     if (body.uses_concat) { text += "    const char* string_failure = NULL;\n" }
     if (body.uses_chars) { text += "    int source_status = KU_SOURCE_OK;\n" }
@@ -49,7 +52,8 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
     if (body.uses_struct_view) { text += "    if (invalid_struct_view) { fputs(\"invalid struct view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_concat) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_chars) { text += char_errors }
-    if (body.uses_add || body.uses_sub) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_div) { text += "    if (division_by_zero) { fputs(\"division by zero\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_index) {
         text += "    if (index_failed) { fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", "
             + "(long long)failure_index, failure_length); exit(EXIT_FAILURE); }\n"
@@ -58,7 +62,10 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
 }
 
 fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding): str! {
-    header = LinkedCPrelude(body, GuardArithmetic(body.uses_add, body.uses_sub) + GuardStringEquality(body.uses_string_equal))
+    ops = GuardArithmetic(body.uses_add, body.uses_sub)
+    if (body.uses_mul || body.uses_div) { ops += "#include <stdio.h>\n#include <stdlib.h>\n\n" }
+    if (body.uses_mul) { ops += ScalarCheckedMultiplyC() }
+    header = LinkedCPrelude(body, ops + GuardStringEquality(body.uses_string_equal))
     declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
     return ok(declarations + EmitLinkedNullPrototypes(body.links, result)?)
 }
