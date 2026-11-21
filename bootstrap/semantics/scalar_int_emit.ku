@@ -327,7 +327,6 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
     index = 0
     while (index < plan.clauses.len()) {
         clause = plan.clauses[index].clone()
-        index = index + 1
         control = clause.control.clone()
         if (control == "else" || control == "end") { depth = depth - 1 }
         indent = "    "
@@ -339,71 +338,69 @@ fn EmitScalarIntPlan(&plan: ScalarIntFunction, external: bool): ScalarIntBodyC {
         if (control == "if") {
             text += indent + "if (0 != (" + clause.condition + ")) {\n"
             depth = depth + 1
-            continue
         } else if (control == "else") {
             text += indent + "} else {\n"
             depth = depth + 1
-            continue
         } else if (control == "end") {
             text += indent + "}\n"
-            continue
-        }
-        guarded = clause.condition != ""
-        if (guarded) {
-            text += "    if (0 != (" + clause.condition + ")) {\n"
-            indent = "        "
-        }
-        result_node = 0
-        step = 0
-        while (step < clause.instructions.len()) {
-            instruction = clause.instructions[step].clone()
-            if (instruction.operation == "println") {
-                text += indent.clone() + "(void)printf(\"%lld\\n\", (long long)t" + str(instruction.operand) + ");\n"
-                text += indent.clone() + "(void)fflush(stdout);\n"
-                step = step + 1
-                continue
-            }
-            expression = ""
-            if (instruction.operation == "constant") {
-                expression = "INT64_C(" + str(instruction.operand) + ")"
-            } else if (instruction.operation == "parameter") {
-                expression = "a" + str(instruction.operand)
-            } else if (instruction.operation == "call") {
-                // Evaluated arguments already have temporaries. C call
-                // argument evaluation order cannot reorder the computations.
-                expression = emitIntCall(instruction)
-            } else {
-                uses_add = uses_add || instruction.operation == "add"
-                uses_sub = uses_sub || instruction.operation == "sub"
-                uses_mul = uses_mul || instruction.operation == "mul"
-                uses_div = uses_div || instruction.operation == "div"
-                uses_rem = uses_rem || instruction.operation == "rem"
-                left = "INT64_C(0)"
-                if (instruction.operand != 0) { left = "t" + str(instruction.operand) }
-                expression = "ku_scalar_" + instruction.operation + "(" + left + ", t" + str(instruction.right_node) + ")"
-            }
-            result_node = instruction.result_node
-            text += indent.clone() + "int64_t t" + str(result_node) + " = " + expression + ";\n"
-            step = step + 1
-        }
-        if (control == "output") {
-            uses_output = true
-            continue
-        }
-        result = clause.scalar_result
-        if (plan.result_type == 1) { result = "t" + str(result_node) }
-        if (clause.string_parts.len() != 0) {
-            assignment = EmitScalarStringAssignment(clause.string_parts, indent)
-            text += assignment.source
-            uses_format = uses_format || assignment.uses_format
-            if (guarded) { text += indent + "goto cleanup;\n" }
-        } else if (uses_cleanup) {
-            text += indent.clone() + "result = " + result + ";\n"
-            if (guarded) { text += indent + "goto cleanup;\n" }
         } else {
-            text += indent + "return " + result + ";\n"
+            guarded = clause.condition != ""
+            if (guarded) {
+                text += "    if (0 != (" + clause.condition + ")) {\n"
+                indent = "        "
+            }
+            result_node = 0
+            step = 0
+            while (step < clause.instructions.len()) {
+                instruction = clause.instructions[step].clone()
+                if (instruction.operation == "println") {
+                    text += indent.clone() + "(void)printf(\"%lld\\n\", (long long)t" + str(instruction.operand) + ");\n"
+                    text += indent.clone() + "(void)fflush(stdout);\n"
+                } else {
+                    expression = ""
+                    if (instruction.operation == "constant") {
+                        expression = "INT64_C(" + str(instruction.operand) + ")"
+                    } else if (instruction.operation == "parameter") {
+                        expression = "a" + str(instruction.operand)
+                    } else if (instruction.operation == "call") {
+                        // Evaluated arguments already have temporaries. C call
+                        // argument evaluation order cannot reorder the computations.
+                        expression = emitIntCall(instruction)
+                    } else {
+                        uses_add = uses_add || instruction.operation == "add"
+                        uses_sub = uses_sub || instruction.operation == "sub"
+                        uses_mul = uses_mul || instruction.operation == "mul"
+                        uses_div = uses_div || instruction.operation == "div"
+                        uses_rem = uses_rem || instruction.operation == "rem"
+                        left = "INT64_C(0)"
+                        if (instruction.operand != 0) { left = "t" + str(instruction.operand) }
+                        expression = "ku_scalar_" + instruction.operation + "(" + left + ", t" + str(instruction.right_node) + ")"
+                    }
+                    result_node = instruction.result_node
+                    text += indent.clone() + "int64_t t" + str(result_node) + " = " + expression + ";\n"
+                }
+                step = step + 1
+            }
+            if (control == "output") {
+                uses_output = true
+            } else {
+                result = clause.scalar_result
+                if (plan.result_type == 1) { result = "t" + str(result_node) }
+                if (clause.string_parts.len() != 0) {
+                    assignment = EmitScalarStringAssignment(clause.string_parts, indent)
+                    text += assignment.source
+                    uses_format = uses_format || assignment.uses_format
+                    if (guarded) { text += indent + "goto cleanup;\n" }
+                } else if (uses_cleanup) {
+                    text += indent.clone() + "result = " + result + ";\n"
+                    if (guarded) { text += indent + "goto cleanup;\n" }
+                } else {
+                    text += indent + "return " + result + ";\n"
+                }
+                if (guarded) { text += "    }\n" }
+            }
         }
-        if (guarded) { text += "    }\n" }
+        index = index + 1
     }
     if (uses_cleanup) {
         if (plan.clauses.len() > 1) { text += "cleanup:\n" }
