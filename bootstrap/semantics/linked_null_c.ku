@@ -289,13 +289,15 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             if (nullary || checked_record ||
                 (statement.edge_count >= 7 && linkedChildKindIs(project, statement, 4, "Parameter"))) {
                 CheckLinkedLocalFunctionName(project, next, statement)?
-                thunk = ReadLinkedAppendThunk(project, next, statement, id)?
-                body = lowerLinkedRegion(project, statement, thunk.parameters.state.clone(), thunk.parameters.body_start, thunk.parameters.result, 1)?
+                prepared = ReadLinkedAppendThunk(project, next, statement, id)?
+                thunk = prepared.thunk
+                body = lowerLinkedRegion(project, statement, prepared.state, thunk.body_start, thunk.result, 1)?
                 next = FinishLinkedAppendThunk(next, thunk, body, statement, id)?
             } else if (statement.edge_count >= 4 && linkedChildKindIs(project, statement, 1, "Parameter")) {
                 CheckLinkedLocalFunctionName(project, next, statement)?
-                thunk = ReadLinkedLocalThunk(project, next, statement, id)?
-                body = lowerLinkedRegion(project, statement, thunk.state.clone(), 3, thunk.result, 1)?
+                prepared = ReadLinkedLocalThunk(project, next, statement, id)?
+                thunk = prepared.thunk
+                body = lowerLinkedRegion(project, statement, prepared.state, 3, thunk.result, 1)?
                 next = FinishLinkedLocalThunk(next, thunk, body, statement, id)?
             } else { next = RegisterLinkedLocalRead(project, next, statement, id)? }
         } else if (statement.kind == "If" && statement.edge_count > 1) {

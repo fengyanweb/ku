@@ -3,10 +3,11 @@ import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
+import { LinkedAppendFailureRelay } from "./linked_array_fields_c.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, LinkedNullParameters, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
 import { AppendLinkedArrayElement, LowerLinkedNullValue } from "./linked_null_values_c.ku"
@@ -252,7 +253,9 @@ fn RestoreLinkedThunkFrame(body: LinkedNullState, &parent: LinkedNullState): Lin
 }
 
 struct LinkedAppendThunk {
-    parameters: LinkedNullParameters
+    body_start: int
+    signature: str
+    result: TypeNameBinding
     arguments: [TypeNameBinding]
     sources: [int]
     environment: str
@@ -260,8 +263,13 @@ struct LinkedAppendThunk {
     initializers: str
 }
 
+struct LinkedAppendBody {
+    state: LinkedNullState
+    thunk: LinkedAppendThunk
+}
+
 fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
-                         &function: Node, id: int): LinkedAppendThunk! {
+                         &function: Node, id: int): LinkedAppendBody! {
     parameters = ReadLinkedNullParametersFrom(project, function, StartLinkedThunkFrame(parent))?
     arguments: [TypeNameBinding] = []
     slots = parameters.state.slots.clone()
@@ -327,28 +335,10 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
         callee.environment = "capture->" + field
         body.local_appends = body.local_appends.push(callee)
     }
-    parameters.state = body
-    return ok(LinkedAppendThunk { parameters: parameters, arguments: arguments, sources: sources,
-        environment: environment, typedef_fields: fields, initializers: initializers })
-}
-
-fn appendThunkFailureRelay(&body: LinkedNullState): str {
-    text = "    failure->append_status = append_status;\n"
-    calls_append = body.local_appends.len() > 0
-    if (calls_append || body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0) {
-        text += "    failure->out_of_memory = out_of_memory;\n"
-    }
-    if (body.validated_arrays.len() > 0) {
-        message = "invalid struct array ownership"
-        if (body.uses_str_array) { message = "invalid array view" }
-        text += "    if (invalid_array) failure->array_error = \"" + message + "\\n\";\n"
-    }
-    if (calls_append) { text += "    if (captured_array_failure) failure->array_error = captured_array_failure;\n" }
-    if (calls_append || body.uses_add || body.uses_sub || body.uses_mul) { text += "    failure->overflow = overflow;\n" }
-    if (calls_append || body.uses_index) {
-        text += "    failure->index_failed = index_failed;\n    failure->index = failure_index;\n    failure->length = failure_length;\n"
-    }
-    return text
+    thunk = LinkedAppendThunk { body_start: parameters.body_start, signature: parameters.signature,
+        result: parameters.result, arguments: arguments, sources: sources,
+        environment: environment, typedef_fields: fields, initializers: initializers }
+    return ok(LinkedAppendBody { state: body, thunk: thunk })
 }
 
 fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
@@ -366,18 +356,18 @@ fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
         next.callback_helpers += "\ntypedef struct { int append_status; bool out_of_memory, overflow, index_failed; const char *array_error; int64_t index; size_t length; } KuLocalAppendFailure;\n"
     }
     signature = "void *raw, KuLocalAppendFailure *failure"
-    if (thunk.parameters.body_start > 1) { signature += ", " + thunk.parameters.signature.clone() }
+    if (thunk.body_start > 1) { signature += ", " + thunk.signature.clone() }
     symbol = "ku_local_append_" + str(id)
     next.callback_helpers += "\ntypedef struct {" + thunk.typedef_fields.clone() + " } " + thunk.environment.clone() + ";\nstatic "
-        + FinishLinkedFunctionC("", next, symbol, signature, LinkedCheckedResultCType(thunk.parameters.result)?,
-            "", "", appendThunkFailureRelay(next))
+        + FinishLinkedFunctionC("", next, symbol, signature, LinkedCheckedResultCType(thunk.result)?,
+            "", "", LinkedAppendFailureRelay(next))
     next = RestoreLinkedThunkFrame(next, parent)
     for index in thunk.sources.clone() {
         if (!ContainsIndex(next.append_captures, index)) { next.append_captures = next.append_captures.push(index) }
     }
     frame = "environment" + str(id)
     callee = LinkedNullFunction { unit: 1, node: id, symbol: symbol.clone(), parameters: thunk.arguments.clone(),
-        result: thunk.parameters.result.clone(), returns_result: true }
+        result: thunk.result.clone(), returns_result: true }
     next.local_appends = next.local_appends.push(LinkedLocalAppend { binding: function.text.clone(),
         function: callee, environment: "&" + frame.clone() })
     next.declarations += "    " + thunk.environment.clone() + " " + frame.clone() + " = {0};\n"

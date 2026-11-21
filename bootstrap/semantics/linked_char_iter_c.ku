@@ -17,7 +17,6 @@ import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { LinkedBooleanWhileCondition, LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedFreshRecordFor, ReadLinkedLocalCaptures, RejectLocalCapture, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./linked_owner_assignment_c.ku"
 
 struct LinkedLocalThunk {
-    state: LinkedNullState
     result: TypeNameBinding
     owners: [int]
     environment: str
@@ -25,8 +24,13 @@ struct LinkedLocalThunk {
     initializers: str
 }
 
+struct LinkedLocalBody {
+    state: LinkedNullState
+    thunk: LinkedLocalThunk
+}
+
 fn ReadLinkedLocalThunk(&project: LinkedNullProject, &parent: LinkedNullState,
-                        &function: Node, id: int): LinkedLocalThunk! {
+                        &function: Node, id: int): LinkedLocalBody! {
     body = StartLinkedThunkFrame(parent)
     for index in [0, 1] {
         parameter = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
@@ -82,8 +86,9 @@ fn ReadLinkedLocalThunk(&project: LinkedNullProject, &parent: LinkedNullState,
         fields = " bool active;"
         initializers = " .active = true,"
     }
-    return ok(LinkedLocalThunk { state: body, result: result, owners: owners, environment: environment,
-        fields: fields, initializers: initializers })
+    thunk = LinkedLocalThunk { result: result, owners: owners, environment: environment,
+        fields: fields, initializers: initializers }
+    return ok(LinkedLocalBody { state: body, thunk: thunk })
 }
 
 fn bindLinkedLocalCallback(state: LinkedNullState, name: str, ty: TypeNameBinding, text: str): LinkedNullState {

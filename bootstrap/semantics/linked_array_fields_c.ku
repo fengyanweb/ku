@@ -37,3 +37,22 @@ fn LowerLinkedFieldAppend(&project: LinkedNullProject, state: LinkedNullState, t
     destination.state.local_append_types = destination.state.local_append_types.push(array.ty.clone())
     return ok(AppendLinkedArrayElement(destination.state, array, item))
 }
+
+fn LinkedAppendFailureRelay(&body: LinkedNullState): str {
+    text = "    failure->append_status = append_status;\n"
+    calls_append = body.local_appends.len() > 0
+    if (calls_append || body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0) {
+        text += "    failure->out_of_memory = out_of_memory;\n"
+    }
+    if (body.validated_arrays.len() > 0) {
+        message = "invalid struct array ownership"
+        if (body.uses_str_array) { message = "invalid array view" }
+        text += "    if (invalid_array) failure->array_error = \"" + message + "\\n\";\n"
+    }
+    if (calls_append) { text += "    if (captured_array_failure) failure->array_error = captured_array_failure;\n" }
+    if (calls_append || body.uses_add || body.uses_sub || body.uses_mul) { text += "    failure->overflow = overflow;\n" }
+    if (calls_append || body.uses_index) {
+        text += "    failure->index_failed = index_failed;\n    failure->index = failure_index;\n    failure->length = failure_length;\n"
+    }
+    return text
+}
