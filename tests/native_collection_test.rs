@@ -12,6 +12,7 @@ use native_harness::{compile_harness, run_bounded, TempDir, RUN_LIMITS, RUN_TIME
 
 const RECEIVER_ORDER_SOURCE: &str = r#"
 struct Container { values: [int], names: [str] }
+struct Buckets { rows: [Container] }
 fn Missing(): int! { fail "missing" }
 fn MissingText(): str! { fail "missing text" }
 
@@ -22,6 +23,33 @@ fn main(): null! {
     container.names[slot] = "changed"
     if (container.values[0] != 7 || container.names[0] != "changed") {
         panic("struct field index assignment wrote a temporary")
+    }
+    container.names = []
+    if (container.names.len() != 0) panic("empty array did not replace the field")
+    buckets = Buckets { rows: [Container { values: [1], names: ["initial"] }] }
+    trace = 0
+    next_word = () => {
+        trace = trace * 10 + 1
+        return "owned" + "界"
+    }
+    which_row = () => {
+        trace = trace * 10 + 2
+        return 0
+    }
+    buckets.rows[which_row()].names = [next_word()]
+    if (trace != 12 || buckets.rows[0].names[0] != "owned界") {
+        panic("array RHS must complete before evaluating the destination index once")
+    }
+    try {
+        buckets.rows[which_row()].names = [MissingText()?]
+    } catch (err) {
+        if (trace != 12 || buckets.rows[0].names[0] != "owned界") {
+            panic("failed array RHS evaluated or modified its destination")
+        }
+    }
+    buckets.rows[which_row()].names = []
+    if (trace != 122 || buckets.rows[0].names.len() != 0) {
+        panic("empty array store did not preserve evaluation order")
     }
     values = [1]
     make_piece = () => {

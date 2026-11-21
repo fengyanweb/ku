@@ -1698,7 +1698,12 @@ impl<'a> FunctionLowerer<'a> {
                 self.store_or_define_name(name, value, span, define_boxed)?;
             }
             Stmt::AssignTarget { target, value, .. } => {
-                let value = self.lower_expr(value)?;
+                let expected = if matches!(value.kind, ExprKind::Array(_)) {
+                    self.static_assignment_array_type(target)
+                } else {
+                    None
+                };
+                let value = self.lower_expr_with_expected(value, expected.as_ref())?;
                 // Match the interpreter: evaluate the RHS completely before any
                 // index expression in the destination. Materializing here also
                 // prevents a later target-side effect from changing a local/field
@@ -2709,6 +2714,24 @@ impl<'a> FunctionLowerer<'a> {
             }
         }
         self.lower_expr(expr)
+    }
+
+    /// Supply a literal's array type without evaluating the destination place.
+    fn static_assignment_array_type(&self, target: &AssignTarget) -> Option<IrType> {
+        let ty = match target {
+            AssignTarget::Variable(name) => self.locals.get(self.local_ir_name(name))?.clone(),
+            AssignTarget::Field { target, name } => {
+                self.field_type(&self.static_place_type(target)?, name)
+            }
+            AssignTarget::Index { target, .. } => match self.static_place_type(target)? {
+                IrType::Array(element) => *element,
+                _ => return None,
+            },
+        };
+        match &ty {
+            IrType::Array(element) if **element != IrType::Unknown => Some(ty),
+            _ => None,
+        }
     }
 
     /// The readable type of a literal or plain place, without emitting anything.
