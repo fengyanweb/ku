@@ -1206,6 +1206,11 @@ impl Parser {
                     }
                 }
                 let paren = self.consume(&TokenKind::RParen, "expected ')' after arguments")?;
+                if let [argument] = args.as_mut_slice() {
+                    if matches!(&expr.kind, ExprKind::Variable(name) if name == input::NAME) {
+                        input::prepare_argument(argument);
+                    }
+                }
                 let span = expr.span.merge(paren.span);
                 expr = Expr::new(
                     ExprKind::Call {

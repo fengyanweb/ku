@@ -279,6 +279,7 @@ impl fmt::Debug for MatchPattern {
                         Literal::Bool(value) => literal_tuple!("Bool", value),
                         Literal::String(value) => literal_tuple!("String", value),
                         Literal::TemplateString(value) => literal_tuple!("TemplateString", value),
+                        Literal::InputTemplate(value) => literal_tuple!("InputTemplate", value),
                         Literal::Null => formatter.write_str("Null")?,
                     }
                 }

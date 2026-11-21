@@ -1,6 +1,8 @@
 use crate::span::Span;
 
 mod compiled;
+#[doc(hidden)]
+pub mod input;
 mod match_pattern;
 pub(crate) use compiled::{reject_compiled_async, reject_compiled_async_expression};
 
@@ -438,6 +440,7 @@ pub enum Literal {
     Bool(bool),
     String(String),
     TemplateString(String),
+    InputTemplate(Box<input::Template>),
     Null,
 }
 

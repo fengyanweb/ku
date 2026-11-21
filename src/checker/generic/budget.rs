@@ -336,6 +336,12 @@ fn walk(
             Node::Expression(expression) => match &expression.kind {
                 ExprKind::Literal(Literal::String(text) | Literal::TemplateString(text))
                 | ExprKind::Variable(text) => pending.push(Node::Text(text)),
+                ExprKind::Literal(Literal::InputTemplate(template)) => {
+                    pending.extend(template.segments.iter().map(|segment| Node::Text(segment)));
+                    bytes = bytes
+                        .checked_add(template.fields.len() * size_of::<crate::ast::input::Field>())
+                        .ok_or_else(|| limit(span, "input template fields"))?;
+                }
                 ExprKind::Literal(_) => {}
                 ExprKind::Unary { expr, .. }
                 | ExprKind::Await(expr)

@@ -16,15 +16,15 @@ use web_time::Instant;
 
 use crate::{
     ast::{
-        is_pure_append_argument, AssignTarget, BinaryOp, Expr, ExprKind, FnDecl, FunctionParam,
-        Item, Literal, MatchPattern, ParamMode, Program, Stmt, UnaryOp,
+        input, is_pure_append_argument, AssignTarget, BinaryOp, Expr, ExprKind, FnDecl,
+        FunctionParam, Item, Literal, MatchPattern, ParamMode, Program, Stmt, UnaryOp,
     },
     env::{BorrowLease, Env},
     error::{KuError, KuResult, RuntimeTermination, TerminationReason},
     lexer::Lexer,
     parser::Parser,
     runtime::{
-        http_listener_registry,
+        http_listener_registry, input as cli_input,
         task::{
             current_cleanup_context, current_task_cancellation, set_execution_termination,
             CancellationContext, CleanupGuard, ExecutionTerminationGuard, TaskHandle,
@@ -974,23 +974,49 @@ impl Interpreter {
                 values,
                 span,
             } => {
-                if names.len() != values.len() {
-                    return Err(KuError::runtime(
-                        format!(
-                            "destructuring assignment expects {} values but got {}",
-                            names.len(),
-                            values.len()
-                        ),
-                        *span,
-                    ));
-                }
-                let mut evaluated = Vec::with_capacity(values.len());
-                for value in values {
-                    evaluated.push(self.eval(value, env, depth)?);
-                    if let Some(value) = self.take_pending_fail() {
-                        return Ok(Flow::fail(value));
+                let template = input::destructure_call(values)
+                    .filter(|_| self.input_builtin_visible(env))
+                    .and_then(input::direct_call)
+                    .filter(|args| args.len() == 1)
+                    .map(|args| input::template(&args[0]))
+                    .transpose()?
+                    .flatten();
+                let evaluated = if let Some(template) = template {
+                    if names.len() != template.fields.len() {
+                        return Err(KuError::runtime(
+                            format!(
+                                "input template has {} fields but assignment has {} targets",
+                                template.fields.len(),
+                                names.len()
+                            ),
+                            *span,
+                        ));
                     }
-                }
+                    self.tick(values[0].span)?;
+                    match self.read_input("", Some(template)) {
+                        Ok(values) => values,
+                        Err(error) => return Ok(Flow::fail(error.value())),
+                    }
+                } else {
+                    if names.len() != values.len() {
+                        return Err(KuError::runtime(
+                            format!(
+                                "destructuring assignment expects {} values but got {}",
+                                names.len(),
+                                values.len()
+                            ),
+                            *span,
+                        ));
+                    }
+                    let mut evaluated = Vec::with_capacity(values.len());
+                    for value in values {
+                        evaluated.push(self.eval(value, env, depth)?);
+                        if let Some(value) = self.take_pending_fail() {
+                            return Ok(Flow::fail(value));
+                        }
+                    }
+                    evaluated
+                };
                 for (name, value) in names.iter().zip(evaluated) {
                     let Some(name) = name else {
                         continue;
@@ -2013,6 +2039,78 @@ impl Interpreter {
         crate::interop::invoke(kind, library, operation, &values, span)
     }
 
+    fn input_builtin_visible(&self, env: &Env) -> bool {
+        !self.functions.contains_key(input::NAME) && !env.contains(input::NAME)
+    }
+
+    fn read_input(
+        &self,
+        prompt: &str,
+        template: Option<&input::Template>,
+    ) -> Result<Vec<Value>, cli_input::ReadError> {
+        #[cfg(feature = "browser")]
+        if crate::browser::active() {
+            return Err(cli_input::ReadError::Unavailable);
+        }
+        if self.async_execution
+            || self.execution_deadline.is_some()
+            || crate::runtime::task::current_task_id() != 0
+        {
+            return Err(cli_input::ReadError::Unavailable);
+        }
+        cli_input::read(prompt, template)
+    }
+
+    fn eval_input(
+        &mut self,
+        args: &[Expr],
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<Value> {
+        let result = match args {
+            [] => self.read_input("", None),
+            [argument] => {
+                if let Some(template) = input::template(argument)? {
+                    if template.fields.len() != 1 {
+                        return Err(KuError::runtime(
+                            "input with multiple placeholders must be destructured with '?'",
+                            span,
+                        ));
+                    }
+                    self.read_input("", Some(template))
+                } else {
+                    let mut leases = Vec::new();
+                    let value = self.eval_read_argument(argument, env, depth, &mut leases)?;
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
+                    value.with_read(argument.span, |value| {
+                        let Value::String(prompt) = value else {
+                            return Err(KuError::runtime(
+                                "input prompt must be a string",
+                                argument.span,
+                            ));
+                        };
+                        Ok(self.read_input(prompt, None))
+                    })?
+                }
+            }
+            _ => return Err(KuError::runtime("input expects zero or one argument", span)),
+        };
+        match result {
+            Ok(mut values) => {
+                Ok(stdlib::errors::ok(values.pop().ok_or_else(|| {
+                    KuError::runtime("input did not produce a value", span)
+                })?))
+            }
+            Err(error) => Ok(Value::Result {
+                ok: false,
+                value: Box::new(error.value()),
+            }),
+        }
+    }
+
     fn eval(&mut self, expr: &Expr, env: &mut Env, depth: usize) -> KuResult<Value> {
         self.tick(expr.span)?;
         let browser_result = match &expr.kind {
@@ -2023,6 +2121,10 @@ impl Interpreter {
             ExprKind::Literal(Literal::TemplateString(value)) => self
                 .eval_template(value, env, depth, expr.span)
                 .map(Value::String),
+            ExprKind::Literal(Literal::InputTemplate(_)) => Err(KuError::runtime(
+                "input placeholders require a direct call to the input builtin",
+                expr.span,
+            )),
             ExprKind::Literal(Literal::Null) => Ok(Value::Null),
             ExprKind::Variable(name) => self.eval_variable(name, env, expr.span),
             ExprKind::Await(task) => {
@@ -2103,6 +2205,11 @@ impl Interpreter {
                     if let Some(kind) = crate::interop::ReturnKind::for_bound(name) {
                         return self.eval_interop(kind, args, env, depth, expr.span);
                     }
+                }
+                if matches!(&callee.kind, ExprKind::Variable(name) if name == input::NAME)
+                    && self.input_builtin_visible(env)
+                {
+                    return self.eval_input(args, env, depth, expr.span);
                 }
                 // Register before even the first argument is evaluated: a later
                 // nested call can observe cancellation before this callee starts.
@@ -6987,7 +7094,7 @@ fn value_from_literal(literal: &Literal) -> Value {
         Literal::Float(value) => Value::Float(*value),
         Literal::Bool(value) => Value::Bool(*value),
         Literal::String(value) | Literal::TemplateString(value) => Value::String(value.clone()),
-        Literal::Null => Value::Null,
+        Literal::Null | Literal::InputTemplate(_) => Value::Null,
     }
 }
 

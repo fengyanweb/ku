@@ -29,6 +29,17 @@ fn main() {
         &root,
         &std::path::PathBuf::from(env::var_os("OUT_DIR").unwrap()),
     );
+    #[cfg(any(unix, windows))]
+    if env::var("CARGO_CFG_TARGET_FAMILY").is_ok_and(|families| {
+        families
+            .split(',')
+            .any(|family| matches!(family, "unix" | "windows"))
+    }) {
+        cc::Build::new()
+            .std("c11")
+            .file(root.join("src/runtime/input.c"))
+            .compile("ku_cli_input");
+    }
     let rustc = Command::new(env::var_os("RUSTC").unwrap())
         .arg("-vV")
         .env("RUSTUP_AUTO_INSTALL", "0")

@@ -17,6 +17,7 @@ use crate::{
 
 mod borrow;
 mod budget;
+pub(crate) mod input;
 use budget::{LowerBudget, LowerLimits};
 
 // Reserve before constructing an instruction payload, including synthetic ones.
@@ -499,7 +500,7 @@ fn lower_program_mode(
     }
     let specialized = monomorph::specialize(program)?;
     let program = specialized.as_ref().unwrap_or(program);
-    let layouts = lower_layouts(program);
+    let mut layouts = lower_layouts(program);
     let mut signatures = HashMap::new();
     let mut next_function_id = 0;
     for item in &program.items {
@@ -690,6 +691,7 @@ fn lower_program_mode(
         }
     }
     functions.append(&mut lifted_functions.borrow_mut());
+    input::register_layouts(&functions, &mut layouts);
     let program = IrProgram { functions, layouts };
     verify_borrow_contract(&program)?;
     Ok(program)
@@ -1790,6 +1792,9 @@ impl<'a> FunctionLowerer<'a> {
                 values,
                 span,
             } => {
+                if self.lower_input_assignment(names, values, *span)? {
+                    return Ok(());
+                }
                 if names.len() != values.len() {
                     return Err(KuError::runtime(
                         format!(
@@ -3844,6 +3849,10 @@ impl<'a> FunctionLowerer<'a> {
             ExprKind::Literal(Literal::TemplateString(raw)) => {
                 self.lower_template_string(raw, expr.span)
             }
+            ExprKind::Literal(Literal::InputTemplate(_)) => Err(KuError::runtime(
+                "input fields require a direct builtin input call",
+                expr.span,
+            )),
             ExprKind::Literal(literal) => Ok(IrExpr {
                 kind: IrExprKind::Literal(literal_text(literal)),
                 ty: literal_type(literal),
@@ -3998,6 +4007,9 @@ impl<'a> FunctionLowerer<'a> {
                     if let Some(kind) = crate::interop::ReturnKind::for_bound(name) {
                         return self.lower_interop(kind, args, expr.span, deferred_safepoint);
                     }
+                }
+                if self.is_builtin_input(callee) {
+                    return self.lower_input_call(args, expr.span, deferred_safepoint);
                 }
                 // Stage 6f: a self-recursive call inside a lifted local-named
                 // function body. Resolve the callee to the lifted function itself
@@ -6561,6 +6573,7 @@ fn literal_text(literal: &Literal) -> String {
         Literal::Float(value) => value.to_string(),
         Literal::Bool(value) => value.to_string(),
         Literal::String(value) | Literal::TemplateString(value) => format!("{value:?}"),
+        Literal::InputTemplate(_) => "<input-template>".into(),
         Literal::Null => "null".to_string(),
     }
 }
@@ -6571,6 +6584,7 @@ fn literal_type(literal: &Literal) -> IrType {
         Literal::Float(_) => IrType::Float,
         Literal::Bool(_) => IrType::Bool,
         Literal::String(_) | Literal::TemplateString(_) => IrType::Str,
+        Literal::InputTemplate(_) => IrType::Unknown,
         Literal::Null => IrType::Null,
     }
 }

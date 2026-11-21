@@ -202,6 +202,7 @@ impl Verifier<'_> {
                 } else if let IrCallKind::Intrinsic(name) = kind {
                     let borrowed_read = matches!(name.as_str(), "__ku_clone" | "__ku_clone_nullable")
                             || crate::interop::ReturnKind::for_builtin(name).is_some()
+                            || name == input::READ_LINE
                             || name == "__ku_enum_tag"
                             || matches!(
                                 name.as_str(),

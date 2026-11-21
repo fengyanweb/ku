@@ -8,6 +8,8 @@ use crate::{
 };
 
 mod generic;
+mod input_checks;
+use input_checks::input_field_type;
 #[cfg(test)]
 mod loop_analysis_tests;
 mod nullable;
@@ -1521,6 +1523,16 @@ impl Checker {
                 values,
                 span,
             } => {
+                if let Some(call) = input::destructure_call(values) {
+                    if !self.contains(input::NAME) && !self.functions.contains_key(input::NAME) {
+                        let args = input::direct_call(call).expect("direct input call");
+                        if let [argument] = args {
+                            if let Some(template) = input::template(argument)? {
+                                return self.check_input_destructure(names, template, values[0].span);
+                            }
+                        }
+                    }
+                }
                 if names.len() != values.len() {
                     return Err(KuError::runtime(
                         format!(
@@ -2158,6 +2170,10 @@ impl Checker {
                     self.check_template_string(value, expr.span)?;
                     Ok(Type::String)
                 }
+                ExprKind::Literal(Literal::InputTemplate(_)) => Err(KuError::runtime(
+                    "input placeholders require a direct call to the input builtin",
+                    expr.span,
+                )),
                 ExprKind::Literal(Literal::Null) => Ok(Type::Null),
                 ExprKind::Variable(name) => {
                     if !plain_field_base {
@@ -2768,15 +2784,7 @@ impl Checker {
                             // `obj[key]?` unwraps a Result(missing_key): it needs a
                             // Result return type or an enclosing try, and yields the
                             // unwrapped value type (not a nullable).
-                            if !matches!(self.current_return, Type::Result(_))
-                                && self.recoverable_depth == 0
-                            {
-                                return Err(KuError::runtime(
-                                    "'?' requires a Result return type or an enclosing try block",
-                                    expr.span,
-                                ));
-                            }
-                            self.capture_try_exit(TryExitKind::Throw);
+                            self.check_result_propagation(expr.span)?;
                             return Ok(value_type);
                         }
                     }
@@ -2785,18 +2793,10 @@ impl Checker {
                             if self.type_may_contain_function_value(&value) {
                                 evaluated_provenance = Some(self.expression_closure_provenance(inner));
                             }
-                            if !matches!(self.current_return, Type::Result(_))
-                                && self.recoverable_depth == 0
-                            {
-                                return Err(KuError::runtime(
-                                    "'?' requires a Result return type or an enclosing try block",
-                                    expr.span,
-                                ));
-                            }
                             // `inner` has already been consumed, but the statement
                             // containing this `?` has not yet run its store/re-init.
                             // This is the precise error edge for ownership flow.
-                            self.capture_try_exit(TryExitKind::Throw);
+                            self.check_result_propagation(expr.span)?;
                             Ok(*value)
                         }
                         other => Err(KuError::runtime(
@@ -3137,6 +3137,9 @@ impl Checker {
                 crate::interop::ReturnKind::Bool => Type::Bool,
             }))));
         }
+        if name == input::NAME {
+            return self.check_input(args, span).map(Some);
+        }
         let Some(signature) = metadata::builtin_signature(name) else {
             return Ok(None);
         };
@@ -3163,6 +3166,17 @@ impl Checker {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn check_result_propagation(&mut self, span: Span) -> KuResult<()> {
+        if !matches!(self.current_return, Type::Result(_)) && self.recoverable_depth == 0 {
+            return Err(KuError::runtime(
+                "'?' requires a Result return type or an enclosing try block",
+                span,
+            ));
+        }
+        self.capture_try_exit(TryExitKind::Throw);
         Ok(())
     }
 
@@ -7316,9 +7330,12 @@ impl Checker {
         };
         if let ExprKind::Variable(name) = &callee.kind {
             return unshadowed(name)
-                && matches!(name.as_str(), "len" | "str" | "ok" | "err" | "println")
-                && metadata::builtin_signature(name)
-                    .is_some_and(|signature| signature.args.len() == args.len());
+                && match name.as_str() {
+                    input::NAME => args.len() <= 1,
+                    "len" | "str" | "ok" | "err" | "println" => metadata::builtin_signature(name)
+                        .is_some_and(|signature| signature.args.len() == args.len()),
+                    _ => false,
+                };
         }
         let ExprKind::Field { target, name } = &callee.kind else {
             return false;
@@ -7853,26 +7870,48 @@ impl Checker {
                     }
                 }
                 Stmt::DestructureAssign { names, values, .. } => {
-                    for (name, value) in names.iter().zip(values) {
+                    let input_fields = input::destructure_call(values)
+                        .filter(|_| {
+                            !environment.locals.contains(input::NAME)
+                                && !environment.types.contains_key(input::NAME)
+                                && !outer_bindings.contains_key(input::NAME)
+                                && !self.functions.contains_key(input::NAME)
+                        })
+                        .and_then(input::direct_call)
+                        .and_then(|args| match args {
+                            [argument] => input::template(argument).ok().flatten(),
+                            _ => None,
+                        })
+                        .map(|template| &template.fields);
+                    for (index, name) in names.iter().enumerate() {
                         let Some(name) = name else {
                             continue;
                         };
-                        self.extend_expression_closure_effects(
-                            value,
-                            outer_bindings,
-                            &environment,
-                            &mut effects,
-                            &mut complete,
-                            summaries,
-                        );
-                        let provenance = self.effect_expression_closure_provenance(
-                            value,
-                            outer_bindings,
-                            &environment,
-                            summaries,
-                        );
-                        let actual_type =
-                            self.effect_expression_type(value, outer_bindings, &environment);
+                        let (actual_type, provenance) = if let Some(field) =
+                            input_fields.and_then(|fields| fields.get(index))
+                        {
+                            (input_field_type(*field), ClosureProvenance::empty())
+                        } else if let Some(value) = values.get(index) {
+                            self.extend_expression_closure_effects(
+                                value,
+                                outer_bindings,
+                                &environment,
+                                &mut effects,
+                                &mut complete,
+                                summaries,
+                            );
+                            (
+                                self.effect_expression_type(value, outer_bindings, &environment),
+                                self.effect_expression_closure_provenance(
+                                    value,
+                                    outer_bindings,
+                                    &environment,
+                                    summaries,
+                                ),
+                            )
+                        } else {
+                            break;
+                        };
                         if environment.locals.contains(name) {
                             environment.symbolic.insert(name.clone(), provenance);
                             environment.types.insert(name.clone(), actual_type);
@@ -8614,7 +8653,13 @@ impl Checker {
                                     _ => None,
                                 })
                         })
-                        .or_else(|| metadata::builtin_signature(name).map(|s| s.arg_modes)),
+                        .or_else(|| {
+                            if name == input::NAME {
+                                Some(vec![ParamMode::View; args.len()])
+                            } else {
+                                metadata::builtin_signature(name).map(|s| s.arg_modes)
+                            }
+                        }),
                     ExprKind::Field { target, name } => {
                         self.collect_method_argument_uses(target, name, args.len(), uses)
                     }
@@ -9732,6 +9777,7 @@ fn type_of_literal(literal: &Literal) -> Type {
         Literal::Float(_) => Type::Float,
         Literal::Bool(_) => Type::Bool,
         Literal::String(_) | Literal::TemplateString(_) => Type::String,
+        Literal::InputTemplate(_) => Type::Unknown,
         Literal::Null => Type::Null,
     }
 }
@@ -9742,6 +9788,7 @@ fn literal_key(literal: &Literal) -> String {
         Literal::Float(value) => format!("float:{value:?}"),
         Literal::Bool(value) => format!("bool:{value}"),
         Literal::String(value) | Literal::TemplateString(value) => format!("str:{value}"),
+        Literal::InputTemplate(template) => format!("input:{template:?}"),
         Literal::Null => "null".to_string(),
     }
 }

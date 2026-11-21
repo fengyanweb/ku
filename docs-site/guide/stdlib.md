@@ -10,6 +10,14 @@ import { fs, http, time, task } from "std"
 
 `fs`、`http`、`config`、`task`、`pg`、`redis`、`mysql` 需要显式导入。`string`、`array`、`json`、`time`、`lexer`、`parser` 仍保留历史直接调用能力。
 
+## input
+
+`input()` 从标准输入读一行。`input("请输入名字：")` 先显示提示，仍返回文本。空行是有效文本，只有未读到字符就结束才返回 `input.eof`。
+
+在直接传入的反引号模板中，``input(`我的名字是${}，今年${:int}岁。`)`` 支持按顺序填写。多格用 `name, age = input(…)?` 解构，全部成功才更新变量。文本保留空格和制表符，整数接受可选正负号及首尾的空格或制表符，并检查 64 位范围。用 `?` 或 `try/catch` 处理错误。完整例子见 [快速开始](./getting-started.md#读取用户输入)。
+
+管道或重定向下每格读一行，模板不输出提示，也不重试错误整数。普通字符串提示仍写入标准输出。`input` 用于同步命令行程序。
+
 ## fs
 
 ```ku

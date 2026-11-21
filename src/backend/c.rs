@@ -22,6 +22,8 @@ mod database_budget;
 mod http_short;
 #[path = "c_http_status.rs"]
 mod http_status;
+#[path = "c_input.rs"]
+mod input;
 #[path = "c_interop.rs"]
 mod interop;
 #[path = "c_service_output.rs"]
@@ -985,6 +987,7 @@ fn generate_c_source_with_frames_attempt(
         &mut nullable_emitted,
     )?;
     interop::emit(&mut out, program)?;
+    input::emit(&mut out, program)?;
     // Array helper bodies use element sizeof/clone/drop. Result and aggregate-
     // signature closure elements are complete only at this point. Result helper
     // bodies can already refer to the earlier clone/drop prototypes.
@@ -17292,6 +17295,9 @@ fn c_string_method_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
 
 fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String> {
     if let Some(expr) = interop::expression(name, args, ty)? {
+        return Ok(expr);
+    }
+    if let Some(expr) = input::expression(name, args, ty)? {
         return Ok(expr);
     }
     if let Some(expression) = http_client::intrinsic_expr(name, args)? {
