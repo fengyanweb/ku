@@ -241,7 +241,7 @@ fn main(): null {
 
 #[test]
 fn borrow_checker_same_call_indexed_copy_preserves_argument_order() {
-    let source = r#"
+    const COPY_INDEX_CALL_SOURCE: &str = r#"
 struct Item { label: str, count: int | null }
 fn Read(&items: [Item], count: int | null): int {
     if (count != null) { panic("null lost") }
@@ -261,8 +261,9 @@ fn main(): null {
     return null
 }
 "#;
-    accepts(source);
-    run_source("borrow-copy-index.ku", source).expect("indexed Copy reads preserve a shared View");
+    accepts(COPY_INDEX_CALL_SOURCE);
+    run_source("borrow-copy-index.ku", COPY_INDEX_CALL_SOURCE)
+        .expect("indexed Copy reads preserve a shared View");
 
     rejects(
         r#"fn Take(&items: [str], owned: str) {} fn main() { items = ["Ku"] Take(items, items[0]) }"#,
