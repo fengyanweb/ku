@@ -3756,10 +3756,11 @@ fn bootstrap_emits_typed_dependencies_for_real_parser_reject() {
     fs::write(
         &script,
         r#"import { ReadProjectModules } from "./project_manifest.ku"
-import { EmitLinkedNullC } from "./linked_null_c.ku"
+import { EmitLinkedNullC, PrepareLinkedNullProject } from "./linked_null_c.ku"
 fn main(): null! {
     supplied = ReadProjectModules(["stage2/expression_support.ku", "stage2/span.ku", "stage2/diagnostic.ku", "stage1/token.ku", "stage2/ast.ku"])?
-    generated = EmitLinkedNullC(supplied, "RejectAt")?
+    project = PrepareLinkedNullProject(supplied)?
+    generated = EmitLinkedNullC(project, "RejectAt")?
     print(generated.source)
     return ok(null)
 }

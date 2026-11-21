@@ -228,11 +228,12 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
                      &result: TypeNameBinding, depth: int): LinkedNullRegion! {
     next = state
     index = start
-    while (index < region.edge_count) {
+    limit = region.edge_count
+    while (index < limit) {
         id = LinkedNullChild(project, 1, region, index)
         statement = LinkedNullNode(project, 1, id)
         if (statement.kind == "Return" || statement.kind == "Fail") {
-            if (index != region.edge_count - 1) {
+            if (index != limit - 1) {
                 RejectLayout("unsupported_linked_terminal", "expected the terminal at the end of its block", DeclarationSpan(statement))?
             }
             if (statement.kind == "Fail") {
@@ -245,7 +246,7 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             } else { next = LowerLinkedSuccess(project, next, statement, result)? }
             return ok(LinkedNullRegion { state: next, terminal: true })
         }
-        if (statement.kind == "Try" && index == region.edge_count - 1) {
+        if (statement.kind == "Try" && index == limit - 1) {
             return lowerLinkedCatch(project, next, statement, id, result, depth)
         }
         if (statement.kind == "Assign" && statement.edge_count == 1) {
@@ -296,7 +297,7 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
         } else if (statement.kind == "If" && statement.edge_count > 1) {
             branch = addGuardedRegion(project, next, statement, result, depth)?
             if (branch.terminal) {
-                if (index != region.edge_count - 1) {
+                if (index != limit - 1) {
                     RejectLayout("unsupported_linked_terminal", "expected the terminal at the end of its block", DeclarationSpan(statement))?
                 }
                 return ok(branch)
@@ -329,13 +330,16 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
     return ok(LinkedNullRegion { state: next, terminal: false })
 }
 
-fn EmitLinkedNullC(&supplied: [SuppliedModule], &entry_name: str): LinkedNullC! {
+fn PrepareLinkedNullProject(supplied: [SuppliedModule]): LinkedNullProject! {
     if (supplied.len() == 0) {
         point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
         RejectLayout("missing_linked_entry_module", "a selected source module is required", point)?
     }
     bound = BindProjectModules(supplied)?
-    project = LinkedNullProject { supplied: supplied.clone(), binding: bound }
+    return ok(LinkedNullProject { supplied: supplied, binding: bound })
+}
+
+fn EmitLinkedNullC(&project: LinkedNullProject, &entry_name: str): LinkedNullC! {
     id = LinkedNullEntry(project, entry_name)?
     function = LinkedNullNode(project, 1, id)
     parameters = ReadLinkedNullParameters(project, function)?

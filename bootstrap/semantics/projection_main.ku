@@ -3,7 +3,7 @@ import { Span } from "../stage2/span.ku"
 import { ParseModule } from "../stage3/parser.ku"
 import { EmitGuardedStructC } from "./guarded_struct_c.ku"
 import { BindProjectImports, SuppliedModule } from "./imports.ku"
-import { EmitLinkedNullC } from "./linked_null_c.ku"
+import { EmitLinkedNullC, PrepareLinkedNullProject } from "./linked_null_c.ku"
 import { LinkedNullDependencyPlan } from "./linked_null_types_c.ku"
 import { EmitLinkPlan, LinkPlanDeclaration, NamedProjectionLinkPlan, StructProjectionLinkPlan } from "./link_plan_c.ku"
 import { EmitManagedArrayC } from "./managed_array_c.ku"
@@ -70,8 +70,9 @@ fn emitProjectFunction(&selected: SuppliedModule, &supplied: [SuppliedModule], &
     return ok(null)
 }
 
-fn emitLinkedNull(&supplied: [SuppliedModule], &function: str, plan: bool): null! {
-    generated = EmitLinkedNullC(supplied, function)?
+fn emitLinkedNull(supplied: [SuppliedModule], &function: str, plan: bool): null! {
+    project = PrepareLinkedNullProject(supplied)?
+    generated = EmitLinkedNullC(project, function)?
     if (!plan) {
         print(generated.source)
         return ok(null)
@@ -80,7 +81,7 @@ fn emitLinkedNull(&supplied: [SuppliedModule], &function: str, plan: bool): null
     for dependency in generated.links {
         links = links.push(LinkedNullDependencyPlan(dependency)?)
     }
-    print(EmitLinkPlan(supplied, "linked-null", generated.entry_plan, links)?)
+    print(EmitLinkPlan(project.supplied, "linked-null", generated.entry_plan, links)?)
     return ok(null)
 }
 
