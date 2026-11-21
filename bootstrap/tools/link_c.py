@@ -495,6 +495,12 @@ def program_caller(entry):
     if entry.signature != Signature((), checked, True):
         raise LinkError("--program requires a zero-argument linked null or null! entry")
     return f'''#include <stdio.h>
+#include <stdlib.h>
+
+/* The entry unit may use only Copy values and omit its string helpers. */
+static void ku_bootstrap_program_drop_error_part(KuProjectionString part) {{
+    if (part.storage == KU_PROJECTION_STRING_OWNED && part.ptr) free(part.ptr);
+}}
 
 int main(void) {{
     KuBootstrapResultNull result = {entry.symbol}();
@@ -502,9 +508,9 @@ int main(void) {{
     if (result.error.message.len)
         fwrite(result.error.message.ptr, 1, result.error.message.len, stderr);
     fputc('\\n', stderr);
-    ku_projection_string_drop(&result.error.domain);
-    ku_projection_string_drop(&result.error.code);
-    ku_projection_string_drop(&result.error.message);
+    ku_bootstrap_program_drop_error_part(result.error.domain);
+    ku_bootstrap_program_drop_error_part(result.error.code);
+    ku_bootstrap_program_drop_error_part(result.error.message);
     return 1;
 }}
 '''.encode("ascii")

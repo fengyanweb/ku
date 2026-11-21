@@ -712,6 +712,22 @@ def exercise_linked_program(compiler, cc, caller):
     missing = execute([binary], caller, 1)
     assert not missing.stdout and b"failed to read file" in missing.stderr
 
+    bare = caller / "linked-bare-checked-app"
+    bare.mkdir()
+    bare_source, bare_manifest = bare / "main.ku", bare / "modules.txt"
+    bare_manifest.write_text("main.ku\n", encoding="utf-8")
+    bare_binary = bare / binary.name
+    for source, status, stderr in (
+        ('fn main(): null! { skip = 7; return ok(null) }\n', 0, b""),
+        ('fn main(): null! { fail { domain: "entry", code: "failed", message: "错误🙂" } }\n',
+         1, "错误🙂\n".encode("utf-8")),
+    ):
+        bare_source.write_text(source, encoding="utf-8")
+        execute([sys.executable, "-B", builder, "--compiler", compiler, "--cc", cc,
+                 bare_manifest, "-o", bare_binary], caller)
+        result = execute([bare_binary], caller, status)
+        assert not result.stdout and result.stderr.replace(b"\r\n", b"\n") == stderr
+
 
 def exercise_direct_owned_moves(compiler, caller):
     project = caller / "direct-owned-moves"
