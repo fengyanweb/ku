@@ -177,6 +177,7 @@ def verify_stage3_applications(repo, source, binary, cc, caller):
             "exercise_glob_import": (cc, caller),
             "exercise_direct_owned_moves": (caller,),
             "exercise_plain_null_entry": (cc, caller),
+            "exercise_linked_program": (cc, caller),
         }
         for name, arguments in checks.items():
             try:
