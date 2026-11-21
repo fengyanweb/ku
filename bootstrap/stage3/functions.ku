@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
-import { RejectAt, RejectAtPoint, SpanFromNode, WindowToken } from "./support.ku"
+import { AppendStage3Node, RejectAt, RejectAtPoint, SpanFromNode, WindowToken } from "./support.ku"
 import { ReadFunctionHeader } from "./function_header.ku"
 import { DeclarationRead } from "./structs.ku"
 import { ReadFunctionBodySpan } from "./statements.ku"
@@ -84,134 +84,102 @@ fn ReadCompilerFunction(&tokens: [Token], first: int, last_index: int, parse_exp
     return ReadFunctionSpan(tokens, first, last_index, 0, parse_expression)
 }
 
-fn ReadFunctionSpan(&tokens: [Token], first: int, last_index: int, token_base: int, parse_expression: fn(int, int): ParseOutput!): DeclarationRead! {
-    function_start = WindowToken(tokens, first, last_index)
-    header = ReadFunctionHeader(tokens, first, last_index, 0)?
-    header_arena = header.arena
-    arena_nodes = header_arena.nodes
-    arena_edges = header_arena.edges
-    parse_steps = header.work
-    body_work = 0
-    body_span = SpanFromToken(WindowToken(tokens, last_index, last_index))
-    body_statements: [int] = []
+struct AttachedFunctionBody {
+    arena: Arena
+    statements: [int]
+    span: Span
+    work: int
+}
 
-    fn AddNode(kind: str, text: str, int_value: int, span: Span, children: [int], error_token: Token): int! {
-        if (arena_nodes.len() >= 4096) {
-            RejectAt(error_token.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")?
-        }
-        if (children.len() > 8192 - arena_edges.len()) {
-            RejectAt(error_token.clone(), "edge_limit", "stage-3 parser accepts at most 8192 AST edges")?
-        }
+fn AttachFunctionBody(parsed: ParseOutput, origin: Token, initial_work: int, arena: Arena): AttachedFunctionBody! {
+    // The body reader is an independently importable producer. Validate
+    // before using its transport metadata or any edge index.
+    validated = ValidateParseOutput(parsed)?
+    { root: parsed_root, arena: parsed_arena } = validated
+    { nodes: parsed_nodes, edges: parsed_edges } = parsed_arena
+    if (parsed_root <= 0 || parsed_root != parsed_nodes.len()) {
+        RejectAt(origin.clone(), "invalid_node_id", "function body transport root is invalid")?
+    }
+    transport = parsed_nodes[parsed_root - 1].clone()
+    if (transport.kind != "FunctionBodyTransport" || transport.text != "") {
+        RejectAt(origin.clone(), "invalid_node_id", "function body transport root has an invalid kind")?
+    }
+    if (transport.int_value < initial_work || transport.int_value > 16384) {
+        RejectAt(origin.clone(), "work_limit", "stage-3 parser work budget exceeded")?
+    }
+    if (transport.edge_count > 128) {
+        RejectAt(origin.clone(), "statement_limit", "stage-3 parser accepts at most 128 statements per function")?
+    }
+    body_node_count = parsed_nodes.len() - 1
+    body_edge_count = transport.first_edge
+    { nodes: arena_nodes, edges: arena_edges } = arena
+    if (body_node_count > 4096 - arena_nodes.len()) {
+        RejectAt(origin.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")?
+    }
+    if (body_edge_count > 8192 - arena_edges.len()) {
+        RejectAt(origin.clone(), "edge_limit", "stage-3 parser accepts at most 8192 AST edges")?
+    }
+    node_base = arena_nodes.len()
+    node_index = 0
+    while (node_index < body_node_count) {
+        input = parsed_nodes[node_index].clone()
         first_edge = arena_edges.len()
-        for child in children {
-            if (child <= 0 || child > arena_nodes.len()) {
-                RejectAt(error_token.clone(), "invalid_node_id", "AST edge references an invalid NodeId")?
+        edge_index = 0
+        while (edge_index < input.edge_count) {
+            child = parsed_edges[input.first_edge + edge_index]
+            if (child <= 0 || child > body_node_count) {
+                RejectAt(origin.clone(), "invalid_node_id", "function body contains an invalid NodeId")?
             }
-            arena_edges = arena_edges.push(child)
+            arena_edges = arena_edges.push(node_base + child)
+            edge_index = edge_index + 1
         }
-        node = Node {
-            kind: kind,
-            text: text,
-            int_value: int_value,
-            line: span.line,
-            column: span.column,
-            offset: span.offset,
-            end_line: span.end_line,
-            end_column: span.end_column,
-            end_offset: span.end_offset,
+        relocated = Node {
+            kind: input.kind,
+            text: input.text,
+            int_value: input.int_value,
+            line: input.line,
+            column: input.column,
+            offset: input.offset,
+            end_line: input.end_line,
+            end_column: input.end_column,
+            end_offset: input.end_offset,
             first_edge: first_edge,
             edge_count: arena_edges.len() - first_edge
         }
-        arena_nodes = arena_nodes.push(node)
-        return ok(arena_nodes.len())
+        arena_nodes = arena_nodes.push(relocated)
+        node_index = node_index + 1
     }
-
-    fn AttachFunctionBody(parsed: ParseOutput, origin: Token): null! {
-        // The body reader is an independently importable producer. Validate
-        // before using its transport metadata or any edge index.
-        validated = ValidateParseOutput(parsed)?
-        parsed_root = validated.root
-        parsed_arena = validated.arena
-        parsed_nodes = parsed_arena.nodes
-        parsed_edges = parsed_arena.edges
-        if (parsed_root <= 0 || parsed_root != parsed_nodes.len()) {
-            RejectAt(origin.clone(), "invalid_node_id", "function body transport root is invalid")?
+    body_statements: [int] = []
+    statement_index = 0
+    while (statement_index < transport.edge_count) {
+        child = parsed_edges[transport.first_edge + statement_index]
+        if (child <= 0 || child > body_node_count) {
+            RejectAt(origin.clone(), "invalid_node_id", "function body transport contains an invalid statement NodeId")?
         }
-        transport = parsed_nodes[parsed_root - 1].clone()
-        if (transport.kind != "FunctionBodyTransport" || transport.text != "") {
-            RejectAt(origin.clone(), "invalid_node_id", "function body transport root has an invalid kind")?
-        }
-        if (transport.int_value < parse_steps || transport.int_value > 16384) {
-            RejectAt(origin.clone(), "work_limit", "stage-3 parser work budget exceeded")?
-        }
-        if (transport.edge_count > 128) {
-            RejectAt(origin.clone(), "statement_limit", "stage-3 parser accepts at most 128 statements per function")?
-        }
-        body_node_count = parsed_nodes.len() - 1
-        body_edge_count = transport.first_edge
-        if (body_node_count > 4096 - arena_nodes.len()) {
-            RejectAt(origin.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")?
-        }
-        if (body_edge_count > 8192 - arena_edges.len()) {
-            RejectAt(origin.clone(), "edge_limit", "stage-3 parser accepts at most 8192 AST edges")?
-        }
-        node_base = arena_nodes.len()
-        node_index = 0
-        while (node_index < body_node_count) {
-            input = parsed_nodes[node_index].clone()
-            first_edge = arena_edges.len()
-            edge_index = 0
-            while (edge_index < input.edge_count) {
-                child = parsed_edges[input.first_edge + edge_index]
-                if (child <= 0 || child > body_node_count) {
-                    RejectAt(origin.clone(), "invalid_node_id", "function body contains an invalid NodeId")?
-                }
-                arena_edges = arena_edges.push(node_base + child)
-                edge_index = edge_index + 1
-            }
-            relocated = Node {
-                kind: input.kind,
-                text: input.text,
-                int_value: input.int_value,
-                line: input.line,
-                column: input.column,
-                offset: input.offset,
-                end_line: input.end_line,
-                end_column: input.end_column,
-                end_offset: input.end_offset,
-                first_edge: first_edge,
-                edge_count: arena_edges.len() - first_edge
-            }
-            arena_nodes = arena_nodes.push(relocated)
-            node_index = node_index + 1
-        }
-        statement_index = 0
-        while (statement_index < transport.edge_count) {
-            child = parsed_edges[transport.first_edge + statement_index]
-            if (child <= 0 || child > body_node_count) {
-                RejectAt(origin.clone(), "invalid_node_id", "function body transport contains an invalid statement NodeId")?
-            }
-            body_statements = body_statements.push(node_base + child)
-            statement_index = statement_index + 1
-        }
-        body_work = transport.int_value
-        body_span = SpanFromNode(transport)
-        return ok(null)
+        body_statements = body_statements.push(node_base + child)
+        statement_index = statement_index + 1
     }
+    body_work = transport.int_value
+    body_span = SpanFromNode(transport)
+    return ok(AttachedFunctionBody { arena: Arena { nodes: arena_nodes, edges: arena_edges },
+        statements: body_statements, span: body_span, work: body_work })
+}
 
-    body_start = header.body_open + 1
-    body_output = ReadFunctionBodySpan(tokens, body_start, last_index, token_base, parse_steps, parse_expression)?
-    AttachFunctionBody(body_output, function_start.clone())?
-    parse_steps = body_work
+fn ReadFunctionSpan(&tokens: [Token], first: int, last_index: int, token_base: int, parse_expression: fn(int, int): ParseOutput!): DeclarationRead! {
+    function_start = WindowToken(tokens, first, last_index)
+    header = ReadFunctionHeader(tokens, first, last_index, 0)?
+    { name: function_name, arena: header_arena, children: function_children, body_open: body_open, work: initial_work } = header
+    body_start = body_open + 1
+    body_output = ReadFunctionBodySpan(tokens, body_start, last_index, token_base, initial_work, parse_expression)?
+    attached = AttachFunctionBody(body_output, function_start.clone(), initial_work, header_arena)?
+    { arena: body_arena, statements: body_statements, span: body_span, work: body_work } = attached
 
-    function_children = header.children
     for statement in body_statements { function_children = function_children.push(statement) }
     function_kind = "Function"
     if (function_start.kind == "Async") { function_kind = "AsyncFunction" }
-    function = AddNode(function_kind, header.name, 0, SpanMerge(SpanFromToken(function_start.clone()), body_span.clone()), function_children, function_start.clone())?
-    output = ValidateParseOutput(ParseOutput {
-        arena: Arena { nodes: arena_nodes.clone(), edges: arena_edges.clone() },
-        root: function
-    })?
-    return ok(DeclarationRead { output: output, consumed: last_index - first, work: parse_steps, start: function_start })
+    appended = AppendStage3Node(function_kind, function_name, 0,
+        SpanMerge(SpanFromToken(function_start.clone()), body_span), function_children, function_start.clone(), body_arena)?
+    { arena: function_arena, root: function } = appended
+    output = ValidateParseOutput(ParseOutput { arena: function_arena, root: function })?
+    return ok(DeclarationRead { output: output, consumed: last_index - first, work: body_work, start: function_start })
 }
