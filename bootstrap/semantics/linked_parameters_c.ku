@@ -8,7 +8,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { LinkedNullBinding, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
 import { LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullParameterPlan,
-         LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedNullView, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
+         LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 
 struct LinkedNullParameters {
     state: LinkedNullState
@@ -143,8 +143,8 @@ fn ReadLinkedNullParameters(&project: LinkedNullProject, &function: Node): Linke
     state.plain_value_result = declared.kind == "TypeArray" || plain_named
     result = ReadLinkedResult(project, 1, result_id, !state.plain_value_result)?
     copy = result.declaration_kind == "Builtin" && (result.name == "bool" || result.name == "int")
-    if (plain_named && !copy && result.declaration_kind != "Struct") {
-        RejectLayout("linked_value_result", "a plain named result requires builtin int, builtin bool or a bound struct", result.span.clone())?
+    if (plain_named && !copy && !LinkedStringResult(result) && result.declaration_kind != "Struct") {
+        RejectLayout("linked_value_result", "a plain named result requires builtin int, bool, str or a bound struct", result.span.clone())?
     }
     if (index == 0) { signature = "void" }
     state.code = state.code + validation

@@ -718,6 +718,9 @@ fn ReadAfterMove(path: str): str! {
     moved = Decorate(path)
     return ok(path)
 }
+fn PlainLiteral(): str { return "源🙂" }
+fn PlainOwner(source: str): str { return source }
+fn PlainBorrow(&source: str): str { return source }
 "#;
 
 const ADD_CALL_PROVIDER: &str = r#"
@@ -823,6 +826,59 @@ pub(super) fn assert_linked_call_addition(seed: &Path, cwd: &Path) {
     assert_eq!(bad.status.code(), Some(1));
     assert!(bad.stdout.is_empty());
     assert!(String::from_utf8_lossy(&bad.stderr).contains("unavailable_linked_binding"));
+    for name in ["PlainLiteral", "PlainOwner"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let result = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&result);
+        let code = String::from_utf8(result.stdout).unwrap();
+        let entry = code
+            .lines()
+            .find_map(|line| line.strip_prefix("KuProjectionString ku_linked_null_"))
+            .unwrap()
+            .split_once('(')
+            .unwrap()
+            .0;
+        let expression = if name == "PlainLiteral" {
+            "()"
+        } else {
+            "((KuProjectionString){data, 7, 7, KU_PROJECTION_STRING_OWNED})"
+        };
+        let main = r#"
+int main(void) {
+    (void)test_realloc;
+    uint8_t *data = NULL;
+    if (__OWNED__) {
+        data = malloc(7);
+        assert(data);
+        memcpy(data, "payload", 7);
+    }
+    KuProjectionString result = __CALL__;
+    assert(result.len == 7);
+    if (__OWNED__) { assert(result.ptr == data && outstanding() == 1); }
+    else { assert(result.storage == KU_PROJECTION_STRING_STATIC && outstanding() == 0); }
+    ku_projection_string_drop(&result);
+    assert(outstanding() == 0);
+    return 0;
+}
+"#
+        .replace("__CALL__", &format!("ku_linked_null_{entry}{expression}"))
+        .replace(
+            "__OWNED__",
+            if name == "PlainOwner" {
+                "true"
+            } else {
+                "false"
+            },
+        );
+        fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{main}")).unwrap();
+        let binary = cwd.join(format!("plain-string{}", std::env::consts::EXE_SUFFIX));
+        compile_projection(&source, &binary, cwd);
+        assert_ok(&execute(&mut Command::new(&binary), cwd, 15));
+    }
+    fs::write(cwd.join("function.txt"), "PlainBorrow").unwrap();
+    let escaped = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(escaped.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&escaped.stderr).contains("linked_value_return"));
 }
 
 const DECORATED_CATCH_SOURCE: &str = r#"import { Supply, Decorate } from "./decorated-provider.ku"
