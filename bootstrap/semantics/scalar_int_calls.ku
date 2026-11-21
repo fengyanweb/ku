@@ -39,11 +39,12 @@ fn ScalarIntCalleeSignature(&nodes: [Node], &edges: [int], &bindings: [TypeNameB
     has_string = false
     parameter_limit = function.edge_count
     while (arity < parameter_limit) {
-        parameter = nodes[edges[function.first_edge + arity] - 1].clone()
-        if (parameter.kind != "Parameter") {
-            result_type = scalarReturnType(nodes, edges, bindings, edges[function.first_edge + arity])
+        parameter_node = edges[function.first_edge + arity]
+        if (nodes[parameter_node - 1].kind != "Parameter") {
+            result_type = scalarReturnType(nodes, edges, bindings, parameter_node)
             return ScalarIntSignature { arity: arity, has_string_parameter: has_string, result_type: result_type }
         }
+        parameter = nodes[parameter_node - 1].clone()
         if (parameter.edge_count == 1) {
             type_node = edges[parameter.first_edge]
             parameter_type = scalarType(bindings, type_node, nodes[type_node - 1])
