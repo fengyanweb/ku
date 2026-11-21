@@ -713,7 +713,10 @@ fn Run(first: str, second: str, reject: bool): int! {
     if (frame.label != "second") { fail { domain: "test", code: "owner", message: "wrong live record" } }
     result = Nested { frame: Frame { label: "result", count: 0 }, complete: true }
     if (result.complete) { result.frame.count = items[0] * 100 }
-    return ok(result.frame.count + items[1])
+    summaries: [Nested] = []
+    summaries = summaries.push(result)
+    summaries[0].frame.count = summaries[0].frame.count + items[1]
+    return ok(summaries[0].frame.count)
 }
 "#;
     let ku = cwd.join("record-capture.ku");

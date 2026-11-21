@@ -1,8 +1,13 @@
+import { EmitLinkedArrayBody, StructArrayStatuses } from "./struct_array_c.ku"
+import { GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
+import { ScalarCheckedMultiplyC, ScalarStringHelpers } from "./scalar_int_emit.ku"
+import { StructResultHeader } from "./struct_result_c.ku"
+import { LinkedIntSnapshotRuntime } from "./guarded_string_parts.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedNullCType, LinkedNullNode, LinkedNullParameterPlan, LinkedNullProject, LinkedNullResultType, LinkedNullType, LinkedResultPlan, SameLinkedType } from "./linked_null_types_c.ku"
 import { Span } from "../stage2/span.ku"
 import { SuppliedModule } from "./imports.ku"
 import { DeclarationSpan } from "./names.ku"
-import { AppendLinkedCheckedInvocation, ExitLinkedFailure, FsReadLinkPlan, LinkedCheckedCall, LinkedFailureTarget, LinkPlanDeclaration, LinkPlanNominalType, LinkPlanType, LinkedIntArrayCallbackFunction, LinkedNullArguments, LinkedNullFunction, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { AppendLinkedCheckedInvocation, ExitLinkedFailure, FsReadLinkPlan, LinkedCPrelude, LinkedCheckedCall, LinkedFailureTarget, LinkPlanDeclaration, LinkPlanNominalType, LinkPlanType, LinkedIntArrayCallbackFunction, LinkedNullArguments, LinkedNullExpression, LinkedNullFunction, LinkedNullState, LinkedReadonlyExpression, LinkedNullValue } from "./link_plan_c.ku"
 import { LinkPlanJsonControls, LinkPlanJsonText } from "./project_paths.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
@@ -221,4 +226,32 @@ fn EmitLinkedScopedCallbackCall(arguments: LinkedNullArguments, &callback: Linke
         next.code += "    result = " + invoke + ";\n" + arguments.handoff + "    goto cleanup;\n"
     }
     return ok(LinkedCheckedCall { state: next, result: result_type, text: result, id: id })
+}
+
+fn HoldLinkedCopyOperand(value: LinkedNullExpression, target: int): LinkedNullExpression! {
+    ty = value.value.ty.clone()
+    if (ty.declaration_kind != "Builtin" || (ty.name != "int" && ty.name != "bool")) { return ok(value) }
+    carrier = LinkedNullCType(ty)?
+    name = "member_rhs" + str(target)
+    next = value.state
+    next.code += "    " + carrier + " " + name.clone() + " = " + value.value.text + ";\n"
+    return ok(LinkedReadonlyExpression(next, ty, name))
+}
+
+fn EmitLinkedBodyPrelude(&body: LinkedNullState): str! {
+    ops = GuardArithmetic(body.uses_add, body.uses_sub)
+    if (body.uses_mul || body.uses_div) { ops += "#include <stdio.h>\n#include <stdlib.h>\n\n" }
+    if (body.uses_mul) { ops += ScalarCheckedMultiplyC() }
+    if (body.uses_string_contains) {
+        ops += ScalarStringHelpers(false, false, true, false, false, false, false)
+        ops += "static bool ku_linked_string_contains(KuProjectionString hay, KuProjectionString needle) {\n"
+            + "    return ku_scalar_string_contains(hay.ptr, hay.len, needle.ptr, needle.len);\n}\n\n"
+    }
+    header = LinkedCPrelude(body, ops + GuardStringEquality(body.uses_string_equal))
+    declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
+    if (body.local_appends.len() > 0 && body.append_slots.len() == 0 && body.local_append_types.len() == 0) {
+        declarations += StructArrayStatuses()
+    }
+    if (body.uses_int_snapshot) { declarations += LinkedIntSnapshotRuntime() }
+    return ok(declarations)
 }

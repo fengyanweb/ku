@@ -1,13 +1,11 @@
-import { LinkedNullPrototype, LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
-import { FinishLinkedFunctionC, GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
-import { ScalarCheckedMultiplyC, ScalarStringHelpers } from "./scalar_int_emit.ku"
-import { StructResultHeader, StructValueResultHeader } from "./struct_result_c.ku"
-import { EmitLinkedArrayBody, StructArrayStatuses } from "./struct_array_c.ku"
+import { EmitLinkedBodyPrelude, HoldLinkedCopyOperand, LinkedNullPrototype, LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
+import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
+import { StructValueResultHeader } from "./struct_result_c.ku"
 import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult, LinkedIntAppendCallbackDeclaration, LinkedIntArrayCallbackDeclaration } from "./struct_projection_c.ku"
 import { TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { CheckLinkedStringAppendTarget, FinishLinkedFieldAppend, FinishLinkedStringAppend, LinkedFieldAppendArgument, LowerLinkedArrayBinding } from "./linked_array_fields_c.ku"
-import { LinkedIntSnapshotRuntime, ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
+import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
 import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
@@ -18,7 +16,7 @@ import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, Linked
          LinkedNullNode, LinkedNullProject,  LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { LinkedFieldRoot, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue, LowerLinkedScopedCallbackCall } from "./linked_null_values_c.ku"
-import { LinkedCPrelude, IsLinkedScopedCallback, LinkedScopedCallbackTypes, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
+import { IsLinkedScopedCallback, LinkedScopedCallbackTypes, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedOkAvailable, LinkedRecordFields } from "./link_plan_c.ku"
 
 fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunction], &slots: [LinkedNullSlot],
@@ -110,20 +108,7 @@ fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunc
 }
 
 fn EmitLinkedNullDeclarations(&project: LinkedNullProject, &body: LinkedNullState, &result: TypeNameBinding): str! {
-    ops = GuardArithmetic(body.uses_add, body.uses_sub)
-    if (body.uses_mul || body.uses_div) { ops += "#include <stdio.h>\n#include <stdlib.h>\n\n" }
-    if (body.uses_mul) { ops += ScalarCheckedMultiplyC() }
-    if (body.uses_string_contains) {
-        ops += ScalarStringHelpers(false, false, true, false, false, false, false)
-        ops += "static bool ku_linked_string_contains(KuProjectionString hay, KuProjectionString needle) {\n"
-            + "    return ku_scalar_string_contains(hay.ptr, hay.len, needle.ptr, needle.len);\n}\n\n"
-    }
-    header = LinkedCPrelude(body, ops + GuardStringEquality(body.uses_string_equal))
-    declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
-    if (body.local_appends.len() > 0 && body.append_slots.len() == 0 && body.local_append_types.len() == 0) {
-        declarations += StructArrayStatuses()
-    }
-    if (body.uses_int_snapshot) { declarations += LinkedIntSnapshotRuntime() }
+    declarations = EmitLinkedBodyPrelude(body)?
     checked = !body.plain_value_result
     return ok(declarations + EmitLinkedNullPrototypes(project, body.links, body.slots, body.local_appends, result, checked)?)
 }
@@ -182,7 +167,8 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     slot = LinkedNullBinding(state.slots, root.text)
     capture = slot > 0 && state.slots[slot - 1].parameter && ContainsIndex(state.append_captures, slot)
     if (root.kind != "Variable" || root.edge_count != 0 || slot == 0 || (state.slots[slot - 1].parameter && (!capture || nested)) ||
-        state.slots[slot - 1].value.borrowed || state.slots[slot - 1].value.ty.declaration_kind != "Struct") {
+        state.slots[slot - 1].value.borrowed || (state.slots[slot - 1].value.ty.declaration_kind != "Struct" &&
+            !(nested && LinkedNullOwnedArray(state.slots[slot - 1].value.ty)))) {
         RejectLayout("linked_member_target", "assignment requires a direct field of a mutable local record", DeclarationSpan(root))?
     }
 
@@ -199,6 +185,7 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     // target in the resulting state. The old member still belongs to cleanup
     // if the RHS fails or consumes its record.
     rhs = LowerLinkedNullValue(project, state, rhs_id, 0)?
+    if (nested) { rhs = HoldLinkedCopyOperand(rhs, target_id)? }
     replacement = rhs.value.clone()
     place = LowerLinkedNullRead(project, rhs.state, target_id, 0)?
     ty = place.value.ty.clone()

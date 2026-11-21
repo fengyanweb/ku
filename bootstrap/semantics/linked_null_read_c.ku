@@ -211,9 +211,14 @@ fn ReadLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalRea
 fn LinkedFieldRoot(&project: LinkedNullProject, receiver: int): int {
     cursor = receiver
     depth = 0
+    indexed = false
     while (depth < 32) {
         node = LinkedNullNode(project, 1, cursor)
-        if (node.kind != "Field" || node.edge_count != 1) { return cursor }
+        if (node.kind == "Index" && node.edge_count == 2 && !indexed) {
+            indexed = true
+        } else if (node.kind != "Field" || node.edge_count != 1) {
+            return cursor
+        }
         cursor = LinkedNullChild(project, 1, node, 0)
         depth = depth + 1
     }
