@@ -2401,6 +2401,52 @@ int main(void) {
     }
 }
 
+#[test]
+fn project_link_plan_uses_standard_json_string_quoting_in_the_interpreter() {
+    let sandbox = Temp::new();
+    stage_sources(&sandbox.0);
+    fs::write(
+        sandbox.0.join("quote-plan.ku"),
+        r#"import { fs } from "std"
+import { EmitLinkPlan, FsReadLinkPlan } from "./semantics/link_plan_c.ku"
+import { SuppliedModule } from "./semantics/imports.ku"
+
+fn main(): null! {
+    mode = fs.read("mode.bin")?
+    supplied: [SuppliedModule] = []
+    export = FsReadLinkPlan("ku_linked_dep_fs_read")
+    print(EmitLinkPlan(supplied, mode, export, [])?)
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let ku_bin = std::env::var_os("KU_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ku")));
+    let escapes = String::from("\"\\/中🙂") + &(0_u8..32).map(char::from).collect::<String>();
+    for mode in [
+        String::from("linked-null"),
+        escapes.clone(),
+        escapes.repeat(20),
+    ] {
+        fs::write(sandbox.0.join("mode.bin"), mode.as_bytes()).unwrap();
+        let output = execute(
+            Command::new(&ku_bin).args(["run", "quote-plan.ku"]),
+            &sandbox.0,
+            15,
+        );
+        assert_ok(&output);
+        assert!(output.stderr.is_empty());
+        let quoted = json::stringify_value(&Value::String(mode), Span::default()).unwrap();
+        let expected =
+            format!("{{\"schema\":\"ku-bootstrap-link-plan-v1\",\"mode\":{quoted},\"export\":");
+        let actual = String::from_utf8(output.stdout).unwrap();
+        assert!(actual.starts_with(&expected), "{actual:?}");
+        assert!(actual.ends_with(",\"dependencies\":[]}\n"), "{actual:?}");
+    }
+}
+
 fn assert_project_link_plans(driver: &Path, cwd: &Path) {
     for (path, source) in [
         (

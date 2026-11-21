@@ -1,4 +1,4 @@
-import { json } from "std"
+import { LinkPlanJsonControls, LinkPlanJsonText } from "./project_paths.ku"
 import { LinkedLocalReadBinding, RejectMissingLinkedValue } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -190,18 +190,18 @@ fn EmptyLinkPlanDeclaration(): LinkPlanDeclaration {
     return LinkPlanDeclaration { unit: 0, node: 0, symbol: "", parameters: [], result: NullLinkPlanResult(), returns_result: false }
 }
 
-fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType): str! {
+fn plannedType(&supplied: [SuppliedModule], &ty: LinkPlanType, &controls: str): str! {
     name = ty.name.clone()
     path = "null"
     if (ty.unit > 0) {
-        path = json.encode(supplied[ty.unit - 1].path.clone())?
+        path = LinkPlanJsonText(supplied[ty.unit - 1].path.clone(), controls)?
         name = supplied[ty.unit - 1].named.parsed.arena.nodes[ty.node - 1].text.clone()
     }
     passing = "value"
     if (ty.view) { passing = "view" }
-    return ok("{\"kind\":" + json.encode(ty.kind.clone())? + ",\"source_name\":" + json.encode(name)?
-        + ",\"source_path\":" + path + ",\"node\":" + str(ty.node) + ",\"c_type\":" + json.encode(ty.c_type.clone())?
-        + ",\"passing\":" + json.encode(passing)? + "}")
+    return ok("{\"kind\":" + LinkPlanJsonText(ty.kind.clone(), controls)? + ",\"source_name\":" + LinkPlanJsonText(name, controls)?
+        + ",\"source_path\":" + path + ",\"node\":" + str(ty.node) + ",\"c_type\":" + LinkPlanJsonText(ty.c_type.clone(), controls)?
+        + ",\"passing\":" + LinkPlanJsonText(passing, controls)? + "}")
 }
 
 fn FsReadLinkPlan(symbol: str): LinkPlanDeclaration {
@@ -210,7 +210,7 @@ fn FsReadLinkPlan(symbol: str): LinkPlanDeclaration {
     return LinkPlanDeclaration { unit: 0, node: 1, symbol: symbol, parameters: [path], result: result, returns_result: true }
 }
 
-fn plannedDeclaration(&supplied: [SuppliedModule], &declaration: LinkPlanDeclaration): str! {
+fn plannedDeclaration(&supplied: [SuppliedModule], &declaration: LinkPlanDeclaration, &controls: str): str! {
     name = ""
     path = ""
     if (declaration.unit > 0) {
@@ -225,28 +225,29 @@ fn plannedDeclaration(&supplied: [SuppliedModule], &declaration: LinkPlanDeclara
         name = builtin.name
         path = builtin.path
     }
-    text = "{\"source_path\":" + json.encode(path)? + ",\"node\":" + str(declaration.node)
-        + ",\"source_name\":" + json.encode(name)? + ",\"symbol\":" + json.encode(declaration.symbol.clone())?
+    text = "{\"source_path\":" + LinkPlanJsonText(path, controls)? + ",\"node\":" + str(declaration.node)
+        + ",\"source_name\":" + LinkPlanJsonText(name, controls)? + ",\"symbol\":" + LinkPlanJsonText(declaration.symbol.clone(), controls)?
         + ",\"signature\":{\"parameters\":["
     index = 0
     while (index < declaration.parameters.len()) {
         if (index > 0) { text += "," }
-        text += plannedType(supplied, declaration.parameters[index])?
+        text += plannedType(supplied, declaration.parameters[index], controls)?
         index = index + 1
     }
     wrapper = "false"
     if (declaration.returns_result) { wrapper = "true" }
-    return ok(text + "],\"result\":" + plannedType(supplied, declaration.result)?
+    return ok(text + "],\"result\":" + plannedType(supplied, declaration.result, controls)?
         + ",\"returns_result\":" + wrapper + "}}")
 }
 
 fn EmitLinkPlan(&supplied: [SuppliedModule], &mode: str, &entry: LinkPlanDeclaration, &links: [LinkPlanDeclaration]): str! {
-    text = "{\"schema\":\"ku-bootstrap-link-plan-v1\",\"mode\":" + json.encode(mode.clone())?
-        + ",\"export\":" + plannedDeclaration(supplied, entry)? + ",\"dependencies\":["
+    controls = LinkPlanJsonControls()?
+    text = "{\"schema\":\"ku-bootstrap-link-plan-v1\",\"mode\":" + LinkPlanJsonText(mode.clone(), controls)?
+        + ",\"export\":" + plannedDeclaration(supplied, entry, controls)? + ",\"dependencies\":["
     index = 0
     while (index < links.len()) {
         if (index > 0) { text += "," }
-        text += plannedDeclaration(supplied, links[index])?
+        text += plannedDeclaration(supplied, links[index], controls)?
         index = index + 1
     }
     return ok(text + "]}\n")
