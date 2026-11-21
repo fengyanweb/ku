@@ -184,8 +184,8 @@ fn patternBinding(
 }
 
 fn checkPatternField(&seen: [str], &field: Token, initial_work: int): int! {
-    index = 0
     work = initial_work
+    index = 0
     while (index < seen.len()) {
         work = NextBodyWork(work, 1, field.clone())?
         if (seen[index] == field.lexeme) {
