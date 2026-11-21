@@ -24,10 +24,11 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     if (ty.declaration_kind == "Builtin" && ty.name == "str") {
         return CloneLinkedStringSlot(project, source, "t" + str(id))
     }
+    // A tracked owned field uses the same checked clone as a named array.
+    if (LinkedNullOwnedArray(ty)) { return CloneLinkedRecordArray(project, source, id) }
     if (field && ty.declaration_kind != "Struct") {
         RejectLayout("unsupported_linked_clone", "field clone requires a bound str or finite struct", DeclarationSpan(subject))?
     }
-    if (LinkedNullOwnedArray(ty)) { return CloneLinkedRecordArray(project, source, id) }
     if (ty.declaration_kind != "Struct") {
         RejectLayout("unsupported_linked_clone", "expected str or a finite struct for clone", DeclarationSpan(subject))?
     }

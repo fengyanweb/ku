@@ -4434,6 +4434,7 @@ int main(int argc, char **argv) {
     linked_guard::assert_named_counted_bound(&compiler, &cwd);
     struct_view::assert_lazy_readonly_bool_call(&compiler, &cwd);
     struct_view::assert_owned_string_field_clone(&compiler, &cwd);
+    struct_view::assert_owned_record_array_field_clone(&compiler, &cwd);
     struct_view::assert_stable_owned_count_bound(&compiler, &cwd);
     struct_view::assert_conditional_partial_members(&compiler, &cwd);
     struct_view::assert_string_prefix_suffix(&compiler, &cwd);

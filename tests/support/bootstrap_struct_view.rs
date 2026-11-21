@@ -1186,6 +1186,125 @@ int main(int argc, char **argv) {
 }
 "#;
 
+pub(super) fn assert_owned_record_array_field_clone(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("array-field-clone.ku"),
+        r#"struct Word { text: str }
+struct Entry { original: Word, alias: Word }
+struct Batch { entries: [Entry], label: str }
+struct Outcome { retained: [Entry], copied: [Entry], label: str }
+fn Snapshot(batch: Batch): Outcome! {
+    copied = batch.entries.clone()
+    retained = batch.entries
+    label = batch.label
+    return ok(Outcome { retained: retained, copied: copied, label: label })
+}
+fn View(&batch: Batch): [Entry]! {
+    copied = batch.entries.clone()
+    return ok(copied)
+}
+fn Take(entries: [Entry]): null! { return ok(null) }
+fn Moved(batch: Batch): [Entry]! {
+    Take(batch.entries)?
+    copied = batch.entries.clone()
+    return ok(copied)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "array-field-clone.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let emit = |entry| {
+        fs::write(cwd.join("function.txt"), entry).unwrap();
+        execute(&mut Command::new(seed), cwd, 30)
+    };
+    let emitted = emit("Snapshot");
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, parameters) = signature.split_once('(').unwrap();
+    let batch = parameters.strip_suffix(" a0) {").unwrap();
+    let outcome = result.strip_prefix("KuBootstrapResult_").unwrap();
+    let element = code
+        .lines()
+        .find_map(|line| line.split_once(" } KuArray_"))
+        .unwrap()
+        .1
+        .strip_suffix(';')
+        .unwrap();
+    let host = r#"
+static KuProjectionString owned(uint8_t value) {
+    uint8_t *data = malloc(1);
+    assert(data);
+    *data = value;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+static void check_failure(void) { assert(attempts == 11 && !outstanding()); }
+int main(int argc, char **argv) {
+    (void)argv;
+    (void)test_realloc;
+    ELEMENT *original = malloc(2 * sizeof(*original));
+    assert(original);
+    BATCH input = {.f0 = {2, original, 2}, .f1 = owned('z')};
+    uint8_t *label = input.f1.ptr;
+    for (size_t i = 0; i < 2; ++i) {
+        original[i].f0.f0 = owned((uint8_t)('a' + i));
+        original[i].f1.f0 = owned((uint8_t)('A' + i));
+    }
+    if (argc > 1) {
+        // Header, both strings in entry zero, and the first string in entry
+        // one succeed. The next allocation fails in the partial element.
+        fail_after = 4;
+        assert(atexit(check_failure) == 0);
+        (void)ENTRY(input);
+        return 90;
+    }
+    RESULT result = ENTRY(input);
+    assert(result.ok && attempts == 11 && outstanding() == 11);
+    assert(result.value.f0.data == original && result.value.f1.data != original);
+    assert(result.value.f0.len == 2 && result.value.f1.len == 2);
+    assert(result.value.f2.ptr == label && *label == 'z');
+    for (size_t i = 0; i < 2; ++i) {
+        ELEMENT copied = result.value.f1.data[i];
+        assert(copied.f0.f0.ptr != original[i].f0.f0.ptr && *copied.f0.f0.ptr == (uint8_t)('a' + i));
+        assert(copied.f1.f0.ptr != original[i].f1.f0.ptr && *copied.f1.f0.ptr == (uint8_t)('A' + i));
+    }
+    DROP(&result.value);
+    assert(!outstanding());
+    result = ENTRY((BATCH){0});
+    assert(result.ok && !result.value.f0.len && !result.value.f1.len);
+    DROP(&result.value);
+    assert(attempts == 11 && !outstanding());
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("RESULT", result)
+    .replace("BATCH", batch)
+    .replace("ELEMENT", element)
+    .replace("DROP", &format!("ku_drop_{outcome}"));
+    let c = cwd.join("array-field-clone.c");
+    let exe = cwd.join(format!("array-field-clone{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    let oom = execute(Command::new(exe).arg("partial"), cwd, 10);
+    assert_eq!(oom.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&oom.stderr).trim(), "out of memory");
+    for (name, reason) in [
+        ("View", "unsupported_linked_clone"),
+        ("Moved", "linked_moved_member"),
+    ] {
+        let rejected = emit(name);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(reason));
+    }
+}
+
 pub(super) fn assert_owned_string_field_clone(seed: &Path, cwd: &Path) {
     fs::write(cwd.join("field-string.ku"), STR_FIELD_SOURCE).unwrap();
     fs::write(cwd.join("modules.txt"), "field-string.ku\n").unwrap();
