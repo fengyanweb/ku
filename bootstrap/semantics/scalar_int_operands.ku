@@ -75,14 +75,16 @@ fn ScalarStringOperand(&parameters: [ScalarIntParameter], &node: Node): str! {
 
 // A local declaration or imported alias can shadow a builtin call.
 fn HasScalarBuiltin(&named: NamedModule, &name: str): bool {
+    declaration_count = named.names.declarations.len()
     index = 0
-    while (index < named.names.declarations.len()) {
+    while (index < declaration_count) {
         if (named.names.declarations[index].name == name) { return false }
         index = index + 1
     }
-    index = 0
-    while (index < named.names.imports.len()) {
-        group = named.parsed.arena.nodes[named.names.imports[index] - 1].clone()
+    import_count = named.names.imports.len()
+    import_index = 0
+    while (import_index < import_count) {
+        group = named.parsed.arena.nodes[named.names.imports[import_index] - 1].clone()
         child = 0
         while (child < group.edge_count) {
             request = named.parsed.arena.nodes[named.parsed.arena.edges[group.first_edge + child] - 1].clone()
@@ -92,7 +94,7 @@ fn HasScalarBuiltin(&named: NamedModule, &name: str): bool {
             } else if (request.text == name) { return false }
             child = child + 1
         }
-        index = index + 1
+        import_index = import_index + 1
     }
     return true
 }
