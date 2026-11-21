@@ -1482,6 +1482,23 @@ fn main(): null! {
         install, root / 'pattern-capture-project', env, target, files, '2\n2\nnull\n2\n0\nnew:tail🙂\n')
 
 
+def installed_task_array_import_consumer(install, root, env, report, repo, commit, target):
+    """Exercise imported Task arrays using the same files as the native source regression."""
+    fixture = 'tests/fixtures/native_task_array_import'
+
+    def read_fixture(name):
+        result = invoke(['git', 'show', f'{commit}:{fixture}/{name}'], repo, env)
+        if result.returncode:
+            raise RuntimeError(f'cannot read committed Task array fixture: {fixture}/{name}')
+        return EXPORT.canonical_example(result.stdout).decode('utf-8')
+
+    files = {name: read_fixture(name) for name in ('main.ku', 'worker.ku')}
+    expected = read_fixture('expected.txt')
+    detail = validate_installed_relative_program(install, root / 'task-array-import-project', env, target, files, expected)
+    report['installed_task_array_import'] = dict(
+        detail, fixture_sha256=hashlib.sha256(EXPORT.json_bytes({**files, 'expected.txt': expected})).hexdigest())
+
+
 def installed_build_interrupt_consumer(install, root, repo, env, manifest, report):
     name = 'interrupted_build_reaps_its_compiler_group_and_preserves_previous_output'
     ku = install / manifest['cli']['path']
@@ -1653,6 +1670,7 @@ def run_structured_only(args, report):
             installed_task_error_consumer(install, root, env, report, target)
             installed_task_optional_consumer(install, root, env, report, target)
             installed_pattern_capture_consumer(install, root, env, report, target)
+            installed_task_array_import_consumer(install, root, env, report, repo, verifier, target)
             installed_collection_and_copy_consumers(install, root, repo, env, report, target)
     if not args.bootstrap_generations:
         report['backend_equivalence'] = True

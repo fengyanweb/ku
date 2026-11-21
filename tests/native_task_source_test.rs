@@ -3219,46 +3219,17 @@ fn native_task_source_imported_array_module_preserves_owners_and_shadowing() {
     fs::create_dir(&sources).unwrap();
     fs::write(
         sources.join("worker.ku"),
-        r#"
-import array from "std.array"
-import time from "std.time"
-
-struct Reply { text: str | null }
-
-async fn Pick(items: [str]): Reply! {
-    words = items
-    first = array.first(words)
-    words = []
-    time.sleep(1)?
-    return ok(Reply { text: first })
-}
-
-async fn Local(array: [str]): Reply! {
-    return ok(Reply { text: array.first() })
-}
-"#,
+        include_str!("fixtures/native_task_array_import/worker.ku"),
     )
     .unwrap();
     let main = sources.join("main.ku");
     fs::write(
         &main,
-        r#"
-import array from "./worker.ku"
-
-async fn main(): null! {
-    reply = (await array.Pick(["整理" + "🙂"]))?
-    println(reply.text)
-    empty: [str] = []
-    missing = (await array.Pick(empty))?
-    if (missing.text == null) { println("missing") }
-    local = (await array.Local(["本地" + "🙂"]))?
-    println(local.text)
-    return ok(null)
-}
-"#,
+        include_str!("fixtures/native_task_array_import/main.ku"),
     )
     .unwrap();
-    let expected = "整理🙂\nmissing\n本地🙂\n";
+    let expected =
+        include_str!("fixtures/native_task_array_import/expected.txt").replace("\r\n", "\n");
     let mut interpreter = Command::new(env!("CARGO_BIN_EXE_ku"));
     interpreter
         .current_dir(directory.path())
