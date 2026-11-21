@@ -152,12 +152,13 @@ fn binary_types_match(op: TaskBinaryOp, left: &IrType, right: &IrType, output: &
 
 #[test]
 fn native_task_expression_ir_unary_exact_type_matrix() {
-    for op in [TaskUnaryOp::Negate, TaskUnaryOp::Not] {
+    for op in [TaskUnaryOp::Negate, TaskUnaryOp::Not, TaskUnaryOp::EnumTag] {
         for input in type_cases() {
             for output in type_cases() {
                 let expected = match op {
                     TaskUnaryOp::Negate => input == IrType::Int && output == IrType::Int,
                     TaskUnaryOp::Not => input == IrType::Bool && output == IrType::Bool,
+                    TaskUnaryOp::EnumTag => false,
                 };
                 let program = unary(op, input.clone(), output.clone());
                 assert_eq!(

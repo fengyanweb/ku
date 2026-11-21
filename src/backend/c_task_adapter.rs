@@ -442,6 +442,7 @@ fn record_strings(
             }
             IrType::Str => Ok(body(place)),
             IrType::Int | IrType::Bool | IrType::Null => Ok(String::new()),
+            ty if crate::ir::task::unit_enum_name(ty).is_some() => Ok(String::new()),
             _ => Err(unsupported(format!(
                 "unsupported native Task record field type: {ty:?}"
             ))),

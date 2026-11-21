@@ -180,7 +180,7 @@ fn value_slot(ty: IrType) -> TaskSlotType {
 fn owned_value(ty: &TaskSlotType) -> bool {
     matches!(ty, TaskSlotType::Callable { .. })
         || matches!(ty, TaskSlotType::Value { ty, borrowed: false }
-        if matches!(ty, IrType::Str | IrType::Result(_)) || matches!(ty, IrType::Nullable(inner) if inner.as_ref() == &IrType::Str) || task::flat_array(ty) || task::pg_params_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty) || task::local_json_type(ty) || task::record_type(ty) || task::nullable_record(ty))
+        if matches!(ty, IrType::Str | IrType::Result(_)) || matches!(ty, IrType::Nullable(inner) if inner.as_ref() == &IrType::Str) || task::flat_array(ty) || task::pg_params_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty) || task::local_json_type(ty) || task::record_type(ty) || task::nullable_record(ty) || task::unit_enum_name(ty).is_some())
 }
 
 fn local_type(ty: &TypeName, span: Span, layouts: &super::IrLayoutTable) -> KuResult<TaskSlotType> {
@@ -518,7 +518,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
             _ => {}
         }
 
-        if matches!(item, Item::Struct(_)) {
+        if matches!(item, Item::Struct(_) | Item::Enum(_)) {
             continue;
         }
         let Item::Function(function) = item else {
@@ -637,6 +637,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
     if !require_entry {
         records::retain_used_layouts(&mut layouts, &tasks);
     }
+    records::retain_used_enums(&mut layouts, &tasks);
     task::verify_and_plan_with_layouts(&tasks, limits, &layouts)?;
     Ok(NativeTaskProgram {
         tasks,
@@ -1148,6 +1149,12 @@ impl<'a> FunctionLowerer<'a> {
                     );
                 }
                 let equality = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual);
+                if equality
+                    && matches!(&self.function.slots[source.0].ty,
+                        TaskSlotType::Value { ty, .. } if task::unit_enum_name(ty).is_some())
+                {
+                    return self.unit_enum_equality(source, *op, right, depth);
+                }
                 if equality && nullable::string_like(&self.function.slots[source.0].ty) {
                     return self.string_equality_expression(
                         source,
@@ -1261,6 +1268,9 @@ impl<'a> FunctionLowerer<'a> {
                     unsupported("optional projection of this Task value", expression.span)
                 }),
             ExprKind::Field { target, name } => {
+                if let Some(value) = self.unit_enum_literal(target, name, expression.span)? {
+                    return Ok(value);
+                }
                 if let Some(field) =
                     self.record_field_expression(target, name, false, expression.span, depth)?
                 {

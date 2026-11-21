@@ -445,6 +445,7 @@ fn transfer(values: &mut [Interval], operation: &TaskOp) -> Option<bool> {
         TaskOp::Unary { dst, op, src } => {
             let (value, proven) = match op {
                 TaskUnaryOp::Not => (Interval::BOOLEAN, false),
+                TaskUnaryOp::EnumTag => return None,
                 TaskUnaryOp::Negate => {
                     Interval::checked(-(values[src.0].high as i128), -(values[src.0].low as i128))
                 }

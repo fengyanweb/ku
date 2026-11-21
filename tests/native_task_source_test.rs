@@ -31,6 +31,223 @@ fn native(source: &str) -> String {
 }
 
 #[test]
+fn native_task_transfers_records_with_nominal_unit_enum_fields() {
+    let directory = TempDir::new("task-enum-record");
+    let path = directory.path();
+    fs::write(
+        path.join("worker.ku"),
+        r#"
+import time from "std.time"
+enum Phase { Ready, Done }
+struct Reply { phase: Phase, message: str }
+
+async fn Build(label: str, done: bool): Reply! {
+    println(label)
+    message = label + "🙂"
+    phase = Phase.Ready
+    if (done) { phase = Phase.Done }
+    time.sleep(30)?
+    return ok(Reply { phase: phase, message: message })
+}
+async fn Inspect(reply: Reply): bool! {
+    time.sleep(30)?
+    println(reply.message)
+    return ok(reply.phase == Phase.Done)
+}
+async fn Broken(reply: Reply): Reply! {
+    time.sleep(30)?
+    if (reply.phase == Phase.Done) { fail "paused failure" }
+    return ok(reply)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        path.join("main.ku"),
+        r#"
+import { Phase, Build, Inspect, Broken } from "./worker"
+async fn Compare(): bool! {
+    return ok(((await Build("left", false))?).phase != ((await Build("right", true))?).phase)
+}
+async fn main(): null! {
+    reply = (await Build("result", true))?
+    println(reply.phase == Phase.Done)
+    println(reply.phase != Phase.Ready)
+    println((await Inspect(reply))?)
+    println((await Compare())?)
+    try { (await Broken((await Build("failed", true))?))? }
+    catch (issue) { println(issue.message) }
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let normalized = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    let expected =
+        "result\ntrue\ntrue\nresult🙂\ntrue\nleft\nright\ntrue\nfailed\npaused failure\n";
+    let mut interpreter = Command::new(env!("CARGO_BIN_EXE_ku"));
+    interpreter.current_dir(path).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        normalized(&interpreted.stderr)
+    );
+    assert_eq!(normalized(&interpreted.stdout), expected);
+
+    let filename = if cfg!(windows) { "app.exe" } else { "app" };
+    let executable = path.join(filename);
+    let mut build = Command::new(env!("CARGO_BIN_EXE_ku"));
+    build
+        .current_dir(path)
+        .args(["build", "--release", "--offline", "main.ku", "-o"])
+        .arg(&executable);
+    let built = run_bounded(&mut build, BUILD_TIMEOUT, BUILD_LIMITS).unwrap();
+    let diagnostic = normalized(&built.stderr);
+    if !built.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none(), "{diagnostic}");
+        return;
+    }
+    assert!(built.status.success(), "{diagnostic}");
+    let c_source = fs::read_dir(path.join(".ku/build/release/c"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("app.c"))
+        .find(|file| file.is_file())
+        .expect("normal Release generates app.c");
+    let c = fs::read_to_string(&c_source).unwrap();
+    assert!(c.contains("ku_task_driver_set_intent(host->ticket,KU_TASK_DRIVER_WAIT)"));
+    assert!(c.contains("if (timer_status==KU_TASK_CONTROL_PENDING)"));
+    let execution = run_bounded(
+        Command::new(executable).current_dir(path),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        execution.status.success(),
+        "{}",
+        normalized(&execution.stderr)
+    );
+    assert_eq!(normalized(&execution.stdout), expected);
+
+    fs::write(path.join("other.ku"), "enum Phase { Ready, Done }\n").unwrap();
+    fs::write(
+        path.join("wrong.ku"),
+        r#"
+import { Phase } from "./worker"
+import { Phase as OtherPhase } from "./other"
+async fn main(): null! { println(Phase.Ready == OtherPhase.Ready) return ok(null) }
+"#,
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ku"));
+    command
+        .current_dir(path)
+        .args(["build", "--native", "wrong.ku"]);
+    let rejected = run_bounded(&mut command, BUILD_TIMEOUT, BUILD_LIMITS).unwrap();
+    let diagnostic = normalized(&rejected.stderr);
+    assert!(!rejected.status.success());
+    assert!(diagnostic.contains("cannot apply operator"), "{diagnostic}");
+}
+
+#[test]
+fn native_task_keeps_unused_enum_declarations_out_and_rejects_payload_layouts() {
+    let scalar = "async fn main(): null! { println(17) return ok(null) }";
+    let unused = format!("enum Unused {{ First, Payload(message: str) }}\n{scalar}");
+    assert_eq!(native(scalar), native(&unused));
+    let unused_unit = format!("enum Unused {{ First, Second }}\n{scalar}");
+    assert_eq!(native(scalar), native(&unused_unit));
+
+    let payload = checked(
+        r#"
+enum Phase { Ready, Full(message: str) }
+struct Reply { phase: Phase }
+async fn Build(): Reply! { return ok(Reply { phase: Phase.Ready }) }
+async fn main(): null! { reply = (await Build())? return ok(null) }
+"#,
+    );
+    let diagnostic = task_lower::lower_program(&payload).unwrap_err().to_string();
+    assert!(
+        diagnostic.contains("async Result payload Custom(\"Reply\")"),
+        "{diagnostic}"
+    );
+
+    let mut valid = task_lower::lower_program(&checked(
+        "enum Phase { Ready, Done }\nasync fn main(): null! { println(Phase.Ready == Phase.Done) return ok(null) }",
+    ))
+    .unwrap();
+    let tag = valid.tasks.functions[0]
+        .states
+        .iter_mut()
+        .flat_map(|state| &mut state.operations)
+        .find_map(|operation| match operation {
+            ku::ir::task::TaskOp::Init {
+                value: ku::ir::task::TaskConstant::UnitEnum { tag },
+                ..
+            } => Some(tag),
+            _ => None,
+        })
+        .expect("payload-free variants lower to nominal constants");
+    *tag = 2;
+    let diagnostic = c::generate_native_task_c_source(&valid, &Default::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        diagnostic.contains("Task enum initializer requires a declared variant"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn native_task_array_try_get_preserves_recoverable_module_and_method_reads() {
+    let source = r#"
+import array from "std.array"
+import time from "std.time"
+
+async fn Lookup(words: [str], index: int): str! {
+    time.sleep(1)?
+    return array.try_get(words, index)
+}
+
+async fn Local(array: [str]): str! {
+    return array.try_get(0)
+}
+
+async fn main(): null! {
+    println((await Lookup(["整理" + "🙂"], 0))?)
+    try { (await Lookup(["ignored"], -1))? }
+    catch (issue) { println(issue.domain + "/" + issue.code) }
+    println((await Local(["继续" + "🙂"]))?)
+    return ok(null)
+}
+"#;
+    ku::cli::run_source("task-array-try-get.ku", source).expect("interpreter Task array reads");
+    let generated = native(source);
+    let directory = TempDir::new("task-array-try-get");
+    let c_source = directory.path().join("native.c");
+    fs::write(&c_source, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &c_source, "task-array-try-get")
+    else {
+        return;
+    };
+    let result = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout).replace("\r\n", "\n"),
+        "整理🙂\narray/index_out_of_bounds\n继续🙂\n"
+    );
+}
+
+#[test]
 fn native_task_string_equality_reads_owners_and_preserves_effectful_operands() {
     use ku::ir::task::TaskOp;
 
@@ -3210,6 +3427,75 @@ fn native_task_source_ordinary_synchronous_artifacts_remain_runtime_free() {
             "synchronous source gained Task runtime: {forbidden}"
         );
     }
+}
+
+#[test]
+fn native_task_source_imported_array_module_preserves_owners_and_shadowing() {
+    let directory = TempDir::new("native-task-array-import");
+    let sources = directory.path().join("sources");
+    fs::create_dir(&sources).unwrap();
+    fs::write(
+        sources.join("worker.ku"),
+        include_str!("fixtures/native_task_array_import/worker.ku"),
+    )
+    .unwrap();
+    let main = sources.join("main.ku");
+    fs::write(
+        &main,
+        include_str!("fixtures/native_task_array_import/main.ku"),
+    )
+    .unwrap();
+    let expected =
+        include_str!("fixtures/native_task_array_import/expected.txt").replace("\r\n", "\n");
+    let mut interpreter = Command::new(env!("CARGO_BIN_EXE_ku"));
+    interpreter
+        .current_dir(directory.path())
+        .arg("run")
+        .arg(&main);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout).replace("\r\n", "\n"),
+        expected
+    );
+
+    let executable = directory
+        .path()
+        .join(if cfg!(windows) { "app.exe" } else { "app" });
+    let mut build = Command::new(env!("CARGO_BIN_EXE_ku"));
+    build
+        .current_dir(directory.path())
+        .args(["build", "--release", "--offline"])
+        .arg(&main)
+        .arg("-o")
+        .arg(&executable);
+    let result = run_bounded(&mut build, BUILD_TIMEOUT, BUILD_LIMITS).unwrap();
+    let diagnostic = String::from_utf8_lossy(&result.stderr);
+    if !result.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none(), "{diagnostic}");
+        return;
+    }
+    assert!(result.status.success(), "{diagnostic}");
+    fs::remove_dir_all(sources).unwrap();
+    let native = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout).replace("\r\n", "\n"),
+        expected
+    );
 }
 
 #[test]

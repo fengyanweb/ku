@@ -70,6 +70,9 @@ pub enum TaskConstant {
     Bool(bool),
     Null,
     Str(String),
+    UnitEnum {
+        tag: i32,
+    },
     Ok(Box<TaskConstant>),
     Err {
         result: IrType,
@@ -127,11 +130,12 @@ pub enum TaskJsonOperation {
     AsStr,
 }
 
-/// Copy-only operations: source lowering maps existing syntax to these tags.
+/// Unary operations read a Value slot without consuming it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskUnaryOp {
     Negate,
     Not,
+    EnumTag,
 }
 
 /// Logical And/Or are intentionally absent: they require Branch/Jump control
@@ -661,6 +665,22 @@ pub(crate) fn record_type(ty: &IrType) -> bool {
     matches!(ty, IrType::Named(name) if name.starts_with("__ku_task_record_"))
 }
 
+/// Nominal enum identity after Task layout validation has excluded payloads.
+pub(crate) fn unit_enum_name(ty: &IrType) -> Option<&str> {
+    match ty {
+        IrType::Named(name) => super::enum_type_name(name),
+        _ => None,
+    }
+}
+
+fn unit_enum_layout<'a>(
+    layouts: &'a super::IrLayoutTable,
+    ty: &IrType,
+) -> Option<&'a super::IrEnumLayout> {
+    let name = unit_enum_name(ty)?;
+    layouts.enums.iter().find(|layout| layout.name == name)
+}
+
 /// This check also bounds generated traversal of owned storage and byte ranges.
 pub(crate) fn record_layout_supported(layouts: &super::IrLayoutTable, name: &str) -> bool {
     fn visit(
@@ -687,7 +707,7 @@ pub(crate) fn record_layout_supported(layouts: &super::IrLayoutTable, name: &str
                 IrType::Named(name) => visit(layouts, name, depth - 1, remaining),
                 _ => false,
             },
-            ty => primitive(ty) || nullable_leaf(ty),
+            ty => primitive(ty) || nullable_leaf(ty) || unit_enum_layout(layouts, ty).is_some(),
         })
     }
     visit(layouts, name, 8, &mut 64)
@@ -708,6 +728,9 @@ fn verify_record_reference(layouts: &super::IrLayoutTable, ty: &IrType) -> bool 
     } else {
         ty
     };
+    if unit_enum_name(ty).is_some() {
+        return unit_enum_layout(layouts, ty).is_some();
+    }
     !record_type(ty)
         || matches!(ty, IrType::Named(name)
         if layouts.structs.iter().any(|layout| layout.name == *name))
@@ -726,6 +749,7 @@ fn parameter_type(ty: &IrType) -> bool {
 }
 fn value_type(ty: &IrType) -> bool {
     parameter_type(ty)
+        || unit_enum_name(ty).is_some()
         || pg_params_array(ty)
         || local_bytes_type(ty)
         || local_net_type(ty)
@@ -1301,7 +1325,16 @@ fn validate_shape(
                     }
                 }
                 TaskOp::Init { dst, value } => {
-                    if slot_type(get_slot(*dst)?)?.0 != &constant_type(value)? {
+                    let ty = slot_type(get_slot(*dst)?)?.0;
+                    if let TaskConstant::UnitEnum { tag } = value {
+                        if !unit_enum_layout(layouts, ty).is_some_and(|layout| {
+                            usize::try_from(*tag).is_ok_and(|index| index < layout.variants.len())
+                        }) {
+                            return Err(invalid(
+                                "Task enum initializer requires a declared variant",
+                            ));
+                        }
+                    } else if ty != &constant_type(value)? {
                         return Err(invalid("initializer type does not match slot"));
                     }
                 }
@@ -1561,17 +1594,19 @@ fn validate_shape(
                     budget.spend()?;
                     let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
                     let (source, _) = slot_type(get_slot(*src)?)?;
-                    let expected = match op {
-                        TaskUnaryOp::Negate => IrType::Int,
-                        TaskUnaryOp::Not => IrType::Bool,
+                    let valid = match op {
+                        TaskUnaryOp::Negate => {
+                            source == &IrType::Int && destination == &IrType::Int
+                        }
+                        TaskUnaryOp::Not => source == &IrType::Bool && destination == &IrType::Bool,
+                        TaskUnaryOp::EnumTag => {
+                            unit_enum_layout(layouts, source).is_some()
+                                && destination == &IrType::Int
+                        }
                     };
-                    if dst == src
-                        || destination_borrowed
-                        || source != &expected
-                        || destination != &expected
-                    {
+                    if dst == src || destination_borrowed || !valid {
                         return Err(invalid(
-                            "Unary requires distinct matching int or bool Value slots",
+                            "Unary requires distinct int, bool or payload-free enum Value slots",
                         ));
                     }
                 }
@@ -1768,7 +1803,8 @@ fn validate_shape(
                             && ty != &IrType::Str
                             && !matches!(ty, IrType::Nullable(inner) if inner.as_ref() == &IrType::Str)
                             && !record_type(ty)
-                            && !nullable_record(ty))
+                            && !nullable_record(ty)
+                            && unit_enum_layout(layouts, ty).is_none())
                     {
                         return Err(invalid("unsupported Task record projection ownership"));
                     }
@@ -4549,6 +4585,15 @@ pub(crate) fn verify_and_plan_with_layouts(
     limits: TaskLimits,
     layouts: &super::IrLayoutTable,
 ) -> KuResult<TaskFramePlan> {
+    if layouts.enums.len() > limits.max_functions
+        || layouts.enums.iter().any(|layout| {
+            layout.variants.iter().enumerate().any(|(index, variant)| {
+                !variant.fields.is_empty() || variant.tag != index || i32::try_from(index).is_err()
+            })
+        })
+    {
+        return Err(invalid("unsupported or over-budget Task enum layout"));
+    }
     if layouts.structs.len() > limits.max_functions
         || layouts
             .structs

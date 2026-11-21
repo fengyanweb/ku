@@ -20,7 +20,12 @@ pub(super) fn layouts(program: &Program) -> super::super::IrLayoutTable {
         .iter()
         .map(|layout| layout.name.clone())
         .collect();
-    layouts.enums.clear();
+    layouts.enums.retain(|layout| {
+        layout
+            .variants
+            .iter()
+            .all(|variant| variant.fields.is_empty())
+    });
     for layout in &mut layouts.structs {
         layout.name = record_name(&layout.name);
         for field in &mut layout.fields {
@@ -94,6 +99,104 @@ pub(super) fn retain_used_layouts(layouts: &mut super::super::IrLayoutTable, tas
         .collect();
     let mut keep = keep.into_iter();
     layouts.structs.retain(|_| keep.next().unwrap_or(false));
+}
+
+pub(super) fn retain_used_enums(layouts: &mut super::super::IrLayoutTable, tasks: &TaskProgram) {
+    if layouts.enums.is_empty() {
+        return;
+    }
+    let mut used = std::collections::HashSet::new();
+    for layout in &layouts.structs {
+        used.extend(
+            layout
+                .fields
+                .iter()
+                .filter_map(|field| task::unit_enum_name(&field.ty)),
+        );
+    }
+    for function in &tasks.functions {
+        for slot in &function.slots {
+            if let TaskSlotType::Value { ty, .. } = &slot.ty {
+                used.extend(task::unit_enum_name(ty));
+            }
+        }
+    }
+    layouts
+        .enums
+        .retain(|layout| used.contains(layout.name.as_str()));
+}
+
+impl FunctionLowerer<'_> {
+    pub(super) fn unit_enum_literal(
+        &mut self,
+        target: &Expr,
+        variant: &str,
+        span: Span,
+    ) -> KuResult<Option<SlotId>> {
+        let ExprKind::Variable(name) = &target.kind else {
+            return Ok(None);
+        };
+        if self.local_binding(name).is_some() {
+            return Ok(None);
+        }
+        let Some(layout) = self
+            .layouts
+            .enums
+            .iter()
+            .find(|layout| &layout.name == name)
+        else {
+            return Ok(None);
+        };
+        let ty = super::super::enum_ir_type(name);
+        let tag = layout
+            .variants
+            .iter()
+            .find(|candidate| candidate.name == variant)
+            .and_then(|candidate| i32::try_from(candidate.tag).ok())
+            .ok_or_else(|| unsupported("unknown payload-free Task enum alternative", span))?;
+        Ok(Some(self.constant(TaskConstant::UnitEnum { tag }, ty)?))
+    }
+
+    pub(super) fn unit_enum_equality(
+        &mut self,
+        left: SlotId,
+        op: BinaryOp,
+        right: &Expr,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        let ty = self.function.slots[left.0].ty.clone();
+        let left_tag = self.slot(value_slot(IrType::Int))?;
+        self.emit(TaskOp::Unary {
+            dst: left_tag,
+            op: TaskUnaryOp::EnumTag,
+            src: left,
+        })?;
+        let right_value = self.expression(right, depth + 1)?;
+        if self.function.slots[right_value.0].ty != ty {
+            return Err(unsupported(
+                "Task equality between different enum types",
+                right.span,
+            ));
+        }
+        let right_tag = self.slot(value_slot(IrType::Int))?;
+        self.emit(TaskOp::Unary {
+            dst: right_tag,
+            op: TaskUnaryOp::EnumTag,
+            src: right_value,
+        })?;
+        let dst = self.slot(value_slot(IrType::Bool))?;
+        self.emit(TaskOp::Binary {
+            dst,
+            op: if op == BinaryOp::Equal {
+                TaskBinaryOp::Equal
+            } else {
+                TaskBinaryOp::NotEqual
+            },
+            left: left_tag,
+            right: right_tag,
+        })?;
+        Ok(dst)
+    }
 }
 
 pub(super) fn payload(ty: &TypeName, layouts: &super::super::IrLayoutTable) -> Option<IrType> {
@@ -281,6 +384,9 @@ impl FunctionLowerer<'_> {
                     ))
                 }
             }
+        }
+        if guarded && task::unit_enum_name(&ty).is_some() {
+            return Err(unsupported("nullable Task enum projection", span));
         }
         if guarded {
             ty = super::super::nullable::nullable_type(ty);
