@@ -151,18 +151,19 @@ fn LinkedIntArrayCallbackTypes(&links: [LinkedNullFunction], &slots: [LinkedNull
         if (slots[index].value.ty.declaration_kind == "IntArrayResultCallback") {
             types = types.push(slots[index].value.ty.clone())
         }
-        index += 1
+        index = index + 1
     }
     index = 0
     while (index < links.len()) {
+        parameter_count = links[index].parameters.len()
         param = 0
-        while (param < links[index].parameters.len()) {
+        while (param < parameter_count) {
             if (links[index].parameters[param].declaration_kind == "IntArrayResultCallback") {
                 types = types.push(links[index].parameters[param].clone())
             }
-            param += 1
+            param = param + 1
         }
-        index += 1
+        index = index + 1
     }
     return types
 }

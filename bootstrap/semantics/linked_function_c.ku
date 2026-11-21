@@ -52,8 +52,9 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlo
         records = records.push(root)
     }
     if (callbacks.len() > 0 && !ContainsType(records, "KuArrayInt")) {
-        text += StructValueResultHeader("KuArrayInt")
-        records = records.push("KuArrayInt")
+        array_result = "KuArrayInt"
+        text += StructValueResultHeader(array_result)
+        records = records.push(array_result)
     }
     index = 0
     while (index < callbacks.len()) {
@@ -62,7 +63,7 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlo
             text += LinkedIntArrayCallbackDeclaration(kind, CTypeName(callbacks[index].module_index, callbacks[index].declaration_node))
             records = records.push(kind)
         }
-        index += 1
+        index = index + 1
     }
     index = 0
     while (index < slots.len()) {
