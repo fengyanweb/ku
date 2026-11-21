@@ -339,15 +339,15 @@ fn CheckLinkedCountedBoundWrites(&project: LinkedNullProject, &state: LinkedNull
     guard = LinkedNullNode(project, 1, guard_id)
     bound_id = LinkedNullChild(project, 1, guard, 1)
     bound = LinkedNullNode(project, 1, bound_id)
-    if (LinkedLiveIntBinding(state, bound) != 0) {
-        cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
-        if (cursor.text == bound.text) {
-            RejectLayout("linked_loop_bound_cursor", "counted cursor and named int bound must be distinct", DeclarationSpan(guard))?
-        }
-        // A stable signed upper bound and a strictly smaller cursor make the
-        // terminal unit increment finite and safe on every reached iteration.
-        RejectLinkedLoopWrite(project, loop, bound.text, "linked_loop_bound_write", "a counted loop cannot rebind its named int bound")?
-        return RejectLinkedLoopWrite(project, loop, cursor.text, "linked_loop_cursor_write", "a counted loop can change its cursor only at the end")
+    cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
+    named_bound = LinkedLiveIntBinding(state, bound) != 0
+    if (named_bound && cursor.text == bound.text) {
+        RejectLayout("linked_loop_bound_cursor", "counted cursor and named int bound must be distinct", DeclarationSpan(guard))?
+    }
+    RejectLinkedLoopWrite(project, loop, cursor.text, "linked_loop_cursor_write", "a counted loop can change its cursor only at the end")?
+    if (named_bound) {
+        // The upper bound stays fixed while the cursor advances by one.
+        return RejectLinkedLoopWrite(project, loop, bound.text, "linked_loop_bound_write", "a counted loop cannot rebind its named int bound")
     }
     name = LinkedNullArrayLimitName(project, bound_id)
     slot = LinkedNullBinding(state.slots, name)

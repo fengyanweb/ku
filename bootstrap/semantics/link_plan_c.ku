@@ -54,7 +54,6 @@ struct LinkedNullSlot {
 
 struct LinkedNullState {
     plain_value_result: bool
-    countdown_body: bool
     layouts: [StructLayout]
     owning_layouts: [StructLayout]
     owning_strings: bool
@@ -96,7 +95,7 @@ struct LinkedNullExpression {
 }
 
 fn NewLinkedNullState(): LinkedNullState {
-    return LinkedNullState { plain_value_result: false, countdown_body: false, layouts: [], owning_layouts: [], owning_strings: false,
+    return LinkedNullState { plain_value_result: false, layouts: [], owning_layouts: [], owning_strings: false,
         slots: [], links: [], local_readers: [], declarations: "", code: "", drops: "", catch_slot: 0,
         catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false, uses_int_snapshot: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,

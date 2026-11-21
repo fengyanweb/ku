@@ -1175,12 +1175,17 @@ fn NestedWrite(start: int): null! {
     }
     return ok(null)
 }
-fn OutsideWrite(start: int): null! {
-    cursor = start
-    remaining = start
-    while (remaining > 0) { remaining = remaining - 1 }
-    cursor = cursor + 1
-    return ok(null)
+fn OutsideWrite(&items: [int], start: int): int! {
+    total = start
+    seen = false
+    cursor = 0
+    while (cursor < items.len()) {
+        total = total + items[cursor]
+        seen = true
+        cursor = cursor + 1
+    }
+    if (seen) { total = total + 1 }
+    return ok(total)
 }
 fn NestedIncrease(&edges: [int], start: int): null! {
     remaining = start
@@ -1237,11 +1242,37 @@ int main(void) {
     .unwrap();
     compile_projection(&c, &app, cwd);
     assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+    fs::write(cwd.join("function.txt"), "OutsideWrite").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let entry = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+#include <assert.h>
+int main(void) {
+    int64_t values[] = {2, 7};
+    KuArrayInt full = {2, values, 2};
+    const KuArrayInt empty = {0};
+    assert(ENTRY(&full, 3).value == 13);
+    assert(ENTRY(&empty, -3).value == -3);
+    assert(full.data == values && values[1] == 7);
+    return 0;
+}
+"#
+    .replace("ENTRY", entry);
+    fs::write(&c, format!("{code}{host}")).unwrap();
+    compile_projection(&c, &app, cwd);
+    assert_ok(&execute(&mut Command::new(&app), cwd, 15));
     for (function, diagnostic) in [
         ("WrongStep", "unsupported_linked_countdown"),
         ("NestedWrite", "linked_loop_cursor_write"),
-        ("OutsideWrite", "linked_rebind_type"),
-        ("NestedIncrease", "linked_rebind_type"),
+        ("NestedIncrease", "linked_loop_cursor_write"),
     ] {
         fs::write(cwd.join("function.txt"), function).unwrap();
         let rejected = execute(&mut Command::new(seed), cwd, 30);
