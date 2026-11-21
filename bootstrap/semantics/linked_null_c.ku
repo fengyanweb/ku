@@ -110,9 +110,15 @@ fn countedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Nod
         step.kind != "Assign" || step.edge_count != 1 || step.text != left.text) {
         RejectLayout("unsupported_linked_loop", "counted while requires one distinct int cursor", DeclarationSpan(loop))?
     }
-    zero = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 0))
+    initial_value = LinkedNullNode(project, 1, LinkedNullChild(project, 1, initial, 0))
+    valid_start = initial_value.kind == "Int" && initial_value.edge_count == 0 && initial_value.int_value == 0
+    if (!valid_start) {
+        bound = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 1))
+        input = LinkedLiveIntBinding(state, initial_value)
+        valid_start = input > 0 && input != slot && LinkedLiveIntBinding(state, bound) > 0
+    }
     rhs = LinkedNullNode(project, 1, LinkedNullChild(project, 1, step, 0))
-    if (zero.kind != "Int" || zero.edge_count != 0 || zero.int_value != 0 || rhs.kind != "Binary" || rhs.edge_count != 2 || rhs.text != "+") {
+    if (!valid_start || rhs.kind != "Binary" || rhs.edge_count != 2 || rhs.text != "+") {
         RejectLayout("unsupported_linked_loop", "counted while requires initialization to zero and a unit increment", DeclarationSpan(loop))?
     }
     cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, rhs, 0))

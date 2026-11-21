@@ -1396,4 +1396,85 @@ int main(void) {
         assert!(rejected.stdout.is_empty());
         assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
     }
+    assert_named_counted_start(seed, cwd);
+}
+
+fn assert_named_counted_start(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("counted-int-start.ku"),
+        r#"struct CountResult { value: int }
+fn Visit(value: int): null! { return ok(null) }
+fn CountFrom(start: int, stop: int): CountResult! {
+    cursor = start
+    while (cursor < stop) {
+        Visit(cursor)?
+        cursor = cursor + 1
+    }
+    return ok(CountResult { value: cursor })
+}
+fn LegacyStart(&values: [int], start: int): CountResult! {
+    cursor = start
+    while (cursor < values.len()) { cursor = cursor + 1 }
+    return ok(CountResult { value: cursor })
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "counted-int-start.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "CountFrom").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let definition = code
+        .lines()
+        .find(|line| line.contains(" ku_linked_null_"))
+        .unwrap();
+    let (result, entry) = definition.split_once(' ').unwrap();
+    let entry = entry.split_once('(').unwrap().0;
+    let visit = code
+        .lines()
+        .find_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+static int64_t observed[8];
+static size_t called;
+KuBootstrapResultNull __VISIT__(int64_t value) {
+    assert(called < sizeof(observed)/sizeof(observed[0]));
+    observed[called++] = value;
+    if (value == 6) return (KuBootstrapResultNull){.error = {
+        .code = {(uint8_t*)"stop",4,0,KU_PROJECTION_STRING_STATIC}}};
+    return (KuBootstrapResultNull){.ok = true};
+}
+int main(void) {
+    __RESULT__ result = __ENTRY__(-2, 0);
+    assert(result.ok && result.value.f0 == 0 && called == 2);
+    assert(observed[0] == -2 && observed[1] == -1);
+    result = __ENTRY__(-1, -2);
+    assert(result.ok && result.value.f0 == -1 && called == 2);
+    result = __ENTRY__(INT64_MAX-1, INT64_MAX);
+    assert(result.ok && result.value.f0 == INT64_MAX && called == 3);
+    assert(observed[2] == INT64_MAX-1);
+    result = __ENTRY__(5, 8);
+    assert(!result.ok && result.error.code.len == 4 && called == 5);
+    assert(observed[3] == 5 && observed[4] == 6);
+    return 0;
+}
+"#
+    .replace("__RESULT__", result)
+    .replace("__ENTRY__", entry)
+    .replace("__VISIT__", visit);
+    let c = cwd.join("counted-int-start.c");
+    let app = cwd.join(format!("counted-int-start{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
+    compile_projection(&c, &app, cwd);
+    assert_ok(&execute(&mut Command::new(&app), cwd, 15));
+
+    fs::write(cwd.join("function.txt"), "LegacyStart").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("requires initialization to zero"));
 }
