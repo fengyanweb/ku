@@ -425,7 +425,8 @@ fn Scan(source: str): [Token]! {
     column = 1
     offset = 0
 
-    while (index < length) {
+    more_input = index < length
+    while (more_input) {
         ch = characters[index].clone()
         whitespace = ch == " " || ch == "\t" || ch == "\r" || ch == "\n" || ch == "﻿"
         next = ""
@@ -544,6 +545,7 @@ fn Scan(source: str): [Token]! {
             CheckTokenCapacity(tokens.len())?
             tokens = tokens.push(token)
         }
+        more_input = index < length
     }
     token = Token {
         kind: "Eof", lexeme: "", int_value: 0,
