@@ -2233,7 +2233,7 @@ ku build --release -o dist/app.exe
 
 `--target` 第一阶段只接受 `host`、`x86_64-linux`、`x86_64-windows`、`aarch64-darwin`；包含路径分隔符、Windows drive prefix 或未知 target 会直接报错，避免输出路径逃逸。`--backend c` 会使用 native C 后端生成 C 后再调用 C 编译器。未设置 `KU_CC` 时，自动候选固定为 `zig cc`、`clang`、`cc`、`gcc`，失败后有界尝试下一个；一旦设置 `KU_CC`，它就是唯一且权威的 compiler，空值、不可执行或编译失败都会直接报错，不会静默换用另一套工具链。显式跨 target 时，Ku 自动给 Zig 传 `-target`、给 Clang 传 `--target`；普通 fallback `cc/gcc` 只用于 host，不会假装支持 cross。需要使用已配置好的交叉 GCC 时，通过 `KU_CC` 显式指定。链接成功后校验目标产物的 PE/ELF/Mach-O 格式和 CPU 架构；使用数据库时还解析最终动态依赖表并要求实际导入 libpq 以及本次选定的 MySQL/MariaDB family，静态、跨 family 或 host 回退都拒绝安装。数据库库文件从已打开句柄复制到私有临时目录后才交给 linker，不扫描或删除用户输出目录中的同名临时文件。`--backend runner` 保留解释器 wrapper，供尚未进入 native lowering 的程序显式选择；native 构建不静默回退。同步程序的 KuString、array、dynamic object、Result/Error 和 closure ABI 已实现明确列出的子集，不能从 ABI 存在推导为所有 payload、捕获形式和动态组合均已支持。
 
-`ku build --backend runner` 生成“解释器打包型二进制”，只嵌入入口文件，带 import 的程序仍会按原路径读取依赖；选择 Runner 时须保留这些源码。native C 路径在生成期展开完整 import graph，生成物不包含 runner 的 `run_source` / `const SOURCE`，移动原源码目录后仍能运行。有限 async 子集也使用该展开路径，但完整 async native lowering 和增量缓存仍未完成。
+`ku build --backend runner` 生成“解释器打包型二进制”，只嵌入入口文件的内容。带非标准库 import 的程序仍需保留入口原目录和原路径上的依赖源码。native C 路径在生成期展开完整 import graph，生成物不包含 runner 的 `run_source` / `const SOURCE`，移动原源码目录后仍能运行。有限 async 子集也使用该展开路径，但完整 async native lowering 和增量缓存仍未完成。
 
 `ku build --native <file.ku>` 不带 `-o` 时是单文件兼容模式：在源码旁写出 `.c`，不调用 linker。带 `-o` 时进入完整 native 链接模式，使用上述 build 目录中的隔离中间产物并校验最终二进制。跨系统发布推荐使用 `ku build --backend c --target <target>`，因为“生成目标 C”本身不等于已生成该目标的可执行文件。
 

@@ -1464,6 +1464,55 @@ def installed_collection_and_copy_consumers(install, root, repo, env, report, ta
         report['installed_' + name] = dict(detail, source_sha256=hashlib.sha256(source.encode('utf-8')).hexdigest())
 
 
+def installed_runner_embedded_entry_consumer(install, root, env, report, target):
+    ku = install / ('ku.exe' if '-windows-' in target else 'ku')
+    detail = report['installed_runner_embedded_entry'] = {'status': 'running', 'cases': []}
+
+    def record(name, result, expected_exit='zero'):
+        case = dict(name='runner-embedded-entry-' + name, exit_code=result.returncode,
+                    expected_exit=expected_exit, stdout_sha256=hashlib.sha256(result.stdout).hexdigest(),
+                    stderr_sha256=hashlib.sha256(result.stderr).hexdigest())
+        detail['cases'].append(case)
+        if 'cases' in report:
+            report['cases'].append(case)
+
+    with tempfile.TemporaryDirectory(prefix='ku-embedded-entry-', dir=root) as temporary:
+        working = Path(temporary)
+        project = working / 'project'
+        entry = project / 'src' / 'nested' / 'main.ku'
+        entry.parent.mkdir(parents=True)
+        (project / 'ku.mod').write_text(
+            'name = "embedded_entry"\nroot = "src"\nmain = "nested/main.ku"\n', encoding='utf-8')
+        entry.write_text(
+            'import { Message } from "helper"\nfn main() { println(Message()) }\n', encoding='utf-8')
+        dependency = project / 'src' / 'helper.ku'
+        dependency.write_text('fn Message(): str { return "original 中文🙂" }\n', encoding='utf-8')
+        launch = working / 'launch'
+        launch.mkdir()
+        executable = launch / ('anchor.exe' if '-windows-' in target else 'anchor')
+        built = invoke([ku, 'build', '--release', '--offline', '--backend', 'runner', '--verbose',
+                        '-o', executable], project, env)
+        record('build', built)
+        assert_build_backend(built, 'runner', 'release')
+        detail['binary_sha256'] = EXPORT.file_hash(executable)
+        entry.unlink()
+        for label, wanted in [('original', 'original 中文🙂\n'), ('edited', 'edited 中文🙂\n')]:
+            if label == 'edited':
+                dependency.write_text('fn Message(): str { return "edited 中文🙂" }\n', encoding='utf-8')
+            launched = invoke([executable], launch, env)
+            record(label, launched)
+            if launched.returncode or output(launched) != wanted or entry.exists():
+                raise RuntimeError('embedded Runner did not use the original package dependency: ' +
+                                   launched.stderr.decode(errors='replace')[-2000:])
+        dependency.unlink()
+        missing = invoke([executable], launch, env)
+        record('dependency-missing', missing, 'nonzero')
+        missing_error = missing.stderr.decode(errors='replace')
+        if not missing.returncode or 'helper.ku' not in missing_error or 'failed to resolve' not in missing_error:
+            raise RuntimeError('embedded Runner did not report its missing external dependency: ' + missing_error[-2000:])
+    detail.update(status='passed', owned_temp_removed=not working.exists())
+
+
 def run_structured_only(args, report):
     """Check the structured Task and declaration examples from a verified installed archive."""
     repo = args.repo.resolve()
@@ -1497,6 +1546,7 @@ def run_structured_only(args, report):
         EXPORT.verify_archive(archive, metadata['files'], install)
         manifest = EXPORT.RUNTIME_BUNDLE.verify(install, metadata['version'], metadata['commit'], target)
         report.update(bundle_id=manifest['bundle_id'], sdk_source_sha256=manifest['build_source_sha256'])
+        installed_runner_embedded_entry_consumer(install, root, env, report, target)
         if target == 'x86_64-unknown-linux-gnu':
             installed_build_interrupt_consumer(install, root, repo, env, manifest, report)
         for backend in ('c', 'runner'):
@@ -2341,6 +2391,7 @@ def run(args, report):
                 or any(selected['identity'][key] != manifest['rustc'][key] for key in ('release', 'commit_hash', 'commit_date', 'host'))):
             raise RuntimeError('doctor JSON does not identify an actually linkable exact compiler')
         report['selected_runner_compiler'] = selected
+        installed_runner_embedded_entry_consumer(install, root, env, report, target)
         other_install = root / 'other-ku-on-PATH'
         other_install.mkdir()
         shutil.copy2(ku, other_install / ku.name)

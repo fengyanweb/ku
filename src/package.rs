@@ -3193,16 +3193,23 @@ pub(crate) fn package_import_scope_for_file<'a>(
     scopes: &'a [PackageImportScope],
     current_file: &Path,
     span: Span,
+    missing_embedded_entry: bool,
 ) -> KuResult<&'a PackageImportScope> {
-    let canonical = fs::canonicalize(current_file).map_err(|err| {
-        KuError::runtime(
-            format!(
-                "failed to resolve current import module '{}': {err}",
-                current_file.display()
-            ),
-            span,
-        )
-    })?;
+    let canonical = if missing_embedded_entry {
+        // The loader already canonicalized the surviving parent directory.
+        None
+    } else {
+        Some(fs::canonicalize(current_file).map_err(|err| {
+            KuError::runtime(
+                format!(
+                    "failed to resolve current import module '{}': {err}",
+                    current_file.display()
+                ),
+                span,
+            )
+        })?)
+    };
+    let canonical = canonical.as_deref().unwrap_or(current_file);
     scopes
         .iter()
         .find(|scope| canonical.starts_with(&scope.import_root))

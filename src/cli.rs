@@ -1173,6 +1173,7 @@ fn package_context_from_path(path: &Path) -> KuResult<PackageContext> {
 struct CheckOptions {
     deny_unused: bool,
     dependency_mode: DependencyResolveMode,
+    embedded_entry: bool,
 }
 
 impl Default for CheckOptions {
@@ -1180,6 +1181,7 @@ impl Default for CheckOptions {
         Self {
             deny_unused: false,
             dependency_mode: DependencyResolveMode::Update,
+            embedded_entry: false,
         }
     }
 }
@@ -8731,7 +8733,7 @@ fn build_runner_source(path: &str, source: &str, dependency_mode: DependencyReso
         DependencyResolveMode::Offline => "Offline",
     };
     format!(
-        "const SOURCE: &str = {literal};\nfn main() {{\n    if let Err(err) = ku::cli::run_source_with_dependency_mode(\n        {path:?},\n        SOURCE,\n        ku::package::DependencyResolveMode::{dependency_mode},\n    ) {{\n        eprintln!(\"{{err}}\");\n        std::process::exit(1);\n    }}\n}}\n"
+        "const SOURCE: &str = {literal};\nfn main() {{\n    if let Err(err) = ku::cli::run_embedded_runner_source(\n        {path:?},\n        SOURCE,\n        ku::package::DependencyResolveMode::{dependency_mode},\n    ) {{\n        eprintln!(\"{{err}}\");\n        std::process::exit(1);\n    }}\n}}\n"
     )
 }
 
@@ -8865,6 +8867,29 @@ pub fn run_source_with_dependency_mode(
     dependency_mode: DependencyResolveMode,
 ) -> Result<(), KuError> {
     let program = checked_program_with_dependency_mode(file, source, dependency_mode)?;
+    run_checked_source(file, source, program)
+}
+
+#[doc(hidden)]
+pub fn run_embedded_runner_source(
+    file: &str,
+    source: &str,
+    dependency_mode: DependencyResolveMode,
+) -> Result<(), KuError> {
+    let program = parse_and_check_with_options(
+        file,
+        source,
+        CheckOptions {
+            dependency_mode,
+            embedded_entry: true,
+            ..CheckOptions::default()
+        },
+    )
+    .map_err(|err| KuError::message(err.diagnostic(file, source)))?;
+    run_checked_source(file, source, program)
+}
+
+fn run_checked_source(file: &str, source: &str, program: Program) -> Result<(), KuError> {
     reject_native_only_compression(&program)?;
     run_program_with_stack(program, source_base_dir(file))
         .map_err(|err| KuError::message(err.diagnostic(file, source)))
@@ -8939,7 +8964,12 @@ fn parse_and_check_with_options(
 ) -> Result<Program, KuError> {
     let original = parse_source(source)?;
     deny_unused_imports(&original)?;
-    let program = parse_and_expand_with_dependency_mode(file, source, options.dependency_mode)?;
+    let program = expand_source(
+        file,
+        source,
+        options.dependency_mode,
+        options.embedded_entry,
+    )?;
     Checker::new().check(&program)?;
     if options.deny_unused {
         deny_unused_local_bindings(&program)?;
@@ -9644,20 +9674,35 @@ fn parse_and_expand_with_dependency_mode(
     source: &str,
     dependency_mode: DependencyResolveMode,
 ) -> Result<Program, KuError> {
+    expand_source(file, source, dependency_mode, false)
+}
+
+fn expand_source(
+    file: &str,
+    source: &str,
+    dependency_mode: DependencyResolveMode,
+    embedded_entry: bool,
+) -> Result<Program, KuError> {
     let program = parse_source(source)?;
     let program = if program_has_imports(&program) {
         let path = Path::new(file);
-        if !path.exists() {
-            if program_has_only_std_imports(&program) {
-                let mut loader = ModuleLoader::new(None)?;
-                loader.load_virtual_entry(path, program, source.len())?
-            } else {
-                return Err(KuError::runtime(
-                    "imports require a real .ku file path",
-                    Span::default(),
-                ));
-            }
+        let missing = !path.exists();
+        if missing && program_has_only_std_imports(&program) {
+            let mut loader = ModuleLoader::new(None)?;
+            loader.load_virtual_entry(path, program, source.len())?
         } else {
+            let embedded_path = if missing {
+                if !embedded_entry {
+                    return Err(KuError::runtime(
+                        "imports require a real .ku file path",
+                        Span::default(),
+                    ));
+                }
+                Some(canonical_missing_runner_entry(path)?)
+            } else {
+                None
+            };
+            let path = embedded_path.as_deref().unwrap_or(path);
             let mut package = package::discover_for_file(path)?;
             let deadline = package
                 .as_ref()
@@ -9680,7 +9725,11 @@ fn parse_and_expand_with_dependency_mode(
                 )?;
             }
             let mut loader = ModuleLoader::new(package)?;
-            let program = loader.load_entry(path, program, source.len())?;
+            let program = if let Some(embedded_path) = embedded_path {
+                loader.load_canonical_entry(embedded_path, program, source.len(), true)?
+            } else {
+                loader.load_entry(path, program, source.len())?
+            };
             if matches!(
                 dependency_mode,
                 DependencyResolveMode::Update | DependencyResolveMode::Refresh
@@ -9698,6 +9747,26 @@ fn parse_and_expand_with_dependency_mode(
         program
     };
     Ok(program)
+}
+
+fn canonical_missing_runner_entry(path: &Path) -> KuResult<PathBuf> {
+    let span = Span::default();
+    let missing_path = || KuError::runtime("imports require a real .ku file path", span);
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(missing_path());
+    };
+    // Use only a genuine missing file. A dangling symlink or unreadable entry
+    // must not silently supply a different import anchor.
+    if path.is_absolute()
+        && is_ku_path(path)
+        && matches!(fs::symlink_metadata(path), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+    {
+        let parent = canonical_file(parent, span)?;
+        if parent.is_dir() {
+            return Ok(parent.join(name));
+        }
+    }
+    Err(missing_path())
 }
 
 fn program_has_imports(program: &Program) -> bool {
@@ -10011,7 +10080,7 @@ impl ModuleLoader {
         self.budget.begin_module(Span::default())?;
         let result = (|| {
             self.budget.charge_source(source_bytes, Span::default())?;
-            self.expand_program(path, program, true, source_bytes)
+            self.expand_program(path, program, true, source_bytes, false)
                 .map(|(program, _, _, _)| program)
         })();
         self.budget.finish_module();
@@ -10025,12 +10094,27 @@ impl ModuleLoader {
         source_bytes: usize,
     ) -> KuResult<Program> {
         let canonical = canonical_file(path, Span::default())?;
+        self.load_canonical_entry(canonical, program, source_bytes, false)
+    }
+
+    fn load_canonical_entry(
+        &mut self,
+        canonical: PathBuf,
+        program: Program,
+        source_bytes: usize,
+        missing_embedded_entry: bool,
+    ) -> KuResult<Program> {
         self.budget.begin_module(Span::default())?;
         let result = (|| {
             self.budget.charge_source(source_bytes, Span::default())?;
             self.states.insert(canonical.clone(), LoadState::Visiting);
-            let (expanded, _, _, _) =
-                self.expand_program(&canonical, program, true, source_bytes)?;
+            let (expanded, _, _, _) = self.expand_program(
+                &canonical,
+                program,
+                true,
+                source_bytes,
+                missing_embedded_entry,
+            )?;
             self.states.insert(canonical.clone(), LoadState::Done);
             let mut items = Vec::new();
             let mut materialized_names = HashSet::new();
@@ -10086,7 +10170,7 @@ impl ModuleLoader {
                 err.with_diagnostic_context(canonical.display().to_string(), source.clone())
             })?;
             let (expanded, material, exports, mut closure) = self
-                .expand_program(&canonical, program, false, source.len())
+                .expand_program(&canonical, program, false, source.len(), false)
                 .map_err(|err| {
                     err.with_diagnostic_context(canonical.display().to_string(), source.clone())
                 })?;
@@ -10162,6 +10246,7 @@ impl ModuleLoader {
         program: Program,
         is_entry: bool,
         source_bytes: usize,
+        missing_embedded_entry: bool,
     ) -> KuResult<(
         Program,
         ExpandedModuleMaterial,
@@ -10239,6 +10324,7 @@ impl ModuleLoader {
                 import.span,
                 self.package.as_ref(),
                 &self.package_import_scopes,
+                missing_embedded_entry,
             )?;
             let module = self.load_module(&import_path, import.span)?;
             closure.union_with(&module.closure);
@@ -10483,13 +10569,21 @@ fn resolve_import_path(
     span: Span,
     package: Option<&PackageContext>,
     package_import_scopes: &[package::PackageImportScope],
+    missing_embedded_entry: bool,
 ) -> KuResult<PathBuf> {
     if package.is_some() {
         package::validate_package_import_text(import_path, span)?;
     }
     let raw = Path::new(import_path);
     let current_scope = package
-        .map(|_| package::package_import_scope_for_file(package_import_scopes, current_file, span))
+        .map(|_| {
+            package::package_import_scope_for_file(
+                package_import_scopes,
+                current_file,
+                span,
+                missing_embedded_entry,
+            )
+        })
         .transpose()?;
     if let Some(current_scope) = current_scope {
         if let Some(path) = package::resolve_dependency_import(
@@ -11594,7 +11688,7 @@ mod tests {
         assert_eq!(mode, DependencyResolveMode::Locked);
 
         let runner = build_runner_source("src/main.ku", "fn main() {}", mode);
-        assert!(runner.contains("run_source_with_dependency_mode"));
+        assert!(runner.contains("run_embedded_runner_source"));
         assert!(runner.contains("DependencyResolveMode::Locked"));
 
         let args = vec![
