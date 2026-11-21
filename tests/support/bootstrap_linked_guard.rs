@@ -857,7 +857,6 @@ int main(void) {
     assert(result.ok && result.value.len == sizeof(expected));
     assert(!memcmp(result.value.ptr, expected, sizeof(expected)));
     assert(result.value.storage == KU_PROJECTION_STRING_STATIC && !result.value.capacity);
-    ku_projection_string_drop(&result.value);
     assert(!outstanding() && !attempts);
     return 0;
 }
