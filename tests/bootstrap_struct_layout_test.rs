@@ -4421,6 +4421,7 @@ int main(int argc, char **argv) {
     linked_guard::assert_empty_owned_int_argument(&compiler, &cwd);
     linked_guard::assert_named_array_parameter_move(&compiler, &cwd);
     linked_guard::assert_owned_local_member_set(&compiler, &cwd);
+    linked_guard::assert_guarded_copy_field_set(&compiler, &cwd);
     linked_guard::assert_owned_int_array_store(&compiler, &cwd);
     struct_view::assert_named_struct_view(&compiler, &cwd);
     member_move::assert_owned_member_transfer(&compiler, &cwd);

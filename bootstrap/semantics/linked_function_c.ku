@@ -155,13 +155,10 @@ fn LowerLinkedTargetSet(&project: LinkedNullProject, state: LinkedNullState, &st
         destination.state.code += "    " + destination.value.text + " = " + stored + ";\n"
         return ok(destination.state)
     }
-    if (depth != 0) {
-        RejectLayout("linked_member_target", "record field assignment requires an outer local", DeclarationSpan(target))?
-    }
-    return LowerLinkedLocalMemberSet(project, state, statement)
+    return LowerLinkedLocalMemberSet(project, state, statement, depth != 0)
 }
 
-fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, guarded: bool): LinkedNullState! {
     target_id = LinkedNullChild(project, 1, statement, 0)
     target = LinkedNullNode(project, 1, target_id)
     if (target.kind != "Field" || target.edge_count != 1) {
@@ -185,6 +182,9 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     ty = place.value.ty.clone()
     string = LinkedStringResult(ty)
     copy = ty.declaration_kind == "Builtin" && (ty.name == "int" || ty.name == "bool")
+    if (guarded && (!copy || ty.name != "int")) {
+        RejectLayout("linked_member_target", "guarded record assignment requires an int field of a mutable local", DeclarationSpan(target))?
+    }
     if (!SameLinkedType(ty, replacement.ty) || (!copy && (!string || replacement.borrowed))) {
         RejectLayout("linked_member_rebind_type", "replacement requires a matching Copy field or separate str owner", DeclarationSpan(target))?
     }

@@ -2816,6 +2816,162 @@ int main(int argc, char **argv) {
     }
 }
 
+pub(super) fn assert_guarded_copy_field_set(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("guarded-copy-field.ku"),
+        r#"struct Parcel { id: int label: str active: bool }
+struct Holder { box: Parcel }
+
+fn Next(&parcel: Parcel, stop: bool): int! { return ok(parcel.id + 1) }
+fn Take(parcel: Parcel): int! { return ok(parcel.id) }
+
+fn Run(input: Parcel, changed: bool, stop: bool): Parcel! {
+    value = input
+    if (changed) {
+        value.id = Next(value, stop)?
+    } else {
+        value.id = value.id + 2
+    }
+    return ok(value)
+}
+
+fn Recover(input: Parcel, changed: bool, stop: bool): Parcel! {
+    value = input
+    try {
+        if (changed) { value.id = Next(value, stop)? }
+        return ok(value)
+    } catch (error) {
+        return ok(value)
+    }
+}
+
+fn BadParameter(input: Parcel, changed: bool): Parcel! {
+    if (changed) { input.id = 1 }
+    return ok(input)
+}
+fn BadView(&input: Parcel, changed: bool): int! {
+    if (changed) { input.id = 1 }
+    return ok(input.id)
+}
+fn BadNested(input: Holder, changed: bool): Holder! {
+    value = input
+    if (changed) { value.box.id = 1 }
+    return ok(value)
+}
+fn BadString(input: Parcel, replacement: str, changed: bool): Parcel! {
+    value = input
+    if (changed) { value.label = replacement }
+    return ok(value)
+}
+fn BadBool(input: Parcel, changed: bool): Parcel! {
+    value = input
+    if (changed) { value.active = false }
+    return ok(value)
+}
+fn BadType(input: Parcel, changed: bool): Parcel! {
+    value = input
+    if (changed) { value.id = false }
+    return ok(value)
+}
+fn BadMove(input: Parcel, changed: bool): Parcel! {
+    value = input
+    if (changed) { value.id = Take(value)? }
+    return ok(value)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "guarded-copy-field.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+
+    for name in ["Run", "Recover"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        let next = code
+            .lines()
+            .find_map(|line| line.strip_prefix("extern KuBootstrapResult_int64_t "))
+            .and_then(|signature| signature.split_once('('))
+            .unwrap()
+            .0;
+        let (result, signature) = code
+            .lines()
+            .find_map(|line| line.split_once(" ku_linked_null_"))
+            .unwrap();
+        let (entry, args) = signature.split_once('(').unwrap();
+        let record = args.split_once(" a0").unwrap().0;
+        let host = r#"
+static uint8_t *original;
+static unsigned calls;
+
+KuBootstrapResult_int64_t __NEXT__(const __RECORD__ *parcel, bool stop) {
+    ++calls;
+    assert(parcel->f0 == 10 && parcel->f1.ptr == original && *original == 5 && parcel->f2);
+    if (stop) {
+        uint8_t *message = malloc(1);
+        *message = 7;
+        return (KuBootstrapResult_int64_t){.error={.message={message,1,1,KU_PROJECTION_STRING_OWNED}}};
+    }
+    return (KuBootstrapResult_int64_t){.ok=true,.value=11};
+}
+
+int main(void) {
+    (void)test_realloc;
+    for (int i = 0; i < 3; ++i) {
+        bool changed = i != 0, stop = i != 1;
+        calls = 0;
+        original = malloc(1);
+        *original = 5;
+        __RECORD__ input = {10,{original,1,1,KU_PROJECTION_STRING_OWNED},true};
+        __RESULT__ result = __ENTRY__(input, changed, stop);
+        assert(calls == (unsigned)changed && outstanding() == 1);
+        if (changed && stop && !__RECOVER__) {
+            assert(!result.ok && result.error.message.len == 1 && *result.error.message.ptr == 7);
+            ku_projection_string_drop(&result.error.message);
+        } else {
+            int expected = !changed ? (__RECOVER__ ? 10 : 12) : (stop ? 10 : 11);
+            assert(result.ok && result.value.f0 == expected && result.value.f2);
+            assert(result.value.f1.ptr == original && *original == 5);
+            ku_projection_string_drop(&result.value.f1);
+        }
+        assert(!outstanding());
+    }
+    return 0;
+}
+"#
+        .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
+        .replace("__RECORD__", record)
+        .replace("__RESULT__", result)
+        .replace("__NEXT__", next)
+        .replace("__RECOVER__", if name == "Recover" { "1" } else { "0" });
+        let source = cwd.join("guarded-copy-field.c");
+        let exe = cwd.join(format!(
+            "guarded-copy-field{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+        compile_projection(&source, &exe, cwd);
+        assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    }
+
+    for (name, diagnostic) in [
+        ("BadParameter", "linked_member_target"),
+        ("BadView", "linked_member_target"),
+        ("BadNested", "linked_member_target"),
+        ("BadString", "linked_member_target"),
+        ("BadBool", "linked_member_target"),
+        ("BadType", "linked_member_rebind_type"),
+        ("BadMove", "unavailable_linked_binding"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}
+
 pub(super) fn assert_owned_local_member_set(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("member-set.ku"),
