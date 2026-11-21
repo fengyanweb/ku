@@ -35,7 +35,8 @@ fn replace_once(source: String, anchor: &str, replacement: &str) -> String {
 #[test]
 fn native_task_record_input_charges_active_owned_fields_and_rejects_aliases() {
     let source = r#"
-struct Inner { first: str, second: str, third: str, fourth: str }
+enum Kind { First, Second }
+struct Inner { first: str, second: str, third: str, fourth: str, kind: Kind }
 struct Input { direct: str, nested: Inner | null }
 async fn Accept(value: Input): int! { return ok(7) }
 async fn main(): null! { return ok(null) }
@@ -90,6 +91,57 @@ async fn main(): null! { return ok(null) }
 
 const RECORD_INPUT_MAIN: &str = r#"
 #define RECORD_CHECK(x) do { if (!(x)) { fprintf(stderr,"line %d: %s\n",__LINE__,#x); return 1; } } while (0)
+static void record_input_wake(void *context, size_t workers) { (void)context; (void)workers; }
+static int record_enum_input(void) {
+  KuTaskDriverV1 driver={0};
+  KuTaskDriverSlotV1 slots[2]={0};
+  size_t ring[2]={0};
+  const size_t fixed=ku_task_driver_fixed_storage_bytes(2u);
+  const uint64_t now=ku_task_driver_now_ms();
+  RECORD_CHECK(now<UINT64_MAX-10000u);
+  const uint64_t deadline=now+10000u;
+  uint64_t next=UINT64_MAX;
+  RECORD_CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,2u,ring,2u,fixed+sizeof(KuTaskInstance_@ID@)+1024u,
+      1u,deadline,NULL,record_input_wake)==KU_TASK_DRIVER_OK);
+  for (size_t mode=0;mode<2u;mode++) {
+    KuStruct___ku_task_record_Input input={0};
+    KuTaskFrame_@ID@ raw={0};
+    KuTaskHandle_@ID@ handle={0};
+    KuTaskAdapterOutcomeV1 outcome={0};
+    input.direct=ku_string_alloc(4u);
+    uint8_t *original=input.direct.ptr;
+    RECORD_CHECK(original);
+    int32_t invalid_tag=mode==0u ? -1 : 2;
+    input.nested.value.kind.tag=invalid_tag;
+    size_t reserved=driver.reserved_bytes;
+    size_t resident=driver.resident;
+    RECORD_CHECK(ku_task_frame_@ID@_init(&raw,sizeof(raw),KU_TASK_FRAME_ABI_VERSION,&input)
+        ==KU_TASK_FRAME_INVALID_ARGUMENT);
+    RECORD_CHECK(ku_task_frame_zero_bytes(&raw,sizeof(raw)) && input.direct.ptr==original);
+    RECORD_CHECK(ku_task_@ID@_try_start(&driver,&input,&handle)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+    RECORD_CHECK(driver.reserved_bytes==reserved && driver.resident==resident);
+    RECORD_CHECK(!handle.owner.lease.control && input.direct.ptr==original
+        && input.nested.value.kind.tag==invalid_tag);
+    if (mode==0u) input.nested.value.kind.tag=1;
+    else input.nested.is_null=true;
+    RECORD_CHECK(ku_task_@ID@_try_start(&driver,&input,&handle)==KU_TASK_DRIVER_OK && !input.direct.ptr);
+    for (size_t turn=0;turn<16u && ku_task_control_status(&handle.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+      RECORD_CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+    RECORD_CHECK(ku_task_@ID@_take(&handle,&outcome)==KU_TASK_CONTROL_OK);
+    RECORD_CHECK(outcome.result_kind==1u && outcome.value.integer.ok && outcome.value.integer.value==7);
+    ku_task_outcome_drop(&outcome);
+    RECORD_CHECK(ku_task_@ID@_drop(&handle,deadline)==KU_TASK_DRIVER_OK);
+  }
+  RECORD_CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for (size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    RECORD_CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  RECORD_CHECK(!driver.resident && !driver.running && !driver.reserved_bytes && !driver.fault);
+  RECORD_CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
+  RECORD_CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  return 0;
+}
+
 int main(void) {
   KuStruct___ku_task_record_Input input={0};
   KuString* leaves[]={&input.direct,&input.nested.value.first,&input.nested.value.second,
@@ -121,6 +173,7 @@ int main(void) {
   RECORD_CHECK(ku_task_@ID@_inputs(NULL,&excluded,1,1,&input,&charge)==KU_TASK_DRIVER_INVALID_ARGUMENT);
   RECORD_CHECK(charge==81);
   for (size_t i=0;i<5;i++) free(leaves[i]->ptr);
+  if (record_enum_input()) return 1;
   puts("task-record-input-ok");
   return 0;
 }

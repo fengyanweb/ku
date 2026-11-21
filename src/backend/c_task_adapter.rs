@@ -393,6 +393,20 @@ pub(super) fn enum_parameter_check(
     else {
         return Ok(String::new());
     };
+    if task_record_type(ty) {
+        return record_leaves(layouts, ty, &format!("*arg_{index}"), &|ty, place| {
+            enum_tag_check(layouts, ty, &format!("({place}).tag"), invalid)
+        });
+    }
+    enum_tag_check(layouts, ty, &format!("arg_{index}->tag"), invalid)
+}
+
+fn enum_tag_check(
+    layouts: &IrLayoutTable,
+    ty: &IrType,
+    tag: &str,
+    invalid: &str,
+) -> KuResult<String> {
     if crate::ir::task::unit_enum_name(ty).is_none() {
         return Ok(String::new());
     }
@@ -403,7 +417,7 @@ pub(super) fn enum_parameter_check(
     }
     let variants = layout.variants.len();
     Ok(format!(
-        "  if ((uint32_t)arg_{index}->tag >= UINT32_C({variants})) return {invalid};\n"
+        "  if ((uint32_t){tag} >= UINT32_C({variants})) return {invalid};\n"
     ))
 }
 
@@ -419,11 +433,27 @@ fn record_strings(
     place: &str,
     body: &impl Fn(&str) -> String,
 ) -> KuResult<String> {
+    record_leaves(layouts, ty, place, &|ty, place| {
+        if ty == &IrType::Str {
+            Ok(body(place))
+        } else {
+            Ok(String::new())
+        }
+    })
+}
+
+// Walk only the verified fields, and guard reads of nullable payloads.
+fn record_leaves(
+    layouts: &IrLayoutTable,
+    ty: &IrType,
+    place: &str,
+    body: &impl Fn(&IrType, &str) -> KuResult<String>,
+) -> KuResult<String> {
     fn walk(
         layouts: &IrLayoutTable,
         ty: &IrType,
         place: &str,
-        body: &impl Fn(&str) -> String,
+        body: &impl Fn(&IrType, &str) -> KuResult<String>,
         depth: usize,
         remaining: &mut usize,
     ) -> KuResult<String> {
@@ -469,9 +499,8 @@ fn record_strings(
                 }
                 Ok(format!("  if (!({place}).is_null) {{\n{code}  }}\n"))
             }
-            IrType::Str => Ok(body(place)),
-            IrType::Int | IrType::Bool | IrType::Null => Ok(String::new()),
-            ty if crate::ir::task::unit_enum_name(ty).is_some() => Ok(String::new()),
+            IrType::Int | IrType::Bool | IrType::Null | IrType::Str => body(ty, place),
+            ty if crate::ir::task::unit_enum_name(ty).is_some() => body(ty, place),
             _ => Err(unsupported(format!(
                 "unsupported native Task record field type: {ty:?}"
             ))),
