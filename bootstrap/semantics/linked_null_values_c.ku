@@ -44,10 +44,7 @@ fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
         if (args != "") { args += ", " }
         if (callee.parameters[index].declaration_kind == "IntPairResultCallback") {
             args += ForwardLinkedCallback(project, next, argument_id, callee.parameters[index])?
-            index = index + 1
-            continue
-        }
-        if (IsLinkedScopedCallback(callee.parameters[index])) {
+        } else if (IsLinkedScopedCallback(callee.parameters[index])) {
             parameter = callee.parameters[index].clone()
             next = RegisterLinkedNullType(project, next, parameter.clone())?
             prepared = PrepareLinkedScopedCallbackArgument(project, next, argument_id, parameter,
@@ -55,29 +52,27 @@ fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
             next = prepared.state
             args += prepared.args
             fault_relays += prepared.handoff
-            index += 1
-            continue
-        }
-        argument = lowerLinkedArgument(project, next, callee.parameters[index], argument_id, depth + 1)?
-        if (LinkedNullView(callee.parameters[index])) {
-            args += LinkedViewArgument(callee.parameters[index], argument.value)?
-            if (argument.value.slot > 0) { loans = loans.push(argument.value.clone()) }
-            next = argument.state
-            index = index + 1
-            continue
-        }
-        if (!SameLinkedType(callee.parameters[index], argument.value.ty)) {
-            RejectLayout("linked_argument_type", "argument type differs from the bound function parameter", argument.value.ty.span.clone())?
-        }
-        // Pending argument slots own their values until the actual call. A
-        // later argument can fail while computing a nested call or a clone.
-        ty = argument.value.ty.clone()
-        pending = AddLinkedNullSlot(project, argument.state, "", "p" + str(id) + "_" + str(index), ty, false)?
-        pending.state.code = pending.state.code + "    " + pending.value.text.clone() + " = " + argument.value.text.clone() + ";\n"
-        next = MoveLinkedNullSlot(pending.state, argument.value)?
-        args += pending.value.text.clone()
-        if (LinkedNullOwner(pending.value.ty)) {
-            handoff += "    " + pending.value.text + " = (" + LinkedNullCType(pending.value.ty)? + "){0};\n"
+        } else {
+            argument = lowerLinkedArgument(project, next, callee.parameters[index], argument_id, depth + 1)?
+            if (LinkedNullView(callee.parameters[index])) {
+                args += LinkedViewArgument(callee.parameters[index], argument.value)?
+                if (argument.value.slot > 0) { loans = loans.push(argument.value.clone()) }
+                next = argument.state
+            } else {
+                if (!SameLinkedType(callee.parameters[index], argument.value.ty)) {
+                    RejectLayout("linked_argument_type", "argument type differs from the bound function parameter", argument.value.ty.span.clone())?
+                }
+                // Pending argument slots own their values until the actual call. A
+                // later argument can fail while computing a nested call or a clone.
+                ty = argument.value.ty.clone()
+                pending = AddLinkedNullSlot(project, argument.state, "", "p" + str(id) + "_" + str(index), ty, false)?
+                pending.state.code = pending.state.code + "    " + pending.value.text.clone() + " = " + argument.value.text.clone() + ";\n"
+                next = MoveLinkedNullSlot(pending.state, argument.value)?
+                args += pending.value.text.clone()
+                if (LinkedNullOwner(pending.value.ty)) {
+                    handoff += "    " + pending.value.text + " = (" + LinkedNullCType(pending.value.ty)? + "){0};\n"
+                }
+            }
         }
         index = index + 1
     }
