@@ -132,25 +132,45 @@ fn SameLinkedCallbackSignature(&left: LinkedNullFunction, &right: LinkedNullFunc
     }
     return true
 }
+
+fn CallbackPlanNominals(&project: LinkedNullProject, &ty: LinkPlanType): [LinkPlanNominalType]! {
+    if (ty.kind == "IntResultAppendCallback" || ty.kind == "IntResultArenaCallback") {
+        checked = LinkedIntAppendCallbackFunction(project, ty.unit, ty.node)?
+        first = 3
+        second = 5
+        if (ty.kind == "IntResultArenaCallback") { first = 0; second = 1 }
+        a = checked.parameters[first].clone()
+        b = checked.parameters[second].clone()
+        return ok([
+            LinkPlanNominalType { unit: a.module_index, node: a.declaration_node, c_type: LinkedNullCType(a)? },
+            LinkPlanNominalType { unit: b.module_index, node: b.declaration_node, c_type: LinkedNullCType(b)? }
+        ])
+    }
+    nominals: [LinkPlanNominalType] = []
+    count = ty.nominals.len()
+    index = 0
+    while (index < count) {
+        entry = ty.nominals[index].clone()
+        nominals = nominals.push(entry)
+        index = index + 1
+    }
+    return ok(nominals)
+}
+
 fn PrepareLinkedAppendCallbackPlan(&project: LinkedNullProject, declaration: LinkPlanDeclaration): LinkPlanDeclaration! {
     parameters: [LinkPlanType] = []
     count = declaration.parameters.len()
     index = 0
     while (index < count) {
-        ty = declaration.parameters[index].clone()
-        if (ty.kind == "IntResultAppendCallback" || ty.kind == "IntResultArenaCallback") {
-            checked = LinkedIntAppendCallbackFunction(project, ty.unit, ty.node)?
-            first = 3
-            second = 5
-            if (ty.kind == "IntResultArenaCallback") { first = 0; second = 1 }
-            a = checked.parameters[first].clone()
-            b = checked.parameters[second].clone()
-            nominals: [LinkPlanNominalType] = [
-                LinkPlanNominalType { unit: a.module_index, node: a.declaration_node, c_type: LinkedNullCType(a)? },
-                LinkPlanNominalType { unit: b.module_index, node: b.declaration_node, c_type: LinkedNullCType(b)? }
-            ]
-            ty = LinkPlanType { kind: ty.kind, name: ty.name, unit: ty.unit, node: ty.node,
-                c_type: ty.c_type, view: ty.view, nominals: nominals }
+        nominals = CallbackPlanNominals(project, declaration.parameters[index])?
+        ty = LinkPlanType {
+            kind: declaration.parameters[index].kind.clone(),
+            name: declaration.parameters[index].name.clone(),
+            unit: declaration.parameters[index].unit,
+            node: declaration.parameters[index].node,
+            c_type: declaration.parameters[index].c_type.clone(),
+            view: declaration.parameters[index].view,
+            nominals: nominals
         }
         parameters = parameters.push(ty)
         index = index + 1
