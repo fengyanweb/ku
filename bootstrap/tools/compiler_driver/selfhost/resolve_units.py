@@ -44,6 +44,9 @@ def generate_exact(repo, revision, producer, limit, output, cc, temp_dir):
     entry_key = None
     attempts = 0
     strict = ["-std=c11", "-O2", "-pedantic-errors", "-Wall", "-Wextra", "-Werror"]
+    if "-windows-msvc" in target:
+        # COFF timestamps are otherwise tied to when each provider compiles.
+        strict.append("-mno-incremental-linker-compatible")
 
     def run(command, cwd, phase):
         result = subprocess.run(command, cwd=cwd, capture_output=True, timeout=30)

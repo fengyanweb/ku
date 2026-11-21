@@ -89,11 +89,14 @@ def main():
     extension = ".exe" if os.name == "nt" else ""
     driver = repo / "bootstrap/tools/compiler_driver"
     sys.path.insert(0, str(driver))
-    host_flags = []
+    host_flags, reproducible_cflags = [], []
     if os.name == "nt":
         from build import windows_host_link_flags, windows_stack_reserve
 
         host_flags = windows_host_link_flags(target)
+        if "-windows-msvc" in target:
+            reproducible_cflags.append("-mno-incremental-linker-compatible")
+            host_flags.extend(["-Xlinker", "/Brepro"])
     sys.path.insert(0, str(repo / "bootstrap/tools"))
     import link_c
 
@@ -226,7 +229,7 @@ static KuProjectionString ku_string_static(const uint8_t *input, size_t size) {
         for name, flags in profiles:
             binary = root / (name + extension)
             link_c.link(units, aliases, binary, entry.key, caller.read_bytes(), cc,
-                        ["-Wall", "-Wextra", "-Werror", "-pedantic-errors", *flags],
+                        ["-Wall", "-Wextra", "-Werror", "-pedantic-errors", *reproducible_cflags, *flags],
                         [*flags, *host_flags], 60, builtin_headers)
             stack = windows_stack_reserve(binary) if os.name == "nt" else None
             current = root / f"{name}-fixture"
