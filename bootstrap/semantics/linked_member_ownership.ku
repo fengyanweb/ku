@@ -1,7 +1,7 @@
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
-import { ContainsIndex } from "./struct_projection_c.ku"
+import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { OwningLayoutDropName } from "./nested_struct_c.ku"
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
@@ -117,6 +117,40 @@ fn CheckLinkedGuardOwners(&outer: [LinkedNullSlot], &taken: LinkedNullState, &st
     // On continuation the taken-arm liveness is already conservative. The
     // untaken scalar record has no resources requiring divergent cleanup.
     return ok(null)
+}
+
+fn linkedMovedMembersContained(&members: [str], &possible: [str]): bool {
+    if (members.len() > possible.len()) { return false }
+    index = 0
+    while (index < members.len()) {
+        if (!ContainsType(possible, members[index])) { return false }
+        index = index + 1
+    }
+    return true
+}
+
+fn joinedLinkedMemberMoves(&first: LinkedNullSlot, &second: LinkedNullSlot, &statement: Node): [str]! {
+    if (first.live && second.live && !first.value.borrowed && !second.value.borrowed
+        && first.value.ty.declaration_kind == "Struct" && SameLinkedType(first.value.ty, second.value.ty)) {
+        if (linkedMovedMembersContained(first.moved_members, second.moved_members)) { return ok(second.moved_members.clone()) }
+        if (linkedMovedMembersContained(second.moved_members, first.moved_members)) { return ok(first.moved_members.clone()) }
+    }
+    RejectLayout("linked_control_move", "conditional code cannot consume an outer owner", DeclarationSpan(statement))?
+    return ok([])
+}
+
+fn MergeLinkedConditionalMembers(state: LinkedNullState, &first: [LinkedNullSlot], &statement: Node): LinkedNullState! {
+    next = state
+    index = 0
+    while (index < first.len()) {
+        if (LinkedNullOwner(first[index].value.ty) && !LinkedSlotOwnershipMatches(first[index], next.slots[index])) {
+            // Only availability merges. Actual moves zero their field in the
+            // arm that executes, so cleanup still visits this live parent.
+            next.slots[index].moved_members = joinedLinkedMemberMoves(first[index], next.slots[index], statement)?
+        }
+        index = index + 1
+    }
+    return ok(next)
 }
 
 fn LinkedMemberPath(&receiver: LinkedNullValue, ordinal: int): str {
