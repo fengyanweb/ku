@@ -6,7 +6,7 @@ import { ContainsType, LinkedFsReadReference } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { LinkedFieldAppendArgument, LowerLinkedFieldAppend } from "./linked_array_fields_c.ku"
-import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
+import { LinkedIntSnapshotRuntime, ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
 import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
@@ -92,6 +92,7 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
     }
     header = LinkedCPrelude(body, ops + GuardStringEquality(body.uses_string_equal))
     declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
+    if (body.uses_int_snapshot) { declarations += LinkedIntSnapshotRuntime() }
     checked = !body.plain_value_result
     return ok(declarations + EmitLinkedNullPrototypes(body.links, body.slots, result, checked)?)
 }

@@ -394,3 +394,29 @@ fn EmitLinkedLogicalBranch(&result: str, &left: str, disjunction: bool): str {
     return "    bool " + result.clone() + " = " + left.clone() + ";\n"
         + "    if (" + negate + result.clone() + ") {\n"
 }
+
+fn LinkedIntSnapshotRuntime(): str {
+    return "
+enum { KU_INT_SNAPSHOT_OK, KU_INT_SNAPSHOT_INVALID, KU_INT_SNAPSHOT_OOM };
+
+static int ku_linked_int_snapshot(const KuArrayInt *source, KuArrayInt *target) {
+    if (!ku_linked_view_int_array_valid(source) || source->len > SIZE_MAX / sizeof(int64_t))
+        return KU_INT_SNAPSHOT_INVALID;
+    size_t count = source->len;
+    if (count) {
+        int64_t *copy = malloc(count * sizeof(*copy));
+        if (!copy) return KU_INT_SNAPSHOT_OOM;
+        memcpy(copy, source->data, count * sizeof(*copy));
+        *target = (KuArrayInt){ count, copy, count };
+    }
+    return KU_INT_SNAPSHOT_OK;
+}
+"
+}
+
+fn LinkedIntSnapshotCall(&source: str, &target: str): str {
+    status = "snapshot_" + target.clone()
+    return "    int " + status.clone() + " = ku_linked_int_snapshot(&(" + source.clone() + "), &" + target.clone() + ");\n"
+        + "    if (" + status.clone() + " != KU_INT_SNAPSHOT_OK) { invalid_array = " + status.clone()
+        + " == KU_INT_SNAPSHOT_INVALID; out_of_memory = " + status + " == KU_INT_SNAPSHOT_OOM; goto cleanup; }\n"
+}

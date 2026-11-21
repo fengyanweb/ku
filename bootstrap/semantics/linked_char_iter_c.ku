@@ -6,8 +6,8 @@ import { LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, Linke
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedIntResult, LinkedNullChild, LinkedNullCType, LinkedNullNode,
     LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedStringResult,
     ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
-import { DropLinkedNullScope, LinkedIncreasingGuard, LinkedLiveIntBinding, RejectLinkedWriteRange } from "./linked_member_ownership.ku"
+import { AddLinkedNullSlot, CheckLinkedUnitDecrement, CloneLinkedIntArray, RegisterLinkedNullType } from "./linked_parameters_c.ku"
+import { DropLinkedNullScope, LinkedIncreasingGuard, LinkedLiveIntBinding, RejectLinkedLoopWrite, RejectLinkedWriteRange } from "./linked_member_ownership.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
@@ -237,24 +237,10 @@ fn openLinkedIntLoop(&project: LinkedNullProject, state: LinkedNullState, &state
     }
     before = state.slots.len()
     suffix = str(id) + "_ints"
-    snapshot = AddLinkedNullSlot(project, state, "", "a" + suffix.clone(), source.value.ty.clone(), false)?
+    // The source binding can grow or be replaced in the loop body.
+    input = LinkedNullExpression { state: state, value: source.value.clone() }
+    snapshot = CloneLinkedIntArray(project, input, "a" + suffix.clone())?
     array = snapshot.value.text.clone()
-    input = "source" + suffix.clone()
-    count = "count" + suffix.clone()
-    // The source binding can grow or be replaced in the loop body. Only
-    // this checked Copy buffer is read by the iteration.
-    snapshot.state = RequireLinkedArrayValidation(snapshot.state, source.value.ty.clone())
-    snapshot.state.uses_int_snapshot = true
-    snapshot.state.slots[snapshot.value.slot - 1].live = true
-    snapshot.state.code += "    const KuArrayInt *const " + input.clone() + " = &" + source.value.text.clone() + ";\n"
-    snapshot.state.code += "    if (!ku_linked_view_int_array_valid(" + input.clone() + ") || " + input.clone()
-        + "->len > SIZE_MAX / sizeof(int64_t)) { invalid_array = true; goto cleanup; }\n"
-    snapshot.state.code += "    const size_t " + count.clone() + " = " + input.clone() + "->len;\n"
-    snapshot.state.code += "    if (" + count.clone() + ") {\n"
-        + "        int64_t *copy = malloc(" + count.clone() + " * sizeof(*copy));\n"
-        + "        if (!copy) { out_of_memory = true; goto cleanup; }\n"
-    snapshot.state.code += "        memcpy(copy, " + input + "->data, " + count.clone() + " * sizeof(*copy));\n"
-    snapshot.state.code += "        " + array.clone() + " = (KuArrayInt){" + count.clone() + ", copy, " + count + "};\n    }\n"
     outer = snapshot.state.slots.clone()
     item = AddLinkedNullSlot(project, snapshot.state, statement.text.clone(), "t" + suffix.clone(), LinkedBuiltin("int", at), false)?
     item.state.slots[item.value.slot - 1].live = true
@@ -369,4 +355,20 @@ fn LinkedCountedInitial(&project: LinkedNullProject, &state: LinkedNullState, &r
         position = position - 1
     }
     return ok(initial)
+}
+
+fn LinkedCountdownIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &step: Node): int! {
+    guard = LinkedNullNode(project, 1, LinkedNullChild(project, 1, loop, 0))
+    if (guard.kind != "Binary" || guard.text != ">" || guard.edge_count != 2) { return ok(0) }
+    zero = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 1))
+    if (zero.kind != "Int" || zero.int_value != 0 || zero.edge_count != 0) { return ok(0) }
+    cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
+    slot = LinkedLiveIntBinding(state, cursor)
+    at = DeclarationSpan(step)
+    if (slot == 0 || step.kind != "Assign" || step.edge_count != 1 || step.text != cursor.text) {
+        RejectLayout("unsupported_linked_countdown", "countdown requires a live int cursor and its final assignment", at.clone())?
+    }
+    CheckLinkedUnitDecrement(project, step, cursor, at)?
+    RejectLinkedLoopWrite(project, loop, cursor.text, "linked_loop_cursor_write", "countdown can change its cursor only at the end")?
+    return ok(slot)
 }

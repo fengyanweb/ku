@@ -1,8 +1,10 @@
-import { LinkedLiveIntBinding, LinkedMemberUnavailable, LinkedNullDropC, RejectLinkedLoopWrite } from "./linked_member_ownership.ku"
+import { LinkedIntSnapshotCall } from "./guarded_string_parts.ku"
+import { LinkedMemberUnavailable, LinkedNullDropC } from "./linked_member_ownership.ku"
 import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
 import { EmitScalarIntString } from "./scalar_int_emit.ku"
 import { HasScalarBuiltin } from "./scalar_int_operands.ku"
 import { Node } from "../stage2/ast.ku"
+import { Span } from "../stage2/span.ku"
 import { FindLinkedLocalRead, LinkedLocalReadBinding } from "./call_contracts.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -301,6 +303,20 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
     return ok(LinkedNullExpression { state: next, value: value })
 }
 
+fn CloneLinkedIntArray(&project: LinkedNullProject, input: LinkedNullExpression, name: str): LinkedNullExpression! {
+    source = input.value
+    state = input.state
+    if (source.borrowed || LinkedMemberUnavailable(state, source, true)) {
+        RejectLayout("linked_int_array_clone", "expected a live owned int array", source.ty.span.clone())?
+    }
+    output = AddLinkedNullSlot(project, state, "", name, source.ty.clone(), false)?
+    output.state = RequireLinkedArrayValidation(output.state, source.ty.clone())
+    output.state.uses_int_snapshot = true
+    output.state.slots[output.value.slot - 1].live = true
+    output.state.code += LinkedIntSnapshotCall(source.text, output.value.text)
+    return ok(output)
+}
+
 fn CloneLinkedStringSlot(&project: LinkedNullProject, source: LinkedNullExpression, name: str): LinkedNullExpression! {
     ty = source.value.ty.clone()
     output = AddLinkedNullSlot(project, source.state, "", name, ty, false)?
@@ -346,31 +362,6 @@ fn LowerLinkedIntString(&project: LinkedNullProject, input: LinkedNullExpression
     return ok(output)
 }
 
-fn LinkedCountdownIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &step: Node): int! {
-    guard = LinkedNullNode(project, 1, LinkedNullChild(project, 1, loop, 0))
-    if (guard.kind != "Binary" || guard.text != ">" || guard.edge_count != 2) { return ok(0) }
-    zero = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 1))
-    if (zero.kind != "Int" || zero.int_value != 0 || zero.edge_count != 0) { return ok(0) }
-    cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
-    slot = LinkedLiveIntBinding(state, cursor)
-    at = DeclarationSpan(step)
-    if (slot == 0 || step.kind != "Assign" || step.edge_count != 1 || step.text != cursor.text) {
-        RejectLayout("unsupported_linked_countdown", "countdown requires a live int cursor and its final assignment", at.clone())?
-    }
-    changed = LinkedNullNode(project, 1, LinkedNullChild(project, 1, step, 0))
-    if (changed.kind != "Binary" || changed.text != "-" || changed.edge_count != 2) {
-        RejectLayout("unsupported_linked_countdown", "countdown must end with a unit decrement", at.clone())?
-    }
-    previous = LinkedNullNode(project, 1, LinkedNullChild(project, 1, changed, 0))
-    one = LinkedNullNode(project, 1, LinkedNullChild(project, 1, changed, 1))
-    if (previous.kind != "Variable" || previous.edge_count != 0 || previous.text != cursor.text
-        || one.kind != "Int" || one.edge_count != 0 || one.int_value != 1) {
-        RejectLayout("unsupported_linked_countdown", "countdown must end with a unit decrement", at.clone())?
-    }
-    RejectLinkedLoopWrite(project, loop, cursor.text, "linked_loop_cursor_write", "countdown can change its cursor only at the end")?
-    return ok(slot)
-}
-
 fn ForwardLinkedCallback(&project: LinkedNullProject, &state: LinkedNullState, id: int,
                          &parameter: TypeNameBinding): str! {
     source = ProjectionCloneSource(project.supplied[0].named.parsed.arena.nodes,
@@ -385,4 +376,18 @@ fn ForwardLinkedCallback(&project: LinkedNullProject, &state: LinkedNullState, i
     // Even an explicit clone keeps the same environment. Both descriptors
     // are borrowed from the invoking frame for this synchronous call.
     return ok(state.slots[slot - 1].value.text.clone())
+}
+
+fn CheckLinkedUnitDecrement(&project: LinkedNullProject, &step: Node, &cursor: Node, &at: Span): null! {
+    changed = LinkedNullNode(project, 1, LinkedNullChild(project, 1, step, 0))
+    if (changed.kind != "Binary" || changed.text != "-" || changed.edge_count != 2) {
+        RejectLayout("unsupported_linked_countdown", "countdown must end with a unit decrement", at.clone())?
+    }
+    previous = LinkedNullNode(project, 1, LinkedNullChild(project, 1, changed, 0))
+    one = LinkedNullNode(project, 1, LinkedNullChild(project, 1, changed, 1))
+    if (previous.kind != "Variable" || previous.edge_count != 0 || previous.text != cursor.text
+        || one.kind != "Int" || one.edge_count != 0 || one.int_value != 1) {
+        RejectLayout("unsupported_linked_countdown", "countdown must end with a unit decrement", at.clone())?
+    }
+    return ok(null)
 }

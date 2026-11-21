@@ -1,6 +1,6 @@
 import { RequireLinkedMutableName } from "./call_contracts.ku"
-import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, LinkedCountdownIndex, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
-import { OpenLinkedForLoop, OpenLinkedConditionalWhile, ReadLinkedWhileCondition, CloseLinkedForLoop, LinkedCountedInitial, ValidLinkedCountedStart, ReadLinkedLocalThunk, FinishLinkedLocalThunk, LowerLinkedLocalAlias, LowerLinkedPredicate } from "./linked_char_iter_c.ku"
+import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
+import { OpenLinkedForLoop, OpenLinkedConditionalWhile, ReadLinkedWhileCondition, CloseLinkedForLoop, LinkedCountdownIndex, LinkedCountedInitial, ValidLinkedCountedStart, ReadLinkedLocalThunk, FinishLinkedLocalThunk, LowerLinkedLocalAlias, LowerLinkedPredicate } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedArrayLocal, LowerLinkedTargetSet, LowerLinkedOwnedDestructure,
          LowerLinkedPlainReturn, LowerLinkedStringAppend, LowerLinkedSuccess } from "./linked_function_c.ku"
