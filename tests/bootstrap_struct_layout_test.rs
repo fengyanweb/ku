@@ -432,10 +432,11 @@ fn bootstrap_emits_owning_layout_for_real_supplied_module() {
     fs::create_dir(&cwd).unwrap();
     stage_sources(&copied);
     for file in [
-        "semantics/call_contracts.ku",
         "semantics/imports.ku",
         "semantics/names.ku",
+        "semantics/project_bindings.ku",
         "semantics/project_paths.ku",
+        "semantics/type_names.ku",
         "stage2/ast.ku",
         "stage2/diagnostic.ku",
         "stage2/span.ku",
@@ -455,14 +456,19 @@ import { BuildProjectOwningLayouts, EmitProjectOwningLayoutsC, OwningLayoutDropN
 import { CTypeName } from "./struct_projection_c.ku"
 fn main(): null! {
     subject = fs.read("subject.txt")?
-    needs_imports = subject == "semantics/call_contracts.ku"
+    signature = subject == "semantics/project_bindings.ku"
+    name = ""
     paths = [subject, "semantics/names.ku", "semantics/project_paths.ku",
         "stage2/ast.ku", "stage2/diagnostic.ku", "stage2/span.ku", "stage1/token.ku"]
-    if (needs_imports) { paths = paths.push("semantics/imports.ku") }
+    if (signature) {
+        name = "DirectSignature"
+        paths = paths.push("semantics/imports.ku")
+        paths = paths.push("semantics/type_names.ku")
+    }
     supplied = ReadProjectModules(paths)?
     project = BindProjectModules(supplied)?
     for item in supplied[0].named.names.declarations {
-        if (item.kind == "Struct") {
+        if (item.kind == "Struct" && (name == "" || item.name == name)) {
             layouts = BuildProjectOwningLayouts(supplied, project, 1, item.node, item.span.clone())?
             emitted = EmitProjectOwningLayoutsC(layouts, 1, item.node, item.span)?
             println(CTypeName(1, item.node) + "|" + OwningLayoutDropName(1, item.node))
@@ -563,7 +569,7 @@ int main(void) {
         "partial and complete Project owners released"
     );
 
-    fs::write(cwd.join("subject.txt"), "semantics/call_contracts.ku").unwrap();
+    fs::write(cwd.join("subject.txt"), "semantics/project_bindings.ku").unwrap();
     let output = execute(&mut Command::new(&seed), &cwd, 30);
     assert_ok(&output);
     let emitted = String::from_utf8(output.stdout).unwrap();
