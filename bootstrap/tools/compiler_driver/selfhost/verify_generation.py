@@ -8,9 +8,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+
+
+MSVC_ASAN_DLL = "clang_rt.asan_dynamic-x86_64.dll"
 
 
 def dynamic_imports(binary):
@@ -22,18 +26,80 @@ def dynamic_imports(binary):
     if os.name == "nt":
         objdump = shutil.which("llvm-objdump") or shutil.which("objdump")
         if objdump:
-            result = subprocess.check_output([objdump, "-p", binary], text=True)
+            result = subprocess.check_output([objdump, "-p", binary], text=True, timeout=20)
             imports = re.findall(r"^\s*DLL Name:\s*(\S+)\s*$", result, re.MULTILINE)
             if imports:
                 return imports
         dumpbin = shutil.which("dumpbin")
         if dumpbin:
-            result = subprocess.check_output([dumpbin, "/nologo", "/dependents", binary], text=True)
+            result = subprocess.check_output([dumpbin, "/nologo", "/dependents", binary], text=True, timeout=20)
             imports = re.findall(r"^\s*(\S+\.dll)\s*$", result, re.MULTILINE | re.IGNORECASE)
             if imports:
                 return imports
         raise ValueError("cannot read the compiler host's PE import table with llvm-objdump, objdump or dumpbin")
     raise ValueError(f"cannot inspect executable imports on {sys.platform}")
+
+
+def sanitizer_imports(imports):
+    return sorted({name.lower() for name in imports
+                   if name.lower().startswith(("clang_rt.", "libclang_rt.", "libasan", "libubsan"))})
+
+
+def require_msvc_asan_import(imports):
+    runtime = sanitizer_imports(imports)
+    if runtime != [MSVC_ASAN_DLL]:
+        raise ValueError(f"expected only {MSVC_ASAN_DLL} as a sanitizer dependency, found {runtime!r}")
+
+
+def require_amd64_dll(path):
+    with path.open("rb") as stream:
+        dos = stream.read(64)
+        if len(dos) != 64 or dos[:2] != b"MZ":
+            raise ValueError(f"invalid sanitizer DLL DOS header: {path}")
+        offset, = struct.unpack_from("<I", dos, 60)
+        if not 64 <= offset <= 1024 * 1024:
+            raise ValueError(f"invalid sanitizer DLL PE header offset: {path}")
+        stream.seek(offset)
+        header = stream.read(26)
+    if (len(header) != 26 or header[:4] != b"PE\0\0" or
+            struct.unpack_from("<H", header, 4)[0] != 0x8664 or
+            struct.unpack_from("<H", header, 20)[0] < 112 or
+            (struct.unpack_from("<H", header, 22)[0] & 0x2002) != 0x2002 or
+            struct.unpack_from("<H", header, 24)[0] != 0x20B):
+        raise ValueError(f"expected an AMD64 PE32+ sanitizer DLL: {path}")
+
+
+def stage_msvc_sanitizer_runtime(cc, target, binary):
+    probe_imports = dynamic_imports(binary)
+    require_msvc_asan_import(probe_imports)
+    compiler = Path(cc).resolve(strict=True)
+
+    def compiler_path(flag):
+        output = subprocess.check_output([cc, f"--target={target}", flag], encoding="utf-8", timeout=20)
+        path = Path(output.strip())
+        if not path.is_absolute():
+            raise ValueError(f"{cc} {flag} did not identify an installed path: {output.strip()!r}")
+        return path.resolve(strict=True)
+
+    resource_dir = compiler_path("-print-resource-dir")
+    # The file lookup includes Clang's legacy lib/windows runtime directory.
+    source = compiler_path(f"-print-file-name={MSVC_ASAN_DLL}")
+    if (not resource_dir.is_dir() or not resource_dir.is_relative_to(compiler.parent.parent) or
+            not source.is_relative_to(resource_dir / "lib") or source.name.lower() != MSVC_ASAN_DLL or
+            not source.is_file()):
+        raise ValueError(f"sanitizer DLL does not belong to the selected compiler resources: {resource_dir}, {source}")
+    require_amd64_dll(source)
+    imports = dynamic_imports(source)
+    dependencies = sanitizer_imports(imports)
+    if dependencies:
+        raise ValueError(f"unsupported sanitizer DLL dependencies in {source}: {dependencies!r}")
+    digest = sha256(source.read_bytes()).hexdigest()
+    staged = binary.with_name(MSVC_ASAN_DLL)
+    shutil.copy2(source, staged)
+    if sha256(staged.read_bytes()).hexdigest() != digest:
+        raise ValueError(f"sanitizer DLL changed while copying {source}")
+    return {"source": str(source), "sha256": digest, "resource_dir": str(resource_dir),
+            "probe_imports": probe_imports, "runtime_imports": imports}
 
 
 def frozen_builtin(repo, commit, path, checkout):
@@ -44,23 +110,38 @@ def frozen_builtin(repo, commit, path, checkout):
     return content
 
 
-def sanitizer_profiles(mode, cc, root, extension, host_flags, execute):
+def sanitizer_profiles(mode, cc, target, root, extension, host_flags, execute):
     profiles = [("strict_o2", [])]
     if mode == "off":
-        return profiles, "disabled by request"
+        return profiles, "disabled by request", None
     flags = ["-fsanitize=address,undefined"]
-    if mode == "auto" and sys.platform != "darwin":
-        source = root / "sanitizer-probe.c"
-        binary = root / ("sanitizer-probe" + extension)
+    msvc = os.name == "nt" and "-windows-msvc" in target
+    runtime = None
+    if msvc or (mode == "auto" and sys.platform != "darwin"):
+        probe_dir = root
+        if msvc:
+            probe_dir = root / "msvc-sanitizer"
+            probe_dir.mkdir()
+        source = probe_dir / "sanitizer-probe.c"
+        binary = probe_dir / ("sanitizer-probe" + extension)
         source.write_text("#include <wchar.h>\nint wmain(int argc, wchar_t **argv) { "
                           "return argc < 1 || argv == 0; }\n" if os.name == "nt"
                           else "int main(void) { return 0; }\n", encoding="ascii")
+        step = "compile"
         try:
-            execute([cc, "-std=c11", "-O2", *flags, source, "-o", binary, *host_flags], root)
+            execute([cc, "-std=c11", "-O2", *flags, source, "-o", binary, *host_flags], probe_dir)
+            if msvc:
+                step = "runtime discovery"
+                runtime = stage_msvc_sanitizer_runtime(cc, target, binary)
+            step = "execute"
             execute([binary], root)
-        except (OSError, AssertionError, subprocess.TimeoutExpired) as error:
-            return profiles, f"compile or runtime probe failed: {error}"
-    return [*profiles, ("asan_ubsan", flags)], "enabled"
+        except (OSError, AssertionError, subprocess.SubprocessError, ValueError) as error:
+            if not msvc:
+                return profiles, f"compile or runtime probe failed: {error}", None
+            if mode == "required":
+                raise RuntimeError(f"required sanitizer probe failed during {step}: {error}") from error
+            return profiles, f"sanitizer probe failed during {step}: {error}", None
+    return [*profiles, ("asan_ubsan", flags)], "enabled", runtime
 
 
 def main():
@@ -73,7 +154,7 @@ def main():
     arguments.add_argument("--cc", default="clang", help="target C11 compiler executable")
     arguments.add_argument("--temp-dir", type=Path, default="/private/tmp" if sys.platform == "darwin" else None)
     arguments.add_argument("--sanitizers", choices=("auto", "required", "off"), default="auto",
-                           help="retain the macOS gate; probe the selected compiler on Linux and Windows in auto mode")
+                           help="retain the macOS gate and probe the selected sanitizer toolchain when needed")
     args = arguments.parse_args()
     if args.host_check == bool(args.output_dir) or (args.output_dir and args.output_dir.exists()):
         arguments.error("choose either --host-check or a fresh --output-dir")
@@ -222,13 +303,22 @@ static KuProjectionString ku_string_static(const uint8_t *input, size_t size) {
             return 0
         aliases = link_c.checked_aliases(units)
         binaries = {}
-        profiles, sanitizer_status = sanitizer_profiles(args.sanitizers, cc, root, extension, host_flags, consumer.execute)
+        profiles, sanitizer_status, msvc_runtime = sanitizer_profiles(
+            args.sanitizers, cc, target, root, extension, host_flags, consumer.execute)
         for name, flags in profiles:
-            binary = root / (name + extension)
+            runtime = msvc_runtime if name == "asan_ubsan" else None
+            binary_dir = root / "msvc-sanitizer" if runtime is not None else root
+            binary = binary_dir / (name + extension)
             link_c.link(units, aliases, binary, entry.key, caller.read_bytes(), cc,
                         ["-Wall", "-Wextra", "-Werror", "-pedantic-errors", *reproducible_cflags, *flags],
                         [*flags, *host_flags], 60, builtin_headers)
             stack = windows_stack_reserve(binary) if os.name == "nt" else None
+            imports = None
+            if runtime is not None:
+                imports = dynamic_imports(binary)
+                require_msvc_asan_import(imports)
+                if sha256(binary.with_name(MSVC_ASAN_DLL).read_bytes()).hexdigest() != runtime["sha256"]:
+                    raise ValueError("staged MSVC sanitizer DLL changed before compiler execution")
             current = root / f"{name}-fixture"
             current.mkdir()
             foreign = current / "不同 工作目录🙂"
@@ -249,9 +339,12 @@ static KuProjectionString ku_string_static(const uint8_t *input, size_t size) {
             consumer.exercise_linked_owned_reader(binary, cc, foreign)
             consumer.exercise_linked_reader_factory(binary, cc, foreign)
             consumer.exercise_linked_owned_string_for(binary, cc, foreign)
-            imports = dynamic_imports(binary)
+            if imports is None:
+                imports = dynamic_imports(binary)
             assert not any("libku" in line.lower() for line in imports)
             binaries[name] = {"sha256": sha256(binary.read_bytes()).hexdigest(), "dynamic_imports": imports}
+            if runtime is not None:
+                binaries[name]["sanitizer_runtime"] = runtime
             if stack is not None:
                 binaries[name]["stack"] = stack
         args.output_dir.mkdir()
