@@ -9,7 +9,7 @@ import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { EmitCheckedScalarArithmetic } from "./scalar_int_emit.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, SameLinkedType } from "./linked_null_types_c.ku"
-import { LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullReadableArray, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches, LinkedViewPointee, RememberLinkedCall } from "./link_plan_c.ku"
+import { EmitLinkedReadonlyPredicate, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullReadableArray, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches, LinkedViewPointee } from "./link_plan_c.ku"
 
 fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &ty: TypeNameBinding, &name: str): str {
     if (ty.declaration_kind == "OwnedStringArray") { return "    ku_managed_source_drop(&" + name.clone() + ");\n" }
@@ -62,10 +62,6 @@ fn MatchesLinkedIntArrayOwner(&target: TypeNameBinding, &origin: TypeNameBinding
     return target.declaration_kind == "BuiltinArray" && target.name == "int" && LinkedNullIntArrayOwner(origin)
 }
 
-fn LinkedDirectCallExpression(&callee: LinkedNullFunction, &arguments: str): str {
-    return callee.symbol.clone() + "(" + arguments.clone() + ")"
-}
-
 fn EmitLinkedReadonlyBoolCall(input: LinkedNullExpression, callee: LinkedNullFunction, id: int, at: Span): LinkedNullExpression! {
     parameter = callee.parameters[0].clone()
     if (callee.result.declaration_kind != "Builtin" || callee.result.name != "bool") {
@@ -78,12 +74,19 @@ fn EmitLinkedReadonlyBoolCall(input: LinkedNullExpression, callee: LinkedNullFun
         || !SameLinkedType(parameter, input.value.ty)) {
         RejectLayout("linked_readonly_call", "readonly direct call requires a matching str View or scalar Copy argument", at)?
     }
-    name = "predicate" + str(id)
-    next = input.state
-    next.code += "    bool " + name.clone() + " = " + LinkedDirectCallExpression(callee, argument) + ";\n"
-    ty = callee.result.clone()
-    next.links = RememberLinkedCall(next.links, callee)
-    return ok(LinkedReadonlyExpression(next, ty, name))
+    return ok(EmitLinkedReadonlyPredicate(input.state, callee, id, argument))
+}
+
+fn RequireLinkedNominalPredicate(&callee: LinkedNullFunction, &at: Span): null! {
+    if (callee.result.declaration_kind != "Builtin" || callee.result.name != "bool") {
+        RejectLayout("linked_readonly_call", "readonly direct call requires a plain bool result", at.clone())?
+    }
+    for parameter in callee.parameters.clone() {
+        if (parameter.declaration_kind != "StructView") {
+            RejectLayout("linked_readonly_call", "a readonly multi-argument call requires nominal record Views", at.clone())?
+        }
+    }
+    return ok(null)
 }
 
 fn matchesLinkedStructArrayOwner(&target: TypeNameBinding, &origin: TypeNameBinding): bool {

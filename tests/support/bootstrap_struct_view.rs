@@ -1057,6 +1057,22 @@ fn RefuseOwned(kind: str): null! {
     if (Own(kind)) { return ok(null) }
     return ok(null)
 }
+fn Four(&a: Entry, &b: Entry, &c: Entry, &d: Entry): bool {
+    return a.kind == b.kind && c.kind != d.kind
+}
+fn ReadFour(enabled: bool, &entries: [Entry]): bool {
+    return enabled && Four(entries[0], entries[1], entries[2], entries[3])
+}
+fn OwnFirst(a: Entry, &b: Entry, &c: Entry, &d: Entry): bool {
+    return a.kind == b.kind && c.kind != d.kind
+}
+fn RefuseOwnedFour(&entries: [Entry]): bool {
+    return true && OwnFirst(entries[0], entries[1], entries[2], entries[3])
+}
+fn RefuseMovedFour(entry: Entry, &other: Entry): bool {
+    label = entry.kind
+    return true && Four(entry, other, other, other)
+}
 fn Measure(&kind: str): int { return 1 }
 fn RefuseNonBool(&entry: Entry): null! {
     if (Measure(entry.kind)) { return ok(null) }
@@ -1127,16 +1143,86 @@ pub(super) fn assert_lazy_readonly_bool_call(seed: &Path, cwd: &Path) {
     compile_projection(&c, &exe, cwd);
     assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
 
-    for (name, reason) in [
-        ("RefuseOwned", "matching str View or scalar Copy argument"),
-        ("RefuseNonBool", "requires a plain bool result"),
+    fs::write(cwd.join("function.txt"), "ReadFour").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (entry, params) = code
+        .lines()
+        .find_map(|line| line.strip_prefix("bool ku_linked_null_"))
+        .unwrap()
+        .split_once("(bool a0, const ")
+        .unwrap();
+    let (array, _) = params.split_once('*').unwrap();
+    let record = array.strip_prefix("KuArray_").unwrap();
+    let provider = code
+        .lines()
+        .find_map(|line| line.strip_prefix("extern bool "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+static const RECORD *items;
+static int visits;
+bool PROVIDER(const RECORD *a, const RECORD *b, const RECORD *c, const RECORD *d) {
+    assert(a == items && b == items + 1 && c == items + 2 && d == items + 3);
+    ++visits;
+    return true;
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    ARRAY entries = {0};
+    assert(!ENTRY(false, &entries) && visits == 0);
+    RECORD storage[4] = {0};
+    items = storage;
+    entries = (ARRAY){argc > 1 ? 2u : 4u, storage, 4};
+    if (argc > 1) { (void)ENTRY(true, &entries); return 2; }
+    assert(ENTRY(true, &entries) && visits == 1);
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("ARRAY", array)
+    .replace("RECORD", record)
+    .replace("PROVIDER", provider);
+    let c = cwd.join("readonly-four.c");
+    let exe = cwd.join(format!("readonly-four{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("#include <assert.h>\n{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    let bounds = execute(Command::new(&exe).arg("short"), cwd, 15);
+    assert_eq!(bounds.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bounds.stderr).contains("index 2 out of bounds for length 2"));
+
+    for (name, diagnostic, reason) in [
+        (
+            "RefuseOwned",
+            "linked_readonly_call",
+            "matching str View or scalar Copy argument",
+        ),
+        (
+            "RefuseNonBool",
+            "linked_readonly_call",
+            "requires a plain bool result",
+        ),
+        (
+            "RefuseOwnedFour",
+            "linked_readonly_call",
+            "requires nominal record Views",
+        ),
+        (
+            "RefuseMovedFour",
+            "linked_view_move",
+            "requires an intact View source",
+        ),
     ] {
         fs::write(cwd.join("function.txt"), name).unwrap();
         let rejected = execute(&mut Command::new(seed), cwd, 30);
         assert_eq!(rejected.status.code(), Some(1));
         assert!(rejected.stdout.is_empty());
         let stderr = String::from_utf8_lossy(&rejected.stderr);
-        assert!(stderr.contains("linked_readonly_call") && stderr.contains(reason));
+        assert!(stderr.contains(diagnostic) && stderr.contains(reason));
     }
 }
 

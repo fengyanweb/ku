@@ -1,11 +1,12 @@
+import { EmitLinkedArrayIndexGuard, EmitLinkedLogicalBranch } from "./guarded_string_parts.ku"
 import { AddLinkedNullSlot, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
-import { CheckLinkedAddition, EmitLinkedMultiplyDivide, EmitLinkedReadonlyBoolCall, LinkedMemberPath, LinkedMemberUnavailable } from "./linked_member_ownership.ku"
+import { CheckLinkedAddition, EmitLinkedMultiplyDivide, EmitLinkedReadonlyBoolCall, LinkedMemberPath, LinkedMemberUnavailable, LinkedViewArgument, RequireLinkedNominalPredicate } from "./linked_member_ownership.ku"
 import { Span } from "../stage2/span.ku"
 import { LinkedLocalReadBinding } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout } from "./struct_layouts.ku"
-import { LinkedErrorField, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { EmitLinkedReadonlyPredicate, LinkedErrorField, LinkedNullFunction, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
@@ -61,8 +62,9 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
         if (target.kind == "Field" && target.edge_count == 1) {
             return readLinkedMethod(project, state, node, target, id, depth)
         }
-        if (node.edge_count == 2 && target.kind == "Variable" && target.edge_count == 0) {
+        if (node.edge_count >= 2 && node.edge_count <= 9 && target.kind == "Variable" && target.edge_count == 0) {
             callee = ResolveLinkedCall(project, state.slots, node, target, false)?
+            if (node.edge_count > 2) { return readLinkedNominalPredicate(project, state, node, callee, id, depth) }
             input = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 1), depth + 1)?
             return EmitLinkedReadonlyBoolCall(input, callee, id, DeclarationSpan(node))
         }
@@ -73,6 +75,25 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
     }
     RejectLayout("unsupported_linked_read", "expected a readonly scalar expression or array view", DeclarationSpan(node))?
     return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", DeclarationSpan(node)), ""))
+}
+
+fn readLinkedNominalPredicate(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
+                             callee: LinkedNullFunction, id: int, depth: int): LinkedNullExpression! {
+    RequireLinkedNominalPredicate(callee, DeclarationSpan(call))?
+    next = state
+    args = ""
+    index = 0
+    while (index < callee.parameters.len()) {
+        input = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, call, index + 1), depth + 1)?
+        if (LinkedMemberUnavailable(input.state, input.value, true)) {
+            RejectLayout("linked_view_move", "readonly call requires an intact View source", input.value.ty.span.clone())?
+        }
+        if (index > 0) { args += ", " }
+        args += LinkedViewArgument(callee.parameters[index], input.value)?
+        next = input.state
+        index += 1
+    }
+    return ok(EmitLinkedReadonlyPredicate(next, callee, id, args))
 }
 
 fn readLinkedMethod(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &target: Node, id: int, depth: int): LinkedNullExpression! {
@@ -125,9 +146,7 @@ fn readArrayItem(&array: LinkedNullValue, input: LinkedNullExpression, &node: No
     offset = "i" + str(id)
     header = LinkedNullArrayHeader(array.ty, array.text)
     index.state.uses_index = true
-    index.state.code = index.state.code + "    int64_t " + offset.clone() + " = " + index.value.text + ";\n"
-        + "    if (" + offset.clone() + " < 0 || (uint64_t)" + offset.clone() + " >= " + header.clone() + "->len) {\n"
-        + "        index_failed = true; failure_index = " + offset.clone() + "; failure_length = " + header.clone() + "->len; goto cleanup;\n    }\n"
+    index.state.code += EmitLinkedArrayIndexGuard(offset, index.value.text, header)
     item = LinkedReadonlyExpression(index.state, LinkedNullArrayElement(array.ty.clone()), header + "->data[" + offset + "]")
     if (item.value.ty.declaration_kind == "Builtin" && item.value.ty.name == "str") {
         item.state.code += "    if (" + item.value.text.clone() + ".len && !" + item.value.text.clone()
@@ -275,10 +294,7 @@ fn readLinkedBinary(&project: LinkedNullProject, state: LinkedNullState, &node: 
     result = ""
     if (logical) {
         result = "b" + str(id)
-        negate = ""
-        if (op == "||") { negate = "!" }
-        left.state.code += "    bool " + result.clone() + " = " + left.value.text.clone() + ";\n"
-            + "    if (" + negate + result.clone() + ") {\n"
+        left.state.code += EmitLinkedLogicalBranch(result, left.value.text, op == "||")
     }
     right = LowerLinkedNullRead(project, left.state, LinkedNullChild(project, 1, node, 1), depth + 1)?
     if (left.value.ty.declaration_kind != "Builtin" || !SameLinkedType(left.value.ty, right.value.ty)) {
@@ -325,14 +341,4 @@ fn LowerLinkedNullLeaf(state: LinkedNullState, &node: Node): LinkedNullExpressio
     if (value.kind != "") { return ok(LinkedReadonlyExpression(state, LinkedBuiltin(value.kind, at), value.text)) }
     RejectLayout("unsupported_linked_operand", "expected a bound value, literal or checked direct call", at.clone())?
     return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", at), ""))
-}
-
-fn StoreLinkedCopyAssignment(&destination: LinkedNullSlot, value: LinkedNullExpression, &assignment: Node): LinkedNullState! {
-    if (!destination.live || destination.value.borrowed || !SameLinkedType(destination.value.ty, value.value.ty)) {
-        RejectLayout("linked_copy_assignment", "assignment requires a live Copy target and matching scalar expression",
-                     DeclarationSpan(assignment))?
-    }
-    next = value.state
-    next.code += "    " + destination.value.text + " = " + value.value.text + ";\n"
-    return ok(next)
 }

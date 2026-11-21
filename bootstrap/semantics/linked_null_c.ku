@@ -14,9 +14,9 @@ import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
 import { ExitLinkedFailure, LinkedFailureTarget, LinkedSlotPrefix, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
-import { LowerLinkedNullRead, StoreLinkedCopyAssignment } from "./linked_null_read_c.ku"
+import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { FinishLinkedAppendThunk, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, ReadLinkedAppendThunk, ReadLinkedCatchParts } from "./linked_owner_assignment_c.ku"
+import { FinishLinkedAppendThunk, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, ReadLinkedAppendThunk, ReadLinkedCatchParts, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 

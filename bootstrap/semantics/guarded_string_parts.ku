@@ -381,3 +381,16 @@ fn CheckedAppendFaultHandoff(id: int): str {
         + "    if (" + fault.clone() + ".index_failed) { index_failed = true; failure_index = " + fault.clone()
         + ".index; failure_length = " + fault + ".length; goto cleanup; }\n"
 }
+
+fn EmitLinkedArrayIndexGuard(&offset: str, &index: str, &header: str): str {
+    return "    int64_t " + offset.clone() + " = " + index.clone() + ";\n"
+        + "    if (" + offset.clone() + " < 0 || (uint64_t)" + offset.clone() + " >= " + header.clone() + "->len) {\n"
+        + "        index_failed = true; failure_index = " + offset.clone() + "; failure_length = " + header.clone() + "->len; goto cleanup;\n    }\n"
+}
+
+fn EmitLinkedLogicalBranch(&result: str, &left: str, disjunction: bool): str {
+    negate = ""
+    if (disjunction) { negate = "!" }
+    return "    bool " + result.clone() + " = " + left.clone() + ";\n"
+        + "    if (" + negate + result.clone() + ") {\n"
+}

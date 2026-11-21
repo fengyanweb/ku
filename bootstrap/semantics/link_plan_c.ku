@@ -138,6 +138,19 @@ fn RememberLinkedCall(calls: [LinkedNullFunction], dependency: LinkedNullFunctio
     return result.push(dependency)
 }
 
+fn LinkedDirectCallExpression(&callee: LinkedNullFunction, &arguments: str): str {
+    return callee.symbol.clone() + "(" + arguments.clone() + ")"
+}
+
+fn EmitLinkedReadonlyPredicate(state: LinkedNullState, callee: LinkedNullFunction, id: int, &arguments: str): LinkedNullExpression {
+    name = "predicate" + str(id)
+    next = state
+    next.code += "    bool " + name.clone() + " = " + LinkedDirectCallExpression(callee, arguments) + ";\n"
+    ty = callee.result.clone()
+    next.links = RememberLinkedCall(next.links, callee)
+    return LinkedReadonlyExpression(next, ty, name)
+}
+
 struct LinkedCheckedCall {
     state: LinkedNullState
     result: TypeNameBinding
