@@ -370,8 +370,9 @@ fn linkedCallbackBuiltinType(&named: NamedModule, id: int, array: bool, &name: s
 
 fn LinkedIntArrayCallbackNominal(&named: NamedModule, &node: Node): int! {
     nominal = 0
+    parameter_count = 4
     index = 0
-    while (index < 4) {
+    while (index < parameter_count) {
         part = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge + index] - 1].clone()
         if (part.kind != "TypeParameter" || part.edge_count != 1 || part.text != "") {
             RejectLayout("linked_callback_type", "scoped array callback arguments must be by-value", DeclarationSpan(part))?
@@ -381,7 +382,7 @@ fn LinkedIntArrayCallbackNominal(&named: NamedModule, &node: Node): int! {
         else if (!linkedCallbackBuiltinType(named, ty, index == 0, "int")) {
             RejectLayout("linked_callback_type", "scoped array callback needs [int], int, int and a named record", DeclarationSpan(part))?
         }
-        index += 1
+        index = index + 1
     }
     result = named.parsed.arena.nodes[named.parsed.arena.edges[node.first_edge + 4] - 1].clone()
     if (result.kind != "TypeResult" || result.edge_count != 1 ||
