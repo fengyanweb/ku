@@ -7,7 +7,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { HasBoundArrayMembers } from "./struct_array_c.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { LinkedNullArrayElement, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, SameLinkedType } from "./linked_null_types_c.ku"
-import { LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullOwner, LinkedRecordFields, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches, LinkedViewPointee } from "./link_plan_c.ku"
+import { LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullReadableArray, LinkedRecordFields, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches, LinkedViewPointee } from "./link_plan_c.ku"
 
 fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &ty: TypeNameBinding, &name: str): str {
     if (ty.declaration_kind == "OwnedStringArray") { return "    ku_managed_source_drop(&" + name.clone() + ");\n" }
@@ -179,8 +179,7 @@ fn BindLinkedCatch(state: LinkedNullState, name: str, &binding: Node, &before: [
 fn LinkedCountBound(&project: LinkedNullProject, &state: LinkedNullState, id: int): bool! {
     array = LinkedNullBinding(state.slots, LinkedNullArrayLimitName(project, id))
     if (array > 0) {
-        kind = state.slots[array - 1].value.ty.declaration_kind.clone()
-        return ok(kind == "StructArray" || kind == "BuiltinArray")
+        return ok(LinkedNullReadableArray(state.slots[array - 1].value.ty))
     }
     member = LinkedNullNode(project, 1, id)
     if (member.kind != "Field" || member.edge_count != 1) { return ok(false) }

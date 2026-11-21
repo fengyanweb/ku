@@ -9,7 +9,7 @@ import { EmitLinkedIntAppend, HasBoundArrayMembers, ReadOwnedArrayPushArgument }
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, EmitLinkedAddition, LowerLinkedNullLeaf,
+import { AddLinkedNullSlot, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf,
          LowerLinkedNullRead, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_null_read_c.ku"
 
 fn cloneLinkedString(&project: LinkedNullProject, source: LinkedNullExpression, id: int): LinkedNullExpression! {
@@ -218,6 +218,7 @@ fn LowerLinkedNullValue(&project: LinkedNullProject, state: LinkedNullState, id:
     if (node.kind == "Call" && node.edge_count > 0) { return emitLinkedCall(project, state, node, id, depth) }
     if (node.kind == "TryUnwrap") { return emitCheckedValue(project, state, node, depth) }
     if (node.kind == "StructLiteral") { return lowerLinkedLiteral(project, state, node, id, depth) }
+    if (node.kind == "Array" && node.edge_count > 0) { return LowerLinkedIntArrayLiteral(project, state, node, id, "") }
     if (node.kind == "Binary" && node.text == "+" && node.edge_count == 2) {
         left = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
         rhs = LinkedNullChild(project, 1, node, 1)

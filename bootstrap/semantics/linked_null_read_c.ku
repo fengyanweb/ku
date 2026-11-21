@@ -8,6 +8,7 @@ import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_s
 import { RegisterLinkedIntArray, LinkedErrorField, ReadLinkedNullBinding, CheckLinkedAddition, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
+import { EmitLinkedIntAppend } from "./struct_array_c.ku"
 import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild,
          LinkedNullLayout, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedStringResult, LinkedNullView, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
 
@@ -100,14 +101,43 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
 
 fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
     ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0), true)?
-    value = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
-    if (value.kind != "Array" || value.edge_count != 0
-        || LinkedNullBinding(state.slots, statement.text) != 0) {
+    value_id = LinkedNullChild(project, 1, statement, 1)
+    value = LinkedNullNode(project, 1, value_id)
+    if (value.kind != "Array" || LinkedNullBinding(state.slots, statement.text) != 0) {
         RejectLayout("linked_array_local", "expected a new typed array owner initialized empty", DeclarationSpan(statement))?
+    }
+    if (value.edge_count != 0) {
+        if (!LinkedNullIntArrayOwner(ty)) {
+            RejectLayout("linked_array_local", "a nonempty literal requires an int array", DeclarationSpan(value))?
+        }
+        literal = LowerLinkedIntArrayLiteral(project, state, value, value_id, statement.text.clone())?
+        return ok(literal.state)
     }
     local = AddLinkedNullSlot(project, state, statement.text.clone(), "l" + str(id), ty, false)?
     local.state.slots[local.value.slot - 1].live = true
     return ok(local.state)
+}
+
+fn LowerLinkedIntArrayLiteral(&project: LinkedNullProject, state: LinkedNullState, &literal: Node, id: int,
+                               binding: str): LinkedNullExpression! {
+    ty = LinkedBuiltin("int", DeclarationSpan(literal))
+    ty.declaration_kind = "OwnedIntArray"
+    output = AddLinkedNullSlot(project, state, binding, "t" + str(id), ty.clone(), false)?
+    next = RequireLinkedArrayValidation(output.state, ty)
+    next.append_slots = next.append_slots.push(output.value.slot)
+    index = 0
+    while (index < literal.edge_count) {
+        child = LinkedNullChild(project, 1, literal, index)
+        value = LowerLinkedNullRead(project, next, child, 0)?
+        if (value.value.ty.declaration_kind != "Builtin" || value.value.ty.name != "int") {
+            RejectLayout("linked_int_array_literal", "integer array elements must be readonly int expressions", value.value.ty.span.clone())?
+        }
+        next = value.state
+        next.code += EmitLinkedIntAppend(output.value.text, value.value.text)
+        index = index + 1
+    }
+    next.slots[output.value.slot - 1].live = true
+    return ok(LinkedNullExpression { state: next, value: output.value })
 }
 
 fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: int, depth: int): LinkedNullExpression! {

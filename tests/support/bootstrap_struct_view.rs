@@ -569,9 +569,7 @@ int main(void) {
 const OWNED_INT_SOURCE: &str = r#"struct Index { values: [int] size: int }
 fn See(&values: [int], size: int): null! { return ok(null) }
 fn Build(value: int): Index! {
-    values: [int] = []
-    values = values.push(value)
-    values = values.push(2)
+    values = [value, 2]
     values = values.push(3)
     values = values.push(4)
     values = values.push(5)
@@ -585,6 +583,10 @@ fn Build(value: int): Index! {
 }
 fn Wrong(&values: [int]): Index! {
     return ok(Index { values: values, size: 0 })
+}
+fn WrongLiteral(value: int): Index! {
+    values = [value, true]
+    return ok(Index { values: values, size: 2 })
 }
 fn Reuse(value: int): Index! {
     values: [int] = []
@@ -688,6 +690,7 @@ pub(super) fn assert_owned_int_locals(seed: &Path, cwd: &Path) {
     }
     for (name, reason) in [
         ("Wrong", "linked_view_escape"),
+        ("WrongLiteral", "linked_int_array_literal"),
         ("Reuse", "unavailable_linked_binding"),
         ("WrongBound", "unsupported_linked_loop"),
         ("WrongIncrement", "unsupported_linked_loop"),
