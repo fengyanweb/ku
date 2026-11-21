@@ -1078,10 +1078,12 @@ struct OtherParcel { payload: str count: int }
 struct Note { label: str score: int reject: bool fatal: bool }
 fn Apply(action: fn(Parcel, Note, bool): int!, note: Note): int! {
     try {
-        begin = "first".clone()
+        begin_text = "first"
+        begin = begin_text.clone()
         first = action(Parcel { payload: begin, count: 31 },
                        Note { label: "begin", score: 1, reject: false, fatal: false }, false)?
-        tail = "second".clone()
+        tail_text = "second"
+        tail = tail_text.clone()
         return action(Parcel { payload: tail, count: first + 2 }, note, true)
     } catch(err) {
         return ok(0)
