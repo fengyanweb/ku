@@ -31,8 +31,10 @@ fn ManifestPaths(manifest: str, at: Span): [str]! {
             line = PrepareManifestPath(line, at.clone())?
             if (line != "") {
                 if (paths.len() == 64) { RejectName("project_limit", "the module manifest accepts at most 64 modules", at.clone())? }
-                for existing in paths {
-                    if (existing == line) { RejectName("ambiguous_module", "duplicate project module '" + line.clone() + "'", at.clone())? }
+                existing = 0
+                while (existing < paths.len()) {
+                    if (paths[existing] == line) { RejectName("ambiguous_module", "duplicate project module '" + line.clone() + "'", at.clone())? }
+                    existing = existing + 1
                 }
                 paths = paths.push(line)
             }
