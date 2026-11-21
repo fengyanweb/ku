@@ -225,8 +225,9 @@ fn LinkedCharacterSource(&project: LinkedNullProject, &state: LinkedNullState, i
     local = receiver.kind == "Variable" && LinkedNullBinding(state.slots, receiver.text) != 0
     if (call.edge_count == 1 && method && (local || receiver.kind != "Variable")) { return receiver_id }
     if (call.edge_count == 2 && receiver.kind == "Variable" && !local) {
+        count = project.binding.modules[0].imports.len()
         index = 0
-        while (index < project.binding.modules[0].imports.len()) {
+        while (index < count) {
             if (project.binding.modules[0].imports[index].local_name == receiver.text &&
                 project.binding.modules[0].imports[index].module_index == 0 &&
                 project.binding.modules[0].imports[index].source_name == "string") {
