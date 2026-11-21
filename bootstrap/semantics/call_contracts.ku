@@ -403,8 +403,9 @@ fn checkLiteralReturns(&nodes: [Node], &edges: [int], &function: Node): null! {
 fn CheckDirectCallContracts(&named: NamedModule, &imports: [ImportBinding], &supplied: [SuppliedModule]): null! {
     signatures = directSignatures(named, imports, supplied)?
     if (signatures.len() == 0) { return ok(null) }
+    declaration_count = named.names.declarations.len()
     index = 0
-    while (index < named.names.declarations.len()) {
+    while (index < declaration_count) {
         if (IsNamedFunction(named.names.declarations[index].kind)) {
             function = named.names.declarations[index].node
             checkFunctionCalls(named.parsed.arena.nodes, named.parsed.arena.edges, signatures, function)?
@@ -415,11 +416,13 @@ fn CheckDirectCallContracts(&named: NamedModule, &imports: [ImportBinding], &sup
 }
 
 fn CheckLiteralResultContracts(&named: NamedModule): null! {
+    node_count = named.parsed.arena.nodes.len()
     index = 0
-    while (index < named.parsed.arena.nodes.len()) {
-        node = named.parsed.arena.nodes[index].clone()
-        if (IsNamedFunction(node.kind) || node.kind == "FunctionExpr") {
-            checkLiteralReturns(named.parsed.arena.nodes, named.parsed.arena.edges, node)?
+    while (index < node_count) {
+        // The kind and function check only borrow the original AST node.
+        is_named = IsNamedFunction(named.parsed.arena.nodes[index].kind)
+        if (is_named || named.parsed.arena.nodes[index].kind == "FunctionExpr") {
+            checkLiteralReturns(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.nodes[index])?
         }
         index = index + 1
     }
