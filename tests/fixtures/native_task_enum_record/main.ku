@@ -1,0 +1,14 @@
+import { Phase, Build, Inspect, Broken } from "./worker"
+async fn Compare(): bool! {
+    return ok(((await Build("left", false))?).phase != ((await Build("right", true))?).phase)
+}
+async fn main(): null! {
+    reply = (await Build("result", true))?
+    println(reply.phase == Phase.Done)
+    println(reply.phase != Phase.Ready)
+    println((await Inspect(reply))?)
+    println((await Compare())?)
+    try { (await Broken((await Build("failed", true))?))? }
+    catch (issue) { println(issue.message) }
+    return ok(null)
+}

@@ -1,0 +1,10 @@
+result
+true
+true
+result🙂
+true
+left
+right
+true
+failed
+paused failure

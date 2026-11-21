@@ -1,0 +1,22 @@
+import time from "std.time"
+enum Phase { Ready, Done }
+struct Reply { phase: Phase, message: str }
+
+async fn Build(label: str, done: bool): Reply! {
+    println(label)
+    message = label + "🙂"
+    phase = Phase.Ready
+    if (done) { phase = Phase.Done }
+    time.sleep(30)?
+    return ok(Reply { phase: phase, message: message })
+}
+async fn Inspect(reply: Reply): bool! {
+    time.sleep(30)?
+    println(reply.message)
+    return ok(reply.phase == Phase.Done)
+}
+async fn Broken(reply: Reply): Reply! {
+    time.sleep(30)?
+    if (reply.phase == Phase.Done) { fail "paused failure" }
+    return ok(reply)
+}

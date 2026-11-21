@@ -36,55 +36,16 @@ fn native_task_transfers_records_with_nominal_unit_enum_fields() {
     let path = directory.path();
     fs::write(
         path.join("worker.ku"),
-        r#"
-import time from "std.time"
-enum Phase { Ready, Done }
-struct Reply { phase: Phase, message: str }
-
-async fn Build(label: str, done: bool): Reply! {
-    println(label)
-    message = label + "🙂"
-    phase = Phase.Ready
-    if (done) { phase = Phase.Done }
-    time.sleep(30)?
-    return ok(Reply { phase: phase, message: message })
-}
-async fn Inspect(reply: Reply): bool! {
-    time.sleep(30)?
-    println(reply.message)
-    return ok(reply.phase == Phase.Done)
-}
-async fn Broken(reply: Reply): Reply! {
-    time.sleep(30)?
-    if (reply.phase == Phase.Done) { fail "paused failure" }
-    return ok(reply)
-}
-"#,
+        include_str!("fixtures/native_task_enum_record/worker.ku"),
     )
     .unwrap();
     fs::write(
         path.join("main.ku"),
-        r#"
-import { Phase, Build, Inspect, Broken } from "./worker"
-async fn Compare(): bool! {
-    return ok(((await Build("left", false))?).phase != ((await Build("right", true))?).phase)
-}
-async fn main(): null! {
-    reply = (await Build("result", true))?
-    println(reply.phase == Phase.Done)
-    println(reply.phase != Phase.Ready)
-    println((await Inspect(reply))?)
-    println((await Compare())?)
-    try { (await Broken((await Build("failed", true))?))? }
-    catch (issue) { println(issue.message) }
-    return ok(null)
-}
-"#,
+        include_str!("fixtures/native_task_enum_record/main.ku"),
     )
     .unwrap();
     let normalized = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace("\r\n", "\n");
-    let expected =
-        "result\ntrue\ntrue\nresult🙂\ntrue\nleft\nright\ntrue\nfailed\npaused failure\n";
+    let expected = include_str!("fixtures/native_task_enum_record/expected.txt");
     let mut interpreter = Command::new(env!("CARGO_BIN_EXE_ku"));
     interpreter.current_dir(path).args(["run", "main.ku"]);
     let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_LIMITS).unwrap();
