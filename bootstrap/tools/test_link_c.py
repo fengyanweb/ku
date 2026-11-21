@@ -453,12 +453,12 @@ int main(void) {
         checked = dict(owned, c_type="KuBootstrapResultStringArray")
         link_c.TypeRef.read(checked, "array", checked_result=True)
         for carrier, checked_result in ((owned, True), (checked, False)):
-            with self.assertRaisesRegex(link_c.LinkError, "matching readonly or owned C carrier"):
+            with self.assertRaisesRegex(link_c.LinkError, "builtin array requires"):
                 link_c.TypeRef.read(carrier, "array", checked_result=checked_result)
         for change in ({"source_name": "int"}, {"source_path": "types.ku"},
                        {"passing": "value", "c_type": "KuArrayInt"},
                        {"c_type": "const OtherArray*"}):
-            with self.assertRaisesRegex(link_c.LinkError, "matching readonly or owned C carrier"):
+            with self.assertRaisesRegex(link_c.LinkError, "builtin array requires"):
                 link_c.TypeRef.read(dict(array, **change), "array")
 
     def test_checked_string_slice_uses_the_native_builtin(self):
@@ -639,9 +639,9 @@ int main(void) {
         args = ["--entry", "consumer.ku", "3", "--caller", str(self.caller), "-o", str(self.output)]
         self.assertEqual(link_c.main([*units, *args]), 0)
         self.assertEqual(subprocess.run([self.output], timeout=15).returncode, 0)
-        with self.assertRaisesRegex(link_c.LinkError, "matching readonly or owned C carrier"):
+        with self.assertRaisesRegex(link_c.LinkError, "builtin array requires"):
             link_c.Signature.read(dict(provider["signature"], returns_result=False), "plain result")
-        with self.assertRaisesRegex(link_c.LinkError, "matching readonly or owned C carrier"):
+        with self.assertRaisesRegex(link_c.LinkError, "builtin array requires"):
             link_c.Signature.read(dict(provider["signature"], parameters=[result]), "owned parameter")
 
     def test_missing_entry_and_ambiguous_local_symbol_are_rejected(self):
