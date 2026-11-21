@@ -192,6 +192,13 @@ fn unresolvedIntCall(&plan: ScalarIntFunction, &completed: [int]): int {
     return 0
 }
 
+fn scalarCallSiteSpan(&nodes: [Node], &supplied: [SuppliedModule], unit: int, node: int): Span {
+    if (supplied.len() > 0) {
+        return DeclarationSpan(supplied[unit].named.parsed.arena.nodes[node - 1])
+    }
+    return DeclarationSpan(nodes[node - 1])
+}
+
 fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [SuppliedModule], entry: int): ScalarIntC! {
     // Each round removes ready functions. If nothing is ready, following
     // unresolved edges among the remaining finite set must encounter a cycle.
@@ -257,12 +264,7 @@ fn EmitScalarIntModule(&plans: [ScalarIntFunction], &nodes: [Node], &supplied: [
             index = index + 1
         }
         if (completed.len() == before) {
-            at = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
-            if (supplied.len() > 0) {
-                at = DeclarationSpan(supplied[blocked_module].named.parsed.arena.nodes[blocked_at - 1])
-            } else {
-                at = DeclarationSpan(nodes[blocked_at - 1])
-            }
+            at = scalarCallSiteSpan(nodes, supplied, blocked_module, blocked_at)
             rejectScalarInt("recursive_int_call", "recursive call graph is outside the bootstrap int subset", at)?
         }
         round = round + 1
