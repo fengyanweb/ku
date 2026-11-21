@@ -2,6 +2,7 @@ import { Node } from "../stage2/ast.ku"
 import { EmitLinkedArrayBody, StructArrayStatuses } from "./struct_array_c.ku"
 import { FinishLinkedFunctionC, GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { ScalarCheckedMultiplyC, ScalarStringHelpers } from "./scalar_int_emit.ku"
+import { ScalarStringReplaceHelpers } from "./scalar_string_replace.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { LinkedIntSnapshotRuntime } from "./guarded_string_parts.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedNullCType, LinkedNullNode, LinkedNullParameterPlan, LinkedNullProject, LinkedNullResultType, LinkedNullType, LinkedResultPlan, SameLinkedType } from "./linked_null_types_c.ku"
@@ -276,6 +277,7 @@ fn EmitLinkedBodyPrelude(&body: LinkedNullState): str! {
         declarations += StructArrayStatuses()
     }
     if (body.uses_int_snapshot) { declarations += LinkedIntSnapshotRuntime() }
+    if (body.uses_replace) { declarations += "typedef KuProjectionString KuScalarString;\n" + ScalarStringReplaceHelpers() }
     return ok(declarations)
 }
 
@@ -288,6 +290,7 @@ fn StartLinkedThunkFrame(&parent: LinkedNullState): LinkedNullState {
     body.code = ""
     body.drops = ""
     body.plain_value_result = false
+    body.uses_replace = false
     body.local_readers = []
     body.local_callbacks = []
     body.callback_owners = []
@@ -316,6 +319,7 @@ fn RestoreLinkedThunkFrame(body: LinkedNullState, &parent: LinkedNullState): Lin
     next.append_captures = parent.append_captures.clone()
     next.declarations = parent.declarations.clone()
     next.plain_value_result = parent.plain_value_result
+    next.uses_replace = parent.uses_replace
     next.catch_slot = parent.catch_slot
     next.catch_edges = parent.catch_edges
     next.catch_moved = parent.catch_moved.clone()

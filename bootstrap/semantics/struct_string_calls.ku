@@ -11,6 +11,7 @@ import { BoundLinkPlanType, LinkedNullBinding, LinkedNullExpression, LinkedNullS
 import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 import { LinkedBuiltin, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedStringResult } from "./linked_null_types_c.ku"
 import { TypeNameBindingWithKind } from "./type_names.ku"
+import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 
 struct StructStringDependency {
     symbol: str
@@ -246,5 +247,35 @@ fn MaterializeLinkedCharacters(&project: LinkedNullProject, input: LinkedNullExp
     output.state.slots[output.value.slot - 1].live = true
     output.state.code += "    source_status = ku_managed_source_chars(" + input.value.text + ", &" + output.value.text.clone() + ");\n"
         + "    if (source_status != KU_SOURCE_OK) goto cleanup;\n"
+    return ok(output)
+}
+
+fn LinkedStringReplaceApplies(&project: LinkedNullProject, &state: LinkedNullState, &target: Node): bool {
+    if (!state.plain_value_result || target.kind != "Field" || target.text != "replace" || target.edge_count != 1) {
+        return false
+    }
+    receiver = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+    if (receiver.kind != "Variable") { return false }
+    slot = LinkedNullBinding(state.slots, receiver.text)
+    return slot > 0 && LinkedStringResult(state.slots[slot - 1].value.ty)
+}
+
+fn LowerLinkedStringReplace(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
+                            &target: Node, id: int, depth: int): LinkedNullExpression! {
+    if (call.edge_count != 3) {
+        RejectLayout("linked_replace_shape", "string.replace requires a string receiver and two arguments", DeclarationSpan(call))?
+    }
+    first = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, target, 0), depth + 1)?
+    second = LowerLinkedNullRead(project, first.state, LinkedNullChild(project, 1, call, 1), depth + 1)?
+    third = LowerLinkedNullRead(project, second.state, LinkedNullChild(project, 1, call, 2), depth + 1)?
+    if (!LinkedStringResult(first.value.ty) || !LinkedStringResult(second.value.ty) || !LinkedStringResult(third.value.ty)) {
+        RejectLayout("linked_replace_type", "string.replace requires three string values", DeclarationSpan(call))?
+    }
+    output = AddLinkedNullSlot(project, third.state, "", "t" + str(id), LinkedBuiltin("str", DeclarationSpan(call)), false)?
+    output.state.uses_replace = true
+    output.state.code += "    string_failure = ku_scalar_string_replace(" + first.value.text + ", "
+        + second.value.text + ", " + third.value.text + ", &" + output.value.text.clone() + ");\n"
+        + "    if (string_failure) goto cleanup;\n"
+    output.state.slots[output.value.slot - 1].live = true
     return ok(output)
 }

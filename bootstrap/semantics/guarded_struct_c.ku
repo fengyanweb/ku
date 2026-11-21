@@ -413,7 +413,7 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
     if (arithmetic) { text += "    bool overflow = false;\n" }
     if (body.uses_div) { text += "    bool division_by_zero = false;\n" }
     if (index_checks) { text += "    bool index_failed = false;\n    int64_t failure_index = 0;\n    size_t failure_length = 0;\n" }
-    if (body.uses_concat) { text += "    const char* string_failure = NULL;\n" }
+    if (body.uses_concat || body.uses_replace) { text += "    const char* string_failure = NULL;\n" }
     if (body.uses_chars) { text += "    int source_status = KU_SOURCE_OK;\n" }
     text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
     if (after_cleanup != "") { return text + after_cleanup.clone() + "    return result;\n}\n" }
@@ -436,7 +436,7 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
     }
     if (body.uses_str_view) { text += "    if (invalid_str) { fputs(\"invalid str view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_struct_view) { text += "    if (invalid_struct_view) { fputs(\"invalid struct view\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (body.uses_concat) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
+    if (body.uses_concat || body.uses_replace) { text += "    if (string_failure) { fputs(string_failure, stderr); exit(EXIT_FAILURE); }\n" }
     if (body.uses_chars) { text += char_errors }
     if (body.uses_div) { text += "    if (division_by_zero) { fputs(\"division by zero\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (arithmetic) { text += "    if (overflow) { fputs(\"integer overflow\\n\", stderr); exit(EXIT_FAILURE); }\n" }
