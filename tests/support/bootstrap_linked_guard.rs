@@ -549,6 +549,16 @@ fn Replace(first: bool): str! {
         return ok(owner)
     }
 }
+fn Append(first: bool): str! {
+    owner: str = Supply(1)?
+    try {
+        if (first) { owner += Supply(2)? }
+        else { owner += Supply(3)? }
+        return ok(owner)
+    } catch (err) {
+        return ok(owner)
+    }
+}
 fn Consume(value: str): null! { return ok(null) }
 fn Keep(value: str): str! { return ok(value) }
 fn WrongElse(first: bool): str! {
@@ -602,7 +612,10 @@ int main(void) {
         refused = 0;
         KuBootstrapResult_KuProjectionString result = __ENTRY__(i == 2);
         assert(result.ok && selected == i && (uintptr_t)result.value.ptr != original_address);
-        assert(outstanding() == 1 && *result.value.ptr == i);
+        assert(outstanding() == 1);
+        if (__APPEND__) {
+            assert(result.value.len == 2 && result.value.ptr[0] == 1 && result.value.ptr[1] == i);
+        } else { assert(result.value.len == 1 && *result.value.ptr == i); }
         ku_projection_string_drop(&result.value);
         assert(!outstanding());
 
@@ -621,52 +634,59 @@ pub(super) fn assert_checked_string_rebind(seed: &Path, cwd: &Path) {
     fs::write(cwd.join("rebind.ku"), REBIND_SOURCE).unwrap();
     fs::write(cwd.join("try-provider.ku"), TRY_PROVIDER).unwrap();
     fs::write(cwd.join("modules.txt"), "rebind.ku\ntry-provider.ku\n").unwrap();
-    fs::write(cwd.join("function.txt"), "Replace").unwrap();
-    fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
-    let planned = execute(&mut Command::new(seed), cwd, 30);
-    assert_ok(&planned);
-    let Some(Value::Result { ok: true, value }) = json::eval(
-        "decode",
-        &[Value::String(String::from_utf8(planned.stdout).unwrap())],
-        Span::default(),
-    )
-    .unwrap() else {
-        panic!("expected a typed checked replacement plan")
-    };
-    let Value::Object(plan) = *value else {
-        panic!("expected plan object")
-    };
-    let Value::Object(export) = &plan["export"] else {
-        panic!("expected export")
-    };
-    let Value::Array(deps) = &plan["dependencies"] else {
-        panic!("expected dependencies")
-    };
-    let [Value::Object(supply)] = deps.as_slice() else {
-        panic!("expected one supplier")
-    };
-    let (Value::String(entry), Value::String(provider)) = (&export["symbol"], &supply["symbol"])
-    else {
-        panic!("expected the bound symbols")
-    };
-    let host = REBIND_HOST
-        .replace("__ENTRY__", entry)
-        .replace("__SUPPLY__", provider);
-    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
-    let emitted = execute(&mut Command::new(seed), cwd, 30);
-    assert_ok(&emitted);
-    let source = cwd.join("rebind-owner.c");
-    let exe = cwd.join(format!("rebind-owner{}", std::env::consts::EXE_SUFFIX));
-    fs::write(
-        &source,
-        format!(
-            "{CHECKED_ARRAY_ALLOCATOR}{}{host}",
-            String::from_utf8(emitted.stdout).unwrap()
-        ),
-    )
-    .unwrap();
-    compile_projection(&source, &exe, cwd);
-    assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    for name in ["Replace", "Append"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+        let planned = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&planned);
+        let Some(Value::Result { ok: true, value }) = json::eval(
+            "decode",
+            &[Value::String(String::from_utf8(planned.stdout).unwrap())],
+            Span::default(),
+        )
+        .unwrap() else {
+            panic!("expected a typed checked replacement plan")
+        };
+        let Value::Object(plan) = *value else {
+            panic!("expected plan object")
+        };
+        let Value::Object(export) = &plan["export"] else {
+            panic!("expected export")
+        };
+        let Value::Array(deps) = &plan["dependencies"] else {
+            panic!("expected dependencies")
+        };
+        let [Value::Object(supply)] = deps.as_slice() else {
+            panic!("expected one supplier")
+        };
+        let (Value::String(entry), Value::String(provider)) =
+            (&export["symbol"], &supply["symbol"])
+        else {
+            panic!("expected the bound symbols")
+        };
+        let host = REBIND_HOST
+            .replace("__ENTRY__", entry)
+            .replace("__SUPPLY__", provider)
+            .replace(
+                "__APPEND__",
+                if name == "Append" { "true" } else { "false" },
+            );
+        fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let source = cwd.join("rebind-owner.c");
+        let exe = cwd.join(format!("rebind-owner{}", std::env::consts::EXE_SUFFIX));
+        fs::write(
+            &source,
+            format!(
+                "{CHECKED_ARRAY_ALLOCATOR}{}{host}",
+                String::from_utf8(emitted.stdout).unwrap()
+            ),
+        )
+        .unwrap();
+        compile_projection(&source, &exe, cwd);
+        assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    }
     for name in ["WrongElse", "WrongMembers"] {
         fs::write(cwd.join("function.txt"), name).unwrap();
         let wrong = execute(&mut Command::new(seed), cwd, 30);
