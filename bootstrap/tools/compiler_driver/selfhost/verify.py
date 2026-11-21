@@ -178,6 +178,10 @@ def verify_stage3_applications(repo, source, binary, cc, caller):
             "exercise_direct_owned_moves": (caller,),
             "exercise_plain_null_entry": (cc, caller),
             "exercise_linked_program": (cc, caller),
+            "exercise_namespace_import": (cc, caller),
+            "exercise_qualified_types": (cc, caller),
+            "exercise_qualified_constructor": (cc, caller),
+            "exercise_static_reader_argument": (cc, caller),
         }
         for name, arguments in checks.items():
             try:
@@ -200,7 +204,7 @@ def main():
     parser.add_argument("--sanitizers", choices=("auto", "required", "off"), default="auto")
     parser.add_argument("--limit", type=int, default=768, help="maximum provider attempts per generation")
     parser.add_argument("--stage3-application-checks", action="store_true",
-                        help="check full imports, ownership and a plain null entry after Stage3 verification")
+                        help="check scoped applications and ABI contracts after Stage3 verification")
     args = parser.parse_args()
     if not __debug__:
         parser.error("verification requires Python assertions")
