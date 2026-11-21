@@ -140,8 +140,7 @@ fn OpenLinkedBooleanWhile(state: LinkedNullState, &statement: Node, condition: s
     outer = state.slots.clone()
     next = state
     // This local is reevaluated by C at the original loop boundary.
-    next.code += "    while (" + condition + ") {
-"
+    next.code += "    while (" + condition + ") {\n"
     return ok(LinkedForLoop { state: next, outer: outer, before: before })
 }
 
