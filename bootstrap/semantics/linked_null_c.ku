@@ -1,5 +1,5 @@
 import { AddLinkedNullSlot, LinkedCountedInitial, LinkedCountdownIndex, ReadLinkedNullParameters, RegisterLinkedLocalRead } from "./linked_parameters_c.ku"
-import { OpenLinkedCharacterLoop, CloseLinkedCharacterLoop } from "./linked_char_iter_c.ku"
+import { OpenLinkedForLoop, CloseLinkedForLoop } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedPlainReturn } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
@@ -306,9 +306,9 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             }
             next = branch.state
         } else if (statement.kind == "For") {
-            opened = OpenLinkedCharacterLoop(project, next, statement, id, depth)?
+            opened = OpenLinkedForLoop(project, next, statement, id, depth)?
             stepped = lowerLinkedRegion(project, statement, opened.state, 1, result, depth + 1)?
-            next = CloseLinkedCharacterLoop(stepped, opened.outer, opened.before, statement)?
+            next = CloseLinkedForLoop(stepped, opened.outer, opened.before, statement)?
         } else if (statement.kind == "While" && statement.edge_count >= 2 && index > start) {
             initial = LinkedCountedInitial(project, next, region, statement, start, index)?
             next = addCountedLoop(project, next, statement, initial, result, depth)?

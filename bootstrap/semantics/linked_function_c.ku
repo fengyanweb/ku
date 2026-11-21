@@ -22,8 +22,8 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
     text += "    " + result_type.clone() + " result = {0};\n"
     text += payload_cleanup.clone()
     if (body.append_slots.len() > 0) { text += "    int append_status = KU_STRUCT_ARRAY_OK;\n" }
-    clone = body.uses_clone || body.element_clones.len() > 0
-    if (clone) { text += "    bool out_of_memory = false;\n" }
+    allocation = body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0
+    if (allocation) { text += "    bool out_of_memory = false;\n" }
     if (array_checks) { text += "    bool invalid_array = false;\n" }
     if (body.uses_print) { text += "    bool output_failed = false;\n" }
     if (body.uses_str_view) { text += "    bool invalid_str = false;\n" }
@@ -35,7 +35,7 @@ fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &sig
     if (body.uses_chars) { text += "    int source_status = KU_SOURCE_OK;\n" }
     text += body.declarations.clone() + body.code.clone() + "cleanup:\n" + body.drops.clone()
     if (body.uses_print) { text += "    if (output_failed) { fputs(\"output write failed\\n\", stderr); exit(EXIT_FAILURE); }\n" }
-    if (clone) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
+    if (allocation) { text += "    if (out_of_memory) { fputs(\"out of memory\\n\", stderr); exit(EXIT_FAILURE); }\n" }
     if (array_checks) {
         message = "invalid struct array ownership"
         if (body.uses_str_array) { message = "invalid array view" }

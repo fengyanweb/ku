@@ -1,14 +1,14 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { LinkedNullBinding, LinkedNullRegion, LinkedNullSlot, LinkedNullState,
+import { LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullRegion, LinkedNullSlot, LinkedNullState,
     PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedStringResult } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
 import { DropLinkedNullScope } from "./linked_member_ownership.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
-struct LinkedCharacterLoop {
+struct LinkedForLoop {
     state: LinkedNullState
     outer: [LinkedNullSlot]
     before: int
@@ -35,7 +35,7 @@ fn linkedCharacterSource(&project: LinkedNullProject, &state: LinkedNullState, &
     return ok(0)
 }
 
-fn OpenLinkedCharacterLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int, depth: int): LinkedCharacterLoop! {
+fn openLinkedCharacterLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int, depth: int): LinkedForLoop! {
     at = DeclarationSpan(statement)
     if (statement.edge_count == 0 || depth >= 32) {
         RejectLayout("linked_control_depth", "expected a finite For within the linked control depth", at.clone())?
@@ -72,10 +72,66 @@ fn OpenLinkedCharacterLoop(&project: LinkedNullProject, state: LinkedNullState, 
         + array + ".len; ++" + index + ") {\n"
         + "    " + name + " = " + source_item.clone() + ";\n"
         + "    " + source_item + " = (KuProjectionString){0};\n"
-    return ok(LinkedCharacterLoop { state: item.state, outer: outer, before: before })
+    return ok(LinkedForLoop { state: item.state, outer: outer, before: before })
 }
 
-fn CloseLinkedCharacterLoop(loop: LinkedNullRegion, &outer: [LinkedNullSlot], before: int, &statement: Node): LinkedNullState! {
+fn openLinkedIntLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
+                      &source: LinkedNullSlot, id: int, depth: int): LinkedForLoop! {
+    at = DeclarationSpan(statement)
+    if (depth >= 32 || LinkedNullBinding(state.slots, statement.text) != 0) {
+        RejectLayout("linked_int_for_scope", "integer-array iteration needs a fresh local binding within the control bound", at.clone())?
+    }
+    if (!source.live || source.value.borrowed) {
+        RejectLayout("linked_int_for_source", "iteration requires an initialized owned [int] array", at.clone())?
+    }
+    before = state.slots.len()
+    suffix = str(id) + "_ints"
+    snapshot = AddLinkedNullSlot(project, state, "", "a" + suffix.clone(), source.value.ty.clone(), false)?
+    array = snapshot.value.text.clone()
+    input = "source" + suffix.clone()
+    count = "count" + suffix.clone()
+    // The source binding can grow or be replaced in the loop body. Only
+    // this checked Copy buffer is read by the iteration.
+    snapshot.state = RequireLinkedArrayValidation(snapshot.state, source.value.ty.clone())
+    snapshot.state.uses_int_snapshot = true
+    snapshot.state.slots[snapshot.value.slot - 1].live = true
+    snapshot.state.code += "    const KuArrayInt *const " + input.clone() + " = &" + source.value.text.clone() + ";\n"
+    snapshot.state.code += "    if (!ku_linked_view_int_array_valid(" + input.clone() + ") || " + input.clone()
+        + "->len > SIZE_MAX / sizeof(int64_t)) { invalid_array = true; goto cleanup; }\n"
+    snapshot.state.code += "    const size_t " + count.clone() + " = " + input.clone() + "->len;\n"
+    snapshot.state.code += "    if (" + count.clone() + ") {\n"
+        + "        int64_t *copy = malloc(" + count.clone() + " * sizeof(*copy));\n"
+        + "        if (!copy) { out_of_memory = true; goto cleanup; }\n"
+    snapshot.state.code += "        memcpy(copy, " + input + "->data, " + count.clone() + " * sizeof(*copy));\n"
+    snapshot.state.code += "        " + array.clone() + " = (KuArrayInt){" + count.clone() + ", copy, " + count + "};\n    }\n"
+    outer = snapshot.state.slots.clone()
+    item = AddLinkedNullSlot(project, snapshot.state, statement.text.clone(), "t" + suffix.clone(), LinkedBuiltin("int", at), false)?
+    item.state.slots[item.value.slot - 1].live = true
+    index = "i" + suffix
+    item.state.code += "    for (size_t " + index.clone() + " = 0; " + index.clone() + " < "
+        + array.clone() + ".len; ++" + index.clone() + ") {\n"
+        + "    " + item.value.text + " = " + array + ".data[" + index + "];\n"
+    return ok(LinkedForLoop { state: item.state, outer: outer, before: before })
+}
+
+fn OpenLinkedForLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int, depth: int): LinkedForLoop! {
+    if (statement.edge_count != 0) {
+        source = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+        if (source.kind == "Variable" && source.edge_count == 0) {
+            slot = LinkedNullBinding(state.slots, source.text)
+            if (slot != 0) {
+                input = state.slots[slot - 1].clone()
+                if (LinkedNullIntArrayOwner(input.value.ty)) { return openLinkedIntLoop(project, state, statement, input, id, depth) }
+                if (input.value.ty.declaration_kind == "BuiltinArray" && input.value.ty.name == "int") {
+                    RejectLayout("linked_int_for_borrowed", "borrowed integer arrays cannot be iterated as owners", DeclarationSpan(source))?
+                }
+            }
+        }
+    }
+    return openLinkedCharacterLoop(project, state, statement, id, depth)
+}
+
+fn CloseLinkedForLoop(loop: LinkedNullRegion, &outer: [LinkedNullSlot], before: int, &statement: Node): LinkedNullState! {
     body = loop
     if (body.terminal) {
         body.state = RestoreLinkedNullSlots(body.state, outer)
