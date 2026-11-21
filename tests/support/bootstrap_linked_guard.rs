@@ -694,6 +694,88 @@ int main(void) {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_result_return"));
 }
 
+pub(super) fn assert_captured_record_updates(seed: &Path, cwd: &Path) {
+    let fixture = r#"struct Frame { label: str count: int }
+fn Run(first: str, second: str, reject: bool): int! {
+    frame = Frame { label: first, count: 10 }
+    items: [int] = []
+    fn Record(step: int): null! {
+        if (step < 0) { fail { domain: "test", code: "reject", message: "requested error" } }
+        if (step != 0) { frame.count = frame.count + step }
+        items = items.push(frame.count)
+        return ok(null)
+    }
+    Record(2)?
+    if (reject) { Record(0 - 1)? }
+    frame = Frame { label: second, count: 20 }
+    Record(3)?
+    if (frame.label != "second") { fail { domain: "test", code: "owner", message: "wrong live record" } }
+    return ok(items[0] * 100 + items[1])
+}
+"#;
+    let ku = cwd.join("record-capture.ku");
+    fs::write(&ku, fixture).unwrap();
+    fs::write(cwd.join("modules.txt"), "record-capture.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Run").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let projected = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&projected);
+    let code = String::from_utf8(projected.stdout).unwrap();
+    let entry = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+#include <assert.h>
+#include <string.h>
+static KuProjectionString owned(const char *label) {
+    size_t bytes = strlen(label);
+    uint8_t *data = malloc(bytes);
+    assert(data);
+    memcpy(data, label, bytes);
+    return (KuProjectionString){data, bytes, bytes, KU_PROJECTION_STRING_OWNED};
+}
+int main(void) {
+    KuBootstrapResult_int64_t result = ENTRY(owned("first"), owned("second"), false);
+    assert(result.ok && result.value == 1223 && !outstanding());
+    result = ENTRY(owned("first"), owned("second"), true);
+    assert(!result.ok && result.error.code.len == 6 && !memcmp(result.error.code.ptr, "reject", 6));
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("ENTRY", entry);
+    let source = cwd.join("record-capture.c");
+    let exe = cwd.join(format!("record-capture{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 10));
+    for (statement, diagnostic) in [
+        ("frame.label = \"wrong\"", "linked_member_target"),
+        (
+            "frame = Frame { label: \"wrong\", count: 0 }",
+            "linked_capture_rebind",
+        ),
+        ("moved = frame.label", "linked_callback_owner"),
+    ] {
+        fs::write(
+            &ku,
+            fixture.replace(
+                "items = items.push",
+                &format!("{statement}\n        items = items.push"),
+            ),
+        )
+        .unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}
+
 pub(super) fn assert_terminal_branch_ownership(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("guard-provider.ku"),

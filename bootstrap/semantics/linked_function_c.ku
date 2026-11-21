@@ -164,7 +164,8 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     }
     root = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
     slot = LinkedNullBinding(state.slots, root.text)
-    if (root.kind != "Variable" || root.edge_count != 0 || slot == 0 || state.slots[slot - 1].parameter ||
+    capture = slot > 0 && state.slots[slot - 1].parameter && ContainsIndex(state.append_captures, slot)
+    if (root.kind != "Variable" || root.edge_count != 0 || slot == 0 || (state.slots[slot - 1].parameter && !capture) ||
         state.slots[slot - 1].value.borrowed || state.slots[slot - 1].value.ty.declaration_kind != "Struct") {
         RejectLayout("linked_member_target", "assignment requires a direct field of a mutable local record", DeclarationSpan(root))?
     }
@@ -173,6 +174,9 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
 
     rhs_id = LinkedNullChild(project, 1, statement, 1)
     argument = LinkedFieldAppendArgument(project, target, root, rhs_id)
+    if (capture && argument > 0) {
+        RejectLayout("linked_member_target", "a local callback can only assign Copy fields of a captured record", DeclarationSpan(target))?
+    }
     if (argument > 0) { return LowerLinkedFieldAppend(project, state, target_id, argument) }
     // Generate the RHS and finish its fallible work before selecting the
     // target in the resulting state. The old member still belongs to cleanup
@@ -183,6 +187,9 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     ty = place.value.ty.clone()
     string = LinkedStringResult(ty)
     copy = ty.declaration_kind == "Builtin" && (ty.name == "int" || ty.name == "bool")
+    if (capture && !copy) {
+        RejectLayout("linked_member_target", "a local callback can only assign Copy fields of a captured record", DeclarationSpan(target))?
+    }
     if (guarded && !copy) {
         RejectLayout("linked_member_target", "guarded record assignment requires a Copy int or bool field of a mutable local", DeclarationSpan(target))?
     }

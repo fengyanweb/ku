@@ -40,6 +40,9 @@ fn LowerLinkedOwnerRebind(&project: LinkedNullProject, state: LinkedNullState, &
         RejectLayout("linked_rebind_target", "expected a declared local owner", DeclarationSpan(assignment))?
     }
     target = state.slots[index - 1].value.clone()
+    if (target.ty.declaration_kind == "Struct" && state.slots[index - 1].parameter && ContainsIndex(state.append_captures, index)) {
+        RejectLayout("linked_capture_rebind", "a local callback cannot replace its captured record", DeclarationSpan(assignment))?
+    }
     value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, assignment, 0), 0)?
     record = target.ty.declaration_kind == "Struct"
     owner = record || LinkedStringResult(target.ty) || LinkedNullOwnedArray(target.ty) || LinkedNullIntArrayOwner(target.ty)
@@ -283,11 +286,13 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     slots = parameters.state.slots.clone()
     null_result = parameters.result.declaration_kind == "Builtin" && parameters.result.name == "null"
     nullary = null_result && parameters.body_start == 1
-    record_input = null_result && parameters.body_start == 2 && slots[0].value.ty.declaration_kind == "Struct"
+    one_input = null_result && parameters.body_start == 2
+    record_input = one_input && slots[0].value.ty.declaration_kind == "Struct"
+    copy_input = one_input && LinkedIntResult(slots[0].value.ty)
     int_result = LinkedIntResult(parameters.result) || LinkedNullIntArrayOwner(parameters.result)
-    if (parameters.state.plain_value_result || (!nullary && !record_input &&
+    if (parameters.state.plain_value_result || (!nullary && !record_input && !copy_input &&
         (!int_result || slots.len() == 0 || slots.len() > 8))) {
-        RejectLocalCapture(function, "a local append function requires int! or [int]! with one to eight arguments, or null! with zero arguments or one owned record")?
+        RejectLocalCapture(function, "a local append function requires int! or [int]! with one to eight arguments, or null! with zero arguments, one int or one owned record")?
     }
     // Direct synchronous calls use the ordinary owning argument slots.
     // Views and callable descriptors still require a separate lifetime proof.
@@ -312,9 +317,10 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
         ty = outer.value.ty.clone()
         array = LinkedNullOwnedArray(ty) || LinkedNullIntArrayOwner(ty)
         scalar = ty.declaration_kind == "Builtin" && (ty.name == "int" || ty.name == "bool")
+        record = copy_input && ty.declaration_kind == "Struct" && !outer.parameter
         if (!outer.live || outer.value.borrowed || outer.moved_members.len() > 0 ||
-            ContainsIndex(parent.callback_owners, index) || (!scalar && !array)) {
-            RejectLocalCapture(function, "a local append capture requires a live scalar or an exclusive array owner")?
+            ContainsIndex(parent.callback_owners, index) || (!scalar && !array && !record)) {
+            RejectLocalCapture(function, "a local append capture requires live Copy storage or an exclusive array or record")?
         }
         field = "c" + str(index)
         fields += " " + LinkedNullCType(ty)? + " *" + field.clone() + ";"
@@ -322,10 +328,10 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
         outer.value.text = "(*capture->" + field + ")"
         outer.value.slot = body.slots.len() + 1
         // These are references to automatic storage in the caller. Only
-        // that caller drops its arrays, including any successfully appended
-        // prefix. The entry cannot move their headers or replace the owner.
+        // that caller drops these owners, including any successfully
+        // appended prefix. The entry borrows their stable storage.
         outer.parameter = true
-        if (array) {
+        if (array || record) {
             body.append_captures = body.append_captures.push(outer.value.slot)
             sources = sources.push(index)
         }

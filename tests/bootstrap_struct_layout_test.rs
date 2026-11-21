@@ -4496,6 +4496,7 @@ int main(int argc, char **argv) {
     linked_guard::assert_local_callback_thunk(&compiler, python, &cwd);
     linked_guard::assert_local_append_thunk(&compiler, &cwd);
     linked_guard::assert_checked_int_array_result(&compiler, python, &cwd);
+    linked_guard::assert_captured_record_updates(&compiler, &cwd);
     linked_guard::assert_empty_owned_int_argument(&compiler, &cwd);
     linked_guard::assert_named_array_parameter_move(&compiler, &cwd);
     linked_guard::assert_owned_local_member_set(&compiler, &cwd);
