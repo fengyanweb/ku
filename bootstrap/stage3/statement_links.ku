@@ -191,9 +191,11 @@ fn AppendStatementLinks(children: [int], &links: [StatementLink], top: int, coun
     }
     if (walk != 0) { RejectStatementLength(error_token.clone())? }
     reverse_index = reversed.len()
-    while (reverse_index > 0) {
+    reversing = reverse_index > 0
+    while (reversing) {
         reverse_index = reverse_index - 1
         output = output.push(reversed[reverse_index])
+        reversing = reverse_index > 0
     }
     return ok(AppendedStatements { children: output, work: work })
 }
