@@ -4,7 +4,7 @@ import { ParseModule } from "../../stage3/parser.ku"
 import { ImportBinding, SuppliedModule } from "../../semantics/imports.ku"
 import { EmitLinkedUnit } from "../../semantics/linked_unit.ku"
 import { BuildNameTable } from "../../semantics/names.ku"
-import { BindProjectModules, CheckDirectCallContracts, CheckLiteralResultContracts } from "../../semantics/project_bindings.ku"
+import { BindProjectModules, CheckDirectCallContracts, CheckFunctionContracts } from "../../semantics/project_bindings.ku"
 import { ManifestPaths, ReadProjectModulesAt } from "../../semantics/project_manifest.ku"
 import { ProjectParent } from "../../semantics/project_paths.ku"
 import { EmitScalarIntC, ScalarIntC } from "../../semantics/scalar_int_c.ku"
@@ -46,7 +46,7 @@ fn BootstrapEntry(&command: str, &path: str, &symbol: str): null! {
     imports: [ImportBinding] = []
     types = BindTypeNames(input, supplied)?
     CheckDirectCallContracts(input, imports, supplied)?
-    CheckLiteralResultContracts(input)?
+    CheckFunctionContracts(input)?
     if (command == "check") { return ok(null) }
     if (command == "emit") {
         return writeScalarC(EmitScalarIntC(input, types, symbol)?)

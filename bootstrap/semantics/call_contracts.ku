@@ -195,3 +195,10 @@ fn RequireLinkedMutableName(&name: str, &at: Span): null! {
     }
     return ok(null)
 }
+
+fn RequireLinkedMutableBinding(&name: str, source_parameter: bool, &at: Span): null! {
+    if (source_parameter) {
+        RejectLayout("linked_immutable_binding", "cannot assign to immutable parameter '" + name.clone() + "'", at.clone())?
+    }
+    return RequireLinkedMutableName(name, at)
+}
