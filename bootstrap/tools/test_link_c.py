@@ -358,6 +358,84 @@ int main(void) {
         with self.assertRaisesRegex(link_c.LinkError, "cannot be a returned value"):
             link_c.Signature.read({"parameters": [], "result": callback(1), "returns_result": False}, "bad")
 
+    def test_int_append_callback_checks_both_nominal_arguments_in_order(self):
+        def callback(unit, node):
+            return dict(view(f"KuBootstrapIntAppendCallback_m{unit}_{node}", f"consumer{unit}.ku"),
+                        kind="IntResultAppendCallback", passing="value", node=node, nominals=[
+                            {"source_path": "positions.ku", "node": 5, "c_type": f"KuStruct_m{unit}_5"},
+                            {"source_path": "tokens.ku", "node": 9, "c_type": f"KuStruct_m{unit}_9"},
+                        ])
+
+        code = """#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+typedef struct { size_t len; int64_t *data; size_t capacity; } KuArrayInt;
+typedef struct { bool ok; int64_t value; } KuBootstrapResult_int64_t;
+typedef struct { size_t length; } KuProjectionString;
+typedef struct {
+    int append_status;
+    bool out_of_memory, overflow, index_failed;
+    const char *array_error;
+    int64_t index;
+    size_t length;
+} KuLocalAppendFailure;
+typedef struct { int64_t value; } POSITION;
+typedef struct { int64_t value; } TOKEN;
+typedef struct {
+    KuBootstrapResult_int64_t (*entry)(void *, KuLocalAppendFailure *, KuProjectionString,
+        KuProjectionString, int64_t, POSITION, KuArrayInt, TOKEN);
+    void *environment;
+    KuLocalAppendFailure *failure;
+} CALLBACK;
+"""
+        entry = declaration("app.ku", 58, "forward", [callback(1, 41)])
+        requested = declaration(self.left_path, 17, "apply", [callback(1, 41)])
+        supplied = declaration(self.left_path, 17, "invoke", [callback(4, 72)])
+        units = self.unit("append-callback-entry", plan(entry, [requested]), (code + """
+extern int64_t apply(CALLBACK);
+int64_t forward(CALLBACK f) { return apply(f); }
+""").replace("CALLBACK", "KuBootstrapIntAppendCallback_m1_41")
+    .replace("POSITION", "KuStruct_m1_5").replace("TOKEN", "KuStruct_m1_9"))
+        provider_code = (code + """
+int64_t invoke(CALLBACK f) {
+    KuBootstrapResult_int64_t result = f.entry(f.environment, f.failure,
+        (KuProjectionString){2}, (KuProjectionString){3}, 4,
+        (POSITION){5}, (KuArrayInt){0}, (TOKEN){7});
+    return result.ok ? result.value : -1;
+}
+""").replace("CALLBACK", "KuBootstrapIntAppendCallback_m4_72")
+        provider_code = provider_code.replace("POSITION", "KuStruct_m4_5").replace("TOKEN", "KuStruct_m4_9")
+        provider = self.unit("append-callback-provider", plan(supplied), provider_code)
+        self.caller.write_text("""
+static KuBootstrapResult_int64_t count(void *raw, KuLocalAppendFailure *failure,
+    KuProjectionString a, KuProjectionString b, int64_t c,
+    KuStruct_m1_5 span, KuArrayInt data, KuStruct_m1_9 token) {
+    (void)failure;
+    int64_t *calls = raw;
+    ++*calls;
+    return (KuBootstrapResult_int64_t){true,
+        (int64_t)(a.length + b.length + data.len) + c + 10 * span.value + token.value};
+}
+int main(void) {
+    int64_t calls = 0;
+    KuLocalAppendFailure failure = {0};
+    KuBootstrapIntAppendCallback_m1_41 f = {count, &calls, &failure};
+    return forward(f) != 66 || calls != 1;
+}
+""", encoding="ascii")
+        self.assertEqual(link_c.main([*units, *provider, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+        original = self.output.read_bytes()
+        wrong_c = provider_code.replace(
+            "int64_t, KuStruct_m4_5, KuArrayInt, KuStruct_m4_9",
+            "int64_t, KuStruct_m4_5, KuArrayInt, KuStruct_m4_5")
+        self.assertNotEqual(wrong_c, provider_code)
+        wrong = self.unit("append-callback-wrong-carrier", plan(supplied), wrong_c)
+        self.assertEqual(link_c.main([*units, *wrong, *self.build_args]), 1)
+        self.assertEqual(self.output.read_bytes(), original)
+        self.change_plan(provider, lambda m: m["export"]["signature"]["parameters"][0]["nominals"].reverse())
+        self.assert_preflight_error([*units, *provider], "signature mismatch")
+
     def test_typed_int_array_callback_checks_nominal_argument_and_failure_record(self):
         def callback(module):
             return dict(view(f"KuBootstrapIntArrayCallback_KuStruct_m{module}_9"),

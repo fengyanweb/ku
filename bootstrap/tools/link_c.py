@@ -25,6 +25,7 @@ BOOTSTRAP_STRING_TYPES = {"KuProjectionString", "KuBootstrapString", "KuScalarSt
 CALLBACK_TYPES = {
     "IntPairResultCallback": ("int_pair_result_callback", "KuBootstrapIntPairCallback_"),
     "IntArrayResultCallback": ("int_array_result_callback", "KuBootstrapIntArrayCallback_"),
+    "IntResultAppendCallback": ("int_result_append_callback", "KuBootstrapIntAppendCallback_"),
 }
 CALLBACK_IDENTITIES = {identity for identity, _ in CALLBACK_TYPES.values()}
 
@@ -80,9 +81,13 @@ class TypeRef:
     identity: tuple
     passing: str
     c_type: str
+    callback_nominals: tuple[str, ...] = ()
 
     def read(value, where, checked_result=False):
-        ref = record(value, "kind source_name source_path node c_type passing", where)
+        fields = "kind source_name source_path node c_type passing"
+        if isinstance(value, dict) and value.get("kind") == "IntResultAppendCallback":
+            fields += " nominals"
+        ref = record(value, fields, where)
         kind_name = text(ref["kind"], f"{where}.kind")
         name = text(ref["source_name"], f"{where}.source_name")
         passing = ref["passing"]
@@ -121,6 +126,26 @@ class TypeRef:
             path = module_path(ref["source_path"], f"{where}.source_path")
             node = node_id(ref["node"], f"{where}.node")
             kind, prefix = CALLBACK_TYPES[kind_name]
+            if kind_name == "IntResultAppendCallback":
+                if (passing != "value" or checked_result or
+                        not re.fullmatch(rf"{prefix}m[1-9][0-9]*_{node}", c_type)):
+                    raise LinkError(f"{where} requires the typed carrier for {kind_name}")
+                nominals = array(ref["nominals"], f"{where}.nominals")
+                if len(nominals) != 2:
+                    raise LinkError(f"{where} requires two ordered nominal callback arguments")
+                keys = []
+                carriers = []
+                for index, value in enumerate(nominals):
+                    field = f"{where}.nominals[{index}]"
+                    nominal = record(value, "source_path node c_type", field)
+                    nominal_path = module_path(nominal["source_path"], f"{field}.source_path")
+                    nominal_node = node_id(nominal["node"], f"{field}.node")
+                    nominal_c = text(nominal["c_type"], f"{field}.c_type")
+                    if not re.fullmatch(rf"KuStruct_m[1-9][0-9]*_{nominal_node}", nominal_c):
+                        raise LinkError(f"{field} requires its nominal C carrier")
+                    keys.append((nominal_path, nominal_node))
+                    carriers.append(nominal_c)
+                return TypeRef((kind, *keys), passing, c_type, tuple(carriers))
             if (passing != "value" or checked_result or
                     not re.fullmatch(rf"{prefix}KuStruct_m[1-9][0-9]*_{node}", c_type)):
                 raise LinkError(f"{where} requires the typed carrier for {kind_name}")
@@ -328,16 +353,16 @@ def check_carrier_layout(carrier, expected, fields):
 def wrapper(unit, include_caller):
     lines = ['#include "emitted.c"']
     declarations = (unit.export, *unit.dependencies)
-    callbacks = sorted({(ref.identity[0], ref.c_type) for decl in declarations for ref in decl.signature.parameters
-                        if ref.identity[0] in CALLBACK_IDENTITIES})
+    callbacks = sorted({(ref.identity[0], ref.c_type, ref.callback_nominals) for decl in declarations
+                        for ref in decl.signature.parameters if ref.identity[0] in CALLBACK_IDENTITIES})
     if callbacks:
         lines.append('#include <stddef.h>')
-    if any(kind == "int_array_result_callback" for kind, _ in callbacks):
+    if any(kind in {"int_array_result_callback", "int_result_append_callback"} for kind, _, _ in callbacks):
         lines.extend(check_carrier_layout("KuLocalAppendFailure", "ku_bootstrap_callback_failure_layout", (
             ("append_status", "int"), ("out_of_memory", "bool"), ("overflow", "bool"), ("index_failed", "bool"),
             ("array_error", "const char *"), ("index", "int64_t"), ("length", "size_t"),
         )))
-    for i, (kind, carrier) in enumerate(callbacks):
+    for i, (kind, carrier, nominals) in enumerate(callbacks):
         entry = f"ku_bootstrap_callback_entry_{i}"
         expected = f"ku_bootstrap_callback_layout_{i}"
         fields = [("entry", entry), ("environment", "void *")]
@@ -345,6 +370,11 @@ def wrapper(unit, include_caller):
             nominal = carrier.removeprefix(CALLBACK_TYPES["IntArrayResultCallback"][1])
             lines.append(f"typedef KuBootstrapResult_KuArrayInt (*{entry})(void*, KuLocalAppendFailure*, "
                          f"KuArrayInt, int64_t, int64_t, {nominal});")
+            fields.append(("failure", "KuLocalAppendFailure *"))
+        elif kind == "int_result_append_callback":
+            first, second = nominals
+            lines.append(f"typedef KuBootstrapResult_int64_t (*{entry})(void*, KuLocalAppendFailure*, "
+                         f"KuProjectionString, KuProjectionString, int64_t, {first}, KuArrayInt, {second});")
             fields.append(("failure", "KuLocalAppendFailure *"))
         else:
             result = carrier.removeprefix(CALLBACK_TYPES["IntPairResultCallback"][1])
