@@ -8,7 +8,7 @@ import { ResolveTypeName, SameBoundTypeIdentity, TypeNameBinding } from "./type_
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { CTypeName, ProjectionBuiltinLinkFor, ProjectionBuiltinLinkId, ProjectionBytesGet, ProjectionLocalFunction, ProjectionPlaceRoot, RequireProjectionBuiltin, ResolveProjectionDirectFunction } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
-import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayLinkPlanType, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayLinkPlanType, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -202,9 +202,7 @@ fn LinkedNullView(&binding: TypeNameBinding): bool {
 fn LinkedNullParameterPlan(&binding: TypeNameBinding, unit: int): LinkPlanType! {
     if (LinkedNullIntArrayOwner(binding)) { return ok(IntArrayLinkPlanType(false)) }
     if (LinkedNullOwnedArray(binding)) {
-        plan = BoundLinkPlanType(binding, unit, LinkedNullCType(binding)?, false)
-        plan.kind = "StructArray"
-        return ok(plan)
+        return ok(BoundLinkPlanTypeWithKind(binding, unit, LinkedNullCType(binding)?, false, "StructArray"))
     }
     if (binding.declaration_kind == "BuiltinArray") {
         if (binding.name == "int") { return ok(IntArrayLinkPlanType(true)) }
@@ -354,18 +352,20 @@ fn LinkedNullResultType(&callee: LinkedNullFunction): str! {
 
 fn LinkedCheckedResultPlan(&result: TypeNameBinding, unit: int): LinkPlanType! {
     if (!LinkedNullHasResultValue(result)) { return ok(NullLinkPlanResult()) }
-    plan = BoundLinkPlanType(result, unit, LinkedCheckedResultCType(result)?, false)
-    if (LinkedNullOwnedArray(result)) { plan.kind = "StructArray" }
-    if (result.declaration_kind == "OwnedStringArray" || LinkedNullIntArrayOwner(result)) { plan.kind = "BuiltinArray" }
-    return ok(plan)
+    carrier = LinkedCheckedResultCType(result)?
+    if (LinkedNullOwnedArray(result)) { return ok(BoundLinkPlanTypeWithKind(result, unit, carrier, false, "StructArray")) }
+    if (result.declaration_kind == "OwnedStringArray" || LinkedNullIntArrayOwner(result)) {
+        return ok(BoundLinkPlanTypeWithKind(result, unit, carrier, false, "BuiltinArray"))
+    }
+    return ok(BoundLinkPlanType(result, unit, carrier, false))
 }
 
 fn LinkedResultPlan(&result: TypeNameBinding, unit: int, checked: bool): LinkPlanType! {
     if (checked) { return LinkedCheckedResultPlan(result, unit) }
     if (LinkedNullIntArrayOwner(result)) { return ok(IntArrayLinkPlanType(false)) }
-    plan = BoundLinkPlanType(result, unit, LinkedNullCType(result)?, false)
-    if (LinkedNullOwnedArray(result)) { plan.kind = "StructArray" }
-    return ok(plan)
+    carrier = LinkedNullCType(result)?
+    if (LinkedNullOwnedArray(result)) { return ok(BoundLinkPlanTypeWithKind(result, unit, carrier, false, "StructArray")) }
+    return ok(BoundLinkPlanType(result, unit, carrier, false))
 }
 
 fn ResolveLinkedCall(&project: LinkedNullProject, &slots: [LinkedNullSlot], &call: Node, &target: Node, checked: bool): LinkedNullFunction! {

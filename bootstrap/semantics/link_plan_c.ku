@@ -161,9 +161,13 @@ struct LinkedCheckedCall {
 }
 
 fn BoundLinkPlanType(&binding: TypeNameBinding, local_unit: int, c_type: str, view: bool): LinkPlanType {
+    return BoundLinkPlanTypeWithKind(binding, local_unit, c_type, view, binding.declaration_kind.clone())
+}
+
+fn BoundLinkPlanTypeWithKind(&binding: TypeNameBinding, local_unit: int, c_type: str, view: bool, kind: str): LinkPlanType {
     unit = binding.module_index
     if (unit == 0 && binding.declaration_kind == "Struct") { unit = local_unit }
-    return LinkPlanType { kind: binding.declaration_kind.clone(), name: binding.name.clone(),
+    return LinkPlanType { kind: kind, name: binding.name.clone(),
         unit: unit, node: binding.declaration_node, c_type: c_type, view: view }
 }
 
