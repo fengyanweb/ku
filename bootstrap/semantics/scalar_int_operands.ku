@@ -222,8 +222,11 @@ fn collectStringParts(&nodes: [Node], &edges: [int], &parameters: [ScalarIntPara
     }
     if (node.kind == "Call" && node.edge_count > 0) {
         target = nodes[edges[node.first_edge] - 1].clone()
-        if (!can_convert || target.kind != "Variable" || target.edge_count != 0 || target.text != "str" ||
-            ScalarParameterIndex(parameters, "str") >= 0 || node.edge_count != 2) {
+        if (!can_convert || target.kind != "Variable" || target.edge_count != 0 || target.text != "str") {
+            RejectScalarInt("unsupported_string_int_call", "expected an unshadowed str conversion with one argument", DeclarationSpan(node))?
+        }
+        shadow = ScalarParameterIndex(parameters, "str")
+        if (shadow >= 0 || node.edge_count != 2) {
             RejectScalarInt("unsupported_string_int_call", "expected an unshadowed str conversion with one argument", DeclarationSpan(node))?
         }
         argument = nodes[edges[node.first_edge + 1] - 1].clone()
