@@ -304,7 +304,12 @@ pub(crate) fn lower_bound_service_handlers_with_layouts(
     program: &Program,
     bindings: &[super::MixedAsyncHandler],
 ) -> KuResult<NativeTaskProgram> {
-    let supported = |name: &str| matches!(name, "time" | "fs" | "net" | "bytes" | "http" | "json");
+    let supported = |name: &str| {
+        matches!(
+            name,
+            "time" | "fs" | "net" | "bytes" | "http" | "json" | "array"
+        )
+    };
     let mut filtered = Program {
         items: program
             .items
@@ -399,6 +404,16 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
     for item in &program.items {
         budget.analysis(1, Span::default())?;
         match item {
+            // Array intrinsics are also visible without an import. Accept the
+            // explicit standard module forms without changing dispatch or scope.
+            Item::Module(module) if module.name == "std:array" => continue,
+            Item::Import(import)
+                if import.path == "std.array"
+                    && (matches!(&import.kind, ImportKind::Glob)
+                        || matches!(&import.kind, ImportKind::Namespace(name) if name == "array")) =>
+            {
+                continue;
+            }
             Item::Module(module) if module.name == "std:json" => {
                 std_json = true;
                 continue;
@@ -426,7 +441,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
             Item::Import(import)
                 if import.path == "std"
                     && matches!(&import.kind,ImportKind::Named(names)
-                if names.iter().all(|name|name.alias.is_none() && matches!(name.source.as_str(),"time"|"fs"|"net"|"bytes"|"http"|"json"))) =>
+                if names.iter().all(|name|name.alias.is_none() && matches!(name.source.as_str(),"time"|"fs"|"net"|"bytes"|"http"|"json"|"array"))) =>
             {
                 if let ImportKind::Named(names) = &import.kind {
                     for name in names {

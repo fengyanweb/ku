@@ -3213,6 +3213,104 @@ fn native_task_source_ordinary_synchronous_artifacts_remain_runtime_free() {
 }
 
 #[test]
+fn native_task_source_imported_array_module_preserves_owners_and_shadowing() {
+    let directory = TempDir::new("native-task-array-import");
+    let sources = directory.path().join("sources");
+    fs::create_dir(&sources).unwrap();
+    fs::write(
+        sources.join("worker.ku"),
+        r#"
+import array from "std.array"
+import time from "std.time"
+
+struct Reply { text: str | null }
+
+async fn Pick(items: [str]): Reply! {
+    words = items
+    first = array.first(words)
+    words = []
+    time.sleep(1)?
+    return ok(Reply { text: first })
+}
+
+async fn Local(array: [str]): Reply! {
+    return ok(Reply { text: array.first() })
+}
+"#,
+    )
+    .unwrap();
+    let main = sources.join("main.ku");
+    fs::write(
+        &main,
+        r#"
+import array from "./worker.ku"
+
+async fn main(): null! {
+    reply = (await array.Pick(["整理" + "🙂"]))?
+    println(reply.text)
+    empty: [str] = []
+    missing = (await array.Pick(empty))?
+    if (missing.text == null) { println("missing") }
+    local = (await array.Local(["本地" + "🙂"]))?
+    println(local.text)
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let expected = "整理🙂\nmissing\n本地🙂\n";
+    let mut interpreter = Command::new(env!("CARGO_BIN_EXE_ku"));
+    interpreter
+        .current_dir(directory.path())
+        .arg("run")
+        .arg(&main);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout).replace("\r\n", "\n"),
+        expected
+    );
+
+    let executable = directory
+        .path()
+        .join(if cfg!(windows) { "app.exe" } else { "app" });
+    let mut build = Command::new(env!("CARGO_BIN_EXE_ku"));
+    build
+        .current_dir(directory.path())
+        .args(["build", "--release", "--offline"])
+        .arg(&main)
+        .arg("-o")
+        .arg(&executable);
+    let result = run_bounded(&mut build, BUILD_TIMEOUT, BUILD_LIMITS).unwrap();
+    let diagnostic = String::from_utf8_lossy(&result.stderr);
+    if !result.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none(), "{diagnostic}");
+        return;
+    }
+    assert!(result.status.success(), "{diagnostic}");
+    fs::remove_dir_all(sources).unwrap();
+    let native = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout).replace("\r\n", "\n"),
+        expected
+    );
+}
+
+#[test]
 fn native_task_source_cli_imports_build_and_run_after_source_graph_moves() {
     for emit_only in [true, false] {
         let directory = TempDir::new("native-task-cli-import");
