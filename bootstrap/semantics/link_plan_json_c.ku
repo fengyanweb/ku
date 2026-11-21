@@ -370,14 +370,17 @@ fn FinishLinkedReaderThunk(next: LinkedNullState, &parent: LinkedNullState, &sym
     return parent_state
 }
 
+fn linkedBooleanWhileSlotText(&slot: LinkedNullSlot): str {
+    if (slot.parameter || !slot.live || slot.value.borrowed || slot.moved_members.len() != 0 ||
+        slot.value.ty.declaration_kind != "Builtin" || slot.value.ty.name != "bool") { return "" }
+    return slot.value.text.clone()
+}
+
 fn LinkedBooleanWhileCondition(&state: LinkedNullState, &guard: Node): str {
     if (guard.kind != "Variable" || guard.edge_count != 0) { return "" }
     index = LinkedNullBinding(state.slots, guard.text)
     if (index == 0) { return "" }
-    slot = state.slots[index - 1].clone()
-    if (slot.parameter || !slot.live || slot.value.borrowed || slot.moved_members.len() != 0 ||
-        slot.value.ty.declaration_kind != "Builtin" || slot.value.ty.name != "bool") { return "" }
-    return slot.value.text
+    return linkedBooleanWhileSlotText(state.slots[index - 1])
 }
 
 fn EmitLinkedPlainInvocation(output: LinkedNullExpression, &invoke: str, handoff: str): LinkedNullExpression {
