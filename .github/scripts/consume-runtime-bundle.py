@@ -2341,6 +2341,37 @@ def run(args, report):
                 or any(selected['identity'][key] != manifest['rustc'][key] for key in ('release', 'commit_hash', 'commit_date', 'host'))):
             raise RuntimeError('doctor JSON does not identify an actually linkable exact compiler')
         report['selected_runner_compiler'] = selected
+        runner_project = project / 'embedded-entry-project'
+        runner_entry = runner_project / 'src' / 'nested' / 'main.ku'
+        runner_entry.parent.mkdir(parents=True)
+        (runner_project / 'ku.mod').write_text(
+            'name = "embedded_entry"\nroot = "src"\nmain = "nested/main.ku"\n', encoding='utf-8')
+        runner_entry.write_text(
+            'import { Message } from "helper"\nfn main() { println(Message()) }\n', encoding='utf-8')
+        runner_dependency = runner_project / 'src' / 'helper.ku'
+        runner_dependency.write_text('fn Message(): str { return "original 中文🙂" }\n', encoding='utf-8')
+        runner_launch = root / 'embedded-entry-launch'
+        runner_launch.mkdir()
+        runner_executable = runner_launch / ('anchor.exe' if os.name == 'nt' else 'anchor')
+        success('runner-embedded-entry-build',
+                ['build', '--release', '--offline', '--backend', 'runner', '-o', runner_executable],
+                working=runner_project)
+        runner_entry.unlink()
+        for label, wanted in [('original', 'original 中文🙂\n'), ('edited', 'edited 中文🙂\n')]:
+            if label == 'edited':
+                runner_dependency.write_text('fn Message(): str { return "edited 中文🙂" }\n', encoding='utf-8')
+            launched = invoke([runner_executable], runner_launch, env)
+            record('runner-embedded-entry-' + label, launched)
+            if launched.returncode or output(launched) != wanted or runner_entry.exists():
+                raise RuntimeError('embedded Runner did not use the original package dependency: ' +
+                                   launched.stderr.decode(errors='replace')[-2000:])
+        runner_dependency.unlink()
+        missing = invoke([runner_executable], runner_launch, env)
+        record('runner-embedded-entry-dependency-missing', missing, 'nonzero')
+        missing_error = missing.stderr.decode(errors='replace')
+        if not missing.returncode or 'helper.ku' not in missing_error or 'failed to resolve' not in missing_error:
+            raise RuntimeError('embedded Runner did not report its missing external dependency: ' + missing_error[-2000:])
+        remove_executable(runner_executable)
         other_install = root / 'other-ku-on-PATH'
         other_install.mkdir()
         shutil.copy2(ku, other_install / ku.name)
