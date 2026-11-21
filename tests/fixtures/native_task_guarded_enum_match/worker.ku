@@ -1,0 +1,18 @@
+import time from "std.time"
+enum Phase { Ready, Done }
+async fn Resolve(phase: Phase): Phase! {
+    println("resolve")
+    time.sleep(25)?
+    return ok(phase)
+}
+async fn Test(label: str, allowed: bool): bool! {
+    println(label)
+    time.sleep(25)?
+    return ok(allowed)
+}
+async fn Broken(): bool! {
+    println("guard error")
+    time.sleep(25)?
+    fail "approval failed"
+}
+async fn Unexpected(): str! { println("unexpected wildcard") fail "wildcard ran" }

@@ -1,0 +1,56 @@
+import { Phase as Workflow, Resolve, Test, Broken, Unexpected } from "./worker"
+async fn Read(): str! {
+    label = "完成" + "🙂"
+    text = match (await Resolve(Workflow.Done))? {
+        Workflow.Ready if ((await Test("mismatch", true))?) => "wrong tag"
+        Workflow.Done if ((await Test(label.clone(), false))?) => "wrong guard"
+        Workflow.Done if (label.len() > 0 && (await Test("accepted", true))?) => label
+        Workflow.Done => "wrong fallback"
+        Workflow.Ready => "ready"
+    }
+    return ok(text)
+}
+async fn Facts(number: int | null): int! {
+    if (number != null) {
+        value = match Workflow.Done {
+            Workflow.Done if (number > 0 && (await Test("known", true))?) => number + 1
+            _ => number
+        }
+        return ok(value)
+    }
+    return ok(-1)
+}
+async fn Disjoint(phase: Workflow): str! {
+    label = "保留" + "🙂"
+    return ok(match phase {
+        Workflow.Done if ((await Test(label, false))?) => "wrong arm"
+        Workflow.Done => "fallback"
+        Workflow.Ready => label
+        _ => (await Unexpected())?
+    })
+}
+async fn Present(value: int | null): bool! {
+    return ok(match Workflow.Done {
+        Workflow.Done if (value != null) => true
+        _ => false
+    })
+}
+async fn main(): null! {
+    println((await Read())?)
+    phase = (await Resolve(Workflow.Done))?
+    try {
+        text = match phase {
+            Workflow.Done if ((await Broken())?) => "wrong selected"
+            _ => "wrong fallback"
+        }
+        println(text)
+    } catch (issue) { println(issue.message) }
+    println(phase == Workflow.Done)
+    println((await Facts(1))?)
+    println((await Facts(0))?)
+    println((await Disjoint(Workflow.Ready))?)
+    println((await Disjoint(Workflow.Done))?)
+    println((await Present(0))?)
+    println((await Present(null))?)
+    return ok(null)
+}
