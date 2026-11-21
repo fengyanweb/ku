@@ -426,3 +426,20 @@ fn ReadLinkedErrorInitializer(&named: NamedModule, &literal: Node): LinkedErrorI
     }
     return ok(LinkedErrorInitializer { fields: fields, scratch: scratch })
 }
+
+fn HasBoundArrayMembers(&layouts: [StructLayout], index: int): bool {
+    count = layouts[index - 1].fields.len()
+    member = 0
+    while (member < count) {
+        if (layouts[index - 1].fields[member].resolved.declaration_kind == "BuiltinArray" ||
+            layouts[index - 1].fields[member].resolved.declaration_kind == "StructArray") { return true }
+        // Layout validation already bounded the acyclic by-value graph.
+        if (layouts[index - 1].fields[member].resolved.declaration_kind == "Struct") {
+            unit = layouts[index - 1].fields[member].resolved.module_index
+            node = layouts[index - 1].fields[member].resolved.declaration_node
+            if (HasBoundArrayMembers(layouts, LayoutIndex(layouts, unit, node))) { return true }
+        }
+        member = member + 1
+    }
+    return false
+}

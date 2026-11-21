@@ -7,7 +7,7 @@ import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { CanCloneNestedStringArrays, CollectOwnedMemberPaths, EmitCombinedCLayouts, EmitLinkedStringArrayElementClone, EmitNestedCLayouts, EmitProjectionCloneString, OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { ContainsType, CTypeName, ProjectionArrayHeader, ProjectionIsStringArray } from "./struct_projection_c.ku"
-import { ExplicitType, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { ExplicitType, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 
 struct StructArrayC {
@@ -15,18 +15,6 @@ struct StructArrayC {
     array_type: str
     prefix: str
     source: str
-}
-
-fn HasBoundArrayMembers(&layouts: [StructLayout], index: int): bool {
-    for member in layouts[index - 1].fields.clone() {
-        field = member.resolved
-        if (field.declaration_kind == "BuiltinArray" || field.declaration_kind == "StructArray") { return true }
-        // Layout validation already bounded the acyclic by-value graph.
-        if (field.declaration_kind == "Struct" && HasBoundArrayMembers(layouts, LayoutIndex(layouts, field.module_index, field.declaration_node))) {
-            return true
-        }
-    }
-    return false
 }
 
 fn collectOwnedFields(&layouts: [StructLayout], index: int, &prefix: str, paths: [str]): [str] {
