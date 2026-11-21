@@ -1574,6 +1574,191 @@ int main(void) {
     }
 }
 
+pub(super) fn assert_local_bool_while(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("local-bool-while.ku"),
+        r#"struct Parcel { label: str }
+
+fn Visit(step: int, producer: str): null! { return ok(null) }
+fn ReadLabel(parcel: Parcel): Parcel! { return ok(parcel) }
+fn Inspect(&parcel: Parcel): null! { return ok(null) }
+
+fn Count(begin: bool, limit: int, &label: str): int! {
+    active = begin
+    step = 0
+    while (active) {
+        current = label.clone()
+        Visit(step, current)?
+        step = step + 1
+        if (step >= limit) { active = false }
+    }
+    return ok(step)
+}
+
+fn TakeNow(begin: bool, parcel: Parcel): Parcel! {
+    active = begin
+    while (active) {
+        local = ReadLabel(parcel)?
+        return ok(local)
+    }
+    return ok(parcel)
+}
+
+fn Nested(begin: bool): int! {
+    active = true
+    step = 0
+    if (begin) {
+        while (active) {
+            step = step + 1
+            active = false
+        }
+    }
+    return ok(step)
+}
+
+fn ForbiddenParameter(active: bool): int! {
+    step = 0
+    while (active) { step = step + 1 }
+    return ok(step)
+}
+fn ForbiddenExpression(begin: bool): int! {
+    active = begin
+    while (!active) { active = true }
+    return ok(0)
+}
+fn ForbiddenMove(begin: bool, parcel: Parcel): null! {
+    active = begin
+    while (active) {
+        ReadLabel(parcel)?
+        active = false
+    }
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "local-bool-while.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+
+    for name in ["Count", "TakeNow", "Nested"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        assert!(code.contains("while (l") && !code.contains("while (true)"));
+        let entry = code
+            .lines()
+            .find(|line| {
+                line.starts_with("KuBootstrapResult_") && line.contains(" ku_linked_null_")
+            })
+            .and_then(|signature| signature.split_once(' '))
+            .and_then(|(_, signature)| signature.split_once('('))
+            .unwrap()
+            .0;
+        let provider = code
+            .lines()
+            .find_map(|line| line.strip_prefix("extern KuBootstrapResult"))
+            .and_then(|signature| signature.split_once(' '))
+            .and_then(|(_, signature)| signature.split_once('('));
+        let (provider, parameters) = provider.unwrap_or(("", ""));
+        let record = parameters.split_once(')').map_or("", |(record, _)| record);
+        let host = r#"
+#if __COUNT__
+static unsigned visits;
+static int fail_step = -1;
+static const uint8_t *source_owner;
+KuBootstrapResultNull __PROVIDER__(int64_t step, KuProjectionString label) {
+    assert(step == (int64_t)visits++ && label.len == 1 && *label.ptr == 6);
+    assert(outstanding() == 2 && label.ptr != source_owner);
+    if (step == fail_step) return (KuBootstrapResultNull){.error={.message=label}};
+    ku_projection_string_drop(&label);
+    return (KuBootstrapResultNull){.ok=true};
+}
+#elif __TAKE__
+static unsigned calls;
+static bool fail_now;
+KuBootstrapResult___RECORD__ __PROVIDER__(__RECORD__ parcel) {
+    ++calls;
+    assert(parcel.f0.len == 1 && *parcel.f0.ptr == 3);
+    if (fail_now) return (KuBootstrapResult___RECORD__){.error={.message=parcel.f0}};
+    return (KuBootstrapResult___RECORD__){.ok=true,.value=parcel};
+}
+#endif
+int main(void) {
+    (void)test_malloc;
+    (void)test_realloc;
+    (void)test_free;
+#if __COUNT__
+    uint8_t *bytes = malloc(1);
+    *bytes = 6;
+    source_owner = bytes;
+    KuProjectionString label = {bytes,1,1,KU_PROJECTION_STRING_OWNED};
+    KuBootstrapResult_int64_t output = __ENTRY__(false,4,&label);
+    assert(output.ok && output.value == 0 && visits == 0 && outstanding() == 1);
+    output = __ENTRY__(true,4,&label);
+    assert(output.ok && output.value == 4 && visits == 4 && outstanding() == 1);
+    fail_step = 1;
+    visits = 0;
+    output = __ENTRY__(true,4,&label);
+    assert(!output.ok && visits == 2 && outstanding() == 2 && *output.error.message.ptr == 6);
+    ku_projection_string_drop(&output.error.message);
+    assert(label.ptr == source_owner && *label.ptr == 6 && outstanding() == 1);
+    ku_projection_string_drop(&label);
+    assert(!outstanding());
+#elif __TAKE__
+    for (int take = 0; take <= 1; ++take) {
+        uint8_t *bytes = malloc(1);
+        *bytes = 3;
+        __RECORD__ parcel = {{bytes,1,1,KU_PROJECTION_STRING_OWNED}};
+        KuBootstrapResult___RECORD__ output = __ENTRY__(take, parcel);
+        assert(output.ok && calls == (unsigned)take && outstanding() == 1);
+        assert(output.value.f0.ptr == bytes);
+        ku_projection_string_drop(&output.value.f0);
+        assert(!outstanding());
+    }
+    fail_now = true;
+    uint8_t *bytes = malloc(1);
+    *bytes = 3;
+    __RECORD__ parcel = {{bytes,1,1,KU_PROJECTION_STRING_OWNED}};
+    KuBootstrapResult___RECORD__ output = __ENTRY__(true, parcel);
+    assert(!output.ok && calls == 2 && outstanding() == 1 && output.error.message.ptr == bytes);
+    ku_projection_string_drop(&output.error.message);
+    assert(!outstanding());
+#else
+    KuBootstrapResult_int64_t output = __ENTRY__(false);
+    assert(output.ok && output.value == 0);
+    output = __ENTRY__(true);
+    assert(output.ok && output.value == 1);
+#endif
+    assert(!outstanding());
+    return 0;
+}
+"#
+        .replace("__ENTRY__", entry)
+        .replace("__PROVIDER__", provider)
+        .replace("__RECORD__", record)
+        .replace("__COUNT__", if name == "Count" { "1" } else { "0" })
+        .replace("__TAKE__", if name == "TakeNow" { "1" } else { "0" });
+        let source = cwd.join("local-bool-while.c");
+        let exe = cwd.join(format!("local-bool-while{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+        compile_projection(&source, &exe, cwd);
+        assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    }
+
+    for (name, diagnostic) in [
+        ("ForbiddenParameter", "unsupported_linked_loop"),
+        ("ForbiddenExpression", "unsupported_linked_loop"),
+        ("ForbiddenMove", "linked_control_move"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}
+
 const ADD_CALL_SOURCE: &str = r#"import { Decorate, Suffix } from "./plus-provider.ku"
 fn Compose(path: str): str! {
     result = Decorate(path) + Suffix(1)

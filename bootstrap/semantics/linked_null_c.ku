@@ -16,7 +16,7 @@ import { LinkedBuiltin, LinkedResultPlan, LinkedNullArrayPrefix, LinkedNullCType
          LinkedNullNode, LinkedNullProject, LinkedNullType, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedCopyRebind, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { LowerLinkedArrayAppend, LowerLinkedOwnerRebind } from "./linked_owner_assignment_c.ku"
+import { LinkedBooleanWhileCondition, LowerLinkedArrayAppend, LowerLinkedOwnerRebind, OpenLinkedBooleanWhile } from "./linked_owner_assignment_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 
@@ -303,9 +303,19 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             opened = OpenLinkedForLoop(project, next, statement, id, depth)?
             stepped = lowerLinkedRegion(project, statement, opened.state, 1, result, depth + 1)?
             next = CloseLinkedForLoop(stepped, opened.outer, opened.before, statement)?
-        } else if (statement.kind == "While" && statement.edge_count >= 2 && index > start) {
-            initial = LinkedCountedInitial(project, next, region, statement, start, index)?
-            next = addCountedLoop(project, next, statement, initial, result, depth)?
+        } else if (statement.kind == "While" && statement.edge_count >= 2) {
+            condition = LinkedBooleanWhileCondition(project, next, statement)
+            if (condition != "") {
+                opened = OpenLinkedBooleanWhile(next, statement, condition, depth)?
+                loop = lowerLinkedRegion(project, statement, opened.state, 1, result, depth + 1)?
+                next = CloseLinkedForLoop(loop, opened.outer, opened.before, statement)?
+            } else {
+                if (index <= start) {
+                    RejectLayout("unsupported_linked_statement", "expected a fresh local, guarded statement, counted while or checked call", DeclarationSpan(statement))?
+                }
+                initial = LinkedCountedInitial(project, next, region, statement, start, index)?
+                next = addCountedLoop(project, next, statement, initial, result, depth)?
+            }
         } else if ((statement.kind == "ExprStmt" || statement.kind == "Print") && statement.edge_count == 1) {
             next = LowerLinkedStatementCall(project, next, statement)?
         } else {

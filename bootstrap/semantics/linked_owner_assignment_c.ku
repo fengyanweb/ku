@@ -3,7 +3,7 @@ import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
-import { LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullProject, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
 import { AppendLinkedArrayElement, LowerLinkedNullValue } from "./linked_null_values_c.ku"
@@ -94,4 +94,28 @@ fn OpenLinkedCheckedRecordFor(&project: LinkedNullProject, state: LinkedNullStat
         + "    " + item.value.text + " = " + element.clone() + ";\n"
         + "    " + element + " = (" + LinkedNullCType(ty)? + "){0};\n"
     return ok(LinkedForLoop { state: item.state, outer: outer, before: before })
+}
+
+fn LinkedBooleanWhileCondition(&project: LinkedNullProject, &state: LinkedNullState, &statement: Node): str {
+    guard = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+    if (guard.kind != "Variable" || guard.edge_count != 0) { return "" }
+    index = LinkedNullBinding(state.slots, guard.text)
+    if (index == 0) { return "" }
+    slot = state.slots[index - 1].clone()
+    if (slot.parameter || !slot.live || slot.value.borrowed || slot.moved_members.len() != 0 ||
+        slot.value.ty.declaration_kind != "Builtin" || slot.value.ty.name != "bool") { return "" }
+    return slot.value.text
+}
+
+fn OpenLinkedBooleanWhile(state: LinkedNullState, &statement: Node, condition: str, depth: int): LinkedForLoop! {
+    if (depth >= 32) {
+        RejectLayout("linked_control_depth", "linked control flow allows at most 32 levels", DeclarationSpan(statement))?
+    }
+    before = state.slots.len()
+    outer = state.slots.clone()
+    next = state
+    // This local is reevaluated by C at the original loop boundary.
+    next.code += "    while (" + condition + ") {
+"
+    return ok(LinkedForLoop { state: next, outer: outer, before: before })
 }
