@@ -256,7 +256,8 @@ fn putLinkedDestructuredField(&project: LinkedNullProject, state: LinkedNullStat
     }
     next.code += "    " + next.slots[target - 1].value.text.clone() + " = " + field.text.clone() + ";\n"
     next.slots[target - 1].live = true
-    next.slots[target - 1].moved_members = []
+    no_moved_members: [str] = []
+    next.slots[target - 1].moved_members = no_moved_members
     return MoveLinkedNullSlot(next, field)
 }
 
