@@ -14,8 +14,8 @@ fn isReplace(&nodes: [Node], &edges: [int], &value: Node): bool {
 fn HasScalarOwnedStringBody(&nodes: [Node], &edges: [int], start: int, end: int): bool {
     first = nodes[edges[start] - 1].clone()
     if (first.kind == "Assign" || first.kind == "VarDecl") { return true }
-    return start + 1 == end && first.kind == "Return" && first.edge_count == 1
-        && isReplace(nodes, edges, nodes[edges[first.first_edge] - 1])
+    if (start + 1 != end || first.kind != "Return" || first.edge_count != 1) { return false }
+    return isReplace(nodes, edges, nodes[edges[first.first_edge] - 1])
 }
 
 fn localIndex(&locals: [str], &name: str): int {

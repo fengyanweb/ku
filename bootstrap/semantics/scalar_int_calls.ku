@@ -107,6 +107,16 @@ fn isIntCallTarget(&calls: [ScalarIntCall], node: int): bool {
     return false
 }
 
+fn ScalarIntArguments(&edges: [int], start: int, count: int): [int] {
+    arguments: [int] = []
+    index = 0
+    while (index < count) {
+        arguments = arguments.push(edges[start + index])
+        index = index + 1
+    }
+    return arguments
+}
+
 fn LowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
                       &bindings: [TypeNameBinding], &parameters: [ScalarIntParameter],
                       &imports: [ScalarIntImport], local_base: int, result_node: int): [ScalarIntInstruction]! {
@@ -130,7 +140,8 @@ fn LowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelNam
         operation = ""
         operand = 0
         right_node = 0
-        arguments: [int] = []
+        argument_start = 0
+        arity = 0
         target = false
         if (node.kind == "Int" && node.edge_count == 0 && node.int_value >= 0) {
             operation = "constant"
@@ -166,18 +177,14 @@ fn LowerIntExpression(&nodes: [Node], &edges: [int], &declarations: [TopLevelNam
             operation = "call"
             operand = calls[call_index].function_node
             call_index = call_index + 1
-            // Materialize the argument IDs only when creating their instruction.
+            argument_start = node.first_edge + 1
             arity = node.edge_count - 1
-            argument = 0
-            while (argument < arity) {
-                arguments = arguments.push(edges[node.first_edge + argument + 1])
-                argument = argument + 1
-            }
         }
         if (!target) {
             if (operation == "") {
                 rejectScalarInt("unsupported_int_expression", "expected an int literal, parameter, arithmetic, or direct int call", DeclarationSpan(node))?
             }
+            arguments = ScalarIntArguments(edges, argument_start, arity)
             instruction = ScalarIntInstruction { operation: operation, result_node: cursor, operand: operand,
                                                 right_node: right_node, arguments: arguments }
             instructions = instructions.push(instruction)
