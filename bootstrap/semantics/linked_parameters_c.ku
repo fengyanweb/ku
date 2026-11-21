@@ -4,7 +4,7 @@ import { EmitScalarIntString } from "./scalar_int_emit.ku"
 import { HasScalarBuiltin } from "./scalar_int_operands.ku"
 import { Node } from "../stage2/ast.ku"
 import { FindLinkedLocalRead, LinkedLocalReadBinding } from "./call_contracts.ku"
-import { ProjectionCloneSource } from "./struct_projection_c.ku"
+import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { LayoutIndex, RejectLayout } from "./struct_layouts.ku"
@@ -20,14 +20,19 @@ struct LinkedNullParameters {
     result: TypeNameBinding
 }
 
+fn LinkedCallableSlot(&state: LinkedNullState, slot: int): bool {
+    return slot > 0 && state.slots[slot - 1].live &&
+        (state.slots[slot - 1].parameter || ContainsIndex(state.local_callbacks, slot))
+}
+
 fn rejectLocalReader(&node: Node, message: str): null! {
     return RejectLayout("unsupported_linked_local_reader", message, DeclarationSpan(node))
 }
 
-fn checkLocalReaderName(&project: LinkedNullProject, &state: LinkedNullState, &function: Node): null! {
-    if (function.edge_count != 3 || function.text == "ok" || LinkedNullBinding(state.slots, function.text) != 0 ||
+fn CheckLinkedLocalFunctionName(&project: LinkedNullProject, &state: LinkedNullState, &function: Node): null! {
+    if (function.text == "ok" || LinkedNullBinding(state.slots, function.text) != 0 ||
         FindLinkedLocalRead(state.local_readers, function.text) != 0) {
-        rejectLocalReader(function, "a local reader needs a distinct name, one parameter and one return")?
+        rejectLocalReader(function, "a local function needs a distinct local name")?
     }
     index = 0
     while (index < project.supplied[0].named.names.declarations.len()) {
@@ -64,7 +69,8 @@ fn readLocalIndexShift(&project: LinkedNullProject, &index: Node, &name: str): i
 }
 
 fn RegisterLinkedLocalRead(&project: LinkedNullProject, state: LinkedNullState, &function: Node, id: int): LinkedNullState! {
-    checkLocalReaderName(project, state, function)?
+    if (function.edge_count != 3) { rejectLocalReader(function, "a local reader needs one parameter and one return")? }
+    CheckLinkedLocalFunctionName(project, state, function)?
     parameter = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, 0))
     exit = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, 2))
     if (parameter.kind != "Parameter" || parameter.edge_count != 1 || parameter.int_value != 0 ||

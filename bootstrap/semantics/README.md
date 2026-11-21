@@ -313,6 +313,16 @@ callee checks the array header and index before reading an element. The
 original binding remains valid after the call, and a later argument cannot
 consume the source of an earlier loan.
 
+The checked `fn(int, int): Record!` ABI also admits a named synchronous
+local function and an explicitly typed local alias. A private C function
+receives the defining frame's stack environment. Captured Copy integers and
+booleans use their original bindings. A captured named struct array supplies
+a const view of its existing header and must stay readable in that frame.
+The descriptor can be invoked locally with `?` or forwarded to a matching checked
+synchronous parameter, including through one explicit `.clone()` of the
+descriptor. The capture does not copy the array. Returning or storing a
+callback beyond this scope remains unsupported.
+
 `managed` emits constructors returning an owned struct array or a Result
 of that array. In the Result form, the selected function can return
 `ok(owner)` or a static Error. A `linked-null` function can bind an

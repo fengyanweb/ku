@@ -337,6 +337,145 @@ int main(void) {
     assert_ok(&execute(&mut Command::new(&program), cwd, 10));
 }
 
+pub(super) fn assert_local_callback_thunk(seed: &Path, python: &str, cwd: &Path) {
+    fs::write(
+        cwd.join("callback-local.ku"),
+        r#"struct Sample { amount: int, label: str }
+struct Reply { total: int, first: int, second: int }
+
+fn Read(&source: [Sample], index: int): int! {
+    if (index < 0) { fail { domain: "test", code: "index", message: "negative index" } }
+    return ok(source[index].amount)
+}
+fn Invoke(callback: fn(int, int): Reply!, left: int, right: int): Reply! {
+    result = callback(left, right)?
+    return ok(result)
+}
+fn Run(source: [Sample], base: int, enabled: bool): Reply! {
+    counter = 0
+    cursor = base
+    fn Local(left: int, right: int): Reply! {
+        a = Read(source, cursor + left)?
+        if (enabled) { counter = counter * 10 + a }
+        b = Read(source, cursor + right)?
+        counter = counter * 10 + b
+        return ok(Reply { total: counter, first: a, second: b })
+    }
+    picker: fn(int, int): Reply! = Local
+    first = Invoke(picker.clone(), 0, 1)?
+    cursor = cursor + 1
+    second = Invoke(picker, 0, 1)?
+    return ok(Reply { total: counter, first: first.total, second: second.total })
+}
+fn Eat(source: [Sample]): Reply! {
+    return ok(Reply { total: source.len(), first: 0, second: 0 })
+}
+fn Moved(source: [Sample]): Reply! {
+    fn Local(left: int, right: int): Reply! {
+        amount = Read(source, left + right)?
+        return ok(Reply { total: amount, first: 0, second: 0 })
+    }
+    skipped = Eat(source)?
+    return Invoke(Local, skipped.total, 0)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "callback-local.ku\n").unwrap();
+    let emit = |name, mode| {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        fs::write(cwd.join("mode.txt"), mode).unwrap();
+        execute(&mut Command::new(seed), cwd, 30)
+    };
+    let rejected = emit("Moved", "linked-null");
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_callback_owner"));
+
+    let linker = Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/tools/link_c.py");
+    let c_compiler = std::env::var("CC").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "clang".into()
+        } else {
+            "cc".into()
+        }
+    });
+    let mut link = Command::new(python);
+    link.arg("-B").arg(linker).arg("--cc").arg(c_compiler);
+    let mut entry_c = String::new();
+    for name in ["Run", "Invoke", "Read"] {
+        let plan = emit(name, "linked-null-plan");
+        assert_ok(&plan);
+        let generated = emit(name, "linked-null");
+        assert_ok(&generated);
+        let plan_path = cwd.join(format!("local-{name}.json"));
+        let source_path = cwd.join(format!("local-{name}.c"));
+        fs::write(&plan_path, plan.stdout).unwrap();
+        fs::write(&source_path, &generated.stdout).unwrap();
+        link.arg("--unit").args([plan_path, source_path]);
+        if name == "Run" {
+            entry_c = String::from_utf8(generated.stdout).unwrap();
+        }
+    }
+    let (head, parameters) = entry_c
+        .lines()
+        .find(|line| line.starts_with("KuBootstrapResult_") && line.contains(" ku_linked_null_"))
+        .and_then(|line| line.split_once('('))
+        .unwrap();
+    let (result, entry) = head.split_once(' ').unwrap();
+    let (array, _) = parameters.split_once(" a0,").unwrap();
+    let element = array.strip_prefix("KuArray_").unwrap();
+    assert!(entry_c.contains(&format!("const {array}* c")));
+    assert!(entry_c.contains("void *raw, int64_t a0, int64_t a1"));
+    assert!(entry_c.contains(", &environment"));
+    assert!(!entry_c.contains("malloc("));
+    let host = r#"
+#include <assert.h>
+static ARRAY sample(void) {
+    ELEMENT *data = calloc(3, sizeof *data);
+    assert(data);
+    for (size_t i = 0; i < 3; ++i) {
+        uint8_t *label = malloc(1);
+        assert(label);
+        *label = (uint8_t)('a' + i);
+        data[i].f0 = (int64_t)i + 1;
+        data[i].f1 = (KuProjectionString){label, 1, 1, KU_PROJECTION_STRING_OWNED};
+    }
+    return (ARRAY){3, data, 3};
+}
+static void check(bool enabled, int64_t first, int64_t total) {
+    RESULT result = ENTRY(sample(), 0, enabled);
+    assert(result.ok && result.value.f0 == total && result.value.f1 == first && result.value.f2 == total);
+}
+int main(void) {
+    check(true, 12, 1223);
+    check(false, 2, 23);
+    RESULT failed = ENTRY(sample(), -1, true);
+    assert(!failed.ok && failed.error.code.len == 5 && !memcmp(failed.error.code.ptr, "index", 5));
+    check(true, 12, 1223);
+    return 0;
+}
+"#
+    .replace("ENTRY", entry)
+    .replace("RESULT", result)
+    .replace("ARRAY", array)
+    .replace("ELEMENT", element);
+    let host_path = cwd.join("callback-local-caller.c");
+    let exe = cwd.join(format!("callback-local{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&host_path, host).unwrap();
+    link.arg("--entry")
+        .args([
+            "callback-local.ku",
+            entry.strip_prefix("ku_linked_null_").unwrap(),
+        ])
+        .arg("--caller")
+        .arg(host_path)
+        .arg("-o")
+        .arg(&exe);
+    assert_ok(&execute(&mut link, cwd, 45));
+    assert_ok(&execute(&mut Command::new(exe), cwd, 10));
+}
+
 pub(super) fn assert_terminal_branch_ownership(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("guard-provider.ku"),

@@ -10,7 +10,7 @@ import { EmitLinkedIntAppend } from "./struct_array_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { CloneLinkedLocalArrayItem, CloneLinkedRecord, CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { AddLinkedNullSlot, CheckedLinkedCallbackExpression, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, CheckedLinkedCallbackExpression, LinkedCallableSlot, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix } from "./linked_parameters_c.ku"
 
 fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int, depth: int): LinkedNullExpression! {
     subject_id = LinkedNullChild(project, 1, target, 0)
@@ -41,8 +41,8 @@ fn forwardLinkedCallback(&project: LinkedNullProject, &state: LinkedNullState, i
     node = LinkedNullNode(project, 1, id)
     if (source != 0) { node = LinkedNullNode(project, 1, source) }
     slot = LinkedNullBinding(state.slots, node.text)
-    if (node.kind != "Variable" || node.edge_count != 0 || slot == 0 || !state.slots[slot - 1].parameter ||
-        !state.slots[slot - 1].live || !SameLinkedType(state.slots[slot - 1].value.ty, parameter)) {
+    if (node.kind != "Variable" || node.edge_count != 0 || !LinkedCallableSlot(state, slot) ||
+        !SameLinkedType(state.slots[slot - 1].value.ty, parameter)) {
         RejectLayout("linked_callback_forward", "expected a live callback parameter with the same checked signature", DeclarationSpan(node))?
     }
     // Even an explicit clone keeps the same environment. Both descriptors
@@ -132,7 +132,7 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
 
 fn emitCheckedCallback(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
                        slot: int, id: int, depth: int): LinkedCheckedCall! {
-    if (!state.slots[slot - 1].parameter || !state.slots[slot - 1].live || call.edge_count != 3) {
+    if (!LinkedCallableSlot(state, slot) || call.edge_count != 3) {
         RejectLayout("linked_callback_call", "expected a live checked callback parameter with two int arguments", DeclarationSpan(call))?
     }
     callback = state.slots[slot - 1].value.clone()

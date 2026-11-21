@@ -50,7 +50,7 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlo
     }
     index = 0
     while (index < slots.len()) {
-        if (slots[index].parameter && slots[index].value.ty.declaration_kind == "IntPairResultCallback") {
+        if (slots[index].value.ty.declaration_kind == "IntPairResultCallback") {
             callback = slots[index].value.ty.clone()
             carrier = LinkedNullCType(callback)?
             if (!ContainsType(records, carrier)) {
@@ -98,7 +98,7 @@ fn EmitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &pa
     keep = LinkedNullResultCleanupReference(body.owning_layouts, payload)
     char_errors = ""
     if (body.uses_chars) { char_errors = ManagedSourceCharactersErrors() }
-    return ok(FinishLinkedFunctionC(header, body, symbol, signature, result, keep, char_errors))
+    return ok(FinishLinkedFunctionC(header + body.callback_helpers.clone(), body, symbol, signature, result, keep, char_errors))
 }
 
 fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {

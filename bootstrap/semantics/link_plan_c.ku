@@ -61,6 +61,9 @@ struct LinkedNullState {
     slots: [LinkedNullSlot]
     links: [LinkedNullFunction]
     local_readers: [LinkedLocalReadBinding]
+    local_callbacks: [int]
+    callback_owners: [int]
+    callback_helpers: str
     declarations: str
     code: str
     drops: str
@@ -98,7 +101,8 @@ struct LinkedNullExpression {
 
 fn NewLinkedNullState(): LinkedNullState {
     return LinkedNullState { plain_value_result: false, layouts: [], owning_layouts: [], owning_strings: false,
-        slots: [], links: [], local_readers: [], declarations: "", code: "", drops: "", catch_slot: 0,
+        slots: [], links: [], local_readers: [], local_callbacks: [], callback_owners: [], callback_helpers: "",
+        declarations: "", code: "", drops: "", catch_slot: 0,
         catch_edges: false, catch_moved: [], moved_error_fields: [], uses_clone: false, uses_int_snapshot: false,
         arrays: [], validated_arrays: [], owned_arrays: [], append_slots: [], uses_str_array: false, uses_str_view: false, uses_struct_view: false,
         element_clones: [], uses_index: false, uses_add: false, uses_sub: false, uses_mul: false, uses_div: false,
