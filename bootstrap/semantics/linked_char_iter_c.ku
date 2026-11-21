@@ -48,7 +48,8 @@ fn ReadLinkedLocalThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     fields = ""
     initializers = ""
     owners: [int] = []
-    for index in ReadLinkedLocalCaptures(project, parent, function, id, 3)? {
+    captures = ReadLinkedLocalCaptures(project, parent, function, id, 3)?
+    for index in captures.slots {
         outer = parent.slots[index - 1].clone()
         owned_array = LinkedNullOwnedArray(outer.value.ty)
         array_view = owned_array || outer.value.ty.declaration_kind == "StructArray"

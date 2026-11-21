@@ -3432,6 +3432,7 @@ pub(super) fn assert_record_field_string_rebind(seed: &Path, cwd: &Path) {
 pub(super) fn assert_local_append_thunk(seed: &Path, cwd: &Path) {
     let body = r#"struct Location { line: int }
 struct Entry { kind: str, text: str, score: int, location: Location, first: int }
+struct ClosingToken { kind: str, lexeme: str, score: int }
 
 fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [int], reject: bool): int! {
     nodes: [Entry] = []
@@ -3450,11 +3451,17 @@ fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [
         cursor = cursor + 1
         return ok(null)
     }
+    fn Close(token: ClosingToken): null! {
+        Advance()?
+        added = Append(token.kind, token.lexeme, token.score, Location { line: 5 }, [cursor, cursor, cursor])?
+        edges = edges.push(added)
+        cursor = added
+        return ok(null)
+    }
     left = Append(first, second, 3, Location { line: 2 }, choices)?
     cursor = 8
-    right = Append(third, fourth, 0 - 5, Location { line: 5 }, more)?
-    Advance()?
-    return ok(left * 1000 + right * 100 + nodes.len() + edges.len() + cursor)
+    Close(ClosingToken { kind: third, lexeme: fourth, score: 0 - 5 })?
+    return ok(left * 1000 + cursor * 100 + nodes.len() + edges.len() + cursor)
 }
 "#;
     let file = cwd.join("append-thunk.ku");
@@ -3474,13 +3481,14 @@ fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [
         .0;
     assert!(code.contains("_append_move(&(*capture->"));
     assert!(code.contains("&environment"));
+    assert!(code.contains("(capture->f"));
     assert!(!code.contains("memcpy(copy, (*capture"));
     let host = r#"
-static int before_call;
-static void after_growth_failure(void) {
-    assert(attempts == before_call + 5);
+static int failure_attempt;
+static void after_nested_failure(void) {
+    assert(attempts == failure_attempt);
     assert(!outstanding());
-    fputs("allocator: cleared both scopes\n", stderr);
+    fputs("allocator: cleared every scope\n", stderr);
 }
 
 static KuProjectionString owned(uint8_t marker) {
@@ -3493,22 +3501,24 @@ static KuArrayInt children(size_t len, int64_t first) {
     for (size_t i = 0; i < len; ++i) data[i] = first + (int64_t)i;
     return (KuArrayInt){len, data, len};
 }
-static KuBootstrapResult_int64_t run(bool reject, bool fatal) {
+static KuBootstrapResult_int64_t run(bool reject, int allocation_before_failure) {
     KuProjectionString a = owned('A'), b = owned('B'), c = owned('C'), d = owned('D');
     KuArrayInt left = children(7, 1), right = children(3, 8);
-    before_call = attempts;
-    if (fatal) {
-        fail_after = 4;
-        assert(atexit(after_growth_failure) == 0);
+    if (allocation_before_failure >= 0) {
+        fail_after = allocation_before_failure;
+        failure_attempt = attempts + allocation_before_failure + 1;
+        assert(atexit(after_nested_failure) == 0);
     }
     return ENTRY(a, b, c, d, left, right, reject);
 }
 int main(int argc, char **argv) {
-    (void)argv;
-    if (argc > 1) { (void)run(false, true); return 2; }
-    KuBootstrapResult_int64_t first = run(false, false);
-    assert(first.ok && first.value == 9022 && !outstanding());
-    KuBootstrapResult_int64_t next = run(true, false);
+    if (argc > 1) {
+        (void)run(false, !strcmp(argv[1], "fail-snapshot") ? 4 : 5);
+        return 2;
+    }
+    KuBootstrapResult_int64_t first = run(false, -1);
+    assert(first.ok && first.value == 9125 && !outstanding());
+    KuBootstrapResult_int64_t next = run(true, -1);
     assert(!next.ok && next.error.domain.len == 1 && *next.error.domain.ptr == 'C');
     assert(next.error.code.len == 1 && *next.error.code.ptr == 'C');
     assert(next.error.message.len == 1 && *next.error.message.ptr == 'D');
@@ -3517,8 +3527,8 @@ int main(int argc, char **argv) {
     ku_projection_string_drop(&next.error.code);
     ku_projection_string_drop(&next.error.message);
     assert(!outstanding());
-    KuBootstrapResult_int64_t last = run(false, false);
-    assert(last.ok && last.value == 9022 && !outstanding());
+    KuBootstrapResult_int64_t last = run(false, -1);
+    assert(last.ok && last.value == 9125 && !outstanding());
     return 0;
 }
 "#
@@ -3528,12 +3538,17 @@ int main(int argc, char **argv) {
     fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
     compile_projection(&source, &program, cwd);
     assert_ok(&execute(&mut Command::new(&program), cwd, 10));
-    let failed = execute(Command::new(program).arg("fail-second-growth"), cwd, 10);
-    assert_eq!(failed.status.code(), Some(1));
-    assert_eq!(
-        String::from_utf8_lossy(&failed.stderr).trim(),
-        "array allocation failed\nallocator: cleared both scopes"
-    );
+    for (fault, expected) in [
+        ("fail-second-growth", "array allocation failed"),
+        ("fail-snapshot", "out of memory"),
+    ] {
+        let failed = execute(Command::new(&program).arg(fault), cwd, 10);
+        assert_eq!(failed.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&failed.stderr).trim(),
+            format!("{expected}\nallocator: cleared every scope")
+        );
+    }
 
     for (from, to, diagnostic) in [
         (
@@ -3553,9 +3568,19 @@ int main(int argc, char **argv) {
         ),
         ("Advance()?", "Advance(9)?", "linked_local_append_arity"),
         (
-            "return ok(left *",
-            "alias = Append\n    return ok(left *",
+            "Advance()?\n        added",
+            "alias = Advance\n        Advance()?\n        added",
             "unavailable_linked_binding",
+        ),
+        (
+            "Advance()?\n        added",
+            "Close(token)?\n        Advance()?\n        added",
+            "unsupported_linked_local_capture",
+        ),
+        (
+            "Close(ClosingToken { kind: third, lexeme: fourth, score: 0 - 5 })?",
+            "Close(0)?",
+            "linked_argument_type",
         ),
     ] {
         assert!(body.contains(from));

@@ -8,8 +8,8 @@ import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { LayoutIndex, RejectLayout } from "./struct_layouts.ku"
-import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
-import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullParameterPlan,
+import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterPlan,
          LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 
 struct LinkedNullParameters {
@@ -103,6 +103,16 @@ fn RegisterLinkedLocalRead(&project: LinkedNullProject, state: LinkedNullState, 
     state.local_readers = state.local_readers.push(LinkedLocalReadBinding {
         name: function.text.clone(), node: id, captured_slot: capture, index_shift: shift })
     return ok(state)
+}
+
+fn CheckLinkedLocalAppendArguments(&callee: LinkedNullFunction, &call: Node, &unwrap: Node, owns_value: bool): null! {
+    if (owns_value && !LinkedNullHasResultValue(callee.result)) {
+        RejectLayout("linked_dependency_result", "expected a Result with a value payload", DeclarationSpan(unwrap))?
+    }
+    if (call.edge_count != callee.parameters.len() + 1) {
+        RejectLayout("linked_local_append_arity", "direct local append call requires its declared arguments", DeclarationSpan(call))?
+    }
+    return ok(null)
 }
 
 fn ReadLinkedNullParameters(&project: LinkedNullProject, &function: Node): LinkedNullParameters! {

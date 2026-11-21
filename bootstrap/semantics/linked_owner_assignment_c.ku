@@ -2,10 +2,10 @@ import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule } from "./names.ku"
-import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
+import { RejectLayout } from "./struct_layouts.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
-import { ExitLinkedFailure, LinkedFailureTarget, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
-import { LinkedBuiltin, LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
+import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, LinkedNullParameters, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
@@ -155,11 +155,16 @@ fn RejectLocalCapture(&node: Node, message: str): null! {
     return RejectLayout("unsupported_linked_local_capture", message, DeclarationSpan(node))
 }
 
+struct LinkedLocalCaptures {
+    slots: [int]
+    calls: [int]
+}
+
 // The validated arena stores this function's subtree contiguously. A second
 // function or a declaration that could shadow an outer slot needs its own
 // binding rules before this restricted same-frame lowering can accept it.
 fn ReadLinkedLocalCaptures(&project: LinkedNullProject, &state: LinkedNullState,
-                           &function: Node, id: int, body_start: int): [int]! {
+                           &function: Node, id: int, body_start: int): LinkedLocalCaptures! {
     names: [str] = []
     index = 0
     while (index < body_start - 1) {
@@ -173,8 +178,18 @@ fn ReadLinkedLocalCaptures(&project: LinkedNullProject, &state: LinkedNullState,
             project.supplied[0].named.parsed.arena.nodes[cursor - 1].first_edge]
     }
     slots: [int] = []
+    calls: [int] = []
+    has_local_calls = state.local_appends.len() > 0
     while (cursor < id) {
         node = LinkedNullNode(project, 1, cursor)
+        if (has_local_calls && node.kind == "Call" && node.edge_count > 0) {
+            target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
+            if (target.kind == "Variable" && target.edge_count == 0 && !ContainsType(names, target.text) &&
+                LinkedNullBinding(state.slots, target.text) == 0) {
+                index = LinkedLocalAppendIndex(state, target.text)
+                if (index > 0 && !ContainsIndex(calls, index)) { calls = calls.push(index) }
+            }
+        }
         use = node.kind == "Variable" || node.kind == "Assign"
         if (IsNamedFunction(node.kind) || node.kind == "FunctionExpr" || (use && node.text == function.text)) {
             RejectLocalCapture(node, "a local callback cannot define or reference a nested callable")?
@@ -190,7 +205,7 @@ fn ReadLinkedLocalCaptures(&project: LinkedNullProject, &state: LinkedNullState,
         }
         cursor = cursor + 1
     }
-    return ok(slots)
+    return ok(LinkedLocalCaptures { slots: slots, calls: calls })
 }
 
 fn StartLinkedThunkFrame(&parent: LinkedNullState): LinkedNullState {
@@ -250,12 +265,15 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
                          &function: Node, id: int): LinkedAppendThunk! {
     parameters = ReadLinkedNullParametersFrom(project, function, StartLinkedThunkFrame(parent))?
     arguments: [TypeNameBinding] = []
-    nullary = parameters.body_start == 1 && parameters.result.declaration_kind == "Builtin" && parameters.result.name == "null"
-    if (parameters.state.plain_value_result || (!nullary && (parameters.body_start != 6 || !LinkedIntResult(parameters.result)))) {
-        RejectLocalCapture(function, "a local append function requires null! without parameters or five typed parameters and int!")?
+    slots = parameters.state.slots.clone()
+    null_result = parameters.result.declaration_kind == "Builtin" && parameters.result.name == "null"
+    nullary = null_result && parameters.body_start == 1
+    record_input = null_result && parameters.body_start == 2 && slots[0].value.ty.declaration_kind == "Struct"
+    if (parameters.state.plain_value_result ||
+        (!nullary && !record_input && (parameters.body_start != 6 || !LinkedIntResult(parameters.result)))) {
+        RejectLocalCapture(function, "a local append function requires null! with zero arguments or one owned record, or a five-argument int!")?
     }
-    if (!nullary) {
-        slots = parameters.state.slots.clone()
+    if (!nullary && !record_input) {
         span = slots[3].value.clone()
         if (!LinkedStringResult(slots[0].value.ty) || !LinkedStringResult(slots[1].value.ty) ||
             !LinkedIntResult(slots[2].value.ty) || span.ty.declaration_kind != "Struct" ||
@@ -263,8 +281,8 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
             !LinkedNullIntArrayOwner(slots[4].value.ty)) {
             RejectLocalCapture(function, "a five-parameter local append function requires str, str, int, a Copy-layout record and [int]")?
         }
-        for slot in slots { arguments = arguments.push(slot.value.ty) }
     }
+    for slot in slots { arguments = arguments.push(slot.value.ty) }
     signature = LinkedNullFunction { unit: 1, node: id, symbol: "ku_local_append_" + str(id), parameters: arguments,
         result: parameters.result.clone(), returns_result: true }
     body = parameters.state
@@ -273,7 +291,8 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     fields = ""
     initializers = ""
     sources: [int] = []
-    for index in ReadLinkedLocalCaptures(project, parent, function, id, parameters.body_start)? {
+    captures = ReadLinkedLocalCaptures(project, parent, function, id, parameters.body_start)?
+    for index in captures.slots {
         outer = parent.slots[index - 1].clone()
         ty = outer.value.ty.clone()
         array = LinkedNullOwnedArray(ty) || LinkedNullIntArrayOwner(ty)
@@ -300,6 +319,17 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     if (sources.len() == 0) {
         RejectLocalCapture(function, "a local append function requires an exclusive array capture")?
     }
+    // Only previously declared local callees are available. Forward their
+    // original environment address, never a rebuilt copy of its owners.
+    for index in captures.calls {
+        callee = parent.local_appends[index - 1].clone()
+        suffix = str(callee.function.node)
+        field = "f" + suffix.clone()
+        fields += " ku_local_append_environment_" + suffix + " *" + field.clone() + ";"
+        initializers += " ." + field.clone() + " = " + callee.environment + ","
+        callee.environment = "capture->" + field
+        body.local_appends = body.local_appends.push(callee)
+    }
     parameters.state = body
     return ok(LinkedAppendThunk { parameters: parameters, function: signature, sources: sources,
         environment: environment, typedef_fields: fields, initializers: initializers })
@@ -307,7 +337,8 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
 
 fn appendThunkFailureRelay(&body: LinkedNullState): str {
     text = "    failure->append_status = append_status;\n"
-    if (body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0) {
+    calls_append = body.local_appends.len() > 0
+    if (calls_append || body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0) {
         text += "    failure->out_of_memory = out_of_memory;\n"
     }
     if (body.validated_arrays.len() > 0) {
@@ -315,8 +346,9 @@ fn appendThunkFailureRelay(&body: LinkedNullState): str {
         if (body.uses_str_array) { message = "invalid array view" }
         text += "    if (invalid_array) failure->array_error = \"" + message + "\\n\";\n"
     }
-    if (body.uses_add || body.uses_sub || body.uses_mul) { text += "    failure->overflow = overflow;\n" }
-    if (body.uses_index) {
+    if (calls_append) { text += "    if (captured_array_failure) failure->array_error = captured_array_failure;\n" }
+    if (calls_append || body.uses_add || body.uses_sub || body.uses_mul) { text += "    failure->overflow = overflow;\n" }
+    if (calls_append || body.uses_index) {
         text += "    failure->index_failed = index_failed;\n    failure->index = failure_index;\n    failure->length = failure_length;\n"
     }
     return text
@@ -345,65 +377,30 @@ fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
     for index in thunk.sources.clone() {
         if (!ContainsIndex(next.append_captures, index)) { next.append_captures = next.append_captures.push(index) }
     }
-    next.local_appends = next.local_appends.push(LinkedLocalAppend { binding: function.text.clone(), function: thunk.function.clone() })
     frame = "environment" + str(thunk.function.node)
+    next.local_appends = next.local_appends.push(LinkedLocalAppend { binding: function.text.clone(),
+        function: thunk.function.clone(), environment: "&" + frame.clone() })
     next.declarations += "    " + thunk.environment.clone() + " " + frame.clone() + " = {0};\n"
     next.code += "    " + frame.clone() + " = (" + thunk.environment.clone() + "){" + thunk.initializers.clone() + " };\n"
         + "    (void)" + frame + "; (void)" + thunk.function.symbol.clone() + ";\n"
     return ok(next)
 }
 
-fn LowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
-    if (statement.kind != "Fail" || statement.edge_count != 1) {
-        RejectLayout("unsupported_linked_terminal", "expected a final Error fail or return ok(null)", DeclarationSpan(statement))?
+fn LowerLinkedLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
+    if (LinkedNullBinding(state.slots, statement.text) != 0) {
+        RejectLayout("linked_binding_shadowed", "expected a new initialized local binding", DeclarationSpan(statement))?
     }
-    id = LinkedNullChild(project, 1, statement, 0)
-    literal = LinkedNullNode(project, 1, id)
-    target = LinkedFailureTarget(state)
-    if (literal.kind == "Variable" && literal.edge_count == 0) {
-        error = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
-        if (error.value.ty.declaration_kind != "CaughtError") {
-            RejectLayout("unsupported_linked_error", "expected a caught Error owner", DeclarationSpan(literal))?
-        }
-        error.state.code += "    " + target + " = " + error.value.text.clone() + ";\n"
-        owner = error.value.clone()
-        moved = MoveLinkedNullSlot(error.state, owner)?
-        return ok(ExitLinkedFailure(moved, "    "))
-    }
-    plan = ReadLinkedErrorInitializer(project.supplied[0].named, literal)?
-    next = state
-    destination = target.clone()
-    if (plan.scratch) {
-        ty = LinkedBuiltin("Error", DeclarationSpan(literal))
-        ty.declaration_kind = "CaughtError"
-        scratch = AddLinkedNullSlot(project, next, "", "error" + str(id), ty, false)?
-        next = scratch.state
-        destination = scratch.value.text
-    }
-    for field in plan.fields {
-        value = LowerLinkedNullValue(project, next, field.expression, 0)?
-        if (value.value.ty.declaration_kind != "Builtin" || value.value.ty.name != "str") {
-            RejectLayout("unsupported_linked_error_field", "error fields require str", value.value.ty.span.clone())?
-        }
-        value.state.code += "    " + destination.clone() + "." + field.name + " = " + value.value.text.clone() + ";\n"
-        owner = value.value
-        if (owner.borrowed) {
-            if (owner.slot == 0 || value.state.catch_slot != 0
-                || value.state.slots[owner.slot - 1].value.ty.declaration_kind != "CaughtError") {
-                RejectLayout("linked_error_field_owner", "error fields require an owned str or a terminal caught field", owner.ty.span.clone())?
-            }
-            value.state.code += "    " + owner.text.clone() + " = (KuProjectionString){0};\n"
-            value.state.moved_error_fields = value.state.moved_error_fields.push(owner.text)
-            next = value.state
-        } else {
-            next = MoveLinkedNullSlot(value.state, owner)?
+    initializer = statement.edge_count - 1
+    value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, initializer), 0)?
+    ty = value.value.ty.clone()
+    if (initializer == 1) {
+        declared = LinkedNullType(project, 1, LinkedNullChild(project, 1, statement, 0))?
+        if (!SameLinkedType(declared, ty)) {
+            RejectLayout("linked_local_type", "initializer must match the declared local type", ty.span.clone())?
         }
     }
-    if (plan.scratch) {
-        next.code += "    " + target + " = " + destination.clone() + ";\n"
-            + "    " + destination + " = (KuBootstrapError){0};\n"
-        cleared: [str] = []
-        next.moved_error_fields = cleared
-    }
-    return ok(ExitLinkedFailure(next, "    "))
+    slot = AddLinkedNullSlot(project, value.state, statement.text.clone(), "l" + str(id), ty, false)?
+    slot.state.code = slot.state.code + "    " + slot.value.text.clone() + " = " + value.value.text.clone() + ";\n"
+    slot.state.slots[slot.value.slot - 1].live = true
+    return MoveLinkedNullSlot(slot.state, value.value)
 }

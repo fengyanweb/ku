@@ -56,6 +56,7 @@ struct LinkedNullSlot {
 struct LinkedLocalAppend {
     binding: str
     function: LinkedNullFunction
+    environment: str
 }
 
 struct LinkedNullState {

@@ -365,8 +365,8 @@ fn CheckedAppendFault(id: int): str {
     return "    KuLocalAppendFailure fault" + str(id) + " = {.append_status = KU_STRUCT_ARRAY_OK};\n"
 }
 
-fn CheckedAppendInvocation(&symbol: str, &args: str, environment: int, id: int): str {
-    invocation = symbol.clone() + "(&environment" + str(environment) + ", &fault" + str(id)
+fn CheckedAppendInvocation(&symbol: str, &args: str, &environment: str, id: int): str {
+    invocation = symbol.clone() + "(" + environment.clone() + ", &fault" + str(id)
     if (args != "") { invocation += ", " + args.clone() }
     return invocation + ")"
 }

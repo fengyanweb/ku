@@ -11,7 +11,7 @@ import { EmitLinkedIntAppend } from "./struct_array_c.ku"
 import { LinkedCallArgument, LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { CloneLinkedLocalArrayItem, CloneLinkedRecord, CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { AddLinkedNullSlot, ForwardLinkedCallback, LinkedCallableSlot, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix, ValidateLinkedPayload } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, CheckLinkedLocalAppendArguments, ForwardLinkedCallback, LinkedCallableSlot, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix, ValidateLinkedPayload } from "./linked_parameters_c.ku"
 
 fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int, depth: int): LinkedNullExpression! {
     subject_id = LinkedNullChild(project, 1, target, 0)
@@ -188,17 +188,13 @@ fn emitCheckedCall(&project: LinkedNullProject, state: LinkedNullState, &unwrap:
     }
     if (local > 0) {
         callee = state.local_appends[local - 1].function.clone()
-        if (owns_value && !LinkedNullHasResultValue(callee.result)) {
-            RejectLayout("linked_dependency_result", "expected a Result with a value payload", DeclarationSpan(unwrap))?
-        }
-        if (call.edge_count != callee.parameters.len() + 1) {
-            RejectLayout("linked_local_append_arity", "direct local append call requires its declared arguments", DeclarationSpan(call))?
-        }
+        environment = state.local_appends[local - 1].environment.clone()
+        CheckLinkedLocalAppendArguments(callee, call, unwrap, owns_value)?
         arguments = LowerLinkedArguments(project, state, call, callee, id, depth, false)?
         result = "dependency" + str(id)
         arguments.state.code += CheckedAppendFault(id)
         next = AppendLinkedCheckedInvocation(arguments.state, LinkedNullResultType(callee)?, result,
-            CheckedAppendInvocation(callee.symbol, arguments.args, callee.node, id),
+            CheckedAppendInvocation(callee.symbol, arguments.args, environment, id),
             arguments.handoff + CheckedAppendFaultHandoff(id))
         return ok(LinkedCheckedCall { state: next, result: callee.result, text: result, id: id })
     }
