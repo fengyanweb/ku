@@ -330,14 +330,18 @@ fn LinkedNullDependency(&project: LinkedNullProject, from_unit: int, &target: No
     callee = LinkedNullNode(project, unit, id)
     parameters: [TypeNameBinding] = []
     index = 0
-    while (index < callee.edge_count) {
+    scanning = true
+    while (scanning && index < callee.edge_count) {
         node = LinkedNullNode(project, unit, LinkedNullChild(project, unit, callee, index))
-        if (node.kind != "Parameter") { break }
-        if (node.edge_count != 1 || node.int_value < 0 || node.int_value > 1) {
-            RejectLayout("linked_parameter_mode", "direct dependencies require explicit value or View parameters", DeclarationSpan(node))?
+        if (node.kind == "Parameter") {
+            if (node.edge_count != 1 || node.int_value < 0 || node.int_value > 1) {
+                RejectLayout("linked_parameter_mode", "direct dependencies require explicit value or View parameters", DeclarationSpan(node))?
+            }
+            parameters = parameters.push(LinkedNullParameterType(project, unit, LinkedNullChild(project, unit, node, 0), node.int_value == 1)?)
+            index = index + 1
+        } else {
+            scanning = false
         }
-        parameters = parameters.push(LinkedNullParameterType(project, unit, LinkedNullChild(project, unit, node, 0), node.int_value == 1)?)
-        index = index + 1
     }
     if (index >= callee.edge_count) {
         RejectLayout("linked_dependency_result", "direct dependency needs an explicit value result", DeclarationSpan(callee))?
