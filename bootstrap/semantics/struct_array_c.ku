@@ -300,14 +300,18 @@ fn BoundArrayCPrefix(&binding: TypeNameBinding): str {
 fn EmitBoundArrayDeclarations(&arrays: [TypeNameBinding], &validated: [TypeNameBinding],
                             &defined: [str], str_array: bool): str {
     source = ""
-    for array in arrays.clone() {
+    index = 0
+    while (index < arrays.len()) {
+        array = arrays[index].clone()
         element = CTypeName(array.module_index, array.declaration_node)
         if (array.declaration_kind == "BuiltinArray" && array.name == "int") { element = "int64_t" }
         array_type = BoundArrayCType(array)
         if (!ContainsType(defined, array_type)) { source += EmitStructArrayHeader(element, array_type) }
-        if (BoundArrayTypePosition(validated, array) > 0) {
+        validation = BoundArrayTypePosition(validated, array)
+        if (validation > 0) {
             source += EmitStructArrayReadValidation(element, array_type, BoundArrayCPrefix(array))
         }
+        index = index + 1
     }
     if (str_array) {
         source += EmitLinkedStringArrayPrelude(validated, !ContainsType(defined, "KuGuardStringArray"))
@@ -318,24 +322,26 @@ fn EmitBoundArrayDeclarations(&arrays: [TypeNameBinding], &validated: [TypeNameB
 fn EmitBoundArrayResults(&layouts: [StructLayout], &owning_layouts: [StructLayout],
                          &types: [TypeNameBinding], chars: bool): str {
     source = ""
-    for owned in types.clone() {
+    index = 0
+    while (index < types.len()) {
+        owned = types[index].clone()
         if (owned.declaration_kind == "OwnedStringArray") {
             source += EmitCheckedStringArrayResultHeader()
             if (!chars) { source += ManagedStringArrayDrop() }
-            continue
-        }
-        array_type = BoundArrayCType(owned)
-        if (LinkedNullIntArrayOwner(owned)) {
+        } else if (LinkedNullIntArrayOwner(owned)) {
             source += "static void ku_linked_view_int_array_drop(KuArrayInt *array) {\n"
                 + "    free(array->data);\n    *array = (KuArrayInt){0};\n}\n\n"
-            continue
+        } else {
+            array_type = BoundArrayCType(owned)
+            layout = LayoutIndex(layouts, owned.module_index, owned.declaration_node)
+            source += EmitStructArrayResultHeader(array_type)
+            prefix = BoundArrayCPrefix(owned)
+            managed = LayoutIndex(owning_layouts, owned.module_index, owned.declaration_node)
+            if (managed != 0) {
+                source += EmitStructArrayDropUsing(array_type, prefix, OwningLayoutDropName(owned.module_index, owned.declaration_node), true)
+            } else { source += EmitOwnedStructArrayDrop(layouts, layout, array_type, prefix) }
         }
-        layout = LayoutIndex(layouts, owned.module_index, owned.declaration_node)
-        source += EmitStructArrayResultHeader(array_type)
-        prefix = BoundArrayCPrefix(owned)
-        if (LayoutIndex(owning_layouts, owned.module_index, owned.declaration_node) != 0) {
-            source += EmitStructArrayDropUsing(array_type, prefix, OwningLayoutDropName(owned.module_index, owned.declaration_node), true)
-        } else { source += EmitOwnedStructArrayDrop(layouts, layout, array_type, prefix) }
+        index = index + 1
     }
     return source
 }
@@ -350,8 +356,11 @@ fn EmitBoundStringOperations(clone: bool, concat: bool, format: bool, prefix_suf
 
 fn EmitBoundElementClones(&layouts: [StructLayout], &requested: [int]): str {
     text = ""
-    for layout in requested.clone() {
+    index = 0
+    while (index < requested.len()) {
+        layout = requested[index]
         text += EmitOwnedStructOperations(layouts, layout, "ku_linked_element_" + str(layout), true)
+        index = index + 1
     }
     return text
 }
