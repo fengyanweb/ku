@@ -366,9 +366,10 @@ fn LowerLinkedCopyRebind(&project: LinkedNullProject, state: LinkedNullState, &a
     destination = state.slots[slot - 1].value.clone()
     live = state.slots[slot - 1].live
     id = LinkedNullChild(project, 1, assignment, 0)
+    rhs = LinkedNullNode(project, 1, id)
     // A checked RHS branches to its existing Error continuation before
     // returning a value; only the successful path may write the binding.
-    if (LinkedNullNode(project, 1, id).kind == "TryUnwrap") {
+    if (rhs.kind == "TryUnwrap") {
         return StoreLinkedCopyAssignment(destination, live, LowerLinkedNullValue(project, state, id, 0)?, assignment)
     }
     if (destination.ty.name == "bool") {
