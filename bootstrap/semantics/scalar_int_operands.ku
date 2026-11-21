@@ -210,6 +210,12 @@ fn LowerScalarBool(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParamet
     return ok(ScalarBoolC { source: "", uses_string_comparison: false, uses_string_contains: false })
 }
 
+fn appendScalarStringPart(parts: [ScalarStringPart], source: str, integer: bool): [ScalarStringPart]! {
+    output = parts
+    output = output.push(ScalarStringPart { source: source, integer: integer })
+    return ok(output)
+}
+
 fn collectStringParts(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], can_convert: bool,
                       node_id: int, depth: int, parts: [ScalarStringPart]): [ScalarStringPart]! {
     node = nodes[node_id - 1].clone()
@@ -231,10 +237,10 @@ fn collectStringParts(&nodes: [Node], &edges: [int], &parameters: [ScalarIntPara
         }
         argument = nodes[edges[node.first_edge + 1] - 1].clone()
         source = scalarStringInteger(nodes, edges, parameters, argument)?
-        return ok(parts.push(ScalarStringPart { source: source, integer: true }))
+        return appendScalarStringPart(parts, source, true)
     }
     source = ScalarStringOperand(parameters, node)?
-    return ok(parts.push(ScalarStringPart { source: source, integer: false }))
+    return appendScalarStringPart(parts, source, false)
 }
 
 fn LowerScalarStringParts(&nodes: [Node], &edges: [int], &parameters: [ScalarIntParameter], can_convert: bool,
