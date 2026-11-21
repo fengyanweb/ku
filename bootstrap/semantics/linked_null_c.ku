@@ -164,8 +164,8 @@ fn lowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &stat
     next = state
     destination = target.clone()
     if (plan.scratch) {
-        ty = LinkedBuiltin("Error", DeclarationSpan(literal))
-        ty.declaration_kind = "CaughtError"
+        ty = TypeNameBinding { use_node: 0, name: "Error", declaration_kind: "CaughtError",
+            module_index: 0, declaration_node: 0, span: DeclarationSpan(literal) }
         scratch = AddLinkedNullSlot(project, next, "", "error" + str(id), ty, false)?
         next = scratch.state
         destination = scratch.value.text

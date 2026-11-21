@@ -207,7 +207,11 @@ fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,
     id = LinkedNullChild(project, 1, statement, 0)
     value = LowerLinkedNullValue(project, state, id, 0)?
     copy = result.declaration_kind == "Builtin" && (result.name == "bool" || result.name == "int")
-    static_string = LinkedStringResult(result) && LinkedNullNode(project, 1, id).kind == "String"
+    static_string = false
+    if (LinkedStringResult(result)) {
+        source = LinkedNullNode(project, 1, id)
+        static_string = source.kind == "String"
+    }
     if (!SameLinkedType(value.value.ty, result) || (!copy && !static_string &&
         (value.value.slot == 0 || (value.value.borrowed && value.value.member_path == "")))) {
         RejectLayout("linked_value_return", "expected a value matching the declared result and ownership", DeclarationSpan(statement))?
