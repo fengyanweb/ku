@@ -4,7 +4,7 @@ import { DeclarationSpan } from "./names.ku"
 import { ProjectBindings } from "./project_bindings.ku"
 import { IsBuiltinType, TypeNameBinding } from "./type_names.ku"
 import { CollectOwningFields, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
-import { EmitLinkedFlatRecordArrayClone, EmitOwnedStringArrayClone, EmitProjectionCloneString } from "./scalar_int_emit.ku"
+import { EmitLinkedFlatRecordArrayClone, EmitOwnedStringArrayClone, EmitOwningStringArrayDrop, EmitProjectionCloneString } from "./scalar_int_emit.ku"
 import { ContainsIndex, ContainsType, CTypeName, EmitLayout, EmitOwningLayout, ProjectionArrayHeader, ProjectionHeaders, StringField, StructArrayTypeName } from "./struct_projection_c.ku"
 
 struct CStructMetrics {
@@ -246,16 +246,6 @@ fn OwningLayoutDropName(module_index: int, declaration: int): str {
     return "ku_drop_" + CTypeName(module_index, declaration)
 }
 
-fn emitOwningStringArrayDrop(&target: str): str {
-    // A malformed foreign header cannot establish an initialized prefix.
-    // Leave its untrusted buffer alone and still drop the other fields.
-    return "    {\n        KuGuardStringArray *array = &" + target.clone() + ";\n"
-        + "        size_t capacity = array->capacity ? array->capacity : array->len;\n"
-        + "        if (array->len <= capacity && capacity <= SIZE_MAX / sizeof(*array->data) && (array->data || !capacity)) {\n"
-        + "            for (size_t i = array->len; i != 0; --i) ku_projection_string_drop(&array->data[i - 1]);\n"
-        + "            free(array->data);\n        }\n    }\n"
-}
-
 fn emitOwningLayoutDrop(&layout: StructLayout, public: bool): str {
     storage = "static "
     if (public) { storage = "" }
@@ -273,7 +263,7 @@ fn emitOwningLayoutDrop(&layout: StructLayout, public: bool): str {
             text += "    " + OwningLayoutDropName(field.module_index, field.declaration_node) + "(&" + target + ");\n"
         } else if (field.declaration_kind == "StructArray" || field.declaration_kind == "BuiltinArray") {
             if (field.declaration_kind == "BuiltinArray" && field.name == "str") {
-                text += emitOwningStringArrayDrop(target)
+                text += EmitOwningStringArrayDrop(target)
             } else {
                 if (field.declaration_kind == "StructArray") {
                     child_drop = OwningLayoutDropName(field.module_index, field.declaration_node)
@@ -288,7 +278,7 @@ fn emitOwningLayoutDrop(&layout: StructLayout, public: bool): str {
     return text + "    *value = (" + type_name + "){0};\n}\n\n"
 }
 
-fn CanCloneNestedStringArrays(&layouts: [StructLayout], index: int): bool {
+fn CanCloneManagedRecord(&layouts: [StructLayout], index: int): bool {
     if (index == 0) { return false }
     field_count = layouts[index - 1].fields.len()
     field_index = 0
@@ -300,7 +290,7 @@ fn CanCloneNestedStringArrays(&layouts: [StructLayout], index: int): bool {
             if (child == 0 || HasBoundArrayMembers(layouts, child)) { return false }
         }
         if (field.declaration_kind == "Struct"
-            && !CanCloneNestedStringArrays(layouts, LayoutIndex(layouts, field.module_index, field.declaration_node))) {
+            && !CanCloneManagedRecord(layouts, LayoutIndex(layouts, field.module_index, field.declaration_node))) {
             return false
         }
         field_index = field_index + 1

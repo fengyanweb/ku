@@ -2,7 +2,7 @@ import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
 import { LinkedIntSnapshotCall, LinkedRecordCloneCall } from "./guarded_string_parts.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC } from "./linked_member_ownership.ku"
-import { BuildProjectOwningLayouts, CanCloneNestedStringArrays, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
+import { BuildProjectOwningLayouts, CanCloneManagedRecord, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
 import { EmitScalarIntString } from "./scalar_int_emit.ku"
 import { HasScalarBuiltin } from "./scalar_int_operands.ku"
 import { Node } from "../stage2/ast.ku"
@@ -150,14 +150,17 @@ fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &el
     layout = BuildProjectOwningLayouts(project.supplied, project.binding, unit, node, element.span.clone())?
     order = OrderProjectOwningLayouts(layout, unit, node, element.span.clone())?
     next.owning_strings = next.owning_strings || order.contains_string
-    for entry in order.entries {
-        item = layout[entry.layout_index - 1].clone()
+    count = order.entries.len()
+    index = 0
+    while (index < count) {
+        item = layout[order.entries[index].layout_index - 1].clone()
         if (LayoutIndex(next.owning_layouts, item.module_index, item.node) == 0) {
             next.owning_layouts = next.owning_layouts.push(item.clone())
         }
         if (LayoutIndex(next.layouts, item.module_index, item.node) == 0) {
             next.layouts = next.layouts.push(item)
         }
+        index = index + 1
     }
     return ok(next)
 }
@@ -385,7 +388,7 @@ fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, 
         drops = GuardOwnedDrops(next.layouts, layout, text)
         direct = drops == ""
     }
-    if (arrays && !CanCloneNestedStringArrays(next.layouts, layout)) {
+    if (arrays && !CanCloneManagedRecord(next.layouts, layout)) {
         fields = LinkedRecordFields(next.layouts, next.owning_layouts, value.ty)?
         count = fields.len()
         index = 0

@@ -462,6 +462,16 @@ fn EmitOwnedStringArrayClone(&prefix: str, &clone_string: str): str {
         + "        ++out->len;\n    }\n    return true;\n}\n\n"
 }
 
+fn EmitOwningStringArrayDrop(&target: str): str {
+    // A malformed foreign header cannot establish an initialized prefix.
+    // Leave its untrusted buffer alone and still drop the other fields.
+    return "    {\n        KuGuardStringArray *array = &" + target.clone() + ";\n"
+        + "        size_t capacity = array->capacity ? array->capacity : array->len;\n"
+        + "        if (array->len <= capacity && capacity <= SIZE_MAX / sizeof(*array->data) && (array->data || !capacity)) {\n"
+        + "            for (size_t i = array->len; i != 0; --i) ku_projection_string_drop(&array->data[i - 1]);\n"
+        + "            free(array->data);\n        }\n    }\n"
+}
+
 fn EmitLinkedFlatRecordArrayClone(&symbol: str, &array_type: str, &element_type: str, &drop: str,
                                   &clone_string: str, &fields: [str]): str {
     text = "static bool " + symbol.clone() + "(const " + array_type.clone() + " *source, " + array_type.clone() + " *out, bool *invalid) {\n"

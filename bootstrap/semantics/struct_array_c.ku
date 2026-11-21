@@ -5,7 +5,7 @@ import { EmitCheckedRecordArrayClone, EmitOwnedStringArrayClone, EmitProjectionC
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
-import { CanCloneNestedStringArrays, CollectOwnedMemberPaths, EmitCombinedCLayouts, EmitLinkedManagedElementClone, EmitNestedCLayouts, OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
+import { CanCloneManagedRecord, CollectOwnedMemberPaths, EmitCombinedCLayouts, EmitLinkedManagedElementClone, EmitNestedCLayouts, OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
 import { ContainsIndex, ContainsType, CTypeName, ProjectionArrayHeader, ProjectionIsStringArray } from "./struct_projection_c.ku"
 import { ExplicitType, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { RetagTypeNameBinding, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
@@ -375,7 +375,7 @@ fn OwnedRecordArrayCloneLayout(&layouts: [StructLayout], &array: TypeNameBinding
     index = LayoutIndex(layouts, array.module_index, array.declaration_node)
     if (index == 0) { return 0 }
     if (HasBoundArrayMembers(layouts, index)) {
-        if (CanCloneNestedStringArrays(layouts, index)) { return index }
+        if (CanCloneManagedRecord(layouts, index)) { return index }
         return 0
     }
     empty_paths: [str] = []
