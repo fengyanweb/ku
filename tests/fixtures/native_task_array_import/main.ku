@@ -9,5 +9,8 @@ async fn main(): null! {
     if (missing.text == null) { println("missing") }
     local = (await array.Local(["本地" + "🙂"]))?
     println(local.text)
+    try { (await array.Lookup(["ignored"], -1))? }
+    catch (issue) { println(issue.domain + "/" + issue.code) }
+    println((await array.Lookup(["继续" + "🙂"], 0))?)
     return ok(null)
 }

@@ -15,3 +15,8 @@ async fn Pick(items: [str]): Reply! {
 async fn Local(array: [str]): Reply! {
     return ok(Reply { text: array.first() })
 }
+
+async fn Lookup(items: [str], index: int): str! {
+    time.sleep(1)?
+    return array.try_get(items, index)
+}
