@@ -1,4 +1,4 @@
-import { LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MatchesLinkedIntArrayOwner, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MatchesLinkedFieldValue, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { Node } from "../stage2/ast.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
@@ -193,8 +193,7 @@ fn lowerLinkedLiteral(&project: LinkedNullProject, state: LinkedNullState, &node
             RejectLayout("invalid_linked_literal_field", "expected each declared struct field once", DeclarationSpan(field))?
         }
         value = LowerLinkedNullValue(project, next.clone(), LinkedNullChild(project, 1, field, 0), depth + 1)?
-        if (!SameLinkedType(fields[ordinal - 1].resolved, value.value.ty)
-            && !MatchesLinkedIntArrayOwner(fields[ordinal - 1].resolved, value.value.ty)) {
+        if (!MatchesLinkedFieldValue(fields[ordinal - 1].resolved, value.value.ty)) {
             RejectLayout("linked_literal_field_type", "field value differs from the bound struct field type", value.value.ty.span.clone())?
         }
         value.state.code = value.state.code + "    " + target.clone() + ".f" + str(ordinal - 1) + " = " + value.value.text.clone() + ";\n"

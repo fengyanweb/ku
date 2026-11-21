@@ -171,8 +171,12 @@ struct Packet { rows: [Row] other: str }
 fn Take(packet: Packet): [Row]! { return ok(packet.rows) }
 fn TakePlain(packet: Packet): [Row] { return packet.rows }
 fn TakeThroughPlain(packet: Packet): [Row]! { return ok(TakePlain(packet)) }
+fn Repack(packet: Packet): Packet! { return ok(Packet { rows: packet.rows, other: "kept" }) }
 fn Refuse(&packet: Packet): [Row]! { return ok(packet.rows) }
 fn RefusePlain(&packet: Packet): [Row] { return packet.rows }
+fn RefuseBorrowInField(&packet: Packet): Packet! {
+    return ok(Packet { rows: packet.rows, other: "invalid" })
+}
 fn RejectUnchecked(): null! { return ok(null) }
 fn RefuseEscapingError(packet: Packet): [Row] {
     RejectUnchecked()?
@@ -186,8 +190,9 @@ fn Duplicate(packet: Packet): [Row]! {
     )
     .unwrap();
     fs::write(cwd.join("modules.txt"), "array-member-source.ku\n").unwrap();
-    assert_array_transfer(cwd, emit, "Take", true);
-    assert_array_transfer(cwd, emit, "TakePlain", false);
+    assert_array_transfer(cwd, emit, "Take", true, "");
+    assert_array_transfer(cwd, emit, "TakePlain", false, "");
+    assert_array_transfer(cwd, emit, "Repack", true, ".f0");
     fs::write(cwd.join("function.txt"), "TakeThroughPlain").unwrap();
     let forward = emit("linked-null-plan");
     assert_ok(&forward);
@@ -197,6 +202,7 @@ fn Duplicate(packet: Packet): [Row]! {
     for (function, diagnostic) in [
         ("Refuse", "linked_result_return"),
         ("RefusePlain", "linked_array_return"),
+        ("RefuseBorrowInField", "linked_literal_field_type"),
         ("RefuseEscapingError", "linked_array_failure"),
         ("Duplicate", "linked_moved_member"),
     ] {
@@ -212,6 +218,7 @@ fn assert_array_transfer(
     emit: &impl Fn(&str) -> super::bounded_process::BoundedOutput,
     function: &str,
     checked: bool,
+    field: &str,
 ) {
     fs::write(cwd.join("function.txt"), function).unwrap();
     let typed = emit("linked-null-plan");
@@ -253,10 +260,7 @@ fn assert_array_transfer(
         panic!("expected export symbol")
     };
     let invocation = if checked {
-        format!(
-            "{result_type} result = {symbol}(packet);\n    assert(result.ok);\n    {} returned = result.value;",
-            result_type.strip_prefix("KuBootstrapResult_").unwrap()
-        )
+        format!("{result_type} result = {symbol}(packet);\n    assert(result.ok);\n#define returned result.value{field}")
     } else {
         format!("{result_type} returned = {symbol}(packet);")
     };

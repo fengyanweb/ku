@@ -45,8 +45,7 @@ fn LinkedViewArgument(&parameter: TypeNameBinding, &value: LinkedNullValue): str
     }
     if (SameLinkedType(parameter, value.ty)) { return ok(value.text.clone()) }
     if (MatchesLinkedIntArrayOwner(parameter, value.ty)) { return ok("&(" + value.text.clone() + ")") }
-    if (parameter.declaration_kind == "StructArray" && LinkedNullOwnedArray(value.ty)
-        && SameLinkedType(LinkedNullArrayElement(parameter.clone()), LinkedNullArrayElement(value.ty.clone()))) {
+    if (matchesLinkedStructArrayOwner(parameter, value.ty)) {
         return ok("&(" + value.text.clone() + ")")
     }
     RejectLayout("linked_argument_type", "expected a matching stable source for the View argument", value.ty.span.clone())?
@@ -55,6 +54,16 @@ fn LinkedViewArgument(&parameter: TypeNameBinding, &value: LinkedNullValue): str
 
 fn MatchesLinkedIntArrayOwner(&target: TypeNameBinding, &origin: TypeNameBinding): bool {
     return target.declaration_kind == "BuiltinArray" && target.name == "int" && LinkedNullIntArrayOwner(origin)
+}
+
+fn matchesLinkedStructArrayOwner(&target: TypeNameBinding, &origin: TypeNameBinding): bool {
+    return target.declaration_kind == "StructArray" && LinkedNullOwnedArray(origin)
+        && SameLinkedType(LinkedNullArrayElement(target.clone()), LinkedNullArrayElement(origin.clone()))
+}
+
+fn MatchesLinkedFieldValue(&target: TypeNameBinding, &origin: TypeNameBinding): bool {
+    if (target.declaration_kind == "StructArray") { return matchesLinkedStructArrayOwner(target, origin) }
+    return SameLinkedType(target, origin) || MatchesLinkedIntArrayOwner(target, origin)
 }
 
 fn scalarGuardSlotMove(&before: LinkedNullSlot, &after: LinkedNullSlot, &state: LinkedNullState): bool {
