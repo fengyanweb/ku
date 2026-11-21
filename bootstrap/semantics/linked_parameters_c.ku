@@ -38,15 +38,17 @@ fn CheckLinkedLocalFunctionName(&project: LinkedNullProject, &state: LinkedNullS
         FindLinkedLocalRead(state.local_readers, function.text) != 0 || LinkedLocalAppendIndex(state, function.text) != 0) {
         RejectLocalReader(function, "a local function needs a distinct local name")?
     }
+    declaration_count = project.supplied[0].named.names.declarations.len()
     index = 0
-    while (index < project.supplied[0].named.names.declarations.len()) {
+    while (index < declaration_count) {
         if (project.supplied[0].named.names.declarations[index].name == function.text) {
             RejectLocalReader(function, "a local reader may not shadow a module declaration")?
         }
         index = index + 1
     }
+    import_count = project.binding.modules[0].imports.len()
     index = 0
-    while (index < project.binding.modules[0].imports.len()) {
+    while (index < import_count) {
         if (project.binding.modules[0].imports[index].local_name == function.text) {
             RejectLocalReader(function, "a local reader may not shadow an imported declaration")?
         }

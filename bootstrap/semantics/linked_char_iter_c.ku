@@ -354,7 +354,8 @@ fn LinkedCountedInitial(&project: LinkedNullProject, &state: LinkedNullState, &r
     // Only a preceding statement in the same lexical region can establish
     // the cursor. Nested statements may invalidate it rather than supply it.
     position = index - 2
-    while (position >= start) {
+    searching = position >= start
+    while (searching) {
         id = LinkedNullChild(project, 1, region, position)
         candidate = LinkedNullNode(project, 1, id)
         if (candidate.kind == "Assign" && candidate.edge_count == 1 && candidate.text == cursor.text) {
@@ -363,6 +364,7 @@ fn LinkedCountedInitial(&project: LinkedNullProject, &state: LinkedNullState, &r
             return ok(candidate)
         }
         position = position - 1
+        searching = position >= start
     }
     return ok(initial)
 }
