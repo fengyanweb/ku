@@ -232,15 +232,16 @@ fn LinkedNullLayout(&project: LinkedNullProject, &ty: TypeNameBinding, layouts: 
     if (depth >= 8) {
         RejectLayout("linked_layout_depth", "linked structs require an acyclic layout of at most 8 levels", ty.span.clone())?
     }
-    named = project.supplied[unit - 1].named.clone()
     declaration = LinkedNullNode(project, unit, ty.declaration_node)
-    fields = CollectFields(named.parsed.arena.nodes, named.parsed.arena.edges, project.binding.modules[unit - 1].types, declaration, false)?
+    module_index = unit - 1
     relocated: [StructFieldLayout] = []
     ordered = layouts
-    for field in fields {
-        local = field
-        local.resolved = absoluteType(local.resolved, unit)
-        ordered = LinkedNullLayout(project, local.resolved, ordered, depth + 1)?
+    for field in CollectFields(project.supplied[module_index].named.parsed.arena.nodes,
+                               project.supplied[module_index].named.parsed.arena.edges,
+                               project.binding.modules[module_index].types, declaration, false)? {
+        resolved = absoluteType(field.resolved, unit)
+        ordered = LinkedNullLayout(project, resolved, ordered, depth + 1)?
+        local = StructFieldLayout { name: field.name, ordinal: field.ordinal, node: field.node, resolved: resolved }
         relocated = relocated.push(local)
     }
     ordered = ordered.push(StructLayout { name: ty.name.clone(), module_index: unit, node: ty.declaration_node, fields: relocated })
