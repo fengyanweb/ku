@@ -1543,10 +1543,18 @@ impl Interpreter {
                     }
                     full_name
                 } else {
+                    let string_transform = matches!(name.as_str(), "trim" | "lower" | "upper");
                     if !matches!(
                         name.as_str(),
                         "len" | "byte_len" | "is_empty" | "contains" | "starts_with" | "ends_with"
-                    ) {
+                    ) && !string_transform
+                    {
+                        return Ok(None);
+                    }
+                    if string_transform
+                        && matches!(&target.kind, ExprKind::Variable(qualifier)
+                            if !env.contains(qualifier) && self.enums.contains_key(qualifier))
+                    {
                         return Ok(None);
                     }
                     let value = self.eval_read_argument(target, env, depth, &mut leases)?;
@@ -5078,6 +5086,9 @@ fn readonly_dotted_name(module: &str, method: &str) -> Option<&'static str> {
         ("string", "contains") => "string.contains",
         ("string", "starts_with") => "string.starts_with",
         ("string", "ends_with") => "string.ends_with",
+        ("string", "trim") => "string.trim",
+        ("string", "lower") => "string.lower",
+        ("string", "upper") => "string.upper",
         ("array", "len") => "array.len",
         ("array", "is_empty") => "array.is_empty",
         ("json", "parse") => "json.parse",
@@ -8358,6 +8369,9 @@ mod collection_tests {
                 "contains",
                 "starts_with",
                 "ends_with",
+                "trim",
+                "lower",
+                "upper",
                 "parse",
                 "decode",
                 "try_parse",

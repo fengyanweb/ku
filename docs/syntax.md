@@ -1441,14 +1441,16 @@ string.chars(text:str): [str]
 string.contains(&text:str, &needle:str): bool
 string.starts_with(&text:str, &prefix:str): bool
 string.ends_with(&text:str, &suffix:str): bool
-string.trim(text:str): str
-string.lower(text:str): str
-string.upper(text:str): str
+string.trim(&text:str): str
+string.lower(&text:str): str
+string.upper(&text:str): str
 string.replace(text:str, from:str, to:str): str
 string.slice(text:str, start:int, end:int): str!
 ```
 
 `string.len` / `text.len()` 仍计 Unicode 标量值；`text.byte_len()` 返回 UTF-8 字节数，直接读取长度，不扫描字符串、不消费接收者。解释器的本地字符串和 native 路径均无需为计数字节复制正文。例如 `"中😀".len()` 为 2，`"中😀".byte_len()` 为 7。`string.chars` 按 Unicode 标量值线性拆分字符串，返回生命周期独立的字符串数组，且不消费接收者。native 的 ASCII 字符引用只读静态表（包括 NUL），不逐字符分配；非 ASCII 字符使用独立 owned 缓冲，释放原字符串不会影响数组。`string.slice` 按字符下标切片，越界返回 `Err(Error)`。
+
+`string.trim`、`string.lower` 和 `string.upper` 借用输入并返回独立字符串，可在输入释放后继续使用结果。
 
 字符串函数也可以作为实例方法调用：
 

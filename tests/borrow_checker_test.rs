@@ -370,6 +370,49 @@ fn main(): null! {
 }
 
 #[test]
+fn unicode_transforms_borrow_input_and_return_independent_strings() {
+    let source = r#"
+import { string } from "std"
+
+fn Namespace(&text: str): str {
+    return string.trim(text) + "|" + string.lower(text) + "|" + string.upper(text)
+}
+fn Method(&text: str): str {
+    return text.trim() + "|" + text.lower() + "|" + text.upper()
+}
+fn Render(): str {
+    text = "　İΣA清单🙂 "
+    namespace = Namespace(text)
+    method = Method(text)
+    if (text != "　İΣA清单🙂 " || namespace != method) { panic("transform changed its input or output") }
+    return namespace
+}
+fn main() {
+    if (Render() != "İΣA清单🙂|　i̇σa清单🙂 |　İΣA清单🙂 ") { panic("transformed result changed after its input died") }
+}
+"#;
+    accepts(source);
+    run_source("borrow-unicode-transforms.ku", source).expect("namespace and method both borrow");
+}
+
+#[test]
+fn unicode_transform_names_preserve_enum_and_object_calls() {
+    let source = r#"
+enum Choice { trim(value: str) }
+fn main() {
+    value = Choice.trim("enum")
+    string = { trim: (): str => "custom" }
+    if (str(value) != "Choice.trim(enum)" || string.trim() != "custom") {
+        panic("read-only dispatch intercepted a different call")
+    }
+}
+"#;
+    accepts(source);
+    run_source("borrow-unicode-transform-names.ku", source)
+        .expect("non-string calls still resolve");
+}
+
+#[test]
 fn borrow_checker_json_parser_aliases_accept_readonly_forwarding() {
     accepts(
         r#"
