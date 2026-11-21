@@ -8,8 +8,8 @@ import { OwningLayoutDropName } from "./nested_struct_c.ku"
 import { IsLinkedDescendant, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { EmitCheckedScalarArithmetic } from "./scalar_int_emit.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
-import { LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullReadableArray, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches, LinkedViewPointee } from "./link_plan_c.ku"
+import { LinkedBuiltin, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullReadableArray, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches } from "./link_plan_c.ku"
 
 fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &ty: TypeNameBinding, &name: str): str {
     if (ty.declaration_kind == "OwnedStringArray") { return "    ku_managed_source_drop(&" + name.clone() + ");\n" }
@@ -42,7 +42,8 @@ fn LinkedViewArgument(&parameter: TypeNameBinding, &value: LinkedNullValue): str
         return ok("&(" + value.text.clone() + ")")
     }
     if (parameter.declaration_kind == "StructView" && (!value.borrowed || value.slot > 0)
-        && SameLinkedType(LinkedViewPointee(parameter.clone()), value.ty)) {
+        && value.ty.declaration_kind == "Struct" && parameter.module_index == value.ty.module_index
+        && parameter.declaration_node == value.ty.declaration_node) {
         return ok("&(" + value.text.clone() + ")")
     }
     if (SameLinkedType(parameter, value.ty)) { return ok(value.text.clone()) }
@@ -78,7 +79,7 @@ fn RequireLinkedReadonlyCall(&callee: LinkedNullFunction, &at: Span): null! {
 
 fn matchesLinkedStructArrayOwner(&target: TypeNameBinding, &origin: TypeNameBinding): bool {
     return target.declaration_kind == "StructArray" && LinkedNullOwnedArray(origin)
-        && SameLinkedType(LinkedNullArrayElement(target.clone()), LinkedNullArrayElement(origin.clone()))
+        && target.module_index == origin.module_index && target.declaration_node == origin.declaration_node
 }
 
 fn MatchesLinkedFieldValue(&target: TypeNameBinding, &origin: TypeNameBinding): bool {
