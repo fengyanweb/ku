@@ -1064,7 +1064,9 @@ fn Choose(input: Pair, label: str, refuse: bool): Pair! {
         cwd.join("rebind-entry.ku"),
         r#"import { Pair, Choose } from "./rebind-provider.ku"
 struct Count { value: int }
+struct CountBox { entry: Count }
 struct Other { first: str second: str }
+struct Bundle { pair: Pair; tail: str }
 fn Replace(previous: Pair, input: Pair, refuse: bool): Pair! {
     local = previous
     kept = local.first
@@ -1090,6 +1092,21 @@ fn RefuseMovedCopyRecord(previous: Count, input: Count): Count! {
     local = previous
     local = input
     return ok(input)
+}
+fn ReplaceMember(previous: Pair, bundle: Bundle): Pair! {
+    local = previous
+    local = bundle.pair
+    return ok(Pair { first: local.first, second: bundle.tail })
+}
+fn RefuseBorrowedMember(previous: Pair, &bundle: Bundle): Pair! {
+    local = previous
+    local = bundle.pair
+    return ok(local)
+}
+fn RefuseMovedCopyMember(previous: Count, bundle: CountBox): Count! {
+    local = previous
+    local = bundle.entry
+    return ok(bundle.entry)
 }
 "#,
     )
@@ -1168,11 +1185,54 @@ int main(void) {
     ));
     compile_projection(&c, &exe, cwd);
     assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+
+    fs::write(cwd.join("function.txt"), "ReplaceMember").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let signature = code
+        .lines()
+        .find(|line| line.starts_with("KuBootstrapResult_") && line.contains(" ku_linked_null_"))
+        .unwrap();
+    let (result, declaration) = signature.split_once(' ').unwrap();
+    let (entry, parameters) = declaration.split_once('(').unwrap();
+    let (pair, bundle) = parameters.split_once(" a0, ").unwrap();
+    let (bundle, _) = bundle.split_once(" a1)").unwrap();
+    let host = r#"
+static KuProjectionString own(char ch) {
+    uint8_t *data = malloc(1);
+    *data = (uint8_t)ch;
+    return (KuProjectionString){data, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+int main(void) {
+    (void)test_realloc;
+    PAIR prior = {own('a'), own('b')};
+    BUNDLE bundle = {{own('c'), own('d')}, own('e')};
+    RESULT result = ENTRY(prior, bundle);
+    assert(result.ok && result.value.f0.ptr == bundle.f0.f0.ptr);
+    assert(result.value.f1.ptr == bundle.f1.ptr && attempts == 5 && outstanding() == 2);
+    ku_projection_string_drop(&result.value.f0);
+    ku_projection_string_drop(&result.value.f1);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("PAIR", pair)
+    .replace("BUNDLE", bundle)
+    .replace("RESULT", result)
+    .replace("ENTRY", entry);
+    let c = cwd.join("rebind-from-record-member.c");
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+
     for (function, diagnostic) in [
         ("RefuseView", "linked_rebind_type"),
         ("RefuseType", "linked_rebind_type"),
         ("RefuseSelf", "linked_rebind_type"),
         ("RefuseMovedCopyRecord", "unavailable_linked_binding"),
+        ("RefuseBorrowedMember", "linked_rebind_type"),
+        ("RefuseMovedCopyMember", "linked_moved_member"),
     ] {
         fs::write(cwd.join("function.txt"), function).unwrap();
         let rejected = execute(&mut Command::new(seed), cwd, 30);

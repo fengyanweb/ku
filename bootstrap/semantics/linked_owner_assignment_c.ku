@@ -4,7 +4,7 @@ import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, IsNamedFunction, NamedModule } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { LinkedAppendFailureRelay } from "./linked_array_fields_c.ku"
-import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
 import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
@@ -44,12 +44,12 @@ fn LowerLinkedOwnerRebind(&project: LinkedNullProject, state: LinkedNullState, &
     record = target.ty.declaration_kind == "Struct"
     owner = record || LinkedStringResult(target.ty) || LinkedNullOwnedArray(target.ty) || LinkedNullIntArrayOwner(target.ty)
         || target.ty.declaration_kind == "OwnedStringArray"
-    // A str selected from an owned record has a tracked field path.
+    // A selected owned field has a tracked path in a separate owner.
     // A View or an indexed borrowed element cannot supply that ownership.
-    owned_string_field = LinkedStringResult(target.ty) && value.value.member_path != ""
+    owned_field = (record || LinkedStringResult(target.ty)) && value.value.member_path != ""
     if (target.borrowed || !owner || !SameLinkedType(target.ty, value.value.ty)
-        || (value.value.borrowed && !owned_string_field)
-        || value.value.slot == index || (record && (value.value.slot == 0 || value.value.member_path != ""))) {
+        || (value.value.borrowed && !owned_field)
+        || value.value.slot == index || (record && value.value.slot == 0)) {
         RejectLayout("linked_rebind_type", "replacement requires a separate owner of the declared type", DeclarationSpan(assignment))?
     }
     // Keep the original fields in cleanup until the checked RHS succeeds.
@@ -62,9 +62,9 @@ fn LowerLinkedOwnerRebind(&project: LinkedNullProject, state: LinkedNullState, &
         cleared: [str] = []
         next.slots[index - 1].moved_members = cleared
     }
-    if (record) {
+    if (record && !LinkedMemberUnavailable(next, moved, true)) {
         // A nominal struct with only Copy fields still moves in Ku.
-        next.slots[moved.slot - 1].live = false
+        next = RecordLinkedMemberMove(next, moved)
     }
     return ok(next)
 }
