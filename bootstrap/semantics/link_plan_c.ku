@@ -48,6 +48,7 @@ struct LinkedNullValue {
 struct LinkedNullSlot {
     binding: str
     value: LinkedNullValue
+    parameter: bool
     live: bool
     moved_members: [str]
 }

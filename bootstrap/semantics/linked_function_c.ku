@@ -7,11 +7,12 @@ import { Node } from "../stage2/ast.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedNullPrototypes, LinkedCheckedResultCType, LinkedNullChild, LinkedNullCType, LinkedNullProject,
-         LinkedNullResultCleanupReference, SameLinkedType } from "./linked_null_types_c.ku"
+         LinkedNullNode, LinkedNullResultCleanupReference, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { LinkedCPrelude, LinkedNullState } from "./link_plan_c.ku"
+import { LinkedCPrelude, LinkedNullBinding, LinkedNullState } from "./link_plan_c.ku"
 
 fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &signature: str,
                          &result_type: str, &payload_cleanup: str, char_errors: str): str {
@@ -79,6 +80,37 @@ fn EmitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &pa
     char_errors = ""
     if (body.uses_chars) { char_errors = ManagedSourceCharactersErrors() }
     return ok(FinishLinkedFunctionC(header, body, symbol, signature, result, keep, char_errors))
+}
+
+fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    target_id = LinkedNullChild(project, 1, statement, 0)
+    target = LinkedNullNode(project, 1, target_id)
+    if (target.kind != "Field" || target.edge_count != 1) {
+        RejectLayout("linked_member_target", "assignment requires a direct field of a mutable local record", DeclarationSpan(target))?
+    }
+    root = LinkedNullNode(project, 1, LinkedNullChild(project, 1, target, 0))
+    slot = LinkedNullBinding(state.slots, root.text)
+    if (root.kind != "Variable" || root.edge_count != 0 || slot == 0 || state.slots[slot - 1].parameter ||
+        state.slots[slot - 1].value.borrowed || state.slots[slot - 1].value.ty.declaration_kind != "Struct") {
+        RejectLayout("linked_member_target", "assignment requires a direct field of a mutable local record", DeclarationSpan(root))?
+    }
+
+    // Generate the RHS and finish its fallible work before selecting the
+    // target in the resulting state. The old member still belongs to cleanup
+    // if the RHS fails or consumes its record.
+    rhs = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 1), 0)?
+    replacement = rhs.value.clone()
+    place = LowerLinkedNullRead(project, rhs.state, target_id, 0)?
+    ty = place.value.ty.clone()
+    string = LinkedStringResult(ty)
+    copy = ty.declaration_kind == "Builtin" && (ty.name == "int" || ty.name == "bool")
+    if (!SameLinkedType(ty, replacement.ty) || (!copy && (!string || replacement.borrowed))) {
+        RejectLayout("linked_member_rebind_type", "replacement requires a matching Copy field or separate str owner", DeclarationSpan(target))?
+    }
+    if (string) { place.state.code += LinkedNullDropC(place.state.layouts, place.state.owning_layouts, ty, place.value.text) }
+    place.state.code += "    " + place.value.text + " = " + replacement.text.clone() + ";\n"
+    if (string) { return MoveLinkedNullSlot(place.state, replacement) }
+    return ok(place.state)
 }
 
 fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,

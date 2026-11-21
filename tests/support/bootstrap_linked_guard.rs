@@ -1478,3 +1478,86 @@ int main(void) {
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("requires initialization to zero"));
 }
+
+pub(super) fn assert_owned_local_member_set(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("member-set.ku"),
+        r#"struct Entry { label: str number: int }
+fn Update(input: Entry, text: str): Entry! {
+    slot = input.clone()
+    slot.label = text.clone()
+    slot.number = 42
+    return ok(slot)
+}
+fn Refuse(input: Entry): Entry! {
+    input.label = "new"
+    return ok(input)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "member-set.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Update").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, args) = signature.split_once('(').unwrap();
+    let (carrier, _) = args.split_once(" a0").unwrap();
+    let host = r#"
+static KuProjectionString owned_text(const char *value) {
+    size_t len = strlen(value);
+    uint8_t *data = malloc(len);
+    memcpy(data, value, len);
+    return (KuProjectionString){data,len,len,KU_PROJECTION_STRING_OWNED};
+}
+static void check_failed_assignment(void) {
+    if (outstanding() || attempts != 4) _Exit(82);
+}
+int main(int argc, char **argv) {
+    (void)test_realloc;
+    (void)argv;
+    ITEM item = {owned_text("old"), -3};
+    KuProjectionString replacement = owned_text("new");
+    if (argc > 1) {
+        assert(!atexit(check_failed_assignment));
+        // The old record is successfully cloned. Preparing the replacement
+        // fails while the old field and both original input owners are live.
+        fail_after = 1;
+    }
+    RESULT result = ENTRY(item, replacement);
+    assert(result.ok && result.value.f1 == 42 && !memcmp(result.value.f0.ptr, "new", 3));
+    assert(outstanding() == 1);
+    ku_projection_string_drop(&result.value.f0);
+    assert(outstanding() == 0);
+    return 0;
+}
+"#
+    .replace("RESULT", result)
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("ITEM", carrier);
+    let path = cwd.join("owned-local-member-set.c");
+    let binary = cwd.join(format!(
+        "owned-local-member-set{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&path, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&path, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(&binary), cwd, 10));
+    let failed = execute(Command::new(binary).arg("replacement-clone"), cwd, 10);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stderr).trim(),
+        "out of memory"
+    );
+
+    fs::write(cwd.join("function.txt"), "Refuse").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_member_target"));
+}
