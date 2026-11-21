@@ -1583,6 +1583,7 @@ fn Make(): Outer {
     linked_null::assert_path_byte_guard(&driver_binary, &cwd);
     linked_chars::assert_owned_characters(&driver_binary, &cwd);
     linked_chars::assert_owned_record_result_iteration(&driver_binary, &cwd);
+    linked_chars::assert_fresh_cloned_record_iteration(&driver_binary, &cwd);
     linked_chars::assert_owned_copy_ints(&driver_binary, &cwd);
     token_window::assert_readonly_preflight(&driver_binary, &cwd);
     assert_managed_source_characters(&driver_binary, &cwd);

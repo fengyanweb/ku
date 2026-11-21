@@ -360,3 +360,140 @@ pub(super) fn assert_owned_record_result_iteration(seed: &Path, cwd: &Path) {
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("|unsupported_linked_for|"));
 }
+
+pub(super) fn assert_fresh_cloned_record_iteration(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("cloned-record-iteration.ku"),
+        r#"struct Entry { text: str }
+struct Batch { entries: [Entry], label: str }
+struct Outcome { entries: [Entry], label: str, bytes: int }
+fn Visit(item: Entry, position: int, fail_at: int): int! {
+    if (position == fail_at) { fail { domain: "loop", code: "after_first", message: "stop" } }
+    return ok(item.text.len())
+}
+fn Snapshot(batch: Batch, fail_at: int): Outcome! {
+    index = 0
+    bytes = 0
+    for item in batch.entries.clone() {
+        index = index + 1
+        amount = Visit(item, index, fail_at)?
+        bytes = bytes + amount
+    }
+    retained = batch.entries
+    label = batch.label
+    return ok(Outcome { entries: retained, label: label, bytes: bytes })
+}
+fn Named(batch: Batch): null! {
+    names = batch.entries.clone()
+    for item in names { Visit(item, 0, 0)? }
+    return ok(null)
+}
+fn Produce(batch: Batch): [Entry]! {
+    entries = batch.entries.clone()
+    return ok(entries)
+}
+fn Checked(batch: Batch): int! {
+    bytes = 0
+    for item in Produce(batch)? {
+        amount = Visit(item, 0, 1)?
+        bytes = bytes + amount
+    }
+    return ok(bytes)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "cloned-record-iteration.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Snapshot").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, parameters) = signature.split_once('(').unwrap();
+    let (batch, _) = parameters.split_once(" a0,").unwrap();
+    let outcome = result.strip_prefix("KuBootstrapResult_").unwrap();
+    let element = code
+        .lines()
+        .find_map(|line| line.split_once(" } KuArray_")?.1.strip_suffix(';'))
+        .unwrap();
+    let visit = code
+        .lines()
+        .find_map(|line| line.strip_prefix("extern KuBootstrapResult_int64_t "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+static int calls;
+static uint8_t *original_text[3];
+static KuProjectionString owned(uint8_t byte, size_t len) {
+    uint8_t *data = malloc(len);
+    assert(data);
+    memset(data, byte, len);
+    return (KuProjectionString){data, len, len, KU_PROJECTION_STRING_OWNED};
+}
+KuBootstrapResult_int64_t VISIT(ELEMENT entry, int64_t position, int64_t fail_at) {
+    assert(position == ++calls && position >= 1 && position <= 3);
+    assert(entry.f0.ptr != original_text[position - 1] && entry.f0.len == (size_t)position);
+    ku_projection_string_drop(&entry.f0);
+    if (position == fail_at) return (KuBootstrapResult_int64_t){
+        .error.code = {(uint8_t*)"after_first", 11, 0, KU_PROJECTION_STRING_STATIC}};
+    return (KuBootstrapResult_int64_t){.ok = true, .value = position};
+}
+static void check(int64_t fail_at) {
+    int start = attempts;
+    calls = 0;
+    ELEMENT *original = malloc(3 * sizeof(*original));
+    assert(original);
+    BATCH input = {.f0 = {3, original, 3}, .f1 = owned('z', 1)};
+    uint8_t *label = input.f1.ptr;
+    for (size_t i = 0; i < 3; ++i) {
+        original[i].f0 = owned((uint8_t)('a' + i), i + 1);
+        original_text[i] = original[i].f0.ptr;
+    }
+    RESULT result = ENTRY(input, fail_at);
+    assert(attempts - start == 9);
+    if (fail_at) {
+        assert(!result.ok && calls == 2 && !outstanding());
+        assert(result.error.code.len == 11 && !memcmp(result.error.code.ptr, "after_first", 11));
+    } else {
+        assert(result.ok && calls == 3 && result.value.f2 == 6);
+        assert(result.value.f0.data == original && result.value.f1.ptr == label);
+        for (size_t i = 0; i < 3; ++i) assert(result.value.f0.data[i].f0.ptr == original_text[i]);
+        DROP(&result.value);
+        assert(!outstanding());
+    }
+}
+int main(void) {
+    (void)test_realloc;
+    check(0);
+    check(2);
+    check(0);
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("RESULT", result)
+    .replace("BATCH", batch)
+    .replace("ELEMENT", element)
+    .replace("VISIT", visit)
+    .replace("DROP", &format!("ku_drop_{outcome}"));
+    let c = cwd.join("cloned-record-iteration.c");
+    let exe = cwd.join(format!(
+        "cloned-record-iteration{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(exe), cwd, 10));
+
+    fs::write(cwd.join("function.txt"), "Named").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("|unsupported_linked_for|"));
+}

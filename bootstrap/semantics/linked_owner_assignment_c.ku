@@ -66,8 +66,8 @@ struct LinkedForLoop {
     before: int
 }
 
-fn OpenLinkedCheckedRecordFor(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
-                              source: int, id: int, depth: int): LinkedForLoop! {
+fn OpenLinkedFreshRecordFor(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
+                            source: int, id: int, depth: int): LinkedForLoop! {
     at = DeclarationSpan(statement)
     if (depth >= 32 || LinkedNullBinding(state.slots, statement.text) != 0) {
         RejectLayout("linked_record_for_scope", "record iteration needs a fresh local binding within the control bound", at.clone())?
@@ -77,10 +77,10 @@ fn OpenLinkedCheckedRecordFor(&project: LinkedNullProject, state: LinkedNullStat
     owner = input.value.clone()
     if (!LinkedNullOwnedArray(owner.ty) || owner.borrowed || owner.slot <= before || owner.member_path != ""
         || input.state.slots[owner.slot - 1].binding != "" || LinkedMemberUnavailable(input.state, owner, true)) {
-        RejectLayout("linked_record_for_source", "expected a fresh checked result with an owned record array", at)?
+        RejectLayout("linked_record_for_source", "expected a fresh owned record array", at)?
     }
 
-    // Checked-result lowering has already admitted this private array header.
+    // The checked call or clone has already admitted this private header.
     // Keep it in cleanup, and move each item out before entering the body.
     outer = input.state.slots.clone()
     ty = LinkedNullArrayElement(owner.ty)

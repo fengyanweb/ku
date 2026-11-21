@@ -10,11 +10,11 @@ import { AddLinkedNullSlot, RegisterLinkedNullType, RequireLinkedArrayValidation
 import { DropLinkedNullScope, LinkedLiveIntBinding } from "./linked_member_ownership.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { ContainsIndex } from "./struct_projection_c.ku"
+import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
-import { LinkedForLoop, OpenLinkedCheckedRecordFor } from "./linked_owner_assignment_c.ku"
+import { LinkedForLoop, OpenLinkedFreshRecordFor } from "./linked_owner_assignment_c.ku"
 
 fn rejectLocalCapture(&node: Node, message: str): null! {
     return RejectLayout("unsupported_linked_local_capture", message, DeclarationSpan(node))
@@ -333,8 +333,9 @@ fn OpenLinkedForLoop(&project: LinkedNullProject, state: LinkedNullState, &state
     if (statement.edge_count != 0) {
         source_id = LinkedNullChild(project, 1, statement, 0)
         source = LinkedNullNode(project, 1, source_id)
-        if (source.kind == "TryUnwrap") {
-            return OpenLinkedCheckedRecordFor(project, state, statement, source_id, id, depth)
+        if (source.kind == "TryUnwrap" || (source.kind == "Call" && ProjectionCloneSource(
+            project.supplied[0].named.parsed.arena.nodes, project.supplied[0].named.parsed.arena.edges, source_id) != 0)) {
+            return OpenLinkedFreshRecordFor(project, state, statement, source_id, id, depth)
         }
         if (source.kind == "Variable" && source.edge_count == 0) {
             slot = LinkedNullBinding(state.slots, source.text)
