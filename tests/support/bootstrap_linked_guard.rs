@@ -2285,6 +2285,10 @@ fn Validate(&path: str, mode: int): null! {
     if (Project(path, mode)? != path) { Observe()? }
     return ok(null)
 }
+fn Contains(&hay: str, &needle: str): int! {
+    if (hay.contains(needle)) { return ok(1) }
+    return ok(0)
+}
 "#,
     )
     .unwrap();
@@ -2346,6 +2350,39 @@ int main(void) {
         format!("{CHECKED_ARRAY_ALLOCATOR}{program}{caller}"),
     )
     .unwrap();
+    compile_projection(&source, &executable, cwd);
+    assert_ok(&execute(&mut Command::new(executable), cwd, 10));
+
+    fs::write(cwd.join("function.txt"), "Contains\n").unwrap();
+    let output = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&output);
+    let program = String::from_utf8(output.stdout).unwrap();
+    let (entry, _) = program
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("KuBootstrapResult_int64_t ")?
+                .split_once('(')
+        })
+        .unwrap();
+    let caller = r#"
+#include <assert.h>
+int main(void) {
+    const KuProjectionString hay = {(uint8_t*)"a\0b", 3u, 0u, KU_PROJECTION_STRING_STATIC};
+    const KuProjectionString needle = {(uint8_t*)"\0b", 2u, 0u, KU_PROJECTION_STRING_STATIC};
+    const KuProjectionString miss = {(uint8_t*)"ab", 2u, 0u, KU_PROJECTION_STRING_STATIC};
+    const KuProjectionString empty = {0};
+    const KuBootstrapResult_int64_t hit = __ENTRY__(&hay, &needle);
+    const KuBootstrapResult_int64_t absent = __ENTRY__(&hay, &miss);
+    const KuBootstrapResult_int64_t vacuous = __ENTRY__(&empty, &empty);
+    assert(hit.ok && hit.value == 1 && absent.ok && absent.value == 0);
+    assert(vacuous.ok && vacuous.value == 1);
+    return 0;
+}
+"#
+    .replace("__ENTRY__", entry);
+    let source = cwd.join("checked-contains.c");
+    let executable = cwd.join(format!("checked-contains{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, format!("{program}{caller}")).unwrap();
     compile_projection(&source, &executable, cwd);
     assert_ok(&execute(&mut Command::new(executable), cwd, 10));
 }

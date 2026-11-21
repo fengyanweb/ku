@@ -11,7 +11,7 @@ import { EmitTryCloneString, HasBoundArrayMembers } from "./struct_array_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardCType, GuardExplicitType, GuardExpression, GuardType } from "./guarded_struct_expr.ku"
 
-import { LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
+import { LinkedNullExpression, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
 
 struct GuardedStructC {
     symbol: str
@@ -279,6 +279,20 @@ fn GuardArithmetic(add: bool, sub: bool): str {
         text += "    *out = a - b;\n    return true;\n}\n\n"
     }
     return text
+}
+
+fn GuardLinkedStringPredicate(&method: str, &left: LinkedNullValue, right: LinkedNullExpression,
+                               result: TypeNameBinding): LinkedNullExpression {
+    next = right.state
+    needle = right.value.text
+    if (method == "contains") {
+        next.uses_string_contains = true
+        return LinkedReadonlyExpression(next, result,
+            "ku_linked_string_contains(" + left.text.clone() + ", " + needle + ")")
+    }
+    next.uses_prefix_suffix = true
+    return LinkedReadonlyExpression(next, result,
+        "ku_scalar_string_matches(" + left.text.clone() + ", " + needle + ", " + str(method == "ends_with") + ")")
 }
 
 fn GuardStringEquality(needed: bool): str {

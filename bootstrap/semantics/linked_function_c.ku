@@ -1,5 +1,5 @@
 import { FinishLinkedFunctionC, GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
-import { ScalarCheckedMultiplyC } from "./scalar_int_emit.ku"
+import { ScalarCheckedMultiplyC, ScalarStringHelpers } from "./scalar_int_emit.ku"
 import { StructResultHeader, StructValueResultHeader } from "./struct_result_c.ku"
 import { EmitLinkedArrayBody } from "./struct_array_c.ku"
 import { ContainsType, LinkedFsReadReference } from "./struct_projection_c.ku"
@@ -84,6 +84,11 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
     ops = GuardArithmetic(body.uses_add, body.uses_sub)
     if (body.uses_mul || body.uses_div) { ops += "#include <stdio.h>\n#include <stdlib.h>\n\n" }
     if (body.uses_mul) { ops += ScalarCheckedMultiplyC() }
+    if (body.uses_string_contains) {
+        ops += ScalarStringHelpers(false, false, true, false, false, false, false)
+        ops += "static bool ku_linked_string_contains(KuProjectionString hay, KuProjectionString needle) {\n"
+            + "    return ku_scalar_string_contains(hay.ptr, hay.len, needle.ptr, needle.len);\n}\n\n"
+    }
     header = LinkedCPrelude(body, ops + GuardStringEquality(body.uses_string_equal))
     declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
     checked = !body.plain_value_result
