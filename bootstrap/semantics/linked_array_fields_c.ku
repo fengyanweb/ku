@@ -277,8 +277,8 @@ fn FinishLinkedStringAppend(&project: LinkedNullProject, input: LinkedNullExpres
 fn PrepareLinkedScopedCallbackArgument(&project: LinkedNullProject, state: LinkedNullState, id: int,
                                        &parameter: TypeNameBinding, fault: str): LinkedNullArguments! {
     source = ProjectionCloneSource(project.supplied[0].named.parsed.arena.nodes, project.supplied[0].named.parsed.arena.edges, id)
-    node = LinkedNullNode(project, 1, id)
-    if (source != 0) { node = LinkedNullNode(project, 1, source) }
+    if (source == 0) { source = id }
+    node = LinkedNullNode(project, 1, source)
     if (node.kind != "Variable" || node.edge_count != 0) {
         RejectLayout("linked_callback_forward", "expected a named synchronous array callback", DeclarationSpan(node))?
     }
@@ -287,14 +287,19 @@ fn PrepareLinkedScopedCallbackArgument(&project: LinkedNullProject, state: Linke
     slot = LinkedNullBinding(state.slots, node.text)
     if (slot != 0) {
         value = state.slots[slot - 1].value.clone()
-        if (!LinkedCallableSlot(state, slot) || !IsLinkedScopedCallback(value.ty) ||
-            !SameLinkedCallbackSignature(LinkedScopedCallbackFunction(project, value.ty)?, expected)) {
+        compatible = LinkedCallableSlot(state, slot) && IsLinkedScopedCallback(value.ty)
+        if (compatible) {
+            actual = LinkedScopedCallbackFunction(project, value.ty)?
+            compatible = SameLinkedCallbackSignature(actual, expected)
+        }
+        if (!compatible) {
             RejectLayout("linked_callback_forward", "expected a live callback with the same checked signature", DeclarationSpan(node))?
         }
         name = value.text
         relay = "    if (" + LinkedIntArrayCallbackFaultPending(name.clone() + ".failure") + ") goto cleanup;\n"
         text = name.clone()
-        if (carrier != LinkedNullCType(value.ty)?) {
+        actual_carrier = LinkedNullCType(value.ty)?
+        if (carrier != actual_carrier) {
             text = "(" + carrier + "){" + name.clone() + ".entry, " + name.clone() + ".environment, " + name + ".failure}"
         }
         return ok(LinkedNullArguments { state: state, args: text, handoff: relay })
@@ -313,8 +318,9 @@ fn PrepareLinkedScopedCallbackArgument(&project: LinkedNullProject, state: Linke
     text = "(" + carrier + "){" + local.function.symbol + ", " + local.environment
         + ", &" + fault.clone() + "}"
     setup = "    KuLocalAppendFailure " + fault.clone() + " = {0};\n"
-    state.code += setup
-    return ok(LinkedNullArguments { state: state, args: text, handoff: LinkedAppendFaultRelayCode(fault) })
+    next = state
+    next.code += setup
+    return ok(LinkedNullArguments { state: next, args: text, handoff: LinkedAppendFaultRelayCode(fault) })
 }
 
 fn prepareLinkedReaderArgument(&project: LinkedNullProject, state: LinkedNullState, &node: Node,

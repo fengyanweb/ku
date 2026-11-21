@@ -148,8 +148,10 @@ fn emitCheckedCallback(&project: LinkedNullProject, state: LinkedNullState, &cal
     payload.declaration_kind = "Struct"
     next = state
     args = ""
-    index = 1
-    while (index < 3) {
+    limit = call.edge_count
+    first = 1
+    index = first
+    while (index < limit) {
         argument = LowerLinkedNullValue(project, next, LinkedNullChild(project, 1, call, index), depth + 1)?
         if (!LinkedIntResult(argument.value.ty)) {
             RejectLayout("linked_callback_argument", "checked callback arguments must be Copy int values", argument.value.ty.span.clone())?
@@ -160,7 +162,7 @@ fn emitCheckedCallback(&project: LinkedNullProject, state: LinkedNullState, &cal
         next.code += "    int64_t " + name.clone() + " = " + argument.value.text + ";\n"
         if (index > 1) { args += ", " }
         args += name
-        index += 1
+        index = index + 1
     }
     result = "dependency" + str(id)
     carrier = LinkedCheckedResultCType(payload)?
