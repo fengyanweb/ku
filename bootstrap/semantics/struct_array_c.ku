@@ -1,6 +1,6 @@
 import { GuardExplicitType, GuardType } from "./guarded_struct_expr.ku"
 import { ManagedSourceCharactersRuntime } from "./guarded_string_parts.ku"
-import { LinkedNullState } from "./link_plan_c.ku"
+import { LinkedNullIntArrayOwner, LinkedNullState } from "./link_plan_c.ku"
 import { EmitProjectionStringJoinHelpers, ScalarStringSuffixC } from "./scalar_int_emit.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -271,11 +271,12 @@ fn BoundArrayTypePosition(&arrays: [TypeNameBinding], &type_name: TypeNameBindin
 }
 
 fn BoundArrayCType(&binding: TypeNameBinding): str {
-    if (binding.declaration_kind == "BuiltinArray" && binding.name == "int") { return "KuArrayInt" }
+    if ((binding.declaration_kind == "BuiltinArray" && binding.name == "int") || LinkedNullIntArrayOwner(binding)) { return "KuArrayInt" }
     return "KuArray_" + CTypeName(binding.module_index, binding.declaration_node)
 }
 
 fn BoundArrayCPrefix(&binding: TypeNameBinding): str {
+    if (LinkedNullIntArrayOwner(binding)) { return "ku_linked_view_int_array" }
     if (binding.declaration_kind == "BuiltinArray") {
         if (binding.name == "int") { return "ku_linked_view_int_array" }
         return "ku_linked_view_str_array"
@@ -304,6 +305,11 @@ fn EmitBoundArrayResults(&layouts: [StructLayout], &owning_layouts: [StructLayou
     source = ""
     for owned in types.clone() {
         array_type = BoundArrayCType(owned)
+        if (LinkedNullIntArrayOwner(owned)) {
+            source += "static void ku_linked_view_int_array_drop(KuArrayInt *array) {\n"
+                + "    free(array->data);\n    *array = (KuArrayInt){0};\n}\n\n"
+            continue
+        }
         layout = LayoutIndex(layouts, owned.module_index, owned.declaration_node)
         source += EmitStructArrayResultHeader(array_type)
         prefix = BoundArrayCPrefix(owned)
@@ -337,11 +343,20 @@ fn EmitBoundArrayAppenders(&types: [TypeNameBinding]): str {
     for ty in types.clone() {
         array = BoundArrayCType(ty)
         if (!ContainsType(seen, array)) {
-            text += EmitOwnedStructArrayAppend(CTypeName(ty.module_index, ty.declaration_node), array, BoundArrayCPrefix(ty))
+            element = "int64_t"
+            if (!LinkedNullIntArrayOwner(ty)) { element = CTypeName(ty.module_index, ty.declaration_node) }
+            text += EmitOwnedStructArrayAppend(element, array, BoundArrayCPrefix(ty))
             seen = seen.push(array)
         }
     }
     return text
+}
+
+// Snapshot a Copy element before realloc can invalidate an indexed source.
+fn EmitLinkedIntAppend(&array: str, &value: str): str {
+    return "    {\n        int64_t element = " + value.clone() + ";\n"
+        + "        append_status = ku_linked_view_int_array_append_move(&" + array.clone() + ", &element);\n"
+        + "    }\n    if (append_status != KU_STRUCT_ARRAY_OK) goto cleanup;\n"
 }
 
 fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str): str! {

@@ -527,6 +527,7 @@ KuBootstrapResultNull __TAKE__(__STAMP__ stamp) {
     error.error.code = (KuProjectionString){(uint8_t *)code,8,0,KU_PROJECTION_STRING_STATIC};
     return error;
 }
+
 int main(void) {
     __OWNER__ parent = {0};
     assert(__GUARD__(&parent, (__STAMP__){47}, false).ok && called == 0);
@@ -562,5 +563,117 @@ int main(void) {
             String::from_utf8_lossy(&rejected.stderr).contains(reason),
             "{name}"
         );
+    }
+}
+
+const OWNED_INT_SOURCE: &str = r#"struct Index { values: [int] size: int }
+fn See(&values: [int], size: int): null! { return ok(null) }
+fn Build(value: int): Index! {
+    values: [int] = []
+    values = values.push(value)
+    values = values.push(2)
+    values = values.push(3)
+    values = values.push(4)
+    values = values.push(5)
+    values = values.push(6)
+    values = values.push(7)
+    values = values.push(8)
+    values = values.push(values[0])
+    size = values.len()
+    See(values, size)?
+    return ok(Index { values: values, size: size })
+}
+fn Wrong(&values: [int]): Index! {
+    return ok(Index { values: values, size: 0 })
+}
+fn Reuse(value: int): Index! {
+    values: [int] = []
+    result = Index { values: values, size: 0 }
+    size = values.len()
+    return ok(result)
+}
+"#;
+
+const OWNED_INT_HOST: &str = r#"
+static const int64_t *observed;
+static int want_attempts;
+static void check_cleanup(void) {
+    if (outstanding() || attempts != want_attempts) _Exit(89);
+}
+KuBootstrapResultNull __SEE__(const KuArrayInt *values, int64_t size) {
+    assert(values->len == 9 && size == 9);
+    assert(values->data[0] == INT64_MAX && values->data[8] == INT64_MAX);
+    observed = values->data;
+    return (KuBootstrapResultNull){.ok = true};
+}
+int main(int argc, char **argv) {
+    (void)test_malloc;
+    if (argc == 2) {
+        fail_after = !strcmp(argv[1], "growth");
+        want_attempts = fail_after + 1;
+        assert(atexit(check_cleanup) == 0);
+        (void)__BUILD__(INT64_MAX);
+        return 90;
+    }
+    __RESULT__ result = __BUILD__(INT64_MAX);
+    assert(result.ok && attempts == 2 && outstanding() == 1);
+    assert(result.value.f1 == 9 && result.value.f0.len == 9 && result.value.f0.data == observed);
+    __DROP__(&result.value);
+    assert(!outstanding());
+    return 0;
+}
+"#;
+
+pub(super) fn assert_owned_int_locals(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("owned-int.ku"), OWNED_INT_SOURCE).unwrap();
+    fs::write(cwd.join("modules.txt"), "owned-int.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Build").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, entry) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, _) = entry.split_once('(').unwrap();
+    let see = code
+        .lines()
+        .find_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let dropped = code
+        .lines()
+        .find_map(|line| line.strip_prefix("static void ku_drop_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = OWNED_INT_HOST
+        .replace("__BUILD__", &format!("ku_linked_null_{entry}"))
+        .replace("__RESULT__", result)
+        .replace("__SEE__", see)
+        .replace("__DROP__", &format!("ku_drop_{dropped}"));
+    let c = cwd.join("owned-int.c");
+    let exe = cwd.join(format!("owned-int{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    for mode in ["first", "growth"] {
+        let failure = execute(Command::new(&exe).arg(mode), cwd, 15);
+        assert_eq!(failure.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&failure.stderr).contains("array allocation failed"));
+    }
+    for (name, reason) in [
+        ("Wrong", "linked_view_escape"),
+        ("Reuse", "unavailable_linked_binding"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(reason));
     }
 }

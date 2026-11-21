@@ -2,10 +2,60 @@ import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
+import { OwningLayoutDropName } from "./nested_struct_c.ku"
+import { TypeNameBinding } from "./type_names.ku"
 import { HasBoundArrayMembers } from "./struct_array_c.ku"
-import { LayoutIndex, RejectLayout } from "./struct_layouts.ku"
-import { LinkedNullCType, LinkedNullDropC } from "./linked_null_types_c.ku"
-import { LinkedNullBinding, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches } from "./link_plan_c.ku"
+import { LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
+import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCType, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedSlotOwnershipMatches, LinkedViewPointee } from "./link_plan_c.ku"
+
+fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &ty: TypeNameBinding, &name: str): str {
+    if (ty.declaration_kind == "OwnedStringArray") { return "    ku_managed_source_drop(&" + name.clone() + ");\n" }
+    if (ty.declaration_kind == "CaughtError") {
+        return "    ku_projection_string_drop(&" + name.clone() + ".domain);\n"
+            + "    ku_projection_string_drop(&" + name.clone() + ".code);\n"
+            + "    ku_projection_string_drop(&" + name.clone() + ".message);\n"
+    }
+    if (ty.name == "str" && ty.declaration_kind == "Builtin") {
+        return "    ku_projection_string_drop(&" + name.clone() + ");\n"
+    }
+    if (ty.declaration_kind == "Struct") {
+        unit = ty.module_index
+        node = ty.declaration_node
+        if (LayoutIndex(owning_layouts, unit, node) != 0) {
+            return "    " + OwningLayoutDropName(unit, node) + "(&" + name.clone() + ");\n"
+        }
+        layout = LayoutIndex(layouts, unit, node)
+        return GuardOwnedDrops(layouts, layout, name)
+    }
+    if (LinkedNullOwnedArray(ty) || LinkedNullIntArrayOwner(ty)) {
+        return "    " + LinkedNullArrayPrefix(ty) + "_drop(&" + name.clone() + ");\n"
+    }
+    return ""
+}
+
+fn LinkedViewArgument(&parameter: TypeNameBinding, &value: LinkedNullValue): str! {
+    if (parameter.declaration_kind == "StringView" && value.ty.declaration_kind == "Builtin" && value.ty.name == "str"
+        && (!value.borrowed || value.slot > 0)) {
+        return ok("&(" + value.text.clone() + ")")
+    }
+    if (parameter.declaration_kind == "StructView" && (!value.borrowed || value.slot > 0)
+        && SameLinkedType(LinkedViewPointee(parameter.clone()), value.ty)) {
+        return ok("&(" + value.text.clone() + ")")
+    }
+    if (SameLinkedType(parameter, value.ty)) { return ok(value.text.clone()) }
+    if (MatchesLinkedIntArrayOwner(parameter, value.ty)) { return ok("&(" + value.text.clone() + ")") }
+    if (parameter.declaration_kind == "StructArray" && LinkedNullOwnedArray(value.ty)
+        && SameLinkedType(LinkedNullArrayElement(parameter.clone()), LinkedNullArrayElement(value.ty.clone()))) {
+        return ok("&(" + value.text.clone() + ")")
+    }
+    RejectLayout("linked_argument_type", "expected a matching stable source for the View argument", value.ty.span.clone())?
+    return ok("")
+}
+
+fn MatchesLinkedIntArrayOwner(&target: TypeNameBinding, &origin: TypeNameBinding): bool {
+    return target.declaration_kind == "BuiltinArray" && target.name == "int" && LinkedNullIntArrayOwner(origin)
+}
 
 fn scalarGuardSlotMove(&before: LinkedNullSlot, &after: LinkedNullSlot, &state: LinkedNullState): bool {
     ty = before.value.ty.clone()

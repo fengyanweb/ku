@@ -8,9 +8,8 @@ import { ResolveTypeName, SameBoundTypeIdentity, TypeNameBinding } from "./type_
 import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { ContainsType, CTypeName, LinkedFsReadReference } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningLayoutDropName } from "./nested_struct_c.ku"
-import { GuardOwnedDrops } from "./guarded_struct_c.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
-import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayViewLinkPlanType, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BuiltinLinkPlanType, FsReadLinkPlan, IntArrayViewLinkPlanType, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanDeclaration, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -104,7 +103,7 @@ fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view
 
 fn LinkedNullArrayElement(binding: TypeNameBinding): TypeNameBinding {
     result = binding
-    if (result.declaration_kind == "BuiltinArray") { result.declaration_kind = "Builtin" }
+    if (result.declaration_kind == "BuiltinArray" || LinkedNullIntArrayOwner(result)) { result.declaration_kind = "Builtin" }
     else { result.declaration_kind = "Struct" }
     return result
 }
@@ -140,7 +139,7 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
     if (binding.declaration_kind == "StructArray") {
         return ok("const " + LinkedNullArrayType(binding) + "*")
     }
-    if (LinkedNullOwnedArray(binding)) { return ok(LinkedNullArrayType(binding)) }
+    if (LinkedNullOwnedArray(binding) || LinkedNullIntArrayOwner(binding)) { return ok(LinkedNullArrayType(binding)) }
     if (binding.declaration_kind == "Builtin") {
         if (binding.name == "str") { return ok("KuProjectionString") }
         if (binding.name == "int") { return ok("int64_t") }
@@ -148,31 +147,6 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
     }
     RejectLayout("unsupported_linked_type", "expected a known struct, str, int or bool", binding.span.clone())?
     return ok("")
-}
-
-fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &ty: TypeNameBinding, &name: str): str {
-    if (ty.declaration_kind == "OwnedStringArray") { return "    ku_managed_source_drop(&" + name.clone() + ");\n" }
-    if (ty.declaration_kind == "CaughtError") {
-        return "    ku_projection_string_drop(&" + name.clone() + ".domain);\n"
-            + "    ku_projection_string_drop(&" + name.clone() + ".code);\n"
-            + "    ku_projection_string_drop(&" + name.clone() + ".message);\n"
-    }
-    if (ty.name == "str" && ty.declaration_kind == "Builtin") {
-        return "    ku_projection_string_drop(&" + name.clone() + ");\n"
-    }
-    if (ty.declaration_kind == "Struct") {
-        unit = ty.module_index
-        node = ty.declaration_node
-        if (LayoutIndex(owning_layouts, unit, node) != 0) {
-            return "    " + OwningLayoutDropName(unit, node) + "(&" + name.clone() + ");\n"
-        }
-        layout = LayoutIndex(layouts, unit, node)
-        return GuardOwnedDrops(layouts, layout, name)
-    }
-    if (LinkedNullOwnedArray(ty)) {
-        return "    " + LinkedNullArrayPrefix(ty) + "_drop(&" + name.clone() + ");\n"
-    }
-    return ""
 }
 
 // Type-only layouts may be forwarded or returned exclusively on other
@@ -252,12 +226,16 @@ fn linkedDirectFunction(&project: LinkedNullProject, unit: int, &target: Node): 
     return ok([])
 }
 
-fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int): TypeNameBinding! {
+fn ReadLinkedOwnedArray(&project: LinkedNullProject, unit: int, id: int, for_local: bool): TypeNameBinding! {
     array = LinkedNullNode(project, unit, id)
     if (array.kind != "TypeArray" || array.edge_count != 1) {
         RejectLayout("linked_owned_array_type", "expected an explicitly typed array of named records", DeclarationSpan(array))?
     }
     element = LinkedNullType(project, unit, LinkedNullChild(project, unit, array, 0))?
+    if (for_local && element.declaration_kind == "Builtin" && element.name == "int") {
+        element.declaration_kind = "OwnedIntArray"
+        return ok(element)
+    }
     if (element.declaration_kind != "Struct") {
         RejectLayout("linked_owned_array_type", "expected a bound struct element", DeclarationSpan(array))?
     }
@@ -275,7 +253,7 @@ fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bo
     }
     payload_id = LinkedNullChild(project, unit, node, 0)
     payload = LinkedNullNode(project, unit, payload_id)
-    if (payload.kind == "TypeArray") { return ReadLinkedOwnedArray(project, unit, payload_id) }
+    if (payload.kind == "TypeArray") { return ReadLinkedOwnedArray(project, unit, payload_id, false) }
     result = LinkedNullType(project, unit, payload_id)?
     if (!LinkedNullHasResultValue(result) && (result.declaration_kind != "Builtin" || result.name != "null")) {
         RejectLayout("linked_dependency_result", "expected null!, str!, a named record Result or a struct array Result", result.span.clone())?

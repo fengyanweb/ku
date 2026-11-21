@@ -286,24 +286,28 @@ fn LinkedNullOwnedArray(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "OwnedStructArray"
 }
 
+fn LinkedNullIntArrayOwner(&binding: TypeNameBinding): bool {
+    return binding.declaration_kind == "OwnedIntArray"
+}
+
 fn LinkedNullReadableArray(&type: TypeNameBinding): bool {
-    return type.declaration_kind == "StructArray" || type.declaration_kind == "BuiltinArray" || LinkedNullOwnedArray(type)
+    return type.declaration_kind == "StructArray" || type.declaration_kind == "BuiltinArray"
+        || LinkedNullOwnedArray(type) || LinkedNullIntArrayOwner(type)
 }
 
 fn RegisterLinkedIntArray(state: LinkedNullState, ty: TypeNameBinding): LinkedNullState {
     next = state
     index = 0
-    while (index < next.validated_arrays.len()) {
-        if (SameBoundTypeIdentity(next.validated_arrays[index], ty)) { return next }
+    while (index < next.arrays.len()) {
+        if (SameBoundTypeIdentity(next.arrays[index], ty)) { return next }
         index = index + 1
     }
-    next.arrays = next.arrays.push(ty.clone())
-    next.validated_arrays = next.validated_arrays.push(ty)
+    next.arrays = next.arrays.push(ty)
     return next
 }
 
 fn LinkedNullArrayHeader(&type: TypeNameBinding, &value: str): str {
-    if (LinkedNullOwnedArray(type)) { return "(&" + value.clone() + ")" }
+    if (LinkedNullOwnedArray(type) || LinkedNullIntArrayOwner(type)) { return "(&" + value.clone() + ")" }
     return value.clone()
 }
 
@@ -326,7 +330,7 @@ fn LinkedRecordFields(&layouts: [StructLayout], &managed: [StructLayout], &type:
 fn LinkedNullOwner(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Struct" || binding.declaration_kind == "CaughtError" || binding.declaration_kind == "OwnedStringArray"
         || (binding.declaration_kind == "Builtin" && binding.name == "str")
-        || LinkedNullOwnedArray(binding)
+        || LinkedNullOwnedArray(binding) || LinkedNullIntArrayOwner(binding)
 }
 
 fn LinkedFailureTarget(&state: LinkedNullState): str {

@@ -1,14 +1,13 @@
-import { LinkedMemberUnavailable, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MatchesLinkedIntArrayOwner, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { Node } from "../stage2/ast.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, RememberLinkedCall, LinkedNullBinding, LinkedOkAvailable, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedViewPointee } from "./link_plan_c.ku"
-import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
+import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, RememberLinkedCall, LinkedNullBinding, LinkedOkAvailable, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { EmitLinkedIntAppend, HasBoundArrayMembers, ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
 import { GuardOwnedDrops } from "./guarded_struct_c.ku"
-import { HasBoundArrayMembers } from "./struct_array_c.ku"
-import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, LinkedNullDropC, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
+import { LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, EmitLinkedAddition, LowerLinkedNullLeaf,
          LowerLinkedNullRead, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_null_read_c.ku"
@@ -58,24 +57,6 @@ fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     return ok(output)
 }
 
-fn linkedViewArgument(&parameter: TypeNameBinding, &value: LinkedNullValue): str! {
-    if (parameter.declaration_kind == "StringView" && value.ty.declaration_kind == "Builtin" && value.ty.name == "str"
-        && (!value.borrowed || value.slot > 0)) {
-        return ok("&(" + value.text.clone() + ")")
-    }
-    if (parameter.declaration_kind == "StructView" && (!value.borrowed || value.slot > 0)
-        && SameLinkedType(LinkedViewPointee(parameter.clone()), value.ty)) {
-        return ok("&(" + value.text.clone() + ")")
-    }
-    if (SameLinkedType(parameter, value.ty)) { return ok(value.text.clone()) }
-    if (parameter.declaration_kind == "StructArray" && LinkedNullOwnedArray(value.ty)
-        && SameLinkedType(LinkedNullArrayElement(parameter.clone()), LinkedNullArrayElement(value.ty.clone()))) {
-        return ok("&(" + value.text.clone() + ")")
-    }
-    RejectLayout("linked_argument_type", "expected a matching stable source for the View argument", value.ty.span.clone())?
-    return ok("")
-}
-
 fn lowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &callee: LinkedNullFunction,
                          id: int, depth: int): LinkedNullArguments! {
     next = state
@@ -88,7 +69,7 @@ fn lowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
         argument = LowerLinkedNullValue(project, next.clone(), LinkedNullChild(project, 1, call, index + 1), depth + 1)?
         if (args != "") { args += ", " }
         if (LinkedNullView(callee.parameters[index])) {
-            args += linkedViewArgument(callee.parameters[index], argument.value)?
+            args += LinkedViewArgument(callee.parameters[index], argument.value)?
             if (argument.value.slot > 0) { loans = loans.push(argument.value.clone()) }
             next = argument.state
             index = index + 1
@@ -209,7 +190,8 @@ fn lowerLinkedLiteral(&project: LinkedNullProject, state: LinkedNullState, &node
             RejectLayout("invalid_linked_literal_field", "expected each declared struct field once", DeclarationSpan(field))?
         }
         value = LowerLinkedNullValue(project, next.clone(), LinkedNullChild(project, 1, field, 0), depth + 1)?
-        if (!SameLinkedType(fields[ordinal - 1].resolved, value.value.ty)) {
+        if (!SameLinkedType(fields[ordinal - 1].resolved, value.value.ty)
+            && !MatchesLinkedIntArrayOwner(fields[ordinal - 1].resolved, value.value.ty)) {
             RejectLayout("linked_literal_field_type", "field value differs from the bound struct field type", value.value.ty.span.clone())?
         }
         value.state.code = value.state.code + "    " + target.clone() + ".f" + str(ordinal - 1) + " = " + value.value.text.clone() + ";\n"
@@ -296,17 +278,22 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
 
 fn LowerLinkedArrayAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, index: int): LinkedNullState! {
     array = state.slots[index - 1].clone()
-    if (!array.live || !LinkedNullOwnedArray(array.value.ty)) {
+    copy = LinkedNullIntArrayOwner(array.value.ty)
+    if (!array.live || (!copy && !LinkedNullOwnedArray(array.value.ty))) {
         RejectLayout("linked_move_append", "expected an initialized array assigned its own push result", DeclarationSpan(statement))?
     }
     id = ReadOwnedArrayPushArgument(project.supplied[0].named, statement)?
     value = LowerLinkedNullValue(project, state, id, 0)?
     if (!value.state.slots[index - 1].live || !SameLinkedType(value.value.ty, LinkedNullArrayElement(array.value.ty.clone()))
-        || value.value.borrowed || value.value.slot == 0) {
-        RejectLayout("linked_move_append", "push requires one independent owned element of the declared type", value.value.ty.span.clone())?
+        || value.value.borrowed || (!copy && value.value.slot == 0)) {
+        RejectLayout("linked_move_append", "push requires one element of the declared type", value.value.ty.span.clone())?
     }
     if (!ContainsIndex(value.state.append_slots, index)) { value.state.append_slots = value.state.append_slots.push(index) }
     value.state = RequireLinkedArrayValidation(value.state, array.value.ty.clone())
+    if (copy) {
+        value.state.code += EmitLinkedIntAppend(array.value.text, value.value.text)
+        return ok(value.state)
+    }
     prefix = LinkedNullArrayPrefix(array.value.ty)
     value.state.code = value.state.code + "    append_status = " + prefix + "_append_move(&" + array.value.text
         + ", &" + value.value.text.clone() + ");\n    if (append_status != KU_STRUCT_ARRAY_OK) goto cleanup;\n"

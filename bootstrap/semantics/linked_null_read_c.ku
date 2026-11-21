@@ -1,14 +1,14 @@
-import { LinkedMemberPath, LinkedMemberUnavailable } from "./linked_member_ownership.ku"
+import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC } from "./linked_member_ownership.ku"
 import { Span } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
-import { RegisterLinkedIntArray, LinkedErrorField, ReadLinkedNullBinding, CheckLinkedAddition, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { RegisterLinkedIntArray, LinkedErrorField, ReadLinkedNullBinding, CheckLinkedAddition, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedViewPointee, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullDropC,
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild,
          LinkedNullLayout, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedStringResult, LinkedNullView, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &element: TypeNameBinding): LinkedNullState! {
@@ -40,7 +40,13 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
     next = state
     if (ty.declaration_kind == "BuiltinArray") {
         if (ty.name == "str") { next.uses_str_array = true }
-        else { next = RegisterLinkedIntArray(next, ty.clone()) }
+        else { next = RequireLinkedArrayValidation(RegisterLinkedIntArray(next, ty.clone()), ty.clone()) }
+    }
+    if (LinkedNullIntArrayOwner(ty)) {
+        carrier = ty.clone()
+        carrier.declaration_kind = "BuiltinArray"
+        next = RegisterLinkedIntArray(next, carrier)
+        if (LinkedNullArrayPosition(next.owned_arrays, ty) == 0) { next.owned_arrays = next.owned_arrays.push(ty.clone()) }
     }
     if (ty.declaration_kind == "StringView") { next.uses_str_view = true }
     if (ty.declaration_kind == "StructView") { next.uses_struct_view = true }
@@ -62,7 +68,8 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
 fn RequireLinkedArrayValidation(state: LinkedNullState, ty: TypeNameBinding): LinkedNullState {
     next = state
     carrier = ty
-    carrier.declaration_kind = "StructArray"
+    if (LinkedNullIntArrayOwner(carrier)) { carrier.declaration_kind = "BuiltinArray" }
+    else if (carrier.declaration_kind != "BuiltinArray") { carrier.declaration_kind = "StructArray" }
     if (LinkedNullArrayPosition(next.validated_arrays, carrier) == 0) {
         next.validated_arrays = next.validated_arrays.push(carrier)
     }
@@ -92,7 +99,7 @@ fn AddLinkedNullSlot(&project: LinkedNullProject, state: LinkedNullState, bindin
 }
 
 fn LowerLinkedArrayLocal(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {
-    ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0))?
+    ty = ReadLinkedOwnedArray(project, 1, LinkedNullChild(project, 1, statement, 0), true)?
     value = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
     if (value.kind != "Array" || value.edge_count != 0
         || LinkedNullBinding(state.slots, statement.text) != 0) {

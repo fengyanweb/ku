@@ -10,7 +10,7 @@ import { TypeNameBinding } from "./type_names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
-import { LinkedReadonlyExpression, LinkedSlotPrefix, ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
+import { LinkedReadonlyExpression, LinkedSlotPrefix, ExitLinkedFailure, LinkedFailureTarget, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, ReadLinkedCatchParts, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedCheckedResultPlan, LinkedNullArrayLimitName, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, LowerLinkedArrayLocal, LowerLinkedNullRead,
@@ -287,7 +287,9 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             return lowerLinkedCatch(project, next, statement, id, result, depth)
         }
         if (statement.kind == "Assign" && statement.edge_count == 1) {
-            if (LinkedNullBinding(next.slots, statement.text) == 0) { next = addLocal(project, next, statement, id)? }
+            slot = LinkedNullBinding(next.slots, statement.text)
+            if (slot == 0) { next = addLocal(project, next, statement, id)? }
+            else if (LinkedNullIntArrayOwner(next.slots[slot - 1].value.ty)) { next = LowerLinkedArrayAppend(project, next, statement, slot)? }
             else { next = LowerLinkedStringRebind(project, next, statement)? }
         } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {
             kind = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0)).kind
