@@ -14,12 +14,7 @@ import { ContainsIndex } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
-
-struct LinkedForLoop {
-    state: LinkedNullState
-    outer: [LinkedNullSlot]
-    before: int
-}
+import { LinkedForLoop, OpenLinkedCheckedRecordFor } from "./linked_owner_assignment_c.ku"
 
 fn rejectLocalCapture(&node: Node, message: str): null! {
     return RejectLayout("unsupported_linked_local_capture", message, DeclarationSpan(node))
@@ -336,7 +331,11 @@ fn openLinkedIntLoop(&project: LinkedNullProject, state: LinkedNullState, &state
 
 fn OpenLinkedForLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int, depth: int): LinkedForLoop! {
     if (statement.edge_count != 0) {
-        source = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
+        source_id = LinkedNullChild(project, 1, statement, 0)
+        source = LinkedNullNode(project, 1, source_id)
+        if (source.kind == "TryUnwrap") {
+            return OpenLinkedCheckedRecordFor(project, state, statement, source_id, id, depth)
+        }
         if (source.kind == "Variable" && source.edge_count == 0) {
             slot = LinkedNullBinding(state.slots, source.text)
             if (slot != 0) {

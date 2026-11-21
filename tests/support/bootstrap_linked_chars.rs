@@ -209,3 +209,154 @@ int main(int argc, char **argv) {
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_int_for_borrowed"));
 }
+
+const RECORD_SOURCE: &str = r#"struct Item { text: str }
+fn Produce(): [Item]! { return ok([]) }
+fn Observe(&item: Item): null! { return ok(null) }
+
+fn Drain(): [Item]! {
+    result: [Item] = []
+    for item in Produce()? {
+        Observe(item)?
+        result = result.push(item)
+    }
+    return ok(result)
+}
+
+fn Reusable(): null! {
+    items = Produce()?
+    for item in items { Observe(item)? }
+    return ok(null)
+}
+"#;
+
+const RECORD_DRIVER: &str = r#"
+static size_t length, produced, seen;
+static bool fail_on_second;
+static uint8_t *strings[3];
+
+__RESULT__ __PRODUCE__(void) {
+    ++produced;
+    __ARRAY__ array = {0};
+    if (length) {
+        array = (__ARRAY__){length, malloc(length * sizeof(*array.data)), length};
+        assert(array.data);
+        for (size_t i = 0; i < length; ++i) {
+            strings[i] = malloc(1);
+            assert(strings[i]);
+            strings[i][0] = (uint8_t)('a' + i);
+            array.data[i] = (__ELEMENT__){
+                (KuProjectionString){strings[i], 1, 1, KU_PROJECTION_STRING_OWNED}
+            };
+        }
+    }
+    return (__RESULT__){.ok = true, .value = array};
+}
+
+KuBootstrapResultNull __OBSERVE__(const __ELEMENT__* item) {
+    assert(seen < length && item->f0.len == 1 && item->f0.ptr == strings[seen]);
+    assert(item->f0.ptr[0] == (uint8_t)('a' + seen));
+    ++seen;
+    if (fail_on_second && seen == 2) {
+        KuBootstrapResultNull result = {0};
+        result.error.code = (KuProjectionString){
+            (uint8_t*)"stop", 4, 0, KU_PROJECTION_STRING_STATIC
+        };
+        return result;
+    }
+    return (KuBootstrapResultNull){.ok = true};
+}
+
+static void verify_failed_append(void) {
+    if (produced != 1 || seen != 1 || attempts != 5 || outstanding()) _Exit(88);
+}
+
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) {
+        length = 3;
+        fail_after = 4;
+        assert(atexit(verify_failed_append) == 0);
+        (void)__ENTRY__();
+        return 89;
+    }
+    __RESULT__ empty = __ENTRY__();
+    assert(empty.ok && empty.value.len == 0 && !empty.value.data);
+    assert(produced == 1 && !seen && !attempts && !outstanding());
+
+    length = 3;
+    __RESULT__ output = __ENTRY__();
+    assert(produced == 2 && seen == 3 && output.ok && output.value.len == 3);
+    assert(attempts == 5 && outstanding() == 4);
+    for (size_t i = 0; i < length; ++i) {
+        assert(output.value.data[i].f0.ptr == strings[i]);
+        test_free(output.value.data[i].f0.ptr);
+    }
+    test_free(output.value.data);
+    assert(!outstanding());
+
+    seen = 0;
+    fail_on_second = true;
+    __RESULT__ stopped = __ENTRY__();
+    assert(produced == 3 && seen == 2 && !stopped.ok && !stopped.value.data);
+    assert(stopped.error.code.len == 4 && !memcmp(stopped.error.code.ptr, "stop", 4));
+    assert(!outstanding());
+    return 0;
+}
+"#;
+
+pub(super) fn assert_owned_record_result_iteration(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("record-iteration.ku"), RECORD_SOURCE).unwrap();
+    fs::write(cwd.join("modules.txt"), "record-iteration.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Drain\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null\n").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let source = String::from_utf8(emitted.stdout).unwrap();
+    let symbol = |prefix| {
+        source
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix)?.split_once('('))
+            .map(|(name, _)| name)
+            .expect("generated typed function")
+    };
+    let (carrier, _) = source
+        .lines()
+        .find_map(|line| {
+            let declaration = line.strip_prefix("extern ")?;
+            let (carrier, tail) = declaration.split_once(' ')?;
+            carrier
+                .starts_with("KuBootstrapResult_KuArray_")
+                .then_some((carrier, tail))
+        })
+        .expect("owned array Result declaration");
+    let array = carrier.strip_prefix("KuBootstrapResult_").unwrap();
+    let element = array.strip_prefix("KuArray_").unwrap();
+    let driver = RECORD_DRIVER
+        .replace("__RESULT__", carrier)
+        .replace("__ARRAY__", array)
+        .replace("__ELEMENT__", element)
+        .replace("__ENTRY__", symbol(&format!("{carrier} ")))
+        .replace("__PRODUCE__", symbol(&format!("extern {carrier} ")))
+        .replace("__OBSERVE__", symbol("extern KuBootstrapResultNull "));
+    let path = cwd.join("owned-record-iteration.c");
+    let binary = cwd.join(format!(
+        "owned-record-iteration{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&path, format!("{CHECKED_ARRAY_ALLOCATOR}{source}{driver}")).unwrap();
+    compile_projection(&path, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(&binary), cwd, 10));
+    let failed = execute(Command::new(binary).arg("inject-append"), cwd, 10);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(failed.stderr).unwrap().trim(),
+        "array allocation failed"
+    );
+
+    fs::write(cwd.join("function.txt"), "Reusable\n").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("|unsupported_linked_for|"));
+}

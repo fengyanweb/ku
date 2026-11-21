@@ -1,9 +1,10 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
-import { LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullState } from "./link_plan_c.ku"
-import { LinkedNullArrayElement, LinkedNullChild, LinkedNullProject, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
+import { LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullProject, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
 import { AppendLinkedArrayElement, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
@@ -54,4 +55,40 @@ fn LowerLinkedOwnerRebind(&project: LinkedNullProject, state: LinkedNullState, &
         next.slots[moved.slot - 1].live = false
     }
     return ok(next)
+}
+
+struct LinkedForLoop {
+    state: LinkedNullState
+    outer: [LinkedNullSlot]
+    before: int
+}
+
+fn OpenLinkedCheckedRecordFor(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
+                              source: int, id: int, depth: int): LinkedForLoop! {
+    at = DeclarationSpan(statement)
+    if (depth >= 32 || LinkedNullBinding(state.slots, statement.text) != 0) {
+        RejectLayout("linked_record_for_scope", "record iteration needs a fresh local binding within the control bound", at.clone())?
+    }
+    before = state.slots.len()
+    input = LowerLinkedNullValue(project, state, source, 0)?
+    owner = input.value.clone()
+    if (!LinkedNullOwnedArray(owner.ty) || owner.borrowed || owner.slot <= before || owner.member_path != ""
+        || input.state.slots[owner.slot - 1].binding != "" || LinkedMemberUnavailable(input.state, owner, true)) {
+        RejectLayout("linked_record_for_source", "expected a fresh checked result with an owned record array", at)?
+    }
+
+    // Checked-result lowering has already admitted this private array header.
+    // Keep it in cleanup, and move each item out before entering the body.
+    outer = input.state.slots.clone()
+    ty = LinkedNullArrayElement(owner.ty)
+    suffix = str(id) + "_records"
+    item = AddLinkedNullSlot(project, input.state, statement.text.clone(), "t" + suffix.clone(), ty.clone(), false)?
+    item.state.slots[item.value.slot - 1].live = true
+    index = "i" + suffix
+    element = owner.text.clone() + ".data[" + index.clone() + "]"
+    item.state.code += "    for (size_t " + index.clone() + " = 0; " + index.clone() + " < "
+        + owner.text + ".len; ++" + index + ") {\n"
+        + "    " + item.value.text + " = " + element.clone() + ";\n"
+        + "    " + element + " = (" + LinkedNullCType(ty)? + "){0};\n"
+    return ok(LinkedForLoop { state: item.state, outer: outer, before: before })
 }
