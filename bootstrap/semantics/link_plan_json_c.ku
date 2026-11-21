@@ -330,9 +330,14 @@ fn LinkedAppendFailureRelay(&body: LinkedNullState): str {
 fn FinishLinkedReaderThunk(next: LinkedNullState, &parent: LinkedNullState, &symbol: str,
                           &result: str, &array: str): LinkedNullState {
     body = next
-    parent_state = RestoreLinkedThunkFrame(body.clone(), parent)
-    // These statements use only array access, owned cloning, or a bound mapper.
-    // Other capabilities in the caller belong to the caller's cleanup.
+    // Render the reader with only the cleanup flags it can use; carry the
+    // translation-unit features back to the parent before exposing the helper.
+    parent_print = body.uses_print
+    chars = body.uses_chars
+    str_view = body.uses_str_view
+    struct_view = body.uses_struct_view
+    concat = body.uses_concat
+    div = body.uses_div
     body.uses_print = false
     body.uses_chars = false
     body.uses_str_view = false
@@ -341,8 +346,17 @@ fn FinishLinkedReaderThunk(next: LinkedNullState, &parent: LinkedNullState, &sym
     body.uses_div = false
     body.uses_scoped_reader = false
     body.code = "    const " + array.clone() + " *const capture = raw;\n" + body.code
-    parent_state.callback_helpers += "static " + FinishLinkedFunctionC("", body, symbol,
-        "void *raw, KuLocalAppendFailure *failure, int64_t input", result, "", "", LinkedAppendFailureRelay(body))
+    failure = LinkedAppendFailureRelay(body)
+    source = FinishLinkedFunctionC("", body, symbol,
+        "void *raw, KuLocalAppendFailure *failure, int64_t input", result, "", "", failure)
+    body.uses_print = parent_print
+    body.uses_chars = chars
+    body.uses_str_view = str_view
+    body.uses_struct_view = struct_view
+    body.uses_concat = concat
+    body.uses_div = div
+    parent_state = RestoreLinkedThunkFrame(body, parent)
+    parent_state.callback_helpers += "static " + source
     parent_state.uses_scoped_reader = true
     return parent_state
 }
