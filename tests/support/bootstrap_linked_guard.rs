@@ -776,6 +776,82 @@ int main(void) {
     }
 }
 
+pub(super) fn assert_int_array_record_snapshot(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("array-record-snapshot.ku"),
+        r#"struct Scope { children: [int] limits: [int] cursor: int active: bool }
+struct Mixed { children: [int] name: str }
+fn Snapshot(&entries: [Scope]): Scope! { return ok(entries[0].clone()) }
+fn Unsupported(&entry: Mixed): Mixed! { return ok(entry.clone()) }
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "array-record-snapshot.ku\n").unwrap();
+    fs::write(cwd.join("function.txt"), "Snapshot").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let projected = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&projected);
+    let code = String::from_utf8(projected.stdout).unwrap();
+    assert_eq!(code.matches("= ku_linked_int_snapshot(").count(), 2);
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let record = result.strip_prefix("KuBootstrapResult_").unwrap();
+    let (entry, _) = signature.split_once('(').unwrap();
+    let host = r#"
+#include <assert.h>
+static void verify_prefix_cleanup(void) {
+    assert(attempts == 2 && !outstanding());
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    (void)test_realloc;
+    int64_t child[] = {1, 2};
+    int64_t limit[] = {3, 4};
+    RECORD source = {{2, child, 2}, {2, limit, 2}, 41, true};
+    KuArray_RECORD entries = {1, &source, 1};
+    if (argc > 1) {
+        fail_after = 1;
+        assert(atexit(verify_prefix_cleanup) == 0);
+        (void)ENTRY(&entries);
+        return 2;
+    }
+    RESULT result = ENTRY(&entries);
+    assert(result.ok && result.value.f2 == 41 && result.value.f3 && outstanding() == 2);
+    assert(result.value.f0.len == 2 && result.value.f0.data != child && result.value.f0.data[1] == 2);
+    assert(result.value.f1.len == 2 && result.value.f1.data != limit && result.value.f1.data[0] == 3);
+    result.value.f0.data[0] = 77;
+    assert(source.f0.data == child && child[0] == 1 && source.f1.data == limit && limit[0] == 3);
+    ku_drop_RECORD(&result.value);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("RESULT", result)
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("RECORD", record);
+    let source = cwd.join("array-record-snapshot.c");
+    let exe = cwd.join(format!(
+        "array-record-snapshot{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&source, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    let failed = execute(Command::new(&exe).arg("oom"), cwd, 10);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stderr).trim(),
+        "out of memory"
+    );
+    fs::write(cwd.join("function.txt"), "Unsupported").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_nested_array_clone"));
+}
+
 pub(super) fn assert_terminal_branch_ownership(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("guard-provider.ku"),

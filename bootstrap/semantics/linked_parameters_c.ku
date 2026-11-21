@@ -12,7 +12,7 @@ import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { LayoutIndex, RejectLayout } from "./struct_layouts.ku"
-import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
+import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedRecordFields, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterPlan,
          LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 
@@ -261,7 +261,7 @@ fn CloneLinkedIntArray(&project: LinkedNullProject, input: LinkedNullExpression,
     output.state = RequireLinkedArrayValidation(output.state, source.ty.clone())
     output.state.uses_int_snapshot = true
     output.state.slots[output.value.slot - 1].live = true
-    output.state.code += LinkedIntSnapshotCall(source.text, output.value.text)
+    output.state.code += LinkedIntSnapshotCall(source.text, output.value.text, output.value.text)
     return ok(output)
 }
 
@@ -347,11 +347,28 @@ fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, 
         RejectLayout("linked_clone_moved", "cloning a whole struct requires all fields to be available", DeclarationSpan(at))?
     }
     layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
-    if (HasBoundArrayMembers(source.state.layouts, layout)) {
-        RejectLayout("linked_nested_array_clone", "a struct with nested owning arrays does not yet support clone", ty.span.clone())?
-    }
+    arrays = HasBoundArrayMembers(source.state.layouts, layout)
     output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
-    if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
+    if (arrays) {
+        fields = LinkedRecordFields(output.state.layouts, output.state.owning_layouts, output.value.ty)?
+        index = 0
+        while (index < fields.len()) {
+            field = fields[index].resolved.clone()
+            suffix = ".f" + str(index)
+            origin = source.value.text.clone() + suffix.clone()
+            target = output.value.text.clone() + suffix
+            if (field.declaration_kind == "BuiltinArray" && field.name == "int") {
+                output.state = RegisterLinkedNullType(project, output.state, field)?
+                output.state.uses_int_snapshot = true
+                output.state.code += LinkedIntSnapshotCall(origin, target, "t" + str(id) + "_" + str(index))
+            } else if (field.declaration_kind == "Builtin" && (field.name == "int" || field.name == "bool")) {
+                output.state.code += "    " + target + " = " + origin + ";\n"
+            } else {
+                RejectLayout("linked_nested_array_clone", "record snapshot requires immediate [int] or Copy int and bool fields", field.span.clone())?
+            }
+            index += 1
+        }
+    } else if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
         output.state.code += "    " + output.value.text.clone() + " = " + source.value.text + ";\n"
     } else {
         if (!ContainsIndex(output.state.element_clones, layout)) {

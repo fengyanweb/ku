@@ -415,8 +415,8 @@ static int ku_linked_int_snapshot(const KuArrayInt *source, KuArrayInt *target) 
 "
 }
 
-fn LinkedIntSnapshotCall(&source: str, &target: str): str {
-    status = "snapshot_" + target.clone()
+fn LinkedIntSnapshotCall(&source: str, &target: str, &name: str): str {
+    status = "snapshot_" + name.clone()
     return "    int " + status.clone() + " = ku_linked_int_snapshot(&(" + source.clone() + "), &" + target.clone() + ");\n"
         + "    if (" + status.clone() + " != KU_INT_SNAPSHOT_OK) { invalid_array = " + status.clone()
         + " == KU_INT_SNAPSHOT_INVALID; out_of_memory = " + status + " == KU_INT_SNAPSHOT_OOM; goto cleanup; }\n"
