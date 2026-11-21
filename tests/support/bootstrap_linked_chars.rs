@@ -840,4 +840,124 @@ int main(void) {
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("|unsupported_linked_for|"));
+
+    assert_borrowed_record_array_clone(seed, cwd);
+}
+
+fn assert_borrowed_record_array_clone(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("borrowed-fields.ku"),
+        r#"struct Name { text: str }
+struct Field { name: str nested: Name ordinal: int }
+struct Layout { fields: [Field] }
+struct Other { name: str nested: Name ordinal: int }
+
+fn Select(&layouts: [Layout], index: int): [Field]! {
+    return ok(layouts[index].fields.clone())
+}
+fn Wrong(&layouts: [Layout], index: int): [Other]! {
+    return ok(layouts[index].fields.clone())
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "borrowed-fields.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Select").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let source = String::from_utf8(emitted.stdout).unwrap();
+    let (result, signature) = source
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, parameters) = signature.split_once('(').unwrap();
+    let (layouts, _) = parameters
+        .strip_prefix("const ")
+        .unwrap()
+        .split_once("* a0,")
+        .unwrap();
+    let layout = layouts.strip_prefix("KuArray_").unwrap();
+    let fields = result.strip_prefix("KuBootstrapResult_").unwrap();
+    let field = fields.strip_prefix("KuArray_").unwrap();
+    let driver = r#"
+static FIELD input[2];
+static int attempts_at_failure;
+static uint8_t shared[] = "literal";
+static KuProjectionString owned(uint8_t byte) {
+    uint8_t *buf = malloc(1);
+    assert(buf);
+    *buf = byte;
+    return (KuProjectionString){buf, 1, 1, KU_PROJECTION_STRING_OWNED};
+}
+static void release_source(void) {
+    ku_projection_string_drop(&input[0].f0);
+    ku_projection_string_drop(&input[1].f0);
+    ku_projection_string_drop(&input[1].f1.f0);
+}
+static void after_oom(void) {
+    if (outstanding() != 3 || attempts != attempts_at_failure ||
+        *input[0].f0.ptr != 'a' || *input[1].f0.ptr != 'b' || *input[1].f1.f0.ptr != 'c') _Exit(82);
+    release_source();
+    if (outstanding()) _Exit(83);
+}
+int main(int argc, char **argv) {
+    (void)test_realloc;
+    LAYOUT layout = {0};
+    const LAYOUT_ARRAY layouts = {1, &layout, 1};
+    RESULT empty = ENTRY(&layouts, 0);
+    assert(empty.ok && !empty.value.len && !empty.value.data && !attempts);
+
+    input[0].f0 = owned('a');
+    input[0].f1.f0 = (KuProjectionString){shared, sizeof(shared) - 1, 0, KU_PROJECTION_STRING_STATIC};
+    input[1].f0 = owned('b');
+    input[1].f1.f0 = owned('c');
+    input[1].f2 = 42;
+    layout.f0 = (FIELD_ARRAY){2, input, 2};
+    if (argc > 1) {
+        assert(!atexit(after_oom));
+        fail_after = strcmp(argv[1], "backing") == 0 ? 0 : 3;
+        attempts_at_failure = attempts + fail_after + 1;
+    }
+    RESULT copy = ENTRY(&layouts, 0);
+    assert(copy.ok && copy.value.len == 2 && layout.f0.data == input);
+    assert(attempts == 7 && outstanding() == 7 && copy.value.data != input);
+    assert(copy.value.data[0].f0.ptr != input[0].f0.ptr);
+    assert(copy.value.data[0].f1.f0.ptr == shared);
+    assert(copy.value.data[1].f0.ptr != input[1].f0.ptr);
+    assert(copy.value.data[1].f1.f0.ptr != input[1].f1.f0.ptr);
+    release_source();
+    assert(*copy.value.data[0].f0.ptr == 'a' && *copy.value.data[1].f0.ptr == 'b');
+    assert(*copy.value.data[1].f1.f0.ptr == 'c' && copy.value.data[1].f2 == 42);
+    DROP(&copy.value);
+    assert(!outstanding());
+    return 0;
+}
+"#
+    .replace("LAYOUT_ARRAY", layouts)
+    .replace("FIELD_ARRAY", fields)
+    .replace("LAYOUT", layout)
+    .replace("FIELD", field)
+    .replace("RESULT", result)
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("DROP", &format!("ku_linked_view_{field}_drop"));
+    let c = cwd.join("borrowed-fields.c");
+    let exe = cwd.join(format!("borrowed-fields{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{source}{driver}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 10));
+    for fail in ["backing", "second-field"] {
+        let result = execute(Command::new(&exe).arg(fail), cwd, 10);
+        assert_eq!(result.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&result.stderr).trim(),
+            "out of memory"
+        );
+    }
+
+    fs::write(cwd.join("function.txt"), "Wrong").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("|linked_result_return|"));
 }

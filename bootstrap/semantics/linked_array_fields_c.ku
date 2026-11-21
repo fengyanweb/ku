@@ -136,8 +136,10 @@ fn EmitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target:
     ty = source.value.ty.clone()
     if (LinkedStringResult(ty)) { return CloneLinkedStringSlot(project, source, "t" + str(id)) }
     if (LinkedNullIntArrayOwner(ty)) { return CloneLinkedIntArray(project, source, "t" + str(id)) }
-    // A tracked owned field uses the same checked clone as a named array.
-    if (LinkedNullOwnedArray(ty)) { return CloneLinkedRecordArray(project, source, id) }
+    if (LinkedNullOwnedArray(ty) ||
+        (ty.declaration_kind == "StructArray" && source.value.borrowed && source.value.slot > 0)) {
+        return CloneLinkedRecordArray(project, source, id)
+    }
     if (field && ty.declaration_kind != "Struct") {
         RejectLayout("unsupported_linked_clone", "field clone requires a bound str or finite struct", DeclarationSpan(subject))?
     }
