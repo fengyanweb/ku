@@ -1,0 +1,12 @@
+initial
+true
+eq left
+eq right
+true
+ne left
+ne right
+true
+advance
+true
+guard
+false

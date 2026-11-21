@@ -1,0 +1,16 @@
+import { Phase, Pick, IsReady } from "./phase"
+fn main(): null! {
+    phase = Pick("initial", false)
+    println(IsReady(phase))
+    println(Pick("eq left", true) == Pick("eq right", true))
+    println(Pick("ne left", true) != Pick("ne right", false))
+    advance = fn(): Phase {
+        println("advance")
+        phase = Phase.Done
+        return Phase.Ready
+    }
+    println(phase == advance())
+    if (phase == Phase.Done) { println("guard") }
+    println(phase != Phase.Done)
+    return ok(null)
+}

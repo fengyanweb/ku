@@ -1,0 +1,7 @@
+enum Phase { Ready, Done }
+fn Pick(marker: str, done: bool): Phase {
+    println(marker)
+    if (done) { return Phase.Done }
+    return Phase.Ready
+}
+fn IsReady(&value: Phase): bool { return value == Phase.Ready }

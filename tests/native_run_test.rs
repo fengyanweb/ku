@@ -8112,35 +8112,12 @@ fn native_payloadless_enum_equality_preserves_operand_order() {
     let dir = unique_temp_dir("enum-equality");
     fs::write(
         dir.join("phase.ku"),
-        r#"enum Phase { Ready, Done }
-fn Pick(marker: str, done: bool): Phase {
-    println(marker)
-    if (done) { return Phase.Done }
-    return Phase.Ready
-}
-fn IsReady(&value: Phase): bool { return value == Phase.Ready }
-"#,
+        include_str!("fixtures/native_payloadless_enum_equality/phase.ku"),
     )
     .expect("write imported enum definition");
     fs::write(
         dir.join("main.ku"),
-        r#"import { Phase, Pick, IsReady } from "./phase"
-fn main(): null! {
-    phase = Pick("initial", false)
-    println(IsReady(phase))
-    println(Pick("eq left", true) == Pick("eq right", true))
-    println(Pick("ne left", true) != Pick("ne right", false))
-    advance = fn(): Phase {
-        println("advance")
-        phase = Phase.Done
-        return Phase.Ready
-    }
-    println(phase == advance())
-    if (phase == Phase.Done) { println("guard") }
-    println(phase != Phase.Done)
-    return ok(null)
-}
-"#,
+        include_str!("fixtures/native_payloadless_enum_equality/main.ku"),
     )
     .expect("write imported enum comparisons");
     let generated = native_emit_c(&dir, "main.ku");
@@ -8152,7 +8129,7 @@ fn main(): null! {
         assert_eq!(code, Some(0));
         assert_eq!(
             stdout.replace('\r', ""),
-            "initial\ntrue\neq left\neq right\ntrue\nne left\nne right\ntrue\nadvance\ntrue\nguard\nfalse\n"
+            include_str!("fixtures/native_payloadless_enum_equality/expected.txt")
         );
     }
 
