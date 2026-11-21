@@ -142,9 +142,9 @@ fn ReadLinkedNullParameters(&project: LinkedNullProject, &function: Node): Linke
     plain_named = declared.kind == "TypeName"
     state.plain_value_result = declared.kind == "TypeArray" || plain_named
     result = ReadLinkedResult(project, 1, result_id, !state.plain_value_result)?
-    plain_bool = result.declaration_kind == "Builtin" && result.name == "bool"
-    if (plain_named && !plain_bool && result.declaration_kind != "Struct") {
-        RejectLayout("linked_value_result", "a plain named result requires builtin bool or a bound struct", result.span.clone())?
+    copy = result.declaration_kind == "Builtin" && (result.name == "bool" || result.name == "int")
+    if (plain_named && !copy && result.declaration_kind != "Struct") {
+        RejectLayout("linked_value_result", "a plain named result requires builtin int, builtin bool or a bound struct", result.span.clone())?
     }
     if (index == 0) { signature = "void" }
     state.code = state.code + validation

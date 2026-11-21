@@ -87,13 +87,16 @@ fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,
         RejectLayout("linked_value_return", "expected one value", DeclarationSpan(statement))?
     }
     value = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
-    copy = result.declaration_kind == "Builtin" && result.name == "bool"
+    copy = result.declaration_kind == "Builtin" && (result.name == "bool" || result.name == "int")
     if (!SameLinkedType(value.value.ty, result) || (!copy && (value.value.borrowed || value.value.slot == 0))) {
         RejectLayout("linked_value_return", "expected a value matching the declared result and ownership", DeclarationSpan(statement))?
     }
     value.state.code += "    result = " + value.value.text.clone() + ";\n"
-    owner = value.value.clone()
-    next = MoveLinkedNullSlot(value.state, owner)?
+    next = value.state
+    if (!copy) {
+        owner = value.value.clone()
+        next = MoveLinkedNullSlot(next, owner)?
+    }
     next.code += "    goto cleanup;\n"
     return ok(next)
 }

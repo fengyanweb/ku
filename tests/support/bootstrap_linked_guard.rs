@@ -974,6 +974,8 @@ fn Read(value: int): int! {
     return ok(out)
 }
 fn Wrong(): int! { return ok("wrong") }
+fn Indexed(&items: [int], slot: int): int { return items[slot] }
+fn WrongPlain(): int { return "wrong" }
 "#,
     )
     .unwrap();
@@ -1019,6 +1021,46 @@ int main(void) {
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_result_return"));
+
+    fs::write(cwd.join("function.txt"), "Indexed").unwrap();
+    let plain = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&plain);
+    let text = String::from_utf8(plain.stdout).unwrap();
+    assert!(!text.contains("KuBootstrapResult_int64_t"));
+    let entry = text
+        .lines()
+        .find_map(|line| line.strip_prefix("int64_t ku_linked_null_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let host = r#"
+#include <assert.h>
+int main(int argc, char **argv) {
+    (void)argv;
+    int64_t values[] = {INT64_MIN, 0, INT64_MAX};
+    KuArrayInt items = {3, values, 3};
+    if (argc > 1) { (void)ENTRY(&items, 3); return 5; }
+    for (int64_t index = 0; index < 3; ++index) {
+        assert(ENTRY(&items, index) == values[index]);
+    }
+    assert(items.data == values && items.len == 3);
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"));
+    let c = cwd.join("plain-int.c");
+    let exe = cwd.join(format!("plain-int{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("{text}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    let bounds = execute(Command::new(&exe).arg("bounds"), cwd, 15);
+    assert_eq!(bounds.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bounds.stderr).contains("index 3 out of bounds"));
+    fs::write(cwd.join("function.txt"), "WrongPlain").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_value_return"));
 }
 
 pub(super) fn assert_checked_str_predicate(seed: &Path, cwd: &Path) {
