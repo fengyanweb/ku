@@ -179,7 +179,7 @@ fn RecordLinkedMemberMove(state: LinkedNullState, &value: LinkedNullValue): Link
 }
 
 fn MoveLinkedNullSlot(state: LinkedNullState, &value: LinkedNullValue): LinkedNullState! {
-    if (ContainsIndex(state.callback_owners, value.slot) || ContainsIndex(state.append_captures, value.slot)) {
+    if (LinkedNullOwner(value.ty) && (ContainsIndex(state.callback_owners, value.slot) || ContainsIndex(state.append_captures, value.slot))) {
         RejectLayout("linked_callback_owner", "cannot move an array captured by a local callback", value.ty.span.clone())?
     }
     if (value.borrowed && (value.member_path == "" || !LinkedNullOwner(value.ty))) {

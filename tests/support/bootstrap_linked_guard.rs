@@ -3610,7 +3610,8 @@ fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [
     left = Append(first, second, 3, Location { line: 2 }, choices)?
     cursor = 8
     Close(ClosingToken { kind: third, lexeme: fourth, score: 0 - 5 })?
-    return ok(left * 1000 + cursor * 100 + nodes.len() + edges.len() + cursor)
+    first_score = nodes[0].score
+    return ok(left * 1000 + cursor * 100 + nodes.len() + edges.len() + cursor + first_score)
 }
 "#;
     let file = cwd.join("append-thunk.ku");
@@ -3666,7 +3667,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     KuBootstrapResult_int64_t first = run(false, -1);
-    assert(first.ok && first.value == 9125 && !outstanding());
+    assert(first.ok && first.value == 9135 && !outstanding());
     KuBootstrapResult_int64_t next = run(true, -1);
     assert(!next.ok && next.error.domain.len == 1 && *next.error.domain.ptr == 'C');
     assert(next.error.code.len == 1 && *next.error.code.ptr == 'C');
@@ -3677,7 +3678,7 @@ int main(int argc, char **argv) {
     ku_projection_string_drop(&next.error.message);
     assert(!outstanding());
     KuBootstrapResult_int64_t last = run(false, -1);
-    assert(last.ok && last.value == 9125 && !outstanding());
+    assert(last.ok && last.value == 9135 && !outstanding());
     return 0;
 }
 "#
