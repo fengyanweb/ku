@@ -371,26 +371,7 @@ fn main(): null! {
 
 #[test]
 fn unicode_transforms_borrow_input_and_return_independent_strings() {
-    let source = r#"
-import { string } from "std"
-
-fn Namespace(&text: str): str {
-    return string.trim(text) + "|" + string.lower(text) + "|" + string.upper(text)
-}
-fn Method(&text: str): str {
-    return text.trim() + "|" + text.lower() + "|" + text.upper()
-}
-fn Render(): str {
-    text = "　İΣA清单🙂 "
-    namespace = Namespace(text)
-    method = Method(text)
-    if (text != "　İΣA清单🙂 " || namespace != method) { panic("transform changed its input or output") }
-    return namespace
-}
-fn main() {
-    if (Render() != "İΣA清单🙂|　i̇σa清单🙂 |　İΣA清单🙂 ") { panic("transformed result changed after its input died") }
-}
-"#;
+    let source = include_str!("fixtures/native_string_view_transforms/main.ku");
     accepts(source);
     run_source("borrow-unicode-transforms.ku", source).expect("namespace and method both borrow");
 }

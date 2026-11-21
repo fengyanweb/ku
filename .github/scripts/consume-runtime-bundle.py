@@ -1499,6 +1499,21 @@ def installed_task_array_import_consumer(install, root, env, report, repo, commi
         detail, fixture_sha256=hashlib.sha256(EXPORT.json_bytes({**files, 'expected.txt': expected})).hexdigest())
 
 
+
+def installed_string_view_transforms_consumer(install, root, env, report, repo, commit, target):
+    fixture = 'tests/fixtures/native_string_view_transforms'
+    files = {}
+    for name in ('main.ku', 'expected.txt'):
+        result = invoke(['git', 'show', f'{commit}:{fixture}/{name}'], repo, env)
+        if result.returncode:
+            raise RuntimeError(f'cannot read committed string View fixture: {fixture}/{name}')
+        files[name] = EXPORT.canonical_example(result.stdout).decode('utf-8')
+    expected = files.pop('expected.txt')
+    detail = validate_installed_relative_program(install, root / 'string-view-transforms', env, target, files, expected)
+    report['installed_string_view_transforms'] = dict(
+        detail, fixture_sha256=hashlib.sha256(EXPORT.json_bytes({**files, 'expected.txt': expected})).hexdigest())
+
+
 def installed_build_interrupt_consumer(install, root, repo, env, manifest, report):
     name = 'interrupted_build_reaps_its_compiler_group_and_preserves_previous_output'
     ku = install / manifest['cli']['path']
@@ -1671,6 +1686,7 @@ def run_structured_only(args, report):
             installed_task_optional_consumer(install, root, env, report, target)
             installed_pattern_capture_consumer(install, root, env, report, target)
             installed_task_array_import_consumer(install, root, env, report, repo, verifier, target)
+            installed_string_view_transforms_consumer(install, root, env, report, repo, verifier, target)
             installed_collection_and_copy_consumers(install, root, repo, env, report, target)
     if not args.bootstrap_generations:
         report['backend_equivalence'] = True
