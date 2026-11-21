@@ -582,6 +582,118 @@ int main(void) {
     assert!(String::from_utf8_lossy(&borrowed.stderr).contains("unsupported_linked_operand"));
 }
 
+pub(super) fn assert_checked_int_array_result(seed: &Path, python: &str, cwd: &Path) {
+    fs::write(
+        cwd.join("checked-int-array.ku"),
+        r#"struct Prepared { items: [int] used: int }
+fn Pack(input: [int], count: int): Prepared! {
+    return ok(Prepared { items: input, used: count })
+}
+fn Transfer(held: [int], input: [int], reject: bool): [int]! {
+    used = 0
+    fn Prepare(payload: [int], failing: bool): [int]! {
+        if (failing) { fail { domain: "example", code: "reject", message: "requested error" } }
+        ready = Pack(payload, held.len())?
+        used = ready.used
+        return ok(ready.items)
+    }
+    result = Prepare(input, reject)?
+    if (used != 1) { fail { domain: "example", code: "scope", message: "unshared capture" } }
+    return ok(result)
+}
+fn Forward(held: [int], input: [int], reject: bool): [int]! {
+    result = Transfer(held, input, reject)?
+    return ok(result)
+}
+fn Borrowed(&input: [int]): [int]! { return ok(input) }
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "checked-int-array.ku\n").unwrap();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cc =
+        std::env::var("CC").unwrap_or_else(|_| if cfg!(windows) { "clang" } else { "cc" }.into());
+    let mut link = Command::new(python);
+    link.arg("-B")
+        .arg(repo.join("bootstrap/tools/link_c.py"))
+        .args(["--cc", &cc]);
+    let mut entry = String::new();
+    for name in ["Forward", "Transfer", "Pack"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        if name != "Pack" {
+            assert_eq!(code.matches("} KuBootstrapResult_KuArrayInt;").count(), 1);
+        }
+        if name == "Forward" {
+            entry = code
+                .lines()
+                .find_map(|line| line.strip_prefix("KuBootstrapResult_KuArrayInt "))
+                .unwrap()
+                .split_once('(')
+                .unwrap()
+                .0
+                .to_owned();
+        } else if name == "Transfer" {
+            assert!(code.contains("ku_local_append_"));
+            assert!(!code.contains("_append_move("));
+        }
+        let unit = cwd.join(format!("{name}.c"));
+        fs::write(&unit, code).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+        let planned = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&planned);
+        let plan = cwd.join(format!("{name}.plan.json"));
+        fs::write(&plan, planned.stdout).unwrap();
+        link.arg("--unit").args([plan, unit]);
+    }
+    let host = r#"
+#include <assert.h>
+#include <string.h>
+static KuArrayInt array(int64_t value) {
+    int64_t *data = malloc(sizeof(*data));
+    assert(data);
+    *data = value;
+    return (KuArrayInt){1, data, 1};
+}
+int main(void) {
+    KuArrayInt source = array(42);
+    KuBootstrapResult_KuArrayInt output = ENTRY(array(1), source, false);
+    assert(output.ok && output.value.len == 1 && output.value.data == source.data && output.value.data[0] == 42);
+    ku_linked_view_int_array_drop(&output.value);
+    output = ENTRY(array(1), array(99), true);
+    assert(!output.ok && !output.value.data && output.error.code.len == 6 && !memcmp(output.error.code.ptr, "reject", 6));
+    ku_projection_string_drop(&output.error.domain);
+    ku_projection_string_drop(&output.error.code);
+    ku_projection_string_drop(&output.error.message);
+    return 0;
+}
+"#
+    .replace("ENTRY", &entry);
+    let input = cwd.join("checked-int-array-host.c");
+    let exe = cwd.join(format!("checked-int-array{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&input, host).unwrap();
+    link.arg("--entry")
+        .args([
+            "checked-int-array.ku",
+            entry.strip_prefix("ku_linked_null_").unwrap(),
+        ])
+        .arg("--caller")
+        .arg(input)
+        .arg("-o")
+        .arg(&exe);
+    assert_ok(&execute(&mut link, cwd, 45));
+    assert_ok(&execute(&mut Command::new(exe), cwd, 10));
+    fs::write(cwd.join("function.txt"), "Borrowed").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_result_return"));
+}
+
 pub(super) fn assert_terminal_branch_ownership(seed: &Path, cwd: &Path) {
     fs::write(
         cwd.join("guard-provider.ku"),

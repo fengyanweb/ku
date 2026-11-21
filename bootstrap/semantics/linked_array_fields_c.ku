@@ -45,8 +45,11 @@ fn LowerLinkedFieldAppend(&project: LinkedNullProject, state: LinkedNullState, t
 }
 
 fn LinkedAppendFailureRelay(&body: LinkedNullState): str {
-    text = "    failure->append_status = append_status;\n"
+    text = ""
     calls_append = body.local_appends.len() > 0
+    if (calls_append || body.append_slots.len() > 0 || body.local_append_types.len() > 0) {
+        text = "    failure->append_status = append_status;\n"
+    }
     if (calls_append || body.uses_clone || body.uses_int_snapshot || body.element_clones.len() > 0) {
         text += "    failure->out_of_memory = out_of_memory;\n"
     }

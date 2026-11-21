@@ -6,7 +6,7 @@ import { LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, Linke
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedIntResult, LinkedNullChild, LinkedNullCType, LinkedNullNode,
     LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedStringResult,
     ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { AddLinkedNullSlot, CheckLinkedUnitDecrement, CloneLinkedIntArray, RegisterLinkedNullType } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, CheckLinkedUnitDecrement, CloneLinkedIntArray, LinkedBooleanWhileCondition, RegisterLinkedNullType } from "./linked_parameters_c.ku"
 import { DropLinkedNullScope, LinkedIncreasingGuard, LinkedLiveIntBinding, RejectLinkedLoopWrite, RejectLinkedWriteRange } from "./linked_member_ownership.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
@@ -14,7 +14,7 @@ import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
-import { LinkedBooleanWhileCondition, LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedFreshRecordFor, ReadLinkedLocalCaptures, RejectLocalCapture, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./linked_owner_assignment_c.ku"
+import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedFreshRecordFor, ReadLinkedLocalCaptures, RejectLocalCapture, RestoreLinkedThunkFrame, StartLinkedThunkFrame } from "./linked_owner_assignment_c.ku"
 
 struct LinkedLocalThunk {
     result: TypeNameBinding

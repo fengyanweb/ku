@@ -145,7 +145,7 @@ fn LinkedIntResult(&binding: TypeNameBinding): bool {
 
 fn LinkedNullHasResultValue(&binding: TypeNameBinding): bool {
     return LinkedNullOwnedArray(binding) || binding.declaration_kind == "Struct" || LinkedBufferResult(binding)
-        || LinkedIntResult(binding) || binding.declaration_kind == "OwnedStringArray"
+        || LinkedIntResult(binding) || LinkedNullIntArrayOwner(binding) || binding.declaration_kind == "OwnedStringArray"
 }
 
 fn LinkedNullCType(&binding: TypeNameBinding): str! {
@@ -276,14 +276,7 @@ fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bo
     payload_id = LinkedNullChild(project, unit, node, 0)
     payload = LinkedNullNode(project, unit, payload_id)
     if (payload.kind == "TypeArray") {
-        if (payload.edge_count == 1) {
-            element = LinkedNullType(project, unit, LinkedNullChild(project, unit, payload, 0))?
-            if (LinkedStringResult(element)) {
-                element.declaration_kind = "OwnedStringArray"
-                return ok(element)
-            }
-        }
-        return ReadLinkedOwnedArray(project, unit, payload_id, false, false)
+        return ReadLinkedOwnedArray(project, unit, payload_id, true, true)
     }
     result = LinkedNullType(project, unit, payload_id)?
     if (!LinkedNullHasResultValue(result) && (result.declaration_kind != "Builtin" || result.name != "null")) {
@@ -363,7 +356,7 @@ fn LinkedCheckedResultPlan(&result: TypeNameBinding, unit: int): LinkPlanType! {
     if (!LinkedNullHasResultValue(result)) { return ok(NullLinkPlanResult()) }
     plan = BoundLinkPlanType(result, unit, LinkedCheckedResultCType(result)?, false)
     if (LinkedNullOwnedArray(result)) { plan.kind = "StructArray" }
-    if (result.declaration_kind == "OwnedStringArray") { plan.kind = "BuiltinArray" }
+    if (result.declaration_kind == "OwnedStringArray" || LinkedNullIntArrayOwner(result)) { plan.kind = "BuiltinArray" }
     return ok(plan)
 }
 

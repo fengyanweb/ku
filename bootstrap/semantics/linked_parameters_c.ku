@@ -198,7 +198,7 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
 fn ValidateLinkedPayload(state: LinkedNullState, &result: TypeNameBinding, &payload: str): LinkedNullState {
     next = state
     prefix = "ku_linked_view_str_array"
-    if (LinkedNullOwnedArray(result)) {
+    if (LinkedNullOwnedArray(result) || LinkedNullIntArrayOwner(result)) {
         prefix = LinkedNullArrayPrefix(result)
     } else if (result.declaration_kind != "OwnedStringArray") { return next }
     next = RequireLinkedArrayValidation(next, result.clone())
@@ -362,4 +362,14 @@ fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, 
     }
     output.state.slots[output.value.slot - 1].live = true
     return ok(output)
+}
+
+fn LinkedBooleanWhileCondition(&state: LinkedNullState, &guard: Node): str {
+    if (guard.kind != "Variable" || guard.edge_count != 0) { return "" }
+    index = LinkedNullBinding(state.slots, guard.text)
+    if (index == 0) { return "" }
+    slot = state.slots[index - 1].clone()
+    if (slot.parameter || !slot.live || slot.value.borrowed || slot.moved_members.len() != 0 ||
+        slot.value.ty.declaration_kind != "Builtin" || slot.value.ty.name != "bool") { return "" }
+    return slot.value.text
 }

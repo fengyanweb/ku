@@ -1,7 +1,7 @@
 import { FinishLinkedFunctionC, GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { ScalarCheckedMultiplyC, ScalarStringHelpers } from "./scalar_int_emit.ku"
 import { StructResultHeader, StructValueResultHeader } from "./struct_result_c.ku"
-import { EmitLinkedArrayBody } from "./struct_array_c.ku"
+import { EmitLinkedArrayBody, StructArrayStatuses } from "./struct_array_c.ku"
 import { CTypeName, ContainsType, LinkedFsReadReference } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
@@ -17,7 +17,7 @@ import { LinkedBufferResult, LinkedCheckedResultCType, LinkedIntResult, LinkedNu
          LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullResultType, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { LinkedCPrelude, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullSlot, LinkedNullState, LinkedNullValue,
+import { LinkedCPrelude, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedOkAvailable, LinkedRecordFields } from "./link_plan_c.ku"
 
 fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
@@ -44,7 +44,7 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlo
         index = index + 1
     }
     if (string_result) { text = StructValueResultHeader("KuProjectionString") }
-    if (payload.declaration_kind == "Struct" || (checked && LinkedIntResult(payload))) {
+    if (payload.declaration_kind == "Struct" || (checked && (LinkedIntResult(payload) || LinkedNullIntArrayOwner(payload)))) {
         root = LinkedNullCType(payload)?
         text += StructValueResultHeader(root)
         records = records.push(root)
@@ -69,8 +69,8 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlo
     }
     link_index = 0
     while (link_index < links.len()) {
-        if (links[link_index].returns_result
-            && (links[link_index].result.declaration_kind == "Struct" || LinkedIntResult(links[link_index].result))) {
+        if (links[link_index].returns_result && (links[link_index].result.declaration_kind == "Struct"
+            || LinkedIntResult(links[link_index].result) || LinkedNullIntArrayOwner(links[link_index].result))) {
             kind = LinkedNullCType(links[link_index].result)?
             if (!ContainsType(records, kind)) {
                 text += StructValueResultHeader(kind)
@@ -82,12 +82,16 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlo
     }
     // Local append thunks are private; their carriers belong in the
     // prelude, even when no link dependency or exported result needs one.
-    if (!ContainsType(records, "int64_t")) {
-        local_index = 0
-        while (local_index < locals.len()) {
-            if (LinkedIntResult(locals[local_index].function.result)) { return ok(text + StructValueResultHeader("int64_t")) }
-            local_index = local_index + 1
+    local_index = 0
+    while (local_index < locals.len()) {
+        if (LinkedIntResult(locals[local_index].function.result) || LinkedNullIntArrayOwner(locals[local_index].function.result)) {
+            kind = LinkedNullCType(locals[local_index].function.result)?
+            if (!ContainsType(records, kind)) {
+                text += StructValueResultHeader(kind)
+                records = records.push(kind)
+            }
         }
+        local_index = local_index + 1
     }
     return ok(text)
 }
@@ -103,6 +107,9 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
     }
     header = LinkedCPrelude(body, ops + GuardStringEquality(body.uses_string_equal))
     declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
+    if (body.local_appends.len() > 0 && body.append_slots.len() == 0 && body.local_append_types.len() == 0) {
+        declarations += StructArrayStatuses()
+    }
     if (body.uses_int_snapshot) { declarations += LinkedIntSnapshotRuntime() }
     checked = !body.plain_value_result
     return ok(declarations + EmitLinkedNullPrototypes(body.links, body.slots, body.local_appends, result, checked)?)

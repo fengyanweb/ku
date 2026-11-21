@@ -105,16 +105,6 @@ fn OpenLinkedFreshRecordFor(&project: LinkedNullProject, state: LinkedNullState,
     return ok(LinkedForLoop { state: item.state, outer: outer, before: before })
 }
 
-fn LinkedBooleanWhileCondition(&state: LinkedNullState, &guard: Node): str {
-    if (guard.kind != "Variable" || guard.edge_count != 0) { return "" }
-    index = LinkedNullBinding(state.slots, guard.text)
-    if (index == 0) { return "" }
-    slot = state.slots[index - 1].clone()
-    if (slot.parameter || !slot.live || slot.value.borrowed || slot.moved_members.len() != 0 ||
-        slot.value.ty.declaration_kind != "Builtin" || slot.value.ty.name != "bool") { return "" }
-    return slot.value.text
-}
-
 fn OpenLinkedBooleanWhile(state: LinkedNullState, &statement: Node, condition: str, depth: int): LinkedForLoop! {
     if (depth >= 32) {
         RejectLayout("linked_control_depth", "linked control flow allows at most 32 levels", DeclarationSpan(statement))?
@@ -276,6 +266,9 @@ fn IsLinkedAppendThunk(&project: LinkedNullProject, &function: Node): bool {
             if (node.kind != "TypeResult" || node.edge_count != 1) { return false }
             if (index <= 1) { return true }
             payload = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
+            if (payload.kind == "TypeArray" && payload.edge_count == 1) {
+                payload = LinkedNullNode(project, 1, LinkedNullChild(project, 1, payload, 0))
+            }
             return payload.kind == "TypeName" && payload.text == "int"
         }
         index += 1
@@ -291,9 +284,10 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     null_result = parameters.result.declaration_kind == "Builtin" && parameters.result.name == "null"
     nullary = null_result && parameters.body_start == 1
     record_input = null_result && parameters.body_start == 2 && slots[0].value.ty.declaration_kind == "Struct"
+    int_result = LinkedIntResult(parameters.result) || LinkedNullIntArrayOwner(parameters.result)
     if (parameters.state.plain_value_result || (!nullary && !record_input &&
-        (!LinkedIntResult(parameters.result) || slots.len() == 0 || slots.len() > 8))) {
-        RejectLocalCapture(function, "a local append function requires int! with one to eight arguments, or null! with zero arguments or one owned record")?
+        (!int_result || slots.len() == 0 || slots.len() > 8))) {
+        RejectLocalCapture(function, "a local append function requires int! or [int]! with one to eight arguments, or null! with zero arguments or one owned record")?
     }
     // Direct synchronous calls use the ordinary owning argument slots.
     // Views and callable descriptors still require a separate lifetime proof.
@@ -360,7 +354,8 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
 fn FinishLinkedAppendThunk(&parent: LinkedNullState, &thunk: LinkedAppendThunk,
                            lowered: LinkedNullRegion, &function: Node, id: int): LinkedNullState! {
     next = lowered.state
-    if (!lowered.terminal || next.append_slots.len() == 0 || next.uses_print || next.uses_chars ||
+    if (!lowered.terminal || (next.append_slots.len() == 0 && !LinkedNullIntArrayOwner(thunk.result)) ||
+        next.uses_print || next.uses_chars ||
         next.uses_str_view || next.uses_struct_view || next.uses_concat || next.uses_div) {
         RejectLocalCapture(function, "a local append function needs checked exits and append-only captured array effects")?
     }

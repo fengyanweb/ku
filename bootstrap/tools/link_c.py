@@ -98,12 +98,11 @@ class TypeRef:
                     c_type[len("const "):-1].rstrip() == view_carrier)
             owned = (name == "str" and checked_result and passing == "value" and
                      c_type == "KuBootstrapResultStringArray")
-            owned_int = (name == "int" and not checked_result and passing == "value" and
-                         c_type == "KuArrayInt")
+            int_array = "KuBootstrapResult_KuArrayInt" if checked_result else "KuArrayInt"
+            owned_int = name == "int" and passing == "value" and c_type == int_array
             if (ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0
                     or not (view or owned or owned_int)):
-                raise LinkError(f"{where} builtin array requires the checked View [str] carrier, "
-                                "the View or owned [int] carrier, or the checked owned [str]! result carrier")
+                raise LinkError(f"{where} builtin array requires a matching readonly or owned C carrier")
             identity = ("builtin_array", name)
         elif ref["kind"] in ("Struct", "StructArray"):
             identity = ("struct" if ref["kind"] == "Struct" else "struct_array",
