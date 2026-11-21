@@ -3595,6 +3595,12 @@ fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [
         nodes = nodes.push(item)
         return ok(nodes.len() + cursor)
     }
+    fn AppendWithOrigin(kind: str, text: str, score: int, location: Location, children: [int], origin: ClosingToken): int! {
+        added = Append(kind, text, score, location, children)?
+        edge = origin.score
+        edges = edges.push(edge)
+        return ok(added)
+    }
     fn Advance(): null! {
         edges = edges.push(cursor)
         cursor = cursor + 1
@@ -3603,7 +3609,8 @@ fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [
     fn Close(token: ClosingToken): null! {
         Advance()?
         added = 0
-        added = Append(token.kind, token.lexeme, token.score, Location { line: 5 }, [cursor, cursor, cursor])?
+        added = AppendWithOrigin(token.kind, token.lexeme, token.score, Location { line: 5 }, [cursor, cursor],
+                                 ClosingToken { kind: "结束", lexeme: "🙂", score: cursor })?
         edges = edges.push(added)
         cursor = added
         return ok(null)
@@ -3718,6 +3725,11 @@ int main(int argc, char **argv) {
             "linked_dependency_result",
         ),
         ("Advance()?", "Advance(9)?", "linked_local_append_arity"),
+        (
+            "ClosingToken { kind: \"结束\", lexeme: \"🙂\", score: cursor }",
+            "cursor",
+            "linked_argument_type",
+        ),
         (
             "Advance()?\n        added = 0",
             "alias = Advance\n        Advance()?\n        added = 0",

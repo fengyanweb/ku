@@ -268,6 +268,21 @@ struct LinkedAppendBody {
     thunk: LinkedAppendThunk
 }
 
+fn IsLinkedAppendThunk(&project: LinkedNullProject, &function: Node): bool {
+    index = 0
+    while (index < function.edge_count - 1) {
+        node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
+        if (node.kind != "Parameter") {
+            if (node.kind != "TypeResult" || node.edge_count != 1) { return false }
+            if (index <= 1) { return true }
+            payload = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
+            return payload.kind == "TypeName" && payload.text == "int"
+        }
+        index += 1
+    }
+    return false
+}
+
 fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
                          &function: Node, id: int): LinkedAppendBody! {
     parameters = ReadLinkedNullParametersFrom(project, function, StartLinkedThunkFrame(parent))?
@@ -276,20 +291,21 @@ fn ReadLinkedAppendThunk(&project: LinkedNullProject, &parent: LinkedNullState,
     null_result = parameters.result.declaration_kind == "Builtin" && parameters.result.name == "null"
     nullary = null_result && parameters.body_start == 1
     record_input = null_result && parameters.body_start == 2 && slots[0].value.ty.declaration_kind == "Struct"
-    if (parameters.state.plain_value_result ||
-        (!nullary && !record_input && (parameters.body_start != 6 || !LinkedIntResult(parameters.result)))) {
-        RejectLocalCapture(function, "a local append function requires null! with zero arguments or one owned record, or a five-argument int!")?
+    if (parameters.state.plain_value_result || (!nullary && !record_input &&
+        (!LinkedIntResult(parameters.result) || slots.len() == 0 || slots.len() > 8))) {
+        RejectLocalCapture(function, "a local append function requires int! with one to eight arguments, or null! with zero arguments or one owned record")?
     }
-    if (!nullary && !record_input) {
-        span = slots[3].value.clone()
-        if (!LinkedStringResult(slots[0].value.ty) || !LinkedStringResult(slots[1].value.ty) ||
-            !LinkedIntResult(slots[2].value.ty) || span.ty.declaration_kind != "Struct" ||
-            LinkedNullDropC(parameters.state.layouts, parameters.state.owning_layouts, span.ty, span.text) != "" ||
-            !LinkedNullIntArrayOwner(slots[4].value.ty)) {
-            RejectLocalCapture(function, "a five-parameter local append function requires str, str, int, a Copy-layout record and [int]")?
+    // Direct synchronous calls use the ordinary owning argument slots.
+    // Views and callable descriptors still require a separate lifetime proof.
+    for slot in slots {
+        ty = slot.value.ty
+        if (slot.value.borrowed || (ty.declaration_kind != "Struct" && !LinkedIntResult(ty) &&
+            !LinkedStringResult(ty) && !(ty.declaration_kind == "Builtin" && ty.name == "bool") &&
+            !LinkedNullIntArrayOwner(ty) && !LinkedNullOwnedArray(ty))) {
+            RejectLocalCapture(function, "local append arguments require a supported Copy or owning parameter type")?
         }
+        arguments = arguments.push(ty)
     }
-    for slot in slots { arguments = arguments.push(slot.value.ty) }
     body = parameters.state
     environment = "ku_local_append_environment_" + str(id)
     body.code += "    " + environment.clone() + " *const capture = raw;\n"

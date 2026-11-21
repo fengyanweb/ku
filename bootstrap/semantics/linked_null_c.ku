@@ -16,7 +16,7 @@ import { LinkedBuiltin, LinkedResultPlan, LinkedNullChild, LinkedNullEntry,
          LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { FinishLinkedAppendThunk, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, ReadLinkedAppendThunk, ReadLinkedCatchParts, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
+import { FinishLinkedAppendThunk, IsLinkedAppendThunk, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, ReadLinkedAppendThunk, ReadLinkedCatchParts, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
 import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 
@@ -282,12 +282,7 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             else if (type_node.kind == "TypeFunction") { next = LowerLinkedLocalAlias(project, next, statement)? }
             else { next = LowerLinkedLocal(project, next, statement, id)? }
         } else if (statement.kind == "Function" && depth == 0) {
-            nullary = statement.edge_count >= 2 && linkedChildKindIs(project, statement, 0, "TypeResult")
-            checked_record = statement.edge_count >= 3 &&
-                linkedChildKindIs(project, statement, 0, "Parameter") &&
-                linkedChildKindIs(project, statement, 1, "TypeResult")
-            if (nullary || checked_record ||
-                (statement.edge_count >= 7 && linkedChildKindIs(project, statement, 4, "Parameter"))) {
+            if (IsLinkedAppendThunk(project, statement)) {
                 CheckLinkedLocalFunctionName(project, next, statement)?
                 prepared = ReadLinkedAppendThunk(project, next, statement, id)?
                 thunk = prepared.thunk
