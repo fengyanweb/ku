@@ -1,3 +1,4 @@
+import { LinkedCharacterSource, MaterializeLinkedCharacters } from "./struct_string_calls.ku"
 import { AppendLinkedArrayElement, EmitLinkedClone, InvokeLinkedReader, PrepareLinkedScopedCallbackArgument } from "./linked_array_fields_c.ku"
 import { CheckLinkedScopedCallback, EmitLinkedPlainInvocation, EmitLinkedScopedCallbackCall, LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
 import { CheckedAppendFault, CheckedAppendFaultHandoff, CheckedAppendInvocation, CheckedLinkedCallbackExpression } from "./guarded_string_parts.ku"
@@ -90,6 +91,13 @@ fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
 
 fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: Node, id: int, depth: int): LinkedNullExpression! {
     target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (target.text == "chars") {
+        source = LinkedCharacterSource(project, state, id, true)
+        if (source != 0) {
+            input = LowerLinkedNullValue(project, state, source, depth + 1)?
+            return MaterializeLinkedCharacters(project, input, "t" + str(id), "")
+        }
+    }
     if (target.kind == "Field" && target.text == "clone" && target.edge_count == 1 && call.edge_count == 1) {
         return EmitLinkedClone(project, state, target, id, depth)
     }

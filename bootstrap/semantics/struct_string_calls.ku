@@ -7,7 +7,10 @@ import { OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { BoundLinkPlanType, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { BoundLinkPlanType, LinkedNullBinding, LinkedNullExpression, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
+import { LinkedBuiltin, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedStringResult } from "./linked_null_types_c.ku"
+import { TypeNameBindingWithKind } from "./type_names.ku"
 
 struct StructStringDependency {
     symbol: str
@@ -208,4 +211,40 @@ fn ReadStructStringFold(&supplied: [SuppliedModule], &project: ProjectBindings, 
     separator = foldSeparator(arena, foldChild(arena, iteration, 1), initial.text, first.text)?
     call = foldElementCall(supplied, project, layouts, arena, iteration, param.text, initial.text, first.text, root)?
     return ok(StructStringFold { initial: ScalarStringLiteral(value)?, separator: separator, dependency: call })
+}
+
+fn LinkedCharacterSource(&project: LinkedNullProject, &state: LinkedNullState, id: int, method: bool): int {
+    call = LinkedNullNode(project, 1, id)
+    if (call.kind != "Call" || call.edge_count == 0) { return 0 }
+    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (target.kind != "Field" || target.text != "chars" || target.edge_count != 1) { return 0 }
+    receiver_id = LinkedNullChild(project, 1, target, 0)
+    receiver = LinkedNullNode(project, 1, receiver_id)
+    local = receiver.kind == "Variable" && LinkedNullBinding(state.slots, receiver.text) != 0
+    if (call.edge_count == 1 && method && (local || receiver.kind != "Variable")) { return receiver_id }
+    if (call.edge_count == 2 && receiver.kind == "Variable" && !local) {
+        index = 0
+        while (index < project.binding.modules[0].imports.len()) {
+            if (project.binding.modules[0].imports[index].local_name == receiver.text &&
+                project.binding.modules[0].imports[index].module_index == 0 &&
+                project.binding.modules[0].imports[index].source_name == "string") {
+                return LinkedNullChild(project, 1, call, 1)
+            }
+            index = index + 1
+        }
+    }
+    return 0
+}
+
+fn MaterializeLinkedCharacters(&project: LinkedNullProject, input: LinkedNullExpression, name: str, binding: str): LinkedNullExpression! {
+    if (!LinkedStringResult(input.value.ty)) {
+        RejectLayout("linked_chars_type", "string.chars requires a str input", input.value.ty.span.clone())?
+    }
+    ty = TypeNameBindingWithKind(LinkedBuiltin("str", input.value.ty.span.clone()), "OwnedStringArray")
+    output = AddLinkedNullSlot(project, input.state, binding, name, ty, false)?
+    output.state.uses_chars = true
+    output.state.slots[output.value.slot - 1].live = true
+    output.state.code += "    source_status = ku_managed_source_chars(" + input.value.text + ", &" + output.value.text.clone() + ");\n"
+        + "    if (source_status != KU_SOURCE_OK) goto cleanup;\n"
+    return ok(output)
 }

@@ -1,7 +1,8 @@
+import { LinkedCharacterSource } from "./struct_string_calls.ku"
 import { RegisterLinkedLocalRead } from "./linked_array_fields_c.ku"
 import { RequireLinkedMutableName } from "./call_contracts.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, ReadLinkedNullParameters } from "./linked_parameters_c.ku"
-import { OpenLinkedForLoop, OpenLinkedConditionalWhile, ReadLinkedWhileCondition, CloseLinkedForLoop, LinkedCountdownIndex, LinkedCountedInitial, ValidLinkedCountedStart, ReadLinkedLocalThunk, FinishLinkedLocalThunk, LowerLinkedLocalAlias, LowerLinkedPredicate } from "./linked_char_iter_c.ku"
+import { OpenLinkedForLoop, OpenLinkedConditionalWhile, ReadLinkedWhileCondition, CloseLinkedForLoop, LinkedCountdownIndex, LinkedCountedInitial, ValidLinkedCountedStart, ReadLinkedLocalThunk, FinishLinkedLocalThunk, LowerLinkedLocalAlias, LowerLinkedPredicate, LowerLinkedCharacterLocal } from "./linked_char_iter_c.ku"
 import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedArrayLocal, LowerLinkedTargetSet, LowerLinkedOwnedDestructure,
          LowerLinkedPlainReturn, LowerLinkedStringAppend, LowerLinkedSuccess } from "./linked_function_c.ku"
@@ -279,7 +280,11 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             next = LowerLinkedOwnedDestructure(project, next, statement)?
         } else if (statement.kind == "VarDecl" && statement.edge_count == 2) {
             type_node = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 0))
-            if (type_node.kind == "TypeArray") { next = LowerLinkedArrayLocal(project, next, statement, id)? }
+            if (type_node.kind == "TypeArray") {
+                source = LinkedCharacterSource(project, next, LinkedNullChild(project, 1, statement, 1), true)
+                if (source == 0) { next = LowerLinkedArrayLocal(project, next, statement, id)? }
+                else { next = LowerLinkedCharacterLocal(project, next, statement, id, source)? }
+            }
             else if (type_node.kind == "TypeFunction") { next = LowerLinkedLocalAlias(project, next, statement)? }
             else { next = LowerLinkedLocal(project, next, statement, id)? }
         } else if (statement.kind == "Function" && depth == 0) {
