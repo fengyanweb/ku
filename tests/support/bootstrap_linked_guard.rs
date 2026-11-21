@@ -1372,6 +1372,208 @@ int main(void) {
     assert_ok(&execute(&mut Command::new(binary), cwd, 15));
 }
 
+pub(super) fn assert_conditional_whole_record_move(seed: &Path, cwd: &Path) {
+    fs::write(
+        cwd.join("conditional-record.ku"),
+        r#"struct Parcel { label: str }
+
+fn Receive(parcel: Parcel, fail_now: bool): null! { return ok(null) }
+fn Observe(&parcel: Parcel): null! { return ok(null) }
+fn End(fail_later: bool): null! { return ok(null) }
+
+fn Handle(move: bool, fail_now: bool, fail_later: bool, parcel: Parcel): null! {
+    if (move) {
+        Receive(parcel, fail_now)?
+    } else {
+        Observe(parcel)?
+    }
+    End(fail_later)?
+    return ok(null)
+}
+
+fn Replace(move: bool, parcel: Parcel, replacement: Parcel): null! {
+    if (move) { Receive(parcel, false)? }
+    parcel = replacement
+    Observe(parcel)?
+    return ok(null)
+}
+
+fn InvalidRead(move: bool, parcel: Parcel): null! {
+    if (move) { Receive(parcel, false)? }
+    Observe(parcel)?
+    return ok(null)
+}
+
+fn InvalidBorrow(move: bool, parcel: Parcel): null! {
+    if (move) { Receive(parcel, false)? }
+    alias: Parcel = parcel.clone()
+    Observe(alias)?
+    return ok(null)
+}
+
+fn InvalidBackedge(move: bool, upper: int, parcel: Parcel): null! {
+    count = 0
+    while (count < upper) {
+        if (move) { Receive(parcel, false)? }
+        count = count + 1
+    }
+    return ok(null)
+}
+
+fn TakeLabel(label: str): null! { return ok(null) }
+fn InvalidPartial(move: bool, parcel: Parcel): null! {
+    if (move) { Receive(parcel, false)? }
+    else { TakeLabel(parcel.label)? }
+    return ok(null)
+}
+
+fn InvalidView(move: bool, &parcel: Parcel): null! {
+    if (move) { Receive(parcel, false)? }
+    return ok(null)
+}
+
+fn TakeArray(boxes: [Parcel]): null! { return ok(null) }
+fn InvalidArray(move: bool, boxes: [Parcel]): null! {
+    if (move) { TakeArray(boxes)? }
+    return ok(null)
+}
+
+fn ReboundStep(move: bool, count: int, parcel: Parcel): null! {
+    step = 0
+    while (step < count) {
+        next = parcel.clone()
+        if (move) { Receive(parcel, false)? }
+        parcel = next
+        step = step + 1
+    }
+    Observe(parcel)?
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("modules.txt"), "conditional-record.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+
+    for name in ["Handle", "Replace", "ReboundStep"] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let emitted = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&emitted);
+        let code = String::from_utf8(emitted.stdout).unwrap();
+        let mut dependencies = code
+            .lines()
+            .filter_map(|line| line.strip_prefix("extern KuBootstrapResultNull "))
+            .filter_map(|signature| signature.split_once('('));
+        let (consume, parameters) = dependencies.next().unwrap();
+        let record = parameters.split_once(',').unwrap().0;
+        let (observe, _) = dependencies.next().unwrap();
+        let end = if let Some((symbol, _)) = dependencies.next() {
+            symbol
+        } else {
+            "unused_final_check"
+        };
+        let entry = code
+            .lines()
+            .find_map(|line| line.strip_prefix("KuBootstrapResultNull "))
+            .and_then(|signature| signature.split_once('('))
+            .unwrap()
+            .0;
+        let host = r#"
+static unsigned consumed, observed, final_checks;
+static unsigned live_before_final;
+static uint8_t expected;
+
+static __RECORD__ parcel(uint8_t byte) {
+    uint8_t *label = malloc(1);
+    *label = byte;
+    return (__RECORD__){{label,1,1,KU_PROJECTION_STRING_OWNED}};
+}
+KuBootstrapResultNull __CONSUME__(__RECORD__ value, bool fail_now) {
+    ++consumed;
+    assert(value.f0.len == 1 && *value.f0.ptr == 3);
+    if (fail_now) return (KuBootstrapResultNull){.error={.message=value.f0}};
+    ku_projection_string_drop(&value.f0);
+    return (KuBootstrapResultNull){.ok=true};
+}
+KuBootstrapResultNull __OBSERVE__(const __RECORD__ *value) {
+    ++observed;
+    assert(value->f0.len == 1 && *value->f0.ptr == expected);
+    return (KuBootstrapResultNull){.ok=true};
+}
+KuBootstrapResultNull __END__(bool fail_later) {
+    ++final_checks;
+    assert(outstanding() == (int)live_before_final);
+    if (fail_later) return (KuBootstrapResultNull){.error={.message=parcel(8).f0}};
+    return (KuBootstrapResultNull){.ok=true};
+}
+int main(void) {
+    (void)test_realloc;
+#if __REPLACE__
+    expected = 9;
+    assert(__ENTRY__(false,parcel(3),parcel(9)).ok);
+    assert(!outstanding() && consumed == 0 && observed == 1);
+    assert(__ENTRY__(true,parcel(3),parcel(9)).ok);
+    assert(!outstanding() && consumed == 1 && observed == 2);
+#elif __REBOUND__
+    expected = 3;
+    assert(__ENTRY__(true,2,parcel(3)).ok);
+    assert(!outstanding() && consumed == 2 && observed == 1);
+    assert(__ENTRY__(false,2,parcel(3)).ok);
+    assert(!outstanding() && consumed == 2 && observed == 2);
+#else
+    expected = 3;
+    for (unsigned move = 0; move < 2; ++move) {
+        live_before_final = move ? 0 : 1;
+        assert(__ENTRY__(move,false,false,parcel(3)).ok);
+        assert(!outstanding());
+        KuBootstrapResultNull late = __ENTRY__(move,false,true,parcel(3));
+        assert(!late.ok && outstanding() == 1 && *late.error.message.ptr == 8);
+        ku_projection_string_drop(&late.error.message);
+        assert(!outstanding());
+    }
+    assert(consumed == 2 && observed == 2 && final_checks == 4);
+    KuBootstrapResultNull early = __ENTRY__(true,true,false,parcel(3));
+    assert(!early.ok && consumed == 3 && final_checks == 4);
+    assert(outstanding() == 1 && *early.error.message.ptr == 3);
+    ku_projection_string_drop(&early.error.message);
+    assert(!outstanding());
+#endif
+    return 0;
+}
+"#
+        .replace("__ENTRY__", entry)
+        .replace("__RECORD__", record)
+        .replace("__CONSUME__", consume)
+        .replace("__OBSERVE__", observe)
+        .replace("__END__", end)
+        .replace("__REBOUND__", if name == "ReboundStep" { "1" } else { "0" })
+        .replace("__REPLACE__", if name == "Replace" { "1" } else { "0" });
+        let source = cwd.join("conditional-record.c");
+        let exe = cwd.join(format!(
+            "conditional-record{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+        compile_projection(&source, &exe, cwd);
+        assert_ok(&execute(&mut Command::new(exe), cwd, 15));
+    }
+
+    for (name, diagnostic) in [
+        ("InvalidRead", "unavailable_linked_binding"),
+        ("InvalidBorrow", "unavailable_linked_binding"),
+        ("InvalidBackedge", "linked_control_move"),
+        ("InvalidPartial", "linked_control_move"),
+        ("InvalidView", "linked_view_escape"),
+        ("InvalidArray", "linked_control_move"),
+    ] {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        let rejected = execute(&mut Command::new(seed), cwd, 30);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+    }
+}
+
 const ADD_CALL_SOURCE: &str = r#"import { Decorate, Suffix } from "./plus-provider.ku"
 fn Compose(path: str): str! {
     result = Decorate(path) + Suffix(1)

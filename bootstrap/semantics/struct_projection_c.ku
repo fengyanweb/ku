@@ -36,6 +36,20 @@ fn ContainsType(&names: [str], &name: str): bool {
     return false
 }
 
+fn ContainsAllTypes(&members: [str], &possible: [str]): bool {
+    if (members.len() > possible.len()) { return false }
+    index = 0
+    while (index < members.len()) {
+        if (!ContainsType(possible, members[index])) { return false }
+        index = index + 1
+    }
+    return true
+}
+
+fn OnlyWholeMemberMoves(&members: [str]): bool {
+    return members.len() == 0 || (members.len() == 1 && members[0] == "")
+}
+
 fn StringField(&field: TypeNameBinding): bool {
     return field.declaration_kind == "Builtin" && field.name == "str"
 }

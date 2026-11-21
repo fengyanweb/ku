@@ -2,7 +2,7 @@ import { Node } from "../stage2/ast.ku"
 import { LinkedLocalReadCaptures } from "./call_contracts.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
-import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
+import { ContainsIndex, ContainsType, ContainsAllTypes, OnlyWholeMemberMoves } from "./struct_projection_c.ku"
 import { GuardOwnedDrops, ScalarGuardSlotMove } from "./guarded_struct_c.ku"
 import { OwningLayoutDropName } from "./nested_struct_c.ku"
 import { SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
@@ -112,27 +112,20 @@ fn MergeLinkedGuardOwners(state: LinkedNullState, &outer: [LinkedNullSlot], &sta
     return ok(next)
 }
 
-fn linkedMovedMembersContained(&members: [str], &possible: [str]): bool {
-    if (members.len() > possible.len()) { return false }
-    index = 0
-    while (index < members.len()) {
-        if (!ContainsType(possible, members[index])) { return false }
-        index = index + 1
-    }
-    return true
-}
-
 fn joinedLinkedMemberMoves(&first: LinkedNullSlot, &second: LinkedNullSlot, &statement: Node): [str]! {
-    if (first.value.ty.declaration_kind == "Builtin" && first.value.ty.name == "str" &&
-        SameLinkedType(first.value.ty, second.value.ty) && !first.value.borrowed && !second.value.borrowed) {
-        // A whole str may have been handed off. Both runtime carriers remain
-        // safe to drop because the arm transferring it zeros the source.
+    same_owner = SameLinkedType(first.value.ty, second.value.ty) && !first.value.borrowed && !second.value.borrowed
+    string_owner = first.value.ty.declaration_kind == "Builtin" && first.value.ty.name == "str"
+    record_move = first.value.ty.declaration_kind == "Struct" && first.live != second.live
+        && OnlyWholeMemberMoves(first.moved_members) && OnlyWholeMemberMoves(second.moved_members)
+    if (same_owner && (string_owner || record_move)) {
+        // Unavailable for every later read. Cleanup still sees a live slot:
+        // the arm transferring its owner zeroes the runtime carrier.
         return ok([""])
     }
     if (first.live && second.live && !first.value.borrowed && !second.value.borrowed
         && first.value.ty.declaration_kind == "Struct" && SameLinkedType(first.value.ty, second.value.ty)) {
-        if (linkedMovedMembersContained(first.moved_members, second.moved_members)) { return ok(second.moved_members.clone()) }
-        if (linkedMovedMembersContained(second.moved_members, first.moved_members)) { return ok(first.moved_members.clone()) }
+        if (ContainsAllTypes(first.moved_members, second.moved_members)) { return ok(second.moved_members.clone()) }
+        if (ContainsAllTypes(second.moved_members, first.moved_members)) { return ok(first.moved_members.clone()) }
     }
     RejectLayout("linked_control_move", "conditional code cannot consume an outer owner", DeclarationSpan(statement))?
     return ok([])
