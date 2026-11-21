@@ -17,7 +17,7 @@ import { LinkedBufferResult, LinkedCheckedResultCType, LinkedIntResult, LinkedNu
          LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullResultType, LinkedStringResult, ReadLinkedOwnedArray, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { LinkedCPrelude, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
+import { LinkedCPrelude, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullSlot, LinkedNullState, LinkedNullValue,
          LinkedOkAvailable, LinkedRecordFields, ReadLinkedNullBinding } from "./link_plan_c.ku"
 
 fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
@@ -34,7 +34,7 @@ fn LinkedNullPrototype(&callee: LinkedNullFunction): str! {
 }
 
 fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlot],
-                            &payload: TypeNameBinding, checked: bool): str! {
+                            &locals: [LinkedLocalAppend], &payload: TypeNameBinding, checked: bool): str! {
     text = ""
     records: [str] = []
     string_result = LinkedBufferResult(payload)
@@ -78,6 +78,13 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlo
         }
         text += LinkedNullPrototype(dependency)?
     }
+    // Local append thunks are private; their carriers belong in the
+    // prelude, even when no link dependency or exported result needs one.
+    if (!ContainsType(records, "int64_t")) {
+        for helper in locals.clone() {
+            if (LinkedIntResult(helper.function.result)) { return ok(text + StructValueResultHeader("int64_t")) }
+        }
+    }
     return ok(text)
 }
 
@@ -94,7 +101,7 @@ fn EmitLinkedNullDeclarations(&body: LinkedNullState, &result: TypeNameBinding):
     declarations = EmitLinkedArrayBody(body, header, StructResultHeader())?
     if (body.uses_int_snapshot) { declarations += LinkedIntSnapshotRuntime() }
     checked = !body.plain_value_result
-    return ok(declarations + EmitLinkedNullPrototypes(body.links, body.slots, result, checked)?)
+    return ok(declarations + EmitLinkedNullPrototypes(body.links, body.slots, body.local_appends, result, checked)?)
 }
 
 fn EmitLinkedFunction(&body: LinkedNullState, &symbol: str, &signature: str, &payload: TypeNameBinding): str! {

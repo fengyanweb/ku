@@ -3581,8 +3581,9 @@ pub(super) fn assert_local_append_thunk(seed: &Path, cwd: &Path) {
     let body = r#"struct Location { line: int }
 struct Entry { kind: str, text: str, score: int, location: Location, first: int }
 struct ClosingToken { kind: str, lexeme: str, score: int }
+struct Outcome { total: int }
 
-fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [int], reject: bool): int! {
+fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [int], reject: bool): Outcome! {
     nodes: [Entry] = []
     edges: [int] = []
     cursor = 7
@@ -3611,7 +3612,7 @@ fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [
     cursor = 8
     Close(ClosingToken { kind: third, lexeme: fourth, score: 0 - 5 })?
     first_score = nodes[0].score
-    return ok(left * 1000 + cursor * 100 + nodes.len() + edges.len() + cursor + first_score)
+    return ok(Outcome { total: left * 1000 + cursor * 100 + nodes.len() + edges.len() + cursor + first_score })
 }
 "#;
     let file = cwd.join("append-thunk.ku");
@@ -3622,13 +3623,12 @@ fn Run(first: str, second: str, third: str, fourth: str, choices: [int], more: [
     let positive = execute(&mut Command::new(seed), cwd, 30);
     assert_ok(&positive);
     let code = String::from_utf8(positive.stdout).unwrap();
-    let entry = code
+    let (outcome, signature) = code
         .lines()
-        .find_map(|line| line.strip_prefix("KuBootstrapResult_int64_t ku_linked_null_"))
-        .unwrap()
-        .split_once('(')
-        .unwrap()
-        .0;
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, _) = signature.split_once('(').unwrap();
+    assert_eq!(code.matches("} KuBootstrapResult_int64_t;").count(), 1);
     assert!(code.contains("_append_move(&(*capture->"));
     assert!(code.contains("&environment"));
     assert!(code.contains("(capture->f"));
@@ -3651,7 +3651,7 @@ static KuArrayInt children(size_t len, int64_t first) {
     for (size_t i = 0; i < len; ++i) data[i] = first + (int64_t)i;
     return (KuArrayInt){len, data, len};
 }
-static KuBootstrapResult_int64_t run(bool reject, int allocation_before_failure) {
+static OUTCOME run(bool reject, int allocation_before_failure) {
     KuProjectionString a = owned('A'), b = owned('B'), c = owned('C'), d = owned('D');
     KuArrayInt left = children(7, 1), right = children(3, 8);
     if (allocation_before_failure >= 0) {
@@ -3666,9 +3666,9 @@ int main(int argc, char **argv) {
         (void)run(false, !strcmp(argv[1], "fail-snapshot") ? 4 : 5);
         return 2;
     }
-    KuBootstrapResult_int64_t first = run(false, -1);
-    assert(first.ok && first.value == 9135 && !outstanding());
-    KuBootstrapResult_int64_t next = run(true, -1);
+    OUTCOME first = run(false, -1);
+    assert(first.ok && first.value.f0 == 9135 && !outstanding());
+    OUTCOME next = run(true, -1);
     assert(!next.ok && next.error.domain.len == 1 && *next.error.domain.ptr == 'C');
     assert(next.error.code.len == 1 && *next.error.code.ptr == 'C');
     assert(next.error.message.len == 1 && *next.error.message.ptr == 'D');
@@ -3677,12 +3677,13 @@ int main(int argc, char **argv) {
     ku_projection_string_drop(&next.error.code);
     ku_projection_string_drop(&next.error.message);
     assert(!outstanding());
-    KuBootstrapResult_int64_t last = run(false, -1);
-    assert(last.ok && last.value == 9135 && !outstanding());
+    OUTCOME last = run(false, -1);
+    assert(last.ok && last.value.f0 == 9135 && !outstanding());
     return 0;
 }
 "#
-    .replace("ENTRY", &format!("ku_linked_null_{entry}"));
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"))
+    .replace("OUTCOME", outcome);
     let source = cwd.join("append-thunk.c");
     let program = cwd.join(format!("append-thunk{}", std::env::consts::EXE_SUFFIX));
     fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
