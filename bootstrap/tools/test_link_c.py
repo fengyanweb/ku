@@ -439,6 +439,63 @@ int main(void) {
                          .update(c_type="KuProjectionString", passing="value"))
         self.assert_preflight_error([*units, *feature], "signature mismatch for std/string.ku#2")
 
+    def test_builtin_bytes_preserves_raw_data_and_has_a_distinct_plan_type(self):
+        view_type = "const KuProjectionString*"
+        text = dict(builtin("str", view_type), passing="view")
+        data = dict(builtin("bytes", view_type), passing="view")
+        take = declaration("std/bytes.ku", 3, "take_bytes", [text])
+        take["signature"].update(result=builtin("bytes", "KuBootstrapResult_KuProjectionString"),
+                                 returns_result=True)
+        at = declaration("std/bytes.ku", 4, "byte_at", [data, builtin()])
+        at["signature"].update(result=builtin("int", "KuBootstrapResult_int64_t"), returns_result=True)
+        entry = declaration("app.ku", 58, "verify_bytes", [])
+        units = self.unit("raw-bytes", plan(entry, [take, at]), """
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+typedef struct { uint8_t *ptr; size_t len, capacity; uint8_t storage; } KuProjectionString;
+typedef struct { KuProjectionString domain, code, message; } KuBootstrapError;
+typedef struct { bool ok; KuProjectionString value; KuBootstrapError error; } KuBootstrapResult_KuProjectionString;
+typedef struct { bool ok; int64_t value; KuBootstrapError error; } KuBootstrapResult_int64_t;
+extern KuBootstrapResult_KuProjectionString take_bytes(const KuProjectionString *);
+extern KuBootstrapResult_int64_t byte_at(const KuProjectionString *, int64_t);
+static void reject(const KuProjectionString *data, int64_t index) {
+    KuBootstrapResult_int64_t result = byte_at(data, index);
+    assert(!result.ok && result.error.domain.len == 5 && !memcmp(result.error.domain.ptr, "bytes", 5));
+    assert(result.error.code.len == 19 && !memcmp(result.error.code.ptr, "index_out_of_bounds", 19));
+}
+int64_t verify_bytes(void) {
+    const uint8_t source[] = {'K', 0, 0xe4, 0xb8, 0xad, 0xf0, 0x9f, 0x99, 0x82};
+    uint8_t *input = malloc(sizeof source);
+    assert(input);
+    memcpy(input, source, sizeof source);
+    const KuProjectionString text = {input, sizeof source, sizeof source, 1};
+    KuBootstrapResult_KuProjectionString result = take_bytes(&text);
+    assert(result.ok && result.value.ptr != input && result.value.len == sizeof source);
+    assert(result.value.capacity == sizeof source && result.value.storage == 1);
+    free(input);
+    for (size_t index = 0; index < sizeof source; index++) {
+        KuBootstrapResult_int64_t value = byte_at(&result.value, (int64_t)index);
+        assert(value.ok && value.value == source[index]);
+    }
+    reject(&result.value, -1);
+    reject(&result.value, sizeof source);
+    free(result.value.ptr);
+    return 0;
+}
+""")
+        self.caller.write_text("int main(void) { return verify_bytes() != 0; }\n", encoding="ascii")
+        features = ["--builtin", "bytes.from_str", "--builtin", "bytes.get"]
+        self.assert_preflight_error(units, "missing provider for std/bytes.ku#3")
+        self.assertEqual(link_c.main([*units, *features, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+        self.change_plan(units, lambda p: p["dependencies"][1]["signature"]["parameters"][0]
+                         .update(source_name="str"))
+        self.assert_preflight_error([*units, *features], "signature mismatch for std/bytes.ku#4")
+
     def test_checked_owned_string_array_result_across_two_c_units(self):
         result = dict(builtin("str", "KuBootstrapResultStringArray"), kind="BuiltinArray")
         provider = declaration("parts.ku", 8, "parts", [builtin()])

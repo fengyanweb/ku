@@ -12,7 +12,7 @@ import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedN
 import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
-import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
+import { LinkedBufferResult, LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
          LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullResultType, LinkedStringResult, ReadLinkedOwnedArray, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue } from "./linked_null_values_c.ku"
@@ -36,10 +36,10 @@ fn EmitLinkedNullPrototypes(&links: [LinkedNullFunction], &slots: [LinkedNullSlo
                             &payload: TypeNameBinding, checked: bool): str! {
     text = ""
     records: [str] = []
-    string_result = LinkedStringResult(payload)
+    string_result = LinkedBufferResult(payload)
     index = 0
     while (!string_result && index < links.len()) {
-        string_result = links[index].returns_result && LinkedStringResult(links[index].result)
+        string_result = links[index].returns_result && LinkedBufferResult(links[index].result)
         index = index + 1
     }
     if (string_result) { text = StructValueResultHeader("KuProjectionString") }

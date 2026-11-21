@@ -80,7 +80,9 @@ fn readLinkedMethod(&project: LinkedNullProject, state: LinkedNullState, &call: 
     at = DeclarationSpan(call)
     if (call.edge_count == 1 && (target.text == "len" || target.text == "byte_len")) {
         value = LowerLinkedNullRead(project, next, LinkedNullChild(project, 1, target, 0), depth + 1)?
-        if (target.text == "byte_len" && LinkedStringResult(value.value.ty)) {
+        // The only linked bytes constructor uses the native 64 MiB bound.
+        if ((target.text == "byte_len" && LinkedStringResult(value.value.ty))
+            || (target.text == "len" && value.value.ty.name == "bytes" && value.value.ty.declaration_kind == "Builtin")) {
             return ok(LinkedReadonlyExpression(value.state, LinkedBuiltin("int", at), "(int64_t)(" + value.value.text + ").len"))
         }
         if (target.text == "len" && LinkedStringResult(value.value.ty)) {

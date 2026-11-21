@@ -194,6 +194,7 @@ fn registerOwnedElement(&project: LinkedNullProject, state: LinkedNullState, &el
 
 fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, ty: TypeNameBinding): LinkedNullState! {
     next = state
+    if (ty.declaration_kind == "Builtin" && ty.name == "bytes") { next.owning_strings = true }
     if (ty.declaration_kind == "OwnedStringArray") {
         next.uses_str_array = true
         next.owning_strings = true

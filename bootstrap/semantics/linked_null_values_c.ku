@@ -7,7 +7,7 @@ import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { ReadLinkedNullBinding, AppendLinkedCheckedInvocation, LinkedCheckedCall, LinkedNullArguments, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
-import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
+import { LinkedCallArgument, LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { CloneLinkedLocalArrayItem, CloneLinkedRecord, CloneLinkedRecordArray, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { AddLinkedNullSlot, CheckedLinkedCallbackExpression, LinkedCallableSlot, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix } from "./linked_parameters_c.ku"
@@ -73,7 +73,7 @@ fn LowerLinkedArguments(&project: LinkedNullProject, state: LinkedNullState, &ca
     loans: [LinkedNullValue] = []
     index = 0
     while (index < callee.parameters.len()) {
-        argument_id = LinkedNullChild(project, 1, call, index + 1)
+        argument_id = LinkedCallArgument(project, call, callee, index)
         if (args != "") { args += ", " }
         if (callee.parameters[index].declaration_kind == "IntPairResultCallback") {
             args += forwardLinkedCallback(project, next, argument_id, callee.parameters[index])?

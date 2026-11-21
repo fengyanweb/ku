@@ -43,17 +43,20 @@ fn ScalarValueLiteralC(&node: Node): ScalarLiteral! {
 // Three-digit C octal escapes preserve all UTF-8 bytes and embedded zeros.
 fn ScalarStringLiteral(&node: Node): str! {
     encoded = bytes.from_str(node.text.clone())?
-    if (encoded.len() > 4095) {
+    length = encoded.len()
+    if (length > 4095) {
         RejectScalarInt("string_literal_limit", "standalone C accepts at most 4095 bytes in a string literal", DeclarationSpan(node))?
     }
     literal = "\""
     index = 0
-    while (index < encoded.len()) {
+    while (index < length) {
         byte = encoded.get(index)?
-        literal += "\\" + str(byte / 64) + str((byte / 8) % 8) + str(byte % 8)
+        high = byte / 64
+        pair = byte / 8
+        literal += "\\" + str(high) + str(pair - high * 8) + str(byte - pair * 8)
         index = index + 1
     }
-    return ok(literal + "\", " + str(encoded.len()) + "u")
+    return ok(literal + "\", " + str(length) + "u")
 }
 
 fn ScalarStringOperand(&parameters: [ScalarIntParameter], &node: Node): str! {
@@ -237,5 +240,6 @@ fn LowerScalarStringParts(&nodes: [Node], &edges: [int], &parameters: [ScalarInt
     if (root.kind != "Call" && (root.kind != "Binary" || root.text != "+")) {
         RejectScalarInt("unsupported_string_return", "expected a str literal or checked string composition", DeclarationSpan(root))?
     }
-    return collectStringParts(nodes, edges, parameters, can_convert, root_id, 0, [])
+    empty: [ScalarStringPart] = []
+    return collectStringParts(nodes, edges, parameters, can_convert, root_id, 0, empty)
 }

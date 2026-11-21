@@ -18,7 +18,7 @@ fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &t
             + "    ku_projection_string_drop(&" + name.clone() + ".code);\n"
             + "    ku_projection_string_drop(&" + name.clone() + ".message);\n"
     }
-    if (ty.name == "str" && ty.declaration_kind == "Builtin") {
+    if ((ty.name == "str" || ty.name == "bytes") && ty.declaration_kind == "Builtin") {
         return "    ku_projection_string_drop(&" + name.clone() + ");\n"
     }
     if (ty.declaration_kind == "Struct") {
@@ -37,7 +37,7 @@ fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &t
 }
 
 fn LinkedViewArgument(&parameter: TypeNameBinding, &value: LinkedNullValue): str! {
-    if (parameter.declaration_kind == "StringView" && value.ty.declaration_kind == "Builtin" && value.ty.name == "str"
+    if (parameter.declaration_kind == "StringView" && value.ty.declaration_kind == "Builtin" && value.ty.name == parameter.name
         && (!value.borrowed || value.slot > 0)) {
         return ok("&(" + value.text.clone() + ")")
     }
