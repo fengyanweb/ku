@@ -1289,7 +1289,7 @@ def installed_bootstrap_module_consumer(install, root, env, report, repo, commit
 
 
 def validate_installed_relative_program(install, project, env, target, files, expected, *,
-                                        native_only_diagnostic=None):
+                                        native_only_diagnostic=None, native_c_abi=None):
     project.mkdir()
     for name, contents in files.items():
         (project / name).write_text(contents, encoding='utf-8')
@@ -1302,6 +1302,7 @@ def validate_installed_relative_program(install, project, env, target, files, ex
         run_env = dict(env, PATH=os.pathsep.join((str(system / 'System32'), str(system))))
     outputs = {}
     programs = {}
+    evidence = {}
     for backend in ('c', 'runner'):
         program = project / (backend + ('.exe' if os.name == 'nt' else ''))
         selection = ['--backend', 'runner'] if backend == 'runner' else []
@@ -1311,6 +1312,15 @@ def validate_installed_relative_program(install, project, env, target, files, ex
                                result.stderr.decode('utf-8', errors='replace')[-4096:])
         assert_build_backend(result, backend, 'release')
         programs[backend] = program
+        if backend == 'c' and native_c_abi is not None:
+            prefix = 'native c ok: '
+            paths = [line[len(prefix):] for line in output(result).splitlines() if line.startswith(prefix)]
+            if len(paths) != 1:
+                raise RuntimeError(project.name + ' expected one generated C artifact')
+            generated = (cwd / paths[0]).resolve(strict=True)
+            if not generated.is_relative_to(cwd.resolve()) or generated.suffix != '.c':
+                raise RuntimeError(project.name + ' generated C escaped the consumer workspace')
+            evidence['native_c_abi'] = native_c_abi(generated.read_bytes())
     for mode, command, selected_env in (
         ('interpreter', [ku, 'run', entry], env),
         ('runner', [programs['runner']], env),
@@ -1333,21 +1343,38 @@ def validate_installed_relative_program(install, project, env, target, files, ex
                                repr((observed + result.stderr.decode('utf-8', errors='replace'))[-4096:]))
         outputs[mode] = observed
     return {'status': 'passed', 'outputs': outputs,
-            'native_sources_removed': all(not (project / name).exists() for name in files)}
+            'native_sources_removed': all(not (project / name).exists() for name in files), **evidence}
 
 
-def installed_static_object_fields_consumer(install, root, env, report, repo, commit, target):
-    fixture = 'tests/fixtures/native_static_object_fields'
+def installed_committed_program_consumer(install, root, env, report, repo, commit, target, case, *,
+                                         native_c_abi=None):
+    fixture = f'tests/fixtures/{case}'
     files = {}
     for name in ('main.ku', 'expected.txt'):
         result = invoke(['git', 'show', f'{commit}:{fixture}/{name}'], repo, env)
         if result.returncode:
-            raise RuntimeError(f'cannot read committed static Object fixture: {fixture}/{name}')
+            raise RuntimeError(f'cannot read committed installed fixture: {fixture}/{name}')
         files[name] = EXPORT.canonical_example(result.stdout).decode('utf-8')
     expected = files.pop('expected.txt')
-    detail = validate_installed_relative_program(install, root / 'static-object-fields', env, target, files, expected)
-    report['installed_native_static_object_fields'] = dict(
+    project = root / case.removeprefix('native_').replace('_', '-')
+    detail = validate_installed_relative_program(install, project, env, target, files, expected,
+                                                 native_c_abi=native_c_abi)
+    report['installed_' + case] = dict(
         detail, fixture_sha256=hashlib.sha256(EXPORT.json_bytes({**files, 'expected.txt': expected})).hexdigest())
+
+
+def verify_callback_fields_c(source):
+    code = source.replace(b'\r\n', b'\n')
+    view = b'struct KuClosure_fn_view_str__to_str { KuString (*invoke)(void*, const KuString*);'
+    owned = b'struct KuClosure_fn_str__to_int { int64_t (*invoke)(void*, KuString);'
+    reader = b'struct KuStruct_Reader {\n  KuClosure_fn_view_str__to_str read;\n  KuClosure_fn_str__to_int consume;'
+    index = code.find(reader)
+    if (not 0 <= code.find(view) < index or not 0 <= code.find(owned) < index or
+            b'ku_closure_clone_fn_view_str__to_str(value.read)' not in code):
+        raise RuntimeError('installed callback fields require typed View and owned invoke ABIs and a cloned View field')
+    return {'view_parameter': 'const KuString*', 'owned_parameter': 'KuString',
+            'value_fields_complete': True, 'view_field_retained_on_clone': True,
+            'sha256': hashlib.sha256(source).hexdigest()}
 
 
 def installed_forward_layout_consumer(install, root, env, report, target):
@@ -1620,7 +1647,10 @@ def run_structured_only(args, report):
         manifest = EXPORT.RUNTIME_BUNDLE.verify(install, metadata['version'], metadata['commit'], target)
         report.update(bundle_id=manifest['bundle_id'], sdk_source_sha256=manifest['build_source_sha256'])
         if args.bootstrap_generations:
-            installed_static_object_fields_consumer(install, root, env, report, repo, verifier, target)
+            installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
+                                                 'native_static_object_fields')
+            installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
+                                                 'native_callback_fields', native_c_abi=verify_callback_fields_c)
             verification = repo / 'bootstrap/tools/compiler_driver/selfhost/verify.py'
             cc = env.get('KU_GNU_CC') if target == 'x86_64-pc-windows-gnu' else 'clang'
             if not cc:
