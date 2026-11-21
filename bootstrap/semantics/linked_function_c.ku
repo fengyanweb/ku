@@ -178,7 +178,8 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     // target in the resulting state. The old member still belongs to cleanup
     // if the RHS fails or consumes its record.
     rhs = LowerLinkedNullValue(project, state, rhs_id, 0)?
-    if (nested) { rhs = HoldLinkedCopyOperand(rhs, target_id)? }
+    record = rhs.state.slots[slot - 1].value.ty.declaration_kind == "Struct"
+    if (nested && !(record && LinkedStringResult(rhs.value.ty))) { rhs = HoldLinkedCopyOperand(rhs, target_id)? }
     replacement = rhs.value.clone()
     place = LowerLinkedNullRead(project, rhs.state, target_id, 0)?
     ty = place.value.ty.clone()
@@ -187,7 +188,10 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     if (capture && !copy) {
         RejectLayout("linked_member_target", "a local callback can only assign Copy fields of a captured record", DeclarationSpan(target))?
     }
-    if ((guarded || nested) && !copy) {
+    // A named member path is stable through the guard and excludes indexed
+    // borrows. Only replace an owned string when cleanup still owns its root.
+    owned_string = string && place.value.slot == slot && place.value.member_path != ""
+    if ((guarded || nested) && !copy && !owned_string) {
         RejectLayout("linked_member_target", "guarded or nested assignment requires a Copy int or bool field of a mutable local", DeclarationSpan(target))?
     }
     if (!SameLinkedType(ty, replacement.ty) || (!copy && (!string || replacement.borrowed))) {
