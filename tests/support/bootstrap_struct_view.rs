@@ -742,3 +742,111 @@ int main(void) {
     compile_projection(&c, &exe, cwd);
     assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
 }
+
+const COUNTED_BODY_SOURCE: &str = r#"struct Bound { count: int }
+struct Entry { text: str index: int }
+fn Branch(&bound: Bound, &marker: str): [Entry]! {
+    entries: [Entry] = []
+    i = 0
+    while (i < bound.count) {
+        if (i == 1) {
+            entry = Entry { text: marker.clone(), index: i }
+            entries = entries.push(entry)
+        } else {
+            entry = Entry { text: "other", index: i }
+            entries = entries.push(entry)
+        }
+        i = i + 1
+    }
+    return ok(entries)
+}
+fn Consume(owner: str): null! { return ok(null) }
+fn Lose(&bound: Bound, owner: str): null! {
+    i = 0
+    while (i < bound.count) {
+        Consume(owner)?
+        i = i + 1
+    }
+    return ok(null)
+}
+"#;
+
+const COUNTED_BODY_HOST: &str = r#"
+static void *caller_owned;
+static void after_failure(void) {
+    free(caller_owned);
+    if (outstanding() || attempts != 3) _Exit(88);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    __BOUND__ limit = {3};
+    uint8_t *text = malloc(3);
+    memcpy(text, "A+B", 3);
+    KuProjectionString marker = {text,3,3,KU_PROJECTION_STRING_OWNED};
+    if (argc == 2) {
+        caller_owned = text;
+        fail_after = 1;
+        assert(atexit(after_failure) == 0);
+        (void)__ENTRY__(&limit, &marker);
+        return 89;
+    }
+    __RESULT__ result = __ENTRY__(&limit, &marker);
+    assert(result.ok && result.value.len == 3 && outstanding() == 3);
+    assert(result.value.data[0].f0.len == 5 && result.value.data[2].f0.len == 5);
+    assert(!memcmp(result.value.data[0].f0.ptr, "other", 5));
+    assert(!memcmp(result.value.data[2].f0.ptr, "other", 5));
+    assert(result.value.data[1].f0.len == 3 && result.value.data[1].f0.ptr != marker.ptr);
+    assert(!memcmp(result.value.data[1].f0.ptr, "A+B", 3));
+    for (int64_t i = 0; i < 3; i++) assert(result.value.data[i].f1 == i);
+    __DROP__(&result.value);
+    assert(outstanding() == 1 && limit.f0 == 3 && !memcmp(marker.ptr, "A+B", 3));
+    free(text);
+    assert(!outstanding());
+    return 0;
+}
+"#;
+
+pub(super) fn assert_counted_branch_owners(seed: &Path, cwd: &Path) {
+    fs::write(cwd.join("counted-branch.ku"), COUNTED_BODY_SOURCE).unwrap();
+    fs::write(cwd.join("modules.txt"), "counted-branch.ku\n").unwrap();
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    fs::write(cwd.join("function.txt"), "Branch").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let (result, signature) = code
+        .lines()
+        .find_map(|line| line.split_once(" ku_linked_null_"))
+        .unwrap();
+    let (entry, params) = signature.split_once("(const ").unwrap();
+    let (bound, _) = params.split_once('*').unwrap();
+    let drop = code
+        .lines()
+        .filter_map(|line| line.strip_prefix("static void ku_linked_view_"))
+        .filter_map(|line| line.split_once('('))
+        .find(|(_, params)| params.starts_with("KuArray_"))
+        .unwrap()
+        .0;
+    let host = COUNTED_BODY_HOST
+        .replace("__ENTRY__", &format!("ku_linked_null_{entry}"))
+        .replace("__BOUND__", bound)
+        .replace("__RESULT__", result)
+        .replace("__DROP__", &format!("ku_linked_view_{drop}"));
+    let c = cwd.join("counted-branch.c");
+    let exe = cwd.join(format!("counted-branch{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&c, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{host}")).unwrap();
+    compile_projection(&c, &exe, cwd);
+    assert_ok(&execute(&mut Command::new(&exe), cwd, 15));
+    let failed = execute(Command::new(&exe).arg("oom"), cwd, 15);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stderr).trim(),
+        "out of memory"
+    );
+
+    fs::write(cwd.join("function.txt"), "Lose").unwrap();
+    let rejected = execute(&mut Command::new(seed), cwd, 30);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("linked_control_move"));
+}
