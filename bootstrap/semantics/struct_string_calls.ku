@@ -7,11 +7,12 @@ import { OrderCStructLayouts } from "./nested_struct_c.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { ExplicitType, RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { BoundLinkPlanType, LinkedNullBinding, LinkedNullExpression, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { BoundLinkPlanType, LinkedNullBinding, LinkedNullExpression, LinkedNullOwnedArray, LinkedNullState, LinkPlanDeclaration, LinkPlanType, NullLinkPlanResult } from "./link_plan_c.ku"
+import { LinkedMemberUnavailable } from "./linked_member_ownership.ku"
 import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
 import { LinkedBuiltin, LinkedIntResult, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullView, LinkedStringResult, ResolveLinkedCall } from "./linked_null_types_c.ku"
 import { TypeNameBindingWithKind } from "./type_names.ku"
-import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { FinishLinkedFieldRead, LowerLinkedNullRead, ReadLinkedArrayElementAfterBase } from "./linked_null_read_c.ku"
 
 struct StructStringDependency {
     symbol: str
@@ -258,6 +259,28 @@ fn LinkedStringReplaceApplies(&project: LinkedNullProject, &state: LinkedNullSta
     if (receiver.kind != "Variable") { return false }
     slot = LinkedNullBinding(state.slots, receiver.text)
     return slot > 0 && LinkedStringResult(state.slots[slot - 1].value.ty)
+}
+
+struct LinkedMemberPlace {
+    place: LinkedNullExpression
+    array_owner: int
+}
+
+fn ReadLinkedMemberPlace(&project: LinkedNullProject, state: LinkedNullState, &node: Node): LinkedMemberPlace! {
+    id = LinkedNullChild(project, 1, node, 0)
+    base = LinkedNullNode(project, 1, id)
+    if (base.kind == "Index" && base.edge_count == 2) {
+        array = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, base, 0), 2)?
+        owner = 0
+        if (LinkedNullOwnedArray(array.value.ty) && !array.value.borrowed &&
+            !LinkedMemberUnavailable(array.state, array.value, true)) {
+            owner = array.value.slot
+        }
+        item = ReadLinkedArrayElementAfterBase(project, array, base, id, 1)?
+        return ok(LinkedMemberPlace { place: FinishLinkedFieldRead(project, item, node, true)?, array_owner: owner })
+    }
+    receiver = LowerLinkedNullRead(project, state, id, 1)?
+    return ok(LinkedMemberPlace { place: FinishLinkedFieldRead(project, receiver, node, true)?, array_owner: 0 })
 }
 
 fn LowerLinkedStringReplace(&project: LinkedNullProject, state: LinkedNullState, &call: Node,

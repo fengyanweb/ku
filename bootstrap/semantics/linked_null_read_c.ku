@@ -49,7 +49,7 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
         return readLinkedIndex(project, state, node, id, depth)
     }
     if (node.kind == "Field" && node.edge_count == 1) {
-        return readLinkedField(project, state, node, depth, false)
+        return readLinkedField(project, state, node, depth)
     }
     if (node.kind == "Binary" && node.edge_count == 2) {
         return readLinkedBinary(project, state, node, id, depth)
@@ -135,6 +135,11 @@ fn readLinkedMethod(&project: LinkedNullProject, state: LinkedNullState, &call: 
 
 fn readLinkedIndex(&project: LinkedNullProject, state: LinkedNullState, &node: Node, id: int, depth: int): LinkedNullExpression! {
     array = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
+    return ReadLinkedArrayElementAfterBase(project, array, node, id, depth)
+}
+
+fn ReadLinkedArrayElementAfterBase(&project: LinkedNullProject, array: LinkedNullExpression,
+                                  &node: Node, id: int, depth: int): LinkedNullExpression! {
     index = LowerLinkedNullRead(project, array.state, LinkedNullChild(project, 1, node, 1), depth + 1)?
     return readArrayItem(array.value, index, node, id)
 }
@@ -208,13 +213,13 @@ fn ReadLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalRea
     return ok(output)
 }
 
-fn ReadLinkedMemberPlace(&project: LinkedNullProject, state: LinkedNullState, &node: Node): LinkedNullExpression! {
-    return readLinkedField(project, state, node, 0, true)
+fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: Node, depth: int): LinkedNullExpression! {
+    receiver = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
+    return FinishLinkedFieldRead(project, receiver, node, false)
 }
 
-fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: Node, depth: int,
-                   place: bool): LinkedNullExpression! {
-    receiver = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
+fn FinishLinkedFieldRead(&project: LinkedNullProject, receiver: LinkedNullExpression, &node: Node,
+                         place: bool): LinkedNullExpression! {
     ty = receiver.value.ty.clone()
     if (ty.declaration_kind == "CaughtError") {
         at = DeclarationSpan(node)
