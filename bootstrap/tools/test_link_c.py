@@ -436,6 +436,60 @@ int main(void) {
         self.change_plan(provider, lambda m: m["export"]["signature"]["parameters"][0]["nominals"].reverse())
         self.assert_preflight_error([*units, *provider], "signature mismatch")
 
+    def test_int_arena_callback_preserves_by_value_positions_and_boolean(self):
+        callback = dict(view("KuBootstrapIntArenaCallback_m1_45", "app.ku"),
+                        kind="IntResultArenaCallback", passing="value", node=45, nominals=[
+                            {"source_path": "input.ku", "node": 7, "c_type": "KuStruct_m2_7"},
+                            {"source_path": "marks.ku", "node": 8, "c_type": "KuStruct_m3_8"},
+                        ])
+        alternate = dict(callback, source_path="caller.ku", node=25, c_type="KuBootstrapIntArenaCallback_m4_25")
+        self.assertEqual(link_c.TypeRef.read(callback, "callback").semantic(),
+                         link_c.TypeRef.read(alternate, "callback").semantic())
+        alternate["nominals"] = list(reversed(callback["nominals"]))
+        self.assertNotEqual(link_c.TypeRef.read(callback, "callback").semantic(),
+                            link_c.TypeRef.read(alternate, "callback").semantic())
+        code = """#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+typedef struct { bool ok; int64_t value; } KuBootstrapResult_int64_t;
+typedef struct {
+    int append_status;
+    bool out_of_memory, overflow, index_failed;
+    const char *array_error;
+    int64_t index;
+    size_t length;
+} KuLocalAppendFailure;
+typedef struct { int64_t value; } KuStruct_m2_7;
+typedef struct { int64_t value; } KuStruct_m3_8;
+typedef struct {
+    KuBootstrapResult_int64_t (*entry)(void *, KuLocalAppendFailure *, KuStruct_m2_7, KuStruct_m3_8, bool);
+    void *environment;
+    KuLocalAppendFailure *failure;
+} KuBootstrapIntArenaCallback_m1_45;
+int64_t invoke(KuBootstrapIntArenaCallback_m1_45 f) {
+    KuBootstrapResult_int64_t value = f.entry(f.environment, f.failure, (KuStruct_m2_7){4},
+                                             (KuStruct_m3_8){2}, true);
+    return value.ok ? value.value : -1;
+}
+"""
+        export = declaration("app.ku", 58, "invoke", [callback])
+        unit = self.unit("arena-callback", plan(export), code)
+        self.caller.write_text("""
+static KuBootstrapResult_int64_t count(void *raw, KuLocalAppendFailure *failure,
+    KuStruct_m2_7 first, KuStruct_m3_8 second, bool plus) {
+    (void)failure;
+    int64_t *factor = raw;
+    return (KuBootstrapResult_int64_t){true, (*factor * first.value + second.value) * (plus ? 1 : -1)};
+}
+int main(void) {
+    int64_t factor = 10;
+    KuLocalAppendFailure failure = {0};
+    return invoke((KuBootstrapIntArenaCallback_m1_45){count, &factor, &failure}) != 42;
+}
+""", encoding="ascii")
+        self.assertEqual(link_c.main([*unit, *self.build_args]), 0)
+        subprocess.run([self.output], check=True, timeout=5)
+
     def test_typed_int_array_callback_checks_nominal_argument_and_failure_record(self):
         def callback(module):
             return dict(view(f"KuBootstrapIntArrayCallback_KuStruct_m{module}_9"),
