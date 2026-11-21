@@ -122,6 +122,153 @@ fn doctor_build_identity_uses_only_the_actual_executable() {
         .contains("does not take additional options"));
 }
 
+#[cfg(unix)]
+#[test]
+fn interrupted_build_reaps_its_compiler_group_and_preserves_previous_output() {
+    use std::io::{self, Read};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Child, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
+
+    struct BuildFixture {
+        directory: PathBuf,
+        cli: Option<Child>,
+        compiler: Option<(i32, i32)>,
+    }
+
+    impl Drop for BuildFixture {
+        fn drop(&mut self) {
+            if let Some((compiler, descendant)) = self.compiler {
+                // SAFETY: the fixture recorded this pair in its private directory
+                // and verified the live group at the compile barrier.
+                unsafe {
+                    if libc::getpgid(compiler) == compiler || libc::getpgid(descendant) == compiler
+                    {
+                        libc::kill(-compiler, libc::SIGKILL);
+                    }
+                }
+            }
+            if let Some(cli) = &mut self.cli {
+                let _ = cli.kill();
+                let _ = cli.wait();
+            }
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    let mut fixture = BuildFixture {
+        directory: unique_temp_dir("interrupt-build"),
+        cli: None,
+        compiler: None,
+    };
+    fs::create_dir(&fixture.directory).unwrap();
+    fs::write(
+        fixture.directory.join("main.ku"),
+        "fn main() { println(42) }\n",
+    )
+    .unwrap();
+    let final_output = fixture.directory.join("demo");
+    let previous = b"previous build artifact";
+    fs::write(&final_output, previous).unwrap();
+    let ready = fixture.directory.join("compiler-ready");
+    let compiler = fixture.directory.join("clang");
+    fs::write(
+        &compiler,
+        r#"#!/bin/sh
+for arg do
+    case "$arg" in
+        *.c) source=$arg ;;
+    esac
+    if [ "$previous" = "-o" ]; then output=$arg; fi
+    previous=$arg
+done
+[ -n "$source" ] && [ -n "$output" ] || exit 72
+printf 'incomplete compiler output' > "$output" || exit 73
+/bin/sleep 12 &
+descendant=$!
+printf '%s %s\n' "$$" "$descendant" > "$KU_TEST_BUILD_READY.tmp" || exit 74
+mv "$KU_TEST_BUILD_READY.tmp" "$KU_TEST_BUILD_READY" || exit 75
+wait "$descendant"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut cli = Command::new(ku_binary())
+        .current_dir(&fixture.directory)
+        .env("KU_CC", format!("\"{}\"", compiler.display()))
+        .env("KU_TEST_BUILD_READY", &ready)
+        .args(["build", "--release", "--offline", "main.ku", "-o", "demo"])
+        .stdout(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let stdout = cli.stdout.take().unwrap();
+    fixture.cli = Some(cli);
+    let cli = fixture.cli.as_mut().unwrap();
+    let (reader, capture) = mpsc::sync_channel(1);
+    let drain = thread::spawn(move || {
+        // The tiny fixture emits only a compiler line and no descendant output.
+        let _ = reader.send(io::copy(&mut stdout.take(8192), &mut io::sink()));
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.is_file() {
+        assert!(
+            cli.try_wait().unwrap().is_none(),
+            "build exited before compiling"
+        );
+        assert!(Instant::now() < deadline, "compiler barrier timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let pids = fs::read_to_string(&ready).unwrap();
+    let pids = pids
+        .split_whitespace()
+        .map(|pid| pid.parse::<i32>().unwrap())
+        .collect::<Vec<_>>();
+    let [compiler, descendant] = pids.as_slice() else {
+        panic!("invalid compiler barrier: {pids:?}")
+    };
+    let cli_pid = i32::try_from(cli.id()).unwrap();
+    assert!(*compiler > 1 && *descendant > 1 && *compiler != cli_pid);
+    // SAFETY: both positive PIDs were just published by the owned compiler wrapper.
+    assert_eq!(unsafe { libc::getpgid(*compiler) }, *compiler);
+    assert_eq!(unsafe { libc::getpgid(*descendant) }, *compiler);
+    fixture.compiler = Some((*compiler, *descendant));
+    // SAFETY: cli owns this still-running PID. The compiler receives no direct signal.
+    assert_eq!(unsafe { libc::kill(cli_pid, libc::SIGTERM) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let status = loop {
+        if let Some(status) = cli.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "interrupted CLI did not terminate"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    fixture.cli = None;
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    let captured = capture
+        .recv_timeout(Duration::from_secs(2))
+        .expect("compiler or its descendant still holds the inherited stdout pipe")
+        .unwrap();
+    drain.join().unwrap();
+    assert!(
+        captured < 8192,
+        "compiler pipe check reached the test read limit"
+    );
+    fixture.compiler = None;
+    assert_eq!(fs::read(final_output).unwrap(), previous);
+    assert!(fs::read_dir(&fixture.directory).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".ku-link-")));
+}
+
 fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }

@@ -268,6 +268,40 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.original = b'{"status":"last valid report"}\n'
         self.path.write_bytes(self.original)
 
+    def test_interrupted_build_requires_verified_cli_and_exact_executed_test(self):
+        install = self.root / '安装 SDK'
+        install.mkdir()
+        ku = install / 'ku'
+        ku.write_bytes(b'installed CLI fixture')
+        digest = hashlib.sha256(ku.read_bytes()).hexdigest()
+        toolchain = '1.99.1-x86_64-unknown-linux-gnu'
+        manifest = {'cli': {'path': 'ku', 'sha256': digest}, 'rustc': {'toolchain': toolchain}}
+        repo = self.root / 'sources'
+        name = 'interrupted_build_reaps_its_compiler_group_and_preserves_previous_output'
+        exact = f'running 1 test\ntest {name} ... ok\n'.encode()
+
+        with mock.patch.object(self.consumer, 'invoke', return_value=subprocess.CompletedProcess([], 0, exact, b'')) as invoke:
+            report = {}
+            self.consumer.installed_build_interrupt_consumer(install, self.root, repo, {'KU_BIN': '/old'}, manifest, report)
+            invoke.assert_called_once_with(['cargo', '+' + toolchain, 'test', '--locked', '--color', 'never',
+                                            '--test', 'cli_v002_test', name, '--', '--exact', '--test-threads=1'],
+                                           repo, {'KU_BIN': str(ku), 'CARGO_TARGET_DIR': str(self.root / 'cli-interrupt-target')},
+                                           seconds=600)
+            self.assertEqual(report['installed_build_interrupt'],
+                             {'status': 'passed', 'executable_sha256': digest, 'test': name})
+
+        with mock.patch.object(self.consumer, 'invoke', return_value=subprocess.CompletedProcess([], 0, b'running 0 tests\n', b'')):
+            report = {}
+            with self.assertRaisesRegex(RuntimeError, 'interrupted-build regression failed'):
+                self.consumer.installed_build_interrupt_consumer(install, self.root, repo, {}, manifest, report)
+            self.assertEqual(report['installed_build_interrupt']['status'], 'failed')
+
+        ku.write_bytes(b'other CLI')
+        with mock.patch.object(self.consumer, 'invoke') as invoke:
+            with self.assertRaisesRegex(ValueError, 'differs from the verified SDK'):
+                self.consumer.installed_build_interrupt_consumer(install, self.root, repo, {}, manifest, {})
+            invoke.assert_not_called()
+
     def test_rustup_management_symlink_keeps_invoked_name(self):
         target = self.root / 'rustup-init'
         alias = self.root / 'rustup'

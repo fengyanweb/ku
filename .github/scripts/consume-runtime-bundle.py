@@ -1425,6 +1425,28 @@ fn main(): null! {
         install, root / 'pattern-capture-project', env, target, files, '2\n2\nnull\n2\n0\nnew:tail🙂\n')
 
 
+def installed_build_interrupt_consumer(install, root, repo, env, manifest, report):
+    name = 'interrupted_build_reaps_its_compiler_group_and_preserves_previous_output'
+    ku = install / manifest['cli']['path']
+    digest = EXPORT.file_hash(ku)
+    if digest != manifest['cli']['sha256']:
+        raise ValueError('interrupted build CLI differs from the verified SDK')
+    detail = dict(status='running', executable_sha256=digest, test=name)
+    report['installed_build_interrupt'] = detail
+    # Cargo builds the test harness. Its KU_BIN override selects the verified
+    # archive executable for the actual interrupted build in the test's own workspace.
+    test_env = dict(env, KU_BIN=str(ku), CARGO_TARGET_DIR=str(root / 'cli-interrupt-target'))
+    result = invoke(['cargo', '+' + manifest['rustc']['toolchain'], 'test', '--locked', '--color', 'never',
+                     '--test', 'cli_v002_test', name, '--', '--exact', '--test-threads=1'],
+                    repo, test_env, seconds=600)
+    stdout = output(result)
+    if result.returncode or f'test {name} ... ok' not in stdout.splitlines():
+        detail['status'] = 'failed'
+        raise RuntimeError('installed interrupted-build regression failed: ' +
+                           (stdout + result.stderr.decode('utf-8', errors='replace'))[-4096:])
+    detail['status'] = 'passed'
+
+
 def run_structured_only(args, report):
     """Check the structured Task and declaration examples from a verified installed archive."""
     repo = args.repo.resolve()
@@ -1458,6 +1480,8 @@ def run_structured_only(args, report):
         EXPORT.verify_archive(archive, metadata['files'], install)
         manifest = EXPORT.RUNTIME_BUNDLE.verify(install, metadata['version'], metadata['commit'], target)
         report.update(bundle_id=manifest['bundle_id'], sdk_source_sha256=manifest['build_source_sha256'])
+        if target == 'x86_64-unknown-linux-gnu':
+            installed_build_interrupt_consumer(install, root, repo, env, manifest, report)
         for backend in ('c', 'runner'):
             installed_native_http_client_consumer(install, root, env, report, args.output, target,
                                                   structured_task=True, backend=backend)

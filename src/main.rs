@@ -9,7 +9,7 @@ fn run_on_cli_worker(args: Vec<String>) -> std::thread::Result<Result<(), ku::er
     match std::thread::Builder::new()
         .name("ku-cli".to_string())
         .stack_size(CLI_WORKER_STACK_BYTES)
-        .spawn(move || ku::cli::run_cli(args))
+        .spawn(move || ku::cli::run_cli_process(args))
     {
         Ok(worker) => worker.join(),
         Err(error) => Ok(Err(ku::error::KuError::runtime(
