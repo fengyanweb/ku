@@ -205,9 +205,19 @@ fn ScalarStringPrefixSuffixC(): str {
         + "}\n\n"
 }
 
-fn EmitProjectionStringJoinHelpers(): str {
+fn EmitProjectionStringJoinHelpers(format: bool): str {
     return "#include <stdio.h>\n#include <string.h>\n\n"
-        + "typedef KuProjectionString KuBootstrapString;\n" + ScalarStringJoinHelpers(false)
+        + "typedef KuProjectionString KuBootstrapString;\n" + ScalarStringJoinHelpers(format)
+}
+
+fn EmitScalarIntString(&value: str, &out: str): str {
+    name = out.clone()
+    digits = name.clone() + "_digits"
+    part = name.clone() + "_part"
+    return "    uint8_t " + digits.clone() + "[20];\n"
+        + "    KuScalarStringPart " + part.clone() + " = ku_scalar_string_int(" + value.clone() + ", " + digits + ");\n"
+        + "    if ((string_failure = ku_scalar_string_join(&" + part + ", 1, &" + name
+        + ")) != NULL) goto cleanup;\n"
 }
 
 // A checked binary join reads both operands once, after Ku's ordered

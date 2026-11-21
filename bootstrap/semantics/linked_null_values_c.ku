@@ -10,7 +10,7 @@ import { EmitLinkedIntAppend, ReadOwnedArrayPushArgument } from "./struct_array_
 import { LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
 import { CloneLinkedLocalArrayItem, CloneLinkedRecord, EmitLinkedAddition, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { AddLinkedNullSlot, CloneLinkedStringSlot, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix } from "./linked_parameters_c.ku"
 
 fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int, depth: int): LinkedNullExpression! {
     subject_id = LinkedNullChild(project, 1, target, 0)
@@ -97,6 +97,10 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
             argument = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, call, 1), depth + 1)?
             return CloneLinkedLocalArrayItem(project, read, argument, call, id)
         }
+    }
+    if (IsLinkedIntConversion(project, state, target, call.edge_count - 1)) {
+        input = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, call, 1), depth + 1)?
+        return LowerLinkedIntString(project, input, call, id)
     }
     callee = ResolveLinkedCall(project, state.slots, call, target, false)?
     arguments = lowerLinkedArguments(project, state, call, callee, id, depth)?

@@ -329,10 +329,10 @@ fn EmitBoundArrayResults(&layouts: [StructLayout], &owning_layouts: [StructLayou
     return source
 }
 
-fn EmitBoundStringOperations(clone: bool, concat: bool, prefix_suffix: bool): str {
+fn EmitBoundStringOperations(clone: bool, concat: bool, format: bool, prefix_suffix: bool): str {
     text = ""
     if (clone) { text += "#include <stdio.h>\n#include <string.h>\n\n" + EmitTryCloneString("ku_linked_clone_string") }
-    if (concat) { text += EmitProjectionStringJoinHelpers() }
+    if (concat) { text += EmitProjectionStringJoinHelpers(format) }
     if (prefix_suffix) { text += ScalarStringPrefixSuffixC() }
     return text
 }
@@ -370,7 +370,7 @@ fn EmitLinkedIntAppend(&array: str, &value: str): str {
 
 fn EmitLinkedArrayBody(&body: LinkedNullState, header: str, result_header: str): str! {
     text = header
-    text += EmitBoundStringOperations(body.uses_clone, body.uses_concat, body.uses_prefix_suffix)
+    text += EmitBoundStringOperations(body.uses_clone, body.uses_concat, body.uses_int_format, body.uses_prefix_suffix)
     definitions = EmitCombinedCLayouts(body.layouts, body.owning_layouts)?
     text += definitions.source
     text += EmitBoundArrayDeclarations(body.arrays, body.validated_arrays, definitions.array_types, body.uses_str_array)

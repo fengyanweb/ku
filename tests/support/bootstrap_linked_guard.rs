@@ -721,6 +721,7 @@ fn ReadAfterMove(path: str): str! {
 fn PlainLiteral(): str { return "源🙂" }
 fn PlainOwner(source: str): str { return source }
 fn PlainBorrow(&source: str): str { return source }
+fn PlainFormat(value: int): str { return str(value) }
 "#;
 
 const ADD_CALL_PROVIDER: &str = r#"
@@ -876,6 +877,38 @@ int main(void) {
         compile_projection(&source, &binary, cwd);
         assert_ok(&execute(&mut Command::new(&binary), cwd, 15));
     }
+    fs::write(cwd.join("function.txt"), "PlainFormat").unwrap();
+    let emitted = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&emitted);
+    let code = String::from_utf8(emitted.stdout).unwrap();
+    let entry = code
+        .lines()
+        .find_map(|line| line.strip_prefix("KuProjectionString ku_linked_null_"))
+        .unwrap()
+        .split_once('(')
+        .unwrap()
+        .0;
+    let main = r#"
+int main(void) {
+    (void)test_realloc;
+    int64_t signed_values[] = {0, INT64_MIN, INT64_MAX};
+    const char* expected[] = {"0", "-9223372036854775808", "9223372036854775807"};
+    for (size_t i = 0; i < 3; ++i) {
+        KuProjectionString value = ENTRY(signed_values[i]);
+        assert(value.storage == KU_PROJECTION_STRING_OWNED && outstanding() == 1);
+        assert(value.len == strlen(expected[i]) && !memcmp(value.ptr, expected[i], value.len));
+        free(value.ptr);
+        assert(!outstanding());
+    }
+    assert(attempts == 3);
+    return 0;
+}
+"#
+    .replace("ENTRY", &format!("ku_linked_null_{entry}"));
+    fs::write(&source, format!("{CHECKED_ARRAY_ALLOCATOR}{code}{main}")).unwrap();
+    let binary = cwd.join(format!("format-int{}", std::env::consts::EXE_SUFFIX));
+    compile_projection(&source, &binary, cwd);
+    assert_ok(&execute(&mut Command::new(&binary), cwd, 15));
     fs::write(cwd.join("function.txt"), "PlainBorrow").unwrap();
     let escaped = execute(&mut Command::new(seed), cwd, 30);
     assert_eq!(escaped.status.code(), Some(1));

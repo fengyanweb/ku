@@ -1,5 +1,7 @@
 import { LinkedIncreasingGuard, LinkedLiveIntBinding, LinkedMemberUnavailable, LinkedNullDropC, RejectLinkedLoopWrite, RejectLinkedWriteRange } from "./linked_member_ownership.ku"
 import { BuildProjectOwningLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
+import { EmitScalarIntString } from "./scalar_int_emit.ku"
+import { HasScalarBuiltin } from "./scalar_int_operands.ku"
 import { Node } from "../stage2/ast.ku"
 import { FindLinkedLocalRead, LinkedLocalReadBinding } from "./call_contracts.ku"
 import { ProjectionCloneSource } from "./struct_projection_c.ku"
@@ -7,7 +9,7 @@ import { DeclarationSpan } from "./names.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { LinkedNullBinding, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
-import { LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullParameterPlan,
+import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullParameterPlan,
          LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullResultCleanupReference, LinkedNullType, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 
 struct LinkedNullParameters {
@@ -270,6 +272,24 @@ fn RestoreLinkedConcatPrefix(&project: LinkedNullProject, state: LinkedNullState
     saved = CloneLinkedStringSlot(project, LinkedNullExpression { state: next, value: left.clone() }, "lhs" + str(id))?
     saved.state.code += after
     return ok(saved)
+}
+
+fn IsLinkedIntConversion(&project: LinkedNullProject, &state: LinkedNullState, &target: Node, arity: int): bool {
+    return target.kind == "Variable" && target.text == "str" && target.edge_count == 0 && arity == 1
+        && LinkedNullBinding(state.slots, target.text) == 0 && HasScalarBuiltin(project.supplied[0].named, target.text)
+}
+
+fn LowerLinkedIntString(&project: LinkedNullProject, input: LinkedNullExpression, &node: Node, id: int): LinkedNullExpression! {
+    at = DeclarationSpan(node)
+    if (!LinkedIntResult(input.value.ty)) {
+        RejectLayout("linked_int_format", "linked str conversion requires an int argument", at.clone())?
+    }
+    output = AddLinkedNullSlot(project, input.state, "", "t" + str(id), LinkedBuiltin("str", at), false)?
+    output.state.code += EmitScalarIntString(input.value.text, output.value.text)
+    output.state.uses_concat = true
+    output.state.uses_int_format = true
+    output.state.slots[output.value.slot - 1].live = true
+    return ok(output)
 }
 
 fn LinkedCountdownIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &step: Node): int! {
