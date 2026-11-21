@@ -117,10 +117,17 @@ fn EmitOwnedStructArrayDrop(&layouts: [StructLayout], root: int, &array: str, &p
     return emitOwnedElementDrop(element, prefix, fields, true) + EmitStructArrayDropUsing(array, prefix, prefix.clone() + "_element_drop", true)
 }
 
-fn EmitLinkedStringArrayPrelude(needs_header: bool): str {
+fn EmitLinkedStringArrayPrelude(&validated: [TypeNameBinding], needs_header: bool): str {
     source = ""
     if (needs_header) { source += EmitStructArrayHeader("KuProjectionString", "KuGuardStringArray") }
-    return source + EmitStructArrayReadValidation("KuProjectionString", "KuGuardStringArray", "ku_linked_view_str_array")
+    index = 0
+    while (index < validated.len()) {
+        if (validated[index].declaration_kind == "BuiltinArray" && validated[index].name == "str") {
+            return source + EmitStructArrayReadValidation("KuProjectionString", "KuGuardStringArray", "ku_linked_view_str_array")
+        }
+        index += 1
+    }
+    return source
 }
 
 fn EmitStructArrayReadValidation(&element: str, &array: str, &prefix: str): str {
@@ -300,7 +307,9 @@ fn EmitBoundArrayDeclarations(&arrays: [TypeNameBinding], &validated: [TypeNameB
             source += EmitStructArrayReadValidation(element, array_type, BoundArrayCPrefix(array))
         }
     }
-    if (str_array) { source += EmitLinkedStringArrayPrelude(!ContainsType(defined, "KuGuardStringArray")) }
+    if (str_array) {
+        source += EmitLinkedStringArrayPrelude(validated, !ContainsType(defined, "KuGuardStringArray"))
+    }
     return source
 }
 

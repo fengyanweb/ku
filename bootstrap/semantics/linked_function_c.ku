@@ -22,7 +22,7 @@ import { LinkedCPrelude, LinkedNullBinding, LinkedNullFunction, LinkedNullSlot, 
 fn FinishLinkedFunctionC(header: str, &body: LinkedNullState, &symbol: str, &signature: str,
                          &result_type: str, &payload_cleanup: str, char_errors: str): str {
     text = header
-    array_checks = body.validated_arrays.len() > 0 || body.uses_str_array
+    array_checks = body.validated_arrays.len() > 0
     arithmetic = body.uses_add || body.uses_sub || body.uses_mul || body.uses_div
     text += "\n" + result_type.clone() + " " + symbol.clone() + "(" + signature.clone() + ") {\n"
     text += "    " + result_type.clone() + " result = {0};\n"

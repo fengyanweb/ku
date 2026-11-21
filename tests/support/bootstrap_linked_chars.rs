@@ -83,6 +83,7 @@ pub(super) fn assert_owned_characters(seed: &Path, cwd: &Path) {
     let emitted = generate();
     assert_ok(&emitted);
     let source = String::from_utf8(emitted.stdout).unwrap();
+    assert!(source.contains("ku_linked_view_str_array_valid(a1)"));
     let symbol = |prefix| {
         source
             .lines()
@@ -108,6 +109,16 @@ pub(super) fn assert_owned_characters(seed: &Path, cwd: &Path) {
         String::from_utf8(failed.stderr).unwrap().trim(),
         "out of memory"
     );
+
+    // An owned character array needs its carrier and destructor, but has
+    // no imported array header to validate.
+    let local = INPUT.replace(", &view: [str]", "");
+    fs::write(cwd.join("iterate.ku"), local).unwrap();
+    let emitted = generate();
+    assert_ok(&emitted);
+    let source = String::from_utf8(emitted.stdout).unwrap();
+    assert!(source.contains("ku_managed_source_drop"));
+    assert!(!source.contains("ku_linked_view_str_array_valid"));
 
     // A non-stdlib iterable is not a supported character iterator.
     let changed = INPUT.replace("string.chars(source.clone())", "source");

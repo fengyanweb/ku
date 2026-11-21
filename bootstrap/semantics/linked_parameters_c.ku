@@ -190,7 +190,10 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
         return ok(next)
     }
     if (ty.declaration_kind == "BuiltinArray") {
-        if (ty.name == "str") { next.uses_str_array = true }
+        if (ty.name == "str") {
+            next.uses_str_array = true
+            next = RequireLinkedArrayValidation(next, ty.clone())
+        }
         else { next = RequireLinkedArrayValidation(RegisterLinkedIntArray(next, ty.clone()), ty.clone()) }
     }
     if (LinkedNullIntArrayOwner(ty)) {
@@ -219,7 +222,9 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
 fn RequireLinkedArrayValidation(state: LinkedNullState, ty: TypeNameBinding): LinkedNullState {
     next = state
     carrier = ty
-    if (LinkedNullIntArrayOwner(carrier)) { carrier.declaration_kind = "BuiltinArray" }
+    if (LinkedNullIntArrayOwner(carrier) || carrier.declaration_kind == "OwnedStringArray") {
+        carrier.declaration_kind = "BuiltinArray"
+    }
     else if (carrier.declaration_kind != "BuiltinArray") { carrier.declaration_kind = "StructArray" }
     if (LinkedNullArrayPosition(next.validated_arrays, carrier) == 0) {
         next.validated_arrays = next.validated_arrays.push(carrier)
