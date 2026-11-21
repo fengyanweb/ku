@@ -2,8 +2,8 @@ import { LinkedLocalReadBinding, RejectMissingLinkedValue } from "./call_contrac
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { GuardBoundType, GuardCType, GuardType } from "./guarded_struct_expr.ku"
-import { ImportBinding, SuppliedModule } from "./imports.ku"
-import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
+import { SuppliedModule } from "./imports.ku"
+import { DeclarationSpan, NamedModule } from "./names.ku"
 import { ScalarFunctionNode } from "./scalar_int_calls.ku"
 import { ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout, StructReturnPlan } from "./struct_layouts.ku"
 import { ContainsIndex, ContainsType, CTypeName, ProjectionHeaders, ScalarCType } from "./struct_projection_c.ku"
@@ -381,8 +381,9 @@ fn ExitLinkedFailure(state: LinkedNullState, &indent: str): LinkedNullState {
     if (next.catch_slot > 0) {
         label = LinkedFailureTarget(next) + "_handler"
         next.catch_edges = true
+        limit = next.catch_slot - 1
         index = 0
-        while (index < next.catch_slot - 1) {
+        while (index < limit) {
             if ((!next.slots[index].live || next.slots[index].moved_members.len() > 0) && LinkedNullOwner(next.slots[index].value.ty)
                 && !ContainsIndex(next.catch_moved, index)) {
                 next.catch_moved = next.catch_moved.push(index)
@@ -417,20 +418,9 @@ fn LinkedLocalAppendIndex(&state: LinkedNullState, &name: str): int {
     index = 0
     while (index < state.local_appends.len()) {
         if (state.local_appends[index].binding == name) { return index + 1 }
-        index += 1
+        index = index + 1
     }
     return 0
-}
-
-fn LinkedOkAvailable(&names: [TopLevelName], &imports: [ImportBinding], &slots: [LinkedNullSlot]): bool {
-    if (LinkedNullBinding(slots, "ok") != 0) { return false }
-    for name in names.clone() {
-        if (name.name == "ok") { return false }
-    }
-    for binding in imports.clone() {
-        if (binding.local_name == "ok") { return false }
-    }
-    return true
 }
 
 fn LinkedErrorField(receiver: LinkedNullExpression, member: str, at: Span): LinkedNullExpression {

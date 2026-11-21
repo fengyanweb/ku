@@ -7,9 +7,9 @@ import { StructResultHeader } from "./struct_result_c.ku"
 import { LinkedIntSnapshotRuntime } from "./guarded_string_parts.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullParameterPlan, LinkedNullProject, LinkedNullResultType, LinkedNullType, LinkedResultPlan, SameLinkedType } from "./linked_null_types_c.ku"
 import { Span } from "../stage2/span.ku"
-import { SuppliedModule } from "./imports.ku"
-import { DeclarationSpan } from "./names.ku"
-import { AppendLinkedCheckedInvocation, ExitLinkedFailure, FsReadLinkPlan, LinkedCPrelude, LinkedCheckedCall, LinkedDirectCallExpression, LinkedFailureTarget, LinkPlanDeclaration, LinkPlanNominalType, LinkPlanType, LinkedIntArrayCallbackFunction, LinkedNullArguments, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullState, LinkedReadonlyExpression, LinkedNullValue } from "./link_plan_c.ku"
+import { ImportBinding, SuppliedModule } from "./imports.ku"
+import { DeclarationSpan, TopLevelName } from "./names.ku"
+import { AppendLinkedCheckedInvocation, ExitLinkedFailure, FsReadLinkPlan, LinkedCPrelude, LinkedCheckedCall, LinkedDirectCallExpression, LinkedFailureTarget, LinkPlanDeclaration, LinkPlanNominalType, LinkPlanType, LinkedIntArrayCallbackFunction, LinkedNullArguments, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullSlot, LinkedNullState, LinkedReadonlyExpression, LinkedNullValue } from "./link_plan_c.ku"
 import { LinkPlanJsonControls, LinkPlanJsonText } from "./project_paths.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
@@ -425,4 +425,19 @@ fn RestoreLinkedAssignedMember(state: LinkedNullState, &value: LinkedNullValue):
     }
     next.slots[slot].moved_members = kept
     return next
+}
+
+fn LinkedBuiltinNameAvailable(&names: [TopLevelName], &imports: [ImportBinding], &slots: [LinkedNullSlot], &name: str): bool {
+    if (LinkedNullBinding(slots, name) != 0) { return false }
+    index = 0
+    while (index < names.len()) {
+        if (names[index].name == name) { return false }
+        index = index + 1
+    }
+    input = 0
+    while (input < imports.len()) {
+        if (imports[input].local_name == name) { return false }
+        input = input + 1
+    }
+    return true
 }

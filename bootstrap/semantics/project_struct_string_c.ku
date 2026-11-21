@@ -16,20 +16,14 @@ import { BindStructStringCall, ReadStructStringFold, StructStringDependency, Str
 import { TypeNameBinding } from "./type_names.ku"
 
 import { DropLinkedNullScope } from "./linked_member_ownership.ku"
-import { LinkedNullBinding, LinkedNullState } from "./link_plan_c.ku"
+import { LinkedBuiltinNameAvailable } from "./link_plan_json_c.ku"
+import { LinkedNullState } from "./link_plan_c.ku"
 import { LinkedNullChild, LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
 import { LowerLinkedNullTry, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 fn linkedOutputBuiltin(&project: LinkedNullProject, &state: LinkedNullState, &target: Node): bool {
-    if (target.kind != "Variable" || target.edge_count != 0 ||
-        target.text != "println" ||
-        LinkedNullBinding(state.slots, target.text) != 0) { return false }
-    for declaration in project.supplied[0].named.names.declarations.clone() {
-        if (declaration.name == target.text) { return false }
-    }
-    for binding in project.binding.modules[0].imports.clone() {
-        if (binding.local_name == target.text) { return false }
-    }
-    return true
+    if (target.kind != "Variable" || target.edge_count != 0 || target.text != "println") { return false }
+    return LinkedBuiltinNameAvailable(project.supplied[0].named.names.declarations,
+        project.binding.modules[0].imports, state.slots, target.text)
 }
 
 fn emitLinkedOutput(&text: str, newline: bool): str {

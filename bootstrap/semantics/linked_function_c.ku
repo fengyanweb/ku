@@ -1,5 +1,5 @@
 import { LinkedFieldAppendArgument } from "./linked_owner_assignment_c.ku"
-import { EmitLinkedBodyPrelude, HoldLinkedCopyOperand, LinkedFieldRoot, LinkedNullPrototype, LinkedScopedCallbackFunction, LinkedScopedCallbackPrototype, RestoreLinkedAssignedMember } from "./link_plan_json_c.ku"
+import { EmitLinkedBodyPrelude, HoldLinkedCopyOperand, LinkedBuiltinNameAvailable, LinkedFieldRoot, LinkedNullPrototype, LinkedScopedCallbackFunction, LinkedScopedCallbackPrototype, RestoreLinkedAssignedMember } from "./link_plan_json_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
 import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult } from "./struct_projection_c.ku"
@@ -19,7 +19,7 @@ import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { ReadLinkedMemberPlace } from "./struct_string_calls.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue, LowerLinkedScopedCallbackCall } from "./linked_null_values_c.ku"
 import { IsLinkedScopedCallback, LinkedScopedCallbackTypes, LinkedLocalAppend, LinkedNullBinding, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue,
-         LinkedOkAvailable, LinkedRecordFields } from "./link_plan_c.ku"
+         LinkedRecordFields } from "./link_plan_c.ku"
 
 fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunction], &slots: [LinkedNullSlot],
                             &locals: [LinkedLocalAppend], &payload: TypeNameBinding, checked: bool): str! {
@@ -347,7 +347,7 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
             + ");\n" + arguments.handoff + "    goto cleanup;\n"
         return ok(arguments.state)
     }
-    if (call.edge_count != 2 || callee.kind != "Variable" || callee.edge_count != 0 || callee.text != "ok" || !LinkedOkAvailable(project.supplied[0].named.names.declarations, project.binding.modules[0].imports, state.slots)) {
+    if (call.edge_count != 2 || callee.kind != "Variable" || callee.edge_count != 0 || callee.text != "ok" || !LinkedBuiltinNameAvailable(project.supplied[0].named.names.declarations, project.binding.modules[0].imports, state.slots, "ok")) {
         RejectLayout("unsupported_linked_success", "expected builtin ok with the declared payload", DeclarationSpan(call))?
     }
     id = LinkedNullChild(project, 1, call, 1)
