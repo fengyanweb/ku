@@ -67,6 +67,15 @@ fn linkIntCallee(&imports: [ScalarIntImport], &target: Node): ScalarIntImport! {
         signature: ScalarIntSignature { arity: 0, has_string_parameter: false, result_type: 0 } })
 }
 
+fn resolveIntCallee(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
+                    &bindings: [TypeNameBinding], &imports: [ScalarIntImport], local_base: int,
+                    &target: Node): ScalarIntImport! {
+    function_node = ScalarFunctionNode(declarations, target.text)
+    if (function_node == 0) { return linkIntCallee(imports, target) }
+    signature = ScalarIntCalleeSignature(nodes, edges, bindings, function_node)
+    return ok(ScalarIntImport { local_name: "", target: local_base + function_node, signature: signature })
+}
+
 fn bindIntCall(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
                &bindings: [TypeNameBinding], &parameters: [ScalarIntParameter],
                &imports: [ScalarIntImport], local_base: int, &call: Node): ScalarIntCall! {
@@ -82,26 +91,18 @@ fn bindIntCall(&nodes: [Node], &edges: [int], &declarations: [TopLevelName],
     if (shadow >= 0) {
         rejectScalarInt("unsupported_int_callee", "expected an unshadowed function name", DeclarationSpan(target))?
     }
-    function_node = ScalarFunctionNode(declarations, target.text)
-    function_key = local_base + function_node
-    signature = ScalarIntSignature { arity: 0, has_string_parameter: false, result_type: 0 }
-    if (function_node > 0) {
-        signature = ScalarIntCalleeSignature(nodes, edges, bindings, function_node)
-    } else {
-        imported = linkIntCallee(imports, target)?
-        function_key = imported.target
-        signature = imported.signature
-    }
-    if (signature.has_string_parameter) {
+    callee = resolveIntCallee(nodes, edges, declarations, bindings, imports, local_base, target)?
+    if (callee.signature.has_string_parameter) {
         rejectScalarInt("unsupported_int_callee_signature", "calls in the int subset cannot transfer string parameters", DeclarationSpan(call))?
     }
-    if (call.edge_count - 1 != signature.arity) {
-        rejectScalarInt("int_call_arity", "expected " + str(signature.arity) + " arguments for '" + target.text + "'", DeclarationSpan(call))?
+    arity = callee.signature.arity
+    if (call.edge_count - 1 != arity) {
+        rejectScalarInt("int_call_arity", "expected " + str(arity) + " arguments for '" + target.text + "'", DeclarationSpan(call))?
     }
-    if (signature.result_type >= 2) {
+    if (callee.signature.result_type >= 2) {
         rejectScalarInt("unsupported_int_callee_result", "calls in an int expression must return int", DeclarationSpan(call))?
     }
-    return ok(ScalarIntCall { target_node: target_node, function_node: function_key })
+    return ok(ScalarIntCall { target_node: target_node, function_node: callee.target })
 }
 
 fn isIntCallTarget(&calls: [ScalarIntCall], node: int): bool {
