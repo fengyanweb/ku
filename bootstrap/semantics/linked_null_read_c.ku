@@ -1,18 +1,18 @@
 import { EmitLinkedArrayIndexGuard, EmitLinkedLogicalBranch } from "./guarded_string_parts.ku"
-import { AddLinkedNullSlot, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, CloneLinkedRecord, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
 import { CheckLinkedAddition, EmitLinkedMultiplyDivide, LinkedMemberPath, LinkedMemberUnavailable, LinkedViewArgument, RequireLinkedReadonlyPredicate } from "./linked_member_ownership.ku"
 import { Span } from "../stage2/span.ku"
 import { LinkedLocalReadBinding } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout } from "./struct_layouts.ku"
-import { EmitLinkedReadonlyPredicate, LinkedErrorField, LinkedNullFunction, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { EmitLinkedReadonlyPredicate, LinkedDirectCallExpression, LinkedErrorField, LinkedNullFunction, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, RememberLinkedCall } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ScalarValueLiteralC } from "./scalar_int_operands.ku"
 import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
-import { GuardLinkedStringPredicate, GuardOwnedDrops } from "./guarded_struct_c.ku"
-import { EmitLinkedIntAppend, EmitLinkedOwnedArrayClone, HasBoundArrayMembers, OwnedRecordArrayCloneLayout } from "./struct_array_c.ku"
-import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
+import { GuardLinkedStringPredicate } from "./guarded_struct_c.ku"
+import { EmitLinkedIntAppend, EmitLinkedOwnedArrayClone, OwnedRecordArrayCloneLayout } from "./struct_array_c.ku"
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedNullResultCleanupReference, LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn LowerLinkedIntArrayLiteral(&project: LinkedNullProject, state: LinkedNullState, &literal: Node, id: int,
                                binding: str): LinkedNullExpression! {
@@ -159,30 +159,6 @@ fn readArrayItem(&array: LinkedNullValue, input: LinkedNullExpression, &node: No
     return ok(item)
 }
 
-fn CloneLinkedRecord(&project: LinkedNullProject, source: LinkedNullExpression, &at: Node,
-                     id: int): LinkedNullExpression! {
-    ty = source.value.ty.clone()
-    if (LinkedMemberUnavailable(source.state, source.value, true)) {
-        RejectLayout("linked_clone_moved", "cloning a whole struct requires all fields to be available", DeclarationSpan(at))?
-    }
-    layout = LayoutIndex(source.state.layouts, ty.module_index, ty.declaration_node)
-    if (HasBoundArrayMembers(source.state.layouts, layout)) {
-        RejectLayout("linked_nested_array_clone", "a struct with nested owning arrays does not yet support clone", ty.span.clone())?
-    }
-    output = AddLinkedNullSlot(project, source.state, "", "t" + str(id), ty, false)?
-    if (GuardOwnedDrops(output.state.layouts, layout, source.value.text) == "") {
-        output.state.code += "    " + output.value.text.clone() + " = " + source.value.text + ";\n"
-    } else {
-        if (!ContainsIndex(output.state.element_clones, layout)) {
-            output.state.element_clones = output.state.element_clones.push(layout)
-        }
-        output.state.code += "    if (!ku_linked_element_" + str(layout) + "_clone_element(&"
-            + source.value.text + ", &" + output.value.text.clone() + ")) { out_of_memory = true; goto cleanup; }\n"
-    }
-    output.state.slots[output.value.slot - 1].live = true
-    return ok(output)
-}
-
 fn CloneLinkedRecordArray(&project: LinkedNullProject, source: LinkedNullExpression, id: int): LinkedNullExpression! {
     value = source.value
     layout = OwnedRecordArrayCloneLayout(source.state.layouts, value.ty)
@@ -199,8 +175,8 @@ fn CloneLinkedRecordArray(&project: LinkedNullProject, source: LinkedNullExpress
     return ok(output)
 }
 
-fn CloneLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalReadBinding, argument: LinkedNullExpression,
-                            &at: Node, id: int): LinkedNullExpression! {
+fn ReadLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalReadBinding, argument: LinkedNullExpression,
+                           &at: Node, id: int): LinkedNullExpression! {
     array = argument.state.slots[reader.captured_slot - 1].value.clone()
     if (LinkedMemberUnavailable(argument.state, array, true)) {
         RejectLayout("linked_local_reader_capture", "the array captured by this declaration is no longer live", DeclarationSpan(at))?
@@ -216,7 +192,20 @@ fn CloneLinkedLocalArrayItem(&project: LinkedNullProject, &reader: LinkedLocalRe
         argument.value.text = shifted
     }
     item = readArrayItem(array, argument, at, id)?
-    return CloneLinkedRecord(project, item, at, id)
+    definition = LinkedNullNode(project, 1, reader.node)
+    exit = LinkedNullNode(project, 1, LinkedNullChild(project, 1, definition, 2))
+    call = LinkedNullNode(project, 1, LinkedNullChild(project, 1, exit, 0))
+    target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+    if (target.kind == "Field") { return CloneLinkedRecord(project, item, at, id) }
+    // Registration proves the mapper's original lexical target. Re-resolve
+    // that module declaration, independent of shadowing at the use site.
+    callee = LinkedNullDependency(project, 1, target, false)?
+    args = LinkedViewArgument(callee.parameters[0], item.value)?
+    output = AddLinkedNullSlot(project, item.state, "", "t" + str(id), callee.result.clone(), false)?
+    output.state.code += "    " + output.value.text.clone() + " = " + LinkedDirectCallExpression(callee, args) + ";\n"
+    output.state.links = RememberLinkedCall(output.state.links, callee)
+    output.state.slots[output.value.slot - 1].live = true
+    return ok(output)
 }
 
 fn readLinkedField(&project: LinkedNullProject, state: LinkedNullState, &node: Node, depth: int): LinkedNullExpression! {

@@ -10,8 +10,8 @@ import { LinkedDirectCallExpression, AppendLinkedCheckedInvocation, LinkedChecke
 import { EmitLinkedIntAppend } from "./struct_array_c.ku"
 import { LinkedCallArgument, LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
          LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { CloneLinkedLocalArrayItem, CloneLinkedRecord, CloneLinkedRecordArray, EmitLinkedAddition, IsLinkedLogicalNegation, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { AddLinkedNullSlot, CheckLinkedLocalAppendArguments, CloneLinkedIntArray, ForwardLinkedCallback, LinkedCallableSlot, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix, ValidateLinkedPayload } from "./linked_parameters_c.ku"
+import { ReadLinkedLocalArrayItem, CloneLinkedRecordArray, EmitLinkedAddition, IsLinkedLogicalNegation, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
+import { AddLinkedNullSlot, CheckLinkedLocalAppendArguments, CloneLinkedIntArray, CloneLinkedRecord, ForwardLinkedCallback, LinkedCallableSlot, CloneLinkedStringSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix, ValidateLinkedPayload } from "./linked_parameters_c.ku"
 
 fn emitLinkedClone(&project: LinkedNullProject, state: LinkedNullState, &target: Node, id: int, depth: int): LinkedNullExpression! {
     subject_id = LinkedNullChild(project, 1, target, 0)
@@ -119,7 +119,7 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
             }
             read = state.local_readers[local - 1].clone()
             argument = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, call, 1), depth + 1)?
-            return CloneLinkedLocalArrayItem(project, read, argument, call, id)
+            return ReadLinkedLocalArrayItem(project, read, argument, call, id)
         }
     }
     if (IsLinkedIntConversion(project, state, target, call.edge_count - 1)) {

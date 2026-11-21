@@ -1563,19 +1563,30 @@ int main(int argc, char **argv) {
     }
 }
 
-pub(super) fn assert_local_array_reader(seed: &Path, cwd: &Path) {
+pub(super) fn assert_local_array_reader(seed: &Path, python: &str, cwd: &Path) {
     fs::write(
         cwd.join("local-reader.ku"),
         r#"struct Item { label: str value: int }
+struct Position { offset: int }
+fn PositionOf(&item: Item): Position { return Position { offset: item.value } }
+fn ConsumePosition(item: Item): Position { return Position { offset: item.value } }
 fn Inspect(first: Item, second: Item): Item! {
     values: [Item] = []
     values = values.push(first)
     fn Read(index: int): Item { return values[index - 1].clone() }
+    fn ReadPosition(index: int): Position { return PositionOf(values[index - 1]) }
     saved = Read(1)
     values = values.push(second)
+    position = ReadPosition(2)
     current = Read(2)
-    if (saved.value != 11) { fail { domain: "test", code: "old", message: "old element changed" } }
+    if (saved.value != 11 || position.offset != 22) { fail { domain: "test", code: "old", message: "wrong element" } }
     return ok(current)
+}
+fn ConsumesItem(first: Item): Position! {
+    values: [Item] = []
+    values = values.push(first)
+    fn Read(index: int): Position { return ConsumePosition(values[index]) }
+    return ok(Read(0))
 }
 fn Escape(first: Item): Item! {
     values: [Item] = []
@@ -1610,12 +1621,12 @@ fn MovedAfterRead(first: Item): Item! {
     let code = String::from_utf8(emitted.stdout).unwrap();
     let (result, signature) = code
         .lines()
+        .filter(|line| !line.starts_with("extern "))
         .find_map(|line| line.split_once(" ku_linked_null_"))
         .unwrap();
     let (entry, args) = signature.split_once('(').unwrap();
     let (carrier, _) = args.split_once(" a0").unwrap();
-    assert!(!code.contains("extern "));
-    assert_eq!(code.matches("int64_t local_index").count(), 2);
+    assert_eq!(code.matches("int64_t local_index").count(), 3);
     let witness = r#"
 #include <assert.h>
 int main(void) {
@@ -1632,13 +1643,50 @@ int main(void) {
     .replace("ENTRY", &format!("ku_linked_null_{entry}"))
     .replace("ITEM", carrier);
     let c = cwd.join("local-reader.c");
+    let host = cwd.join("local-reader-host.c");
     let exe = cwd.join(format!("local-reader{}", std::env::consts::EXE_SUFFIX));
-    fs::write(&c, format!("{code}{witness}")).unwrap();
-    compile_projection(&c, &exe, cwd);
+    fs::write(&c, &code).unwrap();
+    fs::write(&host, witness).unwrap();
+    let describe = |name: &str| {
+        fs::write(cwd.join("function.txt"), name).unwrap();
+        fs::write(cwd.join("mode.txt"), "linked-null-plan").unwrap();
+        let output = execute(&mut Command::new(seed), cwd, 30);
+        assert_ok(&output);
+        let plan = cwd.join(format!("{name}.plan.json"));
+        fs::write(&plan, output.stdout).unwrap();
+        plan
+    };
+    let entry_plan = describe("Inspect");
+    let mapper_plan = describe("PositionOf");
+    fs::write(cwd.join("mode.txt"), "linked-null").unwrap();
+    let output = execute(&mut Command::new(seed), cwd, 30);
+    assert_ok(&output);
+    let mapper_c = cwd.join("position-of.c");
+    fs::write(&mapper_c, output.stdout).unwrap();
+    let compiler = std::env::var("KU_CC")
+        .unwrap_or_else(|_| if cfg!(windows) { "clang" } else { "cc" }.into());
+    let linked = execute(
+        Command::new(python)
+            .arg("-B")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/tools/link_c.py"))
+            .args(["--cc", &compiler, "--entry", "local-reader.ku", entry])
+            .arg("--unit")
+            .args([entry_plan, c])
+            .arg("--unit")
+            .args([mapper_plan, mapper_c])
+            .arg("--caller")
+            .arg(&host)
+            .arg("-o")
+            .arg(&exe),
+        cwd,
+        120,
+    );
+    assert_ok(&linked);
     assert_ok(&execute(&mut Command::new(exe), cwd, 15));
 
     for (name, error) in [
         ("Escape", "linked_local_callable_escape"),
+        ("ConsumesItem", "mapper must borrow one matching element"),
         ("Moved", "linked_local_reader_capture_move"),
         ("MovedAfterRead", "linked_local_reader_capture_move"),
     ] {
