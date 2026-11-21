@@ -1,5 +1,7 @@
 import { EmitLinkedBodyPrelude, HoldLinkedCopyOperand, LinkedBuiltinNameAvailable, LinkedFieldRoot, LinkedNullPrototype, LinkedScopedCallbackFunction, LinkedScopedCallbackPrototype, RestoreLinkedAssignedMember } from "./link_plan_json_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
+import { LinkedOptionalReaderHeader } from "./linked_nullable_reader_c.ku"
+import { EmitLinkedOptionalIntReturn, LinkedNullCallSymbol } from "./scalar_result_null.ku"
 import { StructValueResultHeader } from "./struct_result_c.ku"
 import { ContainsType, CTypeName, LinkedAppendFailureDeclaration, LinkedBufferResult } from "./struct_projection_c.ku"
 import { LinkedCopyResult, TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
@@ -12,7 +14,7 @@ import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedN
 import { AddLinkedNullSlot, LinkedStringArrayAssignmentPlace } from "./linked_parameters_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
-import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullCallSymbol, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
+import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue,
          LinkedNullNode, LinkedNullProject,  LinkedStringResult, ResolveLinkedCall, SameLinkedType } from "./linked_null_types_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LinkedFieldAppendArgument, ReadLinkedMemberPlace } from "./struct_string_calls.ku"
@@ -103,7 +105,7 @@ fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunc
 fn EmitLinkedNullDeclarations(&project: LinkedNullProject, &body: LinkedNullState, &result: TypeNameBinding): str! {
     declarations = EmitLinkedBodyPrelude(body)?
     checked = !body.plain_value_result
-    return ok(declarations + EmitLinkedNullPrototypes(project, body.links, body.slots, body.local_appends, result, checked)?)
+    return ok(declarations + LinkedOptionalReaderHeader(body.slots, result)? + EmitLinkedNullPrototypes(project, body.links, body.slots, body.local_appends, result, checked)?)
 }
 
 fn EmitLinkedFunction(&project: LinkedNullProject, &body: LinkedNullState, &symbol: str, &signature: str, &payload: TypeNameBinding): str! {
@@ -168,7 +170,9 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
     if (capture && argument > 0) {
         RejectLayout("linked_member_target", "a local callback can only assign Copy fields of a captured record", DeclarationSpan(target))?
     }
-    if (argument > 0) { return LowerLinkedFieldAppend(project, state, target_id, argument, nested) }
+    if (argument > 0) {
+        return FinishLinkedFieldAppend(project, LowerLinkedNullValue(project, state, argument, 0)?, target_id, argument, nested)
+    }
     // Generate the RHS and finish its fallible work before selecting the
     // target in the resulting state. The old member still belongs to cleanup
     // if the RHS fails or consumes its record.
@@ -218,6 +222,7 @@ fn LowerLinkedPlainReturn(&project: LinkedNullProject, state: LinkedNullState,
     }
     id = LinkedNullChild(project, 1, statement, 0)
     value = LowerLinkedNullValue(project, state, id, 0)?
+    if (result.declaration_kind == "NullableInt") { return EmitLinkedOptionalIntReturn(value, statement) }
     copy = result.declaration_kind == "Builtin" && (result.name == "bool" || result.name == "int")
     static_string = false
     if (LinkedStringResult(result)) {
@@ -372,10 +377,6 @@ fn LowerLinkedSuccess(&project: LinkedNullProject, state: LinkedNullState, &stat
     }
     next.code = next.code + "    result.ok = true;\n    goto cleanup;\n"
     return ok(next)
-}
-
-fn LowerLinkedFieldAppend(&project: LinkedNullProject, state: LinkedNullState, target: int, argument: int, nested: bool): LinkedNullState! {
-    return FinishLinkedFieldAppend(project, LowerLinkedNullValue(project, state, argument, 0)?, target, argument, nested)
 }
 
 fn LowerLinkedStringAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {

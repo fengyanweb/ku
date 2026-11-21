@@ -28,6 +28,7 @@ CALLBACK_TYPES = {
     "IntResultAppendCallback": ("int_result_append_callback", "KuBootstrapIntAppendCallback_"),
     "IntResultArenaCallback": ("int_result_arena_callback", "KuBootstrapIntArenaCallback_"),
     "IntRecordReaderCallback": ("int_record_reader_callback", "KuBootstrapIntReaderCallback_"),
+    "NullableRecordViewReader": ("nullable_record_view_reader", "KuBootstrapNullableRecordViewReader_"),
 }
 CALLBACK_IDENTITIES = {identity for identity, _ in CALLBACK_TYPES.values()}
 CALLBACK_PREFIXES = {identity: prefix for identity, prefix in CALLBACK_TYPES.values()}
@@ -117,6 +118,11 @@ class TypeRef:
             if name == "bool" and checked_result and c_type != "KuBootstrapResult_bool":
                 raise LinkError(f"{where} checked bool requires the KuBootstrapResult_bool carrier")
             identity = ("builtin", name)
+        elif kind_name == "NullableInt":
+            if (name != "int" or ref["source_path"] is not None or type(ref["node"]) is not int or ref["node"] != 0
+                    or passing != "value" or checked_result or c_type != "KuBootstrapOptionalInt"):
+                raise LinkError(f"{where} requires the plain by-value nullable int carrier")
+            identity = ("nullable_int",)
         elif kind_name == "BuiltinArray":
             view_carrier = {"str": "KuGuardStringArray", "int": "KuArrayInt"}.get(name)
             view = (passing == "view" and view_carrier is not None and
@@ -194,7 +200,7 @@ class Signature:
         if type(sig["returns_result"]) is not bool:
             raise LinkError(f"{where} requires a by-value result and boolean returns_result")
         result = TypeRef.read(sig["result"], f"{where}.result", checked_result=sig["returns_result"])
-        if result.identity[0] in CALLBACK_IDENTITIES:
+        if result.identity[0] in CALLBACK_IDENTITIES and result.identity[0] != "nullable_record_view_reader":
             raise LinkError(f"{where} callback carrier cannot be a returned value")
         if result.passing != "value":
             raise LinkError(f"{where} requires a by-value result and boolean returns_result")
@@ -214,16 +220,17 @@ class Declaration:
     key: tuple[str, int]
     symbol: str
     signature: Signature
+    source_name: str | None = None
 
     def read(value, where):
         decl = record(value, "source_path node source_name symbol signature", where)
         key = (module_path(decl["source_path"], f"{where}.source_path"),
                node_id(decl["node"], f"{where}.node"))
-        text(decl["source_name"], f"{where}.source_name")
+        name = text(decl["source_name"], f"{where}.source_name")
         symbol = text(decl["symbol"], f"{where}.symbol")
         if not IDENTIFIER.fullmatch(symbol):
             raise LinkError(f"{where}.symbol requires a C identifier")
-        return Declaration(key, symbol, Signature.read(decl["signature"], f"{where}.signature"))
+        return Declaration(key, symbol, Signature.read(decl["signature"], f"{where}.signature"), name)
 
 
 @dataclass(frozen=True)
@@ -282,6 +289,19 @@ def string_slice_provider():
                           TypeRef(("builtin", "str"), "value", "KuBootstrapResult_KuProjectionString"), True)
     export = Declaration(("std/string.ku", 2), "KuBootstrapStringSlice", signature)
     return Unit(source, source, source.read_bytes(), export, ()), {implementation: implementation.read_bytes()}
+
+
+def string_trim_provider():
+    tools = Path(__file__).resolve().parent
+    driver = tools / "compiler_driver"
+    backend = tools.parents[1] / "src" / "backend"
+    source = driver / "string_trim.c"
+    headers = (driver / "string_trim_whitespace.h",
+               backend / "c_string_unicode_base.c", backend / "c_string_unicode_trim.c")
+    input_type = TypeRef(("builtin", "str"), "view", "const KuProjectionString*")
+    result_type = TypeRef(("builtin", "str"), "value", "KuProjectionString")
+    export = Declaration(("std/string.ku", 5), "KuBootstrapStringTrim", Signature((input_type,), result_type, False))
+    return Unit(source, source, source.read_bytes(), export, ()), {path: path.read_bytes() for path in headers}
 
 
 def bytes_provider(method, number, symbol, parameters, result):
@@ -391,24 +411,32 @@ def carrier_aliases(unit):
     return aliases
 
 
-def check_carrier_layout(carrier, expected, fields):
+def check_carrier_layout(carrier, expected, fields, diagnostic="link-plan C callback has a different carrier"):
     members = " ".join(f"{c_type} {name};" for name, c_type in fields)
     checks = [f"sizeof({carrier}) == sizeof({expected})", f"_Alignof({carrier}) == _Alignof({expected})"]
     for name, c_type in fields:
         checks.append(f"_Generic((({carrier}){{0}}).{name}, {c_type}: 1, default: 0)")
         checks.append(f"offsetof({carrier}, {name}) == offsetof({expected}, {name})")
     return [f"typedef struct {{ {members} }} {expected};",
-            f'_Static_assert({" && ".join(checks)}, "link-plan C callback has a different carrier");']
+            f'_Static_assert({" && ".join(checks)}, "{diagnostic}");']
 
 
 def wrapper(unit, include_caller):
     lines = ['#include "emitted.c"']
     declarations = (unit.export, *unit.dependencies)
+    nullable_int = any(ref.identity[0] == "nullable_int" for decl in declarations
+                       for ref in (*decl.signature.parameters, decl.signature.result))
     callbacks = sorted({(ref.identity[0], ref.c_type, ref.callback_nominals) for decl in declarations
-                        for ref in decl.signature.parameters if ref.identity[0] in CALLBACK_IDENTITIES})
-    if callbacks:
+                        for ref in (*decl.signature.parameters, decl.signature.result)
+                        if ref.identity[0] in CALLBACK_IDENTITIES})
+    nullable_int = nullable_int or any(kind == "nullable_record_view_reader" for kind, _, _ in callbacks)
+    if callbacks or nullable_int:
         lines.append('#include <stddef.h>')
-    if any(kind != "int_pair_result_callback" for kind, _, _ in callbacks):
+    if nullable_int:
+        lines.extend(check_carrier_layout("KuBootstrapOptionalInt", "ku_bootstrap_optional_int_layout",
+                                         (("is_null", "bool"), ("value", "int64_t")),
+                                         "link-plan C nullable int has a different carrier"))
+    if any(kind not in {"int_pair_result_callback", "nullable_record_view_reader"} for kind, _, _ in callbacks):
         lines.extend(check_carrier_layout("KuLocalAppendFailure", "ku_bootstrap_callback_failure_layout", (
             ("append_status", "int"), ("out_of_memory", "bool"), ("overflow", "bool"), ("index_failed", "bool"),
             ("array_error", "const char *"), ("index", "int64_t"), ("length", "size_t"),
@@ -417,7 +445,11 @@ def wrapper(unit, include_caller):
         entry = f"ku_bootstrap_callback_entry_{i}"
         expected = f"ku_bootstrap_callback_layout_{i}"
         fields = [("entry", entry), ("environment", "void *")]
-        if kind == "int_array_result_callback":
+        if kind == "nullable_record_view_reader":
+            nominal = carrier.removeprefix(CALLBACK_TYPES["NullableRecordViewReader"][1])
+            lines.append(f"typedef KuBootstrapOptionalInt (*{entry})(const KuProjectionString*, const {nominal}*);")
+            fields = [("entry", entry), ("capture", "KuProjectionString")]
+        elif kind == "int_array_result_callback":
             nominal = carrier.removeprefix(CALLBACK_TYPES["IntArrayResultCallback"][1])
             lines.append(f"typedef KuBootstrapResult_KuArrayInt (*{entry})(void*, KuLocalAppendFailure*, "
                          f"KuArrayInt, int64_t, int64_t, {nominal});")
@@ -444,6 +476,27 @@ def wrapper(unit, include_caller):
     if include_caller:
         lines.append('#include "caller.c"')
     return "\n".join(lines) + "\n"
+
+
+def program_caller(entry):
+    """Provide a C process entry for one checked linked Ku application."""
+    application_result = TypeRef(("builtin", "null"), "value", "KuBootstrapResultNull")
+    if entry.signature != Signature((), application_result, True):
+        raise LinkError("--program requires a zero-argument linked null! entry")
+    return f'''#include <stdio.h>
+
+int main(void) {{
+    KuBootstrapResultNull result = {entry.symbol}();
+    if (result.ok) return 0;
+    if (result.error.message.len)
+        fwrite(result.error.message.ptr, 1, result.error.message.len, stderr);
+    fputc('\\n', stderr);
+    ku_projection_string_drop(&result.error.domain);
+    ku_projection_string_drop(&result.error.code);
+    ku_projection_string_drop(&result.error.message);
+    return 1;
+}}
+'''.encode("ascii")
 
 
 def run_cc(args, timeout):
@@ -540,16 +593,20 @@ def link(units, aliases, output, entry, caller, cc, cflags, ldflags, timeout, bu
             os.replace(binary, output)
 
 
+BUILTIN_PROVIDERS = {
+    "fs.read": fs_read_provider, "string.slice": string_slice_provider, "string.trim": string_trim_provider,
+    "bytes.from_str": bytes_from_str_provider, "bytes.get": bytes_get_provider,
+}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--unit", nargs=2, required=True, action="append", metavar=("PLAN", "C"))
-    builtin_providers = {
-        "fs.read": fs_read_provider, "string.slice": string_slice_provider,
-        "bytes.from_str": bytes_from_str_provider, "bytes.get": bytes_get_provider,
-    }
-    parser.add_argument("--builtin", action="append", choices=builtin_providers, default=[])
+    parser.add_argument("--builtin", action="append", choices=BUILTIN_PROVIDERS, default=[])
     parser.add_argument("--entry", nargs=2, metavar=("MODULE", "NODE"))
-    parser.add_argument("--caller", type=Path)
+    host = parser.add_mutually_exclusive_group()
+    host.add_argument("--caller", type=Path)
+    host.add_argument("--program", action="store_true", help="add a process entry for a checked linked null! function")
     parser.add_argument("-o", "--output", type=Path)
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--cc", default=os.environ.get("CC", "cc"))
@@ -558,8 +615,8 @@ def main(argv=None):
     parser.add_argument("--timeout", type=float, default=120)
     args = parser.parse_args(argv)
     try:
-        if bool(args.entry) != bool(args.caller):
-            raise LinkError("--entry and --caller must be supplied together")
+        if bool(args.entry) != bool(args.caller or args.program):
+            raise LinkError("--entry requires either --caller or --program, and vice versa")
         if not args.check_only and not args.output:
             raise LinkError("--output is required when linking")
         if not 0 < args.timeout < float("inf"):
@@ -567,7 +624,7 @@ def main(argv=None):
         units = [Unit.read(Path(plan).resolve(), Path(source).resolve()) for plan, source in args.unit]
         builtin_headers = {}
         for name in args.builtin:
-            provider, headers = builtin_providers[name]()
+            provider, headers = BUILTIN_PROVIDERS[name]()
             units.append(provider)
             builtin_headers.update(headers)
         aliases = checked_aliases(units)
@@ -577,7 +634,11 @@ def main(argv=None):
             entry = (module_path(args.entry[0], "entry module"), node_id(int(args.entry[1]), "entry node"))
             if entry not in aliases:
                 raise LinkError(f"missing entry unit for {label(entry)}")
-            caller = args.caller.read_bytes()
+            if args.program:
+                selected = next(unit.export for unit in units if unit.export.key == entry)
+                caller = program_caller(selected)
+            else:
+                caller = args.caller.read_bytes()
         if args.check_only:
             print(json.dumps({label(key): table for key, table in sorted(aliases.items())}, sort_keys=True))
             return 0

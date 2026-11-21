@@ -1,19 +1,21 @@
 import { LinkedCharacterSource, LinkedStringReplaceApplies, LowerLinkedStringReplace, MaterializeLinkedCharacters } from "./struct_string_calls.ku"
-import { AppendLinkedArrayElement, EmitLinkedClone, InvokeLinkedReader, PrepareLinkedScopedCallbackArgument } from "./linked_array_fields_c.ku"
+import { AppendLinkedArrayElement, EmitLinkedClone, PrepareLinkedScopedCallbackArgument } from "./linked_array_fields_c.ku"
 import { CheckLinkedScopedCallback, EmitLinkedPlainInvocation, EmitLinkedScopedCallbackCall, LinkedScopedCallbackFunction, PublishLinkedCheckedValue } from "./link_plan_json_c.ku"
 import { CheckedAppendFault, CheckedAppendFaultHandoff, CheckedAppendInvocation, CheckedLinkedCallbackExpression } from "./guarded_string_parts.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC, LinkedViewArgument, MatchesLinkedFieldValue, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { Node } from "../stage2/ast.ku"
 import { FindLinkedLocalRead } from "./call_contracts.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { InvokeLinkedReader, LinkedCallArgument, LinkedReaderCallable } from "./linked_nullable_reader_c.ku"
+import { LinkedNullCallSymbol } from "./scalar_result_null.ku"
+import { IsLinkedReaderParameter, TypeNameBinding } from "./type_names.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
-import { AppendLinkedCheckedInvocation, IsLinkedScopedCallback, LinkedCheckedCall, LinkedDirectCallExpression, LinkedScalarArrayLayout, LinkedScalarArrayOwner, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
-import { LinkedCallArgument, LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullCallSymbol, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
-         LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { AppendLinkedCheckedInvocation, IsLinkedScopedCallback, LinkedCheckedCall, LinkedDirectCallExpression, LinkedScalarArrayLayout, LinkedScalarArrayOwner, LinkedNullArguments, LinkedLocalAppendIndex, RememberLinkedCall, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullOwner, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
+import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, ResolveLinkedCall, LinkedNullHasResultValue, LinkedNullLiteralType,
+         LinkedNullNode, LinkedNullProject, LinkedNullResultType, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
 import { ReadLinkedLocalArrayItem, EmitLinkedAddition, IsLinkedLogicalNegation, LowerLinkedIntArrayLiteral, LowerLinkedNullLeaf, LowerLinkedNullRead } from "./linked_null_read_c.ku"
-import { AddLinkedNullSlot, CheckLinkedLocalAppendArguments, ForwardLinkedCallback, LinkedCallableSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RequireLinkedArrayValidation, RestoreLinkedConcatPrefix, ValidateLinkedPayload } from "./linked_parameters_c.ku"
+import { AddLinkedNullSlot, CheckLinkedLocalAppendArguments, ForwardLinkedCallback, LinkedCallableSlot, IsLinkedIntConversion, LowerLinkedIntString, RegisterLinkedNullType, RestoreLinkedConcatPrefix, ValidateLinkedPayload } from "./linked_parameters_c.ku"
 
 
 fn lowerLinkedArgument(&project: LinkedNullProject, state: LinkedNullState, &parameter: TypeNameBinding,
@@ -112,10 +114,10 @@ fn emitLinkedCall(&project: LinkedNullProject, state: LinkedNullState, &call: No
     if (target.kind == "Variable" && target.edge_count == 0) {
         local = FindLinkedLocalRead(state.local_readers, target.text)
         slot = LinkedNullBinding(state.slots, target.text)
-        reader = slot > 0 && state.slots[slot - 1].value.ty.declaration_kind == "IntRecordReaderCallback"
+        reader = slot > 0 && IsLinkedReaderParameter(state.slots[slot - 1].value.ty)
         if (local != 0 || reader) {
-            if (call.edge_count != 2 || (reader && !LinkedCallableSlot(state, slot)) || (!reader && slot != 0)) {
-                RejectLayout("linked_local_reader_call", "expected a direct local reader call with one int argument", DeclarationSpan(call))?
+            if (call.edge_count != 2 || (reader && !LinkedReaderCallable(state, slot)) || (!reader && slot != 0)) {
+                RejectLayout("linked_local_reader_call", "expected a direct local reader call with one argument", DeclarationSpan(call))?
             }
             if (reader) {
                 callback = state.slots[slot - 1].value.clone()

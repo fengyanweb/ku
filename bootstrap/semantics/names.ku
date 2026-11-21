@@ -44,6 +44,151 @@ fn IsNamedFunction(&kind: str): bool {
     return kind == "Function" || kind == "AsyncFunction"
 }
 
+// The Stage0 checker visits all siblings when inferring a function's return,
+// and in a for body. Ordinary nested blocks stop at a non-fallthrough statement.
+fn parameterBlockExit(&nodes: [Node], &edges: [int], start: int, stop: int, seeking_break: bool): bool {
+    cursor = start
+    while (cursor < stop) {
+        statement = nodes[edges[cursor] - 1].clone()
+        first = statement.first_edge
+        end = first + statement.edge_count
+        if (statement.kind == "If") {
+            then_start = first + 1
+            else_start = then_start + statement.int_value
+            if (seeking_break) {
+                if (parameterBlockExit(nodes, edges, then_start, end, true)) { return true }
+            } else if (else_start < end && parameterBlockExit(nodes, edges, then_start, else_start, false)
+                       && parameterBlockExit(nodes, edges, else_start, end, false)) {
+                return true
+            }
+        } else if (seeking_break) {
+            if (statement.kind == "Break") { return true }
+            if (statement.kind == "Try") {
+                try_body = nodes[edges[first] - 1].clone()
+                catch_clause = nodes[edges[first + 1] - 1].clone()
+                catch_body = nodes[edges[catch_clause.first_edge + 1] - 1].clone()
+                if (parameterBlockExit(nodes, edges, try_body.first_edge, try_body.first_edge + try_body.edge_count, true)
+                    || parameterBlockExit(nodes, edges, catch_body.first_edge, catch_body.first_edge + catch_body.edge_count, true)) {
+                    return true
+                }
+            }
+        } else if (statement.kind == "Break" || statement.kind == "Continue" || statement.kind == "Return"
+                   || statement.kind == "Fail" || statement.kind == "Panic") {
+            return true
+        } else if (statement.kind == "While") {
+            condition = nodes[edges[first] - 1].clone()
+            if (condition.kind == "Bool" && condition.text == "true"
+                && !parameterBlockExit(nodes, edges, first + 1, end, true)) {
+                return true
+            }
+        }
+        cursor = cursor + 1
+    }
+    return false
+}
+
+fn writesParameter(&nodes: [Node], &edges: [int], &statement: Node, &name: str): bool {
+    if (statement.kind == "Assign") { return statement.text == name }
+    if (statement.kind == "CompoundAssign") {
+        target = nodes[edges[statement.first_edge] - 1].clone()
+        return target.kind == "Variable" && target.text == name
+    }
+    if (statement.kind == "ObjectDestructureAssign") {
+        start = statement.first_edge
+        stop = start + statement.edge_count - 1
+        cursor = start
+        while (cursor < stop) {
+            field = nodes[edges[cursor] - 1].clone()
+            if (field.kind == "ObjectDestructureRest") {
+                if (field.text == name) { return true }
+            } else if (nodes[edges[field.first_edge] - 1].text == name) {
+                return true
+            }
+            cursor = cursor + 1
+        }
+    }
+    return false
+}
+
+fn parameterEnd(&nodes: [Node], &edges: [int], start: int, stop: int): int {
+    cursor = start
+    while (cursor < stop && nodes[edges[cursor] - 1].kind == "Parameter") { cursor = cursor + 1 }
+    return cursor
+}
+
+// Inspect one known formal through lexical block edges only. A local which
+// shadows it masks the remainder of that block, never a sibling branch.
+fn checkParameterBlock(&nodes: [Node], &edges: [int], start: int, stop: int, &name: str,
+                       infer_return: bool, stop_at_exit: bool): null! {
+    cursor = start
+    while (cursor < stop) {
+        statement = nodes[edges[cursor] - 1].clone()
+        first = statement.first_edge
+        end = first + statement.edge_count
+        if (statement.kind == "If") {
+            then_start = first + 1
+            else_start = then_start + statement.int_value
+            checkParameterBlock(nodes, edges, then_start, else_start, name, infer_return, !infer_return)?
+            checkParameterBlock(nodes, edges, else_start, end, name, infer_return, !infer_return)?
+        } else if (statement.kind == "While") {
+            checkParameterBlock(nodes, edges, first + 1, end, name, false, true)?
+        } else if (statement.kind == "For") {
+            if (statement.text != name) {
+                checkParameterBlock(nodes, edges, first + 1, end, name, false, false)?
+            }
+        } else if (statement.kind == "Try") {
+            try_body = nodes[edges[first] - 1].clone()
+            checkParameterBlock(nodes, edges, try_body.first_edge, try_body.first_edge + try_body.edge_count, name, false, true)?
+            catch_clause = nodes[edges[first + 1] - 1].clone()
+            if (nodes[edges[catch_clause.first_edge] - 1].text != name) {
+                catch_body = nodes[edges[catch_clause.first_edge + 1] - 1].clone()
+                checkParameterBlock(nodes, edges, catch_body.first_edge, catch_body.first_edge + catch_body.edge_count, name, false, true)?
+            }
+        } else {
+            if (writesParameter(nodes, edges, statement, name)) {
+                RejectName("immutable_parameter", "cannot assign to immutable parameter '" + name.clone() + "'", DeclarationSpan(statement))?
+            }
+            nested = 0
+            if (IsNamedFunction(statement.kind)) { nested = edges[cursor] }
+            else if (statement.kind == "VarDecl" || statement.kind == "Assign") {
+                if (end > first && nodes[edges[end - 1] - 1].kind == "FunctionExpr") { nested = edges[end - 1] }
+            }
+            if (nested != 0) {
+                function = nodes[nested - 1].clone()
+                args = function.first_edge
+                body_stop = args + function.edge_count
+                body_start = parameterEnd(nodes, edges, args, body_stop)
+                captures = function.text != name
+                while (args < body_start && captures) {
+                    captures = nodes[edges[args] - 1].text != name
+                    args = args + 1
+                }
+                if (captures) { checkParameterBlock(nodes, edges, body_start, body_stop, name, true, false)? }
+            }
+            if ((statement.kind == "VarDecl" || IsNamedFunction(statement.kind)) && statement.text == name) {
+                return ok(null)
+            }
+        }
+        if (stop_at_exit && cursor + 1 < stop && parameterBlockExit(nodes, edges, cursor, cursor + 1, false)) {
+            return ok(null)
+        }
+        cursor = cursor + 1
+    }
+    return ok(null)
+}
+
+fn CheckParameterWrites(&nodes: [Node], &edges: [int], &function: Node): null! {
+    start = function.first_edge
+    stop = start + function.edge_count
+    body = parameterEnd(nodes, edges, start, stop)
+    cursor = start
+    while (cursor < body) {
+        checkParameterBlock(nodes, edges, body, stop, nodes[edges[cursor] - 1].text, true, false)?
+        cursor = cursor + 1
+    }
+    return ok(null)
+}
+
 fn CheckSignatureBindings(&nodes: [Node], &edges: [int], &item: Node): null! {
     item_span = DeclarationSpan(item)
     index = 0

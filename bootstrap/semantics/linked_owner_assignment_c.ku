@@ -1,18 +1,20 @@
+import { LinkedLocalCaptures, ReadLinkedParameterCaptures } from "./linked_nullable_reader_c.ku"
 import { RejectLocalCapture } from "./call_contracts.ku"
 import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { Node } from "../stage2/ast.ku"
-import { DeclarationSpan, IsNamedFunction } from "./names.ku"
+import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { LinkedAppendFailureRelay, RestoreLinkedThunkFrame } from "./link_plan_json_c.ku"
 import { StartLinkedThunkFrame } from "./scalar_result_null.ku"
 import { AppendLinkedArrayElement, LowerLinkedArrayBinding } from "./linked_array_fields_c.ku"
-import { LinkedLiveIntBinding, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
-import { LinkedLocalAppend, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove, RequireLinkedMove } from "./linked_member_ownership.ku"
+import { LinkedLocalAppend, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
 import { LinkedCheckedResultCType, LinkedIntResult, LinkedNullArrayElement, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, ReadLinkedOwnedArray, SameLinkedType } from "./linked_null_types_c.ku"
 import { AddLinkedNullSlot, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ReadOwnedArrayPushArgument } from "./struct_array_c.ku"
+import { CloneLinkedStringArray } from "./struct_string_calls.ku"
 import { CloneLinkedRecordArray } from "./linked_null_read_c.ku"
 import { LowerLinkedExpectedValue, LowerLinkedNullValue } from "./linked_null_values_c.ku"
 
@@ -96,23 +98,25 @@ struct LinkedForLoop {
     before: int
 }
 
-fn OpenLinkedRecordForLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
+fn OpenLinkedOwnedForLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
                             source: int, id: int, depth: int): LinkedForLoop! {
     at = DeclarationSpan(statement)
     if (depth >= 32 || LinkedNullBinding(state.slots, statement.text) != 0) {
-        RejectLayout("linked_record_for_scope", "record iteration needs a fresh local binding within the control bound", at.clone())?
+        RejectLayout("linked_record_for_scope", "owned array iteration needs a fresh local binding within the control bound", at.clone())?
     }
     before = state.slots.len()
     input = LowerLinkedNullValue(project, state, source, 0)?
     owner = input.value.clone()
-    if (!LinkedNullOwnedArray(owner.ty) || owner.borrowed || owner.slot == 0 ||
+    strings = owner.ty.declaration_kind == "OwnedStringArray"
+    if ((!LinkedNullOwnedArray(owner.ty) && !strings) || owner.borrowed || owner.slot == 0 ||
         LinkedMemberUnavailable(input.state, owner, true)) {
-        RejectLayout("linked_record_for_source", "expected a live owned record array", at)?
+        RejectLayout("linked_record_for_source", "expected a live owned record or string array", at)?
     }
     if (owner.slot <= before || owner.member_path != "" || input.state.slots[owner.slot - 1].binding != "") {
         // The language keeps a named source usable after iteration. Move
         // elements out of its independent snapshot, as for a fresh result.
-        input = CloneLinkedRecordArray(project, input, id)?
+        if (strings) { input = CloneLinkedStringArray(project, input, id)? }
+        else { input = CloneLinkedRecordArray(project, input, id)? }
         owner = input.value.clone()
     }
 
@@ -121,6 +125,7 @@ fn OpenLinkedRecordForLoop(&project: LinkedNullProject, state: LinkedNullState, 
     outer = input.state.slots.clone()
     ty = LinkedNullArrayElement(owner.ty)
     suffix = str(id) + "_records"
+    if (strings) { suffix = str(id) + "_strings" }
     item = AddLinkedNullSlot(project, input.state, statement.text.clone(), "t" + suffix.clone(), ty.clone(), false)?
     item.state.slots[item.value.slot - 1].live = true
     index = "i" + suffix
@@ -144,63 +149,9 @@ fn OpenLinkedBooleanWhile(state: LinkedNullState, &statement: Node, condition: s
     return ok(LinkedForLoop { state: next, outer: outer, before: before })
 }
 
-struct LinkedLocalCaptures {
-    slots: [int]
-    calls: [int]
-}
-
-// The validated arena stores this function's subtree contiguously. A second
-// function or a declaration that could shadow an outer slot needs its own
-// binding rules before this restricted same-frame lowering can accept it.
 fn ReadLinkedLocalCaptures(&project: LinkedNullProject, &state: LinkedNullState,
                            &function: Node, id: int, body_start: int): LinkedLocalCaptures! {
-    names: [str] = []
-    limit = body_start - 1
-    index = 0
-    while (index < limit) {
-        parameter = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
-        names = names.push(parameter.text)
-        index = index + 1
-    }
-    start = LinkedNullChild(project, 1, function, body_start)
-    descending = true
-    while (descending) {
-        descending = project.supplied[0].named.parsed.arena.nodes[start - 1].edge_count > 0
-        if (descending) {
-            start = project.supplied[0].named.parsed.arena.edges[
-                project.supplied[0].named.parsed.arena.nodes[start - 1].first_edge]
-        }
-    }
-    slots: [int] = []
-    calls: [int] = []
-    has_local_calls = state.local_appends.len() > 0
-    cursor = start
-    while (cursor < id) {
-        node = LinkedNullNode(project, 1, cursor)
-        if (has_local_calls && node.kind == "Call" && node.edge_count > 0) {
-            target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
-            if (target.kind == "Variable" && target.edge_count == 0 && !ContainsType(names, target.text) &&
-                LinkedNullBinding(state.slots, target.text) == 0) {
-                index = LinkedLocalAppendIndex(state, target.text)
-                if (index > 0 && !ContainsIndex(calls, index)) { calls = calls.push(index) }
-            }
-        }
-        use = node.kind == "Variable" || node.kind == "Assign"
-        if (IsNamedFunction(node.kind) || node.kind == "FunctionExpr" || (use && node.text == function.text)) {
-            RejectLocalCapture(node, "a local callback cannot define or reference a nested callable")?
-        }
-        declares = node.kind == "VarDecl" || node.kind == "For" || node.kind == "CatchBinding" ||
-            node.kind == "ObjectDestructureLocal" || node.kind == "ObjectDestructureRest"
-        if ((use || declares) && !ContainsType(names, node.text)) {
-            slot = LinkedNullBinding(state.slots, node.text)
-            if (slot > 0 && declares) {
-                RejectLocalCapture(node, "a local callback binding cannot shadow an outer capture")?
-            }
-            if (slot > 0 && !ContainsIndex(slots, slot)) { slots = slots.push(slot) }
-        }
-        cursor = cursor + 1
-    }
-    return ok(LinkedLocalCaptures { slots: slots, calls: calls })
+    return ReadLinkedParameterCaptures(project, state, function, id, body_start, body_start - 1)
 }
 
 struct LinkedAppendThunk {
@@ -416,4 +367,36 @@ fn ValidLinkedCountedStart(&project: LinkedNullProject, &state: LinkedNullState,
     }
     input = LinkedLiveIntBinding(state, initial)
     return input > 0 && input != slot
+}
+
+fn CheckLinkedCountedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &initial: Node, &step: Node): int! {
+    guard = LinkedIncreasingGuard(project, loop)
+    bounded = false
+    if (guard.kind == "Binary" && guard.edge_count == 2 && guard.text == "<") {
+        bounded = LinkedCountBound(project, state, LinkedNullChild(project, 1, guard, 1))?
+    }
+    if (!bounded) {
+        RejectLayout("unsupported_linked_loop", "counted while requires a readonly array length or stable int bound", DeclarationSpan(guard))?
+    }
+    left = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
+    slot = LinkedLiveIntBinding(state, left)
+    if (slot == 0 ||
+        initial.kind != "Assign" || initial.edge_count != 1 || initial.text != left.text ||
+        step.kind != "Assign" || step.edge_count != 1 || step.text != left.text) {
+        RejectLayout("unsupported_linked_loop", "counted while requires one distinct int cursor", DeclarationSpan(loop))?
+    }
+    bound = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 1))
+    named_bound = LinkedLiveIntBinding(state, bound) > 0
+    valid_start = ValidLinkedCountedStart(project, state, LinkedNullChild(project, 1, initial, 0), slot, named_bound)
+    rhs = LinkedNullNode(project, 1, LinkedNullChild(project, 1, step, 0))
+    if (!valid_start || rhs.kind != "Binary" || rhs.edge_count != 2 || rhs.text != "+") {
+        RejectLayout("unsupported_linked_loop", "counted while requires initialization to zero or a supported stable int start and a fixed increment", DeclarationSpan(loop))?
+    }
+    cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, rhs, 0))
+    amount = LinkedNullNode(project, 1, LinkedNullChild(project, 1, rhs, 1))
+    if (cursor.kind != "Variable" || cursor.edge_count != 0 || cursor.text != left.text ||
+        amount.kind != "Int" || amount.edge_count != 0 || amount.int_value <= 0 || (!named_bound && amount.int_value != 1)) {
+        RejectLayout("unsupported_linked_loop", "counted while requires a positive constant step with a named int bound and a unit step otherwise", DeclarationSpan(step))?
+    }
+    return ok(slot)
 }

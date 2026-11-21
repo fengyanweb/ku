@@ -1,9 +1,10 @@
+import { FinishLinkedOwnedReader, ReadLinkedOwnedReader } from "./linked_nullable_reader_c.ku"
 import { LinkedCharacterSource } from "./struct_string_calls.ku"
 import { RegisterLinkedLocalRead } from "./linked_array_fields_c.ku"
 import { RequireLinkedMutableBinding } from "./call_contracts.ku"
 import { AddLinkedNullSlot, CheckLinkedLocalFunctionName, ReadLinkedNullParameters } from "./linked_parameters_c.ku"
 import { OpenLinkedForLoop, OpenLinkedConditionalWhile, CloseLinkedForLoop, LinkedCountdownIndex, LinkedCountedInitial, ReadLinkedLocalThunk, FinishLinkedLocalThunk, LowerLinkedLocalAlias, LowerLinkedCopyRebind, LowerLinkedPredicate, LowerLinkedCharacterLocal } from "./linked_char_iter_c.ku"
-import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedCountBound, LinkedIncreasingGuard, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
+import { BindLinkedCatch, CheckLinkedCountedBoundWrites, DropLinkedNullScope, LinkedLiveIntBinding, MergeLinkedConditionalMembers, MergeLinkedGuardOwners, MoveLinkedNullSlot } from "./linked_member_ownership.ku"
 import { EmitLinkedFunction, LowerLinkedTargetSet, LowerLinkedOwnedDestructure,
          LowerLinkedPlainReturn, LowerLinkedStringAppend, LowerLinkedSuccess } from "./linked_function_c.ku"
 import { Node } from "../stage2/ast.ku"
@@ -14,15 +15,15 @@ import { SuppliedModule } from "./imports.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { ReadLinkedErrorInitializer, RejectLayout } from "./struct_layouts.ku"
 import { ExitLinkedFailure, LinkedFailureTarget, LinkedSlotPrefix, LinkedNullBinding, LinkedNullC, LinkedNullFunction, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkPlanDeclaration, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
-import { LinkedBuiltin, LinkedResultPlan, LinkedNullChild, LinkedNullEntry,
+import { LinkedBuiltin, LinkedResultPlan, LinkedNullChild,
          LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
 import { LinkedChildKindIs } from "./link_plan_json_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedNullValue } from "./linked_null_values_c.ku"
-import { FinishLinkedAppendThunk, IsLinkedAppendThunk, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, LowerLinkedTypedArrayLocal, ReadLinkedAppendThunk, ValidLinkedCountedStart } from "./linked_owner_assignment_c.ku"
+import { CheckLinkedCountedIndex, FinishLinkedAppendThunk, IsLinkedAppendThunk, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, LowerLinkedTypedArrayLocal, ReadLinkedAppendThunk } from "./linked_owner_assignment_c.ku"
 import { ReadLinkedCatchParts } from "./scalar_result_null.ku"
 import { LowerLinkedStatementCall, ReadLinkedWhileCondition } from "./project_struct_string_c.ku"
-import { ContainsIndex } from "./struct_projection_c.ku"
+import { ContainsIndex, RequireProjectionLocalFunction } from "./struct_projection_c.ku"
 
 
 fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
@@ -76,38 +77,6 @@ fn addGuardedRegion(&project: LinkedNullProject, state: LinkedNullState, &statem
     return ok(LinkedNullRegion { state: next, terminal: then_terminal && else_terminal })
 }
 
-fn countedIndex(&project: LinkedNullProject, &state: LinkedNullState, &loop: Node, &initial: Node, &step: Node): int! {
-    guard = LinkedIncreasingGuard(project, loop)
-    bounded = false
-    if (guard.kind == "Binary" && guard.edge_count == 2 && guard.text == "<") {
-        bounded = LinkedCountBound(project, state, LinkedNullChild(project, 1, guard, 1))?
-    }
-    if (!bounded) {
-        RejectLayout("unsupported_linked_loop", "counted while requires a readonly array length or stable int bound", DeclarationSpan(guard))?
-    }
-    left = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 0))
-    slot = LinkedLiveIntBinding(state, left)
-    if (slot == 0 ||
-        initial.kind != "Assign" || initial.edge_count != 1 || initial.text != left.text ||
-        step.kind != "Assign" || step.edge_count != 1 || step.text != left.text) {
-        RejectLayout("unsupported_linked_loop", "counted while requires one distinct int cursor", DeclarationSpan(loop))?
-    }
-    bound = LinkedNullNode(project, 1, LinkedNullChild(project, 1, guard, 1))
-    named_bound = LinkedLiveIntBinding(state, bound) > 0
-    valid_start = ValidLinkedCountedStart(project, state, LinkedNullChild(project, 1, initial, 0), slot, named_bound)
-    rhs = LinkedNullNode(project, 1, LinkedNullChild(project, 1, step, 0))
-    if (!valid_start || rhs.kind != "Binary" || rhs.edge_count != 2 || rhs.text != "+") {
-        RejectLayout("unsupported_linked_loop", "counted while requires initialization to zero or a supported stable int start and a fixed increment", DeclarationSpan(loop))?
-    }
-    cursor = LinkedNullNode(project, 1, LinkedNullChild(project, 1, rhs, 0))
-    amount = LinkedNullNode(project, 1, LinkedNullChild(project, 1, rhs, 1))
-    if (cursor.kind != "Variable" || cursor.edge_count != 0 || cursor.text != left.text ||
-        amount.kind != "Int" || amount.edge_count != 0 || amount.int_value <= 0 || (!named_bound && amount.int_value != 1)) {
-        RejectLayout("unsupported_linked_loop", "counted while requires a positive constant step with a named int bound and a unit step otherwise", DeclarationSpan(step))?
-    }
-    return ok(slot)
-}
-
 fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, &initial: Node,
                   &result: TypeNameBinding, depth: int): LinkedNullState! {
     if (depth >= 32) {
@@ -116,7 +85,7 @@ fn addCountedLoop(&project: LinkedNullProject, state: LinkedNullState, &statemen
     step = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, statement.edge_count - 1))
     countdown = LinkedCountdownIndex(project, state, statement, step)?
     cursor = countdown
-    if (cursor == 0) { cursor = countedIndex(project, state, statement, initial, step)? }
+    if (cursor == 0) { cursor = CheckLinkedCountedIndex(project, state, statement, initial, step)? }
     RequireLinkedMutableBinding(state.slots[cursor - 1].binding, state.slots[cursor - 1].source_parameter, DeclarationSpan(step))?
     outer = state.slots.clone()
     next = state
@@ -246,7 +215,9 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
                 }
                 next = lowerLinkedFailure(project, next, statement)?
             } else if (next.plain_value_result) {
-                next = LowerLinkedPlainReturn(project, next, statement, result)?
+                if (result.declaration_kind == "NullableInt" && statement.edge_count == 1 && LinkedChildKindIs(project, statement, 0, "Null")) {
+                    next.code += "    result = (KuBootstrapOptionalInt){true, 0};\n    goto cleanup;\n"
+                } else { next = LowerLinkedPlainReturn(project, next, statement, result)? }
             } else { next = LowerLinkedSuccess(project, next, statement, result)? }
             return ok(LinkedNullRegion { state: next, terminal: true })
         }
@@ -262,7 +233,17 @@ fn lowerLinkedRegion(&project: LinkedNullProject, &region: Node, state: LinkedNu
             if (ContainsIndex(next.callback_owners, slot)) {
                 RejectLayout("linked_callback_owner", "a captured array must remain readable by its local callback", DeclarationSpan(statement))?
             }
-            if (slot == 0) { next = LowerLinkedLocal(project, next, statement, id)? }
+            if (slot == 0 && depth == 0 && result.declaration_kind == "NullableRecordViewReader" && LinkedChildKindIs(project, statement, 0, "FunctionExpr")) {
+                end = LinkedNullChild(project, 1, region, limit - 1)
+                prepared = ReadLinkedOwnedReader(project, next, statement, result, id, end)?
+                function_id = prepared.function
+                capture = prepared.capture
+                body_start = prepared.start
+                reader_result = prepared.result
+                function = LinkedNullNode(project, 1, function_id)
+                body = lowerLinkedRegion(project, function, prepared.state, body_start, reader_result, 1)?
+                next = FinishLinkedOwnedReader(project, next, body, statement, result, capture, function_id)?
+            } else if (slot == 0) { next = LowerLinkedLocal(project, next, statement, id)? }
             else if (LinkedNullIntArrayOwner(next.slots[slot - 1].value.ty) || LinkedNullOwnedArray(next.slots[slot - 1].value.ty)
                 || next.slots[slot - 1].value.ty.declaration_kind == "OwnedStringArray") {
                 next = LowerLinkedArrayAppend(project, next, statement, slot)?
@@ -354,7 +335,7 @@ fn PrepareLinkedNullProject(supplied: [SuppliedModule]): LinkedNullProject! {
 }
 
 fn EmitLinkedNullC(&project: LinkedNullProject, &entry_name: str): LinkedNullC! {
-    id = LinkedNullEntry(project, entry_name)?
+    id = RequireProjectionLocalFunction(project.supplied, entry_name)?
     function = LinkedNullNode(project, 1, id)
     parameters = ReadLinkedNullParameters(project, function)?
     result = parameters.result.clone()

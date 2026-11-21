@@ -9,9 +9,10 @@ import { RejectLayout, StructLayout } from "../semantics/struct_layouts.ku"
 import { EmitNestedCLayouts, OrderCStructLayouts } from "../semantics/nested_struct_c.ku"
 import { ScalarStringHelpers } from "../semantics/scalar_int_emit.ku"
 import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
-import { LinkedNullProject, LinkedNullEntry, LinkedNullChild, LinkedNullNode,
+import { LinkedNullProject, LinkedNullChild, LinkedNullNode,
     LinkedNullParameterType, LinkedNullDependency, LinkedNullLayout,
     LinkedNullCType, LinkedNullParameterPlan } from "../semantics/linked_null_types_c.ku"
+import { RequireProjectionLocalFunction } from "../semantics/struct_projection_c.ku"
 import { BuiltinLinkPlanType, LinkPlanDeclaration, LinkedNullFunction } from "../semantics/link_plan_c.ku"
 import { EmitLinkPlan, LinkedNullDependencyPlan, LinkedNullPrototype } from "../semantics/link_plan_json_c.ku"
 import { TypeNameBinding } from "../semantics/type_names.ku"
@@ -173,7 +174,7 @@ fn emitLine(&plan: PathLinePlan, &symbol: str, &context_type: str, layouts: str)
 fn EmitPathLineC(&supplied: [SuppliedModule], &name: str): PathLineC! {
     bound = BindProjectModules(supplied)?
     project = LinkedNullProject { supplied: supplied.clone(), binding: bound }
-    id = LinkedNullEntry(project, name)?
+    id = RequireProjectionLocalFunction(project.supplied, name)?
     entry = LinkedNullNode(project, 1, id)
     shape(entry, "Function", 7)?
     line = child(project, entry, 0)

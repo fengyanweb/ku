@@ -13,8 +13,7 @@ import tempfile
 
 def builtin_signatures(link_c):
     result = {}
-    for name, provider in (("fs.read", link_c.fs_read_provider), ("string.slice", link_c.string_slice_provider),
-                           ("bytes.from_str", link_c.bytes_from_str_provider), ("bytes.get", link_c.bytes_get_provider)):
+    for name, provider in link_c.BUILTIN_PROVIDERS.items():
         unit, _ = provider()
         result[unit.export.key] = (name, unit.export.signature.semantic())
     return result

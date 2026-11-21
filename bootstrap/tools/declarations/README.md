@@ -22,3 +22,14 @@ a matching function and `null` for other declarations. An empty prefix returns
 
 For a native deployment, copy `declarations`, `source.ku` and `prefix.txt`
 together. An explicit Runner build still needs its original module sources.
+
+With a standalone `ku-bootstrap` compiler, build the same tool from the
+bootstrap module manifest. Run from a directory containing `bootstrap/`.
+
+```sh
+python3 bootstrap/tools/build_program.py bootstrap/declarations.modules.txt \
+  --compiler ku-bootstrap --cc cc -o declarations
+printf 'fn Keep(): int { return 42 }\n' > source.ku
+printf 'Keep\n' > prefix.txt
+./declarations
+```

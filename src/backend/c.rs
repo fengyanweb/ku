@@ -861,6 +861,18 @@ fn generate_c_source_with_frames_attempt(
     let mut nullable_emitted = HashSet::new();
     emit_layouts(&mut out, &abi_program, &mut nullable_emitted)?;
     emit_named_ownership_helpers(&mut out, program)?;
+    if nullable_emitted.contains("int")
+        && program_has_intrinsic(program, |name, args| {
+            name == "str"
+                && matches!(args.first().map(|arg| &arg.ty), Some(IrType::Nullable(inner)) if **inner == IrType::Int)
+        })
+    {
+        out.push_str(
+            "static KuString __ku_string_from_nullable_int(__ku_nullable_type_int value) {\n\
+             \x20 return value.is_null ? ku_string_static((const uint8_t*)\"null\", 4) : ku_string_from_int(value.value);\n\
+             }\n\n",
+        );
+    }
     register_closure_invoke_symbols(program);
     // The env header carries the type-erased retain/release used by both closures
     // and the `KuValue` Function tag. Emit it up front whenever either feature is
@@ -3801,6 +3813,9 @@ fn c_move_place(expr: &IrExpr) -> KuResult<Option<String>> {
 
 fn c_value_expr(expr: &IrExpr) -> KuResult<String> {
     if let IrExprKind::Call { kind, args, .. } = &expr.kind {
+        if matches!(kind, IrCallKind::Intrinsic(name) if name.starts_with("__ku_enum_payload:")) {
+            return c_move_value(&expr.ty, &c_expr(expr)?);
+        }
         if is_c_owned_type(&expr.ty)
             && matches!(kind, IrCallKind::Intrinsic(name) if name == "__ku_nullable_get")
         {
@@ -16348,18 +16363,22 @@ fn emit_string_chars_helper(out: &mut COutput, program: &IrProgram) -> KuResult<
 }
 
 fn program_uses_intrinsic(program: &IrProgram, intrinsic: &str) -> bool {
+    program_has_intrinsic(program, |name, _| name == intrinsic)
+}
+
+fn program_has_intrinsic(program: &IrProgram, predicate: impl Fn(&str, &[IrExpr]) -> bool) -> bool {
     program.functions.iter().any(|function| {
         function.blocks.iter().any(|block| {
             let mut used = false;
             for inst in &block.instructions {
                 walk_inst_exprs(inst, &mut |expr| {
-                    if expr_uses_intrinsic(expr, intrinsic) {
+                    if expr_has_intrinsic(expr, &predicate) {
                         used = true;
                     }
                 });
             }
             walk_terminator_exprs(&block.terminator, &mut |expr| {
-                if expr_uses_intrinsic(expr, intrinsic) {
+                if expr_has_intrinsic(expr, &predicate) {
                     used = true;
                 }
             });
@@ -16429,16 +16448,17 @@ fn expr_mentions_native_tls_config(expr: &IrExpr) -> bool {
         .any(expr_mentions_native_tls_config)
 }
 
-fn expr_uses_intrinsic(expr: &IrExpr, intrinsic: &str) -> bool {
+fn expr_has_intrinsic(expr: &IrExpr, predicate: &impl Fn(&str, &[IrExpr]) -> bool) -> bool {
     matches!(
         &expr.kind,
         IrExprKind::Call {
             kind: IrCallKind::Intrinsic(name),
+            args,
             ..
-        } if name == intrinsic
+        } if predicate(name, args)
     ) || expr_children(expr)
         .into_iter()
-        .any(|child| expr_uses_intrinsic(child, intrinsic))
+        .any(|child| expr_has_intrinsic(child, predicate))
 }
 
 fn collect_array_elements_program(program: &IrProgram, output: &mut Vec<IrType>) {
@@ -17507,16 +17527,14 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
         let value = args
             .first()
             .ok_or_else(|| unsupported("enum payload access requires one argument"))?;
-        // Binding a payload in a `match` arm MOVES it out of the enum (Ku matches
-        // by value), so clear the enum's slot: the enum is deep-dropped afterwards
-        // and would otherwise free the same buffer the binding now owns.
-        let place = format!(
+        // Tag tests, deeper projections and guarded arm candidates must
+        // inspect this place without consuming it. Only c_value_expr moves.
+        return Ok(format!(
             "({}).payload.{}.{}",
             c_expr(value)?,
             c_ident(variant),
             c_ident(field)
-        );
-        return c_move_value(ty, &place);
+        ));
     }
     if let Some(method) = name.strip_prefix("array.") {
         let receiver = args
@@ -17826,6 +17844,9 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
             IrType::Bool => Ok(format!("ku_string_from_bool({})", c_expr(arg)?)),
             IrType::Str => Ok(format!("ku_string_clone({})", c_expr(arg)?)),
             IrType::Null => Ok("ku_string_static((const uint8_t*)\"null\", 4)".to_string()),
+            IrType::Nullable(inner) if **inner == IrType::Int => {
+                Ok(format!("__ku_string_from_nullable_int({})", c_expr(arg)?))
+            }
             other => Err(unsupported(format!(
                 "native C str() is not implemented for {other} yet"
             ))),

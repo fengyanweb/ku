@@ -5,8 +5,9 @@ import { DeclarationSpan } from "../semantics/names.ku"
 import { BindProjectModules } from "../semantics/project_bindings.ku"
 import { ManifestPaths, ReadProjectModulesAt } from "../semantics/project_manifest.ku"
 import { RejectLayout } from "../semantics/struct_layouts.ku"
-import { LinkedNullChild, LinkedNullEntry, LinkedNullNode, LinkedNullProject,
+import { LinkedNullChild, LinkedNullNode, LinkedNullProject,
     LinkedNullType, LinkedStringResult } from "../semantics/linked_null_types_c.ku"
+import { RequireProjectionLocalFunction } from "../semantics/struct_projection_c.ku"
 import { BuiltinLinkPlanType, LinkPlanDeclaration } from "../semantics/link_plan_c.ku"
 import { EmitLinkPlan } from "../semantics/link_plan_json_c.ku"
 import { EmitStaticJsonString } from "../semantics/scalar_int_emit.ku"
@@ -90,7 +91,7 @@ fn main(): null! {
     binding = BindProjectModules(supplied)?
     project = LinkedNullProject { supplied: supplied.clone(), binding: binding }
     name = string.trim(fs.read("function.txt")?)
-    entry = LinkedNullEntry(project, name)?
+    entry = RequireProjectionLocalFunction(project.supplied, name)?
     literal = readLiteral(project, LinkedNullNode(project, 1, entry))?
     symbol = "ku_json_literal_str_" + str(entry)
     source = emitLiteral(literal, symbol)?

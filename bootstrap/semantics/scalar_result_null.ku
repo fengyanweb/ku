@@ -1,10 +1,12 @@
 import { Node } from "../stage2/ast.ku"
+import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { GuardBinding, GuardBindingIndex, GuardBindingName, GuardExpression, GuardLeaf, GuardRead, GuardType, GuardValue } from "./guarded_struct_expr.ku"
-import { LinkedNullState, NewLinkedNullState } from "./link_plan_c.ku"
+import { LinkedNullExpression, LinkedNullFunction, LinkedNullSlot, LinkedNullState, LinkedReadonlyExpression, NewLinkedNullState } from "./link_plan_c.ku"
 import { ContainsType } from "./struct_projection_c.ku"
 import { RejectLayout, StructLayout } from "./struct_layouts.ku"
-import { ScalarIntParameter } from "./scalar_int_emit.ku"
+import { TypeNameBinding } from "./type_names.ku"
+import { EmitScalarIntString, ScalarIntParameter } from "./scalar_int_emit.ku"
 import { RejectScalarInt, ScalarParameterIndex, ScalarStringLiteral } from "./scalar_int_operands.ku"
 
 fn ScalarStaticErrorFields(&nodes: [Node], &edges: [int], &object: Node, &string_type: str): str! {
@@ -275,4 +277,61 @@ fn ReadLinkedCatchParts(&named: NamedModule, &node: Node): LinkedCatchParts! {
         RejectLayout("unsupported_linked_catch", "expected a named catch and handler body", DeclarationSpan(handler))?
     }
     return ok(LinkedCatchParts { protected: protected, binding: binding, recovery: recovery })
+}
+
+fn LinkedOptionalIntHeader(&slots: [LinkedNullSlot], &result: TypeNameBinding): str {
+    needed = result.declaration_kind == "NullableInt"
+    index = 0
+    while (!needed && index < slots.len()) {
+        needed = slots[index].value.ty.declaration_kind == "NullableInt"
+        index = index + 1
+    }
+    if (!needed) { return "" }
+    return "typedef struct { bool is_null; int64_t value; } KuBootstrapOptionalInt;\n"
+}
+
+fn EmitLinkedOptionalIntReturn(value: LinkedNullExpression, &statement: Node): LinkedNullState! {
+    expression = value.value.text.clone()
+    if (value.value.ty.declaration_kind == "Builtin" && value.value.ty.name == "int") {
+        expression = "(KuBootstrapOptionalInt){false, " + expression + "}"
+    } else if (value.value.ty.declaration_kind != "NullableInt") {
+        RejectLayout("linked_value_return", "expected int, null, or int | null", DeclarationSpan(statement))?
+    }
+    next = value.state
+    next.code += "    result = " + expression + ";\n    goto cleanup;\n"
+    return ok(next)
+}
+
+fn EmitLinkedOptionalIntTest(input: LinkedNullExpression, &node: Node): LinkedNullExpression! {
+    at = DeclarationSpan(node)
+    if (input.value.ty.declaration_kind != "NullableInt") {
+        RejectLayout("linked_binary_type", "a linked null comparison requires an int | null value", at.clone())?
+    }
+    expression = "(" + input.value.text + ").is_null"
+    if (node.text == "!=") { expression = "!" + expression }
+    ty = TypeNameBinding { use_node: 0, name: "bool", declaration_kind: "Builtin", module_index: 0, declaration_node: 0, span: at }
+    return ok(LinkedReadonlyExpression(input.state, ty, expression))
+}
+
+fn LinkedNullCallSymbol(&callee: LinkedNullFunction): str {
+    if (callee.unit == 0 && callee.node == 1) { return "ku_linked_fs_read" }
+    return callee.symbol.clone()
+}
+
+fn CheckLinkedIntString(&ty: TypeNameBinding, &at: Span): bool! {
+    if (ty.declaration_kind == "NullableInt") { return ok(true) }
+    if (ty.declaration_kind != "Builtin" || ty.name != "int") {
+        RejectLayout("linked_int_format", "linked str conversion requires an int or int | null argument", at.clone())?
+    }
+    return ok(false)
+}
+
+fn EmitLinkedIntString(&value: str, &out: str, optional: bool): str {
+    if (!optional) { return EmitScalarIntString(value, out) }
+    // Never read the payload of null. Non-null values use the existing formatter.
+    saved = out + "_optional"
+    return "    const KuBootstrapOptionalInt " + saved + " = " + value + ";\n"
+        + "    if (" + saved + ".is_null) {\n"
+        + "        " + out + " = (KuProjectionString){.ptr=(uint8_t*)\"null\", .len=4u};\n"
+        + "    } else {\n" + EmitScalarIntString(saved + ".value", out) + "    }\n"
 }

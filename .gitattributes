@@ -1,2 +1,4 @@
 /.github/fixtures/native-three-os/fs-relative/src/asset.txt text eol=lf
 /src/backend/c_fs_*.c text eol=lf
+/src/backend/c_string_unicode_base.c text eol=lf
+/src/backend/c_string_unicode_trim.c text eol=lf

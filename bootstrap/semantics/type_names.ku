@@ -107,6 +107,19 @@ fn SameBoundTypeIdentity(&a: TypeNameBinding, &b: TypeNameBinding): bool {
         && ((a.declaration_kind != "Builtin" && a.declaration_kind != "BuiltinArray") || a.name == b.name)
 }
 
+// This linked carrier is defined only for the closed union of the two core
+// scalar types. Container layout and general union inference remain separate.
+fn IsLinkedNullableIntType(&named: NamedModule, &annotation: Node): bool {
+    if (annotation.kind != "TypeUnion" || annotation.edge_count != 2) { return false }
+    edges = annotation.first_edge
+    left = named.parsed.arena.edges[edges] - 1
+    right = named.parsed.arena.edges[edges + 1] - 1
+    if (named.parsed.arena.nodes[left].kind != "TypeName" || named.parsed.arena.nodes[right].kind != "TypeName") { return false }
+    first = named.parsed.arena.nodes[left].text.clone()
+    second = named.parsed.arena.nodes[right].text.clone()
+    return first == "int" && second == "null" || first == "null" && second == "int"
+}
+
 fn LinkedCopyResult(&binding: TypeNameBinding): bool {
     return binding.declaration_kind == "Builtin" && (binding.name == "int" || binding.name == "bool")
 }
@@ -157,4 +170,66 @@ fn NamedFieldPushArgument(&nodes: [Node], &edges: [int], target: int, rhs: int):
     if (method.kind != "Field" || method.edge_count != 1 || method.text != "push") { return 0 }
     if (!sameNamedFieldPlace(nodes, edges, target, edges[method.first_edge])) { return 0 }
     return edges[call.first_edge + 1]
+}
+
+fn ScalarType(&bindings: [TypeNameBinding], use_node: int, &ty: Node): int {
+    lo = 0
+    hi = bindings.len()
+    // Each step at least halves the remaining range of a signed int length.
+    max_steps = 64
+    step = 0
+    while (step < max_steps && lo < hi) {
+        middle = lo + (hi - lo) / 2
+        if (bindings[middle].use_node < use_node) { lo = middle + 1 }
+        else { hi = middle }
+        step = step + 1
+    }
+    if (ty.kind == "TypeName" && lo < bindings.len() && bindings[lo].use_node == use_node
+        && bindings[lo].declaration_kind == "Builtin") {
+        if (bindings[lo].name == "int") { return 1 }
+        if (bindings[lo].name == "str") { return 2 }
+        if (bindings[lo].name == "bool") { return 3 }
+        if (bindings[lo].name == "null") { return 4 }
+    }
+    return 0
+}
+
+// Plain null is not a return type of this scalar emitter.
+fn ScalarReturnType(&nodes: [Node], &edges: [int], &bindings: [TypeNameBinding], type_id: int): int {
+    ty = nodes[type_id - 1].clone()
+    if (ty.kind == "TypeResult" && ty.edge_count == 1) {
+        inner_id = edges[ty.first_edge]
+        inner = ScalarType(bindings, inner_id, nodes[inner_id - 1])
+        if (inner == 4) { return 4 }
+    }
+    plain = ScalarType(bindings, type_id, ty)
+    if (plain < 4) { return plain }
+    return 0
+}
+
+fn LinkedNullableReaderParameter(&named: NamedModule, &annotation: Node): int {
+    if (annotation.kind != "TypeFunction" || annotation.edge_count != 2) { return 0 }
+    start = annotation.first_edge
+    parameter = named.parsed.arena.nodes[named.parsed.arena.edges[start] - 1].clone()
+    if (parameter.kind != "TypeParameter" || parameter.edge_count != 1 || parameter.text != "&") { return 0 }
+    result = named.parsed.arena.edges[start + 1]
+    if (!IsLinkedNullableIntType(named, named.parsed.arena.nodes[result - 1])) { return 0 }
+    return named.parsed.arena.edges[parameter.first_edge]
+}
+
+fn LinkedNominalReaderPrefix(&kind: str): str {
+    if (kind == "IntArrayResultCallback") { return "KuBootstrapIntArrayCallback_" }
+    if (kind == "IntRecordReaderCallback") { return "KuBootstrapIntReaderCallback_" }
+    if (kind == "IntPairResultCallback") { return "KuBootstrapIntPairCallback_" }
+    if (kind == "NullableRecordViewReader") { return "KuBootstrapNullableRecordViewReader_" }
+    return ""
+}
+
+fn IsLinkedReaderParameter(&ty: TypeNameBinding): bool {
+    return ty.declaration_kind == "IntRecordReaderCallback" || ty.declaration_kind == "NullableRecordViewReader"
+}
+
+fn MatchesLinkedStructArrayOwner(&target: TypeNameBinding, &origin: TypeNameBinding): bool {
+    return target.declaration_kind == "StructArray" && origin.declaration_kind == "OwnedStructArray"
+        && target.module_index == origin.module_index && target.declaration_node == origin.declaration_node
 }

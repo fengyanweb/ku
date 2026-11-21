@@ -122,20 +122,14 @@ def exercise_project(compiler, cc, root, caller):
     for input_path, name in [(relative, "Answer"), (library_manifest, "Increment")]:
         plan = caller / f"{name}.plan.json"
         document = execute([compiler, "emit-unit-plan", input_path, name], caller)
-        assert not document.stderr, (
-            f"{compiler.name} emit-unit-plan {name} wrote: "
-            + document.stderr[:1000].decode(errors="replace")
-        )
+        assert not document.stderr
         plan.write_bytes(document.stdout)
         parsed = json.loads(document.stdout)
         assert parsed["export"]["source_name"] == name
         plans.append(parsed)
         code = caller / f"{name}.c"
         record = execute([compiler, "emit-unit", input_path, name], caller)
-        assert not record.stderr, (
-            f"{compiler.name} emit-unit {name} wrote: "
-            + record.stderr[:1000].decode(errors="replace")
-        )
+        assert not record.stderr
         code.write_bytes(record.stdout)
         units.extend(["--unit", plan, code])
 
@@ -254,29 +248,450 @@ int main(void) {{
     assert b"checked bool requires the KuBootstrapResult_bool carrier" in rejected.stderr
 
 
+def exercise_linked_nullable_int(compiler, cc, caller):
+    project = caller / "linked-nullable-int"
+    project.mkdir()
+    (project / "row.ku").write_text('''\
+struct Record { line: int }
+fn SelectLine(&row: Record, gate: bool): int | null {
+    if (!gate) { return null }
+    return row.line
+}
+fn IsMissing(line: null | int): bool {
+    if (line == null) { return true }
+    return false
+}
+''', encoding="utf-8")
+    (project / "select.ku").write_text('''\
+import { Record, SelectLine, IsMissing } from "./row.ku"
+fn SelectFrom(value: int, gate: bool): int | null {
+    row = Record { line: value }
+    chosen = SelectLine(row, gate)
+    missing = IsMissing(chosen)
+    if (missing) { return null }
+    return chosen
+}
+fn Unsupported(value: float | null): float | null { return value }
+''', encoding="utf-8")
+    manifest = project / "modules.txt"
+    manifest.write_text("select.ku\nrow.ku\n", encoding="utf-8")
+    provider_manifest = project / "row-modules.txt"
+    provider_manifest.write_text("row.ku\nselect.ku\n", encoding="utf-8")
+    linker = Path(__file__).resolve().parents[1] / "link_c.py"
+    link = [sys.executable, "-B", linker, "--cc", cc]
+    units = []
+    declarations = {}
+    for function in ("SelectFrom", "SelectLine", "IsMissing"):
+        plan = project / f"{function}.plan.json"
+        code = project / f"{function}.c"
+        selected = manifest if function == "SelectFrom" else provider_manifest
+        plan.write_bytes(execute([compiler, "emit-unit-plan", selected, function], caller).stdout)
+        code.write_bytes(execute([compiler, "emit-unit", selected, function], caller).stdout)
+        declarations[function] = json.loads(plan.read_bytes())["export"]
+        units.extend(["--unit", plan, code])
+    entry = declarations["SelectFrom"]
+    expected = {"kind": "NullableInt", "source_name": "int", "source_path": None, "node": 0,
+                "c_type": "KuBootstrapOptionalInt", "passing": "value"}
+    assert entry["signature"]["result"] == expected and not entry["signature"]["returns_result"]
+    assert declarations["SelectLine"]["signature"]["result"] == expected
+    assert declarations["IsMissing"]["signature"]["parameters"] == [expected]
+
+    host = project / "host.c"
+    symbol = entry["symbol"]
+    host.write_text(f'''\
+#include <assert.h>
+int main(void) {{
+    KuBootstrapOptionalInt missing = {symbol}(42, false);
+    KuBootstrapOptionalInt zero = {symbol}(0, true);
+    KuBootstrapOptionalInt positive = {symbol}(7, true);
+    assert(missing.is_null && missing.value == 0);
+    assert(!zero.is_null && zero.value == 0);
+    assert(!positive.is_null && positive.value == 7);
+    return 0;
+}}
+''', encoding="ascii")
+    binary = project / ("linked-nullable-int.exe" if os.name == "nt" else "linked-nullable-int")
+    options = [*link, *units, "--entry", entry["source_path"], str(entry["node"]), "--caller", host, "-o", binary]
+    execute(options, caller)
+    assert execute([binary], caller).stdout == b""
+
+    original = project / "SelectLine.c"
+    drift = project / "wrong-tag.c"
+    code = original.read_bytes()
+    assert code.count(b"bool is_null;") == 1
+    drift.write_bytes(code.replace(b"bool is_null;", b"uint8_t is_null;"))
+    rejected_carrier = execute([drift if item == original else item for item in options], caller, 1)
+    assert b"link-plan C nullable int has a different carrier" in rejected_carrier.stderr
+    invalid = execute([compiler, "emit-unit", manifest, "Unsupported"], caller, 1)
+    assert not invalid.stdout and b"unsupported_layout_type" in invalid.stderr
+
+
+def exercise_linked_owned_reader(compiler, cc, caller):
+    project = caller / "linked-owned-reader"
+    project.mkdir()
+    (project / "apply.ku").write_text('''\
+struct Row { line: int }
+struct Other { line: int }
+fn Apply(filter: fn(&Row): int | null, &row: Row): int | null {
+    return filter(row)
+}
+fn Different(filter: fn(&Other): int | null, &row: Other): int | null {
+    return filter(row)
+}
+''', encoding="utf-8")
+    (project / "forward.ku").write_text('''\
+import { Apply, Other, Row } from "./apply.ku"
+fn Forward(filter: fn(&Row): int | null, &row: Row): int | null {
+    return Apply(filter, row)
+}
+fn Bad(filter: fn(&Other): int | null, &row: Row): int | null {
+    return Apply(filter, row)
+}
+''', encoding="utf-8")
+    local = project / "forward.txt"
+    local.write_text("forward.ku\napply.ku\n", encoding="utf-8")
+    imported = project / "apply.txt"
+    imported.write_text("apply.ku\nforward.ku\n", encoding="utf-8")
+    linker = Path(__file__).resolve().parents[1] / "link_c.py"
+    link = [sys.executable, "-B", linker, "--cc", cc]
+    units = []
+    exports = {}
+    for function, manifest in [("Forward", local), ("Apply", imported)]:
+        plan = project / f"{function}.plan.json"
+        code = project / f"{function}.c"
+        plan.write_bytes(execute([compiler, "emit-unit-plan", manifest, function], caller).stdout)
+        code.write_bytes(execute([compiler, "emit-unit", manifest, function], caller).stdout)
+        exports[function] = json.loads(plan.read_bytes())["export"]
+        units.extend(["--unit", plan, code])
+    entry = exports["Forward"]
+    callback, view = entry["signature"]["parameters"]
+    assert callback["kind"] == "NullableRecordViewReader" and callback["passing"] == "value"
+    assert (callback["source_path"], callback["node"]) == (view["source_path"], view["node"])
+    assert view["passing"] == "view" and view["kind"] == "Struct"
+    assert entry["signature"]["result"]["kind"] == "NullableInt"
+    row = view["c_type"].removeprefix("const ").removesuffix("*")
+    carrier = callback["c_type"]
+    assert carrier == "KuBootstrapNullableRecordViewReader_" + row
+    host = project / "host.c"
+    host.write_text(f'''\
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+static void *active;
+static unsigned int drops;
+static bool invalid;
+void check_reader_free(void *ptr) {{
+    assert(ptr == active && drops == 0);
+    ++drops;
+    active = NULL;
+    free(ptr);
+    if (invalid) puts("capture dropped");
+}}
+static KuBootstrapOptionalInt pick(const KuProjectionString *capture, const {row} *input) {{
+    assert(capture->len == 1 && capture->ptr == active && capture->ptr[0] == 'x');
+    if (input->f0 < 0) return (KuBootstrapOptionalInt){{true, 0}};
+    return (KuBootstrapOptionalInt){{false, input->f0}};
+}}
+int main(int argc, char **argv) {{
+    invalid = argc > 1 && strcmp(argv[1], "invalid") == 0;
+    const bool track = argc > 1;
+    const int64_t values[] = {{-1, 0, 7}};
+    for(size_t i = 0; i < sizeof(values)/sizeof(*values); ++i) {{
+        uint8_t *storage = malloc(1);
+        assert(storage);
+        storage[0] = 'x';
+        active = storage;
+        drops = 0;
+        {row} input = {{ .f0 = values[i] }};
+        KuBootstrapOptionalInt result = {entry["symbol"]}(
+            ({carrier}){{invalid ? NULL : pick, {{storage, 1, 1, 1}}}}, &input);
+        assert(result.is_null == (values[i] < 0));
+        assert(result.value == (values[i] < 0 ? 0 : values[i]));
+        if (track) assert(drops == 1 && active == NULL);
+    }}
+    return 0;
+}}
+''', encoding="ascii")
+    binary = project / ("owned-reader.exe" if os.name == "nt" else "owned-reader")
+    args = ["--entry", entry["source_path"], str(entry["node"]), "--caller", host, "-o", binary]
+    execute([*link, *units, *args], caller)
+    assert execute([binary], caller).stdout == b""
+    instrumentation = b"#include <stdlib.h>\nextern void check_reader_free(void *);\n#define free check_reader_free\n"
+    tracked = []
+    for item in units:
+        if isinstance(item, Path) and item.suffix == ".c":
+            checked = item.with_suffix(".tracked.c")
+            checked.write_bytes(instrumentation + item.read_bytes() + b"\n#undef free\n")
+            item = checked
+        tracked.append(item)
+    execute([*link, *tracked, *args], caller)
+    assert execute([binary, "track"], caller).stdout == b""
+    absent = execute([binary, "invalid"], caller, 1)
+    assert absent.stdout.strip() == b"capture dropped" and b"invalid owned reader callback" in absent.stderr
+
+    original = project / "Apply.c"
+    invalid_c = project / "wrong-entry.c"
+    code = original.read_bytes()
+    signature = b"(*entry)(const KuProjectionString*,"
+    assert code.count(signature) == 1
+    invalid_c.write_bytes(code.replace(signature, b"(*entry)(KuProjectionString*,"))
+    refused = execute([*link, *[invalid_c if item == original else item for item in units], *args], caller, 1)
+    assert b"link-plan C callback has a different carrier" in refused.stderr
+
+    wrong = json.loads(execute([compiler, "emit-unit-plan", imported, "Different"], caller).stdout)
+    forward = project / "Forward.plan.json"
+    plan = json.loads(forward.read_bytes())
+    plan["dependencies"][0]["signature"]["parameters"][0] = wrong["export"]["signature"]["parameters"][0]
+    swapped = project / "wrong-nominal.plan.json"
+    swapped.write_text(json.dumps(plan), encoding="utf-8")
+    refused = execute([*link, *[swapped if item == forward else item for item in units], "--check-only"], caller, 1)
+    assert b"signature mismatch" in refused.stderr
+    refused_source = execute([compiler, "emit-unit", local, "Bad"], caller, 1)
+    assert not refused_source.stdout and b"linked_argument_type" in refused_source.stderr
+
+
+def exercise_linked_reader_factory(compiler, cc, caller):
+    project = caller / "linked-reader-factory"
+    project.mkdir()
+    (project / "select.ku").write_text('''\
+struct Row { text: str, line: int }
+fn Select(prefix: str): fn(&Row): int | null {
+    read = fn(&row: Row) {
+        if (!row.text.starts_with(prefix)) { return null }
+        return row.line
+    }
+    reader = read
+    return reader
+}
+fn EarlyUse(prefix: str): fn(&Row): int | null {
+    read = fn(&row: Row) {
+        if (!row.text.starts_with(prefix)) { return null }
+        return row.line
+    }
+    println(prefix)
+    return read
+}
+''', encoding="utf-8")
+    (project / "use.ku").write_text('''\
+import { Row, Select } from "./select.ku"
+fn Choose(one: str, two: str, &row: Row): int | null {
+    first = Select(one)
+    second = Select(two)
+    hit1 = first(row)
+    hit2 = second(row)
+    if (hit1 == null) { return hit2 }
+    return hit1
+}
+''', encoding="utf-8")
+    manifests = {"Choose": project / "use.txt", "Select": project / "select.txt"}
+    manifests["Choose"].write_text("use.ku\nselect.ku\n", encoding="utf-8")
+    manifests["Select"].write_text("select.ku\nuse.ku\n", encoding="utf-8")
+    linker = Path(__file__).resolve().parents[1] / "link_c.py"
+    link = [sys.executable, "-B", linker, "--cc", cc]
+    units = []
+    exports = {}
+    for function, manifest in manifests.items():
+        plan = project / f"{function}.plan.json"
+        code = project / f"{function}.c"
+        plan.write_bytes(execute([compiler, "emit-unit-plan", manifest, function], caller).stdout)
+        code.write_bytes(execute([compiler, "emit-unit", manifest, function], caller).stdout)
+        exports[function] = json.loads(plan.read_bytes())["export"]
+        units.extend(["--unit", plan, code])
+    entry = exports["Choose"]
+    view = entry["signature"]["parameters"][2]
+    produced = exports["Select"]["signature"]["result"]
+    assert produced["kind"] == "NullableRecordViewReader" and not exports["Select"]["signature"]["returns_result"]
+    assert (produced["source_path"], produced["node"]) == (view["source_path"], view["node"])
+    row = view["c_type"].removeprefix("const ").removesuffix("*")
+    host = project / "host.c"
+    host.write_text(f'''\
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+static unsigned int dropped;
+static uint8_t *owned[2];
+void check_factory_free(void *ptr) {{
+    assert(ptr && (ptr == owned[0] || ptr == owned[1]));
+    if (ptr == owned[0]) owned[0] = NULL;
+    else owned[1] = NULL;
+    ++dropped;
+    free(ptr);
+}}
+static KuProjectionString prefix(const char *text, size_t slot) {{
+    size_t len = strlen(text);
+    uint8_t *storage = malloc(len);
+    assert(storage);
+    memcpy(storage, text, len);
+    owned[slot] = storage;
+    return (KuProjectionString){{storage, len, len, 1}};
+}}
+int main(void) {{
+    const char *one = "\\345\\211\\215\\360\\237\\231\\202";
+    const char *two = "\\345\\210\\253\\360\\237\\207\\250\\360\\237\\207\\263";
+    const char *texts[] = {{one, two, "none"}};
+    const int64_t lines[] = {{0, 7, 2}};
+    for(size_t i = 0; i < sizeof(lines)/sizeof(*lines); ++i) {{
+        KuProjectionString first = prefix(one, 0);
+        KuProjectionString second = prefix(two, 1);
+        {row} input = {{ .f0 = {{(uint8_t *)texts[i], strlen(texts[i]), 0, 0}}, .f1 = lines[i] }};
+        dropped = 0;
+        KuBootstrapOptionalInt out = {entry["symbol"]}(first, second, &input);
+        assert(out.is_null == (i == 2) && out.value == (i == 2 ? 0 : lines[i]));
+        assert(dropped == 2 && !owned[0] && !owned[1]);
+    }}
+    return 0;
+}}
+''', encoding="ascii")
+    binary = project / ("owned-reader-factory.exe" if os.name == "nt" else "owned-reader-factory")
+    instrumentation = b"#include <stdlib.h>\nextern void check_factory_free(void *);\n#define free check_factory_free\n"
+    tracked = []
+    for item in units:
+        if isinstance(item, Path) and item.suffix == ".c":
+            checked = item.with_suffix(".tracked.c")
+            checked.write_bytes(instrumentation + item.read_bytes() + b"\n#undef free\n")
+            item = checked
+        tracked.append(item)
+    execute([*link, *tracked, "--entry", entry["source_path"], str(entry["node"]), "--caller", host, "-o", binary], caller)
+    assert execute([binary], caller).stdout == b""
+    used_later = execute([compiler, "emit-unit", manifests["Select"], "EarlyUse"], caller, 1)
+    assert not used_later.stdout and b"capture is still used" in used_later.stderr
+
+
+def exercise_linked_owned_string_for(compiler, cc, caller):
+    project = caller / "linked-string-for"
+    project.mkdir()
+    (project / "main.ku").write_text('''\
+import { string } from "std"
+fn ReadAfter(): null! {
+    items = string.chars("甲🙂")
+    for item in items { println(item) }
+    println(items[0])
+    return ok(null)
+}
+fn ReplaceDuring(): null! {
+    items = string.chars("乙🙂")
+    for item in items {
+        println(item)
+        items = string.chars("替")
+    }
+    println(items[0])
+    return ok(null)
+}
+fn First(items: [str]): str {
+    for item in items { return item }
+    return "empty"
+}
+fn main(): null! {
+    ReadAfter()?
+    ReplaceDuring()?
+    println(First(string.chars("早🙂")))
+    println(First(string.chars("")))
+    return ok(null)
+}
+''', encoding="utf-8")
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\n", encoding="utf-8")
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    binary = project / ("linked-string-for.exe" if os.name == "nt" else "linked-string-for")
+    execute([sys.executable, "-B", builder, "--compiler", compiler, "--cc", cc, manifest, "-o", binary], caller)
+    assert execute([binary], caller).stdout.decode().splitlines() == ["甲", "🙂", "甲", "乙", "🙂", "替", "早", "empty"]
+
+
+def exercise_linked_program(compiler, cc, caller):
+    project = caller / "linked-application"
+    project.mkdir()
+    main = project / "main.ku"
+    provider = project / "读取.ku"
+    main.write_text('import { Location, ReadSource } from "./读取"\n'
+                    'fn main(): null! { source = ReadSource("input.txt")?; println(source);\n'
+                    '    line = Location(0, true); if (line != null) { println(str(line)) }\n'
+                    '    println(str(Location(0, false))); return ok(null) }\n',
+                    encoding="utf-8")
+    provider.write_text('import { fs, string } from "std"\n'
+                        'fn Clean(&text: str): str { return string.trim(text) }\n'
+                        'fn ReadSource(path: str): str! { raw = fs.read(path)?; result = Clean(raw);'
+                        ' raw = "released"; return ok(result) }\n'
+                        'fn Location(line: int, present: bool): int | null { println("lookup");\n'
+                        '    if (!present) { return null }; return line }\n', encoding="utf-8")
+    manifest = project / "modules.txt"
+    valid = f"{main.name}\r\n{provider.name}\r\n".encode("utf-8")
+    manifest.write_bytes(valid)
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    options = [sys.executable, "-B", builder, "--compiler", compiler, "--cc", cc, manifest]
+    binary = caller / ("linked-app.exe" if os.name == "nt" else "linked-app")
+    execute([*options, "-o", binary], caller)
+    original = hashlib.sha256(binary.read_bytes()).digest()
+
+    # A partially listed project and an output alias must leave the valid
+    # executable and manifest untouched.
+    manifest.write_bytes(f"{main.name}\n".encode())
+    failed = execute([*options, "-o", binary], caller, 1)
+    assert b"import" in failed.stderr and hashlib.sha256(binary.read_bytes()).digest() == original
+    manifest.write_bytes(valid)
+    refused = execute([*options, "-o", manifest], caller, 1)
+    assert b"output refers to an input file" in refused.stderr and manifest.read_bytes() == valid
+    reserved = project / "std/fs.ku"
+    reserved.parent.mkdir()
+    reserved.write_bytes(b'fn read(path: str): str! { return ok(path) }\n')
+    manifest.write_bytes(valid + b"std/fs.ku\r\n")
+    collision = execute([*options, "-o", binary], caller, 1)
+    assert b"linked_builtin_collision" in collision.stderr
+    assert hashlib.sha256(binary.read_bytes()).digest() == original
+
+    main.unlink()
+    provider.unlink()
+    input_file = caller / "input.txt"
+    for raw, expected in (("\t　清单🙂\u200b\u00a0\r\n", "清单🙂\u200b\n"),
+                          ("\u0085　\u00a0", "\n")):
+        input_file.write_bytes(raw.encode("utf-8"))
+        success = execute([binary], caller)
+        assert success.stdout.replace(b"\r\n", b"\n") == (expected + "lookup\n0\nlookup\nnull\n").encode("utf-8")
+        assert not success.stderr
+    input_file.unlink()
+    missing = execute([binary], caller, 1)
+    assert not missing.stdout and b"failed to read file" in missing.stderr
+
+
 def exercise_parameter_bindings(compiler, cc, caller):
     source = caller / "parameter-binding.ku"
     manifest = caller / "parameter-binding.txt"
     manifest.write_text(source.name + "\n", encoding="utf-8")
-    direct = [
+    rejected_writes = [
         "fn Check(value: int): null! { value = value + 1; return ok(null) }",
         "fn Check(value: [int]): null! { value = value.push(42); return ok(null) }",
         'fn Check(value: str): null! { value += "suffix"; return ok(null) }',
-    ]
-    nested = [
-        "fn Check(value: int): null! { local = value; while (value > 0) { value = value - 1 }; return ok(null) }",
+        "fn Check(value: int): null! { while (value > 0) { value = value - 1 }; return ok(null) }",
         'fn Check(value: str): null! { if (true) { value += "suffix" }; return ok(null) }',
+        "fn Check(value: int, gate: bool): null! { if (gate) { value: int = 1; value += 1 }"
+        " else { value = 4 }; return ok(null) }",
+        'fn Check(value: int): null! { try { fail "problem" } catch (other) { value = 0 } return ok(null) }',
+        "fn Check(value: int): null! { fn write(): int { value = 1; return value }; return ok(null) }",
+        "fn Check(value: int): null! { write = fn(): int { value += 1; return value }; return ok(null) }",
+        "fn Check(value: int): null! { for item in [1] { break; value = item }; return ok(null) }",
+        "fn Check(value: int): null! { {field: value} = {field: 1}; return ok(null) }",
     ]
     diagnostic = b"cannot assign to immutable parameter 'value'"
-    for body in direct + nested:
+    for body in rejected_writes:
         source.write_text(body + "\n", encoding="utf-8")
-        for command, entry in (("emit-unit", "Check"), ("emit-unit-plan", "Check")):
-            result = execute([compiler, command, manifest, entry], caller, 1)
+        for args in (("check", source), ("check-project", manifest),
+                     ("emit-unit", manifest, "Check"), ("emit-unit-plan", manifest, "Check")):
+            result = execute([compiler, *args], caller, 1)
             assert not result.stdout and diagnostic in result.stderr, result.stderr
-        if body in direct:
-            for command, path in (("check", source), ("check-project", manifest)):
-                result = execute([compiler, command, path], caller, 1)
-                assert not result.stdout and diagnostic in result.stderr, result.stderr
+
+    accepted_checks = [
+        "fn Check(value: int): int { for value in [1, 2] { value += 1 }; return value }",
+        "fn Check(value: int, gate: bool): int { if (gate) { value: int = 1; value += 1 }; return value }",
+        'fn Check(value: int): int { try { fail "problem" } catch (value) { println(value.message) } return value }',
+        "fn Check(value: int): int { fn read(): int { value: int = 1; value += 1; return value }; return read() }",
+        "fn Check(value: int, gate: bool): int { while (gate) { break; value += 1 }; return value }",
+        "fn Check(value: int, gate: bool): int { while (gate) { if (gate) { break } else { continue };"
+        " value += 1 }; return value }",
+        'fn Check(value: int): int { try { fail "problem"; value += 1 } catch (err) { println(err.message) } return value }',
+    ]
+    for body in accepted_checks:
+        source.write_text(body + "\n", encoding="utf-8")
+        execute([compiler, "check", source], caller)
+        execute([compiler, "check-project", manifest], caller)
     source.write_text('''\
 fn Check(value: int): int! {
     local = value
@@ -460,7 +875,12 @@ def exercise(ku, cc):
         emitted = execute([compiler, "emit", source.name, "AddOne"], caller).stdout
         exercise_emitted(cc, emitted, caller, "derived", b"(41)", b"42")
         exercise_project(compiler, cc, root, caller)
+        exercise_linked_program(compiler, cc, caller)
         exercise_checked_bool(compiler, cc, caller)
+        exercise_linked_nullable_int(compiler, cc, caller)
+        exercise_linked_owned_reader(compiler, cc, caller)
+        exercise_linked_reader_factory(compiler, cc, caller)
+        exercise_linked_owned_string_for(compiler, cc, caller)
         exercise_parameter_bindings(compiler, cc, caller)
         exercise_owned_recovery(compiler, cc, caller)
         print("bootstrap argv, module checks, signature and standalone C verified")

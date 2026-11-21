@@ -2,7 +2,7 @@ import { EscapeCanonical } from "../stage1/token.ku"
 import { FirstSubtreeNode, Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { BindProjectImports, ImportBinding, ReadImportNode, SuppliedModule } from "./imports.ku"
-import { DeclarationSpan, IsNamedFunction, NamedModule, RejectName } from "./names.ku"
+import { DeclarationSpan, IsNamedFunction, NamedModule, RejectName, CheckParameterWrites } from "./names.ku"
 import { BindImportedTypeNames, TypeNameBinding } from "./type_names.ku"
 
 struct ProjectModuleBindings {
@@ -344,43 +344,6 @@ fn CheckDirectCallContracts(&named: NamedModule, &imports: [ImportBinding], &sup
     return ok(null)
 }
 
-fn directBindingWrite(&nodes: [Node], &edges: [int], &statement: Node): str {
-    if (statement.kind == "Assign") { return statement.text.clone() }
-    if (statement.kind == "CompoundAssign" && statement.edge_count == 2) {
-        target = nodes[edges[statement.first_edge] - 1].clone()
-        if (target.kind == "Variable") { return target.text }
-    }
-    return ""
-}
-
-fn checkDirectParameterWrites(&nodes: [Node], &edges: [int], &function: Node): null! {
-    start = function.first_edge
-    stop = start + function.edge_count
-    boundary = start
-    reading = boundary < stop
-    while (reading) {
-        if (nodes[edges[boundary] - 1].kind != "Parameter") { reading = false }
-        else { boundary = boundary + 1; reading = boundary < stop }
-    }
-    if (boundary == start) { return ok(null) }
-    cursor = boundary
-    while (cursor < stop) {
-        id = edges[cursor] - 1
-        name = directBindingWrite(nodes, edges, nodes[id])
-        if (name != "") {
-            parameter = start
-            while (parameter < boundary) {
-                if (nodes[edges[parameter] - 1].text == name) {
-                    RejectName("immutable_parameter", "cannot assign to immutable parameter '" + name.clone() + "'", DeclarationSpan(nodes[id]))?
-                }
-                parameter = parameter + 1
-            }
-        }
-        cursor = cursor + 1
-    }
-    return ok(null)
-}
-
 fn CheckFunctionContracts(&named: NamedModule): null! {
     node_count = named.parsed.arena.nodes.len()
     index = 0
@@ -389,7 +352,7 @@ fn CheckFunctionContracts(&named: NamedModule): null! {
         is_named = IsNamedFunction(named.parsed.arena.nodes[index].kind)
         if (is_named || named.parsed.arena.nodes[index].kind == "FunctionExpr") {
             checkLiteralReturns(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.nodes[index])?
-            checkDirectParameterWrites(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.nodes[index])?
+            CheckParameterWrites(named.parsed.arena.nodes, named.parsed.arena.edges, named.parsed.arena.nodes[index])?
         }
         index = index + 1
     }

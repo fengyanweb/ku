@@ -356,23 +356,3 @@ fn prepareLinkedReaderArgument(&project: LinkedNullProject, state: LinkedNullSta
     text = "(" + carrier.clone() + "){" + symbol + ", &(" + source.value.text + "), &" + fault.clone() + "}"
     return ok(LinkedNullArguments { state: next, args: text, handoff: LinkedAppendFaultRelayCode(fault) })
 }
-
-fn InvokeLinkedReader(&project: LinkedNullProject, argument: LinkedNullExpression, &callback: LinkedNullValue,
-                      &call: Node, id: int): LinkedNullExpression! {
-    if (!LinkedIntResult(argument.value.ty)) {
-        RejectLayout("linked_callback_argument", "reader callback requires a Copy int index", DeclarationSpan(call))?
-    }
-    result = callback.ty.clone()
-    result.declaration_kind = "Struct"
-    output = AddLinkedNullSlot(project, argument.state, "", "t" + str(id), result, false)?
-    name = callback.text.clone()
-    output.state.uses_scoped_reader = true
-    output.state.code += "    if (!" + name.clone() + ".entry || !" + name.clone() + ".failure) {\n"
-        + "        if (" + name.clone() + ".failure) " + name.clone() + ".failure->array_error = \"invalid scoped reader callback\\n\";\n"
-        + "        else captured_array_failure = \"invalid scoped reader callback\\n\";\n        goto cleanup;\n    }\n"
-        + "    " + output.value.text.clone() + " = " + name.clone() + ".entry(" + name.clone() + ".environment, "
-        + name.clone() + ".failure, " + argument.value.text + ");\n"
-        + "    if (" + LinkedIntArrayCallbackFaultPending(name + ".failure") + ") goto cleanup;\n"
-    output.state.slots[output.value.slot - 1].live = true
-    return ok(output)
-}

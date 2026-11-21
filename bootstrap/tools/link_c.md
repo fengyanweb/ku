@@ -16,7 +16,13 @@ python3 bootstrap/tools/link_c.py \
 `--caller` supplies a C `main` compiled in that unit. It can use the emitted
 types and local function names directly. The linker includes it after the
 entry C, so the caller file does not need to include the emitted unit itself.
-If one of the supplied units already defines `main`, omit both options.
+For a zero-argument Ku `main(): null!` produced by `emit-unit`, use
+`--program` with `--entry` and omit `--caller`. The generated process
+entry exits with status 0 on success or writes the error message to standard
+error and exits with status 1. The app uses the typed backend for linked
+dependencies, including supported builtins such as `--builtin fs.read`.
+If a supplied C unit already defines `main`, omit `--entry`, `--caller`,
+and `--program`.
 
 The linker checks the providers and all dependencies before starting the C
 compiler. It compares the ordered parameter identities, passing modes, result

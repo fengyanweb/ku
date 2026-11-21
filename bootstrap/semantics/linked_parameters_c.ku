@@ -3,7 +3,7 @@ import { LinkedScopedCallbackFunction } from "./link_plan_json_c.ku"
 import { LinkedIntSnapshotCall, LinkedRecordCloneCall } from "./guarded_string_parts.ku"
 import { LinkedMemberUnavailable, LinkedNullDropC } from "./linked_member_ownership.ku"
 import { BuildProjectOwningLayouts, CanCloneManagedRecord, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
-import { EmitScalarIntString } from "./scalar_int_emit.ku"
+import { CheckLinkedIntString, EmitLinkedIntString } from "./scalar_result_null.ku"
 import { HasScalarBuiltin } from "./scalar_int_operands.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
@@ -12,10 +12,10 @@ import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { DeclarationSpan } from "./names.ku"
 import { LinkedCopyResult, TypeNameBinding } from "./type_names.ku"
 import { HasBoundArrayMembers, LayoutIndex, RejectLayout } from "./struct_layouts.ku"
-import { IsLinkedScopedCallback, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullReadableArray, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedRecordFields, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
-import { RegisterLinkedElementClone } from "./struct_array_c.ku"
-import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPosition, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterPlan,
-         LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { IsLinkedScopedCallback, LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullFunction, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedRecordFields, LinkedViewPointee, LinkPlanType, NewLinkedNullState, RegisterLinkedIntArray } from "./link_plan_c.ku"
+import { BoundArrayTypePosition, RegisterLinkedElementClone } from "./struct_array_c.ku"
+import { LinkedBuiltin, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullHasResultValue, LinkedNullNode, LinkedNullParameterPlan,
+         LinkedNullLayout, LinkedNullParameterType, LinkedNullProject, LinkedNullView, LinkedStringResult, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
 
 struct LinkedNullParameters {
     state: LinkedNullState
@@ -123,7 +123,7 @@ fn ReadLinkedNullParametersFrom(&project: LinkedNullProject, &function: Node, se
     result_id = LinkedNullChild(project, 1, function, index)
     declared = LinkedNullNode(project, 1, result_id)
     plain_named = declared.kind == "TypeName"
-    state.plain_value_result = declared.kind == "TypeArray" || plain_named
+    state.plain_value_result = declared.kind == "TypeArray" || declared.kind == "TypeUnion" || declared.kind == "TypeFunction" || plain_named
     result = ReadLinkedResult(project, 1, result_id, !state.plain_value_result)?
     copy = result.declaration_kind == "Builtin" && (result.name == "bool" || result.name == "int")
     if (plain_named && !copy && !LinkedStringResult(result) && result.declaration_kind != "Struct") {
@@ -184,11 +184,11 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
         }
         return ok(next)
     }
-    if (ty.declaration_kind == "Builtin" && ty.name == "bytes") { next.owning_strings = true }
+    if (ty.declaration_kind == "Builtin" && ty.name == "bytes" || ty.declaration_kind == "NullableRecordViewReader") { next.owning_strings = true }
     if (ty.declaration_kind == "OwnedStringArray") {
         next.uses_str_array = true
         next.owning_strings = true
-        if (LinkedNullArrayPosition(next.owned_arrays, ty) == 0) { next.owned_arrays = next.owned_arrays.push(ty) }
+        if (BoundArrayTypePosition(next.owned_arrays, ty) == 0) { next.owned_arrays = next.owned_arrays.push(ty) }
         return ok(next)
     }
     if (ty.declaration_kind == "BuiltinArray") {
@@ -202,20 +202,20 @@ fn RegisterLinkedNullType(&project: LinkedNullProject, state: LinkedNullState, t
         carrier = ty.clone()
         carrier.declaration_kind = "BuiltinArray"
         next = RegisterLinkedIntArray(next, carrier)
-        if (LinkedNullArrayPosition(next.owned_arrays, ty) == 0) { next.owned_arrays = next.owned_arrays.push(ty.clone()) }
+        if (BoundArrayTypePosition(next.owned_arrays, ty) == 0) { next.owned_arrays = next.owned_arrays.push(ty.clone()) }
     }
     if (ty.declaration_kind == "StringView") { next.uses_str_view = true }
     if (ty.declaration_kind == "StructView") { next.uses_struct_view = true }
     if (ty.declaration_kind == "StructArray" || LinkedNullOwnedArray(ty)) {
         element = LinkedNullArrayElement(ty.clone())
         next = registerOwnedElement(project, next, element)?
-        if (LinkedNullOwnedArray(ty) && LinkedNullArrayPosition(next.owned_arrays, ty) == 0) {
+        if (LinkedNullOwnedArray(ty) && BoundArrayTypePosition(next.owned_arrays, ty) == 0) {
             next.owned_arrays = next.owned_arrays.push(ty.clone())
         }
         carrier = ty.clone()
         carrier.declaration_kind = "StructArray"
-        if (LinkedNullArrayPosition(next.arrays, carrier) == 0) { next.arrays = next.arrays.push(carrier) }
-    } else if (ty.declaration_kind == "Struct" || ty.declaration_kind == "StructView") {
+        if (BoundArrayTypePosition(next.arrays, carrier) == 0) { next.arrays = next.arrays.push(carrier) }
+    } else if (ty.declaration_kind == "Struct" || ty.declaration_kind == "StructView" || ty.declaration_kind == "NullableRecordViewReader") {
         next = registerOwnedElement(project, next, LinkedViewPointee(ty))?
     }
     return ok(next)
@@ -240,7 +240,7 @@ fn RequireLinkedArrayValidation(state: LinkedNullState, ty: TypeNameBinding): Li
         carrier.declaration_kind = "BuiltinArray"
     }
     else if (carrier.declaration_kind != "BuiltinArray") { carrier.declaration_kind = "StructArray" }
-    if (LinkedNullArrayPosition(next.validated_arrays, carrier) == 0) {
+    if (BoundArrayTypePosition(next.validated_arrays, carrier) == 0) {
         next.validated_arrays = next.validated_arrays.push(carrier)
     }
     return next
@@ -330,11 +330,9 @@ fn IsLinkedIntConversion(&project: LinkedNullProject, &state: LinkedNullState, &
 
 fn LowerLinkedIntString(&project: LinkedNullProject, input: LinkedNullExpression, &node: Node, id: int): LinkedNullExpression! {
     at = DeclarationSpan(node)
-    if (!LinkedIntResult(input.value.ty)) {
-        RejectLayout("linked_int_format", "linked str conversion requires an int argument", at.clone())?
-    }
+    optional = CheckLinkedIntString(input.value.ty, at)?
     output = AddLinkedNullSlot(project, input.state, "", "t" + str(id), LinkedBuiltin("str", at), false)?
-    output.state.code += EmitScalarIntString(input.value.text, output.value.text)
+    output.state.code += EmitLinkedIntString(input.value.text, output.value.text, optional)
     output.state.uses_concat = true
     output.state.uses_int_format = true
     output.state.slots[output.value.slot - 1].live = true

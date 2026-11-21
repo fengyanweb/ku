@@ -1,9 +1,8 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { TypeNameBinding, ScalarType } from "./type_names.ku"
 import { EmitScalarStringJoinTo, ScalarIntParameter, ScalarStringPart } from "./scalar_int_emit.ku"
 import { RejectScalarInt, ScalarParameterIndex, ScalarStringLiteral } from "./scalar_int_operands.ku"
-import { ScalarType } from "./scalar_types.ku"
 
 fn isReplace(&nodes: [Node], &edges: [int], &value: Node): bool {
     if (value.kind != "Call" || value.edge_count == 0) { return false }

@@ -141,10 +141,6 @@ struct LinkedNullArguments {
     handoff: str
 }
 
-fn LinkedIntArrayCallbackCarrier(&ty: TypeNameBinding): str {
-    return "KuBootstrapIntArrayCallback_" + CTypeName(ty.module_index, ty.declaration_node)
-}
-
 fn LinkedIntArrayCallbackFunction(&ty: TypeNameBinding): LinkedNullFunction {
     array = TypeNameBinding { use_node: 0, name: "int", declaration_kind: "OwnedIntArray",
         module_index: 0, declaration_node: 0, span: ty.span.clone() }
@@ -354,7 +350,7 @@ fn LinkedNullArrayHeader(&type: TypeNameBinding, &value: str): str {
 
 fn LinkedViewPointee(binding: TypeNameBinding): TypeNameBinding {
     kind = "Builtin"
-    if (binding.declaration_kind == "StructView") { kind = "Struct" }
+    if (binding.declaration_kind == "StructView" || binding.declaration_kind == "NullableRecordViewReader") { kind = "Struct" }
     else if (binding.declaration_kind != "StringView") { return binding }
     return TypeNameBinding { use_node: binding.use_node, name: binding.name, declaration_kind: kind,
                              module_index: binding.module_index, declaration_node: binding.declaration_node, span: binding.span }
@@ -370,7 +366,7 @@ fn LinkedRecordFields(&layouts: [StructLayout], &managed: [StructLayout], &type:
 }
 
 fn LinkedNullOwner(&binding: TypeNameBinding): bool {
-    return binding.declaration_kind == "Struct" || binding.declaration_kind == "CaughtError"
+    return binding.declaration_kind == "Struct" || binding.declaration_kind == "CaughtError" || binding.declaration_kind == "NullableRecordViewReader"
         || binding.declaration_kind == "Builtin" && (binding.name == "str" || binding.name == "bytes")
         || LinkedNullOwnedArray(binding) || LinkedScalarArrayOwner(binding)
 }

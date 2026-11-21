@@ -1,14 +1,14 @@
-import { BoundArrayCPrefix, BoundArrayCType, BoundArrayTypePosition } from "./struct_array_c.ku"
+import { BoundArrayCPrefix, BoundArrayCType } from "./struct_array_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
 import { ProjectBindings } from "./project_bindings.ku"
-import { LinkedCopyResult, ResolveTypeName, RetagTypeNameBinding, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
-import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
-import { CTypeName, ProjectionBuiltinLinkFor, ProjectionBuiltinLinkId, ProjectionBytesGet, LinkedBufferResult, LinkedIntArrayCallbackNominal, LinkedIntAppendCallbackNominals, RequireProjectionLocalFunction, ProjectionPlaceRoot, RequireProjectionBuiltin, ResolveProjectionDirectFunction } from "./struct_projection_c.ku"
+import { IsLinkedNullableIntType, LinkedCopyResult, LinkedNominalReaderPrefix, LinkedNullableReaderParameter, ResolveTypeName, RetagTypeNameBinding, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
+import { CollectFields, ExplicitType, LayoutIndex, RejectLayout, RejectLinkedBuiltinBorrow, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
+import { CTypeName, ProjectionBuiltinLinkFor, ProjectionBuiltinLinkId, ProjectionBytesGet, LinkedBufferResult, LinkedIntArrayCallbackNominal, LinkedIntAppendCallbackNominals, ProjectionPlaceRoot, RequireProjectionBuiltin, ResolveProjectionDirectFunction } from "./struct_projection_c.ku"
 import { OrderCStructLayouts, OwningStructDropReference } from "./nested_struct_c.ku"
-import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, IntArrayLinkPlanType, LinkedIntArrayCallbackCarrier, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
+import { BoundLinkPlanType, BoundLinkPlanTypeWithKind, BuiltinLinkPlanType, IntArrayLinkPlanType, LinkedNullBinding, LinkedNullSlot, LinkedNullFunction, LinkedNullOwnedArray, LinkedNullIntArrayOwner, LinkPlanType, LinkedViewPointee, NullLinkPlanResult, StrArrayViewLinkPlanType } from "./link_plan_c.ku"
 
 struct LinkedNullProject {
     supplied: [SuppliedModule]
@@ -21,10 +21,6 @@ fn LinkedBuiltin(name: str, at: Span): TypeNameBinding {
 
 fn SameLinkedType(&a: TypeNameBinding, &b: TypeNameBinding): bool {
     return SameBoundTypeIdentity(a, b)
-}
-
-fn LinkedNullArrayPosition(&arrays: [TypeNameBinding], &type_name: TypeNameBinding): int {
-    return BoundArrayTypePosition(arrays, type_name)
 }
 
 fn LinkedNullNode(&project: LinkedNullProject, unit: int, node: int): Node {
@@ -44,7 +40,12 @@ fn absoluteType(binding: TypeNameBinding, unit: int): TypeNameBinding {
 }
 
 fn LinkedNullType(&project: LinkedNullProject, unit: int, node: int): TypeNameBinding! {
-    resolved = ExplicitType(project.binding.modules[unit - 1].types, node, DeclarationSpan(LinkedNullNode(project, unit, node)))?
+    annotation = LinkedNullNode(project, unit, node)
+    at = DeclarationSpan(annotation)
+    if (IsLinkedNullableIntType(project.supplied[unit - 1].named, annotation)) {
+        return ok(RetagTypeNameBinding(LinkedBuiltin("int", at), "NullableInt"))
+    }
+    resolved = ExplicitType(project.binding.modules[unit - 1].types, node, at)?
     return ok(absoluteType(resolved, unit))
 }
 
@@ -99,7 +100,15 @@ fn LinkedNullParameterType(&project: LinkedNullProject, unit: int, id: int, view
         }
         return ok(RetagTypeNameBinding(ty, "IntArrayResultCallback"))
     }
-    if (node.kind == "TypeFunction") { return readIntCallback(project, unit, node, view) }
+    if (node.kind == "TypeFunction") {
+        record = LinkedNullableReaderParameter(project.supplied[unit - 1].named, node)
+        if (!view && record > 0) {
+            ty = LinkedNullType(project, unit, record)?
+            if (ty.declaration_kind == "Struct") { return ok(RetagTypeNameBinding(ty, "NullableRecordViewReader")) }
+            RejectLayout("linked_callback_type", "nullable reader requires a View of a named record", ty.span.clone())?
+        }
+        return readIntCallback(project, unit, node, view)
+    }
     if (!view) {
         if (node.kind == "TypeArray") {
             return ReadLinkedOwnedArray(project, unit, id, true, true)
@@ -160,14 +169,10 @@ fn LinkedNullCType(&binding: TypeNameBinding): str! {
         if (binding.declaration_kind == "IntResultArenaCallback") { prefix = "KuBootstrapIntArenaCallback_m" }
         return ok(prefix + str(binding.module_index) + "_" + str(binding.declaration_node))
     }
-    if (binding.declaration_kind == "IntArrayResultCallback") { return ok(LinkedIntArrayCallbackCarrier(binding)) }
-    if (binding.declaration_kind == "IntRecordReaderCallback") {
-        return ok("KuBootstrapIntReaderCallback_" + CTypeName(binding.module_index, binding.declaration_node))
-    }
-    if (binding.declaration_kind == "IntPairResultCallback") {
-        return ok("KuBootstrapIntPairCallback_" + CTypeName(binding.module_index, binding.declaration_node))
-    }
+    nominal_prefix = LinkedNominalReaderPrefix(binding.declaration_kind)
+    if (nominal_prefix != "") { return ok(nominal_prefix + CTypeName(binding.module_index, binding.declaration_node)) }
     if (binding.declaration_kind == "OwnedStringArray") { return ok("KuGuardStringArray") }
+    if (binding.declaration_kind == "NullableInt") { return ok("KuBootstrapOptionalInt") }
     if (binding.declaration_kind == "CaughtError") { return ok("KuBootstrapError") }
     if (binding.declaration_kind == "BuiltinArray") {
         if (binding.name == "int") { return ok("const KuArrayInt*") }
@@ -222,7 +227,8 @@ fn LinkedNullParameterPlan(&binding: TypeNameBinding, unit: int): LinkPlanType! 
     if (binding.declaration_kind == "StringView") {
         return ok(BuiltinLinkPlanType(binding.name.clone(), LinkedNullCType(binding)?, true))
     }
-    type = LinkedViewPointee(binding.clone())
+    type = binding.clone()
+    if (LinkedNullView(binding)) { type = LinkedViewPointee(type) }
     return ok(BoundLinkPlanType(type, unit, LinkedNullCType(binding)?, LinkedNullView(binding)))
 }
 
@@ -275,6 +281,11 @@ fn ReadLinkedResult(&project: LinkedNullProject, unit: int, id: int, checked: bo
     node = LinkedNullNode(project, unit, id)
     if (!checked) {
         if (node.kind == "TypeArray") { return ReadLinkedOwnedArray(project, unit, id, true, true) }
+        if (node.kind == "TypeFunction") {
+            reader = LinkedNullParameterType(project, unit, id, false)?
+            if (reader.declaration_kind == "NullableRecordViewReader") { return ok(reader) }
+            RejectLayout("linked_callback_escape", "only the owned nullable reader may be returned", DeclarationSpan(node))?
+        }
         return LinkedNullType(project, unit, id)
     }
     if (node.kind != "TypeResult" || node.edge_count != 1) {
@@ -301,7 +312,7 @@ fn linkedBuiltinDependency(&project: LinkedNullProject, unit: int, &target: Node
             operation.namespace, operation.path, at.clone())?
     }
     input_name = "str"
-    if (id >= 4) { input_name = "bytes" }
+    if (id == 4) { input_name = "bytes" }
     input = RetagTypeNameBinding(LinkedBuiltin(input_name, at.clone()), "StringView")
     index_type = LinkedBuiltin("int", at.clone())
     parameters: [TypeNameBinding] = [input]
@@ -311,12 +322,7 @@ fn linkedBuiltinDependency(&project: LinkedNullProject, unit: int, &target: Node
     if (id == 3) { result = "bytes" }
     else if (id == 4) { result = "int" }
     return ok(LinkedNullFunction { unit: 0, node: id, symbol: operation.symbol,
-        parameters: parameters, result: LinkedBuiltin(result, at), returns_result: true })
-}
-
-fn LinkedNullCallSymbol(&callee: LinkedNullFunction): str {
-    if (callee.unit == 0 && callee.node == 1) { return "ku_linked_fs_read" }
-    return callee.symbol.clone()
+        parameters: parameters, result: LinkedBuiltin(result, at), returns_result: id != 5 })
 }
 
 fn LinkedNullDependency(&project: LinkedNullProject, from_unit: int, &target: Node, checked: bool): LinkedNullFunction! {
@@ -396,31 +402,14 @@ fn ResolveLinkedCall(&project: LinkedNullProject, &slots: [LinkedNullSlot], &cal
     if (callee.parameters.len() != call.edge_count - 1) {
         RejectLayout("linked_dependency_arity", "argument count differs from the bound function declaration", DeclarationSpan(call))?
     }
-    if (callee.unit == 0 && callee.node >= 2) {
+    if (callee.unit == 0 && callee.node >= 2 && callee.node <= 4) {
         input = LinkedNullChild(project, 1, call, 1)
         root = ProjectionPlaceRoot(project.supplied[0].named.parsed.arena.nodes,
                                    project.supplied[0].named.parsed.arena.edges, input)
         slot = LinkedNullBinding(slots, root)
         if (slot != 0 && slots[slot - 1].value.borrowed) {
-            borrowed_at = DeclarationSpan(LinkedNullNode(project, 1, input))
-            if (callee.node == 2) {
-                RejectLayout("linked_slice_borrow", "string.slice requires an owned source value; clone the View explicitly", borrowed_at)?
-            } else {
-                RejectLayout("linked_bytes_borrow", "the bytes operation requires an ordinary source value", borrowed_at)?
-            }
+            RejectLinkedBuiltinBorrow(callee.node, DeclarationSpan(LinkedNullNode(project, 1, input)))?
         }
     }
     return ok(callee)
-}
-
-fn LinkedCallArgument(&project: LinkedNullProject, &call: Node, &callee: LinkedNullFunction, index: int): int {
-    if (callee.unit == 0 && callee.node == 4) {
-        if (index == 1) { return LinkedNullChild(project, 1, call, 1) }
-        return LinkedNullChild(project, 1, LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0)), 0)
-    }
-    return LinkedNullChild(project, 1, call, index + 1)
-}
-
-fn LinkedNullEntry(&project: LinkedNullProject, &name: str): int! {
-    return RequireProjectionLocalFunction(project.supplied, name)
 }

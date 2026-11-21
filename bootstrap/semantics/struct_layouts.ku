@@ -49,6 +49,13 @@ fn RejectLayout(code: str, message: str, span: Span): null! {
     fail { domain: domain, code: code, message: DiagnosticCanonical(diagnostic) }
 }
 
+fn RejectLinkedBuiltinBorrow(id: int, at: Span): null! {
+    if (id == 2) {
+        return RejectLayout("linked_slice_borrow", "string.slice requires an owned source value; clone the View explicitly", at)
+    }
+    return RejectLayout("linked_bytes_borrow", "the bytes operation requires an ordinary source value", at)
+}
+
 fn ExplicitType(&bindings: [TypeNameBinding], use_node: int, at: Span): TypeNameBinding! {
     lo = 0
     hi = bindings.len()

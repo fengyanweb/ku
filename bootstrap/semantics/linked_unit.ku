@@ -3,13 +3,14 @@ import { SuppliedModule } from "./imports.ku"
 import { BuiltinLinkPlanType, LinkPlanDeclaration } from "./link_plan_c.ku"
 import { EmitLinkPlan, LinkedNullDependencyPlan, PrepareLinkedAppendCallbackPlan } from "./link_plan_json_c.ku"
 import { EmitLinkedNullC, PrepareLinkedNullProject } from "./linked_null_c.ku"
-import { LinkedNullChild, LinkedNullEntry, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult } from "./linked_null_types_c.ku"
+import { LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult } from "./linked_null_types_c.ku"
+import { RequireProjectionLocalFunction } from "./struct_projection_c.ku"
 import { EmitStaticJsonString } from "./scalar_int_emit.ku"
 import { ReadStaticAsciiJsonString } from "./scalar_int_operands.ku"
 
 fn EmitLinkedUnit(supplied: [SuppliedModule], &function: str, plan: bool): str! {
     project = PrepareLinkedNullProject(supplied)?
-    node = LinkedNullEntry(project, function)?
+    node = RequireProjectionLocalFunction(project.supplied, function)?
     literal_id = linkedJsonLiteral(project, LinkedNullNode(project, 1, node))?
     if (literal_id != 0) {
         literal = LinkedNullNode(project, 1, literal_id)

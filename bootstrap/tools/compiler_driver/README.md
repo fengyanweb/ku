@@ -68,30 +68,53 @@ KU
   arguments and validates the same limit after conversion. It accepts
   ordinary drive and UNC paths. Device and verbatim paths are rejected.
 
+## Build a typed application
+
+List the entry module first in `modules.txt` and include its imported project
+modules. Define `fn main(): null!` in the entry module. Use the standalone
+compiler and your target C compiler to build the reachable units and link
+the program.
+
+```sh
+python3 -B bootstrap/tools/build_program.py \
+    --compiler /tmp/ku-bootstrap --cc cc /path/to/project/modules.txt -o ./app
+./app
+```
+
+The build uses the typed `emit-unit` path, including supported owned values,
+Result propagation and file reads across module boundaries. The application
+retains its launch directory for runtime input files. The supported language
+subset is the same as `emit-unit`. Select the target compiler explicitly on
+Windows and give the output a `.exe` suffix.
+
+
 The private C entry checks the exact signature of its synchronous Ku
 callee. This driver provides the command interface for the current bounded
 self-hosted compiler.
 
-The native integration test has run on macOS ARM64. Windows MSVC and GNU
-execution require verification on their respective Windows toolchains.
+The installed driver has been exercised on macOS ARM64, Linux GNU x64,
+Windows MSVC x64, and Windows GNU x64. Use the corresponding host toolchain
+to reproduce its platform results.
 
 ```sh
 python3 -B bootstrap/tools/compiler_driver/test_driver.py \
     --ku "$(command -v ku)" --cc cc
 ```
 
-## Verify a same-source bootstrap
 
-Use an installed Ku CLI and a C compiler for the current target. Pass a private
-output directory for the executables, C units, plans, and verification receipts.
+## Verify the same-source compiler generations
+
+Use a clean output directory and the currently installed Ku to build the seed
+and check two subsequent generations from the same Git commit.
 
 ```sh
 python3 -B bootstrap/tools/compiler_driver/selfhost/verify.py \
-    --ku "$(command -v ku)" --cc clang --output-dir /tmp/ku-bootstrap-verify
+    --repo . --revision HEAD --ku "$(command -v ku)" --cc clang \
+    --output-dir ./bootstrap-verification
 ```
 
-On Windows, use the selected x64 Clang or MinGW compiler and the installed
-`ku.exe`. The verifier builds Stage1, uses it to build and run Stage2, and uses
-Stage2 to build and run Stage3 from the same Git commit. It checks C and type-plan
-identity across the two generations. Repeat the command with the same source,
-installed CLI and compiler to reuse verified checkpoints.
+The verifier uses the committed source bytes, records all three executable
+identities, and compares the generated C and typed plans before reporting a
+successful run. Its receipts also describe the strict O2 objects, binaries,
+and available sanitizer checks. This workflow covers the current bounded
+bootstrap compiler source and the linked application cases it supports.

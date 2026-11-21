@@ -125,48 +125,9 @@ pub(super) fn emit(out: &mut COutput, trim: bool, casing: bool) -> KuResult<()> 
     out.check()
 }
 
-const BASE: &str = r#"
-typedef struct { uint32_t first,last; unsigned char kind; } KuUnicodeRange;
-typedef struct { uint32_t codepoint,offset,length; } KuUnicodeMap;
-static unsigned ku_unicode_class(const KuUnicodeRange* table,size_t count,uint32_t cp) {
-  size_t lo=0,hi=count;
-  while(lo<hi){size_t mid=lo+(hi-lo)/2u;if(table[mid].last<cp)lo=mid+1u;else hi=mid;}
-  return lo<count && table[lo].first<=cp ? table[lo].kind : 0u;
-}
-static uint32_t ku_unicode_read(KuString s,size_t* at) {
-  uint32_t cp=s.ptr[(*at)++];size_t extra=0;uint32_t minimum=0;
-  if(cp<0x80u)return cp;
-  if(cp>=0xc2u&&cp<=0xdfu){cp&=0x1fu;extra=1u;minimum=0x80u;}
-  else if(cp>=0xe0u&&cp<=0xefu){cp&=0x0fu;extra=2u;minimum=0x800u;}
-  else if(cp>=0xf0u&&cp<=0xf4u){cp&=7u;extra=3u;minimum=0x10000u;}
-  else goto bad;
-  if(extra>s.len-*at)goto bad;
-  for(size_t k=0;k<extra;k++){unsigned c=s.ptr[(*at)++];if((c&0xc0u)!=0x80u)goto bad;cp=(cp<<6)|(c&0x3fu);}
-  if(cp<minimum || cp>0x10ffffu || (cp>=0xd800u&&cp<=0xdfffu))goto bad;
-  return cp;
-bad: fputs("invalid UTF-8 in native string transform\n",stderr);exit(1);
-}
-static int ku_unicode_continue(size_t* fuel) {
-  if(++*fuel<64u)return 1;
-  *fuel=0;return !__ku_handler_timeout_poll();
-}
-"#;
+const BASE: &str = include_str!("c_string_unicode_base.c");
 
-const TRIM: &str = r#"
-static KuString ku_string_unicode_trim(KuString s) {
-  size_t at=0,start=0,end=0,fuel=0;int found=0;
-  while(at<s.len){
-    if(!ku_unicode_continue(&fuel))return (KuString){0};
-    size_t before=at;uint32_t cp=ku_unicode_read(s,&at);
-    if(!ku_unicode_class(ku_unicode_space,sizeof(ku_unicode_space)/sizeof(*ku_unicode_space),cp)){
-      if(!found){start=before;found=1;}end=at;
-    }
-  }
-  KuString result=ku_string_alloc(end-start);
-  if(result.len)memcpy(result.ptr,s.ptr+start,result.len);
-  return result;
-}
-"#;
+const TRIM: &str = include_str!("c_string_unicode_trim.c");
 
 const CASE: &str = r#"
 static const KuUnicodeMap* ku_unicode_mapping(const KuUnicodeMap* table,size_t count,uint32_t cp) {
@@ -218,3 +179,25 @@ static KuString ku_string_unicode_case(KuString s,int upper) {
 static KuString ku_string_unicode_lower(KuString s){return ku_string_unicode_case(s,0);}
 static KuString ku_string_unicode_upper(KuString s){return ku_string_unicode_case(s,1);}
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::{emit_ranges, tables, COutput};
+
+    #[test]
+    fn bootstrap_whitespace_matches_native_unicode_table() {
+        let (major, minor, patch) = char::UNICODE_VERSION;
+        let mut expected = COutput::new(1024);
+        expected.push_str(&format!(
+            "/* Rust Unicode whitespace {major}.{minor}.{patch}. Generated from char::is_whitespace(). */\n"
+        ));
+        emit_ranges(&mut expected, "ku_unicode_space", &tables().whitespace);
+
+        let actual = include_str!("../../bootstrap/tools/compiler_driver/string_trim_whitespace.h");
+        assert_eq!(
+            actual.replace("\r\n", "\n"),
+            expected.finish().expect("whitespace table fits"),
+            "regenerate the bootstrap whitespace table with the pinned Rust toolchain"
+        );
+    }
+}

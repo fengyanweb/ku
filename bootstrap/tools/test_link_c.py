@@ -167,6 +167,11 @@ class LinkTests(unittest.TestCase):
         with self.assertRaises(link_c.LinkError):
             link_c.TypeRef.read(dict(owned, c_type="KuGuardStringArray"), "value")
 
+    def test_program_requires_checked_null_entry(self):
+        units = [*self.entry_args, *self.left_args, *self.right_args]
+        self.build_args = ["--entry", "app.ku", "58", "--program", "-o", str(self.output)]
+        self.assert_preflight_error(units, "--program requires a zero-argument linked null! entry")
+
     def test_fs_read_provider_links_and_preserves_bytes_and_errors(self):
         path_type = dict(builtin("str", "const KuString*"), passing="view")
         result_type = builtin("str", "KuResult_str")

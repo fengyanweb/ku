@@ -2,14 +2,13 @@ import { Node } from "../stage2/ast.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule, TopLevelName } from "./names.ku"
 import { SuppliedModule } from "./imports.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { TypeNameBinding, ScalarType as scalarType, ScalarReturnType as scalarReturnType } from "./type_names.ku"
 import { ScalarIntInstruction, ScalarIntParameter, ScalarIntClause, ScalarIntFunction, ScalarStringPart, ScalarIntegerHelpers, ScalarStringHelpers, ScalarSymbol, EmitScalarIntPlan } from "./scalar_int_emit.ku"
 import { RejectScalarInt as rejectScalarInt, ScalarParameterIndex as scalarParameterIndex,
     ScalarStringLiteral as scalarStringLiteral,
     HasScalarBuiltin, LowerScalarBool, LowerScalarStringParts } from "./scalar_int_operands.ku"
 import { LowerNullResultExit } from "./scalar_result_null.ku"
 import { HasScalarControlBody, LowerScalarControlBody } from "./scalar_program_c.ku"
-import { ScalarType as scalarType, ScalarReturnType as scalarReturnType } from "./scalar_types.ku"
 import { ScalarIntImport, ScalarFunctionNode as scalarFunctionNode, LowerIntExpression as lowerIntExpression } from "./scalar_int_calls.ku"
 import { HasScalarOwnedStringBody, LowerScalarOwnedStringBody, ScalarStringReplaceHelpers } from "./scalar_string_replace.ku"
 

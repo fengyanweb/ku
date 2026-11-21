@@ -10,9 +10,10 @@ import { ScalarFunctionNode } from "../semantics/scalar_int_calls.ku"
 import { ScalarStringHelpers } from "../semantics/scalar_int_emit.ku"
 import { ScalarStringLiteral } from "../semantics/scalar_int_operands.ku"
 import { EmitCheckedStringArrayResultHeader } from "../semantics/struct_array_c.ku"
-import { LinkedNullProject, LinkedNullEntry, LinkedNullChild, LinkedNullNode,
+import { LinkedNullProject, LinkedNullChild, LinkedNullNode,
     LinkedNullParameterType, LinkedNullDependency, LinkedNullLayout,
     LinkedNullCType, LinkedNullParameterPlan } from "../semantics/linked_null_types_c.ku"
+import { RequireProjectionLocalFunction } from "../semantics/struct_projection_c.ku"
 import { BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType, LinkedNullFunction } from "../semantics/link_plan_c.ku"
 import { EmitLinkPlan, LinkedNullDependencyPlan, LinkedNullPrototype } from "../semantics/link_plan_json_c.ku"
 import { TypeNameBinding } from "../semantics/type_names.ku"
@@ -163,7 +164,7 @@ fn emitManifest(&scan: ManifestScan, &symbol: str, &record: str, layouts: str,
 fn EmitManifestPathsC(&supplied: [SuppliedModule], &name: str): ManifestPathsC! {
     bound = BindProjectModules(supplied)?
     project = LinkedNullProject { supplied: supplied.clone(), binding: bound }
-    id = LinkedNullEntry(project, name)?
+    id = RequireProjectionLocalFunction(project.supplied, name)?
     entry = LinkedNullNode(project, 1, id)
     ManifestShape(entry, "Function", 9)?
     input = ownedParameter(project, entry, 0)?

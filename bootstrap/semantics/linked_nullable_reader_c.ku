@@ -1,0 +1,239 @@
+import { Node } from "../stage2/ast.ku"
+import { RejectLocalCapture } from "./call_contracts.ku"
+import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
+import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
+import { DeclarationSpan, IsNamedFunction } from "./names.ku"
+import { LinkedMemberUnavailable, LinkedViewArgument, MoveLinkedNullSlot, RequireLinkedMove } from "./linked_member_ownership.ku"
+import { AddLinkedNullSlot, LinkedCallableSlot } from "./linked_parameters_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullParameterType, LinkedNullProject, ReadLinkedResult, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkedNullValue } from "./link_plan_c.ku"
+import { RestoreLinkedThunkFrame } from "./link_plan_json_c.ku"
+import { LinkedOptionalIntHeader, StartLinkedThunkFrame } from "./scalar_result_null.ku"
+import { RejectLayout } from "./struct_layouts.ku"
+import { ContainsIndex, ContainsType, CTypeName, LinkedIntArrayCallbackFaultPending } from "./struct_projection_c.ku"
+import { RetagTypeNameBinding, TypeNameBinding } from "./type_names.ku"
+
+fn nullableReaderTypeDeclaration(&ty: TypeNameBinding): str! {
+    record = CTypeName(ty.module_index, ty.declaration_node)
+    carrier = LinkedNullCType(ty)?
+    return ok("typedef struct { KuBootstrapOptionalInt (*entry)(const KuProjectionString*, const " + record
+        + "*); KuProjectionString capture; } " + carrier + ";\n")
+}
+
+fn LinkedOptionalReaderHeader(&slots: [LinkedNullSlot], &result: TypeNameBinding): str! {
+    declarations = ""
+    known: [str] = []
+    if (result.declaration_kind == "NullableRecordViewReader") {
+        declarations += nullableReaderTypeDeclaration(result)?
+        known = known.push(LinkedNullCType(result)?)
+    }
+    index = 0
+    while (index < slots.len()) {
+        ty = slots[index].value.ty.clone()
+        if (ty.declaration_kind == "NullableRecordViewReader") {
+            carrier = LinkedNullCType(ty)?
+            if (!ContainsType(known, carrier)) {
+                declarations += nullableReaderTypeDeclaration(ty)?
+                known = known.push(carrier)
+            }
+        }
+        index = index + 1
+    }
+    base = result.clone()
+    if (declarations != "") { base.declaration_kind = "NullableInt" }
+    return ok(LinkedOptionalIntHeader(slots, base) + declarations)
+}
+
+fn invokeLinkedOptionalReader(&project: LinkedNullProject, argument: LinkedNullExpression,
+                              &callback: LinkedNullValue, &call: Node, id: int): LinkedNullExpression! {
+    at = DeclarationSpan(call)
+    if (LinkedMemberUnavailable(argument.state, callback, true)) {
+        RejectLayout("linked_callback_argument", "a callback argument cannot consume the callback itself", at.clone())?
+    }
+    view = RetagTypeNameBinding(callback.ty.clone(), "StructView")
+    value = LinkedViewArgument(view, argument.value)?
+    result = RetagTypeNameBinding(LinkedBuiltin("int", at), "NullableInt")
+    output = AddLinkedNullSlot(project, argument.state, "", "t" + str(id), result, false)?
+    name = callback.text.clone()
+    output.state.uses_scoped_reader = true
+    output.state.code += "    if (!" + name.clone() + ".entry || (" + name.clone() + ".capture.len && !" + name.clone()
+        + ".capture.ptr)) { captured_array_failure = \"invalid owned reader callback\\n\"; goto cleanup; }\n"
+        + "    " + output.value.text.clone() + " = " + name.clone() + ".entry(&" + name + ".capture, " + value + ");\n"
+    output.state.slots[output.value.slot - 1].live = true
+    return ok(output)
+}
+
+fn InvokeLinkedReader(&project: LinkedNullProject, argument: LinkedNullExpression, &callback: LinkedNullValue,
+                      &call: Node, id: int): LinkedNullExpression! {
+    if (callback.ty.declaration_kind == "NullableRecordViewReader") {
+        return invokeLinkedOptionalReader(project, argument, callback, call, id)
+    }
+    if (!LinkedIntResult(argument.value.ty)) {
+        RejectLayout("linked_callback_argument", "reader callback requires a Copy int index", DeclarationSpan(call))?
+    }
+    result = callback.ty.clone()
+    result.declaration_kind = "Struct"
+    output = AddLinkedNullSlot(project, argument.state, "", "t" + str(id), result, false)?
+    name = callback.text.clone()
+    output.state.uses_scoped_reader = true
+    output.state.code += "    if (!" + name.clone() + ".entry || !" + name.clone() + ".failure) {\n"
+        + "        if (" + name.clone() + ".failure) " + name.clone() + ".failure->array_error = \"invalid scoped reader callback\\n\";\n"
+        + "        else captured_array_failure = \"invalid scoped reader callback\\n\";\n        goto cleanup;\n    }\n"
+        + "    " + output.value.text.clone() + " = " + name.clone() + ".entry(" + name.clone() + ".environment, "
+        + name.clone() + ".failure, " + argument.value.text + ");\n"
+        + "    if (" + LinkedIntArrayCallbackFaultPending(name + ".failure") + ") goto cleanup;\n"
+    output.state.slots[output.value.slot - 1].live = true
+    return ok(output)
+}
+
+fn LinkedReaderCallable(&state: LinkedNullState, slot: int): bool {
+    return LinkedCallableSlot(state, slot) || slot > 0 && state.slots[slot - 1].live
+        && state.slots[slot - 1].value.ty.declaration_kind == "NullableRecordViewReader"
+}
+
+struct LinkedLocalCaptures {
+    slots: [int]
+    calls: [int]
+}
+
+// The validated arena stores this function's subtree contiguously. A second
+// function or a declaration that could shadow an outer slot needs its own
+// binding rules before this restricted same-frame lowering can accept it.
+fn ReadLinkedParameterCaptures(&project: LinkedNullProject, &state: LinkedNullState,
+                           &function: Node, id: int, body_start: int, parameter_count: int): LinkedLocalCaptures! {
+    names: [str] = []
+    index = 0
+    while (index < parameter_count) {
+        parameter = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, index))
+        names = names.push(parameter.text)
+        index = index + 1
+    }
+    start = LinkedNullChild(project, 1, function, body_start)
+    descending = true
+    while (descending) {
+        descending = project.supplied[0].named.parsed.arena.nodes[start - 1].edge_count > 0
+        if (descending) {
+            start = project.supplied[0].named.parsed.arena.edges[
+                project.supplied[0].named.parsed.arena.nodes[start - 1].first_edge]
+        }
+    }
+    slots: [int] = []
+    calls: [int] = []
+    has_local_calls = state.local_appends.len() > 0
+    cursor = start
+    while (cursor < id) {
+        node = LinkedNullNode(project, 1, cursor)
+        if (has_local_calls && node.kind == "Call" && node.edge_count > 0) {
+            target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, node, 0))
+            if (target.kind == "Variable" && target.edge_count == 0 && !ContainsType(names, target.text) &&
+                LinkedNullBinding(state.slots, target.text) == 0) {
+                index = LinkedLocalAppendIndex(state, target.text)
+                if (index > 0 && !ContainsIndex(calls, index)) { calls = calls.push(index) }
+            }
+        }
+        use = node.kind == "Variable" || node.kind == "Assign"
+        if (IsNamedFunction(node.kind) || node.kind == "FunctionExpr" || (use && node.text == function.text)) {
+            RejectLocalCapture(node, "a local callback cannot define or reference a nested callable")?
+        }
+        declares = node.kind == "VarDecl" || node.kind == "For" || node.kind == "CatchBinding" ||
+            node.kind == "ObjectDestructureLocal" || node.kind == "ObjectDestructureRest"
+        if ((use || declares) && !ContainsType(names, node.text)) {
+            slot = LinkedNullBinding(state.slots, node.text)
+            if (slot > 0 && declares) {
+                RejectLocalCapture(node, "a local callback binding cannot shadow an outer capture")?
+            }
+            if (slot > 0 && !ContainsIndex(slots, slot)) { slots = slots.push(slot) }
+        }
+        cursor = cursor + 1
+    }
+    return ok(LinkedLocalCaptures { slots: slots, calls: calls })
+}
+
+
+struct LinkedOwnedReaderBody {
+    state: LinkedNullState
+    result: TypeNameBinding
+    capture: int
+    function: int
+    start: int
+}
+
+fn ReadLinkedOwnedReader(&project: LinkedNullProject, &parent: LinkedNullState, &statement: Node,
+                         &reader: TypeNameBinding, statement_id: int, last_statement: int): LinkedOwnedReaderBody! {
+    id = LinkedNullChild(project, 1, statement, 0)
+    function = LinkedNullNode(project, 1, id)
+    if (function.edge_count < 2) { RejectLocalCapture(function, "an owned reader requires a named View parameter and a body")? }
+    parameter = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, 0))
+    if (parameter.kind != "Parameter" || parameter.edge_count != 1 || parameter.int_value != 1) {
+        RejectLocalCapture(parameter, "an owned reader requires one typed View parameter")?
+    }
+    view = LinkedNullParameterType(project, 1, LinkedNullChild(project, 1, parameter, 0), true)?
+    expected = RetagTypeNameBinding(reader.clone(), "StructView")
+    if (!SameLinkedType(view, expected)) {
+        RejectLocalCapture(parameter, "reader View must match its declared nominal parameter")?
+    }
+    start = 1
+    result = RetagTypeNameBinding(LinkedBuiltin("int", DeclarationSpan(function)), "NullableInt")
+    second = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, 1))
+    if (second.kind == "TypeUnion") {
+        written = ReadLinkedResult(project, 1, LinkedNullChild(project, 1, function, 1), false)?
+        if (!SameLinkedType(written, result)) { RejectLocalCapture(second, "reader result must be int | null")? }
+        start = 2
+    }
+    if (start >= function.edge_count || second.kind == "Parameter") {
+        RejectLocalCapture(function, "an owned reader requires one View parameter and a nonempty body")?
+    }
+    captured = ReadLinkedParameterCaptures(project, parent, function, id, start, 1)?
+    if (captured.slots.len() != 1 || captured.calls.len() != 0) {
+        RejectLocalCapture(function, "an owned reader requires one immutable str capture")?
+    }
+    source = captured.slots[0]
+    owner = parent.slots[source - 1].clone()
+    if (!owner.source_parameter || !owner.live || owner.value.borrowed || owner.value.ty.declaration_kind != "Builtin" || owner.value.ty.name != "str") {
+        RejectLocalCapture(function, "an owned reader requires a live owning str parameter as its capture")?
+    }
+    RequireLinkedMove(parent, owner.value)?
+    cursor = statement_id + 1
+    end = last_statement + 1
+    while (cursor < end) {
+        use = LinkedNullNode(project, 1, cursor)
+        if (use.kind == "Variable" && use.text == owner.binding) {
+            RejectLocalCapture(use, "the immutable reader capture is still used after the closure is created")?
+        }
+        cursor = cursor + 1
+    }
+    frame = StartLinkedThunkFrame(parent)
+    frame.plain_value_result = true
+    input = AddLinkedNullSlot(project, frame, parameter.text, "input", view, true)?
+    capture_type = RetagTypeNameBinding(owner.value.ty, "StringView")
+    capture_slot = AddLinkedNullSlot(project, input.state, owner.binding, "capture", capture_type, true)?
+    capture_slot.state.code += "    (void)input; (void)capture;\n"
+    return ok(LinkedOwnedReaderBody { state: capture_slot.state, result: result, capture: source, function: id, start: start })
+}
+
+fn FinishLinkedOwnedReader(&project: LinkedNullProject, &parent: LinkedNullState, body: LinkedNullRegion,
+                           &statement: Node, &reader: TypeNameBinding, capture: int, id: int): LinkedNullState! {
+    if (!body.terminal) { RejectLocalCapture(statement, "an owned reader must return int or null on all paths")? }
+    symbol = "ku_owned_reader_" + str(id)
+    next = body.state
+    signature = "const KuProjectionString *capture, const " + CTypeName(reader.module_index, reader.declaration_node) + " *input"
+    character_errors = ""
+    if (next.uses_chars) { character_errors = ManagedSourceCharactersErrors() }
+    next.callback_helpers += "\nstatic " + FinishLinkedFunctionC("", next, symbol, signature,
+        "KuBootstrapOptionalInt", "", character_errors, "")
+    next = RestoreLinkedThunkFrame(next, parent)
+    result = AddLinkedNullSlot(project, next, statement.text.clone(), "reader" + str(id), reader.clone(), false)?
+    owner = parent.slots[capture - 1].value.clone()
+    result.state.code += "    " + result.value.text.clone() + " = (" + LinkedNullCType(reader)? + "){"
+        + symbol + ", " + owner.text.clone() + "};\n"
+    result.state.slots[result.value.slot - 1].live = true
+    return MoveLinkedNullSlot(result.state, owner)
+}
+
+fn LinkedCallArgument(&project: LinkedNullProject, &call: Node, &callee: LinkedNullFunction, index: int): int {
+    if (callee.unit == 0 && callee.node == 4) {
+        if (index == 1) { return LinkedNullChild(project, 1, call, 1) }
+        return LinkedNullChild(project, 1, LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0)), 0)
+    }
+    return LinkedNullChild(project, 1, call, index + 1)
+}

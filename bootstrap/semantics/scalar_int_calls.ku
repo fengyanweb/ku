@@ -1,9 +1,8 @@
 import { FirstSubtreeNode, Node } from "../stage2/ast.ku"
 import { DeclarationSpan, TopLevelName } from "./names.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { TypeNameBinding, ScalarType as scalarType, ScalarReturnType as scalarReturnType } from "./type_names.ku"
 import { ScalarIntInstruction, ScalarIntParameter } from "./scalar_int_emit.ku"
 import { RejectScalarInt as rejectScalarInt, ScalarParameterIndex as scalarParameterIndex } from "./scalar_int_operands.ku"
-import { ScalarType as scalarType, ScalarReturnType as scalarReturnType } from "./scalar_types.ku"
 
 struct ScalarIntSignature {
     arity: int

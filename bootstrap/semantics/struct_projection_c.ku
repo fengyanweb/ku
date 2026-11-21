@@ -319,6 +319,9 @@ fn ProjectionBuiltinLinkFor(id: int): ProjectionBuiltinLink {
     if (id == 2) {
         return ProjectionBuiltinLink { name: "slice", namespace: "string", path: "std/string.ku", symbol: "ku_linked_dep_string_slice" }
     }
+    if (id == 5) {
+        return ProjectionBuiltinLink { name: "trim", namespace: "string", path: "std/string.ku", symbol: "ku_linked_dep_string_trim" }
+    }
     name = ""
     if (id == 3) { name = "from_str" }
     else if (id == 4) { name = "get" }
@@ -327,7 +330,10 @@ fn ProjectionBuiltinLinkFor(id: int): ProjectionBuiltinLink {
 }
 
 fn ProjectionBuiltinLinkId(&name: str, checked: bool): int {
-    if (!checked) { return 0 }
+    if (!checked) {
+        if (name == "trim") { return 5 }
+        return 0
+    }
     if (name == "read") { return 1 }
     if (name == "slice") { return 2 }
     if (name == "from_str") { return 3 }

@@ -4,7 +4,7 @@ import { LinkedWhileCondition } from "./project_struct_string_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"
-import { BindLinkedLocalCallback, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState, LinkedNullValue,
+import { BindLinkedLocalCallback, LinkedNullBinding, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullRegion, LinkedNullSlot, LinkedNullState,
     LinkedReadonlyExpression, PreserveLinkedOwners, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 import { LinkedBuiltin, LinkedCheckedResultCType, LinkedIntResult, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullNode,
     LinkedNullParameterType, LinkedNullProject, LinkedNullType, LinkedStringResult,
@@ -17,9 +17,9 @@ import { ContainsIndex, ProjectionCloneSource } from "./struct_projection_c.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { FinishLinkedFunctionC } from "./guarded_struct_c.ku"
 import { ManagedSourceCharactersErrors } from "./guarded_string_parts.ku"
-import { RestoreLinkedThunkFrame } from "./link_plan_json_c.ku"
-import { StartLinkedThunkFrame } from "./scalar_result_null.ku"
-import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedRecordForLoop, ReadLinkedLocalCaptures, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
+import { LinkedChildKindIs, RestoreLinkedThunkFrame } from "./link_plan_json_c.ku"
+import { EmitLinkedOptionalIntTest, StartLinkedThunkFrame } from "./scalar_result_null.ku"
+import { LinkedForLoop, OpenLinkedBooleanWhile, OpenLinkedOwnedForLoop, ReadLinkedLocalCaptures, StoreLinkedCopyAssignment } from "./linked_owner_assignment_c.ku"
 
 struct LinkedLocalThunk {
     result: TypeNameBinding
@@ -148,11 +148,16 @@ fn LowerLinkedLocalAlias(&project: LinkedNullProject, state: LinkedNullState, &s
 
 fn LowerLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, id: int): LinkedNullExpression! {
     node = LinkedNullNode(project, 1, id)
+    equality = node.text == "==" || node.text == "!="
+    null_test = node.kind == "Binary" && node.edge_count == 2 && equality && LinkedChildKindIs(project, node, 1, "Null")
     invocation = node.kind == "TryUnwrap"
     if (!invocation) { invocation = LinkedOwnedStringPredicate(project, state, node)? }
-    if (invocation) {
+    if (invocation || null_test) {
         before = state.slots.len()
-        value = LowerLinkedNullValue(project, state, id, 0)?
+        operand = id
+        if (null_test) { operand = LinkedNullChild(project, 1, node, 0) }
+        value = LowerLinkedNullValue(project, state, operand, 0)?
+        if (null_test) { value = EmitLinkedOptionalIntTest(value, node)? }
         result = value.value
         if (result.ty.declaration_kind != "Builtin" || result.ty.name != "bool") {
             RejectLayout("linked_guard_type", "expected a bool condition", DeclarationSpan(node))?
@@ -160,7 +165,6 @@ fn LowerLinkedPredicate(&project: LinkedNullProject, state: LinkedNullState, id:
         done = DropLinkedNullScope(value.state, before)
         return ok(LinkedReadonlyExpression(done, result.ty, result.text))
     }
-    equality = node.text == "==" || node.text == "!="
     if (node.kind != "Binary" || node.edge_count != 2 || !equality) {
         return LowerLinkedNullRead(project, state, id, 0)
     }
@@ -268,18 +272,19 @@ fn OpenLinkedForLoop(&project: LinkedNullProject, state: LinkedNullState, &state
         source = LinkedNullNode(project, 1, source_id)
         if (source.kind == "Field" || source.kind == "TryUnwrap" || (source.kind == "Call" && ProjectionCloneSource(
             project.supplied[0].named.parsed.arena.nodes, project.supplied[0].named.parsed.arena.edges, source_id) != 0)) {
-            return OpenLinkedRecordForLoop(project, state, statement, source_id, id, depth)
+            return OpenLinkedOwnedForLoop(project, state, statement, source_id, id, depth)
         }
         if (source.kind == "Variable" && source.edge_count == 0) {
             slot = LinkedNullBinding(state.slots, source.text)
             if (slot != 0) {
-                if (LinkedNullOwnedArray(state.slots[slot - 1].value.ty)) {
-                    return OpenLinkedRecordForLoop(project, state, statement, source_id, id, depth)
+                ty = state.slots[slot - 1].value.ty.clone()
+                if (LinkedNullOwnedArray(ty) || ty.declaration_kind == "OwnedStringArray") {
+                    return OpenLinkedOwnedForLoop(project, state, statement, source_id, id, depth)
                 }
-                if (LinkedNullIntArrayOwner(state.slots[slot - 1].value.ty)) {
+                if (LinkedNullIntArrayOwner(ty)) {
                     return openLinkedIntLoop(project, state, statement, slot, id, depth)
                 }
-                if (state.slots[slot - 1].value.ty.declaration_kind == "BuiltinArray" && state.slots[slot - 1].value.ty.name == "int") {
+                if (ty.declaration_kind == "BuiltinArray" && ty.name == "int") {
                     RejectLayout("linked_int_for_borrowed", "borrowed integer arrays cannot be iterated as owners", DeclarationSpan(source))?
                 }
             }

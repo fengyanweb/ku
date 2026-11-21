@@ -5,7 +5,7 @@ import { DeclarationSpan } from "./names.ku"
 import { ContainsIndex, ContainsAllTypes, OnlyWholeMemberMoves } from "./struct_projection_c.ku"
 import { GuardOwnedDrops, ScalarGuardSlotMove } from "./guarded_struct_c.ku"
 import { OwningLayoutDropName } from "./nested_struct_c.ku"
-import { IsLinkedDescendant, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
+import { IsLinkedDescendant, MatchesLinkedStructArrayOwner, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { EmitCheckedScalarArithmetic } from "./scalar_int_emit.ku"
 import { FieldIndex, LayoutIndex, RejectLayout, StructLayout } from "./struct_layouts.ku"
 import { LinkedBuiltin, LinkedNullArrayPrefix, LinkedNullCType, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullView, SameLinkedType } from "./linked_null_types_c.ku"
@@ -13,6 +13,7 @@ import { LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNull
 
 fn LinkedNullDropC(&layouts: [StructLayout], &owning_layouts: [StructLayout], &ty: TypeNameBinding, &name: str): str {
     if (ty.declaration_kind == "OwnedStringArray") { return "    ku_managed_source_drop(&" + name.clone() + ");\n" }
+    if (ty.declaration_kind == "NullableRecordViewReader") { return "    ku_projection_string_drop(&" + name.clone() + ".capture);\n" }
     if (ty.declaration_kind == "CaughtError") {
         return "    ku_projection_string_drop(&" + name.clone() + ".domain);\n"
             + "    ku_projection_string_drop(&" + name.clone() + ".code);\n"
@@ -52,7 +53,7 @@ fn LinkedViewArgument(&parameter: TypeNameBinding, &value: LinkedNullValue): str
         return ok("&(" + value.text.clone() + ")")
     }
     if (MatchesLinkedIntArrayOwner(parameter, value.ty)) { return ok("&(" + value.text.clone() + ")") }
-    if (matchesLinkedStructArrayOwner(parameter, value.ty)) {
+    if (MatchesLinkedStructArrayOwner(parameter, value.ty)) {
         return ok("&(" + value.text.clone() + ")")
     }
     RejectLayout("linked_argument_type", "expected a matching stable source for the View argument", value.ty.span.clone())?
@@ -77,13 +78,8 @@ fn RequireLinkedReadonlyCall(&callee: LinkedNullFunction, &at: Span): null! {
     return ok(null)
 }
 
-fn matchesLinkedStructArrayOwner(&target: TypeNameBinding, &origin: TypeNameBinding): bool {
-    return target.declaration_kind == "StructArray" && LinkedNullOwnedArray(origin)
-        && target.module_index == origin.module_index && target.declaration_node == origin.declaration_node
-}
-
 fn MatchesLinkedFieldValue(&target: TypeNameBinding, &origin: TypeNameBinding): bool {
-    if (target.declaration_kind == "StructArray") { return matchesLinkedStructArrayOwner(target, origin) }
+    if (target.declaration_kind == "StructArray") { return MatchesLinkedStructArrayOwner(target, origin) }
     return SameLinkedType(target, origin) || MatchesLinkedIntArrayOwner(target, origin)
 }
 

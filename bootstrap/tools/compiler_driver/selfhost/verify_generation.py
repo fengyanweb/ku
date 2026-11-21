@@ -141,12 +141,6 @@ def main():
                    for dep in plans[0]["dependencies"]):
             raise SystemExit("frozen BootstrapEntry plan predates emit-unit and emit-unit-plan; "
                              "resolve the current compiler-driver receipt")
-    providers = {
-        "bytes.from_str": link_c.bytes_from_str_provider,
-        "bytes.get": link_c.bytes_get_provider,
-        "fs.read": link_c.fs_read_provider,
-        "string.slice": link_c.string_slice_provider,
-    }
     units = []
     for item in rows:
         unit = link_c.Unit.read(ledger_member(item["plan"]), ledger_member(item["c"]))
@@ -158,7 +152,7 @@ def main():
         units.append(unit)
     builtin_headers = {}
     for name in (() if host_check else ledger["builtins"]):
-        unit, headers = providers[name]()
+        unit, headers = link_c.BUILTIN_PROVIDERS[name]()
         units.append(replace(unit, code=frozen_builtin(repo, source_commit, unit.source, unit.code)))
         builtin_headers.update({path: frozen_builtin(repo, source_commit, path, checkout)
                                 for path, checkout in headers.items()})
@@ -245,8 +239,13 @@ static KuProjectionString ku_string_static(const uint8_t *input, size_t size) {
             rendered = consumer.execute([binary, "emit", file.name, "AddOne"], foreign)
             consumer.exercise_emitted(cc, rendered.stdout, foreign, "standalone-module", b"(41)", b"42")
             consumer.exercise_project(binary, cc, current, foreign)
+            consumer.exercise_linked_program(binary, cc, foreign)
             consumer.exercise_parameter_bindings(binary, cc, foreign)
             consumer.exercise_owned_recovery(binary, cc, foreign)
+            consumer.exercise_linked_nullable_int(binary, cc, foreign)
+            consumer.exercise_linked_owned_reader(binary, cc, foreign)
+            consumer.exercise_linked_reader_factory(binary, cc, foreign)
+            consumer.exercise_linked_owned_string_for(binary, cc, foreign)
             imports = dynamic_imports(binary)
             assert not any("libku" in line.lower() for line in imports)
             binaries[name] = {"sha256": sha256(binary.read_bytes()).hexdigest(), "dynamic_imports": imports}

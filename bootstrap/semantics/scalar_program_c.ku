@@ -1,11 +1,10 @@
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan, TopLevelName } from "./names.ku"
-import { TypeNameBinding } from "./type_names.ku"
+import { TypeNameBinding, ScalarReturnType } from "./type_names.ku"
 import { LowerIntExpression, ScalarIntImport } from "./scalar_int_calls.ku"
 import { ScalarIntClause, ScalarIntFunction, ScalarIntInstruction, ScalarIntParameter, ScalarStringPart } from "./scalar_int_emit.ku"
 import { LowerScalarBool, RejectScalarInt } from "./scalar_int_operands.ku"
 import { LowerNullResultExit } from "./scalar_result_null.ku"
-import { ScalarReturnType } from "./scalar_types.ku"
 
 fn programOutputArgument(&nodes: [Node], &edges: [int], &statement: Node, builtin: bool): int! {
     if (builtin && statement.kind == "ExprStmt" && statement.edge_count == 1) {
