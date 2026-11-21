@@ -415,6 +415,40 @@ def run_cc(args, timeout):
         raise LinkError(f"C compiler timed out after {timeout:g}s") from error
 
 
+def windows_command_fits(args):
+    # CreateProcessW counts UTF-16 code units, including the trailing NUL.
+    command = subprocess.list2cmdline([str(arg) for arg in args])
+    return len(command.encode("utf-16-le", errors="surrogatepass")) // 2 + 1 <= 32767
+
+
+def link_command(cc, objects, binary, ldflags, *, msvc):
+    prefix = [cc, "/nologo"] if msvc else [cc]
+    target = [f"/Fe{binary}"] if msvc else ["-o", binary]
+    command = [*prefix, *objects, *target, *ldflags]
+    if sys.platform != "win32" or windows_command_fits(command):
+        return command
+
+    # Leave flags on the command line so their order and relative paths
+    # keep their original meaning. The response file only holds objects.
+    response = binary.with_name("objects.rsp")
+    command = [*prefix, f"@{response}", *target, *ldflags]
+    if not windows_command_fits(command):
+        raise LinkError("C linker arguments exceed the Windows command-line limit even with an object response file")
+    if msvc:
+        lines = [subprocess.list2cmdline([str(obj)]) for obj in objects]
+        data = b"\xff\xfe" + ("\n".join(lines) + "\n").encode("utf-16-le")
+    else:
+        lines = ['"' + str(obj).replace('\\', '\\\\').replace('"', '\\"') + '"' for obj in objects]
+        # MinGW GCC reads its system ANSI code page. Clang reads UTF-8.
+        encoding = "mbcs" if os.name == "nt" and "clang" not in Path(cc).stem.lower() else "utf-8"
+        try:
+            data = ("\n".join(lines) + "\n").encode(encoding)
+        except UnicodeEncodeError as error:
+            raise LinkError("GNU C linker response file cannot encode a temporary object path") from error
+    response.write_bytes(data)
+    return command
+
+
 def link(units, aliases, output, entry, caller, cc, cflags, ldflags, timeout, builtin_headers):
     msvc = Path(cc).stem.lower() in {"cl", "clang-cl"}
     windows_gnu = sys.platform == "win32" and not msvc
@@ -449,8 +483,7 @@ def link(units, aliases, output, entry, caller, cc, cflags, ldflags, timeout, bu
             run_cc([cc, *flags, *cflags, *macros, *compile_args], timeout)
             objects.append(obj)
         binary = root / ("program.exe" if os.name == "nt" or msvc else "program")
-        link_args = ["/nologo", *objects, f"/Fe{binary}"] if msvc else [*objects, "-o", binary]
-        run_cc([cc, *link_args, *ldflags], timeout)
+        run_cc(link_command(cc, objects, binary, ldflags, msvc=msvc), timeout)
         if windows_gnu:
             # Scratch can be on another volume. Stage the finished binary
             # beside the output so replacement keeps its atomic semantics.
