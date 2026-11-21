@@ -840,6 +840,62 @@ int main(void) {{
         assert not rejected.stdout and diagnostic in rejected.stderr, rejected.stderr
 
 
+def exercise_linked_unit_enum_branch(compiler, cc, caller):
+    project = caller / "linked-unit-enum-branch"
+    project.mkdir()
+    (project / "model.ku").write_text("""enum Phase { Ready\n Done }
+enum Other { Ready\n Done }
+fn Select(flag: int): Phase {
+    println(str(flag))
+    if (flag == 1) { return Phase.Ready }
+    return Phase.Done
+}
+fn Pass(value: Phase): Phase { return value }
+""", encoding="utf-8")
+    header = 'import model from "./model.ku"\nimport { Select } from "./model.ku"\n'
+    main = project / "main.ku"
+    main.write_text(header + """fn Compile(flag: int): int {
+    phase = model.Select(flag)
+    if (phase == model.Phase.Ready && phase != model.Phase.Done) { return 11 }
+    return 29
+}
+fn Direct(flag: int): int {
+    if (Select(flag) != Select(flag + 1)) { return 37 }
+    return 41
+}
+fn Skip(flag: int): int {
+    if (flag == 0 || Select(9) == Select(10)) { return 43 }
+    return 45
+}
+fn main(): null! {
+    println(str(Compile(1)))
+    println(str(Compile(2)))
+    println(str(Direct(1)))
+    println(str(Direct(2)))
+    println(str(Skip(0)))
+    println(str(Skip(1)))
+    return ok(null)
+}
+""", encoding="utf-8")
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\nmodel.ku\n", encoding="utf-8")
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    output = project / ("dispatch.exe" if os.name == "nt" else "dispatch")
+    execute([sys.executable, "-B", builder, manifest, "--compiler", compiler, "--cc", cc, "-o", output], caller)
+    assert execute([output], caller).stdout.replace(b"\r\n", b"\n") == (
+        b"1\n11\n2\n29\n1\n2\n37\n2\n3\n41\n43\n9\n10\n43\n"
+    )
+    for source, error in [
+        ("    phase = Select(1)\n    return phase == model.Other.Ready\n", b"linked_enum_comparison"),
+        ("    phase = Select(1)\n    moved = model.Pass(phase)\n"
+         "    return phase == model.Phase.Ready\n", b"unavailable_linked_binding"),
+        ("    return Select(1) < model.Phase.Ready\n", b"linked_binary_type"),
+    ]:
+        main.write_text(header + "fn Bad(): bool {\n" + source + "}\n", encoding="utf-8")
+        rejected = execute([compiler, "emit-unit-plan", manifest, "Bad"], caller, 1)
+        assert error in rejected.stderr and not rejected.stdout, rejected.stderr
+
+
 def exercise_linked_reader_factory(compiler, cc, caller):
     project = caller / "linked-reader-factory"
     project.mkdir()
@@ -1435,6 +1491,7 @@ def exercise(ku, cc):
         exercise_linked_owned_reader(compiler, cc, caller)
         exercise_static_reader_argument(compiler, cc, caller)
         exercise_linked_unit_enum(compiler, cc, caller)
+        exercise_linked_unit_enum_branch(compiler, cc, caller)
         exercise_linked_reader_factory(compiler, cc, caller)
         exercise_linked_owned_string_for(compiler, cc, caller)
         exercise_parameter_bindings(compiler, cc, caller)

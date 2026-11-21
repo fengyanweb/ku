@@ -1,11 +1,12 @@
+import { DropLinkedNullScope } from "./linked_member_ownership.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FindLinkedLocalRead } from "./call_contracts.ku"
-import { LinkedAbsoluteType, LinkedBuiltin, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
-import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullSlot, LinkedNullState } from "./link_plan_c.ku"
+import { LinkedAbsoluteType, LinkedBuiltin, LinkedNullChild, LinkedNullCType, LinkedNullNode, LinkedNullProject, LinkedNullView } from "./linked_null_types_c.ku"
+import { LinkedLocalAppendIndex, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullSlot, LinkedNullState, LinkedNullValue, LinkedReadonlyExpression } from "./link_plan_c.ku"
 import { CollectFields, HasBoundArrayMembers, LayoutIndex, RejectLayout, StructFieldLayout, StructLayout } from "./struct_layouts.ku"
 import { BuildProjectOwningLayouts, OrderCStructLayouts, OrderProjectOwningLayouts } from "./nested_struct_c.ku"
-import { FindUnitEnumType, ReadUnitEnumVariant, TypeNameBinding } from "./type_names.ku"
+import { FindUnitEnumType, ReadUnitEnumVariant, SameBoundTypeIdentity, TypeNameBinding } from "./type_names.ku"
 import { Span } from "../stage2/span.ku"
 import { SuppliedModule } from "./imports.ku"
 import { BuiltinLinkPlanType, LinkPlanDeclaration, LinkPlanType } from "./link_plan_c.ku"
@@ -236,4 +237,40 @@ fn FindLinkedEnumSelection(&project: LinkedNullProject, &state: LinkedNullState,
     if (ty.declaration_kind != "UnitEnum") { return ok(LinkedEnumSelection { ty: empty, index: 0 }) }
     ordinal = ReadUnitEnumVariant(project.supplied, ty, field.text, DeclarationSpan(field))?
     return ok(LinkedEnumSelection { ty: ty, index: ordinal + 1 })
+}
+
+fn RequireLinkedReadonlyCall(&callee: LinkedNullFunction, &at: Span): null! {
+    scalar = callee.result.declaration_kind == "Builtin" && (callee.result.name == "int" || callee.result.name == "bool")
+    if (callee.returns_result || (!scalar && callee.result.declaration_kind != "UnitEnum")) {
+        RejectLayout("linked_readonly_call", "readonly direct call requires a plain int, bool, or payload-free enum result", at.clone())?
+    }
+    for parameter in callee.parameters.clone() {
+        scalar = parameter.declaration_kind == "Builtin" && (parameter.name == "int" || parameter.name == "bool")
+        if (!scalar && !LinkedNullView(parameter)) {
+            RejectLayout("linked_readonly_call", "readonly direct call requires View or scalar Copy arguments", at.clone())?
+        }
+    }
+    return ok(null)
+}
+
+fn HoldLinkedEnumTag(value: LinkedNullExpression, id: int): LinkedNullExpression {
+    next = value
+    tag = "enum_left_tag_" + str(id)
+    next.state.code += "    const int32_t " + tag.clone() + " = (" + next.value.text.clone() + ").tag;\n"
+    next.value.text = tag
+    return next
+}
+
+fn FinishLinkedEnumComparison(value: LinkedNullExpression, &left: LinkedNullValue,
+                              &node: Node, id: int, before: int): LinkedNullExpression! {
+    right = value
+    at = DeclarationSpan(node)
+    if (!SameBoundTypeIdentity(left.ty, right.value.ty)) {
+        RejectLayout("linked_enum_comparison", "expected two values of the same payload-free enum", at.clone())?
+    }
+    result = "enum_comparison_" + str(id)
+    right.state.code += "    const bool " + result.clone() + " = " + left.text.clone() + " "
+        + node.text.clone() + " (" + right.value.text.clone() + ").tag;\n"
+    done = DropLinkedNullScope(right.state, before)
+    return ok(LinkedReadonlyExpression(done, LinkedBuiltin("bool", at), result))
 }

@@ -64,20 +64,6 @@ fn MatchesLinkedIntArrayOwner(&target: TypeNameBinding, &origin: TypeNameBinding
     return target.declaration_kind == "BuiltinArray" && target.name == "int" && LinkedNullIntArrayOwner(origin)
 }
 
-fn RequireLinkedReadonlyCall(&callee: LinkedNullFunction, &at: Span): null! {
-    if (callee.returns_result || callee.result.declaration_kind != "Builtin" ||
-        (callee.result.name != "int" && callee.result.name != "bool")) {
-        RejectLayout("linked_readonly_call", "readonly direct call requires a plain int or bool result", at.clone())?
-    }
-    for parameter in callee.parameters.clone() {
-        scalar = parameter.declaration_kind == "Builtin" && (parameter.name == "int" || parameter.name == "bool")
-        if (!scalar && !LinkedNullView(parameter)) {
-            RejectLayout("linked_readonly_call", "readonly direct call requires View or scalar Copy arguments", at.clone())?
-        }
-    }
-    return ok(null)
-}
-
 fn MatchesLinkedFieldValue(&target: TypeNameBinding, &origin: TypeNameBinding): bool {
     if (target.declaration_kind == "StructArray") { return MatchesLinkedStructArrayOwner(target, origin) }
     return SameLinkedType(target, origin) || MatchesLinkedIntArrayOwner(target, origin)

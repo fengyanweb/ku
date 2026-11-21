@@ -1,18 +1,19 @@
+import { FinishLinkedEnumComparison, HoldLinkedEnumTag, RequireLinkedReadonlyCall } from "./scalar_project_c.ku"
 import { ResolveLinkedCall } from "./scalar_result_null.ku"
 import { EmitLinkedArrayIndexGuard, EmitLinkedLogicalBranch } from "./guarded_string_parts.ku"
 import { AddLinkedNullSlot, CloneLinkedRecord, ReadLinkedUnitEnum, RegisterLinkedNullType, RequireLinkedArrayValidation } from "./linked_parameters_c.ku"
-import { CheckLinkedAddition, EmitLinkedMultiplyDivide, LinkedMemberPath, LinkedMemberUnavailable, LinkedViewArgument, RequireLinkedReadonlyCall } from "./linked_member_ownership.ku"
+import { CheckLinkedAddition, EmitLinkedMultiplyDivide, LinkedMemberPath, LinkedMemberUnavailable, LinkedViewArgument } from "./linked_member_ownership.ku"
 import { Span } from "../stage2/span.ku"
 import { LinkedLocalReadBinding } from "./call_contracts.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, LayoutIndex, ReadLinkedErrorMember, RejectLayout } from "./struct_layouts.ku"
-import { EmitLinkedReadonlyScalar, LinkedDirectCallExpression, LinkedErrorField, LinkedNullFunction, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, RememberLinkedCall } from "./link_plan_c.ku"
+import { EmitLinkedReadonlyCall, LinkedDirectCallExpression, LinkedErrorField, LinkedNullFunction, ReadLinkedNullBinding, LinkedNullArrayHeader, LinkedNullReadableArray, LinkedNullBinding, LinkedReadonlyExpression, LinkedRecordFields, LinkedNullExpression, LinkedNullIntArrayOwner, LinkedNullOwner, LinkedNullState, LinkedNullValue, RememberLinkedCall } from "./link_plan_c.ku"
 import { EmitCheckedScalarArithmetic, EmitScalarStringPair } from "./scalar_int_emit.ku"
 import { ContainsIndex, ProjectionStringLength } from "./struct_projection_c.ku"
 import { GuardLinkedStringPredicate } from "./guarded_struct_c.ku"
 import { EmitLinkedIntAppend, EmitLinkedOwnedArrayClone, OwnedRecordArrayCloneLayout, OwnedRecordArrayCloneType } from "./struct_array_c.ku"
-import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedStringResult, LowerLinkedNullLeaf, SameLinkedType } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedIntResult, LinkedNullArrayElement, LinkedNullArrayPrefix, LinkedNullResultCleanupReference, LinkedNullChild, LinkedNullCType, LinkedNullDependency, LinkedNullNode, LinkedNullProject, LinkedStringResult, LowerLinkedNullLeaf, SameLinkedType } from "./linked_null_types_c.ku"
 
 fn LowerLinkedIntArrayLiteral(&project: LinkedNullProject, state: LinkedNullState, &literal: Node, id: int,
                                binding: str): LinkedNullExpression! {
@@ -70,7 +71,7 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
         }
         if (node.edge_count >= 2 && node.edge_count <= 9 && target.kind == "Variable" && target.edge_count == 0) {
             callee = ResolveLinkedCall(project, state, node, target, false)?
-            return readLinkedScalarCall(project, state, node, callee, id, depth)
+            return readLinkedReadonlyCall(project, state, node, callee, id, depth)
         }
     }
     if (node.edge_count == 0 && (node.kind == "Variable" || node.kind == "Int" ||
@@ -81,7 +82,7 @@ fn LowerLinkedNullRead(&project: LinkedNullProject, state: LinkedNullState, id: 
     return ok(LinkedReadonlyExpression(state, LinkedBuiltin("", DeclarationSpan(node)), ""))
 }
 
-fn readLinkedScalarCall(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
+fn readLinkedReadonlyCall(&project: LinkedNullProject, state: LinkedNullState, &call: Node,
                       callee: LinkedNullFunction, id: int, depth: int): LinkedNullExpression! {
     RequireLinkedReadonlyCall(callee, DeclarationSpan(call))?
     next = state
@@ -97,7 +98,8 @@ fn readLinkedScalarCall(&project: LinkedNullProject, state: LinkedNullState, &ca
         next = input.state
         index = index + 1
     }
-    return ok(EmitLinkedReadonlyScalar(next, callee, id, args))
+    carrier = LinkedNullCType(callee.result)?
+    return ok(EmitLinkedReadonlyCall(next, callee, id, args, carrier))
 }
 
 fn readLinkedMethod(&project: LinkedNullProject, state: LinkedNullState, &call: Node, &target: Node, id: int, depth: int): LinkedNullExpression! {
@@ -295,8 +297,11 @@ fn EmitLinkedAddition(&project: LinkedNullProject, state: LinkedNullState, &left
 }
 
 fn readLinkedBinary(&project: LinkedNullProject, state: LinkedNullState, &node: Node, id: int, depth: int): LinkedNullExpression! {
+    before = state.slots.len()
     left = LowerLinkedNullRead(project, state, LinkedNullChild(project, 1, node, 0), depth + 1)?
     op = node.text.clone()
+    enum_comparison = left.value.ty.declaration_kind == "UnitEnum" && (op == "==" || op == "!=")
+    if (enum_comparison) { left = HoldLinkedEnumTag(left, id) }
     logical = op == "&&" || op == "||"
     result = ""
     if (logical) {
@@ -304,6 +309,7 @@ fn readLinkedBinary(&project: LinkedNullProject, state: LinkedNullState, &node: 
         left.state.code += EmitLinkedLogicalBranch(result, left.value.text, op == "||")
     }
     right = LowerLinkedNullRead(project, left.state, LinkedNullChild(project, 1, node, 1), depth + 1)?
+    if (enum_comparison) { return FinishLinkedEnumComparison(right, left.value, node, id, before) }
     if (left.value.ty.declaration_kind != "Builtin" || !SameLinkedType(left.value.ty, right.value.ty)) {
         RejectLayout("linked_binary_type", "readonly operation requires matching scalar inputs", DeclarationSpan(node))?
     }
