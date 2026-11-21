@@ -1287,7 +1287,7 @@ def installed_forward_layout_consumer(install, root, env, report, target):
                    'fn Read(): str { main = Make(); return main.detail.name }\n'
                    'struct Payload { name: str }\n',
         'main.ku': 'import { Read } from "./data.ku"\n'
-                   'fn main() { println(Read()) }\n',
+                   'fn main(): null { println(Read()); return null }\n',
     }
     report['installed_forward_layout'] = validate_installed_relative_program(
         install, root / 'forward-layout-project', env, target, files, 'Ku🙂\n')

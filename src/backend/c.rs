@@ -16719,6 +16719,7 @@ fn emit_main_wrapper(
     // result tag or output. Failed frames returned only a typed transport zero.
     match &function.return_type {
         IrType::Void => out.push_str("  ku_main();\n"),
+        IrType::Null => out.push_str("  (void)ku_main();\n"),
         IrType::Int | IrType::Bool | IrType::Str | IrType::Result(_) => out.push_str(&format!(
             "  {} result = ku_main();\n",
             c_type(&function.return_type)?,
@@ -16738,7 +16739,7 @@ fn emit_main_wrapper(
         "  const char* message = __ku_sync_error_message(signal); ku_output_stream_write(stderr, message, __ku_sync_error_message_length(signal)); ku_output_stream_write(stderr, \"\\n\", 1); return {};\n  }}\n", exit("1")
     ));
     match &function.return_type {
-        IrType::Void => {
+        IrType::Void | IrType::Null => {
             out.push_str(mysql_shutdown);
             out.push_str(&format!("  return {};\n", exit("0")));
         }

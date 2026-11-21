@@ -27,7 +27,7 @@ fn Div(n: int, d: int): int {
     finally { println("BAD-div-finally") }
     return 99
 }
-fn main() {
+fn main(): null {
     owner = "main-" + "owner"
     println(owner)
     try {
@@ -35,6 +35,7 @@ fn main() {
         println("BAD-main-after")
     } catch (e) { println("BAD-main-catch") }
     finally { println("BAD-main-finally") }
+    return null
 }
 "#;
 
