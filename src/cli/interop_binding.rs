@@ -268,6 +268,14 @@ fn read_small(path: &Path) -> KuResult<String> {
     read_text(path, 1024 * 1024).map_err(|error| io_error(path, error))
 }
 
+pub(super) fn install_origin(import_root: &Path) -> KuResult<Option<String>> {
+    let manifest = read_small(&import_root.join("ku.interop"))?;
+    if manifest.lines().next().unwrap_or_default().trim() == "kind = \"python\"" {
+        return interop::python::install_origin(import_root).map(Some);
+    }
+    Ok(None)
+}
+
 fn read_text(path: &Path, limit: u64) -> io::Result<String> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.len() > limit {

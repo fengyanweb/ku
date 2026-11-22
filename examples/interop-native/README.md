@@ -13,7 +13,8 @@ ku i ./vendor/tinyxml_example
 
 PowerShell accepts the same relative paths. Invoke the script with `python` or `py -3` if your Python uses that name. For a specific Windows ABI, set `KU_INTEROP_CC` and `KU_INTEROP_CXX` to the absolute paths returned by `Get-Command` for your selected LLVM C and C++ drivers. They each name one executable. Check that `-dumpmachine` reports the intended Windows MSVC or GNU target before building the package.
 
-The installer prints these imports. The script puts the same lines in `src/main.ku`.
+The installer prints a separate import for each callable export. The example
+groups imports from the same module in `src/main.ku`.
 
 ```ku
 import { Query, Version } from "@sqlite_example/database"

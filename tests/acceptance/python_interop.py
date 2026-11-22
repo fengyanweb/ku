@@ -95,9 +95,9 @@ def Dynamic(value):
 """)
         output = run(ku, author, env, "i", "./tools/subtitles.py", "--module", "text",
                      "--python", python)
-        match = re.search(r'^import \{ [^\n]+ \} from "@subtitles/text"$', output, re.M)
-        assert match, output
-        imports = [match.group()]
+        assert "Python file tools/subtitles.py" in output, output
+        imports = re.findall(r'^import \{ [A-Za-z]+ \} from "@subtitles/text"$', output, re.M)
+        assert {line.split()[2] for line in imports} == {"Clean", "Count", "Dynamic", "Explode"}, output
         main = """    text = "  你好😀  "
     println(Clean(text)?)
     if (text != "  你好😀  ") { fail("Python bridge mutated its borrowed input") }
@@ -112,8 +112,16 @@ def Dynamic(value):
 """
         expected = ['你好😀', 'call_error', 'next', '2', '{"subtitle": "雪"}']
         if wheels:
-            run(ku, author, env, "package", "install", "pypi:pysubs2==1.8.0", "--module", "pysubs2")
+            configured = run(ku, author, env, "package", "install", "pypi:pysubs2==1.8.0",
+                             "--module", "pysubs2.time")
+            assert "PyPI pysubs2==1.8.0" in configured, configured
+            copied = re.search(r'^import \{ MsToTimes \} from "@pysubs2/time"$', configured, re.M)
+            assert copied, configured
+            write(author / "src" / "main.ku", copied.group() + '\n\nfn main(): null! {\n'
+                  '    println(MsToTimes("[1500]")?)\n    return ok(null)\n}\n')
+            assert run(ku, author, env, "run", "src/main.ku") == "[0, 0, 1, 500]\n"
             unconfigured = run(ku, author, env, "i", "pypi:pillow==11.3.0")
+            assert "PyPI pillow==11.3.0" in unconfigured, unconfigured
             assert "No callable Ku exports" in unconfigured, unconfigured
             add_adapter(author, "pysubs2", "Shift", """import pysubs2
 

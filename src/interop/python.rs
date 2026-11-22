@@ -387,6 +387,38 @@ fn descriptor(import_root: &Path) -> KuResult<HashMap<String, Value>> {
     Ok(fields)
 }
 
+pub(crate) fn install_origin(import_root: &Path) -> KuResult<String> {
+    let fields = descriptor(import_root)?;
+    let origin = string(&fields, "origin")?;
+    if origin.starts_with("pypi:") {
+        let distribution = string(&fields, "distribution")?;
+        let version = string(&fields, "version")?;
+        if distribution.is_empty()
+            || !distribution
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || version.is_empty()
+            || !version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".+!-".contains(&byte))
+        {
+            return Err(invalid("Invalid selected PyPI distribution or version"));
+        }
+        return Ok(format!("PyPI {distribution}=={version}"));
+    }
+    let relative = origin
+        .strip_prefix("path:")
+        .filter(|value| {
+            !value.is_empty()
+                && !value.chars().any(char::is_control)
+                && std::path::Path::new(value)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+        })
+        .ok_or_else(|| invalid("Invalid local Python origin"))?;
+    Ok(format!("Python file {relative}"))
+}
+
 fn digest_file(path: &Path, limit: u64) -> KuResult<String> {
     let mut hash = Sha256::new();
     let n = io::copy(&mut plain(path, limit)?.take(limit + 1), &mut hash)
@@ -959,11 +991,20 @@ pub(crate) fn prepare_bridge(
     };
     let definitions = format!(
         "#define KU_PY_HOME {}\n#define KU_PY_EXECUTABLE {}\n#define KU_PY_LIBRARY {}\n#define KU_PY_RELEASE {}\n#define KU_PY_ENV {}\n#define KU_PY_MODULE {}\n#define KU_PY_MODULE_KEY {}\n#define KU_PY_LOCAL {}\n#define KU_PY_WHEELS {}\n#define KU_PY_DISTS {}\n#define KU_PY_PORTABLE {}\n#define KU_PY_MODULE_OWNERS {}\n#define KU_PY_OWNER {}\n#define KU_PY_TARGET {}\n",
-        quote_c(runtime_home), quote_c(runtime_executable), quote_c(runtime_library),
-        quote_c(&toolchain.release), quote_c(&environment), quote_c(module),
-        quote_c(&format!("_ku_python_{source_key}")), i32::from(local),
-        i32::from(!wheels.is_empty()), declarations, i32::from(portable.is_some()),
-        modules, quote_c(origin), quote_c(&toolchain.target)
+        quote_c(runtime_home),
+        quote_c(runtime_executable),
+        quote_c(runtime_library),
+        quote_c(&toolchain.release),
+        quote_c(&environment),
+        quote_c(module),
+        quote_c(&format!("_ku_python_{source_key}")),
+        i32::from(local),
+        i32::from(!wheels.is_empty()),
+        declarations,
+        i32::from(portable.is_some()),
+        modules,
+        quote_c(origin),
+        quote_c(&toolchain.target)
     );
     write_new(&src, format!("{definitions}{BRIDGE}").as_bytes())?;
     write_new(&abi, ABI.as_bytes())?;

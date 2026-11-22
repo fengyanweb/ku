@@ -54,7 +54,18 @@ def Pixel() -> int:
         return image.getpixel((1, 0))[1]
 ```
 
-将该包的 `src/ku.python.json` 中 `local` 改为 `true`，保留锁定的 wheel 和目标记录。将已有的 Ku 模块内容替换为这个接口，也可以新增 `src/text.ku`。
+在该包的 `src/ku.python.json` 中更新以下两个字段，保留锁定的 wheel 和目标记录。
+
+```json
+{
+  "local": true,
+  "exports": [
+    {"name": "Pixel", "callable": "Pixel", "parameters": [], "returns": "int"}
+  ]
+}
+```
+
+将生成的 `src/Image.ku` 改名为 `src/text.ku` 并替换内容。
 
 ```ku
 fn Pixel(): int! {

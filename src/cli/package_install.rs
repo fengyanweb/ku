@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use crate::{
     error::KuResult,
@@ -77,13 +77,14 @@ pub(super) fn run(args: &[String]) -> KuResult<()> {
         options.module,
     )?;
     let mode = options.mode.unwrap_or(DependencyResolveMode::Update);
+    let mut origins = HashMap::new();
     let installed = package::install_dependency_with(
         &mut project,
         source.as_deref(),
         options.development,
         options.production,
         mode,
-        |resolved, _| {
+        |resolved, receipts| {
             for scope in package::package_import_scopes(resolved, Span::default())? {
                 if scope.interop_version.as_deref() == Some("1") {
                     super::interop_binding::prepare_with_python(
@@ -93,6 +94,16 @@ pub(super) fn run(args: &[String]) -> KuResult<()> {
                         None,
                         options.python.as_deref(),
                     )?;
+                    if receipts
+                        .iter()
+                        .any(|receipt| receipt.name == scope.package_name)
+                    {
+                        if let Some(origin) =
+                            super::interop_binding::install_origin(&scope.import_root)?
+                        {
+                            origins.insert(scope.package_name, origin);
+                        }
+                    }
                 }
             }
             if let Some(python) = options.python.as_deref() {
@@ -112,17 +123,15 @@ pub(super) fn run(args: &[String]) -> KuResult<()> {
             receipt.source,
             env!("KU_BUILD_TARGET"),
         );
+        if let Some(origin) = origins.get(&receipt.name) {
+            println!("  Python source: {origin}");
+        }
         let mut callable = false;
         for module in receipt.imports {
-            if module.exports.is_empty() {
-                continue;
+            for export in module.exports {
+                println!("import {{ {export} }} from {:?}", module.path);
+                callable = true;
             }
-            println!(
-                "import {{ {} }} from {:?}",
-                module.exports.join(", "),
-                module.path,
-            );
-            callable = true;
         }
         if !callable {
             println!("  No callable Ku exports were found in this package.");
