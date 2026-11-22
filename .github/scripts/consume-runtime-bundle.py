@@ -1447,6 +1447,15 @@ def verify_task_enum_string_result_c(source):
     return dict(detail, nominal_enum_outcome=True, moves_owned_string_payload=True)
 
 
+def verify_task_closure_timer_c(source):
+    pending = (rb'if \(timer_status==KU_TASK_CONTROL_PENDING\) \{ frame->header.status=KU_TASK_FRAME_PENDING; '
+               rb'frame->header.running=0; return [^;\r\n]*KU_TASK_FRAME_PENDING[^;\r\n]*; \}')
+    timer_sites = len(re.findall(pending, source))
+    if (timer_sites != 2 or b'ku_task_driver_timer_arm(host->ticket,now+(uint64_t)millis,host->timer)' not in source):
+        raise RuntimeError('installed Task closure fixture must retain the Scan and Pause timer Pending paths')
+    return {'timer_pending_sites': timer_sites, 'sha256': hashlib.sha256(source).hexdigest()}
+
+
 def installed_forward_layout_consumer(install, root, env, report, target):
     """Check owned forward layout binding through a relative import."""
     files = {
@@ -1752,6 +1761,9 @@ def run_structured_only(args, report):
                                                  native_c_abi=verify_task_enum_string_result_c)
             installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
                                                  'native_c_runtime_names')
+            installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
+                                                 'native_task_closure_string_length', sources=('main.ku', 'worker.ku'),
+                                                 native_c_abi=verify_task_closure_timer_c)
             verification = repo / 'bootstrap/tools/compiler_driver/selfhost/verify.py'
             cc = env.get('KU_GNU_CC') if target == 'x86_64-pc-windows-gnu' else 'clang'
             if not cc:
