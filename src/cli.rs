@@ -2347,6 +2347,7 @@ fn write_native_c_artifact(
     let delivery = interop_binding::Delivery {
         output_dir: link_output_directory(&plan.output),
         matches_host: plan.target.as_ref().is_none_or(BuildTarget::matches_host),
+        needs_linked_runner: None,
     };
     write_native_c_for_delivery(
         &path_string(&plan.entry),
@@ -2612,9 +2613,11 @@ fn build_executable_to(
         parse_source(source).map_err(|err| KuError::message(err.diagnostic(path, source)))?;
     let rust_source = if program_has_imports(&original) && !program_has_only_std_imports(&original)
     {
+        let needs_linked_runner = std::cell::Cell::new(false);
         let delivery = interop_binding::Delivery {
             output_dir: output_directory,
             matches_host: config.target.is_none_or(BuildTarget::matches_host),
+            needs_linked_runner: Some(&needs_linked_runner),
         };
         let parsed = (|| {
             deny_unused_imports(&original)?;
@@ -2628,7 +2631,11 @@ fn build_executable_to(
             Ok::<_, KuError>(program)
         })()
         .map_err(|err| KuError::message(err.diagnostic(path, source)))?;
-        build_linked_runner_source(&parsed, path, source)?
+        if needs_linked_runner.get() {
+            build_linked_runner_source(&parsed, path, source)?
+        } else {
+            build_runner_source(&embedded_path, source, config.dependency_mode)
+        }
     } else {
         check_source_with_dependency_mode(path, source, config.dependency_mode)?;
         build_runner_source(&embedded_path, source, config.dependency_mode)
@@ -9204,6 +9211,9 @@ fn parse_and_expand_for_delivery(
                     Some((delivery.output_dir.to_path_buf(), delivery.matches_host));
             }
             let program = loader.load_entry(path, program, source.len())?;
+            if let Some(linked) = delivery.and_then(|delivery| delivery.needs_linked_runner) {
+                linked.set(loader.uses_package_import || !loader.interop_bindings.is_empty());
+            }
             if matches!(
                 dependency_mode,
                 DependencyResolveMode::Update | DependencyResolveMode::Refresh
@@ -9501,6 +9511,7 @@ struct ModuleLoader {
     interop_bindings: HashMap<PathBuf, String>,
     interop_mode: DependencyResolveMode,
     interop_delivery: Option<(PathBuf, bool)>,
+    uses_package_import: bool,
     budget: ImportBudget,
 }
 
@@ -9526,6 +9537,7 @@ impl ModuleLoader {
             interop_bindings: HashMap::new(),
             interop_mode: DependencyResolveMode::Update,
             interop_delivery: None,
+            uses_package_import: false,
             budget: ImportBudget::default(),
         })
     }
@@ -9704,6 +9716,7 @@ impl ModuleLoader {
             .map(|(output_dir, matches_host)| interop_binding::Delivery {
                 output_dir,
                 matches_host: *matches_host,
+                needs_linked_runner: None,
             });
         let binding = interop_binding::prepare(
             &scope.import_root,
@@ -9800,6 +9813,12 @@ impl ModuleLoader {
                 self.package.as_ref(),
                 &self.package_import_scopes,
             )?;
+            self.uses_package_import |= import
+                .path
+                .strip_prefix('@')
+                .and_then(|path| path.split_once('/'))
+                .zip(self.package.as_ref())
+                .is_some_and(|((name, _), package)| name != package.manifest.name);
             let module = self.load_module(&import_path, import.span)?;
             closure.union_with(&module.closure);
             match &import.kind {

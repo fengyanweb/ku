@@ -28,6 +28,7 @@ const MAX_NOTICE_BYTES: u64 = 1024 * 1024;
 pub(super) struct Delivery<'a> {
     pub(super) output_dir: &'a Path,
     pub(super) matches_host: bool,
+    pub(super) needs_linked_runner: Option<&'a std::cell::Cell<bool>>,
 }
 
 pub(super) fn prepare(

@@ -48,6 +48,8 @@ fn main() {
 
 普通单头文件、单 C 源文件可放在项目内，然后执行 `ku i ./vendor/your_sdk`。自动生成的接入包在 `ku-libraries`，可由作者维护。带所有权约束的 SQLite 和 TinyXML-2 见 [C/C++ 示例](../examples/interop-native)，Python 见 [交付示例](interop-python.md)。生成 `ku-runtime.d` 的应用交付时将它与可执行文件一起搬移。外库调用使用同步 CLI 路径。
 
+Runner 会随引用了已安装包的应用携带解析后的 Ku 模块，该模式下相对数据路径以可执行文件目录为基准。只使用本地源码导入的 Runner 仍采用源码目录。
+
 ## ku.mod
 
 包根目录放 `ku.mod`：

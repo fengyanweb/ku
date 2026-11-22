@@ -152,6 +152,26 @@ def local_python_package(ku, root, python):
           '    println(Greet("Ku 😀")?)\n    return ok(null)\n}\n')
     assert_three_entries(ku, project, root / "python-delivery", "你好 Ku 😀\n", True)
 
+def local_runner_preserves_resource_base(ku, root):
+    project = root / "local-runner"
+    init(ku, project, '''import { Value } from "./helper"
+import "std.fs"
+
+fn main(): null! {
+    println(Value())
+    println(fs.read("note.txt")?)
+    return ok(null)
+}
+''')
+    write(project / "src" / "helper.ku", "fn Value(): int { return 42 }\n")
+    write(project / "src" / "note.txt", "source data")
+    output = root / "local-runner-delivery"
+    output.mkdir()
+    executable = output / ("local.exe" if os.name == "nt" else "local")
+    run([ku, "build", "--backend", "runner", "--release", "-o", executable], project)
+    actual, _ = run([executable], output)
+    assert actual == "42\nsource data\n", actual
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -172,6 +192,7 @@ def main():
             "bundle_id": doctor["bundle_id"],
             "source": doctor["runtime_source_commit"],
         }))
+        local_runner_preserves_resource_base(ku, root)
         native_package(ku, root)
         if arguments.public_git:
             git_package(ku, root)
