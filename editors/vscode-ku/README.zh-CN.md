@@ -55,27 +55,24 @@ Run 使用可输入的集成进程终端，编辑器按钮针对当前文件，�
 
 ## 五分钟例子
 
-先选择 CLI，在中文或带空格目录保存以下文件。输入 `rest.` 查看真实字段，悬停 `today` / `time.date`，对 `name` 跳转；随后使用 Run、Check、Build。
+先选择 CLI，在中文或带空格目录保存以下文件。在 `reply = Make()` 后另起一行输入 `reply.` 查看 `title`、`count` 字段，然后删除临时输入；悬停 `reply`，对 `name` 跳转；随后使用 Run、Check、Build。
 
 ```ku
-import time from "std.time"
-
 struct Reply { title: str, count: int }
 
-async fn Make(): Reply! {
-    return ok(Reply { title: "你好🙂", count: 2 })
+fn Make(): Reply {
+    return Reply { title: "你好🙂", count: 2 }
 }
 
-async fn main(): null! {
-    reply = (await Make())?
-    {title: name, ...rest} = reply
+fn main() {
+    reply = Make()
+    {title: name, count: number} = reply
     println(name)
-    println(rest.count)
-    today = time.date()
-    println(today.year)
-    return ok(null)
+    println(number)
 }
 ```
+
+此例已实测 Check、Run、默认原生构建及生成程序均成功，输出 `你好🙂` 和 `2`。实际异步 HTTP/PG 应用验收见 [VERIFICATION.md](VERIFICATION.md)。SDK 原生后端对其他部分 async/rest 字段投影和闭包捕获仍有限制，编辑器类型提示不会扩大编译器支持范围。
 
 ## 开发与验收
 

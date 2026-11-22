@@ -58,28 +58,25 @@ Opening, saving, completing or navigating never installs packages, starts servic
 ## Five-minute example
 
 1. Select your installed CLI and save this as a `.ku` file, including in a Chinese/space-containing folder.
-2. Type `rest.` below to inspect the known remaining fields; hover `today` and `time.date`. Use Go to Definition on `name`.
+2. Type `reply.` after the `reply = Make()` line to inspect its `title` and `count` fields, then remove that temporary line. Hover `reply` and use Go to Definition on `name`.
 3. Click Run, then Check and Build. Review the actual tool path/version in the status bar or Show Version.
 
 ```ku
-import time from "std.time"
-
 struct Reply { title: str, count: int }
 
-async fn Make(): Reply! {
-    return ok(Reply { title: "你好🙂", count: 2 })
+fn Make(): Reply {
+    return Reply { title: "你好🙂", count: 2 }
 }
 
-async fn main(): null! {
-    reply = (await Make())?
-    {title: name, ...rest} = reply
+fn main() {
+    reply = Make()
+    {title: name, count: number} = reply
     println(name)
-    println(rest.count)
-    today = time.date()
-    println(today.year)
-    return ok(null)
+    println(number)
 }
 ```
+
+Check, Run, the default native build and the generated program were all verified for this example; it prints `你好🙂` and `2`. The tested asynchronous HTTP/PG applications are listed in [VERIFICATION.md](VERIFICATION.md). The SDK native backend still rejects some other async/rest field projections and closure captures; editor type assistance does not expand that compiler subset.
 
 ## Development and verification
 

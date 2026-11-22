@@ -40,7 +40,7 @@
 7. 使用 VS Code 自带 TextMate + Oniguruma 引擎，对安装包 grammar 标记两个实际示例共 325 行；async/await、rest、可选字段/Result、箭头、HttpRequest/Response 的 scope 符合预期。
 8. 内存定向回归覆盖语义 21 组、统一表达式提取 13 组、集成 provider 14 组，以及保存失败、对话框期间保存/信任变化、跨块日志脱敏/64KiB边界、EPIPE、取消/reset/旧结果、Windows 终止 helper 失败回退等。适配器验证不当作 Windows 实机验收。
 9. 本地真实 `ku i ./vendor/pysubs2` 和 Python 文件绑定安装均通过；公开导出和 UTF-16 声明位置可读。拒绝过期清单、缺缓存、其他版本替代、跨项目、路径越界和符号链接。
-10. README 五分钟例子 check/run 退出 0，实际输出“你好🙂”、2 和当前年份。
+10. 最终 README 五分钟对象/解构例子：check、ku run、默认原生 build 及生成程序均退出 0，实际输出“你好🙂”和 2。
 
 ## 实际应用验收
 
@@ -53,6 +53,7 @@
 ## 限制与未实跑
 
 - Linux、Windows：本轮没有实机/远端 CI 运行。专用 CI 定义覆盖三平台模型/构建/打包；真实终端、文件选择器和进程终止仍需对应平台验收。最低 VS Code 1.85、远程扩展宿主也未实跑。
+- 日常 SDK 的原生 async 子集仍有限制：初版入门例子在 async main 内解构 rest 后直接读取字段，check/ku run 成功，但默认原生 build 报不支持 field projection；捕获该 rest 的闭包改写也被原生后端拒绝。未修改编译器或切换后端掩盖错误。最终入门例子改用已完整验证的同步对象/命名解构；上述两个真实异步应用的原生构建结果仍为通过。
 - 日常编译器 `input()`、`input(prompt)` 都实测 E0001 undefined function，不提供虚构片段；原生终端 stdin 通过临时 CLI 包装器输入后转发真实 CLI 的方式验证，不声称 Ku 已有 input API。
 - 在线 registry/Git/PyPI 安装、本次未选择的 Runner/Release/locked 构建组合、实际 GC 删除没有冒充已通过。安装由真实 CLI 管理，必要的 registry/Python/工具链配置仍由 CLI 报告。
 - 静态模型不是完整语言服务器；动态 JSON、复杂控制流、任意泛型和所有跨模块类型关系不保证推导。第三方缓存按锁定身份/回执定位，未额外全量重算内容树哈希；只有二进制的包不伪造源定义。
