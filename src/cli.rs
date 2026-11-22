@@ -7202,12 +7202,11 @@ fn compile_c_source_with_output(
                 command.arg(format!("--target={probed_target}"));
             }
         }
-        let compiler_output = temporary_output;
         command
-            .arg(source)
+            .arg(strip_verbatim(source))
             .arg("-std=c11")
             .arg("-o")
-            .arg(compiler_output);
+            .arg(strip_verbatim(temporary_output));
         if needs_native_tls {
             command.arg("-DKU_NATIVE_TLS_ENABLED=1");
         }

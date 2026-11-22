@@ -87,6 +87,24 @@ static int ku_py_sidecar_wide(const char *file, wchar_t *path, DWORD capacity) {
     int remaining = (int)(capacity - (size_t)(slash + 1 - path));
     return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, file, -1, slash + 1, remaining) != 0;
 }
+
+static int ku_py_known_windows_file(const wchar_t *path, BY_HANDLE_FILE_INFORMATION *info) {
+    HANDLE file = CreateFileW(path, FILE_READ_ATTRIBUTES,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return 0;
+    int ok = GetFileInformationByHandle(file, info) != 0;
+    CloseHandle(file);
+    return ok;
+}
+
+static int ku_py_same_windows_file(const wchar_t *actual, const wchar_t *expected) {
+    BY_HANDLE_FILE_INFORMATION a, b;
+    if (!ku_py_known_windows_file(actual, &a) || !ku_py_known_windows_file(expected, &b)) return 0;
+    return a.dwVolumeSerialNumber == b.dwVolumeSerialNumber
+        && a.nFileIndexHigh == b.nFileIndexHigh
+        && a.nFileIndexLow == b.nFileIndexLow;
+}
 #endif
 
 #if !defined(_WIN32) && (KU_PY_LOCAL || KU_PY_WHEELS || KU_PY_PORTABLE)
@@ -136,7 +154,7 @@ static int ku_py_pin_library(void) {
         && (length = GetModuleFileNameW(python, actual, (DWORD)(sizeof(actual) / sizeof(actual[0]))))
         && length < sizeof(actual) / sizeof(actual[0])
         && ku_py_sidecar_wide(KU_PY_LIBRARY, expected, (DWORD)(sizeof(expected) / sizeof(expected[0])))
-        && _wcsicmp(actual, expected) == 0;
+        && ku_py_same_windows_file(actual, expected);
 #else
     /* CPython's native extension modules must resolve symbols from the selected
        runtime even when Ku loads this provider with RTLD_LOCAL. */

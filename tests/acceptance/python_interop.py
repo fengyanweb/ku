@@ -58,10 +58,11 @@ def add_adapter(project, name, operation, code, ku_parameter, ku_return, with_ar
           f'}}\n')
 
 
-def bridges(files):
+def cache_artifacts(files):
+    records = [*files.rglob(".ku-bridge-identity"), *files.rglob("*.whl")]
     return {
         path.relative_to(files).as_posix(): (path.stat().st_mtime_ns, path.stat().st_size)
-        for path in files.rglob(".ku-bridge-identity")
+        for path in records
     }
 
 
@@ -139,14 +140,21 @@ def Pixel() -> int:
         consumer = sandbox / "consumer"
         shutil.copytree(author, consumer, ignore=shutil.ignore_patterns(".ku"))
         before_lock = (consumer / "ku.lock").read_bytes()
+        offline = subprocess.run(
+            [str(ku), "i", "--offline"], cwd=consumer, env=env, capture_output=True,
+            text=True, encoding="utf-8", timeout=30
+        )
+        assert offline.returncode and "offline" in offline.stderr.lower(), offline
+        assert (consumer / "ku.lock").read_bytes() == before_lock
+        assert not list((consumer / ".ku").rglob("*.whl"))
         run(ku, consumer, env, "i", "--locked")
         assert (consumer / "ku.lock").read_bytes() == before_lock
         cache = consumer / ".ku" / "cache"
-        cold = bridges(cache)
-        assert cold, "no compiled interop artifacts"
+        cold = cache_artifacts(cache)
+        assert any(key.endswith(".ku-bridge-identity") for key in cold), cold
         run(ku, consumer, env, "i", "--offline")
         run(ku, consumer, env, "i")
-        assert bridges(cache) == cold, "warm restoration rebuilt a prepared bridge"
+        assert cache_artifacts(cache) == cold, "warm restoration rebuilt a bridge or downloaded a wheel"
         assert run(ku, consumer, env, "run", "--offline", "src/main.ku") == expect
 
         for backend, args in [("native", []), ("runner", ["--backend", "runner"])]:
@@ -164,10 +172,56 @@ def Pixel() -> int:
         print(f"Python package interop passed on {sys.platform} ({sys.version.split()[0]})")
 
 
+def portable_acceptance(ku, python, notices):
+    env = os.environ.copy()
+    env["KU_PYTHON"] = str(python)
+    env["KU_PYTHON_REDISTRIBUTION_NOTICES"] = str(notices)
+    with tempfile.TemporaryDirectory(prefix="ku-portable-accept-") as temp:
+        sandbox = Path(temp)
+        author = sandbox / "author"
+        write(author / "ku.mod", 'name = "portable"\nversion = "0.1.0"\nroot = "src"\nmain = "main.ku"\n')
+        write(author / "src" / "main.ku", 'fn main() { println("hello") }\n')
+        run(ku, author, env, "i", "pypi:pillow==11.3.0")
+        add_adapter(author, "pillow", "Pixel", """from PIL import Image
+
+def Pixel() -> int:
+    with Image.new("RGB", (2, 1), (17, 31, 47)) as image:
+        return image.getpixel((1, 0))[1]
+""", "", "int")
+        write(author / "src" / "main.ku", """
+import { Pixel } from "@pillow/text"
+
+fn main(): null! {
+    println(Pixel()?)
+    return ok(null)
+}
+""")
+        run(ku, author, env, "i")
+        for backend, args in [("native", []), ("runner", ["--backend", "runner"])]:
+            stage = author / backend
+            stage.mkdir()
+            run(ku, author, env, "build", *args, "--offline", "--release", "src/main.ku",
+                "-o", stage / "portable", timeout=220)
+            receiver = sandbox / f"received-{backend}"
+            shutil.copytree(stage, receiver)
+            runtimes = [path for path in (receiver / "ku-runtime.d").rglob("python") if path.is_dir()]
+            assert len(runtimes) == 1 and (runtimes[0] / "notices").is_dir()
+            assert list((runtimes[0] / "lib").glob("python*/LICENSE.txt"))
+            runtime_env = {"HOME": str(sandbox), "PATH": "/usr/bin:/bin"}
+            assert run(receiver / "portable", receiver, runtime_env) == "31\n"
+        print(f"Bundled Python runtime passed relocation ({sys.platform})")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ku", required=True, type=Path)
     parser.add_argument("--python", default=Path(sys.executable), type=Path)
     parser.add_argument("--wheels", action="store_true", help="also restore public PyPI wheels")
+    parser.add_argument("--portable-notices", type=Path, help="test an explicitly redistributable CPython")
     opts = parser.parse_args()
-    acceptance(opts.ku.resolve(strict=True), opts.wheels, opts.python.resolve(strict=True))
+    ku = opts.ku.resolve(strict=True)
+    python = opts.python.resolve(strict=True)
+    if opts.portable_notices:
+        portable_acceptance(ku, python, opts.portable_notices.resolve(strict=True))
+    else:
+        acceptance(ku, opts.wheels, python)

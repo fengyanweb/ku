@@ -389,6 +389,7 @@ def unpack(descriptor, cache, output, offline):
         raise ValueError("Too many pinned Python dependencies")
     if artifacts:
         wheel_tags, utils, _, Version = package_api()
+        from pip._vendor.packaging.specifiers import SpecifierSet
     total = 0
     count = 0
     seen = set()
@@ -400,6 +401,9 @@ def unpack(descriptor, cache, output, offline):
             raise ValueError(f"Wheel identity or CPython tag mismatch for {path.name}")
         with zipfile.ZipFile(path) as archive:
             meta = wheel_metadata(archive)
+            compatible = meta.get("Requires-Python")
+            if compatible and platform.python_version() not in SpecifierSet(compatible):
+                raise ValueError(f"Wheel {path.name} requires Python {compatible}; found {platform.python_version()}")
             if (utils.canonicalize_name(meta["Name"]) != row["name"]
                     or str(Version(meta["Version"])) != row["version"]
                     or meta.get_all("Requires-Dist", []) != row["requires"]):

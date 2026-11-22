@@ -24,6 +24,8 @@ mod signatures;
 
 use signatures::load_exports;
 
+use super::gnu_paths;
+
 pub(crate) const ABI_HEADER: &str = include_str!("abi.h");
 const DESCRIPTOR_LIMIT: usize = 64 * 1024;
 const SOURCE_LIMIT: u64 = 32 * 1024 * 1024;
@@ -381,25 +383,6 @@ pub(crate) fn prepare_bridge(import_root: &Path, staging: &Path) -> KuResult<Pat
     let staging = fs::canonicalize(staging)
         .map_err(|error| io_failure("resolve build directory", staging, error))?;
     let descriptor = NativeDescriptor::read(&root)?;
-    let exports = load_exports(&root, &descriptor)?;
-    let header = staging.join("ku_interop_abi.h");
-    write_new(&header, ABI_HEADER.as_bytes())?;
-    let extension = if descriptor.language == Language::C {
-        "c"
-    } else {
-        "cpp"
-    };
-    let bridge = staging.join(format!("ku_interop_bridge.{extension}"));
-    let bridge_source = codegen::producer_source(&descriptor, &exports)?;
-    write_new(&bridge, bridge_source.as_bytes())?;
-
-    let output = staging.join(if cfg!(windows) {
-        "ku_bridge.dll"
-    } else if cfg!(target_os = "macos") {
-        "libku_bridge.dylib"
-    } else {
-        "libku_bridge.so"
-    });
     let compiler = descriptor.language.compiler();
     let target = if cfg!(windows) || descriptor.target.is_some() {
         Some(compiler_probe(&compiler, "-dumpmachine")?)
@@ -417,9 +400,50 @@ pub(crate) fn prepare_bridge(import_root: &Path, staging: &Path) -> KuResult<Pat
             ));
         }
     }
+    let windows_gnu = cfg!(windows) && target.as_deref().is_some_and(gnu_paths::is_target);
+    let workspace = windows_gnu.then(gnu_paths::Workspace::create).transpose()?;
+    let relative_source = Path::new("inputs");
+    let (tool_source, tool_root) = match &workspace {
+        Some(workspace) => {
+            workspace.copy_tree(&root, relative_source)?;
+            (workspace.path().join(relative_source), workspace.path())
+        }
+        None => (root, staging.as_path()),
+    };
+    let input_argument = |member: &Path, directory: bool| {
+        let checked = path_in(&tool_source, member, directory)?;
+        Ok::<_, KuError>(if workspace.is_some() {
+            relative_source.join(member)
+        } else {
+            checked
+        })
+    };
+    let exports = load_exports(&tool_source, &descriptor)?;
+    let header = tool_root.join("ku_interop_abi.h");
+    write_new(&header, ABI_HEADER.as_bytes())?;
+    let bridge_leaf = if descriptor.language == Language::C {
+        "ku_interop_bridge.c"
+    } else {
+        "ku_interop_bridge.cpp"
+    };
+    let bridge = tool_root.join(bridge_leaf);
+    let bridge_source = codegen::producer_source(&descriptor, &exports)?;
+    write_new(&bridge, bridge_source.as_bytes())?;
+    let output_leaf = if cfg!(windows) {
+        "ku_bridge.dll"
+    } else if cfg!(target_os = "macos") {
+        "libku_bridge.dylib"
+    } else {
+        "libku_bridge.so"
+    };
+    let output = staging.join(output_leaf);
     let mut command = Command::new(&compiler);
+    if let Some(workspace) = &workspace {
+        workspace.configure(&mut command);
+    } else {
+        command.current_dir(&staging);
+    }
     command
-        .current_dir(&staging)
         .arg(match descriptor.language {
             Language::C => "-std=gnu11",
             Language::Cpp => "-std=c++17",
@@ -440,10 +464,7 @@ pub(crate) fn prepare_bridge(import_root: &Path, staging: &Path) -> KuResult<Pat
     if descriptor.language == Language::Cpp {
         if !cfg!(windows) {
             command.arg("-pthread");
-        } else if target
-            .as_deref()
-            .is_some_and(|triple| triple.trim_end().ends_with("-mingw32"))
-        {
+        } else if windows_gnu {
             // A source package has all class code compiled under this driver.
             // Keep the GCC C++ runtime in the companion rather than depending
             // on a user's compiler executable directory at application start.
@@ -454,15 +475,20 @@ pub(crate) fn prepare_bridge(import_root: &Path, staging: &Path) -> KuResult<Pat
             }
         }
     }
-    command.arg("-I").arg(&root).arg(&bridge);
+    command.arg("-I");
+    if workspace.is_some() {
+        command.arg(relative_source).arg(bridge_leaf);
+    } else {
+        command.arg(&tool_source).arg(&bridge);
+    }
     for path in &descriptor.include {
-        command.arg("-I").arg(path_in(&root, path, true)?);
+        command.arg("-I").arg(input_argument(path, true)?);
     }
     for path in &descriptor.sources {
-        command.arg(path_in(&root, path, false)?);
+        command.arg(input_argument(path, false)?);
     }
     for library in &descriptor.archives {
-        let archive = path_in(&root, library, false)?;
+        let archive = path_in(&tool_source, library, false)?;
         let mut header = [0u8; 8];
         File::open(&archive)
             .and_then(|mut file| file.read_exact(&mut header))
@@ -476,7 +502,7 @@ pub(crate) fn prepare_bridge(import_root: &Path, staging: &Path) -> KuResult<Pat
                 ),
             ));
         }
-        command.arg(archive);
+        command.arg(input_argument(library, false)?);
     }
     for library in &descriptor.system {
         if !cfg!(windows) && !(cfg!(target_os = "macos") && library == "dl") {
@@ -484,16 +510,25 @@ pub(crate) fn prepare_bridge(import_root: &Path, staging: &Path) -> KuResult<Pat
         }
     }
     if let Some(archive) = winpthread_archive {
-        command.arg(archive);
+        if let Some(workspace) = &workspace {
+            command.arg(workspace.copy_file(&archive, Path::new("winpthread.a"), SOURCE_LIMIT)?);
+        } else {
+            command.arg(archive);
+        }
     }
-    command.arg("-o").arg(&output);
+    command.arg("-o");
+    if workspace.is_some() {
+        command.arg(output_leaf);
+    } else {
+        command.arg(&output);
+    }
     let status = run_build_process_bounded(&mut command, BUILD_TIMEOUT).map_err(|error| {
         err(
             "native_build",
             format!("could not run native compiler {compiler:?}: {error}"),
         )
     })?;
-    if !status.success() || !output.is_file() {
+    if !status.success() || !tool_root.join(output_leaf).is_file() {
         return Err(err(
             "native_build",
             format!(
@@ -502,10 +537,14 @@ pub(crate) fn prepare_bridge(import_root: &Path, staging: &Path) -> KuResult<Pat
             ),
         ));
     }
-    fs::remove_file(&bridge)
-        .map_err(|error| io_failure("remove bridge source staging", &bridge, error))?;
-    fs::remove_file(&header)
-        .map_err(|error| io_failure("remove header staging", &header, error))?;
+    if let Some(workspace) = &workspace {
+        workspace.copy_output(Path::new(output_leaf), &output, 512 * 1024 * 1024)?;
+    } else {
+        fs::remove_file(&bridge)
+            .map_err(|error| io_failure("remove bridge source staging", &bridge, error))?;
+        fs::remove_file(&header)
+            .map_err(|error| io_failure("remove header staging", &header, error))?;
+    }
     Ok(output)
 }
 

@@ -416,27 +416,55 @@ fn nested_dependency_rejects_absent_author_machine_paths_before_installing() {
 }
 
 #[test]
-fn no_argument_install_retains_valid_local_lock_until_explicit_refresh() {
+fn locked_install_rejects_changed_relative_source_and_ordinary_install_refreshes_only_it() {
     let root = project_fixture();
     fixture_package(&root.path, "consumer");
     let local = root.path.join("vendor/core");
     fixture_package(&local, "core");
+    fixture_package(&root.path.join("vendor/sibling"), "sibling");
     let mut project = context(&root.path);
-    install_dependency(
-        &mut project,
-        Some("./vendor/core"),
-        false,
-        false,
-        DependencyResolveMode::Update,
-    )
-    .unwrap();
+    for source in ["./vendor/core", "./vendor/sibling"] {
+        install_dependency(
+            &mut project,
+            Some(source),
+            false,
+            false,
+            DependencyResolveMode::Update,
+        )
+        .unwrap();
+    }
     let lock = fs::read(&project.lock_path).unwrap();
     let installed = project.resolved_file_dependencies[0].package_root.clone();
+    let unaffected = project.resolved_file_dependencies[1].clone();
     fs::write(
         local.join("src/value.ku"),
         "fn Value(): int { return 43 }\n",
     )
     .unwrap();
+    let err = install_dependency(
+        &mut project,
+        None,
+        false,
+        false,
+        DependencyResolveMode::Locked,
+    )
+    .unwrap_err();
+    assert_eq!(err.code.as_deref(), Some("locked_local_source_changed"));
+    assert_eq!(fs::read(&project.lock_path).unwrap(), lock);
+
+    install_dependency(
+        &mut project,
+        None,
+        false,
+        false,
+        DependencyResolveMode::Offline,
+    )
+    .unwrap();
+    assert_eq!(
+        project.resolved_file_dependencies[0].package_root,
+        installed
+    );
+
     install_dependency(
         &mut project,
         None,
@@ -445,19 +473,12 @@ fn no_argument_install_retains_valid_local_lock_until_explicit_refresh() {
         DependencyResolveMode::Update,
     )
     .unwrap();
-    assert_eq!(
-        project.resolved_file_dependencies[0].package_root,
-        installed
-    );
-    assert_eq!(fs::read(&project.lock_path).unwrap(), lock);
-
-    resolve_remote_dependencies_with_mode(&mut project, DependencyResolveMode::Refresh).unwrap();
-    write_lock(&project).unwrap();
     assert_ne!(fs::read(&project.lock_path).unwrap(), lock);
     assert_ne!(
         project.resolved_file_dependencies[0].package_root,
         installed
     );
+    assert_eq!(&project.resolved_file_dependencies[1], &unaffected);
 }
 
 #[test]

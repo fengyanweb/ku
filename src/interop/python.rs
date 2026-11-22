@@ -928,6 +928,17 @@ pub(crate) fn prepare_bridge(
 
     let mut compiler = Command::new(compiler_tool());
     compiler.current_dir(staging);
+    #[cfg(all(windows, target_env = "gnu"))]
+    let workspace = {
+        use super::gnu_paths::Workspace;
+        let workspace = Workspace::create()?;
+        workspace.copy_file(&src, Path::new("python-bridge.c"), MAX_SOURCE as u64)?;
+        workspace.copy_file(&abi, Path::new("abi.h"), MAX_SOURCE as u64)?;
+        workspace.copy_tree(&toolchain.include, Path::new("include"))?;
+        workspace.copy_file(&link_library, Path::new("python.lib"), MAX_RUNTIME_LIBRARY)?;
+        workspace.configure(&mut compiler);
+        workspace
+    };
     if cfg!(target_env = "msvc") {
         compiler
             .args(["/nologo", "/LD", "/O2", "/std:c11", "/I"])
@@ -937,14 +948,16 @@ pub(crate) fn prepare_bridge(
             .arg("/link")
             .arg(&link_library);
     } else {
-        compiler
-            .args(["-std=c11", "-O2", "-fvisibility=hidden", "-I"])
-            .arg(&toolchain.include)
-            .arg(if cfg!(target_os = "macos") {
-                "-dynamiclib"
-            } else {
-                "-shared"
-            });
+        compiler.args(["-std=c11", "-O2", "-fvisibility=hidden", "-I"]);
+        #[cfg(all(windows, target_env = "gnu"))]
+        compiler.arg("include");
+        #[cfg(not(all(windows, target_env = "gnu")))]
+        compiler.arg(&toolchain.include);
+        compiler.arg(if cfg!(target_os = "macos") {
+            "-dynamiclib"
+        } else {
+            "-shared"
+        });
         if !cfg!(windows) {
             compiler
                 .args(["-fPIC", "-pthread", "-Xlinker", "-rpath", "-Xlinker"])
@@ -958,11 +971,16 @@ pub(crate) fn prepare_bridge(
                     library_rpath(&toolchain.library)?
                 });
         }
-        compiler.arg(&src).arg(&link_library);
-        if cfg!(target_os = "linux") {
-            compiler.arg("-ldl");
+        #[cfg(all(windows, target_env = "gnu"))]
+        compiler.args(["python-bridge.c", "python.lib", "-o", "python-bridge.dll"]);
+        #[cfg(not(all(windows, target_env = "gnu")))]
+        {
+            compiler.arg(&src).arg(&link_library);
+            if cfg!(target_os = "linux") {
+                compiler.arg("-ldl");
+            }
+            compiler.args(["-o"]).arg(&plugin);
         }
-        compiler.args(["-o"]).arg(&plugin);
     }
     let status =
         run_build_process_bounded(&mut compiler, Duration::from_secs(60)).map_err(|error| {
@@ -975,6 +993,8 @@ pub(crate) fn prepare_bridge(
             "Python bridge compiler failed with {status}"
         )));
     }
+    #[cfg(all(windows, target_env = "gnu"))]
+    workspace.copy_output(Path::new("python-bridge.dll"), &plugin, MAX_RUNTIME_LIBRARY)?;
     plain(&plugin, MAX_RUNTIME_LIBRARY)?;
     for file in [
         src,

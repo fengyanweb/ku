@@ -101,7 +101,14 @@ where
             production,
         ) {
             Ok(()) => true,
-            Err(err) if err.code.as_deref() == Some("lock_out_of_date") => false,
+            Err(err)
+                if matches!(
+                    err.code.as_deref(),
+                    Some("lock_out_of_date" | "locked_local_source_changed")
+                ) =>
+            {
+                false
+            }
             Err(err) => return Err(err),
         }
     } else {
@@ -588,7 +595,29 @@ pub(super) fn resolve_local_source(package: &PackageContext, source: &str) -> Ku
     })
 }
 
+pub(super) fn active_portable_source(
+    package: &PackageContext,
+    source: &str,
+) -> KuResult<Option<PathBuf>> {
+    let relative = source
+        .strip_prefix("path:")
+        .expect("portable source requires path: prefix");
+    inspect_relative_directory(&package.package_dir, relative)
+}
+
 fn resolve_relative_directory(root: &Path, relative: &str) -> KuResult<PathBuf> {
+    inspect_relative_directory(root, relative)?.ok_or_else(|| {
+        error(
+            "local_package_unavailable",
+            format!(
+                "dependency directory '{relative}' is missing in '{}'",
+                root.display()
+            ),
+        )
+    })
+}
+
+fn inspect_relative_directory(root: &Path, relative: &str) -> KuResult<Option<PathBuf>> {
     validate_project_relative(relative, Span::default())?;
     let canonical_root = fs::canonicalize(root).map_err(|err| {
         error(
@@ -599,15 +628,19 @@ fn resolve_relative_directory(root: &Path, relative: &str) -> KuResult<PathBuf> 
     let mut path = canonical_root.clone();
     for component in relative.split('/') {
         path.push(component);
-        let metadata = fs::symlink_metadata(&path).map_err(|err| {
-            error(
-                "local_package_unavailable",
-                format!(
-                    "cannot inspect dependency directory '{}': {err}",
-                    path.display()
-                ),
-            )
-        })?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(error(
+                    "local_package_unavailable",
+                    format!(
+                        "cannot inspect dependency directory '{}': {err}",
+                        path.display()
+                    ),
+                ))
+            }
+        };
         if metadata.file_type().is_symlink()
             || archive_metadata_is_reparse_point(&metadata)
             || !metadata.is_dir()
@@ -633,7 +666,7 @@ fn resolve_relative_directory(root: &Path, relative: &str) -> KuResult<PathBuf> 
             "project-relative dependency escaped the package",
         ));
     }
-    Ok(actual)
+    Ok(Some(actual))
 }
 
 pub(super) fn resolve_nested_path(root: &Path, source: &str) -> KuResult<PathBuf> {

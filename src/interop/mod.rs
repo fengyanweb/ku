@@ -7,6 +7,7 @@ use crate::{
 };
 
 pub(crate) mod c_ffi;
+pub(crate) mod gnu_paths;
 pub(crate) mod python;
 mod runtime;
 
@@ -119,7 +120,10 @@ pub(crate) fn prepare_install(
     } else if path.is_dir() && !path.join("ku.mod").is_file() {
         self::c_ffi::prepare_install(project, path)?
     } else {
-        if path.is_relative() && (source.starts_with("./") || source.starts_with("../")) {
+        if matches!(
+            path.components().next(),
+            Some(std::path::Component::CurDir | std::path::Component::ParentDir)
+        ) {
             let absolute = std::env::current_dir()
                 .map_err(|error| {
                     KuError::message(format!("cannot read current directory: {error}"))
@@ -147,6 +151,7 @@ pub(crate) fn implementation_digest() -> String {
     for unit in [
         include_bytes!("abi.h").as_slice(),
         include_bytes!("c_ffi.rs").as_slice(),
+        include_bytes!("gnu_paths.rs").as_slice(),
         include_bytes!("native/signatures.rs").as_slice(),
         include_bytes!("native/codegen.rs").as_slice(),
         include_bytes!("python.rs").as_slice(),

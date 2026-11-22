@@ -2501,22 +2501,39 @@ fn resolve_file_dependency_with_mode(
             Span::default(),
         ));
     }
-    let nested = parent_root
-        .filter(|_| source.starts_with("path:"))
-        .map(|root| install::resolve_nested_path(root, source))
-        .transpose()?;
-    if let Some(path) = &nested {
-        if snapshot_for_source(path, source, None)?.checksum != locked.checksum {
-            return Err(KuError::package(
-                "locked_source_changed",
-                format!(
-                    "package '{}' nested source does not match the locked parent package contents",
-                    dependency.name
-                ),
-                Span::default(),
-            ));
+    let portable = if source.starts_with("path:") {
+        if let Some(root) = parent_root {
+            Some(install::resolve_nested_path(root, source)?)
+        } else if mode == DependencyResolveMode::Offline {
+            // Offline restore needs only the verified cache, even when the
+            // project's local source tree is currently unavailable.
+            None
+        } else {
+            let path = install::active_portable_source(package, source)?;
+            if let Some(path) = &path {
+                validate_file_dependency_source_is_external(package, path)?;
+            }
+            path
         }
-    }
+    } else {
+        None
+    };
+    let portable = portable
+        .map(|path| {
+            let snapshot = snapshot_for_source(&path, source, None)?;
+            if snapshot.checksum != locked.checksum {
+                return Err(KuError::package(
+                    "locked_local_source_changed",
+                    format!(
+                        "portable dependency '{}' has changed since ku.lock was written; run ku i to adopt the local changes",
+                        dependency.name
+                    ),
+                    Span::default(),
+                ));
+            }
+            Ok((path, snapshot))
+        })
+        .transpose()?;
     let target = file_dependency_cache_root(package, &dependency.name, &locked.cache_key);
     if let Some(snapshot) = installed_file_cache_snapshot(
         &target,
@@ -2557,15 +2574,15 @@ fn resolve_file_dependency_with_mode(
             deadline,
         );
     }
-    let source_path = if let Some(path) = nested {
-        path
+    let (source_path, actual_snapshot) = if let Some(checked) = portable {
+        checked
     } else {
         let path = install::resolve_local_source(package, source)?;
         validate_file_dependency_source_is_external(package, &path)?;
-        path
+        let snapshot = snapshot_for_source(&path, source, None)?;
+        (path, snapshot)
     };
     let identity = inspect_file_dependency_identity(&source_path, dependency, Span::default())?;
-    let actual_snapshot = snapshot_for_source(&source_path, source, None)?;
     ensure_registry_deadline(deadline, Span::default())?;
     if actual_snapshot.checksum != locked.checksum || identity.version != locked.version {
         return Err(KuError::package(
@@ -10080,17 +10097,21 @@ impl PackageDependencyDraft {
             install::validate_source(source, span)?;
         }
         if let Some(checksum) = &self.checksum {
-            let source = self.source.as_deref().ok_or_else(|| {
-                KuError::package(
+            if let Some(source) = self.source.as_deref() {
+                install::validate_source_checksum(source, checksum, span)?;
+            } else {
+                // Preserve the legacy format diagnostic before rejecting a
+                // checksum attached to a registry dependency.
+                validate_checksum(checksum, span)?;
+                return Err(KuError::package(
                     "invalid_dependency_checksum_source",
                     format!(
                         "registry dependency '{}' gets its SHA-256 checksum from the signed index",
                         self.name
                     ),
                     span,
-                )
-            })?;
-            install::validate_source_checksum(source, checksum, span)?;
+                ));
+            }
         }
         Ok(PackageDependency {
             name: self.name,
