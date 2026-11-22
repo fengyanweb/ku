@@ -1,0 +1,9 @@
+3050004
+call_error
+你好，Ku
+SQLite after error
+0
+example native exception
+root
+root
+call_error

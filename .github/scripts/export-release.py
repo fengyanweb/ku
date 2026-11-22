@@ -687,7 +687,8 @@ Run ./{executable} --version (PowerShell: .\\{executable} --version).
 Optionally add that directory to PATH. Install ku-language-{version}.vsix in VS Code.
 
 Running/checking Ku source does not require Rust. The default build backend is
-Runner: it needs the exact publisher compiler recorded in ku-runtime.json
+native C, which needs a C compiler and linker. The explicit Runner backend
+(`ku build --backend runner`) needs the exact publisher compiler in ku-runtime.json
 (Rust {runtime['rustc']['release']} for this bundle) plus the target native linker.
 Ku automatically selects a matching installed compiler without changing your
 Rust default, project override or toolchain file. Diagnose with:
@@ -704,14 +705,14 @@ matching TLS pack discovery; no extra setting is needed in this bundle layout.
 External database client libraries are not bundled; database programs need the
 matching dynamic libraries. This is not a universal executable for all OSes.
 
-The default runner embeds the entry source only. Imported modules are loaded
-from their original source locations at runtime, so those source locations must
-remain available. For self-contained deployment of the complete local import
-graph, use ku build --backend c --release with the target C compiler/linker.
+Runner keeps the source-relative behavior for local-file imports. When the
+application imports installed packages, Runner embeds the resolved Ku modules.
+Keep any generated ku-runtime.d directory next to that executable. Relative
+application data paths in this mode are based on the executable directory.
 The historical --native form without -o only emits C; it is not this command.
 
-中文：运行/检查源码不需要 Rust；默认 build 使用 Runner。保留整个安装包。
-编译前可执行 ku doctor --backend runner；缺少匹配工具链时，显式执行
+中文：运行/检查源码不需要 Rust。默认构建使用原生 C。保留整个安装包。
+使用显式 Runner 前可执行 ku doctor --backend runner；缺少匹配工具链时，显式执行
 ku doctor --install-runner-toolchain。该操作不会修改全局 Rust 默认版本。
 完整说明 / Details: https://github.com/fengyanweb/ku/blob/{commit}/docs/cli-runtime-bundle.md
 English: https://github.com/fengyanweb/ku/blob/{commit}/docs/cli-runtime-bundle.en.md

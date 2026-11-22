@@ -11,6 +11,8 @@ mod checked_int;
 mod database_budget;
 #[path = "c_http_short.rs"]
 mod http_short;
+#[path = "c_interop.rs"]
+mod interop;
 #[path = "c_service_output.rs"]
 mod service_output;
 #[path = "c_sync.rs"]
@@ -769,6 +771,7 @@ fn generate_c_source_with_frames_attempt(
     emit_late_array_typedefs(&mut out, program)?;
     emit_http_types(&mut out, program)?;
     emit_result_abi(&mut out, program, &frame_result_types)?;
+    interop::emit(&mut out, program)?;
     emit_closure_types(
         &mut out,
         program,
@@ -16701,6 +16704,9 @@ fn c_string_method_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
 }
 
 fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String> {
+    if let Some(expr) = interop::expression(name, args, ty)? {
+        return Ok(expr);
+    }
     if let Some(expr) = c_http_intrinsic_expr(name, args)? {
         return Ok(expr);
     }

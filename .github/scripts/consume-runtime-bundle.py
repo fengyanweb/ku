@@ -318,7 +318,7 @@ def windows_readonly_installation(install, project, root, env, report, report_pa
         if failures:
             raise RuntimeError('read-only ACL preflight failed: ' + '; '.join(failures))
         built = project / 'readonly-result.exe'
-        command('read-only-install', [ku, 'build', 'hello.ku', '-o', built])
+        command('read-only-install', [ku, 'build', '--backend', 'runner', 'hello.ku', '-o', built])
         command('read-only-install-result', [built], 'Hello Ku\n')
         built.unlink()
         detail['build_and_run_passed'] = True
@@ -477,7 +477,7 @@ def run(args, report):
         def failure(name, selected_env=None):
             destination = project / ("preserved.exe" if os.name == "nt" else "preserved")
             destination.write_bytes(b"preexisting output must survive\n")
-            result = invoke([ku, "build", "hello.ku", "-o", destination], project, selected_env or env)
+            result = invoke([ku, "build", "--backend", "runner", "hello.ku", "-o", destination], project, selected_env or env)
             record(name, result, "nonzero-without-bare-E0514")
             text = output(result) + result.stderr.decode(errors="replace")
             if result.returncode == 0 or "E0514" in text or destination.read_bytes() != b"preexisting output must survive\n":
@@ -504,7 +504,8 @@ def run(args, report):
             remove_executable(executable)
 
         def build_run(name, arguments, destination, verbose_profile=None, entry="hello.ku", wanted=None):
-            result = success(name, ['build', *arguments, '-o', destination, entry])
+            selection = [] if '--backend' in arguments else ['--backend', 'runner']
+            result = success(name, ['build', *selection, *arguments, '-o', destination, entry])
             if verbose_profile is not None:
                 text = output(result)
                 if 'build profile: ' + verbose_profile not in text or 'rustc command:' not in text:
@@ -716,7 +717,7 @@ def run(args, report):
                 install = destination
                 ku = install / 'ku.exe'
                 try:
-                    success('cross-drive-original-build', ['build', 'hello.ku', '-o', 'cross-drive-result'])
+                    success('cross-drive-original-build', ['build', '--backend', 'runner', 'hello.ku', '-o', 'cross-drive-result'])
                     execute_and_remove('cross-drive-result', project / 'cross-drive-result')
                 finally:
                     shutil.move(str(install), str(old_install))
@@ -728,7 +729,7 @@ def run(args, report):
         before_project = b'[toolchain]\nchannel = "' + consumer_name.encode() + b'"\n'
         (project / "rust-toolchain.toml").write_bytes(before_project)
         configured = dict(env, RUSTUP_TOOLCHAIN=consumer_name)
-        success("original-build-project-and-env-unlike", ["build", "hello.ku"], selected_env=configured)
+        success("original-build-project-and-env-unlike", ["build", "--backend", "runner", "hello.ku"], selected_env=configured)
         built = project / ".ku/build/debug" / ("hello.exe" if os.name == "nt" else "hello")
         result = invoke([built], root, env)
         record("original-build-result", result)
@@ -747,7 +748,7 @@ def run(args, report):
         if result.returncode:
             raise RuntimeError("cannot prepare real unlike-compiler interference")
         os.utime(wrong, (time.time() + 3600, time.time() + 3600))
-        success("ignore-newer-incompatible-rlib", ["build", "hello.ku", "-o", "newer-ignored"])
+        success("ignore-newer-incompatible-rlib", ["build", "--backend", "runner", "hello.ku", "-o", "newer-ignored"])
         execute_and_remove("ignore-newer-incompatible-rlib-result", project / "newer-ignored")
         wrong.unlink()
         runtime_path = install / "ku-runtime.json"
@@ -806,12 +807,12 @@ def run(args, report):
         else:
             direct["PATH"] = os.pathsep.join(p for p in env["PATH"].split(os.pathsep)
                 if not any((Path(p) / name).is_file() for name in ("rustup", "rustc")))
-        success("standalone-explicit-compiler-no-rustup", ["build", "hello.ku", "-o", "standalone-result"], selected_env=direct)
+        success("standalone-explicit-compiler-no-rustup", ["build", "--backend", "runner", "hello.ku", "-o", "standalone-result"], selected_env=direct)
         execute_and_remove("standalone-explicit-compiler-result", project / "standalone-result")
         # Common immutable env for both processes; no per-thread env mutation.
         OWNER.COMMAND_TIMEOUT_SECONDS = 300
         with environment(env), ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(OWNER.run_bounded, [str(ku), "build", "hello.ku", "-o", str(project / ("parallel-" + str(i)))], project, "parallel Runner consumer", check=False) for i in range(2)]
+            futures = [pool.submit(OWNER.run_bounded, [str(ku), "build", "--backend", "runner", "hello.ku", "-o", str(project / ("parallel-" + str(i)))], project, "parallel Runner consumer", check=False) for i in range(2)]
             for i, future in enumerate(futures):
                 result = future.result()
                 record("parallel-build-" + str(i), result)
@@ -830,7 +831,7 @@ def run(args, report):
                         destination = root / ("retired-checkout-" + name)
                         relocate_checkout_entry(old, destination)
                         retired.append((old, destination))
-                success("source-and-target-unavailable", ["build", "hello.ku", "-o", "without-source"])
+                success("source-and-target-unavailable", ["build", "--backend", "runner", "hello.ku", "-o", "without-source"])
                 execute_and_remove("source-and-target-unavailable-result", project / "without-source")
             finally:
                 for old, destination in reversed(retired):
@@ -864,7 +865,7 @@ def run(args, report):
                 else:
                     probe.unlink()
                     raise RuntimeError('Unix installation was not actually read-only')
-                success("read-only-install", ["build", "hello.ku", "-o", "readonly-result"])
+                success("read-only-install", ["build", "--backend", "runner", "hello.ku", "-o", "readonly-result"])
                 execute_and_remove("read-only-install-result", project / "readonly-result")
             finally:
                 for p, mode in modes:

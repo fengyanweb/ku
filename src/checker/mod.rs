@@ -2739,10 +2739,42 @@ impl Checker {
         args: &[Expr],
         span: Span,
     ) -> KuResult<Option<Type>> {
+        if let Some(kind) = crate::interop::ReturnKind::for_bound(name) {
+            self.check_interop_arguments(args, span)?;
+            return Ok(Some(Type::Result(Box::new(match kind {
+                crate::interop::ReturnKind::Null => Type::Null,
+                crate::interop::ReturnKind::Int => Type::Int,
+                crate::interop::ReturnKind::Str => Type::String,
+                crate::interop::ReturnKind::Bool => Type::Bool,
+            }))));
+        }
         let Some(signature) = metadata::builtin_signature(name) else {
             return Ok(None);
         };
         Ok(Some(self.apply_stdlib_signature(&signature, args, span)?))
+    }
+
+    fn check_interop_arguments(&mut self, args: &[Expr], span: Span) -> KuResult<()> {
+        crate::interop::binding_arguments(args, span)?;
+        if self.async_depth != 0 || self.readonly_capture.is_some() {
+            return Err(KuError::runtime(
+                "interop bridge calls may block and require synchronous CLI execution",
+                span,
+            ));
+        }
+        let args = &args[2..];
+        let modes = vec![ParamMode::View; args.len()];
+        self.check_argument_modes_conflicts(args, &modes, span)?;
+        for argument in args {
+            let ty = self.check_expr(argument)?;
+            if !matches!(ty, Type::Int | Type::Bool | Type::String | Type::Null) {
+                return Err(KuError::runtime(
+                    "interop arguments must be int, bool, str or null",
+                    argument.span,
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn check_assign_target(&mut self, target: &AssignTarget, span: Span) -> KuResult<Type> {

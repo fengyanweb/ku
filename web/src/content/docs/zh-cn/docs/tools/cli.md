@@ -8,6 +8,10 @@ sources: ['src/cli.rs', 'docs/package.md', 'docs/process-execution.md']
 
 先用 `ku -v` 查看版本，`ku --help` 查看当前安装的总帮助。
 
+## 源码构建版的包安装
+
+`ku i [来源]` 是 `ku package install [来源]` 的顶层简写。源码构建版见 `ku help package install` 和[公开 Git 教程](https://github.com/fengyanweb/ku/blob/main/docs/package.md)。该构建默认采用 native C，使用 `--backend runner` 可显式选择 Runner。下方仍按 0.0.20 稳定版说明。
+
 ## 日常命令
 
 ```sh

@@ -155,7 +155,7 @@ def create(root, version, commit, target, rustc_text, toolchain, features=(), pr
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
         raise ValueError("canonical Ku version required")
     compiler = rust_identity(rustc_text, toolchain, target)
-    cli = entry(root, "ku.exe" if target.endswith("windows-msvc") else "ku")
+    cli = entry(root, "ku.exe" if "-windows-" in target else "ku")
     identity = dict(ku_version=version, source_commit=commit, host=target, runtime_target=target,
                     rustc=compiler, profile="release", features=sorted(features), cli=cli)
     if provenance is not None:
@@ -205,7 +205,7 @@ def verify(root, version=None, commit=None, target=None):
             or manifest.get('profile') != 'release'
             or manifest.get('features') != []
             or manifest.get('runtime_rlib') != 'libku.rlib'
-            or manifest.get('cli', {}).get('path') != ('ku.exe' if manifest['host'].endswith('windows-msvc') else 'ku')):
+            or manifest.get('cli', {}).get('path') != ('ku.exe' if '-windows-' in manifest['host'] else 'ku')):
         raise ValueError('unsupported/mixed publisher identity or layout')
     rust_identity("\n".join(k.replace("_", "-") + ": " + compiler[k] for k in ("release", "commit_hash", "commit_date", "host")), compiler["release"], manifest["host"])
     identity = {key: manifest[key] for key in ("ku_version", "source_commit", "host", "runtime_target", "rustc", "profile", "features", "cli")}

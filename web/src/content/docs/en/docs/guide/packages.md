@@ -10,6 +10,10 @@ sidebar:
 
 The standard library ships with Ku. Use imports for your own modules and third-party packages. There is no officially hosted public package directory; the repository provides a self-hosted registry implementation.
 
+## Installing from a source build
+
+The main-branch installer uses `ku i` (alias `ku package install`). It can add signed registry, project-relative, HTTPS Git and declared foreign packages. Use `ku i --locked --prod` to restore production pins and `ku i --offline` for verified local restore. The stable 0.0.20 CLI does not ship this command. See the [source setup and public Git example](https://github.com/fengyanweb/ku/blob/main/docs/package.en.md).
+
 ## Project layout
 
 ```text

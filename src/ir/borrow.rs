@@ -178,6 +178,7 @@ impl Verifier<'_> {
                     }
                 } else if let IrCallKind::Intrinsic(name) = kind {
                     let borrowed_read = name == "__ku_clone"
+                        || crate::interop::ReturnKind::for_builtin(name).is_some()
                         || name == "__ku_enum_tag"
                         || (name.starts_with("__ku_enum_payload:") && !ir_type_is_owned(&expr.ty));
                     if !borrowed_read {
