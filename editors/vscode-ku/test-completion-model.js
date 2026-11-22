@@ -22,7 +22,7 @@ assert.deepStrictEqual(model.memberCompletionLabels("status", "not"), ["notModif
 assert.deepStrictEqual(model.memberCompletionLabels("code", "SUCCESS"), ["SUCCESS"]);
 assert.deepStrictEqual(model.memberCompletionLabels("router", "g"), ["get"]);
 assert.deepStrictEqual(model.memberCompletionLabels("app", "listen"), ["listen"]);
-assert.deepStrictEqual(model.memberCompletionLabels("values", ""), ["len", "try_get", "push", "concat", "map"]);
+assert.deepStrictEqual(model.memberCompletionLabels("values", ""), ["len", "try_get", "push", "concat", "map", "first", "last", "is_empty"]);
 assert.deepStrictEqual(model.memberCompletionLabels("time", "d"), ["date", "datetime", "duration", "diff", "days_in_month"]);
 assert.deepStrictEqual(model.memberCompletionLabels("json", "e"), ["encode"]);
 assert.deepStrictEqual(model.memberCompletionLabels("json", "d"), ["decode"]);
@@ -35,7 +35,7 @@ assert.deepStrictEqual(model.memberCompletionLabels("string", "ch"), ["chars"]);
 assert.deepStrictEqual(model.memberCompletionLabels("text", "ch"), ["chars"]);
 assert.deepStrictEqual(model.memberCompletionLabels("string", "by"), ["byte_len"]);
 assert.deepStrictEqual(model.memberCompletionLabels("text", "by"), ["byte_len"]);
-assert.deepStrictEqual(model.stdRootModules, ["fs", "http", "string", "array", "object", "json", "config", "time", "task", "pg", "redis", "mysql", "bytes", "net", "lexer", "parser"]);
+assert.deepStrictEqual(model.stdRootModules, ["fs", "http", "string", "array", "object", "json", "config", "time", "task", "pg", "redis", "mysql", "bytes", "net", "lexer", "parser", "zstd", "gzip", "deflate"]);
 assert.deepStrictEqual(model.memberCompletionLabels("pg"), ["client"]);
 assert.deepStrictEqual(model.memberCompletionLabels("redis"), ["client"]);
 assert.deepStrictEqual(model.memberCompletionLabels("mysql"), ["client"]);
@@ -69,6 +69,9 @@ assert.deepStrictEqual(model.stdImportPathLabels("std."), [
   "std.net",
   "std.lexer",
   "std.parser",
+  "std.zstd",
+  "std.gzip",
+  "std.deflate",
 ]);
 
 assert(!model.globalCompletionLabels().includes("http.service"));

@@ -27,10 +27,10 @@ export const keywords = [
   "null",
 ];
 
-export const types = ["int", "float", "bool", "str", "null"];
+export const types = ["int", "float", "bool", "str", "null", "HttpRequest", "HttpResponse"];
 export const builtins = ["len", "str", "ok", "err", "println"];
-export const stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.object", "std.json", "std.config", "std.time", "std.task", "std.pg", "std.redis", "std.mysql", "std.bytes", "std.net", "std.lexer", "std.parser"];
-export const stdRootModules = ["fs", "http", "string", "array", "object", "json", "config", "time", "task", "pg", "redis", "mysql", "bytes", "net", "lexer", "parser"];
+export const stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.object", "std.json", "std.config", "std.time", "std.task", "std.pg", "std.redis", "std.mysql", "std.bytes", "std.net", "std.lexer", "std.parser", "std.zstd", "std.gzip", "std.deflate"];
+export const stdRootModules = stdModules.map((module) => module.slice(4));
 
 export const stdFunctions = [
   "fs.read",
@@ -104,13 +104,18 @@ export const stdFunctions = [
   "array.first",
   "array.last",
   "array.is_empty",
-  "array.map",
   "pg.client",
   "redis.client",
   "mysql.client",
   "bytes.from_str",
   "bytes.from_array",
   "net.client",
+  "zstd.compress",
+  "zstd.decompress",
+  "gzip.compress",
+  "gzip.decompress",
+  "deflate.compress",
+  "deflate.decompress",
 ];
 
 export const namespaceMembers: Record<string, string[]> = {
@@ -142,6 +147,7 @@ export const namespaceMembers: Record<string, string[]> = {
     "uriTooLong",
     "unsupportedMedia",
     "rangeNotSatisfiable",
+    "expectationFailed",
     "unprocessable",
     "tooManyRequests",
     "headerTooLarge",
@@ -187,11 +193,14 @@ export const namespaceMembers: Record<string, string[]> = {
   mysql: ["client"],
   bytes: ["from_str", "from_array"],
   net: ["client"],
+  zstd: ["compress", "decompress"],
+  gzip: ["compress", "decompress"],
+  deflate: ["compress", "decompress"],
   err: ["domain", "code", "message"],
   text: ["len", "byte_len", "chars", "contains", "starts_with", "ends_with", "trim", "lower", "upper", "replace", "slice"],
-  values: ["len", "try_get", "push", "concat", "map"],
-  items: ["len", "try_get", "push", "concat", "map"],
-  nums: ["len", "try_get", "push", "concat", "map"],
+  values: ["len", "try_get", "push", "concat", "map", "first", "last", "is_empty"],
+  items: ["len", "try_get", "push", "concat", "map", "first", "last", "is_empty"],
+  nums: ["len", "try_get", "push", "concat", "map", "first", "last", "is_empty"],
   req: ["method", "path", "params", "query", "headers", "body"],
   request: ["method", "path", "params", "query", "headers", "body"],
   response: ["status", "headers", "body"],
@@ -259,8 +268,15 @@ export const namespaceMembers: Record<string, string[]> = {
     "idle_timeout_ms",
     "max_body_bytes",
   ],
-  listener: ["run", "close", "port", "address"],
+  listener: ["run", "close", "address"],
 };
+
+// These fields are audited against http_service_type in checker/mod.rs. Running
+// belongs to the bound listener, not the service configuration itself.
+for (const receiver of ["app", "service", "server", "router"]) {
+  namespaceMembers[receiver] = namespaceMembers[receiver].filter((member) => member !== "run");
+  namespaceMembers[receiver].push("read_header_timeout_ms", "read_body_timeout_ms", "write_timeout_ms", "max_header_bytes", "max_buffer_bytes");
+}
 
 export function stdImportPathLabels(current: string): string[] {
   if (!current.startsWith("std.")) {

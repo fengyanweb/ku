@@ -197,5 +197,50 @@
     "prefix": "try_get",
     "body": ["${1:value} = ${2:values}.try_get(${3:0})?"],
     "description": "Array safe index with Result"
+  },
+  "array concat": {
+    "prefix": "array.concat",
+    "body": ["${1:combined} = ${2:left}.concat(${3:right})"],
+    "description": "Return a new array; both inputs remain readable"
+  },
+  "array nullable first": {
+    "prefix": "array.first",
+    "body": ["${1:first} = ${2:values}.first()", "if (${1:first} != null) {", "    $0", "}"],
+    "description": "First returns an element or null, not Result"
+  },
+  "nullable member": {
+    "prefix": "optional.member",
+    "body": ["${1:value} = (${2:reply}?.${3:meta}?.${4:title}).clone()"],
+    "description": "Copy an optional member projection through nullable values without moving from its owner"
+  },
+  "time date": {
+    "prefix": "time.date",
+    "body": ["${1:today} = time.date()", "println(${1:today}.year)", "println(${1:today}.month)", "println(${1:today}.day)"],
+    "description": "Local Date fields; zero-argument time.date is not Result"
+  },
+  "time duration": {
+    "prefix": "time.duration",
+    "body": ["${1:pause} = time.duration(${2:250}, \"${3:ms}\")?", "time.sleep(${1:pause})?"],
+    "description": "Construct a bounded nonnegative Duration and sleep; use in Result-returning code"
+  },
+  "async HTTP handler": {
+    "prefix": "http.async",
+    "body": ["async fn ${1:handle}(req: HttpRequest): HttpResponse! {", "    ${2:body} = req.body.clone()", "    return ok(http.text(${2:body}))", "}", "${3:app}.post(\"${4:/echo}\", ${1:handle})"],
+    "description": "Register an async Result-returning handler on an existing HTTP service"
+  },
+  "ordinary PG query": {
+    "prefix": "pg.query",
+    "body": ["${1:rows} = ${2:client}.query(\"SELECT \\$1::text AS value\", [${3:\"value\"}])?", "${4:value} = ${1:rows}.value(0, 0)?"],
+    "description": "Parameterized query on an existing pooled PG client; also usable inside async fn"
+  },
+  "typed PG single row": {
+    "prefix": "pg.query_one_typed",
+    "body": ["${1:row} = ${2:client}.query_one_typed(", "    \"SELECT \\$1::int4 AS id, \\$2::bool AS enabled\",", "    [${3:17}, ${4:true}],", "    [\"int4\", \"bool\"],", "    [\"int4\", \"bool\"]", ")?", "${5:id} = ${1:row}.value_int(0, 0)?", "${6:enabled} = ${1:row}.value_bool(0, 1)?"],
+    "description": "Exactly one typed PG row; explicit parameter/result schemas, no implicit retry"
+  },
+  "bounded native compression": {
+    "prefix": "zstd.compress",
+    "body": ["${1:compressed} = ${2:zstd}.compress(${3:data}, ${4:4096})?"],
+    "description": "Compress bytes with an explicit max_output_bytes limit; also available in gzip/deflate"
   }
 }

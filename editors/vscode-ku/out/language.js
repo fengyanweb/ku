@@ -46,7 +46,11 @@ const vscode = __importStar(require("vscode"));
 const completionModel_1 = require("./completionModel");
 const executableModel_1 = require("./executableModel");
 const imports_1 = require("./imports");
+const semanticModel_1 = require("./semanticModel");
+const metadataModel_1 = require("./metadataModel");
+const packageModel_1 = require("./packageModel");
 const formatter_1 = require("./formatter");
+const toolTerminal_1 = require("./toolTerminal");
 var formatter_2 = require("./formatter");
 Object.defineProperty(exports, "formatKu", { enumerable: true, get: function () { return formatter_2.formatKu; } });
 const diagnosticModel_1 = require("./diagnosticModel");
@@ -70,7 +74,7 @@ function activate(context) {
     status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
     status.command = "ku.showVersion";
     context.subscriptions.push(status);
-    context.subscriptions.push(vscode.commands.registerCommand("ku.runCurrentFile", (uri) => runKuCommand("run", uri)), vscode.commands.registerCommand("ku.checkCurrentFile", (uri) => checkActiveFile(true, uri)), vscode.commands.registerCommand("ku.showIr", (uri) => runKuCommand("ir", uri)), vscode.commands.registerCommand("ku.buildCurrentFile", (uri) => runKuCommand("build", uri)), vscode.commands.registerCommand("ku.buildNativeC", (uri) => buildNativeC(uri)), vscode.commands.registerCommand("ku.packageGc", (uri) => runKuCommand("package gc", uri)), vscode.commands.registerCommand("ku.showVersion", () => showVersion()), vscode.workspace.onDidOpenTextDocument((doc) => {
+    context.subscriptions.push(vscode.commands.registerCommand("ku.runCurrentFile", (uri) => runKuCommand("run", uri)), vscode.commands.registerCommand("ku.checkCurrentFile", (uri) => checkActiveFile(true, uri)), vscode.commands.registerCommand("ku.showIr", (uri) => runKuCommand("ir", uri)), vscode.commands.registerCommand("ku.buildCurrentFile", (uri, outputUri) => runKuCommand("build", uri, outputUri)), vscode.commands.registerCommand("ku.buildNativeC", (uri) => buildNativeC(uri)), vscode.commands.registerCommand("ku.packageGc", (uri) => runKuCommand("package gc", uri)), vscode.commands.registerCommand("ku.showVersion", () => showVersion()), vscode.commands.registerCommand("ku.selectExecutable", (uri) => selectKuExecutable(uri)), vscode.commands.registerCommand("ku.installDependencies", (uri, source) => installDependencies(uri, source)), vscode.commands.registerCommand("ku.buildWithOptions", (uri) => buildWithOptions(uri)), vscode.workspace.onDidOpenTextDocument((doc) => {
         if (isKu(doc) && config(doc.uri).get("checkOnOpen", true)) {
             void scheduleCheck(doc, 0);
         }
@@ -111,10 +115,16 @@ function activate(context) {
             }
         }
         void refreshStatus();
+    }), vscode.workspace.onDidGrantWorkspaceTrust(() => {
+        for (const doc of vscode.workspace.textDocuments) {
+            if (isKu(doc) && config(doc.uri).get("checkOnOpen", true))
+                void scheduleCheck(doc, 0);
+        }
+        void refreshStatus();
     }), vscode.window.onDidChangeActiveTextEditor(() => {
         void refreshStatus();
         void refreshEditorContext();
-    }), vscode.languages.registerCompletionItemProvider(KU_MODE, new KuCompletionProvider(), ".", "\"", "'", "/", "@"), vscode.languages.registerHoverProvider(KU_MODE, new KuHoverProvider()), vscode.languages.registerDefinitionProvider(KU_MODE, new KuDefinitionProvider()), vscode.languages.registerDocumentSymbolProvider(KU_MODE, new KuSymbolProvider()), vscode.languages.registerCodeActionsProvider(KU_MODE, new KuCodeActionProvider(), {
+    }), vscode.languages.registerCompletionItemProvider(KU_MODE, new KuCompletionProvider(), ".", "\"", "'", "/", "@"), vscode.languages.registerHoverProvider(KU_MODE, new KuHoverProvider()), vscode.languages.registerSignatureHelpProvider(KU_MODE, new KuSignatureProvider(), "(", ","), vscode.languages.registerDefinitionProvider(KU_MODE, new KuDefinitionProvider()), vscode.languages.registerDocumentSymbolProvider(KU_MODE, new KuSymbolProvider()), vscode.languages.registerCodeActionsProvider(KU_MODE, new KuCodeActionProvider(), {
         providedCodeActionKinds: [vscode.CodeActionKind.QuickFix],
     }), vscode.languages.registerDocumentFormattingEditProvider(KU_MODE, new KuFormatter()));
     for (const doc of vscode.workspace.textDocuments) {
@@ -129,6 +139,7 @@ function deactivate() {
     diagnosticsEnabled = false;
     statusGeneration++;
     resetChecks();
+    (0, toolTerminal_1.closeKuTools)();
 }
 function resetChecks() {
     diagnosticSession++;
@@ -182,7 +193,12 @@ function invalidateDocumentDiagnostics(document) {
     drainChecks();
 }
 function config(uri) {
-    return vscode.workspace.getConfiguration("ku", uri ?? vscode.workspace.workspaceFolders?.[0]?.uri ?? null);
+    let resource = uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+    const folder = resource && containingWorkspace(resource);
+    if (resource && folder && !vscode.workspace.getWorkspaceFolder(resource)) {
+        resource = vscode.Uri.file(path.join(folder.uri.fsPath, path.relative(fileIdentity(folder.uri.fsPath), fileIdentity(resource.fsPath))));
+    }
+    return vscode.workspace.getConfiguration("ku", resource ?? null);
 }
 function isKu(document) {
     return document.languageId === "ku" && document.uri.scheme === "file";
@@ -229,6 +245,8 @@ async function checkActiveFile(reveal, uri) {
 }
 async function runCheck(document, reveal) {
     if (!diagnosticsEnabled || document.isClosed || document.isDirty)
+        return;
+    if (!allowTools(reveal))
         return;
     const rootKey = document.uri.toString();
     cancelRootCheck(rootKey);
@@ -278,13 +296,13 @@ async function runCheckJob(request, signal) {
     if (!exe) {
         return;
     }
-    let result = await execFile(exe, ["check", "--json", document.uri.fsPath], workspaceFolder(document.uri), 15000, signal);
+    let result = await execFile(exe, ["check", "--json", document.uri.fsPath], terminalCwd(document.uri), 15000, signal);
     if (!current())
         return;
     let diagnostics = parseJsonDiagnosticEntries(result.stdout + result.stderr, document);
     let command = `${exe} check --json ${document.uri.fsPath}`;
     if (result.code !== 0 && diagnostics === undefined && /\b(?:unknown|unrecognized|unexpected|unsupported|invalid)\b[^\r\n]*--json/i.test(result.stdout + result.stderr)) {
-        result = await execFile(exe, ["check", document.uri.fsPath], workspaceFolder(document.uri), 15000, signal);
+        result = await execFile(exe, ["check", document.uri.fsPath], terminalCwd(document.uri), 15000, signal);
         if (!current())
             return;
         diagnostics = parseTextDiagnosticEntries(result.stdout + result.stderr, document);
@@ -300,9 +318,10 @@ async function runCheckJob(request, signal) {
     }
     diagnostics = diagnostics.filter((entry) => !vscode.workspace.textDocuments.some((doc) => doc.isDirty && doc.uri.toString() === entry.uri.toString()));
     output.clear();
+    output.appendLine(`cwd: ${terminalCwd(document.uri)}`);
     output.appendLine(`> ${command}`);
-    output.append(result.stdout);
-    output.append(result.stderr);
+    output.append((0, toolTerminal_1.redactToolOutput)(result.stdout));
+    output.append((0, toolTerminal_1.redactToolOutput)(result.stderr));
     replaceDiagnostics(rootKey, diagnostics ?? []);
     if (reveal) {
         output.show(true);
@@ -373,6 +392,14 @@ function isPositiveInteger(value) {
 function diagnosticSourceKey(file) {
     const absolute = path.resolve(file);
     return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+function fileIdentity(file) {
+    try {
+        return diagnosticSourceKey(fs.realpathSync.native(path.resolve(file)));
+    }
+    catch {
+        return diagnosticSourceKey(file);
+    }
 }
 function openDiagnosticSource(document) {
     try {
@@ -488,8 +515,12 @@ function diagnosticUri(file, document) {
     }
     const absolute = path.isAbsolute(file)
         ? file
-        : path.resolve(workspaceFolder(document.uri) ?? path.dirname(document.uri.fsPath), file);
-    return vscode.Uri.file(absolute);
+        : path.resolve(terminalCwd(document.uri), file);
+    const key = fileIdentity(absolute);
+    if (key === fileIdentity(document.uri.fsPath))
+        return document.uri;
+    return (vscode.workspace.textDocuments ?? []).find((opened) => fileIdentity(opened.uri.fsPath) === key)?.uri
+        ?? vscode.Uri.file(absolute);
 }
 function replaceDiagnostics(rootKey, entries) {
     const affected = new Map();
@@ -553,7 +584,9 @@ async function kuDocumentFromCommand(uri) {
     const editor = vscode.window.activeTextEditor;
     return editor && isKu(editor.document) ? editor.document : undefined;
 }
-async function runKuCommand(command, uri) {
+async function runKuCommand(command, uri, outputUri) {
+    if (!allowTools())
+        return;
     const document = await kuDocumentFromCommand(uri);
     if (!document || !isKu(document)) {
         void vscode.window.showWarningMessage("当前文件不是 Ku 源文件。");
@@ -570,9 +603,33 @@ async function runKuCommand(command, uri) {
         return;
     }
     const cwd = terminalCwd(document.uri);
-    await executeKuTask(document.uri, `Ku ${command}`, exe, [...command.split(" "), document.uri.fsPath], cwd);
+    const args = command === "build" ? await buildArguments(document, ["build"], outputUri) : [...command.split(" "), document.uri.fsPath];
+    if (args && await saveForCommand(document))
+        await executeKuTask(document.uri, `Ku ${command}`, exe, args, cwd);
+}
+async function buildArguments(document, args, requestedOutput) {
+    const project = (0, packageModel_1.discoverProject)(document.uri.fsPath).project;
+    const entry = project && path.resolve(project.importRoot, project.fields.get("main") ?? "main.ku");
+    const needsOutput = entry && fileIdentity(entry) !== fileIdentity(document.uri.fsPath);
+    if (needsOutput || requestedOutput) {
+        const selected = requestedOutput ?? await vscode.window.showSaveDialog({
+            title: "当前文件不是 ku.mod 的 main，请选择构建输出", saveLabel: "构建到此文件",
+            defaultUri: vscode.Uri.file(path.join(project.directory, path.basename(document.uri.fsPath, ".ku") + (process.platform === "win32" ? ".exe" : ""))),
+        });
+        if (!selected)
+            return undefined;
+        if (selected.scheme !== "file" || !selected.fsPath) {
+            void vscode.window.showErrorMessage("构建输出必须是本地文件路径。");
+            return undefined;
+        }
+        args.push("-o", selected.fsPath);
+    }
+    args.push(document.uri.fsPath);
+    return args;
 }
 async function buildNativeC(uri) {
+    if (!allowTools())
+        return;
     const document = await kuDocumentFromCommand(uri);
     if (!document || !isKu(document)) {
         void vscode.window.showWarningMessage("当前文件不是 Ku 源文件。");
@@ -584,6 +641,8 @@ async function buildNativeC(uri) {
     if (!exe) {
         return;
     }
+    if (!await saveForCommand(document))
+        return;
     const cwd = terminalCwd(document.uri);
     await executeKuTask(document.uri, "Ku Emit Native C", exe, ["build", "--native", document.uri.fsPath], cwd);
 }
@@ -601,14 +660,21 @@ async function saveForCommand(document) {
     return false;
 }
 async function executeKuTask(uri, name, exe, args, cwd) {
+    if (!allowTools())
+        return;
+    output.appendLine(`\n> ${(0, toolTerminal_1.redactToolOutput)([exe, ...args].map((arg) => JSON.stringify(arg)).join(" "))}\ncwd: ${cwd}`);
+    const interactive = args[0] === "run";
     // VS Code's task process launcher needs a workspace. A loose file can still
     // launch the CLI as the terminal executable, with the same argument array.
     if (!vscode.workspace.workspaceFolders?.length) {
-        const terminal = vscode.window.createTerminal({ name, cwd, shellPath: exe, shellArgs: args });
+        const terminal = interactive
+            ? vscode.window.createTerminal({ name, cwd, shellPath: exe, shellArgs: args })
+            : vscode.window.createTerminal({ name, pty: new toolTerminal_1.KuToolTerminal(exe, args, cwd, (text) => output.append(text)) });
         terminal.show();
         return;
     }
-    const task = new vscode.Task({ type: "ku", command: args[0], args: [...args], file: uri.fsPath }, vscode.workspace.getWorkspaceFolder(uri) ?? vscode.TaskScope.Workspace, name, "Ku", new vscode.ProcessExecution(exe, args, { cwd }), []);
+    const task = new vscode.Task({ type: "ku", command: args[0], args: [...args], file: uri.fsPath }, containingWorkspace(uri) ?? vscode.TaskScope.Workspace, name, "Ku", interactive ? new vscode.ProcessExecution(exe, args, { cwd })
+        : new vscode.CustomExecution(async () => new toolTerminal_1.KuToolTerminal(exe, args, cwd, (text) => output.append(text))), []);
     task.presentationOptions = { reveal: vscode.TaskRevealKind.Always, focus: true, panel: vscode.TaskPanelKind.Dedicated };
     try {
         await vscode.tasks.executeTask(task);
@@ -628,7 +694,12 @@ async function showVersion() {
         return;
     }
     const version = (result.stdout || result.stderr).trim();
-    void vscode.window.showInformationMessage(`${version} | plugin ${KU_VERSION}`);
+    output.appendLine(`CLI: ${exe}\n${version}\nExtension: ${KU_VERSION}`);
+    const action = await vscode.window.showInformationMessage(`${version} · 插件 ${KU_VERSION}\n${exe}`, "选择可执行文件", "查看输出");
+    if (action === "选择可执行文件")
+        await selectKuExecutable(vscode.window.activeTextEditor?.document.uri);
+    if (action === "查看输出")
+        output.show(true);
     await refreshStatus();
 }
 let statusGeneration = 0;
@@ -639,19 +710,172 @@ async function refreshStatus() {
     if (generation !== statusGeneration)
         return;
     if (!exe) {
-        setStatus("Ku: executable missing", true);
+        setStatus(vscode.workspace.isTrusted === false ? "Ku: 静态编辑（受限模式）" : "Ku: 选择可执行文件", true);
+        status.command = vscode.workspace.isTrusted === false ? "workbench.trust.manage" : "ku.selectExecutable";
         return;
     }
     const result = await execFile(exe, ["version"], workspaceFolder(uri));
     if (generation !== statusGeneration)
         return;
     const actual = /ku\s+([0-9]+\.[0-9]+\.[0-9]+)/.exec(result.stdout + result.stderr)?.[1] ?? "unknown";
-    setStatus(actual === KU_VERSION ? `Ku ${actual}` : `Ku ${actual} / plugin ${KU_VERSION}`, actual !== KU_VERSION);
+    setStatus(`Ku ${actual} · 插件 ${KU_VERSION}`, result.code !== 0 || actual === "unknown");
+    status.command = "ku.showVersion";
+    status.tooltip = `${exe}\nCLI ${actual} · Extension ${KU_VERSION}`;
 }
 function setStatus(text, warn) {
     status.text = warn ? `$(warning) ${text}` : `$(check) ${text}`;
     status.tooltip = "Ku interpreter and extension version";
     status.show();
+}
+function allowTools(notify = true) {
+    if (vscode.workspace.isTrusted !== false)
+        return true;
+    if (notify)
+        void vscode.window.showInformationMessage("当前为受限模式，可静态浏览和编辑；信任工作区后才能运行 Ku 工具。");
+    return false;
+}
+function executableOnPath(candidate) {
+    if (path.isAbsolute(candidate) || /[/\\]/.test(candidate))
+        return path.resolve(candidate);
+    const extensions = process.platform === "win32" ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";") : [""];
+    for (const directory of (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
+        for (const extension of ["", ...extensions]) {
+            const file = path.join(directory, candidate + extension);
+            try {
+                if (!fs.statSync(file).isFile())
+                    continue;
+                // execFile/ProcessExecution require a native executable on Windows.
+                if (process.platform === "win32" && !/\.exe$/i.test(file))
+                    continue;
+                fs.accessSync(file, process.platform === "win32" ? fs.constants.F_OK : fs.constants.X_OK);
+                return file;
+            }
+            catch { /* Try the next PATH entry without changing the user's PATH. */ }
+        }
+    }
+    return undefined;
+}
+async function selectKuExecutable(uri) {
+    if (!allowTools())
+        return undefined;
+    const resource = uri ?? vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+    const selection = await vscode.window.showOpenDialog({
+        title: "选择 Ku 可执行文件", openLabel: "使用此 Ku CLI", canSelectFiles: true,
+        canSelectFolders: false, canSelectMany: false,
+        ...(process.platform === "win32" ? { filters: { "Ku executable": ["exe"] } } : {}),
+    });
+    const file = selection?.[0]?.fsPath;
+    if (!file)
+        return undefined;
+    const result = await execFile(file, ["version"], resource ? terminalCwd(resource) : undefined, 3000);
+    if (result.code !== 0 || !/\bku\s+\d+\.\d+\.\d+\b/i.test(result.stdout + result.stderr)) {
+        output.appendLine(`CLI: ${file}\n${(0, toolTerminal_1.redactToolOutput)(result.stdout + result.stderr)}`);
+        void vscode.window.showErrorMessage("所选文件没有成功返回 Ku 版本，原设置已保留。详情见 Ku 输出。");
+        return undefined;
+    }
+    const folder = resource && containingWorkspace(resource);
+    await config(resource).update("executablePath", file, folder ? vscode.ConfigurationTarget.WorkspaceFolder : vscode.ConfigurationTarget.Global);
+    output.appendLine(`CLI: ${file}\n${result.stdout.trim()}`);
+    void refreshStatus();
+    return file;
+}
+async function installDependencies(uri, providedSource) {
+    if (!allowTools())
+        return;
+    const resource = uri ?? vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+    const cwd = resource && projectDirectory(resource);
+    if (!resource || !cwd) {
+        void vscode.window.showErrorMessage("当前文件不属于 Ku 项目。请先在项目目录执行 ku init，创建 ku.mod。");
+        return;
+    }
+    if (!await saveProjectMetadata(cwd))
+        return;
+    const exe = await findKuExecutable(resource);
+    if (!exe)
+        return;
+    const help = await execFile(exe, ["help", "i"], cwd, 3000);
+    if (help.code !== 0 || !/\bku (?:i|package install)\b/.test(help.stdout)) {
+        output.appendLine(`CLI: ${exe}\n${(0, toolTerminal_1.redactToolOutput)(help.stdout + help.stderr)}`);
+        void vscode.window.showErrorMessage(`此 CLI 不支持 ku i：${exe}。请选择支持 package install 的 Ku，再显式安装依赖。`);
+        return;
+    }
+    let source = providedSource;
+    if (source === undefined) {
+        const choice = await vscode.window.showQuickPick(["恢复清单和锁定依赖", "输入包名、Git 或 PyPI 来源", "选择本地目录或文件"], { title: "Ku：安装依赖" });
+        if (!choice)
+            return;
+        if (choice === "输入包名、Git 或 PyPI 来源") {
+            source = await vscode.window.showInputBox({ title: "依赖来源", prompt: "例如 ./vendor/library、HTTPS Git URL、pypi:DISTRIBUTION；按所选 CLI 的 ku help i 规则解析" });
+            if (!source?.trim())
+                return;
+        }
+        else if (choice === "选择本地目录或文件") {
+            const selection = await vscode.window.showOpenDialog({ title: "选择本地 Ku 包或 Python 文件", canSelectFiles: true, canSelectFolders: true, canSelectMany: false });
+            source = selection?.[0]?.fsPath;
+            if (!source)
+                return;
+        }
+    }
+    if (source?.trim().startsWith("-")) {
+        void vscode.window.showErrorMessage("请填写依赖来源，不附带 CLI 选项。");
+        return;
+    }
+    if (await saveProjectMetadata(cwd))
+        await executeKuTask(resource, "Ku Install Dependencies", exe, ["i", ...(source?.trim() ? [source.trim()] : [])], cwd);
+}
+async function saveProjectMetadata(cwd) {
+    for (const document of vscode.workspace.textDocuments) {
+        if (document.uri.scheme === "file" && ["ku.mod", "ku.lock"].some((name) => fileIdentity(document.uri.fsPath) === fileIdentity(path.join(cwd, name)))) {
+            if (!await saveForCommand(document))
+                return false;
+        }
+    }
+    return true;
+}
+async function buildWithOptions(uri) {
+    if (!allowTools())
+        return;
+    const document = await kuDocumentFromCommand(uri);
+    if (!document || !await saveForCommand(document))
+        return;
+    const exe = await findKuExecutable(document.uri);
+    if (!exe)
+        return;
+    const cwd = terminalCwd(document.uri);
+    const help = await execFile(exe, ["help", "build"], cwd, 3000);
+    if (help.code !== 0) {
+        output.append((0, toolTerminal_1.redactToolOutput)(help.stdout + help.stderr));
+        output.show(true);
+        return;
+    }
+    const choices = ["CLI 默认构建"];
+    if (/--release|--profile/.test(help.stdout))
+        choices.push("Release");
+    if (/--locked/.test(help.stdout))
+        choices.push("锁定依赖（--locked）");
+    if (/--backend runner/.test(help.stdout))
+        choices.push("Runner（匹配工具链）");
+    const choice = await vscode.window.showQuickPick(choices, { title: "Ku：构建选项" });
+    if (!choice)
+        return;
+    const args = ["build"];
+    if (choice === "Release")
+        args.push("--release");
+    if (choice.startsWith("锁定"))
+        args.push("--locked");
+    if (choice.startsWith("Runner")) {
+        const doctor = await execFile(exe, ["doctor", "--json", "--backend", "runner"], cwd);
+        output.append((0, toolTerminal_1.redactToolOutput)(doctor.stdout + doctor.stderr));
+        if (doctor.code !== 0) {
+            output.show(true);
+            void vscode.window.showErrorMessage(`Runner 工具链未就绪。CLI：${exe}，请查看 Ku 输出并按该 SDK 的 doctor 提示配置。`);
+            return;
+        }
+        args.push("--backend", "runner");
+    }
+    const selected = await buildArguments(document, args);
+    if (selected && await saveForCommand(document))
+        await executeKuTask(document.uri, "Ku Build", exe, selected, cwd);
 }
 async function findKuExecutable(uri, notify = true, signal) {
     if (signal?.aborted || vscode.workspace.isTrusted === false)
@@ -685,18 +909,24 @@ async function findKuExecutable(uri, notify = true, signal) {
     const found = await (0, executableModel_1.firstWorkingExecutable)(candidates, async (candidate) => {
         if (signal?.aborted)
             return { code: 1 };
-        const result = await execFile(candidate, ["version"], folder, 3000, signal);
+        const resolved = executableOnPath(candidate);
+        if (!resolved)
+            return { code: 1 };
+        const result = await execFile(resolved, ["version"], folder, 3000, signal);
         return { code: result.code === 0 && /\bku\s+\d+\.\d+\.\d+\b/i.test(result.stdout + result.stderr) ? 0 : 1 };
     });
     if (signal?.aborted)
         return undefined;
     if (found) {
-        return found;
+        return executableOnPath(found);
     }
     if (notify) {
-        void vscode.window.showErrorMessage(configured
+        const message = configured
             ? `ku.executablePath 无法执行 Ku version：${configured}。请填写可执行文件路径，不附带命令参数或 shell 引号。`
-            : "找不到 Ku CLI。请安装 CLI 并设置 ku.executablePath，或确认 VS Code 进程的 PATH 包含 ku。");
+            : "找不到 Ku CLI。请选择已安装的 Ku 可执行文件；仍可继续静态编辑。";
+        output.appendLine(message);
+        if (await vscode.window.showErrorMessage(message, "选择可执行文件") === "选择可执行文件")
+            return selectKuExecutable(uri);
     }
     return undefined;
 }
@@ -716,13 +946,43 @@ function hostReleaseTarget() {
     return undefined;
 }
 function workspaceFolder(uri) {
-    const folder = uri ? vscode.workspace.getWorkspaceFolder(uri) : vscode.workspace.workspaceFolders?.[0];
+    const folder = uri ? containingWorkspace(uri) : vscode.workspace.workspaceFolders?.[0];
     return folder?.uri.fsPath;
 }
+function containingWorkspace(uri) {
+    const direct = vscode.workspace.getWorkspaceFolder(uri);
+    if (direct)
+        return direct;
+    const target = fileIdentity(uri.fsPath);
+    return [...(vscode.workspace.workspaceFolders ?? [])].sort((a, b) => b.uri.fsPath.length - a.uri.fsPath.length)
+        .find((folder) => {
+        const relative = path.relative(fileIdentity(folder.uri.fsPath), target);
+        return !relative || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+    });
+}
 function terminalCwd(uri) {
-    return workspaceFolder(uri) ?? path.dirname(uri.fsPath);
+    return projectDirectory(uri) ?? workspaceFolder(uri) ?? path.dirname(uri.fsPath);
+}
+function projectDirectory(uri) {
+    let directory = path.dirname(uri.fsPath);
+    try {
+        if (fs.statSync(uri.fsPath).isDirectory())
+            directory = uri.fsPath;
+    }
+    catch { /* A new file may not exist yet. */ }
+    for (let depth = 0; depth < 64; depth++) {
+        if (fs.existsSync(path.join(directory, "ku.mod")))
+            return directory;
+        const parent = path.dirname(directory);
+        if (parent === directory)
+            return undefined;
+        directory = parent;
+    }
+    return undefined;
 }
 function execFile(file, args, cwd, timeoutMs = 15000, signal) {
+    if (!allowTools(false))
+        return Promise.resolve({ code: 1, stdout: "", stderr: "Workspace trust is required to run Ku tools.\n" });
     if (signal?.aborted)
         return Promise.resolve({ code: 1, stdout: "", stderr: "Ku command cancelled.\n" });
     return new Promise((resolve) => {
@@ -747,6 +1007,99 @@ function execFile(file, args, cwd, timeoutMs = 15000, signal) {
         child.once("close", () => { closed = true; finish(); });
     });
 }
+const documentModels = new WeakMap();
+const importedModels = new Map();
+const symbolOrigins = new WeakMap();
+const resolvingModules = new Set();
+function sourceModel(source, uri) {
+    const lines = source.split(/\r\n|\n|\r/);
+    const starts = [0, ...[...source.matchAll(/\r\n|\n|\r/g)].map((match) => match.index + match[0].length)];
+    const imports = (0, imports_1.parseImports)({ lineCount: lines.length, lineAt: (line) => ({ text: lines[line] }) })
+        .filter((entry) => codePrefix(source.slice(0, starts[entry.pathRange.start.line] + entry.pathRange.start.character - 1)));
+    return (0, semanticModel_1.analyzeSource)(source, { resolveExternal: (qualifiedName) => {
+            const imp = [...imports].sort((a, b) => b.path.length - a.path.length)
+                .find((entry) => qualifiedName === entry.path || qualifiedName.startsWith(`${entry.path}.`));
+            if (!imp || imp.path === "std" || imp.path.startsWith("std."))
+                return undefined;
+            const imported = (0, imports_1.readImportModule)(uri, imp.path);
+            if (!imported.uri || imported.source === undefined)
+                return undefined;
+            const key = imported.uri.toString();
+            if (resolvingModules.has(key))
+                return undefined;
+            resolvingModules.add(key);
+            try {
+                let cached = importedModels.get(key);
+                if (!cached || cached.source !== imported.source) {
+                    cached = { source: imported.source, model: sourceModel(imported.source, imported.uri) };
+                    importedModels.set(key, cached);
+                    if (importedModels.size > 32)
+                        importedModels.delete(importedModels.keys().next().value);
+                }
+                const exported = (name) => imported.exports.some((entry) => entry.name === name)
+                    ? cached.model.resolve(name, imported.source.length) : undefined;
+                const name = qualifiedName.slice(imp.path.length).replace(/^\./, "");
+                const type = name ? exported(name)?.type : { kind: "object", members: new Map(imported.exports.flatMap((entry) => {
+                        const symbol = exported(entry.name);
+                        return symbol ? [[entry.name, symbol]] : [];
+                    })) };
+                if (type)
+                    markOrigin(type, imported.uri, imported.source, new Set(), 0);
+                return type;
+            }
+            finally {
+                resolvingModules.delete(key);
+            }
+        } });
+}
+function markOrigin(type, uri, source, seen, depth) {
+    if (depth > 12 || seen.has(type))
+        return;
+    seen.add(type);
+    for (const member of type.members?.values() ?? []) {
+        if (member.start >= 0) {
+            if (!symbolOrigins.has(member))
+                symbolOrigins.set(member, { uri, source });
+            markOrigin(member.type, uri, source, seen, depth + 1);
+        }
+    }
+    for (const nested of [type.returnType, type.valueType, type.elementType])
+        if (nested)
+            markOrigin(nested, uri, source, seen, depth + 1);
+}
+function semanticModel(document) {
+    let cached = documentModels.get(document);
+    if (!cached || cached.version !== document.version) {
+        cached = { version: document.version, model: sourceModel(document.getText(), document.uri) };
+        documentModels.set(document, cached);
+    }
+    return cached.model;
+}
+function describeType(type, depth = 0) {
+    if (depth > 4)
+        return type.name ?? "unknown";
+    if (type.kind === "function")
+        return `fn(${(type.parameters ?? []).map((p) => `${p.name}${p.optional ? "?" : ""}: ${describeType(p.type, depth + 1)}`).join(", ")}): ${describeType(type.returnType ?? { kind: "unknown" }, depth + 1)}`;
+    if (type.kind === "result")
+        return `${describeType(type.valueType ?? { kind: "unknown" }, depth + 1)}!`;
+    if (type.kind === "task")
+        return `Task<${describeType(type.valueType ?? { kind: "unknown" }, depth + 1)}>`;
+    if (type.kind === "array")
+        return `[${describeType(type.elementType ?? { kind: "unknown" }, depth + 1)}]`;
+    const name = type.name ?? (type.members ? `{ ${[...type.members.keys()].slice(0, 8).join(", ")} }` : "unknown");
+    return type.nullable && !name.includes("null") ? `${name} | null` : name;
+}
+function semanticCompletion(symbol, range) {
+    const kind = symbol.type.kind === "function" ? vscode.CompletionItemKind.Function
+        : symbol.kind === "module" ? vscode.CompletionItemKind.Module : symbol.kind === "field" ? vscode.CompletionItemKind.Field
+            : symbol.kind === "struct" ? vscode.CompletionItemKind.Struct : vscode.CompletionItemKind.Variable;
+    const item = new vscode.CompletionItem(symbol.name, kind);
+    item.range = range;
+    item.detail = `${symbol.name}: ${describeType(symbol.type)}`;
+    if (["service", "server"].includes(symbol.name) && symbol.type.kind === "function")
+        item.insertText = new vscode.SnippetString(`${symbol.name}($0)`);
+    return item;
+}
 class KuCompletionProvider {
     async provideCompletionItems(document, position) {
         const linePrefix = document.lineAt(position).text.slice(0, position.character);
@@ -762,20 +1115,8 @@ class KuCompletionProvider {
         }
         const member = memberAccessContext(linePrefix, position);
         if (member) {
-            const labels = (0, completionModel_1.memberCompletionLabels)(member.receiver, member.prefix);
-            if (labels.length > 0) {
-                return labels.map((label) => memberCompletionItem(label, member.receiver, member.range));
-            }
-            return [];
-        }
-        if (/\berr\.$/.test(linePrefix)) {
-            return fieldCompletions(["domain", "code", "message"], "Error field");
-        }
-        if (/\bresponse\.$/.test(linePrefix)) {
-            return fieldCompletions(["status", "headers", "body"], "HttpResponse field");
-        }
-        if (/["'`][^"'`]*\.$/.test(linePrefix) || /\btext\.$/.test(linePrefix)) {
-            return methodCompletions(["trim", "lower", "upper", "len", "slice"]);
+            return semanticModel(document).memberSymbols(member.receiver, document.offsetAt(position))
+                .filter((symbol) => symbol.name.startsWith(member.prefix)).map((symbol) => semanticCompletion(symbol, member.range));
         }
         for (const value of completionModel_1.keywords) {
             items.push(new vscode.CompletionItem(value, vscode.CompletionItemKind.Keyword));
@@ -786,24 +1127,17 @@ class KuCompletionProvider {
         for (const value of completionModel_1.builtins) {
             items.push(new vscode.CompletionItem(value, vscode.CompletionItemKind.Function));
         }
-        for (const value of completionModel_1.stdModules) {
-            const item = new vscode.CompletionItem(value, vscode.CompletionItemKind.Module);
-            item.insertText = `import "${value}"`;
-            items.push(item);
-        }
-        for (const value of completionModel_1.stdFunctions) {
-            items.push(new vscode.CompletionItem(value, vscode.CompletionItemKind.Function));
-        }
+        items.push(...semanticModel(document).visibleSymbols(document.offsetAt(position)).map((symbol) => semanticCompletion(symbol)));
         return items;
     }
 }
 function memberAccessContext(linePrefix, position) {
-    const match = /\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)?$/.exec(linePrefix);
+    const match = /(?:\?\.|\.)([\p{L}_][\p{L}\p{N}_]*)?$/u.exec(linePrefix);
     if (!match) {
         return undefined;
     }
-    const receiver = match[1];
-    const prefix = match[2] ?? "";
+    const receiver = (0, semanticModel_1.expressionBefore)(linePrefix, match.index)?.text ?? "";
+    const prefix = match[1] ?? "";
     const start = position.character - prefix.length;
     return {
         receiver,
@@ -812,7 +1146,9 @@ function memberAccessContext(linePrefix, position) {
     };
 }
 function completionIsCode(document, position) {
-    const source = document.getText(new vscode.Range(new vscode.Position(0, 0), position));
+    return codePrefix(document.getText(new vscode.Range(new vscode.Position(0, 0), position)));
+}
+function codePrefix(source) {
     let state = "code";
     for (let i = 0; i < source.length; i++) {
         const ch = source[i];
@@ -889,18 +1225,6 @@ async function importPathCompletions(document, position, linePrefix) {
     }
     return items;
 }
-function memberCompletionItem(label, receiver, range) {
-    const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Method);
-    if (receiver === "http" && (label === "service" || label === "server")) {
-        item.insertText = new vscode.SnippetString(`${label}($0)`);
-    }
-    else {
-        item.insertText = label;
-    }
-    item.range = range;
-    item.detail = `${receiver} member`;
-    return item;
-}
 function importPathItem(label, range, kind) {
     const item = new vscode.CompletionItem(label, kind);
     item.insertText = label;
@@ -909,11 +1233,11 @@ function importPathItem(label, range, kind) {
 }
 function dependencyCompletions(document, current, range) {
     try {
-        return [...new Set(readKuModDependencies(document))].map((dep) => `@${dep}/`)
-            .filter((dep) => dep.startsWith(current))
-            .map((dep) => {
-            const item = importPathItem(dep, range, vscode.CompletionItemKind.Module);
-            item.detail = "ku.mod dependency prefix; dependency-file completion is not available";
+        const resolved = (0, imports_1.listDependencyImports)(document, current);
+        return resolved.items.map((dep) => {
+            const item = importPathItem(dep.path, range, vscode.CompletionItemKind.Module);
+            item.detail = dep.dependency.reason ?? `${dep.dependency.name}@${dep.dependency.version ?? "unresolved"} · 当前项目 ku.lock`;
+            item.documentation = [dep.exports.map((entry) => entry.signature).join("\n"), dep.dependency.reason, dep.dependency.nextStep].filter(Boolean).join("\n");
             return item;
         });
     }
@@ -935,180 +1259,183 @@ function exportNameCompletions(document, position) {
     if (importPath === "std") {
         return completionModel_1.stdRootModules.map((name) => new vscode.CompletionItem(name, vscode.CompletionItemKind.Module));
     }
-    const uri = (0, imports_1.resolveImportUri)(document, importPath);
-    if (!uri || !fs.existsSync(uri.fsPath)) {
-        return [];
-    }
-    try {
-        return exportedNames(fs.readFileSync(uri.fsPath, "utf8")).map((name) => new vscode.CompletionItem(name, vscode.CompletionItemKind.Reference));
-    }
-    catch {
-        return [];
-    }
-}
-function exportedNames(source) {
-    const names = new Set();
-    for (const match of source.matchAll(/^\s*(?:(?:async\s+)?fn|struct|enum)\s+([A-Z][A-Za-z0-9_]*)/gm)) {
-        names.add(match[1]);
-    }
-    for (const match of source.matchAll(/^\s*([A-Z][A-Za-z0-9_]*)\s*=/gm)) {
-        names.add(match[1]);
-    }
-    return [...names].sort();
-}
-function fieldCompletions(fields, detail) {
-    return fields.map((field) => {
-        const item = new vscode.CompletionItem(field, vscode.CompletionItemKind.Field);
-        item.detail = detail;
+    const imported = (0, imports_1.readImportModule)(document, importPath);
+    return imported.exports.map((entry) => {
+        const item = new vscode.CompletionItem(entry.name, entry.kind === "function" ? vscode.CompletionItemKind.Function : vscode.CompletionItemKind.Struct);
+        item.detail = entry.signature;
+        item.documentation = imported.dependency ? `${imported.dependency.name}@${imported.dependency.version} · ${imported.uri?.fsPath}` : imported.uri?.fsPath;
         return item;
     });
 }
-function methodCompletions(methods) {
-    return methods.map((method) => new vscode.CompletionItem(method, vscode.CompletionItemKind.Method));
-}
-function dottedHoverKey(document, range) {
-    const line = document.lineAt(range.start.line).text;
-    const word = document.getText(range);
-    const before = line.slice(0, range.start.character);
-    const after = line.slice(range.end.character);
-    const receiver = /([A-Za-z_][A-Za-z0-9_]*)\.$/.exec(before)?.[1];
-    if (receiver) {
-        return `${receiver}.${word}`;
-    }
-    const member = /^\s*\.([A-Za-z_][A-Za-z0-9_]*)/.exec(after)?.[1];
-    if (member) {
-        return `${word}.${member}`;
-    }
-    return undefined;
+function expressionAtWord(document, range) {
+    return (0, semanticModel_1.expressionBefore)(document.lineAt(range.start.line).text, range.end.character)?.text ?? document.getText(range);
 }
 class KuHoverProvider {
     provideHover(document, position) {
-        const range = document.getWordRangeAtPosition(position);
-        if (!range) {
-            return undefined;
+        for (const imp of (0, imports_1.parseImports)(document)) {
+            if (!imp.pathRange.contains(position) || imp.path.startsWith("std")
+                || !completionIsCode(document, new vscode.Position(imp.pathRange.start.line, imp.pathRange.start.character - 1)))
+                continue;
+            const imported = (0, imports_1.readImportModule)(document, imp.path);
+            const text = imported.uri ? [imported.dependency ? `${imported.dependency.name}@${imported.dependency.version}` : imp.path,
+                imported.uri.fsPath, ...imported.exports.slice(0, 20).map((entry) => entry.signature)].join("\n\n")
+                : [imported.reason, imported.nextStep].filter(Boolean).join("\n\n");
+            return new vscode.Hover(new vscode.MarkdownString(text));
         }
+        const range = document.getWordRangeAtPosition(position);
+        if (!range || !completionIsCode(document, range.end))
+            return undefined;
         const word = document.getText(range);
-        const dotted = dottedHoverKey(document, range);
+        const expression = expressionAtWord(document, range);
+        const type = semanticModel(document).resolveExpression(expression, document.offsetAt(position));
+        if (type.kind !== "unknown") {
+            const key = type.qualifiedName ?? type.name?.split("(")[0] ?? expression;
+            const registered = type.kind === "function" ? (0, metadataModel_1.stdSignatures)(key) : [];
+            const signature = registered.length ? registered.map((entry) => entry.label).join("\n") : `${expression}: ${describeType(type)}`;
+            const markdown = new vscode.MarkdownString();
+            markdown.appendCodeblock(signature, "ku");
+            if (registered[0])
+                markdown.appendMarkdown(`\n${registered[0].documentation}\n\n实现：${registered[0].source}`);
+            return new vscode.Hover(markdown, range);
+        }
         const docs = {
-            "async": "`async fn` 调用会立即启动一次性 task 句柄，并且必须显式返回 `T!`。",
-            "await": "`await task?` 等价于 `(await task)?`；await 会消费 task，普通 task 只能 await 一次。",
-            "catch": "`catch (err)` 中 `err` 是结构化 Error 对象：`err.domain`、`err.code`、`err.message`。",
-            "err": "`err(message)` 返回 `Unknown!`，失败 payload 是 `{ domain, code, message }`。",
-            "fail": "`fail` 主动返回可恢复错误；字符串会包装为 `{ domain: \"ku\", code: \"fail\", message }`。",
-            "http": "`import \"std.http\"` 后使用。`http.get/post/request` 返回 `{ status, headers, body }!`；普通 route 不读请求写 `fn()`，读请求写 `fn(req)`，并返回 `http.text/html/json/empty/redirect(...)`。",
-            "service": "`http.service()` 返回带默认资源限制的 HTTP service 配置对象；普通 handler 接受 `fn()` 或 `fn(req)`，不接受 `fn(req, res)`。",
-            "status": "`http.status` 是 HTTP 协议状态码常量对象，例如 `http.status.ok`、`http.status.created`、`http.status.notFound`。",
-            "statusText": "`http.statusText(code)` 把 HTTP 状态码转成标准原因短语，例如 404 -> \"Not Found\"。",
-            "server": "`http.server()` 返回带默认 timeout/body/header/concurrency 限制的 server 配置对象。",
-            "fs": "`import \"std.fs\"` 后使用。支持 `fs.read/write/try_read/try_write/exists/read_dir`。",
-            "fs.exists": "`fs.exists(path)` 返回路径是否存在。",
-            "fs.read_dir": "`fs.read_dir(path)?` 返回排序后的目录条目路径数组。",
-            "bytes": "`import bytes from \"std.bytes\"` 后使用。`bytes.from_str(text)?` 和 `bytes.from_array(values)?` 创建拥有所有权的二进制数据；对象提供 len/get/to_str/clone。当前通过 native C 路径执行。",
-            "net": "`import net from \"std.net\"` 后使用。`net.client(config)?` 创建 TCP 客户端；对象提供 read/write/close，配置可启用 TLS。当前通过 native C 路径执行。",
-            "lexer": "`lexer.scan(text)` 返回词法单元字符串数组。",
-            "parser": "`parser.parse(textOrTokens)` 对源码返回解析调试文本；token 字符串数组只返回数量摘要。",
-            "config": "`import \"std.config\"` 后使用。支持 `config.env/env_file/yaml`。",
-            "task": "`task` 不是关键字。业务 task 来自 async fn 调用并只能 await；`std.task` 只提供 stats/stress 诊断压测函数。",
-            "object": "`object.get_or(obj, key, default)` 和 `obj.get_or(key, default)` 是显式宽松读取；普通对象缺键仍报错。",
-            "object.get_or": "`object.get_or(obj, key, default)` 缺键返回 default，存在则返回字段值；default 参数会立即求值。",
-            "get_or": "`obj.get_or(key, default)` 缺键返回 default；default 参数会立即求值，不是惰性计算。",
-            "time": "`time.now()` 返回 Unix 毫秒整数；`time.instant()` 返回 Time 对象。测量时长可使用进程内单调时钟 `time.steady_millis()`。",
-            "time.now": "`time.now()` 返回当前 Unix 毫秒整数，只接受零个参数。",
-            "time.instant": "`time.instant()` 返回 `{ kind: \"time.time\", millis }` Time 对象，供日期与格式化 API 使用。",
-            "time.elapsed": "`time.elapsed(previous)` 返回 Time 到当前墙上时间的毫秒差；测量耗时优先使用 `time.steady_millis()` 的差值。",
-            "time.steady_millis": "`time.steady_millis()` 返回进程内单调时钟的毫秒整数，不能作为 Unix 时间戳使用。",
-            "time.millis": "`time.millis()` 返回当前 Unix 毫秒；`time.millis(timeOrDuration)` 读取 Time/Duration 的毫秒值。",
-            "time.unix": "`time.unix()` 返回当前 Unix 秒；`time.unix(time)` 读取 Time 的 Unix 秒。",
-            "time.date": "`time.date()` 直接返回今天日期；`time.date(time)?` 按本地时区提取日期，带参数的重载均返回 Result：`time.date(time[, zone])?`、`time.date(year, month, day)?`。",
-            "time.datetime": "`time.datetime(year, month, day, hour, minute, second[, zone])?` 构造 Time。",
-            "time.duration": "`time.duration(ms)?` 或 `time.duration(value, unit)?` 构造 Duration；unit 支持 ms/s/m/h/d。",
-            "time.format": "`time.format(time, layout[, zone])?` 使用 yyyy/MM/dd/HH/mm/ss/SSS token 格式化。",
-            "time.parse": "`time.parse(text[, layout[, zone]])?` 解析 Time。",
-            "time.add": "`time.add(time, duration)` 返回加上 Duration 后的 Time。",
-            "time.sub": "`time.sub(time, duration)` 返回减去 Duration 后的 Time。",
-            "time.diff": "`time.diff(later, earlier)` 返回 Duration。",
-            "time.compare": "`time.compare(a, b)` 返回 -1、0 或 1。",
-            "time.parts": "`time.parts(time[, zone])?` 返回 year/month/day/hour/minute/second/millis 等字段。",
-            "time.weekday": "`time.weekday(date)` 返回 1..7，1 表示周一。",
-            "time.is_leap": "`time.is_leap(year)` 判断闰年。",
-            "time.days_in_month": "`time.days_in_month(year, month)?` 返回月份天数。",
-            "time.sleep": "`time.sleep(msOrDuration)?` 阻塞当前任务；async 中会进入 blocking pool。",
-            "match": "Ku 0.0.15 保留 `match`，不再支持 `switch`。",
-            "try_get": "`values.try_get(index)?` 越界时返回结构化 Error。",
-            "trim": "`text.trim()` 是 string 实例方法。",
+            async: "async fn 调用启动一次性 Task。await 消费该句柄；Result 的 ? 需要 Result 返回类型或 try。",
+            await: "await task? 等价于 (await task)?；普通 Task 不是可重复等待或可取消的生命周期句柄。",
+            fail: "fail 返回可恢复错误；用 Result 返回类型或 try/catch 处理。",
+            match: "match 分支匹配；插件不会将 switch 当作 Ku 语法。",
         };
-        const text = (dotted && docs[dotted]) || docs[word];
-        return text ? new vscode.Hover(new vscode.MarkdownString(text)) : undefined;
+        return docs[word] ? new vscode.Hover(new vscode.MarkdownString(docs[word])) : undefined;
     }
+}
+function symbolLocation(document, symbol) {
+    if (symbol.start < 0)
+        return undefined;
+    const origin = symbolOrigins.get(symbol);
+    if (!origin)
+        return new vscode.Location(document.uri, document.positionAt(symbol.start));
+    return sourceLocation(origin.uri, origin.source, symbol.start);
+}
+function sourceLocation(uri, source, offset) {
+    const lines = source.slice(0, offset).split(/\r\n|\n|\r/);
+    return new vscode.Location(uri, new vscode.Position(lines.length - 1, lines[lines.length - 1].length));
 }
 class KuDefinitionProvider {
     provideDefinition(document, position) {
-        const importDef = importDefinition(document, position);
-        if (importDef) {
-            return importDef;
+        const imports = (0, imports_1.parseImports)(document).filter((entry) => completionIsCode(document, new vscode.Position(entry.pathRange.start.line, entry.pathRange.start.character - 1)));
+        for (const imp of imports) {
+            if (!imp.pathRange.contains(position))
+                continue;
+            if (!completionIsCode(document, new vscode.Position(imp.pathRange.start.line, imp.pathRange.start.character - 1)))
+                continue;
+            const imported = (0, imports_1.readImportModule)(document, imp.path);
+            return imported.uri ? new vscode.Location(imported.uri, new vscode.Position(0, 0)) : undefined;
         }
         const range = document.getWordRangeAtPosition(position);
-        if (!range) {
+        if (!range || !completionIsCode(document, range.end))
+            return undefined;
+        const word = document.getText(range), model = semanticModel(document), offset = document.offsetAt(position);
+        const expression = expressionAtWord(document, range);
+        const dot = expression.lastIndexOf(".");
+        if (dot >= 0) {
+            const receiver = expression.slice(0, dot).replace(/\?$/, "");
+            const field = model.memberSymbols(receiver, offset).find((entry) => entry.name === word);
+            if (field)
+                return symbolLocation(document, field);
             return undefined;
         }
-        const word = document.getText(range);
-        const sameFile = findDefinitionInDocument(document, word);
-        if (sameFile) {
-            return sameFile;
-        }
-        for (const imp of (0, imports_1.parseImports)(document)) {
-            const uri = (0, imports_1.resolveImportUri)(document, imp.path);
-            if (!uri || !fs.existsSync(uri.fsPath)) {
+        const local = model.resolve(word, offset);
+        if (local && local.kind !== "module")
+            return symbolLocation(document, local);
+        for (const imp of imports) {
+            const name = imp.kind === "named" ? imp.names.find((entry) => entry.local === word)?.source
+                : imp.module === word ? undefined : imp.kind === "glob" ? word : undefined;
+            if (!name && imp.module !== word)
                 continue;
-            }
-            const importedName = imp.kind === "named" ? imp.names.find((name) => name.local === word)?.source : word;
-            if (!importedName)
+            const imported = (0, imports_1.readImportModule)(document, imp.path);
+            if (!imported.uri || imported.source === undefined)
                 continue;
             if (imp.module === word)
-                return new vscode.Location(uri, new vscode.Position(0, 0));
-            try {
-                const source = fs.readFileSync(uri.fsPath, "utf8");
-                const target = findDefinitionInText(uri, source, importedName);
-                if (target)
-                    return target;
-            }
-            catch {
-                // The imported file may be removed or become unreadable after resolution.
-            }
+                return new vscode.Location(imported.uri, new vscode.Position(0, 0));
+            const declaration = imported.exports.find((entry) => entry.name === name);
+            if (declaration)
+                return sourceLocation(imported.uri, imported.source, declaration.start);
         }
         return undefined;
     }
 }
-function importDefinition(document, position) {
-    for (const imp of (0, imports_1.parseImports)(document)) {
-        if (imp.pathRange.contains(position)) {
-            const uri = (0, imports_1.resolveImportUri)(document, imp.path);
-            return uri && fs.existsSync(uri.fsPath) ? new vscode.Location(uri, new vscode.Position(0, 0)) : undefined;
+class KuSignatureProvider {
+    provideSignatureHelp(document, position) {
+        const source = document.getText(new vscode.Range(new vscode.Position(0, 0), position));
+        const stack = [];
+        let state = "code";
+        for (let i = 0; i < source.length; i++) {
+            const ch = source[i], next = source[i + 1];
+            if (state === "line") {
+                if (ch === "\n")
+                    state = "code";
+                continue;
+            }
+            if (state === "block") {
+                if (ch === "*" && next === "/") {
+                    state = "code";
+                    i++;
+                }
+                continue;
+            }
+            if (state !== "code") {
+                if (ch === "\\")
+                    i++;
+                else if (ch === state)
+                    state = "code";
+                continue;
+            }
+            if (ch === "/" && next === "/") {
+                state = "line";
+                i++;
+                continue;
+            }
+            if (ch === "/" && next === "*") {
+                state = "block";
+                i++;
+                continue;
+            }
+            if (ch === '"' || ch === "'" || ch === "\x60") {
+                state = ch;
+                continue;
+            }
+            if ("([{".includes(ch))
+                stack.push({ char: ch, index: i, commas: 0 });
+            else if (")]}".includes(ch))
+                stack.pop();
+            else if (ch === "," && stack.length)
+                stack[stack.length - 1].commas++;
         }
+        const frame = [...stack].reverse().find((entry) => entry.char === "(");
+        if (!frame)
+            return undefined;
+        const callee = (0, semanticModel_1.expressionBefore)(source, frame.index)?.text;
+        if (!callee)
+            return undefined;
+        const type = semanticModel(document).resolveExpression(callee, document.offsetAt(position));
+        if (type.kind !== "function")
+            return undefined;
+        const registered = (0, metadataModel_1.stdSignatures)(type.qualifiedName ?? type.name?.split("(")[0] ?? callee);
+        const help = new vscode.SignatureHelp();
+        help.signatures = registered.length ? registered.map((entry) => {
+            const signature = new vscode.SignatureInformation(entry.label, entry.documentation);
+            signature.parameters = entry.parameters.map((parameter) => new vscode.ParameterInformation(`${parameter.name}${parameter.optional ? "?" : ""}: ${parameter.type}`));
+            return signature;
+        }) : [new vscode.SignatureInformation(`${callee}: ${describeType(type)}`)];
+        if (!registered.length)
+            help.signatures[0].parameters = (type.parameters ?? [])
+                .map((parameter) => new vscode.ParameterInformation(`${parameter.name}: ${describeType(parameter.type)}`));
+        help.activeParameter = frame.commas;
+        const count = source.slice(frame.index + 1).trim() ? frame.commas + 1 : 0;
+        help.activeSignature = registered.findIndex((entry) => count <= entry.parameters.length && count >= entry.parameters.filter((p) => !p.optional).length);
+        if (help.activeSignature < 0)
+            help.activeSignature = 0;
+        return help;
     }
-    return undefined;
-}
-function findDefinitionInDocument(document, word) {
-    return findDefinitionInText(document.uri, document.getText(), word);
-}
-function findDefinitionInText(uri, source, word) {
-    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const patterns = [
-        new RegExp(`^\\s*(?:async\\s+)?fn\\s+${escaped}\\b`, "m"),
-        new RegExp(`^\\s*struct\\s+${escaped}\\b`, "m"),
-        new RegExp(`^\\s*enum\\s+${escaped}\\b`, "m"),
-        new RegExp(`^\\s*${escaped}\\s*=`, "m"),
-    ];
-    for (const pattern of patterns) {
-        const match = pattern.exec(source);
-        if (match) {
-            const before = source.slice(0, match.index);
-            const line = before.split(/\r?\n/).length - 1;
-            const col = match[0].search(/\S/);
-            return new vscode.Location(uri, new vscode.Position(line, Math.max(0, col)));
-        }
-    }
-    return undefined;
 }
 class KuSymbolProvider {
     provideDocumentSymbols(document) {
@@ -1188,16 +1515,4 @@ class KuFormatter {
         const full = new vscode.Range(document.positionAt(0), document.positionAt(text.length));
         return [vscode.TextEdit.replace(full, formatted)];
     }
-}
-function readKuModDependencies(document) {
-    const root = workspaceFolder(document.uri);
-    if (!root) {
-        return [];
-    }
-    const manifest = path.join(root, "ku.mod");
-    if (!fs.existsSync(manifest)) {
-        return [];
-    }
-    const text = fs.readFileSync(manifest, "utf8");
-    return [...text.matchAll(/^\s*([A-Za-z_][A-Za-z0-9_-]*)\.(?:version|source|checksum)\s*=/gm)].map((m) => m[1]);
 }

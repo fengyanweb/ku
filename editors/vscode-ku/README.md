@@ -1,58 +1,87 @@
-# Ku Language for VS Code
+# Ku Programming Language for VS Code
 
 [中文说明](README.zh-CN.md)
 
-Editor support for Ku 0.0.19: `.ku`, `ku.mod`, and `ku.lock` highlighting, snippets, built-in completion/hover, local/import definition lookup, outline, conservative formatting, and commands backed by an installed Ku CLI. This is not an LSP and does not infer arbitrary receiver types or resolve package caches for navigation.
+Extension **0.0.21** (`ku-lang.ku-language`) supports the current Ku language workflow: write and run a file, edit structured asynchronous HTTP/PG code, and work with installed, locked third-party packages. Extension versions are independent of CLI versions. This delivery was checked against the daily **Ku 0.0.20** SDK whose source identity starts with `264e53d44f21`; another SDK with the same version number may expose different capabilities.
 
-## Install
+## Install and choose Ku
 
-Install the delivered `ku-language-0.0.19.vsix` using **Extensions → … → Install from VSIX…**, then reload VS Code. For a deliberate reinstall of the same version:
+Install `ku-language-0.0.21.vsix` with **Extensions → … → Install from VSIX…**, then reload the window when VS Code requests it. A CLI alternative is:
 
 ```sh
-code --install-extension /absolute/path/ku-language-0.0.19.vsix --force
+code --install-extension /absolute/path/ku-language-0.0.21.vsix --force
 ```
 
-The extension does not include or install Ku, database drivers, or native target packs. Install the CLI separately. This local delivery does not establish Marketplace or GitHub Release availability.
+Run **Ku：选择可执行文件** to pick an installed `ku` or Windows `ku.exe`. The status bar and **Ku: Show Version** show the actual executable path, CLI version and extension version. The extension does not install or replace an SDK or alter PATH.
 
-## Select Ku
+The existing resource setting `ku.executablePath` is preserved. It accepts Chinese/space-containing paths, `${workspaceFolder}`, `${userHome}`, `~/` and workspace-relative paths without shell quoting or arguments. An invalid explicit path is reported, without falling back to another SDK. When empty, discovery checks the extension host PATH and the containing workspace's release/target locations. Remote windows require a remote CLI. Static editing remains available without a CLI and in Restricted Mode; tool execution requires a trusted workspace.
 
-`ku.executablePath` is a resource setting: each folder in a multi-root workspace can select its own CLI. Enter an executable path without shell quotes or arguments. Chinese characters and spaces are supported. For example:
+## What the editor understands
 
-```json
-{
-  "ku.executablePath": "${userHome}/tools/Ku SDK/ku"
+- Local lexical scopes, parameters, declarations, closures and aliases. Go to Definition respects function/block boundaries.
+- Structs and literal object fields; known function return types, async Task and Result unwrapping; nested destructuring with renamed/default/rest bindings and optional `?.` access. Unknown or conflicting types do not receive invented fields.
+- Signature help and hover metadata for the delivered time Date/Time/Duration overloads, non-consuming array concat/first/last, HTTP service/client/request/response, ordinary and typed PG, and asynchronous PG calls. A PG client's query inside an async function is the existing async runtime path; it is not a new `query_async` API.
+- Highlighting/snippets for structured asynchronous code, Result, nullable fields and rest patterns. Completion in comments and ordinary strings is suppressed, with import paths handled separately.
+- Formatting preserves strings, multiline literals, comment text, CRLF and indentation options. It leaves unfinished literals alone. Existing structured HTTP and async HTTP/PG examples were checked before/after formatting and for a second identical formatting pass.
+
+The model is deliberately conservative and local, rather than a complete language server. It caches document parsing by document version and uses a compact audited metadata table, not an SDK scan on every open. Runtime/compiler errors remain authoritative. Dynamic JSON and arbitrary control-flow/type inference have limits; see [VERIFICATION.md](VERIFICATION.md).
+
+## Run, check, build and tools
+
+Existing command IDs and user check settings are preserved. Run uses an interactive integrated process terminal, targeting the active editor or the file clicked in Explorer, and saves dirty content first. Cancelling or failing a save stops the command. In a multi-root workspace commands use the containing Ku project; loose files use their directory.
+
+| Command | CLI behavior |
+| --- | --- |
+| Ku Run | `ku run FILE`; interactive stdin belongs to this terminal. |
+| Check Current File | `ku check --json FILE`; Problems shows compiler diagnostics, Ku Output shows command/cwd/errors. |
+| Build Current File | `ku build FILE`; follows the chosen CLI's default backend. The tested daily SDK defaults to native C. |
+| Ku：构建选项 | One picker for supported default/Release/locked/Runner choices; Runner requires its matching toolchain doctor check. |
+| Show IR | `ku ir FILE`. |
+| Emit Native C Source | Existing `ku build --native FILE` compatibility form; emits C only. |
+| Package GC | Existing project cache collection command; invoke deliberately. |
+| Ku：安装依赖 | Explicit `ku i` restore or source selection; supports source text and local file/directory selection when the chosen CLI supports it. |
+
+When a package file is not its ku.mod main entry, Build asks for the explicit output path required by the CLI; the backend remains unchanged.
+
+Build/IR/install tools tee output to the task terminal and Ku Output, with common credential patterns redacted in the latter. Stop a task/terminal to stop its own process tree. The extension does not call a Run action “debugging” and does not provide breakpoints.
+
+The tested daily compiler rejects both `input()` and `input(prompt)` as undefined functions. No unsupported input snippet is advertised. Run still uses a terminal that accepts stdin for programs/toolchains which support it.
+
+## Locked packages
+
+Open a real Ku project with `ku.mod` and `ku.lock`, then run **Ku：安装依赖** deliberately to restore or add a dependency. The CLI owns manifest and lock updates. A reproducible local source such as `./vendor/pysubs2` works without registry/network access; Git/PyPI sources follow `ku help i` and may need additional CLI configuration.
+
+After a package is installed, import completion lists actual public exports, for example `import { FromMs } from "@pysubs2/time"` when that package really exports `FromMs`. Navigation uses the current project's lock identity and readable Ku sources/generated binding declarations. It does not select another version from a neighbouring project. Missing/mismatched locks or caches explain the problem and suggest an explicit restore; hovering an import displays the detail. Binary-only packages have no fabricated source target.
+
+Opening, saving, completing or navigating never installs packages, starts services, connects to a database or fetches from the network. Restricted Mode preserves static browsing but does not launch a workspace executable, check, build or install dependencies.
+
+## Five-minute example
+
+1. Select your installed CLI and save this as a `.ku` file, including in a Chinese/space-containing folder.
+2. Type `rest.` below to inspect the known remaining fields; hover `today` and `time.date`. Use Go to Definition on `name`.
+3. Click Run, then Check and Build. Review the actual tool path/version in the status bar or Show Version.
+
+```ku
+import time from "std.time"
+
+struct Reply { title: str, count: int }
+
+async fn Make(): Reply! {
+    return ok(Reply { title: "你好🙂", count: 2 })
+}
+
+async fn main(): null! {
+    reply = (await Make())?
+    {title: name, ...rest} = reply
+    println(name)
+    println(rest.count)
+    today = time.date()
+    println(today.year)
+    return ok(null)
 }
 ```
 
-`${workspaceFolder}`, `${userHome}`, `~/`, and paths relative to the containing workspace folder are supported. A relative path for a loose file is resolved against its directory. An invalid explicit setting is reported; it does not silently select another Ku. A probe must exit successfully and identify itself as `ku <version>`.
-
-With the setting empty, search order is `ku` in the VS Code extension host's PATH, the containing workspace's `release/<rust-target>/ku[.exe]`, then `target/release` and `target/debug`. Bundle targets are Windows x64, Linux x64, and macOS ARM64; other architectures can use an explicit path or PATH. No SDK or PATH setting is modified. Remote windows use the CLI installed on the remote extension host. Restricted Mode and virtual workspaces do not activate the executable extension.
-
-## Commands and diagnostics
-
-| Command | Existing CLI invocation | Behavior |
-| --- | --- | --- |
-| Ku Run | `ku run FILE` | Requires a main function; runs in a process task terminal. |
-| Check Current File | `ku check --json FILE` | Saves first, then shows diagnostics in Problems and details in Ku Output. |
-| Show IR | `ku ir FILE` | Prints IR in a process task terminal. |
-| Build Current File | `ku build FILE` | Uses the CLI's default backend/profile; its matching toolchain must be installed. |
-| Emit Native C Source | `ku build --native FILE` | Emits C source only; this compatibility CLI form does not link an executable. |
-| Package GC | `ku package gc FILE` | Uses the containing Ku project and removes unused dependency cache entries. |
-| Show Version | `ku version` | Shows the selected CLI and extension versions. |
-
-Commands save dirty files and stop when saving fails. Workspace tasks pass executable and arguments directly, without shell quoting or separator conversion, and can be stopped in VS Code's task UI. With no folder open, the CLI runs directly as the terminal executable with the same argument array; close that terminal to stop it. The CLI determines build output paths and toolchain errors.
-
-Automatic checks run on open/save by default. The CLI reads saved files, so dirty buffers are never presented as freshly checked; editing invalidates affected diagnostics. `ku.checkOnChange` only debounces checks of saved documents, and does not add an unsaved-buffer compiler protocol. At most two check jobs run at once; newer checks replace pending work for that root and cancel obsolete checks. Checks keep the existing 15-second bound. Only an older CLI explicitly rejecting `--json` triggers text fallback; launch errors and timeouts remain visible in Ku Output.
-
-Diagnostics use the compiler's actual target files, including imported sources, and map Unicode scalar columns to VS Code UTF-16 positions. Shared imported-file diagnostics are retained until all contributing roots clear them. Closing a root, changing Ku settings, and deactivation cancel its pending work. Source mapping has bounded file/byte/read limits; when unavailable, the diagnostic says so.
-
-## Editor features and limits
-
-Completion uses a built-in API/name model, including ordinary one-use async tasks, `std.http`, `std.task`, `std.json`, `std.bytes`, `std.net`, and time APIs. It is not semantic type inference. Local import completion preserves the directory prefix, including Chinese and space-containing paths; dependency prefix labels come from `ku.mod`. Package-cache navigation is not supported.
-
-The formatter adjusts indentation, spacing, blank lines and adjacent `else`/`catch`/`finally`. It honors VS Code indentation options and file line endings, protects strings (including multiline literals) and comment contents, and returns unchanged input for unfinished literals/comments. It does not invoke a CLI formatter. Quick fixes and outline/definition lookup are heuristic; review edits as usual.
-
-## Build locally
+## Development and verification
 
 Requires Node.js 20+ and npm. From this directory:
 
@@ -62,9 +91,7 @@ npm run lint
 npm run typecheck
 npm test
 npm run build
-npm run package -- --out /absolute/output/ku-language-0.0.19.vsix
+npm run package
 ```
 
-`lint` uses TypeScript's strict unused-symbol checks; no separate lint dependency is required. Existing model/formatter/diagnostic tests are reused. The VSIX includes compiled `out/`, grammars, snippets, docs and notices, without development dependencies, source or temporary tests. For a development host, compile and launch `code --extensionDevelopmentPath=/absolute/path/to/editors/vscode-ku`.
-
-See [CHANGELOG.md](CHANGELOG.md) and [VERIFICATION.md](VERIFICATION.md) for this local delivery. Apache-2.0; original `LICENSE.txt` and `NOTICE` are included.
+Tests reuse the existing extension model/formatter/diagnostic tests. A plugin-only CI matrix runs these commands on macOS, Linux and Windows without building Ku or running performance workloads. An unexecuted CI definition is not a platform acceptance result: actual runs and installed-VSIX checks are listed in [VERIFICATION.md](VERIFICATION.md). [CHANGELOG.md](CHANGELOG.md) records editor changes. Apache-2.0; original LICENSE.txt and NOTICE are included. This delivery does not publish to Marketplace or change Ku release tags.

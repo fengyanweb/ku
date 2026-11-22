@@ -1,66 +1,82 @@
 # Ku VS Code 插件
 
-适配 Ku 0.0.19。提供 `.ku`、`ku.mod`、`ku.lock` 高亮、代码片段、内置补全和悬浮提示、本地/导入符号跳转、Outline、格式化，以及调用现有 Ku CLI 的命令。没有完整 LSP，不推断任意变量类型，不解析包缓存做依赖跳转。
+插件 **0.0.21**，扩展 ID 仍为 **ku-lang.ku-language**。提供三个开发流程：写并运行 Ku 文件，维护结构化异步 HTTP/PG 服务，使用已安装并锁定的第三方依赖。插件版本独立于语言版本；本次按日常 **Ku 0.0.20**、源码身份 `264e53d44f21` 开头的 SDK 核对，同为 0.0.20 的其他安装包可能有能力差异。
 
-## 安装与解释器
+## 安装和选择 CLI
 
-在 VS Code 扩展面板选择 **… → 从 VSIX 安装**，选取本次交付的 `ku-language-0.0.19.vsix` 并重载窗口。同版本重装可执行：
+用扩展菜单“从 VSIX 安装”选择 `ku-language-0.0.21.vsix`；需要时重载窗口。也可运行：
 
 ```sh
-code --install-extension /绝对路径/ku-language-0.0.19.vsix --force
+code --install-extension /绝对路径/ku-language-0.0.21.vsix --force
 ```
 
-插件与 CLI 分别安装，不包含数据库驱动或 native target pack。本次为本地交付，不代表市场或 GitHub Release 已公开发布。
+命令 **Ku：选择可执行文件** 可选择 `ku` 或 Windows 的 `ku.exe`。状态栏及 Show Version 显示实际工具路径、CLI 版本和插件版本。插件不替换 SDK，不更改 PATH。
 
-`ku.executablePath` 支持文件夹级设置、多根工作区、中文和空格路径。填写可执行文件路径，不加 shell 引号或命令参数：
+沿用 `ku.executablePath`、`checkOnOpen`、`checkOnSave`、`checkOnChange`。可执行路径支持中文、空格、`${workspaceFolder}`、`${userHome}`、`~/` 和相对工作区路径，不加 shell 引号/参数。显式设置错误会提示选择，不会偷偷改用别的 SDK。留空按扩展宿主 PATH、所属工作区 release/target 目录查找。远程窗口需要远端 CLI。缺 CLI 和受限模式均可静态编辑，工具执行需要信任工作区。
 
-```json
-{
-  "ku.executablePath": "${userHome}/tools/Ku SDK/ku"
+## 补全、签名和跳转
+
+- 识别词法作用域、函数参数/局部声明、闭包别名；同名局部变量不跳到另一个函数。
+- 从 struct、对象字面量、已知函数返回、Task/await/Result 解包推导真实字段；支持嵌套解构、字段重命名、默认值、rest 和可选字段访问。未知或分支冲突的类型不编造字段。
+- 标准库提示来自紧凑的已核对元数据：time 日期/Duration 及重载、array concat/first/last、HTTP service/client/request/response、普通/typed PG，以及 async 函数内已有的 PG query 路径；没有虚构 query_async 接口。
+- 高亮和片段覆盖上述结构化异步语法。非 import 字符串和注释内不弹代码补全。
+- 格式化保护中文、emoji、字符串、模板、多行内容与注释，遵循换行符和缩进设置。真实 structured HTTP、async HTTP/PG 示例格式化后仍通过 check，第二次不再变化。
+
+这是有边界的本地编辑器模型，不是完整 LSP。按文档版本缓存解析，不在每次打开文件时扫描整个 SDK；动态对象和复杂控制流无法保证推断。CLI 编译器诊断是最终依据。
+
+## 运行、检查和构建
+
+Run 使用可输入的集成进程终端，编辑器按钮针对当前文件，资源管理器右键针对被点的文件。先保存再执行，取消/保存失败即停止。项目内采用最近 ku.mod 的目录；单文件也能工作。
+
+| 入口 | 实际行为 |
+| --- | --- |
+| Ku Run | `ku run FILE`，终端保留 stdin。 |
+| Check Current File | `ku check --json FILE`，诊断进 Problems；命令、cwd 和错误进 Ku 输出。 |
+| Build Current File | `ku build FILE`，服从 CLI 默认后端；本次日常 SDK 默认为原生 C。 |
+| Ku：构建选项 | 一个选择器提供 CLI 已支持的默认、Release、锁定依赖、Runner；Runner 先检查匹配工具链。 |
+| Show IR | `ku ir FILE`。 |
+| Emit Native C Source | 保留 `ku build --native FILE`，兼容形式仅生成 C。 |
+| Package GC | 用户主动触发项目依赖缓存回收。 |
+| Ku：安装依赖 | 用户主动调用 `ku i` 恢复、输入来源或选择本地文件/目录。 |
+
+构建非 ku.mod main 的文件时，会让用户选择 CLI 要求的显式输出路径，仍不改后端。
+
+构建、IR 和安装输出同步到任务终端及 Ku 输出；后者遮蔽常见凭据字段。停止任务或关闭终端只终止本次进程树。插件不把运行称为断点调试。
+
+当前日常编译器对 `input()` 和 `input(prompt)` 均返回未定义函数，因此本次不提前提供这两种片段。Run 仍提供能接收 stdin 的原生终端，供支持读取输入的程序/工具链使用。
+
+## 第三方依赖
+
+项目需有真实 ku.mod/ku.lock。主动执行“Ku：安装依赖”，可选择恢复，输入 CLI 接受的来源，或选择本地 Ku 包/Python 文件；清单与锁由 CLI 管理。可用 `./vendor/pysubs2` 这样的本地小包离线复现；Git、PyPI 来源按所选 CLI 的 `ku help i` 配置。
+
+安装后，`import { … } from "@pysubs2/time"` 只提示该项目锁定包实际公开的导出。能读到 Ku 源码或生成绑定声明时才能跳转，不使用其他项目缓存中的同名版本。缺锁、失配或缺缓存时，悬停 import 可查看原因和手动恢复步骤；二进制包不伪造声明位置。
+
+打开、保存、补全、跳转不会自动安装、联网、起服务或连接数据库；受限工作区只提供静态浏览和编辑。
+
+## 五分钟例子
+
+先选择 CLI，在中文或带空格目录保存以下文件。输入 `rest.` 查看真实字段，悬停 `today` / `time.date`，对 `name` 跳转；随后使用 Run、Check、Build。
+
+```ku
+import time from "std.time"
+
+struct Reply { title: str, count: int }
+
+async fn Make(): Reply! {
+    return ok(Reply { title: "你好🙂", count: 2 })
+}
+
+async fn main(): null! {
+    reply = (await Make())?
+    {title: name, ...rest} = reply
+    println(name)
+    println(rest.count)
+    today = time.date()
+    println(today.year)
+    return ok(null)
 }
 ```
 
-支持 `${workspaceFolder}`、`${userHome}`、`~/`、相对工作区路径；单独打开的文件以文件所在目录解析相对路径。显式路径错误会提示，避免悄悄换用其他 Ku；探测会同时检查退出码和 `ku <版本>` 输出。
+## 开发与验收
 
-留空时依次查找 VS Code 扩展进程的 PATH、当前文件所属工作区 `release/<rust-target>/ku[.exe]`、`target/release`、`target/debug`。bundle 映射覆盖 Windows x64、Linux x64、macOS ARM64；其他架构请设置路径或使用 PATH。插件不修改 SDK、PATH。远程窗口使用远端扩展宿主的 CLI。受限模式和虚拟工作区不激活执行代码的扩展。
-
-## 命令的实际行为
-
-| 命令 | CLI | 结果 |
-| --- | --- | --- |
-| Ku Run | `ku run FILE` | 在进程任务终端运行，需要 main。 |
-| Check Current File | `ku check --json FILE` | 先保存，再在 Problems 和 Ku Output 显示诊断。 |
-| Show IR | `ku ir FILE` | 终端打印 IR。 |
-| Build Current File | `ku build FILE` | 使用 CLI 默认后端/profile，需要对应版本工具链。 |
-| Emit Native C Source | `ku build --native FILE` | 只生成 C 源码；现有 CLI 的这个兼容形式不链接可执行程序。 |
-| Package GC | `ku package gc FILE` | 按所属项目回收无用依赖缓存，会实际删除符合条件的缓存项。 |
-| Show Version | `ku version` | 显示实际 CLI 及插件版本。 |
-
-命令先保存脏文件，保存失败即停止。工作区进程任务直接传入可执行文件和参数，保留原生路径；可在 VS Code 任务界面停止。未打开文件夹时，直接把 CLI 作为终端可执行文件并传入同一参数数组，可关闭该终端停止。构建输出位置与工具链错误由 CLI 决定。
-
-默认打开/保存时检查。CLI 读取磁盘文件，未保存编辑会使相关旧诊断失效，不会把旧磁盘内容当作当前编辑结果。`ku.checkOnChange` 只对已保存文档防抖，不新增未保存缓冲区协议。检查最多同时运行两个作业，同根只保留最新待办，过期检查会取消，沿用 15 秒上限。只有明确不支持 `--json` 的旧 CLI 才回退文本检查；启动失败、超时会保留错误说明。
-
-诊断指向实际出错文件，包含导入文件，并把 Unicode 标量列映射为 VS Code UTF-16 位置。多个入口对同一导入文件的诊断按来源聚合，不互相清除。关闭入口、修改 Ku 配置、停用扩展时取消待办。读取诊断源码有文件数、大小和时间边界；无法映射列时会明确说明。
-
-## 补全和格式化边界
-
-补全依赖插件内置 API/名称模型，包括 async 一次性 Task、HTTP、JSON、bytes/net 和时间 API，不代表真实类型推导。本地 import 补全保留目录前缀，支持中文、空格及对应引号中的另一种引号；依赖前缀从 `ku.mod` 读取，不提供完整包缓存导航。
-
-格式化调整缩进、运算符/逗号空格、空行及相邻 else/catch/finally，遵循编辑器缩进设置和原换行符，保护字符串（含多行内容）及注释文字。未闭合字面量/注释保持原文。它不调用 CLI 格式化器。快速修复、Outline 和定义查找仍为启发式功能。
-
-## 本地构建
-
-需要 Node.js 20+ 和 npm，在本目录运行：
-
-```sh
-npm ci --ignore-scripts
-npm run lint
-npm run typecheck
-npm test
-npm run build
-npm run package -- --out /绝对输出目录/ku-language-0.0.19.vsix
-```
-
-lint 使用 TypeScript 严格的未使用符号检查，无新增依赖；复用已有模型、格式化和诊断测试。VSIX 只含编译产物、语法、片段、文档和许可证，不包含开发依赖、源码或临时测试。开发宿主可在编译后使用 `code --extensionDevelopmentPath=/绝对路径/editors/vscode-ku` 启动。
-
-本次记录见 [CHANGELOG.md](CHANGELOG.md)、[VERIFICATION.md](VERIFICATION.md)。Apache-2.0；分发包保留原始 `LICENSE.txt` 与 `NOTICE`。
+Node.js 20+，在本目录运行 `npm ci --ignore-scripts`、`npm run lint`、`npm run typecheck`、`npm test`、`npm run build`、`npm run package`。复用已有测试，插件专用 CI 矩阵覆盖 macOS/Linux/Windows，不构建 Ku 或跑性能工作负载。CI 定义不等于三平台已经实跑；安装后的 VSIX、实际平台和限制见 [VERIFICATION.md](VERIFICATION.md)，更新见 [CHANGELOG.md](CHANGELOG.md)。Apache-2.0，保留 LICENSE.txt/NOTICE；本次不发布 Marketplace 或修改 Ku 版本标签。

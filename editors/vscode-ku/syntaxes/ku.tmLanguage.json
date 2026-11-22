@@ -6,9 +6,10 @@
     { "include": "#comments" },
     { "include": "#strings" },
     { "include": "#numbers" },
+    { "include": "#functions" },
     { "include": "#keywords" },
     { "include": "#types" },
-    { "include": "#functions" },
+    { "include": "#operators" },
     { "include": "#constants" }
   ],
   "repository": {
@@ -39,14 +40,24 @@
     },
     "types": {
       "patterns": [
-        { "name": "storage.type.ku", "match": "\\b(int|float|bool|str|null)\\b" }
+        { "name": "storage.type.ku", "match": "\\b(int|float|bool|str|null|Task|Result|Error|HttpRequest|HttpResponse)\\b" }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        { "name": "keyword.operator.optional.ku", "match": "\\?\\.|\\?(?!\\.)" },
+        { "name": "keyword.operator.rest.ku", "match": "\\.\\.\\." },
+        { "name": "keyword.operator.result.ku", "match": "!(?!=)" },
+        { "name": "keyword.operator.arrow.ku", "match": "=>" },
+        { "name": "keyword.operator.union.ku", "match": "(?<!\\|)\\|(?!\\|)" }
       ]
     },
     "functions": {
       "patterns": [
-        { "name": "entity.name.function.ku", "match": "(?<=\\bfn\\s)[A-Za-z_][A-Za-z0-9_]*" },
+        { "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)", "captures": { "1": { "name": "storage.type.function.ku" }, "2": { "name": "entity.name.function.ku" } } },
+        { "match": "\\b(struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)", "captures": { "1": { "name": "storage.type.ku" }, "2": { "name": "entity.name.type.ku" } } },
         { "name": "support.function.builtin.ku", "match": "\\b(len|str|ok|err|println)\\b(?=\\s*\\()" },
-        { "name": "support.function.stdlib.ku", "match": "\\b(string|array|object|json|time|lexer|parser|fs|http|config|task|pg|redis|mysql)\\.[A-Za-z_][A-Za-z0-9_]*\\b" }
+        { "name": "support.function.stdlib.ku", "match": "\\b(string|array|object|json|time|lexer|parser|fs|http|config|task|pg|redis|mysql|bytes|net|zstd|gzip|deflate)\\.[A-Za-z_][A-Za-z0-9_]*\\b" }
       ]
     },
     "constants": {
