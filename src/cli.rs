@@ -7010,16 +7010,15 @@ fn compile_c_source_with_output(
             && candidate.kind == CCompilerKind::Clang;
         let needs_native_tls_probe = needs_native_tls
             && (target.is_none() || candidate.kind == CCompilerKind::Preconfigured);
-        let windows_gnu_interop =
-            features.interop && target_is_windows && candidate.kind != CCompilerKind::ZigCc;
+        let may_link_gnu_runtime = target_is_windows && candidate.kind != CCompilerKind::ZigCc;
         let explicit_link_target = declared_target.or_else(|| {
             target_arguments
                 .iter()
                 .find_map(|argument| argument.strip_prefix("--target="))
         });
-        let needs_interop_probe = windows_gnu_interop && explicit_link_target.is_none();
+        let needs_gnu_runtime_probe = may_link_gnu_runtime && explicit_link_target.is_none();
         let probed_compiler_target = if declared_target.is_none()
-            && (needs_database_clang_probe || needs_native_tls_probe || needs_interop_probe)
+            && (needs_database_clang_probe || needs_native_tls_probe || needs_gnu_runtime_probe)
         {
             match probe_clang_default_target(&candidate, link_deadline) {
                 Ok(target) => Some(target),
@@ -7052,9 +7051,9 @@ fn compile_c_source_with_output(
         } else {
             None
         };
-        // MinGW can otherwise import the compiler's libwinpthread even for a
-        // plain C executable. Keep generated interop apps runnable off SDK PATH.
-        let static_interop_runtime = windows_gnu_interop
+        // MinGW can import the compiler's libwinpthread even for ordinary C.
+        // Resolve its runtime statically while retaining explicit DLL imports.
+        let static_gnu_runtime = may_link_gnu_runtime
             && explicit_link_target
                 .or(probed_compiler_target.as_deref())
                 .is_some_and(crate::interop::gnu_paths::is_target);
@@ -7239,7 +7238,7 @@ fn compile_c_source_with_output(
         if let Some(opt_level) = profile.rustc_opt_level() {
             command.arg(format!("-O{opt_level}"));
         }
-        if static_link || static_interop_runtime {
+        if static_link || static_gnu_runtime {
             command.arg("-static");
         }
         if needs_winsock {
@@ -7297,8 +7296,8 @@ fn compile_c_source_with_output(
                         continue;
                     }
                 };
-                if static_interop_runtime {
-                    interop_binding::publish_gnu_runtime_notice(output_directory)?;
+                if static_gnu_runtime {
+                    interop_binding::publish_gnu_runtime_notice(output, features.interop)?;
                 }
                 install_verified_link_output(verified, &output_staging)?;
                 return Ok(());

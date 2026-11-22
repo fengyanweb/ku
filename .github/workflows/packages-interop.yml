@@ -67,6 +67,7 @@ jobs:
           "KU_INTEROP_CC=$cc" >> $env:GITHUB_ENV
           "KU_INTEROP_CXX=$cxx" >> $env:GITHUB_ENV
       - name: Build and install the matching CLI and SDK from source
+        id: install
         shell: pwsh
         env:
           TARGET: ${{ matrix.rust-host }}
@@ -86,7 +87,8 @@ jobs:
         run: |
           python -B tests/acceptance/packages_interop.py --ku $env:INSTALLED_KU --public-git
           if ($LASTEXITCODE) { throw 'Installed package smoke test failed' }
-      - name: Run actual C, C++, Python and wheel consumers in all three engines
+      - name: Run actual C and C++ consumers in all three engines
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -118,10 +120,14 @@ jobs:
             $got = & $exe
             if ($LASTEXITCODE -or (Compare-Object $wanted $got -SyncWindow 0)) { throw "Moved native provider output differed for $entry" }
           }
+      - name: Run actual Python and wheel consumers in all three engines
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        shell: pwsh
+        run: |
           python -B tests/acceptance/python_interop.py --ku $env:INSTALLED_KU --wheels
           if ($LASTEXITCODE) { throw 'Python package consumption failed' }
       - name: Run a bundled Python wheel app without its author interpreter
-        if: matrix.rust-host == 'aarch64-apple-darwin'
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.rust-host == 'aarch64-apple-darwin' }}
         shell: pwsh
         run: |
           python -B tests/acceptance/python_interop.py --ku $env:INSTALLED_KU --standalone-macos

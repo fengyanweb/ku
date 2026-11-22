@@ -28,6 +28,8 @@ fn main() {
 
 执行 `../ku-sdk/ku build --release --locked -o app`、`./app`，输出 `7`。Windows 使用 `-o app.exe` 和 `./app.exe`。显式 Runner 使用 `--backend runner`。此例的两个产物都可在没有 Ku 和源码的目录运行。用 `ku run --locked` 可直接解释执行。
 
+若 Windows GNU 构建同时生成 `app.exe.windows-gnu-notices.txt`，分发时将其与可执行文件一同交付。
+
 ## 安装来源与还原
 
 | 输入 | 行为 |

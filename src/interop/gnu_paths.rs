@@ -18,7 +18,7 @@ pub(crate) const NOTICE_LEAF: &str = "windows-gnu.txt";
 pub(crate) const NOTICE: &[u8] = include_bytes!("gnu-runtime-notices.txt");
 
 pub(crate) fn is_target(target: &str) -> bool {
-    let target = target.trim();
+    let target = target.trim().to_ascii_lowercase();
     target.ends_with("-windows-gnu") || target.ends_with("-mingw32") || target.ends_with("-mingw64")
 }
 

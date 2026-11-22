@@ -42,6 +42,8 @@ The program prints `7`. Use `-o app.exe` and `./app.exe` on Windows. Add
 `--backend runner` to build the explicit Runner instead. Both outputs for this
 example run without a Ku installation or the package author's checkout.
 `ku run --locked` interprets the project directly.
+If a Windows GNU build produces `app.exe.windows-gnu-notices.txt`,
+keep it alongside the executable when distributing the app.
 
 ## Restore and share
 

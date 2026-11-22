@@ -28,6 +28,18 @@ def run(argv, cwd, env=None, success=True):
     return stdout, stderr
 
 
+def windows_dll_imports(image):
+    objdump = shutil.which("objdump.exe") if os.name == "nt" else None
+    if not objdump:
+        return []
+    try:
+        info = subprocess.run([objdump, "-p", str(image)], capture_output=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return [line.strip() for line in info.stdout.decode(errors="replace").splitlines()
+            if "DLL Name:" in line]
+
+
 def write(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="\n") as output:
@@ -79,7 +91,15 @@ def assert_three_entries(ku, project, deploy, expected, bridge):
     gone = project.with_name(project.name + "-removed")
     project.rename(gone)
     for entry in (native, runner):
-        actual, _ = run([clean / entry.name], clean, shell_env)
+        moved = clean / entry.name
+        try:
+            actual, _ = run([moved], clean, shell_env)
+        except AssertionError as error:
+            for binary in [moved, *clean.glob("ku-runtime.d/interop/*/*.dll")]:
+                imports = windows_dll_imports(binary)
+                if imports:
+                    error.add_note(f"{binary.name}\n" + "\n".join(imports))
+            raise
         assert actual == expected, (entry, actual, expected)
     print(f"{project.name}: interpreter, native Release and explicit Runner passed; copied delivery ran")
 

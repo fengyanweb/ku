@@ -211,16 +211,27 @@ fn provider_notices(import_root: &Path) -> KuResult<Vec<(&'static str, Vec<u8>)>
     Ok(notices)
 }
 
-pub(super) fn publish_gnu_runtime_notice(output_dir: &Path) -> KuResult<()> {
+pub(super) fn publish_gnu_runtime_notice(output: &Path, has_bridge: bool) -> KuResult<()> {
     use interop::gnu_paths;
 
-    let root = output_dir.join(RELATIVE_RUNTIME_ROOT);
-    ensure_directory(&root)?;
-    let notices = root.join(gnu_paths::NOTICE_DIRECTORY);
-    ensure_directory(&notices)?;
-    let stage = Stage::create(&notices)?;
+    let output_dir = super::link_output_directory(output);
+    let (directory, destination) = if has_bridge {
+        let root = output_dir.join(RELATIVE_RUNTIME_ROOT);
+        ensure_directory(&root)?;
+        let directory = root.join(gnu_paths::NOTICE_DIRECTORY);
+        ensure_directory(&directory)?;
+        let destination = directory.join(gnu_paths::NOTICE_LEAF);
+        (directory, destination)
+    } else {
+        let mut notice = output
+            .file_name()
+            .expect("native output path was validated")
+            .to_os_string();
+        notice.push(".windows-gnu-notices.txt");
+        (output_dir.to_path_buf(), output_dir.join(notice))
+    };
+    let stage = Stage::create(&directory)?;
     let source = stage.0.join(gnu_paths::NOTICE_LEAF);
-    let destination = notices.join(gnu_paths::NOTICE_LEAF);
     fs::write(&source, gnu_paths::NOTICE).map_err(|error| io_error(&source, error))?;
     fs::rename(&source, &destination).map_err(|error| io_error(&destination, error))
 }
