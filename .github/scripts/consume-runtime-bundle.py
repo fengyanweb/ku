@@ -1310,11 +1310,11 @@ def read_installed_native_c(project, program, result):
 
 
 def validate_installed_relative_program(install, project, env, target, files, expected, *,
-                                        native_only_diagnostic=None, native_c_abi=None):
+                                        entry_name='main.ku', native_only_diagnostic=None, native_c_abi=None):
     project.mkdir()
     for name, contents in files.items():
         (project / name).write_text(contents, encoding='utf-8')
-    entry = project / 'main.ku'
+    entry = project / entry_name
     cwd = project.parent
     ku = install / ('ku.exe' if os.name == 'nt' else 'ku')
     run_env = env
@@ -1363,18 +1363,24 @@ def validate_installed_relative_program(install, project, env, target, files, ex
 def installed_committed_program_consumer(install, root, env, report, repo, commit, target, case, *,
                                          sources=('main.ku',), native_c_abi=None):
     fixture = f'tests/fixtures/{case}'
+    entry = sources[0]
+    expected_name = 'expected.txt'
+    if entry != 'main.ku':
+        variant = Path(entry).stem
+        case += '_' + variant
+        expected_name = variant + '-expected.txt'
     files = {}
-    for name in (*sources, 'expected.txt'):
+    for name in (*sources, expected_name):
         result = invoke(['git', 'show', f'{commit}:{fixture}/{name}'], repo, env)
         if result.returncode:
             raise RuntimeError(f'cannot read committed installed fixture: {fixture}/{name}')
         files[name] = EXPORT.canonical_example(result.stdout).decode('utf-8')
-    expected = files.pop('expected.txt')
+    expected = files.pop(expected_name)
     project = root / case.removeprefix('native_').replace('_', '-')
     detail = validate_installed_relative_program(install, project, env, target, files, expected,
-                                                 native_c_abi=native_c_abi)
+                                                 entry_name=entry, native_c_abi=native_c_abi)
     report['installed_' + case] = dict(
-        detail, fixture_sha256=hashlib.sha256(EXPORT.json_bytes({**files, 'expected.txt': expected})).hexdigest())
+        detail, fixture_sha256=hashlib.sha256(EXPORT.json_bytes({**files, expected_name: expected})).hexdigest())
 
 
 def verify_callback_fields_c(source):
@@ -1740,6 +1746,9 @@ def run_structured_only(args, report):
                                                  native_c_abi=verify_task_enum_result_c)
             installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
                                                  'native_task_enum_str_result', sources=('main.ku', 'worker.ku'),
+                                                 native_c_abi=verify_task_enum_string_result_c)
+            installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
+                                                 'native_task_enum_str_result', sources=('named.ku', 'worker.ku'),
                                                  native_c_abi=verify_task_enum_string_result_c)
             installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
                                                  'native_c_runtime_names')
