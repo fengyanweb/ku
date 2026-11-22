@@ -6679,6 +6679,19 @@ mod tests {
 
     #[test]
     fn registry_signed_foreign_package_installs_and_runs_without_author() {
+        const INTERPRETER_ENTRY: &str = "KU_TEST_SIGNED_FOREIGN_ENTRY";
+        if let Some(entry) = env::var_os(INTERPRETER_ENTRY) {
+            run_cli(vec![
+                "ku".into(),
+                "run".into(),
+                "--offline".into(),
+                entry
+                    .into_string()
+                    .expect("foreign entry path must be UTF-8"),
+            ])
+            .expect("interpret the verified foreign package offline");
+            return;
+        }
         let root = TestRoot::new("signed-foreign");
         let files = test_server_files(
             &root.0,
@@ -6765,13 +6778,24 @@ mod tests {
             entry.clone(),
         ])
         .expect("prepare and check the published foreign source with the registry stopped");
-        run_cli(vec![
-            "ku".into(),
-            "run".into(),
-            "--offline".into(),
-            entry.clone(),
-        ])
-        .expect("interpret the verified foreign package offline");
+        // Windows keeps the loaded bridge DLL locked until the interpreter exits.
+        let mut interpreter = Command::new(env::current_exe().expect("resolve test executable"));
+        interpreter
+            .args([
+                "--exact",
+                "registry_server::tests::registry_signed_foreign_package_installs_and_runs_without_author",
+                "--nocapture",
+            ])
+            .env(INTERPRETER_ENTRY, &main)
+            .current_dir(&consumer);
+        let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_LIMITS)
+            .expect("bounded signed foreign interpretation");
+        let stdout = String::from_utf8_lossy(&interpreted.stdout);
+        assert!(
+            interpreted.status.success() && stdout.split_whitespace().any(|word| word == "42"),
+            "offline interpretation failed:\n{stdout}{}",
+            String::from_utf8_lossy(&interpreted.stderr)
+        );
         let delivery = TestRoot::new("signed-foreign-delivery");
         let native = delivery
             .0
