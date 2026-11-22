@@ -37,6 +37,10 @@ KU
 - `check` accepts one source module. It runs the bounded parser,
   declaration and explicit type-name passes, and implemented direct-call
   checks.
+- `check` and `check-project` parse braced `try` with a `finally` clause.
+  The linked C emitter supports a synchronous top-level straight-line
+  `try/finally` and an optional named `catch` in a checked function.
+  See [the linked emitter contracts](../../semantics/README.md).
 - `check-project modules.txt` reads the existing manifest format. Each line
   lists a normalized project-relative `.ku` file. The compiler reads these
   files relative to the manifest's directory, even when invoked elsewhere.
@@ -111,7 +115,7 @@ and check two subsequent generations from the same Git commit.
 ```sh
 python3 -B bootstrap/tools/compiler_driver/selfhost/verify.py \
     --repo . --revision HEAD --ku "$(command -v ku)" --cc clang \
-    --output-dir ./bootstrap-verification
+    --limit 820 --output-dir ./bootstrap-verification
 ```
 
 The verifier uses the committed source bytes, records all three executable

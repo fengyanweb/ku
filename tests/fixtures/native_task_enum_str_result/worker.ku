@@ -1,0 +1,12 @@
+import time from "std.time"
+enum Report { Ready, Rejected(label: str) }
+async fn ParseLine(text: str, malformed: bool): Report! {
+    time.sleep(10)?
+    if (malformed) { return ok(Report.Rejected(text)) }
+    return ok(Report.Ready)
+}
+async fn Pause(broken: bool): str! {
+    time.sleep(10)?
+    if (broken) { fail "no suffix" }
+    return ok("继续：")
+}

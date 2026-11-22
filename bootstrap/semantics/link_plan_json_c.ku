@@ -2,6 +2,7 @@ import { Node } from "../stage2/ast.ku"
 import { EmitLinkedArrayBody, StructArrayStatuses } from "./struct_array_c.ku"
 import { FinishLinkedFunctionC, GuardArithmetic, GuardStringEquality } from "./guarded_struct_c.ku"
 import { ScalarCheckedMultiplyC, ScalarStringHelpers } from "./scalar_int_emit.ku"
+import { DropLinkedNullScope } from "./linked_member_ownership.ku"
 import { ScalarStringReplaceHelpers } from "./scalar_string_replace.ku"
 import { StructResultHeader } from "./struct_result_c.ku"
 import { LinkedIntSnapshotRuntime } from "./guarded_string_parts.ku"
@@ -11,6 +12,7 @@ import { ImportBinding, SuppliedModule } from "./imports.ku"
 import { DeclarationSpan, TopLevelName } from "./names.ku"
 import { AppendLinkedCheckedInvocation, ExitLinkedFailure, FsReadLinkPlan, LinkedCPrelude, LinkedCheckedCall, LinkedDirectCallExpression, LinkedFailureTarget, LinkPlanDeclaration, LinkPlanNominalType, LinkPlanType, LinkedIntArrayCallbackFunction, LinkedNullArguments, LinkedNullBinding, LinkedNullExpression, LinkedNullFunction, LinkedNullSlot, LinkedNullState, LinkedReadonlyExpression, LinkedNullValue } from "./link_plan_c.ku"
 import { LinkPlanJsonControls, LinkPlanJsonText } from "./project_paths.ku"
+import { PreserveLinkedOwners } from "./link_plan_c.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { EmitUnitEnumHeader, TypeNameBinding } from "./type_names.ku"
 import { ContainsType, LinkedFsReadReference, LinkedIntAppendCallbackDeclaration, LinkedIntAppendCallbackNominals, LinkedIntArrayCallbackDeclaration, LinkedIntArrayCallbackFaultPending, ProjectionBuiltinLinkFor } from "./struct_projection_c.ku"
@@ -240,6 +242,18 @@ fn HoldLinkedCopyOperand(value: LinkedNullExpression, target: int): LinkedNullEx
     next = value.state
     next.code += "    " + carrier + " " + name.clone() + " = " + value.value.text + ";\n"
     return ok(LinkedReadonlyExpression(next, ty, name))
+}
+
+fn FinishLinkedMatchGuard(guard: LinkedNullExpression, &outer: [LinkedNullSlot], &arm: Node, id: int): LinkedNullState! {
+    if (guard.value.ty.declaration_kind != "Builtin" || guard.value.ty.name != "bool") {
+        RejectLayout("linked_match_guard_type", "expected a readonly bool match guard", DeclarationSpan(arm))?
+    }
+    PreserveLinkedOwners(outer, guard.state.slots, arm)?
+    // Materialize the condition before releasing any guard-local storage.
+    test = HoldLinkedCopyOperand(guard, id)?
+    next = DropLinkedNullScope(test.state, outer.len())
+    next.code += "    if (" + test.value.text + ") {\n"
+    return ok(next)
 }
 
 fn EmitLinkedBodyPrelude(&body: LinkedNullState, &member_enums: [TypeNameBinding]): str! {

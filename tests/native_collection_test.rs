@@ -8,7 +8,9 @@ mod native_harness;
 use std::{fs, process::Command};
 
 use ku::{backend::c, checker::Checker, cli::run_source, ir, lexer::Lexer, parser::Parser};
-use native_harness::{compile_harness, run_bounded, TempDir, RUN_LIMITS, RUN_TIMEOUT};
+use native_harness::{
+    compile_harness, run_bounded, BoundedOutput, TempDir, RUN_LIMITS, RUN_TIMEOUT,
+};
 
 const RECEIVER_ORDER_SOURCE: &str = r#"
 struct Container { values: [int], names: [str] }
@@ -153,7 +155,7 @@ fn native_stdout(label: &str, source: &str) -> Option<String> {
     native_c_stdout(label, generated)
 }
 
-fn native_c_stdout(label: &str, generated: String) -> Option<String> {
+fn native_c_output(label: &str, generated: String) -> Option<BoundedOutput> {
     assert!(!generated.contains("run_source"));
     assert!(!generated.contains("const SOURCE"));
     let temp = TempDir::new(label);
@@ -166,6 +168,11 @@ fn native_c_stdout(label: &str, generated: String) -> Option<String> {
         RUN_LIMITS,
     )
     .unwrap_or_else(|error| panic!("collection executable did not finish safely: {error}"));
+    Some(output)
+}
+
+fn native_c_stdout(label: &str, generated: String) -> Option<String> {
+    let output = native_c_output(label, generated)?;
     assert!(
         output.status.success(),
         "collection executable failed:\n{}{}",
@@ -251,6 +258,83 @@ fn native_identifiers_escape_c_keywords_and_preexisting_escape_prefix() {
         return;
     };
     assert_eq!(stdout, "Ku\n147\n");
+}
+
+const C_RUNTIME_NAME_CONTROL: &str = r#"
+fn Count(exit: int, fprintf: int): int {
+    if (exit <= 0) { return fprintf }
+    return Count(exit - 1, fprintf + 1)
+}
+fn Trace(fputc: int): int {
+    if (fputc < 0) { panic("bad🙂") }
+    return fputc
+}
+"#;
+
+#[test]
+fn native_identifiers_escape_runtime_function_names() {
+    let source = format!(
+        "{C_RUNTIME_NAME_CONTROL}{}",
+        r#"
+fn abort(value: int): int { return value + 3 }
+fn ku_c_name_abort(value: int): int { return value + 100 }
+fn free(value: int): int { return value * 3 }
+fn MakeReader(seed: int): fn(): int {
+    malloc = seed
+    fprintf = 5
+    exit = 1
+    read = fn(): int { return malloc + fprintf + exit }
+    malloc = malloc + 2
+    return read
+}
+fn main(): null! {
+    println(Count(4, 10))
+    println(Trace(1))
+    println(abort(4))
+    println(ku_c_name_abort(4))
+    println(free(4))
+    callback = abort
+    println(callback(5))
+    read = MakeReader(7)
+    println(read())
+    return ok(null)
+}
+"#
+    );
+    run_source("native-c-runtime-names.ku", &source).expect("runtime names are legal in Ku");
+    let program = ir::optimize_program(&checked_ir(&source));
+    let generated = c::generate_c_source(&program).expect("emit runtime names");
+    assert!(generated.contains("int64_t ku_c_name_abort(int64_t value)"));
+    assert!(generated.contains("int64_t ku_c_name_ku_c_name_abort(int64_t value)"));
+    assert!(generated.contains("KuCell_int* ku_c_name_malloc"));
+    assert!(generated.contains("malloc(sizeof(KuEnv_"));
+    assert!(generated.contains("free(e);"));
+    let Some(stdout) = native_c_stdout("c-runtime-names", generated) else {
+        return;
+    };
+    assert_eq!(stdout, "14\n1\n7\n104\n12\n8\n15\n");
+
+    for (label, call, expected) in [
+        (
+            "runtime-depth",
+            "Count(600, 0)",
+            "maximum call depth exceeded: 512\n",
+        ),
+        ("runtime-panic", "Trace(-1)", "bad🙂\n"),
+    ] {
+        let source = format!(
+            "{C_RUNTIME_NAME_CONTROL}\nfn main(): null! {{ println({call}); return ok(null) }}"
+        );
+        let program = ir::optimize_program(&checked_ir(&source));
+        let generated = c::generate_c_source(&program).expect("emit runtime failure fixture");
+        let output = native_c_output(label, generated).expect("the compiler was already available");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).replace('\r', ""),
+            expected
+        );
+    }
 }
 
 #[test]

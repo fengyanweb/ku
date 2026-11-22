@@ -375,8 +375,8 @@ fn CheckDirectOwnedMoves(&nodes: [Node], &edges: [int], &transfers: [int], first
 }
 
 fn ReadLinkedProtectedTail(&named: NamedModule, &protected: Node): Node! {
-    if (protected.kind != "TryBody") {
-        RejectLayout("unsupported_linked_finally", "expected a protected body", DeclarationSpan(protected))?
+    if (protected.kind != "TryBody" && protected.kind != "CatchBody") {
+        RejectLayout("unsupported_linked_finally", "expected a try or catch body", DeclarationSpan(protected))?
     }
     tail = protected.clone()
     count = protected.edge_count
@@ -387,7 +387,7 @@ fn ReadLinkedProtectedTail(&named: NamedModule, &protected: Node): Node! {
         kind = tail.kind.clone()
         if (!(kind == "Print" || kind == "ExprStmt" || kind == "Assign" || kind == "VarDecl" ||
             (index == count - 1 && (kind == "Return" || kind == "Fail")))) {
-            RejectLayout("unsupported_linked_finally", "protected body requires straight-line statements and an optional terminal", DeclarationSpan(tail))?
+            RejectLayout("unsupported_linked_finally", "try and catch bodies require straight-line statements and an optional terminal", DeclarationSpan(tail))?
         }
         index = index + 1
     }

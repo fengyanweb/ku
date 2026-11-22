@@ -558,9 +558,11 @@ impl<'a> FrameEmitter<'a> {
                 != (task_mask != 0
                     || exit_bridge
                     || crate::ir::task::array_result(&function.result) || crate::ir::task::http_type(&function.result)
+                    || crate::ir::task::string_enum_value(layouts, &function.result)
                     || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty)
                             || crate::ir::task::record_type(ty)
-                            || crate::ir::task::nullable_record(ty)))
+                            || crate::ir::task::nullable_record(ty)
+                            || crate::ir::task::string_enum_value(layouts, ty)))
                     || function.states.iter().any(|state| {
                         matches!(
                             state.terminator,
@@ -3138,13 +3140,22 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     if let Some(kind) = super::task_adapter::outcome_nominal_kind_symbol(inner) {
                         out.push_str(&format!("  if (received.result_kind!={kind}) {{ ku_task_outcome_drop(&received); frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n"));
                     }
+                    let unpack = if let Some(layout) =
+                        crate::ir::task::enum_layout(self.layouts, inner)
+                            .filter(|layout| crate::ir::task::enum_str_variant(layout).is_some())
+                    {
+                        out.push_str(&format!("  if (received.value.{field}.ok && (uint32_t)received.value.{field}.tag>={}u) {{ ku_task_outcome_drop(&received); frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n", layout.variants.len()));
+                        format!("ku_task_unpack_{suffix}")
+                    } else {
+                        format!("ku_result_move_{suffix}")
+                    };
                     out.push_str("  if (received.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE) {\n    frame->header.has_exit_deadline=received.has_cleanup_deadline;\n    frame->header.exit_deadline=received.cleanup_deadline;\n");
                     self.emit_runtime_error(
                         out,
                         &format!("ku_error_move(&received.value.{field}.error)"),
                     )?;
                     out.push_str("  }\n");
-                    out.push_str(&format!("  {}=ku_result_move_{suffix}(&received.value.{field});\n  ku_task_outcome_drop(&received);\n",self.place(*dst)));
+                    out.push_str(&format!("  {}={unpack}(&received.value.{field});\n  ku_task_outcome_drop(&received);\n",self.place(*dst)));
                     self.set_init(out, *dst, true);
                     out.push_str(&format!(
                         "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
@@ -3235,6 +3246,29 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             }
             // Verified lexical ownership annotation; no runtime stack or bits.
             TaskOp::ScopeEnter { .. } => {}
+            TaskOp::EnumStringMove { dst, src, tag } => {
+                let extracting = self.slot_type(*dst)? == &IrType::Str;
+                let enum_type = self.slot_type(if extracting { *src } else { *dst })?;
+                let variant = crate::ir::task::enum_str_layout(self.layouts, enum_type)
+                    .ok_or_else(|| unsupported("missing Task enum string layout"))?;
+                let field = format!(
+                    "payload.{}.{}",
+                    c_ident(&variant.name),
+                    c_ident(&variant.fields[0].name)
+                );
+                let source = self.place(*src);
+                let destination = self.place(*dst);
+                if extracting {
+                    out.push_str(&format!("  if ({source}.tag!={tag}) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  {destination}=ku_string_move(&{source}.{field});\n  {source}.tag=-1;\n"));
+                } else {
+                    out.push_str(&format!(
+                        "  {destination}=({}){{.tag={tag},.{field}=ku_string_move(&{source})}};\n",
+                        c_type(enum_type)?
+                    ));
+                }
+                self.set_init(out, *dst, true);
+                self.set_init(out, *src, false);
+            }
             TaskOp::Unary { dst, op, src } => match op {
                 TaskUnaryOp::EnumTag => {
                     out.push_str(&format!(
@@ -4662,6 +4696,19 @@ static uint32_t {prefix}_finish_finally(void* storage, size_t bytes, uint32_t ab
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        let string_enum = match &self.function.result {
+            IrType::Result(inner) => crate::ir::task::enum_layout(self.layouts, inner)
+                .filter(|layout| crate::ir::task::enum_str_variant(layout).is_some()),
+            _ => None,
+        };
+        let owned_preflight = if let Some(layout) = string_enum {
+            let alias_checks = super::task_adapter::string_enum_result_strings(self.layouts, &self.function.result, "frame->result", &|leaf| {
+                format!("  checked=ku_task_adapter_string_charge({leaf},&payload_bytes);\n  if (checked!=KU_TASK_DRIVER_OK || ku_task_adapter_string_overlaps({leaf},output,sizeof(*output))) return KU_TASK_FRAME_INVALID_ARGUMENT;\n")
+            }).ok_or_else(|| unsupported("missing Task result string alias check"))?;
+            format!("if (frame->result.ok && (uint32_t)frame->result.value.tag>={}u) return KU_TASK_FRAME_INVALID_STATE;\n  size_t payload_bytes=0;\n{alias_checks}", layout.variants.len())
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
             "static uint32_t {prefix}_take_result(void* storage, size_t bytes, uint32_t abi, {result_type}* output) {{\n\
                uint32_t checked = {prefix}_check(storage, bytes, abi);\n\
@@ -4669,7 +4716,7 @@ static uint32_t {prefix}_finish_finally(void* storage, size_t bytes, uint32_t ab
                {frame_type}* frame = ({frame_type}*)storage;\n\
                if (frame->header.status != KU_TASK_FRAME_READY || !frame->header.result_initialized) return KU_TASK_FRAME_INVALID_STATE;\n\
                if (!ku_task_frame_storage_valid(output, sizeof(*output), sizeof(*output), KU_TASK_FRAME_ALIGNOF({result_type})) || ku_task_frame_ranges_overlap(storage, bytes, output, sizeof(*output))) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
-               if (!({})) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
+               {owned_preflight}if (!({})) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
                {tag_check}*output = {};\n\
                frame->header.result_initialized = 0;\n\
                return KU_TASK_FRAME_OK;\n\

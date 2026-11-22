@@ -141,6 +141,14 @@ pub(super) fn enum_type(ty: &TypeName, layouts: &super::super::IrLayoutTable) ->
         .then(|| super::super::enum_ir_type(name))
 }
 
+#[derive(Clone, Copy)]
+struct EnumMatchBinding<'a> {
+    arm: usize,
+    tag: i32,
+    name: &'a str,
+    owned: bool,
+}
+
 impl FunctionLowerer<'_> {
     pub(super) fn enum_literal(
         &mut self,
@@ -172,7 +180,7 @@ impl FunctionLowerer<'_> {
         Ok(Some(self.constant(TaskConstant::UnitEnum { tag }, ty)?))
     }
 
-    pub(super) fn int_enum_constructor(
+    pub(super) fn payload_enum_constructor(
         &mut self,
         target: &Expr,
         name: &str,
@@ -191,7 +199,9 @@ impl FunctionLowerer<'_> {
             .enums
             .iter()
             .find(|layout| &layout.name == enum_name)
-            .and_then(task::enum_int_variant)
+            .and_then(|layout| {
+                task::enum_int_variant(layout).or_else(|| task::enum_str_variant(layout))
+            })
             .filter(|variant| variant.name == name)
         else {
             return Ok(None);
@@ -204,15 +214,23 @@ impl FunctionLowerer<'_> {
         };
         let tag = i32::try_from(variant.tag)
             .map_err(|_| unsupported("Task enum constructor tag out of range", span))?;
+        let ty = variant.fields[0].ty.clone();
         let src = self.expression(argument, depth + 1)?;
-        if self.function.slots[src.0].ty != value_slot(IrType::Int) {
-            return Err(unsupported("non-int Task enum payload", argument.span));
+        if self.function.slots[src.0].ty != value_slot(ty.clone()) {
+            return Err(unsupported(
+                "a Task enum payload of a different type",
+                argument.span,
+            ));
         }
         let dst = self.slot(value_slot(super::super::enum_ir_type(enum_name)))?;
-        self.emit(TaskOp::Unary {
-            dst,
-            op: TaskUnaryOp::EnumFromInt { tag },
-            src,
+        self.emit(if ty == IrType::Str {
+            TaskOp::EnumStringMove { dst, src, tag }
+        } else {
+            TaskOp::Unary {
+                dst,
+                op: TaskUnaryOp::EnumFromInt { tag },
+                src,
+            }
         })?;
         Ok(Some(dst))
     }
@@ -293,8 +311,11 @@ impl FunctionLowerer<'_> {
         })?;
         self.budget.analysis(layout.variants.len(), span)?;
         self.budget.analysis(arms.len(), span)?;
-        let int_variant = task::enum_int_variant(layout).map(|variant| variant.tag);
-        if int_variant.is_some() && arms.iter().any(|arm| arm.guard.is_some()) {
+        let str_variant = task::enum_str_variant(layout);
+        let payload_tag = str_variant
+            .or_else(|| task::enum_int_variant(layout))
+            .map(|variant| variant.tag);
+        if payload_tag.is_some() && arms.iter().any(|arm| arm.guard.is_some()) {
             return Err(unsupported(
                 "a guard in a Task match on a payload-bearing enum",
                 span,
@@ -319,16 +340,18 @@ impl FunctionLowerer<'_> {
                     let tag = variants.get(variant.as_str()).copied().ok_or_else(|| {
                         unsupported("an unknown Task enum match variant", arm.span)
                     })?;
-                    match (int_variant == Some(tag), fields.as_slice()) {
+                    match (payload_tag == Some(tag), fields.as_slice()) {
                         (true, [MatchPattern::Binding(name)]) => {
                             let tag = i32::try_from(tag).map_err(|_| {
                                 unsupported("Task enum match tag out of range", arm.span)
                             })?;
-                            payload_binding = Some((index, tag, name.as_str()));
+                            payload_binding = Some(EnumMatchBinding {
+                                arm: index, tag, name, owned: str_variant.is_some(),
+                            });
                         }
                         (true, [MatchPattern::Wildcard]) | (false, []) => {}
                         _ => return Err(unsupported(
-                            "Task enum patterns other than unit variants and int payload bindings or wildcards",
+                            "Task enum patterns other than unit variants and supported payload bindings or wildcards",
                             arm.span,
                         )),
                     }
@@ -358,6 +381,12 @@ impl FunctionLowerer<'_> {
         }
         if tags.is_empty() || (tags.last() != Some(&None) && covered.len() != variant_count) {
             return Err(unsupported("a nonexhaustive Task enum match", span));
+        }
+        if self.stable_slots[source.0] && payload_binding.is_some_and(|binding| binding.owned) {
+            return Err(unsupported(
+                "an owned Task enum payload binding on a named subject",
+                value.span,
+            ));
         }
         // A tag-only pattern never consumes a named enum. Anonymous
         // scrutinees can retire once the tag has been read.
@@ -522,26 +551,40 @@ impl FunctionLowerer<'_> {
         &mut self,
         arm: &MatchArm,
         subject: SlotId,
-        payload_binding: Option<(usize, i32, &str)>,
+        payload_binding: Option<EnumMatchBinding<'_>>,
         index: usize,
         depth: usize,
     ) -> KuResult<SlotId> {
-        let Some((selected, tag, name)) = payload_binding else {
+        let Some(EnumMatchBinding {
+            arm: selected,
+            tag,
+            name,
+            owned,
+        }) = payload_binding
+        else {
             return self.unit_enum_match_value(arm, depth);
         };
         let local = if selected == index {
             self.budget.text(name.len(), arm.span)?;
-            let dst = self.slot(value_slot(IrType::Int))?;
-            self.emit(TaskOp::Unary {
-                dst,
-                op: TaskUnaryOp::EnumPayloadInt { tag },
-                src: subject,
+            let dst = self.slot(value_slot(if owned { IrType::Str } else { IrType::Int }))?;
+            self.emit(if owned {
+                TaskOp::EnumStringMove {
+                    dst,
+                    src: subject,
+                    tag,
+                }
+            } else {
+                TaskOp::Unary {
+                    dst,
+                    op: TaskUnaryOp::EnumPayloadInt { tag },
+                    src: subject,
+                }
             })?;
             Some(dst)
         } else {
             None
         };
-        if !self.stable_slots[subject.0] {
+        if !self.stable_slots[subject.0] && !(owned && local.is_some()) {
             self.emit(TaskOp::Drop { slot: subject })?;
         }
         if let Some(slot) = local {
@@ -550,7 +593,11 @@ impl FunctionLowerer<'_> {
             self.locals.push(locals);
             let value = self.unit_enum_match_value(arm, depth);
             self.locals.pop();
-            value
+            let value = value?;
+            if owned && value != slot {
+                self.emit(TaskOp::DropIfInit { slot })?;
+            }
+            Ok(value)
         } else {
             self.unit_enum_match_value(arm, depth)
         }

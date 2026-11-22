@@ -365,10 +365,13 @@ fn native_task_matches_an_awaited_enum_with_one_int_payload() {
             "type error: expected int",
         ),
         (
-            "string-field.ku",
+            "two-fields.ku",
             worker
-                .replace("Found(index: int)", "Found(label: str)")
-                .replace("Found(line.len() - 1)", "Found(line)"),
+                .replace("Found(index: int)", "Found(label: str, index: int)")
+                .replace(
+                    "Found(line.len() - 1)",
+                    "Found(line.clone(), line.len() - 1)",
+                ),
             "does not support async Result payload",
         ),
         (
@@ -387,6 +390,161 @@ fn native_task_matches_an_awaited_enum_with_one_int_payload() {
         assert!(!rejected.status.success(), "{file}");
         assert!(diagnostic.contains(error), "{file}: {diagnostic}");
     }
+}
+
+#[test]
+fn native_task_moves_owned_enum_string_from_an_awaited_temporary() {
+    let directory = TempDir::new("task-enum-string-result");
+    let path = directory.path();
+    fs::write(
+        path.join("main.ku"),
+        include_str!("fixtures/native_task_enum_str_result/main.ku"),
+    )
+    .unwrap();
+    fs::write(
+        path.join("worker.ku"),
+        include_str!("fixtures/native_task_enum_str_result/worker.ku"),
+    )
+    .unwrap();
+    let normalized = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    let expected = include_str!("fixtures/native_task_enum_str_result/expected.txt");
+    let call = |args: &[&str]| {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_ku"));
+        cli.current_dir(path).args(args);
+        run_bounded(&mut cli, BUILD_TIMEOUT, BUILD_LIMITS).unwrap()
+    };
+    let interpreted = call(&["run", "main.ku"]);
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        normalized(&interpreted.stderr)
+    );
+    assert_eq!(normalized(&interpreted.stdout), expected);
+    let filename = if cfg!(windows) { "app.exe" } else { "app" };
+    let built = call(&["build", "--release", "--offline", "main.ku", "-o", filename]);
+    let diagnostic = normalized(&built.stderr);
+    if !built.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none(), "{diagnostic}");
+        return;
+    }
+    assert!(built.status.success(), "{diagnostic}");
+    let execution = run_bounded(
+        Command::new(path.join(filename)).current_dir(path),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        execution.status.success(),
+        "{}",
+        normalized(&execution.stderr)
+    );
+    assert_eq!(normalized(&execution.stdout), expected);
+
+    let named = r#"
+import { Report, ParseLine } from "./worker"
+async fn main(): null! {
+    report = (await ParseLine("诊断" + "🙂", true))?
+    text = match report {
+        Report.Ready => "ok"
+        Report.Rejected(label) => label + (match report.clone() { Report.Ready => "ready" Report.Rejected(other) => other })
+    }
+    println(text)
+    return ok(null)
+}
+"#;
+    fs::write(path.join("named.ku"), named).unwrap();
+    let named_run = call(&["run", "named.ku"]);
+    assert!(
+        named_run.status.success(),
+        "{}",
+        normalized(&named_run.stderr)
+    );
+    assert_eq!(normalized(&named_run.stdout), "诊断🙂诊断🙂\n");
+    let rejected = call(&["build", "--native", "named.ku"]);
+    assert!(!rejected.status.success());
+    let diagnostic = normalized(&rejected.stderr);
+    assert!(
+        diagnostic.contains("owned Task enum payload binding on a named subject"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn native_task_preserves_owned_enum_string_take_and_charge() {
+    let mut generated = native(
+        r#"
+import time from "std.time"
+enum ProbeReport { Rejected(label: str), Ready }
+async fn Probe(label: str, mode: int): ProbeReport! {
+    time.sleep(30)?
+    if (mode == 1) { return ok(ProbeReport.Ready) }
+    if (mode == 2) { fail label }
+    return ok(ProbeReport.Rejected(label))
+}
+async fn main(): null! { return ok(null) }
+"#,
+    );
+    generated = generated.replacen(
+        "typedef struct KuString {",
+        &format!("{ALLOCATION_HOOK}\ntypedef struct KuString {{"),
+        1,
+    );
+    let clock = "static uint64_t ku_task_driver_now_ms(void) {";
+    assert_eq!(generated.matches(clock).count(), 1);
+    generated = generated.replacen(clock, "static uint64_t fixture_now;\nstatic uint64_t ku_task_driver_now_ms(void) { return fixture_now; }\nstatic uint64_t fixture_original_now(void) {", 1);
+    let take = "static uint32_t ku_task_0_take_frame_payload(KuTaskInstance_0* instance) {";
+    assert_eq!(generated.matches(take).count(), 1);
+    generated = generated.replacen(take, &format!(r#"static size_t fixture_rejected_tags, fixture_rejected_ranges;
+{take}
+  KuResult_enum_ProbeReport* result=&instance->frame.result;
+  if (instance->frame.header.status==KU_TASK_FRAME_READY && instance->frame.header.result_initialized) {{
+    const KuString impossible={{.ptr=(uint8_t*)(uintptr_t)1,.len=8u,.capacity=1u,.storage=KU_STRING_OWNED}};
+    KuString active={{0}};
+    if (result->ok) {{
+      KuResult_enum_ProbeReport output={{0}};
+      int32_t tag=result->value.tag;
+      result->value.tag=INT32_MAX;
+      uint32_t status=ku_task_frame_0_take_result(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION,&output);
+      fixture_rejected_tags+=status==KU_TASK_FRAME_INVALID_STATE && !output.ok && instance->frame.header.result_initialized;
+      result->value.tag=tag;
+      if (tag==0) active=result->value.payload.Rejected.label;
+      else result->value.payload.Rejected.label=impossible;
+      result->error.message=impossible;
+    }} else {{
+      active=result->error.message;
+      result->value.payload.Rejected.label=impossible;
+    }}
+    if (active.ptr) {{
+      uint32_t status=ku_task_frame_0_take_result(&instance->frame,sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION,(KuResult_enum_ProbeReport*)(void*)active.ptr);
+      fixture_rejected_ranges+=status==KU_TASK_FRAME_INVALID_ARGUMENT && instance->frame.header.result_initialized;
+    }}
+  }}"#), 1);
+    let source = generated.replacen(
+        "int main(void) {",
+        "static int ku_unused_source_main(void) {",
+        1,
+    ) + include_str!("fixtures/native_task_enum_str_result/raw_take.c");
+    let directory = TempDir::new("task-enum-string-take");
+    let file = directory.path().join("raw.c");
+    fs::write(&file, source).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &file, "raw") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "owned enum pending, alias guards, pointer transfer, and drain ok\n"
+    );
 }
 
 #[test]

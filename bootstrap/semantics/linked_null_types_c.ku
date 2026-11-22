@@ -415,7 +415,10 @@ fn CheckLinkedFinallyMoves(&before: [LinkedNullSlot], &state: LinkedNullState, &
     PreserveLinkedOwners(before, state.slots, node)?
     index = 0
     while (index < state.catch_moved.len()) {
-        if (before[state.catch_moved[index]].live) {
+        slot = state.catch_moved[index]
+        // Catching the protected block can place hidden pending owners
+        // above the source scope. This check only examines source owners.
+        if (slot < before.len() && before[slot].live) {
             RejectLayout("linked_finally_move", "protected error cannot consume an outer owner", DeclarationSpan(node))?
         }
         index = index + 1

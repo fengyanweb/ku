@@ -18174,6 +18174,8 @@ fn c_ident(name: &str) -> String {
                 | "_Static_assert" | "_Thread_local"
                 // Names supplied as macros by the runtime's standard headers.
                 | "bool" | "true" | "false" | "NULL" | "EOF" | "stdin" | "stdout" | "stderr"
+                // Standard functions used by emitted control flow and closures.
+                | "abort" | "exit" | "malloc" | "free" | "fprintf" | "fputc"
         )
     {
         output.insert_str(0, ESCAPE_PREFIX);

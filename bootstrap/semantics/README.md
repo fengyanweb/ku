@@ -68,19 +68,31 @@ these members remain outside this subset.
 A complete `return match` can choose an `int` or `int!` result. A payload-free
 enum subject uses unit-variant arms and may end with a wildcard. A `str` subject
 uses string literal arms and requires a final wildcard. String patterns compare
-decoded UTF-8 bytes, including embedded zeros.
+decoded UTF-8 bytes, including embedded zeros. A matching string literal can
+have a readonly `bool` guard. Supported direct guard calls return a plain `bool`
+and use View or scalar Copy arguments. A false guard advances to the next arm.
 The subject is evaluated once, and the selected arm alone runs. An `int!` arm
 can call `ok` with an int expression that propagates errors with `?`, or forward
-a declared `int!` call directly. Payload patterns, guards, other match expression
-positions, enum payloads, and enum containers remain outside the linked subset.
+a declared `int!` call directly. Payload patterns, guarded wildcards or enum
+arms, other match expression positions, enum payloads, and enum containers
+remain outside the linked subset.
 
 The linked emitter also supports a top-level synchronous `try/finally` in a
 checked function returning `null`, `int`, `bool`, or `str`. A straight-line
 protected block can finish normally, propagate an Error, or end with
-`return ok(...)`. The `finally` block can print while the selected result or
-Error remains owned. Its output statements must fall through. Nested cleanup,
-combined catch/finally, transfers of outer owners in the protected block, and
-cleanup that returns or propagates an Error still require a different backend.
+`return ok(...)`. A named `catch` can report, recover from, or rethrow the
+protected Error before the one `finally` runs. The try and catch bodies must
+both fall through or both end with `return ok(...)` or `fail`. The `finally`
+block can print while the selected result or Error remains owned. Its output
+statements must fall through. Nested cleanup, transfers of outer owners in the
+try or catch, and cleanup that returns or propagates an Error still require a
+different backend.
+
+A checked counted `while` can exit early with a direct `if (predicate) { break }`
+before its trailing cursor update. The exit releases owners created in the
+iteration and preserves outer owners. The predicate follows existing readonly
+`bool` rules. Exits through deeper control blocks or cleanup are outside this
+subset.
 
 ## Check a set of relative modules
 

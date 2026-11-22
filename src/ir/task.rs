@@ -173,6 +173,12 @@ pub enum TaskCollectionOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOp {
+    /// Move the sole owned string between its enum alternative and a string slot.
+    EnumStringMove {
+        dst: SlotId,
+        src: SlotId,
+        tag: i32,
+    },
     /// Assemble the exact generated layout in declaration order.
     RecordMake {
         dst: SlotId,
@@ -687,7 +693,7 @@ pub(crate) fn enum_layout<'a>(
     layouts.enums.iter().find(|layout| layout.name == name)
 }
 
-pub(crate) fn enum_int_variant(layout: &super::IrEnumLayout) -> Option<&super::IrVariantLayout> {
+fn single_payload_variant(layout: &super::IrEnumLayout) -> Option<&super::IrVariantLayout> {
     if layout.variants.len() > 64 {
         return None;
     }
@@ -697,16 +703,19 @@ pub(crate) fn enum_int_variant(layout: &super::IrEnumLayout) -> Option<&super::I
         .filter(|variant| !variant.fields.is_empty());
     let variant = payloads.next()?;
     match variant.fields.as_slice() {
-        [field]
-            if field.ty == IrType::Int
-                && field.offset == 0
-                && !field.is_async_callable
-                && payloads.next().is_none() =>
-        {
+        [field] if field.offset == 0 && !field.is_async_callable && payloads.next().is_none() => {
             Some(variant)
         }
         _ => None,
     }
+}
+
+pub(crate) fn enum_int_variant(layout: &super::IrEnumLayout) -> Option<&super::IrVariantLayout> {
+    single_payload_variant(layout).filter(|variant| variant.fields[0].ty == IrType::Int)
+}
+
+pub(crate) fn enum_str_variant(layout: &super::IrEnumLayout) -> Option<&super::IrVariantLayout> {
+    single_payload_variant(layout).filter(|variant| variant.fields[0].ty == IrType::Str)
 }
 
 pub(crate) fn enum_variant_layout_supported(layout: &super::IrEnumLayout) -> bool {
@@ -714,7 +723,8 @@ pub(crate) fn enum_variant_layout_supported(layout: &super::IrEnumLayout) -> boo
         .variants
         .iter()
         .all(|variant| variant.fields.is_empty())
-        || enum_int_variant(layout).is_some()
+        || single_payload_variant(layout)
+            .is_some_and(|variant| matches!(variant.fields[0].ty, IrType::Int | IrType::Str))
 }
 
 pub(crate) fn unit_enum_layout<'a>(
@@ -722,7 +732,7 @@ pub(crate) fn unit_enum_layout<'a>(
     ty: &IrType,
 ) -> Option<&'a super::IrEnumLayout> {
     // The caller uses a table already checked for supported variant layouts.
-    enum_layout(layouts, ty).filter(|layout| enum_int_variant(layout).is_none())
+    enum_layout(layouts, ty).filter(|layout| single_payload_variant(layout).is_none())
 }
 
 pub(crate) fn enum_int_layout<'a>(
@@ -730,6 +740,24 @@ pub(crate) fn enum_int_layout<'a>(
     ty: &IrType,
 ) -> Option<&'a super::IrVariantLayout> {
     enum_layout(layouts, ty).and_then(enum_int_variant)
+}
+
+pub(crate) fn enum_str_layout<'a>(
+    layouts: &'a super::IrLayoutTable,
+    ty: &IrType,
+) -> Option<&'a super::IrVariantLayout> {
+    enum_layout(layouts, ty).and_then(enum_str_variant)
+}
+
+pub(crate) fn string_enum_value(layouts: &super::IrLayoutTable, ty: &IrType) -> bool {
+    enum_str_layout(
+        layouts,
+        match ty {
+            IrType::Result(payload) => payload,
+            ty => ty,
+        },
+    )
+    .is_some()
 }
 
 /// This check also bounds generated traversal of owned storage and byte ranges.
@@ -1250,10 +1278,10 @@ fn validate_shape(
     let mut has_scope_exit = false;
     let mut has_timer = false;
     let mut has_blocking = false;
-    let mut has_error_projection = http_type(&function.result) || array_result(&function.result) || function
+    let mut has_error_projection = http_type(&function.result) || array_result(&function.result) || string_enum_value(layouts, &function.result) || function
         .slots
         .iter()
-        .any(|slot| matches!(&slot.ty, TaskSlotType::Value { ty, .. } if flat_array(ty) || pg_params_array(ty) || array_result(ty) || http_type(ty) || local_json_type(ty)));
+        .any(|slot| matches!(&slot.ty, TaskSlotType::Value { ty, .. } if flat_array(ty) || pg_params_array(ty) || array_result(ty) || http_type(ty) || local_json_type(ty) || string_enum_value(layouts, ty)));
     let mut has_finally = false;
     for (index, slot) in function.slots.iter().enumerate() {
         if let TaskSlotType::Callable { parameters, .. } = &slot.ty {
@@ -1649,6 +1677,24 @@ fn validate_shape(
                         operation,
                     ) {
                         has_error_projection = true;
+                    }
+                }
+                TaskOp::EnumStringMove { dst, src, tag } => {
+                    let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                    let (source, source_borrowed) = slot_type(get_slot(*src)?)?;
+                    let variant = if source == &IrType::Str {
+                        enum_str_layout(layouts, destination)
+                    } else if destination == &IrType::Str {
+                        enum_str_layout(layouts, source)
+                    } else {
+                        None
+                    };
+                    if dst == src
+                        || destination_borrowed
+                        || source_borrowed
+                        || !variant.is_some_and(|variant| usize::try_from(*tag) == Ok(variant.tag))
+                    {
+                        return Err(invalid("enum string transfer requires its declared tag and distinct owned enum and string slots"));
                     }
                 }
                 TaskOp::Unary { dst, op, src } => {
@@ -2795,6 +2841,7 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::ArrayTryGet { dst, .. }
         | TaskOp::Copy { dst, .. }
         | TaskOp::Move { dst, .. }
+        | TaskOp::EnumStringMove { dst, .. }
         | TaskOp::WrapOk { dst, .. }
         | TaskOp::MakeError { dst, .. }
         | TaskOp::WrapError { dst, .. }
@@ -3221,7 +3268,7 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
             state.must = (state.must & !consumed) | bit(*dst);
             state.may = (state.may & !consumed) | bit(*dst);
         }
-        TaskOp::Move { dst, src } => {
+        TaskOp::Move { dst, src } | TaskOp::EnumStringMove { dst, src, .. } => {
             state.must = (state.must & !bit(*src)) | bit(*dst);
             state.may = (state.may & !bit(*src)) | bit(*dst);
         }
@@ -3615,6 +3662,7 @@ fn live_states(
                     | TaskOp::StringClone { dst, src }
                     | TaskOp::PrimitiveString { dst, src }
                     | TaskOp::Move { dst, src }
+                    | TaskOp::EnumStringMove { dst, src, .. }
                     | TaskOp::WrapOk { dst, src }
                     | TaskOp::WrapError { dst, src }
                     | TaskOp::MakeError { dst, message: src }
@@ -3790,6 +3838,7 @@ fn validate_ownership_and_plan(
                 | TaskOp::Bytes { src, .. }
                 | TaskOp::StartIndirect { callee: src, .. }
                 | TaskOp::Move { src, .. }
+                | TaskOp::EnumStringMove { src, .. }
                 | TaskOp::WrapOk { src, .. }
                 | TaskOp::WrapError { src, .. }
                 | TaskOp::MakeError { message: src, .. }
@@ -4756,6 +4805,7 @@ fn source_op_slots(operation: &mut TaskOp, visit: &mut impl FnMut(&mut SlotId)) 
         | TaskOp::PrimitiveString { dst, src }
         | TaskOp::Copy { dst, src }
         | TaskOp::Move { dst, src }
+        | TaskOp::EnumStringMove { dst, src, .. }
         | TaskOp::Unary { dst, src, .. }
         | TaskOp::WrapOk { dst, src }
         | TaskOp::WrapError { dst, src }

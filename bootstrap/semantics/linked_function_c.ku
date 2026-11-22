@@ -1,26 +1,25 @@
-import { PlanLinkedReturnMatch, RequireLinkedIntMatch } from "./scalar_project_c.ku"
-import { LinkedMatchCase } from "./scalar_int_operands.ku"
-import { HoldLinkedCopyOperand, LinkedBuiltinNameAvailable, LinkedChildKindIs, LinkedFieldRoot, RestoreLinkedAssignedMember } from "./link_plan_json_c.ku"
+import { BeginLinkedReturnMatch, PlanLinkedReturnMatch } from "./scalar_project_c.ku"
+import { LinkedMatchCase, RequireLinkedIntMatch, RequireLinkedReturnValue } from "./scalar_int_operands.ku"
+import { FinishLinkedMatchGuard, HoldLinkedCopyOperand, LinkedBuiltinNameAvailable, LinkedChildKindIs, LinkedFieldRoot, RestoreLinkedAssignedMember } from "./link_plan_json_c.ku"
 import { NoLinkedRetention } from "./linked_nullable_reader_c.ku"
 import { EmitLinkedOptionalIntReturn, LinkedNullCallSymbol, ResolveLinkedCall } from "./scalar_result_null.ku"
 import { LinkedCopyResult, LinkedPlainCopyResult, TypeNameBinding, TypeNameBindingWithKind } from "./type_names.ku"
-import { EmitLinkedMatchEnd, EmitLinkedMatchStart, EmitLinkedFinallyJoin, EmitLinkedFinallyError } from "./scalar_int_emit.ku"
+import { EmitLinkedMatchArmEnd, EmitLinkedMatchEnd } from "./scalar_int_emit.ku"
 import { Node } from "../stage2/ast.ku"
 import { CheckLinkedStringAppendTarget, FinishLinkedFieldAppend, FinishLinkedStringAppend } from "./linked_array_fields_c.ku"
 import { DeclarationSpan } from "./names.ku"
 import { FieldIndex, RejectLayout } from "./struct_layouts.ku"
-import { DropLinkedNullScope, UnwindLinkedNullScope, LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
+import { LinkedMemberPath, LinkedMemberUnavailable, LinkedNullDropC, MoveLinkedNullSlot, RecordLinkedMemberMove } from "./linked_member_ownership.ku"
 import { AddLinkedNullSlot, LinkedStringArrayAssignmentPlace } from "./linked_parameters_c.ku"
 import { ContainsIndex, ContainsType } from "./struct_projection_c.ku"
 import { FindLinkedLocalRead, LinkedLocalReadCaptures, RequireLinkedMutableName } from "./call_contracts.ku"
 import { LinkedNullChild, LinkedNullHasResultValue,
          LinkedNullNode, LinkedNullProject,  LinkedStringResult, SameLinkedType } from "./linked_null_types_c.ku"
-import { LowerLinkedStatementCall } from "./project_struct_string_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { LowerLinkedReturnValue } from "./linked_char_iter_c.ku"
 import { LinkedFieldAppendArgument, ReadLinkedMemberPlace } from "./struct_string_calls.ku"
 import { LowerLinkedArguments, LowerLinkedExpectedValue, LowerLinkedNullValue, LowerLinkedScopedCallbackCall } from "./linked_null_values_c.ku"
-import { IsLinkedScopedCallback, LinkedFailureTarget, LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullState, LinkedNullValue,
+import { IsLinkedScopedCallback, LinkedNullBinding, LinkedNullIntArrayOwner, LinkedNullOwnedArray, LinkedNullState, LinkedNullValue,
          LinkedRecordFields, RestoreLinkedNullSlots } from "./link_plan_c.ku"
 
 fn LowerLinkedTargetSet(&project: LinkedNullProject, state: LinkedNullState, &statement: Node,
@@ -122,13 +121,7 @@ fn LowerLinkedLocalMemberSet(&project: LinkedNullProject, state: LinkedNullState
 fn LowerLinkedReturn(&project: LinkedNullProject, state: LinkedNullState,
                      &statement: Node, &result: TypeNameBinding): LinkedNullState! {
     checked = !state.plain_value_result
-    if (statement.edge_count != 1) {
-        if (checked) {
-            RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(statement))?
-        } else {
-            RejectLayout("linked_value_return", "expected one value", DeclarationSpan(statement))?
-        }
-    }
+    RequireLinkedReturnValue(statement, checked)?
     id = LinkedNullChild(project, 1, statement, 0)
     if (LinkedChildKindIs(project, statement, 0, "Match")) {
         match_node = LinkedNullNode(project, 1, id)
@@ -136,17 +129,20 @@ fn LowerLinkedReturn(&project: LinkedNullProject, state: LinkedNullState,
         subject = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, match_node, 0), 0)?
         plan = PlanLinkedReturnMatch(project, subject.state, match_node, subject.value.ty)?
         string = LinkedStringResult(subject.value.ty)
-        next = subject.state
+        next = BeginLinkedReturnMatch(subject, id, plan.len(), string)
         outer = next.slots.clone()
-        compare_string = string && plan.len() > 1
-        if (compare_string) { next.uses_string_equal = true }
-        next.code += EmitLinkedMatchStart(subject.value.text, id, string, compare_string)
         index = 0
         while (index < plan.len()) {
             selected = plan[index]
             next.code += LinkedMatchCase(project.supplied[0].named.parsed.arena.nodes, id, selected, string)?
             arm = LinkedNullNode(project, 1, LinkedNullChild(project, 1, match_node, index + 1))
-            arm_id = LinkedNullChild(project, 1, arm, 1)
+            guarded = arm.edge_count == 3
+            if (guarded) {
+                guard_id = LinkedNullChild(project, 1, arm, 1)
+                guard = LowerLinkedNullRead(project, next, guard_id, 0)?
+                next = FinishLinkedMatchGuard(guard, outer, arm, guard_id)?
+            }
+            arm_id = LinkedNullChild(project, 1, arm, arm.edge_count - 1)
             if (checked) {
                 next = LowerLinkedSuccess(project, next, arm_id, result)?
             } else {
@@ -155,7 +151,7 @@ fn LowerLinkedReturn(&project: LinkedNullProject, state: LinkedNullState,
                 value.state.code += "    result = " + value.value.text + ";\n    goto cleanup;\n"
                 next = value.state
             }
-            next.code += "    }\n"
+            next.code += EmitLinkedMatchArmEnd(guarded)
             next = RestoreLinkedNullSlots(next, outer)
             index = index + 1
         }
@@ -337,45 +333,6 @@ fn StoreLinkedFinallyReturn(&project: LinkedNullProject, state: LinkedNullState,
     next = lowerLinkedConstructedSuccess(project, state, call, target, result, destination)?
     if (saved > 0) { next.slots[saved - 1].live = true }
     return ok(next)
-}
-
-fn FinishLinkedFinally(&project: LinkedNullProject, state: LinkedNullState, &cleanup: Node,
-                       saved: int, terminal: bool, returning: bool): LinkedNullState! {
-    next = state
-    error_slot = next.catch_slot
-    error = LinkedFailureTarget(next)
-    catches = next.catch_edges
-    if (catches) { next.declarations += "    bool " + error.clone() + "_failed = false;\n" }
-    next.code += EmitLinkedFinallyJoin(error, catches, !terminal || returning)
-    keep = error_slot
-    if (saved > 0) { keep = saved }
-    next = UnwindLinkedNullScope(next, keep)
-    next.catch_edges = false
-    index = 0
-    while (index < cleanup.edge_count) {
-        statement = LinkedNullNode(project, 1, LinkedNullChild(project, 1, cleanup, index))
-        if ((statement.kind != "Print" && statement.kind != "ExprStmt") || statement.edge_count != 1) {
-            RejectLayout("unsupported_linked_finally_cleanup", "cleanup requires fallthrough output statements", DeclarationSpan(statement))?
-        }
-        next = LowerLinkedStatementCall(project, next, statement)?
-        if (next.catch_edges) {
-            RejectLayout("unsupported_linked_finally_cleanup", "cleanup cannot propagate a checked Error", DeclarationSpan(statement))?
-        }
-        index = index + 1
-    }
-    next.catch_slot = 0
-    cleared: [int] = []
-    next.catch_moved = cleared
-    if (catches) { next.code += EmitLinkedFinallyError(error) }
-    if (returning) {
-        if (saved > 0) {
-            pending = next.slots[saved - 1].value.clone()
-            next.code += "    result.value = " + pending.text.clone() + ";\n"
-            next = MoveLinkedNullSlot(next, pending)?
-        }
-        next.code += "    result.ok = true;\n    goto cleanup;\n"
-    }
-    return ok(DropLinkedNullScope(next, error_slot - 1))
 }
 
 fn LowerLinkedStringAppend(&project: LinkedNullProject, state: LinkedNullState, &statement: Node, id: int): LinkedNullState! {

@@ -1,0 +1,18 @@
+fn Depth(exit: int, fprintf: int): int {
+    if (exit == 0) { return fprintf }
+    return Depth(exit - 1, fprintf + 1)
+}
+
+fn Read(): fn(): int {
+    malloc = 7
+    exit = 1
+    read = fn(): int { return malloc + exit }
+    malloc = malloc + 2
+    return read
+}
+
+fn main(): null! {
+    read = Read()
+    println(Depth(4, read()))
+    return ok(null)
+}

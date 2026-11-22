@@ -16,7 +16,7 @@ import { EmitLinkPlan, LinkedNullPrototype, LinkedScopedCallbackFunction, Linked
 import { BindProjectModules, ProjectModuleBindings } from "./project_bindings.ku"
 import { EmitScalarIntModule, LowerScalarIntFunction, ScalarIntC, AppendScalarIntCallees } from "./scalar_int_c.ku"
 import { ScalarFunctionNode, ScalarIntCalleeSignature, ScalarIntImport } from "./scalar_int_calls.ku"
-import { ScalarIntFunction, ScalarParameterCType, ScalarResultCType } from "./scalar_int_emit.ku"
+import { EmitLinkedMatchStart, ScalarIntFunction, ScalarParameterCType, ScalarResultCType } from "./scalar_int_emit.ku"
 import { HasScalarBuiltin, RejectScalarInt } from "./scalar_int_operands.ku"
 import { ComposeScalarProgramC, LowerScalarProgramEntry } from "./scalar_program_c.ku"
 
@@ -254,13 +254,11 @@ fn FindLinkedEnumSelection(&project: LinkedNullProject, &state: LinkedNullState,
 }
 
 fn RequireLinkedReadonlyCall(&callee: LinkedNullFunction, &at: Span): null! {
-    scalar = callee.result.declaration_kind == "Builtin" && (callee.result.name == "int" || callee.result.name == "bool")
-    if (callee.returns_result || (!scalar && callee.result.declaration_kind != "UnitEnum")) {
+    if (callee.returns_result || (!LinkedCopyResult(callee.result) && callee.result.declaration_kind != "UnitEnum")) {
         RejectLayout("linked_readonly_call", "readonly direct call requires a plain int, bool, or payload-free enum result", at.clone())?
     }
     for parameter in callee.parameters.clone() {
-        scalar = parameter.declaration_kind == "Builtin" && (parameter.name == "int" || parameter.name == "bool")
-        if (!scalar && !LinkedNullView(parameter)) {
+        if (!LinkedCopyResult(parameter) && !LinkedNullView(parameter)) {
             RejectLayout("linked_readonly_call", "readonly direct call requires View or scalar Copy arguments", at.clone())?
         }
     }
@@ -289,14 +287,6 @@ fn FinishLinkedEnumComparison(value: LinkedNullExpression, &left: LinkedNullValu
     return ok(LinkedReadonlyExpression(done, LinkedBuiltin("bool", at), result))
 }
 
-fn RequireLinkedIntMatch(&ty: TypeNameBinding, &node: Node, arm: bool): null! {
-    if (LinkedIntResult(ty)) { return ok(null) }
-    if (arm) {
-        return RejectLayout("linked_match_arm_result", "expected an int match arm value", DeclarationSpan(node))
-    }
-    return RejectLayout("linked_match_result", "expected an int or int! result for return match", DeclarationSpan(node))
-}
-
 fn PlanLinkedReturnMatch(&project: LinkedNullProject, &state: LinkedNullState,
                          &match_node: Node, &ty: TypeNameBinding): [int]! {
     at = DeclarationSpan(match_node)
@@ -312,22 +302,26 @@ fn PlanLinkedReturnMatch(&project: LinkedNullProject, &state: LinkedNullState,
     index = 0
     while (index < arm_count) {
         arm = LinkedNullNode(project, 1, LinkedNullChild(project, 1, match_node, index + 1))
-        if (arm.kind != "MatchArm" || arm.edge_count != 2 || wildcard) {
-            RejectLayout("linked_match_arm", "expected an unguarded match arm before any wildcard", DeclarationSpan(arm))?
+        guarded = string && arm.edge_count == 3
+        if (arm.kind != "MatchArm" || (arm.edge_count != 2 && !guarded) || wildcard) {
+            RejectLayout("linked_match_arm", "expected a match arm before any wildcard", DeclarationSpan(arm))?
         }
         pattern_id = LinkedNullChild(project, 1, arm, 0)
         pattern = LinkedNullNode(project, 1, pattern_id)
         if (pattern.kind == "MatchWildcard") {
+            if (guarded) { RejectLayout("linked_match_arm", "expected an unguarded wildcard", DeclarationSpan(arm))? }
             wildcard = true
             plan = plan.push(0)
         } else if (string) {
             if (pattern.kind != "String" || pattern.edge_count != 0) {
                 RejectLayout("linked_match_pattern", "expected a string literal or wildcard", DeclarationSpan(pattern))?
             }
-            if (ContainsType(literals, pattern.text)) {
-                RejectLayout("linked_match_unreachable", "duplicate string literal match arm", DeclarationSpan(arm))?
+            if (!guarded) {
+                if (ContainsType(literals, pattern.text)) {
+                    RejectLayout("linked_match_unreachable", "duplicate string literal match arm", DeclarationSpan(arm))?
+                }
+                literals = literals.push(pattern.text)
             }
-            literals = literals.push(pattern.text)
             plan = plan.push(pattern_id)
         } else {
             if (pattern.kind != "Field" || pattern.edge_count != 1) {
@@ -364,6 +358,14 @@ fn PlanLinkedReturnMatch(&project: LinkedNullProject, &state: LinkedNullState,
         RejectLayout("linked_match_nonexhaustive", "enum match is not exhaustive; missing " + missing, at)?
     }
     return ok(plan)
+}
+
+fn BeginLinkedReturnMatch(subject: LinkedNullExpression, id: int, arms: int, string: bool): LinkedNullState {
+    next = subject.state
+    compare = string && arms > 1
+    next.uses_string_equal = next.uses_string_equal || compare
+    next.code += EmitLinkedMatchStart(subject.value.text, id, string, compare)
+    return next
 }
 
 fn EmitLinkedNullPrototypes(&project: LinkedNullProject, &links: [LinkedNullFunction], &slots: [LinkedNullSlot],

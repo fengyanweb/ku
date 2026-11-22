@@ -4,6 +4,8 @@ import { DiagnosticCanonical, MakeDiagnostic } from "../stage2/diagnostic.ku"
 import { Span } from "../stage2/span.ku"
 import { DeclarationSpan, NamedModule } from "./names.ku"
 import { EmitLinkedEnumMatchCase, ScalarIntParameter, ScalarStringPart } from "./scalar_int_emit.ku"
+import { RejectLayout } from "./struct_layouts.ku"
+import { TypeNameBinding } from "./type_names.ku"
 
 fn RejectScalarInt(code: str, message: str, span: Span): null! {
     domain = "bootstrap.semantics.int"
@@ -72,6 +74,22 @@ fn LinkedMatchCase(&nodes: [Node], id: int, selected: int, string: bool): str! {
     literal = nodes[selected - 1].clone()
     return ok("    if (ku_guard_string_equal(match_" + str(id)
         + ", (KuProjectionString){(uint8_t*)" + ScalarStringLiteral(literal)? + ", 0u, KU_PROJECTION_STRING_STATIC})) {\n")
+}
+
+fn RequireLinkedIntMatch(&ty: TypeNameBinding, &node: Node, arm: bool): null! {
+    if (ty.declaration_kind == "Builtin" && ty.name == "int") { return ok(null) }
+    if (arm) {
+        return RejectLayout("linked_match_arm_result", "expected an int match arm value", DeclarationSpan(node))
+    }
+    return RejectLayout("linked_match_result", "expected an int or int! result for return match", DeclarationSpan(node))
+}
+
+fn RequireLinkedReturnValue(&statement: Node, checked: bool): null! {
+    if (statement.edge_count == 1) { return ok(null) }
+    if (checked) {
+        return RejectLayout("unsupported_linked_success", "expected return ok(null)", DeclarationSpan(statement))
+    }
+    return RejectLayout("linked_value_return", "expected one value", DeclarationSpan(statement))
 }
 
 fn ScalarStringOperand(&parameters: [ScalarIntParameter], &node: Node): str! {

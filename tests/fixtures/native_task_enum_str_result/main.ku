@@ -1,0 +1,25 @@
+import { Report as Status, ParseLine, Pause } from "./worker"
+async fn Format(line: str, broken: bool): str! {
+    return ok(match (await ParseLine(line, true))? {
+        Status.Ready => "ok"
+        Status.Rejected(label) => (await Pause(broken))? + label
+    })
+}
+async fn LabelLength(line: str): int! {
+    return ok(match (await ParseLine(line, true))? {
+        Status.Ready => 0
+        Status.Rejected(label) => label.len()
+    })
+}
+async fn main(): null! {
+    bad = ParseLine("第 3 行" + "🙂", true)
+    good = ParseLine("unused", false)
+    println(match (await bad)? { Status.Ready => "ok" Status.Rejected(label) => label })
+    println(match (await good)? { Status.Ready => "ok" Status.Rejected(label) => label })
+    println((await Format("余" + "🙂", false))?)
+    println((await LabelLength("余".clone()))?)
+    try {
+        println((await Format("清理" + "🙂", true))?)
+    } catch (issue) { println(issue.message) }
+    return ok(null)
+}

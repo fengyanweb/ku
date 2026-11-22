@@ -1,6 +1,6 @@
 import { RejectLocalCapture } from "./call_contracts.ku"
 import { CloneLinkedIntArray, LinkedCharacterSource, LinkedOwnedStringPredicate, MaterializeLinkedCharacters } from "./struct_string_calls.ku"
-import { LinkedWhileCondition } from "./project_struct_string_c.ku"
+import { LinkedWhileCondition } from "./linked_statement_c.ku"
 import { Node } from "../stage2/ast.ku"
 import { DeclarationSpan } from "./names.ku"
 import { RejectLayout } from "./struct_layouts.ku"

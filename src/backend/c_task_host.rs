@@ -116,6 +116,13 @@ impl<'a> OutcomeKinds<'a> {
         if has_records {
             out.push_str("#define KU_TASK_RECORD_OUTCOMES 1\n");
         }
+        if self
+            .results
+            .iter()
+            .any(|ty| crate::ir::task::string_enum_value(layouts, ty))
+        {
+            out.push_str(STRING_ENUM_OUTCOME);
+        }
         for result in &self.results {
             out.check()?;
             let IrType::Result(inner) = result else {
@@ -128,6 +135,16 @@ impl<'a> OutcomeKinds<'a> {
             let kind_symbol = nominal_kind_symbol(result)
                 .ok_or_else(|| unsupported("Task nominal outcome has no kind symbol"))?;
             out.push_str(&format!("enum {{ {kind_symbol}={kind}u }};\n"));
+            if let Some(variant) = crate::ir::task::enum_str_layout(layouts, inner) {
+                emit_string_enum_moves(out, variant, &c_ty, &suffix);
+                let place = format!("output->value.{field}");
+                let empty_value = string_enum_empty_value(variant, &place)?;
+                members.push_str(&format!("          KuTaskStringEnumOutcomeV1 {field};\n"));
+                empty.push_str(&format!("    case {kind_symbol}: if ({place}.ok || !({empty_value})) return 0; error=&{place}.error; break;\n"));
+                drop.push_str(&format!("    case {kind_symbol}: if ({place}.ok) {{ if ({place}.tag=={}) ku_string_drop(&{place}.value); }} else ku_error_drop(&{place}.error); break;\n", variant.tag));
+                failure.push_str(&format!("      case {kind_symbol}: {place}=(KuTaskStringEnumOutcomeV1){{.error=error}}; break;\n"));
+                continue;
+            }
             if enum_name(result).is_some() {
                 out.push_str(&format!(
                     "typedef char KuTaskEnumOutcomeFits_{suffix}[\n  sizeof({c_ty}) <= sizeof(KuResult_str)\n  && KU_TASK_FRAME_ALIGNOF({c_ty}) <= KU_TASK_FRAME_ALIGNOF(KuResult_str) ? 1 : -1];\n"
@@ -163,12 +180,90 @@ impl<'a> OutcomeKinds<'a> {
     }
 }
 
+const STRING_ENUM_OUTCOME: &str = r#"
+/* Use the string outcome offsets without accessing the padding of another type. */
+typedef struct KuTaskStringEnumOutcomeV1 {
+  bool ok;
+  int32_t tag;
+  KuString value;
+  KuError error;
+} KuTaskStringEnumOutcomeV1;
+typedef char KuTaskStringEnumOutcomeLayoutV1[
+  sizeof(KuTaskStringEnumOutcomeV1)==sizeof(KuResult_str)
+  && KU_TASK_FRAME_ALIGNOF(KuTaskStringEnumOutcomeV1)==KU_TASK_FRAME_ALIGNOF(KuResult_str)
+  && offsetof(KuTaskStringEnumOutcomeV1,ok)==offsetof(KuResult_str,ok)
+  && offsetof(KuTaskStringEnumOutcomeV1,value)==offsetof(KuResult_str,value)
+  && offsetof(KuTaskStringEnumOutcomeV1,error)==offsetof(KuResult_str,error) ? 1 : -1];
+static uint32_t ku_task_adapter_string_charge(KuString value, size_t* charge);
+static int ku_task_adapter_string_overlaps(KuString value, const void* pointer, size_t bytes);
+"#;
+
+fn emit_string_enum_moves(
+    out: &mut COutput,
+    variant: &crate::ir::IrVariantLayout,
+    result: &str,
+    suffix: &str,
+) {
+    let tag = variant.tag;
+    let field = format!(
+        "value.payload.{}.{}",
+        c_ident(&variant.name),
+        c_ident(&variant.fields[0].name)
+    );
+    out.push_str(&format!(
+        r#"
+static KuTaskStringEnumOutcomeV1 ku_task_pack_{suffix}({result}* source) {{
+  KuTaskStringEnumOutcomeV1 packed={{0}};
+  if (source->ok) {{
+    packed.ok=true; packed.tag=source->value.tag;
+    if (packed.tag=={tag}) packed.value=ku_string_move(&source->{field});
+  }} else packed.error=ku_error_move(&source->error);
+  *source=({result}){{0}};
+  return packed;
+}}
+static {result} ku_task_unpack_{suffix}(KuTaskStringEnumOutcomeV1* source) {{
+  {result} unpacked={{0}};
+  if (source->ok) {{
+    unpacked.ok=true; unpacked.value.tag=source->tag;
+    if (source->tag=={tag}) unpacked.{field}=ku_string_move(&source->value);
+  }} else unpacked.error=ku_error_move(&source->error);
+  *source=(KuTaskStringEnumOutcomeV1){{0}};
+  return unpacked;
+}}
+"#
+    ));
+}
+
+fn string_enum_empty_value(variant: &crate::ir::IrVariantLayout, place: &str) -> KuResult<String> {
+    if variant.tag == 0 {
+        let field =
+            super::super::task::empty_value_expr(&IrType::Str, &format!("({place}).value"))?;
+        return Ok(format!("({place}).tag == 0 && ({field})"));
+    }
+    Ok(format!("({place}).tag == 0"))
+}
+
+pub(super) fn compact_enum_empty_result(
+    variant: &crate::ir::IrVariantLayout,
+    place: &str,
+) -> KuResult<String> {
+    let field = string_enum_empty_value(variant, place)?;
+    let error = super::super::task::empty_value_expr(
+        &IrType::Named("__ku_error_type".into()),
+        &format!("({place}).error"),
+    )?;
+    Ok(format!("!({place}).ok && ({field}) && ({error})"))
+}
+
 pub(super) fn empty_expr(layouts: &IrLayoutTable, ty: &IrType, place: &str) -> KuResult<String> {
     let payload = match ty {
         IrType::Result(inner) => inner,
         ty => ty,
     };
-    if record_name(ty).is_some() || crate::ir::task::enum_int_layout(layouts, payload).is_some() {
+    if record_name(ty).is_some()
+        || crate::ir::task::enum_int_layout(layouts, payload).is_some()
+        || crate::ir::task::enum_str_layout(layouts, payload).is_some()
+    {
         return typed_empty_expr(layouts, ty, place, 0, &mut 64);
     }
     super::super::task::empty_value_expr(ty, place)
@@ -185,6 +280,18 @@ fn typed_empty_expr(
 ) -> KuResult<String> {
     if depth > 24 {
         return Err(unsupported("Task record outcome layout is too deep"));
+    }
+    if let Some(variant) = crate::ir::task::enum_str_layout(layouts, ty) {
+        if variant.tag != 0 {
+            return Ok(format!("({place}).tag == 0"));
+        }
+        let member = format!(
+            "({place}).payload.{}.{}",
+            c_ident(&variant.name),
+            c_ident(&variant.fields[0].name)
+        );
+        let field = super::super::task::empty_value_expr(&IrType::Str, &member)?;
+        return Ok(format!("({place}).tag == 0 && ({field})"));
     }
     if let Some(variant) = crate::ir::task::enum_int_layout(layouts, ty) {
         // The zero tag chooses the only active storage in a vacant enum.

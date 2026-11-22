@@ -303,13 +303,22 @@ fn ReadReturnMatch(&tokens: [Token], first: int, last: int, token_base: int,
             }
         }
         marker = WindowToken(tokens, pattern_end, last)
+        guarded = marker.kind == "If" && arm_start.kind == "String"
+        arrow = pattern_end
+        if (guarded) {
+            arrow = ReadExpressionEnd(tokens, pattern_end + 1, last, "match_guard")?
+            marker = WindowToken(tokens, arrow, last)
+            if (arrow == pattern_end + 1) {
+                RejectAt(marker.clone(), "unexpected_token", "expected a match guard expression")?
+            }
+        }
         if (marker.kind == "If" || marker.kind == "LParen") {
             RejectAt(marker.clone(), "unsupported_match_pattern", "stage-3 return match does not support guards or payload patterns")?
         }
         if (marker.kind != "Arrow") {
             RejectAt(marker, "unexpected_token", "expected '=>' after match pattern")?
         }
-        value_start = pattern_end + 1
+        value_start = arrow + 1
         value_end = ReadExpressionEnd(tokens, value_start, last, "match_arm")?
         if (value_end == value_start) {
             RejectAt(WindowToken(tokens, value_start, last), "unexpected_token", "expected match arm expression")?
@@ -324,10 +333,17 @@ fn ReadReturnMatch(&tokens: [Token], first: int, last: int, token_base: int,
         } else {
             pattern = append(parse(token_base + cursor, token_base + pattern_end)?, arm_start.clone(), false)?
         }
+        arm_children = [pattern]
+        if (guarded) {
+            guard_start = pattern_end + 1
+            guard = append(parse(token_base + guard_start, token_base + arrow)?, WindowToken(tokens, guard_start, last), false)?
+            arm_children = arm_children.push(guard)
+        }
         value = append(parse(token_base + value_start, token_base + value_end)?,
                        WindowToken(tokens, value_start, last), false)?
         span = SpanMerge(SpanFromToken(arm_start.clone()), read_span(value))
-        arm = add("MatchArm", "", 0, span, [pattern, value], arm_start)?
+        arm_children = arm_children.push(value)
+        arm = add("MatchArm", "", 0, span, arm_children, arm_start)?
         children = children.push(arm)
         cursor = after_arm
         reading = !WindowKindIs(tokens, cursor, last, "RBrace")

@@ -548,6 +548,11 @@ fn EmitLinkedEnumMatchCase(selected: int): str {
     return "    default: {\n"
 }
 
+fn EmitLinkedMatchArmEnd(guarded: bool): str {
+    if (guarded) { return "    }\n    }\n" }
+    return "    }\n"
+}
+
 fn EmitLinkedMatchEnd(string: bool, has_default: bool): str {
     if (string) { return "" }
     if (has_default) { return "    }\n" }

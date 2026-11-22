@@ -14,7 +14,7 @@ use crate::ir::task::{TaskFunction, TaskOp, TaskProgram, TaskSlotType, TaskTermi
 use crate::ir::{IrLayoutTable, IrType};
 
 use super::output::COutput;
-use super::{c_move_value, c_type, c_type_suffix, unsupported};
+use super::{c_ident, c_move_value, c_type, c_type_suffix, unsupported};
 
 #[path = "c_task_host.rs"]
 mod host;
@@ -260,6 +260,11 @@ fn charge_with_layouts(
     let charge = |leaf: &str| {
         format!("  {status}=ku_task_adapter_string_charge({leaf},&{total}); if ({status}!=KU_TASK_DRIVER_OK) return {status};\n")
     };
+    if let Some(code) = string_enum_strings(layouts, ty, place, &charge)
+        .or_else(|| string_enum_result_strings(layouts, ty, place, &charge))
+    {
+        return Ok(code);
+    }
     if task_record_type(ty) {
         return record_strings(layouts, ty, place, &charge);
     }
@@ -283,13 +288,47 @@ fn record_result_strings(
     emit: &impl Fn(&str) -> String,
 ) -> KuResult<String> {
     let value = record_strings(layouts, payload, &format!("({result}).value"), emit)?;
+    Ok(aggregate_result_strings(result, &value, emit))
+}
+
+fn aggregate_result_strings(result: &str, value: &str, emit: &impl Fn(&str) -> String) -> String {
     let error = ["domain", "code", "message"]
         .iter()
         .map(|field| emit(&format!("({result}).error.{field}")))
         .collect::<String>();
-    Ok(format!(
-        "  if (({result}).ok) {{\n{value}  }} else {{\n{error}  }}\n"
+    format!("  if (({result}).ok) {{\n{value}  }} else {{\n{error}  }}\n")
+}
+
+fn string_enum_strings(
+    layouts: &IrLayoutTable,
+    ty: &IrType,
+    place: &str,
+    emit: &impl Fn(&str) -> String,
+) -> Option<String> {
+    let variant = crate::ir::task::enum_str_layout(layouts, ty)?;
+    let field = format!(
+        "({place}).payload.{}.{}",
+        c_ident(&variant.name),
+        c_ident(&variant.fields[0].name)
+    );
+    Some(format!(
+        "  if (({place}).tag=={}) {{\n{}  }}\n",
+        variant.tag,
+        emit(&field)
     ))
+}
+
+pub(super) fn string_enum_result_strings(
+    layouts: &IrLayoutTable,
+    ty: &IrType,
+    place: &str,
+    emit: &impl Fn(&str) -> String,
+) -> Option<String> {
+    let IrType::Result(inner) = ty else {
+        return None;
+    };
+    let value = string_enum_strings(layouts, inner, &format!("({place}).value"), emit)?;
+    Some(aggregate_result_strings(place, &value, emit))
 }
 
 // Each take stage excludes every header address known at that point before
@@ -302,6 +341,9 @@ fn result_aliases(
     extra_count: usize,
     body: &impl Fn(&str) -> String,
 ) -> KuResult<String> {
+    if let Some(code) = string_enum_result_strings(layouts, ty, place, body) {
+        return Ok(code);
+    }
     if crate::ir::task::http_response_type(ty) {
         let leaves = ["content_type", "body", "location"]
             .iter()
@@ -789,7 +831,9 @@ fn emit_function(
     let dynamic_projection = blocking
         || crate::ir::task::array_result(&function.result) || crate::ir::task::http_type(&function.result)
         || task_record_type(inner)
+        || crate::ir::task::string_enum_value(layouts, &function.result)
         || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty) || task_record_type(ty) || matches!(ty, IrType::Result(inner) if task_record_type(inner))))
+        || function.slots.iter().any(|slot| matches!(&slot.ty, TaskSlotType::Value {ty,..} if crate::ir::task::string_enum_value(layouts, ty)))
         || function.states.iter().any(|state| {
             state
                 .operations
@@ -814,7 +858,10 @@ fn emit_function(
                 borrowed: false,
             } = &slot.ty
             {
-                if owned(ty) || task_record_type(ty) {
+                if owned(ty)
+                    || task_record_type(ty)
+                    || crate::ir::task::string_enum_value(layouts, ty)
+                {
                     reconcile_fields.push_str(&format!("  if (instance->frame.header.initialized & (UINT64_C(1)<<{index})) {{\n{}  }}\n",
                         charge_with_layouts(layouts, ty, &format!("instance->frame.s_{index}"),"bytes","status")?));
                 }
@@ -843,6 +890,25 @@ fn emit_function(
         ));
     }
     let result_type = c_type(&function.result)?;
+    let suffix = c_type_suffix(inner)?;
+    let string_enum = crate::ir::task::enum_str_layout(layouts, inner);
+    let (outcome_type, pack, empty_result, payload_tag_check) = if let Some(variant) = string_enum {
+        let layout = crate::ir::task::enum_layout(layouts, inner)
+            .ok_or_else(|| unsupported("missing Task string enum result layout"))?;
+        (
+            "KuTaskStringEnumOutcomeV1",
+            format!("ku_task_pack_{suffix}(&instance->payload)"),
+            host::compact_enum_empty_result(variant, "(*output)")?,
+            format!("  if (instance->payload.ok && (uint32_t)instance->payload.value.tag>={}u) return KU_TASK_CONTROL_INVALID_ARGUMENT;\n", layout.variants.len()),
+        )
+    } else {
+        (
+            result_type.as_str(),
+            format!("ku_result_move_{suffix}(&instance->payload)"),
+            outcome_empty_expr(layouts, &function.result, "(*output)")?,
+            String::new(),
+        )
+    };
     let mut declarations = String::new();
     let mut arguments = String::new();
     let mut preflight = String::new();
@@ -1112,7 +1178,10 @@ fn emit_function(
         .replace("@WAIT_RECEIPTS@", if has_children { WAIT_RECEIPTS } else { "" })
         .replace("@ID@", &id)
         .replace("@RESULT@", &result_type)
-        .replace("@SUFFIX@", &c_type_suffix(inner)?)
+        .replace("@OUTCOME_TYPE@", outcome_type)
+        .replace("@PAYLOAD_MOVE@", &pack)
+        .replace("@PAYLOAD_TAG_CHECK@", &payload_tag_check)
+        .replace("@SUFFIX@", &suffix)
         .replace("@PARAM_DECLS@", &declarations)
         .replace("@PARAM_ARGS@", &arguments)
         .replace("@PREFLIGHT@", &preflight)
@@ -1134,10 +1203,7 @@ fn emit_function(
         .replace("@TRANSFERS@", &transfers)
         .replace("@PAYLOAD_ALIASES@", &payload_aliases)
         .replace("@REQUEST_ALIASES@", &request_aliases)
-        .replace(
-            "@EMPTY_RESULT@",
-            &outcome_empty_expr(layouts, &function.result, "(*output)")?,
-        );
+        .replace("@EMPTY_RESULT@", &empty_result);
     out.push_str(&source);
     out.check()
 }
@@ -1761,7 +1827,7 @@ static uint32_t ku_task_@ID@_take_payload(void* raw, void* destination) {
   if (!ku_task_driver_external_storage(instance->ticket.driver,request,sizeof(*request),KU_TASK_FRAME_ALIGNOF(KuTaskAdapterTakeRequestV1))
       || ku_task_frame_ranges_overlap(instance,sizeof(*instance),request,sizeof(*request))) return KU_TASK_CONTROL_INVALID_ARGUMENT;
   if (!instance->payload_initialized) return KU_TASK_CONTROL_RESULT_TAKEN;
-@REQUEST_ALIASES@
+@PAYLOAD_TAG_CHECK@@REQUEST_ALIASES@
   /* The request may alias a smaller payload allocation. Reject that address
    * before reading even its private HTTP receipt fields. */
   if(request->retained_bytes || request->retain_payload_charge>1u
@@ -1773,7 +1839,7 @@ static uint32_t ku_task_@ID@_take_payload(void* raw, void* destination) {
   if (request->parent && (!ku_task_driver_external_storage(instance->ticket.driver,request->parent,sizeof(*request->parent),KU_TASK_FRAME_ALIGNOF(KuTaskDriverTicketV1))
       || ku_task_frame_ranges_overlap(request->parent,sizeof(*request->parent),outcome,sizeof(*outcome))
       || ku_task_frame_ranges_overlap(request->parent,sizeof(*request->parent),request,sizeof(*request)))) return KU_TASK_CONTROL_INVALID_ARGUMENT;
-  @RESULT@* output=&outcome->value.@FIELD@;
+  @OUTCOME_TYPE@* output=&outcome->value.@FIELD@;
 @PAYLOAD_ALIASES@
   /* Reject deep alias before reading a typed header from that address: the
    * aliased allocation itself may be smaller than sizeof(*output). */
@@ -1789,7 +1855,7 @@ static uint32_t ku_task_@ID@_take_payload(void* raw, void* destination) {
     if(checked!=KU_TASK_DRIVER_OK) return checked;
     request->retained_bytes=payload_charge;
   }
-  *output = ku_result_move_@SUFFIX@(&instance->payload);
+  *output = @PAYLOAD_MOVE@;
   outcome->result_kind=@KIND@u; outcome->exit_class=instance->exit_class;
   outcome->has_cleanup_deadline=instance->has_cleanup_deadline; outcome->cleanup_deadline=instance->cleanup_deadline;
   instance->payload_initialized = false;

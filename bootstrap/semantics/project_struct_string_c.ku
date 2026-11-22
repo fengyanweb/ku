@@ -15,55 +15,6 @@ import { HasScalarBuiltin, ScalarStringLiteral } from "./scalar_int_operands.ku"
 import { BindStructStringCall, ReadStructStringFold, StructStringDependency, StructStringFold } from "./struct_string_calls.ku"
 import { TypeNameBinding } from "./type_names.ku"
 
-import { DropLinkedNullScope } from "./linked_member_ownership.ku"
-import { LinkedBooleanWhileCondition, LinkedBuiltinNameAvailable } from "./link_plan_json_c.ku"
-import { LinkedNullState } from "./link_plan_c.ku"
-import { LinkedNullChild, LinkedNullNode, LinkedNullProject } from "./linked_null_types_c.ku"
-import { LowerLinkedNullTry, LowerLinkedNullValue } from "./linked_null_values_c.ku"
-fn linkedOutputBuiltin(&project: LinkedNullProject, &state: LinkedNullState, &target: Node): bool {
-    if (target.kind != "Variable" || target.edge_count != 0 || target.text != "println") { return false }
-    return LinkedBuiltinNameAvailable(project.supplied[0].named.names.declarations,
-        project.binding.modules[0].imports, state.slots, target.text)
-}
-
-fn emitLinkedOutput(&text: str, newline: bool): str {
-    code = "    {\n        KuProjectionString written_text = " + text.clone() + ";\n"
-        + "        size_t offset = 0;\n        while (offset < written_text.len) {\n"
-        + "            size_t count = fwrite(written_text.ptr + offset, 1, written_text.len - offset, stdout);\n"
-        + "            if (!count) { output_failed = true; goto cleanup; }\n"
-        + "            offset += count;\n        }\n"
-    if (newline) { code += "        if (fputc('\\n', stdout) == EOF) { output_failed = true; goto cleanup; }\n" }
-    return code + "        (void)fflush(stdout);\n    }\n"
-}
-
-fn lowerLinkedOutputValue(&project: LinkedNullProject, state: LinkedNullState, id: int,
-                          newline: bool): LinkedNullState! {
-    scope = state.slots.len()
-    value = LowerLinkedNullValue(project, state, id, 0)?
-    if (value.value.ty.declaration_kind != "Builtin" || value.value.ty.name != "str") {
-        node = LinkedNullNode(project, 1, id)
-        RejectLayout("linked_output_type", "expected a str argument for linked output", DeclarationSpan(node))?
-    }
-    value.state.uses_print = true
-    value.state.code += emitLinkedOutput(value.value.text, newline)
-    return ok(DropLinkedNullScope(value.state, scope))
-}
-
-fn LowerLinkedStatementCall(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
-    id = LinkedNullChild(project, 1, statement, 0)
-    // Stage3 represents the print keyword separately from a println call.
-    if (statement.kind == "Print") { return lowerLinkedOutputValue(project, state, id, false) }
-    call = LinkedNullNode(project, 1, id)
-    if (call.kind == "Call" && call.edge_count == 2) {
-        target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
-        if (linkedOutputBuiltin(project, state, target)) {
-            argument = LinkedNullChild(project, 1, call, 1)
-            return lowerLinkedOutputValue(project, state, argument, true)
-        }
-    }
-    return LowerLinkedNullTry(project, state, statement)
-}
-
 struct ProjectStructStringC {
     symbol: str
     dependencies: [StructStringDependency]
@@ -360,18 +311,4 @@ fn EmitProjectStructStringC(&supplied: [SuppliedModule], &function: str): Projec
     }
     RejectLayout("unknown_struct_string_function", "undefined struct-to-string function '" + function.clone() + "'", start)?
     return ok(ProjectStructStringC { symbol: "", dependencies: [], source: "", entry_plan: EmptyLinkPlanDeclaration() })
-}
-
-struct LinkedWhileCondition {
-    conjunction: int
-    local: str
-}
-
-fn ReadLinkedWhileCondition(&project: LinkedNullProject, &state: LinkedNullState, &statement: Node): LinkedWhileCondition {
-    id = LinkedNullChild(project, 1, statement, 0)
-    guard = LinkedNullNode(project, 1, id)
-    if (guard.kind == "Binary" && guard.text == "&&" && guard.edge_count == 2) {
-        return LinkedWhileCondition { conjunction: id, local: "" }
-    }
-    return LinkedWhileCondition { conjunction: 0, local: LinkedBooleanWhileCondition(state, guard) }
 }

@@ -1,0 +1,252 @@
+import { Node } from "../stage2/ast.ku"
+import { DeclarationSpan } from "./names.ku"
+import { RejectLayout, ReadLinkedErrorInitializer } from "./struct_layouts.ku"
+import { LinkedBooleanWhileCondition, LinkedBuiltinNameAvailable } from "./link_plan_json_c.ku"
+import { BindLinkedCatch, DropLinkedNullScope, LinkedNullDropC, MoveLinkedNullSlot, UnwindLinkedNullScope } from "./linked_member_ownership.ku"
+import { ExitLinkedFailure, LinkedFailureTarget, LinkedNullExpression, LinkedNullOwner, LinkedNullSlot, LinkedNullState, PreserveLinkedOwners } from "./link_plan_c.ku"
+import { LinkedBuiltin, LinkedNullChild, LinkedNullHasResultValue, LinkedNullNode, LinkedNullProject, LinkedStringResult } from "./linked_null_types_c.ku"
+import { LowerLinkedNullTry, LowerLinkedNullValue, LowerLinkedRetainedTry } from "./linked_null_values_c.ku"
+import { LinkedCopyResult, TypeNameBinding } from "./type_names.ku"
+import { AddLinkedNullSlot } from "./linked_parameters_c.ku"
+import { EmitLinkedFinallyJoin, EmitLinkedFinallyError } from "./scalar_int_emit.ku"
+
+import { LinkedRetainedViewPlan, LinkedViewRetention } from "./linked_nullable_reader_c.ku"
+import { LowerLinkedLocal } from "./linked_owner_assignment_c.ku"
+
+fn linkedOutputBuiltin(&project: LinkedNullProject, &state: LinkedNullState, &target: Node): bool {
+    if (target.kind != "Variable" || target.edge_count != 0 || target.text != "println") { return false }
+    return LinkedBuiltinNameAvailable(project.supplied[0].named.names.declarations,
+        project.binding.modules[0].imports, state.slots, target.text)
+}
+
+fn emitLinkedOutput(&text: str, newline: bool): str {
+    code = "    {\n        KuProjectionString written_text = " + text.clone() + ";\n"
+        + "        size_t offset = 0;\n        while (offset < written_text.len) {\n"
+        + "            size_t count = fwrite(written_text.ptr + offset, 1, written_text.len - offset, stdout);\n"
+        + "            if (!count) { output_failed = true; goto cleanup; }\n"
+        + "            offset += count;\n        }\n"
+    if (newline) { code += "        if (fputc('\\n', stdout) == EOF) { output_failed = true; goto cleanup; }\n" }
+    return code + "        (void)fflush(stdout);\n    }\n"
+}
+
+fn lowerLinkedOutputValue(&project: LinkedNullProject, state: LinkedNullState, id: int,
+                          newline: bool): LinkedNullState! {
+    scope = state.slots.len()
+    value = LowerLinkedNullValue(project, state, id, 0)?
+    if (value.value.ty.declaration_kind != "Builtin" || value.value.ty.name != "str") {
+        node = LinkedNullNode(project, 1, id)
+        RejectLayout("linked_output_type", "expected a str argument for linked output", DeclarationSpan(node))?
+    }
+    value.state.uses_print = true
+    value.state.code += emitLinkedOutput(value.value.text, newline)
+    return ok(DropLinkedNullScope(value.state, scope))
+}
+
+fn LowerLinkedStatementCall(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    id = LinkedNullChild(project, 1, statement, 0)
+    // Stage3 represents the print keyword separately from a println call.
+    if (statement.kind == "Print") { return lowerLinkedOutputValue(project, state, id, false) }
+    call = LinkedNullNode(project, 1, id)
+    if (call.kind == "Call" && call.edge_count == 2) {
+        target = LinkedNullNode(project, 1, LinkedNullChild(project, 1, call, 0))
+        if (linkedOutputBuiltin(project, state, target)) {
+            argument = LinkedNullChild(project, 1, call, 1)
+            return lowerLinkedOutputValue(project, state, argument, true)
+        }
+    }
+    return LowerLinkedNullTry(project, state, statement)
+}
+
+struct LinkedWhileCondition {
+    conjunction: int
+    local: str
+}
+
+fn ReadLinkedWhileCondition(&project: LinkedNullProject, &state: LinkedNullState, &statement: Node): LinkedWhileCondition {
+    id = LinkedNullChild(project, 1, statement, 0)
+    guard = LinkedNullNode(project, 1, id)
+    if (guard.kind == "Binary" && guard.text == "&&" && guard.edge_count == 2) {
+        return LinkedWhileCondition { conjunction: id, local: "" }
+    }
+    return LinkedWhileCondition { conjunction: 0, local: LinkedBooleanWhileCondition(state, guard) }
+}
+
+fn LowerLinkedFailure(&project: LinkedNullProject, state: LinkedNullState, &statement: Node): LinkedNullState! {
+    if (statement.kind != "Fail" || statement.edge_count != 1) {
+        RejectLayout("unsupported_linked_terminal", "expected a final Error fail or return ok(null)", DeclarationSpan(statement))?
+    }
+    id = LinkedNullChild(project, 1, statement, 0)
+    literal = LinkedNullNode(project, 1, id)
+    target = LinkedFailureTarget(state)
+    if (literal.kind == "Variable" && literal.edge_count == 0) {
+        error = LowerLinkedNullValue(project, state, LinkedNullChild(project, 1, statement, 0), 0)?
+        if (error.value.ty.declaration_kind != "CaughtError") {
+            RejectLayout("unsupported_linked_error", "expected a caught Error owner", DeclarationSpan(literal))?
+        }
+        error.state.code += "    " + target + " = " + error.value.text.clone() + ";\n"
+        owner = error.value.clone()
+        moved = MoveLinkedNullSlot(error.state, owner)?
+        return ok(ExitLinkedFailure(moved, "    "))
+    }
+    plan = ReadLinkedErrorInitializer(project.supplied[0].named, literal)?
+    next = state
+    destination = target.clone()
+    if (plan.scratch) {
+        ty = TypeNameBinding { use_node: 0, name: "Error", declaration_kind: "CaughtError",
+            module_index: 0, declaration_node: 0, span: DeclarationSpan(literal) }
+        scratch = AddLinkedNullSlot(project, next, "", "error" + str(id), ty, false)?
+        next = scratch.state
+        destination = scratch.value.text
+    }
+    for field in plan.fields {
+        value = LowerLinkedNullValue(project, next, field.expression, 0)?
+        if (value.value.ty.declaration_kind != "Builtin" || value.value.ty.name != "str") {
+            RejectLayout("unsupported_linked_error_field", "error fields require str", value.value.ty.span.clone())?
+        }
+        value.state.code += "    " + destination.clone() + "." + field.name + " = " + value.value.text.clone() + ";\n"
+        owner = value.value
+        if (owner.borrowed) {
+            if (owner.slot == 0 || value.state.catch_slot != 0
+                || value.state.slots[owner.slot - 1].value.ty.declaration_kind != "CaughtError") {
+                RejectLayout("linked_error_field_owner", "error fields require an owned str or a terminal caught field", owner.ty.span.clone())?
+            }
+            value.state.code += "    " + owner.text.clone() + " = (KuProjectionString){0};\n"
+            value.state.moved_error_fields = value.state.moved_error_fields.push(owner.text)
+            next = value.state
+        } else {
+            next = MoveLinkedNullSlot(value.state, owner)?
+        }
+    }
+    if (plan.scratch) {
+        next.code += "    " + target + " = " + destination.clone() + ";\n"
+            + "    " + destination + " = (KuBootstrapError){0};\n"
+        cleared: [str] = []
+        next.moved_error_fields = cleared
+    }
+    return ok(ExitLinkedFailure(next, "    "))
+}
+
+fn CheckLinkedFinallyContext(&state: LinkedNullState, &node: Node, &result: TypeNameBinding, depth: int): null! {
+    if (depth != 0 || state.catch_slot != 0 || state.plain_value_result ||
+        !(LinkedCopyResult(result) || LinkedStringResult(result) || !LinkedNullHasResultValue(result))) {
+        RejectLayout("unsupported_linked_finally", "expected a top-level checked primitive try/finally", DeclarationSpan(node))?
+    }
+    return ok(null)
+}
+
+fn OpenLinkedNamedCatch(&project: LinkedNullProject, state: LinkedNullState, &binding: Node, id: int): LinkedNullState! {
+    ty = LinkedBuiltin("Error", DeclarationSpan(binding))
+    ty.declaration_kind = "CaughtError"
+    owner = AddLinkedNullSlot(project, state, "", "caught" + str(id), ty, false)?
+    owner.state.catch_slot = owner.value.slot
+    return ok(owner.state)
+}
+
+fn EnterLinkedCatchBeforeFinally(state: LinkedNullState, &binding: Node, &before: [LinkedNullSlot],
+                                 pending: int, resumes: bool): LinkedNullState! {
+    next = state
+    if (resumes) {
+        next.code += "    goto " + next.slots[pending - 1].value.text.clone() + "_run;\n"
+    }
+    caught = BindLinkedCatch(next, binding.text.clone(), binding, before)?
+    caught.catch_slot = pending
+    return ok(caught)
+}
+
+fn FinishLinkedFinally(&project: LinkedNullProject, state: LinkedNullState, &cleanup: Node,
+                       saved: int, terminal: bool, returning: bool): LinkedNullState! {
+    next = state
+    error_slot = next.catch_slot
+    error = LinkedFailureTarget(next)
+    catches = next.catch_edges
+    if (catches) { next.declarations += "    bool " + error.clone() + "_failed = false;\n" }
+    next.code += EmitLinkedFinallyJoin(error, catches, !terminal || returning)
+    keep = error_slot
+    if (saved > 0) { keep = saved }
+    next = UnwindLinkedNullScope(next, keep)
+    next.catch_edges = false
+    index = 0
+    while (index < cleanup.edge_count) {
+        statement = LinkedNullNode(project, 1, LinkedNullChild(project, 1, cleanup, index))
+        if ((statement.kind != "Print" && statement.kind != "ExprStmt") || statement.edge_count != 1) {
+            RejectLayout("unsupported_linked_finally_cleanup", "cleanup requires fallthrough output statements", DeclarationSpan(statement))?
+        }
+        next = LowerLinkedStatementCall(project, next, statement)?
+        if (next.catch_edges) {
+            RejectLayout("unsupported_linked_finally_cleanup", "cleanup cannot propagate a checked Error", DeclarationSpan(statement))?
+        }
+        index = index + 1
+    }
+    next.catch_slot = 0
+    cleared: [int] = []
+    next.catch_moved = cleared
+    if (catches) { next.code += EmitLinkedFinallyError(error) }
+    if (returning) {
+        if (saved > 0) {
+            pending = next.slots[saved - 1].value.clone()
+            next.code += "    result.value = " + pending.text.clone() + ";\n"
+            next = MoveLinkedNullSlot(next, pending)?
+        }
+        next.code += "    result.ok = true;\n    goto cleanup;\n"
+    }
+    return ok(DropLinkedNullScope(next, error_slot - 1))
+}
+
+fn LowerLinkedRetainedPair(&project: LinkedNullProject, state: LinkedNullState, &region: Node,
+                           &statement: Node, id: int, index: int, &plan: LinkedRetainedViewPlan): LinkedNullState! {
+    next = state
+    if (statement.kind == "Assign" || statement.kind == "VarDecl") {
+        next = LowerLinkedLocal(project, next, statement, id, true)?
+    } else {
+        move = LinkedViewRetention { field: plan.field, whole_view: false }
+        next = LowerLinkedRetainedTry(project, next, statement, move)?
+    }
+    limit = plan.end
+    start = index + 1
+    cursor = start
+    while (cursor < limit) {
+        output = LinkedNullNode(project, 1, LinkedNullChild(project, 1, region, cursor))
+        next = LowerLinkedStatementCall(project, next, output)?
+        cursor = cursor + 1
+    }
+    call = LinkedNullNode(project, 1, LinkedNullChild(project, 1, region, limit))
+    view = LinkedViewRetention { field: 0, whole_view: true }
+    return LowerLinkedRetainedTry(project, next, call, view)
+}
+
+struct LinkedCountedBreak {
+    boundary: int
+    before: [LinkedNullSlot]
+}
+
+fn IsLinkedDirectBreak(&project: LinkedNullProject, &statement: Node): bool {
+    if (statement.kind != "If" || statement.edge_count != 2 || statement.int_value != 1) { return false }
+    branch = LinkedNullNode(project, 1, LinkedNullChild(project, 1, statement, 1))
+    return branch.kind == "Break" && branch.edge_count == 0
+}
+
+fn LowerLinkedDirectBreak(condition: LinkedNullExpression, &statement: Node,
+                          &break_scope: LinkedCountedBreak): LinkedNullState! {
+    guard = condition
+    if (guard.value.ty.declaration_kind != "Builtin" || guard.value.ty.name != "bool") {
+        RejectLayout("linked_guard_type", "expected a readonly bool condition", DeclarationSpan(statement))?
+    }
+    PreserveLinkedOwners(break_scope.before, guard.state.slots, statement)?
+    guard.state.code += "    if ((bool)(" + guard.value.text + ")) {\n"
+    // Keep the false path's bindings live. Emit drops for the true edge without
+    // changing the facts used to compile statements after the guard.
+    first = break_scope.boundary - 1
+    remaining = guard.state.slots.len() - first
+    while (remaining > 0) {
+        index = first + remaining - 1
+        if (guard.state.slots[index].live && !guard.state.slots[index].value.borrowed &&
+            LinkedNullOwner(guard.state.slots[index].value.ty)) {
+            drop = LinkedNullDropC(guard.state.layouts, guard.state.owning_layouts,
+                                   guard.state.slots[index].value.ty, guard.state.slots[index].value.text)
+            guard.state.code += drop
+        }
+        remaining = remaining - 1
+    }
+    guard.state.code += "        break;\n    }\n"
+    return ok(guard.state)
+}

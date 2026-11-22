@@ -1046,6 +1046,57 @@ fn main(): null! {
     assert execute([output], caller).stdout.replace(b"\r\n", b"\n") == b"2\n1\n0\nsubject\n7\n"
 
 
+def exercise_linked_string_match_guard(compiler, cc, caller):
+    project = caller / "linked string guard"
+    project.mkdir()
+    main = project / "main.ku"
+    classify = project / "classify.ku"
+    main.write_text('''\
+import { Token, Classify } from "./classify.ku"
+
+fn main(): null! {
+    println(str(Classify(Token { kind: "If" }, false)))
+    println(str(Classify(Token { kind: "If" }, true)))
+    println(str(Classify(Token { kind: "EOF" }, false)))
+    return ok(null)
+}
+''', encoding="utf-8")
+    classify.write_text('''\
+struct Token { kind: str }
+
+fn Allow(&token: Token, allowed: bool): bool {
+    println("guard " + token.kind)
+    return allowed
+}
+
+fn Mark(code: int): int {
+    println("arm " + str(code))
+    return code
+}
+
+fn Classify(&token: Token, allowed: bool): int {
+    return match token.kind {
+        "If" if Allow(token, allowed) => Mark(21)
+        'If' => Mark(22)
+        "LBrace" if Allow(token, true) => Mark(11)
+        _ => Mark(0)
+    }
+}
+''', encoding="utf-8")
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\nclassify.ku\n", encoding="utf-8")
+    execute([compiler, "check-project", manifest], caller)
+    output = project / ("classify.exe" if os.name == "nt" else "classify")
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    execute([sys.executable, "-B", builder, "--compiler", compiler, "--cc", cc,
+             manifest, "-o", output], caller)
+    main.unlink()
+    classify.unlink()
+    assert execute([output], caller).stdout.splitlines() == [
+        b"guard If", b"arm 22", b"22", b"guard If", b"arm 21", b"21", b"arm 0", b"0",
+    ]
+
+
 def exercise_linked_unit_enum_result(compiler, cc, caller):
     project = caller / "linked-unit-enum-result"
     project.mkdir()
@@ -1226,6 +1277,65 @@ def exercise_finally_frontend(compiler, caller):
         assert diagnostic in rejected.stderr and not rejected.stdout, rejected.stderr
 
 
+def exercise_linked_counted_break(compiler, cc, caller):
+    project = caller / "linked counted break"
+    project.mkdir()
+    (project / "main.ku").write_text('''\
+import { FirstStop } from "./scan.ku"
+
+fn main(): null! {
+    values: [int] = [11, 29, 7]
+    println(str(FirstStop(values, 29)))
+    println(str(FirstStop(values, 11)))
+    println(str(FirstStop(values, 8)))
+    return ok(null)
+}
+''', encoding="utf-8")
+    (project / "scan.ku").write_text('''\
+fn FirstStop(&values: [int], target: int): int {
+    outside = "kept-" + str(target)
+    cursor = 0
+    while (cursor < values.len()) {
+        line = "line-" + str(cursor)
+        if (values[cursor] == target) { break }
+        println(line)
+        cursor = cursor + 1
+    }
+    println(outside)
+    return cursor
+}
+''', encoding="utf-8")
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\nscan.ku\n", encoding="utf-8")
+    execute([compiler, "check-project", manifest], caller)
+    output = project / ("scan.exe" if os.name == "nt" else "scan")
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    execute([sys.executable, "-B", builder, "--compiler", compiler, "--cc", cc,
+             manifest, "-o", output], caller)
+    (project / "main.ku").unlink()
+    (project / "scan.ku").unlink()
+    assert execute([output], caller).stdout.splitlines() == [
+        b"line-0", b"kept-29", b"1", b"kept-11", b"0",
+        b"line-0", b"line-1", b"line-2", b"kept-8", b"3",
+    ]
+
+    source = project / "unsupported.ku"
+    source.write_text('''\
+fn Nested(&values: [int]): int {
+    index = 0
+    while (index < values.len()) {
+        if (index == 0) { if (index == 0) { break } }
+        index = index + 1
+    }
+    return index
+}
+''', encoding="utf-8")
+    manifest.write_text("unsupported.ku\n", encoding="utf-8")
+    execute([compiler, "check-project", manifest], caller)
+    rejected = execute([compiler, "emit-unit", manifest, "Nested"], caller, 1)
+    assert not rejected.stdout and b"unsupported_linked_statement" in rejected.stderr
+
+
 def exercise_linked_finally(compiler, cc, caller):
     project = caller / "linked-finally"
     project.mkdir()
@@ -1290,13 +1400,102 @@ fn main(): null! {
         ('try { return ok("x") } finally { return ok("y") }', b"unsupported_linked_finally_cleanup"),
         ('try { return ok("x") } finally { println(Probe(false)?) }', b"unsupported_linked_finally_cleanup"),
         ('try { return ok(text) } finally { println("done") }', b"linked_control_move"),
-        ('try { return ok("x") } catch (err) { return ok("z") } finally { println("done") }',
-         b"unsupported_linked_catch"),
     ]:
         main.write_text('fn Probe(read: bool): str! { return ok("probe") }\n'
                         f'fn Bad(read: bool, text: str): str! {{ {invalid} }}\n', encoding="utf-8")
         rejected = execute([compiler, "emit-unit-plan", manifest, "Bad"], caller, 1)
         assert not rejected.stdout and error in rejected.stderr, rejected.stderr
+
+
+def exercise_linked_caught_finally(compiler, cc, caller):
+    project = caller / "linked-caught-finally"
+    project.mkdir()
+    main = project / "main.ku"
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\n", encoding="utf-8")
+    main.write_text('''fn Load(found: bool): str! {
+    if (!found) { fail { domain: "catalog", code: "missing", message: "name " + "缺失🙂" } }
+    return ok("name-" + "🙂")
+}
+fn Reload(): str! {
+    fail { domain: "archive", code: "closed", message: "archive " + "关闭🙂" }
+}
+fn Audit(found: bool): str! {
+    try { name = Load(found)?; println(name) }
+    catch(issue) { println(issue.code); println(issue.message) }
+    finally { println("audit cleanup") }
+    return ok("continued")
+}
+fn Resolve(found: bool): str! {
+    try { name = Load(found)?; return ok(name) }
+    catch(issue) { println(issue.message); return ok("fallback-" + "🙂") }
+    finally { println("resolve cleanup") }
+}
+fn Relay(): str! {
+    try { name = Load(false)?; return ok(name) }
+    catch(issue) { println(issue.code); fail issue }
+    finally { println("relay cleanup") }
+}
+fn Replace(): str! {
+    try { name = Load(false)?; return ok(name) }
+    catch(issue) { println(issue.code); next = Reload()?; return ok(next) }
+    finally { println("replacement cleanup") }
+}
+fn Observe(replace: bool): null! {
+    if (replace) {
+        try { println(Replace()?); return ok(null) }
+        catch(issue) { println(issue.domain); println(issue.code); println(issue.message); return ok(null) }
+    }
+    try { println(Relay()?); return ok(null) }
+    catch(issue) { println(issue.domain); println(issue.code); println(issue.message); return ok(null) }
+}
+fn main(): null! {
+    println(Audit(true)?)
+    println(Audit(false)?)
+    println(Resolve(true)?)
+    println(Resolve(false)?)
+    Observe(false)?
+    Observe(true)?
+    return ok(null)
+}
+''', encoding="utf-8")
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    binary = caller / ("caught-finally.exe" if os.name == "nt" else "caught-finally")
+    build = [sys.executable, "-B", builder, manifest, "--compiler", compiler, "--cc", cc, "-o", binary]
+    execute(build, caller)
+    expected = (
+        "name-🙂\naudit cleanup\ncontinued\nmissing\n"
+        "name 缺失🙂\naudit cleanup\ncontinued\nresolve cleanup\n"
+        "name-🙂\nname 缺失🙂\nresolve cleanup\nfallback-🙂\n"
+        "missing\nrelay cleanup\ncatalog\nmissing\n"
+        "name 缺失🙂\nmissing\nreplacement cleanup\narchive\n"
+        "closed\narchive 关闭🙂\n"
+    ).encode()
+    assert execute([binary], caller).stdout.replace(b"\r\n", b"\n") == expected
+
+    main.write_text('''fn Load(): str! { fail { domain: "catalog", code: "missing", message: "name " + "gone" } }
+fn Report(divisor: int): str! {
+    try { name = Load()?; return ok(name) }
+    catch(issue) { println(issue.message); println(str(18 / divisor)); fail issue }
+    finally { println("BAD: fatal cleanup") }
+}
+fn main(): null! { println(Report(0)?); return ok(null) }
+''', encoding="utf-8")
+    execute(build, caller)
+    failed = execute([binary], caller, 1)
+    assert failed.stdout.replace(b"\r\n", b"\n") == b"name gone\n"
+    assert b"division by zero" in failed.stderr
+
+    main.write_text('''fn Load(): str! { fail { domain: "catalog", code: "missing", message: "name gone" } }
+fn Bad(): str! {
+    try { name = Load()?; return ok(name) }
+    catch (issue) { println(issue.message) }
+    finally { println("cleanup") }
+    return ok("continued")
+}
+''', encoding="utf-8")
+    rejected = execute([compiler, "emit-unit-plan", manifest, "Bad"], caller, 1)
+    assert not rejected.stdout and b"linked_finally_branch_mode" in rejected.stderr, rejected.stderr
 
 
 def exercise_linked_reader_factory(compiler, cc, caller):
@@ -1898,10 +2097,13 @@ def exercise(ku, cc):
         exercise_linked_unit_enum_match(compiler, cc, caller)
         exercise_linked_checked_enum_match(compiler, cc, caller)
         exercise_linked_string_return_match(compiler, cc, caller)
+        exercise_linked_string_match_guard(compiler, cc, caller)
         exercise_linked_unit_enum_result(compiler, cc, caller)
         exercise_linked_unit_enum_member(compiler, cc, caller)
         exercise_finally_frontend(compiler, caller)
         exercise_linked_finally(compiler, cc, caller)
+        exercise_linked_counted_break(compiler, cc, caller)
+        exercise_linked_caught_finally(compiler, cc, caller)
         exercise_linked_reader_factory(compiler, cc, caller)
         exercise_linked_owned_string_for(compiler, cc, caller)
         exercise_parameter_bindings(compiler, cc, caller)

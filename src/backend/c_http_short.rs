@@ -1223,7 +1223,7 @@ fn task_request_fields(function: &crate::ir::task::TaskFunction) -> Option<u32> 
                     }
                 }
                 // The typed verifier restricts all remaining operands to
-                // primitives, errors, responses, flat arrays, PG/net handles,
+                // primitives, bounded enums, errors, responses, flat arrays, PG/net handles,
                 // or Task/callable identities; they cannot observe a request.
                 // Drop accepts the zero owners of omitted fields.
                 TaskOp::Drop { .. }
@@ -1241,6 +1241,7 @@ fn task_request_fields(function: &crate::ir::task::TaskFunction) -> Option<u32> 
                 | TaskOp::ArrayMake { .. }
                 | TaskOp::RecordMake { .. }
                 | TaskOp::RecordField { .. }
+                | TaskOp::EnumStringMove { .. }
                 | TaskOp::ArrayClone { .. }
                 | TaskOp::Collection { .. }
                 | TaskOp::ArrayLen { .. }

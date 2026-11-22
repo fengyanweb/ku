@@ -1423,6 +1423,24 @@ def verify_task_enum_result_c(source):
     return dict(detail, nominal_enum_outcome=True)
 
 
+def verify_task_enum_string_result_c(source):
+    detail = verify_task_enum_record_c(source)
+    carrier = re.search(rb'KuTaskStringEnumOutcomeV1 ku_task_pack_enum_([A-Za-z0-9_]*Report)\(', source)
+    if carrier is None:
+        raise RuntimeError('installed Task string enum result is missing its nominal carrier')
+    nominal = carrier[1]
+    markers = (
+        b'KU_TASK_OUTCOME_KIND_ENUM_' + nominal,
+        b'ku_task_pack_enum_%s(KuResult_enum_%s* source)' % (nominal, nominal),
+        b'KuResult_enum_%s ku_task_unpack_enum_%s(KuTaskStringEnumOutcomeV1* source)' % (nominal, nominal),
+        b'if (packed.tag==1) packed.value=ku_string_move(&source->value.payload.Rejected.label)',
+        b'if (source->tag==1) unpacked.value.payload.Rejected.label=ku_string_move(&source->value)',
+    )
+    if not all(marker in source for marker in markers):
+        raise RuntimeError('installed Task string enum result must move its active nominal payload through the host ABI')
+    return dict(detail, nominal_enum_outcome=True, moves_owned_string_payload=True)
+
+
 def installed_forward_layout_consumer(install, root, env, report, target):
     """Check owned forward layout binding through a relative import."""
     files = {
@@ -1720,6 +1738,11 @@ def run_structured_only(args, report):
             installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
                                                  'native_task_enum_int_result', sources=('main.ku', 'worker.ku'),
                                                  native_c_abi=verify_task_enum_result_c)
+            installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
+                                                 'native_task_enum_str_result', sources=('main.ku', 'worker.ku'),
+                                                 native_c_abi=verify_task_enum_string_result_c)
+            installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
+                                                 'native_c_runtime_names')
             verification = repo / 'bootstrap/tools/compiler_driver/selfhost/verify.py'
             cc = env.get('KU_GNU_CC') if target == 'x86_64-pc-windows-gnu' else 'clang'
             if not cc:
@@ -1729,7 +1752,7 @@ def run_structured_only(args, report):
             result = invoke([sys.executable, '-B', verification, '--repo', repo,
                              '--revision', verifier, '--ku', ku, '--cc', cc,
                              '--output-dir', root / 'generations', '--temp-dir', root,
-                             '--limit', '800', '--stage3-application-checks', *seed_options],
+                             '--limit', '820', '--stage3-application-checks', *seed_options],
                             root, env, seconds=2400)
             if result.returncode:
                 raise RuntimeError('installed bootstrap generations failed: ' +

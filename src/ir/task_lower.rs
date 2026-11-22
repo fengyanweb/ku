@@ -1948,7 +1948,7 @@ impl<'a> FunctionLowerer<'a> {
         span: Span,
         depth: usize,
     ) -> KuResult<SlotId> {
-        if let Some(value) = self.int_enum_constructor(object, name, args, span, depth)? {
+        if let Some(value) = self.payload_enum_constructor(object, name, args, span, depth)? {
             return Ok(value);
         }
         if let Some(value) = self.array_collection_call(object, name, args, span, depth)? {
