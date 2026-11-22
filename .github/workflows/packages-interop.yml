@@ -13,7 +13,7 @@ on:
       - '.github/scripts/runtime-bundle.py'
       - '.github/workflows/packages-interop.yml'
   push:
-    branches: [main, 'codex/packages-interop']
+    branches: [main]
 
 permissions:
   contents: read
@@ -120,3 +120,9 @@ jobs:
           }
           python -B tests/acceptance/python_interop.py --ku $env:INSTALLED_KU --wheels
           if ($LASTEXITCODE) { throw 'Python package consumption failed' }
+      - name: Run a bundled Python wheel app without its author interpreter
+        if: matrix.rust-host == 'aarch64-apple-darwin'
+        shell: pwsh
+        run: |
+          python -B tests/acceptance/python_interop.py --ku $env:INSTALLED_KU --standalone-macos
+          if ($LASTEXITCODE) { throw 'Bundled Python runtime delivery failed' }

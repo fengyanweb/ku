@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     error::{KuError, KuResult},
     interop::{self, RELATIVE_RUNTIME_ROOT},
-    package::DependencyResolveMode,
+    package::{DependencyResolveMode, LEGAL_FILES},
 };
 
 use super::{acquire_build_file_lock_until, BuildLockMode, BUILD_LOCK_TIMEOUT};
@@ -23,6 +23,7 @@ const IDENTITY: &str = ".ku-bridge-identity";
 const LOCAL_PYTHON: &str = "interop-python-path";
 const MAX_FILES: usize = 20_000;
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_NOTICE_BYTES: u64 = 1024 * 1024;
 
 pub(super) struct Delivery<'a> {
     pub(super) output_dir: &'a Path,
@@ -77,16 +78,24 @@ pub(super) fn prepare_with_python(
     };
     let fingerprint =
         tree_digest(import_root, None).map_err(|error| io_error(import_root, error))?;
+    let notices = provider_notices(import_root)?;
+    let mut legal_digest = Sha256::new();
+    for (name, contents) in &notices {
+        legal_digest.update(name.as_bytes());
+        legal_digest.update([0]);
+        legal_digest.update(Sha256::digest(contents));
+    }
     let key = format!(
         "{:x}",
         Sha256::digest(format!(
-            "ku-interop-v1\0{}\0{}\0{}\0{}\0{}\0{}",
+            "ku-interop-v1\0{}\0{}\0{}\0{}\0{}\0{}\0{:x}",
             std::env::consts::OS,
             std::env::consts::ARCH,
             env!("KU_BUILD_TARGET"),
             interop::implementation_digest(),
             compiler,
             fingerprint,
+            legal_digest.finalize(),
         ))
     );
     let cache = package_cache.join("interop");
@@ -126,6 +135,14 @@ pub(super) fn prepare_with_python(
                 .ok_or_else(|| {
                     KuError::message("interop bridge producer returned an invalid path")
                 })?;
+            if !notices.is_empty() {
+                let legal_dir = stage.0.join("provider-notices");
+                fs::create_dir(&legal_dir).map_err(|error| io_error(&legal_dir, error))?;
+                for (name, contents) in &notices {
+                    let path = legal_dir.join(name);
+                    fs::write(&path, contents).map_err(|error| io_error(&path, error))?;
+                }
+            }
             let digest =
                 tree_digest(&stage.0, Some(IDENTITY)).map_err(|error| io_error(&stage.0, error))?;
             fs::write(stage.0.join(IDENTITY), format!("{name}\n{digest}\n"))
@@ -159,6 +176,53 @@ pub(super) fn prepare_with_python(
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| KuError::message("interop library path is not UTF-8"))
+}
+
+fn provider_notices(import_root: &Path) -> KuResult<Vec<(&'static str, Vec<u8>)>> {
+    let mut notices = Vec::new();
+    let Some(package_root) = import_root.parent() else {
+        return Ok(notices);
+    };
+    for &name in LEGAL_FILES {
+        let path = package_root.join(name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error(&path, error)),
+        };
+        if !metadata.is_file() || metadata.len() > MAX_NOTICE_BYTES {
+            return Err(KuError::message(format!(
+                "interop notice '{}' must be a bounded regular file",
+                path.display()
+            )));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        fs::File::open(&path)
+            .and_then(|file| file.take(MAX_NOTICE_BYTES + 1).read_to_end(&mut bytes))
+            .map_err(|error| io_error(&path, error))?;
+        if bytes.len() as u64 > MAX_NOTICE_BYTES {
+            return Err(KuError::message(format!(
+                "interop notice '{}' exceeds its size limit",
+                path.display()
+            )));
+        }
+        notices.push((name, bytes));
+    }
+    Ok(notices)
+}
+
+pub(super) fn publish_gnu_runtime_notice(output_dir: &Path) -> KuResult<()> {
+    use interop::gnu_paths;
+
+    let root = output_dir.join(RELATIVE_RUNTIME_ROOT);
+    ensure_directory(&root)?;
+    let notices = root.join(gnu_paths::NOTICE_DIRECTORY);
+    ensure_directory(&notices)?;
+    let stage = Stage::create(&notices)?;
+    let source = stage.0.join(gnu_paths::NOTICE_LEAF);
+    let destination = notices.join(gnu_paths::NOTICE_LEAF);
+    fs::write(&source, gnu_paths::NOTICE).map_err(|error| io_error(&source, error))?;
+    fs::rename(&source, &destination).map_err(|error| io_error(&destination, error))
 }
 
 pub(super) fn remember_python(cache: &Path, path: &Path) -> KuResult<()> {

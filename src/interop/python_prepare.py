@@ -373,6 +373,22 @@ def select(requirement_text, cache, module, fixed):
             "exports": exports}
 
 
+def wheel_modules(archive):
+    modules = set()
+    for member in archive.infolist():
+        if member.is_dir():
+            continue
+        parts = member.filename.split("/")
+        if parts[0].endswith(".data") and len(parts) >= 3 and parts[1] in ("purelib", "platlib"):
+            parts = parts[2:]
+        if not parts[-1].endswith((".py", ".pyc", ".so", ".pyd")):
+            continue
+        owner = parts[0].split(".", 1)[0] if len(parts) == 1 else parts[0]
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,159}", owner):
+            modules.add(owner)
+    return modules
+
+
 def unpack(descriptor, cache, output, offline):
     artifacts = descriptor.get("artifacts", [])
     if not isinstance(artifacts, list):
@@ -393,6 +409,7 @@ def unpack(descriptor, cache, output, offline):
     total = 0
     count = 0
     seen = set()
+    module_owners = {}
     for row in artifacts:
         path = wheel_path(cache, row, offline)
         name, version, _, encoded = utils.parse_wheel_filename(path.name)
@@ -408,6 +425,12 @@ def unpack(descriptor, cache, output, offline):
                     or str(Version(meta["Version"])) != row["version"]
                     or meta.get_all("Requires-Dist", []) != row["requires"]):
                 raise ValueError(f"Locked metadata differs for {path.name}")
+            for module in sorted(wheel_modules(archive)):
+                previous = module_owners.setdefault(module, row["name"])
+                if previous != row["name"]:
+                    raise ValueError(f"Python module {module!r} is provided by both {previous!r} and {row['name']!r}")
+            if len(module_owners) > 1024:
+                raise ValueError("Python wheel modules exceed the ownership limit")
             for member in archive.infolist():
                 count += 1
                 total += member.file_size
@@ -450,6 +473,7 @@ def unpack(descriptor, cache, output, offline):
                         out.write(chunk)
                     if copied != member.file_size:
                         raise ValueError(f"Invalid Python wheel member length: {raw}")
+    return {"modules": module_owners}
 
 
 def main():
@@ -465,8 +489,7 @@ def main():
         result = select(args[0], Path(args[1]), args[2] or None, json.loads(args[3]) if len(args) > 3 else {})
     elif command == "unpack":
         descriptor = json.loads(read_bounded(Path(args[0]), MAX_INDEX))
-        unpack(descriptor, Path(args[1]), Path(args[2]), args[3] == "offline")
-        result = {"ok": True}
+        result = unpack(descriptor, Path(args[1]), Path(args[2]), args[3] == "offline")
     else:
         raise ValueError("Unknown Ku Python preparation request")
     return result

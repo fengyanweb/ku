@@ -30,7 +30,7 @@ ku build --backend runner --release -o runner-demo
 ./runner-demo
 ```
 
-On Windows, use `-o native-demo.exe` and `-o runner-demo.exe` and run `.\native-demo.exe` and `.\runner-demo.exe`. Move the executable together with the adjacent `ku-runtime.d` directory. Its subdirectories contain the compiled companion libraries and keep the source and build cache out of the shipping directory. If your chosen compiler uses an external C++ runtime, keep its redistributable runtime available on the target as specified by that compiler.
+On Windows, use `-o native-demo.exe` and `-o runner-demo.exe` and run `.\native-demo.exe` and `.\runner-demo.exe`. Move the executable together with the adjacent `ku-runtime.d` directory. Its subdirectories contain the compiled companion libraries and their notices. Windows GNU builds link the compiler runtimes statically. Keep the toolchain notices in the delivery directory. If another compiler uses an external C++ runtime, keep its redistributable runtime available on the target as specified by that compiler.
 
 Expected output
 

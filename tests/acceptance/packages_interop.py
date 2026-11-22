@@ -104,6 +104,8 @@ def native_package(ku, root):
     vendor = project / "vendor" / "unseen"
     write(vendor / "lib.h", "#include <stdint.h>\nint64_t fresh_twice(int64_t value);\n")
     write(vendor / "lib.c", '#include "lib.h"\nint64_t fresh_twice(int64_t value) { return value * 2; }\n')
+    notice = "Fixture notices accompany the generated provider.\n"
+    write(vendor / "NOTICE", notice)
     output, _ = run([ku, "package", "install", "./vendor/unseen"], project)
     imported = import_line(output, "FreshTwice", "@unseen/native")
     write(project / "src" / "main.ku", f"{imported}\nfn main(): null! {{\n"
@@ -111,7 +113,11 @@ def native_package(ku, root):
     lock = (project / "ku.lock").read_bytes()
     run([ku, "i", "--offline"], project)
     assert (project / "ku.lock").read_bytes() == lock
-    assert_three_entries(ku, project, root / "native-provider-delivery", "42\n", True)
+    deploy = root / "native-provider-delivery"
+    assert_three_entries(ku, project, deploy, "42\n", True)
+    moved = deploy.with_name(deploy.name + "-moved")
+    notices = list(moved.glob("ku-runtime.d/interop/*/provider-notices/NOTICE"))
+    assert len(notices) == 1 and notices[0].read_text(encoding="utf-8") == notice
 
 
 def local_python_package(ku, root, python):

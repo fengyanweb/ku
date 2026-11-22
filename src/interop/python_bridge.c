@@ -235,7 +235,7 @@ static int ku_py_initialize(KuInteropValue *result) {
         return error;
     }
 
-    PyObject *identity = PyUnicode_FromString(KU_PY_ENV);
+    PyObject *identity = Py_BuildValue("(ssss)", KU_PY_ENV, KU_PY_OWNER, KU_PY_RELEASE, KU_PY_TARGET);
     if (!identity || PySys_SetObject(KU_PY_ENV_KEY, identity) < 0) {
         Py_XDECREF(identity);
         int error = ku_py_exception(result, "initialize");
@@ -249,47 +249,107 @@ static int ku_py_initialize(KuInteropValue *result) {
     return 0;
 }
 
+#if KU_PY_WHEELS
+static int ku_py_record(PyObject *map, const char *const entries[][2], const char *kind,
+                        int modules, KuInteropValue *result) {
+    PyObject *stdlib = modules ? PySys_GetObject("stdlib_module_names") : NULL;
+    for (size_t i = 0; entries[i][0]; ++i) {
+        const char *name = entries[i][0], *requested = entries[i][1];
+        if (stdlib && PyAnySet_Check(stdlib)) {
+            PyObject *key = PyUnicode_FromString(name);
+            int member = key ? PySet_Contains(stdlib, key) : -1;
+            Py_XDECREF(key);
+            if (member < 0) return ku_py_exception(result, "prepare");
+            if (member) {
+                char detail[1024];
+                (void)snprintf(detail, sizeof(detail),
+                               "Python module %s from %s (%s) conflicts with the CPython standard library for %s",
+                               name, KU_PY_OWNER, requested, KU_PY_TARGET);
+                return ku_py_error(result, detail);
+            }
+        }
+
+        PyObject *existing = PyDict_GetItemString(map, name);
+        if (existing) {
+            if (!PyTuple_Check(existing) || PyTuple_GET_SIZE(existing) != 2)
+                return ku_py_error(result, "Invalid embedded CPython dependency ownership record");
+            PyObject *identity = PyTuple_GET_ITEM(existing, 0);
+            PyObject *owner = PyTuple_GET_ITEM(existing, 1);
+            if (PyUnicode_Check(identity) && PyUnicode_CompareWithASCIIString(identity, requested) == 0)
+                continue;
+            const char *current = PyUnicode_Check(identity) ? PyUnicode_AsUTF8(identity) : NULL;
+            const char *previous = PyUnicode_Check(owner) ? PyUnicode_AsUTF8(owner) : NULL;
+            char detail[2048];
+            (void)snprintf(detail, sizeof(detail), "Python %s %s conflict for %s: %s requires %s; %s requires %s",
+                           kind, name, KU_PY_TARGET, previous ? previous : "unknown",
+                           current ? current : "unknown", KU_PY_OWNER, requested);
+            PyErr_Clear();
+            return ku_py_error(result, detail);
+        }
+        PyObject *record = Py_BuildValue("(ss)", requested, KU_PY_OWNER);
+        if (!record) return ku_py_exception(result, "prepare");
+        int status = PyDict_SetItemString(map, name, record);
+        Py_DECREF(record);
+        if (status != 0) return ku_py_exception(result, "prepare");
+    }
+    return 0;
+}
+
+static int ku_py_register_wheels(KuInteropValue *result) {
+    static const char *const packages[][2] = { KU_PY_DISTS, {NULL, NULL} };
+    static const char *const modules[][2] = { KU_PY_MODULE_OWNERS };
+    PyObject *before = PySys_GetObject(KU_PY_DISTS_KEY);
+    if (before && (!PyTuple_Check(before) || PyTuple_GET_SIZE(before) != 2
+            || !PyDict_Check(PyTuple_GET_ITEM(before, 0)) || !PyDict_Check(PyTuple_GET_ITEM(before, 1))))
+        return ku_py_error(result, "Invalid embedded CPython dependency state");
+
+    PyObject *by_distribution = before ? PyDict_Copy(PyTuple_GET_ITEM(before, 0)) : PyDict_New();
+    if (!by_distribution) return ku_py_exception(result, "prepare");
+    PyObject *by_module = before ? PyDict_Copy(PyTuple_GET_ITEM(before, 1)) : PyDict_New();
+    if (!by_module) {
+        Py_DECREF(by_distribution);
+        return ku_py_exception(result, "prepare");
+    }
+    int status = ku_py_record(by_distribution, packages, "distribution", 0, result);
+    if (!status) status = ku_py_record(by_module, modules, "module", 1, result);
+    if (!status) {
+        PyObject *after = PyTuple_Pack(2, by_distribution, by_module);
+        if (!after || PySys_SetObject(KU_PY_DISTS_KEY, after) < 0) {
+            status = ku_py_exception(result, "prepare");
+        }
+        Py_XDECREF(after);
+    }
+    Py_DECREF(by_module);
+    Py_DECREF(by_distribution);
+    return status;
+}
+#endif
+
 static int ku_py_environment(KuInteropValue *result) {
     static int registered;
     if (registered) return 0;
     PyObject *identity = PySys_GetObject(KU_PY_ENV_KEY);
-    if (!identity || !PyUnicode_Check(identity)
-        || PyUnicode_CompareWithASCIIString(identity, KU_PY_ENV) != 0) {
-        PyErr_Clear();
-        return ku_py_error(result, "Conflicting CPython libraries in one application");
+    if (!identity || !PyTuple_Check(identity) || PyTuple_GET_SIZE(identity) != 4) {
+        return ku_py_error(result, "A CPython interpreter outside the prepared Ku environment is already initialized");
     }
-#if KU_PY_WHEELS
-    static const char *const declarations[][2] = { KU_PY_DISTS };
-    PyObject *dists = PySys_GetObject(KU_PY_DISTS_KEY);
-    if (!dists) {
-        PyObject *created = PyDict_New();
-        if (!created) return ku_py_exception(result, "prepare");
-        int status = PySys_SetObject(KU_PY_DISTS_KEY, created);
-        Py_DECREF(created);
-        if (status != 0) return ku_py_exception(result, "prepare");
-        dists = PySys_GetObject(KU_PY_DISTS_KEY);
-    }
-    if (!dists || !PyDict_Check(dists)) return ku_py_error(result, "Invalid embedded CPython dependency state");
-    for (size_t i = 0; i < sizeof(declarations) / sizeof(declarations[0]); ++i) {
-        const char *name = declarations[i][0];
-        const char *requested = declarations[i][1];
-        PyObject *existing = PyDict_GetItemString(dists, name);
-        if (!existing || (PyUnicode_Check(existing)
-                && PyUnicode_CompareWithASCIIString(existing, requested) == 0)) continue;
-        const char *current = PyUnicode_Check(existing) ? PyUnicode_AsUTF8(existing) : NULL;
-        char detail[1024];
-        (void)snprintf(detail, sizeof(detail), "Python package %s conflict: installed %s; %s requires %s",
-                      name, current ? current : "unknown", KU_PY_MODULE, requested);
+    PyObject *digest = PyTuple_GET_ITEM(identity, 0);
+    if (!PyUnicode_Check(digest) || PyUnicode_CompareWithASCIIString(digest, KU_PY_ENV) != 0) {
+        PyObject *previous_owner = PyTuple_GET_ITEM(identity, 1);
+        PyObject *previous_release = PyTuple_GET_ITEM(identity, 2);
+        PyObject *previous_target = PyTuple_GET_ITEM(identity, 3);
+        const char *owner = PyUnicode_Check(previous_owner) ? PyUnicode_AsUTF8(previous_owner) : NULL;
+        const char *release = PyUnicode_Check(previous_release) ? PyUnicode_AsUTF8(previous_release) : NULL;
+        const char *target = PyUnicode_Check(previous_target) ? PyUnicode_AsUTF8(previous_target) : NULL;
+        char detail[2048];
+        (void)snprintf(detail, sizeof(detail),
+                       "Conflicting CPython environments: %s requires CPython %s for %s; %s requires CPython %s for %s",
+                       owner ? owner : "unknown", release ? release : "unknown", target ? target : "unknown",
+                       KU_PY_OWNER, KU_PY_RELEASE, KU_PY_TARGET);
         PyErr_Clear();
         return ku_py_error(result, detail);
     }
-    for (size_t i = 0; i < sizeof(declarations) / sizeof(declarations[0]); ++i) {
-        PyObject *version = PyUnicode_FromString(declarations[i][1]);
-        if (!version) return ku_py_exception(result, "prepare");
-        int status = PyDict_SetItemString(dists, declarations[i][0], version);
-        Py_DECREF(version);
-        if (status != 0) return ku_py_exception(result, "prepare");
-    }
+#if KU_PY_WHEELS
+    if (ku_py_register_wheels(result)) return 1;
 #endif
     registered = 1;
     return 0;

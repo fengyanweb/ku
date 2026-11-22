@@ -1,5 +1,6 @@
 """Run real Python package consumers with an installed Ku, outside source."""
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -7,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from pathlib import Path
 
 
@@ -174,10 +176,14 @@ def Pixel() -> int:
 
 def portable_acceptance(ku, python, notices):
     env = os.environ.copy()
-    env["KU_PYTHON"] = str(python)
     env["KU_PYTHON_REDISTRIBUTION_NOTICES"] = str(notices)
     with tempfile.TemporaryDirectory(prefix="ku-portable-accept-") as temp:
         sandbox = Path(temp)
+        if python.parent.name != "bin":
+            raise ValueError("Portable test requires a relocatable bin/python installation")
+        disposable_python = sandbox / "build-python"
+        shutil.copytree(python.parent.parent, disposable_python, symlinks=True)
+        env["KU_PYTHON"] = str(disposable_python / "bin" / python.name)
         author = sandbox / "author"
         write(author / "ku.mod", 'name = "portable"\nversion = "0.1.0"\nroot = "src"\nmain = "main.ku"\n')
         write(author / "src" / "main.ku", 'fn main() { println("hello") }\n')
@@ -197,6 +203,7 @@ fn main(): null! {
 }
 """)
         run(ku, author, env, "i")
+        receivers = []
         for backend, args in [("native", []), ("runner", ["--backend", "runner"])]:
             stage = author / backend
             stage.mkdir()
@@ -207,9 +214,52 @@ fn main(): null! {
             runtimes = [path for path in (receiver / "ku-runtime.d").rglob("python") if path.is_dir()]
             assert len(runtimes) == 1 and (runtimes[0] / "notices").is_dir()
             assert list((runtimes[0] / "lib").glob("python*/LICENSE.txt"))
-            runtime_env = {"HOME": str(sandbox), "PATH": "/usr/bin:/bin"}
+            copied_notices = runtimes[0] / "notices"
+            for notice in notices.glob("LICENSE.*.txt"):
+                assert (copied_notices / notice.name).read_bytes() == notice.read_bytes()
+            receivers.append(receiver)
+        disposable_python.rename(sandbox / "unavailable-build-python")
+        runtime_env = {"HOME": str(sandbox), "PATH": "/usr/bin:/bin"}
+        for receiver in receivers:
             assert run(receiver / "portable", receiver, runtime_env) == "31\n"
         print(f"Bundled Python runtime passed relocation ({sys.platform})")
+
+
+def download_exact(url, file, size, expected):
+    digest = hashlib.sha256()
+    copied = 0
+    with urllib.request.urlopen(url, timeout=60) as source, file.open("xb") as out:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            copied += len(chunk)
+            if copied > size:
+                raise AssertionError(f"Published archive exceeds its pinned size: {url}")
+            digest.update(chunk)
+            out.write(chunk)
+    if copied != size or digest.hexdigest() != expected:
+        raise AssertionError(f"Published archive differs from its pinned identity: {url}")
+
+
+def official_macos_runtime(ku):
+    if sys.platform != "darwin" or os.uname().machine != "arm64":
+        raise ValueError("The pinned portable Python acceptance asset is macOS ARM64")
+    prefix = ("https://github.com/astral-sh/python-build-standalone/releases/download/"
+              "20261110/cpython-3.12.16%2B20261110-aarch64-apple-darwin")
+    with tempfile.TemporaryDirectory(prefix="ku-cpython-assets-") as temp:
+        temp = Path(temp)
+        runtime = temp / "runtime.tar.gz"
+        complete = temp / "complete.tar.zst"
+        download_exact(prefix + "-install_only.tar.gz", runtime, 25_371_130,
+                       "e956e60bc9465d577ef8062059aa05cd3a2665b4b8678a2ed24e432368330b8f")
+        download_exact(prefix + "-pgo%2Blto-full.tar.zst", complete, 58_217_880,
+                       "4da072af9dbbc2557d3aabf51db553a19694f6ac61b5b7169749e4acfa5a052d")
+        subprocess.run(["bsdtar", "-xf", str(runtime), "-C", str(temp)], check=True, timeout=60)
+        notices = temp / "notices"
+        notices.mkdir()
+        subprocess.run(["bsdtar", "-xf", str(complete), "-C", str(notices), "python/licenses"],
+                       check=True, timeout=60)
+        licenses = notices / "python" / "licenses"
+        assert len(list(licenses.glob("LICENSE.*.txt"))) == 20
+        portable_acceptance(ku, temp / "python" / "bin" / "python3.12", licenses)
 
 
 if __name__ == "__main__":
@@ -217,11 +267,15 @@ if __name__ == "__main__":
     parser.add_argument("--ku", required=True, type=Path)
     parser.add_argument("--python", default=Path(sys.executable), type=Path)
     parser.add_argument("--wheels", action="store_true", help="also restore public PyPI wheels")
-    parser.add_argument("--portable-notices", type=Path, help="test an explicitly redistributable CPython")
+    portable = parser.add_mutually_exclusive_group()
+    portable.add_argument("--portable-notices", type=Path, help="test an explicitly redistributable CPython")
+    portable.add_argument("--standalone-macos", action="store_true", help="test a pinned public macOS CPython distribution")
     opts = parser.parse_args()
     ku = opts.ku.resolve(strict=True)
     python = opts.python.resolve(strict=True)
-    if opts.portable_notices:
+    if opts.standalone_macos:
+        official_macos_runtime(ku)
+    elif opts.portable_notices:
         portable_acceptance(ku, python, opts.portable_notices.resolve(strict=True))
     else:
         acceptance(ku, opts.wheels, python)

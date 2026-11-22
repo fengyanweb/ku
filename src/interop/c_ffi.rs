@@ -14,6 +14,7 @@ use std::{
 use crate::{
     cli::{run_build_process_bounded, run_build_process_capture_stdout},
     error::{KuError, KuResult},
+    package::LEGAL_FILES,
     span::Span,
 };
 
@@ -460,20 +461,16 @@ pub(crate) fn prepare_bridge(import_root: &Path, staging: &Path) -> KuResult<Pat
     if cfg!(target_os = "linux") {
         command.arg("-Wl,--no-undefined");
     }
-    let mut winpthread_archive = None;
-    if descriptor.language == Language::Cpp {
-        if !cfg!(windows) {
-            command.arg("-pthread");
-        } else if windows_gnu {
-            // A source package has all class code compiled under this driver.
-            // Keep the GCC C++ runtime in the companion rather than depending
-            // on a user's compiler executable directory at application start.
-            command.args(["-static-libgcc", "-static-libstdc++"]);
-            let winpthread = compiler_probe(&compiler, "-print-file-name=libwinpthread.a")?;
-            if Path::new(winpthread.trim()).is_file() {
-                winpthread_archive = Some(PathBuf::from(winpthread.trim()));
-            }
+    if windows_gnu {
+        // Retain a shared bridge and use the driver's static GNU runtimes,
+        // including its choice of thread support, inside the bridge.
+        command.args(["-static", "-static-libgcc"]);
+        if descriptor.language == Language::Cpp {
+            command.arg("-static-libstdc++");
         }
+    }
+    if descriptor.language == Language::Cpp && (!cfg!(windows) || windows_gnu) {
+        command.arg("-pthread");
     }
     command.arg("-I");
     if workspace.is_some() {
@@ -509,13 +506,6 @@ pub(crate) fn prepare_bridge(import_root: &Path, staging: &Path) -> KuResult<Pat
             command.arg(format!("-l{library}"));
         }
     }
-    if let Some(archive) = winpthread_archive {
-        if let Some(workspace) = &workspace {
-            command.arg(workspace.copy_file(&archive, Path::new("winpthread.a"), SOURCE_LIMIT)?);
-        } else {
-            command.arg(archive);
-        }
-    }
     command.arg("-o");
     if workspace.is_some() {
         command.arg(output_leaf);
@@ -539,6 +529,10 @@ pub(crate) fn prepare_bridge(import_root: &Path, staging: &Path) -> KuResult<Pat
     }
     if let Some(workspace) = &workspace {
         workspace.copy_output(Path::new(output_leaf), &output, 512 * 1024 * 1024)?;
+        let notices = staging.join(gnu_paths::NOTICE_DIRECTORY);
+        fs::create_dir(&notices)
+            .map_err(|error| io_failure("create toolchain notices", &notices, error))?;
+        write_new(&notices.join(gnu_paths::NOTICE_LEAF), gnu_paths::NOTICE)?;
     } else {
         fs::remove_file(&bridge)
             .map_err(|error| io_failure("remove bridge source staging", &bridge, error))?;
@@ -639,11 +633,15 @@ pub(crate) fn prepare_install(project: &Path, source: &Path) -> KuResult<PathBuf
         let bytes = read_capped(original, SOURCE_LIMIT as usize)?;
         write_new(&destination, &bytes)?;
     }
-    for notice in ["LICENSE", "LICENSE.md", "NOTICE", "COPYING"] {
+    for &notice in LEGAL_FILES {
         let original = source.join(notice);
-        if original.is_file() {
-            let bytes = read_capped(&original, DESCRIPTOR_LIMIT)?;
-            write_new(&pending.path.join(notice), &bytes)?;
+        match fs::symlink_metadata(&original) {
+            Ok(_) => {
+                let bytes = read_capped(&original, DESCRIPTOR_LIMIT)?;
+                write_new(&pending.path.join(notice), &bytes)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_failure("inspect notice", &original, error)),
         }
     }
     let declaration = format!(

@@ -77,6 +77,18 @@ editable package under `ku-libraries`. Commit the package and use its
 cannot be inferred. The [SQLite and TinyXML-2 examples](../examples/interop-native)
 show an annotated C adapter and a C++ owner with a checked lifetime.
 
+When packages must share one native instance, put the foreign adapter in its
+own Ku package and have both consumers depend on that package. Ku resolves one
+provider version and prepares one bridge for that application. Independently
+bundled static copies have separate state. If two paths to a provider require
+different sources or incompatible versions, installation reports the conflict.
+
+The signed Ku registry can carry a source-only adapter with
+`interop.version = "1"`. This pins its descriptor and allowed native or Python
+sources with the same signed archive checksum used for pure Ku packages.
+Compiled bridges are prepared on the consumer's platform. A registry upload
+cannot include prebuilt shared libraries or install scripts.
+
 For Python, `ku i ./tools/subtitles.py --module text` can generate a module
 from statically visible functions. To install PyPI artifacts use, for example,
 `ku i pypi:Pillow --module PIL.Image`; the distribution and Python module

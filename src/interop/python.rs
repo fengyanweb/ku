@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -123,12 +123,22 @@ fn python_tool(explicit: Option<&Path>) -> KuResult<OsString> {
 
 fn compiler_tool() -> OsString {
     std::env::var_os("KU_INTEROP_CC").unwrap_or_else(|| {
-        if cfg!(target_env = "msvc") {
-            "cl".into()
+        if cfg!(all(windows, target_env = "msvc")) {
+            "clang".into()
+        } else if cfg!(windows) {
+            "gcc".into()
         } else {
             "cc".into()
         }
     })
+}
+
+fn uses_msvc_driver(tool: &OsStr) -> bool {
+    cfg!(all(windows, target_env = "msvc"))
+        && Path::new(tool)
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| matches!(name.to_ascii_lowercase().as_str(), "cl" | "clang-cl"))
 }
 
 fn run_helper(
@@ -733,19 +743,20 @@ impl PythonToolchain {
     }
 
     fn compiler_identity(&self, working_dir: &Path) -> KuResult<String> {
-        let mut command = Command::new(compiler_tool());
-        command.current_dir(working_dir);
-        if cfg!(target_env = "msvc") {
-            command.arg("/Bv");
-        } else {
-            command.arg("--version");
-        }
+        let compiler = compiler_tool();
+        let mut command = Command::new(&compiler);
+        command
+            .current_dir(working_dir)
+            .arg(if uses_msvc_driver(&compiler) {
+                "/Bv"
+            } else {
+                "--version"
+            });
         let (_, version) =
             run_build_process_capture_stdout(&mut command, Duration::from_secs(10), 64_000)
                 .map_err(|_| {
                     invalid("No supported host C compiler for the Python bridge; set KU_INTEROP_CC")
                 })?;
-        let compiler = compiler_tool();
         let identity = format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             self.executable.display(),
@@ -770,6 +781,29 @@ impl PythonToolchain {
 pub(crate) fn compiler_identity(import_root: &Path, python: Option<&Path>) -> KuResult<String> {
     let toolchain = PythonToolchain::probe(import_root, python)?;
     toolchain.compiler_identity(import_root)
+}
+
+fn render_modules(resolved: &HashMap<String, Value>) -> KuResult<String> {
+    let Some(Value::Object(modules)) = resolved.get("modules") else {
+        return Err(invalid(
+            "Python preparation did not report module ownership",
+        ));
+    };
+    let mut records = modules.iter().collect::<Vec<_>>();
+    records.sort_unstable_by_key(|&(name, _)| name);
+    let formatted = records
+        .into_iter()
+        .map(|(module, owner)| {
+            let Value::String(owner) = owner else {
+                return Err(invalid("Invalid Python module owner"));
+            };
+            if !is_identifier(module) || owner.len() > 200 {
+                return Err(invalid("Python module identity exceeds its bounds"));
+            }
+            Ok(format!("{{{}, {}}}, ", quote_c(module), quote_c(owner)))
+        })
+        .collect::<KuResult<String>>()?;
+    Ok(format!("{formatted}{{NULL, NULL}}"))
 }
 
 fn quote_c(input: &str) -> String {
@@ -889,10 +923,10 @@ pub(crate) fn prepare_bridge(
         let script = import_root.join("bridge.py");
         write_new(&sidecar, &read(&script, MAX_SOURCE)?)?;
     }
-    if !wheels.is_empty() {
+    let modules = if !wheels.is_empty() {
         directory(&site)?;
         let cache = wheel_cache(project_cache)?;
-        run_helper(
+        let resolved = run_helper(
             &toolchain.python,
             staging,
             &[
@@ -909,6 +943,13 @@ pub(crate) fn prepare_bridge(
             ],
             Duration::from_secs(180),
         )?;
+        render_modules(&resolved)?
+    } else {
+        "{NULL, NULL}".to_owned()
+    };
+    let origin = string(&fields, "origin")?;
+    if origin.len() > 480 {
+        return Err(invalid("Python provider origin is too long"));
     }
 
     let source_key = if local {
@@ -917,16 +958,18 @@ pub(crate) fn prepare_bridge(
         String::new()
     };
     let definitions = format!(
-        "#define KU_PY_HOME {}\n#define KU_PY_EXECUTABLE {}\n#define KU_PY_LIBRARY {}\n#define KU_PY_RELEASE {}\n#define KU_PY_ENV {}\n#define KU_PY_MODULE {}\n#define KU_PY_MODULE_KEY {}\n#define KU_PY_LOCAL {}\n#define KU_PY_WHEELS {}\n#define KU_PY_DISTS {}\n#define KU_PY_PORTABLE {}\n",
+        "#define KU_PY_HOME {}\n#define KU_PY_EXECUTABLE {}\n#define KU_PY_LIBRARY {}\n#define KU_PY_RELEASE {}\n#define KU_PY_ENV {}\n#define KU_PY_MODULE {}\n#define KU_PY_MODULE_KEY {}\n#define KU_PY_LOCAL {}\n#define KU_PY_WHEELS {}\n#define KU_PY_DISTS {}\n#define KU_PY_PORTABLE {}\n#define KU_PY_MODULE_OWNERS {}\n#define KU_PY_OWNER {}\n#define KU_PY_TARGET {}\n",
         quote_c(runtime_home), quote_c(runtime_executable), quote_c(runtime_library),
         quote_c(&toolchain.release), quote_c(&environment), quote_c(module),
         quote_c(&format!("_ku_python_{source_key}")), i32::from(local),
-        i32::from(!wheels.is_empty()), declarations, i32::from(portable.is_some())
+        i32::from(!wheels.is_empty()), declarations, i32::from(portable.is_some()),
+        modules, quote_c(origin), quote_c(&toolchain.target)
     );
     write_new(&src, format!("{definitions}{BRIDGE}").as_bytes())?;
     write_new(&abi, ABI.as_bytes())?;
 
-    let mut compiler = Command::new(compiler_tool());
+    let compiler_tool = compiler_tool();
+    let mut compiler = Command::new(&compiler_tool);
     compiler.current_dir(staging);
     #[cfg(all(windows, target_env = "gnu"))]
     let workspace = {
@@ -939,7 +982,7 @@ pub(crate) fn prepare_bridge(
         workspace.configure(&mut compiler);
         workspace
     };
-    if cfg!(target_env = "msvc") {
+    if uses_msvc_driver(&compiler_tool) {
         compiler
             .args(["/nologo", "/LD", "/O2", "/std:c11", "/I"])
             .arg(&toolchain.include)
@@ -948,6 +991,9 @@ pub(crate) fn prepare_bridge(
             .arg("/link")
             .arg(&link_library);
     } else {
+        if cfg!(all(windows, target_env = "msvc")) {
+            compiler.arg(format!("--target={}", env!("KU_BUILD_TARGET")));
+        }
         compiler.args(["-std=c11", "-O2", "-fvisibility=hidden", "-I"]);
         #[cfg(all(windows, target_env = "gnu"))]
         compiler.arg("include");

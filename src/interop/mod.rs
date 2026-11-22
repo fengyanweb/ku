@@ -152,6 +152,7 @@ pub(crate) fn implementation_digest() -> String {
         include_bytes!("abi.h").as_slice(),
         include_bytes!("c_ffi.rs").as_slice(),
         include_bytes!("gnu_paths.rs").as_slice(),
+        gnu_paths::NOTICE,
         include_bytes!("native/signatures.rs").as_slice(),
         include_bytes!("native/codegen.rs").as_slice(),
         include_bytes!("python.rs").as_slice(),

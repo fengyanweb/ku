@@ -21,6 +21,7 @@ use crate::{
 };
 
 mod install;
+pub(crate) use install::LEGAL_FILES;
 pub use install::{
     install_dependency, install_dependency_with, PackageInstallModule, PackageInstallReceipt,
 };
@@ -4297,11 +4298,9 @@ fn collect_package_archive_entries(
         "tests",
     ]
     .into_iter()
-    .chain(
-        ["LICENSE.txt", "NOTICE", "NOTICE.md", "NOTICE.txt"]
-            .into_iter()
-            .filter(|_| package.manifest.interop_version.is_some()),
-    ) {
+    .chain(LEGAL_FILES.iter().copied().filter(|name| {
+        package.manifest.interop_version.is_some() && !matches!(*name, "LICENSE" | "LICENSE.md")
+    })) {
         let path = package.package_dir.join(name);
         match fs::symlink_metadata(&path) {
             Ok(_) => collect_package_archive_entry(
@@ -10682,6 +10681,7 @@ fn validate_archive_top_level(relative: &Path, span: Span) -> KuResult<()> {
             | "NOTICE"
             | "NOTICE.md"
             | "NOTICE.txt"
+            | "COPYING"
     ) {
         Ok(())
     } else {

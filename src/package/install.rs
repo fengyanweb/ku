@@ -712,9 +712,14 @@ pub(super) fn expand_file_dependency_graph(
     deadline: Instant,
     budget: &mut RegistryGraphResourceBudget,
 ) -> KuResult<()> {
-    let mut owners = resolved
+    let mut chains = resolved
         .iter()
-        .map(|dep| (dep.name.clone(), package.manifest.name.clone()))
+        .map(|dep| {
+            (
+                dep.name.clone(),
+                format!("{} -> {}", package.manifest.name, dep.name),
+            )
+        })
         .collect::<HashMap<_, _>>();
     let direct_registry = direct
         .iter()
@@ -727,6 +732,7 @@ pub(super) fn expand_file_dependency_graph(
         let parent = &resolved[cursor];
         let root = parent.package_root.clone();
         let parent_name = parent.name.clone();
+        let parent_chain = chains[&parent_name].clone();
         let dependencies = parent.dependencies.clone();
         cursor += 1;
         for dependency in &dependencies {
@@ -746,12 +752,13 @@ pub(super) fn expand_file_dependency_graph(
                 .find(|selected| selected.name == dependency.name)
             {
                 let conflict = || {
+                    let existing_chain = &chains[&existing.name];
                     error(
                     "dependency_source_conflict",
                     format!(
-                        "packages '{}' and '{parent_name}' declare incompatible sources or versions for '{}'",
-                        owners.get(&dependency.name).map(String::as_str).unwrap_or(&package.manifest.name),
-                        dependency.name,
+                            "incompatible dependency '{}' on {}: {existing_chain} selected {} from '{}'; {parent_chain} -> {} requires {} from '{}'. The two paths must select the same package contents.",
+                            dependency.name, env!("KU_BUILD_TARGET"), existing.version,
+                            existing.source, dependency.name, dependency.version, source,
                     ),
                 )
                 };
@@ -794,7 +801,10 @@ pub(super) fn expand_file_dependency_graph(
                 Some(&root),
             )?;
             budget.record_file_snapshot(child.snapshot_bytes)?;
-            owners.insert(child.name.clone(), parent_name.clone());
+            chains.insert(
+                child.name.clone(),
+                format!("{parent_chain} -> {}", child.name),
+            );
             resolved.push(child);
         }
     }
@@ -1698,13 +1708,14 @@ fn commit_install(
     restore_transaction_locked(&project.manifest_path)
 }
 
-pub(super) const LEGAL_FILES: &[&str] = &[
+pub(crate) const LEGAL_FILES: &[&str] = &[
     "LICENSE",
     "LICENSE.md",
     "LICENSE.txt",
     "NOTICE",
     "NOTICE.md",
     "NOTICE.txt",
+    "COPYING",
 ];
 
 pub(super) fn validate_interop_sources(root: &Path, span: Span) -> KuResult<()> {

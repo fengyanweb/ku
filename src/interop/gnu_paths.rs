@@ -13,6 +13,9 @@ use crate::error::{KuError, KuResult};
 const MAX_TREE_ENTRIES: usize = 4096;
 const MAX_TREE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DEPTH: usize = 32;
+pub(crate) const NOTICE_DIRECTORY: &str = "toolchain-notices";
+pub(crate) const NOTICE_LEAF: &str = "windows-gnu.txt";
+pub(crate) const NOTICE: &[u8] = include_bytes!("gnu-runtime-notices.txt");
 
 pub(crate) fn is_target(target: &str) -> bool {
     let target = target.trim();
@@ -34,12 +37,15 @@ impl Workspace {
             write!(label, "{byte:02x}").expect("String accepts writes");
         }
         let root = base.join(label);
-        let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = fs::DirBuilder::new();
             builder.mode(0o700);
-        }
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = fs::DirBuilder::new();
         builder.create(&root).map_err(error)?;
         Ok(Self { root })
     }
@@ -57,6 +63,7 @@ impl Workspace {
     }
 
     /// Copy a verified source file and return the plain relative tool argument.
+    #[cfg(all(windows, target_env = "gnu"))]
     pub(crate) fn copy_file(
         &self,
         source: &Path,

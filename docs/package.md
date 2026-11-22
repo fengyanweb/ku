@@ -295,12 +295,13 @@ yank 不是强制吊销已锁定代码：v1 没有 signed monotonic revision，�
 
 - 单根目录且根内必须有普通文件 `ku.mod` 和真实目录 `src`。
 - 允许顶层：`ku.mod`、`src`、`README`、`README.md`、`LICENSE`、`LICENSE.md`、`docs`、`examples`、`tests`。
+- 声明 `interop.version = "1"` 的包可携带 `src/ku.interop`、允许的接入源码及许可证。描述与源码受同一个签名归档校验约束。按消费平台构建桥，不上传 DLL、静态库或安装钩子。
 - 拒绝绝对路径、`.`、`..`、反斜杠、Windows drive/ADS/保留设备名、尾随空格/点、超长/过深路径。
 - 拒绝重复路径、大小写冲突、symlink、hardlink、设备、socket、fifo 和其他特殊条目。
 - cache 安装内容不可覆盖；崩溃 staging 与超过 24 小时、扫描确认是普通有界树的 repair quarantine 由有界 GC 清理，活跃 staging、包含 link/reparse/special entry 或未完整扫描的 quarantine 不会被递归删除。
 
 ## v1 明确不提供
 
-- preinstall/postinstall/build script 或第三方本机动态库加载。
+- preinstall、postinstall 或任意第三方构建脚本。源依赖通过受限描述生成桥，运行时只按对应目标加载生成的桥。
 - 自动 signed-roots、在线 key 吊销和透明轮换；v1 由项目审查后显式更新公钥 pin。
 - 多 package workspace。
