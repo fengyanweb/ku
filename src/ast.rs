@@ -4,11 +4,19 @@ mod compiled;
 mod match_pattern;
 pub(crate) use compiled::{reject_compiled_async, reject_compiled_async_expression};
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub items: Vec<Item>,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Import(ImportDecl),
@@ -18,6 +26,10 @@ pub enum Item {
     Module(ModuleDecl),
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportDecl {
     pub kind: ImportKind,
@@ -25,6 +37,10 @@ pub struct ImportDecl {
     pub span: Span,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImportKind {
     Namespace(String),
@@ -32,6 +48,10 @@ pub enum ImportKind {
     Glob,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportName {
     pub source: String,
@@ -45,6 +65,10 @@ impl ImportName {
     }
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
     pub name: String,
@@ -56,6 +80,10 @@ pub struct FnDecl {
     pub span: Span,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ParamMode {
     #[default]
@@ -63,6 +91,10 @@ pub enum ParamMode {
     View,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub mode: ParamMode,
@@ -71,6 +103,10 @@ pub struct Param {
     pub span: Span,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructDecl {
     pub name: String,
@@ -78,6 +114,10 @@ pub struct StructDecl {
     pub span: Span,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumDecl {
     pub name: String,
@@ -85,6 +125,10 @@ pub struct EnumDecl {
     pub span: Span,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumVariant {
     pub name: String,
@@ -92,12 +136,20 @@ pub struct EnumVariant {
     pub span: Span,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleDecl {
     pub name: String,
     pub span: Span,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeName {
     Int,
@@ -118,6 +170,10 @@ pub enum TypeName {
     Custom(String),
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     VarDecl {
@@ -207,6 +263,10 @@ pub enum Stmt {
     },
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Expr {
     pub kind: ExprKind,
@@ -239,6 +299,10 @@ pub(crate) fn is_pure_append_argument(expr: &Expr, receiver: &str) -> bool {
     }
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssignTarget {
     Variable(String),
@@ -246,6 +310,10 @@ pub enum AssignTarget {
     Field { target: Expr, name: String },
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectDestructureBinding {
     pub field: String,
@@ -254,12 +322,20 @@ pub struct ObjectDestructureBinding {
     pub span: Span,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectDestructureRest {
     pub local: Option<String>,
     pub span: Span,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Literal(Literal),
@@ -312,6 +388,10 @@ pub enum ExprKind {
     },
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchArm {
     pub pattern: MatchPattern,
@@ -320,6 +400,10 @@ pub struct MatchArm {
     pub span: Span,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub enum MatchPattern {
     Wildcard,
     Binding(String),
@@ -331,6 +415,10 @@ pub enum MatchPattern {
     },
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionParam {
     pub mode: ParamMode,
@@ -339,22 +427,34 @@ pub struct FunctionParam {
     pub span: Span,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Int(i64),
-    Float(f64),
+    Float(#[cfg_attr(not(target_arch = "wasm32"), serde(with = "float_bits"))] f64),
     Bool(bool),
     String(String),
     TemplateString(String),
     Null,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Negate,
     Not,
 }
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Add,
@@ -370,4 +470,17 @@ pub enum BinaryOp {
     GreaterEqual,
     And,
     Or,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod float_bits {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(value: &f64, encoder: S) -> Result<S::Ok, S::Error> {
+        encoder.serialize_u64(value.to_bits())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(decoder: D) -> Result<f64, D::Error> {
+        u64::deserialize(decoder).map(f64::from_bits)
+    }
 }

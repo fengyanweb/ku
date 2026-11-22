@@ -8,6 +8,10 @@ sources: ['src/cli.rs', 'docs/package.md', 'docs/process-execution.md']
 
 Use `ku -v` to print the version and `ku --help` for the installed CLI's top-level help.
 
+## Package install in the source build
+
+`ku i [source]` is the top-level alias of `ku package install [source]`. Use `ku help package install` and the [public Git tutorial](https://github.com/fengyanweb/ku/blob/main/docs/package.en.md) with a source build. That build defaults to native C, and `--backend runner` selects the Runner explicitly. The stable 0.0.20 command table below retains its original defaults.
+
 ## Everyday commands
 
 ```sh

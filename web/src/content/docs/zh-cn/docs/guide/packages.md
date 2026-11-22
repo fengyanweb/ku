@@ -10,6 +10,10 @@ sidebar:
 
 标准库随 Ku 分发；自己的模块和第三方包通过 import 使用。当前没有官方托管的公共包目录，仓库内的 registry 是可自行部署的参考服务。
 
+## 源码构建版的安装命令
+
+主线源码构建版使用 `ku i`（等同 `ku package install`），支持签名 registry、项目相对路径、HTTPS Git 及已声明的跨语言包。生产依赖用 `ku i --locked --prod` 还原，离线还原用 `ku i --offline`。0.0.20 稳定安装包未内置此命令。见[源码安装与公开 Git 示例](https://github.com/fengyanweb/ku/blob/main/docs/package.md)。
+
 ## 项目结构
 
 ```text

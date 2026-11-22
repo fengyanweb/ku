@@ -854,6 +854,9 @@ impl BuildProcessTree {
         Err("process-tree containment is unavailable on this host".to_string())
     }
 }
+mod interop_binding;
+mod package_install;
+
 const HELP: &str = crate::cli_contract::TOP_LEVEL_HELP;
 
 pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
@@ -938,12 +941,14 @@ fn dispatch_cli(args: Vec<String>) -> Result<(), KuError> {
             }
             Ok(())
         }
+        Some("i") => package_install::run(&args[2..]),
         Some("package") => {
             let subcommand = args
                 .get(2)
                 .map(String::as_str)
                 .ok_or_else(|| command_error("missing package command"))?;
             match subcommand {
+                "install" => package_install::run(&args[3..]),
                 "gc" => {
                     let package = package_context_arg(&args, "package gc")?;
                     let removed = package::gc_cache(&package, 64)?;
@@ -1748,7 +1753,7 @@ enum BuildLockMode {
     Exclusive,
 }
 
-struct BuildFileLock {
+pub(crate) struct BuildFileLock {
     file: fs::File,
 }
 
@@ -1792,6 +1797,14 @@ fn acquire_build_file_lock_until(
             }
         }
     }
+}
+
+pub(crate) fn acquire_interop_artifact_lock(path: &Path) -> KuResult<BuildFileLock> {
+    acquire_build_file_lock_until(
+        path,
+        BuildLockMode::Exclusive,
+        Instant::now() + BUILD_LOCK_TIMEOUT,
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1944,7 +1957,7 @@ fn run_build_command(args: &[String]) -> Result<(), KuError> {
             let llvm_output = write_llvm_ir_artifact(&plan, options.dependency_mode)?;
             println!("llvm ir ok: {}", llvm_output.display());
             return Err(KuError::message(format!(
-                "LLVM backend does not link executables yet; wrote {}\nhelp: use `ku build` for a runnable wrapper, or `ku build --emit-llvm` when you only need text IR",
+                "LLVM backend does not link executables yet; wrote {}\nhelp: use `ku build` for a native executable, `ku build --backend runner` for the interpreter wrapper, or `ku build --emit-llvm` when you need the additional text IR artifact",
                 llvm_output.display()
             )));
         }
@@ -1959,7 +1972,7 @@ fn parse_build_options(args: &[String]) -> Result<BuildOptions, KuError> {
         output: None,
         profile: BuildProfile::Debug,
         target: None,
-        backend: BuildBackend::Runner,
+        backend: BuildBackend::C,
         emit_c: false,
         emit_ir: false,
         emit_llvm: false,
@@ -2331,12 +2344,17 @@ fn write_native_c_artifact(
 ) -> Result<PathBuf, KuError> {
     let output = plan.native_c_output.clone();
     let fs_base = native_fs_base_for_output(&plan.entry, &plan.output)?;
-    write_native_c_to(
+    let delivery = interop_binding::Delivery {
+        output_dir: link_output_directory(&plan.output),
+        matches_host: plan.target.as_ref().is_none_or(BuildTarget::matches_host),
+    };
+    write_native_c_for_delivery(
         &path_string(&plan.entry),
         &plan.source,
         &output,
         fs_base,
         dependency_mode,
+        Some(&delivery),
     )
 }
 
@@ -2576,7 +2594,6 @@ fn build_executable_to(
     output: &Path,
     config: RunnerBuildConfig<'_>,
 ) -> Result<PathBuf, KuError> {
-    check_source_with_dependency_mode(path, source, config.dependency_mode)?;
     validate_native_output_name(output)?;
     let output_directory = link_output_directory(output);
     fs::create_dir_all(output_directory).map_err(|err| {
@@ -2591,7 +2608,31 @@ fn build_executable_to(
         .unwrap_or_else(|_| Path::new(path).to_path_buf())
         .to_string_lossy()
         .to_string();
-    let rust_source = build_runner_source(&embedded_path, source, config.dependency_mode);
+    let original =
+        parse_source(source).map_err(|err| KuError::message(err.diagnostic(path, source)))?;
+    let rust_source = if program_has_imports(&original) && !program_has_only_std_imports(&original)
+    {
+        let delivery = interop_binding::Delivery {
+            output_dir: output_directory,
+            matches_host: config.target.is_none_or(BuildTarget::matches_host),
+        };
+        let parsed = (|| {
+            deny_unused_imports(&original)?;
+            let program = parse_and_expand_for_delivery(
+                path,
+                source,
+                config.dependency_mode,
+                Some(&delivery),
+            )?;
+            Checker::new().check(&program)?;
+            Ok::<_, KuError>(program)
+        })()
+        .map_err(|err| KuError::message(err.diagnostic(path, source)))?;
+        build_linked_runner_source(&parsed, path, source)?
+    } else {
+        check_source_with_dependency_mode(path, source, config.dependency_mode)?;
+        build_runner_source(&embedded_path, source, config.dependency_mode)
+    };
     let temp_guard = TempBuildDir::create_private("runner").map_err(|err| {
         KuError::message(format!("failed to create private build directory: {err}"))
     })?;
@@ -2698,7 +2739,18 @@ fn write_native_c_to(
     fs_base: backend::c::NativeFsBase,
     dependency_mode: DependencyResolveMode,
 ) -> Result<PathBuf, KuError> {
-    let program = parse_and_expand_with_dependency_mode(path, source, dependency_mode)?;
+    write_native_c_for_delivery(path, source, output, fs_base, dependency_mode, None)
+}
+
+fn write_native_c_for_delivery(
+    path: &str,
+    source: &str,
+    output: &Path,
+    fs_base: backend::c::NativeFsBase,
+    dependency_mode: DependencyResolveMode,
+    delivery: Option<&interop_binding::Delivery<'_>>,
+) -> Result<PathBuf, KuError> {
+    let program = parse_and_expand_for_delivery(path, source, dependency_mode, delivery)?;
     let native_task_entry = ir::task_lower::has_async_entry(&program);
     Checker::new().check(&program).map_err(|err| {
         let id = err.diagnostic_id();
@@ -7763,6 +7815,13 @@ fn compile_with_msvc(
     }
     if options.verbose {
         println!("msvc: {} (env from {})", cl.display(), vcvars.display());
+        // Printing Command itself would also expose the explicitly restored
+        // vcvars environment. The reproducible compiler argv is sufficient.
+        println!(
+            "c compiler command: {:?} {:?}",
+            command.get_program(),
+            command.get_args().collect::<Vec<_>>()
+        );
     }
 
     let timeout = remaining_build_phase_timeout(
@@ -8126,6 +8185,59 @@ fn build_runner_source(path: &str, source: &str, dependency_mode: DependencyReso
     )
 }
 
+fn build_linked_runner_source(program: &Program, path: &str, source: &str) -> KuResult<String> {
+    let serialized = serde_json::to_string(program)
+        .map_err(|error| KuError::message(format!("cannot package resolved project: {error}")))?;
+    if serialized.len() > MAX_LINKED_PROGRAM_BYTES {
+        return Err(KuError::message(
+            "resolved project exceeds the Runner payload limit",
+        ));
+    }
+    let payload = raw_string_literal(&serialized);
+    let diagnostic_source = raw_string_literal(source);
+    let file = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("main.ku");
+    Ok(format!(
+        "fn main() {{\n    if let Err(error) = ku::cli::run_linked_project({payload}, {file:?}, {diagnostic_source}) {{\n        eprintln!(\"{{error}}\");\n        std::process::exit(1);\n    }}\n}}\n"
+    ))
+}
+
+const MAX_LINKED_PROGRAM_BYTES: usize = 128 * 1024 * 1024;
+
+#[doc(hidden)]
+pub fn run_linked_project(payload: &'static str, file: &str, source: &str) -> KuResult<()> {
+    let exe = env::current_exe().map_err(|error| {
+        KuError::message(format!(
+            "could not locate linked project executable: {error}"
+        ))
+    })?;
+    let base = exe
+        .parent()
+        .ok_or_else(|| KuError::message("missing linked project directory"))?;
+    if payload.len() > MAX_LINKED_PROGRAM_BYTES {
+        return Err(KuError::message(
+            "resolved project exceeds the Runner payload limit",
+        ));
+    }
+    run_with_interpreter_stack(base.to_path_buf(), move || {
+        use serde::Deserialize;
+        let mut decoder = serde_json::Deserializer::from_str(payload);
+        // The payload is the checker's finite, compiler-authored AST, with
+        // a source expansion budget. Decode on the interpreter's stack.
+        decoder.disable_recursion_limit();
+        let program = Program::deserialize(&mut decoder).map_err(|error| {
+            KuError::message(format!("cannot restore packaged project: {error}"))
+        })?;
+        decoder.end().map_err(|error| {
+            KuError::message(format!("unexpected packaged project data: {error}"))
+        })?;
+        Ok(program)
+    })
+    .map_err(|error| KuError::message(error.diagnostic(file, source)))
+}
+
 fn raw_string_literal(source: &str) -> String {
     for hashes in 0..16 {
         let fence = "#".repeat(hashes);
@@ -8261,12 +8373,19 @@ pub fn run_source_with_dependency_mode(
 }
 
 fn run_program_with_stack(program: Program, base_dir: PathBuf) -> Result<(), KuError> {
+    run_with_interpreter_stack(base_dir, move || Ok(program))
+}
+
+fn run_with_interpreter_stack(
+    base_dir: PathBuf,
+    load: impl FnOnce() -> KuResult<Program> + Send + 'static,
+) -> KuResult<()> {
     thread::Builder::new()
         .name("ku-interpreter".to_string())
         .stack_size(INTERPRETER_STACK_SIZE)
         .spawn(move || {
             let mut interpreter = Interpreter::with_base_dir(base_dir);
-            interpreter.run(program)
+            interpreter.run(load()?)
         })
         .map_err(|err| KuError::message(format!("failed to start interpreter: {err}")))?
         .join()
@@ -9017,6 +9136,15 @@ fn parse_and_expand_with_dependency_mode(
     source: &str,
     dependency_mode: DependencyResolveMode,
 ) -> Result<Program, KuError> {
+    parse_and_expand_for_delivery(file, source, dependency_mode, None)
+}
+
+fn parse_and_expand_for_delivery(
+    file: &str,
+    source: &str,
+    dependency_mode: DependencyResolveMode,
+    delivery: Option<&interop_binding::Delivery<'_>>,
+) -> Result<Program, KuError> {
     let program = parse_source(source)?;
     let program = if program_has_imports(&program) {
         let path = Path::new(file);
@@ -9053,6 +9181,11 @@ fn parse_and_expand_with_dependency_mode(
                 )?;
             }
             let mut loader = ModuleLoader::new(package)?;
+            loader.interop_mode = dependency_mode;
+            if let Some(delivery) = delivery {
+                loader.interop_delivery =
+                    Some((delivery.output_dir.to_path_buf(), delivery.matches_host));
+            }
             let program = loader.load_entry(path, program, source.len())?;
             if matches!(
                 dependency_mode,
@@ -9348,6 +9481,9 @@ struct ModuleLoader {
     package: Option<PackageContext>,
     package_import_scopes: Vec<package::PackageImportScope>,
     dependency_snapshots: Vec<package::LockDependency>,
+    interop_bindings: HashMap<PathBuf, String>,
+    interop_mode: DependencyResolveMode,
+    interop_delivery: Option<(PathBuf, bool)>,
     budget: ImportBudget,
 }
 
@@ -9370,6 +9506,9 @@ impl ModuleLoader {
             package,
             package_import_scopes,
             dependency_snapshots: Vec::new(),
+            interop_bindings: HashMap::new(),
+            interop_mode: DependencyResolveMode::Update,
+            interop_delivery: None,
             budget: ImportBudget::default(),
         })
     }
@@ -9525,6 +9664,39 @@ impl ModuleLoader {
         }
         self.budget.finish_module();
         result
+    }
+
+    fn interop_for_module(&mut self, path: &Path) -> KuResult<Option<String>> {
+        let Some(context) = &self.package else {
+            return Ok(None);
+        };
+        let scope = package::package_import_scope_for_file(
+            &self.package_import_scopes,
+            path,
+            Span::default(),
+        )?;
+        if scope.interop_version.as_deref() != Some("1") {
+            return Ok(None);
+        }
+        if let Some(binding) = self.interop_bindings.get(&scope.import_root) {
+            return Ok(Some(binding.clone()));
+        }
+        let delivery = self
+            .interop_delivery
+            .as_ref()
+            .map(|(output_dir, matches_host)| interop_binding::Delivery {
+                output_dir,
+                matches_host: *matches_host,
+            });
+        let binding = interop_binding::prepare(
+            &scope.import_root,
+            &context.cache_dir,
+            self.interop_mode,
+            delivery.as_ref(),
+        )?;
+        self.interop_bindings
+            .insert(scope.import_root.clone(), binding.clone());
+        Ok(Some(binding))
     }
 
     fn expand_program(
@@ -9689,6 +9861,11 @@ impl ModuleLoader {
             }
         }
 
+        let bridge = if is_entry {
+            None
+        } else {
+            self.interop_for_module(path)?
+        };
         for item in program.items {
             if matches!(item, Item::Import(_)) {
                 continue;
@@ -9701,7 +9878,12 @@ impl ModuleLoader {
                 Item::Module(decl) => decl.span,
             };
             self.budget.charge_item(span)?;
-            let item = rewrite_top_level_names_in_item(item, &reference_renames, &namespace_maps)?;
+            let item = rewrite_top_level_names_in_item(
+                item,
+                &reference_renames,
+                &namespace_maps,
+                bridge.as_deref(),
+            )?;
             // Do not deduplicate source declarations: duplicate declarations in
             // one file must still reach the checker and produce its diagnostic.
             items.push(item);
@@ -9967,13 +10149,19 @@ fn rewrite_top_level_names_in_item(
     item: Item,
     rename_map: &HashMap<String, String>,
     namespaces: &NamespaceMaps,
+    bridge: Option<&str>,
 ) -> KuResult<Item> {
     match item {
         Item::Function(mut function) => {
             if let Some(renamed) = rename_map.get(&function.name) {
                 function.name = renamed.clone();
             }
-            rewrite_top_level_references_in_function(&mut function, rename_map, namespaces)?;
+            rewrite_top_level_references_in_function_with_bridge(
+                &mut function,
+                rename_map,
+                namespaces,
+                bridge,
+            )?;
             Ok(Item::Function(function))
         }
         Item::Struct(mut decl) => {
@@ -10080,12 +10268,23 @@ fn rewrite_type_name(
     }
 }
 
+#[cfg(test)]
 fn rewrite_top_level_references_in_function(
     function: &mut FnDecl,
     rename_map: &HashMap<String, String>,
     namespaces: &NamespaceMaps,
 ) -> KuResult<()> {
+    rewrite_top_level_references_in_function_with_bridge(function, rename_map, namespaces, None)
+}
+
+fn rewrite_top_level_references_in_function_with_bridge(
+    function: &mut FnDecl,
+    rename_map: &HashMap<String, String>,
+    namespaces: &NamespaceMaps,
+    bridge: Option<&str>,
+) -> KuResult<()> {
     let mut rewriter = TopLevelReferenceRewriter::new(rename_map, namespaces);
+    rewriter.bridge = bridge;
     if !function.type_params.is_empty() {
         rewriter.type_scopes.push(function.type_params.clone());
     }
@@ -10102,6 +10301,7 @@ fn rewrite_top_level_references_in_function(
 struct TopLevelReferenceRewriter<'a> {
     rename_map: &'a HashMap<String, String>,
     namespaces: &'a NamespaceMaps,
+    bridge: Option<&'a str>,
     scopes: Vec<HashSet<String>>,
     /// Type parameters have a separate namespace from local value bindings.
     /// Empty for non-generic programs, without copying the module rename map.
@@ -10113,6 +10313,7 @@ impl<'a> TopLevelReferenceRewriter<'a> {
         Self {
             rename_map,
             namespaces,
+            bridge: None,
             scopes: Vec::new(),
             type_scopes: Vec::new(),
         }
@@ -10338,6 +10539,24 @@ impl<'a> TopLevelReferenceRewriter<'a> {
                 self.rewrite_expr(right)?;
             }
             ExprKind::Call { callee, args } => {
+                if let ExprKind::Variable(name) = &mut callee.kind {
+                    if crate::interop::ReturnKind::for_builtin(name).is_some() {
+                        let bridge = self.bridge.ok_or_else(|| KuError::runtime(
+                            "interop calls require an imported package with interop.version = \"1\"",
+                            expr.span,
+                        ))?;
+                        let (source, _) = crate::interop::binding_arguments(args, expr.span)?;
+                        if source != "self" {
+                            return Err(KuError::runtime(
+                                "interop package wrappers must bind to the package's own bridge",
+                                expr.span,
+                            ));
+                        }
+                        let suffix = name.trim_start_matches("__ku_interop_");
+                        *name = format!("{}{suffix}", crate::interop::BOUND_PREFIX);
+                        args[0].kind = ExprKind::Literal(Literal::String(bridge.to_owned()));
+                    }
+                }
                 self.rewrite_expr(callee)?;
                 for arg in args {
                     self.rewrite_expr(arg)?;
@@ -10914,10 +11133,39 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_build_defaults_to_c_without_changing_explicit_backends() {
+        let default = parse_build_options(&["ku".into(), "build".into(), "main.ku".into()])
+            .expect("ordinary build options");
+        assert_eq!(default.backend, BuildBackend::C);
+        assert_eq!(default.profile, BuildProfile::Debug);
+        for (name, expected) in [
+            ("c", BuildBackend::C),
+            ("native-c", BuildBackend::C),
+            ("runner", BuildBackend::Runner),
+            ("interp", BuildBackend::Runner),
+            ("interpreter", BuildBackend::Runner),
+            ("llvm", BuildBackend::Llvm),
+            ("ll", BuildBackend::Llvm),
+        ] {
+            let options = parse_build_options(&[
+                "ku".into(),
+                "build".into(),
+                "--backend".into(),
+                name.into(),
+                "main.ku".into(),
+            ])
+            .expect("explicit backend remains available");
+            assert_eq!(options.backend, expected, "{name}");
+        }
+    }
+
+    #[test]
     fn dependency_mode_flags_are_single_and_propagate_to_built_runner() {
         let args = vec![
             "ku".to_string(),
             "build".to_string(),
+            "--backend".to_string(),
+            "runner".to_string(),
             "src/main.ku".to_string(),
             "--offline".to_string(),
         ];

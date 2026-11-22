@@ -756,6 +756,107 @@ fn main() {
 }
 
 #[test]
+fn ordinary_build_uses_native_c_and_missing_compiler_never_falls_back() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = unique_temp_dir("default-native 中文 project");
+    fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    let source = root.join("main.ku");
+    fs::write(&source, "fn main() { println(42) }\n").unwrap();
+    let program = root.join(if cfg!(windows) { "app.exe" } else { "app" });
+    let missing_rust = root.join("missing-rustc");
+    let mut build = Command::new(ku_binary());
+    build
+        .current_dir(&root)
+        .args(["build", "--release", "--verbose", "main.ku", "-o"])
+        .arg(&program)
+        .env("KU_CC", "clang")
+        .env("KU_RUNNER_RUSTC", &missing_rust);
+    let built = run_bounded(
+        &mut build,
+        Duration::from_secs(60),
+        SHORT_PROCESS_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    let text = String::from_utf8_lossy(&built.stdout);
+    assert!(
+        built.status.success(),
+        "{text}\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    assert!(text.contains("c compiler command:"), "{text}");
+    assert!(!text.contains("rustc command:"), "{text}");
+    assert!(root.join(".ku/build/release/c").is_dir());
+
+    let missing_cc = root.join("missing-compiler");
+    let mut interpret = Command::new(ku_binary());
+    interpret
+        .current_dir(&root)
+        .args(["run", "main.ku"])
+        .env("KU_CC", &missing_cc)
+        .env("KU_RUNNER_RUSTC", &missing_rust);
+    let interpreted = run_bounded(
+        &mut interpret,
+        Duration::from_secs(15),
+        SHORT_PROCESS_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(interpreted.status.success());
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        "42\n"
+    );
+
+    fs::remove_file(source).unwrap();
+    let executed = run_bounded(
+        Command::new(&program).current_dir(&root),
+        Duration::from_secs(15),
+        SHORT_PROCESS_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(executed.status.success());
+    assert_eq!(
+        String::from_utf8(executed.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        "42\n"
+    );
+
+    fs::write(root.join("main.ku"), "fn main() { println(99) }\n").unwrap();
+    let previous = fs::read(&program).unwrap();
+    let mut absent = Command::new(ku_binary());
+    absent
+        .current_dir(&root)
+        .args(["build", "--release", "--verbose", "main.ku", "-o"])
+        .arg(&program)
+        .env("KU_CC", &missing_cc)
+        .env("KU_RUNNER_RUSTC", &missing_rust);
+    let failed = run_bounded(
+        &mut absent,
+        Duration::from_secs(30),
+        SHORT_PROCESS_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        !failed.status.success(),
+        "missing C compiler unexpectedly built a program"
+    );
+    assert!(!String::from_utf8_lossy(&failed.stdout).contains("rustc command:"));
+    assert_eq!(
+        fs::read(program).unwrap(),
+        previous,
+        "failed build replaced prior native program"
+    );
+}
+
+#[test]
 fn command_help_is_consistent_and_has_no_project_side_effects() {
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {

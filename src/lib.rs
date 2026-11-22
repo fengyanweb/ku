@@ -5,6 +5,7 @@ pub mod cli;
 pub mod cli_contract;
 pub mod env;
 pub mod error;
+mod interop;
 pub mod ir;
 pub mod lexer;
 mod native_tls_archive;

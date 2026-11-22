@@ -1,0 +1,33 @@
+import { Query, Version } from "@sqlite_example/database"
+import { Close, New, Parse, RaiseExampleError, RootName } from "@tinyxml_example/document"
+
+fn main(): null! {
+    println(Version()?)
+    first = Query("SELECT ?1", "你好，Ku")?
+    try {
+        Query("SELECT", "bad statement")?
+    } catch (failure) {
+        println(failure.code)
+    }
+    other = Query("SELECT ?1", "SQLite after error")?
+    println(first)
+    println(other)
+
+    document = New()?
+    println(Parse(document, "<root><child/></root>")?)
+    root_name = RootName(document)?
+    try {
+        RaiseExampleError(document)?
+    } catch (failure) {
+        println(failure.message)
+    }
+    println(RootName(document)?)
+    Close(document)?
+    println(root_name)
+    try {
+        RootName(document)?
+    } catch (failure) {
+        println(failure.code)
+    }
+    return ok(null)
+}

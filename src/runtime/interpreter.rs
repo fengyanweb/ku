@@ -1742,6 +1742,36 @@ impl Interpreter {
         Ok(Some(value))
     }
 
+    fn eval_interop(
+        &mut self,
+        kind: crate::interop::ReturnKind,
+        args: &[Expr],
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<Value> {
+        if self.async_execution
+            || self.execution_deadline.is_some()
+            || crate::runtime::task::current_task_id() != 0
+        {
+            return Ok(stdlib::errors::err(
+                "interop",
+                "unavailable",
+                "interop bridge calls may block and require synchronous CLI execution",
+            ));
+        }
+        let (library, operation) = crate::interop::binding_arguments(args, span)?;
+        let mut leases = Vec::new();
+        let mut values = Vec::with_capacity(args.len() - 2);
+        for argument in &args[2..] {
+            values.push(self.eval_read_argument(argument, env, depth, &mut leases)?);
+            if self.pending_fail.is_some() {
+                return Ok(Value::Null);
+            }
+        }
+        crate::interop::invoke(kind, library, operation, &values, span)
+    }
+
     fn eval(&mut self, expr: &Expr, env: &mut Env, depth: usize) -> KuResult<Value> {
         self.tick(expr.span)?;
         match &expr.kind {
@@ -1828,6 +1858,11 @@ impl Interpreter {
                 eval_binary(*op, left, right, expr.span)
             }
             ExprKind::Call { callee, args } => {
+                if let ExprKind::Variable(name) = &callee.kind {
+                    if let Some(kind) = crate::interop::ReturnKind::for_bound(name) {
+                        return self.eval_interop(kind, args, env, depth, expr.span);
+                    }
+                }
                 // Register before even the first argument is evaluated: a later
                 // nested call can observe cancellation before this callee starts.
                 let previous_observers = self.caller_owners.len();

@@ -3013,6 +3013,39 @@ impl<'a> FunctionLowerer<'a> {
         Ok(result)
     }
 
+    fn lower_interop(
+        &mut self,
+        kind: crate::interop::ReturnKind,
+        args: &[Expr],
+        span: Span,
+        deferred_safepoint: Option<&mut bool>,
+    ) -> KuResult<IrExpr> {
+        use crate::interop::ReturnKind;
+        let (library, operation) = crate::interop::binding_arguments(args, span)?;
+        let mut lowered = [library, operation]
+            .into_iter()
+            .map(|text| IrExpr {
+                kind: IrExprKind::Literal(format!("{text:?}")),
+                ty: IrType::Str,
+            })
+            .collect::<Vec<_>>();
+        let values = &args[2..];
+        let modes = vec![ParamMode::View; values.len()];
+        let first_argument_temp = self.next_temp_id;
+        lowered.extend(self.lower_call_arguments(values, None, Some(&modes), false, true)?);
+        let result = IrType::Result(Box::new(match kind {
+            ReturnKind::Null => IrType::Null,
+            ReturnKind::Int => IrType::Int,
+            ReturnKind::Str => IrType::Str,
+            ReturnKind::Bool => IrType::Bool,
+        }));
+        self.finish_borrowing_call(
+            intrinsic_expr(kind.intrinsic(), lowered, result),
+            first_argument_temp,
+            deferred_safepoint,
+        )
+    }
+
     fn emit_borrow_temporary_drop(&mut self, owner: IrExpr) -> KuResult<()> {
         emit_ir_instruction!(
             self,
@@ -3293,6 +3326,11 @@ impl<'a> FunctionLowerer<'a> {
                 })
             }
             ExprKind::Call { callee, args } => {
+                if let ExprKind::Variable(name) = &callee.kind {
+                    if let Some(kind) = crate::interop::ReturnKind::for_bound(name) {
+                        return self.lower_interop(kind, args, expr.span, deferred_safepoint);
+                    }
+                }
                 // Stage 6f: a self-recursive call inside a lifted local-named
                 // function body. Resolve the callee to the lifted function itself
                 // and thread the running `__env` as the leading argument, instead

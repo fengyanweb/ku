@@ -2,7 +2,49 @@
 
 当前 Ku package 链路包含本地 `file://` 开发依赖，以及第三方 HTTPS registry 的确定性打包、发布、签名 index、传递依赖求解、精确 lock、内容寻址 cache 和 `@name/path` 导入。registry v1 使用项目显式固定的 Ed25519 公钥；没有无签名或自动信任模式。仓库提供可自行部署的有界参考服务 `ku-registry`，并以真实 TLS listener 覆盖发布、消费、ACL、并发和重启闭环；它不是官方托管服务，也没有生产吞吐量或高并发基准。配置与安全边界见 [Registry API v1](registry-api.md)。
 
-包命令只有 `ku package pack [path]`、`ku package publish [path]`、`ku package yank [path]`、`ku package resolve [path] [--locked|--offline]` 和 `ku package gc [path]` 这些 `ku package ...` 入口；`path` 默认 `.`，可以是 package 内文件或 package 目录。文中的 `.` 表示当前 package，不另设 bare `ku pack/publish/yank/resolve/gc` 别名。
+`ku i` 与 `ku package install` 共用安装器。发布、撤回、主动刷新和清理继续使用 `ku package publish/yank/resolve/gc`。0.0.20 的旧发行包未包含安装子命令。
+
+## 从公开 Git 仓库安装并运行
+
+使用 Git、Python 3、仓库固定的 Rust 工具链和 C 编译器。在源码目录执行 `python3 -B scripts/install-runtime-from-source.py --prefix ../ku-sdk`，然后创建项目。PowerShell 使用 `python`，可执行文件用 `..\ku-sdk\ku.exe`。
+
+```sh
+cd ..
+mkdir consumer
+cd consumer
+../ku-sdk/ku init
+../ku-sdk/ku i 'https://github.com/fengyanweb/ku.git#780e3955473eaaf1d7b101ed68c946c7173866c9:examples/package'
+```
+
+把安装输出中的导入复制到 `src/main.ku`。
+
+```ku
+import { Value } from "@demo_pkg/util"
+
+fn main() {
+    println(Value())
+}
+```
+
+执行 `../ku-sdk/ku build --release --locked -o app`、`./app`，输出 `7`。Windows 使用 `-o app.exe` 和 `./app.exe`。显式 Runner 使用 `--backend runner`。此例的两个产物都可在没有 Ku 和源码的目录运行。用 `ku run --locked` 可直接解释执行。
+
+## 安装来源与还原
+
+| 输入 | 行为 |
+| --- | --- |
+| `ku i demo` | 从项目配置并固定公钥的 HTTPS registry 安装。 |
+| `ku i ./vendor/demo` | 安装项目内的 Ku 包，清单记录项目相对路径。 |
+| `ku i 'https://host/owner/repo.git#v1.2.3'` | 安装 Git 包并锁到完整提交。完整提交后也可加 `:包子路径`。 |
+| `ku i ./tools/subtitles.py --module text` | 为本地 Python 文件生成模块。使用 `--python PATH` 选择解释器。 |
+| `ku i pypi:Pillow --module PIL.Image` | 获取匹配解释器 ABI 的锁定 wheel。发行名与模块名单独指定。 |
+| `ku i --dev testkit` | 添加开发依赖。 |
+| `ku i` | 恢复现有锁并补齐缺少的工件。主动更新版本用 `ku package resolve`。 |
+| `ku i --locked --prod` | 仅准备生产依赖，保持已有锁。 |
+| `ku i --offline` | 严格使用经校验的本地材料。与 `--locked` 互斥。 |
+
+要分享自己的 Ku 包，可用 `ku init --template lib`，在 `ku.mod` 设置包名和版本，编写以 ASCII 大写字母开头的导出函数，将清单和源码提交到 Git。将 HTTPS 地址和提交或标签发给使用者即可。需要按包名分享时，配置有权发布该包的 registry，再按原有协议打包和发布。
+
+普通单头文件、单 C 源文件可放在项目内，然后执行 `ku i ./vendor/your_sdk`。自动生成的接入包在 `ku-libraries`，可由作者维护。带所有权约束的 SQLite 和 TinyXML-2 见 [C/C++ 示例](../examples/interop-native)，Python 见 [交付示例](interop-python.md)。生成 `ku-runtime.d` 的应用交付时将它与可执行文件一起搬移。外库调用使用同步 CLI 路径。
 
 ## ku.mod
 
@@ -40,7 +82,7 @@ dep.math = "^1.2.0"
 | `registry.url` | 有 registry 依赖时是 | HTTPS API 基址；不能含凭据、query、fragment 或空白，必须以 `/` 结尾 |
 | `registry.public_key` | 有 registry 依赖时是 | 固定的 Ed25519 验签公钥，格式 `ed25519-` 加 64 位 hex |
 | `dep.<name>` | 否 | 依赖版本；resolver 支持精确 `1.2.3` 和 caret `^1.2.3`，`~` 暂不进入求解 |
-| `dep.<name>.source` | 否 | 仅本地开发覆盖使用绝对 `file://` 路径，路径分隔符固定为 `/`；省略时从项目固定的 registry 解析，不增加第二套 registry source 语法 |
+| `dep.<name>.source` | 否 | 省略时使用签名 registry。安装器写入 `path:` 项目相对路径或锁定的 HTTPS Git 来源。旧的绝对 `file://` 仍可作为显式本地开发覆盖。 |
 | `dep.<name>.checksum` | 否 | 可选的本地快照额外 pin，格式为 `ku-fnv64-` 加 16 位十六进制；通常省略并由 resolver 计算后写入 lock；registry checksum 来自签名 index |
 
 `ku.mod` 只接受 `key = "value"`，`#` 后面是注释。同一个 key 只能出现一次；普通字段、`registry.*`、`dep.<name>`、`dep.<name>.source` 和 `dep.<name>.checksum` 的重复声明都会报错，不使用 last-wins。
