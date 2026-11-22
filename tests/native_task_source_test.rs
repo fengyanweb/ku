@@ -465,9 +465,71 @@ async fn main(): null! {
     assert!(!rejected.status.success());
     let diagnostic = normalized(&rejected.stderr);
     assert!(
-        diagnostic.contains("owned Task enum payload binding on a named subject"),
+        diagnostic.contains(
+            "owned Task enum payload binding on a named subject outside a direct string result or length read"
+        ),
         "{diagnostic}"
     );
+}
+
+#[test]
+fn native_task_consumes_named_string_enum_in_a_direct_arm() {
+    let directory = TempDir::new("task-named-string-enum");
+    let path = directory.path();
+    let source = include_str!("fixtures/native_task_enum_str_result/named.ku");
+    fs::write(path.join("main.ku"), source).unwrap();
+    fs::write(
+        path.join("worker.ku"),
+        include_str!("fixtures/native_task_enum_str_result/worker.ku"),
+    )
+    .unwrap();
+    let normalized = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    let call = |args: &[&str]| {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_ku"));
+        cli.current_dir(path).args(args);
+        run_bounded(&mut cli, BUILD_TIMEOUT, BUILD_LIMITS).unwrap()
+    };
+    let expected = include_str!("fixtures/native_task_enum_str_result/named-expected.txt");
+    let interpreted = call(&["run", "main.ku"]);
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        normalized(&interpreted.stderr)
+    );
+    assert_eq!(normalized(&interpreted.stdout), expected);
+    let reused = source.replace(
+        "    println(length)",
+        "    println(length)\n    println(match report { Report.Ready => true Report.Rejected(_) => false })",
+    );
+    fs::write(path.join("reuse.ku"), reused).unwrap();
+    let rejected = call(&["check", "reuse.ku"]);
+    let diagnostic = normalized(&rejected.stderr);
+    assert!(!rejected.status.success());
+    assert!(
+        diagnostic.contains("error[E0901]: error: use of moved value 'report'"),
+        "{diagnostic}"
+    );
+
+    let filename = if cfg!(windows) { "app.exe" } else { "app" };
+    let built = call(&["build", "--release", "--offline", "main.ku", "-o", filename]);
+    let diagnostic = normalized(&built.stderr);
+    if !built.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none(), "{diagnostic}");
+        return;
+    }
+    assert!(built.status.success(), "{diagnostic}");
+    let execution = run_bounded(
+        Command::new(path.join(filename)).current_dir(path),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        execution.status.success(),
+        "{}",
+        normalized(&execution.stderr)
+    );
+    assert_eq!(normalized(&execution.stdout), expected);
 }
 
 #[test]
@@ -481,6 +543,10 @@ async fn Probe(label: str, mode: int): ProbeReport! {
     if (mode == 1) { return ok(ProbeReport.Ready) }
     if (mode == 2) { fail label }
     return ok(ProbeReport.Rejected(label))
+}
+async fn ReadLabel(text: str): str! {
+    report = (await Probe(text, 0))?
+    return ok(match report { ProbeReport.Ready => "ok" ProbeReport.Rejected(label) => label })
 }
 async fn main(): null! { return ok(null) }
 "#,

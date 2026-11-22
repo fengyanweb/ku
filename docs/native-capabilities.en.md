@@ -91,6 +91,12 @@ A declared enum whose variants have no payload can be passed as an owned Task ar
 
 In a native Task, `match` can select an alternative of a payload-free enum or a final unguarded `_` arm. Each arm yields the same type among `int`, `bool`, `null` and owned `str`. The subject is evaluated once. A variant's boolean guard runs after its tag matches. A false guard continues to the next matching alternative or the final wildcard. Both the guard and the selected arm can suspend and propagate an error through `?`. To retain an owned value for a later arm, pass `.clone()` to owning calls in the guard.
 
+A named enum with at most 64 variants, one variant carrying a single `int` and the others carrying no payload, can also be returned in a single-layer Result. An unguarded match can read the integer with a binding such as `ScanStatus.Found(index)`, or ignore it with `ScanStatus.Found(_)`. Binding the integer leaves the enum available for another match.
+
+A single owned `str` field is also supported for Task results within the same variant limit. An unguarded match on a temporary such as `match (await Scan())?` moves the string into the selected arm, where it remains valid across another suspension.
+
+An unguarded match on a named enum can consume it by returning the string binding directly or reading it with `.len()` or `.byte_len()` in the selected arm. Using `_` in place of the binding keeps the named subject available for another match.
+
 Tasks can read response `body/status`, read or write `response.headers[key]`, and retain or return owned responses across suspension. Existing HTTP checks still govern string types, names, values, counts, bytes and transport-managed fields. Allocations use the Task budget. Invalid responses do not prevent subsequent valid requests. This does not add arbitrary Task objects, structs or nested containers.
 
 See [native_task_http_client.ku](../examples/native_task_http_client.ku) for a Task client and [native_http_relay.ku](../examples/native_http_relay.ku) for the end-to-end service. Provide a local upstream at `127.0.0.1:8080/hello`, then build and run the service. `/info` uses a read-only handler; `/relay` fetches the upstream through a Task and returns dynamic headers.

@@ -149,6 +149,22 @@ struct EnumMatchBinding<'a> {
     owned: bool,
 }
 
+// These selected expressions use only the new string binding and cannot
+// enter a recoverable error path or suspend after the subject is consumed.
+fn direct_string_binding_use(value: &Expr, binding: &str) -> bool {
+    let is_binding =
+        |expr: &Expr| matches!(&expr.kind, ExprKind::Variable(name) if name == binding);
+    if is_binding(value) {
+        return true;
+    }
+    let ExprKind::Call { callee, args } = &value.kind else {
+        return false;
+    };
+    args.is_empty()
+        && matches!(&callee.kind, ExprKind::Field { target, name }
+            if matches!(name.as_str(), "len" | "byte_len") && is_binding(target))
+}
+
 impl FunctionLowerer<'_> {
     pub(super) fn enum_literal(
         &mut self,
@@ -382,11 +398,18 @@ impl FunctionLowerer<'_> {
         if tags.is_empty() || (tags.last() != Some(&None) && covered.len() != variant_count) {
             return Err(unsupported("a nonexhaustive Task enum match", span));
         }
-        if self.stable_slots[source.0] && payload_binding.is_some_and(|binding| binding.owned) {
-            return Err(unsupported(
-                "an owned Task enum payload binding on a named subject",
-                value.span,
-            ));
+        if let Some(binding) =
+            payload_binding.filter(|binding| binding.owned && self.stable_slots[source.0])
+        {
+            let named_subject =
+                matches!(&value.kind, ExprKind::Variable(name) if self.local(name) == Some(source));
+            if !named_subject || !direct_string_binding_use(&arms[binding.arm].value, binding.name)
+            {
+                return Err(unsupported(
+                    "an owned Task enum payload binding on a named subject outside a direct string result or length read",
+                    value.span,
+                ));
+            }
         }
         // A tag-only pattern never consumes a named enum. Anonymous
         // scrutinees can retire once the tag has been read.
@@ -599,7 +622,13 @@ impl FunctionLowerer<'_> {
             }
             Ok(value)
         } else {
-            self.unit_enum_match_value(arm, depth)
+            let value = self.unit_enum_match_value(arm, depth)?;
+            if owned && self.stable_slots[subject.0] {
+                // The checker consumes the named subject on normal match
+                // exit. Until then a nonbinding arm or its catch can read it.
+                self.emit(TaskOp::Drop { slot: subject })?;
+            }
+            Ok(value)
         }
     }
 

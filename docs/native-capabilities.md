@@ -91,6 +91,12 @@ Task 的 `http.request` 支持字面量和局部配置对象，字符串 header 
 
 native Task 可以用 `match` 匹配无载荷枚举的变体，也可以用末尾无 guard 的 `_` 分支。各分支产生同一种 `int`、`bool`、`null` 或 owned `str`。匹配对象只求值一次。变体的 tag 匹配后才求值布尔 guard。guard 为 false 时继续匹配同一变体的后续分支或末尾通配分支。guard 和选中的分支都可以挂起，也可以通过 `?` 传播错误。若后续分支仍要使用某个 owned 值，可给 guard 中的 owned 调用传入该值的 `.clone()`。
 
+如果具名枚举最多有 64 个变体，只有一个变体携带单个 `int`，其余变体均无载荷，也可以通过单层 Result 返回。无 guard 的 `match` 可以用 `ScanStatus.Found(index)` 读取整数，也可以用 `ScanStatus.Found(_)` 跳过它。读取整数后仍可再次匹配原枚举值。
+
+在同一变体数量限制下，Task 结果也支持只有一个变体携带单个 owned `str`。对 `match (await Scan())?` 这样的临时值执行无 guard 的 `match` 时，字符串移交给选中的分支，后续挂起后仍然有效。
+
+对具名枚举执行无 guard 的 `match` 时，选中分支可以直接返回字符串绑定，也可以调用绑定的 `.len()` 或 `.byte_len()`。这些绑定会消费原枚举。用 `_` 忽略该字段时，仍可再次匹配原枚举值。
+
 Task 可以读取响应的 `body/status`，读取或写入 `response.headers[key]`，并将 owned 响应跨等待保存或返回。动态 header 的字符串类型、名称、值、数量、字节和传输字段仍由既有 HTTP 校验约束；分配计入 Task 预算。非法响应不会使后续合法请求失效。这不扩展为任意 Task 对象、结构体或嵌套容器。
 
 Task 客户端示例：[native_task_http_client.ku](../examples/native_task_http_client.ku)。端到端服务示例：[native_http_relay.ku](../examples/native_http_relay.ku)。先在 `127.0.0.1:8080/hello` 提供本机上游，再构建并运行服务示例；`/info` 使用只读处理器，`/relay` 通过 Task 请求上游，并返回动态 header。

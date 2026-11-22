@@ -2,6 +2,17 @@
 
 static void test_wake(void* data, size_t owner) { (void)data; (void)owner; }
 
+static int finish_driver(KuTaskDriverV1* driver, KuTaskValueV1* task, uint64_t deadline) {
+  uint64_t next=UINT64_MAX;
+  if (task->tag) CHECK(ku_task_value_drop(task,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(driver,deadline)==KU_TASK_DRIVER_OK);
+  for (size_t i=0; i<64u && driver->workers_exited!=1u; ++i)
+    CHECK(ku_task_driver_pump(driver,0u,16u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver->resident && !driver->running && !driver->queued && !driver->timers && !driver->reserved_bytes && !driver->fault);
+  CHECK(ku_task_driver_join(driver,deadline)==KU_TASK_DRIVER_OK && ku_task_driver_destroy(driver)==KU_TASK_DRIVER_OK);
+  return 0;
+}
+
 enum Disposition { UNPACK, DROP_OUTCOME, CANCEL, UNRECEIVED, INLINE_FAILURE };
 
 static int trial(int64_t mode, enum Disposition disposition) {
@@ -72,12 +83,7 @@ static int trial(int64_t mode, enum Disposition disposition) {
       }
     }
   }
-  if (task.tag) CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
-  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
-  for (size_t i=0; i<64u && driver.workers_exited!=1u; ++i)
-    CHECK(ku_task_driver_pump(&driver,0u,16u,&next)<=KU_TASK_DRIVER_PENDING);
-  CHECK(!driver.resident && !driver.running && !driver.queued && !driver.timers && !driver.reserved_bytes && !driver.fault);
-  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK && ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  CHECK(!finish_driver(&driver,&task,deadline));
   if (disposition==UNPACK) {
     size_t allocations=ku_perf_calls;
     KuResult_enum_ProbeReport result=ku_task_unpack_enum_ProbeReport(&output.value.enum_ProbeReport);
@@ -100,6 +106,40 @@ static int trial(int64_t mode, enum Disposition disposition) {
   return 0;
 }
 
+static int trial_named(void) {
+  KuTaskDriverV1 driver={0};
+  KuTaskDriverSlotV1 slots[2]={0};
+  size_t ring[2]={0};
+  KuTaskValueV1 task={0};
+  KuTaskAdapterOutcomeV1 output={0};
+  uint64_t deadline=3000, next=UINT64_MAX;
+  size_t fixed=ku_task_driver_fixed_storage_bytes(2u);
+  fixture_now=1000;
+  KuString label=ku_string_alloc(8u);
+  CHECK(label.ptr);
+  memcpy(label.ptr,"rejected",8u);
+  uint8_t* original=label.ptr;
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,2u,ring,2u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+64u,1u,deadline,NULL,test_wake)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_1_start_value(&driver,&label,&task)==KU_TASK_DRIVER_OK && !label.ptr);
+  for (size_t i=0; i<64u && !driver.timers; ++i)
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(driver.timers==1u && driver.resident==2u);
+  CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING);
+  CHECK(ku_task_value_take(&task,NULL,&output)!=KU_TASK_CONTROL_OK && !output.result_kind);
+  fixture_now=1031;
+  for (size_t i=0; i<64u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING; ++i)
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_COMPLETED);
+  CHECK(ku_task_value_take(&task,NULL,&output)==KU_TASK_CONTROL_OK && output.result_kind==4u);
+  CHECK(!finish_driver(&driver,&task,deadline));
+  CHECK(output.value.string.ok && output.value.string.value.ptr==original);
+  CHECK(output.value.string.value.len==8u && !memcmp(original,"rejected",8u));
+  ku_task_outcome_drop(&output);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  return 0;
+}
+
 int main(void) {
   CHECK(!trial(0,UNPACK));
   CHECK(!trial(1,UNPACK));
@@ -110,6 +150,7 @@ int main(void) {
   CHECK(!trial(0,UNRECEIVED));
   CHECK(!trial(2,UNRECEIVED));
   CHECK(!trial(0,INLINE_FAILURE));
+  CHECK(!trial_named());
   puts("owned enum pending, alias guards, pointer transfer, and drain ok");
   return 0;
 }

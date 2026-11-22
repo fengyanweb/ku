@@ -1,0 +1,38 @@
+import { Report, ParseLine, Pause } from "./worker"
+
+async fn ReadLabel(text: str): str! {
+    report = (await ParseLine(text, true))?
+    println(match report { Report.Ready => false Report.Rejected(_) => true })
+    return ok(match report { Report.Ready => "ok" Report.Rejected(label) => label })
+}
+
+async fn LabelBytes(text: str): int! {
+    report = (await ParseLine(text, true))?
+    return ok(match report { Report.Ready => 0 Report.Rejected(label) => label.byte_len() })
+}
+
+async fn InspectStatus(): null! {
+    report = (await ParseLine("unused", false))?
+    println(match report { Report.Ready => "ready" Report.Rejected(_) => "rejected" })
+    try {
+        value = match report {
+            Report.Ready => ((await Pause(true))?).len()
+            Report.Rejected(label) => label.len()
+        }
+        println(value)
+    } catch (issue) {
+        println(issue.message)
+        println(match report { Report.Ready => true Report.Rejected(_) => false })
+    }
+    return ok(null)
+}
+
+async fn main(): null! {
+    pending = ParseLine("整理" + "🙂", true)
+    report = (await pending)?
+    length = match report { Report.Ready => 0 Report.Rejected(label) => label.len() }
+    println(length)
+    println((await ReadLabel("诊断" + "🙂"))?)
+    println((await LabelBytes("整理🙂".clone()))?)
+    return (await InspectStatus())
+}
