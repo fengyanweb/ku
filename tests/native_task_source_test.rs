@@ -1278,6 +1278,74 @@ int main(void) {
 }
 
 #[test]
+fn native_task_closure_alias_reads_nested_string_lengths_after_timer() {
+    let directory = TempDir::new("task-closure-string-length");
+    let path = directory.path();
+    let source = include_str!("fixtures/native_task_closure_string_length/main.ku");
+    fs::write(path.join("main.ku"), source).unwrap();
+    fs::write(
+        path.join("worker.ku"),
+        include_str!("fixtures/native_task_closure_string_length/worker.ku"),
+    )
+    .unwrap();
+    let expected = include_str!("fixtures/native_task_closure_string_length/expected.txt");
+    let normalized = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    let call = |args: &[&str]| {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_ku"));
+        cli.current_dir(path).args(args);
+        run_bounded(&mut cli, BUILD_TIMEOUT, BUILD_LIMITS).unwrap()
+    };
+    let interpreted = call(&["run", "main.ku"]);
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        normalized(&interpreted.stderr)
+    );
+    assert_eq!(normalized(&interpreted.stdout), expected);
+
+    let file = if cfg!(windows) { "app.exe" } else { "app" };
+    let built = call(&["build", "--release", "--offline", "main.ku", "-o", file]);
+    let diagnostic = normalized(&built.stderr);
+    if !built.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none(), "{diagnostic}");
+        return;
+    }
+    assert!(built.status.success(), "{diagnostic}");
+    let output = run_bounded(
+        Command::new(path.join(file)).current_dir(path),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(output.status.success(), "{}", normalized(&output.stderr));
+    assert_eq!(normalized(&output.stdout), expected);
+
+    for (file, changed, error) in [
+        ("callback-parameter.ku", source.replace("reader: fn(): int = length", "reader = fn(next: fn(): int): int { return next() }").replace("println(reader())", "println(reader(length))"), "parameters of a Task lexical closure"),
+        ("general-call.ku", source.replace("length: fn(): int = fn(): int { return rest.line.title.len() }", "measure = fn(): int { return rest.line.number }\n    length: fn(): int = fn(): int { return measure() }"), "calls, suspension or construction inside a Task lexical closure body"),
+        ("escape.ku", source.replace("reader: fn(): int = length", "readers = [length]").replace("println(reader())", "println(readers[0]())"), "a Task lexical closure escaping a direct call"),
+    ] {
+        fs::write(path.join(file), changed).unwrap();
+        let rejected = call(&["build", "--native", file]);
+        let diagnostic = normalized(&rejected.stderr);
+        assert!(!rejected.status.success(), "{file}");
+        assert!(diagnostic.contains(error), "{file}: {diagnostic}");
+    }
+    fs::write(
+        path.join("wrong-receiver.ku"),
+        source.replace("rest.line.title.len()", "rest.line.number.len()"),
+    )
+    .unwrap();
+    let rejected = call(&["check", "wrong-receiver.ku"]);
+    let diagnostic = normalized(&rejected.stderr);
+    assert!(!rejected.status.success());
+    assert!(
+        diagnostic.contains("error[E0301]: error: type error: int has no fields"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
 fn native_task_catch_closure_alias_keeps_error_live_across_wait() {
     use ku::ir::task::TaskOp;
 

@@ -197,6 +197,16 @@ impl<'a> FunctionLowerer<'a> {
                     pending.push((right, depth + 1));
                     pending.push((left, depth + 1));
                 }
+                ExprKind::Call { callee, args }
+                    if args.is_empty()
+                        && matches!(&callee.kind, ExprKind::Field { target, name }
+                            if matches!(name.as_str(), "len" | "byte_len")
+                                && matches!(&target.kind, ExprKind::Field { .. } | ExprKind::OptionalField { .. })) =>
+                {
+                    // Keep the ordinary Task receiver/type check. Visiting the
+                    // callee accounts for its field path and captures its root.
+                    pending.push((callee, depth + 1));
+                }
                 _ => {
                     return Err(unsupported(
                         "calls, suspension or construction inside a Task lexical closure body",

@@ -1,0 +1,14 @@
+import { Scan, Pause } from "./worker"
+async fn main(): null! {
+    report = (await Scan("整理" + "🙂"))?
+    { status, ...rest } = report
+    length: fn(): int = fn(): int { return rest.line.title.len() }
+    bytes = fn(): int { return rest.line.title.byte_len() }
+    reader: fn(): int = length
+    byte_reader = bytes
+    tick = (await Pause())?
+    println(status)
+    println(reader())
+    println(byte_reader())
+    return ok(null)
+}

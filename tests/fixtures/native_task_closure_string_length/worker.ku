@@ -1,0 +1,11 @@
+import time from "std.time"
+struct Line { title: str, number: int }
+struct Report { status: int, line: Line }
+async fn Scan(title: str): Report! {
+    time.sleep(15)?
+    return ok(Report { status: 200, line: Line { title: title, number: 4 } })
+}
+async fn Pause(): null! {
+    time.sleep(15)?
+    return ok(null)
+}
