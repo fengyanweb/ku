@@ -188,6 +188,89 @@ fn native_task_outbound_http_uses_real_net_wait_and_sync_wrappers_remain_rejecte
 }
 
 #[test]
+fn native_task_http_config_keeps_nullable_record_projections_in_source_order() {
+    use ir::task::{TaskNetOperation, TaskOp, TaskSlotType, TaskTerminator};
+    use ir::IrType;
+
+    let mut ast = checked(
+        r#"
+struct Options { method: str | null, body: str | null, deadline: int | null, limit: int | null }
+struct Plan { url: str, options: Options }
+async fn Fetch(plan: Plan): HttpResponse! {
+    return http.request({
+        url: plan.url,
+        method: plan.options.method,
+        body: plan.options.body,
+        timeout_ms: plan.options.deadline,
+        max_body_bytes: plan.options.limit
+    })
+}
+async fn main(): null! { return ok(null) }
+"#,
+    );
+    ast.items
+        .retain(|item| !matches!(item,ku::ast::Item::Module(m)if m.name=="std:string"));
+    let native = ir::task_lower::lower_program(&ast).expect("nullable HTTP projection must lower");
+    let function = &native.tasks.functions[0];
+    let reads: Vec<_> = function
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter_map(|op| match op {
+            TaskOp::RecordField {
+                src, path, take, ..
+            } => {
+                assert_eq!(*src, function.parameters[0]);
+                assert!(!take);
+                Some(path.last().unwrap().0.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reads, ["url", "method", "body", "deadline", "limit"]);
+    let (owner, fields) = function
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .find_map(|op| match op {
+            TaskOp::JsonObject { dst, fields } => Some((dst, fields)),
+            _ => None,
+        })
+        .expect("projected nulls need the tagged HTTP config object");
+    let types: Vec<_> = fields
+        .iter()
+        .map(|(name, slot)| {
+            let TaskSlotType::Value {
+                ty,
+                borrowed: false,
+            } = &function.slots[slot.0].ty
+            else {
+                panic!("config field {name} was not materialized as a value");
+            };
+            (name.as_str(), ty.clone())
+        })
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("url", IrType::Str),
+            ("method", IrType::Nullable(Box::new(IrType::Str))),
+            ("body", IrType::Nullable(Box::new(IrType::Str))),
+            ("timeout_ms", IrType::Nullable(Box::new(IrType::Int))),
+            ("max_body_bytes", IrType::Nullable(Box::new(IrType::Int))),
+        ],
+    );
+    assert!(function.states.iter().any(|state| matches!(
+        &state.terminator,
+        TaskTerminator::BlockingNet { operation: TaskNetOperation::HttpRequestObject, inputs, ready, .. }
+            if inputs[0].as_ref() == Some(owner)
+                && function.states[ready.0].operations.iter().any(|op| matches!(
+                    op, TaskOp::Drop { slot } if slot == owner
+                ))
+    )));
+}
+
+#[test]
 fn native_task_http_value_and_client_only_c11_o2_compile_without_server() {
     let programs = [
         (

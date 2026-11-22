@@ -332,7 +332,7 @@ fn ProjectionBuiltinLinkId(&name: str, checked: bool): int {
         if (name == "trim") { return 5 }
         return 0
     }
-    if (name == "read") { return 1 }
+    if (name == "read" || name == "try_read") { return 1 }
     if (name == "slice") { return 2 }
     if (name == "from_str") { return 3 }
     return 0

@@ -1,0 +1,21 @@
+import http from "std.http"
+import { LoadPlan, RequestPlan } from "./request.ku"
+
+async fn Fetch(plan: RequestPlan): null! {
+    reply = http.request({
+        url: plan.url, method: plan.options.method, body: plan.options.body,
+        timeout_ms: plan.options.deadline, max_body_bytes: plan.options.body_limit,
+        headers: { "x-ku-input": "structured" }
+    })?
+    println(reply.status)
+    println(reply.body)
+    println(plan.label)
+    return ok(null)
+}
+
+async fn main(): null! {
+    base = "URL_TEMPLATE"
+    get = (await Fetch((await LoadPlan(base.clone(), true))?))?
+    post = (await Fetch((await LoadPlan(base, false))?))?
+    return ok(null)
+}

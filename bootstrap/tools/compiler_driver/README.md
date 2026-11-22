@@ -75,7 +75,10 @@ KU
 ## Build a typed application
 
 List the entry module first in `modules.txt` and include its imported project
-modules. Define `fn main(): null` or `fn main(): null!` in the entry module.
+modules. Define `fn main()`, `fn main(): null`, or `fn main(): null!` in the
+entry module. An unannotated `main()` can complete by falling through.
+It can handle a checked error in a named `catch` and run a shared `finally`
+when both the try body and the handler fall through.
 Use the standalone compiler and your target C compiler to build and link the
 reachable units. A checked `null!` entry reports an Error and exits with
 status 1 when the function fails.

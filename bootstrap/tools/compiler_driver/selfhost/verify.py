@@ -192,6 +192,7 @@ def verify_stage3_applications(repo, source, binary, cc, caller):
             "exercise_direct_owned_moves": (caller,),
             "exercise_plain_null_entry": (cc, caller),
             "exercise_linked_program": (cc, caller),
+            "exercise_linked_int_output": (cc, caller),
             "exercise_namespace_import": (cc, caller),
             "exercise_qualified_types": (cc, caller),
             "exercise_qualified_constructor": (cc, caller),
@@ -208,6 +209,7 @@ def verify_stage3_applications(repo, source, binary, cc, caller):
             "exercise_linked_string_match_guard": (cc, caller),
             "exercise_linked_counted_break": (cc, caller),
             "exercise_finally_frontend": (caller,),
+            "exercise_linked_literal_fail": (cc, caller),
             "exercise_linked_finally": (cc, caller),
             "exercise_linked_caught_finally": (cc, caller),
         }

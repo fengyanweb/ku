@@ -18,7 +18,7 @@ import { LinkedChildKindIs } from "./link_plan_json_c.ku"
 import { LowerLinkedNullRead } from "./linked_null_read_c.ku"
 import { CheckLinkedCountedIndex, FinishLinkedAppendThunk, IsLinkedAppendThunk, LowerLinkedArrayAppend, LowerLinkedLocal, LowerLinkedOwnerRebind, LowerLinkedTypedArrayLocal, ReadLinkedAppendThunk } from "./linked_owner_assignment_c.ku"
 import { ReadLinkedCatchParts } from "./scalar_result_null.ku"
-import { CheckLinkedFinallyContext, EnterLinkedCatchBeforeFinally, FinishLinkedFinally, LowerLinkedFailure, LowerLinkedStatementCall, OpenLinkedNamedCatch, ReadLinkedWhileCondition, LinkedCountedBreak, IsLinkedDirectBreak, LowerLinkedDirectBreak, LowerLinkedRetainedPair } from "./linked_statement_c.ku"
+import { CheckLinkedFinallyContext, EnterLinkedCatchBeforeFinally, FinishLinkedFinally, LeaveLinkedProtectedScope, LowerLinkedFailure, LowerLinkedStatementCall, OpenLinkedNamedCatch, ReadLinkedWhileCondition, LinkedCountedBreak, IsLinkedDirectBreak, LowerLinkedDirectBreak, LowerLinkedRetainedPair } from "./linked_statement_c.ku"
 import { ContainsIndex } from "./struct_projection_c.ku"
 
 
@@ -143,6 +143,9 @@ fn lowerLinkedCaughtFinally(&project: LinkedNullProject, state: LinkedNullState,
     handler = ReadLinkedProtectedTail(project.supplied[0].named, clauses.recovery)?
     terminal = body.kind == "Return" || body.kind == "Fail"
     handler_terminal = handler.kind == "Return" || handler.kind == "Fail"
+    if (state.plain_value_result && (terminal || handler_terminal)) {
+        RejectLayout("unsupported_linked_finally", "plain null try and catch must both continue to finally", DeclarationSpan(node))?
+    }
     if (terminal != handler_terminal) {
         RejectLayout("linked_finally_branch_mode", "try and catch must both fall through or both return or fail", DeclarationSpan(node))?
     }
@@ -162,6 +165,7 @@ fn lowerLinkedCaughtFinally(&project: LinkedNullProject, state: LinkedNullState,
     resumed = EnterLinkedCatchBeforeFinally(attempted, clauses.binding, before, pending, body.kind != "Fail")?
     handled = lowerLinkedFinallyPath(project, resumed, clauses.recovery, handler, result, saved)?
     CheckLinkedFinallyMoves(outer, handled, node)?
+    if (handled.plain_value_result) { handled.catch_slot = pending }
     // Only a successful return reaches the payload transfer after finally.
     // The handler's incoming state had no pending successful return.
     if (saved > 0) { handled.slots[saved - 1].live = true }
@@ -185,11 +189,23 @@ fn lowerLinkedCatch(&project: LinkedNullProject, state: LinkedNullState, &node: 
     outer = state.slots.clone()
     caught = OpenLinkedNamedCatch(project, state, clauses.binding, id)?
     body = LowerLinkedRegion(project, clauses.protected, caught, 0, result, depth + 1)?
+    attempt = body.state
+    join = ""
     if (!body.terminal) {
-        RejectLayout("unsupported_linked_catch", "the protected body must return or fail", DeclarationSpan(clauses.protected))?
+        join = "catch_join" + str(id)
+        attempt = LeaveLinkedProtectedScope(attempt, outer, clauses.protected, join)?
     }
-    resumed = BindLinkedCatch(body.state, clauses.binding.text.clone(), clauses.binding, outer)?
+    resumed = BindLinkedCatch(attempt, clauses.binding.text.clone(), clauses.binding, outer)?
     handled = LowerLinkedRegion(project, clauses.recovery, resumed, 0, result, depth + 1)?
+    if (join != "") {
+        if (handled.terminal) {
+            RejectLayout("unsupported_linked_catch", "try and catch must both fall through", DeclarationSpan(clauses.recovery))?
+        }
+        CheckLinkedFinallyMoves(outer, handled.state, clauses.recovery)?
+        next = DropLinkedNullScope(handled.state, outer.len())
+        next.code += join + ":;\n"
+        return ok(LinkedNullRegion { state: next, terminal: false })
+    }
     if (handled.terminal) {
         if (!last) {
             RejectLayout("unsupported_linked_terminal", "expected the terminal at the end of its block", DeclarationSpan(node))?

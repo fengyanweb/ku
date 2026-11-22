@@ -1,0 +1,30 @@
+import time from "std.time"
+
+struct Options {
+    method: str | null
+    body: str | null
+    deadline: int | null
+    body_limit: int | null
+}
+
+struct RequestPlan {
+    url: str
+    options: Options
+    label: str
+}
+
+async fn LoadPlan(base: str, defaults: bool): RequestPlan! {
+    time.sleep(5)?
+    if (defaults) {
+        return ok(RequestPlan {
+            url: base + "/hello",
+            options: Options { method: null, body: null, deadline: null, body_limit: null },
+            label: "默认" + "🙂"
+        })
+    }
+    return ok(RequestPlan {
+        url: base + "/post",
+        options: Options { method: "PO" + "ST", body: "整理" + "🙂", deadline: 1000, body_limit: 4096 },
+        label: "明确" + "🙂"
+    })
+}

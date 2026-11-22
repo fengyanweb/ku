@@ -1,0 +1,19 @@
+import time from "std.time"
+
+struct Meta {
+    title: str
+    offset: int
+}
+
+struct Report {
+    status: int
+    line: Meta | null
+}
+
+async fn Scan(found: bool): Report! {
+    time.sleep(15)?
+    if (found) {
+        return ok(Report { status: 200, line: Meta { title: "整理" + "🙂", offset: 0 } })
+    }
+    return ok(Report { status: 404, line: null })
+}

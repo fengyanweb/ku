@@ -1480,6 +1480,69 @@ int main(void) {
 }
 
 #[test]
+fn native_task_clones_a_nullable_projected_string_before_its_record_drops() {
+    let directory = TempDir::new("task-nullable-projection-clone");
+    let path = directory.path();
+    let source = include_str!("fixtures/native_task_nullable_projection_clone/main.ku");
+    fs::write(path.join("main.ku"), source).unwrap();
+    fs::write(
+        path.join("scan.ku"),
+        include_str!("fixtures/native_task_nullable_projection_clone/scan.ku"),
+    )
+    .unwrap();
+    let normalized = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    let expected = include_str!("fixtures/native_task_nullable_projection_clone/expected.txt");
+    let cli = |arguments: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ku"));
+        command.current_dir(path).args(arguments);
+        run_bounded(&mut command, BUILD_TIMEOUT, BUILD_LIMITS).unwrap()
+    };
+    let interpreted = cli(&["run", "--offline", "main.ku"]);
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        normalized(&interpreted.stderr)
+    );
+    assert_eq!(normalized(&interpreted.stdout), expected);
+
+    fs::write(
+        path.join("move.ku"),
+        source.replace("report.line?.title.clone()", "report.line?.title"),
+    )
+    .unwrap();
+    let rejected = cli(&["check", "--offline", "move.ku"]);
+    assert!(!rejected.status.success());
+    let diagnostic = normalized(&rejected.stderr);
+    assert!(
+        diagnostic.contains("add '.clone()' for an independent copy"),
+        "{diagnostic}"
+    );
+
+    let name = if cfg!(windows) { "app.exe" } else { "app" };
+    let built = cli(&["build", "--release", "--offline", "main.ku", "-o", name]);
+    let diagnostic = normalized(&built.stderr);
+    if !built.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none(), "{diagnostic}");
+        return;
+    }
+    assert!(built.status.success(), "{diagnostic}");
+    let outside = path.join("deployed");
+    fs::create_dir(&outside).unwrap();
+    fs::rename(path.join(name), outside.join(name)).unwrap();
+    fs::remove_file(path.join("main.ku")).unwrap();
+    fs::remove_file(path.join("scan.ku")).unwrap();
+    let result = run_bounded(
+        Command::new(outside.join(name)).current_dir(&outside),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(result.status.success(), "{}", normalized(&result.stderr));
+    assert!(result.stderr.is_empty());
+    assert_eq!(normalized(&result.stdout), expected);
+}
+
+#[test]
 fn native_task_optional_absence_releases_awaited_records_before_timer() {
     use ku::ir::task::TaskOp;
 

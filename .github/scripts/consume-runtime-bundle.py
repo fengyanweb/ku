@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 import importlib.util
 import json
@@ -858,6 +858,73 @@ def installed_native_time_array_consumer(install, root, env, report, report_path
             cleanup.raise_if_any(primary)
 
 
+@contextmanager
+def installed_http_client_peer(listener, request_count, structured_task, detail):
+    """Run the existing bounded peer on a caller-owned loopback listener."""
+    stop = threading.Event()
+    errors = []
+    received = []
+
+    def serve():
+        deadline=time.monotonic()+20
+        try:
+            while len(received)<request_count and not stop.is_set() and time.monotonic()<deadline:
+                try:connection,_=listener.accept()
+                except socket.timeout:continue
+                with connection:
+                    connection.settimeout(2);data=bytearray()
+                    while b'\r\n\r\n' not in data:
+                        block=connection.recv(4096)
+                        if not block:raise RuntimeError('incomplete HTTP fixture request')
+                        data.extend(block)
+                        if len(data)>16384:raise RuntimeError('HTTP fixture header bound')
+                    head,body=bytes(data).split(b'\r\n\r\n',1);line=head.split(b'\r\n',1)[0]
+                    length=0
+                    structured_header = False
+                    for header in head.split(b'\r\n')[1:]:
+                        if header.lower().startswith(b'content-length:'):length=int(header.split(b':',1)[1])
+                        if header.lower().startswith(b'x-ku-input:'):
+                            structured_header = header.split(b':',1)[1].strip() == b'structured'
+                    if structured_task and not structured_header:
+                        raise RuntimeError('structured Task HTTP configuration header did not reach the server')
+                    if not 0<=length<=4096:raise RuntimeError('HTTP fixture body bound')
+                    while len(body)<length:
+                        block=connection.recv(length-len(body))
+                        if not block:raise RuntimeError('incomplete HTTP fixture body')
+                        body+=block
+                    received.append(line.decode('ascii'))
+                    if line.startswith(b'GET /hello '):status,payload=200,'hello 中文🙂'.encode()
+                    elif line.startswith(b'POST /post '):status,payload=201,body
+                    elif line.startswith(b'GET /missing '):status,payload=404,b'missing'
+                    else:raise RuntimeError('unexpected HTTP fixture request')
+                    if structured_task and line.startswith(b'GET /hello '):
+                        # The native client's first read sees a live connection with no response.
+                        if stop.wait(0.05):
+                            return
+                    connection.sendall(('HTTP/1.1 '+str(status)+' Result\r\nX-Ku: yes\r\nContent-Length: '+str(len(payload))+'\r\nConnection: close\r\n\r\n').encode()+payload)
+            if len(received)!=request_count and not stop.is_set():raise RuntimeError('HTTP fixture did not finish')
+        except BaseException as e:errors.append(repr(e))
+
+    peer = threading.Thread(target=serve, name='installed-native-http-client-peer')
+    peer.start()
+    primary = None
+    try:
+        yield received
+        peer.join(3)
+        if peer.is_alive() or errors or len(received) != request_count:
+            raise RuntimeError('HTTP fixture failed: ' + repr(errors))
+    except BaseException as error:
+        primary = error
+    finally:
+        stop.set()
+        peer.join(3)
+        detail['fixture_thread_exited'] = not peer.is_alive()
+        cleanup = OWNER.CleanupErrors()
+        if peer.is_alive():
+            cleanup.add('HTTP loopback fixture thread did not exit')
+        cleanup.raise_if_any(primary)
+
+
 def installed_native_http_client_consumer(install, root, env, report, report_path, target, *,
                                           checkout_hidden=False, task_client=False, structured_task=False,
                                           backend='c'):
@@ -891,51 +958,12 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
         temp=Path(temp);project=temp/'project outside SDK 中文';project.mkdir()
         deployment=temp/'deployed';deployment.mkdir();unrelated=temp/'unrelated';unrelated.mkdir()
         ku=install/('ku.exe' if os.name=='nt' else 'ku');retired=root/'installed-sdk-unavailable-for-http-client'
-        stop=threading.Event();errors=[];received=[];peer=None;retired_sdk=False;primary=None
+        detail['fixture_thread_exited']=True;retired_sdk=False;primary=None
         with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as listener:
             listener.bind(('127.0.0.1',0));listener.listen(4);listener.settimeout(.1)
             address='http://127.0.0.1:'+str(listener.getsockname()[1])
             source=(Path(__file__).resolve().parents[2]/'examples'/(example+'.ku')).read_text(encoding='utf-8').replace('http://127.0.0.1:8080',address)
             (project/'main.ku').write_text(source,encoding='utf-8');program=project/('client.exe' if os.name=='nt' else 'client')
-            def serve():
-                deadline=time.monotonic()+20
-                try:
-                    while len(received)<3 and not stop.is_set() and time.monotonic()<deadline:
-                        try:connection,_=listener.accept()
-                        except socket.timeout:continue
-                        with connection:
-                            connection.settimeout(2);data=bytearray()
-                            while b'\r\n\r\n' not in data:
-                                block=connection.recv(4096)
-                                if not block:raise RuntimeError('incomplete HTTP fixture request')
-                                data.extend(block)
-                                if len(data)>16384:raise RuntimeError('HTTP fixture header bound')
-                            head,body=bytes(data).split(b'\r\n\r\n',1);line=head.split(b'\r\n',1)[0]
-                            length=0
-                            structured_header = False
-                            for header in head.split(b'\r\n')[1:]:
-                                if header.lower().startswith(b'content-length:'):length=int(header.split(b':',1)[1])
-                                if header.lower().startswith(b'x-ku-input:'):
-                                    structured_header = header.split(b':',1)[1].strip() == b'structured'
-                            if structured_task and not structured_header:
-                                raise RuntimeError('structured Task HTTP configuration header did not reach the server')
-                            if not 0<=length<=4096:raise RuntimeError('HTTP fixture body bound')
-                            while len(body)<length:
-                                block=connection.recv(length-len(body))
-                                if not block:raise RuntimeError('incomplete HTTP fixture body')
-                                body+=block
-                            received.append(line.decode('ascii'))
-                            if line.startswith(b'GET /hello '):status,payload=200,'hello 中文🙂'.encode()
-                            elif line.startswith(b'POST /post '):status,payload=201,body
-                            elif line.startswith(b'GET /missing '):status,payload=404,b'missing'
-                            else:raise RuntimeError('unexpected HTTP fixture request')
-                            if structured_task and line.startswith(b'GET /hello '):
-                                # The native client's first read sees a live connection with no response.
-                                if stop.wait(0.05):
-                                    return
-                            connection.sendall(('HTTP/1.1 '+str(status)+' Result\r\nX-Ku: yes\r\nContent-Length: '+str(len(payload))+'\r\nConnection: close\r\n\r\n').encode()+payload)
-                    if len(received)!=3 and not stop.is_set():raise RuntimeError('HTTP fixture did not finish')
-                except BaseException as e:errors.append(repr(e))
             try:
                 entry=ku;detail['cli_entry_kind']='direct'
                 if os.name!='nt':
@@ -957,29 +985,23 @@ def installed_native_http_client_consumer(install, root, env, report, report_pat
                 if retired.exists():raise RuntimeError('HTTP client SDK quarantine exists')
                 relocate_checkout_entry(install,retired);retired_sdk=True
                 detail['source_removed_before_run']=not project.exists();detail['sdk_unavailable_during_run']=not install.exists()
-                peer=threading.Thread(target=serve,name='installed-native-http-client-peer');peer.start()
-                result=invoke([deployed],unrelated,runtime_env,seconds=15)
-                detail['run_exit']=result.returncode;detail['run_stderr_bytes']=len(result.stderr)
-                detail['process_owner_cleanup']=getattr(result,'process_owner_cleanup',None)
-                expected='native-task-http-client-ok\n' if task_client else '[object]\nnative-http-client-ok\n'
-                if structured_task:
-                    expected = 'plan-ready\nstatus-ready\n'+expected
-                stdout = output(result)
-                if result.returncode or stdout!=expected or result.stderr:raise RuntimeError('installed HTTP client produced incorrect output: '+(stdout+result.stderr.decode(errors='replace'))[-4096:])
-                if structured_task:
-                    detail['run_stdout'] = stdout
-                peer.join(3)
-                if peer.is_alive() or errors or len(received)!=3:raise RuntimeError('HTTP fixture failed: '+repr(errors))
+                with installed_http_client_peer(listener, 3, structured_task, detail) as received:
+                    result=invoke([deployed],unrelated,runtime_env,seconds=15)
+                    detail['run_exit']=result.returncode;detail['run_stderr_bytes']=len(result.stderr)
+                    detail['process_owner_cleanup']=getattr(result,'process_owner_cleanup',None)
+                    expected='native-task-http-client-ok\n' if task_client else '[object]\nnative-http-client-ok\n'
+                    if structured_task:
+                        expected = 'plan-ready\nstatus-ready\n'+expected
+                    stdout = output(result)
+                    if result.returncode or stdout!=expected or result.stderr:raise RuntimeError('installed HTTP client produced incorrect output: '+(stdout+result.stderr.decode(errors='replace'))[-4096:])
+                    if structured_task:
+                        detail['run_stdout'] = stdout
                 if structured_task and [line.rsplit(' ',1)[0] for line in received] != ['GET /hello', 'GET /missing', 'POST /post']:
                     raise RuntimeError('structured Task HTTP recovery order failed: '+repr(received))
                 detail['requests']=received
             except BaseException as e:primary=e
             finally:
-                stop.set()
-                if peer:peer.join(3)
                 cleanup=OWNER.CleanupErrors()
-                if peer and peer.is_alive():cleanup.add('HTTP loopback fixture thread did not exit')
-                detail['fixture_thread_exited']=not peer or not peer.is_alive()
                 if retired_sdk:
                     if retired.is_dir() and not install.exists():cleanup.attempt('restore HTTP SDK',lambda:relocate_checkout_entry(retired,install))
                     else:cleanup.add('HTTP SDK restoration paths changed')
@@ -1310,7 +1332,8 @@ def read_installed_native_c(project, program, result):
 
 
 def validate_installed_relative_program(install, project, env, target, files, expected, *,
-                                        entry_name='main.ku', native_only_diagnostic=None, native_c_abi=None):
+                                        entry_name='main.ku', native_only_diagnostic=None, native_c_abi=None,
+                                        runtime_fixture=None):
     project.mkdir()
     for name, contents in files.items():
         (project / name).write_text(contents, encoding='utf-8')
@@ -1343,19 +1366,20 @@ def validate_installed_relative_program(install, project, env, target, files, ex
         if mode == 'c':
             for name in files:
                 (project / name).unlink()
-        result = invoke(command, cwd, selected_env, seconds=20)
-        observed = output(result)
-        if native_only_diagnostic is not None and mode != 'c':
-            diagnostic = result.stderr.decode('utf-8', errors='replace')
-            if result.returncode != 1 or observed or native_only_diagnostic not in diagnostic:
-                raise RuntimeError(project.name + ' installed diagnostic differed: ' +
-                                   repr((observed + diagnostic)[-4096:]))
-            outputs[mode] = {'exit_code': result.returncode, 'diagnostic': native_only_diagnostic}
-            continue
-        if result.returncode or result.stderr or observed != expected:
-            raise RuntimeError(project.name + ' installed execution differed: ' +
-                               repr((observed + result.stderr.decode('utf-8', errors='replace'))[-4096:]))
-        outputs[mode] = observed
+        with runtime_fixture(mode) if runtime_fixture is not None else nullcontext():
+            result = invoke(command, cwd, selected_env, seconds=20)
+            observed = output(result)
+            if native_only_diagnostic is not None and mode != 'c':
+                diagnostic = result.stderr.decode('utf-8', errors='replace')
+                if result.returncode != 1 or observed or native_only_diagnostic not in diagnostic:
+                    raise RuntimeError(project.name + ' installed diagnostic differed: ' +
+                                       repr((observed + diagnostic)[-4096:]))
+                outputs[mode] = {'exit_code': result.returncode, 'diagnostic': native_only_diagnostic}
+                continue
+            if result.returncode or result.stderr or observed != expected:
+                raise RuntimeError(project.name + ' installed execution differed: ' +
+                                   repr((observed + result.stderr.decode('utf-8', errors='replace'))[-4096:]))
+            outputs[mode] = observed
     return {'status': 'passed', 'outputs': outputs,
             'native_sources_removed': all(not (project / name).exists() for name in files), **evidence}
 
@@ -1454,6 +1478,49 @@ def verify_task_closure_timer_c(source):
     if (timer_sites != 2 or b'ku_task_driver_timer_arm(host->ticket,now+(uint64_t)millis,host->timer)' not in source):
         raise RuntimeError('installed Task closure fixture must retain the Scan and Pause timer Pending paths')
     return {'timer_pending_sites': timer_sites, 'sha256': hashlib.sha256(source).hexdigest()}
+
+
+def installed_inline_http_config_consumer(install, root, env, report, repo, commit, target):
+    fixture = 'tests/fixtures/native_task_inline_http_nullable'
+    templates = {
+        name: checked(['git', 'show', f'{commit}:{fixture}/{name}'], repo, env)
+        for name in ('main.template', 'request.template', 'expected.txt')
+    }
+    pack = EXPORT.NATIVE_HTTP_CLIENT.validate_pack(install / 'native-http/v1' / target, target)
+    build_env = {key: value for key, value in env.items()
+                 if key.lower() not in ('http_proxy', 'https_proxy', 'all_proxy', 'ku_native_http_client_pack')}
+    modes = {}
+
+    def verify_inline_c(source):
+        if b'net_status=ku_task_host_http_object(' not in source or b'.is_null ? ku_v_null()' not in source:
+            raise RuntimeError('inline HTTP config must preserve nullable fields through the native object path')
+        return {'tagged_config': True, 'sha256': hashlib.sha256(source).hexdigest()}
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(4)
+        listener.settimeout(.1)
+        address = f'http://127.0.0.1:{listener.getsockname()[1]}'
+        main = templates['main.template']
+        if main.count('URL_TEMPLATE') != 1:
+            raise ValueError('inline HTTP fixture requires exactly one private loopback URL')
+        files = {'main.ku': main.replace('URL_TEMPLATE', address), 'request.ku': templates['request.template']}
+
+        @contextmanager
+        def peer(mode):
+            detail = modes[mode] = {}
+            with installed_http_client_peer(listener, 2, True, detail) as received:
+                yield
+            detail['requests'] = [line.rsplit(' ', 1)[0] for line in received]
+            if detail['requests'] != ['GET /hello', 'POST /post']:
+                raise RuntimeError('inline HTTP config did not send the expected GET then POST')
+
+        result = validate_installed_relative_program(
+            install, root / 'task-inline-http-nullable', build_env, target, files, templates['expected.txt'],
+            native_c_abi=verify_inline_c, runtime_fixture=peer)
+    report['installed_native_task_inline_http_nullable'] = dict(
+        result, modes=modes, pack_source_sha256=pack['source_sha256'],
+        fixture_sha256=hashlib.sha256(EXPORT.json_bytes(templates)).hexdigest())
 
 
 def installed_forward_layout_consumer(install, root, env, report, target):
@@ -1764,6 +1831,9 @@ def run_structured_only(args, report):
             installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
                                                  'native_task_closure_string_length', sources=('main.ku', 'worker.ku'),
                                                  native_c_abi=verify_task_closure_timer_c)
+            installed_committed_program_consumer(install, root, env, report, repo, verifier, target,
+                                                 'native_task_nullable_projection_clone', sources=('main.ku', 'scan.ku'))
+            installed_inline_http_config_consumer(install, root, env, report, repo, verifier, target)
             verification = repo / 'bootstrap/tools/compiler_driver/selfhost/verify.py'
             cc = env.get('KU_GNU_CC') if target == 'x86_64-pc-windows-gnu' else 'clang'
             if not cc:

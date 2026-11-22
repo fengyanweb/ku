@@ -1885,6 +1885,20 @@ impl<'a> FunctionLowerer<'a> {
     ) -> KuResult<SlotId> {
         let source = self.expression(object, depth + 1)?;
         let ty = self.function.slots[source.0].ty.clone();
+        if name == "clone"
+            && matches!(
+                object.kind,
+                ExprKind::Field { .. } | ExprKind::OptionalField { .. }
+            )
+            && !self.stable_slots[source.0]
+            && self.slot_owners[source.0] == self.scopes.last().copied()
+            && matches!(&ty, TaskSlotType::Value { ty: IrType::Nullable(inner), borrowed: false }
+                if inner.as_ref() == &IrType::Str)
+        {
+            // Record projection already owns the active string or represents
+            // null. Its fresh slot is the independent snapshot for clone().
+            return Ok(source);
+        }
         if matches!(
             &ty,
             TaskSlotType::Value {
@@ -3046,8 +3060,7 @@ impl<'a> FunctionLowerer<'a> {
                                 ExprKind::ObjectLiteral { .. } | ExprKind::Literal(Literal::Null)
                             );
                         }
-                        // Nullable values in named fields use the normal
-                        // tagged object representation, including null.
+                        // Nullable locals use the tagged object representation.
                         !matches!(&value.kind, ExprKind::Variable(name)
                             if self.local(name).is_some_and(|slot|
                                 matches!(&self.function.slots[slot.0].ty,
@@ -3058,6 +3071,18 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 _ => return self.outbound_http_object(argument, depth),
             };
+            // Decide before lowering any fields so they are still evaluated
+            // once, in source order. The object form retains projected nulls
+            // for the existing runtime default and validation rules.
+            for (name, value) in inline_fields {
+                if matches!(
+                    name.as_str(),
+                    "method" | "body" | "timeout_ms" | "max_body_bytes"
+                ) && self.is_nullable_local_record_field(value)
+                {
+                    return self.outbound_http_object(argument, depth);
+                }
+            }
             let names = [
                 "url",
                 "body",

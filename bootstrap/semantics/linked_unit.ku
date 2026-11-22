@@ -1,7 +1,7 @@
 import { Span } from "../stage2/span.ku"
 import { BindProjectModules } from "./project_bindings.ku"
 import { DeclarationSpan } from "./names.ku"
-import { ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
+import { LinkedNullParameters, ReadLinkedNullParametersFrom } from "./linked_parameters_c.ku"
 import { RejectLayout } from "./struct_layouts.ku"
 import { TypeNameBinding } from "./type_names.ku"
 import { EmitLinkedNullPrototypes } from "./scalar_project_c.ku"
@@ -13,7 +13,7 @@ import { SuppliedModule } from "./imports.ku"
 import { BuiltinLinkPlanType, LinkedNullC, LinkedNullState, LinkPlanDeclaration, LinkPlanNominalType, LinkPlanType, NewLinkedNullState } from "./link_plan_c.ku"
 import { CallbackPlanNominals, EmitLinkPlan, EmitLinkedBodyPrelude, LinkedNullDependencyPlan } from "./link_plan_json_c.ku"
 import { LowerLinkedRegion } from "./linked_null_c.ku"
-import { LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, LinkedCheckedResultCType, LinkedNullCType, LinkedNullResultCleanupReference, LinkedResultPlan } from "./linked_null_types_c.ku"
+import { LinkedBuiltin, LinkedNullChild, LinkedNullNode, LinkedNullProject, LinkedNullType, LinkedStringResult, LinkedCheckedResultCType, LinkedNullCType, LinkedNullResultCleanupReference, LinkedResultPlan } from "./linked_null_types_c.ku"
 import { RequireProjectionLocalFunction } from "./struct_projection_c.ku"
 import { EmitStaticJsonString } from "./scalar_int_emit.ku"
 import { ReadStaticAsciiJsonString } from "./scalar_int_operands.ku"
@@ -154,14 +154,33 @@ fn PrepareLinkedNullProject(supplied: [SuppliedModule]): LinkedNullProject! {
     return ok(LinkedNullProject { supplied: supplied, binding: bound })
 }
 
+fn readLinkedEntryParameters(&project: LinkedNullProject, &function: Node): LinkedNullParameters! {
+    state = NewLinkedNullState()
+    if (function.text != "main") { return ReadLinkedNullParametersFrom(project, function, state) }
+    if (function.edge_count > 0) {
+        first = LinkedNullNode(project, 1, LinkedNullChild(project, 1, function, 0))
+        if (first.kind == "Parameter" || first.kind.starts_with("Type")) {
+            return ReadLinkedNullParametersFrom(project, function, state)
+        }
+    }
+    // Procedural main has no source result value. The program adapter already
+    // uses the plain null carrier for an entry whose C return value it ignores.
+    state.plain_value_result = true
+    result = LinkedBuiltin("null", DeclarationSpan(function))
+    return ok(LinkedNullParameters { state: state, signature: "void", body_start: 0, plan: [], result: result })
+}
+
 fn EmitLinkedNullC(&project: LinkedNullProject, &entry_name: str): LinkedNullC! {
     id = RequireProjectionLocalFunction(project.supplied, entry_name)?
     function = LinkedNullNode(project, 1, id)
-    parameters = ReadLinkedNullParametersFrom(project, function, NewLinkedNullState())?
+    parameters = readLinkedEntryParameters(project, function)?
     result = parameters.result.clone()
     region = LowerLinkedRegion(project, function, parameters.state, parameters.body_start, result, 0)?
     if (!region.terminal) {
-        RejectLayout("unsupported_linked_terminal", "expected a final return or Error fail", DeclarationSpan(function))?
+        if (parameters.body_start != 0) {
+            RejectLayout("unsupported_linked_terminal", "expected a final return or Error fail", DeclarationSpan(function))?
+        }
+        region.state.code += "    goto cleanup;\n"
     }
     symbol = "ku_linked_null_" + str(id)
     source = EmitLinkedFunction(project, region.state, symbol, parameters.signature, result)?

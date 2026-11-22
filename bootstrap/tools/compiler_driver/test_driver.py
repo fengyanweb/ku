@@ -1277,6 +1277,42 @@ def exercise_finally_frontend(compiler, caller):
         assert diagnostic in rejected.stderr and not rejected.stdout, rejected.stderr
 
 
+def exercise_linked_literal_fail(compiler, cc, caller):
+    project = caller / "linked literal fail"
+    project.mkdir()
+    manifest = project / "modules.txt"
+    manifest.write_text("main.ku\nreader.ku\n", encoding="utf-8")
+    entry = project / "main.ku"
+    entry.write_text('''\
+import { ReadName } from "./reader.ku"
+
+fn main(): null! {
+    owner = "still-" + str(7)
+    try {
+        println(ReadName()?)
+        return ok(null)
+    } catch(err) {
+        println(err.domain)
+        println(err.code)
+        println(err.message)
+        println(owner)
+        return ok(null)
+    }
+}
+''', encoding="utf-8")
+    message = "整理🙂\0name missing".encode()
+    reader = project / "reader.ku"
+    reader.write_bytes(b'fn ReadName(): str! { fail "' + message + b'" }\n')
+    output = project / ("read.exe" if os.name == "nt" else "read")
+    builder = Path(__file__).resolve().parents[1] / "build_program.py"
+    execute([sys.executable, "-B", builder, "--compiler", compiler, "--cc", cc,
+             manifest, "-o", output], caller)
+    entry.unlink()
+    reader.unlink()
+    result = execute([output], caller)
+    assert result.stdout.replace(b"\r\n", b"\n") == b"ku\nfail\n" + message + b"\nstill-7\n"
+
+
 def exercise_linked_counted_break(compiler, cc, caller):
     project = caller / "linked counted break"
     project.mkdir()
@@ -1857,6 +1893,61 @@ fn Find(present: bool): int | null { if (!present) { return null }; return 0 }
     failed = execute([sys.executable, "-B", root / "link_c.py", "--unit", invalid, emitted, "--check-only"], caller, 1)
     assert not failed.stdout and b"null requires the by-value uint8_t carrier" in failed.stderr
 
+    entry = project / "main.ku"
+    manifest.write_text("main.ku\n", encoding="utf-8")
+    example = (root.parent.parent / "examples/result.ku").read_bytes()
+    for index, (source, expected) in enumerate([
+        (example, [b"cleanup", b"caught: name missing"]),
+        (b'fn main() { println("normal fallthrough") }\n', [b"normal fallthrough"]),
+    ]):
+        entry.write_bytes(source)
+        procedure = project / (f"procedure-{index}.exe" if os.name == "nt" else f"procedure-{index}")
+        execute([sys.executable, "-B", root / "build_program.py", "--compiler", compiler,
+                 "--cc", cc, manifest, "-o", procedure], caller)
+        entry.unlink()
+        assert execute([procedure], caller).stdout.splitlines() == expected
+
+    entry.write_bytes((root.parent.parent / "examples/try_read.ku").read_bytes())
+    read_config = project / ("read-config.exe" if os.name == "nt" else "read-config")
+    execute([sys.executable, "-B", root / "build_program.py", "--compiler", compiler,
+             "--cc", cc, manifest, "-o", read_config], caller)
+    entry.unlink()
+    assert execute([read_config], project).stdout.splitlines() == [b"using default config"]
+    config = project / "missing-config.ku"
+    text = "配置🙂".encode()
+    config.write_bytes(text)
+    assert execute([read_config], project).stdout.splitlines() == [text]
+    config.write_bytes(b"\xff")
+    assert execute([read_config], project).stdout.splitlines() == [b"using default config"]
+
+    for invalid_source, diagnostic in [
+        ('fn main(): null { println("missing return") }', b"unsupported_linked_terminal"),
+        ('fn main() { fail "unhandled" }', b"linked_value_failure"),
+        ('''fn Read(): str! { fail "error" }
+fn main() { try { Read()? } catch(err) { Read()? } finally { println("cleanup") } }
+''', b"linked_value_failure"),
+    ]:
+        entry.write_text(invalid_source + "\n", encoding="utf-8")
+        attempt = execute([compiler, "emit-unit-plan", manifest, "main"], caller, 1)
+        assert not attempt.stdout and diagnostic in attempt.stderr, attempt.stderr
+
+
+def exercise_linked_int_output(compiler, cc, caller):
+    project = caller / "linked int output"
+    project.mkdir()
+    tools = Path(__file__).resolve().parents[1]
+    examples = tools.parent.parent / "examples"
+    for filename in ("imports.ku", "math.ku"):
+        (project / filename).write_bytes((examples / filename).read_bytes())
+    manifest = project / "modules.txt"
+    manifest.write_text("imports.ku\nmath.ku\n", encoding="utf-8")
+    output = project / ("imports.exe" if os.name == "nt" else "imports")
+    execute([sys.executable, "-B", tools / "build_program.py", "--compiler", compiler,
+             "--cc", cc, manifest, "-o", output], caller)
+    (project / "imports.ku").unlink()
+    (project / "math.ku").unlink()
+    assert execute([output], caller).stdout.splitlines() == [b"10", b"5"]
+
 
 def exercise_parameter_bindings(compiler, cc, caller):
     source = caller / "parameter-binding.ku"
@@ -1947,6 +2038,19 @@ fn Recover(abort: bool): int! {
     }
     return ok(29)
 }
+fn RecoverThenContinue(abort: bool): int! {
+    text = "before-" + str(8)
+    try {
+        local = "try-" + str(9)
+        if (abort) { fail { domain: "fixture", code: "recover", message: local } }
+        text = local
+    } catch (err) {
+        text = "caught " + err.message
+    }
+    if (text == "try-9") { return ok(31) }
+    if (text == "caught try-9") { return ok(42) }
+    return ok(0)
+}
 fn CloneNested(): int! {
     texts: [str] = []
     text = "item" + str(8)
@@ -1977,6 +2081,7 @@ fn CloneRows(): int! {
     cases = {
         "Replace": [("", 15)],
         "Recover": [("false", 11), ("true", 29)],
+        "RecoverThenContinue": [("false", 31), ("true", 42)],
         "CloneNested": [("", 38)],
         "CloneRows": [("", 56)],
     }
@@ -2088,6 +2193,7 @@ def exercise(ku, cc):
         exercise_linked_program(compiler, cc, caller)
         exercise_partial_record_view(compiler, cc, caller)
         exercise_plain_null_entry(compiler, cc, caller)
+        exercise_linked_int_output(compiler, cc, caller)
         exercise_checked_bool(compiler, cc, caller)
         exercise_linked_nullable_int(compiler, cc, caller)
         exercise_linked_owned_reader(compiler, cc, caller)
@@ -2102,6 +2208,7 @@ def exercise(ku, cc):
         exercise_linked_unit_enum_member(compiler, cc, caller)
         exercise_finally_frontend(compiler, caller)
         exercise_linked_finally(compiler, cc, caller)
+        exercise_linked_literal_fail(compiler, cc, caller)
         exercise_linked_counted_break(compiler, cc, caller)
         exercise_linked_caught_finally(compiler, cc, caller)
         exercise_linked_reader_factory(compiler, cc, caller)

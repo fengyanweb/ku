@@ -1,0 +1,27 @@
+import {Scan} from "./scan"
+import time from "std.time"
+
+async fn Inventory(found: bool): null! {
+    title: str | null = null
+    if (true) {
+        report = (await Scan(found))?
+        title = report.line?.title.clone()
+        println(report.status)
+        println(report.line?.title == "整理🙂")
+        println(report.line?.offset)
+    }
+    // Only the independent title is still live after leaving the report scope.
+    time.sleep(15)?
+    if (title != null) {
+        println(title)
+        println(title.len())
+    }
+    println(title == null)
+    return ok(null)
+}
+
+async fn main(): null! {
+    ready = (await Inventory(true))?
+    missing = (await Inventory(false))?
+    return ok(null)
+}

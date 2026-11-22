@@ -404,6 +404,7 @@ return or failure transfers its selected Result through the same cleanup as
 the final return. Only the untaken path can reach the following statements.
 Linked `print` and `println` can read a checked string expression once;
 its temporary is released after the write without consuming a named owner.
+They also write signed `int` expressions directly, without an owned string.
 A checked call used as a statement drops its success payload before the next
 statement and transfers the original Error if the call fails.
 A named struct View uses a const pointer to the bound declaration. Field
@@ -431,8 +432,8 @@ preserve the callee's status and all owned fields. The latter links to the
 typed collector, while the former still requires the private module reader.
 
 Linked entry points can unwrap a `str!` Result and return its owner. A
-checked `fs.read` requires the bound standard namespace and the existing
-`std/fs.ku` provider in the link plan. C uses the provider's `fs_read.h`
+checked `fs.read` or `fs.try_read` requires the bound standard namespace and
+the existing `std/fs.ku` provider in the link plan. C uses the provider's `fs_read.h`
 and converts the carrier fields without copying the file contents. The
 caller retains its path, and the original error fields are transferred.
 
@@ -442,10 +443,15 @@ including values whose moves occur after the failing call. The handler
 may return a replacement or transfer the intact Error with `fail err`.
 Fatal allocation and bounds exits use the common cleanup. A binding
 that was consumed on any caught edge is unavailable in the handler.
+When the try body and named catch both fall through, they release their
+local owners before continuing. An outer owner must remain available on
+both paths.
 A terminal fail can move caught Error fields into a new Error. Its
 other string operands can read still-live caught fields. The scratch
 Error owns each completed field during message construction, so a
 fatal allocation failure also releases the partially constructed Error.
+The `fail "message"` shorthand follows the same checked exit with the
+static `ku` domain, `fail` code, and exact message bytes.
 
 An explicitly typed local uses the existing ownership path once its
 initializer matches the declared type. A conditional replacement of one

@@ -2,6 +2,34 @@
 use super::*;
 use crate::ast::{MatchArm, MatchPattern};
 
+enum RecordProjection {
+    Field(IrType),
+    Absent,
+}
+
+fn field_path<'a>(
+    mut base: &'a Expr,
+    name: &'a str,
+    optional: bool,
+    span: Span,
+) -> KuResult<(&'a Expr, Vec<(&'a str, bool)>)> {
+    let mut path = vec![(name, optional)];
+    while let ExprKind::Field { target, name } | ExprKind::OptionalField { target, name } =
+        &base.kind
+    {
+        if path.len() == 8 {
+            return Err(unsupported(
+                "Task record field paths deeper than 8 fields",
+                span,
+            ));
+        }
+        path.push((name, matches!(base.kind, ExprKind::OptionalField { .. })));
+        base = target;
+    }
+    path.reverse();
+    Ok((base, path))
+}
+
 pub(super) fn record_name(name: &str) -> String {
     format!("__ku_task_record_{name}")
 }
@@ -747,46 +775,54 @@ impl FunctionLowerer<'_> {
         span: Span,
         depth: usize,
     ) -> KuResult<Option<SlotId>> {
-        let mut path = vec![(name.to_owned(), optional)];
-        let mut base = target;
-        while let ExprKind::Field { target, name } | ExprKind::OptionalField { target, name } =
-            &base.kind
-        {
-            if path.len() == 8 {
-                return Err(unsupported(
-                    "Task record field paths deeper than 8 fields",
-                    span,
-                ));
-            }
-            path.push((
-                name.clone(),
-                matches!(base.kind, ExprKind::OptionalField { .. }),
-            ));
-            base = target;
-        }
+        let (base, path) = field_path(target, name, optional, span)?;
         let source = match &base.kind {
             ExprKind::Variable(name) => {
-                let Some(slot) = self.local(name) else {
+                let Some((slot, _)) = self.local_record(name) else {
                     return Ok(None);
                 };
-                if !matches!(&self.function.slots[slot.0].ty, TaskSlotType::Value { ty, .. }
-                    if task::record_type(ty) || task::nullable_record(ty))
-                {
-                    return Ok(None);
-                }
                 slot
             }
             ExprKind::StructLiteral { .. } => self.expression(base, depth + path.len())?,
             _ if optional => self.expression(base, depth + path.len())?,
             _ => return Ok(None),
         };
-        path.reverse();
         self.record_field_slot(
             source,
             path,
             span,
             false,
             !matches!(base.kind, ExprKind::Variable(_)),
+        )
+    }
+
+    fn local_record(&self, name: &str) -> Option<(SlotId, &IrType)> {
+        let slot = self.local(name)?;
+        let TaskSlotType::Value { ty, .. } = &self.function.slots[slot.0].ty else {
+            return None;
+        };
+        (task::record_type(ty) || task::nullable_record(ty)).then_some((slot, ty))
+    }
+
+    pub(super) fn is_nullable_local_record_field(&self, expression: &Expr) -> bool {
+        let ExprKind::Field { target, name } = &expression.kind else {
+            return false;
+        };
+        let Ok((base, path)) = field_path(target, name, false, expression.span) else {
+            return false;
+        };
+        if path.iter().any(|(_, optional)| *optional) {
+            return false;
+        }
+        let ExprKind::Variable(root) = &base.kind else {
+            return false;
+        };
+        let Some((_, ty)) = self.local_record(root) else {
+            return false;
+        };
+        matches!(
+            self.record_projection_type(ty, &path, expression.span),
+            Ok(RecordProjection::Field(IrType::Nullable(_) | IrType::Null))
         )
     }
 
@@ -805,39 +841,62 @@ impl FunctionLowerer<'_> {
         }
         // The current expression owns this anonymous record. Move the selected
         // field before dropping the rest; named owners keep their existing read.
-        let path = fields
-            .iter()
-            .map(|field| (field.to_string(), false))
-            .collect();
+        let path = fields.iter().map(|field| (*field, false)).collect();
         self.record_field_slot(source, path, span, true, true)
     }
 
     fn record_field_slot(
         &mut self,
         source: SlotId,
-        path: Vec<(String, bool)>,
+        path: Vec<(&str, bool)>,
         span: Span,
         take: bool,
         drop_source: bool,
     ) -> KuResult<Option<SlotId>> {
         self.budget.analysis(path.len(), span)?;
-        let mut ty = match &self.function.slots[source.0].ty {
-            TaskSlotType::Value { ty, .. } => ty.clone(),
+        let ty = match &self.function.slots[source.0].ty {
+            TaskSlotType::Value { ty, .. } => ty,
             _ => return Ok(None),
         };
+        let ty = match self.record_projection_type(ty, &path, span)? {
+            RecordProjection::Field(ty) => ty,
+            RecordProjection::Absent => return self.null_record_projection(source, drop_source),
+        };
+        let dst = self.slot(value_slot(ty))?;
+        self.emit(TaskOp::RecordField {
+            dst,
+            src: source,
+            path: path
+                .into_iter()
+                .map(|(name, optional)| (name.to_owned(), optional))
+                .collect(),
+            take,
+        })?;
+        if drop_source {
+            self.emit(TaskOp::Drop { slot: source })?;
+        }
+        Ok(Some(dst))
+    }
+
+    fn record_projection_type<'a>(
+        &'a self,
+        mut ty: &'a IrType,
+        path: &[(&str, bool)],
+        span: Span,
+    ) -> KuResult<RecordProjection> {
         let mut guarded = false;
-        for (name, optional) in &path {
+        for &(name, optional) in path {
             if let IrType::Nullable(inner) = ty {
                 if !optional {
                     return Err(unsupported("a nullable record projection without ?.", span));
                 }
                 guarded = true;
-                ty = *inner;
+                ty = inner;
             }
-            if ty == IrType::Null && *optional {
-                return self.null_record_projection(source, drop_source);
+            if ty == &IrType::Null && optional {
+                return Ok(RecordProjection::Absent);
             }
-            let IrType::Named(ref record) = ty else {
+            let IrType::Named(record) = ty else {
                 return Err(unsupported(
                     "field path through a non-record Task value",
                     span,
@@ -848,10 +907,10 @@ impl FunctionLowerer<'_> {
                 .structs
                 .iter()
                 .find(|layout| layout.name == *record)
-                .and_then(|layout| layout.fields.iter().find(|field| field.name == *name));
+                .and_then(|layout| layout.fields.iter().find(|field| field.name == name));
             match field {
-                Some(field) => ty = field.ty.clone(),
-                None if *optional => return self.null_record_projection(source, drop_source),
+                Some(field) => ty = &field.ty,
+                None if optional => return Ok(RecordProjection::Absent),
                 None => {
                     return Err(unsupported(
                         &format!("field {name} of {}", public_name(record)),
@@ -860,23 +919,15 @@ impl FunctionLowerer<'_> {
                 }
             }
         }
-        if guarded && task::enum_name(&ty).is_some() {
+        if guarded && task::enum_name(ty).is_some() {
             return Err(unsupported("nullable Task enum projection", span));
         }
-        if guarded {
-            ty = super::super::nullable::nullable_type(ty);
-        }
-        let dst = self.slot(value_slot(ty))?;
-        self.emit(TaskOp::RecordField {
-            dst,
-            src: source,
-            path,
-            take,
-        })?;
-        if drop_source {
-            self.emit(TaskOp::Drop { slot: source })?;
-        }
-        Ok(Some(dst))
+        let ty = if guarded {
+            super::super::nullable::nullable_type(ty.clone())
+        } else {
+            ty.clone()
+        };
+        Ok(RecordProjection::Field(ty))
     }
 
     fn null_record_projection(
